@@ -8,12 +8,13 @@ For each OCXO lane the report independently reconstructs both nanosecond clock
 candidates:
 
 * PhaseLedger: prior candidate + 1 second + reported PhaseLedger residual.
-* Delta Cycles: prior candidate + exact raw-interval ratio, including the
-  firmware's carried fractional-nanosecond remainder.
+* Delta Cycles: prior candidate + the firmware-published window-aligned
+  residual, including the carried fractional-nanosecond remainder.
 
-It then checks candidate-count conservation, highlights 100 ns tooth events,
-and calls attention to phase suffix boundaries, discontinuities, malformed
-candidate state, or disagreement that cannot be explained by the two residuals.
+The complete-current-interval ratio remains visible as a raw frequency witness,
+but it is not the accumulated candidate equation.  Ordinary phase-tooth
+boundaries, recovery gaps, and alignment corrections stay quiet; the report
+emits notes only for integrity failures.
 """
 
 from __future__ import annotations
@@ -340,7 +341,7 @@ def _append_candidate_health_notes(lane: LaneAudit, candidate: Candidate, label:
         lane.notes.append(f"{label}_CONTINUITY_INVALID")
     if candidate.status not in {"ADVANCED", "SEEDED"}:
         lane.notes.append(f"{label}_STATUS={candidate.status}")
-    if candidate.residual_available is False:
+    if candidate.status == "ADVANCED" and candidate.residual_available is False:
         lane.notes.append(f"{label}_RESIDUAL_UNAVAILABLE")
 
 
@@ -405,8 +406,6 @@ def build_lane(
 
     if phase.ns is not None:
         lane.phase_suffix_ns = phase.ns % 100
-        if lane.phase_suffix_ns <= near_tooth_ns or lane.phase_suffix_ns >= 100 - near_tooth_ns:
-            lane.notes.append(f"NEAR_TOOTH={lane.phase_suffix_ns:02d}")
 
     if phase.ns is not None and delta.ns is not None:
         lane.computed_difference_ns = delta.ns - phase.ns
@@ -469,27 +468,27 @@ def build_lane(
             )
             if lane.phase_raw_suffix_step_ns <= -50:
                 lane.phase_wrap_direction = "FWD"
-                lane.notes.append(
-                    f"PHASE_WRAP_FWD={state.previous_phase_suffix:02d}->{lane.phase_suffix_ns:02d}"
-                )
             elif lane.phase_raw_suffix_step_ns >= 50:
                 lane.phase_wrap_direction = "REV"
-                lane.notes.append(
-                    f"PHASE_WRAP_REV={state.previous_phase_suffix:02d}->{lane.phase_suffix_ns:02d}"
-                )
 
+    # The accumulated Delta candidate advances from the firmware-published
+    # window-aligned residual.  The complete-current-interval ratio is retained
+    # independently as a raw frequency witness only.
     exact_delta_increment_ns: Optional[float] = None
+    if delta.residual_ns_exact is not None:
+        exact_delta_increment_ns = NS_PER_SECOND + delta.residual_ns_exact
+
     if (
         lane.reference_cycles is not None
         and lane.clock_cycles is not None
         and lane.reference_cycles > 0
         and lane.clock_cycles > 0
     ):
-        exact_delta_increment_ns = (
+        raw_ratio_increment_ns = (
             NS_PER_SECOND * lane.reference_cycles / lane.clock_cycles
         )
         lane.delta_ratio_residual_ns_exact = (
-            exact_delta_increment_ns - NS_PER_SECOND
+            raw_ratio_increment_ns - NS_PER_SECOND
         )
 
     delta_increment_rounded: Optional[int] = None
@@ -520,27 +519,6 @@ def build_lane(
             if abs(lane.delta_fractional_error_ns) > FLOAT_EPSILON_NS:
                 lane.notes.append(
                     f"DELTA_FRAC_ERR={lane.delta_fractional_error_ns:+.6f}"
-                )
-
-    if (
-        lane.reference_cycles is not None
-        and lane.clock_cycles is not None
-        and lane.reference_cycles > 0
-        and lane.clock_cycles > 0
-    ):
-        lane.delta_formula_residual_ns_exact = (
-            (lane.reference_cycles - lane.clock_cycles)
-            * NS_PER_SECOND
-            / lane.reference_cycles
-        )
-        if delta.residual_ns_exact is not None:
-            lane.delta_residual_formula_error_ns = (
-                delta.residual_ns_exact - lane.delta_formula_residual_ns_exact
-            )
-            if abs(lane.delta_residual_formula_error_ns) > FLOAT_EPSILON_NS:
-                lane.notes.append(
-                    "DELTA_RES_FORMULA_ERR="
-                    f"{lane.delta_residual_formula_error_ns:+.6f}"
                 )
 
     if (
@@ -637,13 +615,6 @@ def build_row(
 
 def row_notes(row: AuditRow, lane: LaneAudit) -> list[str]:
     notes: list[str] = []
-    if row.recovery_boundary:
-        skipped = row.count_delta - 1 if row.count_delta is not None else 0
-        notes.append(f"RECOVER_GAP={skipped}")
-    elif row.gap:
-        notes.append(f"NON_ADJACENT={row.count_delta}")
-    if row.disposition != "ACCEPT":
-        notes.append(row.disposition)
     if row.timeline_valid is False:
         notes.append("TIMELINE_INVALID")
     notes.extend(lane.notes)
@@ -787,7 +758,7 @@ def parse(
     )
 
 
-def note_is_attention(note: str) -> bool:
+def note_is_fatal(note: str) -> bool:
     return note != "OK"
 
 
@@ -796,7 +767,13 @@ def update_summary(summary: Summary, lane: LaneAudit, displayed: bool) -> None:
         summary.lane_rows_displayed += 1
     if lane.phase_wrap_direction:
         summary.phase_wraps += 1
-    if any(note.startswith("NEAR_TOOTH=") for note in lane.notes):
+    if (
+        lane.phase_suffix_ns is not None
+        and (
+            lane.phase_suffix_ns <= DEFAULT_NEAR_TOOTH_NS
+            or lane.phase_suffix_ns >= 100 - DEFAULT_NEAR_TOOTH_NS
+        )
+    ):
         summary.near_tooth_rows += 1
     if "ONE_TOOTH_STEP" in lane.notes or "ONE_TOOTH_RESIDUAL" in lane.notes:
         summary.tooth_alerts += 1
@@ -839,7 +816,7 @@ def main(argv: Sequence[str]) -> None:
     )
     print(
         "Deduction: Phase=prior+1s+phase_residual; "
-        "Delta=prior+round(prior_fraction+1s*reference_cycles/clock_cycles)."
+        "Delta=prior+round(prior_fraction+1s+window_aligned_delta_residual)."
     )
 
     header = [
@@ -848,7 +825,7 @@ def main(argv: Sequence[str]) -> None:
         f"{'suf':>5}",
         f"{'p_res':>7}",
         f"{'d_res':>9}",
-        f"{'ratio':>9}",
+        f"{'raw_ratio':>9}",
         f"{'phase_ns':>15}",
         f"{'phase_calc':>15}",
         f"{'delta_ns':>15}",
@@ -888,7 +865,7 @@ def main(argv: Sequence[str]) -> None:
             lane = row.lanes[name]
             notes = row_notes(row, lane)
             note = " | ".join(notes) if notes else "OK"
-            displayed = not pathology_only or note_is_attention(note)
+            displayed = not pathology_only or note_is_fatal(note)
             update_summary(summary, lane, displayed)
             if not displayed:
                 continue
@@ -915,9 +892,7 @@ def main(argv: Sequence[str]) -> None:
         f"displayed {summary.lane_rows_displayed:,} lane rows."
     )
     print(
-        "Attention totals: "
-        f"wraps={summary.phase_wraps:,} "
-        f"near_tooth={summary.near_tooth_rows:,} "
+        "Fatal totals: "
         f"one_tooth_alerts={summary.tooth_alerts:,} "
         f"reconstruction_failures={summary.reconstruction_failures:,} "
         f"closure_failures={summary.closure_failures:,}"

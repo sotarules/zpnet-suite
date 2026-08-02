@@ -225,8 +225,9 @@ uint64_t clocks_dwt_cycles_at_dwt(uint32_t dwt32);
 //
 // PPS_COUNTERLEDGER makes the public OCXO nanosecond clocks the exact
 // edge-authored CounterLedger whole-tick value plus the PhaseLedger 0..99 ns
-// suffix.  The same adjacent programmed OCXO compare targets and DWT-at-edge
-// geometry author both pieces; the PPS-time ambient CNTR read is witness only.
+// suffix.  The same adjacent programmed OCXO compare targets and canonical
+// selected VCLOCK DWT-at-edge geometry author both pieces.  Physical-PPS-time
+// ambient CNTR reads are a different event species and remain diagnostics only.
 // Alpha does not release the row to Beta until both lanes resolve the same PPS
 // sequence.  Delta Cycles remains the independent observed-edge frequency
 // candidate; bridge and static projection surfaces remain forensic only.
@@ -372,8 +373,9 @@ struct clocks_alpha_ocxo_counterledger_snapshot_t {
 
   // CounterLedger and PhaseLedger are one edge-authored construction.  The
   // adjacent programmed OCXO compare targets identify the whole 100 ns cell;
-  // DWT-at-edge locates physical PPS inside that cell and supplies the 0..99 ns
-  // suffix.  No ambient CNTR read participates in the authoritative clockface.
+  // the canonical selected VCLOCK DWT-at-edge locates that reference inside the
+  // cell and supplies the 0..99 ns suffix.  No physical-PPS ambient CNTR read
+  // participates in the authoritative clockface.
   bool     phase_valid = false;
   bool     phase_pending = false;
   bool     phase_near_boundary = false;

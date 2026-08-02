@@ -1681,10 +1681,21 @@ struct ocxo_science_totals_t {
 static ocxo_science_totals_t g_ocxo_science_totals_ocxo1 DMAMEM = {};
 static ocxo_science_totals_t g_ocxo_science_totals_ocxo2 DMAMEM = {};
 
+// Defined below the candidate implementation.
+static bool delta_raw_interval_cycles_plausible(uint32_t cycles);
+static int64_t beta_round_double_to_i64(double value);
+
 // Campaign-scoped Delta-Cycles shadow clocks.  The canonical public OCXO
-// clockface remains CounterLedger + PhaseLedger.  These states independently
-// advance from the same-row Delta residual and are never repaired from the
-// canonical clock after their lifecycle seed.
+// clockface remains CounterLedger + PhaseLedger.  The independent Delta clock
+// closes on the same selected VCLOCK endpoints, but it derives elapsed OCXO
+// nanoseconds directly from the VCLOCK and OCXO DWT-at-edge transcripts.
+//
+// A selected VCLOCK second generally straddles two OCXO one-second intervals:
+// the tail of the prior interval and the head of the current interval.  Applying
+// only the current interval's rate to the whole VCLOCK second creates a boundary
+// term whenever adjacent OCXO intervals differ and makes D-P drift until the
+// next campaign/recovery seed.  Preserve the prior bracket so each increment is
+// the exact two-piece, window-aligned Delta construction.
 struct delta_clock_candidate_state_t {
   bool seeded = false;
   bool continuity_valid = false;
@@ -1695,6 +1706,15 @@ struct delta_clock_candidate_state_t {
   uint32_t interval_count = 0;
   uint64_t ns = 0;
   double fractional_ns = 0.0;
+
+  bool geometry_valid = false;
+  uint32_t geometry_target_dwt = 0;
+  uint32_t geometry_next_ocxo_dwt = 0;
+  uint32_t geometry_interval_cycles = 0;
+
+  bool last_residual_available = false;
+  int64_t last_residual_ns = 0;
+  double last_residual_ns_exact = 0.0;
 };
 
 static delta_clock_candidate_state_t
@@ -1896,19 +1916,82 @@ static ocxo_science_totals_t g_beta_probe_science_totals_o2 DMAMEM = {};
 static ocxo_science_totals_t g_beta_row_science_totals_o1_before DMAMEM = {};
 static ocxo_science_totals_t g_beta_row_science_totals_o2_before DMAMEM = {};
 
+static bool delta_clock_candidate_geometry_valid(
+    uint32_t target_dwt,
+    uint32_t next_ocxo_dwt,
+    uint32_t interval_cycles) {
+  if (!delta_raw_interval_cycles_plausible(interval_cycles)) return false;
+  const uint32_t previous_ocxo_dwt = next_ocxo_dwt - interval_cycles;
+  const uint32_t target_delta_cycles = target_dwt - previous_ocxo_dwt;
+  return target_delta_cycles <= interval_cycles;
+}
+
+static bool delta_clock_candidate_capture_geometry(
+    delta_clock_candidate_state_t& state,
+    uint32_t target_dwt,
+    uint32_t next_ocxo_dwt,
+    uint32_t interval_cycles) {
+  if (!delta_clock_candidate_geometry_valid(
+          target_dwt, next_ocxo_dwt, interval_cycles)) {
+    return false;
+  }
+
+  state.geometry_valid = true;
+  state.geometry_target_dwt = target_dwt;
+  state.geometry_next_ocxo_dwt = next_ocxo_dwt;
+  state.geometry_interval_cycles = interval_cycles;
+  return true;
+}
+
 static void delta_clock_candidate_fail(
     delta_clock_candidate_state_t& state,
     clocks_monitor_clock_candidate_status_t status,
     uint32_t public_count) {
   state.continuity_valid = false;
+  state.geometry_valid = false;
+  state.last_residual_available = false;
+  state.last_residual_ns = 0;
+  state.last_residual_ns_exact = 0.0;
   state.status = status;
   state.last_public_count = public_count;
+}
+
+static bool delta_clock_candidate_reanchor(
+    delta_clock_candidate_state_t& state,
+    uint32_t public_count,
+    uint64_t phaseledger_ns,
+    uint32_t target_dwt,
+    uint32_t next_ocxo_dwt,
+    uint32_t interval_cycles) {
+  if (phaseledger_ns == 0ULL ||
+      !delta_clock_candidate_capture_geometry(
+          state, target_dwt, next_ocxo_dwt, interval_cycles)) {
+    return false;
+  }
+
+  // START supplies private PPS0 geometry, so public PPS1 normally advances
+  // independently.  RECOVER and FLASH_CUT may have no lawful pre-boundary
+  // bracket; their first public row becomes an explicit splice anchor.
+  state.ns = phaseledger_ns;
+  state.fractional_ns = 0.0;
+  state.last_public_count = public_count;
+  state.interval_count = public_count >= state.start_public_count
+      ? public_count - state.start_public_count
+      : 0U;
+  state.last_residual_available = false;
+  state.last_residual_ns = 0;
+  state.last_residual_ns_exact = 0.0;
+  state.status = clocks_monitor_clock_candidate_status_t::SEEDED;
+  return true;
 }
 
 static void delta_clock_candidate_advance(
     delta_clock_candidate_state_t& state,
     uint32_t public_count,
-    const clock_science_row_t& row) {
+    const clock_science_row_t& row,
+    const clocks_alpha_lane_forensics_t& clock_forensics,
+    uint64_t phaseledger_ns,
+    bool phaseledger_clockface_valid) {
   if (!state.seeded) {
     state.status = clocks_monitor_clock_candidate_status_t::UNAVAILABLE;
     state.last_public_count = public_count;
@@ -1930,8 +2013,19 @@ static void delta_clock_candidate_advance(
     return;
   }
 
-  if (!row.delta_raw_valid ||
-      !isfinite(row.delta_raw_fast_residual_ns_exact)) {
+  const uint32_t current_target_dwt = row.pps_vclock_dwt_at_edge;
+  const uint32_t current_next_ocxo_dwt = clock_forensics.last_event_dwt;
+  const uint32_t current_interval_cycles =
+      clock_forensics.dwt_cycles_between_edges;
+  const bool current_geometry_valid =
+      clock_forensics.valid &&
+      delta_clock_candidate_geometry_valid(
+          current_target_dwt,
+          current_next_ocxo_dwt,
+          current_interval_cycles);
+
+  if (!phaseledger_clockface_valid || phaseledger_ns == 0ULL ||
+      !current_geometry_valid) {
     delta_clock_candidate_fail(
         state,
         clocks_monitor_clock_candidate_status_t::DELTA_INVALID,
@@ -1939,17 +2033,71 @@ static void delta_clock_candidate_advance(
     return;
   }
 
-  // The familiar Delta fast residual is the first-order expression of this
-  // relationship.  Advance the shadow clock from the underlying interval ratio
-  // itself so the candidate does not accumulate a known second-order residual
-  // approximation error.
-  const double exact_increment_ns =
+  if (!state.geometry_valid) {
+    if (!delta_clock_candidate_reanchor(
+            state,
+            public_count,
+            phaseledger_ns,
+            current_target_dwt,
+            current_next_ocxo_dwt,
+            current_interval_cycles)) {
+      delta_clock_candidate_fail(
+          state,
+          clocks_monitor_clock_candidate_status_t::DELTA_INVALID,
+          public_count);
+    }
+    return;
+  }
+
+  const uint32_t current_previous_ocxo_dwt =
+      current_next_ocxo_dwt - current_interval_cycles;
+  const uint32_t current_head_cycles =
+      current_target_dwt - current_previous_ocxo_dwt;
+  const uint32_t previous_tail_cycles =
+      state.geometry_next_ocxo_dwt - state.geometry_target_dwt;
+  const uint32_t reference_interval_cycles =
+      current_target_dwt - state.geometry_target_dwt;
+
+  const bool geometry_contiguous =
+      current_previous_ocxo_dwt == state.geometry_next_ocxo_dwt;
+  const bool pieces_valid =
+      previous_tail_cycles <= state.geometry_interval_cycles &&
+      current_head_cycles <= current_interval_cycles &&
+      (uint64_t)previous_tail_cycles + (uint64_t)current_head_cycles ==
+          (uint64_t)reference_interval_cycles;
+  const bool row_matches_geometry =
+      row.delta_raw_valid &&
+      isfinite(row.delta_raw_fast_residual_ns_exact) &&
+      row.delta_raw_reference_interval_cycles == reference_interval_cycles &&
+      row.delta_raw_clock_interval_cycles == current_interval_cycles &&
+      row.clock_observed_interval_cycles == current_interval_cycles;
+
+  if (!geometry_contiguous || !pieces_valid || !row_matches_geometry ||
+      !delta_raw_interval_cycles_plausible(reference_interval_cycles) ||
+      !delta_raw_interval_cycles_plausible(state.geometry_interval_cycles) ||
+      !delta_raw_interval_cycles_plausible(current_interval_cycles)) {
+    delta_clock_candidate_fail(
+        state,
+        clocks_monitor_clock_candidate_status_t::DELTA_INVALID,
+        public_count);
+    return;
+  }
+
+  // The VCLOCK window straddles the common OCXO boundary.  Convert each DWT
+  // piece with the OCXO interval that actually contains it, then add the two
+  // elapsed OCXO-nanosecond pieces.  This is the endpoint-aligned Delta clock.
+  const double previous_tail_ns =
       ((double)CLOCKS_BETA_NS_PER_SECOND *
-       (double)row.delta_raw_reference_interval_cycles) /
-      (double)row.delta_raw_clock_interval_cycles;
+       (double)previous_tail_cycles) /
+      (double)state.geometry_interval_cycles;
+  const double current_head_ns =
+      ((double)CLOCKS_BETA_NS_PER_SECOND *
+       (double)current_head_cycles) /
+      (double)current_interval_cycles;
+  const double exact_increment_ns = previous_tail_ns + current_head_ns;
   const double increment_with_carry =
       state.fractional_ns + exact_increment_ns;
-  if (!isfinite(increment_with_carry) ||
+  if (!isfinite(exact_increment_ns) || !isfinite(increment_with_carry) ||
       increment_with_carry > (double)INT64_MAX ||
       increment_with_carry < 1.0) {
     delta_clock_candidate_fail(
@@ -1959,9 +2107,7 @@ static void delta_clock_candidate_advance(
     return;
   }
 
-  const int64_t increment_ns = increment_with_carry >= 0.0
-      ? (int64_t)(increment_with_carry + 0.5)
-      : (int64_t)(increment_with_carry - 0.5);
+  const int64_t increment_ns = beta_round_double_to_i64(increment_with_carry);
   if (increment_ns <= 0 ||
       UINT64_MAX - state.ns < (uint64_t)increment_ns) {
     delta_clock_candidate_fail(
@@ -1976,7 +2122,23 @@ static void delta_clock_candidate_advance(
       increment_with_carry - (double)increment_ns;
   state.last_public_count = public_count;
   state.interval_count++;
+  state.last_residual_available = true;
+  state.last_residual_ns_exact =
+      exact_increment_ns - (double)CLOCKS_BETA_NS_PER_SECOND;
+  state.last_residual_ns =
+      beta_round_double_to_i64(state.last_residual_ns_exact);
   state.status = clocks_monitor_clock_candidate_status_t::ADVANCED;
+
+  if (!delta_clock_candidate_capture_geometry(
+          state,
+          current_target_dwt,
+          current_next_ocxo_dwt,
+          current_interval_cycles)) {
+    delta_clock_candidate_fail(
+        state,
+        clocks_monitor_clock_candidate_status_t::DELTA_INVALID,
+        public_count);
+  }
 }
 
 static const char* delta_raw_interval_reject_reason(uint32_t cycles) {
@@ -5676,6 +5838,25 @@ static bool campaign_start_prologue_consume_private_candidate(
   // offsets to this edge; the next qualified candidate becomes public PPS1.
   campaign_public_offsets_reset_to_current();
 
+  // Preserve the exact private-PPS0 DWT geometry.  Public PPS1 can then form a
+  // fully independent, window-aligned Delta increment rather than re-anchoring
+  // from the PhaseLedger clockface.
+  const uint32_t private_target_dwt = (uint32_t)g_dwt_at_pps_vclock;
+  if (!delta_clock_candidate_capture_geometry(
+          g_delta_clock_candidate_ocxo1,
+          private_target_dwt,
+          ocxo1_f.last_event_dwt,
+          ocxo1_f.dwt_cycles_between_edges) ||
+      !delta_clock_candidate_capture_geometry(
+          g_delta_clock_candidate_ocxo2,
+          private_target_dwt,
+          ocxo2_f.last_event_dwt,
+          ocxo2_f.dwt_cycles_between_edges)) {
+    campaign_start_prologue_set_reason(
+        "private_candidate_missing_delta_geometry");
+    return false;
+  }
+
   const delta_residual_reference_t ref =
       delta_residual_capture_vclock_reference(0U, vclock_valid, vclock_f);
 
@@ -6021,13 +6202,19 @@ static FLASHMEM void clocks_monitor_clock_candidates_snapshot_from_row(
   out.delta_cycles.interval_count = delta_state.interval_count;
   out.delta_cycles.ns = delta_state.ns;
   out.delta_cycles.fractional_ns = delta_state.fractional_ns;
-  out.delta_cycles.residual_available = delta_row.delta_raw_valid;
-  out.delta_cycles.residual_ns = delta_row.delta_raw_valid
-      ? delta_row.delta_raw_fast_residual_ns
+  // Candidate residuals describe the same selected-VCLOCK endpoint window as
+  // the accumulated Delta clock.  The single full-OCXO-interval rate witness
+  // remains separately available under ocxoN.science.delta_raw_*.
+  out.delta_cycles.residual_available =
+      delta_state.last_residual_available &&
+      delta_state.last_public_count == public_count;
+  out.delta_cycles.residual_ns = out.delta_cycles.residual_available
+      ? delta_state.last_residual_ns
       : 0LL;
-  out.delta_cycles.residual_ns_exact = delta_row.delta_raw_valid
-      ? delta_row.delta_raw_fast_residual_ns_exact
+  out.delta_cycles.residual_ns_exact = out.delta_cycles.residual_available
+      ? delta_state.last_residual_ns_exact
       : 0.0;
+  (void)delta_row;
 
   out.comparable =
       out.phaseledger.available && out.delta_cycles.available;
@@ -8063,10 +8250,16 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   // until the next explicit campaign or RECOVER seed.
   delta_clock_candidate_advance(g_delta_clock_candidate_ocxo1,
                                 public_count,
-                                ocxo1_science);
+                                ocxo1_science,
+                                ocxo1_forensics,
+                                public_ocxo1_ns,
+                                ocxo1_clockface_valid);
   delta_clock_candidate_advance(g_delta_clock_candidate_ocxo2,
                                 public_count,
-                                ocxo2_science);
+                                ocxo2_science,
+                                ocxo2_forensics,
+                                public_ocxo2_ns,
+                                ocxo2_clockface_valid);
 
   clock_science_apply_counterledger_row(ocxo1_science,
                                         ocxo1_counterledger,

@@ -4103,9 +4103,14 @@ static void alpha_counterledger_note_capture_status(
 
 
 
-// Stage one physical PPS fact for later resolution by the adjacent programmed
-// OCXO compare targets.  The ambient counter is copied only as a witness tied to
-// this PPS sequence; missing witness data never blocks the authoritative path.
+// Stage one canonical selected PPS/VCLOCK fact for later resolution by the
+// adjacent programmed OCXO compare targets.  PhaseLedger must terminate at the
+// same observed VCLOCK DWT coordinate used by Delta Cycles; the physical PPS
+// witness is a distinct event and must not author this clockface.
+//
+// ambient_counter_witness_valid is therefore false for the canonical call site.
+// The retained parameters keep the resolver shape stable for diagnostics and
+// future same-coordinate counter testimony.
 static bool alpha_counterledger_stage_pps_fact(
     time_clock_id_t clock,
     alpha_pps_counterledger_lane_t& s,
@@ -9818,27 +9823,25 @@ static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& sna
                                             cap,
                                             snap.sequence);
 
-    const bool ambient_witness_valid_ocxo1 =
-        cap_available && cap.valid && cap.ocxo1_capture_valid &&
-        cap.sequence == snap.sequence;
-    const bool ambient_witness_valid_ocxo2 =
-        cap_available && cap.valid && cap.ocxo2_capture_valid &&
-        cap.sequence == snap.sequence;
-
+    // PhaseLedger and Delta Cycles must close on the same event coordinate.
+    // snap.dwt_at_edge is the selected observed VCLOCK edge used by Delta's
+    // reference interval.  The ambient OCXO counter captures belong to the
+    // earlier physical PPS event, so they cannot witness the implied tooth at
+    // this VCLOCK coordinate and are deliberately not attached here.
     const bool staged_ocxo1 = alpha_counterledger_stage_pps_fact(
         time_clock_id_t::OCXO1,
         g_ocxo1_pps_counterledger,
         snap.sequence,
-        snap.physical_pps_dwt_normalized_at_edge,
-        ambient_witness_valid_ocxo1,
-        ambient_witness_valid_ocxo1 ? cap.ocxo1_counter32 : 0U);
+        snap.dwt_at_edge,
+        false,
+        0U);
     const bool staged_ocxo2 = alpha_counterledger_stage_pps_fact(
         time_clock_id_t::OCXO2,
         g_ocxo2_pps_counterledger,
         snap.sequence,
-        snap.physical_pps_dwt_normalized_at_edge,
-        ambient_witness_valid_ocxo2,
-        ambient_witness_valid_ocxo2 ? cap.ocxo2_counter32 : 0U);
+        snap.dwt_at_edge,
+        false,
+        0U);
 
     if ((!staged_ocxo1 || !staged_ocxo2) && counterledger_authority_enabled) {
       const uint32_t rejected_lane_mask =
@@ -9849,17 +9852,17 @@ static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& sna
                ? 1U : 0U) |
           (alpha_counterledger_phase_left_edge_ready(time_clock_id_t::OCXO2)
                ? 2U : 0U) |
-          (snap.physical_pps_dwt_normalized_at_edge != 0U ? 4U : 0U);
+          (snap.dwt_at_edge != 0U ? 4U : 0U);
       clocks_row_exclude(
           clocks_row_objection_source_t::ALPHA,
           clocks_row_objection_reason_t::ALPHA_COUNTERLEDGER_CAPTURE,
           rejected_lane_mask,
           snap.sequence,
-          snap.physical_pps_dwt_normalized_at_edge,
+          snap.dwt_at_edge,
           stage_evidence_bits,
           0U);
-      // Ambient witness loss alone never enters this branch.  A failure here
-      // means Alpha could not stage the physical PPS DWT for edge resolution.
+      // A failure here means Alpha could not stage the canonical selected
+      // VCLOCK DWT coordinate for edge resolution.
     }
   }
 
