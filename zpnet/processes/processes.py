@@ -62,6 +62,13 @@ TEENSY_PUBLISH_SUBSCRIBE_SOCKET = "/tmp/zpnet_teensy_ps.sock"
 # command/response requests during repaint.
 PUBSUB_TAP_SOCKET = "/tmp/zpnet_pubsub_tap.sock"
 
+# Pi PUBSUB fan-out uses one Unix-stream connection per publication and closes
+# that connection after sendall().  EOF, not an arbitrary recv() boundary, is
+# therefore the message delimiter.  Keep the bound generous beside current
+# ~40 KiB MONITOR traffic while still rejecting a runaway peer.
+PUBSUB_RECV_CHUNK_BYTES = 65536
+PUBSUB_MAX_MESSAGE_BYTES = 1024 * 1024
+
 
 class PubSubTapCache:
     """Maintain latest payloads for a fixed set of local PUBSUB topics."""
@@ -518,17 +525,47 @@ def _serve_pubsub(*, subsystem: str, subscriptions: Dict[str, Callable[[dict], N
     while True:
         conn, _ = srv.accept()
         with conn:
+            chunks: list[bytes] = []
+            total_bytes = 0
             try:
-                raw = conn.recv(65536)
-                if not raw:
+                while True:
+                    chunk = conn.recv(PUBSUB_RECV_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    total_bytes += len(chunk)
+                    if total_bytes > PUBSUB_MAX_MESSAGE_BYTES:
+                        raise ValueError(
+                            "pubsub publication exceeds "
+                            f"{PUBSUB_MAX_MESSAGE_BYTES} bytes"
+                        )
+                    chunks.append(chunk)
+
+                if not chunks:
                     continue
+
+                raw = b"".join(chunks)
                 msg = json.loads(raw.decode("utf-8"))
             except Exception:
-                logging.exception("[pubsub] bad message (ignored) %s", subsystem)
+                tail = b"" if not chunks else b"".join(chunks)[-80:]
+                logging.exception(
+                    "[pubsub] bad message ignored subsystem=%s bytes=%d "
+                    "ends_with_brace=%s tail=%r",
+                    subsystem,
+                    total_bytes,
+                    tail.rstrip().endswith(b"}"),
+                    tail,
+                )
                 continue
 
             topic = msg.get("topic")
             payload = msg.get("payload")
+            logging.debug(
+                "[pubsub] recv subsystem=%s topic=%r bytes=%d chunks=%d",
+                subsystem,
+                topic,
+                total_bytes,
+                len(chunks),
+            )
 
             handler = subscriptions.get(topic)
             if handler is None:
