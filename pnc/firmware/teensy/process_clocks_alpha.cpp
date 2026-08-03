@@ -3028,6 +3028,173 @@ static uint32_t g_instrument_stats_vclock_interval_reject_count = 0U;
 static uint32_t g_instrument_stats_ocxo1_interval_reject_count = 0U;
 static uint32_t g_instrument_stats_ocxo2_interval_reject_count = 0U;
 
+// Four frequency-bearing always-on lanes share one bounded rolling history.
+// The exact 10-minute view retains one-second samples. Longer views retain
+// completed minute aggregates, limiting the 24-hour state to about 49 KiB while
+// keeping TOTAL on the existing double-precision Welford/TAU authorities. The
+// longer windows update at minute boundaries and always span whole minutes.
+enum class alpha_ppb_lane_t : uint8_t {
+  DWT = 0,
+  VCLOCK = 1,
+  OCXO1 = 2,
+  OCXO2 = 3,
+};
+
+static constexpr size_t ALPHA_PPB_LANE_COUNT = 4U;
+static constexpr uint32_t ALPHA_PPB_SECOND_CAPACITY = 10U * 60U;
+static constexpr uint32_t ALPHA_PPB_MINUTE_CAPACITY = 24U * 60U;
+
+struct alpha_ppb_second_sample_t {
+  uint32_t pps_sequence = 0U;
+  float ppb[ALPHA_PPB_LANE_COUNT] = {};
+  uint8_t valid_mask = 0U;
+  uint8_t reserved[3] = {};
+};
+
+struct alpha_ppb_minute_sample_t {
+  // Stored as minute index + 1 so zero remains the empty-slot identity.
+  uint32_t minute_key = 0U;
+  float ppb_sum[ALPHA_PPB_LANE_COUNT] = {};
+  uint8_t sample_count[ALPHA_PPB_LANE_COUNT] = {};
+};
+
+static alpha_ppb_second_sample_t
+    g_alpha_ppb_seconds[ALPHA_PPB_SECOND_CAPACITY] DMAMEM = {};
+static alpha_ppb_minute_sample_t
+    g_alpha_ppb_minutes[ALPHA_PPB_MINUTE_CAPACITY] DMAMEM = {};
+
+static size_t alpha_ppb_lane_index(alpha_ppb_lane_t lane) {
+  return (size_t)((uint8_t)lane);
+}
+
+static void alpha_ppb_windows_reset(void) {
+  for (size_t i = 0; i < ALPHA_PPB_SECOND_CAPACITY; i++) {
+    g_alpha_ppb_seconds[i] = alpha_ppb_second_sample_t{};
+  }
+  for (size_t i = 0; i < ALPHA_PPB_MINUTE_CAPACITY; i++) {
+    g_alpha_ppb_minutes[i] = alpha_ppb_minute_sample_t{};
+  }
+}
+
+static uint32_t alpha_ppb_minute_key(uint32_t pps_sequence) {
+  return ((pps_sequence - 1U) / 60U) + 1U;
+}
+
+static void alpha_ppb_windows_begin_row(uint32_t pps_sequence) {
+  alpha_ppb_second_sample_t& second =
+      g_alpha_ppb_seconds[(pps_sequence - 1U) % ALPHA_PPB_SECOND_CAPACITY];
+  second = alpha_ppb_second_sample_t{};
+  second.pps_sequence = pps_sequence;
+
+  const uint32_t minute_key = alpha_ppb_minute_key(pps_sequence);
+  alpha_ppb_minute_sample_t& minute =
+      g_alpha_ppb_minutes[(minute_key - 1U) % ALPHA_PPB_MINUTE_CAPACITY];
+  if (minute.minute_key != minute_key) {
+    minute = alpha_ppb_minute_sample_t{};
+    minute.minute_key = minute_key;
+  }
+}
+
+static void alpha_ppb_windows_note(alpha_ppb_lane_t lane,
+                                   uint32_t pps_sequence,
+                                   double ppb) {
+  const size_t lane_index = alpha_ppb_lane_index(lane);
+  alpha_ppb_second_sample_t& second =
+      g_alpha_ppb_seconds[(pps_sequence - 1U) % ALPHA_PPB_SECOND_CAPACITY];
+  second.ppb[lane_index] = (float)ppb;
+  second.valid_mask |= (uint8_t)(1U << lane_index);
+
+  const uint32_t minute_key = alpha_ppb_minute_key(pps_sequence);
+  alpha_ppb_minute_sample_t& minute =
+      g_alpha_ppb_minutes[(minute_key - 1U) % ALPHA_PPB_MINUTE_CAPACITY];
+  minute.ppb_sum[lane_index] += (float)ppb;
+  minute.sample_count[lane_index]++;
+}
+
+static clocks_instrument_ppb_value_snapshot_t alpha_ppb_second_window(
+    alpha_ppb_lane_t lane,
+    uint32_t current_pps_sequence) {
+  clocks_instrument_ppb_value_snapshot_t out{};
+  const size_t lane_index = alpha_ppb_lane_index(lane);
+  const uint8_t lane_bit = (uint8_t)(1U << lane_index);
+  double sum = 0.0;
+
+  for (size_t i = 0; i < ALPHA_PPB_SECOND_CAPACITY; i++) {
+    const alpha_ppb_second_sample_t& sample = g_alpha_ppb_seconds[i];
+    if (sample.pps_sequence == 0U ||
+        (current_pps_sequence - sample.pps_sequence) >=
+            ALPHA_PPB_SECOND_CAPACITY ||
+        (sample.valid_mask & lane_bit) == 0U) {
+      continue;
+    }
+    sum += (double)sample.ppb[lane_index];
+    out.sample_count++;
+  }
+
+  if (out.sample_count != 0ULL) {
+    out.ppb = sum / (double)out.sample_count;
+  }
+  return out;
+}
+
+static clocks_instrument_ppb_value_snapshot_t alpha_ppb_minute_window(
+    alpha_ppb_lane_t lane,
+    uint32_t current_pps_sequence,
+    uint32_t window_minutes) {
+  clocks_instrument_ppb_value_snapshot_t out{};
+  const size_t lane_index = alpha_ppb_lane_index(lane);
+  const uint32_t current_minute_key =
+      alpha_ppb_minute_key(current_pps_sequence);
+  const bool current_minute_complete =
+      ((current_pps_sequence - 1U) % 60U) == 59U;
+  double sum = 0.0;
+
+  for (size_t i = 0; i < ALPHA_PPB_MINUTE_CAPACITY; i++) {
+    const alpha_ppb_minute_sample_t& minute = g_alpha_ppb_minutes[i];
+    if (minute.minute_key == 0U) continue;
+
+    const uint32_t age_minutes = current_minute_key - minute.minute_key;
+    const bool inside_window = current_minute_complete
+        ? age_minutes < window_minutes
+        : (age_minutes >= 1U && age_minutes <= window_minutes);
+    if (!inside_window) continue;
+
+    sum += (double)minute.ppb_sum[lane_index];
+    out.sample_count += minute.sample_count[lane_index];
+  }
+
+  if (out.sample_count != 0ULL) {
+    out.ppb = sum / (double)out.sample_count;
+  }
+  return out;
+}
+
+static clocks_instrument_ppb_buckets_snapshot_t alpha_ppb_windows_snapshot(
+    alpha_ppb_lane_t lane,
+    uint32_t current_pps_sequence) {
+  clocks_instrument_ppb_buckets_snapshot_t out{};
+  if (current_pps_sequence == 0U) return out;
+
+  out.minute_10 = alpha_ppb_second_window(lane, current_pps_sequence);
+  out.minute_60 = alpha_ppb_minute_window(lane, current_pps_sequence, 60U);
+  out.hour_8 = alpha_ppb_minute_window(lane, current_pps_sequence, 8U * 60U);
+  out.hour_24 = alpha_ppb_minute_window(lane, current_pps_sequence, 24U * 60U);
+  return out;
+}
+
+static void alpha_ppb_attach_windows(
+    clocks_instrument_frequency_snapshot_t& frequency,
+    alpha_ppb_lane_t lane,
+    uint32_t current_pps_sequence) {
+  clocks_instrument_ppb_buckets_snapshot_t buckets =
+      alpha_ppb_windows_snapshot(lane, current_pps_sequence);
+  if (frequency.valid) {
+    buckets.total.sample_count = frequency.sample_count;
+    buckets.total.ppb = frequency.ppb;
+  }
+  frequency.ppb_buckets = buckets;
+}
+
 static clocks_instrument_frequency_snapshot_t
 alpha_frequency_from_welford(const welford_t& w) {
   clocks_instrument_frequency_snapshot_t f{};
@@ -3065,6 +3232,7 @@ void clocks_alpha_instrument_stats_reset(void) {
   welford_reset(welford_ocxo1_dac);
   welford_reset(welford_ocxo2_dac);
   alpha_tau_reset_all();
+  alpha_ppb_windows_reset();
 
   g_instrument_stats_reset_count++;
   g_instrument_stats_update_count = 0U;
@@ -3115,6 +3283,10 @@ static void alpha_instrument_stats_note_completed_row(
   const uint32_t ocxo2_cycles =
       g_ocxo2_measurement.dwt_cycles_between_edges;
 
+  // Every completed identity ages the rolling windows. Only admitted lane
+  // values are added below, so rejected seconds leave an explicit time gap.
+  alpha_ppb_windows_begin_row(pps_sequence);
+
   if (science_eligible) {
     // GNSS is the exact reference clock. Give it a real Welford population of
     // admitted zero-residual samples; PPS count remains a timeline identity.
@@ -3124,12 +3296,18 @@ static void alpha_instrument_stats_note_completed_row(
       const double expected = (double)DWT_EXPECTED_PER_PPS;
       const double dwt_ppb = ((double)cps - expected) / expected * 1.0e9;
       welford_update(welford_dwt, dwt_ppb);
+      alpha_ppb_windows_note(alpha_ppb_lane_t::DWT,
+                             pps_sequence,
+                             dwt_ppb);
     }
 
     if (reference_valid && alpha_instrument_interval_plausible(vclock_cycles)) {
-      welford_update(welford_vclock,
-                     alpha_instrument_delta_fast_ns(reference_cycles,
-                                                    vclock_cycles));
+      const double vclock_ppb =
+          alpha_instrument_delta_fast_ns(reference_cycles, vclock_cycles);
+      welford_update(welford_vclock, vclock_ppb);
+      alpha_ppb_windows_note(alpha_ppb_lane_t::VCLOCK,
+                             pps_sequence,
+                             vclock_ppb);
     } else {
       g_instrument_stats_vclock_interval_reject_count++;
     }
@@ -3143,6 +3321,10 @@ static void alpha_instrument_stats_note_completed_row(
                                     reference_cycles,
                                     ocxo1_cycles,
                                     g_ocxo1_measured_gnss_ns_at_pps_vclock);
+      alpha_ppb_windows_note(
+          alpha_ppb_lane_t::OCXO1,
+          pps_sequence,
+          ((double)reference_cycles / (double)ocxo1_cycles - 1.0) * 1.0e9);
     } else {
       g_instrument_stats_ocxo1_interval_reject_count++;
     }
@@ -3156,6 +3338,10 @@ static void alpha_instrument_stats_note_completed_row(
                                     reference_cycles,
                                     ocxo2_cycles,
                                     g_ocxo2_measured_gnss_ns_at_pps_vclock);
+      alpha_ppb_windows_note(
+          alpha_ppb_lane_t::OCXO2,
+          pps_sequence,
+          ((double)reference_cycles / (double)ocxo2_cycles - 1.0) * 1.0e9);
     } else {
       g_instrument_stats_ocxo2_interval_reject_count++;
     }
@@ -3261,6 +3447,19 @@ FLASHMEM bool clocks_alpha_instrument_stats_snapshot(
     local.ocxo2_frequency =
         alpha_frequency_from_tau(local.ocxo2_tau_state);
 
+    alpha_ppb_attach_windows(local.dwt_frequency,
+                             alpha_ppb_lane_t::DWT,
+                             local.last_pps_sequence);
+    alpha_ppb_attach_windows(local.vclock_frequency,
+                             alpha_ppb_lane_t::VCLOCK,
+                             local.last_pps_sequence);
+    alpha_ppb_attach_windows(local.ocxo1_frequency,
+                             alpha_ppb_lane_t::OCXO1,
+                             local.last_pps_sequence);
+    alpha_ppb_attach_windows(local.ocxo2_frequency,
+                             alpha_ppb_lane_t::OCXO2,
+                             local.last_pps_sequence);
+
     local.gnss_welford = welford_gnss;
     local.dwt_welford = welford_dwt;
     local.vclock_welford = welford_vclock;
@@ -3316,6 +3515,10 @@ bool clocks_alpha_instrument_stats_restore(
       time_clock_id_t::OCXO1, &state->ocxo1_tau_state);
   (void)clocks_alpha_ocxo_tau_restore(
       time_clock_id_t::OCXO2, &state->ocxo2_tau_state);
+
+  // Recovery restores TOTAL's sufficient state exactly. Rolling membership is
+  // deliberately restarted because no per-second history crosses the reboot.
+  alpha_ppb_windows_reset();
 
   g_instrument_stats_reset_count = state->reset_count;
   g_instrument_stats_update_count = state->update_count;
