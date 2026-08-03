@@ -16,10 +16,9 @@ Controls:
   Q        — Quit
 
 Display layout:
-  Row 0   — Status header (network, battery, health, GNSS)
-  Row 1   — Separator
-  Row 2   — Readout name + lock indicator
-  Row 3+  — Readout content
+  Row 0   — White status title; ``* `` prefix indicates display lock
+  Row 1   — Blank
+  Row 2+  — Readout content; the body itself supplies section spacing
 
 When unlocked, cycles through readouts on a fixed cadence.
 When locked, holds the current readout until manually advanced.
@@ -172,9 +171,9 @@ def _main(stdscr: curses.window) -> None:
     stdscr.keypad(True)               # decode function keys as curses.KEY_F(n)
     stdscr.timeout(int(REFRESH_INTERVAL_S * 1000))
 
-    # Green on black
+    # Green body, white title, and yellow warnings on black.
     curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
-    curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_GREEN)
+    curses.init_pair(2, curses.COLOR_WHITE, curses.COLOR_BLACK)
     curses.init_pair(3, curses.COLOR_YELLOW, curses.COLOR_BLACK)
 
     COLOR_NORMAL = curses.color_pair(1)
@@ -222,7 +221,7 @@ def _main(stdscr: curses.window) -> None:
             readout = readouts[readout_index]
             if readout.scrollable:
                 max_y, _ = stdscr.getmaxyx()
-                body_height = max(1, max_y - 6)
+                body_height = max(1, max_y - 4)
                 step = _page_step(body_height)
                 current = scroll_offsets.get(readout.name, 0)
                 if key == curses.KEY_PPAGE:
@@ -270,7 +269,7 @@ def _main(stdscr: curses.window) -> None:
         # -----------------------------------------------------
         stdscr.erase()
         max_y, max_x = stdscr.getmaxyx()
-        body_height = max(0, max_y - 6)
+        body_height = max(0, max_y - 4)
 
         scroll_offset = 0
         max_scroll = max(0, len(lines) - body_height)
@@ -290,43 +289,20 @@ def _main(stdscr: curses.window) -> None:
             scroll_offset = min(scroll_offsets.get(readout.name, 0), max_scroll)
             scroll_offsets[readout.name] = scroll_offset
 
-        # Row 0 — status header (inverse video)
-        header_text = header[:max_x - 1].ljust(max_x - 1)
+        # Row 0 — white status title. Match the dashboard convention: the
+        # title itself carries the lock state as a leading ``* `` marker.
+        title_prefix = "* " if locked else ""
+        header_text = title_prefix + header.lstrip()
         try:
-            stdscr.addstr(0, 0, header_text, COLOR_HEADER)
+            stdscr.addstr(0, 0, header_text[:max_x - 1], COLOR_HEADER)
         except curses.error:
             pass
 
-        # Row 1 — separator
-        sep = "─" * (max_x - 1)
-        try:
-            stdscr.addstr(1, 0, sep, COLOR_DIM)
-        except curses.error:
-            pass
-
-        # Row 2 — readout name + lock state
-        lock_indicator = " [LOCKED]" if locked else ""
-        scroll_indicator = ""
-        if readout.scrollable and max_scroll > 0:
-            first = scroll_offset + 1
-            last = min(len(lines), scroll_offset + body_height)
-            scroll_indicator = f"  [{first}-{last}/{len(lines)}]"
-        nav_label = f" {readout_name}{lock_indicator}{scroll_indicator}"
-        try:
-            stdscr.addstr(2, 0, nav_label, COLOR_BRIGHT)
-        except curses.error:
-            pass
-
-        # Row 3 — separator
-        try:
-            stdscr.addstr(3, 0, sep, COLOR_DIM)
-        except curses.error:
-            pass
-
-        # Row 4+ — readout content
+        # Row 1 remains blank. Page names and horizontal rules are deliberately
+        # absent; the body content identifies the active readout.
         visible_lines = lines[scroll_offset:scroll_offset + body_height]
         for i, line in enumerate(visible_lines):
-            row = 4 + i
+            row = 2 + i
             if row >= max_y - 2:
                 break
             text = line[:max_x - 1]

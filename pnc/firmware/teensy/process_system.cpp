@@ -3513,16 +3513,51 @@ static void system_monitor_add_welford(
   parent.add_object(key, value);
 }
 
+enum class system_monitor_ppb_bucket_view_t : uint8_t {
+  NONE = 0,
+  ALL = 1,
+  CAMPAIGN_ONLY = 2,
+};
+
+static void system_monitor_add_ppb_bucket(
+    Payload& buckets,
+    const char* key,
+    const clocks_monitor_ppb_value_snapshot_t& sample) {
+  if (sample.sample_count == 0ULL) return;
+  buckets.add(key, toFixedDecimal(sample.ppb, 6));
+}
+
+static void system_monitor_add_ppb_buckets(
+    Payload& clock,
+    const clocks_monitor_ppb_buckets_snapshot_t& buckets,
+    system_monitor_ppb_bucket_view_t view) {
+  if (view == system_monitor_ppb_bucket_view_t::NONE) return;
+
+  Payload values;
+  if (view == system_monitor_ppb_bucket_view_t::ALL) {
+    system_monitor_add_ppb_bucket(values, "10_min", buckets.minute_10);
+    system_monitor_add_ppb_bucket(values, "60_min", buckets.minute_60);
+    system_monitor_add_ppb_bucket(values, "8_hour", buckets.hour_8);
+    system_monitor_add_ppb_bucket(values, "24_hour", buckets.hour_24);
+    system_monitor_add_ppb_bucket(values, "total", buckets.total);
+  }
+  system_monitor_add_ppb_bucket(values, "campaign", buckets.campaign);
+  clock.add_object("ppb_buckets", values);
+}
+
 static void system_monitor_add_stats_clock(
     Payload& parent,
     const char* key,
-    const clocks_monitor_stats_clock_snapshot_t& clock) {
+    const clocks_monitor_stats_clock_snapshot_t& clock,
+    system_monitor_ppb_bucket_view_t bucket_view) {
   Payload value;
   system_monitor_add_welford(value, "welford", clock.welford);
   if (clock.frequency_present) {
+    // Compatibility aliases. Both remain the authoritative TOTAL population.
     value.add("tau", toFixedDecimal(clock.tau, 12));
     value.add("ppb", toFixedDecimal(clock.ppb, 3));
   }
+  system_monitor_add_ppb_buckets(value, clock.ppb_buckets, bucket_view);
   parent.add_object(key, value);
 }
 
@@ -3561,9 +3596,10 @@ static void system_monitor_add_tau_state(
 
 static void system_monitor_add_stats(
     Payload& parent,
-    const clocks_monitor_stats_snapshot_t& snapshot) {
+    const clocks_monitor_stats_snapshot_t& snapshot,
+    system_monitor_ppb_bucket_view_t bucket_view) {
   Payload stats;
-  stats.add("schema", "CLOCKS_INSTRUMENT_STATS_V1");
+  stats.add("schema", "CLOCKS_INSTRUMENT_STATS_V2");
   stats.add("always_on", true);
   stats.add("owner", "ALPHA");
   stats.add("lifetime", "BOOT_TO_REBOOT_OR_STATS_RESET");
@@ -3574,12 +3610,19 @@ static void system_monitor_add_stats(
   stats.add("last_pps_sequence", snapshot.last_pps_sequence);
   stats.add("completed_row_coherent", snapshot.completed_row_coherent);
 
-  system_monitor_add_stats_clock(stats, "gnss", snapshot.gnss);
-  system_monitor_add_stats_clock(stats, "dwt", snapshot.dwt);
-  system_monitor_add_stats_clock(stats, "vclock", snapshot.vclock);
-  system_monitor_add_stats_clock(stats, "ocxo1", snapshot.ocxo1);
-  system_monitor_add_stats_clock(stats, "ocxo2", snapshot.ocxo2);
-  system_monitor_add_stats_clock(stats, "pps_witness", snapshot.pps_witness);
+  system_monitor_add_stats_clock(
+      stats, "gnss", snapshot.gnss, bucket_view);
+  system_monitor_add_stats_clock(
+      stats, "dwt", snapshot.dwt, bucket_view);
+  system_monitor_add_stats_clock(
+      stats, "vclock", snapshot.vclock, bucket_view);
+  system_monitor_add_stats_clock(
+      stats, "ocxo1", snapshot.ocxo1, bucket_view);
+  system_monitor_add_stats_clock(
+      stats, "ocxo2", snapshot.ocxo2, bucket_view);
+  system_monitor_add_stats_clock(
+      stats, "pps_witness", snapshot.pps_witness,
+      system_monitor_ppb_bucket_view_t::NONE);
   system_monitor_add_tau_state(
       stats, "ocxo1_tau_state", snapshot.ocxo1_tau_state);
   system_monitor_add_tau_state(
@@ -3817,7 +3860,10 @@ static void system_monitor_add_restore_state(
   instrument.add("ocxo2_ns", snapshot.instrument_ocxo2_ns);
   state.add_object("instrument_clockfaces", instrument);
 
-  system_monitor_add_stats(state, snapshot.stats);
+  // Restore persists TOTAL through the existing scalar/Welford/TAU state.
+  // Rolling membership and CAMP are intentionally not durable reboot state.
+  system_monitor_add_stats(
+      state, snapshot.stats, system_monitor_ppb_bucket_view_t::NONE);
   system_monitor_add_live_dac(state, snapshot.dac);
   parent.add_object("restore_state", state);
 }
@@ -3942,7 +3988,8 @@ static Payload system_monitor_clocks_payload(
       snapshot.ocxo2_interval_cycles);
 
   system_monitor_add_raw_cycles(clocks, snapshot.raw_cycles);
-  system_monitor_add_stats(clocks, snapshot.stats);
+  system_monitor_add_stats(
+      clocks, snapshot.stats, system_monitor_ppb_bucket_view_t::ALL);
   system_monitor_add_live_dac(clocks, snapshot.dac);
   system_monitor_add_restore_state(clocks, snapshot.restore_state);
   return clocks;
@@ -4120,7 +4167,11 @@ static Payload system_monitor_campaign_row_payload(
       snapshot.ocxo2_clockface_valid,
       snapshot.ocxo2_clock_candidates,
       snapshot.ocxo2_science);
-  system_monitor_add_stats(row, snapshot.stats);
+  // The top-level live clock surface already carries all rolling buckets.
+  // A durable campaign row needs only its campaign-scoped PPB decoration.
+  system_monitor_add_stats(
+      row, snapshot.stats,
+      system_monitor_ppb_bucket_view_t::CAMPAIGN_ONLY);
   if (snapshot.dac_present) {
     system_monitor_add_campaign_dac(row, snapshot.dac);
   }

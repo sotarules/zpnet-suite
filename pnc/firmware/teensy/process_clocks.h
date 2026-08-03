@@ -375,11 +375,32 @@ struct clocks_monitor_tau_recovery_snapshot_t {
   double interval_m2_ppb = 0.0;
 };
 
+// One explicitly named PPB population. A zero sample count means that the
+// population is not yet available; numeric zero remains a legitimate PPB value.
+struct clocks_monitor_ppb_value_snapshot_t {
+  uint64_t sample_count = 0;
+  double ppb = 0.0;
+};
+
+// Always-on rolling frequency views plus the two long-lived scopes. TOTAL is
+// the authoritative boot/statistics-reset population. CAMP is populated only
+// while a campaign is active. The legacy scalar tau/ppb fields below remain
+// aliases of TOTAL so baseline and control consumers retain their meaning.
+struct clocks_monitor_ppb_buckets_snapshot_t {
+  clocks_monitor_ppb_value_snapshot_t minute_10{};
+  clocks_monitor_ppb_value_snapshot_t minute_60{};
+  clocks_monitor_ppb_value_snapshot_t hour_8{};
+  clocks_monitor_ppb_value_snapshot_t hour_24{};
+  clocks_monitor_ppb_value_snapshot_t total{};
+  clocks_monitor_ppb_value_snapshot_t campaign{};
+};
+
 struct clocks_monitor_stats_clock_snapshot_t {
   clocks_monitor_welford_snapshot_t welford{};
   bool frequency_present = false;
   double tau = 1.0;
   double ppb = 0.0;
+  clocks_monitor_ppb_buckets_snapshot_t ppb_buckets{};
 };
 
 struct clocks_monitor_stats_snapshot_t {

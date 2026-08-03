@@ -1869,6 +1869,21 @@ double welford_stderr(const welford_t& w);
 // construction keeps Priority 0 capture live and excludes only the Priority 16
 // TimePop/handoff tier until the response has been fully copied.
 
+struct clocks_instrument_ppb_value_snapshot_t {
+  uint64_t sample_count = 0;
+  double ppb = 0.0;
+};
+
+// Alpha owns only the always-on populations. Beta decorates the public handoff
+// with the campaign-scoped value because campaign identity is not Alpha state.
+struct clocks_instrument_ppb_buckets_snapshot_t {
+  clocks_instrument_ppb_value_snapshot_t minute_10{};
+  clocks_instrument_ppb_value_snapshot_t minute_60{};
+  clocks_instrument_ppb_value_snapshot_t hour_8{};
+  clocks_instrument_ppb_value_snapshot_t hour_24{};
+  clocks_instrument_ppb_value_snapshot_t total{};
+};
+
 struct clocks_instrument_frequency_snapshot_t {
   bool     valid = false;
   uint64_t sample_count = 0;
@@ -1876,6 +1891,7 @@ struct clocks_instrument_frequency_snapshot_t {
   double   tau = 1.0;
   double   ppb = 0.0;
   double   stderr_ppb = 0.0;
+  clocks_instrument_ppb_buckets_snapshot_t ppb_buckets{};
 };
 
 struct clocks_instrument_stats_snapshot_t {

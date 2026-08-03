@@ -12,21 +12,27 @@ Stats policy (Pi is a stenographer):
   Teensy-authored TIMEBASE_FRAGMENT, including the GNSS reference Welford.
   GNSS residual samples are definitionally zero, but its N is the real
   Alpha-owned always-on Welford population, never campaign PPS count.
-  No Pi-side means, stddevs, stderrs, or residuals are computed here.  The only
-  Pi-side arithmetic is deterministic presentation conversion: DAC code →
-  voltage, baseline delta (NOW - BASE), and campaign PPB reconstructed from the
-  campaign-scoped clockface identity.  None is a statistical estimator.
+  No Pi-side means, stddevs, stderrs, PPB windows, or campaign frequencies are
+  computed here.  The only Pi-side arithmetic is deterministic presentation
+  conversion: DAC code → voltage and baseline delta (NOW - BASE).
 
 Clock row doctrine:
+  The dense operator table shows GNSS, VCLOCK, OCXO1, and OCXO2 only.
+  GN_RAW and DWT remain available in MONITOR/focused diagnostics but are omitted
+  here because they are not primary TEMPEST science clocks.
   VALUE is the canonical 64-bit clock value.
-  TAU/PPB are the Alpha-owned always-on instrument estimate.
-  CAMP PPB is the current campaign clockface ratio relative to GNSS.  It prefers
-  a firmware-published campaign total when present and otherwise reconstructs
-  the exact identity from the campaign OCXO/GNSS clockfaces already in MONITOR.
+  10-MIN/60-MIN/8-HOUR/24-HOUR are firmware/Pi-producer-authored rolling PPB
+  buckets.  Metrics never estimates a rolling population from repaint history.
+  TOTAL is the always-on population since boot or the last statistics reset.
+  TOTAL owns the displayed Welford population, baseline NOW value, and the
+  legacy stats.<lane>.ppb fallback while producers migrate to ppb_buckets.
+  CAMP is the firmware-authored campaign population.  It is --- outside an
+  active campaign and is never reconstructed by the metrics process.
   RES is the firmware-published residual for the prior PPS interval.
 
 Column layout (CLK rows):
-  NAME   VALUE   TAU   PPB   CAMP PPB   RES   MEAN   SD   SE   N   BASE   NOW   DELTA
+  NAME   VALUE   10-MIN   60-MIN   8-HOUR   24-HOUR   TOTAL   CAMP   RES
+         MEAN   SD   SE   N   BASE   NOW   DELTA
 
 Column layout (DAC rows):
   NAME   DAC_VALUE_VOLTAGE   (blanks)   MEAN   SD   SE   N   BASE   NOW   DELTA
@@ -52,6 +58,9 @@ DAC_MAX_CODE = 65535.0
 
 FEATURE_GRID_COLUMNS = 4
 FEATURE_GRID_CELL_WIDTH = 39
+
+PPB_BUCKET_KEYS = ("10_min", "60_min", "8_hour", "24_hour", "total")
+PPB_VISIBLE_COLUMN_COUNT = len(PPB_BUCKET_KEYS) + 1  # + campaign
 
 MONITOR_TOPIC = "MONITOR"
 _LIVE_CACHE = create_pubsub_cache(MONITOR_TOPIC)
@@ -393,6 +402,54 @@ def _freq_value(r: dict, prefix: str, field: str):
     if val is not None:
         return val
     return _frag(r, f"{prefix}_{field}")
+
+
+def _ppb_bucket(r: dict, lane: str, bucket: str):
+    """Read one producer-authored always-on PPB bucket.
+
+    Canonical V1 publication is ``stats.<lane>.ppb_buckets.<bucket>``.  The
+    aliases keep this readout usable while the producer surfaces are introduced
+    independently.  Only TOTAL may fall back to the legacy scalar PPB because
+    that scalar already denotes the always-on population.  A missing rolling
+    bucket remains missing; substituting TOTAL would falsely label its window.
+    """
+    if lane == "gnss":
+        return 0.0
+
+    aliases = {
+        "10_min": ("10_min", "min_10", "m10", "10m"),
+        "60_min": ("60_min", "min_60", "m60", "60m"),
+        "8_hour": ("8_hour", "hour_8", "h8", "8h"),
+        "24_hour": ("24_hour", "hour_24", "h24", "24h"),
+        "total": ("total",),
+    }.get(bucket, (bucket,))
+
+    paths = []
+    for alias in aliases:
+        paths.extend((
+            f"stats.{lane}.ppb_buckets.{alias}",
+            f"stats.{lane}.ppb_windows.{alias}",
+            f"{lane}.ppb_buckets.{alias}",
+            f"{lane}.ppb_windows.{alias}",
+        ))
+
+    value = _to_float(_field(r, *paths, default=None))
+    if value is not None:
+        return value
+
+    if bucket != "total":
+        return None
+
+    if lane == "gnss_raw":
+        return _to_float(_extra(r, "gnss_raw_ppb"))
+
+    return _to_float(_freq_value(r, lane, "ppb"))
+
+
+def _ppb_cols_fragment(r: dict, lane: str, width: int) -> str:
+    values = [_ppb_bucket(r, lane, bucket) for bucket in PPB_BUCKET_KEYS]
+    values.append(_campaign_ppb(r, lane))
+    return "".join(_fmt(value, f">{width}.3f", width) for value in values)
 
 
 def _welford_value(r: dict, prefix: str, field: str):
@@ -1002,53 +1059,76 @@ def _dac_report_dither_summary(r: dict, report_dac: dict | None, lane: str, dac_
     return f"{prefix}{low_code}:{low_s} {high_code}:{high_s}"
 
 
-def _dac_detail_lines(r: dict, baseline: dict | None, report_dac: dict | None,
-                      W_NAME: int, W_VALUE: int, W_TAU: int, W_PPB: int,
-                      W_CAMP_PPB: int, W_RES: int, W_MEAN: int, W_SD: int,
-                      W_SE: int, W_N: int, W_BASE: int, W_NOW: int,
-                      W_DELTA: int) -> list[str]:
+def _dac_detail_lines(r: dict, baseline: dict | None, report_dac: dict | None) -> list[str]:
+    """Render DAC telemetry as a dedicated, spacious table.
+
+    DAC rows no longer inherit the clock-table geometry. VALUE and VOUT are
+    separate columns, and every subsequent field has an explicit gutter so
+    adjacent numbers can never visually merge.
+    """
     lines: list[str] = []
-    # The DAC value column shows firmware/VREF voltage at nanovolt precision.
-    # That adds three printable characters versus the original microvolt
-    # display, so borrow those characters from the blank/dither field.  The
-    # Welford MEAN/SD/SE/N columns therefore start at exactly the same screen
-    # position as the clock rows.
-    dac_value_width = W_VALUE + DAC_VOLTAGE_EXTRA_DECIMALS
-    dither_width = max(0, W_TAU + W_PPB + W_CAMP_PPB + W_RES - DAC_VOLTAGE_EXTRA_DECIMALS)
+
+    W_NAME = 6
+    W_VALUE = 10
+    W_VOUT = 13
+    W_DITHER = 21
+    W_MEAN = 10
+    W_SD = 8
+    W_SE = 8
+    W_N = 7
+    W_BASE = 10
+    W_NOW = 10
+    W_DELTA = 10
+    G = " "
 
     lines.append(
         f"{'DAC':<{W_NAME}}"
-        f"{'VALUE/VOUT':>{dac_value_width}}"
-        f"{'DITHER':>{dither_width}}"
-        f"{'MEAN':>{W_MEAN}}"
-        f"{'SD':>{W_SD}}"
-        f"{'SE':>{W_SE}}"
-        f"{'N':>{W_N}}"
-        f"  "
-        f"{'BASE':>{W_BASE}}"
-        f"{'NOW':>{W_NOW}}"
+        f"{'VALUE':>{W_VALUE}}{G}"
+        f"{'VOUT':>{W_VOUT}}{G}"
+        f"{'DITHER':>{W_DITHER}}{G}"
+        f"{'MEAN':>{W_MEAN}}{G}"
+        f"{'SD':>{W_SD}}{G}"
+        f"{'SE':>{W_SE}}{G}"
+        f"{'N':>{W_N}}{G}"
+        f"{'BASE':>{W_BASE}}{G}"
+        f"{'NOW':>{W_NOW}}{G}"
         f"{'DELTA':>{W_DELTA}}"
     )
-    for name, key in [("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
+
+    for name, key in (("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")):
         dac_now = _dac_current_value(r, report_dac, key)
-        dac_label = _dac_label(dac_now, _dac_current_voltage(r, report_dac, key))
+        dac_voltage = _dac_current_voltage(r, report_dac, key)
         dither_summary = _dac_report_dither_summary(r, report_dac, key, dac_now)
 
         base_dac = None
         if baseline:
-            # BASE is the selected campaign's final instantaneous DAC
-            # setpoint.  The DAC Welford mean remains the MEAN column and is
-            # only a compatibility fallback for older baseline records.
             base_dac = baseline.get("baseline_dac", {}).get(key)
             if base_dac is None:
                 base_dac = baseline.get("baseline_dac_mean", {}).get(key)
 
+        mean = _to_float(_welford_value(r, f"{key}_dac", "mean"))
+        sd = _to_float(_welford_value(r, f"{key}_dac", "stddev"))
+        se = _to_float(_welford_value(r, f"{key}_dac", "stderr"))
+        wn = _to_int(_welford_value(r, f"{key}_dac", "n"))
+        if wn == 0:
+            mean = sd = se = wn = None
+
+        delta = None
+        if base_dac is not None and dac_now is not None:
+            delta = float(dac_now) - float(base_dac)
+
         lines.append(
             f"{name:<{W_NAME}}"
-            f"{dac_label:>{dac_value_width}}"
-            f"{dither_summary:>{dither_width}}"
-            f"{_welford_cols_fragment(r, f'{key}_dac', W_MEAN, W_SD, W_SE, W_N)}"
-            f"  {_baseline_comp(base_dac, dac_now)}"
+            f"{_fmt(dac_now, f'>{W_VALUE}.3f', W_VALUE)}{G}"
+            f"{_fmt(dac_voltage, f'>{W_VOUT}.9f', W_VOUT)}{G}"
+            f"{dither_summary:>{W_DITHER}}{G}"
+            f"{_fmt(mean, f'>{W_MEAN}.3f', W_MEAN)}{G}"
+            f"{_fmt(sd, f'>{W_SD}.3f', W_SD)}{G}"
+            f"{_fmt(se, f'>{W_SE}.3f', W_SE)}{G}"
+            f"{_fmt(wn, f'>{W_N}d', W_N)}{G}"
+            f"{_fmt(base_dac, f'>{W_BASE}.3f', W_BASE)}{G}"
+            f"{_fmt(dac_now, f'>{W_NOW}.3f', W_NOW)}{G}"
+            f"{_fmt(delta, f'>+{W_DELTA}.3f', W_DELTA)}"
         )
 
     return lines
@@ -1154,15 +1234,15 @@ def status_header() -> str:
 # Baseline comparison helper
 # ---------------------------------------------------------------------
 
-def _baseline_comp(base_val, now_val):
+def _baseline_comp(base_val, now_val, width=9):
     if base_val is not None and now_val is not None:
         delta = float(now_val) - float(base_val)
         return (
-            f"{_fmt(base_val, '>10.3f', 10)}"
-            f"{_fmt(now_val, '>10.3f', 10)}"
-            f"{_fmt(delta, '>+10.3f', 10)}"
+            f"{_fmt(base_val, f'>{width}.3f', width)}"
+            f"{_fmt(now_val, f'>{width}.3f', width)}"
+            f"{_fmt(delta, f'>+{width}.3f', width)}"
         )
-    return f"{'---':>10}{'---':>10}{'---':>10}"
+    return f"{'---':>{width}}{'---':>{width}}{'---':>{width}}"
 
 
 # ---------------------------------------------------------------------
@@ -1289,7 +1369,7 @@ def _get_campaign_rows() -> list[dict]:
     """Return compact campaign ledger rows, newest first.
 
     ``campaigns.payload`` stores the full TIMEBASE dossier as JSON text.  Metrics
-    asks PostgreSQL to project only the five values needed by this panel, avoiding
+    asks PostgreSQL to project only the values needed by this panel, avoiding
     a one-second transfer and parse of every historical forensic payload.  The
     active row is denormalized by PI CLOCKS on every accepted TIMEBASE row, so the
     newest campaign remains live while completed campaigns remain frozen.
@@ -1306,22 +1386,14 @@ def _get_campaign_rows() -> list[dict]:
                     payload::jsonb #>> '{report,fragment,ocxo1,ns}'
                         AS ocxo1_ns,
                     COALESCE(
-                        payload::jsonb #>> '{report,fragment,ocxo1,science,total_tau}',
-                        payload::jsonb #>> '{report,fragment,stats,ocxo1,tau}'
-                    ) AS ocxo1_tau,
-                    COALESCE(
-                        payload::jsonb #>> '{report,fragment,ocxo1,science,total_ppb}',
-                        payload::jsonb #>> '{report,fragment,stats,ocxo1,ppb}'
+                        payload::jsonb #>> '{report,fragment,stats,ocxo1,ppb_buckets,campaign}',
+                        payload::jsonb #>> '{report,fragment,ocxo1,science,total_ppb}'
                     ) AS ocxo1_ppb,
                     payload::jsonb #>> '{report,fragment,ocxo2,ns}'
                         AS ocxo2_ns,
                     COALESCE(
-                        payload::jsonb #>> '{report,fragment,ocxo2,science,total_tau}',
-                        payload::jsonb #>> '{report,fragment,stats,ocxo2,tau}'
-                    ) AS ocxo2_tau,
-                    COALESCE(
-                        payload::jsonb #>> '{report,fragment,ocxo2,science,total_ppb}',
-                        payload::jsonb #>> '{report,fragment,stats,ocxo2,ppb}'
+                        payload::jsonb #>> '{report,fragment,stats,ocxo2,ppb_buckets,campaign}',
+                        payload::jsonb #>> '{report,fragment,ocxo2,science,total_ppb}'
                     ) AS ocxo2_ppb
                 FROM campaigns
                 ORDER BY ts DESC, id DESC
@@ -1343,15 +1415,13 @@ def campaigns_readout() -> list[str]:
     W_CAMPAIGN = 27
     W_DEV = 8
     W_VALUE = 22
-    W_TAU = 18
-    W_PPB = 10
+    W_PPB = 12
 
     lines.append(
         f"{'CAMPAIGN':<{W_CAMPAIGN}}"
         f"{'DEV':<{W_DEV}}"
         f"{'VALUE':>{W_VALUE}}"
-        f"{'TAU':>{W_TAU}}"
-        f"{'PPB':>{W_PPB}}"
+        f"{'CAMP PPB':>{W_PPB}}"
     )
 
     if not rows:
@@ -1366,14 +1436,12 @@ def campaigns_readout() -> list[str]:
 
         for lane_name, lane_key in (("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")):
             value = _to_int(row.get(f"{lane_key}_ns"))
-            tau = _to_float(row.get(f"{lane_key}_tau"))
             ppb = _to_float(row.get(f"{lane_key}_ppb"))
 
             lines.append(
                 f"{campaign:<{W_CAMPAIGN}}"
                 f"{lane_name:<{W_DEV}}"
                 f"{_comma_int(value, W_VALUE)}"
-                f"{_fmt(tau, f'>{W_TAU}.12f', W_TAU)}"
                 f"{_fmt(ppb, f'>{W_PPB}.3f', W_PPB)}"
             )
 
@@ -1384,7 +1452,7 @@ def campaigns_readout() -> list[str]:
 
 
 def _clockface_value(r: dict, lane: str):
-    """Return the MONITOR presentation clockface for one lane."""
+    """Return the always-on MONITOR clockface used by the VALUE column."""
     for path in (
         f"instrument_clockfaces.{lane}",
         f"presentation_clockfaces.{lane}",
@@ -1402,17 +1470,11 @@ def _clockface_value(r: dict, lane: str):
 
 
 def _campaign_ppb(r: dict, lane: str):
-    """Return campaign-scoped PPB from the campaign clockface identity.
+    """Return the firmware-authored campaign PPB bucket.
 
-    Prefer an explicit firmware-authored campaign total when a future/current
-    fragment publishes one.  Contemporary TIMEBASE_FRAGMENT_V6 already carries
-    the sufficient campaign clockfaces, so the fallback uses the cancellation-
-    safe form of (clock / GNSS - 1) * 1e9:
-
-        (clock_ns - gnss_ns) * 1e9 / gnss_ns
-
-    Outside an active campaign the visible clockfaces may be instrument-scoped,
-    so no campaign value is published.
+    CAMP exists only while a campaign is active.  Missing publication remains
+    missing; metrics never substitutes TOTAL or reconstructs a ratio from
+    clockfaces.
     """
     state = str(
         r.get("campaign_state")
@@ -1421,25 +1483,14 @@ def _campaign_ppb(r: dict, lane: str):
     if state != "STARTED" and not r.get("campaign_present"):
         return None
 
-    if lane == "gnss":
-        return 0.0
+    if lane == "gnss_raw":
+        return _to_float(_extra(r, "gnss_raw_ppb_buckets.campaign"))
 
-    explicit = _to_float(_field(
+    return _to_float(_field(
         r,
-        f"{lane}.science.total_ppb",
-        f"{lane}.campaign.ppb",
-        f"campaign.{lane}.ppb",
+        f"stats.{lane}.ppb_buckets.campaign",
         default=None,
     ))
-    if explicit is not None:
-        return explicit
-
-    gnss_ns = _clockface_value(r, "gnss")
-    clock_ns = _clockface_value(r, lane)
-    if gnss_ns is None or clock_ns is None or gnss_ns <= 0:
-        return None
-
-    return float(clock_ns - gnss_ns) * 1_000_000_000.0 / float(gnss_ns)
 
 
 def _monitor_count(r: dict) -> int:
@@ -1502,32 +1553,33 @@ def clocks_combined_readout() -> list[str]:
 
     # ── Column widths ──
     W_NAME  = 6
-    W_VALUE = 20
-    W_TAU   = 18
-    W_PPB   = 10
-    W_CAMP_PPB = 14
-    W_RES   = 8
-    W_MEAN  = 10
-    W_SD    = 8
-    W_SE    = 8
-    W_N     = 8
-    W_BASE  = 10
-    W_NOW   = 10
-    W_DELTA = 10
+    W_VALUE = 19
+    W_PPB_BUCKET = 9
+    W_RES   = 6
+    W_MEAN  = 9
+    W_SD    = 7
+    W_SE    = 7
+    W_N     = 6
+    W_BASE  = 9
+    W_NOW   = 9
+    W_DELTA = 9
 
     # ── CLK header ──
     lines.append(
         f"{'CLK':<{W_NAME}}"
         f"{'VALUE':>{W_VALUE}}"
-        f"{'TAU':>{W_TAU}}"
-        f"{'PPB':>{W_PPB}}"
-        f"{'CAMP PPB':>{W_CAMP_PPB}}"
+        f"{'10-MIN':>{W_PPB_BUCKET}}"
+        f"{'60-MIN':>{W_PPB_BUCKET}}"
+        f"{'8-HOUR':>{W_PPB_BUCKET}}"
+        f"{'24-HOUR':>{W_PPB_BUCKET}}"
+        f"{'TOTAL':>{W_PPB_BUCKET}}"
+        f"{'CAMP':>{W_PPB_BUCKET}}"
         f"{'RES':>{W_RES}}"
         f"{'MEAN':>{W_MEAN}}"
         f"{'SD':>{W_SD}}"
         f"{'SE':>{W_SE}}"
         f"{'N':>{W_N}}"
-        f"  "
+        f" "
         f"{'BASE':>{W_BASE}}"
         f"{'NOW':>{W_NOW}}"
         f"{'DELTA':>{W_DELTA}}"
@@ -1535,143 +1587,54 @@ def clocks_combined_readout() -> list[str]:
 
     # ── GNSS (reference nanosecond clock) ──
     gnss_ns = _clockface_value(r, "gnss")
-    gnss_tau = 1.0
-    gnss_ppb = 0.0
-    gnss_campaign_ppb = _campaign_ppb(r, "gnss")
+    gnss_total_ppb = _ppb_bucket(r, "gnss", "total")
     gnss_res = _to_int(_field(r, "gnss.second_residual_ns", "gnss_residual_ns")) or 0
     lines.append(
         f"{'GNSS':<{W_NAME}}"
         f"{_comma_int(gnss_ns, W_VALUE)}"
-        f"{_fmt(gnss_tau, f'>{W_TAU}.12f', W_TAU)}"
-        f"{_fmt(gnss_ppb, f'>{W_PPB}.3f', W_PPB)}"
-        f"{_fmt(gnss_campaign_ppb, f'>{W_CAMP_PPB}.3f', W_CAMP_PPB)}"
+        f"{_ppb_cols_fragment(r, 'gnss', W_PPB_BUCKET)}"
         f"{_sign_int(gnss_res, W_RES)}"
         f"{_welford_cols_fragment(r, 'gnss', W_MEAN, W_SD, W_SE, W_N)}"
-        f"  {_baseline_comp(baseline_ppb.get('gnss'), gnss_ppb)}"
+        f" {_baseline_comp(baseline_ppb.get('gnss'), gnss_total_ppb, W_BASE)}"
     )
 
     # ── VCLOCK (GNSS-disciplined nanosecond clock) ──
     vclock_ns  = _clockface_value(r, "vclock")
-    vclock_tau = _to_float(_freq_value(r, "vclock", "tau"))
-    vclock_ppb = _to_float(_freq_value(r, "vclock", "ppb"))
-
-    vclock_campaign_ppb = _campaign_ppb(r, "vclock")
+    vclock_total_ppb = _ppb_bucket(r, "vclock", "total")
     vclock_res = _vclock_residual_ns(r)
-    vclock_raw = _vclock_interval_ns(r)
 
-    # VCLOCK is the GNSS-disciplined nanosecond ledger.  If the current
-    # TIMEBASE build does not expose a named VCLOCK interval object, the
-    # visible nanosecond interval is still 1e9 plus its visible residual.
-    # This keeps VCLOCK aligned with GNSS/OCXO rows while DWT remains the
-    # cycle-oriented exception.
     if vclock_res is None:
         vclock_res = 0
-    if vclock_raw is None:
-        vclock_raw = 1_000_000_000 + vclock_res
-
-    # If firmware has not yet published frequency stats, derive the displayed
-    # interval ratio from the nanosecond interval surface, not from cycle RAW.
-    if vclock_tau is None or vclock_ppb is None:
-        vclock_tau = vclock_tau if vclock_tau is not None else (float(vclock_raw) / 1_000_000_000.0)
-        vclock_ppb = vclock_ppb if vclock_ppb is not None else ((float(vclock_raw) / 1_000_000_000.0) - 1.0) * 1_000_000_000.0
 
     lines.append(
         f"{'VCLOCK':<{W_NAME}}"
         f"{_comma_int(vclock_ns, W_VALUE)}"
-        f"{_fmt(vclock_tau, f'>{W_TAU}.12f', W_TAU)}"
-        f"{_fmt(vclock_ppb, f'>{W_PPB}.3f', W_PPB)}"
-        f"{_fmt(vclock_campaign_ppb, f'>{W_CAMP_PPB}.3f', W_CAMP_PPB)}"
+        f"{_ppb_cols_fragment(r, 'vclock', W_PPB_BUCKET)}"
         f"{_sign_int(vclock_res, W_RES)}"
         f"{_welford_cols_fragment_or_zero(r, 'vclock', W_MEAN, W_SD, W_SE, W_N)}"
-        f"  {_baseline_comp(baseline_ppb.get('vclock'), vclock_ppb)}"
+        f" {_baseline_comp(baseline_ppb.get('vclock'), vclock_total_ppb, W_BASE)}"
     )
 
     # ── OCXO1, OCXO2 (nanosecond clocks) ──
     for name, key in [("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
         ocxo_ns = _clockface_value(r, key)
-        tau     = _to_float(_freq_value(r, key, "tau"))
-        ppb     = _to_float(_freq_value(r, key, "ppb"))
-        campaign_ppb = _campaign_ppb(r, key)
+        total_ppb = _ppb_bucket(r, key, "total")
         res          = _ocxo_residual_ns(r, key)
         lines.append(
             f"{name:<{W_NAME}}"
             f"{_comma_int(ocxo_ns, W_VALUE)}"
-            f"{_fmt(tau, f'>{W_TAU}.12f', W_TAU)}"
-            f"{_fmt(ppb, f'>{W_PPB}.3f', W_PPB)}"
-            f"{_fmt(campaign_ppb, f'>{W_CAMP_PPB}.3f', W_CAMP_PPB)}"
+            f"{_ppb_cols_fragment(r, key, W_PPB_BUCKET)}"
             f"{_sign_int(res, W_RES)}"
             f"{_welford_cols_fragment(r, key, W_MEAN, W_SD, W_SE, W_N)}"
-            f"  {_baseline_comp(baseline_ppb.get(key), ppb)}"
+            f" {_baseline_comp(baseline_ppb.get(key), total_ppb, W_BASE)}"
         )
 
-    # Separate standard nanosecond clocks from synthetic/cycle-oriented clocks.
-    lines.append("")
-
-    # ── GN_RAW (GNSS receiver self-reported drift; Pi-side synthetic) ──
-    gnss_raw_ns  = _to_int(_extra(r, "gnss_raw_ns"))
-    gnss_raw_tau = _to_float(_extra(r, "gnss_raw_tau"))
-    gnss_raw_ppb = _to_float(_extra(r, "gnss_raw_ppb"))
-    gnss_raw_res = _to_float(_extra(r, "gnss_raw_drift_ppb"))
-    gnss_raw_interval_ns = int(1_000_000_000.0 + gnss_raw_ppb) if gnss_raw_ppb is not None else None
-    lines.append(
-        f"{'GN_RAW':<{W_NAME}}"
-        f"{_comma_int(gnss_raw_ns, W_VALUE)}"
-        f"{_fmt(gnss_raw_tau, f'>{W_TAU}.12f', W_TAU)}"
-        f"{_fmt(gnss_raw_ppb, f'>{W_PPB}.3f', W_PPB)}"
-        f"{_fmt(gnss_raw_ppb, f'>{W_CAMP_PPB}.3f', W_CAMP_PPB)}"
-        f"{_fmt(gnss_raw_res, f'>{W_RES}.1f', W_RES)}"
-        f"{_welford_cols_extra(r, 'gnss_raw', W_MEAN, W_SD, W_SE, W_N)}"
-        f"  {_baseline_comp(baseline_ppb.get('gnss_raw'), gnss_raw_ppb)}"
-    )
-
-    # ── DWT (cycle-oriented clock) ──
-    dwt_present = _has_any(
-        r,
-        "dwt.ns",
-        "dwt.cycle_count_total",
-        "stats.dwt.ppb",
-        "dwt.cycles_between_pps_vclock",
-        "dwt_ns",
-        "dwt_cycle_count_total",
-        "dwt_welford_mean",
-    )
-    if dwt_present:
-        dwt_total = _to_int(_field(
-            r,
-            "dwt.value",
-            "dwt.cycles",
-            "dwt.cycle_count_total",
-            "dwt_cycle_count_total",
-            "dwt.ns",
-            "dwt_ns",
-        ))
-        dwt_tau   = _to_float(_freq_value(r, "dwt", "tau"))
-        dwt_ppb   = _to_float(_freq_value(r, "dwt", "ppb"))
-        dwt_raw   = _to_int(_field(r, "dwt.cycles_between_pps_vclock", "dwt_cycles_between_pps_vclock", "dwt_cycle_count_between_pps"))
-        dwt_res   = _to_int(_field(
-            r,
-            "dwt.second_residual_cycles",
-            "raw_cycles.pps.residual_cycles",
-            "dwt_second_residual_cycles",
-        ))
-        lines.append(
-            f"{'DWT':<{W_NAME}}"
-            f"{_comma_int(dwt_total, W_VALUE)}"
-            f"{_fmt(dwt_tau, f'>{W_TAU}.12f', W_TAU)}"
-            f"{_fmt(dwt_ppb, f'>{W_PPB}.3f', W_PPB)}"
-            f"{_fmt(None, f'>{W_CAMP_PPB}.3f', W_CAMP_PPB)}"
-            f"{_sign_int(dwt_res, W_RES)}"
-            f"{_welford_cols_fragment(r, 'dwt', W_MEAN, W_SD, W_SE, W_N)}"
-            f"  {_baseline_comp(baseline_ppb.get('dwt'), dwt_ppb)}"
-        )
+    # GN_RAW and DWT remain available in MONITOR and focused reports, but are
+    # intentionally omitted from this operator-facing clock table.
 
     # ── DAC detail ──
     lines.append("")
-    lines.extend(_dac_detail_lines(
-        r, baseline, report_dac,
-        W_NAME, W_VALUE, W_TAU, W_PPB, W_CAMP_PPB, W_RES,
-        W_MEAN, W_SD, W_SE, W_N, W_BASE, W_NOW, W_DELTA,
-    ))
+    lines.extend(_dac_detail_lines(r, baseline, report_dac))
 
     lines.append("")
 

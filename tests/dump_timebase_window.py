@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-Dump TIMEBASE JSON records around a PPS identity.
+Print TIMEBASE JSON records around a PPS identity to stdout.
 
 Examples:
     python dump_timebase_window.py Servo3 8321
     python dump_timebase_window.py Servo3 8321 --radius 4
     python dump_timebase_window.py Servo3 --start 8318 --end 8325
-    python dump_timebase_window.py Servo3 8321 --output servo3_pps8321_window.json
 
-The output is one JSON document containing:
+Stdout contains one JSON document containing:
   - campaign
   - requested range
   - record count
@@ -59,12 +58,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--start", type=int, help="First PPS count to include.")
     parser.add_argument("--end", type=int, help="Last PPS count to include.")
-    parser.add_argument(
-        "--output",
-        "-o",
-        type=Path,
-        help="Output JSON file. Defaults to <campaign>_pps_<start>_<end>.json",
-    )
     parser.add_argument(
         "--indent",
         type=int,
@@ -142,10 +135,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
-    output_path = args.output or Path(
-        f"{args.campaign}_pps_{start}_{end}.json"
-    )
-
     document = {
         "campaign": args.campaign,
         "requested_start_pps": start,
@@ -154,21 +143,31 @@ def main(argv: Optional[List[str]] = None) -> int:
         "records": records,
     }
 
-    output_path.write_text(
-        json.dumps(document, indent=args.indent, sort_keys=False, default=str) + "\n",
-        encoding="utf-8",
-        newline="\r\n",
-    )
+    print(json.dumps(document, indent=args.indent, sort_keys=False, default=str))
 
     found = [record["_pps_count"] for record in records]
-    print(f"Wrote {len(records)} TIMEBASE record(s) to {output_path}")
+    print(
+        f"Returned {len(records)} TIMEBASE record(s) on stdout.",
+        file=sys.stderr,
+    )
     if found:
-        print(f"Found PPS range: {found[0]} -> {found[-1]}")
-        missing = [pps for pps in range(start, end + 1) if pps not in set(found)]
+        print(
+            f"Found PPS range: {found[0]} -> {found[-1]}",
+            file=sys.stderr,
+        )
+        found_set = set(found)
+        missing = [pps for pps in range(start, end + 1) if pps not in found_set]
         if missing:
-            print("Missing PPS identities in requested range: " + ", ".join(map(str, missing)))
+            print(
+                "Missing PPS identities in requested range: "
+                + ", ".join(map(str, missing)),
+                file=sys.stderr,
+            )
     else:
-        print("No TIMEBASE rows matched the requested range.")
+        print(
+            "No TIMEBASE rows matched the requested range.",
+            file=sys.stderr,
+        )
 
     return 0
 

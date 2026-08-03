@@ -4979,6 +4979,75 @@ static FLASHMEM clocks_monitor_stats_clock_snapshot_t clocks_monitor_stats_clock
   return out;
 }
 
+static FLASHMEM clocks_monitor_ppb_value_snapshot_t clocks_monitor_ppb_value(
+    const clocks_instrument_ppb_value_snapshot_t& source) {
+  clocks_monitor_ppb_value_snapshot_t out{};
+  out.sample_count = source.sample_count;
+  out.ppb = source.sample_count != 0ULL ? source.ppb : 0.0;
+  return out;
+}
+
+static FLASHMEM clocks_monitor_ppb_buckets_snapshot_t clocks_monitor_ppb_buckets(
+    const clocks_instrument_ppb_buckets_snapshot_t& source) {
+  clocks_monitor_ppb_buckets_snapshot_t out{};
+  out.minute_10 = clocks_monitor_ppb_value(source.minute_10);
+  out.minute_60 = clocks_monitor_ppb_value(source.minute_60);
+  out.hour_8 = clocks_monitor_ppb_value(source.hour_8);
+  out.hour_24 = clocks_monitor_ppb_value(source.hour_24);
+  out.total = clocks_monitor_ppb_value(source.total);
+  return out;
+}
+
+static void clocks_monitor_campaign_ppb_set(
+    clocks_monitor_stats_clock_snapshot_t& clock,
+    uint64_t sample_count,
+    double ppb) {
+  clock.ppb_buckets.campaign.sample_count = sample_count;
+  clock.ppb_buckets.campaign.ppb = sample_count != 0ULL ? ppb : 0.0;
+}
+
+static double clocks_monitor_campaign_dwt_ppb(uint64_t gnss_ns,
+                                               uint64_t dwt_cycles) {
+  const double expected_cycles =
+      ((double)gnss_ns * (double)DWT_EXPECTED_PER_PPS) / 1.0e9;
+  return ((double)dwt_cycles / expected_cycles - 1.0) * 1.0e9;
+}
+
+static void clocks_monitor_stats_apply_campaign_ppb(
+    clocks_monitor_stats_snapshot_t& stats,
+    uint64_t sample_count,
+    uint64_t gnss_ns,
+    uint64_t dwt_cycles,
+    uint64_t ocxo1_ns,
+    uint64_t ocxo2_ns) {
+  if (sample_count == 0ULL || gnss_ns == 0ULL) return;
+
+  // GNSS and VCLOCK are the campaign reference identity.
+  clocks_monitor_campaign_ppb_set(stats.gnss, sample_count, 0.0);
+  clocks_monitor_campaign_ppb_set(stats.vclock, sample_count, 0.0);
+
+  if (dwt_cycles != 0ULL) {
+    clocks_monitor_campaign_ppb_set(
+        stats.dwt,
+        sample_count,
+        clocks_monitor_campaign_dwt_ppb(gnss_ns, dwt_cycles));
+  }
+  if (ocxo1_ns != 0ULL) {
+    clocks_monitor_campaign_ppb_set(
+        stats.ocxo1,
+        sample_count,
+        campaign_total_ppb_from_tau(
+            campaign_total_tau_from_ratio(gnss_ns, ocxo1_ns)));
+  }
+  if (ocxo2_ns != 0ULL) {
+    clocks_monitor_campaign_ppb_set(
+        stats.ocxo2,
+        sample_count,
+        campaign_total_ppb_from_tau(
+            campaign_total_tau_from_ratio(gnss_ns, ocxo2_ns)));
+  }
+}
+
 static FLASHMEM clocks_monitor_tau_recovery_snapshot_t
 clocks_monitor_tau_recovery_snapshot(
     const clocks_alpha_tau_snapshot_t& state) {
@@ -5020,15 +5089,36 @@ static FLASHMEM void clocks_monitor_stats_snapshot_from_instrument(
 
   out.gnss = clocks_monitor_stats_clock(instrument.gnss_welford, true, 0.0);
   out.dwt = clocks_monitor_stats_clock(
-      instrument.dwt_welford, true, instrument.dwt_frequency.ppb);
+      instrument.dwt_welford,
+      instrument.dwt_frequency.valid,
+      instrument.dwt_frequency.ppb);
   out.vclock = clocks_monitor_stats_clock(
-      instrument.vclock_welford, true, instrument.vclock_frequency.ppb);
+      instrument.vclock_welford,
+      instrument.vclock_frequency.valid,
+      instrument.vclock_frequency.ppb);
   out.ocxo1 = clocks_monitor_stats_clock(
-      instrument.ocxo1_welford, true, instrument.ocxo1_frequency.ppb);
+      instrument.ocxo1_welford,
+      instrument.ocxo1_frequency.valid,
+      instrument.ocxo1_frequency.ppb);
   out.ocxo2 = clocks_monitor_stats_clock(
-      instrument.ocxo2_welford, true, instrument.ocxo2_frequency.ppb);
+      instrument.ocxo2_welford,
+      instrument.ocxo2_frequency.valid,
+      instrument.ocxo2_frequency.ppb);
   out.pps_witness = clocks_monitor_stats_clock(
       instrument.pps_witness_welford, false, 0.0);
+
+  out.dwt.ppb_buckets = clocks_monitor_ppb_buckets(
+      instrument.dwt_frequency.ppb_buckets);
+  out.vclock.ppb_buckets = clocks_monitor_ppb_buckets(
+      instrument.vclock_frequency.ppb_buckets);
+  out.ocxo1.ppb_buckets = clocks_monitor_ppb_buckets(
+      instrument.ocxo1_frequency.ppb_buckets);
+  out.ocxo2.ppb_buckets = clocks_monitor_ppb_buckets(
+      instrument.ocxo2_frequency.ppb_buckets);
+  if (instrument.gnss_welford.n != 0ULL) {
+    out.gnss.ppb_buckets.total.sample_count = instrument.gnss_welford.n;
+    out.gnss.ppb_buckets.total.ppb = 0.0;
+  }
   out.ocxo1_tau_state = clocks_monitor_tau_recovery_snapshot(
       instrument.ocxo1_tau_state);
   out.ocxo2_tau_state = clocks_monitor_tau_recovery_snapshot(
@@ -7711,6 +7801,15 @@ static FLASHMEM void clocks_monitor_live_snapshot_fill(
       g_beta_monitor_ocxo1_forensics,
       g_beta_monitor_ocxo2_forensics);
   clocks_monitor_stats_snapshot_from_instrument(out.stats, instrument);
+  if (campaign_presentation_ready) {
+    clocks_monitor_stats_apply_campaign_ppb(
+        out.stats,
+        campaign_seconds,
+        out.presentation_gnss_ns,
+        out.presentation_dwt_cycles,
+        out.presentation_ocxo1_ns,
+        out.presentation_ocxo2_ns);
+  }
   clocks_monitor_dac_snapshot(out.dac);
   clocks_recovery_state_snapshot(
       out.restore_state,
@@ -8400,14 +8499,20 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
         g_beta_instrument_stats.ocxo1_frequency;
     const clocks_instrument_frequency_snapshot_t& ocxo2_frequency =
         g_beta_instrument_stats.ocxo2_frequency;
+    const clocks_instrument_ppb_value_snapshot_t& ocxo1_total =
+        ocxo1_frequency.ppb_buckets.total;
+    const clocks_instrument_ppb_value_snapshot_t& ocxo2_total =
+        ocxo2_frequency.ppb_buckets.total;
     const bool ocxo1_total_slope_valid =
         instrument_stats_ready &&
         pps_residuals.ocxo1_valid &&
-        ocxo1_frequency.valid;
+        ocxo1_frequency.valid &&
+        ocxo1_total.sample_count != 0ULL;
     const bool ocxo2_total_slope_valid =
         instrument_stats_ready &&
         pps_residuals.ocxo2_valid &&
-        ocxo2_frequency.valid;
+        ocxo2_frequency.valid &&
+        ocxo2_total.sample_count != 0ULL;
 
     // Populate OCXO1 servo diagnostics directly.  This deliberately avoids a
     // reference-heavy helper boundary on the completed-row hot path.
@@ -8429,18 +8534,16 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
         pps_residuals.ocxo1_valid &&
         (welford_ocxo1.n >= SERVO_MIN_SAMPLES);
 
-    g_servo_input_ocxo1.total_tau =
-        ocxo1_total_slope_valid ? ocxo1_frequency.tau : 1.0;
     g_servo_input_ocxo1.total_ppb =
-        ocxo1_total_slope_valid ? ocxo1_frequency.ppb : 0.0;
+        ocxo1_total_slope_valid ? ocxo1_total.ppb : 0.0;
+    g_servo_input_ocxo1.total_tau =
+        1.0 + g_servo_input_ocxo1.total_ppb / 1.0e9;
     g_servo_input_ocxo1.total_basis = SERVO_TOTAL_BASIS_INSTRUMENT;
     g_servo_input_ocxo1.total_population_seconds =
-        ocxo1_total_slope_valid
-            ? ocxo1_frequency.sample_count
-            : 0ULL;
+        ocxo1_total_slope_valid ? ocxo1_total.sample_count : 0ULL;
     g_servo_input_ocxo1.total_input_valid =
         ocxo1_total_slope_valid &&
-        ocxo1_frequency.sample_count >= SERVO_MIN_SAMPLES;
+        ocxo1_total.sample_count >= SERVO_MIN_SAMPLES;
 
     // A one-second residual in ns is numerically ppb over a one-second gate.
     g_servo_input_ocxo1.now_ppb = pps_residuals.ocxo1_valid
@@ -8511,18 +8614,16 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
         pps_residuals.ocxo2_valid &&
         (welford_ocxo2.n >= SERVO_MIN_SAMPLES);
 
-    g_servo_input_ocxo2.total_tau =
-        ocxo2_total_slope_valid ? ocxo2_frequency.tau : 1.0;
     g_servo_input_ocxo2.total_ppb =
-        ocxo2_total_slope_valid ? ocxo2_frequency.ppb : 0.0;
+        ocxo2_total_slope_valid ? ocxo2_total.ppb : 0.0;
+    g_servo_input_ocxo2.total_tau =
+        1.0 + g_servo_input_ocxo2.total_ppb / 1.0e9;
     g_servo_input_ocxo2.total_basis = SERVO_TOTAL_BASIS_INSTRUMENT;
     g_servo_input_ocxo2.total_population_seconds =
-        ocxo2_total_slope_valid
-            ? ocxo2_frequency.sample_count
-            : 0ULL;
+        ocxo2_total_slope_valid ? ocxo2_total.sample_count : 0ULL;
     g_servo_input_ocxo2.total_input_valid =
         ocxo2_total_slope_valid &&
-        ocxo2_frequency.sample_count >= SERVO_MIN_SAMPLES;
+        ocxo2_total.sample_count >= SERVO_MIN_SAMPLES;
 
     g_servo_input_ocxo2.now_ppb = pps_residuals.ocxo2_valid
         ? ocxo2_science.fast_residual_ns_exact
@@ -8762,6 +8863,13 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   }
   clocks_monitor_stats_snapshot_from_instrument(
       record.stats, g_beta_instrument_stats);
+  clocks_monitor_stats_apply_campaign_ppb(
+      record.stats,
+      public_count,
+      public_gnss_ns,
+      public_dwt_total,
+      public_ocxo1_ns,
+      public_ocxo2_ns);
 
   // DAC/servo state is scientific context regardless of whether a servo is
   // active. Campaigns observe it; they never own it.
