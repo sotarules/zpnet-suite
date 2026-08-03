@@ -4992,13 +4992,16 @@ def _enqueue_timebase_piece(
     payload: Dict[str, Any],
     *,
     restore_state: Optional[Dict[str, Any]] = None,
+    ppb_buckets: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Enqueue one campaign row plus same-second structured recovery state."""
+    """Enqueue one campaign row plus same-second monitor decoration."""
     _fragment_queue.put({
         "topic": topic,
         "payload": dict(payload),
         "restore_state": copy.deepcopy(restore_state)
             if isinstance(restore_state, dict) else None,
+        "ppb_buckets": copy.deepcopy(ppb_buckets)
+            if isinstance(ppb_buckets, dict) else None,
         "received_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     })
 
@@ -5024,6 +5027,58 @@ def _drain_timebase_ingress() -> int:
 # ---------------------------------------------------------------------
 # Fragment handler (PUBSUB — fast path, NEVER blocks)
 # ---------------------------------------------------------------------
+
+
+def _monitor_fragment_ppb_buckets(monitor_fragment: Dict[str, Any]) -> Dict[str, Any]:
+    """Return same-second producer-authored PPB buckets from MONITOR_FRAGMENT.
+
+    The always-on bucket family lives under ``MONITOR_FRAGMENT.clocks.stats``.
+    The campaign-row candidate carries CAMP and remains unchanged for the final
+    court.  These sibling always-on values travel beside that candidate and are
+    merged only into the durable fragment after the candidate is accepted.
+
+    This function runs for every MONITOR_FRAGMENT containing ``campaign_row``;
+    no startup-only latch or logging throttle controls persistence cadence.
+    """
+    clocks = monitor_fragment.get("clocks")
+    stats = clocks.get("stats") if isinstance(clocks, dict) else None
+    if not isinstance(stats, dict):
+        return {}
+
+    out: Dict[str, Any] = {}
+    for lane in ("ocxo1", "ocxo2"):
+        lane_stats = stats.get(lane)
+        buckets = lane_stats.get("ppb_buckets") if isinstance(lane_stats, dict) else None
+        if isinstance(buckets, dict):
+            out[lane] = dict(buckets)
+    return out
+
+
+def _decorate_persisted_fragment_ppb_buckets(
+    fragment: Dict[str, Any],
+    ppb_buckets: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Add admitted same-second PPB windows to a durable fragment copy."""
+    decorated = copy.deepcopy(fragment)
+    if not isinstance(ppb_buckets, dict):
+        return decorated
+
+    stats = decorated.setdefault("stats", {})
+    if not isinstance(stats, dict):
+        return decorated
+
+    for lane in ("ocxo1", "ocxo2"):
+        buckets = ppb_buckets.get(lane)
+        if not isinstance(buckets, dict):
+            continue
+        lane_stats = stats.setdefault(lane, {})
+        if not isinstance(lane_stats, dict):
+            continue
+        existing = lane_stats.get("ppb_buckets")
+        merged = dict(existing) if isinstance(existing, dict) else {}
+        merged.update(buckets)
+        lane_stats["ppb_buckets"] = merged
+    return decorated
 
 
 def on_monitor_fragment(payload: Payload) -> None:
@@ -5068,6 +5123,7 @@ def on_monitor_fragment(payload: Payload) -> None:
         TIMEBASE_FRAGMENT_TOPIC,
         candidate,
         restore_state=_monitor_restore_state(monitor_fragment),
+        ppb_buckets=_monitor_fragment_ppb_buckets(monitor_fragment),
     )
     _diag["timebase_candidates_queued"] += 1
     _diag["fragments_queued"] += 1
@@ -5103,6 +5159,9 @@ def _process_loop() -> None:
         restore_state = piece.get("restore_state")
         if not isinstance(restore_state, dict):
             restore_state = None
+        ppb_buckets = piece.get("ppb_buckets")
+        if not isinstance(ppb_buckets, dict):
+            ppb_buckets = None
         if not isinstance(payload, dict):
             logging.error("💥 [clocks] processor received malformed MONITOR_FRAGMENT campaign row: %s", piece)
             continue
@@ -5335,6 +5394,10 @@ def _process_loop() -> None:
             gnss_raw_instrument_valid = bool(_gnss_raw_instrument_valid)
 
         # --- Build TIMEBASE record ---
+        persisted_frag = _decorate_persisted_fragment_ppb_buckets(
+            frag,
+            ppb_buckets,
+        )
         timebase = {
             "schema": "TIMEBASE_V3",
             "timebase_message_version": frag.get("timebase_message_version"),
@@ -5359,7 +5422,7 @@ def _process_loop() -> None:
             "pps_count": int(pps_vclock_count),          # legacy alias
 
             # Compatible durable shape reconstructed from one Teensy message.
-            "fragment": frag,
+            "fragment": persisted_frag,
             "forensics": forensics,
 
             # Environment snapshot (correlated with this PPS edge)

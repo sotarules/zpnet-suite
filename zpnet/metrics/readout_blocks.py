@@ -1366,13 +1366,12 @@ def _dwt_expected_cycles(r: dict):
 # ---------------------------------------------------------------------
 
 def _get_campaign_rows() -> list[dict]:
-    """Return compact campaign ledger rows, newest first.
+    """Return OCXO campaign ledger rows, newest first.
 
-    ``campaigns.payload`` stores the full TIMEBASE dossier as JSON text.  Metrics
-    asks PostgreSQL to project only the values needed by this panel, avoiding
-    a one-second transfer and parse of every historical forensic payload.  The
-    active row is denormalized by PI CLOCKS on every accepted TIMEBASE row, so the
-    newest campaign remains live while completed campaigns remain frozen.
+    ``campaigns.payload.report`` is the latest accepted TIMEBASE dossier for the
+    campaign.  PI CLOCKS refreshes that report on every accepted row, so the
+    active campaign remains live and stopped campaigns retain their final
+    clockface, PPB windows, residual, and TOTAL Welford population.
     """
     with open_db(row_dict=True) as conn:
         with conn.cursor() as cur:
@@ -1383,18 +1382,68 @@ def _get_campaign_rows() -> list[dict]:
                     ts,
                     campaign,
                     active,
+
                     payload::jsonb #>> '{report,fragment,ocxo1,ns}'
                         AS ocxo1_ns,
+                    payload::jsonb #>> '{report,fragment,stats,ocxo1,ppb_buckets,10_min}'
+                        AS ocxo1_ppb_10_min,
+                    payload::jsonb #>> '{report,fragment,stats,ocxo1,ppb_buckets,60_min}'
+                        AS ocxo1_ppb_60_min,
+                    payload::jsonb #>> '{report,fragment,stats,ocxo1,ppb_buckets,8_hour}'
+                        AS ocxo1_ppb_8_hour,
+                    payload::jsonb #>> '{report,fragment,stats,ocxo1,ppb_buckets,24_hour}'
+                        AS ocxo1_ppb_24_hour,
+                    COALESCE(
+                        payload::jsonb #>> '{report,fragment,stats,ocxo1,ppb_buckets,total}',
+                        payload::jsonb #>> '{report,fragment,stats,ocxo1,ppb}'
+                    ) AS ocxo1_ppb_total,
                     COALESCE(
                         payload::jsonb #>> '{report,fragment,stats,ocxo1,ppb_buckets,campaign}',
                         payload::jsonb #>> '{report,fragment,ocxo1,science,total_ppb}'
-                    ) AS ocxo1_ppb,
+                    ) AS ocxo1_ppb_campaign,
+                    COALESCE(
+                        payload::jsonb #>> '{report,fragment,ocxo1,pps_residual,fast_residual_ns}',
+                        payload::jsonb #>> '{report,fragment,ocxo1,science,fast_residual_ns}'
+                    ) AS ocxo1_residual,
+                    payload::jsonb #>> '{report,fragment,stats,ocxo1,welford,mean}'
+                        AS ocxo1_mean,
+                    payload::jsonb #>> '{report,fragment,stats,ocxo1,welford,stddev}'
+                        AS ocxo1_stddev,
+                    payload::jsonb #>> '{report,fragment,stats,ocxo1,welford,stderr}'
+                        AS ocxo1_stderr,
+                    payload::jsonb #>> '{report,fragment,stats,ocxo1,welford,n}'
+                        AS ocxo1_n,
+
                     payload::jsonb #>> '{report,fragment,ocxo2,ns}'
                         AS ocxo2_ns,
+                    payload::jsonb #>> '{report,fragment,stats,ocxo2,ppb_buckets,10_min}'
+                        AS ocxo2_ppb_10_min,
+                    payload::jsonb #>> '{report,fragment,stats,ocxo2,ppb_buckets,60_min}'
+                        AS ocxo2_ppb_60_min,
+                    payload::jsonb #>> '{report,fragment,stats,ocxo2,ppb_buckets,8_hour}'
+                        AS ocxo2_ppb_8_hour,
+                    payload::jsonb #>> '{report,fragment,stats,ocxo2,ppb_buckets,24_hour}'
+                        AS ocxo2_ppb_24_hour,
+                    COALESCE(
+                        payload::jsonb #>> '{report,fragment,stats,ocxo2,ppb_buckets,total}',
+                        payload::jsonb #>> '{report,fragment,stats,ocxo2,ppb}'
+                    ) AS ocxo2_ppb_total,
                     COALESCE(
                         payload::jsonb #>> '{report,fragment,stats,ocxo2,ppb_buckets,campaign}',
                         payload::jsonb #>> '{report,fragment,ocxo2,science,total_ppb}'
-                    ) AS ocxo2_ppb
+                    ) AS ocxo2_ppb_campaign,
+                    COALESCE(
+                        payload::jsonb #>> '{report,fragment,ocxo2,pps_residual,fast_residual_ns}',
+                        payload::jsonb #>> '{report,fragment,ocxo2,science,fast_residual_ns}'
+                    ) AS ocxo2_residual,
+                    payload::jsonb #>> '{report,fragment,stats,ocxo2,welford,mean}'
+                        AS ocxo2_mean,
+                    payload::jsonb #>> '{report,fragment,stats,ocxo2,welford,stddev}'
+                        AS ocxo2_stddev,
+                    payload::jsonb #>> '{report,fragment,stats,ocxo2,welford,stderr}'
+                        AS ocxo2_stderr,
+                    payload::jsonb #>> '{report,fragment,stats,ocxo2,welford,n}'
+                        AS ocxo2_n
                 FROM campaigns
                 ORDER BY ts DESC, id DESC
                 """
@@ -1402,8 +1451,18 @@ def _get_campaign_rows() -> list[dict]:
             return list(cur.fetchall())
 
 
+def _campaign_cell(name: str, active: bool, width: int) -> str:
+    """Return one bounded campaign label, reserving the final cell for ``*``."""
+    marker = "*" if active else ""
+    usable = max(1, width - len(marker))
+    label = str(name or "?")
+    if len(label) > usable:
+        label = label[:max(1, usable - 1)] + "~"
+    return f"{label + marker:<{width}}"
+
+
 def campaigns_readout() -> list[str]:
-    """Render the live campaign ledger with cumulative OCXO clock results."""
+    """Render each campaign with the same OCXO science fields as CLOCKS."""
     try:
         rows = _get_campaign_rows()
     except Exception as e:
@@ -1412,16 +1471,32 @@ def campaigns_readout() -> list[str]:
     newest_identity = str(rows[0].get("id")) if rows else "EMPTY"
     lines = [f"\0CAMPAIGN:{newest_identity}"]
 
-    W_CAMPAIGN = 27
-    W_DEV = 8
-    W_VALUE = 22
-    W_PPB = 12
+    W_CAMPAIGN = 20
+    W_DEV = 6
+    W_VALUE = 19
+    W_PPB_BUCKET = 9
+    W_RES = 6
+    W_MEAN = 9
+    W_SD = 7
+    W_SE = 7
+    W_N = 7
+    G = " "
 
     lines.append(
-        f"{'CAMPAIGN':<{W_CAMPAIGN}}"
+        f"{'CAMPAIGN':<{W_CAMPAIGN}}{G}"
         f"{'DEV':<{W_DEV}}"
         f"{'VALUE':>{W_VALUE}}"
-        f"{'CAMP PPB':>{W_PPB}}"
+        f"{'10-MIN':>{W_PPB_BUCKET}}"
+        f"{'60-MIN':>{W_PPB_BUCKET}}"
+        f"{'8-HOUR':>{W_PPB_BUCKET}}"
+        f"{'24-HOUR':>{W_PPB_BUCKET}}"
+        f"{'TOTAL':>{W_PPB_BUCKET}}"
+        f"{'CAMP':>{W_PPB_BUCKET}}"
+        f"{'RES':>{W_RES}}"
+        f"{'MEAN':>{W_MEAN}}"
+        f"{'SD':>{W_SD}}"
+        f"{'SE':>{W_SE}}"
+        f"{'N':>{W_N}}"
     )
 
     if not rows:
@@ -1430,25 +1505,45 @@ def campaigns_readout() -> list[str]:
         return lines
 
     for row_index, row in enumerate(rows):
-        campaign = str(row.get("campaign") or "?")
-        if row.get("active"):
-            campaign += "*"
+        campaign_cell = _campaign_cell(
+            str(row.get("campaign") or "?"),
+            bool(row.get("active")),
+            W_CAMPAIGN,
+        )
 
         for lane_name, lane_key in (("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")):
             value = _to_int(row.get(f"{lane_key}_ns"))
-            ppb = _to_float(row.get(f"{lane_key}_ppb"))
+            ppb_values = (
+                _to_float(row.get(f"{lane_key}_ppb_10_min")),
+                _to_float(row.get(f"{lane_key}_ppb_60_min")),
+                _to_float(row.get(f"{lane_key}_ppb_8_hour")),
+                _to_float(row.get(f"{lane_key}_ppb_24_hour")),
+                _to_float(row.get(f"{lane_key}_ppb_total")),
+                _to_float(row.get(f"{lane_key}_ppb_campaign")),
+            )
+            residual = _to_int(row.get(f"{lane_key}_residual"))
+            mean = _to_float(row.get(f"{lane_key}_mean"))
+            stddev = _to_float(row.get(f"{lane_key}_stddev"))
+            stderr = _to_float(row.get(f"{lane_key}_stderr"))
+            n = _to_int(row.get(f"{lane_key}_n"))
 
             lines.append(
-                f"{campaign:<{W_CAMPAIGN}}"
+                f"{campaign_cell}{G}"
                 f"{lane_name:<{W_DEV}}"
                 f"{_comma_int(value, W_VALUE)}"
-                f"{_fmt(ppb, f'>{W_PPB}.3f', W_PPB)}"
+                f"{''.join(_fmt(v, f'>{W_PPB_BUCKET}.3f', W_PPB_BUCKET) for v in ppb_values)}"
+                f"{_sign_int(residual, W_RES)}"
+                f"{_fmt(mean, f'>{W_MEAN}.3f', W_MEAN)}"
+                f"{_fmt(stddev, f'>{W_SD}.3f', W_SD)}"
+                f"{_fmt(stderr, f'>{W_SE}.3f', W_SE)}"
+                f"{_fmt(n, f'>{W_N}d', W_N)}"
             )
 
         if row_index != len(rows) - 1:
             lines.append("")
 
     return lines
+
 
 
 def _clockface_value(r: dict, lane: str):
