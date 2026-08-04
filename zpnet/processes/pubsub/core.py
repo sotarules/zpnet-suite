@@ -49,6 +49,7 @@ from zpnet.shared.socket_io import (
     recv_until_eof,
     send_bytes_and_shutdown,
 )
+import zpnet.shared.transport as transport_module
 from zpnet.shared.transport import (
     transport_send,
     transport_register_receive_callback,
@@ -75,6 +76,10 @@ SOCKET_DIR = "/tmp"
 
 # Transport retry configuration
 TRANSPORT_RETRY_INTERVAL_S = 0.25   # poll every 250 ms — aggressive but not a spinlock
+
+# Raw byte-for-byte transport logging is normally disabled.  Set the
+# ZPNET_TRANSPORT_RAW_LOG environment variable to 1 to enable it temporarily.
+TRANSPORT_RAW_LOG_ENABLED = os.environ.get("ZPNET_TRANSPORT_RAW_LOG") == "1"
 
 # Subsystems that PUBSUB should never query during ALLSUBSCRIPTIONS.
 # These are test/utility programs that may leave stale sockets behind.
@@ -1780,6 +1785,12 @@ def run() -> None:
     setup_logging()
     open_debug_log()
     open_pubsub_log()
+
+    transport_module.RAW_TRANSPORT_LOG_ENABLED = TRANSPORT_RAW_LOG_ENABLED
+    logging.info(
+        "📝 [transport] raw wire logging %s",
+        "ENABLED" if TRANSPORT_RAW_LOG_ENABLED else "disabled",
+    )
 
     # Register receive handlers before starting the serial RX supervisor.
     # The Teensy emits DEBUG/PUBSUB frames immediately during boot; the
