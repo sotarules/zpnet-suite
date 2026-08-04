@@ -645,6 +645,157 @@ static void tx_pump_once() {
 }
 
 // =============================================================
+// TX wire allocation / queue helpers
+// =============================================================
+
+static bool tx_allocate_wire(uint32_t sequence,
+                             uint8_t traffic,
+                             const char* topic,
+                             size_t json_len,
+                             bool timebase,
+                             uint8_t** out_data,
+                             size_t* out_wire_len,
+                             size_t* out_json_offset) {
+  if (!out_data || !out_wire_len || !out_json_offset) return false;
+  *out_data = nullptr;
+  *out_wire_len = 0U;
+  *out_json_offset = 0U;
+
+  if (json_len > TRANSPORT_MAX_MESSAGE) {
+    tx_budget_fail++;
+    tx_message_too_large_count++;
+    tx_note_reject(sequence, traffic, topic, json_len, 0U,
+                   TX_REASON_MESSAGE_TOO_LARGE, timebase);
+    if (traffic == TRAFFIC_REQUEST_RESPONSE) {
+      tx_rr_drop_count++;
+    }
+    return false;
+  }
+
+  char header[32];
+  const int header_len = snprintf(header, sizeof(header),
+                                  "<STX=%u>", (unsigned)json_len);
+  if (header_len <= 0 || (size_t)header_len >= sizeof(header)) {
+    tx_budget_fail++;
+    tx_header_format_fail_count++;
+    tx_note_reject(sequence, traffic, topic, json_len, 0U,
+                   TX_REASON_HEADER_FORMAT, timebase);
+    if (traffic == TRAFFIC_REQUEST_RESPONSE) {
+      tx_rr_drop_count++;
+    }
+    return false;
+  }
+
+  const size_t wire_len =
+      1U +                     // traffic byte
+      (size_t)header_len +
+      json_len +
+      ETX_LEN;
+
+  if (timebase) {
+    tx_timebase_last_wire_bytes = (uint32_t)wire_len;
+    if (wire_len > tx_timebase_largest_wire_bytes) {
+      tx_timebase_largest_wire_bytes = (uint32_t)wire_len;
+    }
+  }
+
+  if (tx_budget_used + wire_len > TX_BUDGET_MAX) {
+    tx_budget_fail++;
+    tx_outstanding_budget_fail_count++;
+    tx_note_reject(sequence, traffic, topic, json_len, wire_len,
+                   TX_REASON_OUTSTANDING_BUDGET, timebase);
+    if (traffic == TRAFFIC_REQUEST_RESPONSE) {
+      tx_rr_drop_count++;
+    }
+    return false;
+  }
+
+  if (tx_job_count >= TX_JOB_MAX) {
+    tx_queue_full++;
+    tx_note_reject(sequence, traffic, topic, json_len, wire_len,
+                   TX_REASON_QUEUE_FULL, timebase);
+    if (traffic == TRAFFIC_REQUEST_RESPONSE) {
+      tx_rr_drop_count++;
+    }
+    return false;
+  }
+
+  // One allocation owns the complete frame for its entire queued lifetime.
+  uint8_t* data = (uint8_t*)malloc(wire_len);
+  if (!data) {
+    tx_alloc_fail++;
+    tx_note_reject(sequence, traffic, topic, json_len, wire_len,
+                   TX_REASON_ALLOC_FAIL, timebase);
+    if (traffic == TRAFFIC_REQUEST_RESPONSE) {
+      tx_rr_drop_count++;
+    }
+    return false;
+  }
+
+  size_t pos = 0U;
+  data[pos++] = traffic;
+  memcpy(data + pos, header, (size_t)header_len);
+  pos += (size_t)header_len;
+
+  *out_data = data;
+  *out_wire_len = wire_len;
+  *out_json_offset = pos;
+  return true;
+}
+
+static void tx_commit_wire(uint32_t sequence,
+                           uint8_t traffic,
+                           const char* topic,
+                           size_t json_len,
+                           size_t wire_len,
+                           uint8_t* data,
+                           bool timebase) {
+  tx_send_serialized_count++;
+  if (timebase) {
+    tx_timebase_serialized_count++;
+    tx_timebase_last_json_bytes = (uint32_t)json_len;
+    if (json_len > tx_timebase_largest_json_bytes) {
+      tx_timebase_largest_json_bytes = (uint32_t)json_len;
+    }
+  }
+
+  tx_job_t& job = tx_jobs[tx_job_head];
+  job = tx_job_t{};
+  job.data = data;
+  job.length = wire_len;
+  job.sent = 0U;
+  job.sequence = sequence;
+  job.json_length = (uint32_t)json_len;
+  job.traffic = traffic;
+  job.timebase_fragment = timebase;
+  tx_copy_topic(job.topic, sizeof(job.topic), topic);
+
+  tx_job_head = (tx_job_head + 1U) % TX_JOB_MAX;
+  tx_job_count++;
+  tx_jobs_enqueued++;
+  tx_send_enqueued_count++;
+  tx_bytes_enqueued += wire_len;
+
+  tx_note_last(sequence, traffic, topic, json_len, wire_len,
+               TX_OUTCOME_ENQUEUED, TX_REASON_NONE);
+  if (timebase) {
+    tx_timebase_enqueued_count++;
+    tx_timebase_last_outcome_id = TX_OUTCOME_ENQUEUED;
+    tx_timebase_last_reason_id = TX_REASON_NONE;
+  }
+
+  tx_budget_used += wire_len;
+
+  if (tx_budget_used > tx_budget_high_water) {
+    tx_budget_high_water = tx_budget_used;
+  }
+
+  if (tx_job_count > tx_job_high_water) {
+    tx_job_high_water = tx_job_count;
+  }
+}
+
+// =============================================================
 // transport_send() — measure, allocate final wire image, serialize, enqueue
 // =============================================================
 
@@ -676,86 +827,18 @@ bool transport_send(uint8_t traffic, const Payload& payload) {
     return false;
   }
 
-  if (json_len > TRANSPORT_MAX_MESSAGE) {
-    tx_budget_fail++;
-    tx_message_too_large_count++;
-    tx_note_reject(sequence, traffic, topic, json_len, 0U,
-                   TX_REASON_MESSAGE_TOO_LARGE, timebase);
-    if (traffic == TRAFFIC_REQUEST_RESPONSE) {
-      tx_rr_drop_count++;
-    }
+  uint8_t* data = nullptr;
+  size_t wire_len = 0U;
+  size_t json_offset = 0U;
+  if (!tx_allocate_wire(sequence, traffic, topic, json_len, timebase,
+                        &data, &wire_len, &json_offset)) {
     return false;
   }
 
-  char header[32];
-  int header_len = snprintf(header, sizeof(header),
-                            "<STX=%u>", (unsigned)json_len);
-  if (header_len <= 0 || (size_t)header_len >= sizeof(header)) {
-    tx_budget_fail++;
-    tx_header_format_fail_count++;
-    tx_note_reject(sequence, traffic, topic, json_len, 0U,
-                   TX_REASON_HEADER_FORMAT, timebase);
-    if (traffic == TRAFFIC_REQUEST_RESPONSE) {
-      tx_rr_drop_count++;
-    }
-    return false;
-  }
-
-  const size_t wire_len =
-    1 +                       // traffic byte
-    (size_t)header_len +
-    json_len +
-    ETX_LEN;
-
-  if (timebase) {
-    tx_timebase_last_wire_bytes = (uint32_t)wire_len;
-    if (wire_len > tx_timebase_largest_wire_bytes) {
-      tx_timebase_largest_wire_bytes = (uint32_t)wire_len;
-    }
-  }
-
-  if (tx_budget_used + wire_len > TX_BUDGET_MAX) {
-    tx_budget_fail++;
-    tx_outstanding_budget_fail_count++;
-    tx_note_reject(sequence, traffic, topic, json_len, wire_len,
-                   TX_REASON_OUTSTANDING_BUDGET, timebase);
-    if (traffic == TRAFFIC_REQUEST_RESPONSE) {
-      tx_rr_drop_count++;
-    }
-    return false;
-  }
-
-  if (tx_job_count >= TX_JOB_MAX) {
-    tx_queue_full++;
-    tx_note_reject(sequence, traffic, topic, json_len, wire_len,
-                   TX_REASON_QUEUE_FULL, timebase);
-    if (traffic == TRAFFIC_REQUEST_RESPONSE) {
-      tx_rr_drop_count++;
-    }
-    return false;
-  }
-
-  // One allocation owns the complete frame for its entire queued lifetime.
   // write_json() writes its trailing NUL into the first ETX byte; ETX is copied
   // immediately afterward, so no extra byte or temporary String is required.
-  uint8_t* data = (uint8_t*)malloc(wire_len);
-  if (!data) {
-    tx_alloc_fail++;
-    tx_note_reject(sequence, traffic, topic, json_len, wire_len,
-                   TX_REASON_ALLOC_FAIL, timebase);
-    if (traffic == TRAFFIC_REQUEST_RESPONSE) {
-      tx_rr_drop_count++;
-    }
-    return false;
-  }
-
-  size_t pos = 0U;
-  data[pos++] = traffic;
-  memcpy(data + pos, header, (size_t)header_len);
-  pos += (size_t)header_len;
-
   const size_t written = payload.write_json(
-      reinterpret_cast<char*>(data + pos), json_len + 1U);
+      reinterpret_cast<char*>(data + json_offset), json_len + 1U);
   if (written != json_len) {
     free(data);
     tx_empty_serialization_count++;
@@ -763,7 +846,8 @@ bool transport_send(uint8_t traffic, const Payload& payload) {
                    TX_REASON_EMPTY_SERIALIZATION, timebase);
     return false;
   }
-  pos += written;
+
+  size_t pos = json_offset + written;
   memcpy(data + pos, ETX_SEQ, ETX_LEN);
   pos += ETX_LEN;
 
@@ -775,48 +859,109 @@ bool transport_send(uint8_t traffic, const Payload& payload) {
     return false;
   }
 
-  tx_send_serialized_count++;
+  tx_commit_wire(sequence, traffic, topic, json_len, wire_len, data, timebase);
+  return true;
+}
+
+// =============================================================
+// transport_send_publish() — write pub/sub envelope directly into final wire
+// =============================================================
+
+bool transport_send_publish(const char* topic, const Payload& payload) {
+
+  const uint8_t traffic = TRAFFIC_PUBLISH_SUBSCRIBE;
+  const uint32_t sequence = ++tx_send_attempt_count;
+  const bool timebase = tx_topic_is_timebase(topic);
   if (timebase) {
-    tx_timebase_serialized_count++;
-    tx_timebase_last_json_bytes = (uint32_t)json_len;
-    if (json_len > tx_timebase_largest_json_bytes) {
-      tx_timebase_largest_json_bytes = (uint32_t)json_len;
-    }
+    tx_timebase_attempt_count++;
+    tx_timebase_last_sequence = sequence;
   }
 
-  tx_job_t& job = tx_jobs[tx_job_head];
-  job = tx_job_t{};
-  job.data = data;
-  job.length = wire_len;
-  job.sent = 0U;
-  job.sequence = sequence;
-  job.json_length = (uint32_t)json_len;
-  job.traffic = traffic;
-  job.timebase_fragment = timebase;
-  tx_copy_topic(job.topic, sizeof(job.topic), topic);
-
-  tx_job_head = (tx_job_head + 1) % TX_JOB_MAX;
-  tx_job_count++;
-  tx_jobs_enqueued++;
-  tx_send_enqueued_count++;
-  tx_bytes_enqueued += wire_len;
-
-  tx_note_last(sequence, traffic, topic, json_len, wire_len,
-               TX_OUTCOME_ENQUEUED, TX_REASON_NONE);
-  if (timebase) {
-    tx_timebase_enqueued_count++;
-    tx_timebase_last_outcome_id = TX_OUTCOME_ENQUEUED;
-    tx_timebase_last_reason_id = TX_REASON_NONE;
+  if (!topic || !*topic) {
+    tx_empty_serialization_count++;
+    tx_note_reject(sequence, traffic, topic, 0U, 0U,
+                   TX_REASON_EMPTY_SERIALIZATION, timebase);
+    return false;
   }
 
-  tx_budget_used += wire_len;
+  // Use a tiny Payload only for the topic field so string validation and JSON
+  // escaping remain identical to the canonical Payload serializer. The large
+  // publication payload is never copied into another Payload.
+  Payload topic_field;
+  if (!topic_field.add("topic", topic)) {
+    tx_empty_serialization_count++;
+    tx_note_reject(sequence, traffic, topic, 0U, 0U,
+                   TX_REASON_EMPTY_SERIALIZATION, timebase);
+    return false;
+  }
 
-  if (tx_budget_used > tx_budget_high_water)
-    tx_budget_high_water = tx_budget_used;
+  const size_t topic_json_len = topic_field.json_size();
+  const size_t payload_json_len = payload.json_size();
+  static constexpr char PAYLOAD_KEY[] = "\"payload\":";
+  static constexpr size_t PAYLOAD_KEY_LEN = sizeof(PAYLOAD_KEY) - 1U;
 
-  if (tx_job_count > tx_job_high_water)
-    tx_job_high_water = tx_job_count;
+  if (topic_json_len < 2U || payload_json_len == 0U) {
+    tx_empty_serialization_count++;
+    tx_note_reject(sequence, traffic, topic, 0U, 0U,
+                   TX_REASON_EMPTY_SERIALIZATION, timebase);
+    return false;
+  }
 
+  // topic_field is {"topic":...}. Replace its closing brace with a comma, append
+  // "payload": plus the original payload JSON, then close the envelope. Payload
+  // arena limits keep this addition far below size_t overflow; tx_allocate_wire()
+  // remains the authoritative message-size court for the completed envelope.
+  const size_t envelope_len =
+      topic_json_len + PAYLOAD_KEY_LEN + payload_json_len + 1U;
+
+  uint8_t* data = nullptr;
+  size_t wire_len = 0U;
+  size_t json_offset = 0U;
+  if (!tx_allocate_wire(sequence, traffic, topic, envelope_len, timebase,
+                        &data, &wire_len, &json_offset)) {
+    return false;
+  }
+
+  const size_t topic_written = topic_field.write_json(
+      reinterpret_cast<char*>(data + json_offset), topic_json_len + 1U);
+  if (topic_written != topic_json_len ||
+      data[json_offset + topic_json_len - 1U] != (uint8_t)'}') {
+    free(data);
+    tx_empty_serialization_count++;
+    tx_note_reject(sequence, traffic, topic, envelope_len, wire_len,
+                   TX_REASON_EMPTY_SERIALIZATION, timebase);
+    return false;
+  }
+
+  size_t pos = json_offset + topic_json_len;
+  data[pos - 1U] = (uint8_t)',';
+  memcpy(data + pos, PAYLOAD_KEY, PAYLOAD_KEY_LEN);
+  pos += PAYLOAD_KEY_LEN;
+
+  const size_t payload_written = payload.write_json(
+      reinterpret_cast<char*>(data + pos), payload_json_len + 1U);
+  if (payload_written != payload_json_len) {
+    free(data);
+    tx_empty_serialization_count++;
+    tx_note_reject(sequence, traffic, topic, envelope_len, wire_len,
+                   TX_REASON_EMPTY_SERIALIZATION, timebase);
+    return false;
+  }
+  pos += payload_written;
+  data[pos++] = (uint8_t)'}';
+
+  memcpy(data + pos, ETX_SEQ, ETX_LEN);
+  pos += ETX_LEN;
+
+  if (pos != wire_len) {
+    free(data);
+    tx_empty_serialization_count++;
+    tx_note_reject(sequence, traffic, topic, envelope_len, wire_len,
+                   TX_REASON_EMPTY_SERIALIZATION, timebase);
+    return false;
+  }
+
+  tx_commit_wire(sequence, traffic, topic, envelope_len, wire_len, data, timebase);
   return true;
 }
 

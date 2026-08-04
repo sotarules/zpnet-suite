@@ -52,18 +52,10 @@ bool publish_to_pi(const char* topic, const Payload& payload) {
 
   if (!topic || !*topic) return false;
 
-  // Envelope construction is part of the custody transaction; a partial
-  // envelope must never be sent.
-  Payload envelope;
-  if (!envelope.add("topic", topic) ||
-      !envelope.add_object("payload", payload)) {
-    return false;
-  }
-
-  return transport_send(
-    TRAFFIC_PUBLISH_SUBSCRIBE,
-    envelope
-  );
+  // Transport authors the pub/sub envelope directly into its final wire image.
+  // This avoids holding a second full Payload copy while allocating the queued
+  // transport frame.
+  return transport_send_publish(topic, payload);
 }
 
 bool publish(const char* topic, const Payload& payload) {

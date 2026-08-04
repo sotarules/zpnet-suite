@@ -152,7 +152,9 @@ static uint32_t g_system_monitor_service_arm_failures = 0U;
 static uint32_t g_system_monitor_campaign_rows_embedded = 0U;
 static uint32_t g_system_monitor_campaign_ready_republish_count = 0U;
 static uint32_t g_system_monitor_campaign_retry_count = 0U;
+static uint32_t g_system_monitor_campaign_row_embed_fail_count = 0U;
 static bool g_system_monitor_retry_snapshot_valid = false;
+static bool g_system_monitor_retry_pi_only = false;
 static uint32_t g_system_monitor_retry_sequence = 0U;
 static uint32_t g_system_monitor_retry_attempt_count = 0U;
 static bool g_system_monitor_interrupt_owner_seen = false;
@@ -4210,7 +4212,7 @@ static void system_monitor_publish_service(timepop_ctx_t*,
         sequence, &g_system_monitor_clocks_snapshot);
   }
 
-  const bool campaign_row_present = clocks_snapshot_ok &&
+  const bool campaign_row_available = clocks_snapshot_ok &&
       g_system_monitor_clocks_snapshot.campaign.present &&
       g_system_monitor_clocks_snapshot.campaign.completed_second_sequence ==
           sequence;
@@ -4223,13 +4225,14 @@ static void system_monitor_publish_service(timepop_ctx_t*,
   // publication once the exact campaign observation exists.
   if (clocks_snapshot_ok &&
       g_system_monitor_clocks_snapshot.live.recording &&
-      !campaign_row_present) {
+      !campaign_row_available) {
     // A retry snapshot is created only from a previously complete campaign row.
     // Reaching this branch while retrying means the retained retry state itself
     // is incoherent; fail closed rather than emitting the wrong observation.
     if (retrying_campaign_row) {
       g_system_monitor_publish_reject_count++;
       g_system_monitor_retry_snapshot_valid = false;
+      g_system_monitor_retry_pi_only = false;
       g_system_monitor_retry_sequence = 0U;
       g_system_monitor_retry_attempt_count = 0U;
     }
@@ -4240,15 +4243,56 @@ static void system_monitor_publish_service(timepop_ctx_t*,
     return;
   }
 
-  const uint32_t next_publish_count = g_system_monitor_publish_count + 1U;
-  const uint32_t next_campaign_rows_embedded =
-      g_system_monitor_campaign_rows_embedded +
-      (campaign_row_present ? 1U : 0U);
-
   Payload fragment;
   fragment.add("schema", "MONITOR_FRAGMENT_V2");
   fragment.add("sequence", sequence);
   fragment.add("generated_dwt", ARM_DWT_CYCCNT);
+
+  // A campaign row is the largest optional child. Embed it while the parent is
+  // still small, then release the temporary row before constructing the large
+  // always-on observation tree. This lowers peak simultaneous arena demand.
+  bool campaign_row_embedded = false;
+  if (campaign_row_available) {
+    {
+      Payload campaign_row = system_monitor_campaign_row_payload(
+          g_system_monitor_clocks_snapshot.campaign);
+      campaign_row_embedded =
+          fragment.add_object("campaign_row", campaign_row);
+    }
+
+    // Availability in the typed snapshot is not proof that the nested Payload
+    // mutation succeeded. Preserve the immutable snapshot and retry rather than
+    // publishing campaign_row_present=true without a campaign_row object.
+    if (!campaign_row_embedded) {
+      g_system_monitor_publish_reject_count++;
+      g_system_monitor_campaign_row_embed_fail_count++;
+
+      if (!retrying_campaign_row) {
+        g_system_monitor_retry_snapshot_valid = true;
+        g_system_monitor_retry_pi_only = false;
+        g_system_monitor_retry_sequence = sequence;
+        g_system_monitor_retry_attempt_count = 1U;
+        g_system_monitor_campaign_retry_count++;
+      } else {
+        g_system_monitor_retry_attempt_count++;
+      }
+
+      // One immediate retry runs after this callback releases both temporary
+      // Payload arenas. A second failure remains in custody until a physical
+      // tick schedules another attempt, avoiding an ALAP spin loop.
+      if (g_system_monitor_retry_attempt_count == 1U) {
+        system_monitor_schedule_publish();
+      }
+      return;
+    }
+  }
+
+  const uint32_t next_publish_count = g_system_monitor_publish_count + 1U;
+  const uint32_t next_campaign_rows_embedded =
+      g_system_monitor_campaign_rows_embedded +
+      (campaign_row_embedded ? 1U : 0U);
+
+  fragment.add("campaign_row_present", campaign_row_embedded);
   fragment.add_object(
       "clocks",
       system_monitor_clocks_payload(g_system_monitor_clocks_snapshot.live));
@@ -4256,15 +4300,6 @@ static void system_monitor_publish_service(timepop_ctx_t*,
   fragment.add_object("process", system_monitor_process_payload());
   fragment.add_object("transport", system_monitor_transport_payload());
   fragment.add_object("payload", system_monitor_payload_payload());
-
-  fragment.add("campaign_row_present", campaign_row_present);
-  if (campaign_row_present) {
-    fragment.add_object(
-        "campaign_row",
-        system_monitor_campaign_row_payload(
-            g_system_monitor_clocks_snapshot.campaign));
-  }
-
   fragment.add_object("features", system_features_tree_payload());
   fragment.add("monitor_publish_count", next_publish_count);
   fragment.add("monitor_publish_reject_count",
@@ -4278,19 +4313,25 @@ static void system_monitor_publish_service(timepop_ctx_t*,
                g_system_monitor_campaign_ready_republish_count);
   fragment.add("monitor_campaign_retry_count",
                g_system_monitor_campaign_retry_count);
+  fragment.add("monitor_campaign_row_embed_fail_count",
+               g_system_monitor_campaign_row_embed_fail_count);
   fragment.add("monitor_retrying_campaign_row", retrying_campaign_row);
   fragment.add("monitor_retry_attempt_count",
                g_system_monitor_retry_attempt_count);
 
-  const bool publication_enqueued = retrying_campaign_row
-      ? publish_to_pi("MONITOR_FRAGMENT", fragment)
-      : publish("MONITOR_FRAGMENT", fragment);
+  // A transport retry is Pi-only because the original full publish may already
+  // have reached local subscribers. An embed retry has never published at all,
+  // so its first complete attempt must use the normal publication path.
+  const bool publication_enqueued =
+      retrying_campaign_row && g_system_monitor_retry_pi_only
+          ? publish_to_pi("MONITOR_FRAGMENT", fragment)
+          : publish("MONITOR_FRAGMENT", fragment);
   fragment.clear();
 
   if (!publication_enqueued) {
     g_system_monitor_publish_reject_count++;
 
-    if (campaign_row_present) {
+    if (campaign_row_embedded) {
       if (!retrying_campaign_row) {
         g_system_monitor_retry_snapshot_valid = true;
         g_system_monitor_retry_sequence = sequence;
@@ -4299,6 +4340,7 @@ static void system_monitor_publish_service(timepop_ctx_t*,
       } else {
         g_system_monitor_retry_attempt_count++;
       }
+      g_system_monitor_retry_pi_only = true;
 
       // One immediate retry runs after this callback releases its temporary
       // Payload storage. If that retry also fails, retain the campaign snapshot
@@ -4311,6 +4353,7 @@ static void system_monitor_publish_service(timepop_ctx_t*,
 
     memset(&g_system_monitor_clocks_snapshot, 0,
            sizeof(g_system_monitor_clocks_snapshot));
+    g_system_monitor_retry_pi_only = false;
     if (g_system_monitor_pending) system_monitor_schedule_publish();
     return;
   }
@@ -4318,6 +4361,7 @@ static void system_monitor_publish_service(timepop_ctx_t*,
   g_system_monitor_publish_count = next_publish_count;
   g_system_monitor_campaign_rows_embedded = next_campaign_rows_embedded;
   g_system_monitor_retry_snapshot_valid = false;
+  g_system_monitor_retry_pi_only = false;
   g_system_monitor_retry_sequence = 0U;
   g_system_monitor_retry_attempt_count = 0U;
 
@@ -4408,6 +4452,7 @@ static void system_dmamem_ensure_initialized(void) {
   memset(&g_system_monitor_clocks_snapshot, 0,
          sizeof(g_system_monitor_clocks_snapshot));
   g_system_monitor_retry_snapshot_valid = false;
+  g_system_monitor_retry_pi_only = false;
   g_system_monitor_retry_sequence = 0U;
   g_system_monitor_retry_attempt_count = 0U;
   memset(g_system_crash_report_text, 0, sizeof(g_system_crash_report_text));

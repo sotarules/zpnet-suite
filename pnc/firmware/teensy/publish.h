@@ -10,8 +10,10 @@
 // Local synchronous delivery still occurs before the forwarding attempt.
 bool publish(const char* topic, const Payload& payload);
 
-// Forward without repeating local delivery. This is reserved for retrying a
-// publication that already completed its synchronous local dispatch.
+// Forward without repeating local delivery. Transport authors the pub/sub
+// envelope directly into its final wire image, so no second full Payload copy
+// is held while the queued transport allocation is acquired. This is reserved
+// for retrying a publication that already completed local synchronous dispatch.
 bool publish_to_pi(const char* topic, const Payload& payload);
 
 void publish_local(const char* topic, const Payload& payload);

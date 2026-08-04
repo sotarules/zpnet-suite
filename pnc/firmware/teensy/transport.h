@@ -106,6 +106,14 @@ bool transport_send(
   const Payload& payload
 );
 
+// Enqueue one publish/subscribe envelope without constructing a second full
+// Payload object. Transport writes {"topic":...,"payload":...} directly into
+// the final TRAFFIC_PUBLISH_SUBSCRIBE wire allocation.
+bool transport_send_publish(
+  const char* topic,
+  const Payload& payload
+);
+
 
 // =============================================================
 // Runtime-loop witness
