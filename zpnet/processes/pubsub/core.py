@@ -81,6 +81,13 @@ TRANSPORT_RETRY_INTERVAL_S = 0.25   # poll every 250 ms — aggressive but not a
 # ZPNET_TRANSPORT_RAW_LOG environment variable to 1 to enable it temporarily.
 TRANSPORT_RAW_LOG_ENABLED = os.environ.get("ZPNET_TRANSPORT_RAW_LOG") == "1"
 
+# Formal Pi fan-out is synchronous today, so one subscriber that stops
+# consuming can otherwise hold the router indefinitely and starve every target
+# visited later in the fan-out loop.  Bound each local Unix-socket delivery and
+# narrate both slow and failed deliveries in the consolidated system log.
+PI_FANOUT_SOCKET_TIMEOUT_S = 2.0
+PI_FANOUT_SLOW_WARN_S = 0.100
+
 # Subsystems that PUBSUB should never query during ALLSUBSCRIPTIONS.
 # These are test/utility programs that may leave stale sockets behind.
 SUBSYSTEM_SKIP = {"TIMEBASE_WATCH"}
@@ -668,6 +675,80 @@ def adhoc_tap_server() -> None:
 
 
 # ---------------------------------------------------------------------
+# Formal Pi fan-out instrumentation
+# ---------------------------------------------------------------------
+
+def _fanout_to_pi(topic: str, subsystem: str, raw: bytes) -> bool:
+    """
+    Deliver one publication to a formal Pi subscriber with bounded timing.
+
+    The router remains sequential, but a stopped/slow subscriber can no longer
+    hold the entire fan-out path forever.  Slow successes and all failures are
+    emitted through normal logging so they appear in the consolidated system
+    journal with the exact topic, target, byte count, and phase timings.
+    """
+    sock_path = f"{SOCKET_DIR}/zpnet-{subsystem.lower()}-pubsub.sock"
+    started = time.monotonic()
+    connected: Optional[float] = None
+
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(PI_FANOUT_SOCKET_TIMEOUT_S)
+            sock.connect(sock_path)
+            connected = time.monotonic()
+            send_bytes_and_shutdown(sock, raw)
+
+        completed = time.monotonic()
+        connect_s = connected - started
+        send_s = completed - connected
+        total_s = completed - started
+
+        if total_s >= PI_FANOUT_SLOW_WARN_S:
+            logging.warning(
+                "🐌 [pubsub] slow Pi fan-out topic=%s target=PI:%s bytes=%d "
+                "connect_ms=%.3f send_ms=%.3f total_ms=%.3f timeout_s=%.3f",
+                topic,
+                subsystem,
+                len(raw),
+                connect_s * 1000.0,
+                send_s * 1000.0,
+                total_s * 1000.0,
+                PI_FANOUT_SOCKET_TIMEOUT_S,
+            )
+        return True
+
+    except Exception as exc:
+        failed = time.monotonic()
+        connect_ms = (
+            None
+            if connected is None
+            else (connected - started) * 1000.0
+        )
+        send_ms = (
+            None
+            if connected is None
+            else (failed - connected) * 1000.0
+        )
+
+        logging.exception(
+            "💥 [pubsub] Pi fan-out failed topic=%s target=PI:%s "
+            "socket=%s bytes=%d phase=%s connect_ms=%s send_ms=%s "
+            "total_ms=%.3f timeout_s=%.3f error=%r",
+            topic,
+            subsystem,
+            sock_path,
+            len(raw),
+            "CONNECT" if connected is None else "SEND",
+            "unavailable" if connect_ms is None else f"{connect_ms:.3f}",
+            "unavailable" if send_ms is None else f"{send_ms:.3f}",
+            (failed - started) * 1000.0,
+            PI_FANOUT_SOCKET_TIMEOUT_S,
+            exc,
+        )
+        return False
+
+
+# ---------------------------------------------------------------------
 # Pub/Sub routing core
 # ---------------------------------------------------------------------
 
@@ -716,14 +797,8 @@ def route_publish(msg: Dict[str, Any], *, forward_to_teensy: bool) -> None:
             server_needed = True
             continue
 
-        # PI target: deliver to its pubsub socket
-        sock_path = f"{SOCKET_DIR}/zpnet-{subsystem.lower()}-pubsub.sock"
-        try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                sock.connect(sock_path)
-                send_bytes_and_shutdown(sock, raw)
-        except Exception:
-            logging.warning("⚠️ [pubsub] fan-out failed %s -> %s:%s", topic, machine, subsystem)
+        # PI target: bounded, instrumented Unix-socket delivery.
+        _fanout_to_pi(topic, subsystem, raw)
 
     if forward_to_teensy and teensy_needed:
         transport_send(TRAFFIC_PUBLISH_SUBSCRIBE, msg)
@@ -1073,14 +1148,8 @@ def _server_handle_publish(msg: Dict[str, Any]) -> None:
             # Do NOT echo back to the originator
             continue
 
-        # PI target
-        sock_path = f"{SOCKET_DIR}/zpnet-{subsystem.lower()}-pubsub.sock"
-        try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                sock.connect(sock_path)
-                send_bytes_and_shutdown(sock, raw)
-        except Exception:
-            logging.warning("⚠️ [pubsub] fan-out failed %s -> %s:%s", topic, machine, subsystem)
+        # PI target: bounded, instrumented Unix-socket delivery.
+        _fanout_to_pi(topic, subsystem, raw)
 
     if teensy_needed:
         transport_send(TRAFFIC_PUBLISH_SUBSCRIBE, pub_msg)

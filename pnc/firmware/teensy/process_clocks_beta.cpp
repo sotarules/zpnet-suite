@@ -631,6 +631,57 @@ static uint32_t g_monitor_campaign_record_stage_count = 0U;
 static uint32_t g_monitor_campaign_record_take_count = 0U;
 static uint32_t g_monitor_campaign_record_backlog_count = 0U;
 
+// SYSTEM publication is normally armed by the first readiness notification.
+// Keep one bounded second-chance notification inside the same public second so
+// an orphaned/stale ALAP arm cannot strand Beta's immutable row until the next
+// candidate reaches the structural backlog court.
+static constexpr uint64_t CAMPAIGN_RECORD_READY_RETRY_NS = 100000000ULL;
+static constexpr const char* CAMPAIGN_RECORD_READY_RETRY_TIMER =
+    "clocks-monitor-campaign-ready-retry";
+static timepop_handle_t g_monitor_campaign_record_ready_retry_handle =
+    TIMEPOP_INVALID_HANDLE;
+static uint32_t g_monitor_campaign_record_ready_retry_arm_count = 0U;
+static uint32_t g_monitor_campaign_record_ready_retry_arm_failure_count = 0U;
+static uint32_t g_monitor_campaign_record_ready_retry_fire_count = 0U;
+static uint32_t g_monitor_campaign_record_ready_retry_cancel_count = 0U;
+
+static void monitor_campaign_record_ready_retry_cancel(void) {
+  if (g_monitor_campaign_record_ready_retry_handle == TIMEPOP_INVALID_HANDLE) {
+    return;
+  }
+  (void)timepop_cancel(g_monitor_campaign_record_ready_retry_handle);
+  g_monitor_campaign_record_ready_retry_handle = TIMEPOP_INVALID_HANDLE;
+  g_monitor_campaign_record_ready_retry_cancel_count++;
+}
+
+static void monitor_campaign_record_ready_retry_callback(
+    timepop_ctx_t*, timepop_diag_t*, void*) {
+  g_monitor_campaign_record_ready_retry_handle = TIMEPOP_INVALID_HANDLE;
+  if (!g_monitor_campaign_record_pending ||
+      g_monitor_campaign_record_sequence == 0U) {
+    return;
+  }
+
+  g_monitor_campaign_record_ready_retry_fire_count++;
+  system_monitor_campaign_row_ready(g_monitor_campaign_record_sequence);
+}
+
+static void monitor_campaign_record_ready_retry_arm(void) {
+  monitor_campaign_record_ready_retry_cancel();
+  g_monitor_campaign_record_ready_retry_handle =
+      timepop_arm(CAMPAIGN_RECORD_READY_RETRY_NS,
+                  false,
+                  monitor_campaign_record_ready_retry_callback,
+                  nullptr,
+                  CAMPAIGN_RECORD_READY_RETRY_TIMER);
+  if (g_monitor_campaign_record_ready_retry_handle ==
+      TIMEPOP_INVALID_HANDLE) {
+    g_monitor_campaign_record_ready_retry_arm_failure_count++;
+    return;
+  }
+  g_monitor_campaign_record_ready_retry_arm_count++;
+}
+
 // Command-report construction is a serialized foreground service. Priority-0
 // capture remains live, but the priority-16 TimePop/handoff tier may not enter a
 // second Payload-building path while a report owns the allocator/formatting
@@ -7835,6 +7886,7 @@ FLASHMEM bool clocks_monitor_snapshot_take(
     g_monitor_campaign_record_pending = false;
     g_monitor_campaign_record_sequence = 0U;
     g_monitor_campaign_record_take_count++;
+    monitor_campaign_record_ready_retry_cancel();
   }
 
   return true;
@@ -8887,6 +8939,11 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   // same-sequence copy if the observation-only fragment already escaped.
   system_monitor_campaign_row_ready(completed_pps_sequence);
 
+  // A second notification 100 ms later is idempotent when SYSTEM consumed the
+  // row normally. If SYSTEM's first ALAP arm was orphaned, the repeated signal
+  // lets SYSTEM replace that stale arm before the next campaign candidate exists.
+  monitor_campaign_record_ready_retry_arm();
+
   clocks_beta_feature_set_cached("CAMPAIGN_RECORD_HANDOFF",
                                  g_clocks_feature_campaign_record,
                                  system_feature_status_t::NOMINAL,
@@ -9879,6 +9936,25 @@ static FLASHMEM Payload cmd_report_recovery(const Payload&) {
   p.add("campaign_record_last_stage", g_campaign_record_last_stage);
   p.add("campaign_record_last_stage_name",
         campaign_record_stage_name(g_campaign_record_last_stage));
+  p.add("campaign_record_pending", g_monitor_campaign_record_pending);
+  p.add("campaign_record_pending_sequence",
+        g_monitor_campaign_record_sequence);
+  p.add("campaign_record_stage_count",
+        g_monitor_campaign_record_stage_count);
+  p.add("campaign_record_take_count",
+        g_monitor_campaign_record_take_count);
+  p.add("campaign_record_backlog_count",
+        g_monitor_campaign_record_backlog_count);
+  p.add("campaign_record_ready_retry_armed",
+        g_monitor_campaign_record_ready_retry_handle != TIMEPOP_INVALID_HANDLE);
+  p.add("campaign_record_ready_retry_arm_count",
+        g_monitor_campaign_record_ready_retry_arm_count);
+  p.add("campaign_record_ready_retry_arm_failure_count",
+        g_monitor_campaign_record_ready_retry_arm_failure_count);
+  p.add("campaign_record_ready_retry_fire_count",
+        g_monitor_campaign_record_ready_retry_fire_count);
+  p.add("campaign_record_ready_retry_cancel_count",
+        g_monitor_campaign_record_ready_retry_cancel_count);
 
   p.add("recover_reattach_active", (bool)g_recover_reattach_active);
   p.add("recover_reattach_degraded_active",

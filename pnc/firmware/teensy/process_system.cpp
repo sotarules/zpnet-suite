@@ -145,6 +145,18 @@ static uint32_t g_system_feature_handler_last_ipsr = 0;
 static volatile uint32_t g_system_monitor_pending_sequence = 0U;
 static volatile bool g_system_monitor_pending = false;
 static volatile bool g_system_monitor_service_armed = false;
+static timepop_handle_t g_system_monitor_service_handle =
+    TIMEPOP_INVALID_HANDLE;
+static uint32_t g_system_monitor_service_generation = 0U;
+static uint32_t g_system_monitor_service_armed_generation = 0U;
+static uint32_t g_system_monitor_service_forced_rearm_count = 0U;
+static uint32_t g_system_monitor_service_cancel_count = 0U;
+static uint32_t g_system_monitor_service_cancel_failure_count = 0U;
+static uint32_t g_system_monitor_service_stale_callback_count = 0U;
+static bool g_system_monitor_campaign_ready_last_valid = false;
+static uint32_t g_system_monitor_campaign_ready_last_sequence = 0U;
+static uint32_t g_system_monitor_campaign_ready_signal_count = 0U;
+static uint32_t g_system_monitor_campaign_ready_repeat_count = 0U;
 static uint32_t g_system_monitor_publish_count = 0U;
 static uint32_t g_system_monitor_publish_reject_count = 0U;
 static uint32_t g_system_monitor_coalesce_count = 0U;
@@ -4187,8 +4199,18 @@ static Payload system_monitor_campaign_row_payload(
 
 static void system_monitor_publish_service(timepop_ctx_t*,
                                            timepop_diag_t*,
-                                           void*) {
+                                           void* user_data) {
+  const uint32_t callback_generation =
+      (uint32_t)(uintptr_t)user_data;
+  if (!g_system_monitor_service_armed ||
+      callback_generation == 0U ||
+      callback_generation != g_system_monitor_service_armed_generation) {
+    g_system_monitor_service_stale_callback_count++;
+    return;
+  }
+
   g_system_monitor_service_armed = false;
+  g_system_monitor_service_handle = TIMEPOP_INVALID_HANDLE;
 
   const bool retrying_campaign_row =
       g_system_monitor_retry_snapshot_valid;
@@ -4307,6 +4329,25 @@ static void system_monitor_publish_service(timepop_ctx_t*,
   fragment.add("monitor_coalesce_count", g_system_monitor_coalesce_count);
   fragment.add("monitor_service_arm_failures",
                g_system_monitor_service_arm_failures);
+  fragment.add("monitor_service_armed", g_system_monitor_service_armed);
+  fragment.add("monitor_service_generation",
+               g_system_monitor_service_generation);
+  fragment.add("monitor_service_forced_rearm_count",
+               g_system_monitor_service_forced_rearm_count);
+  fragment.add("monitor_service_cancel_count",
+               g_system_monitor_service_cancel_count);
+  fragment.add("monitor_service_cancel_failure_count",
+               g_system_monitor_service_cancel_failure_count);
+  fragment.add("monitor_service_stale_callback_count",
+               g_system_monitor_service_stale_callback_count);
+  fragment.add("monitor_campaign_ready_signal_count",
+               g_system_monitor_campaign_ready_signal_count);
+  fragment.add("monitor_campaign_ready_repeat_count",
+               g_system_monitor_campaign_ready_repeat_count);
+  fragment.add("monitor_campaign_ready_last_sequence",
+               g_system_monitor_campaign_ready_last_valid
+                   ? g_system_monitor_campaign_ready_last_sequence
+                   : 0U);
   fragment.add("monitor_campaign_rows_embedded",
                next_campaign_rows_embedded);
   fragment.add("monitor_campaign_ready_republish_count",
@@ -4376,13 +4417,48 @@ static void system_monitor_schedule_publish(void) {
       g_system_monitor_service_armed) {
     return;
   }
+
+  uint32_t generation = g_system_monitor_service_generation + 1U;
+  if (generation == 0U) generation = 1U;
+
   const timepop_handle_t handle = timepop_arm_alap(
-      system_monitor_publish_service, nullptr, "SYSTEM_MONITOR_FRAGMENT");
+      system_monitor_publish_service,
+      (void*)(uintptr_t)generation,
+      "SYSTEM_MONITOR_FRAGMENT");
   if (handle == TIMEPOP_INVALID_HANDLE) {
     g_system_monitor_service_arm_failures++;
     return;
   }
+
+  g_system_monitor_service_handle = handle;
+  g_system_monitor_service_generation = generation;
+  g_system_monitor_service_armed_generation = generation;
   g_system_monitor_service_armed = true;
+}
+
+static void system_monitor_force_rearm(void) {
+  if (!g_system_monitor_service_armed) {
+    system_monitor_schedule_publish();
+    return;
+  }
+
+  bool cancelled = false;
+  if (g_system_monitor_service_handle != TIMEPOP_INVALID_HANDLE) {
+    cancelled = timepop_cancel(g_system_monitor_service_handle);
+  }
+  if (cancelled) {
+    g_system_monitor_service_cancel_count++;
+  } else {
+    g_system_monitor_service_cancel_failure_count++;
+  }
+
+  // Generation-tagged callbacks make this safe even if the old handle was
+  // already selected for dispatch and could not be cancelled. The replacement
+  // arm advances the generation; any superseded callback becomes a no-op.
+  g_system_monitor_service_handle = TIMEPOP_INVALID_HANDLE;
+  g_system_monitor_service_armed = false;
+  g_system_monitor_service_forced_rearm_count++;
+  system_monitor_schedule_publish();
 }
 
 static void system_monitor_accept_tick(uint32_t completed_second_sequence) {
@@ -4416,13 +4492,29 @@ void system_monitor_campaign_row_ready(uint32_t completed_second_sequence) {
     return;
   }
 
+  g_system_monitor_campaign_ready_signal_count++;
+  const bool repeated_signal =
+      g_system_monitor_campaign_ready_last_valid &&
+      g_system_monitor_campaign_ready_last_sequence ==
+          completed_second_sequence;
+  const bool service_was_armed = g_system_monitor_service_armed;
+  if (repeated_signal) {
+    g_system_monitor_campaign_ready_repeat_count++;
+  }
+  g_system_monitor_campaign_ready_last_valid = true;
+  g_system_monitor_campaign_ready_last_sequence = completed_second_sequence;
+
   // If the canonical interrupt tick is still pending, keep one publication and
   // let the completed campaign observation ride along. If that sequence already
   // published, arm a deliberate same-sequence decorated copy rather than losing
   // durable truth.
   if (g_system_monitor_pending &&
       g_system_monitor_pending_sequence == completed_second_sequence) {
-    system_monitor_schedule_publish();
+    if (repeated_signal && service_was_armed) {
+      system_monitor_force_rearm();
+    } else {
+      system_monitor_schedule_publish();
+    }
     return;
   }
 
@@ -4431,11 +4523,18 @@ void system_monitor_campaign_row_ready(uint32_t completed_second_sequence) {
     g_system_monitor_campaign_ready_republish_count++;
     g_system_monitor_pending_sequence = completed_second_sequence;
     g_system_monitor_pending = true;
-    system_monitor_schedule_publish();
+    if (repeated_signal && service_was_armed) {
+      system_monitor_force_rearm();
+    } else {
+      system_monitor_schedule_publish();
+    }
     return;
   }
 
   system_monitor_accept_tick(completed_second_sequence);
+  if (repeated_signal && service_was_armed) {
+    system_monitor_force_rearm();
+  }
 }
 
 

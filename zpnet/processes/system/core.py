@@ -73,6 +73,13 @@ MONITOR_CHECKPOINT_CONFIG_KEY = "MONITOR"
 MONITOR_RESTORE_TIMEOUT_S = 60.0
 MONITOR_RESTORE_COMMAND_RETRY_S = 10.0
 
+# Full unified MONITOR flight recorder.  The dedicated FIFO deliberately does
+# not coalesce rows: unlike config.MONITOR, monitor_history is an append-only
+# observation stream.  One hour of buffering keeps pub/sub nonblocking through
+# a temporary local PostgreSQL interruption.
+MONITOR_HISTORY_QUEUE_MAX = 3600
+MONITOR_HISTORY_RETRY_S = 1.0
+
 _TEENSY_MONITOR_RESTORE_ACCEPTED_STATUSES = {
     "monitor_restore_requested",
 }
@@ -270,6 +277,18 @@ _GNSS_ANNOUNCEMENT_FALLBACK_MATCHES = 0
 _LATEST_MONITOR_RECEIVED_MONOTONIC: Optional[float] = None
 _MONITOR_CHECKPOINT_QUEUE: queue.Queue[Dict[str, Any]] = queue.Queue(maxsize=1)
 _MONITOR_CHECKPOINT_WRITER_STARTED = threading.Event()
+
+# Every fresh unified MONITOR is copied into this FIFO after publication.
+# The history writer retries the current head until PostgreSQL accepts it, so
+# ordinary transient database failures preserve row order rather than silently
+# turning monitor_history into another latest-state checkpoint.
+_MONITOR_HISTORY_QUEUE: queue.Queue[Dict[str, Any]] = queue.Queue(
+    maxsize=MONITOR_HISTORY_QUEUE_MAX
+)
+_MONITOR_HISTORY_WRITER_STARTED = threading.Event()
+_MONITOR_HISTORY_ENQUEUED = 0
+_MONITOR_HISTORY_PERSISTED = 0
+_MONITOR_HISTORY_DROPPED = 0
 
 # Compact cross-process startup barrier consumed by Pi CLOCKS before campaign
 # recovery.  This is lifecycle narration only; the durable MONITOR checkpoint
@@ -1597,6 +1616,108 @@ def _persist_monitor_checkpoint(monitor: Dict[str, Any]) -> None:
         )
 
 
+def _monitor_history_campaign(monitor: Dict[str, Any]) -> Optional[str]:
+    """Extract a searchable campaign label without changing MONITOR truth."""
+    candidates = [
+        monitor.get("campaign"),
+        _monitor_clocks_payload(monitor).get("campaign"),
+        _monitor_clocks_payload(monitor).get("campaign_name"),
+    ]
+
+    fragment = monitor.get("monitor_fragment")
+    if isinstance(fragment, dict):
+        candidates.extend([
+            fragment.get("campaign"),
+            fragment.get("campaign_name"),
+        ])
+
+    for candidate in candidates:
+        if isinstance(candidate, dict):
+            candidate = (
+                candidate.get("name")
+                or candidate.get("campaign")
+                or candidate.get("id")
+            )
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def _persist_monitor_history(monitor: Dict[str, Any]) -> None:
+    """Append one unchanged unified MONITOR to public.monitor_history."""
+    encoded = json.dumps(monitor, separators=(",", ":"), ensure_ascii=False)
+    sequence = monitor.get("sequence")
+    pps_count = monitor.get("pps_count")
+    campaign = _monitor_history_campaign(monitor)
+
+    with open_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO monitor_history
+                (payload, sequence, campaign, pps_count)
+            VALUES
+                (%s::jsonb, %s, %s, %s)
+            """,
+            (encoded, sequence, campaign, pps_count),
+        )
+
+
+def _queue_monitor_history(monitor: Dict[str, Any]) -> None:
+    """Queue every fresh unified MONITOR without blocking the pub/sub callback."""
+    global _MONITOR_HISTORY_ENQUEUED, _MONITOR_HISTORY_DROPPED
+
+    try:
+        _MONITOR_HISTORY_QUEUE.put_nowait(copy.deepcopy(monitor))
+        _MONITOR_HISTORY_ENQUEUED += 1
+    except queue.Full:
+        _MONITOR_HISTORY_DROPPED += 1
+        logging.error(
+            "💥 [system] monitor_history FIFO full; dropping sequence=%s "
+            "(queued=%d persisted=%d dropped=%d)",
+            monitor.get("sequence"),
+            _MONITOR_HISTORY_ENQUEUED,
+            _MONITOR_HISTORY_PERSISTED,
+            _MONITOR_HISTORY_DROPPED,
+        )
+
+
+def _monitor_history_writer_loop() -> None:
+    """Persist the append-only MONITOR stream in order, retrying each head."""
+    global _MONITOR_HISTORY_PERSISTED
+
+    _MONITOR_HISTORY_WRITER_STARTED.set()
+    while True:
+        monitor = _MONITOR_HISTORY_QUEUE.get()
+        failure_logged = False
+
+        while True:
+            try:
+                _persist_monitor_history(monitor)
+                _MONITOR_HISTORY_PERSISTED += 1
+                break
+            except Exception:
+                if not failure_logged:
+                    logging.exception(
+                        "⚠️ [system] monitor_history append failed for sequence=%s; "
+                        "retrying without discarding the row",
+                        monitor.get("sequence"),
+                    )
+                    failure_logged = True
+                time.sleep(MONITOR_HISTORY_RETRY_S)
+
+
+def _start_monitor_history_writer() -> None:
+    if _MONITOR_HISTORY_WRITER_STARTED.is_set():
+        return
+
+    threading.Thread(
+        target=_monitor_history_writer_loop,
+        daemon=True,
+        name="system-monitor-history-writer",
+    ).start()
+
+
 def _monitor_clocks_payload(monitor: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not isinstance(monitor, dict):
         return {}
@@ -2449,6 +2570,7 @@ def on_monitor_fragment(payload: Optional[dict]) -> None:
         _LATEST_MONITOR_RECEIVED_MONOTONIC = time.monotonic()
 
     publish("MONITOR", monitor)
+    _queue_monitor_history(monitor)
     _queue_monitor_checkpoint(monitor)
 
 
@@ -2599,6 +2721,7 @@ def startup_teensy_quiet_delay() -> None:
 
 def run() -> None:
     setup_logging()
+    _start_monitor_history_writer()
 
     try:
         server_setup(
