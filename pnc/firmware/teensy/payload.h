@@ -574,6 +574,10 @@ public:
     Payload clone() const;
 
     // Serialization
+    // json_size() returns the exact JSON byte count excluding the trailing NUL.
+    // It performs the same integrity and semantic validation as write_json()
+    // without allocating, so transport can reserve the final wire image once.
+    size_t json_size() const;
     size_t write_json(char* buf, size_t buf_size) const;
     String to_json() const;
 

@@ -4547,36 +4547,54 @@ def _tau_from_ppb(ppb: Optional[float]) -> Optional[float]:
     return 1.0 + float(ppb) / 1.0e9
 
 
+def _firmware_total_ppb(
+    fragment: Dict[str, Any],
+    report: Dict[str, Any],
+    lane: str,
+) -> Optional[float]:
+    """Return the explicit firmware TOTAL bucket for one clock lane.
+
+    ``stats.<lane>.ppb`` remains a rolling-deploy compatibility alias of TOTAL,
+    but baseline storage names the population explicitly so CAMP or a future
+    selected servo bucket can never become baseline authority by accident.
+    """
+    return _first_float(
+        _path_get(fragment, f"stats.{lane}.ppb_buckets.total"),
+        _path_get(fragment, f"stats.{lane}.ppb"),
+        fragment.get(f"{lane}_ppb"),
+        report.get(f"{lane}_ppb"),
+    )
+
+
 def _baseline_ppb_from_report(report: Dict[str, Any]) -> Dict[str, float]:
-    """Extract baseline PPB values from the current TIMEBASE-shaped report."""
+    """Extract explicit TOTAL PPB values from a TIMEBASE-shaped report."""
     frag = _report_fragment(report)
-    extra = _report_extra_clocks(report)
 
     candidates = {
         "gnss": 0.0,
-        "vclock": _first_float(_path_get(frag, "stats.vclock.ppb"), frag.get("vclock_ppb"), report.get("vclock_ppb")),
+        "vclock": _firmware_total_ppb(frag, report, "vclock"),
         "gnss_raw": _gnss_raw_baseline_ppb_from_report(report),
-        "dwt": _first_float(_path_get(frag, "stats.dwt.ppb"), frag.get("dwt_ppb"), report.get("dwt_ppb")),
-        "ocxo1": _first_float(_path_get(frag, "stats.ocxo1.ppb"), frag.get("ocxo1_ppb"), report.get("ocxo1_ppb")),
-        "ocxo2": _first_float(_path_get(frag, "stats.ocxo2.ppb"), frag.get("ocxo2_ppb"), report.get("ocxo2_ppb")),
+        "dwt": _firmware_total_ppb(frag, report, "dwt"),
+        "ocxo1": _firmware_total_ppb(frag, report, "ocxo1"),
+        "ocxo2": _firmware_total_ppb(frag, report, "ocxo2"),
     }
 
     return {k: round(v, 3) for k, v in candidates.items() if v is not None}
 
 
 def _baseline_tau_from_report(report: Dict[str, Any]) -> Dict[str, float]:
-    """Extract baseline tau values from the current TIMEBASE-shaped report."""
+    """Extract tau values derived from the same explicit TOTAL population."""
     frag = _report_fragment(report)
     extra = _report_extra_clocks(report)
     gnss_raw_ppb = _gnss_raw_baseline_ppb_from_report(report)
 
     candidates = {
         "gnss": 1.0,
-        "vclock": _first_float(_path_get(frag, "stats.vclock.tau"), frag.get("vclock_tau"), report.get("vclock_tau")),
+        "vclock": _tau_from_ppb(_firmware_total_ppb(frag, report, "vclock")),
         "gnss_raw": _first_float(extra.get("gnss_raw_tau"), report.get("gnss_raw_tau")),
-        "dwt": _first_float(_path_get(frag, "stats.dwt.tau"), frag.get("dwt_tau"), report.get("dwt_tau")),
-        "ocxo1": _first_float(_path_get(frag, "stats.ocxo1.tau"), frag.get("ocxo1_tau"), report.get("ocxo1_tau")),
-        "ocxo2": _first_float(_path_get(frag, "stats.ocxo2.tau"), frag.get("ocxo2_tau"), report.get("ocxo2_tau")),
+        "dwt": _tau_from_ppb(_firmware_total_ppb(frag, report, "dwt")),
+        "ocxo1": _tau_from_ppb(_firmware_total_ppb(frag, report, "ocxo1")),
+        "ocxo2": _tau_from_ppb(_firmware_total_ppb(frag, report, "ocxo2")),
     }
     candidates["gnss_raw"] = _tau_from_ppb(gnss_raw_ppb) or candidates.get("gnss_raw")
 

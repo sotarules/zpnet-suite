@@ -146,10 +146,15 @@ static volatile uint32_t g_system_monitor_pending_sequence = 0U;
 static volatile bool g_system_monitor_pending = false;
 static volatile bool g_system_monitor_service_armed = false;
 static uint32_t g_system_monitor_publish_count = 0U;
+static uint32_t g_system_monitor_publish_reject_count = 0U;
 static uint32_t g_system_monitor_coalesce_count = 0U;
 static uint32_t g_system_monitor_service_arm_failures = 0U;
 static uint32_t g_system_monitor_campaign_rows_embedded = 0U;
 static uint32_t g_system_monitor_campaign_ready_republish_count = 0U;
+static uint32_t g_system_monitor_campaign_retry_count = 0U;
+static bool g_system_monitor_retry_snapshot_valid = false;
+static uint32_t g_system_monitor_retry_sequence = 0U;
+static uint32_t g_system_monitor_retry_attempt_count = 0U;
 static bool g_system_monitor_interrupt_owner_seen = false;
 static bool g_system_monitor_last_tick_valid = false;
 static uint32_t g_system_monitor_last_tick_sequence = 0U;
@@ -4182,16 +4187,28 @@ static void system_monitor_publish_service(timepop_ctx_t*,
                                            timepop_diag_t*,
                                            void*) {
   g_system_monitor_service_armed = false;
-  if (!g_system_monitor_pending) return;
+
+  const bool retrying_campaign_row =
+      g_system_monitor_retry_snapshot_valid;
+  if (!retrying_campaign_row && !g_system_monitor_pending) return;
 
   system_dmamem_ensure_initialized();
-  const uint32_t sequence = g_system_monitor_pending_sequence;
-  g_system_monitor_pending = false;
 
-  memset(&g_system_monitor_clocks_snapshot, 0,
-         sizeof(g_system_monitor_clocks_snapshot));
-  const bool clocks_snapshot_ok = clocks_monitor_snapshot_take(
-      sequence, &g_system_monitor_clocks_snapshot);
+  uint32_t sequence = 0U;
+  bool clocks_snapshot_ok = false;
+  if (retrying_campaign_row) {
+    // The prior attempt already consumed Beta's immutable campaign record.
+    // Preserve and reuse that exact snapshot until transport accepts custody.
+    sequence = g_system_monitor_retry_sequence;
+    clocks_snapshot_ok = true;
+  } else {
+    sequence = g_system_monitor_pending_sequence;
+    g_system_monitor_pending = false;
+    memset(&g_system_monitor_clocks_snapshot, 0,
+           sizeof(g_system_monitor_clocks_snapshot));
+    clocks_snapshot_ok = clocks_monitor_snapshot_take(
+        sequence, &g_system_monitor_clocks_snapshot);
+  }
 
   const bool campaign_row_present = clocks_snapshot_ok &&
       g_system_monitor_clocks_snapshot.campaign.present &&
@@ -4207,12 +4224,26 @@ static void system_monitor_publish_service(timepop_ctx_t*,
   if (clocks_snapshot_ok &&
       g_system_monitor_clocks_snapshot.live.recording &&
       !campaign_row_present) {
+    // A retry snapshot is created only from a previously complete campaign row.
+    // Reaching this branch while retrying means the retained retry state itself
+    // is incoherent; fail closed rather than emitting the wrong observation.
+    if (retrying_campaign_row) {
+      g_system_monitor_publish_reject_count++;
+      g_system_monitor_retry_snapshot_valid = false;
+      g_system_monitor_retry_sequence = 0U;
+      g_system_monitor_retry_attempt_count = 0U;
+    }
     g_system_monitor_pending_sequence = sequence;
     g_system_monitor_pending = true;
     memset(&g_system_monitor_clocks_snapshot, 0,
            sizeof(g_system_monitor_clocks_snapshot));
     return;
   }
+
+  const uint32_t next_publish_count = g_system_monitor_publish_count + 1U;
+  const uint32_t next_campaign_rows_embedded =
+      g_system_monitor_campaign_rows_embedded +
+      (campaign_row_present ? 1U : 0U);
 
   Payload fragment;
   fragment.add("schema", "MONITOR_FRAGMENT_V2");
@@ -4232,29 +4263,75 @@ static void system_monitor_publish_service(timepop_ctx_t*,
         "campaign_row",
         system_monitor_campaign_row_payload(
             g_system_monitor_clocks_snapshot.campaign));
-    g_system_monitor_campaign_rows_embedded++;
   }
 
   fragment.add_object("features", system_features_tree_payload());
-  fragment.add("monitor_publish_count", g_system_monitor_publish_count + 1U);
+  fragment.add("monitor_publish_count", next_publish_count);
+  fragment.add("monitor_publish_reject_count",
+               g_system_monitor_publish_reject_count);
   fragment.add("monitor_coalesce_count", g_system_monitor_coalesce_count);
   fragment.add("monitor_service_arm_failures",
                g_system_monitor_service_arm_failures);
   fragment.add("monitor_campaign_rows_embedded",
-               g_system_monitor_campaign_rows_embedded);
+               next_campaign_rows_embedded);
   fragment.add("monitor_campaign_ready_republish_count",
                g_system_monitor_campaign_ready_republish_count);
+  fragment.add("monitor_campaign_retry_count",
+               g_system_monitor_campaign_retry_count);
+  fragment.add("monitor_retrying_campaign_row", retrying_campaign_row);
+  fragment.add("monitor_retry_attempt_count",
+               g_system_monitor_retry_attempt_count);
 
-  publish("MONITOR_FRAGMENT", fragment);
-  g_system_monitor_publish_count++;
+  const bool publication_enqueued = retrying_campaign_row
+      ? publish_to_pi("MONITOR_FRAGMENT", fragment)
+      : publish("MONITOR_FRAGMENT", fragment);
   fragment.clear();
+
+  if (!publication_enqueued) {
+    g_system_monitor_publish_reject_count++;
+
+    if (campaign_row_present) {
+      if (!retrying_campaign_row) {
+        g_system_monitor_retry_snapshot_valid = true;
+        g_system_monitor_retry_sequence = sequence;
+        g_system_monitor_retry_attempt_count = 1U;
+        g_system_monitor_campaign_retry_count++;
+      } else {
+        g_system_monitor_retry_attempt_count++;
+      }
+
+      // One immediate retry runs after this callback releases its temporary
+      // Payload storage. If that retry also fails, retain the campaign snapshot
+      // and wait for the next physical tick instead of spinning in ALAP.
+      if (g_system_monitor_retry_attempt_count == 1U) {
+        system_monitor_schedule_publish();
+      }
+      return;
+    }
+
+    memset(&g_system_monitor_clocks_snapshot, 0,
+           sizeof(g_system_monitor_clocks_snapshot));
+    if (g_system_monitor_pending) system_monitor_schedule_publish();
+    return;
+  }
+
+  g_system_monitor_publish_count = next_publish_count;
+  g_system_monitor_campaign_rows_embedded = next_campaign_rows_embedded;
+  g_system_monitor_retry_snapshot_valid = false;
+  g_system_monitor_retry_sequence = 0U;
+  g_system_monitor_retry_attempt_count = 0U;
+
   memset(&g_system_monitor_clocks_snapshot, 0,
          sizeof(g_system_monitor_clocks_snapshot));
   if (g_system_monitor_pending) system_monitor_schedule_publish();
 }
 
 static void system_monitor_schedule_publish(void) {
-  if (!g_system_monitor_pending || g_system_monitor_service_armed) return;
+  if ((!g_system_monitor_pending &&
+       !g_system_monitor_retry_snapshot_valid) ||
+      g_system_monitor_service_armed) {
+    return;
+  }
   const timepop_handle_t handle = timepop_arm_alap(
       system_monitor_publish_service, nullptr, "SYSTEM_MONITOR_FRAGMENT");
   if (handle == TIMEPOP_INVALID_HANDLE) {
@@ -4330,6 +4407,9 @@ static void system_dmamem_ensure_initialized(void) {
   system_feature_registry_reset();
   memset(&g_system_monitor_clocks_snapshot, 0,
          sizeof(g_system_monitor_clocks_snapshot));
+  g_system_monitor_retry_snapshot_valid = false;
+  g_system_monitor_retry_sequence = 0U;
+  g_system_monitor_retry_attempt_count = 0U;
   memset(g_system_crash_report_text, 0, sizeof(g_system_crash_report_text));
   memset(g_system_debug_buffer, 0, sizeof(g_system_debug_buffer));
   memset((void*)&g_system_timepop_dispatch_trace_scratch, 0,

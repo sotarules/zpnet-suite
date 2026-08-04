@@ -43,24 +43,36 @@ void publish_local(const char* topic, const Payload& payload) {
 //
 // Semantics:
 //   • Synchronous local delivery
-//   • Unconditional forward to Pi
+//   • Best-effort forward to Pi with an explicit custody verdict
+//   • true means the complete Pi-bound wire image was enqueued
 //   • No inference, no filtering
 //
 
-void publish(const char* topic, const Payload& payload) {
+bool publish_to_pi(const char* topic, const Payload& payload) {
 
-  if (!topic || !*topic) return;
+  if (!topic || !*topic) return false;
+
+  // Envelope construction is part of the custody transaction; a partial
+  // envelope must never be sent.
+  Payload envelope;
+  if (!envelope.add("topic", topic) ||
+      !envelope.add_object("payload", payload)) {
+    return false;
+  }
+
+  return transport_send(
+    TRAFFIC_PUBLISH_SUBSCRIBE,
+    envelope
+  );
+}
+
+bool publish(const char* topic, const Payload& payload) {
+
+  if (!topic || !*topic) return false;
 
   // 1) Local synchronous delivery
   publish_local(topic, payload);
 
   // 2) Forward to Pi (authoritative routing)
-  Payload envelope;
-  envelope.add("topic", topic);
-  envelope.add_object("payload", payload);
-
-  transport_send(
-    TRAFFIC_PUBLISH_SUBSCRIBE,
-    envelope
-  );
+  return publish_to_pi(topic, payload);
 }

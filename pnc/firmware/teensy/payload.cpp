@@ -6192,6 +6192,10 @@ size_t Payload::_write_json_unchecked(char* buf) const {
     return (size_t)(out - buf);
 }
 
+size_t Payload::json_size() const {
+    return _json_size();
+}
+
 size_t Payload::write_json(char* buf, size_t buf_size) const {
     if (!buf || buf_size == 0) {
         g_payload_serialize_overflow++;

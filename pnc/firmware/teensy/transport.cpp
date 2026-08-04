@@ -645,10 +645,10 @@ static void tx_pump_once() {
 }
 
 // =============================================================
-// transport_send() — serialize, allocate complete wire image, enqueue
+// transport_send() — measure, allocate final wire image, serialize, enqueue
 // =============================================================
 
-void transport_send(uint8_t traffic, const Payload& payload) {
+bool transport_send(uint8_t traffic, const Payload& payload) {
 
   const uint32_t sequence = ++tx_send_attempt_count;
   const char* topic = payload.getString("topic");
@@ -658,29 +658,22 @@ void transport_send(uint8_t traffic, const Payload& payload) {
     tx_timebase_last_sequence = sequence;
   }
 
-  String json = payload.to_json();
-  if (json.length() == 0) {
+  // Measure without allocating. Payload performs the same structural and
+  // semantic validation used by write_json(). A zero result is therefore an
+  // explicit serialization failure, not an empty JSON document (which is "{}").
+  const size_t json_len = payload.json_size();
+  if (json_len == 0U) {
     tx_empty_serialization_count++;
     tx_note_reject(sequence, traffic, topic, 0U, 0U,
                    TX_REASON_EMPTY_SERIALIZATION, timebase);
-    return;
+    return false;
   }
 
-  const size_t json_len = json.length();
-  tx_send_serialized_count++;
-  if (timebase) {
-    tx_timebase_serialized_count++;
-    tx_timebase_last_json_bytes = (uint32_t)json_len;
-    if (json_len > tx_timebase_largest_json_bytes) {
-      tx_timebase_largest_json_bytes = (uint32_t)json_len;
-    }
-  }
-
-  if (!payload.empty() && json == "{}") {
+  if (!payload.empty() && json_len == 2U) {
     tx_semantic_empty_count++;
     tx_note_reject(sequence, traffic, topic, json_len, 0U,
                    TX_REASON_SEMANTIC_EMPTY, timebase);
-    return;
+    return false;
   }
 
   if (json_len > TRANSPORT_MAX_MESSAGE) {
@@ -691,7 +684,7 @@ void transport_send(uint8_t traffic, const Payload& payload) {
     if (traffic == TRAFFIC_REQUEST_RESPONSE) {
       tx_rr_drop_count++;
     }
-    return;
+    return false;
   }
 
   char header[32];
@@ -705,7 +698,7 @@ void transport_send(uint8_t traffic, const Payload& payload) {
     if (traffic == TRAFFIC_REQUEST_RESPONSE) {
       tx_rr_drop_count++;
     }
-    return;
+    return false;
   }
 
   const size_t wire_len =
@@ -729,7 +722,7 @@ void transport_send(uint8_t traffic, const Payload& payload) {
     if (traffic == TRAFFIC_REQUEST_RESPONSE) {
       tx_rr_drop_count++;
     }
-    return;
+    return false;
   }
 
   if (tx_job_count >= TX_JOB_MAX) {
@@ -739,11 +732,13 @@ void transport_send(uint8_t traffic, const Payload& payload) {
     if (traffic == TRAFFIC_REQUEST_RESPONSE) {
       tx_rr_drop_count++;
     }
-    return;
+    return false;
   }
 
+  // One allocation owns the complete frame for its entire queued lifetime.
+  // write_json() writes its trailing NUL into the first ETX byte; ETX is copied
+  // immediately afterward, so no extra byte or temporary String is required.
   uint8_t* data = (uint8_t*)malloc(wire_len);
-
   if (!data) {
     tx_alloc_fail++;
     tx_note_reject(sequence, traffic, topic, json_len, wire_len,
@@ -751,16 +746,43 @@ void transport_send(uint8_t traffic, const Payload& payload) {
     if (traffic == TRAFFIC_REQUEST_RESPONSE) {
       tx_rr_drop_count++;
     }
-    return;
+    return false;
   }
 
-  size_t pos = 0;
+  size_t pos = 0U;
   data[pos++] = traffic;
-  memcpy(data + pos, header, header_len);
+  memcpy(data + pos, header, (size_t)header_len);
   pos += (size_t)header_len;
-  memcpy(data + pos, json.c_str(), json_len);
-  pos += json_len;
+
+  const size_t written = payload.write_json(
+      reinterpret_cast<char*>(data + pos), json_len + 1U);
+  if (written != json_len) {
+    free(data);
+    tx_empty_serialization_count++;
+    tx_note_reject(sequence, traffic, topic, json_len, wire_len,
+                   TX_REASON_EMPTY_SERIALIZATION, timebase);
+    return false;
+  }
+  pos += written;
   memcpy(data + pos, ETX_SEQ, ETX_LEN);
+  pos += ETX_LEN;
+
+  if (pos != wire_len) {
+    free(data);
+    tx_empty_serialization_count++;
+    tx_note_reject(sequence, traffic, topic, json_len, wire_len,
+                   TX_REASON_EMPTY_SERIALIZATION, timebase);
+    return false;
+  }
+
+  tx_send_serialized_count++;
+  if (timebase) {
+    tx_timebase_serialized_count++;
+    tx_timebase_last_json_bytes = (uint32_t)json_len;
+    if (json_len > tx_timebase_largest_json_bytes) {
+      tx_timebase_largest_json_bytes = (uint32_t)json_len;
+    }
+  }
 
   tx_job_t& job = tx_jobs[tx_job_head];
   job = tx_job_t{};
@@ -794,6 +816,8 @@ void transport_send(uint8_t traffic, const Payload& payload) {
 
   if (tx_job_count > tx_job_high_water)
     tx_job_high_water = tx_job_count;
+
+  return true;
 }
 
 // =============================================================

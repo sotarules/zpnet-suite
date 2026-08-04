@@ -95,11 +95,13 @@ void transport_register_receive_callback(
 //
 //   • Callers do NOT transmit inline.
 //   • transport_send() serializes and enqueues.
+//   • true means the complete wire image entered transport custody.
+//   • false means serialization, sizing, budget, queue, or allocation failed.
 //   • Physical transmission occurs later in scheduled context.
 //   • This eliminates multi-writer interleave by construction.
 //
 
-void transport_send(
+bool transport_send(
   uint8_t traffic,
   const Payload& payload
 );

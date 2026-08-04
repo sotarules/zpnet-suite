@@ -6,7 +6,13 @@
 // Public publish()
 // -----------------------------------------------------------------------------
 
-void publish(const char* topic, const Payload& payload);
+// Returns true only when the Pi-bound envelope enters transport custody.
+// Local synchronous delivery still occurs before the forwarding attempt.
+bool publish(const char* topic, const Payload& payload);
+
+// Forward without repeating local delivery. This is reserved for retrying a
+// publication that already completed its synchronous local dispatch.
+bool publish_to_pi(const char* topic, const Payload& payload);
 
 void publish_local(const char* topic, const Payload& payload);
 
