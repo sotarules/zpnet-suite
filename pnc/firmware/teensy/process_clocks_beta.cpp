@@ -315,6 +315,8 @@ static const char* clocks_row_objection_reason_name(
       return "beta_recovery_science_hold";
     case clocks_row_objection_reason_t::BETA_ANTECEDENT_SCIENCE_HOLD:
       return "beta_antecedent_science_hold";
+    case clocks_row_objection_reason_t::BETA_CAMPAIGN_CLOCKFACE_CONTINUITY:
+      return "beta_campaign_clockface_continuity";
     case clocks_row_objection_reason_t::ALPHA_COUNTERLEDGER_INTERVAL:
       return "alpha_counterledger_interval";
     case clocks_row_objection_reason_t::ALPHA_BRIDGE_NONMONOTONIC:
@@ -395,6 +397,20 @@ static void clocks_row_objection_format_reason(
              (unsigned long)objection.detail0,
              (unsigned long)objection.detail1,
              (unsigned long)objection.lane_mask);
+    return;
+  }
+
+  if (objection.reason ==
+      clocks_row_objection_reason_t::BETA_CAMPAIGN_CLOCKFACE_CONTINUITY) {
+    snprintf(out, out_size,
+             "PPS %lu campaign clockface discontinuity: lanes=0x%02lX "
+             "candidate error=%ld ns exceeds gate=%lu ns; raw candidate "
+             "preserved for audit, canonical campaign clockface advanced by "
+             "nominal holdover and excluded from science/control",
+             (unsigned long)objection.detail0,
+             (unsigned long)objection.lane_mask,
+             (long)(int32_t)objection.detail2,
+             (unsigned long)objection.detail3);
     return;
   }
 
@@ -506,6 +522,11 @@ bool clocks_row_science_eligible(uint32_t pps_sequence) {
       __atomic_load_n(&g_row_objection_latch_state,
                       __ATOMIC_ACQUIRE) != 0U;
   return !objection_pending && hold_flags == 0U;
+}
+
+static bool clocks_row_objection_pending(void) {
+  return __atomic_load_n(&g_row_objection_latch_state,
+                         __ATOMIC_ACQUIRE) != 0U;
 }
 
 static bool clocks_row_objection_consume(
@@ -1600,6 +1621,38 @@ static int64_t g_campaign_public_ocxo2_measured_offset = 0;
 static int64_t g_campaign_public_counterledger_ocxo1_offset = 0;
 static int64_t g_campaign_public_counterledger_ocxo2_offset = 0;
 
+// Canonical campaign clockface custody. CounterLedger/PhaseLedger remains the
+// raw candidate authority, but a candidate does not become the durable campaign
+// coordinate until Beta proves both row eligibility and one-second continuity.
+// A rejected row advances the public coordinate by nominal holdover and rebases
+// the raw-to-public offset so the injury cannot persist into later CAMP ratios.
+static constexpr int64_t CLOCKS_CAMPAIGN_CLOCKFACE_STEP_GATE_NS = 500LL;
+
+struct campaign_clockface_guard_lane_t {
+  bool     seeded = false;
+  uint32_t last_public_count = 0U;
+  uint64_t committed_ns = 0ULL;
+  uint32_t accept_count = 0U;
+  uint32_t holdover_count = 0U;
+  uint32_t continuity_reject_count = 0U;
+  int64_t  last_candidate_error_ns = 0LL;
+};
+
+struct campaign_clockface_guard_result_t {
+  bool     valid = false;
+  bool     continuity_ok = false;
+  bool     holdover_applied = false;
+  uint64_t raw_candidate_ns = 0ULL;
+  uint64_t expected_public_ns = 0ULL;
+  uint64_t public_ns = 0ULL;
+  int64_t  candidate_error_ns = 0LL;
+};
+
+static campaign_clockface_guard_lane_t
+    g_campaign_clockface_guard_ocxo1 DMAMEM = {};
+static campaign_clockface_guard_lane_t
+    g_campaign_clockface_guard_ocxo2 DMAMEM = {};
+
 // Canonical OCXO residual rendering.  Delta Cycles is now the authority:
 // each OCXO observed one-second DWT interval is compared against the exact
 // same-row PPS/VCLOCK one-second DWT interval.  The
@@ -1954,6 +2007,18 @@ static void delta_clock_candidate_fail(
   state.last_residual_ns_exact = 0.0;
   state.status = status;
   state.last_public_count = public_count;
+}
+
+static void delta_clock_candidate_exclude_row(
+    delta_clock_candidate_state_t& state,
+    uint32_t public_count) {
+  if (!state.seeded) return;
+  state.geometry_valid = false;
+  state.last_public_count = public_count;
+  state.last_residual_available = false;
+  state.last_residual_ns = 0LL;
+  state.last_residual_ns_exact = 0.0;
+  state.status = clocks_monitor_clock_candidate_status_t::DELTA_INVALID;
 }
 
 static bool delta_clock_candidate_reanchor(
@@ -2745,6 +2810,188 @@ static uint64_t campaign_public_counterledger_ocxo2_ns(void) {
       g_campaign_public_counterledger_ocxo2_offset);
 }
 
+static campaign_clockface_guard_lane_t* campaign_clockface_guard_lane(
+    time_clock_id_t clock) {
+  switch (clock) {
+    case time_clock_id_t::OCXO1:
+      return &g_campaign_clockface_guard_ocxo1;
+    case time_clock_id_t::OCXO2:
+      return &g_campaign_clockface_guard_ocxo2;
+    default:
+      return nullptr;
+  }
+}
+
+static int64_t* campaign_clockface_guard_offset(time_clock_id_t clock) {
+  switch (clock) {
+    case time_clock_id_t::OCXO1:
+      return &g_campaign_public_counterledger_ocxo1_offset;
+    case time_clock_id_t::OCXO2:
+      return &g_campaign_public_counterledger_ocxo2_offset;
+    default:
+      return nullptr;
+  }
+}
+
+static uint32_t campaign_clockface_guard_lane_mask(time_clock_id_t clock) {
+  return clock == time_clock_id_t::OCXO1
+      ? CLOCKS_ROW_LANE_OCXO1
+      : (clock == time_clock_id_t::OCXO2
+             ? CLOCKS_ROW_LANE_OCXO2
+             : 0U);
+}
+
+static int64_t campaign_clockface_guard_signed_delta_u64(
+    uint64_t observed,
+    uint64_t expected) {
+  if (observed >= expected) {
+    const uint64_t delta = observed - expected;
+    return delta > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)delta;
+  }
+  const uint64_t delta = expected - observed;
+  return delta > (uint64_t)INT64_MAX ? INT64_MIN : -(int64_t)delta;
+}
+
+static uint64_t campaign_clockface_guard_abs_i64(int64_t value) {
+  return value >= 0 ? (uint64_t)value : (uint64_t)(-(value + 1LL)) + 1ULL;
+}
+
+static void campaign_clockface_guard_seed(
+    campaign_clockface_guard_lane_t& state,
+    uint32_t public_count,
+    uint64_t public_ns) {
+  state = campaign_clockface_guard_lane_t{};
+  state.seeded = true;
+  state.last_public_count = public_count;
+  state.committed_ns = public_ns;
+}
+
+static void campaign_clockface_guards_seed_zero(void) {
+  campaign_clockface_guard_seed(g_campaign_clockface_guard_ocxo1, 0U, 0ULL);
+  campaign_clockface_guard_seed(g_campaign_clockface_guard_ocxo2, 0U, 0ULL);
+}
+
+static void campaign_clockface_guards_seed_recover(void) {
+  const uint32_t recovered_public_count =
+      (uint32_t)(recover_gnss_ns / CLOCKS_BETA_NS_PER_SECOND);
+  campaign_clockface_guard_seed(
+      g_campaign_clockface_guard_ocxo1,
+      recovered_public_count,
+      recover_ocxo1_ns);
+  campaign_clockface_guard_seed(
+      g_campaign_clockface_guard_ocxo2,
+      recovered_public_count,
+      recover_ocxo2_ns);
+}
+
+static void campaign_clockface_guard_rebase_raw(
+    time_clock_id_t clock,
+    uint64_t canonical_public_ns) {
+  int64_t* offset = campaign_clockface_guard_offset(clock);
+  const uint64_t raw = current_raw_counterledger_ns(clock);
+  if (!offset || raw == 0ULL) return;
+  *offset = campaign_public_offset_for_recovered_value(
+      raw, canonical_public_ns);
+}
+
+static campaign_clockface_guard_result_t campaign_clockface_guard_evaluate(
+    time_clock_id_t clock,
+    uint32_t public_count,
+    uint64_t raw_candidate_ns,
+    bool raw_candidate_valid) {
+  campaign_clockface_guard_result_t result{};
+  result.raw_candidate_ns = raw_candidate_ns;
+
+  campaign_clockface_guard_lane_t* state =
+      campaign_clockface_guard_lane(clock);
+  if (!state || !state->seeded || public_count <= state->last_public_count) {
+    clocks_row_exclude(
+        clocks_row_objection_source_t::BETA,
+        clocks_row_objection_reason_t::BETA_CAMPAIGN_CLOCKFACE_CONTINUITY,
+        campaign_clockface_guard_lane_mask(clock),
+        public_count,
+        state ? state->last_public_count : 0U,
+        0U,
+        (uint32_t)CLOCKS_CAMPAIGN_CLOCKFACE_STEP_GATE_NS);
+    return result;
+  }
+
+  const uint32_t elapsed_seconds = public_count - state->last_public_count;
+  const uint64_t nominal_increment =
+      (uint64_t)elapsed_seconds * CLOCKS_BETA_NS_PER_SECOND;
+  if (UINT64_MAX - state->committed_ns < nominal_increment) {
+    clocks_row_exclude(
+        clocks_row_objection_source_t::BETA,
+        clocks_row_objection_reason_t::BETA_CAMPAIGN_CLOCKFACE_CONTINUITY,
+        campaign_clockface_guard_lane_mask(clock),
+        public_count,
+        elapsed_seconds,
+        0U,
+        (uint32_t)CLOCKS_CAMPAIGN_CLOCKFACE_STEP_GATE_NS);
+    return result;
+  }
+
+  result.valid = true;
+  result.expected_public_ns = state->committed_ns + nominal_increment;
+  result.candidate_error_ns = raw_candidate_valid
+      ? campaign_clockface_guard_signed_delta_u64(
+            raw_candidate_ns, result.expected_public_ns)
+      : (int64_t)INT32_MAX;
+  result.continuity_ok = raw_candidate_valid &&
+      campaign_clockface_guard_abs_i64(result.candidate_error_ns) <=
+          (uint64_t)CLOCKS_CAMPAIGN_CLOCKFACE_STEP_GATE_NS;
+
+  if (!result.continuity_ok) {
+    state->continuity_reject_count++;
+    clocks_row_exclude(
+        clocks_row_objection_source_t::BETA,
+        clocks_row_objection_reason_t::BETA_CAMPAIGN_CLOCKFACE_CONTINUITY,
+        campaign_clockface_guard_lane_mask(clock),
+        public_count,
+        elapsed_seconds,
+        (uint32_t)(int32_t)result.candidate_error_ns,
+        (uint32_t)CLOCKS_CAMPAIGN_CLOCKFACE_STEP_GATE_NS);
+  }
+
+  return result;
+}
+
+static void campaign_clockface_guard_commit(
+    time_clock_id_t clock,
+    uint32_t public_count,
+    bool force_holdover,
+    campaign_clockface_guard_result_t& result) {
+  campaign_clockface_guard_lane_t* state =
+      campaign_clockface_guard_lane(clock);
+  if (!state || !result.valid) return;
+
+  result.holdover_applied = force_holdover || !result.continuity_ok;
+  result.public_ns = result.holdover_applied
+      ? result.expected_public_ns
+      : result.raw_candidate_ns;
+
+  state->last_public_count = public_count;
+  state->committed_ns = result.public_ns;
+  state->last_candidate_error_ns = result.candidate_error_ns;
+  if (result.holdover_applied) {
+    state->holdover_count++;
+    campaign_clockface_guard_rebase_raw(clock, result.public_ns);
+  } else {
+    state->accept_count++;
+  }
+}
+
+static uint64_t campaign_clockface_guard_current(
+    time_clock_id_t clock,
+    uint32_t public_count,
+    uint64_t fallback_ns) {
+  const campaign_clockface_guard_lane_t* state =
+      campaign_clockface_guard_lane(clock);
+  return state && state->seeded && state->last_public_count == public_count
+      ? state->committed_ns
+      : fallback_ns;
+}
+
 static void campaign_public_counterledger_offsets_reset_to_current(void) {
   const uint64_t o1 = current_raw_counterledger_ns(time_clock_id_t::OCXO1);
   const uint64_t o2 = current_raw_counterledger_ns(time_clock_id_t::OCXO2);
@@ -2792,6 +3039,7 @@ static void campaign_public_offsets_reset_to_current(void) {
   g_campaign_public_ocxo2_measured_offset =
       campaign_public_offset_to_zero(current_raw_ocxo2_measured_ns());
   campaign_public_counterledger_offsets_reset_to_current();
+  campaign_clockface_guards_seed_zero();
   delta_clock_candidates_seed_zero();
 }
 
@@ -2816,6 +3064,7 @@ static void campaign_public_offsets_reset_for_recover(void) {
       campaign_public_offset_for_recovered_value(current_raw_ocxo2_measured_ns(),
                                                  recover_ocxo2_ns);
   campaign_public_counterledger_offsets_reset_for_recover();
+  campaign_clockface_guards_seed_recover();
   delta_clock_candidates_seed_recover();
 }
 
@@ -6255,15 +6504,20 @@ static FLASHMEM void clocks_monitor_clock_candidates_snapshot_from_row(
     uint32_t public_count,
     uint64_t phaseledger_ns,
     bool phaseledger_clockface_valid,
+    bool phaseledger_continuity_valid,
+    bool canonical_holdover_applied,
     const clocks_alpha_ocxo_counterledger_snapshot_t& phaseledger,
     const clock_science_row_t& delta_row) {
   out = clocks_monitor_clock_candidates_snapshot_t{};
   clocks_monitor_copy_text(out.published_source,
                            sizeof(out.published_source),
-                           "COUNTERLEDGER_PHASELEDGER");
+                           canonical_holdover_applied
+                               ? "NOMINAL_HOLDOVER"
+                               : "COUNTERLEDGER_PHASELEDGER");
 
   out.phaseledger.available = phaseledger_clockface_valid;
-  out.phaseledger.continuity_valid = phaseledger_clockface_valid;
+  out.phaseledger.continuity_valid =
+      phaseledger_clockface_valid && phaseledger_continuity_valid;
   out.phaseledger.status = phaseledger_clockface_valid
       ? clocks_monitor_clock_candidate_status_t::ADVANCED
       : clocks_monitor_clock_candidate_status_t::UNAVAILABLE;
@@ -6284,7 +6538,11 @@ static FLASHMEM void clocks_monitor_clock_candidates_snapshot_from_row(
 
   out.delta_cycles.available =
       delta_state.seeded && delta_state.continuity_valid &&
-      delta_state.last_public_count == public_count;
+      delta_state.last_public_count == public_count &&
+      (delta_state.status ==
+           clocks_monitor_clock_candidate_status_t::SEEDED ||
+       delta_state.status ==
+           clocks_monitor_clock_candidate_status_t::ADVANCED);
   out.delta_cycles.continuity_valid = delta_state.continuity_valid;
   out.delta_cycles.status = delta_state.status;
   out.delta_cycles.start_public_count = delta_state.start_public_count;
@@ -7757,13 +8015,21 @@ static FLASHMEM void clocks_monitor_live_snapshot_fill(
   // Alpha's coherent snapshot carries public-origin-normalized OCXO values.
   // Use the matching measured/public offsets for the live presentation species;
   // the raw CounterLedger/PhaseLedger offsets remain campaign-record authority.
+  const uint64_t measured_campaign_ocxo1_ns = campaign_public_from_offset(
+      instrument.ocxo1_ns, g_campaign_public_ocxo1_measured_offset);
+  const uint64_t measured_campaign_ocxo2_ns = campaign_public_from_offset(
+      instrument.ocxo2_ns, g_campaign_public_ocxo2_measured_offset);
   out.presentation_ocxo1_ns = campaign_presentation_ready
-      ? campaign_public_from_offset(
-            instrument.ocxo1_ns, g_campaign_public_ocxo1_measured_offset)
+      ? campaign_clockface_guard_current(
+            time_clock_id_t::OCXO1,
+            (uint32_t)campaign_seconds,
+            measured_campaign_ocxo1_ns)
       : logical_instrument_ocxo1_ns;
   out.presentation_ocxo2_ns = campaign_presentation_ready
-      ? campaign_public_from_offset(
-            instrument.ocxo2_ns, g_campaign_public_ocxo2_measured_offset)
+      ? campaign_clockface_guard_current(
+            time_clock_id_t::OCXO2,
+            (uint32_t)campaign_seconds,
+            measured_campaign_ocxo2_ns)
       : logical_instrument_ocxo2_ns;
   out.presentation_count = (uint32_t)(
       out.presentation_gnss_ns / CLOCKS_BETA_NS_PER_SECOND);
@@ -8225,8 +8491,6 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
 
   dwt_cycle_count_total = public_dwt_total;
   gnss_raw_64           = public_gnss_ns / 100ull;
-  ocxo1_measured_gnss_ticks_64        = campaign_public_ocxo1_ns() / 100ull;
-  ocxo2_measured_gnss_ticks_64        = campaign_public_ocxo2_ns() / 100ull;
 
   // Alpha already advanced the boot-lifetime instrument statistics for this
   // completed row before entering Beta.  The remaining work is campaign
@@ -8319,46 +8583,20 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   const bool recover_degraded_science_hold =
       recover_reattach_degraded_science_hold_active();
 
-  const uint64_t public_ocxo1_counterledger_ns =
+  const uint64_t raw_public_ocxo1_counterledger_ns =
       campaign_public_counterledger_ocxo1_ns();
-  const uint64_t public_ocxo2_counterledger_ns =
+  const uint64_t raw_public_ocxo2_counterledger_ns =
       campaign_public_counterledger_ocxo2_ns();
-  const uint64_t public_ocxo1_ns = clocks_ocxo_counterledger_mode_enabled()
-      ? public_ocxo1_counterledger_ns
-      : science_render_public_clock_ns(
-            public_gnss_ns, ocxo1_science, public_ocxo1_measured_ns);
-  const uint64_t public_ocxo2_ns = clocks_ocxo_counterledger_mode_enabled()
-      ? public_ocxo2_counterledger_ns
-      : science_render_public_clock_ns(
-            public_gnss_ns, ocxo2_science, public_ocxo2_measured_ns);
-
-  const bool ocxo1_clockface_valid = clocks_ocxo_counterledger_mode_enabled()
+  const bool raw_ocxo1_clockface_valid = clocks_ocxo_counterledger_mode_enabled()
       ? clocks_beta_counterledger_clockface_ready(ocxo1_counterledger,
                                                    completed_pps_sequence,
-                                                   public_ocxo1_ns)
-      : (public_ocxo1_ns != 0ULL && ocxo1_pps_projected_valid);
-  const bool ocxo2_clockface_valid = clocks_ocxo_counterledger_mode_enabled()
+                                                   raw_public_ocxo1_counterledger_ns)
+      : (public_ocxo1_measured_ns != 0ULL && ocxo1_pps_projected_valid);
+  const bool raw_ocxo2_clockface_valid = clocks_ocxo_counterledger_mode_enabled()
       ? clocks_beta_counterledger_clockface_ready(ocxo2_counterledger,
                                                    completed_pps_sequence,
-                                                   public_ocxo2_ns)
-      : (public_ocxo2_ns != 0ULL && ocxo2_pps_projected_valid);
-
-  // Advance the independent Delta-Cycles campaign clocks before any science
-  // exclusion can suppress statistical/control mutation.  The candidate is
-  // audit evidence; a missing Delta interval permanently breaks its continuity
-  // until the next explicit campaign or RECOVER seed.
-  delta_clock_candidate_advance(g_delta_clock_candidate_ocxo1,
-                                public_count,
-                                ocxo1_science,
-                                ocxo1_forensics,
-                                public_ocxo1_ns,
-                                ocxo1_clockface_valid);
-  delta_clock_candidate_advance(g_delta_clock_candidate_ocxo2,
-                                public_count,
-                                ocxo2_science,
-                                ocxo2_forensics,
-                                public_ocxo2_ns,
-                                ocxo2_clockface_valid);
+                                                   raw_public_ocxo2_counterledger_ns)
+      : (public_ocxo2_measured_ns != 0ULL && ocxo2_pps_projected_valid);
 
   clock_science_apply_counterledger_row(ocxo1_science,
                                         ocxo1_counterledger,
@@ -8366,21 +8604,6 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   clock_science_apply_counterledger_row(ocxo2_science,
                                         ocxo2_counterledger,
                                         public_gnss_ns);
-
-  // Published OCXO TAU/PPB are campaign clockface ratios, not physical-period
-  // Delta ratios: public_ocxo_ns / public_gnss_ns.  RECOVER may have just
-  // applied a one-time presentation transform so this ratio continues from the
-  // Pi-projected campaign ledger instead of a fresh reattachment intercept.
-  // The one-second residuals and Welfords above remain Delta/PhaseLedger
-  // evidence surfaces.
-  clock_science_apply_campaign_public_ratio(ocxo1_science,
-                                            public_gnss_ns,
-                                            public_ocxo1_ns,
-                                            public_count);
-  clock_science_apply_campaign_public_ratio(ocxo2_science,
-                                            public_gnss_ns,
-                                            public_ocxo2_ns,
-                                            public_count);
 
   clock_science_apply_alpha_tau(ocxo1_science,
                                 ocxo1_alpha_tau_ok,
@@ -8398,6 +8621,119 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
       science_residual_quarantine_apply(public_count,
                                         ocxo1_science,
                                         ocxo2_science);
+
+  const pps_interval_residuals_t pps_residuals =
+      pps_interval_residuals_update(public_count,
+                                    ocxo1_science,
+                                    ocxo2_science);
+
+  // Preserve the raw CounterLedger candidates for courtroom output, but decide
+  // canonical campaign-clock custody only after every upstream science objection
+  // and Beta custody check is visible.  The guard may add its own objection if a
+  // candidate step is physically impossible even when all other witnesses agree.
+  const uint32_t ocxo_science_invalid_mask =
+      clocks_beta_public_ocxo_science_invalid_mask(
+          public_count,
+          raw_public_ocxo1_counterledger_ns,
+          raw_public_ocxo2_counterledger_ns,
+          ocxo1_science,
+          ocxo2_science);
+  const bool row_excluded_before_clockface_commit =
+      clocks_row_objection_pending() || ocxo_science_invalid_mask != 0U;
+
+  campaign_clockface_guard_result_t ocxo1_clockface =
+      campaign_clockface_guard_evaluate(
+          time_clock_id_t::OCXO1,
+          public_count,
+          clocks_ocxo_counterledger_mode_enabled()
+              ? raw_public_ocxo1_counterledger_ns
+              : science_render_public_clock_ns(
+                    public_gnss_ns, ocxo1_science, public_ocxo1_measured_ns),
+          raw_ocxo1_clockface_valid);
+  campaign_clockface_guard_result_t ocxo2_clockface =
+      campaign_clockface_guard_evaluate(
+          time_clock_id_t::OCXO2,
+          public_count,
+          clocks_ocxo_counterledger_mode_enabled()
+              ? raw_public_ocxo2_counterledger_ns
+              : science_render_public_clock_ns(
+                    public_gnss_ns, ocxo2_science, public_ocxo2_measured_ns),
+          raw_ocxo2_clockface_valid);
+
+  // A PPS row is one scientific custody unit. If either lane is discontinuous
+  // or any upstream layer excluded the row, neither canonical OCXO clockface may
+  // consume that row's candidate. Both advance through the same nominal holdover.
+  const bool row_requires_clockface_holdover =
+      row_excluded_before_clockface_commit ||
+      !ocxo1_clockface.continuity_ok ||
+      !ocxo2_clockface.continuity_ok;
+  campaign_clockface_guard_commit(
+      time_clock_id_t::OCXO1,
+      public_count,
+      row_requires_clockface_holdover,
+      ocxo1_clockface);
+  campaign_clockface_guard_commit(
+      time_clock_id_t::OCXO2,
+      public_count,
+      row_requires_clockface_holdover,
+      ocxo2_clockface);
+
+  clocks_row_objection_record_t candidate_objection{};
+  const bool external_row_objection =
+      clocks_row_objection_consume(candidate_objection);
+  if (!external_row_objection && ocxo_science_invalid_mask != 0U) {
+    candidate_objection.source = clocks_row_objection_source_t::BETA;
+    candidate_objection.reason =
+        clocks_row_objection_reason_t::BETA_OCXO_SCIENCE_CUSTODY;
+    candidate_objection.lane = ocxo_science_invalid_mask;
+    candidate_objection.lane_mask = ocxo_science_invalid_mask;
+    candidate_objection.objection_count = 1U;
+    candidate_objection.detail0 = ocxo_science_invalid_mask;
+  } else if (external_row_objection && ocxo_science_invalid_mask != 0U) {
+    candidate_objection.lane_mask |= ocxo_science_invalid_mask;
+    candidate_objection.objection_count++;
+  }
+  const bool candidate_science_excluded =
+      candidate_objection.reason != clocks_row_objection_reason_t::NONE ||
+      ocxo_science_invalid_mask != 0U;
+  const bool candidate_math_permitted = !candidate_science_excluded;
+
+  const uint64_t public_ocxo1_ns = ocxo1_clockface.public_ns;
+  const uint64_t public_ocxo2_ns = ocxo2_clockface.public_ns;
+  const bool ocxo1_clockface_valid = ocxo1_clockface.valid;
+  const bool ocxo2_clockface_valid = ocxo2_clockface.valid;
+
+  // CAMP is the canonical guarded clockface ratio. Excluded rows use nominal
+  // holdover and therefore contribute no pathological phase step. The raw
+  // CounterLedger candidate remains separately serialized below.
+  clock_science_apply_campaign_public_ratio(ocxo1_science,
+                                            public_gnss_ns,
+                                            public_ocxo1_ns,
+                                            public_count);
+  clock_science_apply_campaign_public_ratio(ocxo2_science,
+                                            public_gnss_ns,
+                                            public_ocxo2_ns,
+                                            public_count);
+
+  if (candidate_science_excluded) {
+    delta_clock_candidate_exclude_row(
+        g_delta_clock_candidate_ocxo1, public_count);
+    delta_clock_candidate_exclude_row(
+        g_delta_clock_candidate_ocxo2, public_count);
+  } else {
+    delta_clock_candidate_advance(g_delta_clock_candidate_ocxo1,
+                                  public_count,
+                                  ocxo1_science,
+                                  ocxo1_forensics,
+                                  public_ocxo1_ns,
+                                  ocxo1_clockface_valid);
+    delta_clock_candidate_advance(g_delta_clock_candidate_ocxo2,
+                                  public_count,
+                                  ocxo2_science,
+                                  ocxo2_forensics,
+                                  public_ocxo2_ns,
+                                  ocxo2_clockface_valid);
+  }
 
   const bool recover_timeline_ready =
       public_gnss_ns != 0ULL && public_dwt_total != 0ULL;
@@ -8419,43 +8755,6 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   ocxo2_measured_gnss_ticks_64 = public_ocxo2_ns / 100ULL;
 
   g_delta_previous_vclock_reference = delta_reference_this_row;
-
-  const pps_interval_residuals_t pps_residuals =
-      pps_interval_residuals_update(public_count,
-                                    ocxo1_science,
-                                    ocxo2_science);
-
-  // Preserve the pre-publication court as compact evidence. Every structurally
-  // coherent candidate becomes a durable TIMEBASE row; this court decides only
-  // whether science/control consumers may use it.
-  const uint32_t ocxo_science_invalid_mask =
-      clocks_beta_public_ocxo_science_invalid_mask(
-          public_count,
-          public_ocxo1_ns,
-          public_ocxo2_ns,
-          ocxo1_science,
-          ocxo2_science);
-
-  clocks_row_objection_record_t candidate_objection{};
-  const bool external_row_objection =
-      clocks_row_objection_consume(candidate_objection);
-  if (!external_row_objection && ocxo_science_invalid_mask != 0U) {
-    candidate_objection.source = clocks_row_objection_source_t::BETA;
-    candidate_objection.reason =
-        clocks_row_objection_reason_t::BETA_OCXO_SCIENCE_CUSTODY;
-    candidate_objection.lane = ocxo_science_invalid_mask;
-    candidate_objection.lane_mask = ocxo_science_invalid_mask;
-    candidate_objection.objection_count = 1U;
-    candidate_objection.detail0 = ocxo_science_invalid_mask;
-  } else if (external_row_objection && ocxo_science_invalid_mask != 0U) {
-    candidate_objection.lane_mask |= ocxo_science_invalid_mask;
-    candidate_objection.objection_count++;
-  }
-  const bool candidate_science_excluded =
-      candidate_objection.reason != clocks_row_objection_reason_t::NONE ||
-      ocxo_science_invalid_mask != 0U;
-
-  const bool candidate_math_permitted = !candidate_science_excluded;
 
   if (candidate_science_excluded) {
     // Beta science totals were tentatively formed to preserve complete row
@@ -8835,8 +9134,10 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
       record.ocxo1_clock_candidates,
       g_delta_clock_candidate_ocxo1,
       public_count,
-      public_ocxo1_ns,
-      ocxo1_clockface_valid,
+      raw_public_ocxo1_counterledger_ns,
+      raw_ocxo1_clockface_valid,
+      ocxo1_clockface.continuity_ok,
+      ocxo1_clockface.holdover_applied,
       ocxo1_counterledger,
       ocxo1_science);
   clocks_monitor_science_snapshot_from_row(
@@ -8847,8 +9148,10 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
       record.ocxo2_clock_candidates,
       g_delta_clock_candidate_ocxo2,
       public_count,
-      public_ocxo2_ns,
-      ocxo2_clockface_valid,
+      raw_public_ocxo2_counterledger_ns,
+      raw_ocxo2_clockface_valid,
+      ocxo2_clockface.continuity_ok,
+      ocxo2_clockface.holdover_applied,
       ocxo2_counterledger,
       ocxo2_science);
   clocks_monitor_science_snapshot_from_row(
