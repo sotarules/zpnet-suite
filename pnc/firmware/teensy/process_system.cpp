@@ -32,6 +32,12 @@
 
 static constexpr uint64_t FLASH_DELAY_NS = 5000000000ULL;  // 5 seconds
 
+// A rejected MONITOR_FRAGMENT remains in exact typed-snapshot custody and is
+// retried after a short foreground delay. The delay gives USB/Transport time
+// to retire outstanding wire images without turning an admission failure into
+// a busy ALAP serialization loop.
+static constexpr uint64_t SYSTEM_MONITOR_RETRY_DELAY_NS = 25000000ULL;  // 25 ms
+
 // --------------------------------------------------------------
 // Forward declarations (terminal paths)
 // --------------------------------------------------------------
@@ -170,6 +176,8 @@ static bool g_system_monitor_retry_pi_only = false;
 static uint32_t g_system_monitor_retry_sequence = 0U;
 static uint32_t g_system_monitor_retry_attempt_count = 0U;
 static uint32_t g_system_monitor_retry_tick_hold_count = 0U;
+static uint32_t g_system_monitor_retry_schedule_count = 0U;
+static uint32_t g_system_monitor_retry_success_count = 0U;
 static bool g_system_monitor_interrupt_owner_seen = false;
 static bool g_system_monitor_last_tick_valid = false;
 static uint32_t g_system_monitor_last_tick_sequence = 0U;
@@ -4213,17 +4221,18 @@ static void system_monitor_publish_service(timepop_ctx_t*,
   g_system_monitor_service_armed = false;
   g_system_monitor_service_handle = TIMEPOP_INVALID_HANDLE;
 
-  const bool retrying_campaign_row =
+  const bool retrying_snapshot =
       g_system_monitor_retry_snapshot_valid;
-  if (!retrying_campaign_row && !g_system_monitor_pending) return;
+  if (!retrying_snapshot && !g_system_monitor_pending) return;
 
   system_dmamem_ensure_initialized();
 
   uint32_t sequence = 0U;
   bool clocks_snapshot_ok = false;
-  if (retrying_campaign_row) {
-    // The prior attempt already consumed Beta's immutable campaign record.
-    // Preserve and reuse that exact snapshot until transport accepts custody.
+  if (retrying_snapshot) {
+    // The prior attempt already captured the exact typed CLOCKS state and may
+    // also have consumed Beta's immutable campaign record. Preserve and reuse
+    // that snapshot until transport accepts custody.
     sequence = g_system_monitor_retry_sequence;
     clocks_snapshot_ok = true;
   } else {
@@ -4240,19 +4249,19 @@ static void system_monitor_publish_service(timepop_ctx_t*,
       g_system_monitor_clocks_snapshot.campaign.completed_second_sequence ==
           sequence;
 
-  // During active recording the interrupt tick can reach SYSTEM before Beta has
-  // completed both OCXO lanes and frozen the matching campaign observation.
-  // Do not publish an observation-only copy carrying the prior coherent row.
-  // Restore custody of this sequence and wait for
-  // system_monitor_campaign_row_ready(), which will arm the single canonical
-  // publication once the exact campaign observation exists.
+  // Once public campaign presentation has begun, the interrupt tick can reach
+  // SYSTEM before Beta has completed both OCXO lanes and frozen the matching
+  // campaign observation. Hold only those public campaign identities. During
+  // CAMPAIGN_ARMING, campaign_seconds is still zero and no public campaign row
+  // exists by design, so publish the always-on observation without decoration.
   if (clocks_snapshot_ok &&
-      g_system_monitor_clocks_snapshot.live.recording &&
+      g_system_monitor_clocks_snapshot.live.campaign_presentation_ready &&
       !campaign_row_available) {
-    // A retry snapshot is created only from a previously complete campaign row.
-    // Reaching this branch while retrying means the retained retry state itself
-    // is incoherent; fail closed rather than emitting the wrong observation.
-    if (retrying_campaign_row) {
+    // A retained snapshot from a public campaign second must already carry its
+    // exact completed campaign row. Reaching this branch while retrying means
+    // retained custody is incoherent; fail closed rather than emitting the
+    // wrong observation.
+    if (retrying_snapshot) {
       g_system_monitor_publish_reject_count++;
       g_system_monitor_retry_snapshot_valid = false;
       g_system_monitor_retry_pi_only = false;
@@ -4290,7 +4299,7 @@ static void system_monitor_publish_service(timepop_ctx_t*,
       g_system_monitor_publish_reject_count++;
       g_system_monitor_campaign_row_embed_fail_count++;
 
-      if (!retrying_campaign_row) {
+      if (!retrying_snapshot) {
         g_system_monitor_retry_snapshot_valid = true;
         g_system_monitor_retry_pi_only = false;
         g_system_monitor_retry_sequence = sequence;
@@ -4300,12 +4309,11 @@ static void system_monitor_publish_service(timepop_ctx_t*,
         g_system_monitor_retry_attempt_count++;
       }
 
-      // One immediate retry runs after this callback releases both temporary
-      // Payload arenas. A second failure remains in custody until a physical
-      // tick schedules another attempt, avoiding an ALAP spin loop.
-      if (g_system_monitor_retry_attempt_count == 1U) {
-        system_monitor_schedule_publish();
-      }
+      // Retry after releasing both temporary Payload arenas. The bounded
+      // timer prevents a serialization spin while preserving exact custody
+      // independently of future PPS ticks.
+      g_system_monitor_retry_schedule_count++;
+      system_monitor_schedule_publish();
       return;
     }
   }
@@ -4357,17 +4365,24 @@ static void system_monitor_publish_service(timepop_ctx_t*,
                g_system_monitor_campaign_retry_count);
   fragment.add("monitor_campaign_row_embed_fail_count",
                g_system_monitor_campaign_row_embed_fail_count);
-  fragment.add("monitor_retrying_campaign_row", retrying_campaign_row);
+  // Compatibility alias retained; its meaning is now generalized custody.
+  fragment.add("monitor_retrying_campaign_row", retrying_snapshot);
+  fragment.add("monitor_retrying_snapshot", retrying_snapshot);
   fragment.add("monitor_retry_attempt_count",
                g_system_monitor_retry_attempt_count);
   fragment.add("monitor_retry_tick_hold_count",
                g_system_monitor_retry_tick_hold_count);
+  fragment.add("monitor_retry_schedule_count",
+               g_system_monitor_retry_schedule_count);
+  fragment.add("monitor_retry_success_count",
+               g_system_monitor_retry_success_count);
+  fragment.add("monitor_retry_delay_ns", SYSTEM_MONITOR_RETRY_DELAY_NS);
 
   // A transport retry is Pi-only because the original full publish may already
   // have reached local subscribers. An embed retry has never published at all,
-  // so its first complete attempt must use the normal publication path.
+  // so its first complete attempt uses the normal publication path.
   const bool publication_enqueued =
-      retrying_campaign_row && g_system_monitor_retry_pi_only
+      retrying_snapshot && g_system_monitor_retry_pi_only
           ? publish_to_pi("MONITOR_FRAGMENT", fragment)
           : publish("MONITOR_FRAGMENT", fragment);
   fragment.clear();
@@ -4375,35 +4390,31 @@ static void system_monitor_publish_service(timepop_ctx_t*,
   if (!publication_enqueued) {
     g_system_monitor_publish_reject_count++;
 
-    if (campaign_row_embedded) {
-      if (!retrying_campaign_row) {
-        g_system_monitor_retry_snapshot_valid = true;
-        g_system_monitor_retry_sequence = sequence;
-        g_system_monitor_retry_attempt_count = 1U;
+    // Transport admission failure is not permission to discard an ambient
+    // second. Retain the exact typed CLOCKS snapshot for every row and retry
+    // until Transport accepts custody. The first full publish may already have
+    // reached local subscribers, so all transport retries are Pi-only.
+    if (!retrying_snapshot) {
+      g_system_monitor_retry_snapshot_valid = true;
+      g_system_monitor_retry_sequence = sequence;
+      g_system_monitor_retry_attempt_count = 1U;
+      if (campaign_row_embedded) {
         g_system_monitor_campaign_retry_count++;
-      } else {
-        g_system_monitor_retry_attempt_count++;
       }
-      g_system_monitor_retry_pi_only = true;
-
-      // One immediate retry runs after this callback releases its temporary
-      // Payload storage. If that retry also fails, retain the campaign snapshot
-      // and wait for the next physical tick instead of spinning in ALAP.
-      if (g_system_monitor_retry_attempt_count == 1U) {
-        system_monitor_schedule_publish();
-      }
-      return;
+    } else {
+      g_system_monitor_retry_attempt_count++;
     }
-
-    memset(&g_system_monitor_clocks_snapshot, 0,
-           sizeof(g_system_monitor_clocks_snapshot));
-    g_system_monitor_retry_pi_only = false;
-    if (g_system_monitor_pending) system_monitor_schedule_publish();
+    g_system_monitor_retry_pi_only = true;
+    g_system_monitor_retry_schedule_count++;
+    system_monitor_schedule_publish();
     return;
   }
 
   g_system_monitor_publish_count = next_publish_count;
   g_system_monitor_campaign_rows_embedded = next_campaign_rows_embedded;
+  if (retrying_snapshot) {
+    g_system_monitor_retry_success_count++;
+  }
   g_system_monitor_retry_snapshot_valid = false;
   g_system_monitor_retry_pi_only = false;
   g_system_monitor_retry_sequence = 0U;
@@ -4424,10 +4435,18 @@ static void system_monitor_schedule_publish(void) {
   uint32_t generation = g_system_monitor_service_generation + 1U;
   if (generation == 0U) generation = 1U;
 
-  const timepop_handle_t handle = timepop_arm_alap(
-      system_monitor_publish_service,
-      (void*)(uintptr_t)generation,
-      "SYSTEM_MONITOR_FRAGMENT");
+  const bool delayed_retry =
+      g_system_monitor_retry_snapshot_valid &&
+      g_system_monitor_retry_attempt_count > 0U;
+  const timepop_handle_t handle = delayed_retry
+      ? timepop_arm(SYSTEM_MONITOR_RETRY_DELAY_NS,
+                    false,
+                    system_monitor_publish_service,
+                    (void*)(uintptr_t)generation,
+                    "SYSTEM_MONITOR_FRAGMENT_RETRY")
+      : timepop_arm_alap(system_monitor_publish_service,
+                         (void*)(uintptr_t)generation,
+                         "SYSTEM_MONITOR_FRAGMENT");
   if (handle == TIMEPOP_INVALID_HANDLE) {
     g_system_monitor_service_arm_failures++;
     return;
@@ -4483,6 +4502,16 @@ static void system_monitor_accept_tick(uint32_t completed_second_sequence) {
   // g_system_monitor_pending_sequence and is published next.
   if (g_system_monitor_retry_snapshot_valid) {
     g_system_monitor_retry_tick_hold_count++;
+    if (!g_system_monitor_pending) {
+      g_system_monitor_pending_sequence = completed_second_sequence;
+      g_system_monitor_pending = true;
+    } else if (g_system_monitor_pending_sequence != completed_second_sequence) {
+      // One exact snapshot is in retry custody and one following identity is
+      // reserved. A further arrival is visible as coalescing rather than
+      // silently replacing the reserved successor. Under normal USB budget
+      // pressure the 25 ms retry must clear long before this boundary.
+      g_system_monitor_coalesce_count++;
+    }
     system_monitor_schedule_publish();
     return;
   }
@@ -4573,6 +4602,9 @@ static void system_dmamem_ensure_initialized(void) {
   g_system_monitor_retry_pi_only = false;
   g_system_monitor_retry_sequence = 0U;
   g_system_monitor_retry_attempt_count = 0U;
+  g_system_monitor_retry_tick_hold_count = 0U;
+  g_system_monitor_retry_schedule_count = 0U;
+  g_system_monitor_retry_success_count = 0U;
   memset(g_system_crash_report_text, 0, sizeof(g_system_crash_report_text));
   memset(g_system_debug_buffer, 0, sizeof(g_system_debug_buffer));
   memset((void*)&g_system_timepop_dispatch_trace_scratch, 0,
