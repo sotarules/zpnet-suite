@@ -3036,11 +3036,11 @@ static uint32_t g_instrument_stats_ocxo2_interval_reject_count = 0U;
 // preserves the clock ledgers as authority and excludes rejected intervals
 // without inserting synthetic zero samples.
 //
-// Exact one-second endpoints are retained for the 10-minute and 60-minute
-// windows.  Retaining 86,401 full endpoints would exceed ordinary Teensy RAM,
-// so the 8-hour and 24-hour windows retain the first admitted endpoint of each
-// minute.  Their old edge is therefore minute-granular, but their live edge is
-// the current admitted second: all four values update every admitted second.
+// Exact one-second endpoints are retained only for the 10-minute window.
+// The 60-minute, 8-hour, and 24-hour windows use the first admitted endpoint of
+// each minute as their old edge and the current admitted second as their live
+// edge.  This keeps every bucket moving each second while avoiding a 3,601-entry
+// second ring that would permanently consume about 120 KiB of additional RAM2.
 enum class alpha_ppb_lane_t : uint8_t {
   DWT = 0,
   VCLOCK = 1,
@@ -3053,8 +3053,9 @@ static constexpr uint32_t ALPHA_PPB_MINUTE_60_SECONDS = 60U * 60U;
 static constexpr uint32_t ALPHA_PPB_HOUR_8_SECONDS = 8U * 60U * 60U;
 static constexpr uint32_t ALPHA_PPB_HOUR_24_SECONDS = 24U * 60U * 60U;
 static constexpr size_t ALPHA_PPB_SECOND_CAPACITY =
-    (size_t)ALPHA_PPB_MINUTE_60_SECONDS + 1U;
+    (size_t)ALPHA_PPB_MINUTE_10_SECONDS + 1U;
 static constexpr size_t ALPHA_PPB_MINUTE_CAPACITY = 24U * 60U + 2U;
+static constexpr size_t ALPHA_PPB_HISTORY_RAM2_BUDGET_BYTES = 90000U;
 
 struct alpha_ppb_raw_endpoint_t {
   bool valid = false;
@@ -3079,8 +3080,8 @@ static_assert(sizeof(alpha_ppb_cumulative_endpoint_t) <= 40U,
 static_assert(
     sizeof(alpha_ppb_cumulative_endpoint_t) *
         (ALPHA_PPB_SECOND_CAPACITY + ALPHA_PPB_MINUTE_CAPACITY) <=
-        210000U,
-    "rolling PPB history exceeds its RAM2 budget");
+        ALPHA_PPB_HISTORY_RAM2_BUDGET_BYTES,
+    "rolling PPB history exceeds compact RAM2 budget");
 
 static alpha_ppb_cumulative_endpoint_t
     g_alpha_ppb_seconds[ALPHA_PPB_SECOND_CAPACITY] DMAMEM = {};
@@ -3329,7 +3330,7 @@ static clocks_instrument_ppb_buckets_snapshot_t alpha_ppb_windows_snapshot(
   out.minute_10 = alpha_ppb_window_value(
       lane, ALPHA_PPB_MINUTE_10_SECONDS, true);
   out.minute_60 = alpha_ppb_window_value(
-      lane, ALPHA_PPB_MINUTE_60_SECONDS, true);
+      lane, ALPHA_PPB_MINUTE_60_SECONDS, false);
   out.hour_8 = alpha_ppb_window_value(
       lane, ALPHA_PPB_HOUR_8_SECONDS, false);
   out.hour_24 = alpha_ppb_window_value(
