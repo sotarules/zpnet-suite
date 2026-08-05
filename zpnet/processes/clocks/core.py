@@ -1,11 +1,11 @@
 """
-ZPNet CLOCKS Process — MONITOR_FRAGMENT TEMPEST Ingress + Generalized Campaign Persistence (Pi-side)
+ZPNet CLOCKS Process — CLOCKS_FRAGMENT TEMPEST Ingress + Generalized Campaign Persistence (Pi-side)
 
 Core contract:
 
   CLOCKS is the final TEMPEST candidate arbiter. It owns no Teensy clock
-  state. It receives the always-on MONITOR_FRAGMENT stream from the Teensy.
-  During a TEMPEST campaign, MONITOR_FRAGMENT carries an optional campaign_row
+  state. It receives the always-on CLOCKS_FRAGMENT stream from the Teensy.
+  During a TEMPEST campaign, CLOCKS_FRAGMENT carries an optional campaign_row
   whose TIMEBASE_FRAGMENT_V7 body carries observation plus mode-free eligibility;
   older fragment versions may also contain embedded forensics. CLOCKS decorates
   the accepted candidate with Pi-owned environment, GF-8802, GNSS_RAW, and
@@ -28,7 +28,7 @@ Core contract:
 
     START is asynchronous. The Pi creates/activates the campaign, sends the
     Teensy START command, and returns. The first public campaign row arrives
-    later through the normal MONITOR_FRAGMENT processor and becomes a typed
+    later through the normal CLOCKS_FRAGMENT processor and becomes a typed
     TEMPEST campaign detail only after Pi adjudication. Firmware may privately
     acquire a lawful PPS0/start-prologue bookend before public PPS1; the Pi does
     not model those private candidates as skipped campaign rows.
@@ -43,7 +43,7 @@ Core contract:
     incoherent candidates.
 
 Responsibilities:
-  * Receive campaign_row candidates from the unified MONITOR_FRAGMENT stream.
+  * Receive campaign_row candidates from the unified CLOCKS_FRAGMENT stream.
   * Adjudicate each candidate: persist coherent audit rows and recover on structural loss.
   * Subscribe to predictive GF-8802 announcements and bind them to PPS-aligned rows.
   * Augment accepted rows with environment, GNSS_RAW, and system time.
@@ -117,7 +117,7 @@ GNSS_ANNOUNCEMENT_HISTORY_MAX = 8
 # Cold START, Flash Cut, and zero-row cold recovery are readiness-gated.
 # Warm recovery uses its narrower recovery-specific lifecycle contract. The
 # Pi no longer expects fixed row burial/warmup suppression during admission:
-# the first public MONITOR_FRAGMENT campaign row is supposed to be useful, and if it is not,
+# the first public CLOCKS_FRAGMENT campaign row is supposed to be useful, and if it is not,
 # the responsible readiness or handoff gate should be fixed.
 RECOVERY_FIRST_PUBLIC_OFFSET = 1
 SYNC_FRAGMENT_TIMEOUT_S = 35.0
@@ -130,7 +130,7 @@ SYNC_POLL_S = 0.005
 # mature OCXO science.
 SYNC_RECOVER_CLEAN_TIMEOUT_S = 180.0
 
-# A recovery that produces no accepted MONITOR_FRAGMENT campaign row inside this window is not
+# A recovery that produces no accepted CLOCKS_FRAGMENT campaign row inside this window is not
 # merely "not clean yet".  Teensy should either publish a clean row or, after
 # its bounded private reattach window, publish degraded rows that let the Pi
 # observe liveness.  If the first row never appears, abort the firmware
@@ -169,15 +169,15 @@ SYNC_LOG_INTERVAL_S = 5.0
 
 # TIMEBASE ingress queue: maxsize=0 means unbounded.
 #
-# The Teensy emits one MONITOR_FRAGMENT whose optional campaign_row contains the
+# The Teensy emits one CLOCKS_FRAGMENT whose optional campaign_row contains the
 # science fragment and an embedded ``forensics`` object. PostgreSQL still
 # receives the compatible {fragment, forensics} TIMEBASE shape after Pi-side
 # adjudication, but there is no standalone forensics route or two-topic pair
 # join in the live architecture.
 TIMEBASE_INGRESS_QUEUE_MAXSIZE = 0
-TIMEBASE_FRAGMENT_TOPIC = "MONITOR_FRAGMENT.campaign_row"
-MONITOR_FRAGMENT_TOPIC = "MONITOR_FRAGMENT"
-MONITOR_TOPIC = "MONITOR"
+TIMEBASE_FRAGMENT_TOPIC = "CLOCKS_FRAGMENT.campaign_row"
+CLOCKS_FRAGMENT_TOPIC = "CLOCKS_FRAGMENT"
+CLOCKS_TOPIC = "CLOCKS"
 CLOCKS_MONITOR_TOPIC = "CLOCKS_MONITOR"
 CLOCKS_MONITOR_BASELINE_REFRESH_S = 30.0
 MONITOR_PREFLIGHT_MAX_AGE_S = 5.0
@@ -256,12 +256,12 @@ TEENSY_HEALTH_RETRY_S = 60.0
 START_FIRST_FRAGMENT_TIMEOUT_S = 180.0
 FLASH_CUT_FIRST_FRAGMENT_TIMEOUT_S = 180.0
 
-# MONITOR-backed campaign preflight.
+# CLOCKS-backed campaign preflight.
 #
-# MONITOR is the sole recurring readiness feed consumed by CLOCKS.  The former
+# CLOCKS is the sole recurring readiness feed consumed by Pi CLOCKS.  The former
 # FEATURE_STATUS / FEATURE_STATUS_FRAGMENT aggregate feeds no longer exist, so
 # campaign admission must depend only on concrete readiness leaves carried in
-# MONITOR.features.  Runtime TIMEBASE row integrity, database command-contract
+# CLOCKS.features.  Runtime TIMEBASE row integrity, database command-contract
 # checks, GNSS mode reconciliation, and recovery projection remain local CLOCKS
 # logic.
 #
@@ -280,7 +280,7 @@ FLASH_CUT_FIRST_FRAGMENT_TIMEOUT_S = 180.0
 # command verdict.
 FEATURE_PREFLIGHT_PROFILE = "CAMPAIGN_PREFLIGHT"
 FEATURE_PREFLIGHT_REQUIRED = (
-    # Concrete readiness leaves from the unified MONITOR.features tree.
+    # Concrete readiness leaves from the unified CLOCKS.features tree.
     # Do not gate on the retired FEATURE_STATUS aggregate nodes or the old
     # FEATURE_STATUS-driven Teensy import sentinel.
     "PI.SYSTEM.HOST",
@@ -323,7 +323,7 @@ _diag: Dict[str, Any] = {
     "fragments_missing_teensy_pps_count": 0,     # legacy diagnostic alias
     "fragments_missing_teensy_pps_vclock_count": 0,
 
-    # Unified MONITOR_FRAGMENT campaign-row processing (processor thread — slow path).
+    # Unified CLOCKS_FRAGMENT campaign-row processing (processor thread — slow path).
     "timebase_pieces_processed": 0,              # legacy alias: queue items
     "timebase_rows_completed": 0,
     "timebase_pairs_completed": 0,               # legacy alias for rows completed
@@ -455,7 +455,7 @@ _diag: Dict[str, Any] = {
     "gnss_wait_seconds_last": 0.0,
     "last_gnss_wait": {},
 
-    # MONITOR-backed campaign preflight
+    # CLOCKS-backed campaign preflight
     "preflight_feature_checks": 0,
     "preflight_feature_blocked": 0,
     "preflight_feature_unavailable": 0,
@@ -531,7 +531,7 @@ _diag: Dict[str, Any] = {
     "startup_control_busy_rejections": 0,
     "last_startup_control_rejection": {},
 
-    # MONITOR_FRAGMENT silence / Teensy restart detection
+    # CLOCKS_FRAGMENT silence / Teensy restart detection
     "timebase_silence_monitor_started": False,
     "timebase_silence_checks": 0,
     "timebase_silence_detected": 0,
@@ -841,7 +841,7 @@ _campaign_active: bool = False
 # START/RESUME must not race active-campaign recovery.
 _startup_control_ready = threading.Event()
 
-# Latest unified operational heartbeat.  CLOCKS consumes MONITOR.features for
+# Latest unified operational heartbeat.  CLOCKS consumes CLOCKS.features for
 # campaign preflight; it never polls or subscribes to a feature-only side feed.
 _monitor_lock = threading.Lock()
 _latest_monitor: Dict[str, Any] = {}
@@ -854,8 +854,8 @@ _last_pps_vclock_count_seen: Optional[int] = None
 # This is observational only; it is never used to reject a fragment.
 _accepted_pps_vclock_count: Optional[int] = None
 
-# MONITOR_FRAGMENT silence monitor.  This is intentionally process-local: if a
-# campaign is active and the Teensy stops publishing MONITOR_FRAGMENT campaign rows, CLOCKS
+# CLOCKS_FRAGMENT silence monitor.  This is intentionally process-local: if a
+# campaign is active and the Teensy stops publishing CLOCKS_FRAGMENT campaign rows, CLOCKS
 # treats the silence as a recoverable Teensy lifecycle event once communication
 # returns.
 _timebase_last_activity_monotonic: Optional[float] = None
@@ -865,7 +865,7 @@ _timebase_last_activity_pps_vclock_count: Optional[int] = None
 _timebase_silence_recovery_active: bool = False
 
 # Asynchronous START observation.  START no longer blocks waiting for the
-# first MONITOR_FRAGMENT campaign row; this records the pending wait so
+# first CLOCKS_FRAGMENT campaign row; this records the pending wait so
 # reports can show whether the Teensy has begun publishing.
 _start_waiting_for_first_fragment: bool = False
 _start_requested_campaign: Optional[str] = None
@@ -917,7 +917,7 @@ class RecoveryRetryableFailure(RuntimeError):
 
 
 class RecoverySyncTimeout(RecoveryRetryableFailure):
-    """Raised when RECOVER produces no accepted MONITOR_FRAGMENT campaign row."""
+    """Raised when RECOVER produces no accepted CLOCKS_FRAGMENT campaign row."""
 
 
 class RecoveryCleanTimeout(RecoveryRetryableFailure):
@@ -991,7 +991,7 @@ def _note_timebase_activity(
     pps_vclock_count: Optional[int],
 ) -> None:
     """
-    Record receipt of one Teensy MONITOR_FRAGMENT campaign-row candidate.
+    Record receipt of one Teensy CLOCKS_FRAGMENT campaign-row candidate.
 
     Candidate receipt is the campaign heartbeat even when the Pi later rejects
     the row.  That keeps transport silence distinct from scientific invalidity.
@@ -1017,10 +1017,10 @@ def _note_timebase_activity(
 
 def _arm_timebase_silence_watch(context: str) -> None:
     """
-    Start or restart the silence timer when CLOCKS expects MONITOR_FRAGMENT campaign rows.
+    Start or restart the silence timer when CLOCKS expects CLOCKS_FRAGMENT campaign rows.
 
     This covers the interval before the first post-START/post-RECOVER fragment.
-    Actual MONITOR_FRAGMENT campaign-row receipts replace this synthetic watch-arm marker through
+    Actual CLOCKS_FRAGMENT campaign-row receipts replace this synthetic watch-arm marker through
     _note_timebase_activity().
     """
     global _timebase_last_activity_monotonic
@@ -1259,7 +1259,7 @@ def _timebase_silence_recovery(reason: str, details: Dict[str, Any]) -> None:
 
     This extends boot-time campaign recovery to the live-Pi / rebooted-Teensy
     case.  The database active-campaign row remains the durable intent; the
-    process-local campaign gate is lowered so stale or partial MONITOR_FRAGMENT campaign-row candidates
+    process-local campaign gate is lowered so stale or partial CLOCKS_FRAGMENT campaign-row candidates
     cannot be persisted while the Teensy is being recovered.
     """
     global _campaign_active, _auto_recovery_in_progress
@@ -1270,7 +1270,7 @@ def _timebase_silence_recovery(reason: str, details: Dict[str, Any]) -> None:
         while True:
             if _teensy_clocks_health_ok():
                 logging.info(
-                    "✅ [clocks] @%s Teensy CLOCKS REPORT responded after MONITOR_FRAGMENT silence — "
+                    "✅ [clocks] @%s Teensy CLOCKS REPORT responded after CLOCKS_FRAGMENT silence — "
                     "invoking campaign recovery",
                     system_time_z(),
                 )
@@ -1280,7 +1280,7 @@ def _timebase_silence_recovery(reason: str, details: Dict[str, Any]) -> None:
                 try:
                     _recover_campaign()
                     logging.info(
-                        "✅ [clocks] @%s MONITOR_FRAGMENT silence recovery complete",
+                        "✅ [clocks] @%s CLOCKS_FRAGMENT silence recovery complete",
                         system_time_z(),
                     )
                     return
@@ -1316,7 +1316,7 @@ def _timebase_silence_recovery(reason: str, details: Dict[str, Any]) -> None:
                             "details": e.details,
                         }
                         logging.error(
-                            "💥 [clocks] MONITOR_FRAGMENT silence recovery stopped after %d attempt(s): "
+                            "💥 [clocks] CLOCKS_FRAGMENT silence recovery stopped after %d attempt(s): "
                             "reason=%s status=%s. The Teensy is commandable but cannot "
                             "re-enter RECOVER from its present interrupt-service state; "
                             "the durable campaign remains available for recovery after "
@@ -1332,7 +1332,7 @@ def _timebase_silence_recovery(reason: str, details: Dict[str, Any]) -> None:
                         _diag.get("auto_recovery_retries", 0) + 1
                     )
                     logging.warning(
-                        "⚠️ [clocks] MONITOR_FRAGMENT silence recovery retryable failure "
+                        "⚠️ [clocks] CLOCKS_FRAGMENT silence recovery retryable failure "
                         "(attempt %d/%d): %s details=%s — retrying after %.1fs",
                         attempts,
                         int(AUTO_RECOVERY_MAX_ATTEMPTS),
@@ -1346,7 +1346,7 @@ def _timebase_silence_recovery(reason: str, details: Dict[str, Any]) -> None:
                 except Exception:
                     _diag["auto_recovery_failures"] = _diag.get("auto_recovery_failures", 0) + 1
                     logging.exception(
-                        "💥 [clocks] MONITOR_FRAGMENT silence recovery failed — "
+                        "💥 [clocks] CLOCKS_FRAGMENT silence recovery failed — "
                         "will retry after %.0fs",
                         TEENSY_HEALTH_RETRY_S,
                     )
@@ -1396,7 +1396,7 @@ def _begin_timebase_silence_recovery(age_s: float, *, timeout_s: float, phase: s
     }
 
     logging.error(
-        "💥 [clocks] MONITOR_FRAGMENT silence detected during active campaign "
+        "💥 [clocks] CLOCKS_FRAGMENT silence detected during active campaign "
         "(age=%.3fs timeout=%.3fs, last_topic=%s, last_pps_vclock_count=%s) — "
         "waiting for Teensy health check before recovery",
         float(age_s),
@@ -1421,7 +1421,7 @@ def _begin_timebase_silence_recovery(age_s: float, *, timeout_s: float, phase: s
 
 def _timebase_silence_monitor_loop() -> None:
     """
-    Detect a live Teensy reboot/loss by absence of MONITOR_FRAGMENT campaign rows.
+    Detect a live Teensy reboot/loss by absence of CLOCKS_FRAGMENT campaign rows.
 
     The monitor is intentionally quiet unless it detects the first silence
     threshold crossing.  Health-check failures after that point are silent and
@@ -1429,7 +1429,7 @@ def _timebase_silence_monitor_loop() -> None:
     """
     _diag["timebase_silence_monitor_started"] = True
     logging.info(
-        "🚀 [clocks] MONITOR_FRAGMENT silence monitor started "
+        "🚀 [clocks] CLOCKS_FRAGMENT silence monitor started "
         "(timeout=%.1fs, health_retry=%.1fs)",
         TIMEBASE_SILENCE_TIMEOUT_S,
         TEENSY_HEALTH_RETRY_S,
@@ -1447,7 +1447,7 @@ def _timebase_silence_monitor_loop() -> None:
             continue
         if _timebase_last_activity_monotonic is None:
             # Avoid treating initial async START/cold boot wait as a reboot.
-            # This monitor is for loss after the MONITOR_FRAGMENT campaign stream has been observed.
+            # This monitor is for loss after the CLOCKS_FRAGMENT campaign stream has been observed.
             continue
 
         age_s = time.monotonic() - _timebase_last_activity_monotonic
@@ -1985,7 +1985,7 @@ def _tempest_state_decoration(detail: Dict[str, Any]) -> Dict[str, Any]:
         "location": detail.get("location"),
         # GNSS_RAW campaign state is Pi CLOCKS-owned and advances only after the
         # final court. It therefore cannot be recovered from the earlier raw
-        # MONITOR_FRAGMENT alone and remains a genuine TEMPEST decoration.
+        # CLOCKS_FRAGMENT alone and remains a genuine TEMPEST decoration.
         "extra_clocks": copy.deepcopy(detail.get("extra_clocks") or {}),
         "adjudicated_at_utc": detail.get("system_time_utc"),
     }
@@ -2164,8 +2164,8 @@ def _wait_for_timebase_routes(
     timeout_s: float = 30.0,
     poll_s: float = 0.5,
 ) -> None:
-    """Confirm the unified always-on MONITOR_FRAGMENT ingress route."""
-    required = {MONITOR_FRAGMENT_TOPIC}
+    """Confirm the unified always-on CLOCKS_FRAGMENT ingress route."""
+    required = {CLOCKS_FRAGMENT_TOPIC}
     t0 = time.monotonic()
     last_log = t0
     last_missing = sorted(required)
@@ -2183,7 +2183,7 @@ def _wait_for_timebase_routes(
                 if not last_missing:
                     if logged_wait:
                         logging.info(
-                            "✅ [%s] MONITOR_FRAGMENT route ready after %.1fs",
+                            "✅ [%s] CLOCKS_FRAGMENT route ready after %.1fs",
                             context, elapsed,
                         )
                     return
@@ -2199,7 +2199,7 @@ def _wait_for_timebase_routes(
 
         if elapsed >= 5.0 and (not logged_wait or now - last_log >= 30.0):
             logging.info(
-                "⏳ [%s] waiting for MONITOR_FRAGMENT route (%.0fs): %s",
+                "⏳ [%s] waiting for CLOCKS_FRAGMENT route (%.0fs): %s",
                 context, elapsed, ", ".join(last_missing) or "route report unavailable",
             )
             logged_wait = True
@@ -2698,7 +2698,7 @@ def _gnss_raw_stats_loop() -> None:
 
 
 def _begin_sync_wait(expected_pps: int) -> None:
-    """Prepare to wait for the first Pi-accepted MONITOR_FRAGMENT campaign row."""
+    """Prepare to wait for the first Pi-accepted CLOCKS_FRAGMENT campaign row."""
     global _sync_expected_pps_vclock, _sync_fragment
 
     with _sync_lock:
@@ -2728,7 +2728,7 @@ def _end_sync_wait(
     global _sync_expected_pps_vclock
 
     logging.info(
-        "⏳ [recovery] waiting for first accepted MONITOR_FRAGMENT campaign row >= %s",
+        "⏳ [recovery] waiting for first accepted CLOCKS_FRAGMENT campaign row >= %s",
         str(_sync_expected_pps_vclock),
     )
 
@@ -2810,7 +2810,7 @@ def _signal_sync_candidate_if_needed(fragment: Dict[str, Any], pps_vclock_count:
         match = int(pps_vclock_count) >= int(_sync_expected_pps_vclock)
         if match:
             logging.info(
-                "✅ [recovery] first accepted MONITOR_FRAGMENT campaign row observed: count=%d expected>=%d",
+                "✅ [recovery] first accepted CLOCKS_FRAGMENT campaign row observed: count=%d expected>=%d",
                 int(pps_vclock_count), int(_sync_expected_pps_vclock),
             )
             _sync_fragment = dict(fragment)
@@ -4939,7 +4939,7 @@ def _normalize_start_args(args: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _mark_start_waiting(campaign: str) -> None:
-    """Record that START returned before the first MONITOR_FRAGMENT campaign row."""
+    """Record that START returned before the first CLOCKS_FRAGMENT campaign row."""
     global _start_waiting_for_first_fragment, _start_requested_campaign
     global _start_requested_at_utc, _start_requested_monotonic
     global _start_first_fragment_at_utc, _start_first_fragment_wait_s
@@ -5278,7 +5278,7 @@ def _enqueue_timebase_piece(
 
 
 def _drain_timebase_ingress() -> int:
-    """Drain queued MONITOR_FRAGMENT campaign rows from an old lifecycle."""
+    """Drain queued CLOCKS_FRAGMENT campaign rows from an old lifecycle."""
     drained = 0
     while not _fragment_queue.empty():
         try:
@@ -5296,14 +5296,14 @@ def _drain_timebase_ingress() -> int:
 
 
 def _monitor_fragment_ppb_buckets(monitor_fragment: Dict[str, Any]) -> Dict[str, Any]:
-    """Return same-second producer-authored PPB buckets from MONITOR_FRAGMENT.
+    """Return same-second producer-authored PPB buckets from CLOCKS_FRAGMENT.
 
-    The always-on bucket family lives under ``MONITOR_FRAGMENT.clocks.stats``.
+    The always-on bucket family lives under ``CLOCKS_FRAGMENT.clocks.stats``.
     The campaign-row candidate carries CAMP and remains unchanged for the final
     court.  These sibling always-on values travel beside that candidate and are
     merged only into the durable fragment after the candidate is accepted.
 
-    This function runs for every MONITOR_FRAGMENT containing ``campaign_row``;
+    This function runs for every CLOCKS_FRAGMENT containing ``campaign_row``;
     no startup-only latch or logging throttle controls persistence cadence.
     """
     clocks = monitor_fragment.get("clocks")
@@ -5348,7 +5348,7 @@ def _decorate_persisted_fragment_ppb_buckets(
 
 
 def on_monitor_fragment(payload: Payload) -> None:
-    """Consume the raw Teensy MONITOR_FRAGMENT and enqueue campaign decoration.
+    """Consume the raw Teensy CLOCKS_FRAGMENT and enqueue campaign decoration.
 
     Observation-only fragments are intentionally ignored by the TIMEBASE path.
     When ``campaign_row`` is present, its body is the unchanged Teensy-authored
@@ -5429,7 +5429,7 @@ def _process_loop() -> None:
         if not isinstance(ppb_buckets, dict):
             ppb_buckets = None
         if not isinstance(payload, dict):
-            logging.error("💥 [clocks] processor received malformed MONITOR_FRAGMENT campaign row: %s", piece)
+            logging.error("💥 [clocks] processor received malformed CLOCKS_FRAGMENT campaign row: %s", piece)
             continue
 
         raw_record = copy.deepcopy(payload)
@@ -5768,7 +5768,7 @@ class TeensyStartRejected(RuntimeError):
 
 
 # START is asynchronous.  These statuses mean that firmware accepted the
-# lifecycle request; they do not claim that the first public MONITOR_FRAGMENT campaign row has
+# lifecycle request; they do not claim that the first public CLOCKS_FRAGMENT campaign row has
 # already been emitted.  Keep the legacy SmartZero/Flash Cut vocabulary for
 # older firmware while accepting the current always-on recording-boundary
 # contract returned by CLOCKS.START.
@@ -5981,7 +5981,7 @@ def cmd_start(args: Optional[dict]) -> dict:
     START — asynchronous cold START or hot Flash Cut.
 
     The Pi prepares DB state and accepted-row ingress before arming Teensy, then
-    accepts the very first MONITOR_FRAGMENT campaign row. There is no Pi-side warmup
+    accepts the very first CLOCKS_FRAGMENT campaign row. There is no Pi-side warmup
     or skipped-row model; if row #1 is unhealthy, the readiness gates or Teensy
     handoff should be fixed.
     """
@@ -6113,7 +6113,7 @@ def cmd_start(args: Optional[dict]) -> dict:
 
     drained = _reset_trackers()
     if drained:
-        logging.info("🧹 [start] drained %d stale MONITOR_FRAGMENT campaign row(s) before arm", drained)
+        logging.info("🧹 [start] drained %d stale CLOCKS_FRAGMENT campaign row(s) before arm", drained)
     _clear_sync_wait()
 
     _accepted_pps_vclock_count = None
@@ -6224,7 +6224,7 @@ def cmd_start(args: Optional[dict]) -> dict:
     )
     logging.info(
         "✅ [start] @%s %s accepted by Teensy — campaign='%s' status='%s'; "
-        "awaiting first MONITOR_FRAGMENT campaign row",
+        "awaiting first CLOCKS_FRAGMENT campaign row",
         system_time_z(),
         "FLASH_CUT" if flash_cut else "START",
         campaign,
@@ -6956,7 +6956,7 @@ def _recover_campaign() -> None:
 
         drained = _reset_trackers()
         if drained:
-            logging.info("🧹 [recovery/cold] drained %d stale MONITOR_FRAGMENT campaign row(s)", drained)
+            logging.info("🧹 [recovery/cold] drained %d stale CLOCKS_FRAGMENT campaign row(s)", drained)
         _clear_sync_wait()
 
         # Campaign recovery is recording-only. The live DAC, servo, and dither
@@ -6972,7 +6972,7 @@ def _recover_campaign() -> None:
         # Cold recovery has no prior TEMPEST detail to recover from.  Treat it as
         # an async START of the existing active campaign, matching cmd_start().
         # The normal processor thread will accept the first
-        # MONITOR_FRAGMENT campaign row whenever it arrives.
+        # CLOCKS_FRAGMENT campaign row whenever it arrives.
         _campaign_active = True
         _arm_timebase_silence_watch("RECOVERY_COLD_START")
 
@@ -6997,7 +6997,7 @@ def _recover_campaign() -> None:
         )
         logging.info(
             "✅ [recovery/cold] START accepted: campaign='%s' status='%s'; "
-            "awaiting first MONITOR_FRAGMENT campaign row",
+            "awaiting first CLOCKS_FRAGMENT campaign row",
             campaign_name, teensy_start_status,
         )
 
@@ -7080,7 +7080,7 @@ def _recover_campaign() -> None:
     #
     # Keep all concrete recovery safeguards below:
     #   * GNSS mode has already been reconciled above.
-    #   * MONITOR_FRAGMENT PUBSUB routing is verified immediately below.
+    #   * CLOCKS_FRAGMENT PUBSUB routing is verified immediately below.
     #   * CLOCKS.RECOVER itself must return an explicitly accepted firmware
     #     lifecycle status in _request_teensy_recover().
     #
@@ -7115,14 +7115,14 @@ def _recover_campaign() -> None:
     # only Pi ingress, and let firmware select the lawful recovery mode.
     logging.info(
         "📡 [recovery] @%s preserving durable campaign identity; "
-        "quiescing Pi MONITOR_FRAGMENT campaign ingress before direct RECOVER "
+        "quiescing Pi CLOCKS_FRAGMENT campaign ingress before direct RECOVER "
         "(firmware selects live reattach or cold bootstrap)...",
         system_time_z(),
     )
 
     _drained = _drain_timebase_ingress()
     if _drained > 0:
-        logging.info("🧹 [recovery] drained %d stale MONITOR_FRAGMENT campaign row(s)", _drained)
+        logging.info("🧹 [recovery] drained %d stale CLOCKS_FRAGMENT campaign row(s)", _drained)
 
     now_frac = time.time() % 1.0
     sleep_to_boundary = (1.0 - now_frac) + 0.050
@@ -7670,7 +7670,7 @@ def cmd_set_baseline(args: Optional[dict]) -> Dict[str, Any]:
 
 
 def on_monitor(payload: Optional[dict]) -> None:
-    """Cache the latest unified MONITOR heartbeat for campaign preflight."""
+    """Cache the latest unified CLOCKS heartbeat for campaign preflight."""
     global _latest_monitor
     global _latest_monitor_received_monotonic
     global _latest_monitor_received_utc
@@ -7689,14 +7689,14 @@ def on_monitor(payload: Optional[dict]) -> None:
 
 
 def _monitor_features() -> Dict[str, Any]:
-    """Return fresh MONITOR.features or raise while the heartbeat is unavailable."""
+    """Return fresh CLOCKS.features or raise while the heartbeat is unavailable."""
     with _monitor_lock:
         monitor = copy.deepcopy(_latest_monitor)
         received_monotonic = _latest_monitor_received_monotonic
         received_utc = _latest_monitor_received_utc
 
     if received_monotonic is None or not monitor:
-        raise RuntimeError("MONITOR heartbeat not yet received")
+        raise RuntimeError("CLOCKS heartbeat not yet received")
 
     age_s = max(0.0, time.monotonic() - received_monotonic)
     if age_s > MONITOR_PREFLIGHT_MAX_AGE_S:
@@ -7708,13 +7708,13 @@ def _monitor_features() -> Dict[str, Any]:
             "max_age_s": float(MONITOR_PREFLIGHT_MAX_AGE_S),
         }
         raise RuntimeError(
-            f"MONITOR heartbeat stale ({age_s:.1f}s > {MONITOR_PREFLIGHT_MAX_AGE_S:.1f}s)"
+            f"CLOCKS heartbeat stale ({age_s:.1f}s > {MONITOR_PREFLIGHT_MAX_AGE_S:.1f}s)"
         )
 
     features = monitor.get("features")
     if not isinstance(features, dict) or not features:
         _diag["preflight_monitor_missing_features"] += 1
-        raise RuntimeError("MONITOR heartbeat has no feature tree")
+        raise RuntimeError("CLOCKS heartbeat has no feature tree")
 
     _diag["last_preflight_monitor"] = {
         "status": "NOMINAL",
@@ -7735,9 +7735,9 @@ def _feature_gate_reason(blocker: Dict[str, Any]) -> str:
 
 
 def _check_feature_preflight(context: str) -> tuple[bool, list[str]]:
-    """Check the single standardized MONITOR campaign preflight profile.
+    """Check the single standardized CLOCKS campaign preflight profile.
 
-    Every required leaf is evaluated from one fresh MONITOR.features snapshot.
+    Every required leaf is evaluated from one fresh CLOCKS.features snapshot.
     There is no second firmware-policy cache and no mirror-bypass path.
     """
     _diag["preflight_feature_checks"] += 1
@@ -7840,7 +7840,7 @@ def _check_preflight(context: str = "campaign") -> tuple[bool, list[str]]:
     reasons: list[str] = []
 
     # -----------------------------------------------------------------
-    # 0. Single unified MONITOR readiness profile
+    # 0. Single unified CLOCKS readiness profile
     # -----------------------------------------------------------------
     feature_ready, feature_reasons = _check_feature_preflight(context)
     if not feature_ready:
@@ -7920,7 +7920,7 @@ def _check_preflight(context: str = "campaign") -> tuple[bool, list[str]]:
 
 
 def _wait_for_preflight(context: str = "recovery") -> None:
-    """Wait quietly until the unified MONITOR readiness profile is open.
+    """Wait quietly until the unified CLOCKS readiness profile is open.
 
     Readiness is polled frequently so startup proceeds promptly.  The log is
     intentionally sparse: no normal-path success line, and while blocked only
@@ -8304,7 +8304,7 @@ def cmd_clocks_info(_: Optional[dict]) -> Dict[str, Any]:
             "profile": FEATURE_PREFLIGHT_PROFILE,
             "required_features": list(FEATURE_PREFLIGHT_REQUIRED),
             "post_start_expected_features": list(FEATURE_PREFLIGHT_POST_START_EXPECTED),
-            "admission_authority": "MONITOR.features",
+            "admission_authority": "CLOCKS.features",
             "firmware_policy_gate_used": False,
             "firmware_start_contract": (
                 "COMMAND_STATE_NUMERIC_DAC_SMARTZERO_PRIVATE_HANDOFF"
@@ -8466,7 +8466,7 @@ def cmd_set_dac(args: Optional[dict]) -> Dict[str, Any]:
             **({"dac1": alias1} if alias1 else {}),
             **({"dac2": alias2} if alias2 else {}),
         },
-        "persistence": "MONITOR",
+        "persistence": "CLOCKS",
         "teensy_message": response.get("message") if isinstance(response, dict) else None,
         "teensy_payload": payload if isinstance(payload, dict) else {},
     }
@@ -8480,7 +8480,7 @@ def cmd_set_dac(args: Optional[dict]) -> Dict[str, Any]:
 
 
 def cmd_set_dither(args: Optional[dict]) -> Dict[str, Any]:
-    """Set live Teensy dithering state; MONITOR owns restart continuity."""
+    """Set live Teensy dithering state; CLOCKS owns restart continuity."""
     if not args or "dither" not in args:
         return {"success": False, "message": "DITHER requires 'dither' argument"}
 
@@ -8541,7 +8541,7 @@ def cmd_set_dither(args: Optional[dict]) -> Dict[str, Any]:
         "message": response.get("message", "OK") if isinstance(response, dict) else "DITHER failed",
         "payload": {
             **teensy_args,
-            "persistence": "MONITOR",
+            "persistence": "CLOCKS",
             "teensy_payload": (
                 response.get("payload", {}) if isinstance(response, dict) else {}
             ),
@@ -8601,14 +8601,14 @@ def run() -> None:
     logging.info(
         "🕐 [clocks] unified PPS/VCLOCK TIMEBASE candidate schema. Teensy PPS/VCLOCK count is canonical. "
         "Four clock domains: GNSS (reference), DWT, OCXO1, OCXO2. "
-        "The Teensy emits one always-on MONITOR_FRAGMENT; campaign rows ride inside campaign_row and the Pi is the final TIMEBASE arbiter. "
-        "SYSTEM owns MONITOR campaign-detail persistence and always-on restore; CLOCKS restores active TEMPEST campaigns from typed campaign details. "
+        "The Teensy emits one always-on CLOCKS_FRAGMENT; campaign rows ride inside campaign_row and the Pi is the final TIMEBASE arbiter. "
+        "SYSTEM owns CLOCKS campaign-detail persistence and always-on restore; CLOCKS restores active TEMPEST campaigns from typed campaign details. "
         "Every coherent PPS second persists; objections make it AUDIT_ONLY while continuity loss triggers recovery. "
         "START while active performs seamless flash-cut to new campaign. "
         "Commands: START, STOP, RESUME, RECOVER_ABORT, RESTORE_GNSS_RAW, REPORT, REPORT_CLOCKS, REPORT_STATS, STATS_RESET, CLEAR, DELETE, TRUNCATE, SET_DAC, DITHER, "
         "SET_BASELINE, BASELINE_INFO, LIST_CAMPAIGNS, CLOCKS_INFO. "
-        "Subscriptions: MONITOR, MONITOR_FRAGMENT, GNSS_ANNOUNCEMENT, WATCHDOG_ANOMALY, CLOCKS_RECOVERY_STALLED. "
-        "Publications: TIMEBASE, CLOCKS_MONITOR (Pi decoration merged into unified MONITOR)."
+        "Subscriptions: CLOCKS, CLOCKS_FRAGMENT, GNSS_ANNOUNCEMENT, WATCHDOG_ANOMALY, CLOCKS_RECOVERY_STALLED. "
+        "Publications: TIMEBASE, CLOCKS_MONITOR (Pi decoration merged into unified CLOCKS)."
     )
 
     # Expose commands and subscriptions immediately.  SYSTEM may invoke the
@@ -8618,8 +8618,8 @@ def run() -> None:
         subsystem="CLOCKS",
         commands=COMMANDS,
         subscriptions={
-            MONITOR_TOPIC: on_monitor,
-            MONITOR_FRAGMENT_TOPIC: on_monitor_fragment,
+            CLOCKS_TOPIC: on_monitor,
+            CLOCKS_FRAGMENT_TOPIC: on_monitor_fragment,
             GNSS_ANNOUNCEMENT_TOPIC: on_gnss_announcement,
             "WATCHDOG_ANOMALY": on_watchdog_anomaly,
             CLOCKS_RECOVERY_STALLED_TOPIC: on_recovery_stalled,

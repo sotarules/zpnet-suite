@@ -2,8 +2,8 @@
 ZPNet Metrics Readout Blocks — Generalized Campaign Detail Edition
 
 Data source:
-  The unified MONITOR heartbeat owns the live operator view.  Clock science is
-  read from MONITOR.clocks, including the always-on instrument clockfaces,
+  The unified CLOCKS heartbeat owns the live operator view.  Clock science is
+  read from CLOCKS.clocks, including the always-on instrument clockfaces,
   Alpha statistics, raw-cycle evidence, DAC state, campaign decoration, and
   baseline comparison.  Metrics never waits for or reads TIMEBASE.
 
@@ -18,7 +18,7 @@ Stats policy (Pi is a stenographer):
 
 Clock row doctrine:
   The dense operator table shows GNSS, VCLOCK, OCXO1, and OCXO2 only.
-  GN_RAW and DWT remain available in MONITOR/focused diagnostics but are omitted
+  GN_RAW and DWT remain available in CLOCKS/focused diagnostics but are omitted
   here because they are not primary TEMPEST science clocks.
   VALUE is the canonical 64-bit clock value.
   10-MIN/60-MIN/8-HOUR/24-HOUR are firmware/Pi-producer-authored rolling PPB
@@ -62,11 +62,11 @@ FEATURE_GRID_CELL_WIDTH = 39
 PPB_BUCKET_KEYS = ("10_min", "60_min", "8_hour", "24_hour", "total")
 PPB_VISIBLE_COLUMN_COUNT = len(PPB_BUCKET_KEYS) + 1  # + campaign
 
-MONITOR_TOPIC = "MONITOR"
-_LIVE_CACHE = create_pubsub_cache(MONITOR_TOPIC)
+CLOCKS_TOPIC = "CLOCKS"
+_LIVE_CACHE = create_pubsub_cache(CLOCKS_TOPIC)
 
 # Mission-control readiness board. The feature payload remains scalar-only;
-# this table is just the operator-facing projection of MONITOR.features.
+# this table is just the operator-facing projection of CLOCKS.features.
 FEATURE_STATUS_GRID = (
     ("NET", "PI.SYSTEM.NETWORK"),
     ("BATTERY", "PI.SYSTEM.BATTERY"),
@@ -95,12 +95,12 @@ FEATURE_STATUS_GRID = (
 # ---------------------------------------------------------------------
 
 def _get_system_snapshot() -> dict:
-    """Return latest MONITOR without command/response traffic."""
-    return _LIVE_CACHE.get(MONITOR_TOPIC) or {}
+    """Return latest CLOCKS without command/response traffic."""
+    return _LIVE_CACHE.get(CLOCKS_TOPIC) or {}
 
 
 def _get_feature_status_payload(force: bool = False) -> tuple[dict, str | None]:
-    """Return the feature tree carried by the latest MONITOR snapshot."""
+    """Return the feature tree carried by the latest CLOCKS snapshot."""
     _ = force
     monitor = _get_system_snapshot()
     features = monitor.get("features")
@@ -110,10 +110,10 @@ def _get_feature_status_payload(force: bool = False) -> tuple[dict, str | None]:
 
 
 def _monitor_root() -> dict:
-    """Return the MONITOR publication itself.
+    """Return the CLOCKS publication itself.
 
     PubSubTapCache already removes the transport envelope and returns the
-    published payload.  MONITOR also legitimately contains a top-level
+    published payload.  CLOCKS also legitimately contains a top-level
     ``payload`` block for Teensy Payload allocator/serialization metrics; that
     block is data, not another message envelope.  Unwrapping it hides sibling
     surfaces such as ``clocks``, ``features``, and ``gnss``.
@@ -122,13 +122,13 @@ def _monitor_root() -> dict:
 
 
 def _get_pi_clocks_report() -> dict:
-    """Return the live MONITOR.clocks surface without command/response traffic."""
+    """Return the live CLOCKS.clocks surface without command/response traffic."""
     root = _monitor_root()
     clocks = root.get("clocks")
     if not isinstance(clocks, dict):
         return {}
 
-    # Keep MONITOR's ownership boundaries visible while presenting a convenient
+    # Keep CLOCKS's ownership boundaries visible while presenting a convenient
     # report-like object to the existing pure formatting helpers.
     report = dict(clocks)
     for key in (
@@ -142,12 +142,12 @@ def _get_pi_clocks_report() -> dict:
 
 
 def _get_pi_clocks_report_dac() -> dict:
-    # MONITOR.clocks.dac is already folded into the live report surface.
+    # CLOCKS.clocks.dac is already folded into the live report surface.
     return {}
 
 
 def _get_clocks_baseline() -> dict | None:
-    """Return the baseline embedded in MONITOR.clocks, never an RPC query."""
+    """Return the baseline embedded in CLOCKS.clocks, never an RPC query."""
     clocks = _get_pi_clocks_report()
     baseline = clocks.get("baseline")
     if not isinstance(baseline, dict) or not baseline.get("baseline_set"):
@@ -261,7 +261,7 @@ def _gnss_from_system_snapshot(snapshot: dict) -> dict:
 
 
 def _gnss_status(r: dict | None = None, snapshot: dict | None = None) -> dict:
-    # TIMEBASE owns accepted clock-correlated GNSS evidence. MONITOR supplies
+    # TIMEBASE owns accepted clock-correlated GNSS evidence. CLOCKS supplies
     # the broader last-known-good receiver snapshot.
     g: dict = {}
     if r is not None:
@@ -328,7 +328,7 @@ def _payload_root(r: dict) -> dict:
 
 
 def _fragment_root(r: dict) -> dict:
-    # MONITOR.clocks is already the canonical live clock root.  Retain support
+    # CLOCKS.clocks is already the canonical live clock root.  Retain support
     # for historical report-shaped dictionaries used by campaign-history code.
     root = _payload_root(r)
     frag = root.get("fragment")
@@ -359,7 +359,7 @@ def _extra(r: dict, key: str, default=None):
         if val is not None:
             return val
 
-    # Pi-owned GNSS_RAW is a first-class MONITOR clock, not a TIMEBASE extra.
+    # Pi-owned GNSS_RAW is a first-class CLOCKS clock, not a TIMEBASE extra.
     gnss_raw = root.get("gnss_raw")
     if isinstance(gnss_raw, dict):
         aliases = {
@@ -860,7 +860,7 @@ def _clamp_dac_code(value: float) -> float:
 def _manual_dac_current_value(lane: str) -> float:
     """Fetch the live DAC value for keyboard nudging.
 
-    Read the live DAC value from the current MONITOR.clocks surface.
+    Read the live DAC value from the current CLOCKS.clocks surface.
     Metrics does not subscribe to CLOCKS_DAC_TICK and does not poll verbose
     TEENSY REPORT_DAC during repaint or keyboard nudging.
     """
@@ -934,7 +934,7 @@ def _dac_dither_summary_from_fractional_code(dac_code) -> str:
     The firmware dither doctrine is a one-second fractional-code realization:
     low=floor(code), high=ceil(code), and the fractional part determines the
     high-code duty count over 1000 scheduler ticks.  This is presentation only;
-    the desired fractional code itself still comes from MONITOR.
+    the desired fractional code itself still comes from CLOCKS.
     """
     code = _to_float(dac_code)
     if code is None:
@@ -1561,7 +1561,7 @@ def campaigns_readout() -> list[str]:
 
 
 def _clockface_value(r: dict, lane: str):
-    """Return the always-on MONITOR clockface used by the VALUE column."""
+    """Return the always-on CLOCKS clockface used by the VALUE column."""
     for path in (
         f"instrument_clockfaces.{lane}",
         f"presentation_clockfaces.{lane}",
@@ -1634,7 +1634,7 @@ def clocks_combined_readout() -> list[str]:
 
     report = p.get("report") if isinstance(p.get("report"), dict) else p
     if not isinstance(report, dict) or not report:
-        return ["CLOCKS: MONITOR UNAVAILABLE", "", *feature_status_grid_lines()]
+        return ["CLOCKS: FEED UNAVAILABLE", "", *feature_status_grid_lines()]
 
     r = report
     state = str(r.get("campaign_state") or ("STARTED" if r.get("campaign_present") else "STOPPED")).upper()
@@ -1738,7 +1738,7 @@ def clocks_combined_readout() -> list[str]:
             f" {_baseline_comp(baseline_ppb.get(key), total_ppb, W_BASE)}"
         )
 
-    # GN_RAW and DWT remain available in MONITOR and focused reports, but are
+    # GN_RAW and DWT remain available in CLOCKS and focused reports, but are
     # intentionally omitted from this operator-facing clock table.
 
     # ── DAC detail ──

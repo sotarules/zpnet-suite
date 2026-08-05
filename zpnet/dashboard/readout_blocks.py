@@ -2,7 +2,7 @@
 ZPNet Dashboard Readout Blocks — Generalized Campaign Detail Edition
 
 The rotating pygame dashboard is an observer.  Both platform state and live
-clock science are read from the unified MONITOR heartbeat.  MONITOR.clocks is
+clock science are read from the unified CLOCKS heartbeat.  CLOCKS.clocks is
 the always-on instrument surface; campaign state merely decorates it.  No
 dashboard panel reads TIMEBASE or polls Teensy CLOCKS imperatively.
 """
@@ -16,20 +16,20 @@ from zpnet.processes.processes import create_pubsub_cache, send_command
 VREF = 5.0
 DAC_CODE_SCALE = 65536.0
 
-_MONITOR_TOPIC = "MONITOR"
-_LIVE_CACHE = create_pubsub_cache(_MONITOR_TOPIC)
+CLOCKS_TOPIC = "CLOCKS"
+_LIVE_CACHE = create_pubsub_cache(CLOCKS_TOPIC)
 
 
 def get_system_snapshot() -> dict:
-    """Return the latest unified MONITOR snapshot without issuing a command."""
-    return _LIVE_CACHE.get(_MONITOR_TOPIC) or {}
+    """Return the latest unified CLOCKS snapshot without issuing a command."""
+    return _LIVE_CACHE.get(CLOCKS_TOPIC) or {}
 
 
 def _monitor_root() -> dict:
-    """Return the MONITOR publication itself.
+    """Return the CLOCKS publication itself.
 
     PubSubTapCache already removes the transport envelope and returns the
-    published payload.  MONITOR also legitimately contains a top-level
+    published payload.  CLOCKS also legitimately contains a top-level
     ``payload`` block for Teensy Payload allocator/serialization metrics; that
     block is data, not another message envelope.  Unwrapping it hides sibling
     surfaces such as ``clocks``, ``features``, and ``gnss``.
@@ -38,7 +38,7 @@ def _monitor_root() -> dict:
 
 
 def get_pi_clocks_report() -> dict:
-    """Return the live MONITOR.clocks surface without issuing a command."""
+    """Return the live CLOCKS.clocks surface without issuing a command."""
     root = _monitor_root()
     clocks = root.get("clocks")
     if not isinstance(clocks, dict):
@@ -172,7 +172,7 @@ def _yes_no(value) -> str:
 def _clock_report() -> tuple[dict | None, str]:
     report = get_pi_clocks_report()
     if not report:
-        return None, "CLOCKS: MONITOR UNAVAILABLE"
+        return None, "CLOCKS: FEED UNAVAILABLE"
 
     state = str(report.get("campaign_state") or ("STARTED" if report.get("campaign_present") else "STOPPED")).upper()
     count = _to_int(_field(
@@ -204,7 +204,7 @@ def _frequency(report: dict, lane: str) -> tuple[float | None, float | None]:
 
 
 def _clockface_value(report: dict, lane: str):
-    """Return the MONITOR campaign/presentation clockface for one lane."""
+    """Return the CLOCKS campaign/presentation clockface for one lane."""
     for path in (
         f"presentation_clockfaces.{lane}",
         f"clockfaces.{lane}",

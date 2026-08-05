@@ -93,8 +93,8 @@ void zpnet_foreground_phase_note(zpnet_foreground_phase_t phase);
 // ============================================================================
 //
 // Teensy SYSTEM owns only Teensy-local feature state.  Every always-on
-// MONITOR_FRAGMENT carries the current Teensy feature tree; Pi SYSTEM unions it
-// with Pi-local feature state into the unified MONITOR dashboard /
+// CLOCKS_FRAGMENT carries the current Teensy feature tree; Pi SYSTEM unions it
+// with Pi-local feature state into the unified CLOCKS dashboard /
 // campaign-readiness surface.
 //
 // Feature paths are reported as:
@@ -136,14 +136,14 @@ bool system_feature_is_nominal(const char* subsystem,
                                const char* feature);
 
 // ============================================================================
-// PPS-aligned MONITOR_FRAGMENT side rail
+// PPS-aligned CLOCKS_FRAGMENT side rail
 // ============================================================================
 // Canonical always-on tick. process_interrupt calls this for every completed
 // PPS/VCLOCK second whether or not a CLOCKS campaign is active. It records only
 // the scalar sequence and arms foreground publication.
 //
 // Foreground SYSTEM then takes one typed CLOCKS snapshot and authors the full
-// MONITOR_FRAGMENT wire shape. The always-on clock view is observational; an
+// CLOCKS_FRAGMENT wire shape. The always-on clock view is observational; an
 // optional campaign observation is included only for a completed public record.
 void system_monitor_pps_tick_from_interrupt(
     uint32_t completed_second_sequence);
@@ -154,7 +154,7 @@ void system_monitor_pps_tick_from_interrupt(
 void system_monitor_pps_tick(uint32_t completed_second_sequence);
 
 // CLOCKS/Beta calls this after it has frozen a typed public campaign observation
-// for the completed instrument sequence. Usually the interrupt-owned MONITOR tick
+// for the completed instrument sequence. Usually the interrupt-owned CLOCKS_FRAGMENT tick
 // is already pending and this merely coalesces into it. If SYSTEM already emitted
 // the observation-only fragment, this deliberately schedules one same-sequence
 // copy carrying the campaign facts so durable truth cannot be lost.

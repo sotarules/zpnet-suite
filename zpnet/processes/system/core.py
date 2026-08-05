@@ -2,10 +2,10 @@
 ZPNet SYSTEM Process (Pi-side, authoritative aggregator)
 
 Responsibilities:
-  • Consume the PPS-aligned Teensy MONITOR_FRAGMENT feed
+  • Consume the PPS-aligned Teensy CLOCKS_FRAGMENT feed
   • Collect Raspberry Pi host metrics on a slower local cadence
   • Decorate each Teensy fragment with last-known-good Pi-owned state
-  • Publish one unified MONITOR snapshot per Teensy second
+  • Publish one unified CLOCKS snapshot per Teensy second
   • Persist each unified MONITOR as a TEMPEST state record in campaign_detail
   • Recover always-on state from the latest TEMPEST campaign_detail
   • Preserve SYSTEM.REPORT as an explicit command surface
@@ -14,7 +14,7 @@ Process model:
   • One systemd service
   • One Pi-context polling thread
   • One blocking command socket
-  • MONITOR_FRAGMENT, CLOCKS_MONITOR, and GNSS_ANNOUNCEMENT subscriptions
+  • CLOCKS_FRAGMENT, CLOCKS_MONITOR, and GNSS_ANNOUNCEMENT subscriptions
 """
 
 from __future__ import annotations
@@ -67,6 +67,8 @@ from zpnet.shared.util import (
 
 POLL_INTERVAL_SEC = 30
 STARTUP_TEENSY_QUIET_DELAY_S = 10.0
+CLOCKS_FRAGMENT_TOPIC = "CLOCKS_FRAGMENT"
+CLOCKS_TOPIC = "CLOCKS"
 CLOCKS_MONITOR_TOPIC = "CLOCKS_MONITOR"
 GNSS_ANNOUNCEMENT_TOPIC = "GNSS_ANNOUNCEMENT"
 GNSS_MONITOR_FRESHNESS_MAX_AGE_S = 2.5
@@ -1901,7 +1903,7 @@ def _seed_system_from_detail(detail: Dict[str, Any]) -> None:
 
     # The detail writer is still closed, so this immediate display seed
     # cannot overwrite the durable recovery authority.
-    publish("MONITOR", copy.deepcopy(detail))
+    publish(CLOCKS_TOPIC, copy.deepcopy(detail))
 
 
 def _request_teensy_monitor_restore(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -2464,12 +2466,12 @@ def on_clocks_monitor(payload: Optional[dict]) -> None:
 
 
 def on_monitor_fragment(payload: Optional[dict]) -> None:
-    """Decorate one Teensy MONITOR_FRAGMENT and rebroadcast it as MONITOR."""
+    """Decorate one Teensy CLOCKS_FRAGMENT and rebroadcast it as CLOCKS."""
     global SYSTEM
     global _LATEST_MONITOR_RECEIVED_MONOTONIC
 
     if not isinstance(payload, dict):
-        logging.warning("[system] ignoring malformed MONITOR_FRAGMENT: %r", payload)
+        logging.warning("[system] ignoring malformed CLOCKS_FRAGMENT: %r", payload)
         return
 
     fragment = dict(payload)
@@ -2532,7 +2534,7 @@ def on_monitor_fragment(payload: Optional[dict]) -> None:
         SYSTEM = dict(monitor)
         _LATEST_MONITOR_RECEIVED_MONOTONIC = time.monotonic()
 
-    publish("MONITOR", monitor)
+    publish(CLOCKS_TOPIC, monitor)
     _queue_campaign_detail(monitor)
 
 
@@ -2688,7 +2690,7 @@ def run() -> None:
             subsystem="SYSTEM",
             commands=COMMANDS,
             subscriptions={
-                "MONITOR_FRAGMENT": on_monitor_fragment,
+                CLOCKS_FRAGMENT_TOPIC: on_monitor_fragment,
                 GNSS_ANNOUNCEMENT_TOPIC: on_gnss_announcement,
                 CLOCKS_MONITOR_TOPIC: on_clocks_monitor,
             },

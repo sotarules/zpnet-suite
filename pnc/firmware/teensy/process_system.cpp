@@ -32,7 +32,7 @@
 
 static constexpr uint64_t FLASH_DELAY_NS = 5000000000ULL;  // 5 seconds
 
-// A rejected MONITOR_FRAGMENT remains in exact typed-snapshot custody and is
+// A rejected CLOCKS_FRAGMENT remains in exact typed-snapshot custody and is
 // retried after a short foreground delay. The delay gives USB/Transport time
 // to retire outstanding wire images without turning an admission failure into
 // a busy ALAP serialization loop.
@@ -141,11 +141,11 @@ static uint32_t g_system_feature_handler_reject_count = 0;
 static uint32_t g_system_feature_handler_last_ipsr = 0;
 
 // --------------------------------------------------------------
-// PPS-aligned MONITOR_FRAGMENT publication custody
+// PPS-aligned CLOCKS_FRAGMENT publication custody
 // --------------------------------------------------------------
 // process_interrupt contributes only the completed PPS/VCLOCK sequence. SYSTEM
 // later takes one typed CLOCKS snapshot in foreground ALAP service and authors the
-// complete MONITOR_FRAGMENT, including optional campaign facts. The former CLOCKS
+// complete CLOCKS_FRAGMENT, including optional campaign facts. The former CLOCKS
 // campaign-side tick remains as a compatibility entry point but is ignored after
 // the always-on interrupt owner is observed.
 static volatile uint32_t g_system_monitor_pending_sequence = 0U;
@@ -3354,7 +3354,7 @@ static FLASHMEM Payload cmd_payload_info(const Payload& /*args*/) {
 
 
 // ============================================================================
-// MONITOR_FRAGMENT — canonical Teensy observation
+// CLOCKS_FRAGMENT — canonical Teensy observation
 // ============================================================================
 //
 // SYSTEM owns the complete wire shape consumed by Dashboard/Metrics and Pi CLOCKS.
@@ -3519,7 +3519,7 @@ static Payload system_monitor_payload_payload(void) {
 // ============================================================================
 //
 // CLOCKS supplies immutable domain facts. These helpers are the sole authority
-// for the CLOCKS and campaign_row shapes carried by MONITOR_FRAGMENT.
+// for the CLOCKS and campaign_row shapes carried by CLOCKS_FRAGMENT.
 
 static constexpr uint64_t SYSTEM_MONITOR_NS_PER_SECOND = 1000000000ULL;
 static constexpr uint32_t SYSTEM_MONITOR_INTERVAL_MIN_CYCLES = 900000000UL;
@@ -4383,8 +4383,8 @@ static void system_monitor_publish_service(timepop_ctx_t*,
   // so its first complete attempt uses the normal publication path.
   const bool publication_enqueued =
       retrying_snapshot && g_system_monitor_retry_pi_only
-          ? publish_to_pi("MONITOR_FRAGMENT", fragment)
-          : publish("MONITOR_FRAGMENT", fragment);
+          ? publish_to_pi("CLOCKS_FRAGMENT", fragment)
+          : publish("CLOCKS_FRAGMENT", fragment);
   fragment.clear();
 
   if (!publication_enqueued) {

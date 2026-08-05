@@ -114,7 +114,7 @@ uint64_t recover_ocxo2_ns = 0;
 
 // Beta owns campaign/science adjudication and freezes at most one typed completed
 // observation for SYSTEM. It does not construct a transport payload or know the
-// MONITOR_FRAGMENT wire schema. SYSTEM consumes this handoff and owns serialization.
+// CLOCKS_FRAGMENT wire schema. SYSTEM consumes this handoff and owns serialization.
 
 // Alpha-authored physical PPS witness DWT audit surface. These facts enter the
 // typed handoff so SYSTEM can expose physical PPS-to-PPS DWT intervals beside the
@@ -685,7 +685,7 @@ static void monitor_campaign_record_ready_retry_arm(void) {
 // Command-report construction is a serialized foreground service. Priority-0
 // capture remains live, but the priority-16 TimePop/handoff tier may not enter a
 // second Payload-building path while a report owns the allocator/formatting
-// surface. The typed MONITOR handoff uses separate RAM2 state and never enters
+// surface. The typed CLOCKS handoff uses separate RAM2 state and never enters
 // the command-report Payload arena.
 static constexpr uint32_t CLOCKS_REPORT_BASEPRI_GUARD = 16U;
 static volatile bool g_clocks_report_build_active = false;
@@ -705,7 +705,7 @@ static Payload g_report_child_maturity DMAMEM;
 static Payload g_report_child_admission DMAMEM;
 static Payload g_report_child_dac DMAMEM;
 
-// Dedicated MONITOR snapshot scratch. The 1 Hz side rail never borrows command
+// Dedicated CLOCKS snapshot scratch. The 1 Hz side rail never borrows command
 // report Payload headers and never constructs transport objects inside CLOCKS.
 static clocks_instrument_stats_snapshot_t
     g_beta_monitor_instrument_stats DMAMEM = {};
@@ -735,7 +735,7 @@ static FLASHMEM void clocks_monitor_dac_snapshot(
 // Durable structured recovery state
 // ============================================================================
 //
-// MONITOR and TIMEBASE carry ordinary typed state.  Floating values cross the
+// CLOCKS and TIMEBASE carry ordinary typed state.  Floating values cross the
 // Payload boundary as fixed-decimal JSON numbers; firmware never constructs,
 // stores, or accepts opaque binary recovery state.
 
@@ -1188,8 +1188,8 @@ void clocks_beta_features_init(void) {
 // ============================================================================
 //
 // Global campaign-readiness policy is evaluated once by Pi CLOCKS from a fresh
-// unified MONITOR.features heartbeat before it sends CLOCKS.START.  Teensy
-// CLOCKS must not subscribe to MONITOR (which would echo its own state back
+// unified CLOCKS.features heartbeat before it sends CLOCKS.START.  Teensy
+// CLOCKS must not subscribe to CLOCKS (which would echo its own state back
 // through the Pi) or to a feature-only side feed.  Receipt of CLOCKS.START is
 // therefore the global-policy authorization boundary.
 //
@@ -1197,7 +1197,7 @@ void clocks_beta_features_init(void) {
 // command/state validation, numeric integrity, DAC realization, SmartZero,
 // private PPS0 acquisition, CounterLedger/PhaseLedger maturity, watchdog
 // custody, and the release of public PPS1.  Those courts remain authoritative
-// and cannot be bypassed by MONITOR.
+// and cannot be bypassed by CLOCKS.
 //
 
 static FLASHMEM const char* campaign_record_stage_name(uint32_t stage) {
@@ -4883,7 +4883,7 @@ static FLASHMEM void prediction_snapshot_for_clock(
 
 
 // ============================================================================
-// Command-report statistics serializers and typed MONITOR snapshots
+// Command-report statistics serializers and typed CLOCKS snapshots
 // ============================================================================
 //
 // SYSTEM serializes the compact campaign row from the typed handoff.
@@ -4910,7 +4910,7 @@ static double campaign_total_ppb_from_tau(double tau) {
 
 // Report-only serializer: every child Payload header lives in RAM2 and is reused.
 // It is called only while clocks_report_build_guard_t excludes priority-16
-// TimePop/handoff entry. Typed MONITOR snapshots use independent RAM2 state.
+// TimePop/handoff entry. Typed CLOCKS snapshots use independent RAM2 state.
 static FLASHMEM void report_add_welford_object(Payload& parent,
                                                const char* key,
                                                const welford_t& w) {
@@ -8744,7 +8744,7 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
 
   // Freeze one immutable completed campaign record for SYSTEM.  Beta owns the
   // lifecycle/science verdicts and values; SYSTEM alone decides how those facts
-  // are named and nested in MONITOR_FRAGMENT.
+  // are named and nested in CLOCKS_FRAGMENT.
   g_campaign_record_last_public_count = public_count;
   g_campaign_record_last_public_gnss_ns = public_gnss_ns;
   g_campaign_record_last_public_dwt_total = public_dwt_total;

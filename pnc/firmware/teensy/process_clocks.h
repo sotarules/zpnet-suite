@@ -20,7 +20,7 @@
 //   • Deferred 1 Hz completed-row handoff after both post-PPS OCXO edges complete
 //   • Serialized command reporting: Priority 0 capture remains live while the
 //     Priority 16 TimePop/handoff tier is excluded from re-entering command
-//     report construction; SYSTEM independently owns MONITOR_FRAGMENT formatting
+//     report construction; SYSTEM independently owns CLOCKS_FRAGMENT formatting
 //   • Continuous DWT-to-GNSS calibration (campaign-independent)
 //   • Static PPS/GPIO-based one-second prediction audit for VCLOCK and OCXO lanes
 //   • VCLOCK heartbeat and OCXO one-second compare consumption as observed
@@ -125,7 +125,7 @@ void process_clocks_register(void);
 // -----------------------------------------------------------------------------
 //
 // There is no runtime science/forensic mode. Every completed PPS second is
-// preserved for MONITOR/TIMEBASE. Any layer may object while it still owns the
+// preserved for CLOCKS/TIMEBASE. Any layer may object while it still owns the
 // evidence needed to adjudicate the second. A pending objection excludes the
 // whole PPS second from Welford, TAU/PPB, servo, and DAC-control math, but does
 // not suppress publication or PostgreSQL persistence.
@@ -309,11 +309,11 @@ bool clocks_alpha_tau_snapshot(time_clock_id_t clock,
 
 
 // -----------------------------------------------------------------------------
-// Typed CLOCKS -> SYSTEM MONITOR handoff
+// Typed CLOCKS -> SYSTEM CLOCKS_FRAGMENT handoff
 // -----------------------------------------------------------------------------
 //
 // CLOCKS owns measurement, campaign lifecycle, and scientific verdicts. SYSTEM
-// owns the complete MONITOR_FRAGMENT wire schema. The structures below contain
+// owns the complete CLOCKS_FRAGMENT wire schema. The structures below contain
 // immutable domain facts only: no Payload objects, field names, or nested
 // serialized fragments cross the subsystem boundary.
 //
@@ -344,7 +344,7 @@ struct clocks_monitor_welford_snapshot_t {
   double max = 0.0;
 };
 
-// Complete Alpha TAU estimator state.  MONITOR persists this verbatim so the
+// Complete Alpha TAU estimator state.  CLOCKS persists this verbatim so the
 // Pi can restore the instrument after a non-campaign reboot without reducing a
 // mature slope estimator to its displayed tau/ppb result.  Seqlock state and
 // other transient writer custody are intentionally excluded.
