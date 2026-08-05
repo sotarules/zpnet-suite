@@ -169,6 +169,7 @@ static bool g_system_monitor_retry_snapshot_valid = false;
 static bool g_system_monitor_retry_pi_only = false;
 static uint32_t g_system_monitor_retry_sequence = 0U;
 static uint32_t g_system_monitor_retry_attempt_count = 0U;
+static uint32_t g_system_monitor_retry_tick_hold_count = 0U;
 static bool g_system_monitor_interrupt_owner_seen = false;
 static bool g_system_monitor_last_tick_valid = false;
 static uint32_t g_system_monitor_last_tick_sequence = 0U;
@@ -4359,6 +4360,8 @@ static void system_monitor_publish_service(timepop_ctx_t*,
   fragment.add("monitor_retrying_campaign_row", retrying_campaign_row);
   fragment.add("monitor_retry_attempt_count",
                g_system_monitor_retry_attempt_count);
+  fragment.add("monitor_retry_tick_hold_count",
+               g_system_monitor_retry_tick_hold_count);
 
   // A transport retry is Pi-only because the original full publish may already
   // have reached local subscribers. An embed retry has never published at all,
@@ -4468,6 +4471,22 @@ static void system_monitor_accept_tick(uint32_t completed_second_sequence) {
   }
   g_system_monitor_last_tick_sequence = completed_second_sequence;
   g_system_monitor_last_tick_valid = true;
+
+  // A retained campaign retry already owns g_system_monitor_clocks_snapshot.
+  // While that exact row remains in transport custody, a newer physical tick
+  // must not replace the pending sequence selected by Beta's next immutable
+  // campaign row. Doing so creates a permanent head-of-line mismatch: Beta
+  // keeps the older row while SYSTEM repeatedly asks for the newest tick.
+  //
+  // The physical tick still drives retry progress. Once the retained row is
+  // accepted, any campaign_row_ready() received during the retry remains in
+  // g_system_monitor_pending_sequence and is published next.
+  if (g_system_monitor_retry_snapshot_valid) {
+    g_system_monitor_retry_tick_hold_count++;
+    system_monitor_schedule_publish();
+    return;
+  }
+
   if (g_system_monitor_pending) g_system_monitor_coalesce_count++;
   g_system_monitor_pending_sequence = completed_second_sequence;
   g_system_monitor_pending = true;

@@ -1,5 +1,5 @@
 """
-ZPNet Metrics Readout Blocks — Dense Clocks Panel
+ZPNet Metrics Readout Blocks — Generalized Campaign Detail Edition
 
 Data source:
   The unified MONITOR heartbeat owns the live operator view.  Clock science is
@@ -84,7 +84,7 @@ FEATURE_STATUS_GRID = (
     ("ALPHA_EPOCH", "TEENSY.CLOCKS.ALPHA_EPOCH"),
     ("OCXO_ORIGIN", "TEENSY.CLOCKS.OCXO_PUBLIC_ORIGIN"),
     ("SCI_RES", "TEENSY.CLOCKS.SCIENCE_RESIDUALS"),
-    ("TB_PUB", "TEENSY.CLOCKS.TIMEBASE_PUBLICATION"),
+    ("TEMP_PUB", "TEENSY.CLOCKS.TIMEBASE_PUBLICATION"),
     ("ENV", "PI.SYSTEM.ENVIRONMENT"),
     ("SENSORS", "PI.SYSTEM.SENSORS"),
 )
@@ -1366,86 +1366,108 @@ def _dwt_expected_cycles(r: dict):
 # ---------------------------------------------------------------------
 
 def _get_campaign_rows() -> list[dict]:
-    """Return OCXO campaign ledger rows, newest first.
+    """Return typed TEMPEST campaign masters with their newest detail, newest first.
 
-    ``campaigns.payload.report`` is the latest accepted TIMEBASE dossier for the
-    campaign.  PI CLOCKS refreshes that report on every accepted row, so the
-    active campaign remains live and stopped campaigns retain their final
-    clockface, PPB windows, residual, and TOTAL Welford population.
+    ``campaign_master`` owns campaign identity and lifecycle.  The newest
+    ``campaign_detail`` row of type TEMPEST owns the displayed scientific
+    dossier.  A newly started campaign may legitimately have no detail yet;
+    it remains visible with empty science columns until row one is persisted.
     """
     with open_db(row_dict=True) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 SELECT
-                    id,
-                    ts,
-                    campaign,
-                    active,
+                    master.id,
+                    master.ts,
+                    master.campaign_type,
+                    master.campaign,
+                    master.active,
+                    detail.id AS detail_id,
+                    detail.ts AS detail_ts,
+                    detail.viable,
+                    detail.sequence,
+                    detail.pps_count,
 
-                    payload::jsonb #>> '{report,fragment,ocxo1,ns}'
+                    detail.payload #>> '{fragment,ocxo1,ns}'
                         AS ocxo1_ns,
-                    payload::jsonb #>> '{report,fragment,stats,ocxo1,ppb_buckets,10_min}'
+                    detail.payload #>> '{fragment,stats,ocxo1,ppb_buckets,10_min}'
                         AS ocxo1_ppb_10_min,
-                    payload::jsonb #>> '{report,fragment,stats,ocxo1,ppb_buckets,60_min}'
+                    detail.payload #>> '{fragment,stats,ocxo1,ppb_buckets,60_min}'
                         AS ocxo1_ppb_60_min,
-                    payload::jsonb #>> '{report,fragment,stats,ocxo1,ppb_buckets,8_hour}'
+                    detail.payload #>> '{fragment,stats,ocxo1,ppb_buckets,8_hour}'
                         AS ocxo1_ppb_8_hour,
-                    payload::jsonb #>> '{report,fragment,stats,ocxo1,ppb_buckets,24_hour}'
+                    detail.payload #>> '{fragment,stats,ocxo1,ppb_buckets,24_hour}'
                         AS ocxo1_ppb_24_hour,
                     COALESCE(
-                        payload::jsonb #>> '{report,fragment,stats,ocxo1,ppb_buckets,total}',
-                        payload::jsonb #>> '{report,fragment,stats,ocxo1,ppb}'
+                        detail.payload #>> '{fragment,stats,ocxo1,ppb_buckets,total}',
+                        detail.payload #>> '{fragment,stats,ocxo1,ppb}'
                     ) AS ocxo1_ppb_total,
                     COALESCE(
-                        payload::jsonb #>> '{report,fragment,stats,ocxo1,ppb_buckets,campaign}',
-                        payload::jsonb #>> '{report,fragment,ocxo1,science,total_ppb}'
+                        detail.payload #>> '{fragment,stats,ocxo1,ppb_buckets,campaign}',
+                        detail.payload #>> '{fragment,ocxo1,science,total_ppb}'
                     ) AS ocxo1_ppb_campaign,
                     COALESCE(
-                        payload::jsonb #>> '{report,fragment,ocxo1,pps_residual,fast_residual_ns}',
-                        payload::jsonb #>> '{report,fragment,ocxo1,science,fast_residual_ns}'
+                        detail.payload #>> '{fragment,ocxo1,pps_residual,fast_residual_ns}',
+                        detail.payload #>> '{fragment,ocxo1,science,fast_residual_ns}'
                     ) AS ocxo1_residual,
-                    payload::jsonb #>> '{report,fragment,stats,ocxo1,welford,mean}'
+                    detail.payload #>> '{fragment,stats,ocxo1,welford,mean}'
                         AS ocxo1_mean,
-                    payload::jsonb #>> '{report,fragment,stats,ocxo1,welford,stddev}'
+                    detail.payload #>> '{fragment,stats,ocxo1,welford,stddev}'
                         AS ocxo1_stddev,
-                    payload::jsonb #>> '{report,fragment,stats,ocxo1,welford,stderr}'
+                    detail.payload #>> '{fragment,stats,ocxo1,welford,stderr}'
                         AS ocxo1_stderr,
-                    payload::jsonb #>> '{report,fragment,stats,ocxo1,welford,n}'
+                    detail.payload #>> '{fragment,stats,ocxo1,welford,n}'
                         AS ocxo1_n,
 
-                    payload::jsonb #>> '{report,fragment,ocxo2,ns}'
+                    detail.payload #>> '{fragment,ocxo2,ns}'
                         AS ocxo2_ns,
-                    payload::jsonb #>> '{report,fragment,stats,ocxo2,ppb_buckets,10_min}'
+                    detail.payload #>> '{fragment,stats,ocxo2,ppb_buckets,10_min}'
                         AS ocxo2_ppb_10_min,
-                    payload::jsonb #>> '{report,fragment,stats,ocxo2,ppb_buckets,60_min}'
+                    detail.payload #>> '{fragment,stats,ocxo2,ppb_buckets,60_min}'
                         AS ocxo2_ppb_60_min,
-                    payload::jsonb #>> '{report,fragment,stats,ocxo2,ppb_buckets,8_hour}'
+                    detail.payload #>> '{fragment,stats,ocxo2,ppb_buckets,8_hour}'
                         AS ocxo2_ppb_8_hour,
-                    payload::jsonb #>> '{report,fragment,stats,ocxo2,ppb_buckets,24_hour}'
+                    detail.payload #>> '{fragment,stats,ocxo2,ppb_buckets,24_hour}'
                         AS ocxo2_ppb_24_hour,
                     COALESCE(
-                        payload::jsonb #>> '{report,fragment,stats,ocxo2,ppb_buckets,total}',
-                        payload::jsonb #>> '{report,fragment,stats,ocxo2,ppb}'
+                        detail.payload #>> '{fragment,stats,ocxo2,ppb_buckets,total}',
+                        detail.payload #>> '{fragment,stats,ocxo2,ppb}'
                     ) AS ocxo2_ppb_total,
                     COALESCE(
-                        payload::jsonb #>> '{report,fragment,stats,ocxo2,ppb_buckets,campaign}',
-                        payload::jsonb #>> '{report,fragment,ocxo2,science,total_ppb}'
+                        detail.payload #>> '{fragment,stats,ocxo2,ppb_buckets,campaign}',
+                        detail.payload #>> '{fragment,ocxo2,science,total_ppb}'
                     ) AS ocxo2_ppb_campaign,
                     COALESCE(
-                        payload::jsonb #>> '{report,fragment,ocxo2,pps_residual,fast_residual_ns}',
-                        payload::jsonb #>> '{report,fragment,ocxo2,science,fast_residual_ns}'
+                        detail.payload #>> '{fragment,ocxo2,pps_residual,fast_residual_ns}',
+                        detail.payload #>> '{fragment,ocxo2,science,fast_residual_ns}'
                     ) AS ocxo2_residual,
-                    payload::jsonb #>> '{report,fragment,stats,ocxo2,welford,mean}'
+                    detail.payload #>> '{fragment,stats,ocxo2,welford,mean}'
                         AS ocxo2_mean,
-                    payload::jsonb #>> '{report,fragment,stats,ocxo2,welford,stddev}'
+                    detail.payload #>> '{fragment,stats,ocxo2,welford,stddev}'
                         AS ocxo2_stddev,
-                    payload::jsonb #>> '{report,fragment,stats,ocxo2,welford,stderr}'
+                    detail.payload #>> '{fragment,stats,ocxo2,welford,stderr}'
                         AS ocxo2_stderr,
-                    payload::jsonb #>> '{report,fragment,stats,ocxo2,welford,n}'
+                    detail.payload #>> '{fragment,stats,ocxo2,welford,n}'
                         AS ocxo2_n
-                FROM campaigns
-                ORDER BY ts DESC, id DESC
+                FROM campaign_master AS master
+                LEFT JOIN LATERAL (
+                    SELECT
+                        id,
+                        ts,
+                        viable,
+                        sequence,
+                        pps_count,
+                        payload
+                    FROM campaign_detail
+                    WHERE campaign_type = master.campaign_type
+                      AND campaign = master.campaign
+                      AND detail_type = 'TEMPEST'
+                    ORDER BY id DESC
+                    LIMIT 1
+                ) AS detail ON true
+                WHERE master.campaign_type = 'TEMPEST'
+                ORDER BY master.ts DESC, master.id DESC
                 """
             )
             return list(cur.fetchall())
@@ -1505,8 +1527,13 @@ def campaigns_readout() -> list[str]:
         return lines
 
     for row_index, row in enumerate(rows):
+        campaign_name = str(row.get("campaign") or "?")
+        if row.get("detail_id") is None:
+            campaign_name += " [WAIT]"
+        elif row.get("viable") is False:
+            campaign_name += " [X]"
         campaign_cell = _campaign_cell(
-            str(row.get("campaign") or "?"),
+            campaign_name,
             bool(row.get("active")),
             W_CAMPAIGN,
         )

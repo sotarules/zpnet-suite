@@ -1,20 +1,20 @@
 """
-ZPNet CLOCKS Process — MONITOR_FRAGMENT Campaign Ingress + TIMEBASE Authority (Pi-side)
+ZPNet CLOCKS Process — MONITOR_FRAGMENT TEMPEST Ingress + Generalized Campaign Persistence (Pi-side)
 
 Core contract:
 
-  CLOCKS is a traffic cop and final TIMEBASE arbiter. It owns no Teensy
-  clock state. It receives the always-on MONITOR_FRAGMENT stream from the
-  Teensy. During a campaign, MONITOR_FRAGMENT carries an optional campaign_row
+  CLOCKS is the final TEMPEST candidate arbiter. It owns no Teensy clock
+  state. It receives the always-on MONITOR_FRAGMENT stream from the Teensy.
+  During a TEMPEST campaign, MONITOR_FRAGMENT carries an optional campaign_row
   whose TIMEBASE_FRAGMENT_V7 body carries observation plus mode-free eligibility;
   older fragment versions may also contain embedded forensics. CLOCKS decorates
   the accepted candidate with Pi-owned environment, GF-8802, GNSS_RAW, and
-  system-time evidence, then persists the immutable TIMEBASE row.
+  system-time evidence, then persists an immutable typed TEMPEST campaign detail.
 
   There is no standalone TIMEBASE_FORENSICS subscription in this process and
-  no two-topic pair join. The durable split between ``fragment`` and
-  ``forensics`` is a PostgreSQL compatibility shape reconstructed from the
-  single Teensy message.
+  no two-topic pair join. The TEMPEST detail payload retains the ``fragment``
+  and ``forensics`` evidence surfaces reconstructed from the single Teensy
+  message.
 
   Architecture:
     • Teensy owns: PPS/VCLOCK identity, GNSS/VCLOCK ns, DWT cycles,
@@ -28,14 +28,14 @@ Core contract:
 
     START is asynchronous. The Pi creates/activates the campaign, sends the
     Teensy START command, and returns. The first public campaign row arrives
-    later through the normal MONITOR_FRAGMENT processor and becomes TIMEBASE
-    only after Pi adjudication. Firmware may privately
+    later through the normal MONITOR_FRAGMENT processor and becomes a typed
+    TEMPEST campaign detail only after Pi adjudication. Firmware may privately
     acquire a lawful PPS0/start-prologue bookend before public PPS1; the Pi does
     not model those private candidates as skipped campaign rows.
 
   RECOVER behavior:
 
-    RECOVER uses the last durable TIMEBASE row as the public base, sends a
+    RECOVER uses the last durable TEMPEST campaign detail as the public base, sends a
     recover command to the Teensy, waits for the first Pi-accepted public row,
     and restores Pi-owned GNSS_RAW/Welford state immediately before that row is
     persisted. Timeline rows may be admitted while OCXO science is explicitly
@@ -47,18 +47,18 @@ Responsibilities:
   * Adjudicate each candidate: persist coherent audit rows and recover on structural loss.
   * Subscribe to predictive GF-8802 announcements and bind them to PPS-aligned rows.
   * Augment accepted rows with environment, GNSS_RAW, and system time.
-  * Publish and persist TIMEBASE rows.
-  * Denormalize the latest accepted TIMEBASE row into the active campaign.
+  * Publish the live TIMEBASE topic and persist typed TEMPEST campaign details.
+  * Denormalize the latest accepted TEMPEST detail into the active campaign master.
   * Recover clocks after restart if a campaign is active.
   * Subscribe to WATCHDOG_ANOMALY and initiate Pi-side campaign recovery.
   * Flash-cut to a new campaign while preserving the hot Teensy stream.
 
 Semantics:
   * No Pi-side smoothing, inference, or repair of Teensy clock state.
-  * TIMEBASE records are immutable.
+  * Persisted TEMPEST campaign details are immutable.
   * Gaps, jumps, regressions, and science exclusions are recorded as evidence.
   * WATCHDOG_ANOMALY is an explicit Teensy continuity surrender and starts
-    Pi-side recovery from the latest canonical TIMEBASE row.
+    Pi-side recovery from the latest canonical TEMPEST campaign detail.
 """
 
 from __future__ import annotations
@@ -93,6 +93,9 @@ from zpnet.shared.events import create_event
 # ---------------------------------------------------------------------
 
 NS_PER_SECOND = 1_000_000_000
+
+CAMPAIGN_TYPE_TEMPEST = "TEMPEST"
+CAMPAIGN_DETAIL_TYPE_TEMPEST = "TEMPEST"
 
 # Teensy DWT conversion constants mirror pnc/firmware/teensy/config.h.
 # RECOVER still accepts a dwt_ns command argument, but current
@@ -238,9 +241,9 @@ PREFLIGHT_QUIET_GRACE_S = 15.0
 PREFLIGHT_STATUS_LOG_INTERVAL_S = 30.0
 PREFLIGHT_LOG_PREFIX = "🛡️ [preflight]"
 STARTUP_TEENSY_QUIET_DELAY_S = 20.0
-SYSTEM_MONITOR_RECOVERY_WAIT_TIMEOUT_S = 120.0
-SYSTEM_MONITOR_RECOVERY_POLL_S = 1.0
-SYSTEM_MONITOR_RECOVERY_LOG_INTERVAL_S = 10.0
+SYSTEM_CAMPAIGN_DETAIL_RECOVERY_WAIT_TIMEOUT_S = 120.0
+SYSTEM_CAMPAIGN_DETAIL_RECOVERY_POLL_S = 1.0
+SYSTEM_CAMPAIGN_DETAIL_RECOVERY_LOG_INTERVAL_S = 10.0
 TIMEBASE_SILENCE_TIMEOUT_S = 30.0
 TIMEBASE_SILENCE_MONITOR_POLL_S = 1.0
 TEENSY_HEALTH_RETRY_S = 60.0
@@ -1105,18 +1108,25 @@ def _mark_flash_cut_committed_if_needed(*, campaign: str, pps_vclock_count: int)
             cur = conn.cursor()
             cur.execute(
                 """
-                UPDATE campaigns
+                UPDATE campaign_master
                 SET payload = (payload - 'flash_cut_pending')
                     || jsonb_build_object(
                         'flash_cut_committed_at', to_jsonb(%s::text),
                         'flash_cut_first_pps_vclock_count', to_jsonb(%s::int),
                         'flash_cut_first_pps_count', to_jsonb(%s::int)
                     )
-                WHERE campaign = %s
+                WHERE campaign_type = %s
+                  AND campaign = %s
                   AND active = true
                   AND payload ? 'flash_cut_pending'
                 """,
-                (now_utc, int(pps_vclock_count), int(pps_vclock_count), campaign),
+                (
+                    now_utc,
+                    int(pps_vclock_count),
+                    int(pps_vclock_count),
+                    CAMPAIGN_TYPE_TEMPEST,
+                    campaign,
+                ),
             )
     except Exception:
         logging.exception("⚠️ [clocks] failed to clear flash_cut_pending marker (ignored)")
@@ -1173,7 +1183,7 @@ def _reattach_pending_flash_cut_without_recovery(
     pending_age_s = _flash_cut_pending_age_s(campaign_payload)
     if pending_age_s is not None and pending_age_s >= FLASH_CUT_FIRST_FRAGMENT_TIMEOUT_S:
         logging.error(
-            "💥 [recovery] pending Flash Cut campaign '%s' has no TIMEBASE rows after %.3fs "
+            "💥 [recovery] pending Flash Cut campaign '%s' has no TEMPEST campaign details after %.3fs "
             "(timeout=%.3fs); allowing cold recovery",
             campaign_name, float(pending_age_s), float(FLASH_CUT_FIRST_FRAGMENT_TIMEOUT_S),
         )
@@ -1201,7 +1211,7 @@ def _reattach_pending_flash_cut_without_recovery(
     _arm_timebase_silence_watch("FLASH_CUT_REATTACH")
 
     logging.info(
-        "⚡ [recovery] campaign '%s' has no TIMEBASE rows but is a pending Flash Cut child; "
+        "⚡ [recovery] campaign '%s' has no TEMPEST campaign details but is a pending Flash Cut child; "
         "reattaching to the hot Teensy stream instead of issuing STOP/START",
         campaign_name,
     )
@@ -1618,17 +1628,19 @@ def _note_pps_vclock_count(teensy_pps_vclock_count: int) -> None:
 
 
 def _get_active_campaign() -> Optional[Dict[str, Any]]:
-    """Return active campaign row or None."""
+    """Return the active TEMPEST campaign master row, or None."""
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT campaign, payload
-            FROM campaigns
-            WHERE active = true
+            SELECT campaign_type, campaign, payload
+            FROM campaign_master
+            WHERE campaign_type = %s
+              AND active = true
             ORDER BY ts DESC
             LIMIT 1
-            """
+            """,
+            (CAMPAIGN_TYPE_TEMPEST,),
         )
         row = cur.fetchone()
 
@@ -1639,7 +1651,12 @@ def _get_active_campaign() -> Optional[Dict[str, Any]]:
     if isinstance(payload, str):
         payload = json.loads(payload)
 
-    return {"campaign": row["campaign"], "payload": payload}
+    return {
+        "campaign_type": row["campaign_type"],
+        "campaign": row["campaign"],
+        "payload": payload,
+    }
+
 
 
 def _get_system_config() -> Dict[str, Any]:
@@ -1938,41 +1955,53 @@ def _restore_gnss_raw_payload(gnss_raw: Dict[str, Any]) -> Dict[str, Any]:
 
 
 
-def _persist_timebase(tb: Dict[str, Any]) -> None:
-    """Append TIMEBASE row and denormalize as active campaign report."""
+def _persist_tempest_detail(detail: Dict[str, Any]) -> None:
+    """Append one typed TEMPEST detail and denormalize the active campaign report."""
     try:
-        # Persist the canonical Teensy-authored PPS/VCLOCK identity as a scalar
-        # column beside the immutable JSONB evidence.  The final court has already
-        # required this top-level field and verified that it agrees with the
-        # fragment identity (and legacy forensics identity when present).
         pps_count = _extract_teensy_pps_vclock_count(
-            tb,
-            topic="TIMEBASE persistence",
+            detail,
+            topic="TEMPEST detail persistence",
         )
+        viable = bool(detail.get("science_eligible"))
 
-        report = dict(tb)
+        report = dict(detail)
+        report["campaign_type"] = CAMPAIGN_TYPE_TEMPEST
+        report["detail_type"] = CAMPAIGN_DETAIL_TYPE_TEMPEST
         report["campaign_state"] = "STARTED"
 
         with open_db() as conn:
             cur = conn.cursor()
             cur.execute(
                 """
-                INSERT INTO timebase (campaign, payload, pps_count)
-                VALUES (%s, %s, %s)
+                INSERT INTO campaign_detail
+                    (detail_type, campaign_type, campaign, viable,
+                     payload, sequence, pps_count)
+                VALUES
+                    (%s, %s, %s, %s, %s::jsonb, %s, %s)
                 """,
-                (tb["campaign"], json.dumps(tb), int(pps_count)),
+                (
+                    CAMPAIGN_DETAIL_TYPE_TEMPEST,
+                    CAMPAIGN_TYPE_TEMPEST,
+                    detail["campaign"],
+                    viable,
+                    json.dumps(report),
+                    int(pps_count),
+                    int(pps_count),
+                ),
             )
             cur.execute(
                 """
-                UPDATE campaigns
+                UPDATE campaign_master
                 SET payload = payload || jsonb_build_object('report', %s::jsonb)
-                WHERE campaign = %s
+                WHERE campaign_type = %s
+                  AND campaign = %s
                   AND active = true
                 """,
-                (json.dumps(report), tb["campaign"]),
+                (json.dumps(report), CAMPAIGN_TYPE_TEMPEST, detail["campaign"]),
             )
     except Exception:
-        logging.exception("⚠️ [clocks] failed to persist TIMEBASE (ignored)")
+        logging.exception("⚠️ [clocks] failed to persist TEMPEST campaign detail (ignored)")
+
 
 
 
@@ -2458,6 +2487,7 @@ def _publish_clocks_monitor() -> None:
         "campaign_active": bool(_campaign_active),
         "campaign_present": bool(_campaign_active),
         "campaign_state": "STARTED" if _campaign_active else "STOPPED",
+        "campaign_type": CAMPAIGN_TYPE_TEMPEST if _campaign_active else None,
         "campaign": _start_requested_campaign if _campaign_active else None,
         "campaign_elapsed": _seconds_to_hms(campaign_seconds),
         "complete_for_display": True,
@@ -4422,56 +4452,62 @@ def _recovery_timebase_snapshot(tb: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _load_last_recoverable_timebase(
+def _load_last_recoverable_tempest_detail(
     campaign_name: str,
     *,
     scan_limit: int = 64,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], int]:
-    """Return the newest TIMEBASE row usable as a warm-recovery base.
+    """Return the newest TEMPEST detail usable as a warm-recovery base.
 
-    The final court protects future rows, but older campaigns may already
-    contain recovery-poison rows with zero OCXO ledgers.  Warm recovery must not
-    project from those zeros.  Scan backward to the newest row whose GNSS, DWT,
-    OCXO1, and OCXO2 ledgers are all nonzero; if none exists, return the newest
-    row so the caller can fail loudly with full diagnostics.
+    The final court protects future rows, but older campaign details may already
+    contain recovery-poison rows with zero OCXO ledgers. Scan backward to the
+    newest recoverable detail; if none exists, return the newest parseable detail
+    so the caller can fail loudly with complete diagnostics.
     """
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
         cur.execute(
             """
             SELECT payload
-            FROM timebase
-            WHERE campaign = %s
-            ORDER BY ts DESC
+            FROM campaign_detail
+            WHERE detail_type = %s
+              AND campaign_type = %s
+              AND campaign = %s
+            ORDER BY id DESC
             LIMIT %s
             """,
-            (campaign_name, int(scan_limit)),
+            (
+                CAMPAIGN_DETAIL_TYPE_TEMPEST,
+                CAMPAIGN_TYPE_TEMPEST,
+                campaign_name,
+                int(scan_limit),
+            ),
         )
         rows = cur.fetchall()
 
     if not rows:
-        raise LookupError("missing_timebase")
+        raise LookupError("missing_tempest_detail")
 
-    newest_tb: Optional[Dict[str, Any]] = None
+    newest_detail: Optional[Dict[str, Any]] = None
     newest_snapshot: Optional[Dict[str, Any]] = None
     newest_error: Optional[str] = None
 
     for skipped, row in enumerate(rows):
-        tb = row["payload"]
-        if isinstance(tb, str):
-            tb = json.loads(tb)
-        if not isinstance(tb, dict):
+        detail = row["payload"]
+        if isinstance(detail, str):
+            detail = json.loads(detail)
+        if not isinstance(detail, dict):
             continue
 
         try:
-            snapshot = _recovery_timebase_snapshot(tb)
+            snapshot = _recovery_timebase_snapshot(detail)
         except Exception as e:
             if newest_error is None:
                 newest_error = str(e)
             continue
 
-        if newest_tb is None:
-            newest_tb = tb
+        if newest_detail is None:
+            newest_detail = detail
             newest_snapshot = snapshot
 
         if snapshot.get("recoverable"):
@@ -4483,17 +4519,22 @@ def _load_last_recoverable_timebase(
                     _diag.get("recovery_last_timebase_unrecoverable", 0) + int(skipped)
                 )
                 logging.warning(
-                    "⚠️ [recovery] skipped %d latest TIMEBASE row(s) with unrecoverable ledgers; "
-                    "using recoverable row at pps_vclock_count=%s",
+                    "⚠️ [recovery] skipped %d latest TEMPEST detail(s) with "
+                    "unrecoverable ledgers; using recoverable detail at "
+                    "pps_vclock_count=%s",
                     skipped,
                     snapshot.get("last_pps_vclock_count"),
                 )
-            return tb, snapshot, int(skipped)
+            return detail, snapshot, int(skipped)
 
-    if newest_tb is not None and newest_snapshot is not None:
-        return newest_tb, newest_snapshot, 0
+    if newest_detail is not None and newest_snapshot is not None:
+        return newest_detail, newest_snapshot, 0
 
-    raise RuntimeError(f"recovery failed: no parseable TIMEBASE payloads ({newest_error or 'unknown error'})")
+    raise RuntimeError(
+        "recovery failed: no parseable TEMPEST campaign details "
+        f"({newest_error or 'unknown error'})"
+    )
+
 
 
 
@@ -5418,6 +5459,8 @@ def _process_loop() -> None:
         )
         timebase = {
             "schema": "TIMEBASE_V3",
+            "campaign_type": CAMPAIGN_TYPE_TEMPEST,
+            "detail_type": CAMPAIGN_DETAIL_TYPE_TEMPEST,
             "timebase_message_version": frag.get("timebase_message_version"),
             "timebase_pair_version": frag.get("timebase_pair_version"),
             "campaign": campaign,
@@ -5476,7 +5519,7 @@ def _process_loop() -> None:
             timebase["restore_state"] = copy.deepcopy(restore_state)
 
         publish("TIMEBASE", timebase)
-        _persist_timebase(timebase)
+        _persist_tempest_detail(timebase)
 
 # ---------------------------------------------------------------------
 # Control-plane: START / STOP / CLEAR / RECOVER
@@ -5784,8 +5827,12 @@ def cmd_start(args: Optional[dict]) -> dict:
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
         cur.execute(
-            "SELECT id, active FROM campaigns WHERE campaign = %s",
-            (campaign,),
+            """
+            SELECT id, active
+            FROM campaign_master
+            WHERE campaign_type = %s AND campaign = %s
+            """,
+            (CAMPAIGN_TYPE_TEMPEST, campaign),
         )
         existing = cur.fetchone()
 
@@ -5822,6 +5869,7 @@ def cmd_start(args: Optional[dict]) -> dict:
 
     cutover_ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     campaign_payload = {
+        "campaign_type": CAMPAIGN_TYPE_TEMPEST,
         "location": location,
         "started_at": cutover_ts,
     }
@@ -5838,19 +5886,20 @@ def cmd_start(args: Optional[dict]) -> dict:
         cur = conn.cursor()
         cur.execute(
             """
-            UPDATE campaigns
+            UPDATE campaign_master
             SET active = false,
                 payload = payload || jsonb_build_object('stopped_at', to_jsonb(%s::text))
-            WHERE active = true
+            WHERE campaign_type = %s
+              AND active = true
             """,
-            (cutover_ts,),
+            (cutover_ts, CAMPAIGN_TYPE_TEMPEST),
         )
         cur.execute(
             """
-            INSERT INTO campaigns (campaign, active, payload)
-            VALUES (%s, true, %s)
+            INSERT INTO campaign_master (campaign_type, campaign, active, payload)
+            VALUES (%s, %s, true, %s)
             """,
-            (campaign, json.dumps(campaign_payload)),
+            (CAMPAIGN_TYPE_TEMPEST, campaign, json.dumps(campaign_payload)),
         )
 
     if not flash_cut:
@@ -5910,7 +5959,7 @@ def cmd_start(args: Optional[dict]) -> dict:
                 cur = conn.cursor()
                 cur.execute(
                     """
-                    UPDATE campaigns
+                    UPDATE campaign_master
                     SET active = false,
                         payload = payload || jsonb_build_object(
                             'start_failed_at', to_jsonb(%s::text),
@@ -5918,25 +5967,29 @@ def cmd_start(args: Optional[dict]) -> dict:
                             'start_failed_error', to_jsonb(%s::text),
                             'start_failed_teensy_payload', %s::jsonb
                         )
-                    WHERE campaign = %s AND active = true
+                    WHERE campaign_type = %s
+                      AND campaign = %s
+                      AND active = true
                     """,
                     (
                         failed_at,
                         str(failure_status),
                         str(failure_payload.get("error") or str(e)),
                         json.dumps(failure_payload),
+                        CAMPAIGN_TYPE_TEMPEST,
                         campaign,
                     ),
                 )
                 if flash_cut and prev_campaign:
                     cur.execute(
                         """
-                        UPDATE campaigns
+                        UPDATE campaign_master
                         SET active = true,
                             payload = payload - 'stopped_at'
-                        WHERE campaign = %s
+                        WHERE campaign_type = %s
+                          AND campaign = %s
                         """,
-                        (prev_campaign,),
+                        (CAMPAIGN_TYPE_TEMPEST, prev_campaign),
                     )
         except Exception:
             logging.exception("⚠️ [clocks] failed to roll back DB after Teensy START rejection")
@@ -5976,6 +6029,7 @@ def cmd_start(args: Optional[dict]) -> dict:
         "success": True,
         "message": "START_REQUESTED",
         "payload": {
+            "campaign_type": CAMPAIGN_TYPE_TEMPEST,
             "campaign": campaign,
             "location": location,
             "waiting_for_first_fragment": True,
@@ -6014,7 +6068,7 @@ def cmd_stop(_: Optional[dict]) -> dict:
         cur = conn.cursor()
         cur.execute(
             """
-            UPDATE campaigns
+            UPDATE campaign_master
             SET active = false,
                 payload = payload
                     || jsonb_build_object('stopped_at', to_jsonb(%s::text))
@@ -6026,9 +6080,10 @@ def cmd_stop(_: Optional[dict]) -> dict:
                         )
                         ELSE '{}'::jsonb
                        END
-            WHERE active = true
+            WHERE campaign_type = %s
+              AND active = true
             """,
-            (stopped_at,),
+            (stopped_at, CAMPAIGN_TYPE_TEMPEST),
         )
 
     _campaign_active = False
@@ -6320,6 +6375,7 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
             "success": True,
             "message": "OK",
             "payload": {
+                "campaign_type": CAMPAIGN_TYPE_TEMPEST,
                 "campaign_state": "IDLE",
                 "integrity_contract": contract,
                 "startup": _start_status_payload(),
@@ -6327,37 +6383,64 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
         }
 
     payload = dict(row["payload"])
+    payload["campaign_type"] = row["campaign_type"]
+    payload["campaign"] = row["campaign"]
     payload["integrity_contract"] = contract
     payload["startup"] = _start_status_payload()
     return {"success": True, "message": "OK", "payload": payload}
 
 
 def cmd_clear(_: Optional[dict]) -> dict:
+    """Delete every TEMPEST master and every detail associated with TEMPEST."""
     global _campaign_active
 
     _request_teensy_stop_best_effort()
     _request_teensy_recover_abort_best_effort("pi_clear_cleanup")
 
+    # Lower local custody before deleting FK-linked rows so no queued TEMPEST
+    # candidate can be persisted behind the deletion transaction.
+    _campaign_active = False
+    _clear_start_wait_state()
+    _clear_flash_cut_wait_state()
+    drained = _drain_timebase_ingress()
+    _reset_trackers()
+
     try:
         with open_db() as conn:
             cur = conn.cursor()
-            cur.execute("DELETE FROM timebase")
-            tb_count = cur.rowcount
-            cur.execute("DELETE FROM campaigns")
-            camp_count = cur.rowcount
+            cur.execute(
+                "DELETE FROM campaign_detail WHERE campaign_type = %s",
+                (CAMPAIGN_TYPE_TEMPEST,),
+            )
+            detail_count = cur.rowcount
+            cur.execute(
+                "DELETE FROM campaign_master WHERE campaign_type = %s",
+                (CAMPAIGN_TYPE_TEMPEST,),
+            )
+            master_count = cur.rowcount
 
-        _campaign_active = False
-        _clear_start_wait_state()
-        _clear_flash_cut_wait_state()
-        _drain_timebase_ingress()
-        _reset_trackers()
-
-        logging.info("🗑️ [clocks] CLEAR: deleted %d timebase rows, %d campaigns", tb_count, camp_count)
-        return {"success": True, "message": "OK", "payload": {"timebase_deleted": tb_count, "campaigns_deleted": camp_count}}
+        logging.info(
+            "🗑️ [clocks] CLEAR: deleted %d TEMPEST campaign details and %d masters; "
+            "drained=%d",
+            detail_count,
+            master_count,
+            drained,
+        )
+        return {
+            "success": True,
+            "message": "OK",
+            "payload": {
+                "campaign_type": CAMPAIGN_TYPE_TEMPEST,
+                "campaign_details_deleted": detail_count,
+                "campaign_master_deleted": master_count,
+                "local_ingress_drained": drained,
+            },
+        }
 
     except Exception as e:
         logging.exception("❌ [clocks] CLEAR failed")
         return {"success": False, "message": str(e)}
+
 
 
 # ---------------------------------------------------------------------
@@ -6403,13 +6486,14 @@ def cmd_resume(args: Optional[dict]) -> dict:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT id, campaign, active, payload
-            FROM campaigns
-            WHERE campaign = %s
+            SELECT id, campaign_type, campaign, active, payload
+            FROM campaign_master
+            WHERE campaign_type = %s
+              AND campaign = %s
             ORDER BY ts DESC
             LIMIT 1
             """,
-            (campaign_name,),
+            (CAMPAIGN_TYPE_TEMPEST, campaign_name),
         )
         row = cur.fetchone()
 
@@ -6423,12 +6507,22 @@ def cmd_resume(args: Optional[dict]) -> dict:
     if row["active"]:
         return {"success": False, "message": f"Campaign '{campaign_name}' is already active"}
 
-    # Verify it has TIMEBASE rows
+    # Verify it has TEMPEST campaign details
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
         cur.execute(
-            "SELECT COUNT(*) AS cnt FROM timebase WHERE campaign = %s",
-            (campaign_name,),
+            """
+            SELECT COUNT(*) AS cnt
+            FROM campaign_detail
+            WHERE detail_type = %s
+              AND campaign_type = %s
+              AND campaign = %s
+            """,
+            (
+                CAMPAIGN_DETAIL_TYPE_TEMPEST,
+                CAMPAIGN_TYPE_TEMPEST,
+                campaign_name,
+            ),
         )
         cnt_row = cur.fetchone()
     tb_count = cnt_row["cnt"] if cnt_row else 0
@@ -6436,7 +6530,7 @@ def cmd_resume(args: Optional[dict]) -> dict:
     if tb_count == 0:
         return {
             "success": False,
-            "message": f"Campaign '{campaign_name}' has no TIMEBASE rows — use START instead",
+            "message": f"Campaign '{campaign_name}' has no TEMPEST campaign details — use START instead",
         }
 
     # Re-activate
@@ -6445,15 +6539,17 @@ def cmd_resume(args: Optional[dict]) -> dict:
         cur = conn.cursor()
         cur.execute(
             """
-            UPDATE campaigns
+            UPDATE campaign_master
             SET active = false
-            WHERE active = true AND campaign != %s
+            WHERE campaign_type = %s
+              AND active = true
+              AND campaign != %s
             """,
-            (campaign_name,),
+            (CAMPAIGN_TYPE_TEMPEST, campaign_name),
         )
         cur.execute(
             """
-            UPDATE campaigns
+            UPDATE campaign_master
             SET active = true,
                 payload = payload
                     - 'stopped_at'
@@ -6466,15 +6562,16 @@ def cmd_resume(args: Optional[dict]) -> dict:
                         )
                         ELSE '{}'::jsonb
                        END
-            WHERE campaign = %s
+            WHERE campaign_type = %s
+              AND campaign = %s
             """,
-            (resumed_at, campaign_name),
+            (resumed_at, CAMPAIGN_TYPE_TEMPEST, campaign_name),
         )
         if cur.rowcount == 0:
             return {"success": False, "message": f"Failed to re-activate campaign '{campaign_name}'"}
 
     logging.info(
-        "▶️ [clocks] RESUME: campaign '%s' re-activated (%d TIMEBASE rows) — starting recovery...",
+        "▶️ [clocks] RESUME: campaign '%s' re-activated (%d TEMPEST campaign details) — starting recovery...",
         campaign_name, tb_count,
     )
 
@@ -6488,17 +6585,20 @@ def cmd_resume(args: Optional[dict]) -> dict:
                 cur = conn.cursor()
                 cur.execute(
                     """
-                    UPDATE campaigns
+                    UPDATE campaign_master
                     SET active = false,
                         payload = payload || jsonb_build_object(
                             'stopped_at', to_jsonb(%s::text),
                             'resume_failed', to_jsonb(%s::text)
                         )
-                    WHERE campaign = %s AND active = true
+                    WHERE campaign_type = %s
+                      AND campaign = %s
+                      AND active = true
                     """,
                     (
                         datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                         str(e),
+                        CAMPAIGN_TYPE_TEMPEST,
                         campaign_name,
                     ),
                 )
@@ -6510,8 +6610,9 @@ def cmd_resume(args: Optional[dict]) -> dict:
         "success": True,
         "message": "OK",
         "payload": {
+            "campaign_type": CAMPAIGN_TYPE_TEMPEST,
             "campaign": campaign_name,
-            "timebase_rows": tb_count,
+            "campaign_detail_rows": tb_count,
             "resumed_at": resumed_at,
         },
     }
@@ -6521,10 +6622,10 @@ def cmd_resume(args: Optional[dict]) -> dict:
 # Recovery — v4 Nanosecond Architecture
 # ---------------------------------------------------------------------
 
-def _wait_for_system_monitor_recovery() -> None:
-    """Hold boot campaign recovery until SYSTEM finishes MONITOR restoration."""
-    terminal_success = {"COMPLETE", "NO_CHECKPOINT"}
-    deadline = time.monotonic() + SYSTEM_MONITOR_RECOVERY_WAIT_TIMEOUT_S
+def _wait_for_system_campaign_detail_recovery() -> None:
+    """Hold boot campaign recovery until SYSTEM finishes detail restoration."""
+    terminal_success = {"COMPLETE", "NO_DETAIL"}
+    deadline = time.monotonic() + SYSTEM_CAMPAIGN_DETAIL_RECOVERY_WAIT_TIMEOUT_S
     started = time.monotonic()
     next_log = started
     last_state = "UNAVAILABLE"
@@ -6541,23 +6642,23 @@ def _wait_for_system_monitor_recovery() -> None:
             )
             payload = response.get("payload") if isinstance(response, dict) else None
             recovery = (
-                payload.get("monitor_recovery")
+                payload.get("campaign_detail_recovery")
                 if isinstance(payload, dict)
-                and isinstance(payload.get("monitor_recovery"), dict)
+                and isinstance(payload.get("campaign_detail_recovery"), dict)
                 else {}
             )
             last_state = str(recovery.get("state") or "UNAVAILABLE").upper()
             last_detail = str(recovery.get("detail") or "status not yet published")
             if last_state in terminal_success:
                 logging.info(
-                    "✅ [recovery] SYSTEM MONITOR barrier open: state=%s; "
-                    "campaign recovery may supersede the always-on restore",
+                    "✅ [recovery] SYSTEM campaign-detail barrier open: state=%s; "
+                    "TEMPEST recovery may continue",
                     last_state,
                 )
                 return
             if last_state == "FAILED":
                 raise RecoveryRetryableFailure(
-                    "system_monitor_restore_failed",
+                    "system_campaign_detail_restore_failed",
                     {"state": last_state, "detail": last_detail},
                 )
         except RecoveryRetryableFailure:
@@ -6569,23 +6670,24 @@ def _wait_for_system_monitor_recovery() -> None:
         now = time.monotonic()
         if now >= next_log:
             logging.info(
-                "⏳ [recovery] waiting for SYSTEM MONITOR restore before campaign "
-                "recovery: state=%s elapsed=%.1fs detail=%s",
+                "⏳ [recovery] waiting for SYSTEM campaign-detail restore before "
+                "TEMPEST recovery: state=%s elapsed=%.1fs detail=%s",
                 last_state,
                 now - started,
                 last_detail,
             )
-            next_log = now + SYSTEM_MONITOR_RECOVERY_LOG_INTERVAL_S
-        time.sleep(SYSTEM_MONITOR_RECOVERY_POLL_S)
+            next_log = now + SYSTEM_CAMPAIGN_DETAIL_RECOVERY_LOG_INTERVAL_S
+        time.sleep(SYSTEM_CAMPAIGN_DETAIL_RECOVERY_POLL_S)
 
     raise RecoveryRetryableFailure(
-        "system_monitor_restore_timeout",
+        "system_campaign_detail_restore_timeout",
         {
-            "timeout_s": SYSTEM_MONITOR_RECOVERY_WAIT_TIMEOUT_S,
+            "timeout_s": SYSTEM_CAMPAIGN_DETAIL_RECOVERY_WAIT_TIMEOUT_S,
             "state": last_state,
             "detail": last_detail,
         },
     )
+
 
 
 def _recover_campaign() -> None:
@@ -6623,19 +6725,25 @@ def _recover_campaign() -> None:
     )
 
     # ------------------------------------------------------------------
-    # Step 1: Read last TIMEBASE row
+    # Step 1: Read last TEMPEST campaign detail
     # ------------------------------------------------------------------
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
         cur.execute(
             """
             SELECT payload
-            FROM timebase
-            WHERE campaign = %s
-            ORDER BY ts DESC
+            FROM campaign_detail
+            WHERE detail_type = %s
+              AND campaign_type = %s
+              AND campaign = %s
+            ORDER BY id DESC
             LIMIT 1
             """,
-            (campaign_name,),
+            (
+                CAMPAIGN_DETAIL_TYPE_TEMPEST,
+                CAMPAIGN_TYPE_TEMPEST,
+                campaign_name,
+            ),
         )
         tb_row = cur.fetchone()
 
@@ -6656,7 +6764,7 @@ def _recover_campaign() -> None:
             return
 
         logging.info(
-            "ℹ️ [recovery] campaign '%s' has no TIMEBASE rows — "
+            "ℹ️ [recovery] campaign '%s' has no TEMPEST campaign details — "
             "treating as fresh start (cold restart)",
             campaign_name,
         )
@@ -6692,7 +6800,7 @@ def _recover_campaign() -> None:
 
         _mark_start_waiting(campaign_name)
 
-        # Cold recovery has no prior TIMEBASE row to recover from.  Treat it as
+        # Cold recovery has no prior TEMPEST detail to recover from.  Treat it as
         # an async START of the existing active campaign, matching cmd_start().
         # The normal processor thread will accept the first
         # MONITOR_FRAGMENT campaign row whenever it arrives.
@@ -6734,10 +6842,10 @@ def _recover_campaign() -> None:
         return
 
     try:
-        last_tb, recovery_snapshot, skipped_unrecoverable_rows = _load_last_recoverable_timebase(campaign_name)
+        last_tb, recovery_snapshot, skipped_unrecoverable_rows = _load_last_recoverable_tempest_detail(campaign_name)
     except LookupError:
         # Preserve the existing cold-restart path above for genuinely zero-row campaigns.
-        raise RuntimeError(f"recovery failed: campaign '{campaign_name}' has no TIMEBASE rows")
+        raise RuntimeError(f"recovery failed: campaign '{campaign_name}' has no TEMPEST campaign details")
 
     last_frag = recovery_snapshot["last_frag"]
     last_pps_vclock_count = int(recovery_snapshot["last_pps_vclock_count"])
@@ -7303,13 +7411,23 @@ def cmd_set_baseline(args: Optional[dict]) -> Dict[str, Any]:
             except (ValueError, TypeError):
                 return {"success": False, "message": f"Invalid baseline id: {args['id']}"}
             cur.execute(
-                "SELECT id, campaign, payload FROM campaigns WHERE id = %s",
-                (baseline_id,),
+                """
+                SELECT id, campaign, payload
+                FROM campaign_master
+                WHERE campaign_type = %s AND id = %s
+                """,
+                (CAMPAIGN_TYPE_TEMPEST, baseline_id),
             )
         else:
             cur.execute(
-                "SELECT id, campaign, payload FROM campaigns WHERE campaign = %s ORDER BY ts DESC LIMIT 1",
-                (campaign_name,),
+                """
+                SELECT id, campaign, payload
+                FROM campaign_master
+                WHERE campaign_type = %s AND campaign = %s
+                ORDER BY ts DESC
+                LIMIT 1
+                """,
+                (CAMPAIGN_TYPE_TEMPEST, campaign_name),
             )
         row = cur.fetchone()
 
@@ -7348,6 +7466,7 @@ def cmd_set_baseline(args: Optional[dict]) -> Dict[str, Any]:
         "baseline_dac": baseline_dac,
         "baseline_dac_mean": baseline_dac_mean,
         "baseline_dac_stats": baseline_dac_stats,
+        "baseline_campaign_type": CAMPAIGN_TYPE_TEMPEST,
         "baseline_campaign": row["campaign"],
         "baseline_pps_vclock_n": baseline_pps_vclock_n,
         "baseline_pps_n": baseline_pps_vclock_n,  # legacy alias
@@ -7715,6 +7834,7 @@ def cmd_baseline_info(_: Optional[dict]) -> Dict[str, Any]:
         "baseline_dac": info.get("baseline_dac", {}),
         "baseline_dac_mean": info.get("baseline_dac_mean", {}),
         "baseline_dac_stats": info.get("baseline_dac_stats", {}),
+        "baseline_campaign_type": CAMPAIGN_TYPE_TEMPEST,
         "baseline_campaign": info.get("baseline_campaign"),
         "baseline_pps_vclock_n": info.get("baseline_pps_vclock_n"),
         "baseline_pps_n": info.get("baseline_pps_n"),
@@ -7724,8 +7844,12 @@ def cmd_baseline_info(_: Optional[dict]) -> Dict[str, Any]:
         with open_db(row_dict=True) as conn:
             cur = conn.cursor()
             cur.execute(
-                "SELECT id, campaign, payload FROM campaigns WHERE id = %s",
-                (baseline_id,),
+                """
+                SELECT id, campaign, payload
+                FROM campaign_master
+                WHERE campaign_type = %s AND id = %s
+                """,
+                (CAMPAIGN_TYPE_TEMPEST, baseline_id),
             )
             row = cur.fetchone()
         if row:
@@ -7741,12 +7865,7 @@ def cmd_baseline_info(_: Optional[dict]) -> Dict[str, Any]:
 
 
 def cmd_delete(args: Optional[dict]) -> Dict[str, Any]:
-    """
-    DELETE(campaign)
-
-    Delete a campaign and all its TIMEBASE records by name.
-    Refuses to delete the currently active campaign — stop it first.
-    """
+    """Delete one stopped TEMPEST campaign and every associated detail."""
     if not args or "campaign" not in args:
         return {"success": False, "message": "DELETE requires 'campaign' argument"}
 
@@ -7754,60 +7873,72 @@ def cmd_delete(args: Optional[dict]) -> Dict[str, Any]:
 
     row = _get_active_campaign()
     if row is not None and row["campaign"] == campaign_name:
-        return {"success": False, "message": f"Campaign '{campaign_name}' is active — STOP it first"}
+        return {
+            "success": False,
+            "message": f"Campaign '{campaign_name}' is active — STOP it first",
+        }
 
     try:
         with open_db() as conn:
             cur = conn.cursor()
             cur.execute(
-                "DELETE FROM timebase WHERE campaign = %s",
-                (campaign_name,),
+                """
+                DELETE FROM campaign_detail
+                WHERE campaign_type = %s AND campaign = %s
+                """,
+                (CAMPAIGN_TYPE_TEMPEST, campaign_name),
             )
-            tb_count = cur.rowcount
+            detail_count = cur.rowcount
             cur.execute(
-                "DELETE FROM campaigns WHERE campaign = %s",
-                (campaign_name,),
+                """
+                DELETE FROM campaign_master
+                WHERE campaign_type = %s AND campaign = %s
+                """,
+                (CAMPAIGN_TYPE_TEMPEST, campaign_name),
             )
-            camp_count = cur.rowcount
+            master_count = cur.rowcount
     except Exception as e:
         logging.exception("❌ [clocks] DELETE failed for campaign '%s'", campaign_name)
         return {"success": False, "message": str(e)}
 
-    if camp_count == 0:
-        return {"success": False, "message": f"No campaign named '{campaign_name}'"}
+    if master_count == 0:
+        return {"success": False, "message": f"No TEMPEST campaign named '{campaign_name}'"}
 
     logging.info(
-        "🗑️ [clocks] DELETE: campaign='%s' — %d campaign row(s), %d timebase row(s) deleted",
-        campaign_name, camp_count, tb_count,
+        "🗑️ [clocks] DELETE: type=%s campaign='%s' — %d master row(s), "
+        "%d associated detail row(s) deleted",
+        CAMPAIGN_TYPE_TEMPEST,
+        campaign_name,
+        master_count,
+        detail_count,
     )
 
     server_args = {
-        "campaign": campaign_name
+        "campaign_type": CAMPAIGN_TYPE_TEMPEST,
+        "campaign": campaign_name,
     }
-    send_command(machine="SERVER", subsystem="SYSTEM", command="DELETE_CAMPAIGN", args=server_args)
+    send_command(
+        machine="SERVER",
+        subsystem="SYSTEM",
+        command="DELETE_CAMPAIGN",
+        args=server_args,
+    )
 
     return {
-        "success": True, "message": "OK",
+        "success": True,
+        "message": "OK",
         "payload": {
+            "campaign_type": CAMPAIGN_TYPE_TEMPEST,
             "campaign": campaign_name,
-            "campaigns_deleted": camp_count,
-            "timebase_deleted": tb_count,
+            "campaign_master_deleted": master_count,
+            "campaign_details_deleted": detail_count,
         },
     }
 
 
+
 def cmd_truncate(args: Optional[dict]) -> Dict[str, Any]:
-    """
-    TRUNCATE
-
-    Drop all local campaign history: every row in Postgres campaigns and
-    timebase.  This is intentionally broader than DELETE(campaign).  It refuses
-    to run while a campaign is active; STOP first so CLOCKS, Teensy, Postgres,
-    and the server-side mirror all cross a clean lifecycle boundary.
-
-    After the local Postgres truncate succeeds, forward TRUNCATE to ZPNet Server
-    so its MongoDB timebase collection can be dropped too.
-    """
+    """Delete all stopped TEMPEST campaign history while retaining ambient details."""
     del args
 
     global _campaign_active, _accepted_pps_vclock_count
@@ -7823,9 +7954,6 @@ def cmd_truncate(args: Optional[dict]) -> Dict[str, Any]:
             "message": f"Campaign '{active_row['campaign']}' is active — STOP it first",
         }
 
-    # Ensure no process-local ingestion or recovery latch can persist a stale
-    # TIMEBASE row after the tables have been emptied.  This mirrors the
-    # recovery discipline: lower the campaign gate first, then drain custody.
     _campaign_active = False
     _clear_sync_wait()
     _clear_flash_cut_wait_state()
@@ -7848,43 +7976,76 @@ def cmd_truncate(args: Optional[dict]) -> Dict[str, Any]:
     try:
         with open_db() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) FROM timebase")
-            tb_count = int(cur.fetchone()[0])
-            cur.execute("SELECT COUNT(*) FROM campaigns")
-            camp_count = int(cur.fetchone()[0])
-            cur.execute("TRUNCATE TABLE timebase, campaigns RESTART IDENTITY")
+            cur.execute(
+                "SELECT COUNT(*) FROM campaign_detail WHERE campaign_type = %s",
+                (CAMPAIGN_TYPE_TEMPEST,),
+            )
+            detail_count = int(cur.fetchone()[0])
+            cur.execute(
+                "SELECT COUNT(*) FROM campaign_master WHERE campaign_type = %s",
+                (CAMPAIGN_TYPE_TEMPEST,),
+            )
+            master_count = int(cur.fetchone()[0])
+            cur.execute(
+                "DELETE FROM campaign_detail WHERE campaign_type = %s",
+                (CAMPAIGN_TYPE_TEMPEST,),
+            )
+            cur.execute(
+                "DELETE FROM campaign_master WHERE campaign_type = %s",
+                (CAMPAIGN_TYPE_TEMPEST,),
+            )
     except Exception as e:
         logging.exception("❌ [clocks] TRUNCATE failed")
         return {"success": False, "message": str(e)}
 
     logging.warning(
-        "🧨 [clocks] TRUNCATE: dropped all campaign history — %d campaign row(s), %d timebase row(s); drained=%d",
-        camp_count, tb_count, drained,
+        "🧨 [clocks] TRUNCATE: dropped all TEMPEST campaign history — "
+        "%d master row(s), %d associated detail row(s); ambient details retained; "
+        "drained=%d",
+        master_count,
+        detail_count,
+        drained,
     )
 
     server_args = {
         "source": "CLOCKS.TRUNCATE",
-        "postgres_campaigns_deleted": camp_count,
-        "postgres_timebase_deleted": tb_count,
+        "campaign_type": CAMPAIGN_TYPE_TEMPEST,
+        "postgres_campaign_master_deleted": master_count,
+        "postgres_campaign_details_deleted": detail_count,
+        "ambient_campaign_details_retained": True,
     }
     try:
-        server_resp = send_command(machine="SERVER", subsystem="SYSTEM", command="TRUNCATE", args=server_args)
+        server_resp = send_command(
+            machine="SERVER",
+            subsystem="SYSTEM",
+            command="TRUNCATE",
+            args=server_args,
+        )
     except Exception as e:
-        logging.exception("⚠️ [clocks] SERVER.SYSTEM.TRUNCATE failed after local truncate")
+        logging.exception("⚠️ [clocks] SERVER.SYSTEM.TRUNCATE failed after local cutover")
         server_resp = {"success": False, "message": str(e)}
 
     return {
         "success": True,
         "message": "OK",
         "payload": {
-            "campaigns_deleted": camp_count,
-            "timebase_deleted": tb_count,
+            "campaign_type": CAMPAIGN_TYPE_TEMPEST,
+            "campaign_master_deleted": master_count,
+            "campaign_details_deleted": detail_count,
+            "ambient_campaign_details_retained": True,
             "local_ingress_drained": drained,
-            "server_truncate_success": bool(server_resp.get("success")) if isinstance(server_resp, dict) else False,
-            "server_truncate_message": server_resp.get("message") if isinstance(server_resp, dict) else None,
-            "server_truncate_payload": server_resp.get("payload") if isinstance(server_resp, dict) else None,
+            "server_truncate_success": (
+                bool(server_resp.get("success")) if isinstance(server_resp, dict) else False
+            ),
+            "server_truncate_message": (
+                server_resp.get("message") if isinstance(server_resp, dict) else None
+            ),
+            "server_truncate_payload": (
+                server_resp.get("payload") if isinstance(server_resp, dict) else None
+            ),
         },
     }
+
 
 
 # ---------------------------------------------------------------------
@@ -7893,9 +8054,7 @@ def cmd_truncate(args: Optional[dict]) -> Dict[str, Any]:
 
 
 def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
-    """
-    LIST_CAMPAIGNS
-    """
+    """List TEMPEST campaign master rows."""
     baseline_info = _get_baseline_from_config()
     baseline_campaign = baseline_info.get("baseline_campaign") if baseline_info else None
 
@@ -7904,10 +8063,12 @@ def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
             cur = conn.cursor()
             cur.execute(
                 """
-                SELECT id, campaign, active, ts, payload
-                FROM campaigns
+                SELECT id, campaign_type, campaign, active, ts, payload
+                FROM campaign_master
+                WHERE campaign_type = %s
                 ORDER BY ts ASC
-                """
+                """,
+                (CAMPAIGN_TYPE_TEMPEST,),
             )
             rows = cur.fetchall()
     except Exception as e:
@@ -7921,9 +8082,10 @@ def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
             payload = json.loads(payload)
 
         report = payload.get("report", {})
-        is_baseline = (row["campaign"] == baseline_campaign)
+        is_baseline = row["campaign"] == baseline_campaign
 
         entry: Dict[str, Any] = {
+            "campaign_type": row["campaign_type"],
             "campaign": row["campaign"],
             "active": bool(row["active"]),
             "baseline": is_baseline,
@@ -7931,7 +8093,9 @@ def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
             "stopped_at": payload.get("stopped_at"),
             "resumed_at": payload.get("resumed_at"),
             "location": payload.get("location"),
-            "teensy_pps_vclock_count": report.get("teensy_pps_vclock_count") or report.get("pps_count"),
+            "teensy_pps_vclock_count": (
+                report.get("teensy_pps_vclock_count") or report.get("pps_count")
+            ),
             "pps_count": report.get("pps_count"),
         }
         campaigns.append(entry)
@@ -7940,10 +8104,12 @@ def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
         "success": True,
         "message": "OK",
         "payload": {
+            "campaign_type": CAMPAIGN_TYPE_TEMPEST,
             "count": len(campaigns),
-            "campaigns": campaigns
+            "campaigns": campaigns,
         },
     }
+
 
 
 # ---------------------------------------------------------------------
@@ -8035,18 +8201,19 @@ def _parse_dac_arg(args: Dict[str, Any], label: str, *aliases: str) -> Tuple[boo
 
 
 def _get_campaign_row_by_name(campaign_name: str) -> Optional[Dict[str, Any]]:
-    """Return the newest campaign row with decoded payload, or None."""
+    """Return the newest TEMPEST campaign master row with decoded payload."""
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT id, campaign, active, ts, payload
-            FROM campaigns
-            WHERE campaign = %s
+            SELECT id, campaign_type, campaign, active, ts, payload
+            FROM campaign_master
+            WHERE campaign_type = %s
+              AND campaign = %s
             ORDER BY ts DESC
             LIMIT 1
             """,
-            (campaign_name,),
+            (CAMPAIGN_TYPE_TEMPEST, campaign_name),
         )
         row = cur.fetchone()
 
@@ -8059,11 +8226,13 @@ def _get_campaign_row_by_name(campaign_name: str) -> Optional[Dict[str, Any]]:
 
     return {
         "id": row["id"],
+        "campaign_type": row["campaign_type"],
         "campaign": row["campaign"],
         "active": bool(row["active"]),
         "ts": row.get("ts") if isinstance(row, dict) else None,
         "payload": payload if isinstance(payload, dict) else {},
     }
+
 
 
 
@@ -8264,7 +8433,7 @@ def run() -> None:
         "🕐 [clocks] unified PPS/VCLOCK TIMEBASE candidate schema. Teensy PPS/VCLOCK count is canonical. "
         "Four clock domains: GNSS (reference), DWT, OCXO1, OCXO2. "
         "The Teensy emits one always-on MONITOR_FRAGMENT; campaign rows ride inside campaign_row and the Pi is the final TIMEBASE arbiter. "
-        "SYSTEM owns MONITOR checkpoint persistence and always-on restore; CLOCKS restores only active campaigns from TIMEBASE. "
+        "SYSTEM owns MONITOR campaign-detail persistence and always-on restore; CLOCKS restores active TEMPEST campaigns from typed campaign details. "
         "Every coherent PPS second persists; objections make it AUDIT_ONLY while continuity loss triggers recovery. "
         "START while active performs seamless flash-cut to new campaign. "
         "Commands: START, STOP, RESUME, RECOVER_ABORT, RESTORE_GNSS_RAW, REPORT, REPORT_CLOCKS, REPORT_STATS, STATS_RESET, CLEAR, DELETE, TRUNCATE, SET_DAC, DITHER, "
@@ -8303,11 +8472,10 @@ def run() -> None:
         name="clocks-timebase-silence-monitor",
     ).start()
 
-    # Campaign recovery is the only CLOCKS-owned boot recovery.  SYSTEM owns
-    # the first boot transaction, so wait until its MONITOR restore is complete
-    # before TIMEBASE deliberately supersedes that always-on state.
+    # TEMPEST recovery remains CLOCKS-owned. SYSTEM completes the first generalized
+    # campaign-detail restore transaction before CLOCKS resumes active TEMPEST state.
     try:
-        _wait_for_system_monitor_recovery()
+        _wait_for_system_campaign_detail_recovery()
         _recover_campaign()
     except TeensyStartRejected as exc:
         logging.error(

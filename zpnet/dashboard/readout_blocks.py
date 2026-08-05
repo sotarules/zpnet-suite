@@ -1,5 +1,5 @@
 """
-ZPNet Dashboard Readout Blocks — TIMEBASE_V3 / SYSTEM 2026 Edition
+ZPNet Dashboard Readout Blocks — Generalized Campaign Detail Edition
 
 The rotating pygame dashboard is an observer.  Both platform state and live
 clock science are read from the unified MONITOR heartbeat.  MONITOR.clocks is
@@ -45,7 +45,7 @@ def get_pi_clocks_report() -> dict:
         return {}
     report = dict(clocks)
     for key in (
-        "campaign", "campaign_state", "campaign_present", "campaign_elapsed",
+        "campaign_type", "campaign", "campaign_state", "campaign_present", "campaign_elapsed",
         "instrument_elapsed", "instrument_always_on", "gnss_time_utc",
         "system_time_utc", "published_at_utc",
     ):
@@ -181,9 +181,10 @@ def _clock_report() -> tuple[dict | None, str]:
         "teensy_pps_vclock_count", "pps_count",
     )) or 0
     if state == "STARTED" or report.get("campaign_present"):
+        campaign_type = str(report.get("campaign_type") or "CAMPAIGN").upper()
         campaign = report.get("campaign", "?")
         elapsed = report.get("campaign_elapsed", "00:00:00")
-        header = f"CLOCKS: {campaign} {elapsed} n={count}"
+        header = f"CLOCKS: {campaign_type}/{campaign} {elapsed} n={count}"
     else:
         elapsed = report.get("instrument_elapsed", "00:00:00")
         header = f"CLOCKS: INSTRUMENT {elapsed} n={count}"
@@ -262,7 +263,7 @@ def _welford(report: dict, lane: str, field: str):
 
 
 def _prediction(report: dict, lane: str, field: str):
-    # TIMEBASE_FRAGMENT_V5 folds the former prediction object into raw_cycles.
+    # The TEMPEST campaign fragment folds the former prediction object into raw_cycles.
     # The previous completed interval is the prediction for the current row.
     raw_field = {
         "prediction_cycles": "previous_observed_cycles",
@@ -443,7 +444,7 @@ _FEATURE_CELLS = (
     ("EPOCH", "TEENSY.CLOCKS.ALPHA_EPOCH"),
     ("ORIGIN", "TEENSY.CLOCKS.OCXO_PUBLIC_ORIGIN"),
     ("SCIENCE", "TEENSY.CLOCKS.SCIENCE_RESIDUALS"),
-    ("TIMEBASE", "TEENSY.CLOCKS.TIMEBASE_PUBLICATION"),
+    ("TEMPEST", "TEENSY.CLOCKS.TIMEBASE_PUBLICATION"),
     ("PI NET", "PI.SYSTEM.NETWORK"),
     ("PI GNSS", "PI.GNSS.REPORT"),
     ("PI POWER", "PI.SYSTEM.POWER"),

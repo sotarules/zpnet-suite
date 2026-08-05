@@ -6,6 +6,8 @@ Responsibilities:
   • Collect Raspberry Pi host metrics on a slower local cadence
   • Decorate each Teensy fragment with last-known-good Pi-owned state
   • Publish one unified MONITOR snapshot per Teensy second
+  • Persist each unified MONITOR as a generalized campaign_detail record
+  • Recover always-on state from the latest MONITOR campaign_detail
   • Preserve SYSTEM.REPORT as an explicit command surface
 
 Process model:
@@ -69,16 +71,19 @@ CLOCKS_MONITOR_TOPIC = "CLOCKS_MONITOR"
 GNSS_ANNOUNCEMENT_TOPIC = "GNSS_ANNOUNCEMENT"
 GNSS_MONITOR_FRESHNESS_MAX_AGE_S = 2.5
 GNSS_ANNOUNCEMENT_HISTORY_MAX = 8
-MONITOR_CHECKPOINT_CONFIG_KEY = "MONITOR"
 MONITOR_RESTORE_TIMEOUT_S = 60.0
 MONITOR_RESTORE_COMMAND_RETRY_S = 10.0
 
-# Full unified MONITOR flight recorder.  The dedicated FIFO deliberately does
-# not coalesce rows: unlike config.MONITOR, monitor_history is an append-only
-# observation stream.  One hour of buffering keeps pub/sub nonblocking through
-# a temporary local PostgreSQL interruption.
-MONITOR_HISTORY_QUEUE_MAX = 3600
-MONITOR_HISTORY_RETRY_S = 1.0
+CAMPAIGN_TYPE_TEMPEST = "TEMPEST"
+CAMPAIGN_DETAIL_TYPE_MONITOR = "MONITOR"
+
+# Full unified MONITOR campaign-detail stream.  The dedicated FIFO deliberately
+# does not coalesce rows: campaign_detail is the canonical append-only record
+# stream and its newest MONITOR row is also the always-on recovery authority.
+# One hour of buffering keeps pub/sub nonblocking through a temporary local
+# PostgreSQL interruption.
+CAMPAIGN_DETAIL_QUEUE_MAX = 3600
+CAMPAIGN_DETAIL_RETRY_S = 1.0
 
 _TEENSY_MONITOR_RESTORE_ACCEPTED_STATUSES = {
     "monitor_restore_requested",
@@ -270,33 +275,26 @@ _GNSS_ANNOUNCEMENT_MALFORMED = 0
 _GNSS_ANNOUNCEMENT_EXACT_MATCHES = 0
 _GNSS_ANNOUNCEMENT_FALLBACK_MATCHES = 0
 
-# SYSTEM owns the durable unified MONITOR checkpoint and the boot restore
-# transaction.  Callbacks may stage fresh checkpoints immediately, but the
-# writer starts only after the previous checkpoint has been consumed and its
+# SYSTEM owns the durable unified MONITOR campaign-detail stream and the boot
+# restore transaction.  Callbacks may queue fresh details immediately, but the
+# writer starts only after the previous latest detail has been consumed and its
 # restore has either succeeded or been found unavailable.
 _LATEST_MONITOR_RECEIVED_MONOTONIC: Optional[float] = None
-_MONITOR_CHECKPOINT_QUEUE: queue.Queue[Dict[str, Any]] = queue.Queue(maxsize=1)
-_MONITOR_CHECKPOINT_WRITER_STARTED = threading.Event()
-
-# Every fresh unified MONITOR is copied into this FIFO after publication.
-# The history writer retries the current head until PostgreSQL accepts it, so
-# ordinary transient database failures preserve row order rather than silently
-# turning monitor_history into another latest-state checkpoint.
-_MONITOR_HISTORY_QUEUE: queue.Queue[Dict[str, Any]] = queue.Queue(
-    maxsize=MONITOR_HISTORY_QUEUE_MAX
+_CAMPAIGN_DETAIL_QUEUE: queue.Queue[Dict[str, Any]] = queue.Queue(
+    maxsize=CAMPAIGN_DETAIL_QUEUE_MAX
 )
-_MONITOR_HISTORY_WRITER_STARTED = threading.Event()
-_MONITOR_HISTORY_ENQUEUED = 0
-_MONITOR_HISTORY_PERSISTED = 0
-_MONITOR_HISTORY_DROPPED = 0
+_CAMPAIGN_DETAIL_WRITER_STARTED = threading.Event()
+_CAMPAIGN_DETAIL_ENQUEUED = 0
+_CAMPAIGN_DETAIL_PERSISTED = 0
+_CAMPAIGN_DETAIL_DROPPED = 0
 
 # Compact cross-process startup barrier consumed by Pi CLOCKS before campaign
-# recovery.  This is lifecycle narration only; the durable MONITOR checkpoint
+# recovery.  This is lifecycle narration only; the latest durable MONITOR detail
 # and the fresh-MONITOR proof remain the actual recovery authorities.
-_MONITOR_RECOVERY_STATUS: Dict[str, Any] = {
+_CAMPAIGN_DETAIL_RECOVERY_STATUS: Dict[str, Any] = {
     "state": "STARTING",
     "detail": "SYSTEM process starting",
-    "checkpoint_sequence": None,
+    "detail_sequence": None,
     "started_at_utc": None,
     "completed_at_utc": None,
 }
@@ -1558,21 +1556,29 @@ def build_battery_status() -> dict:
 
 
 # ------------------------------------------------------------------
-# Durable MONITOR checkpoint and boot recovery
+# Durable MONITOR campaign-detail persistence and boot recovery
 # ------------------------------------------------------------------
 
-def _read_monitor_checkpoint() -> Optional[Dict[str, Any]]:
-    """Read the last unified MONITOR checkpoint without changing it."""
+def _read_latest_monitor_detail() -> Optional[Dict[str, Any]]:
+    """Read the latest durable MONITOR detail without changing it."""
     try:
         with open_db(row_dict=True) as conn:
             cur = conn.cursor()
             cur.execute(
-                "SELECT payload FROM config WHERE config_key = %s",
-                (MONITOR_CHECKPOINT_CONFIG_KEY,),
+                """
+                SELECT payload
+                FROM campaign_detail
+                WHERE detail_type = %s
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (CAMPAIGN_DETAIL_TYPE_MONITOR,),
             )
             row = cur.fetchone()
     except Exception:
-        logging.exception("⚠️ [system/recovery] failed to read config.MONITOR")
+        logging.exception(
+            "⚠️ [system/recovery] failed to read latest campaign_detail MONITOR"
+        )
         return None
 
     if row is None:
@@ -1585,39 +1591,15 @@ def _read_monitor_checkpoint() -> Optional[Dict[str, Any]]:
         except Exception:
             payload = None
     if not isinstance(payload, dict):
-        logging.error("💥 [system/recovery] config.MONITOR payload is not an object")
+        logging.error(
+            "💥 [system/recovery] latest campaign_detail MONITOR payload is not an object"
+        )
         return None
     return copy.deepcopy(payload)
 
 
-def _persist_monitor_checkpoint(monitor: Dict[str, Any]) -> None:
-    """Replace config.MONITOR with one unchanged unified MONITOR payload."""
-    encoded = json.dumps(monitor, separators=(",", ":"), ensure_ascii=False)
-    with open_db() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            WITH updated AS (
-                UPDATE config
-                SET "timestamp" = now(), payload = %s::jsonb
-                WHERE config_key = %s
-                RETURNING 1
-            )
-            INSERT INTO config (config_key, payload)
-            SELECT %s, %s::jsonb
-            WHERE NOT EXISTS (SELECT 1 FROM updated)
-            """,
-            (
-                encoded,
-                MONITOR_CHECKPOINT_CONFIG_KEY,
-                MONITOR_CHECKPOINT_CONFIG_KEY,
-                encoded,
-            ),
-        )
-
-
-def _monitor_history_campaign(monitor: Dict[str, Any]) -> Optional[str]:
-    """Extract a searchable campaign label without changing MONITOR truth."""
+def _monitor_detail_campaign(monitor: Dict[str, Any]) -> Optional[str]:
+    """Extract the TEMPEST campaign association from one unified MONITOR."""
     candidates = [
         monitor.get("campaign"),
         _monitor_clocks_payload(monitor).get("campaign"),
@@ -1630,6 +1612,12 @@ def _monitor_history_campaign(monitor: Dict[str, Any]) -> Optional[str]:
             fragment.get("campaign"),
             fragment.get("campaign_name"),
         ])
+        campaign_row = fragment.get("campaign_row")
+        if isinstance(campaign_row, dict):
+            candidates.extend([
+                campaign_row.get("campaign"),
+                campaign_row.get("campaign_name"),
+            ])
 
     for candidate in candidates:
         if isinstance(candidate, dict):
@@ -1643,78 +1631,108 @@ def _monitor_history_campaign(monitor: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _persist_monitor_history(monitor: Dict[str, Any]) -> None:
-    """Append one unchanged unified MONITOR to public.monitor_history."""
+def _monitor_detail_viable(monitor: Dict[str, Any]) -> bool:
+    """Return firmware-authored scientific viability for this MONITOR detail."""
+    fragment = monitor.get("monitor_fragment")
+    campaign_row = fragment.get("campaign_row") if isinstance(fragment, dict) else None
+    if not isinstance(campaign_row, dict):
+        return True
+
+    disposition = str(campaign_row.get("candidate_disposition") or "ACCEPT").strip().upper()
+    if disposition in {"SCIENCE_EXCLUDE", "SCIENCE_REJECT"}:
+        return False
+    if campaign_row.get("science_excluded") is True:
+        return False
+    if "science_eligible" in campaign_row:
+        value = campaign_row.get("science_eligible")
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+    return True
+
+
+def _persist_campaign_detail(monitor: Dict[str, Any]) -> None:
+    """Append one unchanged unified MONITOR to public.campaign_detail."""
     encoded = json.dumps(monitor, separators=(",", ":"), ensure_ascii=False)
     sequence = monitor.get("sequence")
     pps_count = monitor.get("pps_count")
-    campaign = _monitor_history_campaign(monitor)
+    campaign = _monitor_detail_campaign(monitor)
+    campaign_type = CAMPAIGN_TYPE_TEMPEST if campaign is not None else None
+    viable = _monitor_detail_viable(monitor)
 
     with open_db() as conn:
         cur = conn.cursor()
         cur.execute(
             """
-            INSERT INTO monitor_history
-                (payload, sequence, campaign, pps_count)
+            INSERT INTO campaign_detail
+                (detail_type, campaign_type, campaign, viable, payload, sequence, pps_count)
             VALUES
-                (%s::jsonb, %s, %s, %s)
+                (%s, %s, %s, %s, %s::jsonb, %s, %s)
             """,
-            (encoded, sequence, campaign, pps_count),
+            (
+                CAMPAIGN_DETAIL_TYPE_MONITOR,
+                campaign_type,
+                campaign,
+                viable,
+                encoded,
+                sequence,
+                pps_count,
+            ),
         )
 
 
-def _queue_monitor_history(monitor: Dict[str, Any]) -> None:
+def _queue_campaign_detail(monitor: Dict[str, Any]) -> None:
     """Queue every fresh unified MONITOR without blocking the pub/sub callback."""
-    global _MONITOR_HISTORY_ENQUEUED, _MONITOR_HISTORY_DROPPED
+    global _CAMPAIGN_DETAIL_ENQUEUED, _CAMPAIGN_DETAIL_DROPPED
 
     try:
-        _MONITOR_HISTORY_QUEUE.put_nowait(copy.deepcopy(monitor))
-        _MONITOR_HISTORY_ENQUEUED += 1
+        _CAMPAIGN_DETAIL_QUEUE.put_nowait(copy.deepcopy(monitor))
+        _CAMPAIGN_DETAIL_ENQUEUED += 1
     except queue.Full:
-        _MONITOR_HISTORY_DROPPED += 1
+        _CAMPAIGN_DETAIL_DROPPED += 1
         logging.error(
-            "💥 [system] monitor_history FIFO full; dropping sequence=%s "
+            "💥 [system] campaign_detail FIFO full; dropping sequence=%s "
             "(queued=%d persisted=%d dropped=%d)",
             monitor.get("sequence"),
-            _MONITOR_HISTORY_ENQUEUED,
-            _MONITOR_HISTORY_PERSISTED,
-            _MONITOR_HISTORY_DROPPED,
+            _CAMPAIGN_DETAIL_ENQUEUED,
+            _CAMPAIGN_DETAIL_PERSISTED,
+            _CAMPAIGN_DETAIL_DROPPED,
         )
 
 
-def _monitor_history_writer_loop() -> None:
-    """Persist the append-only MONITOR stream in order, retrying each head."""
-    global _MONITOR_HISTORY_PERSISTED
+def _campaign_detail_writer_loop() -> None:
+    """Persist the generalized MONITOR detail stream in order, retrying each head."""
+    global _CAMPAIGN_DETAIL_PERSISTED
 
-    _MONITOR_HISTORY_WRITER_STARTED.set()
+    _CAMPAIGN_DETAIL_WRITER_STARTED.set()
     while True:
-        monitor = _MONITOR_HISTORY_QUEUE.get()
+        monitor = _CAMPAIGN_DETAIL_QUEUE.get()
         failure_logged = False
 
         while True:
             try:
-                _persist_monitor_history(monitor)
-                _MONITOR_HISTORY_PERSISTED += 1
+                _persist_campaign_detail(monitor)
+                _CAMPAIGN_DETAIL_PERSISTED += 1
                 break
             except Exception:
                 if not failure_logged:
                     logging.exception(
-                        "⚠️ [system] monitor_history append failed for sequence=%s; "
+                        "⚠️ [system] campaign_detail append failed for sequence=%s; "
                         "retrying without discarding the row",
                         monitor.get("sequence"),
                     )
                     failure_logged = True
-                time.sleep(MONITOR_HISTORY_RETRY_S)
+                time.sleep(CAMPAIGN_DETAIL_RETRY_S)
 
 
-def _start_monitor_history_writer() -> None:
-    if _MONITOR_HISTORY_WRITER_STARTED.is_set():
+def _start_campaign_detail_writer() -> None:
+    if _CAMPAIGN_DETAIL_WRITER_STARTED.is_set():
         return
 
     threading.Thread(
-        target=_monitor_history_writer_loop,
+        target=_campaign_detail_writer_loop,
         daemon=True,
-        name="system-monitor-history-writer",
+        name="system-campaign-detail-writer",
     ).start()
 
 
@@ -1828,85 +1846,32 @@ def _monitor_gnss_raw_payload(monitor: Optional[Dict[str, Any]]) -> Optional[Dic
     return copy.deepcopy(gnss_raw) if isinstance(gnss_raw, dict) else None
 
 
-def _queue_monitor_checkpoint(monitor: Dict[str, Any]) -> None:
-    """Stage only the newest fully recoverable MONITOR; never block pub/sub."""
-    if (
-        _monitor_restore_state(monitor) is None
-        or _monitor_gnss_raw_payload(monitor) is None
-    ):
-        return
-
-    item = copy.deepcopy(monitor)
-    try:
-        _MONITOR_CHECKPOINT_QUEUE.put_nowait(item)
-        return
-    except queue.Full:
-        pass
-
-    try:
-        _MONITOR_CHECKPOINT_QUEUE.get_nowait()
-    except queue.Empty:
-        pass
-
-    try:
-        _MONITOR_CHECKPOINT_QUEUE.put_nowait(item)
-    except queue.Full:
-        # Another callback won the latest-state replacement race.
-        pass
-
-
-def _set_monitor_recovery_status(
+def _set_campaign_detail_recovery_status(
     state: str,
     detail: str,
     *,
-    checkpoint_sequence: Any = None,
+    detail_sequence: Any = None,
 ) -> None:
     """Publish a compact startup-recovery phase for dependent Pi processes."""
     now_utc = datetime.datetime.now(datetime.timezone.utc) \
         .isoformat() \
         .replace("+00:00", "Z")
     with _SYSTEM_LOCK:
-        _MONITOR_RECOVERY_STATUS["state"] = str(state).strip().upper()
-        _MONITOR_RECOVERY_STATUS["detail"] = str(detail)
-        _MONITOR_RECOVERY_STATUS["checkpoint_sequence"] = checkpoint_sequence
-        if _MONITOR_RECOVERY_STATUS.get("started_at_utc") is None:
-            _MONITOR_RECOVERY_STATUS["started_at_utc"] = now_utc
-        _MONITOR_RECOVERY_STATUS["completed_at_utc"] = (
+        _CAMPAIGN_DETAIL_RECOVERY_STATUS["state"] = str(state).strip().upper()
+        _CAMPAIGN_DETAIL_RECOVERY_STATUS["detail"] = str(detail)
+        _CAMPAIGN_DETAIL_RECOVERY_STATUS["detail_sequence"] = detail_sequence
+        if _CAMPAIGN_DETAIL_RECOVERY_STATUS.get("started_at_utc") is None:
+            _CAMPAIGN_DETAIL_RECOVERY_STATUS["started_at_utc"] = now_utc
+        _CAMPAIGN_DETAIL_RECOVERY_STATUS["completed_at_utc"] = (
             now_utc
-            if _MONITOR_RECOVERY_STATUS["state"]
-            in {"COMPLETE", "NO_CHECKPOINT", "FAILED"}
+            if _CAMPAIGN_DETAIL_RECOVERY_STATUS["state"]
+            in {"COMPLETE", "NO_DETAIL", "FAILED"}
             else None
         )
 
 
-def _monitor_checkpoint_writer_loop() -> None:
-    """Persist latest-state MONITOR checkpoints after boot recovery completes."""
-    _MONITOR_CHECKPOINT_WRITER_STARTED.set()
-    while True:
-        monitor = _MONITOR_CHECKPOINT_QUEUE.get()
-        while True:
-            try:
-                monitor = _MONITOR_CHECKPOINT_QUEUE.get_nowait()
-            except queue.Empty:
-                break
-        try:
-            _persist_monitor_checkpoint(monitor)
-        except Exception:
-            logging.exception("⚠️ [system] failed to persist config.MONITOR")
-
-
-def _start_monitor_checkpoint_writer() -> None:
-    if _MONITOR_CHECKPOINT_WRITER_STARTED.is_set():
-        return
-    threading.Thread(
-        target=_monitor_checkpoint_writer_loop,
-        daemon=True,
-        name="system-monitor-checkpoint-writer",
-    ).start()
-
-
-def _seed_system_from_checkpoint(checkpoint: Dict[str, Any]) -> None:
-    """Publish the last unified state immediately and seed CLOCKS decoration."""
+def _seed_system_from_detail(detail: Dict[str, Any]) -> None:
+    """Publish the latest durable detail immediately and seed CLOCKS decoration."""
     global SYSTEM
     global _LATEST_MONITOR_RECEIVED_MONOTONIC
     global _LATEST_CLOCKS_MONITOR
@@ -1916,7 +1881,7 @@ def _seed_system_from_checkpoint(checkpoint: Dict[str, Any]) -> None:
     seeded_at_utc = datetime.datetime.now(datetime.timezone.utc) \
         .isoformat() \
         .replace("+00:00", "Z")
-    clocks = _monitor_clocks_payload(checkpoint)
+    clocks = _monitor_clocks_payload(detail)
     pi_clocks = clocks.get("pi")
     if not isinstance(pi_clocks, dict):
         pi_clocks = {
@@ -1933,12 +1898,12 @@ def _seed_system_from_checkpoint(checkpoint: Dict[str, Any]) -> None:
         _LATEST_CLOCKS_MONITOR_RECEIVED_UTC = seeded_at_utc
 
     with _SYSTEM_LOCK:
-        SYSTEM = copy.deepcopy(checkpoint)
+        SYSTEM = copy.deepcopy(detail)
         _LATEST_MONITOR_RECEIVED_MONOTONIC = time.monotonic()
 
-    # The checkpoint writer is still closed, so this immediate display seed
+    # The detail writer is still closed, so this immediate display seed
     # cannot overwrite the durable recovery authority.
-    publish("MONITOR", copy.deepcopy(checkpoint))
+    publish("MONITOR", copy.deepcopy(detail))
 
 
 def _request_teensy_monitor_restore(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -2153,13 +2118,13 @@ def _monitor_restore_pending_categories(
 
 
 def _wait_for_monitor_restore(
-    checkpoint: Dict[str, Any],
+    detail: Dict[str, Any],
     *,
     requested_monotonic: float,
     timeout_s: float = MONITOR_RESTORE_TIMEOUT_S,
 ) -> Dict[str, Any]:
     """Wait for a fresh unified MONITOR proving the staged restore committed."""
-    expected = _monitor_restore_probe(checkpoint)
+    expected = _monitor_restore_probe(detail)
     deadline = time.monotonic() + float(timeout_s)
     next_progress_log = requested_monotonic + 10.0
     last_observed: Dict[str, Any] = {}
@@ -2199,21 +2164,21 @@ def _wait_for_monitor_restore(
     )
 
 
-def _recover_monitor_checkpoint(checkpoint: Dict[str, Any]) -> Dict[str, Any]:
+def _recover_monitor_detail(detail: Dict[str, Any]) -> Dict[str, Any]:
     """Restore always-on Teensy and Pi clock state without campaign policy."""
-    restore_state = _monitor_restore_state(checkpoint)
+    restore_state = _monitor_restore_state(detail)
     if restore_state is None:
-        raise RuntimeError("config.MONITOR has no structured firmware restore state")
-    gnss_raw = _monitor_gnss_raw_payload(checkpoint)
+        raise RuntimeError("campaign_detail MONITOR has no structured firmware restore state")
+    gnss_raw = _monitor_gnss_raw_payload(detail)
     if gnss_raw is None:
-        raise RuntimeError("config.MONITOR has no clocks.gnss_raw state")
+        raise RuntimeError("campaign_detail MONITOR has no clocks.gnss_raw state")
 
     logging.info(
-        "♻️ [system/recovery] found recoverable MONITOR checkpoint sequence=%s; "
+        "♻️ [system/recovery] found recoverable MONITOR detail sequence=%s; "
         "seeding last-known display state and restoring the always-on instrument",
-        checkpoint.get("sequence"),
+        detail.get("sequence"),
     )
-    _seed_system_from_checkpoint(checkpoint)
+    _seed_system_from_detail(detail)
     requested_monotonic = time.monotonic()
     logging.info(
         "⏳ [system/recovery] last-known MONITOR published; requesting Teensy "
@@ -2237,7 +2202,7 @@ def _recover_monitor_checkpoint(checkpoint: Dict[str, Any]) -> Dict[str, Any]:
         result = {
             "success": True,
             "mode": "LIVE_CAMPAIGN_SUPERSEDED_MONITOR_RESTORE",
-            "checkpoint_sequence": checkpoint.get("sequence"),
+            "detail_sequence": detail.get("sequence"),
             "restore_schema_version": 2,
             "teensy": teensy_payload,
             "clocks": None,
@@ -2249,8 +2214,8 @@ def _recover_monitor_checkpoint(checkpoint: Dict[str, Any]) -> Dict[str, Any]:
         }
         logging.info(
             "♻️ [system/recovery] live Teensy campaign superseded MONITOR "
-            "restore: sequence=%s campaign_state=%s; checkpoint writing may resume",
-            checkpoint.get("sequence"),
+            "restore: sequence=%s campaign_state=%s; detail writing may resume",
+            detail.get("sequence"),
             teensy_campaign_state,
         )
         return result
@@ -2261,14 +2226,14 @@ def _recover_monitor_checkpoint(checkpoint: Dict[str, Any]) -> Dict[str, Any]:
         "MONITOR to prove clockfaces, statistics, DACs, servo mode, and dithering"
     )
     proof = _wait_for_monitor_restore(
-        checkpoint,
+        detail,
         requested_monotonic=requested_monotonic,
     )
 
     result = {
         "success": True,
         "mode": "SYSTEM_MONITOR",
-        "checkpoint_sequence": checkpoint.get("sequence"),
+        "detail_sequence": detail.get("sequence"),
         "restore_schema_version": 2,
         "teensy": teensy_response.get("payload")
             if isinstance(teensy_response, dict) else None,
@@ -2570,8 +2535,7 @@ def on_monitor_fragment(payload: Optional[dict]) -> None:
         _LATEST_MONITOR_RECEIVED_MONOTONIC = time.monotonic()
 
     publish("MONITOR", monitor)
-    _queue_monitor_history(monitor)
-    _queue_monitor_checkpoint(monitor)
+    _queue_campaign_detail(monitor)
 
 
 # ------------------------------------------------------------------
@@ -2582,7 +2546,7 @@ def cmd_report(_: Optional[dict]) -> Dict:
     """Return the most recent SYSTEM snapshot."""
     with _SYSTEM_LOCK:
         snapshot = dict(SYSTEM)
-        snapshot["monitor_recovery"] = copy.deepcopy(_MONITOR_RECOVERY_STATUS)
+        snapshot["campaign_detail_recovery"] = copy.deepcopy(_CAMPAIGN_DETAIL_RECOVERY_STATUS)
     return {
         "success": True,
         "message": "OK",
@@ -2706,12 +2670,12 @@ def startup_teensy_quiet_delay() -> None:
     """
     logging.info(
         "⏳ [system] waiting %.1fs for pubsub routing and Teensy initialization "
-        "before MONITOR recovery or active polling",
+        "before campaign-detail recovery or active polling",
         STARTUP_TEENSY_QUIET_DELAY_S,
     )
     time.sleep(STARTUP_TEENSY_QUIET_DELAY_S)
     logging.info(
-        "✅ [system] startup quiet delay complete — MONITOR recovery may begin"
+        "✅ [system] startup quiet delay complete — campaign-detail recovery may begin"
     )
 
 
@@ -2721,8 +2685,6 @@ def startup_teensy_quiet_delay() -> None:
 
 def run() -> None:
     setup_logging()
-    _start_monitor_history_writer()
-
     try:
         server_setup(
             subsystem="SYSTEM",
@@ -2735,66 +2697,63 @@ def run() -> None:
             blocking=False,
         )
 
-        _set_monitor_recovery_status(
+        _set_campaign_detail_recovery_status(
             "QUIET_DELAY",
             "waiting for pubsub routing and Teensy initialization",
         )
         startup_teensy_quiet_delay()
 
-        # SYSTEM always restores the latest recoverable MONITOR, independent of
-        # campaign state.  CLOCKS may later supersede this with TIMEBASE recovery
-        # when an active campaign exists.  Keep the checkpoint writer closed
+        # SYSTEM restores the latest recoverable MONITOR campaign_detail,
+        # independent of campaign state.  Keep the campaign-detail writer closed
         # until this transaction has consumed the previous durable authority.
-        checkpoint_writer_allowed = True
-        checkpoint = _read_monitor_checkpoint()
-        checkpoint_recoverable = bool(
-            checkpoint is not None
-            and _monitor_restore_state(checkpoint) is not None
-            and _monitor_gnss_raw_payload(checkpoint) is not None
+        detail_writer_allowed = True
+        detail = _read_latest_monitor_detail()
+        detail_recoverable = bool(
+            detail is not None
+            and _monitor_restore_state(detail) is not None
+            and _monitor_gnss_raw_payload(detail) is not None
         )
-        if checkpoint_recoverable:
+        if detail_recoverable:
             try:
-                assert checkpoint is not None
-                _set_monitor_recovery_status(
+                assert detail is not None
+                _set_campaign_detail_recovery_status(
                     "RESTORING",
-                    "restoring always-on MONITOR state and awaiting fresh proof",
-                    checkpoint_sequence=checkpoint.get("sequence"),
+                    "restoring latest MONITOR detail and awaiting fresh proof",
+                    detail_sequence=detail.get("sequence"),
                 )
-                _recover_monitor_checkpoint(checkpoint)
-                _set_monitor_recovery_status(
+                _recover_monitor_detail(detail)
+                _set_campaign_detail_recovery_status(
                     "COMPLETE",
                     "fresh MONITOR proved restored clockfaces and statistics",
-                    checkpoint_sequence=checkpoint.get("sequence"),
+                    detail_sequence=detail.get("sequence"),
                 )
             except Exception:
-                checkpoint_writer_allowed = False
-                _set_monitor_recovery_status(
+                detail_writer_allowed = False
+                _set_campaign_detail_recovery_status(
                     "FAILED",
-                    "MONITOR restore failed; durable checkpoint preserved",
-                    checkpoint_sequence=(
-                        checkpoint.get("sequence") if checkpoint else None
-                    ),
+                    "MONITOR detail restore failed; durable detail preserved",
+                    detail_sequence=(detail.get("sequence") if detail else None),
                 )
                 logging.exception(
-                    "💥 [system/recovery] MONITOR restore failed; preserving "
-                    "config.MONITOR and continuing with the seeded last-known state"
+                    "💥 [system/recovery] MONITOR detail restore failed; preserving "
+                    "the latest durable campaign_detail and continuing with seeded state"
                 )
         else:
-            _set_monitor_recovery_status(
-                "NO_CHECKPOINT",
-                "no structured-recoverable MONITOR checkpoint; using live state",
+            _set_campaign_detail_recovery_status(
+                "NO_DETAIL",
+                "no structured-recoverable MONITOR detail; using live state",
             )
             logging.info(
-                "ℹ️ [system/recovery] no structured-recoverable config.MONITOR; "
+                "ℹ️ [system/recovery] no structured-recoverable campaign_detail MONITOR; "
                 "starting from live MONITOR_FRAGMENT state"
             )
 
-        if checkpoint_writer_allowed:
-            _start_monitor_checkpoint_writer()
+        if detail_writer_allowed:
+            _start_campaign_detail_writer()
         else:
             logging.warning(
-                "🧤 [system] MONITOR checkpoint writer held closed to preserve "
-                "the last recoverable checkpoint after restore failure"
+                "🧤 [system] campaign_detail writer held closed to preserve "
+                "the last recoverable detail after restore failure"
             )
 
         threading.Thread(

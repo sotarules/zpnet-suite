@@ -101,9 +101,18 @@ def header_readout(prefix: str = "") -> list[str]:
     remaining_pct = battery.get("remaining_pct")
     batt_str = f"{remaining_pct:.1f}%" if isinstance(remaining_pct, (int, float)) else "N/A"
 
+    clocks = system.get("clocks", {}) if isinstance(system.get("clocks"), dict) else {}
+    campaign_present = bool(clocks.get("campaign_present"))
+    if campaign_present:
+        campaign_type = str(clocks.get("campaign_type") or "CAMPAIGN").upper()
+        campaign = str(clocks.get("campaign") or "?")
+        stream_context = f"CAMPAIGN: {campaign_type}/{campaign}"
+    else:
+        stream_context = "STREAM: AMBIENT"
+
     return [
         f"{prefix}NET: {net_state}  BAT: {batt_str}  SYS: {overall}",
-        "",
+        stream_context,
     ]
 
 
