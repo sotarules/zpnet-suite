@@ -1,13 +1,13 @@
 """ZPNet raw_delta — streamed PhaseLedger versus Delta Cycles science audit.
 
-The report reads TIMEBASE in indexed ``timebase.pps_count`` order through a
-named PostgreSQL cursor. Each JSON payload is decoded, reduced to the two OCXO
-science lanes, printed, and discarded. Memory use is therefore independent of
-campaign length.
+The report reads TEMPEST-decorated ``campaign_detail`` rows in campaign-public
+PPS order through a named PostgreSQL cursor. Each unified state payload is
+decoded, reduced to the two OCXO science lanes, printed, and discarded. Memory
+use is therefore independent of campaign length.
 
-No JSONB path is used for ordering or filtering, and the SQL deliberately uses
-no COALESCE expression. The scalar database identity must agree with the
-immutable identity carried inside the payload.
+The SQL explicitly selects ``campaign_type='TEMPEST'`` and derives the campaign
+PPS identity from ``payload.campaign.tempest``. That identity must agree with the
+immutable identity carried inside the merged campaign view.
 
 For each OCXO lane the report shows:
 
@@ -64,6 +64,13 @@ LANE_KEYS = {"OCXO1": "ocxo1", "OCXO2": "ocxo2"}
 NS_PER_SECOND = Decimal("1000000000")
 DEFAULT_BATCH_SIZE = 16
 DEFAULT_PAUSE_MS = 25
+CAMPAIGN_TYPE = "TEMPEST"
+PPS_COUNT_SQL = """
+NULLIF(
+    payload #>> '{campaign,tempest,teensy_pps_vclock_count}',
+    ''
+)::bigint
+"""
 
 
 @dataclass
@@ -187,13 +194,40 @@ def first_decimal(*values: Any) -> Optional[Decimal]:
 
 
 def root(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the persisted record, unwrapping only a true outer envelope.
+
+    A unified MONITOR_V2 detail legitimately has a top-level ``payload`` field
+    containing Payload subsystem diagnostics.  That field is not an envelope
+    and must never replace the complete state record.
+    """
+    if any(
+        key in payload
+        for key in ("schema", "monitor_fragment", "fragment", "campaign_row", "campaign")
+    ):
+        return payload
+
     inner = d(payload.get("payload"))
     return inner or payload
 
 
-def fragment(payload: Dict[str, Any]) -> Dict[str, Any]:
+def tempest_decoration(payload: Dict[str, Any]) -> Dict[str, Any]:
     value = root(payload)
-    return d(value.get("fragment")) or value
+    return d(d(value.get("campaign")).get("tempest"))
+
+
+def fragment(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Return one merged TEMPEST campaign view from a unified state detail."""
+    value = root(payload)
+    direct = d(value.get("fragment")) or d(value.get("campaign_row"))
+    monitor_fragment = d(value.get("monitor_fragment"))
+    embedded = d(monitor_fragment.get("campaign_row"))
+    decoration = tempest_decoration(payload)
+    source = embedded or direct
+    if source or decoration:
+        merged = dict(source)
+        merged.update(decoration)
+        return merged
+    return value
 
 
 def _payload_pps_count(payload: Dict[str, Any], frag: Dict[str, Any]) -> Optional[int]:
@@ -209,19 +243,22 @@ def _payload_pps_count(payload: Dict[str, Any], frag: Dict[str, Any]) -> Optiona
 
 def _assert_campaign_indexed(cur: Any, campaign: str) -> None:
     cur.execute(
-        """
+        f"""
         SELECT count(*) AS missing_count
-        FROM timebase
-        WHERE campaign = %s AND pps_count IS NULL
+        FROM campaign_detail
+        WHERE campaign_type = %s
+          AND campaign = %s
+          AND payload #> '{{campaign,tempest}}' IS NOT NULL
+          AND {PPS_COUNT_SQL} IS NULL
         """,
-        (campaign,),
+        (CAMPAIGN_TYPE, campaign),
     )
     row = cur.fetchone()
     missing = int(row["missing_count"] if row else 0)
     if missing:
         raise RuntimeError(
-            f"campaign {campaign!r} has {missing:,} rows with NULL "
-            "timebase.pps_count; backfill the scalar identity before reporting"
+            f"TEMPEST campaign {campaign!r} has {missing:,} decorated rows without "
+            "campaign.tempest.teensy_pps_vclock_count"
         )
 
 
@@ -233,23 +270,26 @@ def iter_payloads(
     batch_size: int,
     pause_ms: int,
 ) -> Iterator[Tuple[int, int, Dict[str, Any]]]:
-    """Yield ``(db_id, pps_count, payload)`` through a true server-side cursor."""
+    """Yield ``(db_id, campaign_pps_count, payload)`` through a server-side cursor."""
     with open_db(row_dict=True) as conn:
         conn.execute("SET TRANSACTION READ ONLY")
         check = conn.cursor()
         _assert_campaign_indexed(check, campaign)
         check.close()
 
-        sql = """
-            SELECT id, pps_count, payload
-            FROM timebase
-            WHERE campaign = %s
+        sql = f"""
+            SELECT id, {PPS_COUNT_SQL} AS pps_count, payload
+            FROM campaign_detail
+            WHERE campaign_type = %s
+              AND campaign = %s
+              AND payload #> '{{campaign,tempest}}' IS NOT NULL
+              AND {PPS_COUNT_SQL} IS NOT NULL
         """
-        params: list[Any] = [campaign]
+        params: list[Any] = [CAMPAIGN_TYPE, campaign]
         if skip > 0:
-            sql += " AND pps_count > %s"
+            sql += f" AND {PPS_COUNT_SQL} > %s"
             params.append(skip)
-        sql += " ORDER BY pps_count ASC, id ASC"
+        sql += f" ORDER BY {PPS_COUNT_SQL} ASC, id ASC"
         if limit > 0:
             sql += " LIMIT %s"
             params.append(limit)
@@ -271,7 +311,7 @@ def iter_payloads(
             payload_count = _payload_pps_count(payload, frag)
             if payload_count is not None and payload_count != db_count:
                 raise ValueError(
-                    "TIMEBASE relational/payload PPS mismatch: "
+                    "campaign_detail relational/payload campaign PPS mismatch: "
                     f"id={row['id']} db={db_count} payload={payload_count}"
                 )
 
@@ -665,7 +705,7 @@ def main(argv: Sequence[str]) -> None:
     print(
         "Residuals are ns/second (positive = fast). "
         "ph_ppb and dc_ppb are independently accumulated by this report; "
-        "tb_ppb is the published TIMEBASE value."
+        "tb_ppb is the published TEMPEST campaign value."
     )
 
     header = [f"{'pps':>7}"]

@@ -1,9 +1,10 @@
 """ZPNet campaign_analyzer — conservative one-pass streaming audit.
 
-This replacement is intentionally modest.  It uses ``timebase.pps_count`` as
-the only relational ordering identity, reads through a named PostgreSQL cursor,
-decodes one large JSON payload at a time, folds it into compact online state,
-and discards it immediately.
+This replacement is intentionally modest. It reads TEMPEST-decorated
+``campaign_detail`` rows through a named PostgreSQL cursor, orders them by the
+campaign-public PPS identity in ``payload.campaign.tempest``, decodes one large
+unified state payload at a time, folds it into compact online state, and discards
+it immediately.
 
 It does not retain a full campaign of expanded JSON dictionaries.  Memory use is
 bounded by the current payload, the previous compact row, online accumulators,
@@ -33,6 +34,19 @@ OCXO_SECOND_ALARM_NS = 10_000
 PPB_ABSOLUTE_ALARM = 10_000.0
 PPB_STEP_ALARM = 100.0
 SNAPSHOT_LANES = ("pps", "vclock", "ocxo1", "ocxo2")
+CAMPAIGN_TYPE = "TEMPEST"
+PPS_COUNT_SQL = """
+NULLIF(
+    payload #>> '{campaign,tempest,teensy_pps_vclock_count}',
+    ''
+)::bigint
+"""
+DETAIL_PPS_COUNT_SQL = """
+NULLIF(
+    d.payload #>> '{campaign,tempest,teensy_pps_vclock_count}',
+    ''
+)::bigint
+"""
 
 
 def d(v: Any) -> Dict[str, Any]:
@@ -105,6 +119,43 @@ def first_bool(*values: Any) -> Optional[bool]:
     return None
 
 
+def root(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the persisted record, unwrapping only a true outer envelope.
+
+    A unified MONITOR_V2 detail legitimately has a top-level ``payload`` field
+    containing Payload subsystem diagnostics.  That field is not an envelope
+    and must never replace the complete state record.
+    """
+    if any(
+        key in payload
+        for key in ("schema", "monitor_fragment", "fragment", "campaign_row", "campaign")
+    ):
+        return payload
+
+    inner = d(payload.get("payload"))
+    return inner or payload
+
+
+def tempest_decoration(payload: Dict[str, Any]) -> Dict[str, Any]:
+    r = root(payload)
+    return d(d(r.get("campaign")).get("tempest"))
+
+
+def fragment(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Return one merged TEMPEST campaign view from a unified state detail."""
+    r = root(payload)
+    direct = d(r.get("fragment")) or d(r.get("campaign_row"))
+    monitor_fragment = d(r.get("monitor_fragment"))
+    embedded = d(monitor_fragment.get("campaign_row"))
+    decoration = tempest_decoration(payload)
+    source = embedded or direct
+    if source or decoration:
+        merged = dict(source)
+        merged.update(decoration)
+        return merged
+    return r
+
+
 def science_disposition(payload: Dict[str, Any],
                         frag: Dict[str, Any]) -> tuple[bool, bool, str]:
     """Resolve completed TIMEBASE science custody.
@@ -115,7 +166,7 @@ def science_disposition(payload: Dict[str, Any],
     present; this preserves historical analyzer behavior without allowing a
     known SCIENCE_EXCLUDE row into science statistics or courts.
     """
-    court = d(payload.get("final_court"))
+    court = d(payload.get("final_court")) or d(frag.get("final_court"))
 
     excluded = first_bool(
         court.get("science_excluded"),
@@ -332,19 +383,22 @@ class Audit:
 
 def _assert_campaign_indexed(cur: Any, campaign: str) -> None:
     cur.execute(
-        """
+        f"""
         SELECT count(*) AS missing_count
-        FROM timebase
-        WHERE campaign = %s AND pps_count IS NULL
+        FROM campaign_detail
+        WHERE campaign_type = %s
+          AND campaign = %s
+          AND payload #> '{{campaign,tempest}}' IS NOT NULL
+          AND {PPS_COUNT_SQL} IS NULL
         """,
-        (campaign,),
+        (CAMPAIGN_TYPE, campaign),
     )
     row = cur.fetchone()
     missing = int(row["missing_count"] if row else 0)
     if missing:
         raise RuntimeError(
-            f"campaign {campaign!r} has {missing:,} rows with NULL timebase.pps_count; "
-            "backfill the scalar identity before analysis"
+            f"TEMPEST campaign {campaign!r} has {missing:,} decorated rows without "
+            "campaign.tempest.teensy_pps_vclock_count"
         )
 
 
@@ -361,13 +415,16 @@ def iter_rows(
         _assert_campaign_indexed(check, campaign)
         check.close()
 
-        sql = """
-            SELECT id, ts, pps_count, payload
-            FROM timebase
-            WHERE campaign = %s
-            ORDER BY pps_count ASC, id ASC
+        sql = f"""
+            SELECT id, ts, {PPS_COUNT_SQL} AS pps_count, payload
+            FROM campaign_detail
+            WHERE campaign_type = %s
+              AND campaign = %s
+              AND payload #> '{{campaign,tempest}}' IS NOT NULL
+              AND {PPS_COUNT_SQL} IS NOT NULL
+            ORDER BY {PPS_COUNT_SQL} ASC, id ASC
         """
-        params: list[Any] = [campaign]
+        params: list[Any] = [CAMPAIGN_TYPE, campaign]
         if limit > 0:
             sql += " LIMIT %s"
             params.append(limit)
@@ -392,20 +449,19 @@ def iter_rows(
 
 
 def compact(db_id: int, db_pps: int, ts: str, payload: Dict[str, Any]) -> CompactRow:
-    frag = d(payload.get("fragment"))
-    if not frag:
-        frag = payload
-    forensic = d(payload.get("forensics")) or d(frag.get("forensics"))
+    payload_root = root(payload)
+    frag = fragment(payload)
+    forensic = d(payload_root.get("forensics")) or d(frag.get("forensics"))
 
     payload_pps = first_int(
-        payload.get("teensy_pps_vclock_count"),
-        payload.get("pps_count"),
         frag.get("teensy_pps_vclock_count"),
         frag.get("pps_count"),
+        payload_root.get("teensy_pps_vclock_count"),
+        payload_root.get("pps_count"),
     )
     if payload_pps is not None and payload_pps != db_pps:
         raise ValueError(
-            f"TIMEBASE PPS identity mismatch id={db_id} db={db_pps} payload={payload_pps}"
+            f"campaign_detail campaign PPS mismatch id={db_id} db={db_pps} payload={payload_pps}"
         )
 
     def ocxo(prefix: str) -> tuple[Optional[int], Optional[int], Optional[int], Optional[bool]]:
@@ -428,7 +484,7 @@ def compact(db_id: int, db_pps: int, ts: str, payload: Dict[str, Any]) -> Compac
     o1_ns, o1_int, o1_res, o1_valid = ocxo("ocxo1")
     o2_ns, o2_int, o2_res, o2_valid = ocxo("ocxo2")
     row_science_eligible, row_science_excluded, row_science_reason = (
-        science_disposition(payload, frag)
+        science_disposition(payload_root, frag)
     )
 
     stats_obj = d(frag.get("stats"))
@@ -548,7 +604,7 @@ def compact(db_id: int, db_pps: int, ts: str, payload: Dict[str, Any]) -> Compac
         db_id=db_id,
         pps=db_pps,
         ts=ts,
-        campaign=str(payload.get("campaign") or frag.get("campaign") or ""),
+        campaign=str(frag.get("campaign") or d(payload_root.get("campaign")).get("campaign") or ""),
         gnss_ns=first_int(path(frag, "gnss.ns"), frag.get("gnss_ns")),
         vclock_ns=first_int(path(frag, "vclock.ns"), path(frag, "gnss.ns")),
         dwt_cycles=first_int(
@@ -607,11 +663,11 @@ def compact(db_id: int, db_pps: int, ts: str, payload: Dict[str, Any]) -> Compac
         servo_mode=str(
             path(frag, "dac.servo_mode")
             or frag.get("servo_mode")
-            or payload.get("servo_mode")
+            or payload_root.get("servo_mode")
             or "?"
         ),
-        location=str(payload.get("location") or "?"),
-        environment=d(payload.get("environment")),
+        location=str(frag.get("location") or payload_root.get("location") or "?"),
+        environment=d(payload_root.get("environment")),
         final_forensics=forensic,
     )
 
@@ -929,7 +985,7 @@ def update(audit: Audit, prev: Optional[CompactRow], cur: CompactRow) -> None:
 
 def print_report(audit: Audit, batch_size: int, pause_ms: int) -> None:
     if audit.rows == 0:
-        print(f"No TIMEBASE rows found for campaign {audit.campaign!r}")
+        print(f"No TEMPEST campaign_detail rows found for campaign {audit.campaign!r}")
         return
 
     assert audit.first_pps is not None and audit.last_pps is not None
@@ -941,7 +997,7 @@ def print_report(audit: Audit, batch_size: int, pause_ms: int) -> None:
     print(f"CAMPAIGN ANALYSIS: {audit.campaign}")
     print("=" * 78)
     print(f"  Streaming policy:  named cursor, batch={batch_size}, pause={pause_ms} ms")
-    print(f"  Database ordering: timebase.pps_count, id")
+    print("  Database ordering: campaign.tempest.teensy_pps_vclock_count, id")
     print(f"  Time range:        {audit.first_ts} -> {audit.last_ts}")
     print(f"  PPS range:         {audit.first_pps} -> {audit.last_pps}")
     print(f"  Actual rows:       {audit.rows:,}")
@@ -1281,20 +1337,26 @@ def list_campaigns() -> None:
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
         cur.execute(
-            """
-            SELECT t.campaign,
-                   bool_or(c.active) AS active,
-                   count(*) AS tb_count,
-                   min(t.pps_count) AS pps_min,
-                   max(t.pps_count) AS pps_max,
-                   count(*) FILTER (WHERE t.pps_count IS NULL) AS pps_missing,
-                   max(t.ts) AS last_ts
-            FROM timebase t
-            LEFT JOIN campaigns c USING (campaign)
-            GROUP BY t.campaign
-            ORDER BY max(t.ts) DESC
+            f"""
+            SELECT d.campaign,
+                   bool_or(m.active) AS active,
+                   count(*) AS detail_count,
+                   min({DETAIL_PPS_COUNT_SQL}) AS pps_min,
+                   max({DETAIL_PPS_COUNT_SQL}) AS pps_max,
+                   count(*) FILTER (WHERE {DETAIL_PPS_COUNT_SQL} IS NULL) AS pps_missing,
+                   max(d.ts) AS last_ts
+            FROM campaign_detail d
+            LEFT JOIN campaign_master m
+              ON m.campaign_type = d.campaign_type
+             AND m.campaign = d.campaign
+            WHERE d.campaign_type = %s
+              AND d.campaign IS NOT NULL
+              AND d.payload #> '{{campaign,tempest}}' IS NOT NULL
+            GROUP BY d.campaign
+            ORDER BY max(d.ts) DESC
             LIMIT 20
-            """
+            """,
+            (CAMPAIGN_TYPE,),
         )
         rows = cur.fetchall()
 
@@ -1310,7 +1372,7 @@ def list_campaigns() -> None:
         print(
             f"  {row['campaign']:<20s} "
             f"{('>' if row['active'] else ''):>7s} "
-            f"{int(row['tb_count']):>9,d} {range_text:>22s}"
+            f"{int(row['detail_count']):>9,d} {range_text:>22s}"
         )
 
 

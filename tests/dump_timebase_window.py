@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Print TIMEBASE JSON records around a PPS identity to stdout.
+Print TEMPEST campaign_detail records around a campaign PPS identity.
 
 Examples:
     python dump_timebase_window.py Servo3 8321
@@ -11,7 +11,7 @@ Stdout contains one JSON document containing:
   - campaign
   - requested range
   - record count
-  - the complete TIMEBASE payload for every matching row
+  - the complete unified campaign_detail payload for every matching row
   - database id/timestamp metadata
 
 No fields are filtered or normalized.
@@ -28,20 +28,19 @@ from typing import Any, Dict, List, Optional
 from zpnet.shared.db import open_db
 
 
+CAMPAIGN_TYPE = "TEMPEST"
+
 PPS_COUNT_SQL = """
-COALESCE(
-    NULLIF(payload->>'teensy_pps_vclock_count', '')::bigint,
-    NULLIF(payload->>'pps_count', '')::bigint,
-    NULLIF(payload->'fragment'->>'teensy_pps_vclock_count', '')::bigint,
-    NULLIF(payload->'fragment'->>'pps_count', '')::bigint,
-    NULLIF(payload->'fragment'->>'campaign_seconds', '')::bigint
-)
+NULLIF(
+    payload #>> '{campaign,tempest,teensy_pps_vclock_count}',
+    ''
+)::bigint
 """
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Dump complete TIMEBASE JSON records around a PPS count."
+        description="Dump complete TEMPEST campaign_detail records around a campaign PPS count."
     )
     parser.add_argument("campaign", help="Campaign name, for example Servo3")
     parser.add_argument(
@@ -96,15 +95,16 @@ def fetch_timebase_window(campaign: str, start: int, end: int) -> List[Dict[str,
             ts,
             {PPS_COUNT_SQL} AS pps_count,
             payload
-        FROM timebase
-        WHERE campaign = %s
+        FROM campaign_detail
+        WHERE campaign_type = %s
+          AND campaign = %s
           AND {PPS_COUNT_SQL} BETWEEN %s AND %s
         ORDER BY {PPS_COUNT_SQL} ASC, id ASC
     """
 
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
-        cur.execute(query, (campaign, start, end))
+        cur.execute(query, (CAMPAIGN_TYPE, campaign, start, end))
         rows = cur.fetchall()
 
     records: List[Dict[str, Any]] = []
@@ -147,7 +147,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     found = [record["_pps_count"] for record in records]
     print(
-        f"Returned {len(records)} TIMEBASE record(s) on stdout.",
+        f"Returned {len(records)} TEMPEST campaign_detail record(s) on stdout.",
         file=sys.stderr,
     )
     if found:
@@ -165,7 +165,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
     else:
         print(
-            "No TIMEBASE rows matched the requested range.",
+            "No TEMPEST campaign_detail rows matched the requested range.",
             file=sys.stderr,
         )
 

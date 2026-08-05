@@ -1,7 +1,7 @@
 """
 ZPNet Raw PPB — canonical running OCXO PPB.
 
-Reads TIMEBASE rows for one campaign and prints one line per campaign PPS row
+Reads TEMPEST-decorated campaign_detail rows and prints one line per campaign PPS row
 for the two OCXO lanes. Every row shows the canonical one-second fast residual
 and its running cumulative mean in ns/s, numerically equivalent to PPB.
 
@@ -38,6 +38,13 @@ from zpnet.shared.db import open_db
 NS_PER_SECOND = 1_000_000_000
 LANE_KEYS = {"OCXO1": "ocxo1", "OCXO2": "ocxo2"}
 LANE_MICRO_PREFIXES = {"ocxo1": "o1", "ocxo2": "o2"}
+CAMPAIGN_TYPE = "TEMPEST"
+PPS_COUNT_SQL = """
+NULLIF(
+    payload #>> '{campaign,tempest,teensy_pps_vclock_count}',
+    ''
+)::bigint
+"""
 
 # -----------------------------------------------------------------------------
 # Database and schema helpers
@@ -45,27 +52,20 @@ LANE_MICRO_PREFIXES = {"ocxo1": "o1", "ocxo2": "o2"}
 
 
 def fetch_timebase(campaign: str) -> List[Dict[str, Any]]:
-    """Fetch TIMEBASE rows in campaign PPS order."""
+    """Fetch TEMPEST campaign_detail payloads in campaign-public PPS order."""
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
         cur.execute(
-            """
-            SELECT payload
-            FROM timebase
-            WHERE campaign = %s
-            ORDER BY COALESCE(
-                NULLIF(jsonb_extract_path_text(payload::jsonb, 'pps_count'), '')::bigint,
-                NULLIF(jsonb_extract_path_text(payload::jsonb, 'teensy_pps_vclock_count'), '')::bigint,
-                NULLIF(jsonb_extract_path_text(payload::jsonb, 'fragment', 'pps_count'), '')::bigint,
-                NULLIF(jsonb_extract_path_text(payload::jsonb, 'fragment', 'teensy_pps_vclock_count'), '')::bigint,
-                NULLIF(jsonb_extract_path_text(payload::jsonb, 'fragment', 'teensy_pps_count'), '')::bigint,
-                NULLIF(jsonb_extract_path_text(payload::jsonb, 'payload', 'pps_count'), '')::bigint,
-                NULLIF(jsonb_extract_path_text(payload::jsonb, 'payload', 'fragment', 'pps_count'), '')::bigint,
-                NULLIF(jsonb_extract_path_text(payload::jsonb, 'payload', 'fragment', 'teensy_pps_vclock_count'), '')::bigint,
-                NULLIF(jsonb_extract_path_text(payload::jsonb, 'payload', 'fragment', 'teensy_pps_count'), '')::bigint
-            ) ASC
+            f"""
+            SELECT id, {PPS_COUNT_SQL} AS pps_count, payload
+            FROM campaign_detail
+            WHERE campaign_type = %s
+              AND campaign = %s
+              AND payload #> '{{campaign,tempest}}' IS NOT NULL
+              AND {PPS_COUNT_SQL} IS NOT NULL
+            ORDER BY {PPS_COUNT_SQL} ASC, id ASC
             """,
-            (campaign,),
+            (CAMPAIGN_TYPE, campaign),
         )
         rows = cur.fetchall()
 
@@ -74,27 +74,78 @@ def fetch_timebase(campaign: str) -> List[Dict[str, Any]]:
         payload = row["payload"]
         if isinstance(payload, str):
             payload = json.loads(payload)
-        if isinstance(payload, dict):
-            out.append(payload)
+        if not isinstance(payload, dict):
+            continue
+
+        root = _root(payload)
+        frag = _frag(payload)
+        forensic = _forensics_root(payload)
+        payload_count = pps_count_from_schema(root, frag, forensic)
+        db_count = int(row["pps_count"])
+        if payload_count is not None and payload_count != db_count:
+            raise ValueError(
+                "campaign_detail relational/payload campaign PPS mismatch: "
+                f"id={row['id']} db={db_count} payload={payload_count}"
+            )
+        out.append(payload)
     return out
 
 
 def _root(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the persisted record, unwrapping only a true outer envelope.
+
+    A unified MONITOR_V2 detail legitimately has a top-level ``payload`` field
+    containing Payload subsystem diagnostics.  That field is not an envelope
+    and must never replace the complete state record.
+    """
     if not isinstance(rec, dict):
         return {}
-    inner = rec.get("payload") if "payload" in rec else rec
-    return inner if isinstance(inner, dict) else {}
+    if any(
+        key in rec
+        for key in ("schema", "monitor_fragment", "fragment", "campaign_row", "campaign")
+    ):
+        return rec
+
+    inner = rec.get("payload")
+    return inner if isinstance(inner, dict) else rec
+
+
+def _tempest_decoration(rec: Dict[str, Any]) -> Dict[str, Any]:
+    root = _root(rec)
+    campaign = root.get("campaign")
+    if not isinstance(campaign, dict):
+        return {}
+    tempest = campaign.get("tempest")
+    return tempest if isinstance(tempest, dict) else {}
 
 
 def _frag(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """Return one merged TEMPEST campaign view from a unified state detail."""
     root = _root(rec)
-    frag = root.get("fragment")
-    return frag if isinstance(frag, dict) else {}
+    direct = root.get("fragment") or root.get("campaign_row")
+    direct = direct if isinstance(direct, dict) else {}
+
+    monitor_fragment = root.get("monitor_fragment")
+    monitor_fragment = monitor_fragment if isinstance(monitor_fragment, dict) else {}
+    embedded = monitor_fragment.get("campaign_row")
+    embedded = embedded if isinstance(embedded, dict) else {}
+
+    decoration = _tempest_decoration(rec)
+    source = embedded or direct
+    if source or decoration:
+        merged = dict(source)
+        merged.update(decoration)
+        return merged
+    return {}
 
 
 def _forensics_root(rec: Dict[str, Any]) -> Dict[str, Any]:
     root = _root(rec)
     forensic = root.get("forensics")
+    if isinstance(forensic, dict):
+        return forensic
+    frag = _frag(rec)
+    forensic = frag.get("forensics")
     return forensic if isinstance(forensic, dict) else {}
 
 
@@ -173,14 +224,16 @@ def pps_count_from_schema(root: Dict[str, Any],
                           frag: Dict[str, Any],
                           forensic: Dict[str, Any]) -> Optional[int]:
     return _first_int(
-        root.get("pps_count"),
-        root.get("teensy_pps_vclock_count"),
-        frag.get("pps_count"),
-        forensic.get("pps_count"),
+        # The merged TEMPEST fragment carries campaign-public identity.
+        # MONITOR root counts are the always-on physical SYSTEM sequence.
         frag.get("teensy_pps_vclock_count"),
+        frag.get("pps_count"),
         frag.get("teensy_pps_count"),
         forensic.get("teensy_pps_vclock_count"),
+        forensic.get("pps_count"),
         forensic.get("teensy_pps_count"),
+        root.get("teensy_pps_vclock_count"),
+        root.get("pps_count"),
     )
 
 
@@ -251,13 +304,34 @@ def gnss_discipline_fields(root: Dict[str, Any],
     """GNSS receiver discipline fields retained as contextual telemetry."""
     gnss = root.get("gnss") if isinstance(root.get("gnss"), dict) else {}
     frag_gnss = frag.get("gnss") if isinstance(frag.get("gnss"), dict) else {}
-    extra = root.get("extra_clocks") if isinstance(root.get("extra_clocks"), dict) else {}
+    discipline = gnss.get("discipline") if isinstance(gnss.get("discipline"), dict) else {}
+    pps = gnss.get("pps") if isinstance(gnss.get("pps"), dict) else {}
+    clock = gnss.get("clock") if isinstance(gnss.get("clock"), dict) else {}
+    extra = frag.get("extra_clocks") if isinstance(frag.get("extra_clocks"), dict) else {}
+    if not extra:
+        extra = root.get("extra_clocks") if isinstance(root.get("extra_clocks"), dict) else {}
 
     return {
-        "pps_err": _first_float(gnss.get("pps_timing_error_ns"), frag_gnss.get("pps_timing_error_ns")),
-        "g_acc": _first_float(gnss.get("estimated_accuracy_ns"), frag_gnss.get("estimated_accuracy_ns")),
-        "g_frq": _first_float(gnss.get("freq_error_ppb"), frag_gnss.get("freq_error_ppb")),
-        "g_clk": _first_float(gnss.get("clock_drift_ppb"), frag_gnss.get("clock_drift_ppb")),
+        "pps_err": _first_float(
+            gnss.get("pps_timing_error_ns"),
+            discipline.get("pps_timing_error_ns"),
+            frag_gnss.get("pps_timing_error_ns"),
+        ),
+        "g_acc": _first_float(
+            gnss.get("estimated_accuracy_ns"),
+            pps.get("estimated_accuracy_ns"),
+            frag_gnss.get("estimated_accuracy_ns"),
+        ),
+        "g_frq": _first_float(
+            gnss.get("freq_error_ppb"),
+            discipline.get("freq_error_ppb"),
+            frag_gnss.get("freq_error_ppb"),
+        ),
+        "g_clk": _first_float(
+            gnss.get("clock_drift_ppb"),
+            clock.get("drift_ppb"),
+            frag_gnss.get("clock_drift_ppb"),
+        ),
         "g_raw": _first_float(extra.get("gnss_raw_drift_ppb")),
     }
 
@@ -415,7 +489,7 @@ def analyze(campaign: str) -> None:
     print()
 
     if not rows:
-        print("No TIMEBASE rows found.")
+        print("No TEMPEST campaign_detail rows found.")
         return
 
     print_table(rows)
