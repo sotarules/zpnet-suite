@@ -9,7 +9,7 @@ Core contract:
   whose TIMEBASE_FRAGMENT_V7 body carries observation plus mode-free eligibility;
   older fragment versions may also contain embedded forensics. CLOCKS decorates
   the accepted candidate with Pi-owned environment, GF-8802, GNSS_RAW, and
-  system-time evidence, then persists an immutable typed TEMPEST campaign detail.
+  system-time evidence, then decorates the same-second unified state detail.
 
   There is no standalone TIMEBASE_FORENSICS subscription in this process and
   no two-topic pair join. The TEMPEST detail payload retains the ``fragment``
@@ -35,7 +35,7 @@ Core contract:
 
   RECOVER behavior:
 
-    RECOVER uses the last durable TEMPEST campaign detail as the public base, sends a
+    RECOVER uses the last durable unified state detail with TEMPEST decoration as the public base, sends a
     recover command to the Teensy, waits for the first Pi-accepted public row,
     and restores Pi-owned GNSS_RAW/Welford state immediately before that row is
     persisted. Timeline rows may be admitted while OCXO science is explicitly
@@ -47,7 +47,7 @@ Responsibilities:
   * Adjudicate each candidate: persist coherent audit rows and recover on structural loss.
   * Subscribe to predictive GF-8802 announcements and bind them to PPS-aligned rows.
   * Augment accepted rows with environment, GNSS_RAW, and system time.
-  * Publish the live TIMEBASE topic and persist typed TEMPEST campaign details.
+  * Publish the live TIMEBASE topic and attach TEMPEST facts to unified state details.
   * Denormalize the latest accepted TEMPEST detail into the active campaign master.
   * Recover clocks after restart if a campaign is active.
   * Subscribe to WATCHDOG_ANOMALY and initiate Pi-side campaign recovery.
@@ -55,7 +55,7 @@ Responsibilities:
 
 Semantics:
   * No Pi-side smoothing, inference, or repair of Teensy clock state.
-  * Persisted TEMPEST campaign details are immutable.
+  * One physical second has one durable state detail; TEMPEST is a decoration.
   * Gaps, jumps, regressions, and science exclusions are recorded as evidence.
   * WATCHDOG_ANOMALY is an explicit Teensy continuity surrender and starts
     Pi-side recovery from the latest canonical TEMPEST campaign detail.
@@ -95,7 +95,8 @@ from zpnet.shared.events import create_event
 NS_PER_SECOND = 1_000_000_000
 
 CAMPAIGN_TYPE_TEMPEST = "TEMPEST"
-CAMPAIGN_DETAIL_TYPE_TEMPEST = "TEMPEST"
+CAMPAIGN_DETAIL_ATTACH_TIMEOUT_S = 5.0
+CAMPAIGN_DETAIL_ATTACH_POLL_S = 0.05
 
 # Teensy DWT conversion constants mirror pnc/firmware/teensy/config.h.
 # RECOVER still accepts a dwt_ns command argument, but current
@@ -326,6 +327,14 @@ _diag: Dict[str, Any] = {
     "timebase_pieces_processed": 0,              # legacy alias: queue items
     "timebase_rows_completed": 0,
     "timebase_pairs_completed": 0,               # legacy alias for rows completed
+
+    # Unified state-detail attachment. CLOCKS decorates the SYSTEM-owned MONITOR
+    # row instead of inserting a second TEMPEST row for the same physical second.
+    "campaign_detail_attach_attempts": 0,
+    "campaign_detail_attach_retries": 0,
+    "campaign_detail_attach_success": 0,
+    "campaign_detail_attach_failures": 0,
+    "last_campaign_detail_attach": {},
 
     # TIMEBASE final acceptance court (processor thread — last gate)
     "timebase_final_court_checks": 0,
@@ -1955,52 +1964,151 @@ def _restore_gnss_raw_payload(gnss_raw: Dict[str, Any]) -> Dict[str, Any]:
 
 
 
-def _persist_tempest_detail(detail: Dict[str, Any]) -> None:
-    """Append one typed TEMPEST detail and denormalize the active campaign report."""
-    try:
-        pps_count = _extract_teensy_pps_vclock_count(
-            detail,
-            topic="TEMPEST detail persistence",
-        )
-        viable = bool(detail.get("science_eligible"))
 
-        report = dict(detail)
-        report["campaign_type"] = CAMPAIGN_TYPE_TEMPEST
-        report["detail_type"] = CAMPAIGN_DETAIL_TYPE_TEMPEST
-        report["campaign_state"] = "STARTED"
+def _tempest_state_decoration(detail: Dict[str, Any]) -> Dict[str, Any]:
+    """Return only the TEMPEST-owned facts added to one common state snapshot."""
+    return {
+        "schema": "TEMPEST_STATE_DECORATION_V1",
+        "campaign_type": CAMPAIGN_TYPE_TEMPEST,
+        "campaign": detail["campaign"],
+        "state": "STARTED",
+        "campaign_elapsed": detail.get("campaign_elapsed"),
+        "teensy_pps_vclock_count": detail.get("teensy_pps_vclock_count"),
+        "viable": bool(detail.get("science_eligible")),
+        "science_eligible": bool(detail.get("science_eligible")),
+        "control_eligible": bool(detail.get("control_eligible")),
+        "science_excluded": bool(detail.get("science_excluded")),
+        "candidate_use": detail.get("candidate_use"),
+        "timebase_message_version": detail.get("timebase_message_version"),
+        "timebase_pair_version": detail.get("timebase_pair_version"),
+        "final_court": copy.deepcopy(detail.get("final_court") or {}),
+        "location": detail.get("location"),
+        # GNSS_RAW campaign state is Pi CLOCKS-owned and advances only after the
+        # final court. It therefore cannot be recovered from the earlier raw
+        # MONITOR_FRAGMENT alone and remains a genuine TEMPEST decoration.
+        "extra_clocks": copy.deepcopy(detail.get("extra_clocks") or {}),
+        "adjudicated_at_utc": detail.get("system_time_utc"),
+    }
 
-        with open_db() as conn:
-            cur = conn.cursor()
-            cur.execute(
-                """
-                INSERT INTO campaign_detail
-                    (detail_type, campaign_type, campaign, viable,
-                     payload, sequence, pps_count)
-                VALUES
-                    (%s, %s, %s, %s, %s::jsonb, %s, %s)
-                """,
-                (
-                    CAMPAIGN_DETAIL_TYPE_TEMPEST,
-                    CAMPAIGN_TYPE_TEMPEST,
-                    detail["campaign"],
-                    viable,
-                    json.dumps(report),
-                    int(pps_count),
-                    int(pps_count),
-                ),
+
+def _attach_tempest_to_state_detail(detail: Dict[str, Any]) -> None:
+    """Attach final TEMPEST facts to the same-second SYSTEM state detail.
+
+    SYSTEM persists the common always-on TEMPEST snapshot first. CLOCKS then identifies
+    that row by the immutable campaign-row PPS/VCLOCK identity already carried
+    inside ``monitor_fragment.campaign_row`` and adds only the type-owned
+    TEMPEST decoration. No second campaign_detail row is created.
+    """
+    pps_count = _extract_teensy_pps_vclock_count(
+        detail,
+        topic="TEMPEST state-detail attachment",
+    )
+    viable = bool(detail.get("science_eligible"))
+    campaign = str(detail["campaign"])
+    decoration = _tempest_state_decoration(detail)
+    campaign_context = {
+        "campaign_type": CAMPAIGN_TYPE_TEMPEST,
+        "campaign": campaign,
+        "state": "STARTED",
+        "viable": viable,
+        "tempest": decoration,
+    }
+
+    # campaign_master is the compact read model. It may retain the complete
+    # accepted report because that copy is intentionally optimized for lists,
+    # baseline selection, and campaign-level presentation rather than recovery.
+    report = dict(detail)
+    report["campaign_type"] = CAMPAIGN_TYPE_TEMPEST
+    report["campaign_state"] = "STARTED"
+
+    deadline = time.monotonic() + CAMPAIGN_DETAIL_ATTACH_TIMEOUT_S
+    attempts = 0
+    last_error: Optional[BaseException] = None
+
+    while True:
+        attempts += 1
+        _diag["campaign_detail_attach_attempts"] += 1
+        try:
+            with open_db(row_dict=True) as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    UPDATE campaign_detail
+                    SET viable = %s,
+                        payload = jsonb_set(
+                            payload,
+                            '{campaign}',
+                            %s::jsonb,
+                            true
+                        )
+                    WHERE id = (
+                        SELECT id
+                        FROM campaign_detail
+                        WHERE campaign_type = %s
+                          AND campaign = %s
+                          AND payload #>> '{monitor_fragment,campaign_row,teensy_pps_vclock_count}' = %s
+                        ORDER BY id DESC
+                        LIMIT 1
+                    )
+                    RETURNING id
+                    """,
+                    (
+                        viable,
+                        json.dumps(campaign_context),
+                        CAMPAIGN_TYPE_TEMPEST,
+                        campaign,
+                        str(int(pps_count)),
+                    ),
+                )
+                attached = cur.fetchone()
+                if attached is not None:
+                    cur.execute(
+                        """
+                        UPDATE campaign_master
+                        SET payload = payload || jsonb_build_object('report', %s::jsonb)
+                        WHERE campaign_type = %s
+                          AND campaign = %s
+                          AND active = true
+                        """,
+                        (json.dumps(report), CAMPAIGN_TYPE_TEMPEST, campaign),
+                    )
+
+            if attached is not None:
+                _diag["campaign_detail_attach_success"] += 1
+                _diag["campaign_detail_attach_retries"] += max(0, attempts - 1)
+                _diag["last_campaign_detail_attach"] = {
+                    "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "campaign": campaign,
+                    "teensy_pps_vclock_count": int(pps_count),
+                    "attempts": attempts,
+                    "success": True,
+                }
+                return
+        except Exception as exc:
+            last_error = exc
+
+        if time.monotonic() >= deadline:
+            _diag["campaign_detail_attach_failures"] += 1
+            _diag["campaign_detail_attach_retries"] += max(0, attempts - 1)
+            _diag["last_campaign_detail_attach"] = {
+                "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "campaign": campaign,
+                "teensy_pps_vclock_count": int(pps_count),
+                "attempts": attempts,
+                "success": False,
+                "error": str(last_error) if last_error is not None else "matching MONITOR detail not found",
+            }
+            logging.error(
+                "⚠️ [clocks] failed to attach TEMPEST decoration to unified "
+                "campaign_detail: campaign=%s pps_vclock_count=%d attempts=%d error=%s",
+                campaign,
+                int(pps_count),
+                attempts,
+                str(last_error) if last_error is not None else "matching MONITOR detail not found",
             )
-            cur.execute(
-                """
-                UPDATE campaign_master
-                SET payload = payload || jsonb_build_object('report', %s::jsonb)
-                WHERE campaign_type = %s
-                  AND campaign = %s
-                  AND active = true
-                """,
-                (json.dumps(report), CAMPAIGN_TYPE_TEMPEST, detail["campaign"]),
-            )
-    except Exception:
-        logging.exception("⚠️ [clocks] failed to persist TEMPEST campaign detail (ignored)")
+            return
+
+        time.sleep(CAMPAIGN_DETAIL_ATTACH_POLL_S)
 
 
 
@@ -4452,32 +4560,131 @@ def _recovery_timebase_snapshot(tb: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+
+def _tempest_detail_from_state_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Reconstruct the established TEMPEST report view from one unified snapshot.
+
+    Storage remains nonredundant: the raw firmware candidate, common clocks,
+    environment, GNSS, and restore state stay in their ordinary MONITOR homes.
+    This adapter presents the former report shape only to existing TEMPEST
+    recovery calculations while they are moved behind generalized state recovery.
+    """
+    campaign_context = state.get("campaign")
+    if not isinstance(campaign_context, dict):
+        raise ValueError("state detail has no campaign context")
+    if str(campaign_context.get("campaign_type") or "").upper() != CAMPAIGN_TYPE_TEMPEST:
+        raise ValueError("state detail is not TEMPEST")
+
+    tempest = campaign_context.get("tempest")
+    if not isinstance(tempest, dict):
+        raise ValueError("state detail has no TEMPEST decoration")
+
+    monitor_fragment = state.get("monitor_fragment")
+    if not isinstance(monitor_fragment, dict):
+        raise ValueError("state detail has no monitor_fragment")
+    candidate = monitor_fragment.get("campaign_row")
+    if not isinstance(candidate, dict):
+        raise ValueError("state detail has no monitor_fragment.campaign_row")
+
+    fragment = copy.deepcopy(candidate)
+    embedded_forensics = fragment.pop("forensics", None)
+    forensics = (
+        copy.deepcopy(embedded_forensics)
+        if isinstance(embedded_forensics, dict)
+        else {}
+    )
+    count = _extract_teensy_pps_vclock_count(
+        fragment,
+        topic="unified TEMPEST state detail",
+    )
+    _normalize_fragment_count_aliases(fragment, count)
+    if forensics:
+        _normalize_fragment_count_aliases(forensics, count)
+
+    clocks = state.get("clocks")
+    clocks = clocks if isinstance(clocks, dict) else {}
+    fragment = _decorate_persisted_fragment_ppb_buckets(
+        fragment,
+        _monitor_fragment_ppb_buckets({"clocks": clocks}),
+    )
+
+    campaign = str(campaign_context.get("campaign") or tempest.get("campaign") or "")
+    detail = {
+        "schema": "TIMEBASE_V3",
+        "campaign_type": CAMPAIGN_TYPE_TEMPEST,
+        "timebase_message_version": tempest.get("timebase_message_version"),
+        "timebase_pair_version": tempest.get("timebase_pair_version"),
+        "campaign": campaign,
+        "campaign_elapsed": tempest.get("campaign_elapsed"),
+        "science_eligible": bool(tempest.get("science_eligible")),
+        "control_eligible": bool(tempest.get("control_eligible")),
+        "persist": True,
+        "science_excluded": bool(tempest.get("science_excluded")),
+        "candidate_use": tempest.get("candidate_use"),
+        "final_court": copy.deepcopy(tempest.get("final_court") or {}),
+        "location": tempest.get("location"),
+        "system_time_utc": state.get("published_at_utc"),
+        "gnss_time_utc": (
+            clocks.get("gnss_time_utc")
+            or _path_get(state, "gnss.gnss_time_utc")
+            or _path_get(state, "gnss.next_utc")
+        ),
+        "teensy_pps_vclock_count": int(count),
+        "teensy_pps_count": int(count),
+        "pps_count": int(count),
+        "fragment": fragment,
+        "forensics": forensics,
+        "environment": copy.deepcopy(state.get("environment")),
+        "gnss": copy.deepcopy(state.get("gnss")),
+        "extra_clocks": copy.deepcopy(tempest.get("extra_clocks") or {}),
+    }
+
+    restore_state = clocks.get("restore_state")
+    if isinstance(restore_state, dict):
+        detail["restore_state"] = copy.deepcopy(restore_state)
+    return detail
+
+
+def _count_tempest_state_details(campaign_name: str) -> int:
+    """Return the number of unified state rows carrying a TEMPEST decoration."""
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM campaign_detail
+            WHERE campaign_type = %s
+              AND campaign = %s
+              AND payload #> '{campaign,tempest}' IS NOT NULL
+            """,
+            (
+                CAMPAIGN_TYPE_TEMPEST,
+                campaign_name,
+            ),
+        )
+        row = cur.fetchone()
+    return int(row["cnt"] if row else 0)
+
+
 def _load_last_recoverable_tempest_detail(
     campaign_name: str,
     *,
     scan_limit: int = 64,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], int]:
-    """Return the newest TEMPEST detail usable as a warm-recovery base.
-
-    The final court protects future rows, but older campaign details may already
-    contain recovery-poison rows with zero OCXO ledgers. Scan backward to the
-    newest recoverable detail; if none exists, return the newest parseable detail
-    so the caller can fail loudly with complete diagnostics.
-    """
+    """Return the newest unified TEMPEST state snapshot usable for recovery."""
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
         cur.execute(
             """
             SELECT payload
             FROM campaign_detail
-            WHERE detail_type = %s
-              AND campaign_type = %s
+            WHERE campaign_type = %s
               AND campaign = %s
+              AND payload #> '{campaign,tempest}' IS NOT NULL
             ORDER BY id DESC
             LIMIT %s
             """,
             (
-                CAMPAIGN_DETAIL_TYPE_TEMPEST,
                 CAMPAIGN_TYPE_TEMPEST,
                 campaign_name,
                 int(scan_limit),
@@ -4486,24 +4693,25 @@ def _load_last_recoverable_tempest_detail(
         rows = cur.fetchall()
 
     if not rows:
-        raise LookupError("missing_tempest_detail")
+        raise LookupError("missing_tempest_state_detail")
 
     newest_detail: Optional[Dict[str, Any]] = None
     newest_snapshot: Optional[Dict[str, Any]] = None
     newest_error: Optional[str] = None
 
     for skipped, row in enumerate(rows):
-        detail = row["payload"]
-        if isinstance(detail, str):
-            detail = json.loads(detail)
-        if not isinstance(detail, dict):
+        state = row["payload"]
+        if isinstance(state, str):
+            state = json.loads(state)
+        if not isinstance(state, dict):
             continue
 
         try:
+            detail = _tempest_detail_from_state_snapshot(state)
             snapshot = _recovery_timebase_snapshot(detail)
-        except Exception as e:
+        except Exception as exc:
             if newest_error is None:
-                newest_error = str(e)
+                newest_error = str(exc)
             continue
 
         if newest_detail is None:
@@ -4519,9 +4727,8 @@ def _load_last_recoverable_tempest_detail(
                     _diag.get("recovery_last_timebase_unrecoverable", 0) + int(skipped)
                 )
                 logging.warning(
-                    "⚠️ [recovery] skipped %d latest TEMPEST detail(s) with "
-                    "unrecoverable ledgers; using recoverable detail at "
-                    "pps_vclock_count=%s",
+                    "⚠️ [recovery] skipped %d latest unified TEMPEST state "
+                    "detail(s) with unrecoverable ledgers; using count=%s",
                     skipped,
                     snapshot.get("last_pps_vclock_count"),
                 )
@@ -4531,7 +4738,7 @@ def _load_last_recoverable_tempest_detail(
         return newest_detail, newest_snapshot, 0
 
     raise RuntimeError(
-        "recovery failed: no parseable TEMPEST campaign details "
+        "recovery failed: no parseable unified TEMPEST state details "
         f"({newest_error or 'unknown error'})"
     )
 
@@ -5460,7 +5667,6 @@ def _process_loop() -> None:
         timebase = {
             "schema": "TIMEBASE_V3",
             "campaign_type": CAMPAIGN_TYPE_TEMPEST,
-            "detail_type": CAMPAIGN_DETAIL_TYPE_TEMPEST,
             "timebase_message_version": frag.get("timebase_message_version"),
             "timebase_pair_version": frag.get("timebase_pair_version"),
             "campaign": campaign,
@@ -5519,7 +5725,7 @@ def _process_loop() -> None:
             timebase["restore_state"] = copy.deepcopy(restore_state)
 
         publish("TIMEBASE", timebase)
-        _persist_tempest_detail(timebase)
+        _attach_tempest_to_state_detail(timebase)
 
 # ---------------------------------------------------------------------
 # Control-plane: START / STOP / CLEAR / RECOVER
@@ -6507,25 +6713,8 @@ def cmd_resume(args: Optional[dict]) -> dict:
     if row["active"]:
         return {"success": False, "message": f"Campaign '{campaign_name}' is already active"}
 
-    # Verify it has TEMPEST campaign details
-    with open_db(row_dict=True) as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT COUNT(*) AS cnt
-            FROM campaign_detail
-            WHERE detail_type = %s
-              AND campaign_type = %s
-              AND campaign = %s
-            """,
-            (
-                CAMPAIGN_DETAIL_TYPE_TEMPEST,
-                CAMPAIGN_TYPE_TEMPEST,
-                campaign_name,
-            ),
-        )
-        cnt_row = cur.fetchone()
-    tb_count = cnt_row["cnt"] if cnt_row else 0
+    # Verify it has unified state rows with TEMPEST decoration.
+    tb_count = _count_tempest_state_details(campaign_name)
 
     if tb_count == 0:
         return {
@@ -6725,29 +6914,9 @@ def _recover_campaign() -> None:
     )
 
     # ------------------------------------------------------------------
-    # Step 1: Read last TEMPEST campaign detail
+    # Step 1: Establish whether unified TEMPEST state exists
     # ------------------------------------------------------------------
-    with open_db(row_dict=True) as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT payload
-            FROM campaign_detail
-            WHERE detail_type = %s
-              AND campaign_type = %s
-              AND campaign = %s
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (
-                CAMPAIGN_DETAIL_TYPE_TEMPEST,
-                CAMPAIGN_TYPE_TEMPEST,
-                campaign_name,
-            ),
-        )
-        tb_row = cur.fetchone()
-
-    if tb_row is None:
+    if _count_tempest_state_details(campaign_name) == 0:
         _diag["recovery_missing_timebase"] += 1
         if _reattach_pending_flash_cut_without_recovery(
             campaign_name=campaign_name,

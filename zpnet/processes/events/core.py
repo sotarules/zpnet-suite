@@ -3,7 +3,7 @@ ZPNet EVENTS Process — Durable Ingress + Outbound Despooler
 
 This service is the single authoritative egress bridge between:
 
-  • Local PostgreSQL stores (zpnet_events, timebase)
+  • Local PostgreSQL stores (zpnet_events, campaign_detail)
   • The remote ZPNet server
 
 It is also the ingress authority for Teensy-originated events.
@@ -11,21 +11,20 @@ It is also the ingress authority for Teensy-originated events.
 Responsibilities:
   • Subscribe to EVENTS and persist them locally (append-only)
   • Periodically despool unsent events to the ZPNet backend
-  • Periodically despool unsent timebase records to the ZPNet backend
+  • Periodically despool unsent campaign_detail records to the ZPNet backend
   • Mark records as despooled only upon confirmed delivery
 
-Note on TIMEBASE ingress:
-  • TIMEBASE records are persisted by the CLOCKS process, not here.
-  • CLOCKS owns persistence because the INSERT and the campaign
-    report UPDATE share transactional context.
-  • This process owns only TIMEBASE egress (despooling to server).
+Note on campaign-detail ingress:
+  • campaign_detail records are persisted and decorated by their owning
+    producer processes, not here.
+  • This process owns only campaign_detail egress to the server.
 
 Process model:
   • One systemd service
   • Three execution contexts:
       1) Pub/Sub handler thread (EVENTS topic)
       2) Events despooler loop thread (HTTP egress)
-      3) Timebase despooler loop thread (HTTP egress)
+      3) Campaign-detail despooler loop thread (HTTP egress)
 
 Semantics:
   • No internal recovery or inference
@@ -66,6 +65,11 @@ from zpnet.shared.logger import setup_logging
 DESPOOL_BATCH_SIZE = 50          # records per HTTP POST
 DESPOOL_INTERVAL_S = 5.0         # polling interval when server is reachable
 DESPOOL_BACKOFF_S = 60.0         # polling interval when server is unreachable
+# SYSTEM inserts the generalized state row and a campaign owner may decorate that
+# same row shortly afterward.  Egress waits beyond the bounded local attachment
+# interval so the server receives the settled snapshot rather than its transient
+# pre-decoration form.
+CAMPAIGN_DETAIL_SETTLE_S = 10.0
 STARTUP_TEENSY_QUIET_DELAY_S = 10.0
 
 
@@ -167,13 +171,12 @@ def _mark_events_despooled(ids: List[int]) -> None:
 
 
 # ---------------------------------------------------------------------
-# Timebase despooler helpers (EGRESS)
+# Campaign-detail despooler helpers (EGRESS)
 # ---------------------------------------------------------------------
 
-def _serialize_timebase(row: dict) -> dict:
-    """
-    Convert a timebase DB row into JSON-safe wire format.
-    """
+
+def _serialize_campaign_detail(row: dict) -> dict:
+    """Convert one campaign_detail DB row into JSON-safe wire format."""
     return {
         "id": row["id"],
         "ts": (
@@ -181,40 +184,47 @@ def _serialize_timebase(row: dict) -> dict:
             if isinstance(row.get("ts"), datetime)
             else row.get("ts")
         ),
+        "campaign_type": row["campaign_type"],
         "campaign": row["campaign"],
+        "viable": row["viable"],
         "payload": row["payload"],
+        "sequence": row["sequence"],
+        "pps_count": row["pps_count"],
     }
 
 
-def _fetch_undespooled_timebase(limit: int) -> List[dict]:
-    """
-    Fetch undelivered timebase records from PostgreSQL.
 
-    Truth source:
-      • despooled IS NULL
-      • ordered oldest → newest
-    """
+def _fetch_undespooled_campaign_details(limit: int) -> List[dict]:
+    """Fetch undelivered generalized state records in canonical stream order."""
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT id, ts, campaign, payload
-            FROM timebase
+            SELECT
+                id,
+                ts,
+                campaign_type,
+                campaign,
+                viable,
+                payload,
+                sequence,
+                pps_count
+            FROM campaign_detail
             WHERE despooled IS NULL
-            ORDER BY ts ASC
+              AND ts <= now() - (%s * INTERVAL '1 second')
+            ORDER BY id ASC
             LIMIT %s
             """,
-            (limit,),
+            (CAMPAIGN_DETAIL_SETTLE_S, limit),
         )
         rows = cur.fetchall()
 
-    return [_serialize_timebase(row) for row in rows]
+    return [_serialize_campaign_detail(row) for row in rows]
 
 
-def _mark_timebase_despooled(ids: List[int]) -> None:
-    """
-    Mark timebase records as successfully despooled.
-    """
+
+def _mark_campaign_details_despooled(ids: List[int]) -> None:
+    """Mark campaign_detail records only after confirmed server delivery."""
     if not ids:
         return
 
@@ -224,7 +234,7 @@ def _mark_timebase_despooled(ids: List[int]) -> None:
         cur = conn.cursor()
         cur.executemany(
             """
-            UPDATE timebase
+            UPDATE campaign_detail
             SET despooled = %s
             WHERE id = %s
             """,
@@ -294,27 +304,27 @@ def events_despooler_loop() -> None:
 
 
 # ---------------------------------------------------------------------
-# Timebase despooler execution context (OWN THREAD)
+# Campaign-detail despooler execution context (OWN THREAD)
 # ---------------------------------------------------------------------
 
-def timebase_despooler_loop() -> None:
-    """
-    Periodically POST undelivered timebase records to the ZPNet backend.
+
+def campaign_detail_despooler_loop() -> None:
+    """Periodically POST undelivered campaign_detail records to the backend.
 
     Semantics:
-      • Symmetric with events despooler
-      • Best-effort, patient
-      • No retries inside the loop
-      • Network failure leaves records untouched in the DB
-      • Success marks records permanently despooled
-      • Server unavailability is boring — back off and wait quietly
+      • Symmetric with the events despooler
+      • Best-effort and patient
+      • No retries inside one loop iteration
+      • Network failure leaves records untouched in PostgreSQL
+      • HTTP 200 marks the delivered local rows permanently despooled
+      • Server unavailability is a normal operating state
     """
-    endpoint = f"http://{ZPNET_REMOTE_HOST}/api/timebase"
+    endpoint = f"http://{ZPNET_REMOTE_HOST}/api/campaign_detail"
     server_down = False
 
     while True:
         try:
-            records = _fetch_undespooled_timebase(DESPOOL_BATCH_SIZE)
+            records = _fetch_undespooled_campaign_details(DESPOOL_BATCH_SIZE)
             if not records:
                 time.sleep(DESPOOL_INTERVAL_S)
                 continue
@@ -330,26 +340,31 @@ def timebase_despooler_loop() -> None:
 
             if response.status_code != 200:
                 raise RuntimeError(
-                    f"[timebase] despool HTTP {response.status_code}: {response.text}"
+                    f"[campaign_detail] despool HTTP {response.status_code}: "
+                    f"{response.text}"
                 )
 
-            ids = [r["id"] for r in records]
-            _mark_timebase_despooled(ids)
+            ids = [record["id"] for record in records]
+            _mark_campaign_details_despooled(ids)
 
             if server_down:
-                logging.info("📡 [timebase] server reachable — despool resumed")
+                logging.info(
+                    "📡 [campaign_detail] server reachable — despool resumed"
+                )
                 server_down = False
 
         except requests.RequestException:
             if not server_down:
-                logging.info("📡 [timebase] server unreachable — backing off")
+                logging.info(
+                    "📡 [campaign_detail] server unreachable — backing off"
+                )
                 server_down = True
             time.sleep(DESPOOL_BACKOFF_S)
             continue
 
         except Exception:
             logging.exception(
-                "💥 [timebase] unhandled exception in timebase despooler thread"
+                "💥 [campaign_detail] unhandled exception in despooler thread"
             )
 
         time.sleep(DESPOOL_INTERVAL_S)
@@ -383,7 +398,7 @@ def run() -> None:
     Execution contexts:
       • Pub/Sub handler via server_setup (EVENTS topic)
       • Events despooler loop thread
-      • Timebase despooler loop thread
+      • Campaign-detail despooler loop thread
     """
     setup_logging()
 
@@ -413,12 +428,12 @@ def run() -> None:
         ).start()
 
         # --------------------------------------------------------------
-        # Start timebase despooler thread (independent fault barrier)
+        # Start campaign-detail despooler thread (independent fault barrier)
         # --------------------------------------------------------------
         threading.Thread(
-            target=timebase_despooler_loop,
+            target=campaign_detail_despooler_loop,
             daemon=True,
-            name="timebase-despooler",
+            name="campaign-detail-despooler",
         ).start()
 
         logging.info("🏁 [events] entering main loop")

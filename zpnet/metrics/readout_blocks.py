@@ -1365,13 +1365,13 @@ def _dwt_expected_cycles(r: dict):
 # Campaign history readout
 # ---------------------------------------------------------------------
 
-def _get_campaign_rows() -> list[dict]:
-    """Return typed TEMPEST campaign masters with their newest detail, newest first.
 
-    ``campaign_master`` owns campaign identity and lifecycle.  The newest
-    ``campaign_detail`` row of type TEMPEST owns the displayed scientific
-    dossier.  A newly started campaign may legitimately have no detail yet;
-    it remains visible with empty science columns until row one is persisted.
+def _get_campaign_rows() -> list[dict]:
+    """Return typed TEMPEST campaign masters as a direct read model.
+
+    ``campaign_master.payload.report`` is the compact campaign-list projection.
+    The UI performs no campaign_detail lookup and no per-campaign aggregation.
+    A campaign without a report remains visible with empty science columns.
     """
     with open_db(row_dict=True) as conn:
         with conn.cursor() as cur:
@@ -1383,89 +1383,76 @@ def _get_campaign_rows() -> list[dict]:
                     master.campaign_type,
                     master.campaign,
                     master.active,
-                    detail.id AS detail_id,
-                    detail.ts AS detail_ts,
-                    detail.viable,
-                    detail.sequence,
-                    detail.pps_count,
+                    master.payload ? 'report' AS report_present,
+                    (master.payload #>> '{report,science_eligible}')::boolean
+                        AS viable,
+                    master.payload #>> '{report,teensy_pps_vclock_count}'
+                        AS sequence,
+                    master.payload #>> '{report,pps_count}'
+                        AS pps_count,
 
-                    detail.payload #>> '{fragment,ocxo1,ns}'
+                    master.payload #>> '{report,fragment,ocxo1,ns}'
                         AS ocxo1_ns,
-                    detail.payload #>> '{fragment,stats,ocxo1,ppb_buckets,10_min}'
+                    master.payload #>> '{report,fragment,stats,ocxo1,ppb_buckets,10_min}'
                         AS ocxo1_ppb_10_min,
-                    detail.payload #>> '{fragment,stats,ocxo1,ppb_buckets,60_min}'
+                    master.payload #>> '{report,fragment,stats,ocxo1,ppb_buckets,60_min}'
                         AS ocxo1_ppb_60_min,
-                    detail.payload #>> '{fragment,stats,ocxo1,ppb_buckets,8_hour}'
+                    master.payload #>> '{report,fragment,stats,ocxo1,ppb_buckets,8_hour}'
                         AS ocxo1_ppb_8_hour,
-                    detail.payload #>> '{fragment,stats,ocxo1,ppb_buckets,24_hour}'
+                    master.payload #>> '{report,fragment,stats,ocxo1,ppb_buckets,24_hour}'
                         AS ocxo1_ppb_24_hour,
                     COALESCE(
-                        detail.payload #>> '{fragment,stats,ocxo1,ppb_buckets,total}',
-                        detail.payload #>> '{fragment,stats,ocxo1,ppb}'
+                        master.payload #>> '{report,fragment,stats,ocxo1,ppb_buckets,total}',
+                        master.payload #>> '{report,fragment,stats,ocxo1,ppb}'
                     ) AS ocxo1_ppb_total,
                     COALESCE(
-                        detail.payload #>> '{fragment,stats,ocxo1,ppb_buckets,campaign}',
-                        detail.payload #>> '{fragment,ocxo1,science,total_ppb}'
+                        master.payload #>> '{report,fragment,stats,ocxo1,ppb_buckets,campaign}',
+                        master.payload #>> '{report,fragment,ocxo1,science,total_ppb}'
                     ) AS ocxo1_ppb_campaign,
                     COALESCE(
-                        detail.payload #>> '{fragment,ocxo1,pps_residual,fast_residual_ns}',
-                        detail.payload #>> '{fragment,ocxo1,science,fast_residual_ns}'
+                        master.payload #>> '{report,fragment,ocxo1,pps_residual,fast_residual_ns}',
+                        master.payload #>> '{report,fragment,ocxo1,science,fast_residual_ns}'
                     ) AS ocxo1_residual,
-                    detail.payload #>> '{fragment,stats,ocxo1,welford,mean}'
+                    master.payload #>> '{report,fragment,stats,ocxo1,welford,mean}'
                         AS ocxo1_mean,
-                    detail.payload #>> '{fragment,stats,ocxo1,welford,stddev}'
+                    master.payload #>> '{report,fragment,stats,ocxo1,welford,stddev}'
                         AS ocxo1_stddev,
-                    detail.payload #>> '{fragment,stats,ocxo1,welford,stderr}'
+                    master.payload #>> '{report,fragment,stats,ocxo1,welford,stderr}'
                         AS ocxo1_stderr,
-                    detail.payload #>> '{fragment,stats,ocxo1,welford,n}'
+                    master.payload #>> '{report,fragment,stats,ocxo1,welford,n}'
                         AS ocxo1_n,
 
-                    detail.payload #>> '{fragment,ocxo2,ns}'
+                    master.payload #>> '{report,fragment,ocxo2,ns}'
                         AS ocxo2_ns,
-                    detail.payload #>> '{fragment,stats,ocxo2,ppb_buckets,10_min}'
+                    master.payload #>> '{report,fragment,stats,ocxo2,ppb_buckets,10_min}'
                         AS ocxo2_ppb_10_min,
-                    detail.payload #>> '{fragment,stats,ocxo2,ppb_buckets,60_min}'
+                    master.payload #>> '{report,fragment,stats,ocxo2,ppb_buckets,60_min}'
                         AS ocxo2_ppb_60_min,
-                    detail.payload #>> '{fragment,stats,ocxo2,ppb_buckets,8_hour}'
+                    master.payload #>> '{report,fragment,stats,ocxo2,ppb_buckets,8_hour}'
                         AS ocxo2_ppb_8_hour,
-                    detail.payload #>> '{fragment,stats,ocxo2,ppb_buckets,24_hour}'
+                    master.payload #>> '{report,fragment,stats,ocxo2,ppb_buckets,24_hour}'
                         AS ocxo2_ppb_24_hour,
                     COALESCE(
-                        detail.payload #>> '{fragment,stats,ocxo2,ppb_buckets,total}',
-                        detail.payload #>> '{fragment,stats,ocxo2,ppb}'
+                        master.payload #>> '{report,fragment,stats,ocxo2,ppb_buckets,total}',
+                        master.payload #>> '{report,fragment,stats,ocxo2,ppb}'
                     ) AS ocxo2_ppb_total,
                     COALESCE(
-                        detail.payload #>> '{fragment,stats,ocxo2,ppb_buckets,campaign}',
-                        detail.payload #>> '{fragment,ocxo2,science,total_ppb}'
+                        master.payload #>> '{report,fragment,stats,ocxo2,ppb_buckets,campaign}',
+                        master.payload #>> '{report,fragment,ocxo2,science,total_ppb}'
                     ) AS ocxo2_ppb_campaign,
                     COALESCE(
-                        detail.payload #>> '{fragment,ocxo2,pps_residual,fast_residual_ns}',
-                        detail.payload #>> '{fragment,ocxo2,science,fast_residual_ns}'
+                        master.payload #>> '{report,fragment,ocxo2,pps_residual,fast_residual_ns}',
+                        master.payload #>> '{report,fragment,ocxo2,science,fast_residual_ns}'
                     ) AS ocxo2_residual,
-                    detail.payload #>> '{fragment,stats,ocxo2,welford,mean}'
+                    master.payload #>> '{report,fragment,stats,ocxo2,welford,mean}'
                         AS ocxo2_mean,
-                    detail.payload #>> '{fragment,stats,ocxo2,welford,stddev}'
+                    master.payload #>> '{report,fragment,stats,ocxo2,welford,stddev}'
                         AS ocxo2_stddev,
-                    detail.payload #>> '{fragment,stats,ocxo2,welford,stderr}'
+                    master.payload #>> '{report,fragment,stats,ocxo2,welford,stderr}'
                         AS ocxo2_stderr,
-                    detail.payload #>> '{fragment,stats,ocxo2,welford,n}'
+                    master.payload #>> '{report,fragment,stats,ocxo2,welford,n}'
                         AS ocxo2_n
                 FROM campaign_master AS master
-                LEFT JOIN LATERAL (
-                    SELECT
-                        id,
-                        ts,
-                        viable,
-                        sequence,
-                        pps_count,
-                        payload
-                    FROM campaign_detail
-                    WHERE campaign_type = master.campaign_type
-                      AND campaign = master.campaign
-                      AND detail_type = 'TEMPEST'
-                    ORDER BY id DESC
-                    LIMIT 1
-                ) AS detail ON true
                 WHERE master.campaign_type = 'TEMPEST'
                 ORDER BY master.ts DESC, master.id DESC
                 """
@@ -1528,7 +1515,7 @@ def campaigns_readout() -> list[str]:
 
     for row_index, row in enumerate(rows):
         campaign_name = str(row.get("campaign") or "?")
-        if row.get("detail_id") is None:
+        if not row.get("report_present"):
             campaign_name += " [WAIT]"
         elif row.get("viable") is False:
             campaign_name += " [X]"

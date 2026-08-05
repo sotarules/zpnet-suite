@@ -6,8 +6,8 @@ Responsibilities:
   • Collect Raspberry Pi host metrics on a slower local cadence
   • Decorate each Teensy fragment with last-known-good Pi-owned state
   • Publish one unified MONITOR snapshot per Teensy second
-  • Persist each unified MONITOR as a generalized campaign_detail record
-  • Recover always-on state from the latest MONITOR campaign_detail
+  • Persist each unified MONITOR as a TEMPEST state record in campaign_detail
+  • Recover always-on state from the latest TEMPEST campaign_detail
   • Preserve SYSTEM.REPORT as an explicit command surface
 
 Process model:
@@ -75,11 +75,11 @@ MONITOR_RESTORE_TIMEOUT_S = 60.0
 MONITOR_RESTORE_COMMAND_RETRY_S = 10.0
 
 CAMPAIGN_TYPE_TEMPEST = "TEMPEST"
-CAMPAIGN_DETAIL_TYPE_MONITOR = "MONITOR"
 
-# Full unified MONITOR campaign-detail stream.  The dedicated FIFO deliberately
-# does not coalesce rows: campaign_detail is the canonical append-only record
-# stream and its newest MONITOR row is also the always-on recovery authority.
+# Full unified TEMPEST state stream.  The dedicated FIFO deliberately does not
+# coalesce rows: campaign_detail is the canonical append-only record stream and
+# its newest TEMPEST row is also the always-on recovery authority.  A null
+# campaign means ambient/campaign-ready TEMPEST state, not an untyped record.
 # One hour of buffering keeps pub/sub nonblocking through a temporary local
 # PostgreSQL interruption.
 CAMPAIGN_DETAIL_QUEUE_MAX = 3600
@@ -1556,11 +1556,11 @@ def build_battery_status() -> dict:
 
 
 # ------------------------------------------------------------------
-# Durable MONITOR campaign-detail persistence and boot recovery
+# Durable TEMPEST state-detail persistence and boot recovery
 # ------------------------------------------------------------------
 
-def _read_latest_monitor_detail() -> Optional[Dict[str, Any]]:
-    """Read the latest durable MONITOR detail without changing it."""
+def _read_latest_tempest_state_detail() -> Optional[Dict[str, Any]]:
+    """Read the latest durable TEMPEST state detail without changing it."""
     try:
         with open_db(row_dict=True) as conn:
             cur = conn.cursor()
@@ -1568,16 +1568,16 @@ def _read_latest_monitor_detail() -> Optional[Dict[str, Any]]:
                 """
                 SELECT payload
                 FROM campaign_detail
-                WHERE detail_type = %s
+                WHERE campaign_type = %s
                 ORDER BY id DESC
                 LIMIT 1
                 """,
-                (CAMPAIGN_DETAIL_TYPE_MONITOR,),
+                (CAMPAIGN_TYPE_TEMPEST,),
             )
             row = cur.fetchone()
     except Exception:
         logging.exception(
-            "⚠️ [system/recovery] failed to read latest campaign_detail MONITOR"
+            "⚠️ [system/recovery] failed to read latest TEMPEST campaign_detail"
         )
         return None
 
@@ -1592,7 +1592,7 @@ def _read_latest_monitor_detail() -> Optional[Dict[str, Any]]:
             payload = None
     if not isinstance(payload, dict):
         logging.error(
-            "💥 [system/recovery] latest campaign_detail MONITOR payload is not an object"
+            "💥 [system/recovery] latest TEMPEST campaign_detail payload is not an object"
         )
         return None
     return copy.deepcopy(payload)
@@ -1652,12 +1652,11 @@ def _monitor_detail_viable(monitor: Dict[str, Any]) -> bool:
 
 
 def _persist_campaign_detail(monitor: Dict[str, Any]) -> None:
-    """Append one unchanged unified MONITOR to public.campaign_detail."""
+    """Append one unchanged TEMPEST state snapshot to public.campaign_detail."""
     encoded = json.dumps(monitor, separators=(",", ":"), ensure_ascii=False)
     sequence = monitor.get("sequence")
     pps_count = monitor.get("pps_count")
     campaign = _monitor_detail_campaign(monitor)
-    campaign_type = CAMPAIGN_TYPE_TEMPEST if campaign is not None else None
     viable = _monitor_detail_viable(monitor)
 
     with open_db() as conn:
@@ -1665,13 +1664,12 @@ def _persist_campaign_detail(monitor: Dict[str, Any]) -> None:
         cur.execute(
             """
             INSERT INTO campaign_detail
-                (detail_type, campaign_type, campaign, viable, payload, sequence, pps_count)
+                (campaign_type, campaign, viable, payload, sequence, pps_count)
             VALUES
-                (%s, %s, %s, %s, %s::jsonb, %s, %s)
+                (%s, %s, %s, %s::jsonb, %s, %s)
             """,
             (
-                CAMPAIGN_DETAIL_TYPE_MONITOR,
-                campaign_type,
+                CAMPAIGN_TYPE_TEMPEST,
                 campaign,
                 viable,
                 encoded,
@@ -1701,7 +1699,7 @@ def _queue_campaign_detail(monitor: Dict[str, Any]) -> None:
 
 
 def _campaign_detail_writer_loop() -> None:
-    """Persist the generalized MONITOR detail stream in order, retrying each head."""
+    """Persist the TEMPEST state-detail stream in order, retrying each head."""
     global _CAMPAIGN_DETAIL_PERSISTED
 
     _CAMPAIGN_DETAIL_WRITER_STARTED.set()
@@ -2703,11 +2701,11 @@ def run() -> None:
         )
         startup_teensy_quiet_delay()
 
-        # SYSTEM restores the latest recoverable MONITOR campaign_detail,
-        # independent of campaign state.  Keep the campaign-detail writer closed
+        # SYSTEM restores the latest recoverable TEMPEST campaign_detail,
+        # independent of named campaign state. Keep the detail writer closed
         # until this transaction has consumed the previous durable authority.
         detail_writer_allowed = True
-        detail = _read_latest_monitor_detail()
+        detail = _read_latest_tempest_state_detail()
         detail_recoverable = bool(
             detail is not None
             and _monitor_restore_state(detail) is not None
@@ -2718,7 +2716,7 @@ def run() -> None:
                 assert detail is not None
                 _set_campaign_detail_recovery_status(
                     "RESTORING",
-                    "restoring latest MONITOR detail and awaiting fresh proof",
+                    "restoring latest TEMPEST state detail and awaiting fresh proof",
                     detail_sequence=detail.get("sequence"),
                 )
                 _recover_monitor_detail(detail)
@@ -2731,20 +2729,20 @@ def run() -> None:
                 detail_writer_allowed = False
                 _set_campaign_detail_recovery_status(
                     "FAILED",
-                    "MONITOR detail restore failed; durable detail preserved",
+                    "TEMPEST state-detail restore failed; durable detail preserved",
                     detail_sequence=(detail.get("sequence") if detail else None),
                 )
                 logging.exception(
-                    "💥 [system/recovery] MONITOR detail restore failed; preserving "
+                    "💥 [system/recovery] TEMPEST state-detail restore failed; preserving "
                     "the latest durable campaign_detail and continuing with seeded state"
                 )
         else:
             _set_campaign_detail_recovery_status(
                 "NO_DETAIL",
-                "no structured-recoverable MONITOR detail; using live state",
+                "no structured-recoverable TEMPEST state detail; using live state",
             )
             logging.info(
-                "ℹ️ [system/recovery] no structured-recoverable campaign_detail MONITOR; "
+                "ℹ️ [system/recovery] no structured-recoverable TEMPEST campaign_detail; "
                 "starting from live MONITOR_FRAGMENT state"
             )
 
