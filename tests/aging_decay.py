@@ -2,10 +2,11 @@
 ZPNet OCXO Aging Decay Analyzer
 
 Characterizes what happens to OCXO frequency when the servo is OFF —
-the natural drift that Holdover must compensate for.
+the natural drift that Holdover must compensate for. Reads completed TEMPEST
+campaign science from the unified campaign_detail stream.
 
 When GNSS disappears, the OCXOs are on their own.  This tool examines
-campaigns where calibrate_ocxo = OFF (or any campaign, really) and
+campaigns where servo_mode = OFF (or any campaign, really) and
 models the PPB trajectory over time to answer:
 
   1. What is the shape of the drift?  Linear?  Exponential?  Phased?
@@ -49,6 +50,104 @@ from typing import Any, Dict, List, Optional, Tuple
 from zpnet.shared.db import open_db
 
 
+CAMPAIGN_TYPE = "TEMPEST"
+PPS_COUNT_SQL = """
+NULLIF(
+    payload #>> '{campaign,tempest,teensy_pps_vclock_count}',
+    ''
+)::bigint
+"""
+
+
+def _dict(value: Any) -> Dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _first(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _root(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the persisted state detail, unwrapping only a true envelope."""
+    if any(
+        key in payload
+        for key in ("schema", "monitor_fragment", "fragment", "campaign_row", "campaign")
+    ):
+        return payload
+    inner = _dict(payload.get("payload"))
+    return inner or payload
+
+
+def _tempest_decoration(payload: Dict[str, Any]) -> Dict[str, Any]:
+    root = _root(payload)
+    return _dict(_dict(root.get("campaign")).get("tempest"))
+
+
+def _fragment(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the merged immutable campaign row plus final TEMPEST decoration."""
+    root = _root(payload)
+    direct = _dict(root.get("fragment")) or _dict(root.get("campaign_row"))
+    monitor = _dict(root.get("monitor_fragment"))
+    embedded = _dict(monitor.get("campaign_row"))
+    decoration = _tempest_decoration(payload)
+    source = embedded or direct
+    if source or decoration:
+        merged = dict(source)
+        merged.update(decoration)
+        return merged
+    return root
+
+
+def _normalized_row(payload: Dict[str, Any], db_pps: int, db_ts: str) -> Dict[str, Any]:
+    root = _root(payload)
+    frag = _fragment(payload)
+    clocks = _dict(root.get("clocks"))
+    dac = _dict(frag.get("dac"))
+    gnss = _dict(frag.get("gnss"))
+    root_gnss = _dict(root.get("gnss"))
+
+    payload_pps = safe_int(
+        _first(
+            frag.get("teensy_pps_vclock_count"),
+            frag.get("pps_count"),
+            root.get("teensy_pps_vclock_count"),
+            root.get("pps_count"),
+        )
+    )
+    if payload_pps is not None and payload_pps != db_pps:
+        raise ValueError(
+            f"campaign_detail campaign PPS mismatch db={db_pps} payload={payload_pps}"
+        )
+
+    return {
+        "pps_count": db_pps,
+        "gnss_time_utc": _first(
+            root_gnss.get("gnss_time_utc"),
+            clocks.get("gnss_time_utc"),
+            root.get("published_at_utc"),
+        ),
+        "system_time_utc": _first(
+            clocks.get("system_time_utc"),
+            root.get("published_at_utc"),
+            db_ts,
+        ),
+        "servo_mode": str(
+            _first(
+                dac.get("servo_mode"),
+                frag.get("servo_mode"),
+                clocks.get("servo_mode"),
+                "UNKNOWN",
+            )
+        ).upper(),
+        "teensy_gnss_ns": safe_int(gnss.get("ns")),
+        "teensy_ocxo1_ns": safe_int(_dict(frag.get("ocxo1")).get("ns")),
+        "teensy_ocxo2_ns": safe_int(_dict(frag.get("ocxo2")).get("ns")),
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Welford online accumulator
 # ─────────────────────────────────────────────────────────────────────
@@ -88,25 +187,33 @@ class Welford:
 # ─────────────────────────────────────────────────────────────────────
 
 def fetch_timebase(campaign: str) -> List[Dict[str, Any]]:
+    """Fetch completed TEMPEST campaign details in campaign-public PPS order."""
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
         cur.execute(
-            """
-            SELECT payload
-            FROM timebase
-            WHERE campaign = %s
-            ORDER BY (payload->>'pps_count')::int ASC
+            f"""
+            SELECT id, ts, {PPS_COUNT_SQL} AS pps_count, payload
+            FROM campaign_detail
+            WHERE campaign_type = %s
+              AND campaign = %s
+              AND payload #> '{{campaign,tempest}}' IS NOT NULL
+              AND {PPS_COUNT_SQL} IS NOT NULL
+            ORDER BY {PPS_COUNT_SQL} ASC, id ASC
             """,
-            (campaign,),
+            (CAMPAIGN_TYPE, campaign),
         )
         rows = cur.fetchall()
 
-    result = []
+    result: List[Dict[str, Any]] = []
     for row in rows:
-        p = row["payload"]
-        if isinstance(p, str):
-            p = json.loads(p)
-        result.append(p)
+        payload = row["payload"]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        if not isinstance(payload, dict):
+            continue
+        result.append(
+            _normalized_row(payload, int(row["pps_count"]), str(row["ts"]))
+        )
     return result
 
 
@@ -418,7 +525,7 @@ def analyze(campaign: str, servo_ok: bool = False) -> None:
     rows = fetch_timebase(campaign)
 
     if not rows:
-        print(f"No TIMEBASE rows found for campaign '{campaign}'")
+        print(f"No TEMPEST campaign_detail rows found for campaign '{campaign}'")
         return
 
     total = len(rows)
@@ -431,7 +538,7 @@ def analyze(campaign: str, servo_ok: bool = False) -> None:
     # Check servo state
     servo_modes = set()
     for row in rows:
-        mode = row.get("calibrate_ocxo")
+        mode = row.get("servo_mode")
         if mode and mode != "OFF":
             servo_modes.add(mode)
 
@@ -703,15 +810,20 @@ def list_campaigns() -> None:
         with open_db(row_dict=True) as conn:
             cur = conn.cursor()
             cur.execute(
-                """
-                SELECT campaign, count(*) as cnt,
-                       min((payload->>'pps_count')::int) as pps_min,
-                       max((payload->>'pps_count')::int) as pps_max
-                FROM timebase
+                f"""
+                SELECT campaign, count(*) AS cnt,
+                       min({PPS_COUNT_SQL}) AS pps_min,
+                       max({PPS_COUNT_SQL}) AS pps_max
+                FROM campaign_detail
+                WHERE campaign_type = %s
+                  AND campaign IS NOT NULL
+                  AND payload #> '{{campaign,tempest}}' IS NOT NULL
+                  AND {PPS_COUNT_SQL} IS NOT NULL
                 GROUP BY campaign
                 ORDER BY max(ts) DESC
                 LIMIT 15
-                """
+                """,
+                (CAMPAIGN_TYPE,),
             )
             rows = cur.fetchall()
         if rows:

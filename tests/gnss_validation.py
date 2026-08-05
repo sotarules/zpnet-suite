@@ -1,30 +1,21 @@
-"""
-ZPNet GNSS Validation Report — PPS Integrity Analysis
+"""ZPNet GNSS Validation Report — TEMPEST PPS integrity analysis.
 
-GNSS nanoseconds are defined by PPS count (campaign_seconds × 1e9),
-so they cannot validate themselves.  This report instead answers:
+GNSS campaign nanoseconds are defined by the campaign PPS identity, so they
+cannot validate themselves.  This report instead asks whether the one-second
+reference is coherent with durable, independently authored timing surfaces:
 
-  "Is the PPS stream arriving at exactly 1-second intervals,
-   as independently witnessed by DWT, OCXO1, and OCXO2?"
+  • physical PPS raw DWT interval
+  • OCXO1 canonical measured one-second duration
+  • OCXO2 canonical measured one-second duration
+  • physical-PPS versus VCLOCK raw-interval closure
 
-Three independent witnesses:
-  • DWT   — 1,008,000,000 cycles per PPS (±ISR entry jitter)
-  • OCXO1 — 10,000,000 ticks per PPS (±frequency offset)
-  • OCXO2 — 10,000,000 ticks per PPS (±frequency offset)
-
-If all three witnesses agree that PPS intervals are stable and
-consistent, then the PPS stream is trustworthy — regardless of
-what the GNSS VCLOCK QTimer says.
-
-Also reports:
-  • isr_residual_gnss — QTimer1 dual-edge raw count sanity check
-  • PPS rejection events (missed PPS edges)
-  • GNSS UTC vs system UTC coherence
-  • DWT calibration stability (dwt_cycles_per_pps)
+The report reads completed TEMPEST campaign_detail rows.  It does not use the
+always-on relational pps_count as campaign time; campaign identity comes from
+payload.campaign.tempest.teensy_pps_vclock_count.
 
 Usage:
     python -m zpnet.tests.gnss_validation <campaign_name> [limit]
-    .zt gnss_validation PPB1
+    .zt gnss_validation GCA4
 """
 
 from __future__ import annotations
@@ -37,30 +28,165 @@ from typing import Any, Dict, List, Optional
 
 from zpnet.shared.db import open_db
 
+
 DWT_NOMINAL = 1_008_000_000
-OCXO_NOMINAL = 10_000_000
+NS_NOMINAL = 1_000_000_000
+PPS_VCLOCK_CLEAN_GATE_CYCLES = 16
+CAMPAIGN_TYPE = "TEMPEST"
+PPS_COUNT_SQL = """
+NULLIF(
+    payload #>> '{campaign,tempest,teensy_pps_vclock_count}',
+    ''
+)::bigint
+"""
+
+
+def _dict(value: Any) -> Dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _as_int(value: Any) -> Optional[int]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _as_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off"}:
+            return False
+    return None
+
+
+def _first(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _root(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if any(
+        key in payload
+        for key in ("schema", "monitor_fragment", "fragment", "campaign_row", "campaign")
+    ):
+        return payload
+    inner = _dict(payload.get("payload"))
+    return inner or payload
+
+
+def _tempest_decoration(payload: Dict[str, Any]) -> Dict[str, Any]:
+    root = _root(payload)
+    return _dict(_dict(root.get("campaign")).get("tempest"))
+
+
+def _fragment(payload: Dict[str, Any]) -> Dict[str, Any]:
+    root = _root(payload)
+    direct = _dict(root.get("fragment")) or _dict(root.get("campaign_row"))
+    monitor = _dict(root.get("monitor_fragment"))
+    embedded = _dict(monitor.get("campaign_row"))
+    decoration = _tempest_decoration(payload)
+    source = embedded or direct
+    if source or decoration:
+        merged = dict(source)
+        merged.update(decoration)
+        return merged
+    return root
+
+
+def _science_interval_ns(frag: Dict[str, Any], lane: str) -> Optional[int]:
+    science = _dict(_dict(frag.get(lane)).get("science"))
+    interval = _as_int(science.get("clock_interval_ns"))
+    if interval is not None:
+        return interval
+    gnss_interval = _as_int(science.get("gnss_interval_ns"))
+    residual = _as_int(science.get("fast_residual_ns"))
+    if gnss_interval is not None and residual is not None:
+        return gnss_interval - residual
+    return None
+
+
+def _normalize(payload: Dict[str, Any], db_pps: int, db_ts: str) -> Dict[str, Any]:
+    root = _root(payload)
+    frag = _fragment(payload)
+    raw = _dict(frag.get("raw_cycles"))
+    pps_raw = _dict(raw.get("pps"))
+    vclock_raw = _dict(raw.get("vclock"))
+    dwt = _dict(frag.get("dwt"))
+    root_gnss = _dict(root.get("gnss"))
+
+    payload_pps = _as_int(
+        _first(
+            frag.get("teensy_pps_vclock_count"),
+            frag.get("pps_count"),
+            root.get("teensy_pps_vclock_count"),
+            root.get("pps_count"),
+        )
+    )
+    if payload_pps is not None and payload_pps != db_pps:
+        raise ValueError(
+            f"campaign_detail campaign PPS mismatch db={db_pps} payload={payload_pps}"
+        )
+
+    pps_cycles = _as_int(pps_raw.get("observed_cycles"))
+    vclock_cycles = _as_int(vclock_raw.get("observed_cycles"))
+
+    return {
+        "pps_count": db_pps,
+        "pps_raw_cycles": pps_cycles,
+        "pps_raw_valid": _as_bool(pps_raw.get("valid")),
+        "vclock_raw_cycles": vclock_cycles,
+        "ocxo1_interval_ns": _science_interval_ns(frag, "ocxo1"),
+        "ocxo2_interval_ns": _science_interval_ns(frag, "ocxo2"),
+        "dwt_selected_cycles": _as_int(dwt.get("cycles_between_pps_vclock")),
+        "pps_minus_vclock_cycles": (
+            pps_cycles - vclock_cycles
+            if pps_cycles is not None and vclock_cycles is not None
+            else None
+        ),
+        "gnss_time_utc": _first(
+            root_gnss.get("gnss_time_utc"),
+            root.get("published_at_utc"),
+            db_ts,
+        ),
+    }
 
 
 def fetch_timebase(campaign: str) -> List[Dict[str, Any]]:
+    """Fetch completed TEMPEST details in campaign-public PPS order."""
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
         cur.execute(
-            """
-            SELECT payload
-            FROM timebase
-            WHERE campaign = %s
-            ORDER BY (payload->>'pps_count')::int ASC
+            f"""
+            SELECT id, ts, {PPS_COUNT_SQL} AS pps_count, payload
+            FROM campaign_detail
+            WHERE campaign_type = %s
+              AND campaign = %s
+              AND payload #> '{{campaign,tempest}}' IS NOT NULL
+              AND {PPS_COUNT_SQL} IS NOT NULL
+            ORDER BY {PPS_COUNT_SQL} ASC, id ASC
             """,
-            (campaign,),
+            (CAMPAIGN_TYPE, campaign),
         )
         rows = cur.fetchall()
 
-    result = []
+    result: List[Dict[str, Any]] = []
     for row in rows:
-        p = row["payload"]
-        if isinstance(p, str):
-            p = json.loads(p)
-        result.append(p)
+        payload = row["payload"]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        if isinstance(payload, dict):
+            result.append(_normalize(payload, int(row["pps_count"]), str(row["ts"])))
     return result
 
 
@@ -76,14 +202,11 @@ class Welford:
 
     def update(self, x: float) -> None:
         self.n += 1
-        d1 = x - self.mean
-        self.mean += d1 / self.n
-        d2 = x - self.mean
-        self.m2 += d1 * d2
-        if self.min_val is None or x < self.min_val:
-            self.min_val = x
-        if self.max_val is None or x > self.max_val:
-            self.max_val = x
+        delta = x - self.mean
+        self.mean += delta / self.n
+        self.m2 += delta * (x - self.mean)
+        self.min_val = x if self.min_val is None else min(self.min_val, x)
+        self.max_val = x if self.max_val is None else max(self.max_val, x)
 
     @property
     def stddev(self) -> float:
@@ -91,334 +214,260 @@ class Welford:
 
     @property
     def range(self) -> float:
-        if self.min_val is not None and self.max_val is not None:
-            return self.max_val - self.min_val
+        if self.min_val is None or self.max_val is None:
+            return 0.0
+        return self.max_val - self.min_val
+
+
+def _pearson(a: List[float], b: List[float]) -> float:
+    n = min(len(a), len(b))
+    if n < 2:
         return 0.0
-
-
-def safe_int(val, default=0) -> int:
-    if val is None:
-        return default
-    return int(val)
+    a = a[:n]
+    b = b[:n]
+    ma = sum(a) / n
+    mb = sum(b) / n
+    covariance = sum((x - ma) * (y - mb) for x, y in zip(a, b))
+    va = sum((x - ma) ** 2 for x in a)
+    vb = sum((y - mb) ** 2 for y in b)
+    denominator = math.sqrt(va * vb)
+    return covariance / denominator if denominator > 0 else 0.0
 
 
 def analyze(campaign: str, limit: int = 0) -> None:
-    rows = fetch_timebase(campaign)
-
-    if not rows:
-        print(f"No TIMEBASE rows for campaign '{campaign}'")
+    all_rows = fetch_timebase(campaign)
+    if not all_rows:
+        print(f"No TEMPEST campaign_detail rows for campaign '{campaign}'")
         return
 
-    n_rows = len(rows)
-    if limit:
-        rows = rows[:limit]
-
-    print(f"=" * 72)
+    rows = all_rows[:limit] if limit else all_rows
+    print("=" * 72)
     print(f"GNSS VALIDATION REPORT: {campaign}")
-    print(f"=" * 72)
-    print(f"  Records: {n_rows} (analyzing {len(rows)})")
+    print("=" * 72)
+    print(f"  Records: {len(all_rows):,} (analyzing {len(rows):,})")
     print()
 
-    # ── Collect per-second data ──
-    w_dwt_delta = Welford()       # DWT cycles per PPS
-    w_ocxo1_delta = Welford()     # OCXO1 ticks per PPS
-    w_ocxo2_delta = Welford()     # OCXO2 ticks per PPS
-    w_dwt_cal = Welford()         # dwt_cycles_per_pps (calibration constant)
-    w_isr_gnss = Welford()        # ISR residual GNSS (QTimer sanity)
+    w_dwt = Welford()
+    w_o1 = Welford()
+    w_o2 = Welford()
+    w_dwt_selected = Welford()
+    w_pps_vclock = Welford()
+    pps_vclock_dist: Counter[int] = Counter()
 
-    isr_gnss_dist: Counter = Counter()
-    pps_rejected_max = 0
-    doubled_count = 0
     prev_pps: Optional[int] = None
     gaps = 0
-
-    # For cross-domain consistency
-    dwt_deltas = []
-    ocxo1_deltas = []
-    ocxo2_deltas = []
+    doubled = 0
+    invalid_pps = 0
+    dwt_ppb_samples: List[float] = []
+    o1_ppb_samples: List[float] = []
+    o2_ppb_samples: List[float] = []
 
     for rec in rows:
-        pps = safe_int(rec.get("pps_count", rec.get("teensy_pps_count")))
-        dwt_raw = safe_int(rec.get("dwt_delta_raw"))
-        o1_raw = safe_int(rec.get("ocxo1_delta_raw"))
-        o2_raw = safe_int(rec.get("ocxo2_delta_raw"))
-        isr_gn = safe_int(rec.get("isr_residual_gnss"))
-        isr_dw = safe_int(rec.get("isr_residual_dwt"))
-        dwt_cal = safe_int(rec.get("dwt_cycles_per_pps"))
-        rej_tot = safe_int(rec.get("pps_rejected_total"))
-
+        pps = _as_int(rec.get("pps_count"))
+        if pps is None:
+            continue
         if prev_pps is not None and pps != prev_pps + 1:
             gaps += 1
         prev_pps = pps
 
-        if rej_tot > pps_rejected_max:
-            pps_rejected_max = rej_tot
-
-        # Detect doubled deltas (missed PPS)
-        is_doubled = (dwt_raw > DWT_NOMINAL * 1.5)
-        if is_doubled:
-            doubled_count += 1
+        dwt_cycles = _as_int(rec.get("pps_raw_cycles"))
+        if rec.get("pps_raw_valid") is False:
+            invalid_pps += 1
+        if dwt_cycles is not None and dwt_cycles > DWT_NOMINAL * 1.5:
+            doubled += 1
             continue
 
-        if dwt_raw > 0:
-            w_dwt_delta.update(float(dwt_raw))
-            dwt_deltas.append(dwt_raw)
-        if o1_raw > 0:
-            w_ocxo1_delta.update(float(o1_raw))
-            ocxo1_deltas.append(o1_raw)
-        if o2_raw > 0:
-            w_ocxo2_delta.update(float(o2_raw))
-            ocxo2_deltas.append(o2_raw)
-        if dwt_cal > 0:
-            w_dwt_cal.update(float(dwt_cal))
+        if dwt_cycles is not None and dwt_cycles > 0:
+            w_dwt.update(float(dwt_cycles))
+            dwt_ppb_samples.append((dwt_cycles - DWT_NOMINAL) / DWT_NOMINAL * 1e9)
 
-        isr_gnss_dist[isr_gn] += 1
-        w_isr_gnss.update(float(isr_gn))
+        for key, stats, samples in (
+            ("ocxo1_interval_ns", w_o1, o1_ppb_samples),
+            ("ocxo2_interval_ns", w_o2, o2_ppb_samples),
+        ):
+            interval = _as_int(rec.get(key))
+            if interval is not None and interval > 0:
+                stats.update(float(interval))
+                samples.append((NS_NOMINAL - interval) / NS_NOMINAL * 1e9)
 
-    # ══════════════════════════════════════════════════════════════════
-    print(f"─" * 72)
-    print(f"1. PPS STREAM HEALTH")
-    print(f"─" * 72)
-    print(f"  PPS edges counted:    {len(rows)}")
-    print(f"  Gaps (recovery):      {gaps}")
-    print(f"  Doubled deltas:       {doubled_count}")
-    print(f"  PPS rejections total: {pps_rejected_max}")
+        selected = _as_int(rec.get("dwt_selected_cycles"))
+        if selected is not None and selected > 0:
+            w_dwt_selected.update(float(selected))
 
-    if doubled_count == 0 and pps_rejected_max == 0 and gaps == 0:
-        print(f"  Assessment:           CLEAN — no missed or rejected PPS edges")
+        closure = _as_int(rec.get("pps_minus_vclock_cycles"))
+        if closure is not None:
+            w_pps_vclock.update(float(closure))
+            pps_vclock_dist[closure] += 1
+
+    print("─" * 72)
+    print("1. PPS STREAM HEALTH")
+    print("─" * 72)
+    print(f"  Campaign rows:        {len(rows):,}")
+    print(f"  Campaign PPS gaps:    {gaps:,}")
+    print(f"  Doubled DWT intervals:{doubled:>8,d}")
+    print(f"  Invalid PPS snapshots:{invalid_pps:>8,d}")
+    if gaps == 0 and doubled == 0 and invalid_pps == 0:
+        print("  Assessment:           CLEAN")
     else:
-        issues = []
-        if doubled_count > 0:
-            issues.append(f"{doubled_count} missed PPS")
-        if pps_rejected_max > 0:
-            issues.append(f"{pps_rejected_max} rejections")
-        if gaps > 0:
-            issues.append(f"{gaps} gaps")
-        print(f"  Assessment:           ANOMALIES — {', '.join(issues)}")
+        print("  Assessment:           ANOMALIES PRESENT")
     print()
 
-    # ══════════════════════════════════════════════════════════════════
-    print(f"─" * 72)
-    print(f"2. INDEPENDENT PPS INTERVAL WITNESSES (excluding doubled)")
-    print(f"─" * 72)
-    print()
-    print(f"  Each witness measures how many of its own ticks fit between")
-    print(f"  consecutive PPS edges.  If PPS is accurate, each witness")
-    print(f"  should see a stable count near its nominal frequency.")
-    print()
-
+    print("─" * 72)
+    print("2. DURABLE ONE-SECOND WITNESSES")
+    print("─" * 72)
     witnesses = [
-        ("DWT (1,008,000,000 Hz)", w_dwt_delta, DWT_NOMINAL, "cycles"),
-        ("OCXO1 (10,000,000 Hz)", w_ocxo1_delta, OCXO_NOMINAL, "ticks"),
-        ("OCXO2 (10,000,000 Hz)", w_ocxo2_delta, OCXO_NOMINAL, "ticks"),
+        ("Physical PPS in DWT cycles", w_dwt, DWT_NOMINAL, "cycles", False),
+        ("OCXO1 measured duration", w_o1, NS_NOMINAL, "ns", True),
+        ("OCXO2 measured duration", w_o2, NS_NOMINAL, "ns", True),
     ]
-
-    for name, w, nominal, unit in witnesses:
-        if w.n < 2:
-            print(f"  {name}: insufficient data")
-            continue
-
-        offset_ppb = ((w.mean - nominal) / nominal) * 1e9
-        stability_ppb = (w.stddev / nominal) * 1e9
-
+    for name, stats, nominal, unit, reciprocal_sign in witnesses:
         print(f"  {name}:")
-        print(f"    n={w.n}  mean={w.mean:,.1f}  stddev={w.stddev:.2f} {unit}")
-        print(f"    min={w.min_val:,.0f}  max={w.max_val:,.0f}  range={w.range:,.0f}")
-        print(f"    offset from nominal: {offset_ppb:+.3f} PPB")
-        print(f"    per-second stability: {stability_ppb:.3f} PPB (1σ)")
-        print()
-
-    # ── Cross-domain agreement ──
-    if len(dwt_deltas) >= 10 and len(ocxo1_deltas) >= 10 and len(ocxo2_deltas) >= 10:
-        n_common = min(len(dwt_deltas), len(ocxo1_deltas), len(ocxo2_deltas))
-
-        # Normalize all three to PPB
-        dwt_ppb = [(d - DWT_NOMINAL) / DWT_NOMINAL * 1e9 for d in dwt_deltas[:n_common]]
-        o1_ppb = [(d - OCXO_NOMINAL) / OCXO_NOMINAL * 1e9 for d in ocxo1_deltas[:n_common]]
-        o2_ppb = [(d - OCXO_NOMINAL) / OCXO_NOMINAL * 1e9 for d in ocxo2_deltas[:n_common]]
-
-        # Correlation between witnesses (if PPS is jittery, all three see the same jitter)
-        def pearson(a, b):
-            n = len(a)
-            ma = sum(a) / n
-            mb = sum(b) / n
-            cov = sum((a[i] - ma) * (b[i] - mb) for i in range(n))
-            va = sum((x - ma) ** 2 for x in a)
-            vb = sum((x - mb) ** 2 for x in b)
-            denom = math.sqrt(va * vb)
-            return cov / denom if denom > 0 else 0.0
-
-        print(f"  Cross-domain correlation (PPB, per-second):")
-        print(f"    DWT  vs OCXO1: {pearson(dwt_ppb, o1_ppb):+.4f}")
-        print(f"    DWT  vs OCXO2: {pearson(dwt_ppb, o2_ppb):+.4f}")
-        print(f"    OCXO1 vs OCXO2: {pearson(o1_ppb, o2_ppb):+.4f}")
-        print()
-        print(f"    (High correlation means all witnesses see the same PPS jitter,")
-        print(f"     confirming PPS is the common reference.  Low correlation would")
-        print(f"     indicate independent noise sources, not PPS variation.)")
-        print()
-
-    # ══════════════════════════════════════════════════════════════════
-    print(f"─" * 72)
-    print(f"3. DWT CALIBRATION STABILITY (dwt_cycles_per_pps)")
-    print(f"─" * 72)
-    print()
-    print(f"  This is the continuous DWT-to-GNSS calibration constant,")
-    print(f"  updated every PPS edge.  It's the foundation of time.h.")
+        if stats.n < 2:
+            print("    insufficient data")
+            continue
+        offset_ppb = (
+            (nominal - stats.mean) / nominal * 1e9
+            if reciprocal_sign
+            else (stats.mean - nominal) / nominal * 1e9
+        )
+        stability_ppb = stats.stddev / nominal * 1e9
+        print(f"    n={stats.n:,} mean={stats.mean:,.3f} sd={stats.stddev:.3f} {unit}")
+        print(f"    min={stats.min_val:,.0f} max={stats.max_val:,.0f} range={stats.range:,.0f}")
+        print(f"    signed frequency offset: {offset_ppb:+.6f} ppb")
+        print(f"    per-second stability:    {stability_ppb:.6f} ppb (1σ)")
     print()
 
-    if w_dwt_cal.n >= 2:
-        cal_ppb = (w_dwt_cal.stddev / w_dwt_cal.mean) * 1e9 if w_dwt_cal.mean > 0 else 0
-        print(f"    n={w_dwt_cal.n}  mean={w_dwt_cal.mean:,.1f}  stddev={w_dwt_cal.stddev:.2f}")
-        print(f"    min={w_dwt_cal.min_val:,.0f}  max={w_dwt_cal.max_val:,.0f}  range={w_dwt_cal.range:,.0f}")
-        print(f"    stability: {cal_ppb:.3f} PPB (1σ)")
+    if min(len(dwt_ppb_samples), len(o1_ppb_samples), len(o2_ppb_samples)) >= 10:
+        print("  Cross-witness correlation (signed per-second PPB):")
+        print(f"    DWT   vs OCXO1: {_pearson(dwt_ppb_samples, o1_ppb_samples):+.4f}")
+        print(f"    DWT   vs OCXO2: {_pearson(dwt_ppb_samples, o2_ppb_samples):+.4f}")
+        print(f"    OCXO1 vs OCXO2: {_pearson(o1_ppb_samples, o2_ppb_samples):+.4f}")
         print()
 
-        if w_dwt_cal.range <= 20:
-            print(f"    Assessment: EXCELLENT — range ≤20 cycles ({w_dwt_cal.range:.0f})")
-        elif w_dwt_cal.range <= 100:
-            print(f"    Assessment: GOOD — range ≤100 cycles ({w_dwt_cal.range:.0f})")
-        else:
-            print(f"    Assessment: ELEVATED — range {w_dwt_cal.range:.0f} cycles")
+    print("─" * 72)
+    print("3. SELECTED PPS/VCLOCK DWT INTERVAL STABILITY")
+    print("─" * 72)
+    if w_dwt_selected.n >= 2:
+        stability = w_dwt_selected.stddev / w_dwt_selected.mean * 1e9
+        print(
+            f"  n={w_dwt_selected.n:,} mean={w_dwt_selected.mean:,.3f} "
+            f"sd={w_dwt_selected.stddev:.3f} cycles"
+        )
+        print(
+            f"  min={w_dwt_selected.min_val:,.0f} max={w_dwt_selected.max_val:,.0f} "
+            f"range={w_dwt_selected.range:,.0f}"
+        )
+        print(f"  stability: {stability:.6f} ppb (1σ)")
     else:
-        print(f"    Insufficient data")
+        print("  Insufficient data")
     print()
 
-    # ══════════════════════════════════════════════════════════════════
-    print(f"─" * 72)
-    print(f"4. GNSS VCLOCK QTIMER SANITY (isr_residual_gnss)")
-    print(f"─" * 72)
-    print()
-    print(f"  QTimer1 dual-edge count residual from 20,000,000 nominal.")
-    print(f"  Expected: ±1 alternation (phase-coherent VCLOCK/PPS).")
-    print(f"  Large values indicate signal integrity or PPS timing anomalies.")
-    print()
-
-    if w_isr_gnss.n >= 2:
-        print(f"    n={w_isr_gnss.n}  mean={w_isr_gnss.mean:+.2f}  stddev={w_isr_gnss.stddev:.2f}")
-        if w_isr_gnss.min_val is not None:
-            print(f"    min={w_isr_gnss.min_val:+.0f}  max={w_isr_gnss.max_val:+.0f}  range={w_isr_gnss.range:.0f}")
-        print()
-
-        # Distribution
-        print(f"    Distribution:")
-        for val in sorted(isr_gnss_dist.keys()):
-            cnt = isr_gnss_dist[val]
-            bar = '#' * min(cnt, 60)
-            print(f"      {val:>+6d}  {cnt:>5d}x  {bar}")
-        print()
-
-        # Assess
-        n_zero = isr_gnss_dist.get(0, 0)
-        n_pm1 = isr_gnss_dist.get(1, 0) + isr_gnss_dist.get(-1, 0) + n_zero
-        n_outlier = w_isr_gnss.n - n_pm1
-        pct_clean = (n_pm1 / w_isr_gnss.n) * 100 if w_isr_gnss.n > 0 else 0
-
-        print(f"    Zero residuals:  {n_zero} ({n_zero/w_isr_gnss.n*100:.1f}%)")
-        print(f"    Within ±1:       {n_pm1} ({pct_clean:.1f}%)")
-        print(f"    Outliers (|r|>1): {n_outlier}")
-        print()
-
-        if n_outlier == 0:
-            print(f"    Assessment: PERFECT — all residuals within ±1")
-        elif n_outlier <= w_isr_gnss.n * 0.01:
-            print(f"    Assessment: GOOD — {n_outlier} outliers (<1%)")
-        else:
-            print(f"    Assessment: ANOMALOUS — {n_outlier} outliers ({n_outlier/w_isr_gnss.n*100:.1f}%)")
+    print("─" * 72)
+    print("4. PHYSICAL PPS VERSUS VCLOCK CLOSURE")
+    print("─" * 72)
+    if w_pps_vclock.n >= 2:
+        outliers = sum(
+            count
+            for value, count in pps_vclock_dist.items()
+            if abs(value) > PPS_VCLOCK_CLEAN_GATE_CYCLES
+        )
+        print(
+            f"  n={w_pps_vclock.n:,} mean={w_pps_vclock.mean:+.3f} "
+            f"sd={w_pps_vclock.stddev:.3f} DWT cycles"
+        )
+        print(
+            f"  min={w_pps_vclock.min_val:+.0f} max={w_pps_vclock.max_val:+.0f} "
+            f"range={w_pps_vclock.range:.0f}"
+        )
+        print(f"  |PPS-VCLOCK| > {PPS_VCLOCK_CLEAN_GATE_CYCLES}: {outliers:,}")
+        print("  Distribution:")
+        for value in sorted(pps_vclock_dist):
+            count = pps_vclock_dist[value]
+            print(f"    {value:+6d}  {count:>6,d}x  {'#' * min(count, 60)}")
     else:
-        print(f"    Insufficient data")
+        outliers = 0
+        print("  Insufficient data")
     print()
 
-    # ══════════════════════════════════════════════════════════════════
-    print(f"─" * 72)
-    print(f"5. GNSS UTC COHERENCE")
-    print(f"─" * 72)
-    print()
-
-    # Check that gnss_time_utc advances by ~1 second per record
-    utc_gaps = 0
+    print("─" * 72)
+    print("5. GNSS UTC COHERENCE")
+    print("─" * 72)
+    utc_stalls = 0
     utc_checked = 0
-    prev_gnss_utc = None
+    previous_utc: Optional[str] = None
     for rec in rows:
-        gnss_utc = rec.get("gnss_time_utc")
-        if gnss_utc and prev_gnss_utc:
+        current = rec.get("gnss_time_utc")
+        if current and previous_utc:
             utc_checked += 1
-            # Simple string comparison — both should be ISO 8601
-            # Just check they're different (advancing)
-            if gnss_utc == prev_gnss_utc:
-                utc_gaps += 1
-        prev_gnss_utc = gnss_utc
-
-    if utc_checked > 0:
-        if utc_gaps == 0:
-            print(f"    GNSS UTC advancing every record ({utc_checked} checked)")
-            print(f"    Assessment: NOMINAL")
-        else:
-            print(f"    GNSS UTC stalled {utc_gaps} times out of {utc_checked} records")
-            print(f"    Assessment: ANOMALOUS")
+            if current == previous_utc:
+                utc_stalls += 1
+        if current:
+            previous_utc = str(current)
+    if utc_checked:
+        print(f"  Adjacent UTC labels checked: {utc_checked:,}")
+        print(f"  Repeated/stalled labels:     {utc_stalls:,}")
     else:
-        print(f"    No GNSS UTC data to check")
+        print("  No GNSS UTC data to check")
     print()
 
-    # ══════════════════════════════════════════════════════════════════
-    print(f"─" * 72)
-    print(f"VERDICT")
-    print(f"─" * 72)
-    print()
+    issues: List[str] = []
+    if gaps:
+        issues.append(f"{gaps} campaign PPS gap(s)")
+    if doubled:
+        issues.append(f"{doubled} doubled DWT interval(s)")
+    if invalid_pps:
+        issues.append(f"{invalid_pps} invalid PPS snapshot(s)")
+    if w_pps_vclock.n and outliers > w_pps_vclock.n * 0.01:
+        issues.append(f"{outliers} PPS/VCLOCK closure outlier(s)")
+    if utc_stalls:
+        issues.append(f"{utc_stalls} GNSS UTC stall(s)")
 
-    issues = []
-    if doubled_count > 0:
-        issues.append(f"{doubled_count} missed PPS edge(s)")
-    if pps_rejected_max > 0:
-        issues.append(f"{pps_rejected_max} PPS rejection(s)")
-    if w_dwt_cal.n >= 2 and w_dwt_cal.range > 100:
-        issues.append(f"DWT calibration range elevated ({w_dwt_cal.range:.0f} cycles)")
-    if w_isr_gnss.n >= 2:
-        n_pm1 = isr_gnss_dist.get(0, 0) + isr_gnss_dist.get(1, 0) + isr_gnss_dist.get(-1, 0)
-        n_outlier = w_isr_gnss.n - n_pm1
-        if n_outlier > w_isr_gnss.n * 0.01:
-            issues.append(f"GNSS VCLOCK outliers ({n_outlier})")
-
+    print("─" * 72)
+    print("VERDICT")
+    print("─" * 72)
     if not issues:
-        print(f"  GNSS PPS INTEGRITY: VALIDATED")
-        print(f"  All three independent witnesses confirm stable 1-second PPS intervals.")
-        print(f"  VCLOCK QTimer sanity check nominal.  No missed or rejected PPS edges.")
+        print("  GNSS PPS INTEGRITY: VALIDATED")
+        print("  Durable timing witnesses are coherent and the campaign timeline is continuous.")
     else:
         print(f"  GNSS PPS INTEGRITY: ANOMALIES ({len(issues)})")
         for issue in issues:
             print(f"    • {issue}")
-
-    print()
-    print(f"=" * 72)
+    print("=" * 72)
 
 
-def main():
+def list_campaigns() -> None:
+    try:
+        with open_db(row_dict=True) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                f"""
+                SELECT campaign, count(*) AS cnt
+                FROM campaign_detail
+                WHERE campaign_type = %s
+                  AND campaign IS NOT NULL
+                  AND payload #> '{{campaign,tempest}}' IS NOT NULL
+                  AND {PPS_COUNT_SQL} IS NOT NULL
+                GROUP BY campaign
+                ORDER BY max(ts) DESC
+                LIMIT 10
+                """,
+                (CAMPAIGN_TYPE,),
+            )
+            rows = cur.fetchall()
+        if rows:
+            print("Available TEMPEST campaigns:")
+            for row in rows:
+                print(f"  {row['campaign']:<20s} {int(row['cnt']):>8,d}")
+    except Exception:
+        pass
+
+
+def main() -> None:
     if len(sys.argv) < 2:
         print("Usage: gnss_validation <campaign_name> [limit]")
         print()
-        try:
-            with open_db(row_dict=True) as conn:
-                cur = conn.cursor()
-                cur.execute(
-                    """
-                    SELECT campaign, count(*) as cnt
-                    FROM timebase
-                    GROUP BY campaign
-                    ORDER BY max(ts) DESC
-                    LIMIT 10
-                    """
-                )
-                rows = cur.fetchall()
-            if rows:
-                print("Available campaigns:")
-                print(f"  {'CAMPAIGN':<20s} {'RECORDS':>8s}")
-                print(f"  {'─'*20} {'─'*8}")
-                for r in rows:
-                    print(f"  {r['campaign']:<20s} {r['cnt']:>8d}")
-        except Exception:
-            pass
-        sys.exit(1)
-
+        list_campaigns()
+        raise SystemExit(1)
     campaign = sys.argv[1]
     limit = int(sys.argv[2]) if len(sys.argv) > 2 else 0
     analyze(campaign, limit)
