@@ -22,7 +22,7 @@ Core contract:
     • Pi owns: GNSS_RAW, GF-8802 correlation, environment correlation,
       campaign lifecycle, final acceptance court, recovery orchestration,
       and PostgreSQL persistence.
-    • GNSS owns: receiver discipline state published through GNSS_ANNOUNCEMENT.
+    • SYSTEM owns: current Pi/GNSS/environment/power context exposed by SYSTEM.REPORT.
 
   START behavior:
 
@@ -64,7 +64,6 @@ Semantics:
 from __future__ import annotations
 
 import copy
-from collections import deque
 import json
 import logging
 import math
@@ -105,12 +104,8 @@ DWT_NS_NUM = 125
 DWT_NS_DEN = 126
 DWT_EXPECTED_PER_PPS = 1_008_000_000
 
-GNSS_POLL_INTERVAL = 5
 GNSS_WAIT_LOG_INTERVAL = 60
-GNSS_RAW_STATS_POLL_INTERVAL_S = 1.0
 GNSS_RAW_INFO_MAX_AGE_S = 2.5
-GNSS_ANNOUNCEMENT_TOPIC = "GNSS_ANNOUNCEMENT"
-GNSS_ANNOUNCEMENT_HISTORY_MAX = 8
 
 # Sync waits
 #
@@ -175,12 +170,13 @@ SYNC_LOG_INTERVAL_S = 5.0
 # adjudication, but there is no standalone forensics route or two-topic pair
 # join in the live architecture.
 TIMEBASE_INGRESS_QUEUE_MAXSIZE = 0
+CLOCKS_STATE_QUEUE_MAXSIZE = 3600
+CLOCKS_STATE_RETRY_S = 0.25
 TIMEBASE_FRAGMENT_TOPIC = "CLOCKS_FRAGMENT.campaign_row"
 CLOCKS_FRAGMENT_TOPIC = "CLOCKS_FRAGMENT"
 CLOCKS_TOPIC = "CLOCKS"
-CLOCKS_MONITOR_TOPIC = "CLOCKS_MONITOR"
-CLOCKS_MONITOR_BASELINE_REFRESH_S = 30.0
-MONITOR_PREFLIGHT_MAX_AGE_S = 5.0
+CLOCKS_BASELINE_REFRESH_S = 30.0
+CLOCKS_PREFLIGHT_MAX_AGE_S = 5.0
 CLOCKS_RECOVERY_STALLED_TOPIC = "CLOCKS_RECOVERY_STALLED"
 TIMEBASE_CANDIDATE_ACCEPT = "ACCEPT"
 TIMEBASE_CANDIDATE_SCIENCE_EXCLUDE = "SCIENCE_EXCLUDE"
@@ -242,9 +238,8 @@ PREFLIGHT_QUIET_GRACE_S = 15.0
 PREFLIGHT_STATUS_LOG_INTERVAL_S = 30.0
 PREFLIGHT_LOG_PREFIX = "🛡️ [preflight]"
 STARTUP_TEENSY_QUIET_DELAY_S = 20.0
-SYSTEM_CAMPAIGN_DETAIL_RECOVERY_WAIT_TIMEOUT_S = 120.0
-SYSTEM_CAMPAIGN_DETAIL_RECOVERY_POLL_S = 1.0
-SYSTEM_CAMPAIGN_DETAIL_RECOVERY_LOG_INTERVAL_S = 10.0
+HOLISTIC_RESTORE_TIMEOUT_S = 60.0
+HOLISTIC_RESTORE_COMMAND_RETRY_S = 10.0
 TIMEBASE_SILENCE_TIMEOUT_S = 30.0
 TIMEBASE_SILENCE_MONITOR_POLL_S = 1.0
 TEENSY_HEALTH_RETRY_S = 60.0
@@ -304,6 +299,8 @@ FEATURE_PREFLIGHT_POST_START_EXPECTED = (
 # ---------------------------------------------------------------------
 
 _fragment_queue: queue.Queue[Dict[str, Any]] = queue.Queue(maxsize=TIMEBASE_INGRESS_QUEUE_MAXSIZE)
+_clocks_state_queue: queue.Queue[Dict[str, Any]] = queue.Queue(maxsize=CLOCKS_STATE_QUEUE_MAXSIZE)
+_clocks_persist_queue: queue.Queue[Dict[str, Any]] = queue.Queue(maxsize=CLOCKS_STATE_QUEUE_MAXSIZE)
 
 # ---------------------------------------------------------------------
 # Diagnostics (monotonic counters + last anomaly snapshots)
@@ -459,11 +456,11 @@ _diag: Dict[str, Any] = {
     "preflight_feature_checks": 0,
     "preflight_feature_blocked": 0,
     "preflight_feature_unavailable": 0,
-    "preflight_monitor_updates": 0,
-    "preflight_monitor_malformed": 0,
-    "preflight_monitor_missing_features": 0,
-    "preflight_monitor_stale": 0,
-    "last_preflight_monitor": {},
+    "preflight_clocks_updates": 0,
+    "preflight_clocks_malformed": 0,
+    "preflight_clocks_missing_features": 0,
+    "preflight_clocks_stale": 0,
+    "last_preflight_clocks": {},
     "last_preflight_feature_gate": {},
     "preflight_wait_log_count": 0,
     "last_preflight_wait": {},
@@ -472,27 +469,17 @@ _diag: Dict[str, Any] = {
     "gnss_info_requests": 0,
     "gnss_info_hits": 0,
     "gnss_info_misses": 0,
-    "gnss_announcements_received": 0,
-    "gnss_announcements_valid": 0,
-    "gnss_announcements_malformed": 0,
-    "gnss_announcement_exact_matches": 0,
-    "gnss_announcement_fallback_matches": 0,
-    "last_gnss_announcement": {},
 
     # GNSS_RAW recovery projection / sanity rebuild
     "gnss_raw_recovery_restore_count": 0,
     "gnss_raw_recovery_rebuild_count": 0,
     "last_gnss_raw_recovery": {},
-    "gnss_raw_stats_loop_started": False,
     "gnss_raw_stats_poll_count": 0,
     "gnss_raw_stats_sample_count": 0,
     "gnss_raw_stats_missing_count": 0,
     "last_gnss_raw_stats_sample": {},
-    "clocks_monitor_publish_count": 0,
-    "clocks_monitor_publish_failures": 0,
-    "clocks_monitor_baseline_refresh_count": 0,
-    "clocks_monitor_baseline_refresh_failures": 0,
-    "last_clocks_monitor": {},
+    "clocks_baseline_refresh_count": 0,
+    "clocks_baseline_refresh_failures": 0,
     "stats_reset_requests": 0,
     "stats_reset_success": 0,
     "stats_reset_teensy_failures": 0,
@@ -521,10 +508,6 @@ _diag: Dict[str, Any] = {
 
     # SYSTEM-owned CLOCKS recovery may hand the Pi-owned GNSS_RAW state back
     # to CLOCKS before CLOCKS startup campaign reconciliation completes.
-    "gnss_raw_monitor_restore_requests": 0,
-    "gnss_raw_monitor_restore_success": 0,
-    "gnss_raw_monitor_restore_failures": 0,
-    "last_gnss_raw_monitor_restore": {},
 
     # CLOCKS startup lifecycle serialization
     "startup_control_ready": False,
@@ -783,10 +766,10 @@ _gnss_raw_instrument_ns: float = 0.0
 _gnss_raw_instrument_n: int = 0
 _gnss_raw_instrument_valid: bool = False
 
-# Cached baseline decoration for CLOCKS_MONITOR.  Refreshing this slow-changing
+# Cached baseline decoration for canonical CLOCKS. Refreshing this slow-changing
 # DB state is bounded and never occurs in a display repaint path.
-_clocks_monitor_baseline_cache: Dict[str, Any] = {}
-_clocks_monitor_baseline_refreshed_monotonic: Optional[float] = None
+_clocks_baseline_cache: Dict[str, Any] = {}
+_clocks_baseline_refreshed_monotonic: Optional[float] = None
 
 # GNSS_RAW statistics are Pi-owned and always-on. Campaign lifecycle may
 # rebase the synthetic clockface, but it never resets this population.
@@ -801,8 +784,6 @@ _gnss_raw_latest_info_monotonic: Optional[float] = None
 
 # Retain a short predictive-UTC history so completed PPS seconds remain
 # selectable after the receiver has staged the following second.
-_gnss_announcement_history: deque[Dict[str, Any]] = deque(maxlen=GNSS_ANNOUNCEMENT_HISTORY_MAX)
-_gnss_announcement_event = threading.Event()
 
 def _gnss_raw_clock_reset() -> None:
     """Reset only the campaign/recovery synthetic clockface."""
@@ -837,16 +818,41 @@ def _gnss_raw_welford_reset() -> Dict[str, Any]:
 
 _campaign_active: bool = False
 
+# Warm recovery may resume on a truthful degraded timeline row while the
+# firmware completes its deterministic OCXO science quarantine.  Arm a one-shot
+# confirmation so the first later science-and-control eligible row closes the
+# recovery narrative explicitly.
+_post_recovery_science_confirmation_pending: bool = False
+_post_recovery_science_confirmation_campaign: Optional[str] = None
+_post_recovery_first_public_pps_vclock_count: Optional[int] = None
+
+# CLOCKS owns the canonical state stream.  The worker publishes fresh state
+# during startup restore, but persistence opens only after the holistic restore
+# transaction reaches a terminal outcome.
+_clocks_persistence_enabled = threading.Event()
+_clocks_persistence_lock = threading.Lock()
+_clocks_state_worker_started = threading.Event()
+_clocks_state_enqueued = 0
+_clocks_state_published = 0
+_clocks_state_persisted = 0
+_clocks_state_inserted = 0
+_clocks_state_merged = 0
+_clocks_state_dropped = 0
+_last_clocks_state_sequence: Optional[int] = None
+_last_clocks_state_monotonic: Optional[float] = None
+_last_tempest_candidate_identity: Optional[Tuple[str, int]] = None
+_last_tempest_candidate_monotonic: Optional[float] = None
+
 # The command server is exposed early so PUBSUB can discover subscriptions, but
-# START/RESUME must not race active-campaign recovery.
+# START/RESUME must not race holistic startup reconciliation.
 _startup_control_ready = threading.Event()
 
 # Latest unified operational heartbeat.  CLOCKS consumes CLOCKS.features for
 # campaign preflight; it never polls or subscribes to a feature-only side feed.
-_monitor_lock = threading.Lock()
-_latest_monitor: Dict[str, Any] = {}
-_latest_monitor_received_monotonic: Optional[float] = None
-_latest_monitor_received_utc: Optional[str] = None
+_clocks_lock = threading.Lock()
+_latest_clocks: Dict[str, Any] = {}
+_latest_clocks_received_monotonic: Optional[float] = None
+_latest_clocks_received_utc: Optional[str] = None
 
 _last_pps_vclock_count_seen: Optional[int] = None
 
@@ -1278,7 +1284,7 @@ def _timebase_silence_recovery(reason: str, details: Dict[str, Any]) -> None:
                 _diag["auto_recovery_attempts"] = _diag.get("auto_recovery_attempts", 0) + 1
                 _diag["timebase_silence_recovery_started"] += 1
                 try:
-                    _recover_campaign()
+                    _restore_active_campaign_state()
                     logging.info(
                         "✅ [clocks] @%s CLOCKS_FRAGMENT silence recovery complete",
                         system_time_z(),
@@ -1507,7 +1513,7 @@ def _begin_auto_recovery(reason: str, details: Dict[str, Any], *, source: str) -
                         "🔄 [clocks] @%s auto-recovery starting (attempt %d/%d)...",
                         system_time_z(), attempt, int(AUTO_RECOVERY_MAX_ATTEMPTS),
                     )
-                    _recover_campaign()
+                    _restore_active_campaign_state()
                     logging.info("✅ [clocks] @%s auto-recovery complete", system_time_z())
                     return
                 except RecoveryRetryableFailure as e:
@@ -1571,7 +1577,7 @@ def _hard_fault(reason: str, details: Dict[str, Any]) -> None:
         global _auto_recovery_in_progress
         try:
             logging.info("🔄 [clocks] @%s auto-recovery starting...", system_time_z())
-            _recover_campaign()
+            _restore_active_campaign_state()
             logging.info("✅ [clocks] @%s auto-recovery complete", system_time_z())
         except Exception:
             logging.exception("💥 [clocks] auto-recovery FAILED — campaign deactivated")
@@ -1775,16 +1781,16 @@ def _ensure_gnss_mode_for_current_location() -> Optional[str]:
     return location
 
 
-def _monitor_clocks_payload(monitor: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def _clocks_payload(monitor: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not isinstance(monitor, dict):
         return {}
     clocks = monitor.get("clocks")
     return clocks if isinstance(clocks, dict) else {}
 
 
-def _monitor_restore_state(monitor: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def _clocks_restore_state(monitor: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Return firmware-authored structured sufficient state from CLOCKS."""
-    state = _monitor_clocks_payload(monitor).get("restore_state")
+    state = _clocks_payload(monitor).get("restore_state")
     if not isinstance(state, dict):
         return None
     try:
@@ -1964,6 +1970,325 @@ def _restore_gnss_raw_payload(gnss_raw: Dict[str, Any]) -> Dict[str, Any]:
 
 
 
+
+
+def _clocks_gnss_raw_payload(state: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Return the complete Pi-owned GNSS_RAW state carried by CLOCKS."""
+    gnss_raw = _clocks_payload(state).get("gnss_raw")
+    return copy.deepcopy(gnss_raw) if isinstance(gnss_raw, dict) else None
+
+
+def _read_latest_recoverable_clocks_state(
+    *,
+    scan_limit: int = 64,
+) -> Tuple[Optional[Dict[str, Any]], int]:
+    """Return the newest durable CLOCKS state with complete holistic restore state."""
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT payload
+            FROM campaign_detail
+            WHERE campaign_type = %s
+            ORDER BY id DESC
+            LIMIT %s
+            """,
+            (CAMPAIGN_TYPE_TEMPEST, int(scan_limit)),
+        )
+        rows = cur.fetchall()
+
+    for skipped, row in enumerate(rows):
+        state = row.get("payload") if isinstance(row, dict) else row[0]
+        if isinstance(state, str):
+            try:
+                state = json.loads(state)
+            except Exception:
+                continue
+        if not isinstance(state, dict):
+            continue
+        if _clocks_restore_state(state) is None:
+            continue
+        if _clocks_gnss_raw_payload(state) is None:
+            continue
+        return copy.deepcopy(state), int(skipped)
+    return None, len(rows)
+
+
+def _seed_clocks_from_detail(detail: Dict[str, Any]) -> None:
+    """Publish and cache the last durable CLOCKS state without persisting it again."""
+    seeded = copy.deepcopy(detail)
+    seeded["restored_display_seed"] = True
+    seeded["restored_display_seed_at_utc"] = (
+        datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    )
+    _cache_clocks_state(seeded)
+    publish(CLOCKS_TOPIC, seeded)
+
+
+def _request_teensy_holistic_restore(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Stage one complete firmware CLOCKS restore, retrying only a busy lifecycle."""
+    deadline = time.monotonic() + HOLISTIC_RESTORE_COMMAND_RETRY_S
+    restore_args = _structured_restore_args(state, include_control=True)
+    last_response: Any = None
+    while True:
+        response = send_command(
+            machine="TEENSY",
+            subsystem="CLOCKS",
+            command="RESTORE_MONITOR",
+            args=restore_args,
+        )
+        last_response = response
+        outer_success = isinstance(response, dict) and bool(response.get("success"))
+        payload = response.get("payload") if isinstance(response, dict) else None
+        status = str(payload.get("status") or "") if isinstance(payload, dict) else ""
+        if outer_success and status in _TEENSY_MONITOR_RESTORE_ACCEPTED_STATUSES:
+            return response
+        if outer_success and status == "monitor_restore_rejected_busy":
+            campaign_state = str(payload.get("campaign_state") or "").strip().upper()
+            if campaign_state == "STARTED":
+                return response
+            if time.monotonic() < deadline:
+                time.sleep(0.25)
+                continue
+        raise RuntimeError(
+            "Teensy CLOCKS holistic restore rejected: "
+            f"status={status or 'missing_handler_status'} response={last_response!r}"
+        )
+
+
+def _holistic_restore_probe(state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    clocks = _clocks_payload(state)
+    instrument = clocks.get("instrument_clockfaces")
+    stats = clocks.get("stats")
+    dac = clocks.get("dac")
+    instrument = instrument if isinstance(instrument, dict) else {}
+    stats = stats if isinstance(stats, dict) else {}
+    dac = dac if isinstance(dac, dict) else {}
+
+    welford_n: Dict[str, int] = {}
+    for lane in ("gnss", "dwt", "vclock", "ocxo1", "ocxo2", "pps_witness"):
+        node = stats.get(lane)
+        wf = node.get("welford") if isinstance(node, dict) else None
+        try:
+            welford_n[lane] = int(wf.get("n") or 0) if isinstance(wf, dict) else 0
+        except (TypeError, ValueError):
+            welford_n[lane] = 0
+    dac_stats = stats.get("dac")
+    for lane in ("ocxo1", "ocxo2"):
+        wf = dac_stats.get(lane) if isinstance(dac_stats, dict) else None
+        try:
+            welford_n[f"dac.{lane}"] = int(wf.get("n") or 0) if isinstance(wf, dict) else 0
+        except (TypeError, ValueError):
+            welford_n[f"dac.{lane}"] = 0
+
+    def int_value(value: Any) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def float_value(value: Any) -> Optional[float]:
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return None
+        return result if math.isfinite(result) else None
+
+    return {
+        "instrument_gnss_ns": int_value(instrument.get("gnss_ns")),
+        "instrument_dwt_cycles": int_value(instrument.get("dwt_cycles")),
+        "instrument_ocxo1_ns": int_value(instrument.get("ocxo1_ns")),
+        "instrument_ocxo2_ns": int_value(instrument.get("ocxo2_ns")),
+        "welford_n": welford_n,
+        "servo_mode": str(dac.get("servo_mode") or "OFF").upper(),
+        "dither_operator_enabled": bool(dac.get("dither_operator_enabled")),
+        "ocxo1_dac": float_value(dac.get("ocxo1_dac")),
+        "ocxo2_dac": float_value(dac.get("ocxo2_dac")),
+    }
+
+
+def _holistic_restore_probe_satisfied(
+    expected: Dict[str, Any],
+    observed: Dict[str, Any],
+) -> bool:
+    for key in (
+        "instrument_gnss_ns", "instrument_dwt_cycles",
+        "instrument_ocxo1_ns", "instrument_ocxo2_ns",
+    ):
+        target = int(expected.get(key) or 0)
+        if target > 0 and int(observed.get(key) or 0) < target:
+            return False
+    expected_n = expected.get("welford_n")
+    observed_n = observed.get("welford_n")
+    if isinstance(expected_n, dict) and isinstance(observed_n, dict):
+        for key, target_value in expected_n.items():
+            target = int(target_value or 0)
+            if target > 0 and int(observed_n.get(key) or 0) < target:
+                return False
+    if str(observed.get("servo_mode") or "OFF").upper() != str(
+        expected.get("servo_mode") or "OFF"
+    ).upper():
+        return False
+    if bool(observed.get("dither_operator_enabled")) != bool(
+        expected.get("dither_operator_enabled")
+    ):
+        return False
+    for key in ("ocxo1_dac", "ocxo2_dac"):
+        target = expected.get(key)
+        value = observed.get(key)
+        if target is not None and (
+            value is None or abs(float(value) - float(target)) > 0.01
+        ):
+            return False
+    return True
+
+
+def _holistic_restore_pending_categories(
+    expected: Dict[str, Any],
+    observed: Dict[str, Any],
+) -> List[str]:
+    pending: List[str] = []
+    for key, category in {
+        "instrument_gnss_ns": "GNSS_CLOCKFACE",
+        "instrument_dwt_cycles": "DWT_CLOCKFACE",
+        "instrument_ocxo1_ns": "OCXO_CLOCKFACES",
+        "instrument_ocxo2_ns": "OCXO_CLOCKFACES",
+    }.items():
+        target = int(expected.get(key) or 0)
+        if target > 0 and int(observed.get(key) or 0) < target and category not in pending:
+            pending.append(category)
+    expected_n = expected.get("welford_n")
+    observed_n = observed.get("welford_n") if isinstance(observed.get("welford_n"), dict) else {}
+    if isinstance(expected_n, dict) and any(
+        int(target or 0) > 0 and int(observed_n.get(key) or 0) < int(target or 0)
+        for key, target in expected_n.items()
+    ):
+        pending.append("STATISTICS")
+    if not _holistic_restore_probe_satisfied(
+        {**expected, "instrument_gnss_ns": 0, "instrument_dwt_cycles": 0,
+         "instrument_ocxo1_ns": 0, "instrument_ocxo2_ns": 0, "welford_n": {}},
+        observed,
+    ):
+        pending.append("DAC_CONTROL")
+    return pending or ["FRESH_CLOCKS_PROOF"]
+
+
+def _wait_for_holistic_restore(
+    detail: Dict[str, Any],
+    *,
+    requested_monotonic: float,
+    timeout_s: float = HOLISTIC_RESTORE_TIMEOUT_S,
+) -> Dict[str, Any]:
+    expected = _holistic_restore_probe(detail)
+    deadline = time.monotonic() + float(timeout_s)
+    next_progress_log = requested_monotonic + 10.0
+    last_observed: Dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        with _clocks_lock:
+            current = copy.deepcopy(_latest_clocks)
+            received = _latest_clocks_received_monotonic
+        if received is not None and received > requested_monotonic and current:
+            last_observed = _holistic_restore_probe(current)
+            if _holistic_restore_probe_satisfied(expected, last_observed):
+                return {
+                    "proved": True,
+                    "expected": expected,
+                    "observed": last_observed,
+                    "clocks_sequence": current.get("sequence"),
+                    "waited_s": round(time.monotonic() - requested_monotonic, 3),
+                }
+        now = time.monotonic()
+        if now >= next_progress_log:
+            logging.info(
+                "⏳ [holistic restore] converging after %.1fs; waiting for %s",
+                now - requested_monotonic,
+                ", ".join(_holistic_restore_pending_categories(expected, last_observed)),
+            )
+            next_progress_log = now + 10.0
+        time.sleep(0.1)
+    raise TimeoutError(
+        "timed out waiting for holistic CLOCKS restore proof "
+        f"after {timeout_s:.1f}s; expected={expected!r} observed={last_observed!r}"
+    )
+
+
+def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
+    restore_state = _clocks_restore_state(detail)
+    gnss_raw = _clocks_gnss_raw_payload(detail)
+    if restore_state is None or gnss_raw is None:
+        raise RuntimeError("CLOCKS detail lacks complete firmware/GNSS_RAW restore state")
+
+    _seed_clocks_from_detail(detail)
+    requested_monotonic = time.monotonic()
+    teensy_response = _request_teensy_holistic_restore(restore_state)
+    payload = teensy_response.get("payload") if isinstance(teensy_response, dict) else None
+    payload = payload if isinstance(payload, dict) else {}
+    status = str(payload.get("status") or "")
+    campaign_state = str(payload.get("campaign_state") or "").strip().upper()
+    if status == "monitor_restore_rejected_busy" and campaign_state == "STARTED":
+        return {
+            "success": True,
+            "mode": "LIVE_CAMPAIGN_CUSTODY",
+            "teensy": payload,
+            "proof": {"proved": True, "basis": "TEENSY_LIVE_CAMPAIGN_CUSTODY"},
+        }
+
+    gnss_raw_result = _restore_gnss_raw_payload(gnss_raw)
+    if not gnss_raw_result.get("restored"):
+        raise RuntimeError(f"GNSS_RAW restore failed: {gnss_raw_result}")
+    proof = _wait_for_holistic_restore(
+        detail,
+        requested_monotonic=requested_monotonic,
+    )
+    return {
+        "success": True,
+        "mode": "HOLISTIC_INSTRUMENT",
+        "teensy": payload,
+        "gnss_raw": gnss_raw_result,
+        "proof": proof,
+    }
+
+
+def _holistic_restore() -> Dict[str, Any]:
+    """Restore the CLOCKS subsystem from one canonical state record.
+
+    Campaign execution is not a separate startup recovery universe.  It is one
+    conditional aspect of the restored CLOCKS state.
+    """
+    active_campaign = _get_active_campaign()
+    detail, skipped = _read_latest_recoverable_clocks_state()
+    result: Dict[str, Any] = {
+        "schema": "PI_CLOCKS_HOLISTIC_RESTORE_V1",
+        "active_campaign": active_campaign.get("campaign") if active_campaign else None,
+        "skipped_unrecoverable_details": int(skipped),
+        "instrument": None,
+        "campaign": None,
+    }
+
+    try:
+        if detail is not None:
+            logging.info(
+                "♻️ [holistic restore] restoring canonical CLOCKS sequence=%s "
+                "(skipped_unrecoverable=%d)",
+                detail.get("sequence"), skipped,
+            )
+            result["instrument"] = _restore_instrument_from_clocks(detail)
+        else:
+            logging.info(
+                "ℹ️ [holistic restore] no structured-recoverable CLOCKS detail; "
+                "continuing from live instrument state"
+            )
+    finally:
+        # Persistence always resumes after the one restore transaction terminates.
+        # Recoverability scans skip incomplete rows, so a failed restore cannot
+        # permanently close the writer or erase older durable authority.
+        _clocks_persistence_enabled.set()
+
+    if active_campaign is not None:
+        result["campaign"] = _restore_active_campaign_state()
+
+    result["completed_at_utc"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return result
 
 def _tempest_state_decoration(detail: Dict[str, Any]) -> Dict[str, Any]:
     """Return only the TEMPEST-owned facts added to one common state snapshot."""
@@ -2219,84 +2544,46 @@ def _parse_utc(value: Any) -> Optional[datetime]:
         return None
 
 
-def _announcement_receiver_info(announcement: Dict[str, Any]) -> Dict[str, Any]:
-    receiver = announcement.get("receiver")
-    info = dict(receiver) if isinstance(receiver, dict) else {}
-    next_utc = str(announcement.get("next_utc") or "")
-    info.update({
-        "announcement_schema": announcement.get("schema"),
-        "semantics": announcement.get("semantics"),
-        "next_utc": next_utc or None,
-        "gnss_time_utc": next_utc or None,
-        "source_sentence": announcement.get("source_sentence"),
-        "announcement_sequence": announcement.get("announcement_sequence"),
-        "received_at_utc": announcement.get("received_at_utc"),
-        "received_wall_ns": announcement.get("received_wall_ns"),
-        "received_monotonic_ns": announcement.get("received_monotonic_ns"),
-        "time_valid": announcement.get("time_valid"),
-        "time_status": announcement.get("time_status"),
-        "pps_sync": announcement.get("pps_sync"),
-        "leap_second": announcement.get("leap_second"),
-        "clock_drift_ppb": announcement.get("clock_drift_ppb"),
-        "temperature_c": announcement.get("temperature_c"),
-        "raw_tps1": announcement.get("raw_tps1"),
-    })
-    return info
 
 
-def _gnss_announcement_for_utc(target_utc: datetime) -> Optional[Dict[str, Any]]:
-    """Select the announcement naming target UTC, never the next staged second."""
-    target = target_utc.astimezone(timezone.utc).replace(microsecond=0)
-    with _gnss_raw_stats_lock:
-        history = [dict(item) for item in _gnss_announcement_history]
-    for item in history:
-        named = _parse_utc(item.get("next_utc"))
-        if named is not None and named.replace(microsecond=0) == target:
-            _diag["gnss_announcement_exact_matches"] += 1
-            return item
-    return None
 
 
-def _gnss_info_for_utc(target_utc: datetime) -> Optional[Dict[str, Any]]:
-    item = _gnss_announcement_for_utc(target_utc)
-    return _announcement_receiver_info(item) if item else None
 
 
 def _wait_for_gnss_time() -> str:
-    """Wait for a publication naming the current PPS/UTC second."""
+    """Wait until SYSTEM.REPORT carries a valid current GNSS UTC identity."""
     _diag["gnss_waits"] += 1
-    t0 = time.monotonic()
-    last_log = t0
-    start_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    started = time.monotonic()
+    next_log = started
     while True:
-        now_utc = datetime.now(timezone.utc)
-        item = _gnss_announcement_for_utc(now_utc)
-        if item and item.get("next_utc"):
-            waited = time.monotonic() - t0
-            _diag["gnss_wait_success"] += 1
-            _diag["gnss_wait_seconds_total"] += float(waited)
-            _diag["gnss_wait_seconds_last"] = float(waited)
-            _diag["last_gnss_wait"] = {
-                "ts_utc": now_utc.isoformat().replace("+00:00", "Z"),
-                "start_utc": start_utc,
-                "waited_s": round(float(waited), 3),
-                "source": GNSS_ANNOUNCEMENT_TOPIC,
-            }
-            return str(item["next_utc"])
+        try:
+            system_context = _fetch_system_report()
+            value = _system_gnss_time_utc(system_context)
+            gnss = _system_gnss_info(system_context)
+            if value and gnss.get("time_valid", True):
+                waited = time.monotonic() - started
+                _diag["gnss_wait_success"] += 1
+                _diag["gnss_wait_seconds_total"] += float(waited)
+                _diag["gnss_wait_seconds_last"] = float(waited)
+                _diag["last_gnss_wait"] = {
+                    "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "waited_s": round(waited, 3),
+                    "source": "SYSTEM.REPORT",
+                }
+                return value
+        except Exception:
+            pass
         now = time.monotonic()
-        if now - last_log >= GNSS_WAIT_LOG_INTERVAL:
-            logging.info("⏳ [clocks] waiting for GNSS_ANNOUNCEMENT... (%.0fs elapsed)", now - t0)
-            last_log = now
-        _gnss_announcement_event.wait(timeout=0.5)
-        _gnss_announcement_event.clear()
+        if now >= next_log:
+            logging.info(
+                "⏳ [clocks] waiting for SYSTEM.REPORT GNSS time... (%.0fs elapsed)",
+                now - started,
+            )
+            next_log = now + GNSS_WAIT_LOG_INTERVAL
+        time.sleep(0.5)
 
 
-def _get_gnss_time() -> str:
-    """Return the announcement naming the current UTC/PPS second."""
-    item = _gnss_announcement_for_utc(datetime.now(timezone.utc))
-    if not item or not item.get("next_utc"):
-        raise RuntimeError("no GNSS_ANNOUNCEMENT names the current UTC second")
-    return str(item["next_utc"])
+
 
 
 def _set_gnss_mode_to(location: str) -> Dict[str, Any]:
@@ -2314,98 +2601,78 @@ def _set_gnss_mode_normal() -> Dict[str, Any]:
 
 
 
-def _fetch_environment() -> Optional[Dict[str, Any]]:
-    """
-    Fetch environment snapshot from SYSTEM REPORT for TIMEBASE correlation.
-
-    Returns a flat dict with temperature, altitude, pressure, and power
-    readings, or None if the report is unavailable.  Best-effort — a miss
-    here should never block TIMEBASE production.
-    """
-    try:
-        resp = send_command(machine="PI", subsystem="SYSTEM", command="REPORT")
-        if not resp.get("success"):
-            return None
-        p = resp.get("payload", {})
-        if not isinstance(p, dict):
-            return None
-
-        env = p.get("environment", {})
-        gnss = p.get("gnss", {})
-        gnss_clock = gnss.get("clock", {})
-        teensy = p.get("teensy", {})
-        pi = p.get("pi", {})
-        power = p.get("power", {})
-        battery = p.get("battery", {})
-
-        # Power state: extract Pi, Teensy, OCXO1 domains from i2c-2
-        i2c2 = power.get("i2c-2", {})
-        pi_power = i2c2.get("0x40", {})
-        teensy_power = i2c2.get("0x45", {})
-        ocxo1_power = i2c2.get("0x44", {})
-        ocxo2_power = i2c2.get("0x41", {})
-
-        return {
-            # Temperature
-            "ambient_temp_c": env.get("temperature_c"),
-            "teensy_temp_c": teensy.get("cpu_temp_c"),
-            "pi_temp_c": pi.get("cpu_temp_c"),
-            "gnss_temp_c": gnss_clock.get("temperature_c"),
-
-            # Altitude (all forms)
-            "barometric_altitude_m": env.get("altitude_m"),
-            "gnss_altitude_m": gnss.get("altitude_m"),
-            "ellipsoid_height_m": gnss.get("ellipsoid_height_m"),
-            "geoid_sep_m": gnss.get("geoid_sep_m"),
-
-            # Barometric pressure
-            "pressure_hpa": env.get("pressure_hpa"),
-            "humidity_pct": env.get("humidity_pct"),
-
-            # Power state
-            "pi_power": {
-                "volts": pi_power.get("volts"),
-                "amps": pi_power.get("amps"),
-                "watts": pi_power.get("watts"),
-            },
-            "teensy_power": {
-                "volts": teensy_power.get("volts"),
-                "amps": teensy_power.get("amps"),
-                "watts": teensy_power.get("watts"),
-            },
-            "ocxo1_power": {
-                "volts": ocxo1_power.get("volts"),
-                "amps": ocxo1_power.get("amps"),
-                "watts": ocxo1_power.get("watts"),
-            },
-            "ocxo2_power": {
-                "volts": ocxo2_power.get("volts"),
-                "amps": ocxo2_power.get("amps"),
-                "watts": ocxo2_power.get("watts"),
-            },
-
-            # Battery state
-            "battery": {
-                "remaining_pct": battery.get("remaining_pct"),
-                "tte_minutes": battery.get("tte_minutes"),
-                "wh_remaining": battery.get("wh_remaining_estimate"),
-                "health_state": battery.get("health_state"),
-            },
-        }
-    except Exception:
-        logging.debug("⚠️ [clocks] _fetch_environment failed (ignored)")
-        return None
+def _fetch_system_report() -> Dict[str, Any]:
+    """Pull the authoritative current platform context from Pi SYSTEM."""
+    response = send_command(
+        machine="PI",
+        subsystem="SYSTEM",
+        command="REPORT",
+        retries=1,
+        retry_delay_s=0.0,
+    )
+    payload = response.get("payload") if isinstance(response, dict) else None
+    if not isinstance(response, dict) or not response.get("success") or not isinstance(payload, dict):
+        raise RuntimeError(f"SYSTEM.REPORT unavailable: {response!r}")
+    return copy.deepcopy(payload)
 
 
-def _fetch_gnss_info() -> Optional[Dict[str, Any]]:
-    """Return the published GF-8802 snapshot bound to the current PPS second."""
-    _diag["gnss_info_requests"] += 1
-    info = _gnss_info_for_utc(datetime.now(timezone.utc))
-    if info is not None:
-        _diag["gnss_info_hits"] += 1
-        return info
-    _diag["gnss_info_misses"] += 1
-    return None
+def _system_gnss_info(system_context: Dict[str, Any]) -> Dict[str, Any]:
+    gnss = system_context.get("gnss") if isinstance(system_context, dict) else None
+    return copy.deepcopy(gnss) if isinstance(gnss, dict) else {}
+
+
+def _system_gnss_time_utc(system_context: Dict[str, Any]) -> Optional[str]:
+    gnss = _system_gnss_info(system_context)
+    for key in ("gnss_time_utc", "next_utc"):
+        value = gnss.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    date = str(gnss.get("date") or "").strip()
+    clock = str(gnss.get("time") or "").strip()
+    return f"{date}T{clock}Z" if date and clock else None
+
+
+def _environment_from_system_report(
+    system_context: Dict[str, Any],
+    clocks_fragment: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Project the established TEMPEST environment shape from SYSTEM.REPORT."""
+    env = system_context.get("environment") if isinstance(system_context.get("environment"), dict) else {}
+    gnss = _system_gnss_info(system_context)
+    gnss_clock = gnss.get("clock") if isinstance(gnss.get("clock"), dict) else {}
+    pi = system_context.get("pi") if isinstance(system_context.get("pi"), dict) else {}
+    power = system_context.get("power") if isinstance(system_context.get("power"), dict) else {}
+    battery = system_context.get("battery") if isinstance(system_context.get("battery"), dict) else {}
+    teensy = clocks_fragment.get("teensy") if isinstance(clocks_fragment.get("teensy"), dict) else {}
+
+    i2c2 = power.get("i2c-2") if isinstance(power.get("i2c-2"), dict) else {}
+    def rail(address: str) -> Dict[str, Any]:
+        value = i2c2.get(address)
+        return value if isinstance(value, dict) else {}
+
+    return {
+        "ambient_temp_c": env.get("temperature_c"),
+        "teensy_temp_c": teensy.get("cpu_temp_c"),
+        "pi_temp_c": pi.get("cpu_temp_c"),
+        "gnss_temp_c": gnss_clock.get("temperature_c", gnss.get("temperature_c")),
+        "barometric_altitude_m": env.get("altitude_m"),
+        "gnss_altitude_m": gnss.get("altitude_m"),
+        "ellipsoid_height_m": gnss.get("ellipsoid_height_m"),
+        "geoid_sep_m": gnss.get("geoid_sep_m"),
+        "pressure_hpa": env.get("pressure_hpa"),
+        "humidity_pct": env.get("humidity_pct"),
+        "pi_power": {k: rail("0x40").get(k) for k in ("volts", "amps", "watts")},
+        "teensy_power": {k: rail("0x45").get(k) for k in ("volts", "amps", "watts")},
+        "ocxo1_power": {k: rail("0x44").get(k) for k in ("volts", "amps", "watts")},
+        "ocxo2_power": {k: rail("0x41").get(k) for k in ("volts", "amps", "watts")},
+        "battery": {
+            "remaining_pct": battery.get("remaining_pct"),
+            "tte_minutes": battery.get("tte_minutes"),
+            "wh_remaining": battery.get("wh_remaining_estimate"),
+            "health_state": battery.get("health_state"),
+        },
+    }
+
 
 
 def _gnss_raw_drift_from_info(info: Optional[Dict[str, Any]]) -> Optional[float]:
@@ -2443,45 +2710,35 @@ def _gnss_raw_welford_snapshot() -> Dict[str, Any]:
     }
 
 
-def _gnss_raw_latest_info_snapshot() -> Optional[Dict[str, Any]]:
-    """Return a fresh cached GNSS discipline sample for TIMEBASE decoration."""
-    with _gnss_raw_stats_lock:
-        received = _gnss_raw_latest_info_monotonic
-        info = dict(_gnss_raw_latest_info)
-    if received is None or not info:
-        return None
-    if time.monotonic() - received > GNSS_RAW_INFO_MAX_AGE_S:
-        return None
-    return info
 
 
-def _clocks_monitor_set_baseline_cache(value: Optional[Dict[str, Any]]) -> None:
-    global _clocks_monitor_baseline_cache
-    global _clocks_monitor_baseline_refreshed_monotonic
-    _clocks_monitor_baseline_cache = dict(value or {})
-    _clocks_monitor_baseline_refreshed_monotonic = time.monotonic()
+def _clocks_baseline_set_cache(value: Optional[Dict[str, Any]]) -> None:
+    global _clocks_baseline_cache
+    global _clocks_baseline_refreshed_monotonic
+    _clocks_baseline_cache = dict(value or {})
+    _clocks_baseline_refreshed_monotonic = time.monotonic()
 
 
-def _clocks_monitor_baseline_snapshot(*, force: bool = False) -> Dict[str, Any]:
+def _clocks_baseline_snapshot(*, force: bool = False) -> Dict[str, Any]:
     """Return bounded-refresh baseline state for the ephemeral monitor feed."""
     now = time.monotonic()
     due = (
         force
-        or _clocks_monitor_baseline_refreshed_monotonic is None
-        or now - _clocks_monitor_baseline_refreshed_monotonic
-            >= CLOCKS_MONITOR_BASELINE_REFRESH_S
+        or _clocks_baseline_refreshed_monotonic is None
+        or now - _clocks_baseline_refreshed_monotonic
+            >= CLOCKS_BASELINE_REFRESH_S
     )
     if due:
         try:
-            _clocks_monitor_set_baseline_cache(_get_baseline_from_config())
-            _diag["clocks_monitor_baseline_refresh_count"] += 1
+            _clocks_baseline_set_cache(_get_baseline_from_config())
+            _diag["clocks_baseline_refresh_count"] += 1
         except Exception:
-            _diag["clocks_monitor_baseline_refresh_failures"] += 1
-            logging.debug("CLOCKS_MONITOR baseline refresh failed", exc_info=True)
-    return dict(_clocks_monitor_baseline_cache)
+            _diag["clocks_baseline_refresh_failures"] += 1
+            logging.debug("CLOCKS baseline refresh failed", exc_info=True)
+    return dict(_clocks_baseline_cache)
 
 
-def _gnss_raw_monitor_snapshot() -> Dict[str, Any]:
+def _gnss_raw_state_snapshot() -> Dict[str, Any]:
     """Build the Pi-owned portion of the always-on CLOCKS monitor view."""
     with _gnss_raw_stats_lock:
         latest_info = dict(_gnss_raw_latest_info)
@@ -2575,123 +2832,8 @@ def _gnss_raw_monitor_snapshot() -> Dict[str, Any]:
     }
 
 
-def _publish_clocks_monitor() -> None:
-    """Publish Pi CLOCKS decoration without command/response or persistence."""
-    gnss_raw = _gnss_raw_monitor_snapshot()
-    presentation = gnss_raw["presentation"]
-    welford = gnss_raw["welford"]
-    baseline = _clocks_monitor_baseline_snapshot()
-    baseline = (
-        {"baseline_set": True, **baseline}
-        if baseline
-        else {"baseline_set": False}
-    )
-    campaign_seconds = int(_accepted_pps_vclock_count or 0) if _campaign_active else 0
-    instrument_seconds = int(gnss_raw.get("instrument", {}).get("clockface_n") or 0)
-    payload = {
-        "schema": "PI_CLOCKS_MONITOR_V2",
-        "published_at_utc": datetime.now(timezone.utc)
-            .isoformat()
-            .replace("+00:00", "Z"),
-        "instrument_always_on": True,
-        "instrument_elapsed": _seconds_to_hms(instrument_seconds),
-        "campaign_active": bool(_campaign_active),
-        "campaign_present": bool(_campaign_active),
-        "campaign_state": "STARTED" if _campaign_active else "STOPPED",
-        "campaign_type": CAMPAIGN_TYPE_TEMPEST if _campaign_active else None,
-        "campaign": _start_requested_campaign if _campaign_active else None,
-        "campaign_elapsed": _seconds_to_hms(campaign_seconds),
-        "complete_for_display": True,
-        "startup": _start_status_payload(),
-        "gnss_raw": gnss_raw,
-        "extra_clocks": {
-            "gnss_raw_ns": presentation.get("ns"),
-            "gnss_raw_ref_ns": presentation.get("ref_ns"),
-            "gnss_raw_drift_ppb": gnss_raw.get("drift_ppb"),
-            "gnss_raw_tau": presentation.get("tau"),
-            "gnss_raw_ppb": presentation.get("ppb"),
-            "gnss_raw_welford_n": welford.get("n"),
-            "gnss_raw_welford_mean": welford.get("mean"),
-            "gnss_raw_welford_m2": welford.get("m2"),
-            "gnss_raw_welford_stddev": welford.get("stddev"),
-            "gnss_raw_welford_stderr": welford.get("stderr"),
-            "gnss_raw_welford_min": welford.get("min"),
-            "gnss_raw_welford_max": welford.get("max"),
-        },
-        "baseline": baseline,
-        "stats_reset": {
-            "requests": int(_diag.get("stats_reset_requests") or 0),
-            "success": int(_diag.get("stats_reset_success") or 0),
-            "last": _diag.get("last_stats_reset") or {},
-        },
-    }
-    try:
-        publish(CLOCKS_MONITOR_TOPIC, payload)
-        _diag["clocks_monitor_publish_count"] += 1
-        _diag["last_clocks_monitor"] = {
-            "published_at_utc": payload["published_at_utc"],
-            "gnss_raw_n": int(welford.get("n") or 0),
-            "presentation_mode": presentation.get("mode"),
-            "success": True,
-        }
-    except Exception as exc:
-        _diag["clocks_monitor_publish_failures"] += 1
-        _diag["last_clocks_monitor"] = {
-            "published_at_utc": payload["published_at_utc"],
-            "success": False,
-            "error": str(exc),
-        }
-        logging.debug("CLOCKS_MONITOR publish failed", exc_info=True)
 
 
-def _gnss_raw_stats_loop() -> None:
-    """Poll GF-8802 drift continuously, independent of campaign recording."""
-    global _gnss_raw_welford_n, _gnss_raw_welford_mean, _gnss_raw_welford_m2
-    global _gnss_raw_welford_min, _gnss_raw_welford_max
-    global _gnss_raw_latest_info, _gnss_raw_latest_info_monotonic
-    global _gnss_raw_instrument_ns, _gnss_raw_instrument_n
-    global _gnss_raw_instrument_valid
-    _diag["gnss_raw_stats_loop_started"] = True
-    logging.info("📊 [clocks] GNSS_RAW always-on statistics loop started")
-    next_poll = time.monotonic()
-    while True:
-        next_poll += GNSS_RAW_STATS_POLL_INTERVAL_S
-        _diag["gnss_raw_stats_poll_count"] += 1
-        info = _fetch_gnss_info()
-        sample = _gnss_raw_drift_from_info(info)
-        now = time.monotonic()
-        if isinstance(info, dict) and info:
-            with _gnss_raw_stats_lock:
-                _gnss_raw_latest_info = dict(info)
-                _gnss_raw_latest_info_monotonic = now
-        with _gnss_raw_stats_lock:
-            _gnss_raw_instrument_ns += (
-                NS_PER_SECOND + (sample if sample is not None else 0.0)
-            )
-            _gnss_raw_instrument_n += 1
-            _gnss_raw_instrument_valid = True
-
-        if sample is None:
-            _diag["gnss_raw_stats_missing_count"] += 1
-        else:
-            with _gnss_raw_stats_lock:
-                _gnss_raw_welford_n += 1
-                d1 = sample - _gnss_raw_welford_mean
-                _gnss_raw_welford_mean += d1 / _gnss_raw_welford_n
-                d2 = sample - _gnss_raw_welford_mean
-                _gnss_raw_welford_m2 += d1 * d2
-                _gnss_raw_welford_min = min(_gnss_raw_welford_min, sample)
-                _gnss_raw_welford_max = max(_gnss_raw_welford_max, sample)
-                n = int(_gnss_raw_welford_n)
-            _diag["gnss_raw_stats_sample_count"] += 1
-            _diag["last_gnss_raw_stats_sample"] = {
-                "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                "drift_ppb": round(float(sample), 6),
-                "n": n,
-            }
-
-        _publish_clocks_monitor()
-        time.sleep(max(0.0, next_poll - time.monotonic()))
 
 
 
@@ -5069,7 +5211,7 @@ def _startup_control_gate(operation: str) -> Optional[Dict[str, Any]]:
 
     The command server is intentionally exposed before boot recovery so PUBSUB
     can discover routes.  START/RESUME, however, must not race the boot DAC push
-    or the active-campaign recovery scan.  STOP, REPORT, CLEAR, and recovery
+    or the holistic startup restore. STOP, REPORT, CLEAR, and recovery
     abort remain available throughout startup.
     """
     if _startup_control_ready.is_set():
@@ -5121,67 +5263,6 @@ def _clear_start_wait_state() -> None:
 # ---------------------------------------------------------------------
 
 
-def on_gnss_announcement(payload: Payload) -> None:
-    """Admit one predictive TPS1 publication and advance GNSS_RAW exactly once."""
-    global _gnss_raw_welford_n, _gnss_raw_welford_mean, _gnss_raw_welford_m2
-    global _gnss_raw_welford_min, _gnss_raw_welford_max
-    global _gnss_raw_latest_info, _gnss_raw_latest_info_monotonic
-    global _gnss_raw_instrument_ns, _gnss_raw_instrument_n, _gnss_raw_instrument_valid
-
-    _diag["gnss_announcements_received"] += 1
-    item = dict(payload)
-    next_utc = _parse_utc(item.get("next_utc"))
-    if (
-        item.get("schema") != "GNSS_ANNOUNCEMENT_V1"
-        or item.get("semantics") != "NEXT_PPS_UTC"
-        or next_utc is None
-    ):
-        _diag["gnss_announcements_malformed"] += 1
-        logging.warning("[clocks] ignoring malformed GNSS_ANNOUNCEMENT: %r", item)
-        return
-
-    now = time.monotonic()
-    info = _announcement_receiver_info(item)
-    sample = _gnss_raw_drift_from_info(info)
-    with _gnss_raw_stats_lock:
-        _gnss_announcement_history.append(dict(item))
-        _gnss_raw_latest_info = dict(info)
-        _gnss_raw_latest_info_monotonic = now
-        _gnss_raw_instrument_ns += NS_PER_SECOND + (sample if sample is not None else 0.0)
-        _gnss_raw_instrument_n += 1
-        _gnss_raw_instrument_valid = True
-        if sample is not None:
-            _gnss_raw_welford_n += 1
-            d1 = sample - _gnss_raw_welford_mean
-            _gnss_raw_welford_mean += d1 / _gnss_raw_welford_n
-            d2 = sample - _gnss_raw_welford_mean
-            _gnss_raw_welford_m2 += d1 * d2
-            _gnss_raw_welford_min = min(_gnss_raw_welford_min, sample)
-            _gnss_raw_welford_max = max(_gnss_raw_welford_max, sample)
-            n = int(_gnss_raw_welford_n)
-        else:
-            n = int(_gnss_raw_welford_n)
-
-    _diag["gnss_announcements_valid"] += 1
-    _diag["gnss_raw_stats_poll_count"] += 1
-    if sample is None:
-        _diag["gnss_raw_stats_missing_count"] += 1
-    else:
-        _diag["gnss_raw_stats_sample_count"] += 1
-        _diag["last_gnss_raw_stats_sample"] = {
-            "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            "drift_ppb": round(float(sample), 6),
-            "n": n,
-            "source": GNSS_ANNOUNCEMENT_TOPIC,
-        }
-    _diag["last_gnss_announcement"] = {
-        "next_utc": item.get("next_utc"),
-        "announcement_sequence": item.get("announcement_sequence"),
-        "received_at_utc": item.get("received_at_utc"),
-        "clock_drift_ppb": sample,
-    }
-    _gnss_announcement_event.set()
-    _publish_clocks_monitor()
 
 
 def on_watchdog_anomaly(payload: Payload) -> None:
@@ -5276,8 +5357,10 @@ def _enqueue_timebase_piece(
     *,
     restore_state: Optional[Dict[str, Any]] = None,
     ppb_buckets: Optional[Dict[str, Any]] = None,
+    system_context: Optional[Dict[str, Any]] = None,
+    clocks_fragment: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Enqueue one campaign row plus same-second monitor decoration."""
+    """Enqueue one already-persisted campaign candidate for TEMPEST adjudication."""
     _fragment_queue.put({
         "topic": topic,
         "payload": dict(payload),
@@ -5285,6 +5368,10 @@ def _enqueue_timebase_piece(
             if isinstance(restore_state, dict) else None,
         "ppb_buckets": copy.deepcopy(ppb_buckets)
             if isinstance(ppb_buckets, dict) else None,
+        "system_context": copy.deepcopy(system_context)
+            if isinstance(system_context, dict) else {},
+        "clocks_fragment": copy.deepcopy(clocks_fragment)
+            if isinstance(clocks_fragment, dict) else {},
         "received_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     })
 
@@ -5292,6 +5379,7 @@ def _enqueue_timebase_piece(
     _diag["queue_depth_current"] = depth
     if depth > _diag["queue_depth_max_seen"]:
         _diag["queue_depth_max_seen"] = depth
+
 
 
 def _drain_timebase_ingress() -> int:
@@ -5305,6 +5393,447 @@ def _drain_timebase_ingress() -> int:
             break
 
     return drained
+
+
+def _drain_clocks_persistence_queue() -> int:
+    """Discard not-yet-durable CLOCKS rows before destructive history commands."""
+    drained = 0
+    while not _clocks_persist_queue.empty():
+        try:
+            _clocks_persist_queue.get_nowait()
+            drained += 1
+        except queue.Empty:
+            break
+    return drained
+
+
+# ---------------------------------------------------------------------
+# Canonical CLOCKS state construction and persistence
+# ---------------------------------------------------------------------
+
+def _deep_merge_dicts(*values: Any) -> Dict[str, Any]:
+    result: Dict[str, Any] = {}
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        for key, item in value.items():
+            if isinstance(item, dict) and isinstance(result.get(key), dict):
+                result[key] = _deep_merge_dicts(result[key], item)
+            else:
+                result[key] = copy.deepcopy(item)
+    return result
+
+
+def _clocks_fragment_count(fragment: Dict[str, Any]) -> Optional[int]:
+    for key in ("sequence", "teensy_pps_vclock_count", "teensy_pps_count", "pps_count"):
+        value = fragment.get(key)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _advance_gnss_raw_instrument(
+    sequence: Optional[int],
+    system_context: Dict[str, Any],
+) -> None:
+    """Advance GNSS_RAW once per physical second, not on a prompt enrichment copy."""
+    global _last_clocks_state_sequence, _last_clocks_state_monotonic
+    global _gnss_raw_welford_n, _gnss_raw_welford_mean, _gnss_raw_welford_m2
+    global _gnss_raw_welford_min, _gnss_raw_welford_max
+    global _gnss_raw_latest_info, _gnss_raw_latest_info_monotonic
+    global _gnss_raw_instrument_ns, _gnss_raw_instrument_n, _gnss_raw_instrument_valid
+
+    now = time.monotonic()
+    if (
+        sequence is not None
+        and _last_clocks_state_sequence == int(sequence)
+        and _last_clocks_state_monotonic is not None
+        and now - _last_clocks_state_monotonic < 0.5
+    ):
+        return
+
+    info = _system_gnss_info(system_context)
+    sample = _gnss_raw_drift_from_info(info)
+    with _gnss_raw_stats_lock:
+        _gnss_raw_latest_info = dict(info)
+        _gnss_raw_latest_info_monotonic = now
+        _gnss_raw_instrument_ns += NS_PER_SECOND + (sample if sample is not None else 0.0)
+        _gnss_raw_instrument_n += 1
+        _gnss_raw_instrument_valid = True
+        if sample is not None:
+            _gnss_raw_welford_n += 1
+            d1 = sample - _gnss_raw_welford_mean
+            _gnss_raw_welford_mean += d1 / _gnss_raw_welford_n
+            d2 = sample - _gnss_raw_welford_mean
+            _gnss_raw_welford_m2 += d1 * d2
+            _gnss_raw_welford_min = min(_gnss_raw_welford_min, sample)
+            _gnss_raw_welford_max = max(_gnss_raw_welford_max, sample)
+            n = int(_gnss_raw_welford_n)
+        else:
+            n = int(_gnss_raw_welford_n)
+
+    _diag["gnss_raw_stats_poll_count"] += 1
+    if sample is None:
+        _diag["gnss_raw_stats_missing_count"] += 1
+    else:
+        _diag["gnss_raw_stats_sample_count"] += 1
+        _diag["last_gnss_raw_stats_sample"] = {
+            "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "drift_ppb": round(float(sample), 6),
+            "n": n,
+            "source": "SYSTEM.REPORT",
+        }
+    if sequence is not None:
+        _last_clocks_state_sequence = int(sequence)
+        _last_clocks_state_monotonic = now
+
+
+
+def _pi_clocks_state_snapshot() -> Dict[str, Any]:
+    gnss_raw = _gnss_raw_state_snapshot()
+    presentation = gnss_raw["presentation"]
+    welford = gnss_raw["welford"]
+    baseline = _clocks_baseline_snapshot()
+    baseline_payload = (
+        {"baseline_set": True, **baseline}
+        if baseline
+        else {"baseline_set": False}
+    )
+    campaign_seconds = int(_accepted_pps_vclock_count or 0) if _campaign_active else 0
+    instrument_seconds = int(gnss_raw.get("instrument", {}).get("clockface_n") or 0)
+    return {
+        "schema": "PI_CLOCKS_STATE_V3",
+        "instrument_always_on": True,
+        "instrument_elapsed": _seconds_to_hms(instrument_seconds),
+        "campaign_active": bool(_campaign_active),
+        "campaign_present": bool(_campaign_active),
+        "campaign_state": "STARTED" if _campaign_active else "STOPPED",
+        "campaign_type": CAMPAIGN_TYPE_TEMPEST if _campaign_active else None,
+        "campaign": _start_requested_campaign if _campaign_active else None,
+        "campaign_elapsed": _seconds_to_hms(campaign_seconds),
+        "complete_for_display": True,
+        "startup": _start_status_payload(),
+        "gnss_raw": gnss_raw,
+        "extra_clocks": {
+            "gnss_raw_ns": presentation.get("ns"),
+            "gnss_raw_ref_ns": presentation.get("ref_ns"),
+            "gnss_raw_drift_ppb": gnss_raw.get("drift_ppb"),
+            "gnss_raw_tau": presentation.get("tau"),
+            "gnss_raw_ppb": presentation.get("ppb"),
+            "gnss_raw_welford_n": welford.get("n"),
+            "gnss_raw_welford_mean": welford.get("mean"),
+            "gnss_raw_welford_m2": welford.get("m2"),
+            "gnss_raw_welford_stddev": welford.get("stddev"),
+            "gnss_raw_welford_stderr": welford.get("stderr"),
+            "gnss_raw_welford_min": welford.get("min"),
+            "gnss_raw_welford_max": welford.get("max"),
+        },
+        "baseline": baseline_payload,
+        "stats_reset": {
+            "requests": int(_diag.get("stats_reset_requests") or 0),
+            "success": int(_diag.get("stats_reset_success") or 0),
+            "last": _diag.get("last_stats_reset") or {},
+        },
+    }
+
+
+def _build_canonical_clocks_state(
+    clocks_fragment: Dict[str, Any],
+    system_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    published_at = datetime.now(timezone.utc)
+    published_at_utc = published_at.isoformat().replace("+00:00", "Z")
+    sequence = _clocks_fragment_count(clocks_fragment)
+    gnss = _system_gnss_info(system_context)
+    pi_clocks = _pi_clocks_state_snapshot()
+    teensy_clocks = clocks_fragment.get("clocks")
+    teensy_clocks = copy.deepcopy(teensy_clocks) if isinstance(teensy_clocks, dict) else {}
+
+    clocks = dict(teensy_clocks)
+    clocks["schema"] = "CLOCKS_LIVE_V2"
+    clocks["teensy_schema"] = teensy_clocks.get("schema")
+    clocks["pi_schema"] = pi_clocks.get("schema")
+    clocks["system_time_utc"] = published_at_utc
+    clocks["gnss_time_utc"] = _system_gnss_time_utc(system_context)
+    clocks["display_elapsed"] = _seconds_to_hms(
+        clocks.get("teensy_pps_vclock_count")
+        or clocks.get("campaign_seconds")
+        or sequence
+        or 0
+    )
+    clocks["campaign_elapsed"] = (
+        _seconds_to_hms(clocks.get("campaign_seconds"))
+        if clocks.get("campaign_present")
+        else None
+    )
+    clocks["instrument_elapsed"] = _seconds_to_hms(clocks.get("instrument_age_seconds"))
+    clocks["pi"] = pi_clocks
+    clocks["gnss_raw"] = copy.deepcopy(pi_clocks.get("gnss_raw") or {})
+    clocks["extra_clocks"] = copy.deepcopy(pi_clocks.get("extra_clocks") or {})
+    clocks["baseline"] = copy.deepcopy(pi_clocks.get("baseline") or {})
+    clocks["stats_reset"] = copy.deepcopy(pi_clocks.get("stats_reset") or {})
+    clocks["complete_for_display"] = bool(teensy_clocks and pi_clocks.get("gnss_raw"))
+    clocks["persisted"] = False
+    clocks["ephemeral"] = True
+
+    fragment_evidence = copy.deepcopy(clocks_fragment)
+    fragment_evidence.pop("clocks", None)
+    features = _deep_merge_dicts(
+        system_context.get("features"),
+        clocks_fragment.get("features"),
+    )
+    gnss_time_utc = _system_gnss_time_utc(system_context)
+    return {
+        "schema": "CLOCKS_V3",
+        "source_schema": clocks_fragment.get("schema"),
+        "sequence": sequence,
+        "teensy_pps_vclock_count": sequence,
+        "teensy_pps_count": sequence,
+        "pps_count": sequence,
+        "published_at_utc": published_at_utc,
+        "pi": copy.deepcopy(system_context.get("pi") or {}),
+        "network": copy.deepcopy(system_context.get("network") or {}),
+        "sensors": copy.deepcopy(system_context.get("sensors") or {}),
+        "environment": copy.deepcopy(system_context.get("environment") or {}),
+        "gnss": gnss,
+        "gnss_monitor": {
+            "source": "SYSTEM.REPORT",
+            "sampled_at_utc": published_at_utc,
+            "source_fresh": bool(gnss),
+        },
+        "time_sanity": {
+            "schema": "CLOCKS_TIME_SANITY_V2",
+            "gnss_utc": gnss_time_utc,
+            "system_utc": published_at_utc,
+            "gnss_source_fresh": bool(gnss),
+        },
+        "power": copy.deepcopy(system_context.get("power") or {}),
+        "battery": copy.deepcopy(system_context.get("battery") or {}),
+        "clocks": clocks,
+        "teensy": copy.deepcopy(clocks_fragment.get("teensy") or {}),
+        "process": copy.deepcopy(clocks_fragment.get("process") or {}),
+        "transport": copy.deepcopy(clocks_fragment.get("transport") or {}),
+        "payload": copy.deepcopy(clocks_fragment.get("payload") or {}),
+        "features": features,
+        "clocks_fragment": fragment_evidence,
+    }
+
+
+def _clocks_detail_campaign(state: Dict[str, Any]) -> Optional[str]:
+    fragment = _state_clocks_fragment(state)
+    candidate = fragment.get("campaign_row") if isinstance(fragment, dict) else None
+    for value in (
+        state.get("campaign"),
+        _clocks_payload(state).get("campaign"),
+        candidate.get("campaign") if isinstance(candidate, dict) else None,
+    ):
+        if isinstance(value, dict):
+            value = value.get("campaign") or value.get("name") or value.get("id")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _clocks_detail_viable(state: Dict[str, Any]) -> bool:
+    fragment = _state_clocks_fragment(state)
+    candidate = fragment.get("campaign_row") if isinstance(fragment, dict) else None
+    if not isinstance(candidate, dict):
+        return True
+    disposition = str(candidate.get("candidate_disposition") or "ACCEPT").strip().upper()
+    if disposition in {"SCIENCE_EXCLUDE", "SCIENCE_REJECT"}:
+        return False
+    if candidate.get("science_excluded") is True:
+        return False
+    if "science_eligible" in candidate:
+        return _timebase_final_court_bool(candidate.get("science_eligible"))
+    return True
+
+
+def _persist_clocks_state(state: Dict[str, Any]) -> str:
+    encoded = json.dumps(state, separators=(",", ":"), ensure_ascii=False)
+    sequence = state.get("sequence")
+    pps_count = state.get("pps_count")
+    campaign = _clocks_detail_campaign(state)
+    viable = _clocks_detail_viable(state)
+    with open_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE campaign_detail
+            SET campaign = %s,
+                viable = %s,
+                payload = %s::jsonb,
+                sequence = %s,
+                pps_count = %s
+            WHERE id = (
+                SELECT id
+                FROM campaign_detail
+                WHERE campaign_type = %s
+                  AND sequence IS NOT DISTINCT FROM %s
+                  AND pps_count IS NOT DISTINCT FROM %s
+                  AND ts >= now() - interval '2 seconds'
+                ORDER BY id DESC
+                LIMIT 1
+            )
+            RETURNING id
+            """,
+            (
+                campaign, viable, encoded, sequence, pps_count,
+                CAMPAIGN_TYPE_TEMPEST, sequence, pps_count,
+            ),
+        )
+        if cur.fetchone() is not None:
+            return "merged"
+        cur.execute(
+            """
+            INSERT INTO campaign_detail
+                (campaign_type, campaign, viable, payload, sequence, pps_count)
+            VALUES (%s, %s, %s, %s::jsonb, %s, %s)
+            """,
+            (
+                CAMPAIGN_TYPE_TEMPEST, campaign, viable, encoded, sequence, pps_count,
+            ),
+        )
+    return "inserted"
+
+
+def _cache_clocks_state(state: Dict[str, Any]) -> None:
+    global _latest_clocks, _latest_clocks_received_monotonic, _latest_clocks_received_utc
+    with _clocks_lock:
+        _latest_clocks = copy.deepcopy(state)
+        _latest_clocks_received_monotonic = time.monotonic()
+        _latest_clocks_received_utc = str(state.get("published_at_utc") or system_time_z())
+    _diag["preflight_clocks_updates"] += 1
+
+
+def _queue_clocks_state(fragment: Dict[str, Any]) -> None:
+    global _clocks_state_enqueued, _clocks_state_dropped
+    try:
+        _clocks_state_queue.put_nowait(copy.deepcopy(fragment))
+        _clocks_state_enqueued += 1
+    except queue.Full:
+        _clocks_state_dropped += 1
+        logging.error(
+            "💥 [clocks] canonical CLOCKS state queue full; dropping sequence=%s",
+            _clocks_fragment_count(fragment),
+        )
+
+
+def _clocks_state_loop() -> None:
+    """Build and publish CLOCKS without letting storage latency stall the live feed."""
+    global _clocks_state_published
+
+    _clocks_state_worker_started.set()
+    logging.info("🚀 [clocks] canonical CLOCKS state worker started")
+    while True:
+        clocks_fragment = _clocks_state_queue.get()
+        failure_logged = False
+        while True:
+            try:
+                system_context = _fetch_system_report()
+                break
+            except Exception:
+                if not failure_logged:
+                    logging.exception(
+                        "⚠️ [clocks] SYSTEM.REPORT unavailable for CLOCKS sequence=%s; retrying",
+                        _clocks_fragment_count(clocks_fragment),
+                    )
+                    failure_logged = True
+                time.sleep(CLOCKS_STATE_RETRY_S)
+
+        sequence = _clocks_fragment_count(clocks_fragment)
+        _advance_gnss_raw_instrument(sequence, system_context)
+        state = _build_canonical_clocks_state(clocks_fragment, system_context)
+        _cache_clocks_state(state)
+        publish(CLOCKS_TOPIC, state)
+        _clocks_state_published += 1
+
+        if not _clocks_persistence_enabled.is_set():
+            continue
+
+        _clocks_persist_queue.put({
+            "state": state,
+            "system_context": system_context,
+            "clocks_fragment": clocks_fragment,
+        })
+
+
+def _clocks_persistence_loop() -> None:
+    """Persist CLOCKS in order, then release embedded TEMPEST candidates."""
+    global _clocks_state_persisted, _clocks_state_inserted, _clocks_state_merged
+    global _last_tempest_candidate_identity, _last_tempest_candidate_monotonic
+
+    logging.info("🚀 [clocks] CLOCKS persistence worker started")
+    while True:
+        item = _clocks_persist_queue.get()
+        state = copy.deepcopy(item["state"])
+        system_context = item["system_context"]
+        clocks_fragment = item["clocks_fragment"]
+        state_clocks = state.get("clocks")
+        if isinstance(state_clocks, dict):
+            state_clocks["persisted"] = True
+            state_clocks["ephemeral"] = False
+
+        failure_logged = False
+        while True:
+            try:
+                with _clocks_persistence_lock:
+                    disposition = _persist_clocks_state(state)
+                _clocks_state_persisted += 1
+                if disposition == "merged":
+                    _clocks_state_merged += 1
+                else:
+                    _clocks_state_inserted += 1
+                break
+            except Exception:
+                if not failure_logged:
+                    logging.exception(
+                        "⚠️ [clocks] campaign_detail persistence failed for CLOCKS sequence=%s; retrying",
+                        state.get("sequence"),
+                    )
+                    failure_logged = True
+                time.sleep(CLOCKS_STATE_RETRY_S)
+
+        candidate = clocks_fragment.get("campaign_row")
+        if not isinstance(candidate, dict):
+            continue
+        try:
+            candidate_count = _extract_teensy_pps_vclock_count(
+                candidate,
+                topic=TIMEBASE_FRAGMENT_TOPIC,
+            )
+        except ValueError:
+            candidate_count = int(state.get("sequence") or 0)
+        identity = (str(candidate.get("campaign") or ""), int(candidate_count))
+        now = time.monotonic()
+        if (
+            _last_tempest_candidate_identity == identity
+            and _last_tempest_candidate_monotonic is not None
+            and now - _last_tempest_candidate_monotonic < 0.5
+        ):
+            _diag["pps_count_repeat"] += 1
+            continue
+        _last_tempest_candidate_identity = identity
+        _last_tempest_candidate_monotonic = now
+
+        _enqueue_timebase_piece(
+            TIMEBASE_FRAGMENT_TOPIC,
+            candidate,
+            restore_state=_clocks_restore_state(clocks_fragment),
+            ppb_buckets=_clocks_fragment_ppb_buckets(clocks_fragment),
+            system_context=system_context,
+            clocks_fragment=clocks_fragment,
+        )
+        _diag["timebase_candidates_received"] += 1
+        _diag["timebase_candidates_queued"] += 1
+        _diag["fragments_received"] += 1
+        _diag["fragments_queued"] += 1
+
+
 
 
 # ---------------------------------------------------------------------
@@ -5365,51 +5894,36 @@ def _decorate_persisted_fragment_ppb_buckets(
 
 
 def on_clocks_fragment(payload: Payload) -> None:
-    """Consume the raw Teensy CLOCKS_FRAGMENT and enqueue campaign decoration.
+    """Queue every Teensy CLOCKS_FRAGMENT for canonical CLOCKS construction.
 
-    Observation-only fragments are intentionally ignored by the TIMEBASE path.
-    When ``campaign_row`` is present, its body is the unchanged Teensy-authored
-    TIMEBASE_FRAGMENT_V7 candidate and enters the existing final court verbatim.
+    The callback is intentionally nonblocking.  The CLOCKS state worker pulls
+    SYSTEM.REPORT, publishes and persists the common row, then hands any embedded
+    campaign candidate to the TEMPEST processor.
     """
     if not isinstance(payload, dict):
         _diag["clocks_fragments_malformed"] = _diag.get("clocks_fragments_malformed", 0) + 1
         return
 
-    clocks_fragment = dict(payload)
-    candidate = clocks_fragment.get("campaign_row")
-    if not isinstance(candidate, dict):
+    fragment = dict(payload)
+    candidate = fragment.get("campaign_row")
+    if isinstance(candidate, dict):
+        _diag["clocks_fragments_with_campaign_row"] = (
+            _diag.get("clocks_fragments_with_campaign_row", 0) + 1
+        )
+        try:
+            candidate_count = _extract_teensy_pps_vclock_count(
+                candidate,
+                topic=TIMEBASE_FRAGMENT_TOPIC,
+            )
+        except ValueError:
+            candidate_count = None
+        _note_timebase_activity(TIMEBASE_FRAGMENT_TOPIC, candidate_count)
+    else:
         _diag["clocks_fragments_observation_only"] = (
             _diag.get("clocks_fragments_observation_only", 0) + 1
         )
-        return
+    _queue_clocks_state(fragment)
 
-    _diag["clocks_fragments_with_campaign_row"] = (
-        _diag.get("clocks_fragments_with_campaign_row", 0) + 1
-    )
-    _diag["timebase_candidates_received"] += 1
-    _diag["fragments_received"] += 1
-    candidate = dict(candidate)
-
-    pps_vclock_count: Optional[int]
-    try:
-        pps_vclock_count = _extract_teensy_pps_vclock_count(
-            candidate,
-            topic=TIMEBASE_FRAGMENT_TOPIC,
-        )
-    except ValueError:
-        pps_vclock_count = None
-        _diag["fragments_missing_teensy_pps_count"] += 1
-        _diag["fragments_missing_teensy_pps_vclock_count"] += 1
-
-    _note_timebase_activity(TIMEBASE_FRAGMENT_TOPIC, pps_vclock_count)
-    _enqueue_timebase_piece(
-        TIMEBASE_FRAGMENT_TOPIC,
-        candidate,
-        restore_state=_monitor_restore_state(clocks_fragment),
-        ppb_buckets=_clocks_fragment_ppb_buckets(clocks_fragment),
-    )
-    _diag["timebase_candidates_queued"] += 1
-    _diag["fragments_queued"] += 1
 
 
 # ---------------------------------------------------------------------
@@ -5424,6 +5938,9 @@ def _process_loop() -> None:
     Runs forever.
     """
     global _campaign_active, _accepted_pps_vclock_count, _gnss_raw_ns, _gnss_raw_n, _gnss_raw_valid
+    global _post_recovery_science_confirmation_pending
+    global _post_recovery_science_confirmation_campaign
+    global _post_recovery_first_public_pps_vclock_count
 
     logging.info("🚀 [clocks] processor thread started")
 
@@ -5445,6 +5962,12 @@ def _process_loop() -> None:
         ppb_buckets = piece.get("ppb_buckets")
         if not isinstance(ppb_buckets, dict):
             ppb_buckets = None
+        system_context = piece.get("system_context")
+        if not isinstance(system_context, dict):
+            system_context = {}
+        clocks_fragment = piece.get("clocks_fragment")
+        if not isinstance(clocks_fragment, dict):
+            clocks_fragment = {}
         if not isinstance(payload, dict):
             logging.error("💥 [clocks] processor received malformed CLOCKS_FRAGMENT campaign row: %s", piece)
             continue
@@ -5647,13 +6170,9 @@ def _process_loop() -> None:
         if gnss_ns > 0:
             _gnss_canary_update(gnss_ns)
 
-        # --- Environment snapshot (best-effort, never blocks TIMEBASE) ---
-        env_snapshot = _fetch_environment()
-
-        # --- GNSS discipline snapshot (best-effort, never blocks TIMEBASE) ---
-        # The always-on sampler owns polling and Welford admission. Reuse its
-        # fresh cached report so campaign publication cannot double-count N.
-        gnss_info = _gnss_info_for_utc(candidate_received_utc or system_time_utc)
+        # --- Same-second contextual state pulled once by the CLOCKS state worker ---
+        env_snapshot = _environment_from_system_report(system_context, clocks_fragment)
+        gnss_info = _system_gnss_info(system_context)
 
         # --- GNSS_RAW synthetic clock ---
         gnss_raw_drift_ppb = _gnss_raw_drift_from_info(gnss_info)
@@ -5744,6 +6263,29 @@ def _process_loop() -> None:
         publish("TIMEBASE", timebase)
         _attach_tempest_to_state_detail(timebase)
 
+        if (
+            _post_recovery_science_confirmation_pending
+            and science_eligible
+            and control_eligible
+            and not science_excluded
+            and (
+                _post_recovery_science_confirmation_campaign is None
+                or campaign == _post_recovery_science_confirmation_campaign
+            )
+        ):
+            recovery_first_count = _post_recovery_first_public_pps_vclock_count
+            _post_recovery_science_confirmation_pending = False
+            _post_recovery_science_confirmation_campaign = None
+            _post_recovery_first_public_pps_vclock_count = None
+            logging.info(
+                "🏁 [recovery] campaign '%s' fully recovered — first "
+                "science-and-control eligible row accepted and persisted at count=%d "
+                "(timeline resumed at count=%s); normal TEMPEST operation is restored",
+                campaign,
+                int(pps_vclock_count),
+                str(recovery_first_count),
+            )
+
 # ---------------------------------------------------------------------
 # Control-plane: START / STOP / CLEAR / RECOVER
 # ---------------------------------------------------------------------
@@ -5751,12 +6293,21 @@ def _process_loop() -> None:
 
 def _reset_trackers() -> int:
     global _last_pps_vclock_count_seen
+    global _last_tempest_candidate_identity, _last_tempest_candidate_monotonic
+    global _post_recovery_science_confirmation_pending
+    global _post_recovery_science_confirmation_campaign
+    global _post_recovery_first_public_pps_vclock_count
     global _timebase_last_activity_monotonic
     global _timebase_last_activity_utc
     global _timebase_last_activity_topic
     global _timebase_last_activity_pps_vclock_count
 
     _last_pps_vclock_count_seen = None
+    _last_tempest_candidate_identity = None
+    _last_tempest_candidate_monotonic = None
+    _post_recovery_science_confirmation_pending = False
+    _post_recovery_science_confirmation_campaign = None
+    _post_recovery_first_public_pps_vclock_count = None
     _timebase_last_activity_monotonic = None
     _timebase_last_activity_utc = None
     _timebase_last_activity_topic = None
@@ -6345,7 +6896,7 @@ def _gnss_raw_clock_snapshot() -> Dict[str, Any]:
         if latest_received is None
         else max(0.0, time.monotonic() - latest_received)
     )
-    monitor_snapshot = _gnss_raw_monitor_snapshot()
+    monitor_snapshot = _gnss_raw_state_snapshot()
     return {
         "owner": "PI",
         "clock": "GNSS_RAW",
@@ -6545,44 +7096,6 @@ def cmd_stats_reset(_: Optional[dict]) -> Dict[str, Any]:
     return {"success": True, "message": "OK", "payload": result}
 
 
-def cmd_restore_gnss_raw(args: Optional[dict]) -> Dict[str, Any]:
-    """Restore Pi-owned GNSS_RAW state under SYSTEM-owned CLOCKS recovery."""
-    _diag["gnss_raw_monitor_restore_requests"] += 1
-    raw_state: Any = (args or {}).get("state")
-    if isinstance(raw_state, str):
-        try:
-            raw_state = json.loads(raw_state)
-        except Exception as exc:
-            _diag["gnss_raw_monitor_restore_failures"] += 1
-            result = {
-                "restored": False,
-                "reason": f"invalid GNSS_RAW JSON: {exc}",
-            }
-            _diag["last_gnss_raw_monitor_restore"] = result
-            return {"success": False, "message": result["reason"], "payload": result}
-
-    result = _restore_gnss_raw_payload(raw_state)
-    result = {
-        "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        **result,
-    }
-    _diag["last_gnss_raw_monitor_restore"] = result
-    if not result.get("restored"):
-        _diag["gnss_raw_monitor_restore_failures"] += 1
-        return {
-            "success": False,
-            "message": str(result.get("reason") or "GNSS_RAW restore failed"),
-            "payload": result,
-        }
-
-    _diag["gnss_raw_monitor_restore_success"] += 1
-    _publish_clocks_monitor()
-    logging.info(
-        "✅ [clocks] SYSTEM restored GNSS_RAW monitor state: instrument_n=%s welford_n=%s",
-        result.get("instrument_n"),
-        result.get("welford_n"),
-    )
-    return {"success": True, "message": "OK", "payload": result}
 
 
 def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
@@ -6614,55 +7127,58 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
 
 
 def cmd_clear(_: Optional[dict]) -> dict:
-    """Delete every TEMPEST master and every detail associated with TEMPEST."""
+    """Delete all TEMPEST state and campaign history at one persistence boundary."""
     global _campaign_active
 
     _request_teensy_stop_best_effort()
     _request_teensy_recover_abort_best_effort("pi_clear_cleanup")
-
-    # Lower local custody before deleting FK-linked rows so no queued TEMPEST
-    # candidate can be persisted behind the deletion transaction.
     _campaign_active = False
     _clear_start_wait_state()
     _clear_flash_cut_wait_state()
-    drained = _drain_timebase_ingress()
+    candidate_drained = _drain_timebase_ingress()
     _reset_trackers()
 
+    persistence_was_enabled = _clocks_persistence_enabled.is_set()
+    _clocks_persistence_enabled.clear()
     try:
-        with open_db() as conn:
-            cur = conn.cursor()
-            cur.execute(
-                "DELETE FROM campaign_detail WHERE campaign_type = %s",
-                (CAMPAIGN_TYPE_TEMPEST,),
-            )
-            detail_count = cur.rowcount
-            cur.execute(
-                "DELETE FROM campaign_master WHERE campaign_type = %s",
-                (CAMPAIGN_TYPE_TEMPEST,),
-            )
-            master_count = cur.rowcount
-
-        logging.info(
-            "🗑️ [clocks] CLEAR: deleted %d TEMPEST campaign details and %d masters; "
-            "drained=%d",
-            detail_count,
-            master_count,
-            drained,
-        )
-        return {
-            "success": True,
-            "message": "OK",
-            "payload": {
-                "campaign_type": CAMPAIGN_TYPE_TEMPEST,
-                "campaign_details_deleted": detail_count,
-                "campaign_master_deleted": master_count,
-                "local_ingress_drained": drained,
-            },
-        }
-
+        with _clocks_persistence_lock:
+            state_drained = _drain_clocks_persistence_queue()
+            with open_db() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    "DELETE FROM campaign_detail WHERE campaign_type = %s",
+                    (CAMPAIGN_TYPE_TEMPEST,),
+                )
+                detail_count = cur.rowcount
+                cur.execute(
+                    "DELETE FROM campaign_master WHERE campaign_type = %s",
+                    (CAMPAIGN_TYPE_TEMPEST,),
+                )
+                master_count = cur.rowcount
     except Exception as e:
         logging.exception("❌ [clocks] CLEAR failed")
         return {"success": False, "message": str(e)}
+    finally:
+        if persistence_was_enabled:
+            _clocks_persistence_enabled.set()
+
+    logging.info(
+        "🗑️ [clocks] CLEAR: deleted %d TEMPEST details and %d masters; "
+        "drained candidates=%d pending_states=%d",
+        detail_count, master_count, candidate_drained, state_drained,
+    )
+    return {
+        "success": True,
+        "message": "OK",
+        "payload": {
+            "campaign_type": CAMPAIGN_TYPE_TEMPEST,
+            "campaign_details_deleted": detail_count,
+            "campaign_master_deleted": master_count,
+            "candidate_ingress_drained": candidate_drained,
+            "pending_state_rows_drained": state_drained,
+        },
+    }
+
 
 
 
@@ -6782,7 +7298,7 @@ def cmd_resume(args: Optional[dict]) -> dict:
     )
 
     try:
-        _recover_campaign()
+        _restore_active_campaign_state()
     except Exception as e:
         logging.exception("💥 [clocks] RESUME recovery failed for '%s'", campaign_name)
         _campaign_active = False
@@ -6828,83 +7344,25 @@ def cmd_resume(args: Optional[dict]) -> dict:
 # Recovery — v4 Nanosecond Architecture
 # ---------------------------------------------------------------------
 
-def _wait_for_system_campaign_detail_recovery() -> None:
-    """Hold boot campaign recovery until SYSTEM finishes detail restoration."""
-    terminal_success = {"COMPLETE", "NO_DETAIL"}
-    deadline = time.monotonic() + SYSTEM_CAMPAIGN_DETAIL_RECOVERY_WAIT_TIMEOUT_S
-    started = time.monotonic()
-    next_log = started
-    last_state = "UNAVAILABLE"
-    last_detail = "SYSTEM.REPORT unavailable"
-
-    while time.monotonic() < deadline:
-        try:
-            response = send_command(
-                machine="PI",
-                subsystem="SYSTEM",
-                command="REPORT",
-                retries=1,
-                retry_delay_s=0.0,
-            )
-            payload = response.get("payload") if isinstance(response, dict) else None
-            recovery = (
-                payload.get("campaign_detail_recovery")
-                if isinstance(payload, dict)
-                and isinstance(payload.get("campaign_detail_recovery"), dict)
-                else {}
-            )
-            last_state = str(recovery.get("state") or "UNAVAILABLE").upper()
-            last_detail = str(recovery.get("detail") or "status not yet published")
-            if last_state in terminal_success:
-                logging.info(
-                    "✅ [recovery] SYSTEM campaign-detail barrier open: state=%s; "
-                    "TEMPEST recovery may continue",
-                    last_state,
-                )
-                return
-            if last_state == "FAILED":
-                raise RecoveryRetryableFailure(
-                    "system_campaign_detail_restore_failed",
-                    {"state": last_state, "detail": last_detail},
-                )
-        except RecoveryRetryableFailure:
-            raise
-        except Exception as exc:
-            last_state = "UNAVAILABLE"
-            last_detail = str(exc)
-
-        now = time.monotonic()
-        if now >= next_log:
-            logging.info(
-                "⏳ [recovery] waiting for SYSTEM campaign-detail restore before "
-                "TEMPEST recovery: state=%s elapsed=%.1fs detail=%s",
-                last_state,
-                now - started,
-                last_detail,
-            )
-            next_log = now + SYSTEM_CAMPAIGN_DETAIL_RECOVERY_LOG_INTERVAL_S
-        time.sleep(SYSTEM_CAMPAIGN_DETAIL_RECOVERY_POLL_S)
-
-    raise RecoveryRetryableFailure(
-        "system_campaign_detail_restore_timeout",
-        {
-            "timeout_s": SYSTEM_CAMPAIGN_DETAIL_RECOVERY_WAIT_TIMEOUT_S,
-            "state": last_state,
-            "detail": last_detail,
-        },
-    )
 
 
 
-def _recover_campaign() -> None:
+def _restore_active_campaign_state() -> Dict[str, Any]:
     """
     RECOVER — v7 exact-first-row architecture.
     """
     global _campaign_active, _accepted_pps_vclock_count
     global _last_pps_vclock_count_seen
+    global _post_recovery_science_confirmation_pending
+    global _post_recovery_science_confirmation_campaign
+    global _post_recovery_first_public_pps_vclock_count
 
     # Immediately deactivate so the processor thread ignores all
-    # fragments during recovery.
+    # fragments during recovery. Any earlier one-shot completion notice belongs
+    # to the superseded recovery generation and must not survive this entry.
+    _post_recovery_science_confirmation_pending = False
+    _post_recovery_science_confirmation_campaign = None
+    _post_recovery_first_public_pps_vclock_count = None
     _campaign_active = False
     _accepted_pps_vclock_count = None
     _clear_start_wait_state()
@@ -6914,8 +7372,8 @@ def _recover_campaign() -> None:
     row = _get_active_campaign()
     if row is None:
         _diag["recovery_no_active_campaign"] += 1
-        logging.info("🔍 [recovery] no active campaign — nothing to recover")
-        return
+        logging.info("🔍 [recovery] no active campaign — nothing to restore")
+        return {"restored": False, "reason": "no_active_campaign"}
 
     campaign_name = row["campaign"]
     campaign_payload = row["payload"]
@@ -6947,7 +7405,11 @@ def _recover_campaign() -> None:
                 "waiting_for_first_fragment": True,
                 "teensy_stop_sent": False,
             }
-            return
+            return {
+                "restored": True,
+                "mode": "flash_cut_zero_row_reattach",
+                "campaign": campaign_name,
+            }
 
         logging.info(
             "ℹ️ [recovery] campaign '%s' has no TEMPEST campaign details — "
@@ -7025,7 +7487,7 @@ def _recover_campaign() -> None:
             "sync_wait_removed": True,
             "waiting_for_first_fragment": True,
         }
-        return
+        return {"restored": True, "mode": "cold_restart_async", "campaign": campaign_name}
 
     try:
         last_tb, recovery_snapshot, skipped_unrecoverable_rows = _load_last_recoverable_tempest_detail(campaign_name)
@@ -7525,6 +7987,17 @@ def _recover_campaign() -> None:
         "gnss_raw_restored": bool(gnss_raw_restored),
     })
 
+    fully_clean_at_admission = bool(recovery_admission_verdict.get("fully_clean"))
+    _post_recovery_science_confirmation_pending = not fully_clean_at_admission
+    _post_recovery_science_confirmation_campaign = (
+        campaign_name if _post_recovery_science_confirmation_pending else None
+    )
+    _post_recovery_first_public_pps_vclock_count = (
+        int(teensy_pps_vclock_count)
+        if _post_recovery_science_confirmation_pending
+        else None
+    )
+
     _campaign_active = True
     _arm_timebase_silence_watch("RECOVERY_RESUME")
     _sync_resume_event.set()
@@ -7547,6 +8020,13 @@ def _recover_campaign() -> None:
         teensy_pps_vclock_count,
         bool(recovery_admission_verdict.get("fully_clean")),
     )
+    return {
+        "restored": True,
+        "mode": "warm_recover",
+        "campaign": campaign_name,
+        "first_public_pps_vclock_count": int(teensy_pps_vclock_count),
+        "science_clean": bool(recovery_admission_verdict.get("fully_clean")),
+    }
 
 
 
@@ -7673,7 +8153,7 @@ def cmd_set_baseline(args: Optional[dict]) -> Dict[str, Any]:
         logging.exception("❌ [clocks] failed to persist baseline to config")
         return {"success": False, "message": "Failed to persist baseline to config"}
 
-    _clocks_monitor_set_baseline_cache(baseline_blob)
+    _clocks_baseline_set_cache(baseline_blob)
 
     logging.info(
         "✅ [clocks] baseline set: id=%d campaign='%s' ppb=%s dac_mean=%s",
@@ -7686,54 +8166,37 @@ def cmd_set_baseline(args: Optional[dict]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------
 
 
-def on_clocks(payload: Optional[dict]) -> None:
-    """Cache the latest unified CLOCKS heartbeat for campaign preflight."""
-    global _latest_monitor
-    global _latest_monitor_received_monotonic
-    global _latest_monitor_received_utc
-
-    if not isinstance(payload, dict):
-        _diag["preflight_monitor_malformed"] += 1
-        return
-
-    now_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    with _monitor_lock:
-        _latest_monitor = copy.deepcopy(payload)
-        _latest_monitor_received_monotonic = time.monotonic()
-        _latest_monitor_received_utc = now_utc
-
-    _diag["preflight_monitor_updates"] += 1
 
 
-def _monitor_features() -> Dict[str, Any]:
+def _clocks_features() -> Dict[str, Any]:
     """Return fresh CLOCKS.features or raise while the heartbeat is unavailable."""
-    with _monitor_lock:
-        monitor = copy.deepcopy(_latest_monitor)
-        received_monotonic = _latest_monitor_received_monotonic
-        received_utc = _latest_monitor_received_utc
+    with _clocks_lock:
+        monitor = copy.deepcopy(_latest_clocks)
+        received_monotonic = _latest_clocks_received_monotonic
+        received_utc = _latest_clocks_received_utc
 
     if received_monotonic is None or not monitor:
         raise RuntimeError("CLOCKS heartbeat not yet received")
 
     age_s = max(0.0, time.monotonic() - received_monotonic)
-    if age_s > MONITOR_PREFLIGHT_MAX_AGE_S:
-        _diag["preflight_monitor_stale"] += 1
-        _diag["last_preflight_monitor"] = {
+    if age_s > CLOCKS_PREFLIGHT_MAX_AGE_S:
+        _diag["preflight_clocks_stale"] += 1
+        _diag["last_preflight_clocks"] = {
             "status": "STALE",
             "received_at_utc": received_utc,
             "age_s": round(age_s, 3),
-            "max_age_s": float(MONITOR_PREFLIGHT_MAX_AGE_S),
+            "max_age_s": float(CLOCKS_PREFLIGHT_MAX_AGE_S),
         }
         raise RuntimeError(
-            f"CLOCKS heartbeat stale ({age_s:.1f}s > {MONITOR_PREFLIGHT_MAX_AGE_S:.1f}s)"
+            f"CLOCKS heartbeat stale ({age_s:.1f}s > {CLOCKS_PREFLIGHT_MAX_AGE_S:.1f}s)"
         )
 
     features = monitor.get("features")
     if not isinstance(features, dict) or not features:
-        _diag["preflight_monitor_missing_features"] += 1
+        _diag["preflight_clocks_missing_features"] += 1
         raise RuntimeError("CLOCKS heartbeat has no feature tree")
 
-    _diag["last_preflight_monitor"] = {
+    _diag["last_preflight_clocks"] = {
         "status": "NOMINAL",
         "received_at_utc": received_utc,
         "age_s": round(age_s, 3),
@@ -7760,7 +8223,7 @@ def _check_feature_preflight(context: str) -> tuple[bool, list[str]]:
     _diag["preflight_feature_checks"] += 1
 
     try:
-        features = _monitor_features()
+        features = _clocks_features()
     except Exception as e:
         _diag["preflight_feature_unavailable"] += 1
         _diag["last_preflight_feature_gate"] = {
@@ -7864,39 +8327,37 @@ def _check_preflight(context: str = "campaign") -> tuple[bool, list[str]]:
         reasons.extend(feature_reasons)
 
     # -----------------------------------------------------------------
-    # 1. GNSS time valid
+    # 1. GNSS state carried by the canonical CLOCKS snapshot
     # -----------------------------------------------------------------
     try:
-        gnss = _gnss_info_for_utc(datetime.now(timezone.utc))
+        with _clocks_lock:
+            latest = copy.deepcopy(_latest_clocks)
+        gnss = latest.get("gnss") if isinstance(latest.get("gnss"), dict) else {}
         if not gnss:
-            reasons.append("GNSS_ANNOUNCEMENT unavailable for current UTC second")
+            reasons.append("SYSTEM.REPORT GNSS context unavailable")
         else:
             if not gnss.get("time_valid"):
                 reasons.append("GNSS time not valid (no satellite time/date)")
-
-            lock_quality = gnss.get("lock_quality", "WEAK")
+            lock_quality = str(gnss.get("lock_quality") or "WEAK").upper()
             if lock_quality == "WEAK":
                 reasons.append(
                     f"GNSS lock quality is WEAK "
                     f"(satellites={gnss.get('satellites', '?')}, "
                     f"hdop={gnss.get('hdop', '?')})"
                 )
-
             if not gnss.get("pps_valid"):
                 reasons.append("GNSS PPS not valid (discipline loop not active)")
             else:
                 discipline = gnss.get("discipline", {})
-                freq_mode = discipline.get("freq_mode", -1)
-                freq_mode_name = discipline.get("freq_mode_name", "UNKNOWN")
-                if freq_mode < 2:
+                freq_mode = discipline.get("freq_mode", -1) if isinstance(discipline, dict) else -1
+                freq_mode_name = discipline.get("freq_mode_name", "UNKNOWN") if isinstance(discipline, dict) else "UNKNOWN"
+                if int(freq_mode) < 2:
                     reasons.append(
                         f"GNSS discipline not locked "
-                        f"(freq_mode={freq_mode} '{freq_mode_name}', "
-                        f"need at least COARSE_LOCK)"
+                        f"(freq_mode={freq_mode} '{freq_mode_name}', need at least COARSE_LOCK)"
                     )
-
     except Exception as e:
-        reasons.append(f"GNSS_ANNOUNCEMENT preflight failed: {e}")
+        reasons.append(f"SYSTEM.REPORT GNSS preflight failed: {e}")
 
     # -----------------------------------------------------------------
     # 4. Chrony PPS selected
@@ -8124,7 +8585,7 @@ def cmd_delete(args: Optional[dict]) -> Dict[str, Any]:
 
 
 def cmd_truncate(args: Optional[dict]) -> Dict[str, Any]:
-    """Delete all stopped TEMPEST campaign history while retaining ambient details."""
+    """Delete stopped TEMPEST campaign history while retaining ambient state."""
     del args
 
     global _campaign_active, _accepted_pps_vclock_count
@@ -8143,7 +8604,7 @@ def cmd_truncate(args: Optional[dict]) -> Dict[str, Any]:
     _campaign_active = False
     _clear_sync_wait()
     _clear_flash_cut_wait_state()
-    drained = _reset_trackers()
+    candidate_drained = _reset_trackers()
     _accepted_pps_vclock_count = None
     _diag["accepted_pps_count"] = None
     _diag["accepted_pps_vclock_count"] = None
@@ -8156,41 +8617,46 @@ def cmd_truncate(args: Optional[dict]) -> Dict[str, Any]:
     _start_first_fragment_wait_s = None
     _start_first_fragment_pps_vclock_count = None
     _diag["start_waiting_for_first_fragment"] = False
-
     _request_teensy_stop_best_effort()
 
+    persistence_was_enabled = _clocks_persistence_enabled.is_set()
+    _clocks_persistence_enabled.clear()
     try:
-        with open_db() as conn:
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT COUNT(*) FROM campaign_detail WHERE campaign_type = %s",
-                (CAMPAIGN_TYPE_TEMPEST,),
-            )
-            detail_count = int(cur.fetchone()[0])
-            cur.execute(
-                "SELECT COUNT(*) FROM campaign_master WHERE campaign_type = %s",
-                (CAMPAIGN_TYPE_TEMPEST,),
-            )
-            master_count = int(cur.fetchone()[0])
-            cur.execute(
-                "DELETE FROM campaign_detail WHERE campaign_type = %s",
-                (CAMPAIGN_TYPE_TEMPEST,),
-            )
-            cur.execute(
-                "DELETE FROM campaign_master WHERE campaign_type = %s",
-                (CAMPAIGN_TYPE_TEMPEST,),
-            )
+        with _clocks_persistence_lock:
+            state_drained = _drain_clocks_persistence_queue()
+            with open_db() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT COUNT(*) FROM campaign_detail "
+                    "WHERE campaign_type = %s AND campaign IS NOT NULL",
+                    (CAMPAIGN_TYPE_TEMPEST,),
+                )
+                detail_count = int(cur.fetchone()[0])
+                cur.execute(
+                    "SELECT COUNT(*) FROM campaign_master WHERE campaign_type = %s",
+                    (CAMPAIGN_TYPE_TEMPEST,),
+                )
+                master_count = int(cur.fetchone()[0])
+                cur.execute(
+                    "DELETE FROM campaign_detail "
+                    "WHERE campaign_type = %s AND campaign IS NOT NULL",
+                    (CAMPAIGN_TYPE_TEMPEST,),
+                )
+                cur.execute(
+                    "DELETE FROM campaign_master WHERE campaign_type = %s",
+                    (CAMPAIGN_TYPE_TEMPEST,),
+                )
     except Exception as e:
         logging.exception("❌ [clocks] TRUNCATE failed")
         return {"success": False, "message": str(e)}
+    finally:
+        if persistence_was_enabled:
+            _clocks_persistence_enabled.set()
 
     logging.warning(
-        "🧨 [clocks] TRUNCATE: dropped all TEMPEST campaign history — "
-        "%d master row(s), %d associated detail row(s); ambient details retained; "
-        "drained=%d",
-        master_count,
-        detail_count,
-        drained,
+        "🧨 [clocks] TRUNCATE: dropped %d TEMPEST masters and %d campaign-associated "
+        "details; ambient state retained; drained candidates=%d pending_states=%d",
+        master_count, detail_count, candidate_drained, state_drained,
     )
 
     server_args = {
@@ -8219,7 +8685,8 @@ def cmd_truncate(args: Optional[dict]) -> Dict[str, Any]:
             "campaign_master_deleted": master_count,
             "campaign_details_deleted": detail_count,
             "ambient_campaign_details_retained": True,
-            "local_ingress_drained": drained,
+            "candidate_ingress_drained": candidate_drained,
+            "pending_state_rows_drained": state_drained,
             "server_truncate_success": (
                 bool(server_resp.get("success")) if isinstance(server_resp, dict) else False
             ),
@@ -8231,6 +8698,7 @@ def cmd_truncate(args: Optional[dict]) -> Dict[str, Any]:
             ),
         },
     }
+
 
 
 
@@ -8577,7 +9045,6 @@ COMMANDS = {
     "REPORT_CLOCKS": cmd_report_clocks,
     "REPORT_STATS": cmd_report_stats,
     "STATS_RESET": cmd_stats_reset,
-    "RESTORE_GNSS_RAW": cmd_restore_gnss_raw,
     "CLEAR": cmd_clear,
     "DELETE": cmd_delete,
     "TRUNCATE": cmd_truncate,
@@ -8594,18 +9061,14 @@ COMMANDS = {
 # ---------------------------------------------------------------------
 
 def startup_teensy_quiet_delay() -> None:
-    """
-    Let pubsub discover CLOCKS routes before active-campaign recovery.
-    """
+    """Let PubSub, SYSTEM, and Teensy CLOCKS reach a queryable startup state."""
     logging.info(
-        "⏳ [clocks] waiting %.1fs for pubsub routing and Teensy initialization "
-        "before active-campaign recovery",
+        "⏳ [clocks] waiting %.1fs for pubsub routing, SYSTEM context, and Teensy initialization",
         STARTUP_TEENSY_QUIET_DELAY_S,
     )
     time.sleep(STARTUP_TEENSY_QUIET_DELAY_S)
-    logging.info(
-        "✅ [clocks] startup quiet delay complete — campaign recovery may begin"
-    )
+    logging.info("✅ [clocks] startup quiet delay complete — holistic restore may begin")
+
 
 
 def run() -> None:
@@ -8613,44 +9076,76 @@ def run() -> None:
     _setup_invalid_timebase_logger()
 
     _startup_control_ready.clear()
+    _clocks_persistence_enabled.clear()
     _diag["startup_control_ready"] = False
 
     logging.info(
-        "🕐 [clocks] unified PPS/VCLOCK TIMEBASE candidate schema. Teensy PPS/VCLOCK count is canonical. "
-        "Four clock domains: GNSS (reference), DWT, OCXO1, OCXO2. "
-        "The Teensy emits one always-on CLOCKS_FRAGMENT; campaign rows ride inside campaign_row and the Pi is the final TIMEBASE arbiter. "
-        "SYSTEM owns CLOCKS campaign-detail persistence and always-on restore; CLOCKS restores active TEMPEST campaigns from typed campaign details. "
-        "Every coherent PPS second persists; objections make it AUDIT_ONLY while continuity loss triggers recovery. "
-        "START while active performs seamless flash-cut to new campaign. "
-        "Commands: START, STOP, RESUME, RECOVER_ABORT, RESTORE_GNSS_RAW, REPORT, REPORT_CLOCKS, REPORT_STATS, STATS_RESET, CLEAR, DELETE, TRUNCATE, SET_DAC, DITHER, "
-        "SET_BASELINE, BASELINE_INFO, LIST_CAMPAIGNS, CLOCKS_INFO. "
-        "Subscriptions: CLOCKS, CLOCKS_FRAGMENT, GNSS_ANNOUNCEMENT, WATCHDOG_ANOMALY, CLOCKS_RECOVERY_STALLED. "
-        "Publications: TIMEBASE, CLOCKS_MONITOR (Pi decoration merged into unified CLOCKS)."
+        "🕐 [clocks] CLOCKS owns CLOCKS_FRAGMENT ingestion, SYSTEM.REPORT context pull, "
+        "canonical CLOCKS publication, campaign_detail persistence, TEMPEST adjudication, "
+        "and holistic subsystem restore. Campaign execution is restored as CLOCKS state."
     )
 
-    # Expose commands and subscriptions immediately.  SYSTEM may invoke the
-    # startup-safe RESTORE_GNSS_RAW handoff while this process is still inside
-    # its longer quiet barrier.
     server_setup(
         subsystem="CLOCKS",
         commands=COMMANDS,
         subscriptions={
-            CLOCKS_TOPIC: on_clocks,
             CLOCKS_FRAGMENT_TOPIC: on_clocks_fragment,
-            GNSS_ANNOUNCEMENT_TOPIC: on_gnss_announcement,
             "WATCHDOG_ANOMALY": on_watchdog_anomaly,
             CLOCKS_RECOVERY_STALLED_TOPIC: on_recovery_stalled,
         },
         blocking=False,
     )
 
-    startup_teensy_quiet_delay()
-
+    # Start the live data plane immediately. Persistence remains closed, so the
+    # startup stream can populate the UI and restore proof without authoring new
+    # durable state before the one holistic transaction has consumed the old one.
+    threading.Thread(
+        target=_clocks_state_loop,
+        daemon=True,
+        name="clocks-state",
+    ).start()
+    threading.Thread(
+        target=_clocks_persistence_loop,
+        daemon=True,
+        name="clocks-persistence",
+    ).start()
     threading.Thread(
         target=_process_loop,
         daemon=True,
-        name="clocks-processor",
+        name="clocks-tempest",
     ).start()
+
+    startup_teensy_quiet_delay()
+
+    try:
+        result = _holistic_restore()
+        logging.info("✅ [holistic restore] complete: %s", result)
+    except TeensyStartRejected as exc:
+        logging.error(
+            "💥 [holistic restore] campaign START rejected (%s); live CLOCKS persistence remains open",
+            exc.status,
+        )
+        _cleanup_after_recovery_failure(
+            "holistic_start_rejected",
+            {"error": str(exc), "status": exc.status},
+        )
+    except Exception as exc:
+        logging.exception(
+            "💥 [holistic restore] failed; live CLOCKS persistence remains open and commands remain available"
+        )
+        _clocks_persistence_enabled.set()
+        try:
+            _cleanup_after_recovery_failure(
+                "holistic_restore_failed",
+                {"error": str(exc)},
+            )
+        except Exception:
+            logging.exception("⚠️ [holistic restore] cleanup also failed")
+    finally:
+        _clocks_persistence_enabled.set()
+        _startup_control_ready.set()
+        _diag["startup_control_ready"] = True
+        logging.info("✅ [clocks] startup state reconciliation complete — START/RESUME enabled")
 
     threading.Thread(
         target=_timebase_silence_monitor_loop,
@@ -8658,41 +9153,11 @@ def run() -> None:
         name="clocks-timebase-silence-monitor",
     ).start()
 
-    # TEMPEST recovery remains CLOCKS-owned. SYSTEM completes the first generalized
-    # campaign-detail restore transaction before CLOCKS resumes active TEMPEST state.
-    try:
-        _wait_for_system_campaign_detail_recovery()
-        _recover_campaign()
-    except TeensyStartRejected as exc:
-        logging.error(
-            "💥 [clocks] boot START rejected (%s); command interface remains available",
-            exc.status,
-        )
-        _cleanup_after_recovery_failure(
-            "boot_start_rejected",
-            {"error": str(exc), "status": exc.status},
-        )
-    except Exception as exc:
-        logging.exception(
-            "💥 [clocks] boot campaign recovery failed; command interface remains available"
-        )
-        try:
-            _cleanup_after_recovery_failure(
-                "boot_recovery_failed",
-                {"error": str(exc)},
-            )
-        except Exception:
-            logging.exception("⚠️ [clocks] boot campaign cleanup also failed")
-    finally:
-        _startup_control_ready.set()
-        _diag["startup_control_ready"] = True
-        logging.info(
-            "✅ [clocks] startup campaign reconciliation complete — START/RESUME enabled"
-        )
-
     logging.info("🏁 [clocks] entering main loop")
     while True:
         time.sleep(3600)
+
+
 
 
 if __name__ == "__main__":

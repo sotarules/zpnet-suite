@@ -1,20 +1,21 @@
 """
-ZPNet SYSTEM Process (Pi-side, authoritative aggregator)
+ZPNet SYSTEM Process (Pi-side platform-context authority)
 
 Responsibilities:
-  • Consume the PPS-aligned Teensy CLOCKS_FRAGMENT feed
-  • Collect Raspberry Pi host metrics on a slower local cadence
-  • Decorate each Teensy fragment with last-known-good Pi-owned state
-  • Publish one unified CLOCKS snapshot per Teensy second
-  • Persist each unified CLOCKS as a TEMPEST state record in campaign_detail
-  • Recover always-on state from the latest TEMPEST campaign_detail
-  • Preserve SYSTEM.REPORT as an explicit command surface
+  • Collect Raspberry Pi host, network, sensor, environment, power, and battery state
+  • Fold the current GNSS receiver announcement into the platform context
+  • Maintain the Pi-authored feature tree
+  • Publish no CLOCKS-domain stream and own no CLOCKS persistence or recovery
+  • Expose the complete current platform context through SYSTEM.REPORT
 
 Process model:
   • One systemd service
   • One Pi-context polling thread
   • One blocking command socket
-  • CLOCKS_FRAGMENT, CLOCKS_MONITOR, and GNSS_ANNOUNCEMENT subscriptions
+  • One GNSS_ANNOUNCEMENT subscription
+
+CLOCKS owns CLOCKS_FRAGMENT ingestion, CLOCKS publication, campaign_detail
+persistence, TEMPEST lifecycle, and holistic CLOCKS state restoration.
 """
 
 from __future__ import annotations
@@ -22,10 +23,7 @@ from __future__ import annotations
 import copy
 import datetime
 from collections import deque
-import json
 import logging
-import math
-import queue
 import os
 import platform
 import random
@@ -42,7 +40,7 @@ import psutil
 import requests
 from smbus2 import SMBus
 
-from zpnet.processes.processes import publish, send_command, server_setup
+from zpnet.processes.processes import send_command, server_setup
 from zpnet.shared.constants import (
     ZPNET_REMOTE_HOST,
     HTTP_TIMEOUT,
@@ -67,29 +65,9 @@ from zpnet.shared.util import (
 
 POLL_INTERVAL_SEC = 30
 STARTUP_TEENSY_QUIET_DELAY_S = 10.0
-CLOCKS_FRAGMENT_TOPIC = "CLOCKS_FRAGMENT"
-CLOCKS_TOPIC = "CLOCKS"
-CLOCKS_MONITOR_TOPIC = "CLOCKS_MONITOR"
 GNSS_ANNOUNCEMENT_TOPIC = "GNSS_ANNOUNCEMENT"
 GNSS_MONITOR_FRESHNESS_MAX_AGE_S = 2.5
 GNSS_ANNOUNCEMENT_HISTORY_MAX = 8
-CLOCKS_RESTORE_TIMEOUT_S = 60.0
-CLOCKS_RESTORE_COMMAND_RETRY_S = 10.0
-
-CAMPAIGN_TYPE_TEMPEST = "TEMPEST"
-
-# Full unified TEMPEST state stream.  The dedicated FIFO deliberately does not
-# coalesce rows: campaign_detail is the canonical append-only record stream and
-# its newest TEMPEST row is also the always-on recovery authority.  A null
-# campaign means ambient/campaign-ready TEMPEST state, not an untyped record.
-# One hour of buffering keeps pub/sub nonblocking through a temporary local
-# PostgreSQL interruption.
-CAMPAIGN_DETAIL_QUEUE_MAX = 3600
-CAMPAIGN_DETAIL_RETRY_S = 1.0
-
-_TEENSY_CLOCKS_RESTORE_ACCEPTED_STATUSES = {
-    "monitor_restore_requested",
-}
 
 # ------------------------------------------------------------------
 # Raspberry Pi status configuration
@@ -259,14 +237,6 @@ SYSTEM: Dict[str, object] = {}
 
 _SYSTEM_LOCK = threading.Lock()
 
-# Pi CLOCKS publishes its Pi-owned GNSS_RAW/baseline decoration independently
-# of the PPS-aligned Teensy fragment.  SYSTEM retains only the latest value and
-# folds it into the next ephemeral CLOCKS snapshot.
-_CLOCKS_MONITOR_LOCK = threading.Lock()
-_LATEST_CLOCKS_MONITOR: Dict[str, Any] = {}
-_LATEST_CLOCKS_MONITOR_RECEIVED_MONOTONIC: Optional[float] = None
-_LATEST_CLOCKS_MONITOR_RECEIVED_UTC: Optional[str] = None
-
 # GNSS publishes predictive TPS1 announcements.  Retain a short history so
 # CLOCKS can select the announcement naming its completed UTC second rather
 # than accidentally displaying the following staged second.
@@ -276,32 +246,6 @@ _GNSS_ANNOUNCEMENT_RECEIVED = 0
 _GNSS_ANNOUNCEMENT_MALFORMED = 0
 _GNSS_ANNOUNCEMENT_EXACT_MATCHES = 0
 _GNSS_ANNOUNCEMENT_FALLBACK_MATCHES = 0
-
-# SYSTEM owns the durable unified CLOCKS campaign-detail stream and the boot
-# restore transaction.  Callbacks may queue fresh details immediately, but the
-# writer starts only after the previous latest detail has been consumed and its
-# restore has either succeeded or been found unavailable.
-_LATEST_CLOCKS_RECEIVED_MONOTONIC: Optional[float] = None
-_CAMPAIGN_DETAIL_QUEUE: queue.Queue[Dict[str, Any]] = queue.Queue(
-    maxsize=CAMPAIGN_DETAIL_QUEUE_MAX
-)
-_CAMPAIGN_DETAIL_WRITER_STARTED = threading.Event()
-_CAMPAIGN_DETAIL_ENQUEUED = 0
-_CAMPAIGN_DETAIL_PERSISTED = 0
-_CAMPAIGN_DETAIL_INSERTED = 0
-_CAMPAIGN_DETAIL_MERGED = 0
-_CAMPAIGN_DETAIL_DROPPED = 0
-
-# Compact cross-process startup barrier consumed by Pi CLOCKS before campaign
-# recovery.  This is lifecycle narration only; the latest durable CLOCKS detail
-# and the fresh-CLOCKS proof remain the actual recovery authorities.
-_CAMPAIGN_DETAIL_RECOVERY_STATUS: Dict[str, Any] = {
-    "state": "STARTING",
-    "detail": "SYSTEM process starting",
-    "detail_sequence": None,
-    "started_at_utc": None,
-    "completed_at_utc": None,
-}
 
 # ------------------------------------------------------------------
 # Feature status clearing house
@@ -319,7 +263,6 @@ _PUBLIC_FEATURE_EXCLUSIONS = {
 
 _FEATURE_LOCK = threading.Lock()
 _PI_FEATURES: Dict[str, Dict[str, Dict[str, str]]] = {"PI": {}}
-_TEENSY_FEATURES: Dict[str, Dict[str, Dict[str, str]]] = {"TEENSY": {}}
 
 
 def _health_to_feature_status(health_state: Any) -> str:
@@ -388,45 +331,10 @@ def _pi_feature_tree_snapshot() -> Dict[str, Dict[str, Dict[str, str]]]:
         return _copy_feature_tree(_PI_FEATURES)
 
 
-def _teensy_feature_tree_snapshot() -> Dict[str, Dict[str, Dict[str, str]]]:
-    with _FEATURE_LOCK:
-        return _copy_feature_tree(_TEENSY_FEATURES)
-
-
-def _teensy_feature_tree_from_report(teensy_payload: Dict[str, Any]) -> Dict[str, Dict[str, Dict[str, str]]]:
-    features = teensy_payload.get("features") if isinstance(teensy_payload, dict) else None
-    tree = _copy_feature_tree(features)
-    return {"TEENSY": tree["TEENSY"]} if "TEENSY" in tree else {}
-
-
-def _combine_feature_trees(*trees: Any) -> Dict[str, Dict[str, Dict[str, str]]]:
-    combined: Dict[str, Dict[str, Dict[str, str]]] = {}
-    for tree in trees:
-        for machine, subsystems in _copy_feature_tree(tree).items():
-            machine_out = combined.setdefault(machine, {})
-            for subsystem, features in subsystems.items():
-                subsystem_out = machine_out.setdefault(subsystem, {})
-                for feature, status in features.items():
-                    subsystem_out[feature] = normalize_feature_status(status)
-    return combined
-
-
-def _replace_teensy_feature_tree(tree: Any) -> bool:
-    """Install a Teensy-authored feature tree.  Returns True on real change."""
-    incoming = _copy_feature_tree(tree)
-    normalized = {"TEENSY": incoming["TEENSY"]} if incoming.get("TEENSY") else {"TEENSY": {}}
-
-    with _FEATURE_LOCK:
-        global _TEENSY_FEATURES
-        if normalized == _TEENSY_FEATURES:
-            return False
-        _TEENSY_FEATURES = normalized
-        return True
-
-
 def _feature_tree_snapshot() -> Dict[str, Dict[str, Dict[str, str]]]:
+    """Return the Pi-authored platform feature tree owned by SYSTEM."""
     with _FEATURE_LOCK:
-        return _combine_feature_trees(_PI_FEATURES, _TEENSY_FEATURES)
+        return _copy_feature_tree(_PI_FEATURES)
 
 
 def _update_builtin_pi_features(*,
@@ -436,8 +344,7 @@ def _update_builtin_pi_features(*,
                                 environment_payload: Dict[str, Any],
                                 gnss_payload: Dict[str, Any],
                                 power_payload: Dict[str, Any],
-                                battery_payload: Dict[str, Any],
-                                teensy_features_available: bool) -> None:
+                                battery_payload: Dict[str, Any]) -> None:
     set_pi_feature("SYSTEM", "FEATURE_STATUS", "NOMINAL")
     set_pi_feature("SYSTEM", "HOST", _health_to_feature_status(pi_payload.get("health_state")))
     set_pi_feature("SYSTEM", "NETWORK", _health_to_feature_status(network_payload.get("network_status")))
@@ -446,7 +353,6 @@ def _update_builtin_pi_features(*,
     set_pi_feature("GNSS", "REPORT", _health_to_feature_status(gnss_payload.get("health_state")))
     set_pi_feature("SYSTEM", "POWER", _health_to_feature_status(power_payload.get("health_state")))
     set_pi_feature("SYSTEM", "BATTERY", _health_to_feature_status(battery_payload.get("health_state")))
-    set_pi_feature("SYSTEM", "TEENSY_FEATURE_IMPORT", "NOMINAL" if teensy_features_available else "INITIALIZING")
 
 
 set_pi_feature("SYSTEM", "FEATURE_STATUS", "NOMINAL")
@@ -1560,863 +1466,11 @@ def build_battery_status() -> dict:
 
 
 # ------------------------------------------------------------------
-# Durable TEMPEST state-detail persistence and boot recovery
+# Pi context publication surface
 # ------------------------------------------------------------------
-
-def _read_latest_tempest_state_detail() -> Optional[Dict[str, Any]]:
-    """Read the latest durable TEMPEST state detail without changing it."""
-    try:
-        with open_db(row_dict=True) as conn:
-            cur = conn.cursor()
-            cur.execute(
-                """
-                SELECT payload
-                FROM campaign_detail
-                WHERE campaign_type = %s
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (CAMPAIGN_TYPE_TEMPEST,),
-            )
-            row = cur.fetchone()
-    except Exception:
-        logging.exception(
-            "⚠️ [system/recovery] failed to read latest TEMPEST campaign_detail"
-        )
-        return None
-
-    if row is None:
-        return None
-
-    payload = row["payload"]
-    if isinstance(payload, str):
-        try:
-            payload = json.loads(payload)
-        except Exception:
-            payload = None
-    if not isinstance(payload, dict):
-        logging.error(
-            "💥 [system/recovery] latest TEMPEST campaign_detail payload is not an object"
-        )
-        return None
-    return copy.deepcopy(payload)
-
-
-def _state_clocks_fragment(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Return the canonical CLOCKS fragment, accepting the previous key on recovery."""
-    fragment = state.get("clocks_fragment")
-    if not isinstance(fragment, dict):
-        fragment = state.get("monitor_fragment")
-    return fragment if isinstance(fragment, dict) else {}
-
-
-def _clocks_detail_campaign(monitor: Dict[str, Any]) -> Optional[str]:
-    """Extract the TEMPEST campaign association from one unified CLOCKS."""
-    candidates = [
-        monitor.get("campaign"),
-        _clocks_payload(monitor).get("campaign"),
-        _clocks_payload(monitor).get("campaign_name"),
-    ]
-
-    fragment = _state_clocks_fragment(monitor)
-    if isinstance(fragment, dict):
-        candidates.extend([
-            fragment.get("campaign"),
-            fragment.get("campaign_name"),
-        ])
-        campaign_row = fragment.get("campaign_row")
-        if isinstance(campaign_row, dict):
-            candidates.extend([
-                campaign_row.get("campaign"),
-                campaign_row.get("campaign_name"),
-            ])
-
-    for candidate in candidates:
-        if isinstance(candidate, dict):
-            candidate = (
-                candidate.get("name")
-                or candidate.get("campaign")
-                or candidate.get("id")
-            )
-        if isinstance(candidate, str) and candidate.strip():
-            return candidate.strip()
-    return None
-
-
-def _clocks_detail_viable(monitor: Dict[str, Any]) -> bool:
-    """Return firmware-authored scientific viability for this CLOCKS detail."""
-    fragment = _state_clocks_fragment(monitor)
-    campaign_row = fragment.get("campaign_row") if isinstance(fragment, dict) else None
-    if not isinstance(campaign_row, dict):
-        return True
-
-    disposition = str(campaign_row.get("candidate_disposition") or "ACCEPT").strip().upper()
-    if disposition in {"SCIENCE_EXCLUDE", "SCIENCE_REJECT"}:
-        return False
-    if campaign_row.get("science_excluded") is True:
-        return False
-    if "science_eligible" in campaign_row:
-        value = campaign_row.get("science_eligible")
-        if isinstance(value, str):
-            return value.strip().lower() in {"1", "true", "yes", "on"}
-        return bool(value)
-    return True
-
-
-def _persist_campaign_detail(clocks: Dict[str, Any]) -> str:
-    """Persist one CLOCKS snapshot, merging a near-simultaneous enrichment copy.
-
-    Firmware may republish the same physical second after the campaign candidate
-    becomes available.  The second copy is stronger testimony, not a second
-    observation, so the persistence boundary updates the recent matching row.
-    """
-    encoded = json.dumps(clocks, separators=(",", ":"), ensure_ascii=False)
-    sequence = clocks.get("sequence")
-    pps_count = clocks.get("pps_count")
-    campaign = _clocks_detail_campaign(clocks)
-    viable = _clocks_detail_viable(clocks)
-
-    with open_db() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            UPDATE campaign_detail
-            SET campaign = %s,
-                viable = %s,
-                payload = %s::jsonb,
-                sequence = %s,
-                pps_count = %s
-            WHERE id = (
-                SELECT id
-                FROM campaign_detail
-                WHERE campaign_type = %s
-                  AND sequence IS NOT DISTINCT FROM %s
-                  AND pps_count IS NOT DISTINCT FROM %s
-                  AND ts >= now() - interval '2 seconds'
-                ORDER BY id DESC
-                LIMIT 1
-            )
-            RETURNING id
-            """,
-            (
-                campaign,
-                viable,
-                encoded,
-                sequence,
-                pps_count,
-                CAMPAIGN_TYPE_TEMPEST,
-                sequence,
-                pps_count,
-            ),
-        )
-        if cur.fetchone() is not None:
-            return "merged"
-
-        cur.execute(
-            """
-            INSERT INTO campaign_detail
-                (campaign_type, campaign, viable, payload, sequence, pps_count)
-            VALUES
-                (%s, %s, %s, %s::jsonb, %s, %s)
-            """,
-            (
-                CAMPAIGN_TYPE_TEMPEST,
-                campaign,
-                viable,
-                encoded,
-                sequence,
-                pps_count,
-            ),
-        )
-        return "inserted"
-
-
-def _queue_campaign_detail(clocks: Dict[str, Any]) -> None:
-    """Queue every fresh unified CLOCKS without blocking the pub/sub callback."""
-    global _CAMPAIGN_DETAIL_ENQUEUED, _CAMPAIGN_DETAIL_DROPPED
-
-    try:
-        _CAMPAIGN_DETAIL_QUEUE.put_nowait(copy.deepcopy(clocks))
-        _CAMPAIGN_DETAIL_ENQUEUED += 1
-    except queue.Full:
-        _CAMPAIGN_DETAIL_DROPPED += 1
-        logging.error(
-            "💥 [system] campaign_detail FIFO full; dropping sequence=%s "
-            "(queued=%d persisted=%d dropped=%d)",
-            clocks.get("sequence"),
-            _CAMPAIGN_DETAIL_ENQUEUED,
-            _CAMPAIGN_DETAIL_PERSISTED,
-            _CAMPAIGN_DETAIL_DROPPED,
-        )
-
-
-def _campaign_detail_writer_loop() -> None:
-    """Persist the TEMPEST state-detail stream in order, retrying each head."""
-    global _CAMPAIGN_DETAIL_PERSISTED, _CAMPAIGN_DETAIL_INSERTED, _CAMPAIGN_DETAIL_MERGED
-
-    _CAMPAIGN_DETAIL_WRITER_STARTED.set()
-    while True:
-        clocks = _CAMPAIGN_DETAIL_QUEUE.get()
-        failure_logged = False
-
-        while True:
-            try:
-                disposition = _persist_campaign_detail(clocks)
-                _CAMPAIGN_DETAIL_PERSISTED += 1
-                if disposition == "merged":
-                    _CAMPAIGN_DETAIL_MERGED += 1
-                else:
-                    _CAMPAIGN_DETAIL_INSERTED += 1
-                break
-            except Exception:
-                if not failure_logged:
-                    logging.exception(
-                        "⚠️ [system] campaign_detail append failed for sequence=%s; "
-                        "retrying without discarding the row",
-                        clocks.get("sequence"),
-                    )
-                    failure_logged = True
-                time.sleep(CAMPAIGN_DETAIL_RETRY_S)
-
-
-def _start_campaign_detail_writer() -> None:
-    if _CAMPAIGN_DETAIL_WRITER_STARTED.is_set():
-        return
-
-    threading.Thread(
-        target=_campaign_detail_writer_loop,
-        daemon=True,
-        name="system-campaign-detail-writer",
-    ).start()
-
-
-def _clocks_payload(monitor: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    if not isinstance(monitor, dict):
-        return {}
-    clocks = monitor.get("clocks")
-    return clocks if isinstance(clocks, dict) else {}
-
-
-def _monitor_restore_state(monitor: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Return firmware-authored structured sufficient state from CLOCKS."""
-    state = _clocks_payload(monitor).get("restore_state")
-    if not isinstance(state, dict):
-        return None
-    try:
-        version = int(state.get("version") or state.get("schema_version") or 0)
-    except (TypeError, ValueError):
-        return None
-    if version != 2 or not state.get("present", True):
-        return None
-    return copy.deepcopy(state)
-
-
-def _structured_restore_args(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Flatten structured CLOCKS state into ordinary CLOCKS command fields."""
-    instrument = state.get("instrument_clockfaces")
-    stats = state.get("stats")
-    dac = state.get("dac")
-    if not isinstance(instrument, dict) or not isinstance(stats, dict) or not isinstance(dac, dict):
-        raise ValueError("structured restore missing instrument_clockfaces/stats/dac")
-
-    def path(mapping: Dict[str, Any], dotted: str) -> Any:
-        current: Any = mapping
-        for part in dotted.split("."):
-            if not isinstance(current, dict):
-                return None
-            current = current.get(part)
-        return current
-
-    out: Dict[str, Any] = {
-        "restore_schema_version": 2,
-        "restore_instrument_gnss_ns": instrument.get("gnss_ns"),
-        "restore_instrument_dwt_cycles": instrument.get("dwt_cycles"),
-        "restore_instrument_ocxo1_ns": instrument.get("ocxo1_ns"),
-        "restore_instrument_ocxo2_ns": instrument.get("ocxo2_ns"),
-        "restore_stats_valid": stats.get("valid"),
-        "restore_stats_completed_row_coherent": stats.get("completed_row_coherent"),
-        "restore_stats_reset_count": stats.get("reset_count"),
-        "restore_stats_update_count": stats.get("update_count"),
-        "restore_stats_vclock_interval_reject_count": path(stats, "interval_admission.vclock_reject_count"),
-        "restore_stats_ocxo1_interval_reject_count": path(stats, "interval_admission.ocxo1_reject_count"),
-        "restore_stats_ocxo2_interval_reject_count": path(stats, "interval_admission.ocxo2_reject_count"),
-        "restore_servo_mode": dac.get("servo_mode") or "OFF",
-        "restore_dither_operator_enabled": dac.get("dither_operator_enabled", False),
-    }
-    welfords = {
-        "gnss": path(stats, "gnss.welford"),
-        "dwt": path(stats, "dwt.welford"),
-        "vclock": path(stats, "vclock.welford"),
-        "ocxo1": path(stats, "ocxo1.welford"),
-        "ocxo2": path(stats, "ocxo2.welford"),
-        "pps_witness": path(stats, "pps_witness.welford"),
-        "ocxo1_dac": path(stats, "dac.ocxo1"),
-        "ocxo2_dac": path(stats, "dac.ocxo2"),
-    }
-    for name, wf in welfords.items():
-        if not isinstance(wf, dict):
-            raise ValueError(f"structured restore missing {name} Welford")
-        for field in ("n", "mean", "m2", "min", "max"):
-            out[f"restore_{name}_welford_{field}"] = wf.get(field)
-    for lane in ("ocxo1", "ocxo2"):
-        tau = path(stats, f"{lane}_tau_state")
-        if not isinstance(tau, dict):
-            raise ValueError(f"structured restore missing {lane} TAU state")
-        for field in (
-            "valid", "reset_count", "sample_count", "interval_count",
-            "reject_count", "gap_reset_count", "last_pps_sequence",
-            "last_interval_pps_sequence", "first_refined_ns", "last_refined_ns",
-            "last_fast_residual_ns", "cumulative_reference_ns",
-            "cumulative_clock_ns", "cumulative_clock_ns_exact", "mean_x",
-            "mean_y", "sxx", "sxy", "syy", "interval_mean_ppb",
-            "interval_m2_ppb",
-        ):
-            out[f"restore_{lane}_tau_{field}"] = tau.get(field)
-        lane_state = dac.get(lane)
-        servo = lane_state.get("servo") if isinstance(lane_state, dict) else None
-        if not isinstance(lane_state, dict) or not isinstance(servo, dict):
-            raise ValueError(f"structured restore missing {lane} DAC/servo state")
-        out[f"restore_{lane}_dac_value"] = lane_state.get("value", lane_state.get("dac"))
-        field_map = {
-            "servo_last_step": "last_step", "servo_last_residual": "last_residual",
-            "servo_settle_count": "settle_count", "servo_adjustments": "adjustments",
-            "servo_predictor_initialized": "predictor_initialized",
-            "servo_last_raw_residual": "last_raw_residual",
-            "servo_filtered_residual": "filtered_residual",
-            "servo_filtered_slope": "filtered_slope",
-            "servo_predicted_residual": "predicted_residual",
-            "servo_predictor_updates": "predictor_updates",
-        }
-        for command_field, json_field in field_map.items():
-            out[f"restore_{lane}_dac_{command_field}"] = servo.get(json_field)
-    missing = [key for key, value in out.items() if value is None]
-    if missing:
-        raise ValueError(f"structured restore missing fields: {missing}")
-    return out
-
-def _monitor_gnss_raw_payload(monitor: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Return the Pi CLOCKS-owned GNSS_RAW state carried by CLOCKS."""
-    gnss_raw = _clocks_payload(monitor).get("gnss_raw")
-    return copy.deepcopy(gnss_raw) if isinstance(gnss_raw, dict) else None
-
-
-def _set_campaign_detail_recovery_status(
-    state: str,
-    detail: str,
-    *,
-    detail_sequence: Any = None,
-) -> None:
-    """Publish a compact startup-recovery phase for dependent Pi processes."""
-    now_utc = datetime.datetime.now(datetime.timezone.utc) \
-        .isoformat() \
-        .replace("+00:00", "Z")
-    with _SYSTEM_LOCK:
-        _CAMPAIGN_DETAIL_RECOVERY_STATUS["state"] = str(state).strip().upper()
-        _CAMPAIGN_DETAIL_RECOVERY_STATUS["detail"] = str(detail)
-        _CAMPAIGN_DETAIL_RECOVERY_STATUS["detail_sequence"] = detail_sequence
-        if _CAMPAIGN_DETAIL_RECOVERY_STATUS.get("started_at_utc") is None:
-            _CAMPAIGN_DETAIL_RECOVERY_STATUS["started_at_utc"] = now_utc
-        _CAMPAIGN_DETAIL_RECOVERY_STATUS["completed_at_utc"] = (
-            now_utc
-            if _CAMPAIGN_DETAIL_RECOVERY_STATUS["state"]
-            in {"COMPLETE", "NO_DETAIL", "FAILED"}
-            else None
-        )
-
-
-def _seed_system_from_detail(detail: Dict[str, Any]) -> None:
-    """Publish the latest durable detail immediately and seed CLOCKS decoration."""
-    global SYSTEM
-    global _LATEST_CLOCKS_RECEIVED_MONOTONIC
-    global _LATEST_CLOCKS_MONITOR
-    global _LATEST_CLOCKS_MONITOR_RECEIVED_MONOTONIC
-    global _LATEST_CLOCKS_MONITOR_RECEIVED_UTC
-
-    seeded_at_utc = datetime.datetime.now(datetime.timezone.utc) \
-        .isoformat() \
-        .replace("+00:00", "Z")
-    clocks = _clocks_payload(detail)
-    pi_clocks = clocks.get("pi")
-    if not isinstance(pi_clocks, dict):
-        pi_clocks = {
-            "schema": clocks.get("pi_schema"),
-            "gnss_raw": _dict_copy(clocks.get("gnss_raw")),
-            "extra_clocks": _dict_copy(clocks.get("extra_clocks")),
-            "baseline": _dict_copy(clocks.get("baseline")),
-            "stats_reset": _dict_copy(clocks.get("stats_reset")),
-        }
-
-    with _CLOCKS_MONITOR_LOCK:
-        _LATEST_CLOCKS_MONITOR = copy.deepcopy(pi_clocks)
-        _LATEST_CLOCKS_MONITOR_RECEIVED_MONOTONIC = time.monotonic()
-        _LATEST_CLOCKS_MONITOR_RECEIVED_UTC = seeded_at_utc
-
-    with _SYSTEM_LOCK:
-        SYSTEM = copy.deepcopy(detail)
-        _LATEST_CLOCKS_RECEIVED_MONOTONIC = time.monotonic()
-
-    # The detail writer is still closed, so this immediate display seed
-    # cannot overwrite the durable recovery authority.
-    publish(CLOCKS_TOPIC, copy.deepcopy(detail))
-
-
-def _request_teensy_monitor_restore(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Stage one structured firmware CLOCKS restore, retrying only busy."""
-    deadline = time.monotonic() + CLOCKS_RESTORE_COMMAND_RETRY_S
-    last_response: Any = None
-    restore_args = _structured_restore_args(state)
-    while True:
-        response = send_command(
-            machine="TEENSY",
-            subsystem="CLOCKS",
-            command="RESTORE_MONITOR",
-            args=restore_args,
-        )
-        last_response = response
-        outer_success = isinstance(response, dict) and bool(response.get("success"))
-        payload = response.get("payload") if isinstance(response, dict) else None
-        status = str(payload.get("status") or "") if isinstance(payload, dict) else ""
-        if outer_success and status in _TEENSY_CLOCKS_RESTORE_ACCEPTED_STATUSES:
-            return response
-        if outer_success and status == "monitor_restore_rejected_busy":
-            campaign_state = str(
-                payload.get("campaign_state") or ""
-            ).strip().upper() if isinstance(payload, dict) else ""
-            if campaign_state == "STARTED":
-                return response
-            if time.monotonic() < deadline:
-                time.sleep(0.25)
-                continue
-        raise RuntimeError(
-            "Teensy CLOCKS.RESTORE_MONITOR rejected: "
-            f"status={status or 'missing_handler_status'} "
-            f"outer_success={outer_success} response={last_response!r}"
-        )
-
-def _request_clocks_gnss_raw_restore(gnss_raw: Dict[str, Any]) -> Dict[str, Any]:
-    """Hand Pi-owned GNSS_RAW state to its CLOCKS process owner."""
-    deadline = time.monotonic() + CLOCKS_RESTORE_COMMAND_RETRY_S
-    last_error: Optional[BaseException] = None
-    while True:
-        try:
-            response = send_command(
-                machine="PI",
-                subsystem="CLOCKS",
-                command="RESTORE_GNSS_RAW",
-                args={
-                    "state": json.dumps(
-                        gnss_raw,
-                        separators=(",", ":"),
-                        ensure_ascii=False,
-                    )
-                },
-                retries=1,
-                retry_delay_s=0.0,
-            )
-            if isinstance(response, dict) and response.get("success"):
-                return response
-            last_error = RuntimeError(f"CLOCKS.RESTORE_GNSS_RAW rejected: {response!r}")
-        except Exception as exc:
-            last_error = exc
-
-        if time.monotonic() >= deadline:
-            raise RuntimeError(
-                f"CLOCKS.RESTORE_GNSS_RAW unavailable: {last_error}"
-            ) from last_error
-        time.sleep(0.25)
-
-
-def _monitor_restore_probe(monitor: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """Extract the durable surfaces used to prove a CLOCKS restore completed."""
-    clocks = _clocks_payload(monitor)
-    instrument = clocks.get("instrument_clockfaces")
-    stats = clocks.get("stats")
-    dac = clocks.get("dac")
-    if not isinstance(instrument, dict):
-        instrument = {}
-    if not isinstance(stats, dict):
-        stats = {}
-    if not isinstance(dac, dict):
-        dac = {}
-
-    welford_n: Dict[str, int] = {}
-    for lane in ("gnss", "dwt", "vclock", "ocxo1", "ocxo2", "pps_witness"):
-        node = stats.get(lane)
-        wf = node.get("welford") if isinstance(node, dict) else None
-        try:
-            welford_n[lane] = int(wf.get("n") or 0) if isinstance(wf, dict) else 0
-        except (TypeError, ValueError):
-            welford_n[lane] = 0
-
-    dac_stats = stats.get("dac")
-    for lane in ("ocxo1", "ocxo2"):
-        wf = dac_stats.get(lane) if isinstance(dac_stats, dict) else None
-        try:
-            welford_n[f"dac.{lane}"] = int(wf.get("n") or 0) if isinstance(wf, dict) else 0
-        except (TypeError, ValueError):
-            welford_n[f"dac.{lane}"] = 0
-
-    def _int_value(value: Any) -> int:
-        try:
-            return int(value or 0)
-        except (TypeError, ValueError):
-            return 0
-
-    def _float_value(value: Any) -> Optional[float]:
-        try:
-            result = float(value)
-        except (TypeError, ValueError):
-            return None
-        return result if math.isfinite(result) else None
-
-    return {
-        "instrument_gnss_ns": _int_value(instrument.get("gnss_ns")),
-        "instrument_dwt_cycles": _int_value(instrument.get("dwt_cycles")),
-        "instrument_ocxo1_ns": _int_value(instrument.get("ocxo1_ns")),
-        "instrument_ocxo2_ns": _int_value(instrument.get("ocxo2_ns")),
-        "welford_n": welford_n,
-        "servo_mode": str(dac.get("servo_mode") or "OFF").upper(),
-        "dither_operator_enabled": bool(dac.get("dither_operator_enabled")),
-        "ocxo1_dac": _float_value(dac.get("ocxo1_dac")),
-        "ocxo2_dac": _float_value(dac.get("ocxo2_dac")),
-    }
-
-
-def _monitor_restore_probe_satisfied(
-    expected: Dict[str, Any],
-    observed: Dict[str, Any],
-) -> bool:
-    for key in (
-        "instrument_gnss_ns",
-        "instrument_dwt_cycles",
-        "instrument_ocxo1_ns",
-        "instrument_ocxo2_ns",
-    ):
-        target = int(expected.get(key) or 0)
-        if target > 0 and int(observed.get(key) or 0) < target:
-            return False
-
-    expected_n = expected.get("welford_n")
-    observed_n = observed.get("welford_n")
-    if isinstance(expected_n, dict) and isinstance(observed_n, dict):
-        for key, target_value in expected_n.items():
-            target = int(target_value or 0)
-            if target > 0 and int(observed_n.get(key) or 0) < target:
-                return False
-
-    if str(observed.get("servo_mode") or "OFF").upper() != str(
-        expected.get("servo_mode") or "OFF"
-    ).upper():
-        return False
-    if bool(observed.get("dither_operator_enabled")) != bool(
-        expected.get("dither_operator_enabled")
-    ):
-        return False
-    for key in ("ocxo1_dac", "ocxo2_dac"):
-        target = expected.get(key)
-        value = observed.get(key)
-        if target is not None and (
-            value is None or abs(float(value) - float(target)) > 0.01
-        ):
-            return False
-    return True
-
-
-def _monitor_restore_pending_categories(
-    expected: Dict[str, Any],
-    observed: Dict[str, Any],
-) -> list[str]:
-    """Summarize restore proof gaps without logging payloads or numeric state."""
-    pending: list[str] = []
-
-    clockface_keys = {
-        "instrument_gnss_ns": "GNSS_CLOCKFACE",
-        "instrument_dwt_cycles": "DWT_CLOCKFACE",
-        "instrument_ocxo1_ns": "OCXO_CLOCKFACES",
-        "instrument_ocxo2_ns": "OCXO_CLOCKFACES",
-    }
-    for key, category in clockface_keys.items():
-        target = int(expected.get(key) or 0)
-        if target > 0 and int(observed.get(key) or 0) < target:
-            if category not in pending:
-                pending.append(category)
-
-    expected_n = expected.get("welford_n")
-    observed_n = observed.get("welford_n")
-    if isinstance(expected_n, dict):
-        observed_n = observed_n if isinstance(observed_n, dict) else {}
-        if any(
-            int(target or 0) > 0
-            and int(observed_n.get(key) or 0) < int(target or 0)
-            for key, target in expected_n.items()
-        ):
-            pending.append("STATISTICS")
-
-    control_pending = (
-        str(observed.get("servo_mode") or "OFF").upper()
-        != str(expected.get("servo_mode") or "OFF").upper()
-        or bool(observed.get("dither_operator_enabled"))
-        != bool(expected.get("dither_operator_enabled"))
-    )
-    for key in ("ocxo1_dac", "ocxo2_dac"):
-        target = expected.get(key)
-        value = observed.get(key)
-        if target is not None and (
-            value is None or abs(float(value) - float(target)) > 0.01
-        ):
-            control_pending = True
-    if control_pending:
-        pending.append("DAC_CONTROL")
-
-    return pending or ["FRESH_MONITOR_PROOF"]
-
-
-def _wait_for_monitor_restore(
-    detail: Dict[str, Any],
-    *,
-    requested_monotonic: float,
-    timeout_s: float = CLOCKS_RESTORE_TIMEOUT_S,
-) -> Dict[str, Any]:
-    """Wait for a fresh unified CLOCKS proving the staged restore committed."""
-    expected = _monitor_restore_probe(detail)
-    deadline = time.monotonic() + float(timeout_s)
-    next_progress_log = requested_monotonic + 10.0
-    last_observed: Dict[str, Any] = {}
-    while time.monotonic() < deadline:
-        with _SYSTEM_LOCK:
-            monitor = copy.deepcopy(SYSTEM)
-            received = _LATEST_CLOCKS_RECEIVED_MONOTONIC
-        if received is not None and received > requested_monotonic and monitor:
-            last_observed = _monitor_restore_probe(monitor)
-            if _monitor_restore_probe_satisfied(expected, last_observed):
-                return {
-                    "proved": True,
-                    "expected": expected,
-                    "observed": last_observed,
-                    "monitor_sequence": clocks.get("sequence"),
-                    "waited_s": round(
-                        max(0.0, time.monotonic() - requested_monotonic),
-                        3,
-                    ),
-                }
-
-        now = time.monotonic()
-        if now >= next_progress_log:
-            pending = _monitor_restore_pending_categories(expected, last_observed)
-            logging.info(
-                "⏳ [system/recovery] CLOCKS restore still converging after %.1fs; "
-                "waiting for %s",
-                max(0.0, now - requested_monotonic),
-                ", ".join(pending),
-            )
-            next_progress_log = now + 10.0
-        time.sleep(0.1)
-
-    raise TimeoutError(
-        "timed out waiting for restored CLOCKS state "
-        f"after {timeout_s:.1f}s; expected={expected!r} observed={last_observed!r}"
-    )
-
-
-def _recover_monitor_detail(detail: Dict[str, Any]) -> Dict[str, Any]:
-    """Restore always-on Teensy and Pi clock state without campaign policy."""
-    restore_state = _monitor_restore_state(detail)
-    if restore_state is None:
-        raise RuntimeError("campaign_detail CLOCKS has no structured firmware restore state")
-    gnss_raw = _monitor_gnss_raw_payload(detail)
-    if gnss_raw is None:
-        raise RuntimeError("campaign_detail CLOCKS has no clocks.gnss_raw state")
-
-    logging.info(
-        "♻️ [system/recovery] found recoverable CLOCKS detail sequence=%s; "
-        "seeding last-known display state and restoring the always-on instrument",
-        detail.get("sequence"),
-    )
-    _seed_system_from_detail(detail)
-    requested_monotonic = time.monotonic()
-    logging.info(
-        "⏳ [system/recovery] last-known CLOCKS published; requesting Teensy "
-        "clockface, statistics, DAC, servo, and dither restoration"
-    )
-    teensy_response = _request_teensy_monitor_restore(restore_state)
-    teensy_payload = (
-        teensy_response.get("payload", {})
-        if isinstance(teensy_response, dict)
-        and isinstance(teensy_response.get("payload"), dict)
-        else {}
-    )
-    teensy_status = str(teensy_payload.get("status") or "")
-    teensy_campaign_state = str(
-        teensy_payload.get("campaign_state") or ""
-    ).strip().upper()
-    if (
-        teensy_status == "monitor_restore_rejected_busy"
-        and teensy_campaign_state == "STARTED"
-    ):
-        result = {
-            "success": True,
-            "mode": "LIVE_CAMPAIGN_SUPERSEDED_MONITOR_RESTORE",
-            "detail_sequence": detail.get("sequence"),
-            "restore_schema_version": 2,
-            "teensy": teensy_payload,
-            "clocks": None,
-            "proof": {
-                "proved": True,
-                "basis": "TEENSY_LIVE_CAMPAIGN_CUSTODY",
-                "campaign_state": teensy_campaign_state,
-            },
-        }
-        logging.info(
-            "♻️ [system/recovery] live Teensy campaign superseded CLOCKS "
-            "restore: sequence=%s campaign_state=%s; detail writing may resume",
-            detail.get("sequence"),
-            teensy_campaign_state,
-        )
-        return result
-
-    clocks_response = _request_clocks_gnss_raw_restore(gnss_raw)
-    logging.info(
-        "⏳ [system/recovery] restore commands accepted; waiting for a fresh "
-        "CLOCKS to prove clockfaces, statistics, DACs, servo mode, and dithering"
-    )
-    proof = _wait_for_monitor_restore(
-        detail,
-        requested_monotonic=requested_monotonic,
-    )
-
-    result = {
-        "success": True,
-        "mode": "SYSTEM_MONITOR",
-        "detail_sequence": detail.get("sequence"),
-        "restore_schema_version": 2,
-        "teensy": teensy_response.get("payload")
-            if isinstance(teensy_response, dict) else None,
-        "clocks": clocks_response.get("payload")
-            if isinstance(clocks_response, dict) else None,
-        "proof": proof,
-    }
-    logging.info(
-        "✅ [system/recovery] CLOCKS restore proved by fresh sequence=%s: "
-        "clockfaces and statistics resumed, servo=%s, waited=%.3fs",
-        proof.get("monitor_sequence"),
-        proof.get("observed", {}).get("servo_mode"),
-        float(proof.get("waited_s") or 0.0),
-    )
-    return result
-
-
-# ------------------------------------------------------------------
-# Pi context poller and CLOCKS aggregation
-# ------------------------------------------------------------------
-
-def _dict_copy(value: Any) -> dict:
-    return dict(value) if isinstance(value, dict) else {}
-
-
-def _seconds_to_hms(seconds: Any) -> str:
-    try:
-        total = max(0, int(seconds))
-    except (TypeError, ValueError):
-        total = 0
-    return f"{total // 3600:02d}:{(total % 3600) // 60:02d}:{total % 60:02d}"
-
-
-def _gnss_time_utc(gnss: Dict[str, Any]) -> Optional[str]:
-    date = str(gnss.get("date") or "").strip()
-    clock = str(gnss.get("time") or "").strip()
-    if not date or not clock:
-        return None
-    return f"{date}T{clock}Z"
-
-
-def _clocks_monitor_snapshot() -> tuple[Dict[str, Any], Optional[float], Optional[str]]:
-    with _CLOCKS_MONITOR_LOCK:
-        payload = dict(_LATEST_CLOCKS_MONITOR)
-        received = _LATEST_CLOCKS_MONITOR_RECEIVED_MONOTONIC
-        received_utc = _LATEST_CLOCKS_MONITOR_RECEIVED_UTC
-    age_s = None if received is None else max(0.0, time.monotonic() - received)
-    return payload, age_s, received_utc
-
-
-def _combine_live_clocks(fragment: Dict[str, Any],
-                         gnss: Dict[str, Any],
-                         published_at_utc: str) -> Dict[str, Any]:
-    """Combine Teensy physical clocks with Pi-owned GNSS_RAW/baseline state."""
-    teensy_clocks = _dict_copy(fragment.get("clocks"))
-    pi_clocks, pi_age_s, pi_received_utc = _clocks_monitor_snapshot()
-
-    clocks = dict(teensy_clocks)
-    clocks["schema"] = "CLOCKS_LIVE_V1"
-    clocks["teensy_schema"] = teensy_clocks.get("schema")
-    clocks["pi_schema"] = pi_clocks.get("schema")
-    clocks["system_time_utc"] = published_at_utc
-    clocks["gnss_time_utc"] = _gnss_time_utc(gnss)
-
-    presentation_count = (
-        clocks.get("teensy_pps_vclock_count")
-        or clocks.get("campaign_seconds")
-        or 0
-    )
-    clocks["display_elapsed"] = _seconds_to_hms(presentation_count)
-    clocks["campaign_elapsed"] = (
-        _seconds_to_hms(clocks.get("campaign_seconds"))
-        if clocks.get("campaign_present")
-        else None
-    )
-    clocks["instrument_elapsed"] = _seconds_to_hms(
-        clocks.get("instrument_age_seconds")
-    )
-    completed_sequence = clocks.get("completed_pps_sequence")
-    monitor_sequence = _clocks_fragment_count(fragment)
-    try:
-        clocks["teensy_clock_source_age_sequences"] = max(
-            0, int(monitor_sequence) - int(completed_sequence)
-        )
-    except (TypeError, ValueError):
-        clocks["teensy_clock_source_age_sequences"] = None
-
-    clocks["pi"] = pi_clocks
-    clocks["gnss_raw"] = _dict_copy(pi_clocks.get("gnss_raw"))
-    clocks["extra_clocks"] = _dict_copy(pi_clocks.get("extra_clocks"))
-    clocks["baseline"] = _dict_copy(pi_clocks.get("baseline"))
-    clocks["stats_reset"] = _dict_copy(pi_clocks.get("stats_reset"))
-    clocks["pi_clock_source_age_s"] = (
-        None if pi_age_s is None else round(pi_age_s, 3)
-    )
-    clocks["pi_clock_source_received_at_utc"] = pi_received_utc
-    clocks["pi_clock_source_fresh"] = bool(
-        pi_age_s is not None and pi_age_s <= 2.5
-    )
-    clocks["complete_for_display"] = bool(
-        teensy_clocks and pi_clocks.get("gnss_raw")
-    )
-    clocks["ephemeral"] = True
-    clocks["persisted"] = False
-    return clocks
-
-
-def _clocks_fragment_count(fragment: Dict[str, Any]) -> Optional[int]:
-    for key in ("sequence", "teensy_pps_vclock_count", "teensy_pps_count", "pps_count"):
-        value = fragment.get(key)
-        if value is None:
-            continue
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            continue
-    return None
-
-
-def _clocks_fragment_teensy(fragment: Dict[str, Any]) -> dict:
-    for key in ("teensy", "system"):
-        value = fragment.get(key)
-        if isinstance(value, dict):
-            return dict(value)
-    return {}
-
 
 def _update_pi_context(snapshot: Dict[str, Any]) -> None:
-    """Replace Pi-owned context while preserving the latest Teensy fragment."""
+    """Replace the current Pi-owned platform context exposed by SYSTEM.REPORT."""
     global SYSTEM
     with _SYSTEM_LOCK:
         current = dict(SYSTEM)
@@ -2426,11 +1480,7 @@ def _update_pi_context(snapshot: Dict[str, Any]) -> None:
 
 
 def system_poller() -> None:
-    """Refresh only Pi-owned operational context.
-
-    This thread deliberately issues no recurring Teensy commands. The current
-    Teensy/process/transport/Payload surfaces arrive through MONITOR_FRAGMENT.
-    """
+    """Refresh the complete Pi-owned platform context for SYSTEM.REPORT."""
     try:
         while True:
             pi_payload = build_pi_status()
@@ -2449,7 +1499,6 @@ def system_poller() -> None:
                 gnss_payload=gnss_payload,
                 power_payload=power_payload,
                 battery_payload=battery_payload,
-                teensy_features_available=bool(_teensy_feature_tree_snapshot()),
             )
 
             pi_context = {
@@ -2500,107 +1549,14 @@ def on_gnss_announcement(payload: Optional[dict]) -> None:
     _GNSS_ANNOUNCEMENT_RECEIVED += 1
 
 
-def on_clocks_monitor(payload: Optional[dict]) -> None:
-    """Cache the latest Pi-owned CLOCKS decoration; never persist it."""
-    global _LATEST_CLOCKS_MONITOR
-    global _LATEST_CLOCKS_MONITOR_RECEIVED_MONOTONIC
-    global _LATEST_CLOCKS_MONITOR_RECEIVED_UTC
-
-    if not isinstance(payload, dict):
-        logging.warning("[system] ignoring malformed CLOCKS_MONITOR: %r", payload)
-        return
-
-    received_utc = datetime.datetime.now(datetime.timezone.utc) \
-        .isoformat() \
-        .replace("+00:00", "Z")
-    with _CLOCKS_MONITOR_LOCK:
-        _LATEST_CLOCKS_MONITOR = dict(payload)
-        _LATEST_CLOCKS_MONITOR_RECEIVED_MONOTONIC = time.monotonic()
-        _LATEST_CLOCKS_MONITOR_RECEIVED_UTC = received_utc
-
-
-def on_clocks_fragment(payload: Optional[dict]) -> None:
-    """Decorate one Teensy CLOCKS_FRAGMENT and rebroadcast it as CLOCKS."""
-    global SYSTEM
-    global _LATEST_CLOCKS_RECEIVED_MONOTONIC
-
-    if not isinstance(payload, dict):
-        logging.warning("[system] ignoring malformed CLOCKS_FRAGMENT: %r", payload)
-        return
-
-    fragment = dict(payload)
-    count = _clocks_fragment_count(fragment)
-
-    teensy_features = _copy_feature_tree(fragment.get("features"))
-    if teensy_features:
-        _replace_teensy_feature_tree(teensy_features)
-
-    features = _feature_tree_snapshot()
-    with _SYSTEM_LOCK:
-        current = dict(SYSTEM)
-
-    published_at = datetime.datetime.now(datetime.timezone.utc)
-    published_at_utc = published_at.isoformat().replace("+00:00", "Z")
-    gnss, gnss_monitor = _gnss_announcement_snapshot(published_at)
-    clocks = _combine_live_clocks(fragment, gnss, published_at_utc)
-    gnss_time_utc = _gnss_time_utc(gnss)
-    time_sanity = {
-        "schema": "CLOCKS_TIME_SANITY_V1",
-        "gnss_utc": gnss_time_utc,
-        "system_utc": published_at_utc,
-        "gnss_source_fresh": bool(gnss_monitor.get("source_fresh")),
-        "gnss_source_age_s": gnss_monitor.get("source_age_s"),
-        "gnss_announcement_sequence": gnss_monitor.get("announcement_sequence"),
-        "gnss_matched_target_utc": gnss_monitor.get("matched_target_utc"),
-    }
-    fragment_evidence = dict(fragment)
-    # The normalized top-level clocks block is the display authority.  Avoid
-    # duplicating that comparatively large object inside clocks_fragment.
-    fragment_evidence.pop("clocks", None)
-
-    monitor = {
-        "schema": "CLOCKS_V3",
-        "source_schema": fragment.get("schema"),
-        "sequence": count,
-        "teensy_pps_vclock_count": count,
-        "teensy_pps_count": count,
-        "pps_count": count,
-        "published_at_utc": published_at_utc,
-        "pi": _dict_copy(current.get("pi")),
-        "network": _dict_copy(current.get("network")),
-        "sensors": _dict_copy(current.get("sensors")),
-        "environment": _dict_copy(current.get("environment")),
-        "gnss": gnss,
-        "gnss_monitor": gnss_monitor,
-        "time_sanity": time_sanity,
-        "power": _dict_copy(current.get("power")),
-        "battery": _dict_copy(current.get("battery")),
-        "clocks": clocks,
-        "teensy": _clocks_fragment_teensy(fragment),
-        "process": _dict_copy(fragment.get("process")),
-        "transport": _dict_copy(fragment.get("transport")),
-        "payload": _dict_copy(fragment.get("payload")),
-        "features": features,
-        "clocks_fragment": fragment_evidence,
-    }
-
-    with _SYSTEM_LOCK:
-        SYSTEM = dict(monitor)
-        _LATEST_CLOCKS_RECEIVED_MONOTONIC = time.monotonic()
-
-    publish(CLOCKS_TOPIC, monitor)
-    _queue_campaign_detail(monitor)
-
-
 # ------------------------------------------------------------------
 # Command handlers
 # ------------------------------------------------------------------
 
 def cmd_report(_: Optional[dict]) -> Dict:
-    """Return the most recent SYSTEM snapshot."""
+    """Return the current Pi-owned platform context."""
     with _SYSTEM_LOCK:
-        snapshot = dict(SYSTEM)
-        snapshot["campaign_detail_recovery"] = copy.deepcopy(_CAMPAIGN_DETAIL_RECOVERY_STATUS)
+        snapshot = copy.deepcopy(SYSTEM)
     return {
         "success": True,
         "message": "OK",
@@ -2719,18 +1675,13 @@ COMMANDS = {
 # ---------------------------------------------------------------------
 
 def startup_teensy_quiet_delay() -> None:
-    """
-    Let pubsub discover SYSTEM before CLOCKS recovery and active polling.
-    """
+    """Let PubSub and GNSS routing settle before the first platform poll."""
     logging.info(
-        "⏳ [system] waiting %.1fs for pubsub routing and Teensy initialization "
-        "before campaign-detail recovery or active polling",
+        "⏳ [system] waiting %.1fs for pubsub routing before active polling",
         STARTUP_TEENSY_QUIET_DELAY_S,
     )
     time.sleep(STARTUP_TEENSY_QUIET_DELAY_S)
-    logging.info(
-        "✅ [system] startup quiet delay complete — campaign-detail recovery may begin"
-    )
+    logging.info("✅ [system] startup quiet delay complete — active polling may begin")
 
 
 # ---------------------------------------------------------------------
@@ -2744,71 +1695,12 @@ def run() -> None:
             subsystem="SYSTEM",
             commands=COMMANDS,
             subscriptions={
-                CLOCKS_FRAGMENT_TOPIC: on_clocks_fragment,
                 GNSS_ANNOUNCEMENT_TOPIC: on_gnss_announcement,
-                CLOCKS_MONITOR_TOPIC: on_clocks_monitor,
             },
             blocking=False,
         )
 
-        _set_campaign_detail_recovery_status(
-            "QUIET_DELAY",
-            "waiting for pubsub routing and Teensy initialization",
-        )
         startup_teensy_quiet_delay()
-
-        # SYSTEM restores the latest recoverable TEMPEST campaign_detail,
-        # independent of named campaign state. Keep the detail writer closed
-        # until this transaction has consumed the previous durable authority.
-        detail_writer_allowed = True
-        detail = _read_latest_tempest_state_detail()
-        detail_recoverable = bool(
-            detail is not None
-            and _monitor_restore_state(detail) is not None
-            and _monitor_gnss_raw_payload(detail) is not None
-        )
-        if detail_recoverable:
-            try:
-                assert detail is not None
-                _set_campaign_detail_recovery_status(
-                    "RESTORING",
-                    "restoring latest TEMPEST state detail and awaiting fresh proof",
-                    detail_sequence=detail.get("sequence"),
-                )
-                _recover_monitor_detail(detail)
-                _set_campaign_detail_recovery_status(
-                    "COMPLETE",
-                    "fresh CLOCKS proved restored clockfaces and statistics",
-                    detail_sequence=detail.get("sequence"),
-                )
-            except Exception:
-                detail_writer_allowed = False
-                _set_campaign_detail_recovery_status(
-                    "FAILED",
-                    "TEMPEST state-detail restore failed; durable detail preserved",
-                    detail_sequence=(detail.get("sequence") if detail else None),
-                )
-                logging.exception(
-                    "💥 [system/recovery] TEMPEST state-detail restore failed; preserving "
-                    "the latest durable campaign_detail and continuing with seeded state"
-                )
-        else:
-            _set_campaign_detail_recovery_status(
-                "NO_DETAIL",
-                "no structured-recoverable TEMPEST state detail; using live state",
-            )
-            logging.info(
-                "ℹ️ [system/recovery] no structured-recoverable TEMPEST campaign_detail; "
-                "starting from live MONITOR_FRAGMENT state"
-            )
-
-        if detail_writer_allowed:
-            _start_campaign_detail_writer()
-        else:
-            logging.warning(
-                "🧤 [system] campaign_detail writer held closed to preserve "
-                "the last recoverable detail after restore failure"
-            )
 
         threading.Thread(
             target=system_poller,
@@ -2816,7 +1708,10 @@ def run() -> None:
             name="system-poller",
         ).start()
 
-        logging.info("🏁 [system] entering main loop")
+        logging.info(
+            "🏁 [system] entering context-only main loop; CLOCKS owns its stream, "
+            "persistence, and holistic restore"
+        )
         while True:
             time.sleep(3600)
 
