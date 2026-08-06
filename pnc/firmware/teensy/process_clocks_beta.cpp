@@ -333,82 +333,6 @@ static const char* clocks_row_objection_reason_name(
   }
 }
 
-static void clocks_row_objection_format_reason(
-    char* out,
-    size_t out_size,
-    const clocks_row_objection_record_t& objection) {
-  if (!out || out_size == 0U) return;
-  if (objection.reason == clocks_row_objection_reason_t::ALPHA_CYCLE_EXCURSION) {
-    const bool injected =
-        objection.source == clocks_row_objection_source_t::BETA;
-    if (injected) {
-      snprintf(out, out_size,
-               "PPS %lu injected cycle excursion: lanes=0x%02lX "
-               "residual span=%lu cycles exceeds gate=%lu; "
-               "excluded from science/control",
-               (unsigned long)objection.detail0,
-               (unsigned long)objection.lane_mask,
-               (unsigned long)objection.detail1,
-               (unsigned long)objection.detail2);
-    } else {
-      snprintf(out, out_size,
-               "PPS %lu cycle excursion: lanes=0x%02lX cycle span=%lu cycles "
-               "exceeds gate=%lu (median=%ld); excluded from science/control",
-               (unsigned long)objection.detail0,
-               (unsigned long)objection.lane_mask,
-               (unsigned long)objection.detail1,
-               (unsigned long)objection.detail2,
-               (long)(int32_t)objection.detail3);
-    }
-    return;
-  }
-
-  if (objection.reason ==
-      clocks_row_objection_reason_t::ALPHA_CYCLE_INTERVAL_IMPLAUSIBLE) {
-    snprintf(out, out_size,
-             "PPS %lu implausible one-second interval: lanes=0x%02lX "
-             "min=%lu max=%lu cycles; excluded from science/control",
-             (unsigned long)objection.detail0,
-             (unsigned long)objection.lane_mask,
-             (unsigned long)objection.detail1,
-             (unsigned long)objection.detail2);
-    return;
-  }
-
-  if (objection.reason ==
-      clocks_row_objection_reason_t::BETA_RECOVERY_SCIENCE_HOLD) {
-    snprintf(out, out_size,
-             "PPS %lu recovery science hold: lanes=0x%02lX flags=0x%02lX; "
-             "persisted for audit and excluded from science/control",
-             (unsigned long)objection.detail0,
-             (unsigned long)objection.lane_mask,
-             (unsigned long)objection.detail1);
-    return;
-  }
-
-  if (objection.reason ==
-      clocks_row_objection_reason_t::BETA_ANTECEDENT_SCIENCE_HOLD) {
-    snprintf(out, out_size,
-             "PPS %lu antecedent science hold: prior PPS %lu had a rejected "
-             "endpoint in lanes=0x%02lX; persisted for audit and excluded "
-             "from science/control",
-             (unsigned long)objection.detail0,
-             (unsigned long)objection.detail1,
-             (unsigned long)objection.lane_mask);
-    return;
-  }
-
-  snprintf(out, out_size,
-           "%s: lane=0x%08lX detail0=%lu detail1=%lu detail2=%lu detail3=%lu; "
-           "excluded from Welford/TAU/PPB/servo",
-           clocks_row_objection_reason_name(objection.reason),
-           (unsigned long)objection.lane,
-           (unsigned long)objection.detail0,
-           (unsigned long)objection.detail1,
-           (unsigned long)objection.detail2,
-           (unsigned long)objection.detail3);
-}
-
 void clocks_row_exclude(clocks_row_objection_source_t source,
                         clocks_row_objection_reason_t reason,
                         uint32_t lane,
@@ -1061,27 +985,6 @@ static bool clocks_recovery_state_from_args(
 }
 
 
-static void clocks_recovery_state_snapshot(
-    clocks_fragment_restore_state_t& out,
-    const clocks_instrument_stats_snapshot_t& instrument,
-    uint64_t logical_gnss_ns,
-    uint64_t logical_dwt_cycles,
-    uint64_t logical_ocxo1_ns,
-    uint64_t logical_ocxo2_ns) {
-  out = clocks_fragment_restore_state_t{};
-  out.present = instrument.valid && logical_gnss_ns != 0ULL &&
-                logical_dwt_cycles != 0ULL && logical_ocxo1_ns != 0ULL &&
-                logical_ocxo2_ns != 0ULL;
-  out.schema_version = CLOCKS_STRUCTURED_RESTORE_VERSION;
-  out.instrument_gnss_ns = logical_gnss_ns;
-  out.instrument_dwt_cycles = logical_dwt_cycles;
-  out.instrument_ocxo1_ns = logical_ocxo1_ns;
-  out.instrument_ocxo2_ns = logical_ocxo2_ns;
-  clocks_fragment_stats_snapshot_from_instrument(out.stats, instrument);
-  clocks_fragment_dac_snapshot(out.dac);
-}
-
-
 struct clocks_report_build_guard_t {
   uint32_t prior_basepri = 0U;
   uint32_t begin_dwt = 0U;
@@ -1130,45 +1033,19 @@ static uint32_t g_flash_cut_last_boundary_pps_count = 0;
 static char     g_flash_cut_last_status[48] = {0};
 
 // ============================================================================
-// SYSTEM feature status — CLOCKS/Beta-owned readiness surfaces
+// Beta diagnostics initialization
 // ============================================================================
 //
-// These are publication/science-pipeline facts.  They remain observational;
-// START/ZERO/RECOVER do not use them as command-admission policy.
-
-static system_feature_status_t g_clocks_feature_science_residuals =
-    system_feature_status_t::ANOMALY;
-static system_feature_status_t g_clocks_feature_campaign_record =
-    system_feature_status_t::ANOMALY;
-
-static void clocks_beta_feature_set_cached(const char* feature,
-                                           system_feature_status_t& cached,
-                                           system_feature_status_t status,
-                                           bool force = false) {
-  if (force || cached != status || !system_feature_has("CLOCKS", feature)) {
-    (void)system_feature_set("CLOCKS", feature, status, nullptr);
-    cached = status;
-  }
-}
+// Campaign publication and science-residual readiness are lifecycle facts, not
+// ambient instrument prerequisites. They are intentionally absent from the
+// canonical CLOCKS feature tree; focused CLOCKS reports retain detailed state.
 
 static FLASHMEM void clocks_beta_cold_diagnostics_init(void);
 static bool g_clocks_beta_dmamem_initialized = false;
 
-static void clocks_beta_features_mark_initializing(void) {
-  clocks_beta_feature_set_cached("SCIENCE_RESIDUALS",
-                                 g_clocks_feature_science_residuals,
-                                 system_feature_status_t::INITIALIZING,
-                                 true);
-  clocks_beta_feature_set_cached("CAMPAIGN_RECORD_HANDOFF",
-                                 g_clocks_feature_campaign_record,
-                                 system_feature_status_t::INITIALIZING,
-                                 true);
-}
-
 void clocks_beta_features_init(void) {
   clocks_beta_cold_diagnostics_init();
-  memset(&g_clocks_fragment_campaign_record, 0,
-         sizeof(g_clocks_fragment_campaign_record));
+  g_clocks_fragment_campaign_record = clocks_fragment_campaign_snapshot_t{};
   g_clocks_fragment_campaign_record_pending = false;
   g_clocks_fragment_campaign_record_sequence = 0U;
   g_report_clocks_payload.clear();
@@ -1180,7 +1057,6 @@ void clocks_beta_features_init(void) {
   g_report_child_maturity.clear();
   g_report_child_admission.clear();
   g_report_child_dac.clear();
-  clocks_beta_features_mark_initializing();
 }
 
 // ============================================================================
@@ -2418,10 +2294,6 @@ static uint32_t clocks_row_lifecycle_science_hold_flags(void) {
 static void pps_interval_residuals_reset(void) {
   ocxo_science_totals_reset();
   g_science_residual_quarantine_remaining = 0;
-  clocks_beta_feature_set_cached("SCIENCE_RESIDUALS",
-                                 g_clocks_feature_science_residuals,
-                                 system_feature_status_t::INITIALIZING,
-                                 true);
 }
 
 static void pps_interval_residuals_begin_recover_quarantine(uint32_t rows) {
@@ -2495,12 +2367,6 @@ static pps_interval_residuals_t pps_interval_residuals_update(
     r.ocxo2_fast_residual_ns = ocxo2_science.fast_residual_ns;
   }
 
-  if (ocxo1_science.science_worthy &&
-      ocxo2_science.science_worthy) {
-    clocks_beta_feature_set_cached("SCIENCE_RESIDUALS",
-                                   g_clocks_feature_science_residuals,
-                                   system_feature_status_t::NOMINAL);
-  }
   return r;
 }
 
@@ -3813,10 +3679,6 @@ static FLASHMEM bool recover_reattach_degraded_science_hold_active(void) {
       g_recover_reattach_stalled
           ? "degraded_publication_science_stalled"
           : "degraded_publication_science_initializing");
-  clocks_beta_feature_set_cached("SCIENCE_RESIDUALS",
-                                 g_clocks_feature_science_residuals,
-                                 system_feature_status_t::INITIALIZING,
-                                 true);
   return true;
 }
 
@@ -3867,10 +3729,6 @@ static FLASHMEM bool science_residual_quarantine_apply(
   ocxo_science_row_suppress_for_recover_hold(ocxo1_science);
   ocxo_science_row_suppress_for_recover_hold(ocxo2_science);
 
-  clocks_beta_feature_set_cached("SCIENCE_RESIDUALS",
-                                 g_clocks_feature_science_residuals,
-                                 system_feature_status_t::INITIALIZING,
-                                 true);
   return true;
 }
 
@@ -5050,11 +4908,11 @@ static FLASHMEM clocks_fragment_ppb_buckets_snapshot_t clocks_fragment_ppb_bucke
 }
 
 static void clocks_fragment_campaign_ppb_set(
-    clocks_fragment_stats_clock_snapshot_t& clock,
+    clocks_fragment_ppb_value_snapshot_t& out,
     uint64_t sample_count,
     double ppb) {
-  clock.ppb_buckets.campaign.sample_count = sample_count;
-  clock.ppb_buckets.campaign.ppb = sample_count != 0ULL ? ppb : 0.0;
+  out.sample_count = sample_count;
+  out.ppb = sample_count != 0ULL ? ppb : 0.0;
 }
 
 static double clocks_fragment_campaign_dwt_ppb(uint64_t gnss_ns,
@@ -5064,16 +4922,16 @@ static double clocks_fragment_campaign_dwt_ppb(uint64_t gnss_ns,
   return ((double)dwt_cycles / expected_cycles - 1.0) * 1.0e9;
 }
 
-static void clocks_fragment_stats_apply_campaign_ppb(
-    clocks_fragment_stats_snapshot_t& stats,
+static void clocks_fragment_campaign_stats_snapshot(
+    clocks_fragment_campaign_stats_snapshot_t& stats,
     uint64_t sample_count,
     uint64_t gnss_ns,
     uint64_t dwt_cycles,
     uint64_t ocxo1_ns,
     uint64_t ocxo2_ns) {
+  stats = clocks_fragment_campaign_stats_snapshot_t{};
   if (sample_count == 0ULL || gnss_ns == 0ULL) return;
 
-  // GNSS and VCLOCK are the campaign reference identity.
   clocks_fragment_campaign_ppb_set(stats.gnss, sample_count, 0.0);
   clocks_fragment_campaign_ppb_set(stats.vclock, sample_count, 0.0);
 
@@ -5130,7 +4988,7 @@ clocks_fragment_tau_recovery_snapshot(
 static FLASHMEM void clocks_fragment_stats_snapshot_from_instrument(
     clocks_fragment_stats_snapshot_t& out,
     const clocks_instrument_stats_snapshot_t& instrument) {
-  memset(&out, 0, sizeof(out));
+  out = clocks_fragment_stats_snapshot_t{};
   out.snapshot_ok = instrument.snapshot_ok;
   out.valid = instrument.valid;
   out.reset_count = instrument.reset_count;
@@ -5175,22 +5033,6 @@ static FLASHMEM void clocks_fragment_stats_snapshot_from_instrument(
   out.ocxo2_tau_state = clocks_fragment_tau_recovery_snapshot(
       instrument.ocxo2_tau_state);
 
-  out.maturity_gnss_samples = instrument.gnss_welford.n;
-  out.maturity_dwt_samples = instrument.dwt_frequency.sample_count;
-  out.maturity_vclock_samples = instrument.vclock_frequency.sample_count;
-  out.maturity_vclock_intervals = instrument.vclock_frequency.interval_count;
-  out.maturity_ocxo1_samples = instrument.ocxo1_frequency.sample_count;
-  out.maturity_ocxo1_intervals = instrument.ocxo1_frequency.interval_count;
-  out.maturity_ocxo1_stderr_ppb = instrument.ocxo1_frequency.stderr_ppb;
-  out.maturity_ocxo2_samples = instrument.ocxo2_frequency.sample_count;
-  out.maturity_ocxo2_intervals = instrument.ocxo2_frequency.interval_count;
-  out.maturity_ocxo2_stderr_ppb = instrument.ocxo2_frequency.stderr_ppb;
-
-  out.interval_min_cycles = CLOCKS_DELTA_RAW_INTERVAL_MIN_CYCLES;
-  out.interval_max_cycles = CLOCKS_DELTA_RAW_INTERVAL_MAX_CYCLES;
-  out.vclock_reject_count = instrument.vclock_interval_reject_count;
-  out.ocxo1_reject_count = instrument.ocxo1_interval_reject_count;
-  out.ocxo2_reject_count = instrument.ocxo2_interval_reject_count;
   out.ocxo1_dac = clocks_fragment_welford_snapshot(instrument.ocxo1_dac_welford);
   out.ocxo2_dac = clocks_fragment_welford_snapshot(instrument.ocxo2_dac_welford);
 }
@@ -6464,7 +6306,7 @@ static FLASHMEM void clocks_fragment_raw_cycles_snapshot(
     const clocks_alpha_lane_forensics_t& vclock_forensics,
     const clocks_alpha_lane_forensics_t& ocxo1_forensics,
     const clocks_alpha_lane_forensics_t& ocxo2_forensics) {
-  memset(&out, 0, sizeof(out));
+  out = clocks_fragment_raw_cycles_snapshot_t{};
   clocks_fragment_raw_cycles_lane_snapshot(out.pps, pps, true, pps_delay);
   clocks_fragment_raw_cycles_lane_snapshot(
       out.vclock, vclock, vclock_forensics.snapshot_ok,
@@ -6738,10 +6580,6 @@ static double servo_total_recent_stderr(const servo_total_state_t& state) {
 static constexpr double SERVO_NOW_FILTER_ALPHA = 1.00;
 static constexpr double SERVO_NOW_GAIN = 1.00;
 static constexpr double SERVO_NOW_DEADBAND_PPB = 0.5;
-
-static double servo_total_ppb_from_tau(double tau) {
-  return (tau - 1.0) * 1.0e9;
-}
 
 static double servo_clamp(double value, double limit) {
   if (value > limit) return limit;
@@ -7039,10 +6877,6 @@ static void campaign_accounting_reset_common() {
 
   campaign_public_offsets_reset_to_current();
   pps_interval_residuals_reset();
-  clocks_beta_feature_set_cached("CAMPAIGN_RECORD_HANDOFF",
-                                 g_clocks_feature_campaign_record,
-                                 system_feature_status_t::INITIALIZING,
-                                 true);
 
   // These are row-presentation diagnostics, not controller memory.
   servo_input_diag_reset(g_servo_input_ocxo1);
@@ -7676,11 +7510,6 @@ static FLASHMEM void clocks_fragment_dac_lane_snapshot(
   out.hw_code = dac.dac_hw_code;
   out.readback_valid = dac.hw_readback_valid;
   out.readback_code = dac.hw_readback_code;
-  out.active = dac.dither_active_this_frame;
-  out.low_code = dac.dither_low_code;
-  out.high_code = dac.dither_high_code;
-  out.high_ms = dac.dither_high_ms;
-  out.phase_high = dac.dither_current_phase_high;
   out.servo_last_step = dac.servo_last_step;
   out.servo_last_residual = dac.servo_last_residual;
   out.servo_settle_count = dac.servo_settle_count;
@@ -7695,7 +7524,7 @@ static FLASHMEM void clocks_fragment_dac_lane_snapshot(
 
 static FLASHMEM void clocks_fragment_dac_snapshot(
     clocks_fragment_dac_snapshot_t& out) {
-  memset(&out, 0, sizeof(out));
+  out = clocks_fragment_dac_snapshot_t{};
   clocks_fragment_copy_text(out.servo_mode,
                            sizeof(out.servo_mode),
                            servo_mode_str(calibrate_ocxo_mode));
@@ -7704,9 +7533,6 @@ static FLASHMEM void clocks_fragment_dac_snapshot(
                            sizeof(out.realization_mode),
                            ocxo_dac_realization_mode_runtime());
   out.dither_operator_enabled = clocks_ocxo_dac_dither_operator_enabled();
-  out.servo_request_pending =
-      ocxo1_dac.pacing_pending || ocxo2_dac.pacing_pending;
-  out.actuator_service_pending = clocks_ocxo_dac_actuator_service_pending();
   clocks_fragment_dac_lane_snapshot(out.ocxo1, ocxo1_dac);
   clocks_fragment_dac_lane_snapshot(out.ocxo2, ocxo2_dac);
 }
@@ -7739,18 +7565,12 @@ static FLASHMEM void clocks_fragment_refresh_prediction_snapshots(void) {
 
 static FLASHMEM void clocks_fragment_live_snapshot_fill(
     clocks_fragment_live_snapshot_t& out) {
-  memset(&out, 0, sizeof(out));
+  out = clocks_fragment_live_snapshot_t{};
   g_beta_clocks_fragment_instrument_stats = clocks_instrument_stats_snapshot_t{};
   out.snapshot_ok = clocks_alpha_instrument_stats_snapshot(
       &g_beta_clocks_fragment_instrument_stats);
   const clocks_instrument_stats_snapshot_t& instrument =
       g_beta_clocks_fragment_instrument_stats;
-
-  const bool campaign_bound =
-      campaign_state != clocks_campaign_state_t::STOPPED &&
-      campaign_name[0] != '\0';
-  const bool campaign_presentation_ready =
-      campaign_bound && campaign_seconds > 0ULL;
 
   const uint64_t logical_instrument_gnss_ns =
       instrument_continuity_gnss_ns(instrument.gnss_ns);
@@ -7767,64 +7587,6 @@ static FLASHMEM void clocks_fragment_live_snapshot_fill(
   out.instrument_age_seconds =
       (uint32_t)(logical_instrument_gnss_ns / CLOCKS_BETA_NS_PER_SECOND);
 
-  clocks_fragment_copy_text(out.campaign_state,
-                           sizeof(out.campaign_state),
-                           clocks_campaign_state_name(campaign_state));
-  out.recording = campaign_state == clocks_campaign_state_t::STARTED;
-  out.campaign_present = campaign_bound;
-  clocks_fragment_copy_text(out.campaign,
-                           sizeof(out.campaign),
-                           campaign_bound ? campaign_name : "");
-  clocks_fragment_copy_text(out.last_campaign,
-                           sizeof(out.last_campaign),
-                           campaign_name);
-  out.campaign_seconds = campaign_seconds;
-  out.campaign_presentation_ready = campaign_presentation_ready;
-  clocks_fragment_copy_text(
-      out.presentation_mode,
-      sizeof(out.presentation_mode),
-      campaign_presentation_ready
-          ? "CAMPAIGN"
-          : (campaign_bound ? "CAMPAIGN_ARMING" : "INSTRUMENT"));
-  clocks_fragment_copy_text(
-      out.presentation_basis,
-      sizeof(out.presentation_basis),
-      campaign_presentation_ready
-          ? "CAMPAIGN_RELATIVE"
-          : (g_instrument_continuity_active
-                 ? "RESTORED_INSTRUMENT_CONTINUITY"
-                 : "ALPHA_SERVICE_EPOCH"));
-  out.presentation_clockfaces_zeroed = campaign_presentation_ready;
-
-  out.presentation_gnss_ns = campaign_presentation_ready
-      ? campaign_public_from_offset(
-            instrument.gnss_ns, g_campaign_public_gnss_offset)
-      : logical_instrument_gnss_ns;
-  out.presentation_dwt_cycles = campaign_presentation_ready
-      ? campaign_public_from_offset(
-            instrument.dwt_cycles, g_campaign_public_dwt_offset)
-      : logical_instrument_dwt_cycles;
-
-  // Alpha's coherent snapshot carries public-origin-normalized OCXO values.
-  // Use the matching measured/public offsets for the live presentation species;
-  // the raw CounterLedger/PhaseLedger offsets remain campaign-record authority.
-  out.presentation_ocxo1_ns = campaign_presentation_ready
-      ? campaign_public_from_offset(
-            instrument.ocxo1_ns, g_campaign_public_ocxo1_measured_offset)
-      : logical_instrument_ocxo1_ns;
-  out.presentation_ocxo2_ns = campaign_presentation_ready
-      ? campaign_public_from_offset(
-            instrument.ocxo2_ns, g_campaign_public_ocxo2_measured_offset)
-      : logical_instrument_ocxo2_ns;
-  out.presentation_count = (uint32_t)(
-      out.presentation_gnss_ns / CLOCKS_BETA_NS_PER_SECOND);
-  out.timeline_valid = instrument.valid &&
-      out.presentation_gnss_ns != 0ULL &&
-      out.presentation_dwt_cycles != 0ULL;
-  out.ocxo_clockface_valid = instrument.valid &&
-      out.presentation_ocxo1_ns != 0ULL &&
-      out.presentation_ocxo2_ns != 0ULL;
-
   out.instrument_gnss_ns = logical_instrument_gnss_ns;
   out.instrument_dwt_cycles = logical_instrument_dwt_cycles;
   out.instrument_ocxo1_ns = logical_instrument_ocxo1_ns;
@@ -7834,11 +7596,6 @@ static FLASHMEM void clocks_fragment_live_snapshot_fill(
   out.dwt_cycles_per_second = instrument.dwt_cycles_per_second;
   out.dwt_at_pps_vclock = instrument.dwt_at_pps_vclock;
   out.counter32_at_pps_vclock = instrument.counter32_at_pps_vclock;
-  out.selected_reference_interval_cycles =
-      instrument.selected_reference_interval_cycles;
-  out.vclock_interval_cycles = instrument.vclock_interval_cycles;
-  out.ocxo1_interval_cycles = instrument.ocxo1_interval_cycles;
-  out.ocxo2_interval_cycles = instrument.ocxo2_interval_cycles;
 
   clocks_fragment_refresh_prediction_snapshots();
   clocks_fragment_raw_cycles_snapshot(
@@ -7852,37 +7609,28 @@ static FLASHMEM void clocks_fragment_live_snapshot_fill(
       g_beta_clocks_fragment_ocxo1_forensics,
       g_beta_clocks_fragment_ocxo2_forensics);
   clocks_fragment_stats_snapshot_from_instrument(out.stats, instrument);
-  if (campaign_presentation_ready) {
-    clocks_fragment_stats_apply_campaign_ppb(
-        out.stats,
-        campaign_seconds,
-        out.presentation_gnss_ns,
-        out.presentation_dwt_cycles,
-        out.presentation_ocxo1_ns,
-        out.presentation_ocxo2_ns);
-  }
   clocks_fragment_dac_snapshot(out.dac);
-  clocks_recovery_state_snapshot(
-      out.restore_state,
-      instrument,
-      logical_instrument_gnss_ns,
-      logical_instrument_dwt_cycles,
-      logical_instrument_ocxo1_ns,
-      logical_instrument_ocxo2_ns);
 }
 
 FLASHMEM bool clocks_fragment_snapshot_take(
     uint32_t completed_second_sequence,
     clocks_fragment_snapshot_t* out) {
   if (!out) return false;
-  memset(out, 0, sizeof(*out));
+  *out = clocks_fragment_snapshot_t{};
   clocks_fragment_live_snapshot_fill(out->live);
+
+  // Publication-custody metadata only. This preserves the old rule that, once
+  // public campaign time is already advancing, SYSTEM must wait for the exact
+  // matching campaign delta before releasing this physical second.
+  out->campaign_row_expected =
+      campaign_state != clocks_campaign_state_t::STOPPED &&
+      campaign_name[0] != '\0' &&
+      campaign_seconds > 0ULL;
 
   if (g_clocks_fragment_campaign_record_pending &&
       g_clocks_fragment_campaign_record_sequence == completed_second_sequence) {
     out->campaign = g_clocks_fragment_campaign_record;
-    memset(&g_clocks_fragment_campaign_record, 0,
-           sizeof(g_clocks_fragment_campaign_record));
+    g_clocks_fragment_campaign_record = clocks_fragment_campaign_snapshot_t{};
     g_clocks_fragment_campaign_record_pending = false;
     g_clocks_fragment_campaign_record_sequence = 0U;
     g_clocks_fragment_campaign_record_take_count++;
@@ -7919,6 +7667,14 @@ static FLASHMEM void publish_dac_tick(const char*) {
 void clocks_beta_pps(uint32_t completed_pps_sequence) {
   clocks_stack_witness_note_hot(CLOCKS_STACK_CONTEXT_BETA_PPS_ENTRY);
   campaign_record_stage(CAMPAIGN_RECORD_STAGE_ENTRY);
+
+  // Alpha enters Beta only after both post-PPS OCXO lanes have frozen this exact
+  // completed row. Wake SYSTEM's PPS-triggered serializer now that the requested
+  // identity is genuinely available. Campaign rows may still hold publication
+  // below until their matching enrichment is frozen.
+  if (completed_pps_sequence != 0U) {
+    system_clocks_fragment_pps_tick(completed_pps_sequence);
+  }
 
   if (request_stop) {
     campaign_record_stage(CAMPAIGN_RECORD_STAGE_STOP_GATE);
@@ -8519,10 +8275,6 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
     ocxo2_science.science_worthy = false;
     g_row_objection_last_public_count = public_count;
     g_row_objection_last = candidate_objection;
-    clocks_beta_feature_set_cached("SCIENCE_RESIDUALS",
-                                   g_clocks_feature_science_residuals,
-                                   system_feature_status_t::ANOMALY,
-                                   true);
   }
 
   // Four local observed-interval snapshots feed raw_cycles.  The prior
@@ -8765,7 +8517,7 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   }
 
   clocks_fragment_campaign_snapshot_t& record = g_clocks_fragment_campaign_record;
-  memset(&record, 0, sizeof(record));
+  record = clocks_fragment_campaign_snapshot_t{};
   record.present = true;
   record.completed_second_sequence = completed_pps_sequence;
   clocks_fragment_copy_text(record.campaign,
@@ -8781,17 +8533,12 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
                            candidate_science_excluded
                                ? "SCIENCE_EXCLUDE"
                                : "ACCEPT");
-  clocks_fragment_copy_text(record.servo_mode,
-                           sizeof(record.servo_mode),
-                           servo_mode_str(calibrate_ocxo_mode));
   record.timeline_valid = recover_timeline_ready;
   record.ocxo_clockface_valid = recover_clockface_ready;
   record.ocxo_science_valid = recover_science_ready &&
                               !candidate_science_excluded;
   record.science_eligible = !candidate_science_excluded;
   record.control_eligible = !candidate_science_excluded;
-  record.persist = true;
-  record.science_excluded = candidate_science_excluded;
 
   if (candidate_science_excluded) {
     record.rejection.present = true;
@@ -8800,25 +8547,12 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
         record.rejection.reason_name,
         sizeof(record.rejection.reason_name),
         clocks_row_objection_reason_name(candidate_objection.reason));
-    clocks_row_objection_format_reason(
-        record.rejection.reason,
-        sizeof(record.rejection.reason),
-        candidate_objection);
     clocks_fragment_copy_text(
         record.rejection.source,
         sizeof(record.rejection.source),
         clocks_row_objection_source_name(candidate_objection.source));
-    record.rejection.lane = candidate_objection.lane;
-    record.rejection.detail0 = candidate_objection.detail0;
-    record.rejection.detail1 = candidate_objection.detail1;
-    record.rejection.detail2 = candidate_objection.detail2;
-    record.rejection.detail3 = candidate_objection.detail3;
-    record.rejection.reject_mask =
+    record.rejection.lane_mask =
         ocxo_science_invalid_mask | candidate_objection.lane_mask;
-    record.rejection.objection_count =
-        candidate_objection.objection_count != 0U
-            ? candidate_objection.objection_count
-            : 1U;
   }
 
   // Recovery testimony remains conditional so ordinary steady-state records do
@@ -8840,49 +8574,17 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
     record.recovery.timeline_ready = recover_timeline_ready;
     record.recovery.clockface_ready = recover_clockface_ready;
     record.recovery.science_ready = recover_science_ready;
-    record.recovery.ocxo1_clockface_ready = ocxo1_clockface_valid;
-    record.recovery.ocxo2_clockface_ready = ocxo2_clockface_valid;
-    record.recovery.ocxo1_science_ready =
-        ocxo1_science.valid && ocxo1_science.antecedents_complete;
-    record.recovery.ocxo2_science_ready =
-        ocxo2_science.valid && ocxo2_science.antecedents_complete;
     record.recovery.science_quarantine_active =
         recover_science_quarantine_applied ||
         g_science_residual_quarantine_remaining != 0U;
     record.recovery.science_quarantine_remaining =
         g_science_residual_quarantine_remaining;
-    record.recovery.no_progress_rows =
-        g_recover_reattach_no_progress_row_count;
-    record.recovery.last_progress_public_count =
-        g_recover_reattach_last_progress_public_count;
-    record.recovery.reattach_active = g_recover_reattach_active;
     record.recovery.degraded_active = g_recover_reattach_degraded_active;
-    record.recovery.degraded_science_hold = recover_degraded_science_hold;
     record.recovery.reattach_stalled = g_recover_reattach_stalled;
-    clocks_fragment_copy_text(
-        record.recovery.reattach_reason,
-        sizeof(record.recovery.reattach_reason),
-        g_recover_reattach_last_reason);
   }
 
-  record.dwt_cycle_count_total = public_dwt_total;
-  record.dwt_cycles_between_pps_vclock =
-      (uint32_t)g_dwt_cycles_between_pps_vclock;
-  record.dwt_at_pps_vclock = (uint32_t)g_dwt_at_pps_vclock;
-  record.counter32_at_pps_vclock = (uint32_t)g_counter32_at_pps_vclock;
-  clocks_fragment_raw_cycles_snapshot(
-      record.raw_cycles,
-      g_beta_pps_cycle_prediction,
-      g_beta_vclock_cycle_prediction,
-      g_beta_ocxo1_cycle_prediction,
-      g_beta_ocxo2_cycle_prediction,
-      g_pps_witness_diag.interrupt_delay,
-      g_beta_pps_vclock_forensics,
-      g_beta_pps_ocxo1_forensics,
-      g_beta_pps_ocxo2_forensics);
-
+  record.dwt_cycles = public_dwt_total;
   record.ocxo1_ns = public_ocxo1_ns;
-  record.ocxo1_clockface_valid = ocxo1_clockface_valid;
   clocks_fragment_clock_candidates_snapshot_from_row(
       record.ocxo1_clock_candidates,
       g_delta_clock_candidate_ocxo1,
@@ -8894,7 +8596,6 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   clocks_fragment_science_snapshot_from_row(
       record.ocxo1_science, ocxo1_science);
   record.ocxo2_ns = public_ocxo2_ns;
-  record.ocxo2_clockface_valid = ocxo2_clockface_valid;
   clocks_fragment_clock_candidates_snapshot_from_row(
       record.ocxo2_clock_candidates,
       g_delta_clock_candidate_ocxo2,
@@ -8906,27 +8607,13 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   clocks_fragment_science_snapshot_from_row(
       record.ocxo2_science, ocxo2_science);
 
-  if (!instrument_stats_ready) {
-    g_beta_instrument_stats = clocks_instrument_stats_snapshot_t{};
-    const bool instrument_stats_snapshot_ok =
-        clocks_alpha_instrument_stats_snapshot(&g_beta_instrument_stats);
-    instrument_stats_ready =
-        instrument_stats_snapshot_ok && g_beta_instrument_stats.valid;
-  }
-  clocks_fragment_stats_snapshot_from_instrument(
-      record.stats, g_beta_instrument_stats);
-  clocks_fragment_stats_apply_campaign_ppb(
+  clocks_fragment_campaign_stats_snapshot(
       record.stats,
       public_count,
       public_gnss_ns,
       public_dwt_total,
       public_ocxo1_ns,
       public_ocxo2_ns);
-
-  // DAC/servo state is scientific context regardless of whether a servo is
-  // active. Campaigns observe it; they never own it.
-  record.dac_present = true;
-  clocks_fragment_dac_snapshot(record.dac);
 
   clocks_stack_witness_note_hot(CLOCKS_STACK_CONTEXT_BETA_PPS_PUBLISH);
   g_clocks_fragment_campaign_record_sequence = completed_pps_sequence;
@@ -8944,10 +8631,6 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   // lets SYSTEM replace that stale arm before the next campaign candidate exists.
   clocks_fragment_campaign_record_ready_retry_arm();
 
-  clocks_beta_feature_set_cached("CAMPAIGN_RECORD_HANDOFF",
-                                 g_clocks_feature_campaign_record,
-                                 system_feature_status_t::NOMINAL,
-                                 true);
   clocks_watchdog_arm_campaign_publication();
 }
 

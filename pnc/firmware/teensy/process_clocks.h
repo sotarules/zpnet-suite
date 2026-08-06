@@ -313,30 +313,28 @@ bool clocks_alpha_tau_snapshot(time_clock_id_t clock,
 // -----------------------------------------------------------------------------
 //
 // CLOCKS owns measurement, campaign lifecycle, and scientific verdicts. SYSTEM
-// owns the complete CLOCKS_FRAGMENT wire schema. The structures below contain
-// immutable domain facts only: no Payload objects, field names, or nested
-// serialized fragments cross the subsystem boundary.
+// owns the CLOCKS_FRAGMENT wire schema.  This handoff is deliberately normalized:
+// one fact has one typed home before serialization.
+//
+//   live     = always-on instrument truth for one completed physical second
+//   campaign = optional campaign-relative state and TEMPEST-only interpretation
+//
+// Campaign state must not clone live raw cycles, DAC/control state, lifetime
+// statistics, or instrument clockfaces.  Recovery consumes the same canonical
+// live state; there is no parallel restore-state mirror.
 //
 // clocks_fragment_snapshot_take() returns whether the typed handoff package was
-// constructed.  live.snapshot_ok separately reports whether Alpha supplied a
-// coherent live instrument snapshot; SYSTEM may therefore publish explicit
-// unavailability instead of suppressing the heartbeat.  If Beta has completed
-// a public campaign record for the requested sequence, that record is copied
-// into campaign and atomically consumed. A later SYSTEM publication therefore
-// cannot accidentally combine campaign facts from different completed seconds.
+// constructed. live.snapshot_ok separately reports whether Alpha supplied a
+// coherent live instrument snapshot. If Beta has completed a public campaign
+// record for the requested sequence, that campaign-only record is copied into
+// campaign and atomically consumed.
 
 static constexpr size_t CLOCKS_FRAGMENT_CAMPAIGN_NAME_MAX = 64U;
 static constexpr size_t CLOCKS_FRAGMENT_STATE_NAME_MAX = 40U;
-static constexpr size_t CLOCKS_FRAGMENT_REASON_MAX = 160U;
-static constexpr size_t CLOCKS_FRAGMENT_DELAY_NAME_MAX = 40U;
 
 struct clocks_fragment_welford_snapshot_t {
   uint64_t n = 0;
   double mean = 0.0;
-
-  // Hidden sufficient statistic required for exact resurrection.  stddev and
-  // stderr remain the operator-facing derived values; m2 lets a restored
-  // accumulator continue without manufacturing a new population.
   double m2 = 0.0;
   double stddev = 0.0;
   double stderr_value = 0.0;
@@ -344,10 +342,8 @@ struct clocks_fragment_welford_snapshot_t {
   double max = 0.0;
 };
 
-// Complete Alpha TAU estimator state.  CLOCKS persists this verbatim so the
-// Pi can restore the instrument after a non-campaign reboot without reducing a
-// mature slope estimator to its displayed tau/ppb result.  Seqlock state and
-// other transient writer custody are intentionally excluded.
+// Stable Alpha TAU sufficient state required for exact resurrection.  Transient
+// writer/seqlock state is intentionally excluded.
 struct clocks_fragment_tau_recovery_snapshot_t {
   bool valid = false;
   uint32_t reset_count = 0;
@@ -375,24 +371,19 @@ struct clocks_fragment_tau_recovery_snapshot_t {
   double interval_m2_ppb = 0.0;
 };
 
-// One explicitly named PPB population. A zero sample count means that the
-// population is not yet available; numeric zero remains a legitimate PPB value.
 struct clocks_fragment_ppb_value_snapshot_t {
   uint64_t sample_count = 0;
   double ppb = 0.0;
 };
 
-// Always-on rolling frequency views plus the two long-lived scopes. TOTAL is
-// the authoritative boot/statistics-reset population. CAMP is populated only
-// while a campaign is active. The legacy scalar tau/ppb fields below remain
-// aliases of TOTAL so baseline and control consumers retain their meaning.
+// Instrument-owned PPB populations only. Campaign PPB is intentionally absent;
+// campaign-relative frequency belongs in clocks_fragment_campaign_snapshot_t.
 struct clocks_fragment_ppb_buckets_snapshot_t {
   clocks_fragment_ppb_value_snapshot_t minute_10{};
   clocks_fragment_ppb_value_snapshot_t minute_60{};
   clocks_fragment_ppb_value_snapshot_t hour_8{};
   clocks_fragment_ppb_value_snapshot_t hour_24{};
   clocks_fragment_ppb_value_snapshot_t total{};
-  clocks_fragment_ppb_value_snapshot_t campaign{};
 };
 
 struct clocks_fragment_stats_clock_snapshot_t {
@@ -403,6 +394,9 @@ struct clocks_fragment_stats_clock_snapshot_t {
   clocks_fragment_ppb_buckets_snapshot_t ppb_buckets{};
 };
 
+// Canonical always-on statistics. Derived maturity aliases and interval-admission
+// flight-recorder counters are intentionally omitted; Welford/TAU state already
+// carries the information needed by dashboards and exact restore.
 struct clocks_fragment_stats_snapshot_t {
   bool snapshot_ok = false;
   bool valid = false;
@@ -418,32 +412,17 @@ struct clocks_fragment_stats_snapshot_t {
   clocks_fragment_stats_clock_snapshot_t ocxo2{};
   clocks_fragment_stats_clock_snapshot_t pps_witness{};
 
-  // Raw always-on OCXO frequency estimators.  These are persistence state, not
-  // a second scientific authority; the displayed frequency fields above remain
-  // the canonical read surface.
   clocks_fragment_tau_recovery_snapshot_t ocxo1_tau_state{};
   clocks_fragment_tau_recovery_snapshot_t ocxo2_tau_state{};
-
-  uint64_t maturity_gnss_samples = 0;
-  uint64_t maturity_dwt_samples = 0;
-  uint64_t maturity_vclock_samples = 0;
-  uint64_t maturity_vclock_intervals = 0;
-  uint64_t maturity_ocxo1_samples = 0;
-  uint64_t maturity_ocxo1_intervals = 0;
-  double maturity_ocxo1_stderr_ppb = 0.0;
-  uint64_t maturity_ocxo2_samples = 0;
-  uint64_t maturity_ocxo2_intervals = 0;
-  double maturity_ocxo2_stderr_ppb = 0.0;
-
-  uint32_t interval_min_cycles = 0;
-  uint32_t interval_max_cycles = 0;
-  uint32_t vclock_reject_count = 0;
-  uint32_t ocxo1_reject_count = 0;
-  uint32_t ocxo2_reject_count = 0;
 
   clocks_fragment_welford_snapshot_t ocxo1_dac{};
   clocks_fragment_welford_snapshot_t ocxo2_dac{};
 };
+
+// raw_cycles is the permanent compact sanity-check surface.  Keep the integrated
+// delay verdict with each rail; deeper interrupt/Alpha forensic transcripts do
+// not belong in the 1 Hz canonical handoff.
+static constexpr size_t CLOCKS_FRAGMENT_DELAY_NAME_MAX = 40U;
 
 struct clocks_fragment_raw_cycles_lane_t {
   bool snapshot_ok = false;
@@ -470,28 +449,19 @@ struct clocks_fragment_raw_cycles_snapshot_t {
   clocks_fragment_raw_cycles_lane_t ocxo2{};
 };
 
+// Durable DAC/control knowledge. In-flight request/service bookkeeping is not
+// persistent instrument state and is intentionally absent.
 struct clocks_fragment_dither_lane_t {
   double value = 0.0;
   uint16_t hw_code = 0;
   bool readback_valid = false;
   uint16_t readback_code = 0;
-  bool active = false;
-  uint16_t low_code = 0;
-  uint16_t high_code = 0;
-  uint16_t high_ms = 0;
-  bool phase_high = false;
 
-  // Stable servo knowledge that must survive reboot.  Pending requests,
-  // quarantine counters, and in-flight hardware service state are deliberately
-  // absent because they are transient custody, not durable instrument memory.
   double servo_last_step = 0.0;
   double servo_last_residual = 0.0;
   uint32_t servo_settle_count = 0;
   uint32_t servo_adjustments = 0;
 
-  // Mode-shared telemetry.  In TOTAL, the historical predictor names carry the
-  // cascaded position/rate transcript: newest residual, recent residual mean,
-  // requested live rate, and resulting live-rate error respectively.
   bool servo_predictor_initialized = false;
   double servo_last_raw_residual = 0.0;
   double servo_filtered_residual = 0.0;
@@ -505,16 +475,12 @@ struct clocks_fragment_dac_snapshot_t {
   bool servo_active = false;
   char realization_mode[CLOCKS_FRAGMENT_STATE_NAME_MAX] = {0};
   bool dither_operator_enabled = false;
-  bool servo_request_pending = false;
-  bool actuator_service_pending = false;
   clocks_fragment_dither_lane_t ocxo1{};
   clocks_fragment_dither_lane_t ocxo2{};
 };
 
-// Two independent OCXO clock constructions carried in every campaign row.
-// CounterLedger/PhaseLedger remains the initial published authority; Delta Cycles
-// advances a separate campaign clock from the same-row differential residual.
-// Neither candidate repairs or overwrites the other.
+// TEMPEST-specific independent clock constructions.  These remain campaign
+// interpretation, not a duplicate of the canonical instrument clockface.
 enum class clocks_fragment_clock_candidate_status_t : uint8_t {
   UNAVAILABLE        = 0,
   SEEDED             = 1,
@@ -563,21 +529,18 @@ struct clocks_fragment_science_snapshot_t {
   int64_t delta_raw_fast_residual_cycles = 0;
 };
 
+// Minimal exclusion testimony: enough to explain a non-science row without
+// transporting the historical courtroom transcript.
 struct clocks_fragment_rejection_snapshot_t {
   bool present = false;
   uint32_t reason_code = 0;
   char reason_name[CLOCKS_FRAGMENT_STATE_NAME_MAX] = {0};
-  char reason[CLOCKS_FRAGMENT_REASON_MAX] = {0};
   char source[CLOCKS_FRAGMENT_STATE_NAME_MAX] = {0};
-  uint32_t lane = 0;
-  uint32_t detail0 = 0;
-  uint32_t detail1 = 0;
-  uint32_t detail2 = 0;
-  uint32_t detail3 = 0;
-  uint32_t reject_mask = 0;
-  uint32_t objection_count = 0;
+  uint32_t lane_mask = 0;
 };
 
+// Only recovery state that changes interpretation/admission of this public row.
+// Historical counters, per-lane mirrors, and narrative strings stay on reports.
 struct clocks_fragment_recovery_snapshot_t {
   bool present = false;
   uint32_t generation = 0;
@@ -585,35 +548,20 @@ struct clocks_fragment_recovery_snapshot_t {
   bool timeline_ready = false;
   bool clockface_ready = false;
   bool science_ready = false;
-  bool ocxo1_clockface_ready = false;
-  bool ocxo2_clockface_ready = false;
-  bool ocxo1_science_ready = false;
-  bool ocxo2_science_ready = false;
+  bool degraded_active = false;
   bool science_quarantine_active = false;
   uint32_t science_quarantine_remaining = 0;
-  uint32_t no_progress_rows = 0;
-  uint32_t last_progress_public_count = 0;
-  bool reattach_active = false;
-  bool degraded_active = false;
-  bool degraded_science_hold = false;
   bool reattach_stalled = false;
-  char reattach_reason[CLOCKS_FRAGMENT_REASON_MAX] = {0};
 };
 
-// Human-readable sufficient state for cold instrument resurrection.  Every
-// floating quantity is published through Payload fixed-decimal JSON numbers;
-// no opaque binary representation exists at any layer.
-struct clocks_fragment_restore_state_t {
-  bool present = false;
-  uint32_t schema_version = 2;
-
-  uint64_t instrument_gnss_ns = 0;
-  uint64_t instrument_dwt_cycles = 0;
-  uint64_t instrument_ocxo1_ns = 0;
-  uint64_t instrument_ocxo2_ns = 0;
-
-  clocks_fragment_stats_snapshot_t stats{};
-  clocks_fragment_dac_snapshot_t dac{};
+// Campaign-relative PPB is a genuine different scope from instrument TOTAL and
+// rolling populations, so it has a separate canonical home here.
+struct clocks_fragment_campaign_stats_snapshot_t {
+  clocks_fragment_ppb_value_snapshot_t gnss{};
+  clocks_fragment_ppb_value_snapshot_t dwt{};
+  clocks_fragment_ppb_value_snapshot_t vclock{};
+  clocks_fragment_ppb_value_snapshot_t ocxo1{};
+  clocks_fragment_ppb_value_snapshot_t ocxo2{};
 };
 
 struct clocks_fragment_campaign_snapshot_t {
@@ -622,38 +570,29 @@ struct clocks_fragment_campaign_snapshot_t {
   char campaign[CLOCKS_FRAGMENT_CAMPAIGN_NAME_MAX] = {0};
   char campaign_state[CLOCKS_FRAGMENT_STATE_NAME_MAX] = {0};
   uint32_t public_count = 0;
+
+  // Campaign-relative clockfaces are a distinct scope, not duplicates of the
+  // always-on instrument clockfaces in live.
   uint64_t gnss_ns = 0;
+  uint64_t dwt_cycles = 0;
+  uint64_t ocxo1_ns = 0;
+  uint64_t ocxo2_ns = 0;
+
   char disposition[CLOCKS_FRAGMENT_STATE_NAME_MAX] = {0};
-  char servo_mode[CLOCKS_FRAGMENT_STATE_NAME_MAX] = {0};
   bool timeline_valid = false;
   bool ocxo_clockface_valid = false;
   bool ocxo_science_valid = false;
   bool science_eligible = true;
   bool control_eligible = true;
-  bool persist = true;
-  bool science_excluded = false;
 
   clocks_fragment_rejection_snapshot_t rejection{};
   clocks_fragment_recovery_snapshot_t recovery{};
 
-  uint64_t dwt_cycle_count_total = 0;
-  uint32_t dwt_cycles_between_pps_vclock = 0;
-  uint32_t dwt_at_pps_vclock = 0;
-  uint32_t counter32_at_pps_vclock = 0;
-  clocks_fragment_raw_cycles_snapshot_t raw_cycles{};
-
-  uint64_t ocxo1_ns = 0;
-  bool ocxo1_clockface_valid = false;
   clocks_fragment_clock_candidates_snapshot_t ocxo1_clock_candidates{};
   clocks_fragment_science_snapshot_t ocxo1_science{};
-  uint64_t ocxo2_ns = 0;
-  bool ocxo2_clockface_valid = false;
   clocks_fragment_clock_candidates_snapshot_t ocxo2_clock_candidates{};
   clocks_fragment_science_snapshot_t ocxo2_science{};
-
-  clocks_fragment_stats_snapshot_t stats{};
-  bool dac_present = false;
-  clocks_fragment_dac_snapshot_t dac{};
+  clocks_fragment_campaign_stats_snapshot_t stats{};
 };
 
 struct clocks_fragment_live_snapshot_t {
@@ -663,49 +602,33 @@ struct clocks_fragment_live_snapshot_t {
   uint32_t completed_pps_sequence = 0;
   uint32_t instrument_age_seconds = 0;
 
-  char campaign_state[CLOCKS_FRAGMENT_STATE_NAME_MAX] = {0};
-  bool recording = false;
-  bool campaign_present = false;
-  char campaign[CLOCKS_FRAGMENT_CAMPAIGN_NAME_MAX] = {0};
-  char last_campaign[CLOCKS_FRAGMENT_CAMPAIGN_NAME_MAX] = {0};
-  uint64_t campaign_seconds = 0;
-  bool campaign_presentation_ready = false;
-  char presentation_mode[CLOCKS_FRAGMENT_STATE_NAME_MAX] = {0};
-  char presentation_basis[CLOCKS_FRAGMENT_STATE_NAME_MAX] = {0};
-  bool presentation_clockfaces_zeroed = false;
-
-  uint32_t presentation_count = 0;
-  uint64_t presentation_gnss_ns = 0;
-  uint64_t presentation_dwt_cycles = 0;
-  uint64_t presentation_ocxo1_ns = 0;
-  uint64_t presentation_ocxo2_ns = 0;
-  bool timeline_valid = false;
-  bool ocxo_clockface_valid = false;
-
+  // Always-on instrument clockfaces. These are the persistence/restore source.
   uint64_t instrument_gnss_ns = 0;
   uint64_t instrument_dwt_cycles = 0;
   uint64_t instrument_ocxo1_ns = 0;
   uint64_t instrument_ocxo2_ns = 0;
   uint32_t instrument_pps_sequence = 0;
 
+  // Current PPS/VCLOCK anchoring/calibration required by the live subsystem.
   uint32_t dwt_cycles_per_second = 0;
   uint32_t dwt_at_pps_vclock = 0;
   uint32_t counter32_at_pps_vclock = 0;
-  uint32_t selected_reference_interval_cycles = 0;
-  uint32_t vclock_interval_cycles = 0;
-  uint32_t ocxo1_interval_cycles = 0;
-  uint32_t ocxo2_interval_cycles = 0;
 
   clocks_fragment_raw_cycles_snapshot_t raw_cycles{};
   clocks_fragment_stats_snapshot_t stats{};
   clocks_fragment_dac_snapshot_t dac{};
-  clocks_fragment_restore_state_t restore_state{};
 };
 
 struct clocks_fragment_snapshot_t {
   clocks_fragment_live_snapshot_t live{};
   clocks_fragment_campaign_snapshot_t campaign{};
+
+  // Publication-custody metadata only; SYSTEM does not serialize this field.
+  // Once public campaign time already exists, the matching campaign delta must
+  // accompany this sequence before SYSTEM releases it.  Keeping the bit here
+  // avoids polluting the canonical live instrument state with campaign mirrors.
+  bool campaign_row_expected = false;
 };
 
 bool clocks_fragment_snapshot_take(uint32_t completed_second_sequence,
-                                  clocks_fragment_snapshot_t* out);
+                                   clocks_fragment_snapshot_t* out);

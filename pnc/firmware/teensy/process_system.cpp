@@ -178,13 +178,8 @@ static uint32_t g_system_clocks_fragment_retry_attempt_count = 0U;
 static uint32_t g_system_clocks_fragment_retry_tick_hold_count = 0U;
 static uint32_t g_system_clocks_fragment_retry_schedule_count = 0U;
 static uint32_t g_system_clocks_fragment_retry_success_count = 0U;
-static bool g_system_clocks_fragment_interrupt_owner_seen = false;
 static bool g_system_clocks_fragment_last_tick_valid = false;
 static uint32_t g_system_clocks_fragment_last_tick_sequence = 0U;
-
-static bool g_system_clocks_fragment_cpu_window_initialized = false;
-static uint64_t g_system_clocks_fragment_cpu_last_wall_cycles = 0U;
-static uint64_t g_system_clocks_fragment_cpu_last_idle_cycles = 0U;
 
 // The CLOCKS handoff is intentionally large and must never become a foreground
 // stack local. SYSTEM owns this RAM2 snapshot and all serialization derived from it.
@@ -253,25 +248,27 @@ static bool system_cstr_equal_ci(const char* a, const char* b) {
   return *a == *b;
 }
 
-// The CLOCKS feature tree is the mission-readiness annunciator, not a dump of
-// every diagnostic witness. QTIMER_DWT_RULER remains in the internal registry
-// and in INTERRUPT.REPORT_INTEGRITY, but its ISR-displacement-sensitive state
-// must not strobe the operator-facing feature tree.
+// CLOCKS_FRAGMENT publishes only readiness facts whose state is independently
+// meaningful to campaign admission. Detailed implementation/diagnostic states may
+// remain in the local registry and focused reports, but the canonical feature tree
+// is deliberately a whitelist rather than a registry dump.
 static bool system_feature_publicly_visible(
     const system_feature_slot_t& slot) {
-  return !(system_cstr_equal(slot.subsystem, "INTERRUPT") &&
-           system_cstr_equal(slot.feature, "QTIMER_DWT_RULER"));
-}
-
-static const char* system_feature_public_name(
-    const system_feature_slot_t& slot) {
-  // CLOCKS speaks in domain terms. SYSTEM retains the established wire spelling
-  // so Pi readiness policy remains unchanged during this ownership migration.
-  if (system_cstr_equal(slot.subsystem, "CLOCKS") &&
-      system_cstr_equal(slot.feature, "CAMPAIGN_RECORD_HANDOFF")) {
-    return "TIMEBASE_PUBLICATION";
+  if (system_cstr_equal(slot.subsystem, "CLOCKS")) {
+    return system_cstr_equal(slot.feature, "ALPHA_EPOCH") ||
+           system_cstr_equal(slot.feature, "DWT_CALIBRATION") ||
+           system_cstr_equal(slot.feature, "OCXO_PUBLIC_ORIGIN") ||
+           system_cstr_equal(slot.feature, "STATIC_PREDICTION");
   }
-  return slot.feature;
+
+  if (system_cstr_equal(slot.subsystem, "INTERRUPT")) {
+    return system_cstr_equal(slot.feature, "COUNTER32_LINEAGE") ||
+           system_cstr_equal(slot.feature, "OBSERVED_EDGE_AUTHORITY") ||
+           system_cstr_equal(slot.feature, "PPS_VCLOCK_AUTHORITY") ||
+           system_cstr_equal(slot.feature, "QTIMER_COUNTER_CUSTODY");
+  }
+
+  return false;
 }
 
 const char* system_feature_status_str(system_feature_status_t status) {
@@ -444,7 +441,7 @@ static FLASHMEM Payload system_features_tree_payload(void) {
       if (!system_cstr_equal(g_system_features[k].subsystem, subsystem)) continue;
 
       subsystem_payload.add(
-        system_feature_public_name(g_system_features[k]),
+        g_system_features[k].feature,
         system_feature_status_str(g_system_features[k].status)
       );
     }
@@ -3354,177 +3351,19 @@ static FLASHMEM Payload cmd_payload_info(const Payload& /*args*/) {
 
 
 // ============================================================================
-// CLOCKS_FRAGMENT — canonical Teensy observation
+// CLOCKS_FRAGMENT — normalized canonical Teensy observation
 // ============================================================================
 //
-// SYSTEM owns the complete wire shape consumed by Dashboard/Metrics and Pi CLOCKS.
-// CLOCKS contributes only typed facts from its latest coherent completed row and,
-// when recording, an optional completed campaign observation. SYSTEM renders both
-// the always-on clocks view and the compatibility campaign_row from that snapshot.
-
-static Payload system_clocks_fragment_teensy_payload(void) {
-  Payload p;
-  p.add("health_state", "NOMINAL");
-  p.add("cpu_freq_mhz", (uint32_t)(F_CPU_ACTUAL / 1000000UL));
-  p.add("crash_report_present", (bool)CrashReport);
-  p.add("feature_status_foreground_court_ok",
-        g_system_feature_handler_reject_count == 0U);
-
-  timepop_idle_witness_snapshot_t idle{};
-  timepop_idle_witness_snapshot(&idle);
-  const uint64_t wall_now = idle.snapshot_wall_cycles;
-  const uint64_t idle_now = idle.snapshot_total_cycles;
-  uint64_t total = 0U;
-  uint64_t idle_cycles = 0U;
-  uint64_t work = 0U;
-  uint32_t work_pct_milli = 0U;
-  uint32_t idle_pct_milli = 0U;
-
-  if (g_system_clocks_fragment_cpu_window_initialized) {
-    total = wall_now - g_system_clocks_fragment_cpu_last_wall_cycles;
-    idle_cycles = idle_now - g_system_clocks_fragment_cpu_last_idle_cycles;
-    if (idle_cycles > total) idle_cycles = total;
-    work = total - idle_cycles;
-    if (total != 0U) {
-      work_pct_milli =
-          (uint32_t)((work * 100000ULL + total / 2ULL) / total);
-      idle_pct_milli =
-          (uint32_t)((idle_cycles * 100000ULL + total / 2ULL) / total);
-    }
-  } else {
-    g_system_clocks_fragment_cpu_window_initialized = true;
-  }
-
-  g_system_clocks_fragment_cpu_last_wall_cycles = wall_now;
-  g_system_clocks_fragment_cpu_last_idle_cycles = idle_now;
-  p.add("cpu_usage_pct_milli", work_pct_milli);
-  p.add("cpu_work_pct_milli", work_pct_milli);
-  p.add("cpu_idle_spin_pct_milli", idle_pct_milli);
-  p.add("cpu_work_cycles64", work);
-  p.add("cpu_idle_spin_cycles64", idle_cycles);
-  p.add("cpu_window_total_cycles64", total);
-  p.add("cpu_wall_cycles", wall_now);
-  return p;
-}
-
-static Payload system_clocks_fragment_process_payload(void) {
-  process_rpc_info_t info{};
-  process_get_rpc_info(&info);
-
-  Payload p;
-  p.add("rpc_received", info.received);
-  p.add("rpc_routed", info.routed);
-  p.add("rpc_handler_invoked", info.handler_invoked);
-  p.add("rpc_handler_completed", info.handler_completed);
-  p.add("rpc_response_sent", info.response_sent);
-  p.add("rpc_err_missing_fields", info.error_missing_fields);
-  p.add("rpc_err_unknown_subsys", info.error_unknown_subsys);
-  p.add("rpc_err_unknown_command", info.error_unknown_command);
-  p.add("rpc_err_response_sent", info.error_response_sent);
-  p.add("ps_dispatched", info.ps_dispatched);
-
-  const uint32_t expected_received = info.routed + info.error_missing_fields +
-      info.error_unknown_subsys + info.error_unknown_command;
-  const bool order_ok = info.received >= info.routed &&
-      info.routed >= info.handler_invoked &&
-      info.handler_invoked >= info.handler_completed &&
-      info.handler_completed >= info.response_sent;
-  const uint32_t inflight = info.handler_invoked >= info.handler_completed
-      ? info.handler_invoked - info.handler_completed : 0xFFFFFFFFUL;
-  const uint32_t pending = info.handler_completed >= info.response_sent
-      ? info.handler_completed - info.response_sent : 0xFFFFFFFFUL;
-
-  p.add("rpc_counter_order_ok", order_ok);
-  p.add("rpc_handler_inflight", inflight);
-  p.add("rpc_response_pending", pending);
-  p.add("invariant_received_ok", info.received == expected_received);
-  p.add("invariant_routed_ok", order_ok && info.routed == info.handler_invoked);
-  p.add("invariant_handler_ok", order_ok && inflight <= 1U);
-  p.add("invariant_response_ok", order_ok && pending == 0U);
-  p.add("health_state", order_ok && inflight <= 1U && pending == 0U
-      ? "NOMINAL" : "ANOMALY");
-  return p;
-}
-
-static Payload system_clocks_fragment_transport_payload(void) {
-  transport_info_t info{};
-  transport_get_info(&info);
-
-  Payload p;
-  p.add("tx_job_count", info.tx_job_count);
-  p.add("tx_job_high_water", info.tx_job_high_water);
-  p.add("tx_jobs_enqueued", info.tx_jobs_enqueued);
-  p.add("tx_jobs_sent", info.tx_jobs_sent);
-  p.add("tx_alloc_fail", info.tx_alloc_fail);
-  p.add("tx_budget_fail", info.tx_budget_fail);
-  p.add("tx_queue_full", info.tx_queue_full);
-  p.add("tx_rr_drop_count", info.tx_rr_drop_count);
-  p.add("rx_frames_complete", info.rx_frames_complete);
-  p.add("rx_frames_dispatched", info.rx_frames_dispatched);
-  p.add("rx_bad_stx", info.rx_bad_stx);
-  p.add("rx_bad_etx", info.rx_bad_etx);
-  p.add("rx_len_overflow", info.rx_len_overflow);
-  p.add("rx_overlap", info.rx_overlap);
-  p.add("rx_buffer_in_dmamem", info.rx_buffer_in_dmamem != 0U);
-  p.add("rx_buffer_alignment_ok", info.rx_buffer_alignment_ok != 0U);
-  p.add("rx_guard_failure_count", info.rx_guard_failure_count);
-
-  const bool nominal = info.tx_alloc_fail == 0U &&
-      info.tx_budget_fail == 0U && info.tx_queue_full == 0U &&
-      info.tx_rr_drop_count == 0U && info.rx_bad_stx == 0U &&
-      info.rx_bad_etx == 0U && info.rx_len_overflow == 0U &&
-      info.rx_guard_failure_count == 0U &&
-      info.rx_buffer_alignment_ok != 0U;
-  p.add("health_state", nominal ? "NOMINAL" : "ANOMALY");
-  return p;
-}
-
-static Payload system_clocks_fragment_payload_payload(void) {
-  payload_info_t info{};
-  payload_get_info(&info);
-
-  Payload p;
-  p.add("payload_instances_constructed", info.instances_constructed);
-  p.add("payload_instances_destroyed", info.instances_destroyed);
-  p.add("payload_alive_now", info.alive_now);
-  p.add("payload_alive_high_water", info.alive_high_water);
-  p.add("payload_heap_bytes_alive",
-        info.entry_heap_bytes_alive + info.arena_heap_bytes_alive);
-  p.add("payload_heap_bytes_high_water",
-        info.entry_heap_bytes_high_water + info.arena_heap_bytes_high_water);
-  p.add("payload_entry_alloc_fail", info.entry_alloc_fail);
-  p.add("payload_entry_overflow", info.entry_overflow);
-  p.add("payload_arena_alloc_fail", info.arena_alloc_fail);
-  p.add("payload_serialize_overflow", info.serialize_overflow);
-  p.add("payload_to_json_fail", info.to_json_fail);
-  p.add("payload_parse_error", info.parse_error);
-  p.add("payload_integrity_fail", info.integrity_fail);
-  p.add("payload_alloc_overlap_detected", info.alloc_overlap_detected);
-  p.add("payload_handler_ctx_alloc", info.handler_ctx_alloc);
-  p.add("payload_handler_ctx_free", info.handler_ctx_free);
-
-  const uint32_t expected_alive =
-      info.instances_constructed - info.instances_destroyed;
-  const bool nominal = info.entry_alloc_fail == 0U &&
-      info.entry_overflow == 0U && info.arena_alloc_fail == 0U &&
-      info.serialize_overflow == 0U && info.to_json_fail == 0U &&
-      info.parse_error == 0U && info.integrity_fail == 0U &&
-      expected_alive == info.alive_now;
-  p.add("health_state", nominal ? "NOMINAL" : "ANOMALY");
-  return p;
-}
+// SYSTEM owns only serialization and publication custody. CLOCKS supplies one
+// always-on instrument snapshot plus, when available, one campaign-relative
+// TEMPEST delta.  The wire format deliberately contains no restore mirror and no
+// periodic transport/process/Payload flight recorder.  raw_cycles is retained as
+// the compact four-rail sanity-check surface; deeper forensics remain on focused
+// reports.
 
 // ============================================================================
 // SYSTEM-owned CLOCKS serialization
 // ============================================================================
-//
-// CLOCKS supplies immutable domain facts. These helpers are the sole authority
-// for the CLOCKS and campaign_row shapes carried by CLOCKS_FRAGMENT.
-
-static constexpr uint64_t SYSTEM_MONITOR_NS_PER_SECOND = 1000000000ULL;
-static constexpr uint32_t SYSTEM_MONITOR_INTERVAL_MIN_CYCLES = 900000000UL;
-static constexpr uint32_t SYSTEM_MONITOR_INTERVAL_MAX_CYCLES = 1100000000UL;
-static constexpr uint32_t SYSTEM_MONITOR_INTERVAL_SENTINEL = 0xFFFFFFFFUL;
 
 static void system_clocks_fragment_add_welford(
     Payload& parent,
@@ -3541,12 +3380,6 @@ static void system_clocks_fragment_add_welford(
   parent.add_object(key, value);
 }
 
-enum class system_clocks_fragment_ppb_bucket_view_t : uint8_t {
-  NONE = 0,
-  ALL = 1,
-  CAMPAIGN_ONLY = 2,
-};
-
 static void system_clocks_fragment_add_ppb_bucket(
     Payload& buckets,
     const char* key,
@@ -3557,35 +3390,27 @@ static void system_clocks_fragment_add_ppb_bucket(
 
 static void system_clocks_fragment_add_ppb_buckets(
     Payload& clock,
-    const clocks_fragment_ppb_buckets_snapshot_t& buckets,
-    system_clocks_fragment_ppb_bucket_view_t view) {
-  if (view == system_clocks_fragment_ppb_bucket_view_t::NONE) return;
-
+    const clocks_fragment_ppb_buckets_snapshot_t& buckets) {
   Payload values;
-  if (view == system_clocks_fragment_ppb_bucket_view_t::ALL) {
-    system_clocks_fragment_add_ppb_bucket(values, "10_min", buckets.minute_10);
-    system_clocks_fragment_add_ppb_bucket(values, "60_min", buckets.minute_60);
-    system_clocks_fragment_add_ppb_bucket(values, "8_hour", buckets.hour_8);
-    system_clocks_fragment_add_ppb_bucket(values, "24_hour", buckets.hour_24);
-    system_clocks_fragment_add_ppb_bucket(values, "total", buckets.total);
-  }
-  system_clocks_fragment_add_ppb_bucket(values, "campaign", buckets.campaign);
+  system_clocks_fragment_add_ppb_bucket(values, "10_min", buckets.minute_10);
+  system_clocks_fragment_add_ppb_bucket(values, "60_min", buckets.minute_60);
+  system_clocks_fragment_add_ppb_bucket(values, "8_hour", buckets.hour_8);
+  system_clocks_fragment_add_ppb_bucket(values, "24_hour", buckets.hour_24);
+  system_clocks_fragment_add_ppb_bucket(values, "total", buckets.total);
   clock.add_object("ppb_buckets", values);
 }
 
 static void system_clocks_fragment_add_stats_clock(
     Payload& parent,
     const char* key,
-    const clocks_fragment_stats_clock_snapshot_t& clock,
-    system_clocks_fragment_ppb_bucket_view_t bucket_view) {
+    const clocks_fragment_stats_clock_snapshot_t& clock) {
   Payload value;
   system_clocks_fragment_add_welford(value, "welford", clock.welford);
   if (clock.frequency_present) {
-    // Compatibility aliases. Both remain the authoritative TOTAL population.
     value.add("tau", toFixedDecimal(clock.tau, 12));
     value.add("ppb", toFixedDecimal(clock.ppb, 3));
   }
-  system_clocks_fragment_add_ppb_buckets(value, clock.ppb_buckets, bucket_view);
+  system_clocks_fragment_add_ppb_buckets(value, clock.ppb_buckets);
   parent.add_object(key, value);
 }
 
@@ -3601,8 +3426,7 @@ static void system_clocks_fragment_add_tau_state(
   value.add("reject_count", state.reject_count);
   value.add("gap_reset_count", state.gap_reset_count);
   value.add("last_pps_sequence", state.last_pps_sequence);
-  value.add("last_interval_pps_sequence",
-            state.last_interval_pps_sequence);
+  value.add("last_interval_pps_sequence", state.last_interval_pps_sequence);
   value.add("first_refined_ns", state.first_refined_ns);
   value.add("last_refined_ns", state.last_refined_ns);
   value.add("last_fast_residual_ns", state.last_fast_residual_ns);
@@ -3615,22 +3439,16 @@ static void system_clocks_fragment_add_tau_state(
   value.add("sxx", toFixedDecimal(state.sxx, 12));
   value.add("sxy", toFixedDecimal(state.sxy, 12));
   value.add("syy", toFixedDecimal(state.syy, 12));
-  value.add("interval_mean_ppb",
-            toFixedDecimal(state.interval_mean_ppb, 12));
-  value.add("interval_m2_ppb",
-            toFixedDecimal(state.interval_m2_ppb, 12));
+  value.add("interval_mean_ppb", toFixedDecimal(state.interval_mean_ppb, 12));
+  value.add("interval_m2_ppb", toFixedDecimal(state.interval_m2_ppb, 12));
   parent.add_object(key, value);
 }
 
 static void system_clocks_fragment_add_stats(
     Payload& parent,
-    const clocks_fragment_stats_snapshot_t& snapshot,
-    system_clocks_fragment_ppb_bucket_view_t bucket_view) {
+    const clocks_fragment_stats_snapshot_t& snapshot) {
   Payload stats;
-  stats.add("schema", "CLOCKS_INSTRUMENT_STATS_V2");
-  stats.add("always_on", true);
-  stats.add("owner", "ALPHA");
-  stats.add("lifetime", "BOOT_TO_REBOOT_OR_STATS_RESET");
+  stats.add("schema", "CLOCKS_INSTRUMENT_STATS_V3");
   stats.add("snapshot_ok", snapshot.snapshot_ok);
   stats.add("valid", snapshot.valid);
   stats.add("reset_count", snapshot.reset_count);
@@ -3638,51 +3456,27 @@ static void system_clocks_fragment_add_stats(
   stats.add("last_pps_sequence", snapshot.last_pps_sequence);
   stats.add("completed_row_coherent", snapshot.completed_row_coherent);
 
-  system_clocks_fragment_add_stats_clock(
-      stats, "gnss", snapshot.gnss, bucket_view);
-  system_clocks_fragment_add_stats_clock(
-      stats, "dwt", snapshot.dwt, bucket_view);
-  system_clocks_fragment_add_stats_clock(
-      stats, "vclock", snapshot.vclock, bucket_view);
-  system_clocks_fragment_add_stats_clock(
-      stats, "ocxo1", snapshot.ocxo1, bucket_view);
-  system_clocks_fragment_add_stats_clock(
-      stats, "ocxo2", snapshot.ocxo2, bucket_view);
-  system_clocks_fragment_add_stats_clock(
-      stats, "pps_witness", snapshot.pps_witness,
-      system_clocks_fragment_ppb_bucket_view_t::NONE);
+  system_clocks_fragment_add_stats_clock(stats, "gnss", snapshot.gnss);
+  system_clocks_fragment_add_stats_clock(stats, "dwt", snapshot.dwt);
+  system_clocks_fragment_add_stats_clock(stats, "vclock", snapshot.vclock);
+  system_clocks_fragment_add_stats_clock(stats, "ocxo1", snapshot.ocxo1);
+  system_clocks_fragment_add_stats_clock(stats, "ocxo2", snapshot.ocxo2);
+
+  // These sufficient-state objects are retained because Holistic Restore must
+  // continue the exact Alpha populations rather than manufacture new ones.
   system_clocks_fragment_add_tau_state(
       stats, "ocxo1_tau_state", snapshot.ocxo1_tau_state);
   system_clocks_fragment_add_tau_state(
       stats, "ocxo2_tau_state", snapshot.ocxo2_tau_state);
 
-  Payload maturity;
-  maturity.add("gnss_samples", snapshot.maturity_gnss_samples);
-  maturity.add("dwt_samples", snapshot.maturity_dwt_samples);
-  maturity.add("vclock_samples", snapshot.maturity_vclock_samples);
-  maturity.add("vclock_intervals", snapshot.maturity_vclock_intervals);
-  maturity.add("ocxo1_samples", snapshot.maturity_ocxo1_samples);
-  maturity.add("ocxo1_intervals", snapshot.maturity_ocxo1_intervals);
-  maturity.add("ocxo1_stderr_ppb",
-               toFixedDecimal(snapshot.maturity_ocxo1_stderr_ppb, 6));
-  maturity.add("ocxo2_samples", snapshot.maturity_ocxo2_samples);
-  maturity.add("ocxo2_intervals", snapshot.maturity_ocxo2_intervals);
-  maturity.add("ocxo2_stderr_ppb",
-               toFixedDecimal(snapshot.maturity_ocxo2_stderr_ppb, 6));
-  stats.add_object("maturity", maturity);
-
-  Payload admission;
-  admission.add("interval_min_cycles", snapshot.interval_min_cycles);
-  admission.add("interval_max_cycles", snapshot.interval_max_cycles);
-  admission.add("vclock_reject_count", snapshot.vclock_reject_count);
-  admission.add("ocxo1_reject_count", snapshot.ocxo1_reject_count);
-  admission.add("ocxo2_reject_count", snapshot.ocxo2_reject_count);
-  stats.add_object("interval_admission", admission);
-
-  Payload dac;
-  system_clocks_fragment_add_welford(dac, "ocxo1", snapshot.ocxo1_dac);
-  system_clocks_fragment_add_welford(dac, "ocxo2", snapshot.ocxo2_dac);
-  stats.add_object("dac", dac);
+  Payload auxiliary_welford;
+  system_clocks_fragment_add_welford(
+      auxiliary_welford, "pps_witness", snapshot.pps_witness.welford);
+  system_clocks_fragment_add_welford(
+      auxiliary_welford, "ocxo1_dac", snapshot.ocxo1_dac);
+  system_clocks_fragment_add_welford(
+      auxiliary_welford, "ocxo2_dac", snapshot.ocxo2_dac);
+  stats.add_object("auxiliary_welford", auxiliary_welford);
 
   parent.add_object("stats", stats);
 }
@@ -3701,9 +3495,6 @@ static void system_clocks_fragment_add_raw_cycles_lane(
   lane.add("residual_cycles", sample.residual_cycles);
   lane.add("delay_status", sample.delay_status);
   lane.add("delay_detail_present", sample.delay_detail_present);
-  // Stable four-rail contract: ON_TIME lanes carry explicit NONE/zero detail
-  // rather than a shorter object. Reports can compare PPS, VCLOCK, OCXO1, and
-  // OCXO2 without treating missing JSON fields as semantic evidence.
   lane.add("delay_by", sample.delay_by);
   lane.add("residual_delay_valid", sample.residual_delay_valid);
   lane.add("residual_delay_cycles", sample.residual_delay_cycles);
@@ -3745,81 +3536,15 @@ static void system_clocks_fragment_add_science(
   parent.add_object("science", value);
 }
 
-static bool system_clocks_fragment_interval_plausible(uint32_t cycles) {
-  return cycles >= SYSTEM_MONITOR_INTERVAL_MIN_CYCLES &&
-         cycles <= SYSTEM_MONITOR_INTERVAL_MAX_CYCLES &&
-         cycles != SYSTEM_MONITOR_INTERVAL_SENTINEL;
-}
-
-static double system_clocks_fragment_fast_residual_ns_exact(
-    uint32_t reference_cycles,
-    uint32_t clock_cycles) {
-  if (!system_clocks_fragment_interval_plausible(reference_cycles) ||
-      !system_clocks_fragment_interval_plausible(clock_cycles)) {
-    return 0.0;
-  }
-  return ((double)((int64_t)reference_cycles - (int64_t)clock_cycles) *
-          (double)SYSTEM_MONITOR_NS_PER_SECOND) /
-         (double)reference_cycles;
-}
-
-static int64_t system_clocks_fragment_round_i64(double value) {
-  return value >= 0.0
-      ? (int64_t)(value + 0.5)
-      : (int64_t)(value - 0.5);
-}
-
-static void system_clocks_fragment_add_live_residual(
+static void system_clocks_fragment_add_control_lane(
     Payload& parent,
     const char* key,
-    uint32_t reference_cycles,
-    uint32_t clock_cycles) {
-  const bool valid =
-      system_clocks_fragment_interval_plausible(reference_cycles) &&
-      system_clocks_fragment_interval_plausible(clock_cycles);
-  const int64_t fast_cycles = valid
-      ? (int64_t)reference_cycles - (int64_t)clock_cycles
-      : 0LL;
-  const double fast_ns_exact = valid
-      ? system_clocks_fragment_fast_residual_ns_exact(reference_cycles, clock_cycles)
-      : 0.0;
-  const int64_t fast_ns = valid
-      ? system_clocks_fragment_round_i64(fast_ns_exact)
-      : 0LL;
-  const int64_t clock_interval_ns =
-      (int64_t)SYSTEM_MONITOR_NS_PER_SECOND - fast_ns;
-
-  Payload residual;
-  residual.add("valid", valid);
-  residual.add("science_worthy", valid);
-  residual.add("antecedents_complete", valid);
-  residual.add("gnss_interval_ns",
-               valid ? SYSTEM_MONITOR_NS_PER_SECOND : 0ULL);
-  residual.add("clock_interval_ns",
-               valid && clock_interval_ns > 0
-                   ? (uint64_t)clock_interval_ns
-                   : 0ULL);
-  residual.add("fast_residual_ns", fast_ns);
-  residual.add("fast_residual_ns_exact", toFixedDecimal(fast_ns_exact, 6));
-  residual.add("delta_raw_valid", valid);
-  residual.add("delta_raw_reference_interval_cycles", reference_cycles);
-  residual.add("delta_raw_clock_interval_cycles", clock_cycles);
-  residual.add("delta_raw_fast_residual_cycles", fast_cycles);
-  residual.add("delta_raw_fast_residual_ns", fast_ns);
-  residual.add("delta_raw_fast_residual_ns_exact",
-               toFixedDecimal(fast_ns_exact, 6));
-  parent.add_object(key, residual);
-}
-
-static void system_clocks_fragment_add_live_dither_lane(
-    Payload& parent,
-    const char* key,
-    const clocks_fragment_dither_lane_t& lane_snapshot,
-    bool dither_operator_enabled) {
+    const clocks_fragment_dither_lane_t& lane_snapshot) {
   Payload lane;
-  lane.add("value", toFixedDecimal(lane_snapshot.value, 6));
-  lane.add("dac", toFixedDecimal(lane_snapshot.value, 6));
+  lane.add("target_code", toFixedDecimal(lane_snapshot.value, 6));
   lane.add("hw_code", (uint32_t)lane_snapshot.hw_code);
+  lane.add("readback_valid", lane_snapshot.readback_valid);
+  lane.add("readback_code", (uint32_t)lane_snapshot.readback_code);
 
   Payload servo;
   servo.add("last_step", toFixedDecimal(lane_snapshot.servo_last_step, 12));
@@ -3827,8 +3552,7 @@ static void system_clocks_fragment_add_live_dither_lane(
             toFixedDecimal(lane_snapshot.servo_last_residual, 12));
   servo.add("settle_count", lane_snapshot.servo_settle_count);
   servo.add("adjustments", lane_snapshot.servo_adjustments);
-  servo.add("predictor_initialized",
-            lane_snapshot.servo_predictor_initialized);
+  servo.add("predictor_initialized", lane_snapshot.servo_predictor_initialized);
   servo.add("last_raw_residual",
             toFixedDecimal(lane_snapshot.servo_last_raw_residual, 12));
   servo.add("filtered_residual",
@@ -3839,187 +3563,50 @@ static void system_clocks_fragment_add_live_dither_lane(
             toFixedDecimal(lane_snapshot.servo_predicted_residual, 12));
   servo.add("predictor_updates", lane_snapshot.servo_predictor_updates);
   lane.add_object("servo", servo);
-
-  Payload dither;
-  dither.add("enabled", dither_operator_enabled);
-  dither.add("active", lane_snapshot.active);
-  dither.add("low_code", (uint32_t)lane_snapshot.low_code);
-  dither.add("high_code", (uint32_t)lane_snapshot.high_code);
-  dither.add("high_ms", (uint32_t)lane_snapshot.high_ms);
-  dither.add("phase_high", lane_snapshot.phase_high);
-  lane.add_object("dither", dither);
   parent.add_object(key, lane);
 }
 
-static void system_clocks_fragment_add_live_dac(
+static void system_clocks_fragment_add_control(
     Payload& parent,
     const clocks_fragment_dac_snapshot_t& snapshot) {
-  Payload dac;
-  dac.add("schema", "CLOCKS_LIVE_DAC_V1");
-  dac.add("servo_mode", snapshot.servo_mode);
-  dac.add("servo_active", snapshot.servo_active);
-  dac.add("realization_mode", snapshot.realization_mode);
-  dac.add("dither_operator_enabled", snapshot.dither_operator_enabled);
-  dac.add("ocxo1_dac", toFixedDecimal(snapshot.ocxo1.value, 6));
-  dac.add("ocxo2_dac", toFixedDecimal(snapshot.ocxo2.value, 6));
-  dac.add("ocxo1_hw_code", (uint32_t)snapshot.ocxo1.hw_code);
-  dac.add("ocxo2_hw_code", (uint32_t)snapshot.ocxo2.hw_code);
-  system_clocks_fragment_add_live_dither_lane(
-      dac, "ocxo1", snapshot.ocxo1, snapshot.dither_operator_enabled);
-  system_clocks_fragment_add_live_dither_lane(
-      dac, "ocxo2", snapshot.ocxo2, snapshot.dither_operator_enabled);
-  parent.add_object("dac", dac);
-}
-
-static void system_clocks_fragment_add_restore_state(
-    Payload& parent,
-    const clocks_fragment_restore_state_t& snapshot) {
-  if (!snapshot.present) return;
-
-  Payload state;
-  state.add("schema", "CLOCKS_STRUCTURED_RESTORE_V2");
-  state.add("version", snapshot.schema_version);
-  state.add("present", snapshot.present);
-
-  Payload instrument;
-  instrument.add("gnss_ns", snapshot.instrument_gnss_ns);
-  instrument.add("dwt_cycles", snapshot.instrument_dwt_cycles);
-  instrument.add("ocxo1_ns", snapshot.instrument_ocxo1_ns);
-  instrument.add("ocxo2_ns", snapshot.instrument_ocxo2_ns);
-  state.add_object("instrument_clockfaces", instrument);
-
-  // Restore persists TOTAL through the existing scalar/Welford/TAU state.
-  // Rolling membership and CAMP are intentionally not durable reboot state.
-  system_clocks_fragment_add_stats(
-      state, snapshot.stats, system_clocks_fragment_ppb_bucket_view_t::NONE);
-  system_clocks_fragment_add_live_dac(state, snapshot.dac);
-  parent.add_object("restore_state", state);
-}
-
-static void system_clocks_fragment_add_campaign_dac(
-    Payload& parent,
-    const clocks_fragment_dac_snapshot_t& snapshot) {
-  Payload dac;
-  dac.add("schema", "TIMEBASE_DAC_PERSISTENCE_V2");
-  dac.add("servo_mode", snapshot.servo_mode);
-  dac.add("servo_active", snapshot.servo_active);
-  dac.add("realization_mode", snapshot.realization_mode);
-  dac.add("dither_operator_enabled", snapshot.dither_operator_enabled);
-  dac.add("ocxo1_dac", toFixedDecimal(snapshot.ocxo1.value, 6));
-  dac.add("ocxo2_dac", toFixedDecimal(snapshot.ocxo2.value, 6));
-  dac.add("ocxo1_hw_code", (uint32_t)snapshot.ocxo1.hw_code);
-  dac.add("ocxo2_hw_code", (uint32_t)snapshot.ocxo2.hw_code);
-  dac.add("ocxo1_readback_valid", snapshot.ocxo1.readback_valid);
-  dac.add("ocxo2_readback_valid", snapshot.ocxo2.readback_valid);
-  dac.add("ocxo1_readback_code", (uint32_t)snapshot.ocxo1.readback_code);
-  dac.add("ocxo2_readback_code", (uint32_t)snapshot.ocxo2.readback_code);
-  dac.add("servo_request_pending", snapshot.servo_request_pending);
-  dac.add("actuator_service_pending", snapshot.actuator_service_pending);
-  parent.add_object("dac", dac);
-}
-
-static void system_clocks_fragment_add_live_vclock(
-    Payload& parent,
-    const clocks_fragment_live_snapshot_t& snapshot) {
-  Payload lane;
-  lane.add("ns", snapshot.presentation_gnss_ns);
-  system_clocks_fragment_add_live_residual(
-      lane,
-      "pps_residual",
-      snapshot.selected_reference_interval_cycles,
-      snapshot.vclock_interval_cycles);
-  parent.add_object("vclock", lane);
-}
-
-static void system_clocks_fragment_add_live_ocxo(
-    Payload& parent,
-    const char* key,
-    uint64_t ns,
-    bool clockface_valid,
-    uint32_t reference_cycles,
-    uint32_t clock_cycles) {
-  Payload lane;
-  lane.add("ns", ns);
-  lane.add("clockface_valid", clockface_valid);
-  system_clocks_fragment_add_live_residual(
-      lane, "science", reference_cycles, clock_cycles);
-  parent.add_object(key, lane);
+  Payload control;
+  control.add("schema", "CLOCKS_CONTROL_V1");
+  control.add("servo_mode", snapshot.servo_mode);
+  control.add("servo_active", snapshot.servo_active);
+  control.add("realization_mode", snapshot.realization_mode);
+  control.add("dither_operator_enabled", snapshot.dither_operator_enabled);
+  system_clocks_fragment_add_control_lane(control, "ocxo1", snapshot.ocxo1);
+  system_clocks_fragment_add_control_lane(control, "ocxo2", snapshot.ocxo2);
+  parent.add_object("control", control);
 }
 
 static Payload system_clocks_fragment_clocks_payload(
     const clocks_fragment_live_snapshot_t& snapshot) {
   Payload clocks;
-  clocks.add("schema", "CLOCKS_LIVE_TEENSY_V2");
-  clocks.add("instrument_always_on", true);
-  clocks.add("instrument_owner", "ALPHA");
+  clocks.add("schema", "CLOCKS_INSTRUMENT_V1");
   clocks.add("snapshot_ok", snapshot.snapshot_ok);
   clocks.add("valid", snapshot.valid);
   clocks.add("completed_row_coherent", snapshot.completed_row_coherent);
   clocks.add("completed_pps_sequence", snapshot.completed_pps_sequence);
   clocks.add("instrument_age_seconds", snapshot.instrument_age_seconds);
-  clocks.add("campaign_state", snapshot.campaign_state);
-  clocks.add("recording", snapshot.recording);
-  clocks.add("campaign_present", snapshot.campaign_present);
-  if (snapshot.campaign_present) clocks.add("campaign", snapshot.campaign);
-  clocks.add("last_campaign", snapshot.last_campaign);
-  clocks.add("campaign_seconds", snapshot.campaign_seconds);
-  clocks.add("campaign_presentation_ready",
-             snapshot.campaign_presentation_ready);
-  clocks.add("presentation_mode", snapshot.presentation_mode);
-  clocks.add("presentation_basis", snapshot.presentation_basis);
-  clocks.add("presentation_clockfaces_zeroed",
-             snapshot.presentation_clockfaces_zeroed);
-  clocks.add("teensy_pps_vclock_count", snapshot.presentation_count);
-  clocks.add("gnss_ns", snapshot.presentation_gnss_ns);
-  clocks.add("servo_mode", snapshot.dac.servo_mode);
-  clocks.add("servo_request_pending", snapshot.dac.servo_request_pending);
-  clocks.add("actuator_service_pending", snapshot.dac.actuator_service_pending);
-  clocks.add("timeline_valid", snapshot.timeline_valid);
-  clocks.add("ocxo_clockface_valid", snapshot.ocxo_clockface_valid);
 
-  Payload instrument;
-  instrument.add("gnss_ns", snapshot.instrument_gnss_ns);
-  instrument.add("dwt_cycles", snapshot.instrument_dwt_cycles);
-  instrument.add("ocxo1_ns", snapshot.instrument_ocxo1_ns);
-  instrument.add("ocxo2_ns", snapshot.instrument_ocxo2_ns);
-  instrument.add("pps_sequence", snapshot.instrument_pps_sequence);
-  clocks.add_object("instrument_clockfaces", instrument);
+  Payload clockfaces;
+  clockfaces.add("gnss_ns", snapshot.instrument_gnss_ns);
+  clockfaces.add("dwt_cycles", snapshot.instrument_dwt_cycles);
+  clockfaces.add("ocxo1_ns", snapshot.instrument_ocxo1_ns);
+  clockfaces.add("ocxo2_ns", snapshot.instrument_ocxo2_ns);
+  clockfaces.add("pps_sequence", snapshot.instrument_pps_sequence);
+  clocks.add_object("clockfaces", clockfaces);
 
-  Payload gnss;
-  gnss.add("ns", snapshot.presentation_gnss_ns);
-  gnss.add("clock_interval_ns", SYSTEM_MONITOR_NS_PER_SECOND);
-  gnss.add("second_residual_ns", 0LL);
-  clocks.add_object("gnss", gnss);
-
-  system_clocks_fragment_add_live_vclock(clocks, snapshot);
-
-  Payload dwt;
-  dwt.add("cycle_count_total", snapshot.presentation_dwt_cycles);
-  dwt.add("cycles_between_pps_vclock", snapshot.dwt_cycles_per_second);
-  dwt.add("at_pps_vclock", snapshot.dwt_at_pps_vclock);
-  dwt.add("counter32_at_pps_vclock", snapshot.counter32_at_pps_vclock);
-  clocks.add_object("dwt", dwt);
-
-  system_clocks_fragment_add_live_ocxo(
-      clocks,
-      "ocxo1",
-      snapshot.presentation_ocxo1_ns,
-      snapshot.valid && snapshot.presentation_ocxo1_ns != 0ULL,
-      snapshot.selected_reference_interval_cycles,
-      snapshot.ocxo1_interval_cycles);
-  system_clocks_fragment_add_live_ocxo(
-      clocks,
-      "ocxo2",
-      snapshot.presentation_ocxo2_ns,
-      snapshot.valid && snapshot.presentation_ocxo2_ns != 0ULL,
-      snapshot.selected_reference_interval_cycles,
-      snapshot.ocxo2_interval_cycles);
+  Payload anchor;
+  anchor.add("dwt_cycles_per_second", snapshot.dwt_cycles_per_second);
+  anchor.add("dwt_at_pps_vclock", snapshot.dwt_at_pps_vclock);
+  anchor.add("counter32_at_pps_vclock", snapshot.counter32_at_pps_vclock);
+  clocks.add_object("anchor", anchor);
 
   system_clocks_fragment_add_raw_cycles(clocks, snapshot.raw_cycles);
-  system_clocks_fragment_add_stats(
-      clocks, snapshot.stats, system_clocks_fragment_ppb_bucket_view_t::ALL);
-  system_clocks_fragment_add_live_dac(clocks, snapshot.dac);
-  system_clocks_fragment_add_restore_state(clocks, snapshot.restore_state);
+  system_clocks_fragment_add_stats(clocks, snapshot.stats);
+  system_clocks_fragment_add_control(clocks, snapshot.dac);
   return clocks;
 }
 
@@ -4088,129 +3675,100 @@ static void system_clocks_fragment_add_clock_candidates(
 static void system_clocks_fragment_add_campaign_ocxo(
     Payload& parent,
     const char* key,
-    uint64_t ns,
-    bool clockface_valid,
     const clocks_fragment_clock_candidates_snapshot_t& clock_candidates,
     const clocks_fragment_science_snapshot_t& science) {
   Payload lane;
-  lane.add("ns", ns);
-  lane.add("clockface_valid", clockface_valid);
   system_clocks_fragment_add_clock_candidates(lane, clock_candidates);
   system_clocks_fragment_add_science(lane, science);
   parent.add_object(key, lane);
 }
 
-static Payload system_clocks_fragment_campaign_row_payload(
-    const clocks_fragment_campaign_snapshot_t& snapshot) {
-  Payload row;
-  row.add("schema", "TIMEBASE_FRAGMENT_V7");
-  row.add("campaign", snapshot.campaign);
-  row.add("campaign_state", snapshot.campaign_state);
-  row.add("teensy_pps_vclock_count", snapshot.public_count);
-  row.add("gnss_ns", snapshot.gnss_ns);
-  row.add("candidate_disposition", snapshot.disposition);
-  row.add("candidate_use", snapshot.science_excluded
-      ? "AUDIT_ONLY"
-      : "SCIENCE_AND_CONTROL");
-  row.add("science_eligible", snapshot.science_eligible);
-  row.add("control_eligible", snapshot.control_eligible);
-  row.add("persist", snapshot.persist);
-  row.add("science_excluded", snapshot.science_excluded);
-  row.add("servo_mode", snapshot.servo_mode);
-  row.add("timeline_valid", snapshot.timeline_valid);
-  row.add("ocxo_clockface_valid", snapshot.ocxo_clockface_valid);
-  row.add("ocxo_science_valid", snapshot.ocxo_science_valid);
+static void system_clocks_fragment_add_campaign_ppb(
+    Payload& ppb,
+    const char* key,
+    const clocks_fragment_ppb_value_snapshot_t& sample) {
+  if (sample.sample_count == 0ULL) return;
+  ppb.add(key, toFixedDecimal(sample.ppb, 6));
+}
 
-  // Stable objection transcript. Accepted rows carry zero/NONE values; excluded
-  // rows carry the first reason plus the combined lane mask/count.
-  row.add("candidate_reason_code", snapshot.rejection.reason_code);
-  row.add("candidate_reason_name",
-          snapshot.rejection.present ? snapshot.rejection.reason_name : "none");
-  row.add("candidate_reason",
-          snapshot.rejection.present ? snapshot.rejection.reason : "");
-  row.add("candidate_source",
-          snapshot.rejection.present ? snapshot.rejection.source : "NONE");
-  row.add("candidate_lane", snapshot.rejection.lane);
-  row.add("candidate_detail0", snapshot.rejection.detail0);
-  row.add("candidate_detail1", snapshot.rejection.detail1);
-  row.add("candidate_detail2", snapshot.rejection.detail2);
-  row.add("candidate_detail3", snapshot.rejection.detail3);
-  row.add("candidate_reject_mask", snapshot.rejection.reject_mask);
-  row.add("candidate_objection_count", snapshot.rejection.objection_count);
+static void system_clocks_fragment_add_campaign_stats(
+    Payload& parent,
+    const clocks_fragment_campaign_stats_snapshot_t& snapshot) {
+  Payload stats;
+  Payload ppb;
+  system_clocks_fragment_add_campaign_ppb(ppb, "gnss", snapshot.gnss);
+  system_clocks_fragment_add_campaign_ppb(ppb, "dwt", snapshot.dwt);
+  system_clocks_fragment_add_campaign_ppb(ppb, "vclock", snapshot.vclock);
+  system_clocks_fragment_add_campaign_ppb(ppb, "ocxo1", snapshot.ocxo1);
+  system_clocks_fragment_add_campaign_ppb(ppb, "ocxo2", snapshot.ocxo2);
+  stats.add_object("ppb", ppb);
+  parent.add_object("stats", stats);
+}
+
+static Payload system_clocks_fragment_campaign_payload(
+    const clocks_fragment_campaign_snapshot_t& snapshot) {
+  Payload campaign;
+  campaign.add("schema", "TEMPEST_FRAGMENT_V1");
+  campaign.add("name", snapshot.campaign);
+  campaign.add("state", snapshot.campaign_state);
+  campaign.add("public_count", snapshot.public_count);
+
+  Payload clockfaces;
+  clockfaces.add("gnss_ns", snapshot.gnss_ns);
+  clockfaces.add("dwt_cycles", snapshot.dwt_cycles);
+  clockfaces.add("ocxo1_ns", snapshot.ocxo1_ns);
+  clockfaces.add("ocxo2_ns", snapshot.ocxo2_ns);
+  campaign.add_object("clockfaces", clockfaces);
+
+  Payload status;
+  status.add("timeline_valid", snapshot.timeline_valid);
+  status.add("ocxo_clockface_valid", snapshot.ocxo_clockface_valid);
+  status.add("ocxo_science_valid", snapshot.ocxo_science_valid);
+  campaign.add_object("status", status);
+
+  Payload disposition;
+  disposition.add("status", snapshot.disposition);
+  disposition.add("use", snapshot.science_eligible && snapshot.control_eligible
+      ? "SCIENCE_AND_CONTROL"
+      : "AUDIT_ONLY");
+  disposition.add("science_eligible", snapshot.science_eligible);
+  disposition.add("control_eligible", snapshot.control_eligible);
+  if (snapshot.rejection.present) {
+    disposition.add("reason_code", snapshot.rejection.reason_code);
+    disposition.add("reason_name", snapshot.rejection.reason_name);
+    disposition.add("source", snapshot.rejection.source);
+    disposition.add("lane_mask", snapshot.rejection.lane_mask);
+  }
+  campaign.add_object("disposition", disposition);
 
   if (snapshot.recovery.present) {
-    row.add("recover_generation", snapshot.recovery.generation);
-    row.add("recover_transition_active",
-            snapshot.recovery.transition_active);
-    row.add("recover_timeline_ready", snapshot.recovery.timeline_ready);
-    row.add("recover_clockface_ready", snapshot.recovery.clockface_ready);
-    row.add("recover_science_ready", snapshot.recovery.science_ready);
-    row.add("recover_ocxo1_clockface_ready",
-            snapshot.recovery.ocxo1_clockface_ready);
-    row.add("recover_ocxo2_clockface_ready",
-            snapshot.recovery.ocxo2_clockface_ready);
-    row.add("recover_ocxo1_science_ready",
-            snapshot.recovery.ocxo1_science_ready);
-    row.add("recover_ocxo2_science_ready",
-            snapshot.recovery.ocxo2_science_ready);
-    row.add("recover_science_quarantine_active",
-            snapshot.recovery.science_quarantine_active);
-    row.add("recover_science_quarantine_remaining",
-            snapshot.recovery.science_quarantine_remaining);
-    row.add("recover_no_progress_rows", snapshot.recovery.no_progress_rows);
-    row.add("recover_last_progress_public_count",
-            snapshot.recovery.last_progress_public_count);
-    row.add("recover_reattach_active", snapshot.recovery.reattach_active);
-    row.add("recover_degraded_active", snapshot.recovery.degraded_active);
-    row.add("recover_degraded_science_hold",
-            snapshot.recovery.degraded_science_hold);
-    row.add("recover_reattach_stalled", snapshot.recovery.reattach_stalled);
-    row.add("recover_reattach_reason", snapshot.recovery.reattach_reason);
+    Payload recovery;
+    recovery.add("generation", snapshot.recovery.generation);
+    recovery.add("transition_active", snapshot.recovery.transition_active);
+    recovery.add("timeline_ready", snapshot.recovery.timeline_ready);
+    recovery.add("clockface_ready", snapshot.recovery.clockface_ready);
+    recovery.add("science_ready", snapshot.recovery.science_ready);
+    recovery.add("degraded_active", snapshot.recovery.degraded_active);
+    recovery.add("science_quarantine_active",
+                 snapshot.recovery.science_quarantine_active);
+    recovery.add("science_quarantine_remaining",
+                 snapshot.recovery.science_quarantine_remaining);
+    recovery.add("reattach_stalled", snapshot.recovery.reattach_stalled);
+    campaign.add_object("recovery", recovery);
   }
 
-  Payload gnss;
-  gnss.add("ns", snapshot.gnss_ns);
-  row.add_object("gnss", gnss);
-
-  Payload dwt;
-  dwt.add("cycle_count_total", snapshot.dwt_cycle_count_total);
-  dwt.add("cycles_between_pps_vclock",
-          snapshot.dwt_cycles_between_pps_vclock);
-  dwt.add("at_pps_vclock", snapshot.dwt_at_pps_vclock);
-  dwt.add("counter32_at_pps_vclock", snapshot.counter32_at_pps_vclock);
-  row.add_object("dwt", dwt);
-
-  system_clocks_fragment_add_raw_cycles(row, snapshot.raw_cycles);
   system_clocks_fragment_add_campaign_ocxo(
-      row,
-      "ocxo1",
-      snapshot.ocxo1_ns,
-      snapshot.ocxo1_clockface_valid,
-      snapshot.ocxo1_clock_candidates,
-      snapshot.ocxo1_science);
+      campaign, "ocxo1", snapshot.ocxo1_clock_candidates, snapshot.ocxo1_science);
   system_clocks_fragment_add_campaign_ocxo(
-      row,
-      "ocxo2",
-      snapshot.ocxo2_ns,
-      snapshot.ocxo2_clockface_valid,
-      snapshot.ocxo2_clock_candidates,
-      snapshot.ocxo2_science);
-  // The top-level live clock surface already carries all rolling buckets.
-  // A durable campaign row needs only its campaign-scoped PPB decoration.
-  system_clocks_fragment_add_stats(
-      row, snapshot.stats,
-      system_clocks_fragment_ppb_bucket_view_t::CAMPAIGN_ONLY);
-  if (snapshot.dac_present) {
-    system_clocks_fragment_add_campaign_dac(row, snapshot.dac);
-  }
-  return row;
+      campaign, "ocxo2", snapshot.ocxo2_clock_candidates, snapshot.ocxo2_science);
+  system_clocks_fragment_add_campaign_stats(campaign, snapshot.stats);
+  return campaign;
 }
 
 static void system_clocks_fragment_publish_service(timepop_ctx_t*,
-                                           timepop_diag_t*,
-                                           void* user_data) {
-  const uint32_t callback_generation =
-      (uint32_t)(uintptr_t)user_data;
+                                                   timepop_diag_t*,
+                                                   void* user_data) {
+  const uint32_t callback_generation = (uint32_t)(uintptr_t)user_data;
   if (!g_system_clocks_fragment_service_armed ||
       callback_generation == 0U ||
       callback_generation != g_system_clocks_fragment_service_armed_generation) {
@@ -4221,8 +3779,7 @@ static void system_clocks_fragment_publish_service(timepop_ctx_t*,
   g_system_clocks_fragment_service_armed = false;
   g_system_clocks_fragment_service_handle = TIMEPOP_INVALID_HANDLE;
 
-  const bool retrying_snapshot =
-      g_system_clocks_fragment_retry_snapshot_valid;
+  const bool retrying_snapshot = g_system_clocks_fragment_retry_snapshot_valid;
   if (!retrying_snapshot && !g_system_clocks_fragment_pending) return;
 
   system_dmamem_ensure_initialized();
@@ -4230,37 +3787,26 @@ static void system_clocks_fragment_publish_service(timepop_ctx_t*,
   uint32_t sequence = 0U;
   bool clocks_snapshot_ok = false;
   if (retrying_snapshot) {
-    // The prior attempt already captured the exact typed CLOCKS state and may
-    // also have consumed Beta's immutable campaign record. Preserve and reuse
-    // that snapshot until transport accepts custody.
     sequence = g_system_clocks_fragment_retry_sequence;
     clocks_snapshot_ok = true;
   } else {
     sequence = g_system_clocks_fragment_pending_sequence;
     g_system_clocks_fragment_pending = false;
-    memset(&g_system_clocks_fragment_clocks_snapshot, 0,
-           sizeof(g_system_clocks_fragment_clocks_snapshot));
+    g_system_clocks_fragment_clocks_snapshot = clocks_fragment_snapshot_t{};
     clocks_snapshot_ok = clocks_fragment_snapshot_take(
         sequence, &g_system_clocks_fragment_clocks_snapshot);
   }
 
-  const bool campaign_row_available = clocks_snapshot_ok &&
-      g_system_clocks_fragment_clocks_snapshot.campaign.present &&
-      g_system_clocks_fragment_clocks_snapshot.campaign.completed_second_sequence ==
-          sequence;
+  const bool instrument_row_exact = clocks_snapshot_ok &&
+      g_system_clocks_fragment_clocks_snapshot.live.snapshot_ok &&
+      g_system_clocks_fragment_clocks_snapshot.live.completed_row_coherent &&
+      g_system_clocks_fragment_clocks_snapshot.live.completed_pps_sequence == sequence;
 
-  // Once public campaign presentation has begun, the interrupt tick can reach
-  // SYSTEM before Beta has completed both OCXO lanes and frozen the matching
-  // campaign observation. Hold only those public campaign identities. During
-  // CAMPAIGN_ARMING, campaign_seconds is still zero and no public campaign row
-  // exists by design, so publish the always-on observation without decoration.
-  if (clocks_snapshot_ok &&
-      g_system_clocks_fragment_clocks_snapshot.live.campaign_presentation_ready &&
-      !campaign_row_available) {
-    // A retained snapshot from a public campaign second must already carry its
-    // exact completed campaign row. Reaching this branch while retrying means
-    // retained custody is incoherent; fail closed rather than emitting the
-    // wrong observation.
+  if (!instrument_row_exact) {
+    // The interrupt-side PPS notification arrives before both post-PPS OCXO edges
+    // have necessarily completed Alpha's immutable row. Never label the latest
+    // completed instrument state with the newer trigger identity. Hold this exact
+    // requested sequence until Beta's completed-row notification rearms service.
     if (retrying_snapshot) {
       g_system_clocks_fragment_publish_reject_count++;
       g_system_clocks_fragment_retry_snapshot_valid = false;
@@ -4270,35 +3816,51 @@ static void system_clocks_fragment_publish_service(timepop_ctx_t*,
     }
     g_system_clocks_fragment_pending_sequence = sequence;
     g_system_clocks_fragment_pending = true;
-    memset(&g_system_clocks_fragment_clocks_snapshot, 0,
-           sizeof(g_system_clocks_fragment_clocks_snapshot));
+    g_system_clocks_fragment_clocks_snapshot = clocks_fragment_snapshot_t{};
+    return;
+  }
+
+  const bool campaign_available = clocks_snapshot_ok &&
+      g_system_clocks_fragment_clocks_snapshot.campaign.present &&
+      g_system_clocks_fragment_clocks_snapshot.campaign.completed_second_sequence ==
+          sequence;
+
+  if (clocks_snapshot_ok &&
+      g_system_clocks_fragment_clocks_snapshot.campaign_row_expected &&
+      !campaign_available) {
+    // Public campaign time is already advancing, so this exact physical second
+    // must wait for Beta's matching campaign delta.  This custody bit is never
+    // serialized and does not contaminate the canonical instrument model.
+    if (retrying_snapshot) {
+      g_system_clocks_fragment_publish_reject_count++;
+      g_system_clocks_fragment_retry_snapshot_valid = false;
+      g_system_clocks_fragment_retry_pi_only = false;
+      g_system_clocks_fragment_retry_sequence = 0U;
+      g_system_clocks_fragment_retry_attempt_count = 0U;
+    }
+    g_system_clocks_fragment_pending_sequence = sequence;
+    g_system_clocks_fragment_pending = true;
+    g_system_clocks_fragment_clocks_snapshot = clocks_fragment_snapshot_t{};
     return;
   }
 
   Payload fragment;
-  fragment.add("schema", "CLOCKS_FRAGMENT_V3");
-  fragment.add("sequence", sequence);
-  fragment.add("generated_dwt", ARM_DWT_CYCCNT);
+  fragment.add("schema", "CLOCKS_FRAGMENT_V4");
+  fragment.add("sequence",
+               g_system_clocks_fragment_clocks_snapshot.live.completed_pps_sequence);
 
-  // A campaign row is the largest optional child. Embed it while the parent is
-  // still small, then release the temporary row before constructing the large
-  // always-on observation tree. This lowers peak simultaneous arena demand.
-  bool campaign_row_embedded = false;
-  if (campaign_row_available) {
-    {
-      Payload campaign_row = system_clocks_fragment_campaign_row_payload(
-          g_system_clocks_fragment_clocks_snapshot.campaign);
-      campaign_row_embedded =
-          fragment.add_object("campaign_row", campaign_row);
-    }
-
-    // Availability in the typed snapshot is not proof that the nested Payload
-    // mutation succeeded. Preserve the immutable snapshot and retry rather than
-    // publishing campaign_row_present=true without a campaign_row object.
-    if (!campaign_row_embedded) {
+  // Campaign is optional enrichment. If Beta has not frozen it yet, publish the
+  // instrument row now; campaign_row_ready() will schedule a same-sequence
+  // strengthening copy. This avoids carrying campaign lifecycle mirrors inside
+  // the always-on instrument snapshot merely to coordinate serialization.
+  bool campaign_embedded = false;
+  if (campaign_available) {
+    Payload campaign = system_clocks_fragment_campaign_payload(
+        g_system_clocks_fragment_clocks_snapshot.campaign);
+    campaign_embedded = fragment.add_object("campaign", campaign);
+    if (!campaign_embedded) {
       g_system_clocks_fragment_publish_reject_count++;
       g_system_clocks_fragment_campaign_row_embed_fail_count++;
-
       if (!retrying_snapshot) {
         g_system_clocks_fragment_retry_snapshot_valid = true;
         g_system_clocks_fragment_retry_pi_only = false;
@@ -4308,79 +3870,37 @@ static void system_clocks_fragment_publish_service(timepop_ctx_t*,
       } else {
         g_system_clocks_fragment_retry_attempt_count++;
       }
-
-      // Retry after releasing both temporary Payload arenas. The bounded
-      // timer prevents a serialization spin while preserving exact custody
-      // independently of future PPS ticks.
       g_system_clocks_fragment_retry_schedule_count++;
       system_clocks_fragment_schedule_publish();
       return;
     }
   }
 
+  if (!clocks_snapshot_ok ||
+      !fragment.add_object(
+          "clocks",
+          system_clocks_fragment_clocks_payload(
+              g_system_clocks_fragment_clocks_snapshot.live)) ||
+      !fragment.add_object("features", system_features_tree_payload())) {
+    g_system_clocks_fragment_publish_reject_count++;
+    if (!retrying_snapshot) {
+      g_system_clocks_fragment_retry_snapshot_valid = true;
+      g_system_clocks_fragment_retry_pi_only = false;
+      g_system_clocks_fragment_retry_sequence = sequence;
+      g_system_clocks_fragment_retry_attempt_count = 1U;
+    } else {
+      g_system_clocks_fragment_retry_attempt_count++;
+    }
+    g_system_clocks_fragment_retry_schedule_count++;
+    system_clocks_fragment_schedule_publish();
+    return;
+  }
+
   const uint32_t next_publish_count = g_system_clocks_fragment_publish_count + 1U;
   const uint32_t next_campaign_rows_embedded =
       g_system_clocks_fragment_campaign_rows_embedded +
-      (campaign_row_embedded ? 1U : 0U);
+      (campaign_embedded ? 1U : 0U);
 
-  fragment.add("campaign_row_present", campaign_row_embedded);
-  fragment.add_object(
-      "clocks",
-      system_clocks_fragment_clocks_payload(g_system_clocks_fragment_clocks_snapshot.live));
-  fragment.add_object("teensy", system_clocks_fragment_teensy_payload());
-  fragment.add_object("process", system_clocks_fragment_process_payload());
-  fragment.add_object("transport", system_clocks_fragment_transport_payload());
-  fragment.add_object("payload", system_clocks_fragment_payload_payload());
-  fragment.add_object("features", system_features_tree_payload());
-  fragment.add("clocks_fragment_publish_count", next_publish_count);
-  fragment.add("clocks_fragment_publish_reject_count",
-               g_system_clocks_fragment_publish_reject_count);
-  fragment.add("clocks_fragment_coalesce_count", g_system_clocks_fragment_coalesce_count);
-  fragment.add("clocks_fragment_service_arm_failures",
-               g_system_clocks_fragment_service_arm_failures);
-  fragment.add("clocks_fragment_service_armed", g_system_clocks_fragment_service_armed);
-  fragment.add("clocks_fragment_service_generation",
-               g_system_clocks_fragment_service_generation);
-  fragment.add("clocks_fragment_service_forced_rearm_count",
-               g_system_clocks_fragment_service_forced_rearm_count);
-  fragment.add("clocks_fragment_service_cancel_count",
-               g_system_clocks_fragment_service_cancel_count);
-  fragment.add("clocks_fragment_service_cancel_failure_count",
-               g_system_clocks_fragment_service_cancel_failure_count);
-  fragment.add("clocks_fragment_service_stale_callback_count",
-               g_system_clocks_fragment_service_stale_callback_count);
-  fragment.add("clocks_fragment_campaign_ready_signal_count",
-               g_system_clocks_fragment_campaign_ready_signal_count);
-  fragment.add("clocks_fragment_campaign_ready_repeat_count",
-               g_system_clocks_fragment_campaign_ready_repeat_count);
-  fragment.add("clocks_fragment_campaign_ready_last_sequence",
-               g_system_clocks_fragment_campaign_ready_last_valid
-                   ? g_system_clocks_fragment_campaign_ready_last_sequence
-                   : 0U);
-  fragment.add("clocks_fragment_campaign_rows_embedded",
-               next_campaign_rows_embedded);
-  fragment.add("clocks_fragment_campaign_ready_enrichment_retry_count",
-               g_system_clocks_fragment_campaign_ready_enrichment_retry_count);
-  fragment.add("clocks_fragment_campaign_retry_count",
-               g_system_clocks_fragment_campaign_retry_count);
-  fragment.add("clocks_fragment_campaign_row_embed_fail_count",
-               g_system_clocks_fragment_campaign_row_embed_fail_count);
-  // Compatibility alias retained; its meaning is now generalized custody.
-  fragment.add("clocks_fragment_retrying_campaign_row", retrying_snapshot);
-  fragment.add("clocks_fragment_retrying_snapshot", retrying_snapshot);
-  fragment.add("clocks_fragment_retry_attempt_count",
-               g_system_clocks_fragment_retry_attempt_count);
-  fragment.add("clocks_fragment_retry_tick_hold_count",
-               g_system_clocks_fragment_retry_tick_hold_count);
-  fragment.add("clocks_fragment_retry_schedule_count",
-               g_system_clocks_fragment_retry_schedule_count);
-  fragment.add("clocks_fragment_retry_success_count",
-               g_system_clocks_fragment_retry_success_count);
-  fragment.add("clocks_fragment_retry_delay_ns", SYSTEM_CLOCKS_FRAGMENT_RETRY_DELAY_NS);
-
-  // A transport retry is Pi-only because the original full publish may already
-  // have reached local subscribers. An embed retry has never published at all,
-  // so its first complete attempt uses the normal publication path.
   const bool publication_enqueued =
       retrying_snapshot && g_system_clocks_fragment_retry_pi_only
           ? publish_to_pi("CLOCKS_FRAGMENT", fragment)
@@ -4389,16 +3909,11 @@ static void system_clocks_fragment_publish_service(timepop_ctx_t*,
 
   if (!publication_enqueued) {
     g_system_clocks_fragment_publish_reject_count++;
-
-    // Transport admission failure is not permission to discard an ambient
-    // second. Retain the exact typed CLOCKS snapshot for every row and retry
-    // until Transport accepts custody. The first full publish may already have
-    // reached local subscribers, so all transport retries are Pi-only.
     if (!retrying_snapshot) {
       g_system_clocks_fragment_retry_snapshot_valid = true;
       g_system_clocks_fragment_retry_sequence = sequence;
       g_system_clocks_fragment_retry_attempt_count = 1U;
-      if (campaign_row_embedded) {
+      if (campaign_embedded) {
         g_system_clocks_fragment_campaign_retry_count++;
       }
     } else {
@@ -4420,8 +3935,7 @@ static void system_clocks_fragment_publish_service(timepop_ctx_t*,
   g_system_clocks_fragment_retry_sequence = 0U;
   g_system_clocks_fragment_retry_attempt_count = 0U;
 
-  memset(&g_system_clocks_fragment_clocks_snapshot, 0,
-         sizeof(g_system_clocks_fragment_clocks_snapshot));
+  g_system_clocks_fragment_clocks_snapshot = clocks_fragment_snapshot_t{};
   if (g_system_clocks_fragment_pending) system_clocks_fragment_schedule_publish();
 }
 
@@ -4483,12 +3997,12 @@ static void system_clocks_fragment_force_rearm(void) {
   system_clocks_fragment_schedule_publish();
 }
 
-static void system_clocks_fragment_accept_tick(uint32_t completed_second_sequence) {
+static void system_clocks_fragment_accept_tick(uint32_t requested_sequence) {
   if (g_system_clocks_fragment_last_tick_valid &&
-      completed_second_sequence == g_system_clocks_fragment_last_tick_sequence) {
+      requested_sequence == g_system_clocks_fragment_last_tick_sequence) {
     return;
   }
-  g_system_clocks_fragment_last_tick_sequence = completed_second_sequence;
+  g_system_clocks_fragment_last_tick_sequence = requested_sequence;
   g_system_clocks_fragment_last_tick_valid = true;
 
   // A retained campaign retry already owns g_system_clocks_fragment_clocks_snapshot.
@@ -4503,9 +4017,9 @@ static void system_clocks_fragment_accept_tick(uint32_t completed_second_sequenc
   if (g_system_clocks_fragment_retry_snapshot_valid) {
     g_system_clocks_fragment_retry_tick_hold_count++;
     if (!g_system_clocks_fragment_pending) {
-      g_system_clocks_fragment_pending_sequence = completed_second_sequence;
+      g_system_clocks_fragment_pending_sequence = requested_sequence;
       g_system_clocks_fragment_pending = true;
-    } else if (g_system_clocks_fragment_pending_sequence != completed_second_sequence) {
+    } else if (g_system_clocks_fragment_pending_sequence != requested_sequence) {
       // One exact snapshot is in retry custody and one following identity is
       // reserved. A further arrival is visible as coalescing rather than
       // silently replacing the reserved successor. Under normal USB budget
@@ -4517,21 +4031,33 @@ static void system_clocks_fragment_accept_tick(uint32_t completed_second_sequenc
   }
 
   if (g_system_clocks_fragment_pending) g_system_clocks_fragment_coalesce_count++;
-  g_system_clocks_fragment_pending_sequence = completed_second_sequence;
+  g_system_clocks_fragment_pending_sequence = requested_sequence;
   g_system_clocks_fragment_pending = true;
   system_clocks_fragment_schedule_publish();
 }
 
 void system_clocks_fragment_pps_tick_from_interrupt(
-    uint32_t completed_second_sequence) {
+    uint32_t pps_sequence) {
   if (system_feature_current_ipsr() != 0U) return;
-  g_system_clocks_fragment_interrupt_owner_seen = true;
-  system_clocks_fragment_accept_tick(completed_second_sequence);
+  system_clocks_fragment_accept_tick(pps_sequence);
 }
 
 void system_clocks_fragment_pps_tick(uint32_t completed_second_sequence) {
-  if (system_feature_current_ipsr() != 0U) return;
-  if (g_system_clocks_fragment_interrupt_owner_seen) return;
+  if (system_feature_current_ipsr() != 0U || completed_second_sequence == 0U) return;
+
+  // Beta calls this only after Alpha has frozen the exact completed row. If the
+  // interrupt-side notification already reserved this identity, wake/rearm the
+  // held serializer now that the row is actually available.
+  if (g_system_clocks_fragment_pending &&
+      g_system_clocks_fragment_pending_sequence == completed_second_sequence) {
+    if (g_system_clocks_fragment_service_armed) {
+      system_clocks_fragment_force_rearm();
+    } else {
+      system_clocks_fragment_schedule_publish();
+    }
+    return;
+  }
+
   system_clocks_fragment_accept_tick(completed_second_sequence);
 }
 
@@ -4596,8 +4122,7 @@ static void system_dmamem_ensure_initialized(void) {
   // process_system_register().
   runtime_ledger_boot_latch();
   system_feature_registry_reset();
-  memset(&g_system_clocks_fragment_clocks_snapshot, 0,
-         sizeof(g_system_clocks_fragment_clocks_snapshot));
+  g_system_clocks_fragment_clocks_snapshot = clocks_fragment_snapshot_t{};
   g_system_clocks_fragment_retry_snapshot_valid = false;
   g_system_clocks_fragment_retry_pi_only = false;
   g_system_clocks_fragment_retry_sequence = 0U;
@@ -4901,9 +4426,6 @@ void process_system_register(void) {
   // Preserve feature states already authored during early INTERRUPT/CLOCKS
   // hardware initialization.  The old unconditional registry reset occurred
   // after those publishers and erased their coherent boot evidence.
-  system_feature_set("SYSTEM", "FEATURE_STATUS",
-                     system_feature_status_t::NOMINAL,
-                     "Teensy SYSTEM feature registry online");
   process_register("SYSTEM", &SYSTEM_PROCESS);
 
 }

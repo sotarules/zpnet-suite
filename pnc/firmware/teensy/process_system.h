@@ -92,10 +92,10 @@ void zpnet_foreground_phase_note(zpnet_foreground_phase_t phase);
 // Feature status substrate
 // ============================================================================
 //
-// Teensy SYSTEM owns only Teensy-local feature state.  Every always-on
-// CLOCKS_FRAGMENT carries the current Teensy feature tree; Pi SYSTEM unions it
-// with Pi-local feature state into the unified CLOCKS dashboard /
-// campaign-readiness surface.
+// Teensy SYSTEM owns only Teensy-local feature state. CLOCKS_FRAGMENT carries a
+// curated readiness tree: only independently meaningful campaign-admission facts
+// are public. Lifecycle facts, feed-publication facts, and detailed diagnostics
+// remain on focused subsystem reports rather than the canonical heartbeat.
 //
 // Feature paths are reported as:
 //
@@ -138,24 +138,27 @@ bool system_feature_is_nominal(const char* subsystem,
 // ============================================================================
 // PPS-aligned CLOCKS_FRAGMENT side rail
 // ============================================================================
-// Canonical always-on tick. process_interrupt calls this for every completed
-// PPS/VCLOCK second whether or not a CLOCKS campaign is active. It records only
-// the scalar sequence and arms foreground publication.
+// Early PPS trigger. process_interrupt calls this when the PPS/VCLOCK identity is
+// known. It reserves that scalar sequence and arms foreground publication, but
+// SYSTEM will not serialize until CLOCKS proves that the exact completed Alpha
+// row with the same sequence exists.
 //
-// Foreground SYSTEM then takes one typed CLOCKS snapshot and authors the full
-// CLOCKS_FRAGMENT wire shape. The always-on clock view is observational; an
-// optional campaign observation is included only for a completed public record.
+// Foreground SYSTEM then takes one typed CLOCKS snapshot and authors the
+// normalized CLOCKS_FRAGMENT wire shape: one canonical always-on instrument
+// object, optional campaign-relative TEMPEST enrichment, and the curated feature
+// tree. The serialized payload sequence is the immutable completed-row identity.
 void system_clocks_fragment_pps_tick_from_interrupt(
-    uint32_t completed_second_sequence);
+    uint32_t pps_sequence);
 
-// Transitional CLOCKS-side entry point. It remains source-compatible with the
-// campaign-coupled caller but is ignored after the canonical interrupt owner
-// has supplied its first tick.
+// Completed-row readiness wake. CLOCKS/Beta calls this after Alpha has frozen a
+// nonzero immutable completed row. If the interrupt trigger already reserved the
+// same identity, this rearms the held serializer now that exact-row custody exists.
 void system_clocks_fragment_pps_tick(uint32_t completed_second_sequence);
 
-// CLOCKS/Beta calls this after it has frozen a typed public campaign observation
-// for the completed instrument sequence. Usually the interrupt-owned CLOCKS_FRAGMENT tick
-// is already pending and this merely coalesces into it. If SYSTEM already emitted
-// the observation-only fragment, this deliberately schedules one same-sequence
-// enrichment copy carrying the campaign facts so durable truth cannot be lost.
+// CLOCKS/Beta calls this after it has frozen the campaign-relative delta for the
+// completed instrument sequence. Usually the interrupt-owned CLOCKS_FRAGMENT tick
+// is already pending and this coalesces into it. The first public campaign row may
+// legitimately strengthen an already-emitted instrument-only row; once public
+// campaign time is advancing, typed custody holds the exact sequence until the
+// matching campaign delta exists.
 void system_clocks_fragment_campaign_row_ready(uint32_t completed_second_sequence);
