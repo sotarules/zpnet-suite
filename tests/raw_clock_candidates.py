@@ -43,7 +43,7 @@ FLOAT_EPSILON_NS = 0.000_001
 CAMPAIGN_TYPE = "TEMPEST"
 PPS_COUNT_SQL = """
 NULLIF(
-    payload #>> '{campaign,tempest,teensy_pps_vclock_count}',
+    payload #>> '{campaign,public_count}',
     ''
 )::bigint
 """
@@ -198,58 +198,22 @@ def first_int(*values: Any) -> Optional[int]:
 
 
 def root(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Return the persisted record, unwrapping only a true outer envelope.
-
-    A unified MONITOR_V2 detail legitimately has a top-level ``payload`` field
-    containing Payload subsystem diagnostics.  That field is not an envelope
-    and must never replace the complete state record.
-    """
-    if any(
-        key in payload
-        for key in ("schema", "monitor_fragment", "fragment", "campaign_row", "campaign")
-    ):
+    """Return one persisted CLOCKS_V4 state detail."""
+    if not isinstance(payload, dict):
+        return {}
+    if payload.get("schema") == "CLOCKS_V4":
         return payload
-
     inner = d(payload.get("payload"))
-    return inner or payload
+    return inner if inner.get("schema") == "CLOCKS_V4" else payload
 
 
-def tempest_decoration(payload: Dict[str, Any]) -> Dict[str, Any]:
-    r = root(payload)
-    return d(d(r.get("campaign")).get("tempest"))
+def campaign_view(payload: Dict[str, Any]) -> Dict[str, Any]:
+    campaign = d(root(payload).get("campaign"))
+    return campaign if campaign.get("schema") == "TEMPEST_FRAGMENT_V1" else {}
 
 
-def fragment(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Return one merged TEMPEST campaign view from a unified state detail."""
-    r = root(payload)
-    direct = d(r.get("fragment")) or d(r.get("campaign_row"))
-
-    monitor_fragment = d(r.get("monitor_fragment"))
-    embedded = d(monitor_fragment.get("campaign_row"))
-
-    if not embedded:
-        clocks = d(r.get("clocks"))
-        clocks_monitor = d(clocks.get("monitor_fragment"))
-        embedded = d(clocks_monitor.get("campaign_row"))
-
-    decoration = tempest_decoration(payload)
-    source = embedded or direct
-    if source or decoration:
-        merged = dict(source)
-        merged.update(decoration)
-        return merged
-    return r
-
-
-def _payload_pps_count(payload: Dict[str, Any], frag: Dict[str, Any]) -> Optional[int]:
-    r = root(payload)
-    return first_int(
-        frag.get("teensy_pps_vclock_count"),
-        frag.get("pps_count"),
-        frag.get("campaign_seconds"),
-        r.get("teensy_pps_vclock_count"),
-        r.get("pps_count"),
-    )
+def _payload_pps_count(payload: Dict[str, Any], campaign: Dict[str, Any]) -> Optional[int]:
+    return i(campaign.get("public_count"))
 
 
 def _assert_campaign_indexed(cur: Any, campaign: str) -> None:
@@ -259,7 +223,7 @@ def _assert_campaign_indexed(cur: Any, campaign: str) -> None:
         FROM campaign_detail
         WHERE campaign_type = %s
           AND campaign = %s
-          AND payload #> '{{campaign,tempest}}' IS NOT NULL
+          AND payload #>> '{{campaign,schema}}' = 'TEMPEST_FRAGMENT_V1'
           AND {PPS_COUNT_SQL} IS NULL
         """,
         (CAMPAIGN_TYPE, campaign),
@@ -269,7 +233,7 @@ def _assert_campaign_indexed(cur: Any, campaign: str) -> None:
     if missing:
         raise RuntimeError(
             f"TEMPEST campaign {campaign!r} has {missing:,} decorated rows without "
-            "campaign.tempest.teensy_pps_vclock_count"
+            "campaign.public_count"
         )
 
 
@@ -293,7 +257,7 @@ def iter_payloads(
             FROM campaign_detail
             WHERE campaign_type = %s
               AND campaign = %s
-              AND payload #> '{{campaign,tempest}}' IS NOT NULL
+              AND payload #>> '{{campaign,schema}}' = 'TEMPEST_FRAGMENT_V1'
               AND {PPS_COUNT_SQL} IS NOT NULL
         """
         params: list[Any] = [CAMPAIGN_TYPE, campaign]
@@ -318,8 +282,8 @@ def iter_payloads(
                 continue
 
             db_count = int(row["pps_count"])
-            frag = fragment(payload)
-            payload_count = _payload_pps_count(payload, frag)
+            campaign = campaign_view(payload)
+            payload_count = _payload_pps_count(payload, campaign)
             if payload_count is not None and payload_count != db_count:
                 raise ValueError(
                     "campaign_detail relational/payload campaign PPS mismatch: "
@@ -335,14 +299,15 @@ def iter_payloads(
                     time.sleep(pause_ms / 1000.0)
 
 
-def explicit_recovery_row(frag: Dict[str, Any]) -> bool:
-    reason = str(frag.get("recover_reattach_reason") or "").strip().lower()
+def explicit_recovery_row(campaign: Dict[str, Any]) -> bool:
+    recovery = d(campaign.get("recovery"))
+    if not recovery:
+        return False
     return bool(
-        reason not in {"", "idle", "none", "ok"}
-        or b(frag.get("recover_degraded_active")) is True
-        or b(frag.get("recover_degraded_science_hold")) is True
-        or b(frag.get("recover_science_quarantine_active")) is True
-        or b(frag.get("recover_transition_active")) is True
+        b(recovery.get("transition_active")) is True
+        or b(recovery.get("degraded_active")) is True
+        or b(recovery.get("science_quarantine_active")) is True
+        or b(recovery.get("reattach_stalled")) is True
     )
 
 
@@ -397,12 +362,14 @@ def build_lane(
     phase = parse_candidate(d(candidates.get("phaseledger")))
     delta = parse_candidate(d(candidates.get("delta_cycles")))
     science = d(lane_obj.get("science"))
+    clockfaces = d(frag.get("clockfaces"))
+    status = d(frag.get("status"))
 
     lane = LaneAudit(
         name=name,
         published_source=str(candidates.get("published_source") or "UNKNOWN").upper(),
-        published_ns=i(lane_obj.get("ns")),
-        clockface_valid=b(lane_obj.get("clockface_valid")),
+        published_ns=i(clockfaces.get(f"{LANE_KEYS[name]}_ns")),
+        clockface_valid=b(status.get("ocxo_clockface_valid")),
         phase=phase,
         delta=delta,
         reference_cycles=i(science.get("delta_raw_reference_interval_cycles")),
@@ -610,7 +577,9 @@ def build_row(
     candidate_gap_gate_ns: int,
     near_tooth_ns: int,
 ) -> AuditRow:
-    frag = fragment(payload)
+    frag = campaign_view(payload)
+    status = d(frag.get("status"))
+    disposition = d(frag.get("disposition"))
     delta = None if previous_count is None else db_count - previous_count
     gap = delta is not None and delta != 1
     recovery = bool(
@@ -642,8 +611,8 @@ def build_row(
         count_delta=delta,
         gap=gap,
         recovery_boundary=recovery,
-        disposition=str(frag.get("candidate_disposition") or "ACCEPT").upper(),
-        timeline_valid=b(frag.get("timeline_valid")),
+        disposition=str(disposition.get("status") or "ACCEPT").upper(),
+        timeline_valid=b(status.get("timeline_valid")),
         lanes=lanes,
     )
 

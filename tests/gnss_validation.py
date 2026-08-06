@@ -11,7 +11,7 @@ reference is coherent with durable, independently authored timing surfaces:
 
 The report reads completed TEMPEST campaign_detail rows.  It does not use the
 always-on relational pps_count as campaign time; campaign identity comes from
-payload.campaign.tempest.teensy_pps_vclock_count.
+payload.campaign.public_count.
 
 Usage:
     python -m zpnet.tests.gnss_validation <campaign_name> [limit]
@@ -35,7 +35,7 @@ PPS_VCLOCK_CLEAN_GATE_CYCLES = 16
 CAMPAIGN_TYPE = "TEMPEST"
 PPS_COUNT_SQL = """
 NULLIF(
-    payload #>> '{campaign,tempest,teensy_pps_vclock_count}',
+    payload #>> '{campaign,public_count}',
     ''
 )::bigint
 """
@@ -76,36 +76,26 @@ def _first(*values: Any) -> Any:
 
 
 def _root(payload: Dict[str, Any]) -> Dict[str, Any]:
-    if any(
-        key in payload
-        for key in ("schema", "monitor_fragment", "fragment", "campaign_row", "campaign")
-    ):
+    """Return one persisted CLOCKS_V4 state detail."""
+    if not isinstance(payload, dict):
+        return {}
+    if payload.get("schema") == "CLOCKS_V4":
         return payload
     inner = _dict(payload.get("payload"))
-    return inner or payload
+    return inner if inner.get("schema") == "CLOCKS_V4" else payload
 
 
-def _tempest_decoration(payload: Dict[str, Any]) -> Dict[str, Any]:
-    root = _root(payload)
-    return _dict(_dict(root.get("campaign")).get("tempest"))
+def _campaign(payload: Dict[str, Any]) -> Dict[str, Any]:
+    campaign = _dict(_root(payload).get("campaign"))
+    return campaign if campaign.get("schema") == "TEMPEST_FRAGMENT_V1" else {}
 
 
-def _fragment(payload: Dict[str, Any]) -> Dict[str, Any]:
-    root = _root(payload)
-    direct = _dict(root.get("fragment")) or _dict(root.get("campaign_row"))
-    monitor = _dict(root.get("monitor_fragment"))
-    embedded = _dict(monitor.get("campaign_row"))
-    decoration = _tempest_decoration(payload)
-    source = embedded or direct
-    if source or decoration:
-        merged = dict(source)
-        merged.update(decoration)
-        return merged
-    return root
+def _clocks(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return _dict(_root(payload).get("clocks"))
 
 
-def _science_interval_ns(frag: Dict[str, Any], lane: str) -> Optional[int]:
-    science = _dict(_dict(frag.get(lane)).get("science"))
+def _science_interval_ns(campaign: Dict[str, Any], lane: str) -> Optional[int]:
+    science = _dict(_dict(campaign.get(lane)).get("science"))
     interval = _as_int(science.get("clock_interval_ns"))
     if interval is not None:
         return interval
@@ -118,22 +108,17 @@ def _science_interval_ns(frag: Dict[str, Any], lane: str) -> Optional[int]:
 
 def _normalize(payload: Dict[str, Any], db_pps: int, db_ts: str) -> Dict[str, Any]:
     root = _root(payload)
-    frag = _fragment(payload)
-    raw = _dict(frag.get("raw_cycles"))
+    campaign = _campaign(payload)
+    clocks = _clocks(payload)
+    raw = _dict(clocks.get("raw_cycles"))
     pps_raw = _dict(raw.get("pps"))
     vclock_raw = _dict(raw.get("vclock"))
-    dwt = _dict(frag.get("dwt"))
     root_gnss = _dict(root.get("gnss"))
 
-    payload_pps = _as_int(
-        _first(
-            frag.get("teensy_pps_vclock_count"),
-            frag.get("pps_count"),
-            root.get("teensy_pps_vclock_count"),
-            root.get("pps_count"),
-        )
-    )
-    if payload_pps is not None and payload_pps != db_pps:
+    payload_pps = _as_int(campaign.get("public_count"))
+    if payload_pps is None:
+        raise ValueError("TEMPEST campaign row missing campaign.public_count")
+    if payload_pps != db_pps:
         raise ValueError(
             f"campaign_detail campaign PPS mismatch db={db_pps} payload={payload_pps}"
         )
@@ -146,9 +131,10 @@ def _normalize(payload: Dict[str, Any], db_pps: int, db_ts: str) -> Dict[str, An
         "pps_raw_cycles": pps_cycles,
         "pps_raw_valid": _as_bool(pps_raw.get("valid")),
         "vclock_raw_cycles": vclock_cycles,
-        "ocxo1_interval_ns": _science_interval_ns(frag, "ocxo1"),
-        "ocxo2_interval_ns": _science_interval_ns(frag, "ocxo2"),
-        "dwt_selected_cycles": _as_int(dwt.get("cycles_between_pps_vclock")),
+        "ocxo1_interval_ns": _science_interval_ns(campaign, "ocxo1"),
+        "ocxo2_interval_ns": _science_interval_ns(campaign, "ocxo2"),
+        # VCLOCK is the canonical selected reference interval used by Delta science.
+        "dwt_selected_cycles": vclock_cycles,
         "pps_minus_vclock_cycles": (
             pps_cycles - vclock_cycles
             if pps_cycles is not None and vclock_cycles is not None
@@ -172,7 +158,7 @@ def fetch_timebase(campaign: str) -> List[Dict[str, Any]]:
             FROM campaign_detail
             WHERE campaign_type = %s
               AND campaign = %s
-              AND payload #> '{{campaign,tempest}}' IS NOT NULL
+              AND payload #>> '{{campaign,schema}}' = 'TEMPEST_FRAGMENT_V1'
               AND {PPS_COUNT_SQL} IS NOT NULL
             ORDER BY {PPS_COUNT_SQL} ASC, id ASC
             """,
@@ -390,7 +376,7 @@ def analyze(campaign: str, limit: int = 0) -> None:
     print()
 
     print("─" * 72)
-    print("5. GNSS UTC COHERENCE")
+    print("5. GNSS UTC CONTEXT (NON-AUTHORITATIVE)")
     print("─" * 72)
     utc_stalls = 0
     utc_checked = 0
@@ -404,10 +390,12 @@ def analyze(campaign: str, limit: int = 0) -> None:
         if current:
             previous_utc = str(current)
     if utc_checked:
-        print(f"  Adjacent UTC labels checked: {utc_checked:,}")
-        print(f"  Repeated/stalled labels:     {utc_stalls:,}")
+        print(f"  Adjacent context labels checked: {utc_checked:,}")
+        print(f"  Repeated context labels:         {utc_stalls:,}")
+        print("  Note: CLOCKS_V4 GNSS is SYSTEM context and may update slower than 1 Hz;")
+        print("        repeated labels are not a campaign-timeline failure.")
     else:
-        print("  No GNSS UTC data to check")
+        print("  No GNSS UTC context available")
     print()
 
     issues: List[str] = []
@@ -419,8 +407,6 @@ def analyze(campaign: str, limit: int = 0) -> None:
         issues.append(f"{invalid_pps} invalid PPS snapshot(s)")
     if w_pps_vclock.n and outliers > w_pps_vclock.n * 0.01:
         issues.append(f"{outliers} PPS/VCLOCK closure outlier(s)")
-    if utc_stalls:
-        issues.append(f"{utc_stalls} GNSS UTC stall(s)")
 
     print("─" * 72)
     print("VERDICT")
@@ -445,7 +431,7 @@ def list_campaigns() -> None:
                 FROM campaign_detail
                 WHERE campaign_type = %s
                   AND campaign IS NOT NULL
-                  AND payload #> '{{campaign,tempest}}' IS NOT NULL
+                  AND payload #>> '{{campaign,schema}}' = 'TEMPEST_FRAGMENT_V1'
                   AND {PPS_COUNT_SQL} IS NOT NULL
                 GROUP BY campaign
                 ORDER BY max(ts) DESC

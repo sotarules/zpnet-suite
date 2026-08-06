@@ -3,10 +3,10 @@ ZPNet OCXO Aging Decay Analyzer
 
 Characterizes what happens to OCXO frequency when the servo is OFF —
 the natural drift that Holdover must compensate for. Reads completed TEMPEST
-campaign science from the unified campaign_detail stream.
+campaign science from CLOCKS_V4 campaign_detail rows.
 
 When GNSS disappears, the OCXOs are on their own.  This tool examines
-campaigns where servo_mode = OFF (or any campaign, really) and
+campaigns whose same-second CLOCKS control state has servo_mode = OFF (or any campaign, really) and
 models the PPB trajectory over time to answer:
 
   1. What is the shape of the drift?  Linear?  Exponential?  Phased?
@@ -53,7 +53,7 @@ from zpnet.shared.db import open_db
 CAMPAIGN_TYPE = "TEMPEST"
 PPS_COUNT_SQL = """
 NULLIF(
-    payload #>> '{campaign,tempest,teensy_pps_vclock_count}',
+    payload #>> '{campaign,public_count}',
     ''
 )::bigint
 """
@@ -71,53 +71,37 @@ def _first(*values: Any) -> Any:
 
 
 def _root(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Return the persisted state detail, unwrapping only a true envelope."""
-    if any(
-        key in payload
-        for key in ("schema", "monitor_fragment", "fragment", "campaign_row", "campaign")
-    ):
+    """Return one persisted CLOCKS_V4 state detail."""
+    if not isinstance(payload, dict):
+        return {}
+    if payload.get("schema") == "CLOCKS_V4":
         return payload
     inner = _dict(payload.get("payload"))
-    return inner or payload
+    return inner if inner.get("schema") == "CLOCKS_V4" else payload
 
 
-def _tempest_decoration(payload: Dict[str, Any]) -> Dict[str, Any]:
-    root = _root(payload)
-    return _dict(_dict(root.get("campaign")).get("tempest"))
+def _campaign(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the canonical TEMPEST_FRAGMENT_V1 campaign delta."""
+    campaign = _dict(_root(payload).get("campaign"))
+    return campaign if campaign.get("schema") == "TEMPEST_FRAGMENT_V1" else {}
 
 
-def _fragment(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Return the merged immutable campaign row plus final TEMPEST decoration."""
-    root = _root(payload)
-    direct = _dict(root.get("fragment")) or _dict(root.get("campaign_row"))
-    monitor = _dict(root.get("monitor_fragment"))
-    embedded = _dict(monitor.get("campaign_row"))
-    decoration = _tempest_decoration(payload)
-    source = embedded or direct
-    if source or decoration:
-        merged = dict(source)
-        merged.update(decoration)
-        return merged
-    return root
+def _clocks(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return _dict(_root(payload).get("clocks"))
 
 
 def _normalized_row(payload: Dict[str, Any], db_pps: int, db_ts: str) -> Dict[str, Any]:
     root = _root(payload)
-    frag = _fragment(payload)
-    clocks = _dict(root.get("clocks"))
-    dac = _dict(frag.get("dac"))
-    gnss = _dict(frag.get("gnss"))
+    campaign = _campaign(payload)
+    clocks = _clocks(payload)
+    clockfaces = _dict(campaign.get("clockfaces"))
+    control = _dict(clocks.get("control"))
     root_gnss = _dict(root.get("gnss"))
 
-    payload_pps = safe_int(
-        _first(
-            frag.get("teensy_pps_vclock_count"),
-            frag.get("pps_count"),
-            root.get("teensy_pps_vclock_count"),
-            root.get("pps_count"),
-        )
-    )
-    if payload_pps is not None and payload_pps != db_pps:
+    payload_pps = safe_int(campaign.get("public_count"))
+    if payload_pps is None:
+        raise ValueError("TEMPEST campaign row missing campaign.public_count")
+    if payload_pps != db_pps:
         raise ValueError(
             f"campaign_detail campaign PPS mismatch db={db_pps} payload={payload_pps}"
         )
@@ -134,17 +118,10 @@ def _normalized_row(payload: Dict[str, Any], db_pps: int, db_ts: str) -> Dict[st
             root.get("published_at_utc"),
             db_ts,
         ),
-        "servo_mode": str(
-            _first(
-                dac.get("servo_mode"),
-                frag.get("servo_mode"),
-                clocks.get("servo_mode"),
-                "UNKNOWN",
-            )
-        ).upper(),
-        "teensy_gnss_ns": safe_int(gnss.get("ns")),
-        "teensy_ocxo1_ns": safe_int(_dict(frag.get("ocxo1")).get("ns")),
-        "teensy_ocxo2_ns": safe_int(_dict(frag.get("ocxo2")).get("ns")),
+        "servo_mode": str(control.get("servo_mode") or "UNKNOWN").upper(),
+        "teensy_gnss_ns": safe_int(clockfaces.get("gnss_ns")),
+        "teensy_ocxo1_ns": safe_int(clockfaces.get("ocxo1_ns")),
+        "teensy_ocxo2_ns": safe_int(clockfaces.get("ocxo2_ns")),
     }
 
 
@@ -196,7 +173,7 @@ def fetch_timebase(campaign: str) -> List[Dict[str, Any]]:
             FROM campaign_detail
             WHERE campaign_type = %s
               AND campaign = %s
-              AND payload #> '{{campaign,tempest}}' IS NOT NULL
+              AND payload #>> '{{campaign,schema}}' = 'TEMPEST_FRAGMENT_V1'
               AND {PPS_COUNT_SQL} IS NOT NULL
             ORDER BY {PPS_COUNT_SQL} ASC, id ASC
             """,
@@ -532,8 +509,8 @@ def analyze(campaign: str, servo_ok: bool = False) -> None:
     first_pps = safe_int(rows[0].get("pps_count") or rows[0].get("teensy_pps_count")) or 0
     last_pps = safe_int(rows[-1].get("pps_count") or rows[-1].get("teensy_pps_count")) or 0
     campaign_seconds = last_pps - first_pps
-    first_ts = rows[0].get("gnss_time_utc") or rows[0].get("system_time_utc", "?")
-    last_ts = rows[-1].get("gnss_time_utc") or rows[-1].get("system_time_utc", "?")
+    first_ts = rows[0].get("system_time_utc") or rows[0].get("gnss_time_utc", "?")
+    last_ts = rows[-1].get("system_time_utc") or rows[-1].get("gnss_time_utc", "?")
 
     # Check servo state
     servo_modes = set()
@@ -817,7 +794,7 @@ def list_campaigns() -> None:
                 FROM campaign_detail
                 WHERE campaign_type = %s
                   AND campaign IS NOT NULL
-                  AND payload #> '{{campaign,tempest}}' IS NOT NULL
+                  AND payload #>> '{{campaign,schema}}' = 'TEMPEST_FRAGMENT_V1'
                   AND {PPS_COUNT_SQL} IS NOT NULL
                 GROUP BY campaign
                 ORDER BY max(ts) DESC

@@ -6,7 +6,7 @@ decoded, audited, printed, and discarded. Memory use is therefore independent
 of campaign length.
 
 The SQL explicitly selects ``campaign_type='TEMPEST'`` and derives the campaign
-PPS identity from ``payload.campaign.tempest``. That identity must agree with the
+PPS identity from ``payload.campaign``. That identity must agree with the
 immutable identity carried inside the merged campaign view.
 """
 
@@ -31,7 +31,7 @@ DEFAULT_PAUSE_MS = 25
 CAMPAIGN_TYPE = "TEMPEST"
 PPS_COUNT_SQL = """
 NULLIF(
-    payload #>> '{campaign,tempest,teensy_pps_vclock_count}',
+    payload #>> '{campaign,public_count}',
     ''
 )::bigint
 """
@@ -104,56 +104,26 @@ def first_int(*values: Any) -> Optional[int]:
 
 
 def root(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Return the persisted record, unwrapping only a true outer envelope.
-
-    A unified MONITOR_V2 detail legitimately has a top-level ``payload`` field
-    containing Payload subsystem diagnostics.  That field is not an envelope
-    and must never replace the complete state record.
-    """
-    if any(
-        key in payload
-        for key in ("schema", "monitor_fragment", "fragment", "campaign_row", "campaign")
-    ):
+    """Return one persisted CLOCKS_V4 state detail."""
+    if not isinstance(payload, dict):
+        return {}
+    if payload.get("schema") == "CLOCKS_V4":
         return payload
-
     inner = d(payload.get("payload"))
-    return inner or payload
+    return inner if inner.get("schema") == "CLOCKS_V4" else payload
 
 
-def tempest_decoration(payload: Dict[str, Any]) -> Dict[str, Any]:
-    r = root(payload)
-    return d(d(r.get("campaign")).get("tempest"))
+def campaign_view(payload: Dict[str, Any]) -> Dict[str, Any]:
+    campaign = d(root(payload).get("campaign"))
+    return campaign if campaign.get("schema") == "TEMPEST_FRAGMENT_V1" else {}
 
 
-def fragment(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Return one merged TEMPEST campaign view from a unified state detail."""
-    r = root(payload)
-    direct = d(r.get("fragment")) or d(r.get("campaign_row"))
-    monitor_fragment = d(r.get("monitor_fragment"))
-    embedded = d(monitor_fragment.get("campaign_row"))
-    decoration = tempest_decoration(payload)
-    source = embedded or direct
-    if source or decoration:
-        merged = dict(source)
-        merged.update(decoration)
-        return merged
-    return r
+def clocks_view(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return d(root(payload).get("clocks"))
 
 
-def forensics(payload: Dict[str, Any], frag: Dict[str, Any]) -> Dict[str, Any]:
-    r = root(payload)
-    return d(r.get("forensics")) or d(frag.get("forensics"))
-
-
-def _payload_pps_count(payload: Dict[str, Any], frag: Dict[str, Any]) -> Optional[int]:
-    r = root(payload)
-    return first_int(
-        frag.get("teensy_pps_vclock_count"),
-        frag.get("pps_count"),
-        frag.get("campaign_seconds"),
-        r.get("teensy_pps_vclock_count"),
-        r.get("pps_count"),
-    )
+def _payload_pps_count(payload: Dict[str, Any], campaign: Dict[str, Any]) -> Optional[int]:
+    return i(campaign.get("public_count"))
 
 
 def _assert_campaign_indexed(cur: Any, campaign: str) -> None:
@@ -163,7 +133,7 @@ def _assert_campaign_indexed(cur: Any, campaign: str) -> None:
         FROM campaign_detail
         WHERE campaign_type = %s
           AND campaign = %s
-          AND payload #> '{{campaign,tempest}}' IS NOT NULL
+          AND payload #>> '{{campaign,schema}}' = 'TEMPEST_FRAGMENT_V1'
           AND {PPS_COUNT_SQL} IS NULL
         """,
         (CAMPAIGN_TYPE, campaign),
@@ -173,7 +143,7 @@ def _assert_campaign_indexed(cur: Any, campaign: str) -> None:
     if missing:
         raise RuntimeError(
             f"TEMPEST campaign {campaign!r} has {missing:,} decorated rows without "
-            "campaign.tempest.teensy_pps_vclock_count"
+            "campaign.public_count"
         )
 
 
@@ -197,7 +167,7 @@ def iter_payloads(
             FROM campaign_detail
             WHERE campaign_type = %s
               AND campaign = %s
-              AND payload #> '{{campaign,tempest}}' IS NOT NULL
+              AND payload #>> '{{campaign,schema}}' = 'TEMPEST_FRAGMENT_V1'
               AND {PPS_COUNT_SQL} IS NOT NULL
         """
         params: list[Any] = [CAMPAIGN_TYPE, campaign]
@@ -222,8 +192,8 @@ def iter_payloads(
                 continue
 
             db_count = int(row["pps_count"])
-            frag = fragment(payload)
-            payload_count = _payload_pps_count(payload, frag)
+            campaign = campaign_view(payload)
+            payload_count = _payload_pps_count(payload, campaign)
             if payload_count is not None and payload_count != db_count:
                 raise ValueError(
                     "campaign_detail relational/payload campaign PPS mismatch: "
@@ -239,33 +209,15 @@ def iter_payloads(
                     time.sleep(pause_ms / 1000.0)
 
 
-def fallback_observed(frag: Dict[str, Any], rail: str) -> Optional[int]:
-    if rail == "PPS":
-        return first_int(d(frag.get("pps")).get("dwt_cycles_between_edges"))
-    if rail == "VCLOCK":
-        v = d(frag.get("vclock"))
-        return first_int(
-            v.get("observed_cycles"),
-            d(v.get("science")).get("cycles_between_edges"),
-            frag.get("pps_vclock_dwt_cycles_between_edges"),
-            d(frag.get("dwt")).get("cycles_between_pps_vclock"),
-        )
-    lane = d(frag.get(RAIL_KEYS[rail]))
-    science = d(lane.get("science"))
-    return first_int(
-        lane.get("observed_cycles"),
-        science.get("delta_raw_clock_interval_cycles"),
-    )
-
-
-def explicit_recovery_row(frag: Dict[str, Any]) -> bool:
-    reason = str(frag.get("recover_reattach_reason") or "").strip().lower()
+def explicit_recovery_row(campaign: Dict[str, Any]) -> bool:
+    recovery = d(campaign.get("recovery"))
+    if not recovery:
+        return False
     return bool(
-        reason not in {"", "idle", "none", "ok"}
-        or b(frag.get("recover_degraded_active")) is True
-        or b(frag.get("recover_degraded_science_hold")) is True
-        or b(frag.get("recover_science_quarantine_active")) is True
-        or b(frag.get("recover_transition_active")) is True
+        b(recovery.get("transition_active")) is True
+        or b(recovery.get("degraded_active")) is True
+        or b(recovery.get("science_quarantine_active")) is True
+        or b(recovery.get("reattach_stalled")) is True
     )
 
 
@@ -275,20 +227,21 @@ def build_row(
     previous_count: Optional[int],
     previous_observed: Dict[str, Optional[int]],
 ) -> AuditRow:
-    frag = fragment(payload)
-    forensic = forensics(payload, frag)
-    raw = d(frag.get("raw_cycles"))
+    campaign = campaign_view(payload)
+    clocks = clocks_view(payload)
+    raw = d(clocks.get("raw_cycles"))
+    status = d(campaign.get("status"))
+    disposition = d(campaign.get("disposition"))
 
     delta = None if previous_count is None else db_count - previous_count
     gap = delta is not None and delta != 1
-    recovery = bool(gap and delta is not None and delta > 1 and explicit_recovery_row(frag))
+    recovery = bool(gap and delta is not None and delta > 1 and explicit_recovery_row(campaign))
 
-    prefixes = {"PPS": "pps", "VCLOCK": "v", "OCXO1": "o1", "OCXO2": "o2"}
     rails: Dict[str, Rail] = {}
 
     for name in RAILS:
         obj = d(raw.get(RAIL_KEYS[name]))
-        observed = first_int(obj.get("observed_cycles"), fallback_observed(frag, name))
+        observed = i(obj.get("observed_cycles"))
         published_previous = i(obj.get("previous_observed_cycles"))
         published_residual = i(obj.get("residual_cycles"))
         computed_previous = None if gap else previous_observed[name]
@@ -297,41 +250,14 @@ def build_row(
             if observed is not None and computed_previous is not None
             else None
         )
-        prefix = prefixes[name]
-
-        # TIMEBASE_FRAGMENT_V5 carries the compact ISR-delay verdict beside
-        # each raw-cycle rail.  Fall back to the retired flat forensics keys so
-        # the report remains able to audit older campaigns.
-        delay_status = str(
-            obj.get("delay_status")
-            or forensic.get(f"{prefix}_delay_status")
-            or "UNKNOWN"
-        ).upper()
-        delay_by = str(
-            obj.get("delay_by")
-            or forensic.get(f"{prefix}_delay_by")
-            or "UNKNOWN"
-        ).upper()
+        # CLOCKS_V4 carries the compact ISR-delay verdict beside
+        # each raw-cycle rail.  The normalized V4 raw-cycle rail is the sole evidence source.
+        delay_status = str(obj.get("delay_status") or "UNKNOWN").upper()
+        delay_by = str(obj.get("delay_by") or "UNKNOWN").upper()
         residual_delay_valid = b(obj.get("residual_delay_valid"))
-        if residual_delay_valid is None:
-            residual_delay_valid = b(
-                forensic.get(f"{prefix}_residual_delay_valid")
-            )
         residual_delay_cycles = i(obj.get("residual_delay_cycles"))
-        if residual_delay_cycles is None:
-            residual_delay_cycles = i(
-                forensic.get(f"{prefix}_residual_delay_cycles")
-            )
-        residual_delay_by = str(
-            obj.get("residual_delay_by")
-            or forensic.get(f"{prefix}_residual_delay_by")
-            or "UNKNOWN"
-        ).upper()
+        residual_delay_by = str(obj.get("residual_delay_by") or "UNKNOWN").upper()
         delay_explains_residual = b(obj.get("delay_explains_residual"))
-        if delay_explains_residual is None:
-            delay_explains_residual = b(
-                forensic.get(f"{prefix}_delay_explains_residual")
-            )
 
         normalized = (
             computed_residual - residual_delay_cycles
@@ -374,8 +300,8 @@ def build_row(
         count_delta=delta,
         gap=gap,
         recovery_boundary=recovery,
-        disposition=str(frag.get("candidate_disposition") or "ACCEPT").upper(),
-        timeline_valid=b(frag.get("timeline_valid")),
+        disposition=str(disposition.get("status") or "ACCEPT").upper(),
+        timeline_valid=b(status.get("timeline_valid")),
         rails=rails,
     )
 

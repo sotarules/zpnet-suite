@@ -1,8 +1,8 @@
 """ZPNet campaign_analyzer — conservative one-pass streaming audit.
 
-This replacement is intentionally modest. It reads TEMPEST-decorated
+This replacement is intentionally modest. It reads TEMPEST-enriched CLOCKS_V4
 ``campaign_detail`` rows through a named PostgreSQL cursor, orders them by the
-campaign-public PPS identity in ``payload.campaign.tempest``, decodes one large
+campaign-public identity in ``payload.campaign.public_count``, decodes one large
 unified state payload at a time, folds it into compact online state, and discards
 it immediately.
 
@@ -37,13 +37,13 @@ SNAPSHOT_LANES = ("pps", "vclock", "ocxo1", "ocxo2")
 CAMPAIGN_TYPE = "TEMPEST"
 PPS_COUNT_SQL = """
 NULLIF(
-    payload #>> '{campaign,tempest,teensy_pps_vclock_count}',
+    payload #>> '{campaign,public_count}',
     ''
 )::bigint
 """
 DETAIL_PPS_COUNT_SQL = """
 NULLIF(
-    d.payload #>> '{campaign,tempest,teensy_pps_vclock_count}',
+    d.payload #>> '{campaign,public_count}',
     ''
 )::bigint
 """
@@ -120,98 +120,69 @@ def first_bool(*values: Any) -> Optional[bool]:
 
 
 def root(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Return the persisted record, unwrapping only a true outer envelope.
-
-    A unified MONITOR_V2 detail legitimately has a top-level ``payload`` field
-    containing Payload subsystem diagnostics.  That field is not an envelope
-    and must never replace the complete state record.
-    """
-    if any(
-        key in payload
-        for key in ("schema", "monitor_fragment", "fragment", "campaign_row", "campaign")
-    ):
+    """Return one persisted CLOCKS_V4 state detail."""
+    if not isinstance(payload, dict):
+        return {}
+    if payload.get("schema") == "CLOCKS_V4":
         return payload
-
     inner = d(payload.get("payload"))
-    return inner or payload
+    return inner if inner.get("schema") == "CLOCKS_V4" else payload
 
 
-def tempest_decoration(payload: Dict[str, Any]) -> Dict[str, Any]:
-    r = root(payload)
-    return d(d(r.get("campaign")).get("tempest"))
+def campaign_view(payload: Dict[str, Any]) -> Dict[str, Any]:
+    campaign = d(root(payload).get("campaign"))
+    return campaign if campaign.get("schema") == "TEMPEST_FRAGMENT_V1" else {}
 
 
-def fragment(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Return one merged TEMPEST campaign view from a unified state detail."""
-    r = root(payload)
-    direct = d(r.get("fragment")) or d(r.get("campaign_row"))
-    monitor_fragment = d(r.get("monitor_fragment"))
-    embedded = d(monitor_fragment.get("campaign_row"))
-    decoration = tempest_decoration(payload)
-    source = embedded or direct
-    if source or decoration:
-        merged = dict(source)
-        merged.update(decoration)
-        return merged
-    return r
+def clocks_view(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return d(root(payload).get("clocks"))
 
 
-def science_disposition(payload: Dict[str, Any],
-                        frag: Dict[str, Any]) -> tuple[bool, bool, str]:
-    """Resolve completed TIMEBASE science custody.
+def adjudication_view(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return d(campaign_view(payload).get("adjudication"))
 
-    The Pi final court is authoritative when present.  Top-level TIMEBASE and
-    firmware-fragment fields are compatibility witnesses for older rows.
-    Unknown legacy rows remain admitted unless an explicit exclusion signal is
-    present; this preserves historical analyzer behavior without allowing a
-    known SCIENCE_EXCLUDE row into science statistics or courts.
-    """
-    court = d(payload.get("final_court")) or d(frag.get("final_court"))
+
+def science_disposition(payload: Dict[str, Any], campaign: Dict[str, Any]) -> tuple[bool, bool, str]:
+    """Resolve completed TEMPEST science custody from the V4 campaign delta."""
+    adjudication = adjudication_view(payload)
+    court = d(adjudication.get("final_court"))
+    disposition = d(campaign.get("disposition"))
 
     excluded = first_bool(
+        adjudication.get("science_excluded"),
         court.get("science_excluded"),
-        payload.get("science_excluded"),
-        frag.get("science_excluded"),
     )
     eligible = first_bool(
+        adjudication.get("science_eligible"),
         court.get("science_eligible"),
-        payload.get("science_eligible"),
-        frag.get("science_eligible"),
+        disposition.get("science_eligible"),
     )
-
     candidate_use = str(
-        court.get("candidate_use")
-        or payload.get("candidate_use")
-        or frag.get("candidate_use")
+        adjudication.get("candidate_use")
+        or court.get("candidate_use")
+        or disposition.get("use")
         or ""
     ).strip().upper()
-    classification = str(court.get("classification") or "").strip().upper()
-    disposition = str(frag.get("candidate_disposition") or "").strip().upper()
+    status = str(disposition.get("status") or "").strip().upper()
 
     explicit_exclusion = bool(
         excluded is True
         or eligible is False
         or candidate_use in {"AUDIT_ONLY", "SCIENCE_EXCLUDE", "EXCLUDE"}
-        or classification in {"SCIENCE_EXCLUDE", "AUDIT_ONLY"}
-        or disposition in {"SCIENCE_EXCLUDE", "AUDIT_ONLY"}
+        or status in {"SCIENCE_EXCLUDE", "REJECT"}
     )
     if explicit_exclusion:
         reason = str(
             court.get("rationale")
             or court.get("primary_rule")
-            or frag.get("candidate_reason")
-            or frag.get("candidate_reason_name")
+            or disposition.get("reason_name")
             or candidate_use
-            or classification
-            or disposition
+            or status
             or "science excluded"
         )
         return False, True, reason
 
-    if eligible is True or excluded is False or candidate_use == "SCIENCE_AND_CONTROL":
-        return True, False, "science admitted"
-
-    return True, False, "legacy row without explicit science disposition"
+    return True, False, "science admitted"
 
 
 @dataclass
@@ -331,7 +302,6 @@ class Audit:
     ppb_alarms: int = 0
     ppb_steps: int = 0
     welford_regressions: int = 0
-    welford_hold_changes: int = 0
     snapshot_contract_rows: int = 0
     snapshot_clean_rows: int = 0
     snapshot_legacy_rows: int = 0
@@ -388,7 +358,7 @@ def _assert_campaign_indexed(cur: Any, campaign: str) -> None:
         FROM campaign_detail
         WHERE campaign_type = %s
           AND campaign = %s
-          AND payload #> '{{campaign,tempest}}' IS NOT NULL
+          AND payload #>> '{{campaign,schema}}' = 'TEMPEST_FRAGMENT_V1'
           AND {PPS_COUNT_SQL} IS NULL
         """,
         (CAMPAIGN_TYPE, campaign),
@@ -398,7 +368,7 @@ def _assert_campaign_indexed(cur: Any, campaign: str) -> None:
     if missing:
         raise RuntimeError(
             f"TEMPEST campaign {campaign!r} has {missing:,} decorated rows without "
-            "campaign.tempest.teensy_pps_vclock_count"
+            "campaign.public_count"
         )
 
 
@@ -420,7 +390,7 @@ def iter_rows(
             FROM campaign_detail
             WHERE campaign_type = %s
               AND campaign = %s
-              AND payload #> '{{campaign,tempest}}' IS NOT NULL
+              AND payload #>> '{{campaign,schema}}' = 'TEMPEST_FRAGMENT_V1'
               AND {PPS_COUNT_SQL} IS NOT NULL
             ORDER BY {PPS_COUNT_SQL} ASC, id ASC
         """
@@ -450,45 +420,39 @@ def iter_rows(
 
 def compact(db_id: int, db_pps: int, ts: str, payload: Dict[str, Any]) -> CompactRow:
     payload_root = root(payload)
-    frag = fragment(payload)
-    forensic = d(payload_root.get("forensics")) or d(frag.get("forensics"))
+    campaign = campaign_view(payload)
+    clocks = clocks_view(payload)
+    adjudication = adjudication_view(payload)
+    final_court = d(adjudication.get("final_court"))
+    clockfaces = d(campaign.get("clockfaces"))
+    campaign_status = d(campaign.get("status"))
+    recovery = d(campaign.get("recovery"))
 
-    payload_pps = first_int(
-        frag.get("teensy_pps_vclock_count"),
-        frag.get("pps_count"),
-        payload_root.get("teensy_pps_vclock_count"),
-        payload_root.get("pps_count"),
-    )
-    if payload_pps is not None and payload_pps != db_pps:
+    payload_pps = first_int(campaign.get("public_count"))
+    if payload_pps is None:
+        raise ValueError(f"campaign_detail TEMPEST row id={db_id} missing campaign.public_count")
+    if payload_pps != db_pps:
         raise ValueError(
             f"campaign_detail campaign PPS mismatch id={db_id} db={db_pps} payload={payload_pps}"
         )
 
     def ocxo(prefix: str) -> tuple[Optional[int], Optional[int], Optional[int], Optional[bool]]:
-        science = d(path(frag, f"{prefix}.science"))
-        residual = d(path(frag, f"{prefix}.pps_residual"))
-        ns = first_int(path(frag, f"{prefix}.ns"), path(frag, f"gnss.{prefix}_ns"))
-        interval = first_int(
-            residual.get("clock_interval_ns"),
-            science.get("clock_interval_ns"),
-        )
-        fast = first_int(
-            residual.get("fast_residual_ns"),
-            science.get("fast_residual_ns"),
-        )
-        valid = b(residual.get("valid"))
-        if valid is None:
-            valid = b(science.get("valid"))
+        lane = d(campaign.get(prefix))
+        science = d(lane.get("science"))
+        ns = first_int(clockfaces.get(f"{prefix}_ns"))
+        interval = first_int(science.get("clock_interval_ns"))
+        fast = first_int(science.get("fast_residual_ns"))
+        valid = b(science.get("valid"))
         return ns, interval, fast, valid
 
     o1_ns, o1_int, o1_res, o1_valid = ocxo("ocxo1")
     o2_ns, o2_int, o2_res, o2_valid = ocxo("ocxo2")
     row_science_eligible, row_science_excluded, row_science_reason = (
-        science_disposition(payload_root, frag)
+        science_disposition(payload_root, campaign)
     )
 
-    stats_obj = d(frag.get("stats"))
-    raw_cycles = d(frag.get("raw_cycles"))
+    stats_obj = d(clocks.get("stats"))
+    raw_cycles = d(clocks.get("raw_cycles"))
     raw_lanes = {lane: d(raw_cycles.get(lane)) for lane in SNAPSHOT_LANES}
 
     stats_snapshot_ok = b(stats_obj.get("snapshot_ok"))
@@ -535,46 +499,31 @@ def compact(db_id: int, db_pps: int, ts: str, payload: Dict[str, Any]) -> Compac
             for name, value in (
                 (f"raw_cycles.{lane}.snapshot_ok", raw_snapshot_ok[lane]),
                 (f"raw_cycles.{lane}.valid", raw_valid[lane]),
-                (
-                    f"raw_cycles.{lane}.forensics_snapshot_ok",
-                    forensics_snapshot_ok[lane],
-                ),
-                (
-                    f"raw_cycles.{lane}.delay_detail_present",
-                    delay_detail_present[lane],
-                ),
+                (f"raw_cycles.{lane}.forensics_snapshot_ok", forensics_snapshot_ok[lane]),
+                (f"raw_cycles.{lane}.delay_detail_present", delay_detail_present[lane]),
             ):
                 if value is None:
                     snapshot_contract_missing.append(name)
             if not delay_status[lane]:
                 snapshot_contract_missing.append(f"raw_cycles.{lane}.delay_status")
 
-    # Legacy rows retain historical behavior.  Once the explicit contract is
-    # present, statistics are admissible only from a coherent, valid completed
-    # statistics row.
     stats_usable = (
-        stats_valid is not False
-        if not snapshot_contract_present
-        else (
-            stats_snapshot_ok is True
-            and stats_valid is True
-            and stats_completed_row_coherent is True
-        )
+        stats_snapshot_ok is True
+        and stats_valid is True
+        and stats_completed_row_coherent is True
     )
 
-    reason = str(frag.get("recover_reattach_reason") or "").strip().lower()
-    recovery_evidence = bool(
-        reason not in {"", "idle", "none", "ok"}
-        or b(frag.get("recover_transition_active")) is True
-        or b(frag.get("recover_degraded_active")) is True
-        or b(frag.get("recover_science_quarantine_active")) is True
+    recovery_evidence = bool(recovery) and bool(
+        b(recovery.get("transition_active")) is True
+        or b(recovery.get("degraded_active")) is True
+        or b(recovery.get("science_quarantine_active")) is True
+        or b(recovery.get("reattach_stalled")) is True
     )
     recovery_hold = bool(
-        b(frag.get("recover_degraded_science_hold")) is True
-        or b(frag.get("recover_science_quarantine_active")) is True
+        b(recovery.get("science_quarantine_active")) is True
         or (
-            b(frag.get("recover_degraded_active")) is True
-            and b(frag.get("recover_science_ready")) is not True
+            b(recovery.get("degraded_active")) is True
+            and b(recovery.get("science_ready")) is not True
         )
     )
 
@@ -582,36 +531,23 @@ def compact(db_id: int, db_pps: int, ts: str, payload: Dict[str, Any]) -> Compac
     welford_sd: Dict[str, Optional[float]] = {}
     for lane in ("dwt", "vclock", "ocxo1", "ocxo2"):
         welford_n[lane] = (
-            first_int(
-                path(frag, f"stats.{lane}.welford.n"),
-                path(frag, f"stats.{lane}.n"),
-                frag.get(f"{lane}_welford_n"),
-            )
-            if stats_usable
-            else None
+            first_int(path(stats_obj, f"{lane}.welford.n")) if stats_usable else None
         )
         welford_sd[lane] = (
-            first_float(
-                path(frag, f"stats.{lane}.welford.stddev"),
-                path(frag, f"stats.{lane}.stddev"),
-                frag.get(f"{lane}_welford_stddev"),
-            )
-            if stats_usable
-            else None
+            first_float(path(stats_obj, f"{lane}.welford.stddev")) if stats_usable else None
         )
+
+    campaign_ppb = d(d(campaign.get("stats")).get("ppb"))
+    control = d(clocks.get("control"))
 
     return CompactRow(
         db_id=db_id,
         pps=db_pps,
         ts=ts,
-        campaign=str(frag.get("campaign") or d(payload_root.get("campaign")).get("campaign") or ""),
-        gnss_ns=first_int(path(frag, "gnss.ns"), frag.get("gnss_ns")),
-        vclock_ns=first_int(path(frag, "vclock.ns"), path(frag, "gnss.ns")),
-        dwt_cycles=first_int(
-            path(frag, "dwt.cycle_count_total"),
-            path(frag, "dwt.cycles"),
-            frag.get("dwt_cycle_count_total"),
-        ),
+        campaign=str(campaign.get("name") or ""),
+        gnss_ns=first_int(clockfaces.get("gnss_ns")),
+        vclock_ns=first_int(clockfaces.get("gnss_ns")),
+        dwt_cycles=first_int(clockfaces.get("dwt_cycles")),
         ocxo1_ns=o1_ns,
         ocxo2_ns=o2_ns,
         ocxo1_interval_ns=o1_int,
@@ -620,34 +556,18 @@ def compact(db_id: int, db_pps: int, ts: str, payload: Dict[str, Any]) -> Compac
         ocxo2_residual_ns=o2_res,
         ocxo1_valid=o1_valid,
         ocxo2_valid=o2_valid,
-        dwt_ppb=(
-            first_float(path(frag, "stats.dwt.ppb"), frag.get("dwt_ppb"))
-            if stats_usable
-            else None
-        ),
-        vclock_ppb=(
-            first_float(path(frag, "stats.vclock.ppb"), frag.get("vclock_ppb"))
-            if stats_usable
-            else None
-        ),
-        ocxo1_ppb=(
-            first_float(path(frag, "stats.ocxo1.ppb"), frag.get("ocxo1_ppb"))
-            if stats_usable
-            else None
-        ),
-        ocxo2_ppb=(
-            first_float(path(frag, "stats.ocxo2.ppb"), frag.get("ocxo2_ppb"))
-            if stats_usable
-            else None
-        ),
+        dwt_ppb=first_float(campaign_ppb.get("dwt")),
+        vclock_ppb=first_float(campaign_ppb.get("vclock")),
+        ocxo1_ppb=first_float(campaign_ppb.get("ocxo1")),
+        ocxo2_ppb=first_float(campaign_ppb.get("ocxo2")),
         science_eligible=row_science_eligible,
         science_excluded=row_science_excluded,
         science_reason=row_science_reason,
         recovery_evidence=recovery_evidence,
         recovery_hold=recovery_hold,
-        timeline_ready=b(frag.get("recover_timeline_ready")),
-        clockface_ready=b(frag.get("recover_clockface_ready")),
-        science_ready=b(frag.get("recover_science_ready")),
+        timeline_ready=b(recovery.get("timeline_ready")),
+        clockface_ready=b(recovery.get("clockface_ready")),
+        science_ready=b(recovery.get("science_ready")),
         welford_n=welford_n,
         welford_sd=welford_sd,
         snapshot_contract_present=snapshot_contract_present,
@@ -660,15 +580,10 @@ def compact(db_id: int, db_pps: int, ts: str, payload: Dict[str, Any]) -> Compac
         forensics_snapshot_ok=forensics_snapshot_ok,
         delay_detail_present=delay_detail_present,
         delay_status=delay_status,
-        servo_mode=str(
-            path(frag, "dac.servo_mode")
-            or frag.get("servo_mode")
-            or payload_root.get("servo_mode")
-            or "?"
-        ),
-        location=str(frag.get("location") or payload_root.get("location") or "?"),
+        servo_mode=str(control.get("servo_mode") or "?"),
+        location=str(adjudication.get("location") or "?"),
         environment=d(payload_root.get("environment")),
-        final_forensics=forensic,
+        final_forensics=final_court,
     )
 
 
@@ -962,11 +877,6 @@ def update(audit: Audit, prev: Optional[CompactRow], cur: CompactRow) -> None:
             audit.welford_regressions += 1
             audit.note_science_event(cur.pps)
             audit.note("Welford regression", f"pps={cur.pps} {lane} {pn}->{cn}")
-        if cur.science_excluded and cn != pn:
-            audit.welford_hold_changes += 1
-            audit.note_science_event(cur.pps)
-            audit.note("Welford changed while science excluded",
-                       f"pps={cur.pps} {lane} {pn}->{cn}")
 
     for lane in ("dwt", "vclock", "ocxo1", "ocxo2"):
         pv = getattr(prev, f"{lane}_ppb")
@@ -997,7 +907,7 @@ def print_report(audit: Audit, batch_size: int, pause_ms: int) -> None:
     print(f"CAMPAIGN ANALYSIS: {audit.campaign}")
     print("=" * 78)
     print(f"  Streaming policy:  named cursor, batch={batch_size}, pause={pause_ms} ms")
-    print("  Database ordering: campaign.tempest.teensy_pps_vclock_count, id")
+    print("  Database ordering: campaign.public_count, id")
     print(f"  Time range:        {audit.first_ts} -> {audit.last_ts}")
     print(f"  PPS range:         {audit.first_pps} -> {audit.last_pps}")
     print(f"  Actual rows:       {audit.rows:,}")
@@ -1098,7 +1008,6 @@ def print_report(audit: Audit, batch_size: int, pause_ms: int) -> None:
         ("PPB absolute alarms", audit.ppb_alarms),
         ("PPB steps", audit.ppb_steps),
         ("Welford regressions", audit.welford_regressions),
-        ("Welford hold changes", audit.welford_hold_changes),
     ]
     total = 0
     for label, count in courts:
@@ -1164,11 +1073,9 @@ def print_report(audit: Audit, batch_size: int, pause_ms: int) -> None:
     )
     statistics_integrity = (
         audit.welford_regressions == 0
-        and audit.welford_hold_changes == 0
     )
     quarantine_integrity = (
         audit.snapshot_failure_science_rows == 0
-        and audit.welford_hold_changes == 0
     )
     confidence_components = [science_confidence, continuity_confidence]
     if snapshot_confidence is not None:
@@ -1203,11 +1110,11 @@ def print_report(audit: Audit, batch_size: int, pause_ms: int) -> None:
         print("  Environment: no data")
     if final.final_forensics:
         print(
-            "  Forensics: "
+            "  Final court: "
             f"schema={final.final_forensics.get('schema') or final.final_forensics.get('micro_schema') or '?'}"
         )
     else:
-        print("  Forensics: no data")
+        print("  Final court: no data")
 
     print("\nVERDICTS")
     science_anomalies = sum((
@@ -1222,7 +1129,6 @@ def print_report(audit: Audit, batch_size: int, pause_ms: int) -> None:
         audit.ppb_alarms,
         audit.ppb_steps,
         audit.welford_regressions,
-        audit.welford_hold_changes,
     ))
     timeline_anomalies = sum((
         audit.gnss_identity_errors,
@@ -1351,7 +1257,7 @@ def list_campaigns() -> None:
              AND m.campaign = d.campaign
             WHERE d.campaign_type = %s
               AND d.campaign IS NOT NULL
-              AND d.payload #> '{{campaign,tempest}}' IS NOT NULL
+              AND d.payload #>> '{{campaign,schema}}' = 'TEMPEST_FRAGMENT_V1'
             GROUP BY d.campaign
             ORDER BY max(d.ts) DESC
             LIMIT 20

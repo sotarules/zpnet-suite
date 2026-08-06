@@ -5,20 +5,15 @@ Core contract:
 
   CLOCKS is the final TEMPEST candidate arbiter. It owns no Teensy clock
   state. It receives the always-on CLOCKS_FRAGMENT stream from the Teensy.
-  During a TEMPEST campaign, CLOCKS_FRAGMENT carries an optional campaign_row
-  whose TIMEBASE_FRAGMENT_V7 body carries observation plus mode-free eligibility;
-  older fragment versions may also contain embedded forensics. CLOCKS decorates
-  the accepted candidate with Pi-owned environment, GF-8802, GNSS_RAW, and
-  system-time evidence, then decorates the same-second unified state detail.
-
-  There is no standalone TIMEBASE_FORENSICS subscription in this process and
-  no two-topic pair join. The TEMPEST detail payload retains the ``fragment``
-  and ``forensics`` evidence surfaces reconstructed from the single Teensy
-  message.
+  During a TEMPEST campaign, CLOCKS_FRAGMENT carries an optional ``campaign``
+  TEMPEST_FRAGMENT_V1 enrichment.  The always-on ``clocks`` object remains the
+  sole instrument authority; the campaign object contains only campaign-relative
+  identity/science.  CLOCKS adjudicates that delta and adds Pi-owned context
+  without cloning the live instrument state.
 
   Architecture:
-    • Teensy owns: PPS/VCLOCK identity, GNSS/VCLOCK ns, DWT cycles,
-      OCXO1 ns, OCXO2 ns, firmware stats, and embedded forensics.
+    • Teensy owns: physical PPS identity, GNSS/DWT/OCXO clockfaces,
+      raw-cycle evidence, firmware statistics/control state, and TEMPEST science.
     • Pi owns: GNSS_RAW, GF-8802 correlation, environment correlation,
       campaign lifecycle, final acceptance court, recovery orchestration,
       and PostgreSQL persistence.
@@ -43,7 +38,7 @@ Core contract:
     incoherent candidates.
 
 Responsibilities:
-  * Receive campaign_row candidates from the unified CLOCKS_FRAGMENT stream.
+  * Receive optional TEMPEST campaign enrichment from the unified CLOCKS_FRAGMENT stream.
   * Adjudicate each candidate: persist coherent audit rows and recover on structural loss.
   * Subscribe to predictive GF-8802 announcements and bind them to PPS-aligned rows.
   * Augment accepted rows with environment, GNSS_RAW, and system time.
@@ -99,7 +94,7 @@ CAMPAIGN_DETAIL_ATTACH_POLL_S = 0.05
 
 # Teensy DWT conversion constants mirror pnc/firmware/teensy/config.h.
 # RECOVER still accepts a dwt_ns command argument, but current
-# TIMEBASE_FRAGMENT_V3 publishes the DWT ledger in native cycles.
+# TEMPEST_FRAGMENT_V1 publishes the DWT ledger in native cycles.
 DWT_NS_NUM = 125
 DWT_NS_DEN = 126
 DWT_EXPECTED_PER_PPS = 1_008_000_000
@@ -112,7 +107,7 @@ GNSS_RAW_INFO_MAX_AGE_S = 2.5
 # Cold START, Flash Cut, and zero-row cold recovery are readiness-gated.
 # Warm recovery uses its narrower recovery-specific lifecycle contract. The
 # Pi no longer expects fixed row burial/warmup suppression during admission:
-# the first public CLOCKS_FRAGMENT campaign row is supposed to be useful, and if it is not,
+# the first public CLOCKS_FRAGMENT campaign delta is supposed to be useful, and if it is not,
 # the responsible readiness or handoff gate should be fixed.
 RECOVERY_FIRST_PUBLIC_OFFSET = 1
 SYNC_FRAGMENT_TIMEOUT_S = 35.0
@@ -125,7 +120,7 @@ SYNC_POLL_S = 0.005
 # mature OCXO science.
 SYNC_RECOVER_CLEAN_TIMEOUT_S = 180.0
 
-# A recovery that produces no accepted CLOCKS_FRAGMENT campaign row inside this window is not
+# A recovery that produces no accepted CLOCKS_FRAGMENT campaign delta inside this window is not
 # merely "not clean yet".  Teensy should either publish a clean row or, after
 # its bounded private reattach window, publish degraded rows that let the Pi
 # observe liveness.  If the first row never appears, abort the firmware
@@ -164,15 +159,14 @@ SYNC_LOG_INTERVAL_S = 5.0
 
 # TIMEBASE ingress queue: maxsize=0 means unbounded.
 #
-# The Teensy emits one CLOCKS_FRAGMENT whose optional campaign_row contains the
-# science fragment and an embedded ``forensics`` object. PostgreSQL still
-# receives the compatible {fragment, forensics} TIMEBASE shape after Pi-side
-# adjudication, but there is no standalone forensics route or two-topic pair
-# join in the live architecture.
+# The Teensy emits one CLOCKS_FRAGMENT_V4. ``clocks`` is canonical always-on
+# instrument state; optional ``campaign`` is the TEMPEST-relative delta.  The
+# outer sequence is physical-row identity while campaign.public_count is the
+# campaign-relative recovery/publication count.
 TIMEBASE_INGRESS_QUEUE_MAXSIZE = 0
 CLOCKS_STATE_QUEUE_MAXSIZE = 3600
 CLOCKS_STATE_RETRY_S = 0.25
-TIMEBASE_FRAGMENT_TOPIC = "CLOCKS_FRAGMENT.campaign_row"
+TIMEBASE_FRAGMENT_TOPIC = "CLOCKS_FRAGMENT.campaign"
 CLOCKS_FRAGMENT_TOPIC = "CLOCKS_FRAGMENT"
 CLOCKS_TOPIC = "CLOCKS"
 CLOCKS_BASELINE_REFRESH_S = 30.0
@@ -180,13 +174,9 @@ CLOCKS_PREFLIGHT_MAX_AGE_S = 5.0
 CLOCKS_RECOVERY_STALLED_TOPIC = "CLOCKS_RECOVERY_STALLED"
 TIMEBASE_CANDIDATE_ACCEPT = "ACCEPT"
 TIMEBASE_CANDIDATE_SCIENCE_EXCLUDE = "SCIENCE_EXCLUDE"
-# Rolling-deploy compatibility only: an older firmware SCIENCE_REJECT is treated
-# exactly like SCIENCE_EXCLUDE. It never selects a mode or causes row burial.
-TIMEBASE_CANDIDATE_LEGACY_SCIENCE_REJECT = "SCIENCE_REJECT"
 TIMEBASE_CANDIDATE_DISPOSITIONS = {
     TIMEBASE_CANDIDATE_ACCEPT,
     TIMEBASE_CANDIDATE_SCIENCE_EXCLUDE,
-    TIMEBASE_CANDIDATE_LEGACY_SCIENCE_REJECT,
 }
 
 INVALID_TIMEBASE_LOG_PATH = os.environ.get(
@@ -265,9 +255,10 @@ FLASH_CUT_FIRST_FRAGMENT_TIMEOUT_S = 180.0
 # they are diagnostic / quality witnesses whose current definitions can strobe
 # during startup, recovery, and report-pressure windows.
 #
-# COUNTER32_LINEAGE and OCXO_PUBLIC_ORIGIN remain admission prerequisites in
-# MONITOR because they protect the physical identity/custody rails needed by the
-# startup handoff.  STATIC_PREDICTION remains post-start evidence.
+# COUNTER32_LINEAGE and OCXO_PUBLIC_ORIGIN remain admission prerequisites because
+# they protect physical identity/custody.  ALPHA_EPOCH subsumes SmartZero readiness:
+# if SmartZero is scientifically blocking, ALPHA_EPOCH must not be NOMINAL.
+# STATIC_PREDICTION remains post-start evidence.
 #
 # Pi CLOCKS owns the one global policy gate.  Teensy CLOCKS does not mirror or
 # re-evaluate CLOCKS policy; it enforces command/state integrity, SmartZero,
@@ -285,7 +276,6 @@ FEATURE_PREFLIGHT_REQUIRED = (
     "TEENSY.INTERRUPT.QTIMER_COUNTER_CUSTODY",
     "TEENSY.INTERRUPT.COUNTER32_LINEAGE",
     "TEENSY.CLOCKS.DWT_CALIBRATION",
-    "TEENSY.CLOCKS.SMARTZERO",
     "TEENSY.CLOCKS.ALPHA_EPOCH",
     "TEENSY.CLOCKS.OCXO_PUBLIC_ORIGIN",
 )
@@ -313,14 +303,13 @@ _diag: Dict[str, Any] = {
     "timebase_candidates_processed": 0,
 
     # Legacy fragment aliases retained for REPORT compatibility. In the live
-    # architecture each campaign_row is the complete pre-TIMEBASE candidate, including
-    # embedded forensics.
+    # architecture each V4 ``campaign`` object is the complete TEMPEST-relative candidate.
     "fragments_received": 0,
     "fragments_queued": 0,
     "fragments_missing_teensy_pps_count": 0,     # legacy diagnostic alias
     "fragments_missing_teensy_pps_vclock_count": 0,
 
-    # Unified CLOCKS_FRAGMENT campaign-row processing (processor thread — slow path).
+    # Unified CLOCKS_FRAGMENT campaign-delta processing (processor thread — slow path).
     "timebase_pieces_processed": 0,              # legacy alias: queue items
     "timebase_rows_completed": 0,
     "timebase_pairs_completed": 0,               # legacy alias for rows completed
@@ -351,7 +340,6 @@ _diag: Dict[str, Any] = {
     # Firmware-authored whole-row science exclusions. Coherent rows are always
     # persisted; these counters explain audit-only admissions.
     "firmware_science_exclude_received": 0,
-    "firmware_science_exclude_legacy_received": 0,
     "last_firmware_science_exclude": {},
 
     # Dedicated invalid-TIMEBASE JSONL evidence log.
@@ -607,7 +595,7 @@ def _log_invalid_timebase(
         _diag["last_invalid_timebase_log"] = {
             "logged_at_utc": entry["logged_at_utc"],
             "campaign": verdict.get("campaign"),
-            "teensy_pps_vclock_count": verdict.get("teensy_pps_vclock_count"),
+            "public_count": verdict.get("public_count"),
             "primary_rule": verdict.get("primary_rule"),
             "rationale": verdict.get("rationale"),
             "path": INVALID_TIMEBASE_LOG_PATH,
@@ -640,10 +628,7 @@ def _firmware_science_exclusion(fragment: Dict[str, Any]) -> Dict[str, Any]:
         and not _timebase_final_court_bool(fragment.get("control_eligible"))
     )
     excluded = (
-        disposition in {
-            TIMEBASE_CANDIDATE_SCIENCE_EXCLUDE,
-            TIMEBASE_CANDIDATE_LEGACY_SCIENCE_REJECT,
-        }
+        disposition == TIMEBASE_CANDIDATE_SCIENCE_EXCLUDE
         or explicit_excluded
         or explicit_ineligible
         or explicit_control_ineligible
@@ -674,7 +659,6 @@ def _firmware_science_exclusion(fragment: Dict[str, Any]) -> Dict[str, Any]:
         "control_eligible": _timebase_final_court_bool(
             fragment.get("control_eligible", not explicit_control_ineligible)
         ),
-        "legacy_disposition": disposition == TIMEBASE_CANDIDATE_LEGACY_SCIENCE_REJECT,
     }
 
 
@@ -861,7 +845,7 @@ _last_pps_vclock_count_seen: Optional[int] = None
 _accepted_pps_vclock_count: Optional[int] = None
 
 # CLOCKS_FRAGMENT silence monitor.  This is intentionally process-local: if a
-# campaign is active and the Teensy stops publishing CLOCKS_FRAGMENT campaign rows, CLOCKS
+# campaign is active and the Teensy stops publishing CLOCKS_FRAGMENT campaign deltas, CLOCKS
 # treats the silence as a recoverable Teensy lifecycle event once communication
 # returns.
 _timebase_last_activity_monotonic: Optional[float] = None
@@ -871,7 +855,7 @@ _timebase_last_activity_pps_vclock_count: Optional[int] = None
 _timebase_silence_recovery_active: bool = False
 
 # Asynchronous START observation.  START no longer blocks waiting for the
-# first CLOCKS_FRAGMENT campaign row; this records the pending wait so
+# first CLOCKS_FRAGMENT campaign delta; this records the pending wait so
 # reports can show whether the Teensy has begun publishing.
 _start_waiting_for_first_fragment: bool = False
 _start_requested_campaign: Optional[str] = None
@@ -923,7 +907,7 @@ class RecoveryRetryableFailure(RuntimeError):
 
 
 class RecoverySyncTimeout(RecoveryRetryableFailure):
-    """Raised when RECOVER produces no accepted CLOCKS_FRAGMENT campaign row."""
+    """Raised when RECOVER produces no accepted CLOCKS_FRAGMENT campaign delta."""
 
 
 class RecoveryCleanTimeout(RecoveryRetryableFailure):
@@ -997,7 +981,7 @@ def _note_timebase_activity(
     pps_vclock_count: Optional[int],
 ) -> None:
     """
-    Record receipt of one Teensy CLOCKS_FRAGMENT campaign-row candidate.
+    Record receipt of one Teensy CLOCKS_FRAGMENT campaign-delta candidate.
 
     Candidate receipt is the campaign heartbeat even when the Pi later rejects
     the row.  That keeps transport silence distinct from scientific invalidity.
@@ -1023,10 +1007,10 @@ def _note_timebase_activity(
 
 def _arm_timebase_silence_watch(context: str) -> None:
     """
-    Start or restart the silence timer when CLOCKS expects CLOCKS_FRAGMENT campaign rows.
+    Start or restart the silence timer when CLOCKS expects CLOCKS_FRAGMENT campaign deltas.
 
     This covers the interval before the first post-START/post-RECOVER fragment.
-    Actual CLOCKS_FRAGMENT campaign-row receipts replace this synthetic watch-arm marker through
+    Actual CLOCKS_FRAGMENT campaign-delta receipts replace this synthetic watch-arm marker through
     _note_timebase_activity().
     """
     global _timebase_last_activity_monotonic
@@ -1265,7 +1249,7 @@ def _timebase_silence_recovery(reason: str, details: Dict[str, Any]) -> None:
 
     This extends boot-time campaign recovery to the live-Pi / rebooted-Teensy
     case.  The database active-campaign row remains the durable intent; the
-    process-local campaign gate is lowered so stale or partial CLOCKS_FRAGMENT campaign-row candidates
+    process-local campaign gate is lowered so stale or partial CLOCKS_FRAGMENT campaign-delta candidates
     cannot be persisted while the Teensy is being recovered.
     """
     global _campaign_active, _auto_recovery_in_progress
@@ -1427,7 +1411,7 @@ def _begin_timebase_silence_recovery(age_s: float, *, timeout_s: float, phase: s
 
 def _timebase_silence_monitor_loop() -> None:
     """
-    Detect a live Teensy reboot/loss by absence of CLOCKS_FRAGMENT campaign rows.
+    Detect a live Teensy reboot/loss by absence of CLOCKS_FRAGMENT campaign deltas.
 
     The monitor is intentionally quiet unless it detects the first silence
     threshold crossing.  Health-check failures after that point are silent and
@@ -1788,38 +1772,33 @@ def _clocks_payload(monitor: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return clocks if isinstance(clocks, dict) else {}
 
 
-def _clocks_restore_state(monitor: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Return firmware-authored structured sufficient state from CLOCKS."""
-    state = _clocks_payload(monitor).get("restore_state")
-    if not isinstance(state, dict):
-        return None
-    try:
-        version = int(state.get("version") or state.get("schema_version") or 0)
-    except (TypeError, ValueError):
-        return None
-    if version != 2 or not state.get("present", True):
-        return None
-    return copy.deepcopy(state)
-
-
-def _structured_restore_args(
-    state: Dict[str, Any],
+def _canonical_restore_args(
+    clocks: Dict[str, Any],
     *,
     include_control: bool = True,
 ) -> Dict[str, Any]:
-    """Flatten structured state into ordinary CLOCKS command fields.
+    """Flatten canonical CLOCKS_V4 instrument state into Teensy restore fields.
 
-    Generalized CLOCKS restore includes DAC/servo control state. Campaign
-    RECOVER deliberately excludes it: campaigns restore timeline/statistics
-    only and leave the live instrument control plane untouched.
+    CLOCKS_FRAGMENT_V4 deliberately has no parallel ``restore_state`` mirror.
+    Exact restart authority is the ordinary canonical instrument state:
+    clockfaces + statistics + control.  The three interval-reject counters are
+    firmware REPORT diagnostics, not canonical science; the current restore
+    command still requires them, so they restart at zero.
     """
-    instrument = state.get("instrument_clockfaces")
-    stats = state.get("stats")
-    dac = state.get("dac")
+    if not isinstance(clocks, dict):
+        raise ValueError("canonical CLOCKS restore source is not an object")
+
+    instrument = clocks.get("clockfaces")
+    stats = clocks.get("stats")
+    control = clocks.get("control")
+    auxiliary = stats.get("auxiliary_welford") if isinstance(stats, dict) else None
+
     if not isinstance(instrument, dict) or not isinstance(stats, dict):
-        raise ValueError("structured restore missing instrument_clockfaces/stats")
-    if include_control and not isinstance(dac, dict):
-        raise ValueError("structured restore missing dac")
+        raise ValueError("canonical CLOCKS restore missing clockfaces/stats")
+    if not isinstance(auxiliary, dict):
+        raise ValueError("canonical CLOCKS restore missing auxiliary_welford")
+    if include_control and not isinstance(control, dict):
+        raise ValueError("canonical CLOCKS restore missing control")
 
     out: Dict[str, Any] = {
         "restore_schema_version": 2,
@@ -1831,15 +1810,11 @@ def _structured_restore_args(
         "restore_stats_completed_row_coherent": stats.get("completed_row_coherent"),
         "restore_stats_reset_count": stats.get("reset_count"),
         "restore_stats_update_count": stats.get("update_count"),
-        "restore_stats_vclock_interval_reject_count": _path_get(
-            stats, "interval_admission.vclock_reject_count"
-        ),
-        "restore_stats_ocxo1_interval_reject_count": _path_get(
-            stats, "interval_admission.ocxo1_reject_count"
-        ),
-        "restore_stats_ocxo2_interval_reject_count": _path_get(
-            stats, "interval_admission.ocxo2_reject_count"
-        ),
+        # These counters are non-scientific diagnostics and are no longer
+        # serialized in CLOCKS_INSTRUMENT_STATS_V3.
+        "restore_stats_vclock_interval_reject_count": 0,
+        "restore_stats_ocxo1_interval_reject_count": 0,
+        "restore_stats_ocxo2_interval_reject_count": 0,
     }
 
     welfords = {
@@ -1848,20 +1823,20 @@ def _structured_restore_args(
         "vclock": _path_get(stats, "vclock.welford"),
         "ocxo1": _path_get(stats, "ocxo1.welford"),
         "ocxo2": _path_get(stats, "ocxo2.welford"),
-        "pps_witness": _path_get(stats, "pps_witness.welford"),
-        "ocxo1_dac": _path_get(stats, "dac.ocxo1"),
-        "ocxo2_dac": _path_get(stats, "dac.ocxo2"),
+        "pps_witness": auxiliary.get("pps_witness"),
+        "ocxo1_dac": auxiliary.get("ocxo1_dac"),
+        "ocxo2_dac": auxiliary.get("ocxo2_dac"),
     }
     for name, wf in welfords.items():
         if not isinstance(wf, dict):
-            raise ValueError(f"structured restore missing {name} Welford")
+            raise ValueError(f"canonical CLOCKS restore missing {name} Welford")
         for field in ("n", "mean", "m2", "min", "max"):
             out[f"restore_{name}_welford_{field}"] = wf.get(field)
 
     for lane in ("ocxo1", "ocxo2"):
         tau = _path_get(stats, f"{lane}_tau_state")
         if not isinstance(tau, dict):
-            raise ValueError(f"structured restore missing {lane} TAU state")
+            raise ValueError(f"canonical CLOCKS restore missing {lane} TAU state")
         for field in (
             "valid", "reset_count", "sample_count", "interval_count",
             "reject_count", "gap_reset_count", "last_pps_sequence",
@@ -1874,13 +1849,11 @@ def _structured_restore_args(
             out[f"restore_{lane}_tau_{field}"] = tau.get(field)
 
         if include_control:
-            lane_state = dac.get(lane)
+            lane_state = control.get(lane)
             servo = lane_state.get("servo") if isinstance(lane_state, dict) else None
             if not isinstance(lane_state, dict) or not isinstance(servo, dict):
-                raise ValueError(f"structured restore missing {lane} DAC/servo state")
-            out[f"restore_{lane}_dac_value"] = lane_state.get(
-                "value", lane_state.get("dac")
-            )
+                raise ValueError(f"canonical CLOCKS restore missing {lane} control/servo state")
+            out[f"restore_{lane}_dac_value"] = lane_state.get("target_code")
             field_map = {
                 "servo_last_step": "last_step",
                 "servo_last_residual": "last_residual",
@@ -1897,17 +1870,64 @@ def _structured_restore_args(
                 out[f"restore_{lane}_dac_{command_field}"] = servo.get(json_field)
 
     if include_control:
-        out["restore_servo_mode"] = (
-            dac.get("servo_mode") or "OFF"
-        )
-        out["restore_dither_operator_enabled"] = dac.get(
+        out["restore_servo_mode"] = control.get("servo_mode") or "OFF"
+        out["restore_dither_operator_enabled"] = control.get(
             "dither_operator_enabled", False
         )
 
     missing = [key for key, value in out.items() if value is None]
     if missing:
-        raise ValueError(f"structured restore missing fields: {missing}")
+        raise ValueError(f"canonical CLOCKS restore missing fields: {missing}")
     return out
+
+
+def _canonical_instrument_restore_ready(
+    clocks: Dict[str, Any],
+    *,
+    include_control: bool = True,
+) -> bool:
+    """True only when canonical CLOCKS_V4 instrument state is restore authority."""
+    if not isinstance(clocks, dict):
+        return False
+    if clocks.get("schema") != "CLOCKS_INSTRUMENT_STATE_V1":
+        return False
+    if clocks.get("source_schema") != "CLOCKS_INSTRUMENT_V1":
+        return False
+    if not bool(clocks.get("snapshot_ok")) or not bool(clocks.get("valid")):
+        return False
+    if not bool(clocks.get("completed_row_coherent")):
+        return False
+
+    completed = _as_int(clocks.get("completed_pps_sequence"))
+    clockfaces = clocks.get("clockfaces")
+    stats = clocks.get("stats")
+    if completed is None or completed <= 0 or not isinstance(clockfaces, dict):
+        return False
+    if not isinstance(stats, dict):
+        return False
+    if not bool(stats.get("snapshot_ok")) or not bool(stats.get("valid")):
+        return False
+    if not bool(stats.get("completed_row_coherent")):
+        return False
+    if _as_int(stats.get("last_pps_sequence")) != completed:
+        return False
+    if _as_int(clockfaces.get("pps_sequence")) != completed:
+        return False
+    for key in ("gnss_ns", "dwt_cycles", "ocxo1_ns", "ocxo2_ns"):
+        value = _as_int(clockfaces.get(key))
+        if value is None or value <= 0:
+            return False
+
+    if include_control:
+        control = clocks.get("control")
+        if not isinstance(control, dict) or control.get("schema") != "CLOCKS_CONTROL_V1":
+            return False
+
+    try:
+        _canonical_restore_args(clocks, include_control=include_control)
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def _restore_gnss_raw_payload(gnss_raw: Dict[str, Any]) -> Dict[str, Any]:
@@ -1982,7 +2002,7 @@ def _read_latest_recoverable_clocks_state(
     *,
     scan_limit: int = 64,
 ) -> Tuple[Optional[Dict[str, Any]], int]:
-    """Return the newest durable CLOCKS state with complete holistic restore state."""
+    """Return the newest durable CLOCKS_V4 state with canonical restore authority."""
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
         cur.execute(
@@ -2006,7 +2026,8 @@ def _read_latest_recoverable_clocks_state(
                 continue
         if not isinstance(state, dict):
             continue
-        if _clocks_restore_state(state) is None:
+        clocks = _clocks_payload(state)
+        if not _canonical_instrument_restore_ready(clocks, include_control=True):
             continue
         if _clocks_gnss_raw_payload(state) is None:
             continue
@@ -2025,10 +2046,10 @@ def _seed_clocks_from_detail(detail: Dict[str, Any]) -> None:
     publish(CLOCKS_TOPIC, seeded)
 
 
-def _request_teensy_holistic_restore(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Stage one complete firmware CLOCKS restore, retrying only a busy lifecycle."""
+def _request_teensy_holistic_restore(clocks: Dict[str, Any]) -> Dict[str, Any]:
+    """Stage one complete firmware CLOCKS restore from canonical instrument state."""
     deadline = time.monotonic() + HOLISTIC_RESTORE_COMMAND_RETRY_S
-    restore_args = _structured_restore_args(state, include_control=True)
+    restore_args = _canonical_restore_args(clocks, include_control=True)
     last_response: Any = None
     while True:
         response = send_command(
@@ -2057,29 +2078,31 @@ def _request_teensy_holistic_restore(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _holistic_restore_probe(state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Project the canonical V4 sufficient state used to prove restore convergence."""
     clocks = _clocks_payload(state)
-    instrument = clocks.get("instrument_clockfaces")
+    instrument = clocks.get("clockfaces")
     stats = clocks.get("stats")
-    dac = clocks.get("dac")
+    control = clocks.get("control")
     instrument = instrument if isinstance(instrument, dict) else {}
     stats = stats if isinstance(stats, dict) else {}
-    dac = dac if isinstance(dac, dict) else {}
+    control = control if isinstance(control, dict) else {}
+    auxiliary = stats.get("auxiliary_welford")
+    auxiliary = auxiliary if isinstance(auxiliary, dict) else {}
 
     welford_n: Dict[str, int] = {}
-    for lane in ("gnss", "dwt", "vclock", "ocxo1", "ocxo2", "pps_witness"):
+    for lane in ("gnss", "dwt", "vclock", "ocxo1", "ocxo2"):
         node = stats.get(lane)
         wf = node.get("welford") if isinstance(node, dict) else None
         try:
             welford_n[lane] = int(wf.get("n") or 0) if isinstance(wf, dict) else 0
         except (TypeError, ValueError):
             welford_n[lane] = 0
-    dac_stats = stats.get("dac")
-    for lane in ("ocxo1", "ocxo2"):
-        wf = dac_stats.get(lane) if isinstance(dac_stats, dict) else None
+    for lane in ("pps_witness", "ocxo1_dac", "ocxo2_dac"):
+        wf = auxiliary.get(lane)
         try:
-            welford_n[f"dac.{lane}"] = int(wf.get("n") or 0) if isinstance(wf, dict) else 0
+            welford_n[lane] = int(wf.get("n") or 0) if isinstance(wf, dict) else 0
         except (TypeError, ValueError):
-            welford_n[f"dac.{lane}"] = 0
+            welford_n[lane] = 0
 
     def int_value(value: Any) -> int:
         try:
@@ -2100,10 +2123,10 @@ def _holistic_restore_probe(state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "instrument_ocxo1_ns": int_value(instrument.get("ocxo1_ns")),
         "instrument_ocxo2_ns": int_value(instrument.get("ocxo2_ns")),
         "welford_n": welford_n,
-        "servo_mode": str(dac.get("servo_mode") or "OFF").upper(),
-        "dither_operator_enabled": bool(dac.get("dither_operator_enabled")),
-        "ocxo1_dac": float_value(dac.get("ocxo1_dac")),
-        "ocxo2_dac": float_value(dac.get("ocxo2_dac")),
+        "servo_mode": str(control.get("servo_mode") or "OFF").upper(),
+        "dither_operator_enabled": bool(control.get("dither_operator_enabled")),
+        "ocxo1_dac": float_value(_path_get(control, "ocxo1.target_code")),
+        "ocxo2_dac": float_value(_path_get(control, "ocxo2.target_code")),
     }
 
 
@@ -2213,14 +2236,14 @@ def _wait_for_holistic_restore(
 
 
 def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
-    restore_state = _clocks_restore_state(detail)
+    clocks = _clocks_payload(detail)
     gnss_raw = _clocks_gnss_raw_payload(detail)
-    if restore_state is None or gnss_raw is None:
-        raise RuntimeError("CLOCKS detail lacks complete firmware/GNSS_RAW restore state")
+    if not _canonical_instrument_restore_ready(clocks, include_control=True) or gnss_raw is None:
+        raise RuntimeError("CLOCKS detail lacks valid canonical instrument/GNSS_RAW restore state")
 
     _seed_clocks_from_detail(detail)
     requested_monotonic = time.monotonic()
-    teensy_response = _request_teensy_holistic_restore(restore_state)
+    teensy_response = _request_teensy_holistic_restore(clocks)
     payload = teensy_response.get("payload") if isinstance(teensy_response, dict) else None
     payload = payload if isinstance(payload, dict) else {}
     status = str(payload.get("status") or "")
@@ -2290,58 +2313,133 @@ def _holistic_restore() -> Dict[str, Any]:
     result["completed_at_utc"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     return result
 
-def _tempest_state_decoration(detail: Dict[str, Any]) -> Dict[str, Any]:
-    """Return only the TEMPEST-owned facts added to one common state snapshot."""
+def _tempest_campaign_name(campaign: Dict[str, Any]) -> str:
+    return str(campaign.get("name") or "").strip()
+
+
+def _tempest_public_count(campaign: Dict[str, Any]) -> int:
+    value = _as_int(campaign.get("public_count"))
+    if value is None or value < 0:
+        raise ValueError("TEMPEST campaign enrichment missing valid public_count")
+    return int(value)
+
+
+def _tempest_candidate_view(campaign: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a transient processor view from TEMPEST_FRAGMENT_V1.
+
+    This adapter is intentionally *not persisted*.  It lets the existing Pi
+    final-court/recovery algorithms consume normalized names while durable
+    CLOCKS retains the exact V4 campaign delta.
+    """
+    if not isinstance(campaign, dict):
+        raise ValueError("TEMPEST campaign enrichment is not an object")
+    if campaign.get("schema") != "TEMPEST_FRAGMENT_V1":
+        raise ValueError(
+            f"unsupported TEMPEST campaign schema {campaign.get('schema')!r}"
+        )
+
+    name = _tempest_campaign_name(campaign)
+    if not name:
+        raise ValueError("TEMPEST campaign enrichment missing name")
+    public_count = _tempest_public_count(campaign)
+    clockfaces = campaign.get("clockfaces")
+    status = campaign.get("status")
+    disposition = campaign.get("disposition")
+    recovery = campaign.get("recovery")
+    clockfaces = clockfaces if isinstance(clockfaces, dict) else {}
+    status = status if isinstance(status, dict) else {}
+    disposition = disposition if isinstance(disposition, dict) else {}
+    recovery = recovery if isinstance(recovery, dict) else {}
+
+    view: Dict[str, Any] = {
+        "schema": campaign.get("schema"),
+        "campaign": name,
+        "campaign_state": campaign.get("state"),
+        "public_count": public_count,
+        # Internal legacy variable names below mean campaign-relative public count,
+        # never CLOCKS_FRAGMENT.sequence.
+        "teensy_pps_vclock_count": public_count,
+        "teensy_pps_count": public_count,
+        "pps_count": public_count,
+        "gnss_ns": clockfaces.get("gnss_ns"),
+        "dwt_cycles": clockfaces.get("dwt_cycles"),
+        "ocxo1_ns": clockfaces.get("ocxo1_ns"),
+        "ocxo2_ns": clockfaces.get("ocxo2_ns"),
+        "timeline_valid": status.get("timeline_valid"),
+        "ocxo_clockface_valid": status.get("ocxo_clockface_valid"),
+        "ocxo_science_valid": status.get("ocxo_science_valid"),
+        "candidate_disposition": disposition.get("status") or "ACCEPT",
+        "candidate_use": disposition.get("use"),
+        "science_eligible": disposition.get("science_eligible"),
+        "control_eligible": disposition.get("control_eligible"),
+        "science_excluded": not bool(disposition.get("science_eligible", True)),
+        "candidate_reason_code": disposition.get("reason_code"),
+        "candidate_reason_name": disposition.get("reason_name"),
+        "candidate_reason": disposition.get("reason_name"),
+        "candidate_source": disposition.get("source"),
+        "candidate_reject_mask": disposition.get("lane_mask"),
+        "candidate_lane": disposition.get("lane_mask"),
+        "ocxo1": copy.deepcopy(campaign.get("ocxo1") or {}),
+        "ocxo2": copy.deepcopy(campaign.get("ocxo2") or {}),
+        "stats": copy.deepcopy(campaign.get("stats") or {}),
+    }
+
+    if recovery:
+        view.update({
+            "recover_generation": recovery.get("generation"),
+            "recover_transition_active": recovery.get("transition_active"),
+            "recover_timeline_ready": recovery.get("timeline_ready"),
+            "recover_clockface_ready": recovery.get("clockface_ready"),
+            "recover_science_ready": recovery.get("science_ready"),
+            "recover_degraded_active": recovery.get("degraded_active"),
+            "recover_science_quarantine_active": recovery.get(
+                "science_quarantine_active"
+            ),
+            "recover_science_quarantine_remaining": recovery.get(
+                "science_quarantine_remaining"
+            ),
+            "recover_reattach_stalled": recovery.get("reattach_stalled"),
+        })
+    return view
+
+
+def _tempest_adjudication(detail: Dict[str, Any]) -> Dict[str, Any]:
+    """Return only Pi-owned TEMPEST facts added to the firmware campaign delta."""
     return {
-        "schema": "TEMPEST_STATE_DECORATION_V1",
-        "campaign_type": CAMPAIGN_TYPE_TEMPEST,
-        "campaign": detail["campaign"],
-        "state": "STARTED",
-        "campaign_elapsed": detail.get("campaign_elapsed"),
-        "teensy_pps_vclock_count": detail.get("teensy_pps_vclock_count"),
+        "schema": "TEMPEST_ADJUDICATION_V1",
+        "sequence": detail.get("sequence"),
+        "public_count": detail.get("public_count"),
         "viable": bool(detail.get("science_eligible")),
         "science_eligible": bool(detail.get("science_eligible")),
         "control_eligible": bool(detail.get("control_eligible")),
         "science_excluded": bool(detail.get("science_excluded")),
         "candidate_use": detail.get("candidate_use"),
-        "timebase_message_version": detail.get("timebase_message_version"),
-        "timebase_pair_version": detail.get("timebase_pair_version"),
         "final_court": copy.deepcopy(detail.get("final_court") or {}),
         "location": detail.get("location"),
-        # GNSS_RAW campaign state is Pi CLOCKS-owned and advances only after the
-        # final court. It therefore cannot be recovered from the earlier raw
-        # CLOCKS_FRAGMENT alone and remains a genuine TEMPEST decoration.
         "extra_clocks": copy.deepcopy(detail.get("extra_clocks") or {}),
         "adjudicated_at_utc": detail.get("system_time_utc"),
     }
 
 
 def _attach_tempest_to_state_detail(detail: Dict[str, Any]) -> None:
-    """Attach final TEMPEST facts to the same-second SYSTEM state detail.
+    """Attach Pi adjudication to the already-persisted same-sequence V4 campaign.
 
-    SYSTEM persists the common always-on TEMPEST snapshot first. CLOCKS then identifies
-    that row by the immutable campaign-row PPS/VCLOCK identity already carried
-    inside ``clocks_fragment.campaign_row`` and adds only the type-owned
-    TEMPEST decoration. No second campaign_detail row is created.
+    The firmware-authored ``campaign`` delta remains intact.  CLOCKS adds one
+    ``campaign.adjudication`` child; it does not replace or clone the campaign.
     """
-    pps_count = _extract_teensy_pps_vclock_count(
-        detail,
-        topic="TEMPEST state-detail attachment",
-    )
+    sequence = _as_int(detail.get("sequence"))
+    public_count = _as_int(detail.get("public_count"))
+    if sequence is None or sequence <= 0:
+        raise ValueError("TEMPEST state-detail attachment missing physical sequence")
+    if public_count is None or public_count <= 0:
+        raise ValueError("TEMPEST state-detail attachment missing campaign public_count")
+
     viable = bool(detail.get("science_eligible"))
     campaign = str(detail["campaign"])
-    decoration = _tempest_state_decoration(detail)
-    campaign_context = {
-        "campaign_type": CAMPAIGN_TYPE_TEMPEST,
-        "campaign": campaign,
-        "state": "STARTED",
-        "viable": viable,
-        "tempest": decoration,
-    }
+    adjudication = _tempest_adjudication(detail)
 
-    # campaign_master is the compact read model. It may retain the complete
-    # accepted report because that copy is intentionally optimized for lists,
-    # baseline selection, and campaign-level presentation rather than recovery.
+    # campaign_master is an intentional read model and may retain the complete
+    # accepted TIMEBASE report for list/baseline presentation.
     report = dict(detail)
     report["campaign_type"] = CAMPAIGN_TYPE_TEMPEST
     report["campaign_state"] = "STARTED"
@@ -2362,7 +2460,7 @@ def _attach_tempest_to_state_detail(detail: Dict[str, Any]) -> None:
                     SET viable = %s,
                         payload = jsonb_set(
                             payload,
-                            '{campaign}',
+                            '{campaign,adjudication}',
                             %s::jsonb,
                             true
                         )
@@ -2371,10 +2469,7 @@ def _attach_tempest_to_state_detail(detail: Dict[str, Any]) -> None:
                         FROM campaign_detail
                         WHERE campaign_type = %s
                           AND campaign = %s
-                          AND COALESCE(
-                                  payload #>> '{clocks_fragment,campaign_row,teensy_pps_vclock_count}',
-                                  payload #>> '{monitor_fragment,campaign_row,teensy_pps_vclock_count}'
-                              ) = %s
+                          AND sequence = %s
                         ORDER BY id DESC
                         LIMIT 1
                     )
@@ -2382,10 +2477,10 @@ def _attach_tempest_to_state_detail(detail: Dict[str, Any]) -> None:
                     """,
                     (
                         viable,
-                        json.dumps(campaign_context),
+                        json.dumps(adjudication),
                         CAMPAIGN_TYPE_TEMPEST,
                         campaign,
-                        str(int(pps_count)),
+                        int(sequence),
                     ),
                 )
                 attached = cur.fetchone()
@@ -2407,7 +2502,8 @@ def _attach_tempest_to_state_detail(detail: Dict[str, Any]) -> None:
                 _diag["last_campaign_detail_attach"] = {
                     "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                     "campaign": campaign,
-                    "teensy_pps_vclock_count": int(pps_count),
+                    "sequence": int(sequence),
+                    "public_count": int(public_count),
                     "attempts": attempts,
                     "success": True,
                 }
@@ -2421,16 +2517,18 @@ def _attach_tempest_to_state_detail(detail: Dict[str, Any]) -> None:
             _diag["last_campaign_detail_attach"] = {
                 "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "campaign": campaign,
-                "teensy_pps_vclock_count": int(pps_count),
+                "sequence": int(sequence),
+                "public_count": int(public_count),
                 "attempts": attempts,
                 "success": False,
                 "error": str(last_error) if last_error is not None else "matching CLOCKS detail not found",
             }
             logging.error(
-                "⚠️ [clocks] failed to attach TEMPEST decoration to unified "
-                "campaign_detail: campaign=%s pps_vclock_count=%d attempts=%d error=%s",
+                "⚠️ [clocks] failed to attach TEMPEST adjudication: "
+                "campaign=%s sequence=%d public_count=%d attempts=%d error=%s",
                 campaign,
-                int(pps_count),
+                int(sequence),
+                int(public_count),
                 attempts,
                 str(last_error) if last_error is not None else "matching CLOCKS detail not found",
             )
@@ -2634,7 +2732,6 @@ def _system_gnss_time_utc(system_context: Dict[str, Any]) -> Optional[str]:
 
 def _environment_from_system_report(
     system_context: Dict[str, Any],
-    clocks_fragment: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Project the established TEMPEST environment shape from SYSTEM.REPORT."""
     env = system_context.get("environment") if isinstance(system_context.get("environment"), dict) else {}
@@ -2643,7 +2740,6 @@ def _environment_from_system_report(
     pi = system_context.get("pi") if isinstance(system_context.get("pi"), dict) else {}
     power = system_context.get("power") if isinstance(system_context.get("power"), dict) else {}
     battery = system_context.get("battery") if isinstance(system_context.get("battery"), dict) else {}
-    teensy = clocks_fragment.get("teensy") if isinstance(clocks_fragment.get("teensy"), dict) else {}
 
     i2c2 = power.get("i2c-2") if isinstance(power.get("i2c-2"), dict) else {}
     def rail(address: str) -> Dict[str, Any]:
@@ -2652,7 +2748,6 @@ def _environment_from_system_report(
 
     return {
         "ambient_temp_c": env.get("temperature_c"),
-        "teensy_temp_c": teensy.get("cpu_temp_c"),
         "pi_temp_c": pi.get("cpu_temp_c"),
         "gnss_temp_c": gnss_clock.get("temperature_c", gnss.get("temperature_c")),
         "barometric_altitude_m": env.get("altitude_m"),
@@ -2739,7 +2834,7 @@ def _clocks_baseline_snapshot(*, force: bool = False) -> Dict[str, Any]:
 
 
 def _gnss_raw_state_snapshot() -> Dict[str, Any]:
-    """Build the Pi-owned portion of the always-on CLOCKS monitor view."""
+    """Return Pi-owned always-on GNSS_RAW instrument state for canonical CLOCKS."""
     with _gnss_raw_stats_lock:
         latest_info = dict(_gnss_raw_latest_info)
         latest_received = _gnss_raw_latest_info_monotonic
@@ -2749,29 +2844,11 @@ def _gnss_raw_state_snapshot() -> Dict[str, Any]:
     welford = _gnss_raw_welford_snapshot()
 
     instrument_ref_ns = instrument_n * NS_PER_SECOND
-    campaign_ref_ns = int(_gnss_raw_n) * NS_PER_SECOND
-    campaign_ns = int(round(_gnss_raw_ns))
-    campaign_valid = bool(_campaign_active and _gnss_raw_valid and campaign_ref_ns > 0)
-
-    if campaign_valid:
-        presentation_mode = "CAMPAIGN"
-        presentation_basis = "CAMPAIGN_RELATIVE"
-        presentation_ns = campaign_ns
-        presentation_ref_ns = campaign_ref_ns
-    else:
-        presentation_mode = "INSTRUMENT"
-        presentation_basis = "PI_PROCESS_LIFETIME"
-        presentation_ns = instrument_ns
-        presentation_ref_ns = instrument_ref_ns
-
     age_s = (
         None
         if latest_received is None
         else max(0.0, time.monotonic() - latest_received)
     )
-    drift_ppb = _gnss_raw_drift_from_info(latest_info)
-    presentation_valid = presentation_ref_ns > 0
-
     instrument = {
         "valid": instrument_valid and instrument_ref_ns > 0,
         "ns": instrument_ns,
@@ -2786,44 +2863,12 @@ def _gnss_raw_state_snapshot() -> Dict[str, Any]:
             if instrument_valid and instrument_ref_ns > 0 else None
         ),
     }
-    campaign = {
-        "valid": campaign_valid,
-        "ns": campaign_ns,
-        "ref_ns": campaign_ref_ns,
-        "clockface_n": int(_gnss_raw_n),
-        "tau": (
-            round(_compute_tau(campaign_ns, campaign_ref_ns), 12)
-            if campaign_valid else None
-        ),
-        "ppb": (
-            round(_compute_ppb(campaign_ns, campaign_ref_ns), 3)
-            if campaign_valid else None
-        ),
-    }
-    presentation = {
-        "mode": presentation_mode,
-        "basis": presentation_basis,
-        "valid": presentation_valid,
-        "ns": presentation_ns,
-        "ref_ns": presentation_ref_ns,
-        "clockface_n": int(presentation_ref_ns // NS_PER_SECOND),
-        "tau": (
-            round(_compute_tau(presentation_ns, presentation_ref_ns), 12)
-            if presentation_valid else None
-        ),
-        "ppb": (
-            round(_compute_ppb(presentation_ns, presentation_ref_ns), 3)
-            if presentation_valid else None
-        ),
-    }
     return {
         "owner": "PI",
         "clock": "GNSS_RAW",
         "always_on_statistics": True,
         "instrument": instrument,
-        "campaign": campaign,
-        "presentation": presentation,
-        "drift_ppb": drift_ppb,
+        "drift_ppb": _gnss_raw_drift_from_info(latest_info),
         "welford": welford,
         "latest_info_age_s": None if age_s is None else round(age_s, 3),
         "latest_info_fresh": bool(
@@ -2833,17 +2878,13 @@ def _gnss_raw_state_snapshot() -> Dict[str, Any]:
 
 
 
-
-
-
-
 # ---------------------------------------------------------------------
 # Draconian sync primitives
 # ---------------------------------------------------------------------
 
 
 def _begin_sync_wait(expected_pps: int) -> None:
-    """Prepare to wait for the first Pi-accepted CLOCKS_FRAGMENT campaign row."""
+    """Prepare to wait for the first Pi-accepted CLOCKS_FRAGMENT campaign delta."""
     global _sync_expected_pps_vclock, _sync_fragment
 
     with _sync_lock:
@@ -2873,7 +2914,7 @@ def _end_sync_wait(
     global _sync_expected_pps_vclock
 
     logging.info(
-        "⏳ [recovery] waiting for first accepted CLOCKS_FRAGMENT campaign row >= %s",
+        "⏳ [recovery] waiting for first accepted CLOCKS_FRAGMENT campaign delta >= %s",
         str(_sync_expected_pps_vclock),
     )
 
@@ -2955,7 +2996,7 @@ def _signal_sync_candidate_if_needed(fragment: Dict[str, Any], pps_vclock_count:
         match = int(pps_vclock_count) >= int(_sync_expected_pps_vclock)
         if match:
             logging.info(
-                "✅ [recovery] first accepted CLOCKS_FRAGMENT campaign row observed: count=%d expected>=%d",
+                "✅ [recovery] first accepted CLOCKS_FRAGMENT campaign delta observed: count=%d expected>=%d",
                 int(pps_vclock_count), int(_sync_expected_pps_vclock),
             )
             _sync_fragment = dict(fragment)
@@ -2982,76 +3023,6 @@ def _compute_tau(clock_ns: int, gnss_ns: int) -> float:
 
 def _compute_ppb(clock_ns: int, gnss_ns: int) -> float:
     return (((clock_ns - gnss_ns) / gnss_ns) * 1e9) if gnss_ns else 0.0
-
-
-WELFORD_RECOVERY_LANES = (
-    ("dwt",         "dwt_welford",         ("stats.dwt.welford",)),
-    ("vclock",      "vclock_welford",      ("stats.vclock.welford",)),
-    ("ocxo1",       "ocxo1_welford",       ("stats.ocxo1.welford",)),
-    ("ocxo2",       "ocxo2_welford",       ("stats.ocxo2.welford",)),
-    ("pps_witness", "pps_witness_welford", ("stats.pps_witness.welford",)),
-    ("ocxo1_dac",   "ocxo1_dac_welford",   ("stats.dac.ocxo1", "stats.ocxo1_dac.welford")),
-    ("ocxo2_dac",   "ocxo2_dac_welford",   ("stats.dac.ocxo2", "stats.ocxo2_dac.welford")),
-)
-
-
-def _recover_welford_value(
-    *,
-    last_tb: Dict[str, Any],
-    last_frag: Dict[str, Any],
-    flat_prefix: str,
-    nested_paths: Tuple[str, ...],
-    field: str,
-) -> Any:
-    """Find one saved Teensy Welford field in the latest TIMEBASE row."""
-    for path in nested_paths:
-        obj = _path_get(last_frag, path)
-        if isinstance(obj, dict) and obj.get(field) is not None:
-            return obj.get(field)
-
-    flat_key = f"{flat_prefix}_{field}"
-    for source in (last_frag, last_tb):
-        if isinstance(source, dict) and source.get(flat_key) is not None:
-            return source.get(flat_key)
-
-    return None
-
-
-def _add_welford_recovery_args(
-    teensy_args: Dict[str, Any],
-    *,
-    last_tb: Dict[str, Any],
-    last_frag: Dict[str, Any],
-) -> int:
-    """Append recoverable Teensy Welford accumulators to CLOCKS.RECOVER args."""
-    restored = 0
-
-    for _lane, flat_prefix, nested_paths in WELFORD_RECOVERY_LANES:
-        n_raw = _recover_welford_value(
-            last_tb=last_tb,
-            last_frag=last_frag,
-            flat_prefix=flat_prefix,
-            nested_paths=nested_paths,
-            field="n",
-        )
-        n = _as_int(n_raw)
-        if n is None:
-            continue
-
-        teensy_args[f"{flat_prefix}_n"] = str(int(n))
-        for field in ("mean", "stddev", "stderr", "min", "max"):
-            value = _recover_welford_value(
-                last_tb=last_tb,
-                last_frag=last_frag,
-                flat_prefix=flat_prefix,
-                nested_paths=nested_paths,
-                field=field,
-            )
-            if value is not None:
-                teensy_args[f"{flat_prefix}_{field}"] = str(value)
-        restored += 1
-
-    return restored
 
 
 def _gnss_raw_recovery_project_seed(
@@ -3499,8 +3470,6 @@ def _fragment_ocxo_science_clean(fragment: Dict[str, Any]) -> Tuple[bool, Dict[s
             "science_valid": _recovery_bool(science.get("valid")),
             "antecedents_complete": _recovery_bool(science.get("antecedents_complete")),
             "delta_raw_valid": _recovery_bool(science.get("delta_raw_valid")),
-            "residual_source": science.get("residual_source"),
-            "public_count": _as_int(science.get("public_count")),
             "clock_interval_ns": _as_int(science.get("clock_interval_ns")),
             "gnss_interval_ns": _as_int(science.get("gnss_interval_ns")),
             "fast_residual_ns": _as_int(science.get("fast_residual_ns")),
@@ -3554,15 +3523,8 @@ def _fragment_recovery_timeline_ready(
     if explicit is not None:
         return explicit
 
-    gnss_ns = _fragment_int(fragment, "gnss_ns", "gnss.ns", default=0)
-    dwt_cycles = _fragment_int(
-        fragment,
-        "dwt_cycles",
-        "dwt.cycles",
-        "dwt.total_cycles",
-        "dwt.cycle_count_total",
-        default=0,
-    )
+    gnss_ns = _fragment_int(fragment, "gnss_ns", default=0)
+    dwt_cycles = _fragment_int(fragment, "dwt_cycles", default=0)
     return int(pps_vclock_count) > 0 and gnss_ns > 0 and dwt_cycles > 0
 
 
@@ -3594,7 +3556,6 @@ def _recovery_admission_verdict(
     fragment_degraded = _fragment_recovery_any_true(
         fragment,
         "recover_degraded_active",
-        "recover_degraded_science_hold",
     )
     degraded = (
         fragment_degraded
@@ -3810,11 +3771,8 @@ def _recovery_admission_verdict(
 
 
 # ---------------------------------------------------------------------
-# TIMEBASE_FRAGMENT schema helpers — PPS/VCLOCK canonical surface
+# Canonical V4 schema helpers
 # ---------------------------------------------------------------------
-
-PPS_VCLOCK_COUNT_KEY = "teensy_pps_vclock_count"
-
 
 def _path_get(mapping: Dict[str, Any], path: str) -> Any:
     """Return mapping[path] where path may be dotted, or None if absent."""
@@ -3826,10 +3784,6 @@ def _path_get(mapping: Dict[str, Any], path: str) -> Any:
     return cur
 
 
-def _float_path(mapping: Dict[str, Any], path: str) -> Optional[float]:
-    return _first_float(_path_get(mapping, path))
-
-
 def _as_int(value: Any) -> Optional[int]:
     if value is None:
         return None
@@ -3839,52 +3793,14 @@ def _as_int(value: Any) -> Optional[int]:
         return None
 
 
-def _first_present_int(mapping: Dict[str, Any], *keys: str) -> Optional[int]:
-    for key in keys:
-        if key in mapping and mapping.get(key) is not None:
-            value = _as_int(mapping.get(key))
-            if value is not None:
-                return value
-    return None
-
-
-def _extract_teensy_pps_vclock_count(publication: Dict[str, Any], *, topic: str = TIMEBASE_FRAGMENT_TOPIC) -> int:
-    """
-    Return the mandatory canonical one-second identity from a Teensy TIMEBASE publication.
-
-    No fallbacks.  No ledger-derived repair.  If this field is missing or
-    invalid, the publication is not a valid TIMEBASE candidate.  The explicit
-    Teensy-authored PPS/VCLOCK count is the only identity surface.
-    """
-    if PPS_VCLOCK_COUNT_KEY not in publication or publication.get(PPS_VCLOCK_COUNT_KEY) is None:
-        raise ValueError(f"{topic} missing mandatory teensy_pps_vclock_count")
-    try:
-        return int(publication[PPS_VCLOCK_COUNT_KEY])
-    except (TypeError, ValueError) as e:
-        raise ValueError(
-            f"{topic} invalid teensy_pps_vclock_count={publication.get(PPS_VCLOCK_COUNT_KEY)!r}"
-        ) from e
-
-
-def _normalize_fragment_count_aliases(fragment: Dict[str, Any], count: int) -> None:
-    """Preserve canonical identity and compatibility aliases in a fragment copy."""
-    fragment["teensy_pps_vclock_count"] = int(count)
-    fragment.setdefault("teensy_pps_count", int(count))
-    fragment.setdefault("pps_count", int(count))
-
-
 def _extract_last_timebase_count(last_tb: Dict[str, Any], fragment: Dict[str, Any]) -> int:
-    """Return canonical count from a persisted TIMEBASE row or its fragment."""
-    if fragment:
-        return _extract_teensy_pps_vclock_count(fragment)
-    if PPS_VCLOCK_COUNT_KEY not in last_tb or last_tb.get(PPS_VCLOCK_COUNT_KEY) is None:
-        raise ValueError("persisted TIMEBASE missing mandatory teensy_pps_vclock_count")
-    try:
-        return int(last_tb[PPS_VCLOCK_COUNT_KEY])
-    except (TypeError, ValueError) as e:
-        raise ValueError(
-            f"persisted TIMEBASE invalid teensy_pps_vclock_count={last_tb.get(PPS_VCLOCK_COUNT_KEY)!r}"
-        ) from e
+    """Return the campaign-relative public count from a TIMEBASE_V4 view."""
+    value = _as_int(last_tb.get("public_count"))
+    if value is None and isinstance(fragment, dict):
+        value = _as_int(fragment.get("public_count"))
+    if value is None:
+        raise ValueError("persisted TEMPEST detail missing campaign public_count")
+    return int(value)
 
 
 def _first_present_int_path(mapping: Dict[str, Any], *keys: str) -> Optional[int]:
@@ -3898,13 +3814,13 @@ def _first_present_int_path(mapping: Dict[str, Any], *keys: str) -> Optional[int
 
 
 def _fragment_int(fragment: Dict[str, Any], *keys: str, default: int = 0) -> int:
-    """Extract an integer field from a TIMEBASE_FRAGMENT, including V3 nested paths."""
+    """Extract an integer field from a transient TEMPEST candidate view."""
     value = _first_present_int_path(fragment, *keys)
     return int(value) if value is not None else int(default)
 
 
 def _fragment_ns(fragment: Dict[str, Any], *keys: str, default: int = 0) -> int:
-    """Extract an integer nanosecond ledger from a TIMEBASE_FRAGMENT, including V3 nested paths."""
+    """Extract an integer nanosecond ledger from a transient TEMPEST candidate view."""
     return _fragment_int(fragment, *keys, default=default)
 
 
@@ -3946,16 +3862,14 @@ def _timebase_final_court_check_candidate_envelope(
     timebase: Dict[str, Any],
     violations: List[Dict[str, Any]],
 ) -> None:
-    """Validate the unified Teensy candidate before examining clock science."""
+    """Validate one transient TEMPEST_FRAGMENT_V1 candidate view."""
     fragment = timebase.get("fragment")
-    forensics = timebase.get("forensics")
-
     if not isinstance(fragment, dict):
         _timebase_final_court_add_violation(
             violations,
             rule="candidate_fragment_present",
             lane="candidate",
-            message="unified TIMEBASE candidate has no fragment object",
+            message="TEMPEST candidate has no fragment object",
             fields={"bad_field": "fragment", "bad_value": fragment},
         )
         return
@@ -3973,70 +3887,31 @@ def _timebase_final_court_check_candidate_envelope(
             },
         )
 
-    # TIMEBASE_FRAGMENT_V7 keeps deep forensics optional; the durable row
-    # carries compact objections and cycle evidence. Older fragments may still
-    # carry a transcript, but its absence is not a structural defect.
-    forensics_present = isinstance(forensics, dict) and bool(forensics)
-
-    outer_count = _first_present_int_path(
-        timebase,
-        "teensy_pps_vclock_count",
-        "pps_count",
-    )
-    fragment_count = _first_present_int_path(
-        fragment,
-        "teensy_pps_vclock_count",
-        "pps_count",
-    )
-    forensics_count = (
-        _first_present_int_path(
-            forensics,
-            "teensy_pps_vclock_count",
-            "pps_count",
-        )
-        if forensics_present
-        else None
-    )
-    if (
-        outer_count is None
-        or fragment_count is None
-        or outer_count != fragment_count
-        or (forensics_present and forensics_count != outer_count)
-    ):
+    outer_count = _as_int(timebase.get("public_count"))
+    fragment_count = _as_int(fragment.get("public_count"))
+    if outer_count is None or fragment_count is None or outer_count != fragment_count:
         _timebase_final_court_add_violation(
             violations,
             rule="candidate_identity_consistent",
             lane="candidate",
-            message="candidate and fragment PPS/VCLOCK identities must agree; legacy forensics must agree when present",
+            message="TEMPEST public_count must agree across candidate envelope",
             fields={
-                "outer_count": outer_count,
-                "fragment_count": fragment_count,
-                "forensics_count": forensics_count,
-                "identity_error": timebase.get("identity_error"),
+                "outer_public_count": outer_count,
+                "fragment_public_count": fragment_count,
             },
         )
 
     campaign = str(timebase.get("campaign") or "")
     fragment_campaign = str(fragment.get("campaign") or "")
-    forensics_campaign = (
-        str(forensics.get("campaign") or "")
-        if forensics_present
-        else ""
-    )
-    if (
-        not campaign
-        or (fragment_campaign and fragment_campaign != campaign)
-        or (forensics_campaign and forensics_campaign != campaign)
-    ):
+    if not campaign or not fragment_campaign or fragment_campaign != campaign:
         _timebase_final_court_add_violation(
             violations,
             rule="candidate_campaign_consistent",
             lane="candidate",
-            message="candidate campaign identity does not match the active campaign",
+            message="TEMPEST campaign identity does not match the active campaign",
             fields={
                 "active_campaign": campaign,
                 "fragment_campaign": fragment_campaign,
-                "forensics_campaign": forensics_campaign,
             },
         )
 
@@ -4044,38 +3919,21 @@ def _timebase_final_court_check_delta_raw_interval(
     timebase: Dict[str, Any],
     violations: List[Dict[str, Any]],
 ) -> None:
-    """
-    Validate the final OCXO Delta Raw interval fields exactly as published.
-
-    This deliberately fishes values out of the final TIMEBASE dictionary rather
-    than checking pre-assembly locals.  If Payload construction, JSON shaping,
-    candidate shaping, or later decoration corrupts the final structure, this gate sees
-    the same object that would otherwise be written to PostgreSQL.
-    """
+    """Validate V4 Delta Raw intervals exactly as they would be persisted."""
+    public_count = _as_int(timebase.get("public_count"))
     for lane in ("ocxo1", "ocxo2"):
         science_path = f"fragment.{lane}.science"
         science = _path_get(timebase, science_path)
         if not isinstance(science, dict):
             continue
-
         if not _timebase_final_court_bool(science.get("delta_raw_valid")):
             continue
 
         clock_interval = _as_int(science.get("delta_raw_clock_interval_cycles"))
         reference_interval = _as_int(science.get("delta_raw_reference_interval_cycles"))
-        public_count = _as_int(science.get("public_count"))
-        delta_reference_public_count = _as_int(
-            science.get("delta_reference_public_count")
-        )
-        delta_publication_public_count = _as_int(
-            science.get("delta_publication_public_count")
-        )
-
         common_fields: Dict[str, Any] = {
             "path": science_path,
             "public_count": public_count,
-            "delta_reference_public_count": delta_reference_public_count,
-            "delta_publication_public_count": delta_publication_public_count,
             "clock_interval_cycles": clock_interval,
             "reference_interval_cycles": reference_interval,
             "gate_cycles": TIMEBASE_FINAL_COURT_DELTA_RAW_INTERVAL_GATE_CYCLES,
@@ -4098,14 +3956,13 @@ def _timebase_final_court_check_delta_raw_interval(
                 violations,
                 rule="delta_raw_interval_reasonable",
                 lane=lane,
-                message="delta_raw_valid is true but the final TIMEBASE JSON is missing required interval fields",
+                message="delta_raw_valid is true but V4 science lacks required interval fields",
                 fields=fields,
             )
             continue
 
         assert clock_interval is not None
         assert reference_interval is not None
-
         for name, value in (
             ("delta_raw_clock_interval_cycles", clock_interval),
             ("delta_raw_reference_interval_cycles", reference_interval),
@@ -4127,23 +3984,17 @@ def _timebase_final_court_check_delta_raw_interval(
 
         interval_error = int(clock_interval) - int(reference_interval)
         if abs(interval_error) > TIMEBASE_FINAL_COURT_DELTA_RAW_INTERVAL_GATE_CYCLES:
-            # A large OCXO-vs-VCLOCK raw difference is diagnostic evidence, not
-            # final-court guilt.  The OCXO may truly be running off-frequency
-            # while still producing a perfectly sane one-second DWT interval.
-            # The final court's fatal job here is to reject impossible interval
-            # magnitudes such as 0/1/sentinel values in the final JSON.
             _diag["timebase_final_court_delta_raw_offset_observed"] = (
                 _diag.get("timebase_final_court_delta_raw_offset_observed", 0) + 1
             )
-            offset_fields = dict(common_fields)
-            offset_fields.update({
+            _diag["last_timebase_final_court_delta_raw_offset"] = {
+                **common_fields,
                 "rule": "delta_raw_interval_offset_observed",
                 "lane": lane,
                 "clock_minus_reference_cycles": interval_error,
                 "abs_clock_minus_reference_cycles": abs(interval_error),
                 "fatal": False,
-            })
-            _diag["last_timebase_final_court_delta_raw_offset"] = offset_fields
+            }
 
 
 def _timebase_final_court_recovery_degraded_context(
@@ -4161,7 +4012,6 @@ def _timebase_final_court_recovery_degraded_context(
     )
     degraded = _fragment_recovery_any_true(
         fragment,
-        "recover_degraded_science_hold",
         "recover_degraded_active",
         "recover_science_quarantine_active",
         "recover_transition_active",
@@ -4184,166 +4034,90 @@ def _timebase_final_court_check_ocxo_lane_alive(
     timebase: Dict[str, Any],
     violations: List[Dict[str, Any]],
 ) -> None:
-    """Block mature public rows whose OCXO lane is entirely zero/missing.
-
-    This is deliberately a final-object check.  Firmware may hold private
-    recovery candidates while OCXO custody is being reattached, but a public
-    TIMEBASE row with ocxoN.ns == 0 and no nonzero science endpoints/intervals
-    is not a valid campaign row.  It is recovered lane absence.
-    """
-    public_count = _first_present_int_path(
-        timebase,
-        "teensy_pps_vclock_count",
-        "fragment.teensy_pps_vclock_count",
-        "pps_count",
-    )
-    if public_count is None:
-        return
-    if int(public_count) <= TIMEBASE_FINAL_COURT_OCXO_ZERO_MATURE_PUBLIC_COUNT:
+    """Reject mature V4 rows only when an OCXO lane has no truthful evidence."""
+    public_count = _as_int(timebase.get("public_count"))
+    if public_count is None or public_count <= TIMEBASE_FINAL_COURT_OCXO_ZERO_MATURE_PUBLIC_COUNT:
         return
 
     recovery_degraded = _timebase_final_court_recovery_degraded_context(timebase)
+    fragment = timebase.get("fragment")
+    if not isinstance(fragment, dict):
+        return
+    shared_clockface_valid_raw = fragment.get("ocxo_clockface_valid")
+    shared_clockface_valid = (
+        None
+        if shared_clockface_valid_raw is None
+        else _timebase_final_court_bool(shared_clockface_valid_raw)
+    )
 
     for lane in ("ocxo1", "ocxo2"):
         science_path = f"fragment.{lane}.science"
         science = _path_get(timebase, science_path)
-        if not isinstance(science, dict):
-            science = {}
-
-        lane_ns = _first_present_int_path(
-            timebase,
-            f"fragment.{lane}.ns",
-            f"fragment.gnss.{lane}_ns",
-            f"fragment.{lane}_ns",
-            f"teensy_{lane}_ns",
-        )
-        clockface_raw = _path_get(timebase, f"fragment.{lane}.clockface_valid")
-        clockface_valid: Optional[bool] = (
-            None if clockface_raw is None else _timebase_final_court_bool(clockface_raw)
-        )
-
-        public_count_in_science = _as_int(science.get("public_count"))
-        clock_raw_dwt = _as_int(science.get("clock_raw_dwt_at_edge"))
-        clock_floorline_dwt = _as_int(science.get("clock_floorline_dwt_at_edge"))
-        clock_published_dwt = _as_int(science.get("clock_published_dwt_at_edge"))
-        clock_observed_interval = _as_int(science.get("clock_observed_interval_cycles"))
-        clock_floorline_interval = _as_int(science.get("clock_floorline_interval_cycles"))
+        science = science if isinstance(science, dict) else {}
+        lane_ns = _as_int(fragment.get(f"{lane}_ns"))
         clock_interval_ns = _as_int(science.get("clock_interval_ns"))
         gnss_interval_ns = _as_int(science.get("gnss_interval_ns"))
         delta_raw_clock_interval = _as_int(science.get("delta_raw_clock_interval_cycles"))
-        delta_floorline_clock_interval = _as_int(science.get("delta_floorline_clock_interval_cycles"))
-        total_sample_count = _as_int(science.get("total_sample_count"))
-        traditional_total_sample_count = _as_int(science.get("traditional_total_sample_count"))
-
-        science_flags = {
-            "science_valid": _timebase_final_court_bool(science.get("valid")),
-            "science_worthy": _timebase_final_court_bool(
-                science.get("science_worthy", science.get("valid"))
-            ),
-            "antecedents_complete": _timebase_final_court_bool(science.get("antecedents_complete")),
-            "clock_floorline_valid": _timebase_final_court_bool(science.get("clock_floorline_valid")),
-            "delta_raw_valid": _timebase_final_court_bool(science.get("delta_raw_valid")),
-            "delta_floorline_valid": _timebase_final_court_bool(science.get("delta_floorline_valid")),
-            "traditional_valid": _timebase_final_court_bool(science.get("traditional_valid")),
-            "total_valid": _timebase_final_court_bool(science.get("total_valid")),
-            "traditional_total_valid": _timebase_final_court_bool(science.get("traditional_total_valid")),
-        }
-
-        evidence_values = (
-            clock_raw_dwt,
-            clock_floorline_dwt,
-            clock_published_dwt,
-            clock_observed_interval,
-            clock_floorline_interval,
-            clock_interval_ns,
-            # The GNSS reference interval does not prove that this OCXO
-            # lane contributed any evidence.  Counting it here would let an
-            # all-zero OCXO lane pass merely because the reference second
-            # was present.
-            delta_raw_clock_interval,
-            delta_floorline_clock_interval,
-            total_sample_count,
-            traditional_total_sample_count,
+        science_valid = _timebase_final_court_bool(science.get("valid"))
+        science_worthy = _timebase_final_court_bool(
+            science.get("science_worthy", science.get("valid"))
         )
-        has_nonzero_science_evidence = any(
-            value is not None and int(value) != 0 for value in evidence_values
-        ) or any(science_flags.values())
+        antecedents_complete = _timebase_final_court_bool(science.get("antecedents_complete"))
+        delta_raw_valid = _timebase_final_court_bool(science.get("delta_raw_valid"))
 
-        lane_ns_zero = lane_ns is None or int(lane_ns) == 0
-
-        if (
-            not recovery_degraded
-            and (
-                not science_flags["science_worthy"]
-                or not science_flags["antecedents_complete"]
-            )
-        ):
+        if not recovery_degraded and (not science_worthy or not antecedents_complete):
             _timebase_final_court_add_violation(
                 violations,
                 rule="ocxo_science_valid",
                 lane=lane,
-                message="mature public TIMEBASE row contains an OCXO clockface without valid OCXO science custody",
+                message="mature TEMPEST row lacks valid OCXO science custody",
                 fields={
                     "path": f"fragment.{lane}",
                     "science_path": science_path,
                     "public_count": int(public_count),
-                    "science_public_count": public_count_in_science,
-                    "mature_after_public_count": TIMEBASE_FINAL_COURT_OCXO_ZERO_MATURE_PUBLIC_COUNT,
                     "lane_ns": lane_ns,
-                    "lane_ns_zero": lane_ns_zero,
-                    "clockface_valid": clockface_valid,
+                    "ocxo_clockface_valid": shared_clockface_valid,
                     "recovery_degraded": recovery_degraded,
-                    "clock_raw_dwt_at_edge": clock_raw_dwt,
-                    "clock_floorline_dwt_at_edge": clock_floorline_dwt,
-                    "clock_published_dwt_at_edge": clock_published_dwt,
-                    "clock_observed_interval_cycles": clock_observed_interval,
-                    "clock_floorline_interval_cycles": clock_floorline_interval,
+                    "science_valid": science_valid,
+                    "science_worthy": science_worthy,
+                    "antecedents_complete": antecedents_complete,
                     "clock_interval_ns": clock_interval_ns,
                     "gnss_interval_ns": gnss_interval_ns,
+                    "delta_raw_valid": delta_raw_valid,
                     "delta_raw_clock_interval_cycles": delta_raw_clock_interval,
-                    "delta_floorline_clock_interval_cycles": delta_floorline_clock_interval,
-                    "total_sample_count": total_sample_count,
-                    "traditional_total_sample_count": traditional_total_sample_count,
-                    **science_flags,
                     "bad_field": f"fragment.{lane}.science.valid",
                     "bad_value": science.get("valid"),
                 },
             )
 
-        allow_missing_clockface = recovery_degraded and clockface_valid is not True
-        if (
-            lane_ns_zero
-            and not has_nonzero_science_evidence
-            and not allow_missing_clockface
-        ):
+        lane_ns_zero = lane_ns is None or lane_ns == 0
+        has_nonzero_science_evidence = bool(
+            science_valid
+            or antecedents_complete
+            or (clock_interval_ns is not None and clock_interval_ns != 0)
+            or (delta_raw_clock_interval is not None and delta_raw_clock_interval != 0)
+        )
+        allow_missing_clockface = recovery_degraded and shared_clockface_valid is not True
+        if lane_ns_zero and not has_nonzero_science_evidence and not allow_missing_clockface:
             _timebase_final_court_add_violation(
                 violations,
                 rule="ocxo_lane_alive",
                 lane=lane,
-                message="mature public TIMEBASE row contains an all-zero OCXO lane after recovery/start maturity",
+                message="mature TEMPEST row contains an all-zero OCXO lane",
                 fields={
                     "path": f"fragment.{lane}",
                     "science_path": science_path,
                     "public_count": int(public_count),
-                    "science_public_count": public_count_in_science,
-                    "mature_after_public_count": TIMEBASE_FINAL_COURT_OCXO_ZERO_MATURE_PUBLIC_COUNT,
                     "lane_ns": lane_ns,
-                    "clockface_valid": clockface_valid,
+                    "ocxo_clockface_valid": shared_clockface_valid,
                     "recovery_degraded": recovery_degraded,
                     "allow_missing_clockface": allow_missing_clockface,
-                    "clock_raw_dwt_at_edge": clock_raw_dwt,
-                    "clock_floorline_dwt_at_edge": clock_floorline_dwt,
-                    "clock_published_dwt_at_edge": clock_published_dwt,
-                    "clock_observed_interval_cycles": clock_observed_interval,
-                    "clock_floorline_interval_cycles": clock_floorline_interval,
                     "clock_interval_ns": clock_interval_ns,
                     "gnss_interval_ns": gnss_interval_ns,
                     "delta_raw_clock_interval_cycles": delta_raw_clock_interval,
-                    "delta_floorline_clock_interval_cycles": delta_floorline_clock_interval,
-                    "total_sample_count": total_sample_count,
-                    "traditional_total_sample_count": traditional_total_sample_count,
-                    **science_flags,
-                    "bad_field": f"fragment.{lane}.ns",
+                    "science_valid": science_valid,
+                    "antecedents_complete": antecedents_complete,
+                    "bad_field": f"fragment.{lane}_ns",
                     "bad_value": lane_ns,
                 },
             )
@@ -4402,12 +4176,12 @@ def _timebase_final_court_evaluate(timebase: Dict[str, Any]) -> Tuple[bool, Dict
             _diag.get("timebase_final_court_degraded_recovery_admitted", 0) + 1
         )
 
-    count = _first_present_int_path(
+    public_count = _first_present_int_path(
         timebase,
-        "teensy_pps_vclock_count",
-        "fragment.teensy_pps_vclock_count",
-        "pps_count",
+        "public_count",
+        "fragment.public_count",
     )
+    sequence = _as_int(timebase.get("sequence"))
 
     if structural_violations:
         primary = structural_violations[0]
@@ -4453,20 +4227,10 @@ def _timebase_final_court_evaluate(timebase: Dict[str, Any]) -> Tuple[bool, Dict
         "source_process": "CLOCKS",
         "source_report": "TEMPEST_FINAL_COURT",
         "campaign": timebase.get("campaign"),
-        "teensy_pps_vclock_count": count,
-        "teensy_pps_count": count,
-        "pps_count": count,
+        "sequence": sequence,
+        "public_count": public_count,
         "timebase_schema": timebase.get("schema"),
         "fragment_schema": _path_get(timebase, "fragment.schema"),
-        "timebase_message_version": timebase.get("timebase_message_version"),
-        "teensy_evidence_invalid_mask": (
-            _as_int(_path_get(timebase, "fragment.teensy_evidence_invalid_mask")) or 0
-        ),
-        "teensy_evidence_status": _path_get(timebase, "fragment.teensy_evidence_status"),
-        "teensy_evidence_reason": _path_get(
-            timebase, "fragment.teensy_evidence_reason"
-        ),
-        "timebase_pair_version": timebase.get("timebase_pair_version"),
         "rule_count": 4,
         "violation_count": (
             len(structural_violations)
@@ -4513,7 +4277,7 @@ def _timebase_final_court_block(
     _diag["last_timebase_final_court_row_drop"] = {
         "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "campaign": verdict.get("campaign"),
-        "teensy_pps_vclock_count": verdict.get("teensy_pps_vclock_count"),
+        "public_count": verdict.get("public_count"),
         "primary_rule": verdict.get("primary_rule"),
         "rationale": verdict.get("rationale"),
         "verdict": verdict,
@@ -4531,7 +4295,7 @@ def _timebase_final_court_block(
             "timebase_structural_integrity_failure",
             {
                 "campaign": verdict.get("campaign"),
-                "teensy_pps_vclock_count": verdict.get("teensy_pps_vclock_count"),
+                "public_count": verdict.get("public_count"),
                 "primary_rule": verdict.get("primary_rule"),
                 "rationale": verdict.get("rationale"),
                 "structural_violations": verdict.get("structural_violations"),
@@ -4546,7 +4310,7 @@ def _timebase_final_court_block(
         "💥 [clocks] structurally incoherent TIMEBASE candidate dropped: "
         "campaign=%s pps=%s rule=%s rationale=%s recovery_started=%s",
         verdict.get("campaign"),
-        verdict.get("teensy_pps_vclock_count"),
+        verdict.get("public_count"),
         verdict.get("primary_rule"),
         verdict.get("rationale"),
         recovery_started,
@@ -4565,7 +4329,7 @@ def _timebase_final_court_block(
 def _dwt_cycles_to_recover_ns(cycles: int) -> int:
     """Convert a DWT cycle ledger to the current Teensy RECOVER dwt_ns argument.
 
-    TIMEBASE_FRAGMENT_V3 publishes DWT as native cycles.  The current firmware
+    TEMPEST_FRAGMENT_V1 publishes DWT as native cycles.  The current firmware
     RECOVER command still accepts dwt_ns and immediately converts it back to
     cycles.  Use a ceiling conversion so the round trip does not restore a
     cycle ledger that is one cycle below the projected value.
@@ -4574,14 +4338,6 @@ def _dwt_cycles_to_recover_ns(cycles: int) -> int:
     if c <= 0:
         return 0
     return (c * DWT_NS_NUM + DWT_NS_DEN - 1) // DWT_NS_DEN
-
-
-def _dwt_recover_ns_to_cycles(ns: int) -> int:
-    """Compatibility conversion for legacy persisted dwt_ns recovery rows."""
-    n = int(ns)
-    if n <= 0:
-        return 0
-    return (n * DWT_NS_DEN) // DWT_NS_NUM
 
 
 def _report_fragment(report: Dict[str, Any]) -> Dict[str, Any]:
@@ -4594,70 +4350,46 @@ def _report_extra_clocks(report: Dict[str, Any]) -> Dict[str, Any]:
     return extra if isinstance(extra, dict) else {}
 
 
-def _report_forensics(report: Dict[str, Any]) -> Dict[str, Any]:
-    forensics = report.get("forensics")
-    return forensics if isinstance(forensics, dict) else {}
-
-
 def _recovery_timebase_snapshot(tb: Dict[str, Any]) -> Dict[str, Any]:
-    """Extract the recovery-critical truth from one persisted TIMEBASE row."""
+    """Extract warm-recovery truth from one persisted TIMEBASE_V4 view."""
     last_tb = dict(tb or {})
     last_frag = _report_fragment(last_tb)
     last_extra = _report_extra_clocks(last_tb)
+    canonical_clocks = last_tb.get("clocks")
+    canonical_clocks = (
+        copy.deepcopy(canonical_clocks)
+        if isinstance(canonical_clocks, dict)
+        else {}
+    )
 
-    last_pps_vclock_count = int(_extract_last_timebase_count(last_tb, last_frag))
+    last_public_count = int(_extract_last_timebase_count(last_tb, last_frag))
 
     last_gnss_ns = _fragment_ns(
         last_frag,
-        "gnss.ns",
-        "gnss.pps_vclock_ns",
-        "gnss.vclock_ns",
-        "pps_vclock_ns",
-        "vclock_ns",
-        "pps_ns",
+        "clockfaces.gnss_ns",
         "gnss_ns",
-        default=int(last_tb.get("teensy_gnss_ns") or 0),
-    )
-
-    legacy_last_dwt_ns = _fragment_ns(
-        last_frag,
-        "dwt.ns",
-        "dwt_ns",
-        default=int(last_tb.get("teensy_dwt_ns") or last_tb.get("dwt_ns") or 0),
+        default=0,
     )
     last_dwt_cycles = _fragment_int(
         last_frag,
-        "dwt.cycle_count_total",
-        "dwt.cycles",
-        "dwt.value",
-        "dwt_cycle_count_total",
+        "clockfaces.dwt_cycles",
         "dwt_cycles",
         default=0,
     )
-    if last_dwt_cycles == 0 and legacy_last_dwt_ns > 0:
-        last_dwt_cycles = _dwt_recover_ns_to_cycles(legacy_last_dwt_ns)
-    last_dwt_ns = (
-        _dwt_cycles_to_recover_ns(last_dwt_cycles)
-        if last_dwt_cycles > 0
-        else legacy_last_dwt_ns
-    )
-
+    last_dwt_ns = _dwt_cycles_to_recover_ns(last_dwt_cycles) if last_dwt_cycles > 0 else 0
     last_ocxo1_ns = _fragment_ns(
         last_frag,
-        "ocxo1.ns",
-        "gnss.ocxo1_ns",
+        "clockfaces.ocxo1_ns",
         "ocxo1_ns",
-        "ocxo1_ns_at_pps_vclock",
-        default=int(last_tb.get("teensy_ocxo1_ns") or 0),
+        default=0,
     )
     last_ocxo2_ns = _fragment_ns(
         last_frag,
-        "ocxo2.ns",
-        "gnss.ocxo2_ns",
+        "clockfaces.ocxo2_ns",
         "ocxo2_ns",
-        "ocxo2_ns_at_pps_vclock",
-        default=int(last_tb.get("teensy_ocxo2_ns") or 0),
+        default=0,
     )
+
     last_gnss_raw_ns = int(
         last_extra.get("gnss_raw_ns")
         or last_tb.get("gnss_raw_ns")
@@ -4666,7 +4398,7 @@ def _recovery_timebase_snapshot(tb: Dict[str, Any]) -> Dict[str, Any]:
     last_gnss_raw_ref_ns = int(
         last_extra.get("gnss_raw_ref_ns")
         or last_tb.get("gnss_raw_ref_ns")
-        or (last_pps_vclock_count * NS_PER_SECOND)
+        or (last_public_count * NS_PER_SECOND)
     )
     last_gnss_raw_welford_mean = _first_float(
         last_extra.get("gnss_raw_welford_mean"),
@@ -4680,24 +4412,28 @@ def _recovery_timebase_snapshot(tb: Dict[str, Any]) -> Dict[str, Any]:
         or last_tb.get("system_time_utc")
         or system_time_z()
     )
-    restore_state = last_tb.get("restore_state")
-    if not isinstance(restore_state, dict):
-        restore_state = None
+
+    canonical_restore_ok = _canonical_instrument_restore_ready(
+        canonical_clocks,
+        include_control=False,
+    )
 
     recoverable = (
-        last_pps_vclock_count > 0
+        last_public_count > 0
         and last_gnss_ns > 0
         and last_dwt_cycles > 0
         and last_ocxo1_ns > 0
         and last_ocxo2_ns > 0
+        and canonical_restore_ok
     )
 
     return {
         "last_tb": last_tb,
         "last_frag": last_frag,
-        "last_pps_vclock_count": int(last_pps_vclock_count),
+        "last_pps_vclock_count": int(last_public_count),
+        "last_public_count": int(last_public_count),
         "last_gnss_ns": int(last_gnss_ns),
-        "legacy_last_dwt_ns": int(legacy_last_dwt_ns),
+        "legacy_last_dwt_ns": 0,
         "last_dwt_cycles": int(last_dwt_cycles),
         "last_dwt_ns": int(last_dwt_ns),
         "last_ocxo1_ns": int(last_ocxo1_ns),
@@ -4706,106 +4442,74 @@ def _recovery_timebase_snapshot(tb: Dict[str, Any]) -> Dict[str, Any]:
         "last_gnss_raw_ref_ns": int(last_gnss_raw_ref_ns),
         "last_gnss_raw_welford_mean": float(last_gnss_raw_welford_mean),
         "last_gnss_time_str": str(last_gnss_time_str),
-        "restore_state": copy.deepcopy(restore_state),
+        "canonical_clocks": canonical_clocks,
         "recoverable": bool(recoverable),
     }
 
 
 
-def _state_clocks_fragment(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Return the canonical CLOCKS fragment, accepting the previous persisted key."""
-    fragment = state.get("clocks_fragment")
-    if not isinstance(fragment, dict):
-        fragment = state.get("monitor_fragment")
-    return fragment if isinstance(fragment, dict) else {}
+def _state_campaign(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the canonical optional TEMPEST campaign delta from CLOCKS_V4."""
+    campaign = state.get("campaign")
+    return campaign if isinstance(campaign, dict) else {}
 
 
 def _tempest_detail_from_state_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Reconstruct the established TEMPEST report view from one unified snapshot.
+    """Reconstruct the operator/recovery TIMEBASE_V4 view from one CLOCKS_V4 row."""
+    campaign = _state_campaign(state)
+    if not campaign:
+        raise ValueError("state detail has no campaign enrichment")
+    if campaign.get("schema") != "TEMPEST_FRAGMENT_V1":
+        raise ValueError("state detail campaign is not TEMPEST_FRAGMENT_V1")
 
-    Storage remains nonredundant: the raw firmware candidate, common clocks,
-    environment, GNSS, and restore state stay in their ordinary CLOCKS homes.
-    This adapter presents the former report shape only to existing TEMPEST
-    recovery calculations while they are moved behind generalized state recovery.
-    """
-    campaign_context = state.get("campaign")
-    if not isinstance(campaign_context, dict):
-        raise ValueError("state detail has no campaign context")
-    if str(campaign_context.get("campaign_type") or "").upper() != CAMPAIGN_TYPE_TEMPEST:
-        raise ValueError("state detail is not TEMPEST")
+    adjudication = campaign.get("adjudication")
+    if not isinstance(adjudication, dict):
+        raise ValueError("state detail campaign has no Pi adjudication")
 
-    tempest = campaign_context.get("tempest")
-    if not isinstance(tempest, dict):
-        raise ValueError("state detail has no TEMPEST decoration")
-
-    clocks_fragment = _state_clocks_fragment(state)
-    if not clocks_fragment:
-        raise ValueError("state detail has no clocks_fragment")
-    candidate = clocks_fragment.get("campaign_row")
-    if not isinstance(candidate, dict):
-        raise ValueError("state detail has no clocks_fragment.campaign_row")
-
-    fragment = copy.deepcopy(candidate)
-    embedded_forensics = fragment.pop("forensics", None)
-    forensics = (
-        copy.deepcopy(embedded_forensics)
-        if isinstance(embedded_forensics, dict)
-        else {}
-    )
-    count = _extract_teensy_pps_vclock_count(
-        fragment,
-        topic="unified TEMPEST state detail",
-    )
-    _normalize_fragment_count_aliases(fragment, count)
-    if forensics:
-        _normalize_fragment_count_aliases(forensics, count)
+    fragment = copy.deepcopy(campaign)
+    fragment.pop("adjudication", None)
+    public_count = _tempest_public_count(fragment)
+    sequence = _as_int(state.get("sequence"))
+    if sequence is None or sequence <= 0:
+        raise ValueError("state detail has no physical sequence")
 
     clocks = state.get("clocks")
-    clocks = clocks if isinstance(clocks, dict) else {}
-    fragment = _decorate_persisted_fragment_ppb_buckets(
-        fragment,
-        _clocks_fragment_ppb_buckets({"clocks": clocks}),
-    )
+    clocks = copy.deepcopy(clocks) if isinstance(clocks, dict) else {}
+    campaign_name = _tempest_campaign_name(fragment)
 
-    campaign = str(campaign_context.get("campaign") or tempest.get("campaign") or "")
-    detail = {
-        "schema": "TIMEBASE_V3",
+    return {
+        "schema": "TIMEBASE_V4",
         "campaign_type": CAMPAIGN_TYPE_TEMPEST,
-        "timebase_message_version": tempest.get("timebase_message_version"),
-        "timebase_pair_version": tempest.get("timebase_pair_version"),
-        "campaign": campaign,
-        "campaign_elapsed": tempest.get("campaign_elapsed"),
-        "science_eligible": bool(tempest.get("science_eligible")),
-        "control_eligible": bool(tempest.get("control_eligible")),
+        "campaign": campaign_name,
+        "sequence": int(sequence),
+        "public_count": int(public_count),
+        "campaign_elapsed": _seconds_to_hms(int(public_count)),
+        "science_eligible": bool(adjudication.get("science_eligible")),
+        "control_eligible": bool(adjudication.get("control_eligible")),
         "persist": True,
-        "science_excluded": bool(tempest.get("science_excluded")),
-        "candidate_use": tempest.get("candidate_use"),
-        "final_court": copy.deepcopy(tempest.get("final_court") or {}),
-        "location": tempest.get("location"),
-        "system_time_utc": state.get("published_at_utc"),
+        "science_excluded": bool(adjudication.get("science_excluded")),
+        "candidate_use": adjudication.get("candidate_use"),
+        "final_court": copy.deepcopy(adjudication.get("final_court") or {}),
+        "location": adjudication.get("location"),
+        "system_time_utc": (
+            adjudication.get("adjudicated_at_utc")
+            or state.get("published_at_utc")
+        ),
         "gnss_time_utc": (
             clocks.get("gnss_time_utc")
             or _path_get(state, "gnss.gnss_time_utc")
             or _path_get(state, "gnss.next_utc")
         ),
-        "teensy_pps_vclock_count": int(count),
-        "teensy_pps_count": int(count),
-        "pps_count": int(count),
         "fragment": fragment,
-        "forensics": forensics,
+        "clocks": clocks,
         "environment": copy.deepcopy(state.get("environment")),
         "gnss": copy.deepcopy(state.get("gnss")),
-        "extra_clocks": copy.deepcopy(tempest.get("extra_clocks") or {}),
+        "extra_clocks": copy.deepcopy(adjudication.get("extra_clocks") or {}),
     }
-
-    restore_state = clocks.get("restore_state")
-    if isinstance(restore_state, dict):
-        detail["restore_state"] = copy.deepcopy(restore_state)
-    return detail
 
 
 def _count_tempest_state_details(campaign_name: str) -> int:
-    """Return the number of unified state rows carrying a TEMPEST decoration."""
+    """Return unified CLOCKS rows carrying a fully adjudicated TEMPEST delta."""
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
         cur.execute(
@@ -4814,7 +4518,7 @@ def _count_tempest_state_details(campaign_name: str) -> int:
             FROM campaign_detail
             WHERE campaign_type = %s
               AND campaign = %s
-              AND payload #> '{campaign,tempest}' IS NOT NULL
+              AND payload #> '{campaign,adjudication}' IS NOT NULL
             """,
             (
                 CAMPAIGN_TYPE_TEMPEST,
@@ -4830,7 +4534,7 @@ def _load_last_recoverable_tempest_detail(
     *,
     scan_limit: int = 64,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], int]:
-    """Return the newest unified TEMPEST state snapshot usable for recovery."""
+    """Return the newest adjudicated CLOCKS_V4 TEMPEST state usable for recovery."""
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
         cur.execute(
@@ -4839,7 +4543,7 @@ def _load_last_recoverable_tempest_detail(
             FROM campaign_detail
             WHERE campaign_type = %s
               AND campaign = %s
-              AND payload #> '{campaign,tempest}' IS NOT NULL
+              AND payload #> '{campaign,adjudication}' IS NOT NULL
             ORDER BY id DESC
             LIMIT %s
             """,
@@ -4887,9 +4591,9 @@ def _load_last_recoverable_tempest_detail(
                 )
                 logging.warning(
                     "⚠️ [recovery] skipped %d latest unified TEMPEST state "
-                    "detail(s) with unrecoverable ledgers; using count=%s",
+                    "detail(s) with unrecoverable canonical state; using public_count=%s",
                     skipped,
-                    snapshot.get("last_pps_vclock_count"),
+                    snapshot.get("last_public_count"),
                 )
             return detail, snapshot, int(skipped)
 
@@ -4959,17 +4663,11 @@ def _firmware_total_ppb(
     report: Dict[str, Any],
     lane: str,
 ) -> Optional[float]:
-    """Return the explicit firmware TOTAL bucket for one clock lane.
-
-    ``stats.<lane>.ppb`` remains a rolling-deploy compatibility alias of TOTAL,
-    but baseline storage names the population explicitly so CAMP or a future
-    selected servo bucket can never become baseline authority by accident.
-    """
+    """Return canonical always-on firmware TOTAL PPB for one lane."""
     return _first_float(
+        _path_get(report, f"clocks.stats.{lane}.ppb_buckets.total"),
+        _path_get(report, f"clocks.stats.{lane}.ppb"),
         _path_get(fragment, f"stats.{lane}.ppb_buckets.total"),
-        _path_get(fragment, f"stats.{lane}.ppb"),
-        fragment.get(f"{lane}_ppb"),
-        report.get(f"{lane}_ppb"),
     )
 
 
@@ -5009,77 +4707,47 @@ def _baseline_tau_from_report(report: Dict[str, Any]) -> Dict[str, float]:
 
 
 def _baseline_dac_from_report(report: Dict[str, Any]) -> Dict[str, float]:
-    """Extract instantaneous DAC setpoints from the current TIMEBASE-shaped report."""
-    frag = _report_fragment(report)
-    forensics = _report_forensics(report)
+    """Extract canonical instantaneous DAC targets from TIMEBASE_V4.clocks.control."""
     out: Dict[str, float] = {}
     for key in ("ocxo1", "ocxo2"):
-        v = _first_float(
-            _path_get(forensics, f"dac.{key}.value"),
-            _path_get(frag, f"dac.{key}.value"),
-            _path_get(frag, f"dac.{key}_dac"),
-            frag.get(f"{key}_dac"),
-            report.get(f"{key}_dac"),
-        )
-        if v is not None:
-            out[key] = round(v, 6)
+        value = _first_float(_path_get(report, f"clocks.control.{key}.target_code"))
+        if value is not None:
+            out[key] = round(value, 6)
     return out
 
 
 def _baseline_dac_mean_from_report(report: Dict[str, Any]) -> Dict[str, float]:
-    """Extract DAC mean values from the firmware Welford surface, falling back to current DAC."""
-    frag = _report_fragment(report)
+    """Extract canonical DAC Welford means, falling back to live target code."""
     current = _baseline_dac_from_report(report)
     out: Dict[str, float] = {}
     for key in ("ocxo1", "ocxo2"):
         current_v = current.get(key)
-        v = _first_float(
-            _path_get(frag, f"stats.dac.{key}.mean"),
-            frag.get(f"{key}_dac_welford_mean"),
-            report.get(f"{key}_dac_welford_mean"),
-            report.get(f"{key}_dac_mean"),
+        value = _first_float(
+            _path_get(report, f"clocks.stats.auxiliary_welford.{key}_dac.mean"),
             current_v,
         )
-        if v == 0.0 and current_v is not None and current_v > 0.0:
-            v = current_v
-        if v is not None:
-            out[key] = round(v, 6)
+        if value == 0.0 and current_v is not None and current_v > 0.0:
+            value = current_v
+        if value is not None:
+            out[key] = round(value, 6)
     return out
 
 
 def _baseline_dac_stats_from_report(report: Dict[str, Any]) -> Dict[str, Dict[str, float | int]]:
-    """Extract the full DAC Welford block for baseline audit/debug display."""
-    frag = _report_fragment(report)
+    """Extract canonical DAC Welford blocks for baseline audit/display."""
     out: Dict[str, Dict[str, float | int]] = {}
     for key in ("ocxo1", "ocxo2"):
-        prefix = f"{key}_dac_welford"
-        n = _as_int(_path_get(frag, f"stats.dac.{key}.n"))
-        mean = _first_float(_path_get(frag, f"stats.dac.{key}.mean"))
-        sd = _first_float(_path_get(frag, f"stats.dac.{key}.stddev"))
-        se = _first_float(_path_get(frag, f"stats.dac.{key}.stderr"))
-        mn = _first_float(_path_get(frag, f"stats.dac.{key}.min"))
-        mx = _first_float(_path_get(frag, f"stats.dac.{key}.max"))
-
-        n = n if n is not None else _as_int(frag.get(f"{prefix}_n"))
-        mean = mean if mean is not None else _first_float(frag.get(f"{prefix}_mean"))
-        sd = sd if sd is not None else _first_float(frag.get(f"{prefix}_stddev"))
-        se = se if se is not None else _first_float(frag.get(f"{prefix}_stderr"))
-        mn = mn if mn is not None else _first_float(frag.get(f"{prefix}_min"))
-        mx = mx if mx is not None else _first_float(frag.get(f"{prefix}_max"))
-
+        wf = _path_get(report, f"clocks.stats.auxiliary_welford.{key}_dac")
+        if not isinstance(wf, dict):
+            continue
         stats: Dict[str, float | int] = {}
+        n = _as_int(wf.get("n"))
         if n is not None:
             stats["n"] = int(n)
-        if mean is not None:
-            stats["mean"] = round(mean, 6)
-        if sd is not None:
-            stats["stddev"] = round(sd, 6)
-        if se is not None:
-            stats["stderr"] = round(se, 6)
-        if mn is not None:
-            stats["min"] = round(mn, 6)
-        if mx is not None:
-            stats["max"] = round(mx, 6)
+        for field in ("mean", "stddev", "stderr", "min", "max"):
+            value = _first_float(wf.get(field))
+            if value is not None:
+                stats[field] = round(value, 6)
         if stats:
             out[key] = stats
     return out
@@ -5098,7 +4766,7 @@ def _normalize_start_args(args: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _mark_start_waiting(campaign: str) -> None:
-    """Record that START returned before the first CLOCKS_FRAGMENT campaign row."""
+    """Record that START returned before the first CLOCKS_FRAGMENT campaign delta."""
     global _start_waiting_for_first_fragment, _start_requested_campaign
     global _start_requested_at_utc, _start_requested_monotonic
     global _start_first_fragment_at_utc, _start_first_fragment_wait_s
@@ -5355,19 +5023,15 @@ def _enqueue_timebase_piece(
     topic: str,
     payload: Dict[str, Any],
     *,
-    restore_state: Optional[Dict[str, Any]] = None,
-    ppb_buckets: Optional[Dict[str, Any]] = None,
+    state_sequence: int,
     system_context: Optional[Dict[str, Any]] = None,
     clocks_fragment: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Enqueue one already-persisted campaign candidate for TEMPEST adjudication."""
+    """Enqueue one already-persisted V4 campaign delta for TEMPEST adjudication."""
     _fragment_queue.put({
         "topic": topic,
-        "payload": dict(payload),
-        "restore_state": copy.deepcopy(restore_state)
-            if isinstance(restore_state, dict) else None,
-        "ppb_buckets": copy.deepcopy(ppb_buckets)
-            if isinstance(ppb_buckets, dict) else None,
+        "payload": copy.deepcopy(payload),
+        "state_sequence": int(state_sequence),
         "system_context": copy.deepcopy(system_context)
             if isinstance(system_context, dict) else {},
         "clocks_fragment": copy.deepcopy(clocks_fragment)
@@ -5383,7 +5047,7 @@ def _enqueue_timebase_piece(
 
 
 def _drain_timebase_ingress() -> int:
-    """Drain queued CLOCKS_FRAGMENT campaign rows from an old lifecycle."""
+    """Drain queued CLOCKS_FRAGMENT campaign deltas from an old lifecycle."""
     drained = 0
     while not _fragment_queue.empty():
         try:
@@ -5425,22 +5089,16 @@ def _deep_merge_dicts(*values: Any) -> Dict[str, Any]:
 
 
 def _clocks_fragment_count(fragment: Dict[str, Any]) -> Optional[int]:
-    for key in ("sequence", "teensy_pps_vclock_count", "teensy_pps_count", "pps_count"):
-        value = fragment.get(key)
-        if value is None:
-            continue
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            continue
-    return None
+    """Return CLOCKS_FRAGMENT_V4 physical completed-row identity."""
+    value = _as_int(fragment.get("sequence")) if isinstance(fragment, dict) else None
+    return int(value) if value is not None else None
 
 
 def _advance_gnss_raw_instrument(
     sequence: Optional[int],
     system_context: Dict[str, Any],
 ) -> None:
-    """Advance GNSS_RAW once per physical second, not on a prompt enrichment copy."""
+    """Advance GNSS_RAW exactly once per physical CLOCKS_FRAGMENT sequence."""
     global _last_clocks_state_sequence, _last_clocks_state_monotonic
     global _gnss_raw_welford_n, _gnss_raw_welford_mean, _gnss_raw_welford_m2
     global _gnss_raw_welford_min, _gnss_raw_welford_max
@@ -5448,13 +5106,20 @@ def _advance_gnss_raw_instrument(
     global _gnss_raw_instrument_ns, _gnss_raw_instrument_n, _gnss_raw_instrument_valid
 
     now = time.monotonic()
-    if (
-        sequence is not None
-        and _last_clocks_state_sequence == int(sequence)
-        and _last_clocks_state_monotonic is not None
-        and now - _last_clocks_state_monotonic < 0.5
-    ):
-        return
+    if sequence is not None and _last_clocks_state_sequence is not None:
+        if int(sequence) == int(_last_clocks_state_sequence):
+            # V4 may strengthen an instrument-only row with campaign enrichment.
+            # Same physical sequence is idempotent regardless of wall-clock delay.
+            _last_clocks_state_monotonic = now
+            return
+        if int(sequence) < int(_last_clocks_state_sequence):
+            logging.warning(
+                "⚠️ [clocks] ignoring GNSS_RAW advance for regressed physical sequence "
+                "%d < %d",
+                int(sequence),
+                int(_last_clocks_state_sequence),
+            )
+            return
 
     info = _system_gnss_info(system_context)
     sample = _gnss_raw_drift_from_info(info)
@@ -5472,9 +5137,7 @@ def _advance_gnss_raw_instrument(
             _gnss_raw_welford_m2 += d1 * d2
             _gnss_raw_welford_min = min(_gnss_raw_welford_min, sample)
             _gnss_raw_welford_max = max(_gnss_raw_welford_max, sample)
-            n = int(_gnss_raw_welford_n)
-        else:
-            n = int(_gnss_raw_welford_n)
+        n = int(_gnss_raw_welford_n)
 
     _diag["gnss_raw_stats_poll_count"] += 1
     if sample is None:
@@ -5487,6 +5150,7 @@ def _advance_gnss_raw_instrument(
             "n": n,
             "source": "SYSTEM.REPORT",
         }
+
     if sequence is not None:
         _last_clocks_state_sequence = int(sequence)
         _last_clocks_state_monotonic = now
@@ -5494,107 +5158,92 @@ def _advance_gnss_raw_instrument(
 
 
 def _pi_clocks_state_snapshot() -> Dict[str, Any]:
+    """Return Pi-owned CLOCKS enrichment without mirroring Teensy instrument state."""
     gnss_raw = _gnss_raw_state_snapshot()
-    presentation = gnss_raw["presentation"]
-    welford = gnss_raw["welford"]
     baseline = _clocks_baseline_snapshot()
     baseline_payload = (
         {"baseline_set": True, **baseline}
         if baseline
         else {"baseline_set": False}
     )
-    campaign_seconds = int(_accepted_pps_vclock_count or 0) if _campaign_active else 0
-    instrument_seconds = int(gnss_raw.get("instrument", {}).get("clockface_n") or 0)
     return {
-        "schema": "PI_CLOCKS_STATE_V3",
-        "instrument_always_on": True,
-        "instrument_elapsed": _seconds_to_hms(instrument_seconds),
-        "campaign_active": bool(_campaign_active),
-        "campaign_present": bool(_campaign_active),
-        "campaign_state": "STARTED" if _campaign_active else "STOPPED",
-        "campaign_type": CAMPAIGN_TYPE_TEMPEST if _campaign_active else None,
-        "campaign": _start_requested_campaign if _campaign_active else None,
-        "campaign_elapsed": _seconds_to_hms(campaign_seconds),
-        "complete_for_display": True,
-        "startup": _start_status_payload(),
+        "schema": "PI_CLOCKS_STATE_V4",
         "gnss_raw": gnss_raw,
-        "extra_clocks": {
-            "gnss_raw_ns": presentation.get("ns"),
-            "gnss_raw_ref_ns": presentation.get("ref_ns"),
-            "gnss_raw_drift_ppb": gnss_raw.get("drift_ppb"),
-            "gnss_raw_tau": presentation.get("tau"),
-            "gnss_raw_ppb": presentation.get("ppb"),
-            "gnss_raw_welford_n": welford.get("n"),
-            "gnss_raw_welford_mean": welford.get("mean"),
-            "gnss_raw_welford_m2": welford.get("m2"),
-            "gnss_raw_welford_stddev": welford.get("stddev"),
-            "gnss_raw_welford_stderr": welford.get("stderr"),
-            "gnss_raw_welford_min": welford.get("min"),
-            "gnss_raw_welford_max": welford.get("max"),
-        },
         "baseline": baseline_payload,
         "stats_reset": {
             "requests": int(_diag.get("stats_reset_requests") or 0),
             "success": int(_diag.get("stats_reset_success") or 0),
             "last": _diag.get("last_stats_reset") or {},
         },
+        "startup": _start_status_payload(),
     }
+
+
+def _validate_clocks_fragment_v4(
+    clocks_fragment: Dict[str, Any],
+) -> Tuple[int, Dict[str, Any]]:
+    """Return (physical_sequence, clocks) only for one coherent V4 instrument row."""
+    if clocks_fragment.get("schema") != "CLOCKS_FRAGMENT_V4":
+        raise ValueError(
+            f"unsupported CLOCKS_FRAGMENT schema {clocks_fragment.get('schema')!r}"
+        )
+
+    sequence = _clocks_fragment_count(clocks_fragment)
+    teensy_clocks = clocks_fragment.get("clocks")
+    if sequence is None or sequence <= 0 or not isinstance(teensy_clocks, dict):
+        raise ValueError("CLOCKS_FRAGMENT_V4 missing sequence/clocks")
+
+    completed = _as_int(teensy_clocks.get("completed_pps_sequence"))
+    clockface_sequence = _as_int(_path_get(teensy_clocks, "clockfaces.pps_sequence"))
+    if (
+        completed != int(sequence)
+        or clockface_sequence != int(sequence)
+        or not bool(teensy_clocks.get("completed_row_coherent"))
+    ):
+        raise ValueError(
+            "CLOCKS_FRAGMENT_V4 identity/coherence violation: "
+            f"outer={sequence} completed={completed} clockface={clockface_sequence} "
+            f"coherent={teensy_clocks.get('completed_row_coherent')!r}"
+        )
+    return int(sequence), teensy_clocks
 
 
 def _build_canonical_clocks_state(
     clocks_fragment: Dict[str, Any],
     system_context: Dict[str, Any],
 ) -> Dict[str, Any]:
+    """Build canonical CLOCKS_V4 from one exact CLOCKS_FRAGMENT_V4 observation."""
     published_at = datetime.now(timezone.utc)
     published_at_utc = published_at.isoformat().replace("+00:00", "Z")
-    sequence = _clocks_fragment_count(clocks_fragment)
+    sequence, teensy_clocks = _validate_clocks_fragment_v4(clocks_fragment)
+
     gnss = _system_gnss_info(system_context)
     pi_clocks = _pi_clocks_state_snapshot()
-    teensy_clocks = clocks_fragment.get("clocks")
-    teensy_clocks = copy.deepcopy(teensy_clocks) if isinstance(teensy_clocks, dict) else {}
 
-    clocks = dict(teensy_clocks)
-    clocks["schema"] = "CLOCKS_LIVE_V2"
-    clocks["teensy_schema"] = teensy_clocks.get("schema")
-    clocks["pi_schema"] = pi_clocks.get("schema")
+    # One canonical clocks object.  Teensy owns the real clocks; Pi adds only
+    # the independently owned GNSS_RAW clock.  No clocks.pi mirror and no
+    # duplicated CLOCKS_FRAGMENT evidence branch.
+    clocks = copy.deepcopy(teensy_clocks)
+    clocks["source_schema"] = teensy_clocks.get("schema")
+    clocks["schema"] = "CLOCKS_INSTRUMENT_STATE_V1"
+    clocks["gnss_raw"] = copy.deepcopy(pi_clocks.get("gnss_raw") or {})
     clocks["system_time_utc"] = published_at_utc
     clocks["gnss_time_utc"] = _system_gnss_time_utc(system_context)
-    clocks["display_elapsed"] = _seconds_to_hms(
-        clocks.get("teensy_pps_vclock_count")
-        or clocks.get("campaign_seconds")
-        or sequence
-        or 0
-    )
-    clocks["campaign_elapsed"] = (
-        _seconds_to_hms(clocks.get("campaign_seconds"))
-        if clocks.get("campaign_present")
-        else None
-    )
-    clocks["instrument_elapsed"] = _seconds_to_hms(clocks.get("instrument_age_seconds"))
-    clocks["pi"] = pi_clocks
-    clocks["gnss_raw"] = copy.deepcopy(pi_clocks.get("gnss_raw") or {})
-    clocks["extra_clocks"] = copy.deepcopy(pi_clocks.get("extra_clocks") or {})
-    clocks["baseline"] = copy.deepcopy(pi_clocks.get("baseline") or {})
-    clocks["stats_reset"] = copy.deepcopy(pi_clocks.get("stats_reset") or {})
-    clocks["complete_for_display"] = bool(teensy_clocks and pi_clocks.get("gnss_raw"))
     clocks["persisted"] = False
     clocks["ephemeral"] = True
 
-    fragment_evidence = copy.deepcopy(clocks_fragment)
-    fragment_evidence.pop("clocks", None)
     features = _deep_merge_dicts(
         system_context.get("features"),
         clocks_fragment.get("features"),
     )
     gnss_time_utc = _system_gnss_time_utc(system_context)
-    return {
-        "schema": "CLOCKS_V3",
+
+    state: Dict[str, Any] = {
+        "schema": "CLOCKS_V4",
         "source_schema": clocks_fragment.get("schema"),
-        "sequence": sequence,
-        "teensy_pps_vclock_count": sequence,
-        "teensy_pps_count": sequence,
-        "pps_count": sequence,
+        "sequence": int(sequence),
         "published_at_utc": published_at_utc,
+        # SYSTEM-owned source payloads remain transitive and structurally intact.
         "pi": copy.deepcopy(system_context.get("pi") or {}),
         "network": copy.deepcopy(system_context.get("network") or {}),
         "sensors": copy.deepcopy(system_context.get("sensors") or {}),
@@ -5614,49 +5263,43 @@ def _build_canonical_clocks_state(
         "power": copy.deepcopy(system_context.get("power") or {}),
         "battery": copy.deepcopy(system_context.get("battery") or {}),
         "clocks": clocks,
-        "teensy": copy.deepcopy(clocks_fragment.get("teensy") or {}),
-        "process": copy.deepcopy(clocks_fragment.get("process") or {}),
-        "transport": copy.deepcopy(clocks_fragment.get("transport") or {}),
-        "payload": copy.deepcopy(clocks_fragment.get("payload") or {}),
         "features": features,
-        "clocks_fragment": fragment_evidence,
+        "baseline": copy.deepcopy(pi_clocks.get("baseline") or {}),
+        "stats_reset": copy.deepcopy(pi_clocks.get("stats_reset") or {}),
+        "startup": copy.deepcopy(pi_clocks.get("startup") or {}),
+        "complete_for_display": bool(teensy_clocks and pi_clocks.get("gnss_raw")),
     }
+
+    campaign = clocks_fragment.get("campaign")
+    if isinstance(campaign, dict):
+        # The raw firmware delta is persisted exactly once at top level.
+        state["campaign"] = copy.deepcopy(campaign)
+
+    return state
 
 
 def _clocks_detail_campaign(state: Dict[str, Any]) -> Optional[str]:
-    fragment = _state_clocks_fragment(state)
-    candidate = fragment.get("campaign_row") if isinstance(fragment, dict) else None
-    for value in (
-        state.get("campaign"),
-        _clocks_payload(state).get("campaign"),
-        candidate.get("campaign") if isinstance(candidate, dict) else None,
-    ):
-        if isinstance(value, dict):
-            value = value.get("campaign") or value.get("name") or value.get("id")
-        if isinstance(value, str) and value.strip():
-            return value.strip()
+    campaign = _state_campaign(state)
+    if campaign:
+        name = _tempest_campaign_name(campaign)
+        return name or None
     return None
 
 
 def _clocks_detail_viable(state: Dict[str, Any]) -> bool:
-    fragment = _state_clocks_fragment(state)
-    candidate = fragment.get("campaign_row") if isinstance(fragment, dict) else None
-    if not isinstance(candidate, dict):
+    campaign = _state_campaign(state)
+    if not campaign:
         return True
-    disposition = str(candidate.get("candidate_disposition") or "ACCEPT").strip().upper()
-    if disposition in {"SCIENCE_EXCLUDE", "SCIENCE_REJECT"}:
+    disposition = campaign.get("disposition")
+    if not isinstance(disposition, dict):
         return False
-    if candidate.get("science_excluded") is True:
-        return False
-    if "science_eligible" in candidate:
-        return _timebase_final_court_bool(candidate.get("science_eligible"))
-    return True
+    return bool(disposition.get("science_eligible"))
 
 
 def _persist_clocks_state(state: Dict[str, Any]) -> str:
     encoded = json.dumps(state, separators=(",", ":"), ensure_ascii=False)
     sequence = state.get("sequence")
-    pps_count = state.get("pps_count")
+    pps_count = sequence
     campaign = _clocks_detail_campaign(state)
     viable = _clocks_detail_viable(state)
     with open_db() as conn:
@@ -5724,11 +5367,11 @@ def _queue_clocks_state(fragment: Dict[str, Any]) -> None:
 
 
 def _clocks_state_loop() -> None:
-    """Build and publish CLOCKS without letting storage latency stall the live feed."""
-    global _clocks_state_published
+    """Build and publish CLOCKS_V4 without storage latency stalling the live feed."""
+    global _clocks_state_published, _clocks_state_dropped
 
     _clocks_state_worker_started.set()
-    logging.info("🚀 [clocks] canonical CLOCKS state worker started")
+    logging.info("🚀 [clocks] canonical CLOCKS_V4 state worker started")
     while True:
         clocks_fragment = _clocks_state_queue.get()
         failure_logged = False
@@ -5746,8 +5389,19 @@ def _clocks_state_loop() -> None:
                 time.sleep(CLOCKS_STATE_RETRY_S)
 
         sequence = _clocks_fragment_count(clocks_fragment)
-        _advance_gnss_raw_instrument(sequence, system_context)
-        state = _build_canonical_clocks_state(clocks_fragment, system_context)
+        try:
+            sequence, _ = _validate_clocks_fragment_v4(clocks_fragment)
+            _advance_gnss_raw_instrument(sequence, system_context)
+            state = _build_canonical_clocks_state(clocks_fragment, system_context)
+        except Exception:
+            _clocks_state_dropped += 1
+            logging.exception(
+                "💥 [clocks] rejecting malformed/incoherent CLOCKS_FRAGMENT_V4 "
+                "sequence=%s without terminating the state worker",
+                sequence,
+            )
+            continue
+
         _cache_clocks_state(state)
         publish(CLOCKS_TOPIC, state)
         _clocks_state_published += 1
@@ -5798,23 +5452,18 @@ def _clocks_persistence_loop() -> None:
                     failure_logged = True
                 time.sleep(CLOCKS_STATE_RETRY_S)
 
-        candidate = clocks_fragment.get("campaign_row")
+        candidate = clocks_fragment.get("campaign")
         if not isinstance(candidate, dict):
             continue
         try:
-            candidate_count = _extract_teensy_pps_vclock_count(
-                candidate,
-                topic=TIMEBASE_FRAGMENT_TOPIC,
-            )
+            candidate_count = _tempest_public_count(candidate)
+            candidate_name = _tempest_campaign_name(candidate)
         except ValueError:
-            candidate_count = int(state.get("sequence") or 0)
-        identity = (str(candidate.get("campaign") or ""), int(candidate_count))
+            logging.exception("💥 [clocks] malformed V4 campaign enrichment after CLOCKS persistence")
+            continue
+        identity = (candidate_name, int(candidate_count))
         now = time.monotonic()
-        if (
-            _last_tempest_candidate_identity == identity
-            and _last_tempest_candidate_monotonic is not None
-            and now - _last_tempest_candidate_monotonic < 0.5
-        ):
+        if _last_tempest_candidate_identity == identity:
             _diag["pps_count_repeat"] += 1
             continue
         _last_tempest_candidate_identity = identity
@@ -5823,8 +5472,7 @@ def _clocks_persistence_loop() -> None:
         _enqueue_timebase_piece(
             TIMEBASE_FRAGMENT_TOPIC,
             candidate,
-            restore_state=_clocks_restore_state(clocks_fragment),
-            ppb_buckets=_clocks_fragment_ppb_buckets(clocks_fragment),
+            state_sequence=int(state.get("sequence") or 0),
             system_context=system_context,
             clocks_fragment=clocks_fragment,
         )
@@ -5841,87 +5489,36 @@ def _clocks_persistence_loop() -> None:
 # ---------------------------------------------------------------------
 
 
-def _clocks_fragment_ppb_buckets(clocks_fragment: Dict[str, Any]) -> Dict[str, Any]:
-    """Return same-second producer-authored PPB buckets from CLOCKS_FRAGMENT.
-
-    The always-on bucket family lives under ``CLOCKS_FRAGMENT.clocks.stats``.
-    The campaign-row candidate carries CAMP and remains unchanged for the final
-    court.  These sibling always-on values travel beside that candidate and are
-    merged only into the durable fragment after the candidate is accepted.
-
-    This function runs for every CLOCKS_FRAGMENT containing ``campaign_row``;
-    no startup-only latch or logging throttle controls persistence cadence.
-    """
-    clocks = clocks_fragment.get("clocks")
-    stats = clocks.get("stats") if isinstance(clocks, dict) else None
-    if not isinstance(stats, dict):
-        return {}
-
-    out: Dict[str, Any] = {}
-    for lane in ("ocxo1", "ocxo2"):
-        lane_stats = stats.get(lane)
-        buckets = lane_stats.get("ppb_buckets") if isinstance(lane_stats, dict) else None
-        if isinstance(buckets, dict):
-            out[lane] = dict(buckets)
-    return out
-
-
-def _decorate_persisted_fragment_ppb_buckets(
-    fragment: Dict[str, Any],
-    ppb_buckets: Optional[Dict[str, Any]],
-) -> Dict[str, Any]:
-    """Add admitted same-second PPB windows to a durable fragment copy."""
-    decorated = copy.deepcopy(fragment)
-    if not isinstance(ppb_buckets, dict):
-        return decorated
-
-    stats = decorated.setdefault("stats", {})
-    if not isinstance(stats, dict):
-        return decorated
-
-    for lane in ("ocxo1", "ocxo2"):
-        buckets = ppb_buckets.get(lane)
-        if not isinstance(buckets, dict):
-            continue
-        lane_stats = stats.setdefault(lane, {})
-        if not isinstance(lane_stats, dict):
-            continue
-        existing = lane_stats.get("ppb_buckets")
-        merged = dict(existing) if isinstance(existing, dict) else {}
-        merged.update(buckets)
-        lane_stats["ppb_buckets"] = merged
-    return decorated
-
-
 def on_clocks_fragment(payload: Payload) -> None:
-    """Queue every Teensy CLOCKS_FRAGMENT for canonical CLOCKS construction.
-
-    The callback is intentionally nonblocking.  The CLOCKS state worker pulls
-    SYSTEM.REPORT, publishes and persists the common row, then hands any embedded
-    campaign candidate to the TEMPEST processor.
-    """
+    """Queue every exact CLOCKS_FRAGMENT_V4 for canonical CLOCKS construction."""
     if not isinstance(payload, dict):
         _diag["clocks_fragments_malformed"] = _diag.get("clocks_fragments_malformed", 0) + 1
         return
 
     fragment = dict(payload)
-    candidate = fragment.get("campaign_row")
-    if isinstance(candidate, dict):
-        _diag["clocks_fragments_with_campaign_row"] = (
-            _diag.get("clocks_fragments_with_campaign_row", 0) + 1
+    if fragment.get("schema") != "CLOCKS_FRAGMENT_V4":
+        _diag["clocks_fragments_malformed"] = _diag.get("clocks_fragments_malformed", 0) + 1
+        logging.error(
+            "💥 [clocks] unsupported CLOCKS_FRAGMENT schema=%r",
+            fragment.get("schema"),
+        )
+        return
+
+    campaign = fragment.get("campaign")
+    if isinstance(campaign, dict):
+        _diag["clocks_fragments_with_campaign"] = (
+            _diag.get("clocks_fragments_with_campaign", 0) + 1
         )
         try:
-            candidate_count = _extract_teensy_pps_vclock_count(
-                candidate,
-                topic=TIMEBASE_FRAGMENT_TOPIC,
-            )
+            public_count = _tempest_public_count(campaign)
         except ValueError:
-            candidate_count = None
-        _note_timebase_activity(TIMEBASE_FRAGMENT_TOPIC, candidate_count)
+            public_count = None
+        _note_timebase_activity(TIMEBASE_FRAGMENT_TOPIC, public_count)
     else:
         _diag["clocks_fragments_observation_only"] = (
             _diag.get("clocks_fragments_observation_only", 0) + 1
         )
+
     _queue_clocks_state(fragment)
 
 
@@ -5932,17 +5529,13 @@ def on_clocks_fragment(payload: Payload) -> None:
 
 
 def _process_loop() -> None:
-    """
-    Dedicated thread: pulls fragments from queue, decorates with
-    environment and GNSS discipline data, builds TIMEBASE, persists.
-    Runs forever.
-    """
+    """Adjudicate persisted V4 TEMPEST deltas without re-authoring Teensy science."""
     global _campaign_active, _accepted_pps_vclock_count, _gnss_raw_ns, _gnss_raw_n, _gnss_raw_valid
     global _post_recovery_science_confirmation_pending
     global _post_recovery_science_confirmation_campaign
     global _post_recovery_first_public_pps_vclock_count
 
-    logging.info("🚀 [clocks] processor thread started")
+    logging.info("🚀 [clocks] TEMPEST V4 processor thread started")
 
     while True:
         try:
@@ -5954,101 +5547,57 @@ def _process_loop() -> None:
         _diag["queue_depth_current"] = _fragment_queue.qsize()
 
         topic = str(piece.get("topic") or "")
-        candidate_received_utc = _parse_utc(piece.get("received_at_utc"))
-        payload = piece.get("payload")
-        restore_state = piece.get("restore_state")
-        if not isinstance(restore_state, dict):
-            restore_state = None
-        ppb_buckets = piece.get("ppb_buckets")
-        if not isinstance(ppb_buckets, dict):
-            ppb_buckets = None
+        raw_campaign = piece.get("payload")
+        state_sequence = _as_int(piece.get("state_sequence"))
         system_context = piece.get("system_context")
-        if not isinstance(system_context, dict):
-            system_context = {}
         clocks_fragment = piece.get("clocks_fragment")
-        if not isinstance(clocks_fragment, dict):
-            clocks_fragment = {}
-        if not isinstance(payload, dict):
-            logging.error("💥 [clocks] processor received malformed CLOCKS_FRAGMENT campaign row: %s", piece)
+        system_context = system_context if isinstance(system_context, dict) else {}
+        clocks_fragment = clocks_fragment if isinstance(clocks_fragment, dict) else {}
+
+        if not isinstance(raw_campaign, dict) or state_sequence is None or state_sequence <= 0:
+            logging.error("💥 [clocks] processor received malformed V4 campaign piece: %s", piece)
             continue
 
-        raw_record = copy.deepcopy(payload)
-        frag = dict(payload)
-        embedded_forensics = frag.pop("forensics", None)
-        forensics = (
-            dict(embedded_forensics)
-            if isinstance(embedded_forensics, dict)
-            else {}
-        )
-
         try:
-            pps_vclock_count = _extract_teensy_pps_vclock_count(
-                frag,
-                topic=topic or TIMEBASE_FRAGMENT_TOPIC,
-            )
-            _normalize_fragment_count_aliases(frag, pps_vclock_count)
-            if forensics:
-                _normalize_fragment_count_aliases(forensics, pps_vclock_count)
+            frag = _tempest_candidate_view(raw_campaign)
+            public_count = _tempest_public_count(raw_campaign)
+            firmware_campaign = _tempest_campaign_name(raw_campaign)
         except ValueError as exc:
             _diag["fragments_missing_teensy_pps_count"] += 1
             _diag["fragments_missing_teensy_pps_vclock_count"] += 1
-            court_timebase = {
-                "schema": "TIMEBASE_V3",
-                "campaign": str(frag.get("campaign") or ""),
-                "fragment": frag,
-                "forensics": forensics,
-                "identity_error": str(exc),
-            }
-            _diag["timebase_final_court_checks"] += 1
-            _court_ok, court_verdict = _timebase_final_court_evaluate(court_timebase)
-            _timebase_final_court_block(
-                court_verdict,
-                raw_record=raw_record,
-                assembled_timebase=court_timebase,
-            )
+            logging.error("💥 [clocks] malformed TEMPEST_FRAGMENT_V1: %s", exc)
             continue
 
+        raw_record = copy.deepcopy(raw_campaign)
         _diag["timebase_candidates_processed"] += 1
         _diag["timebase_rows_completed"] += 1
-        # Compatibility counter: one unified candidate is one completed former pair.
         _diag["timebase_pairs_completed"] += 1
 
-        # The active DB campaign supplies the canonical namespace.  During
-        # recovery _campaign_active may still be false while this row is being
-        # used to satisfy the accepted-candidate sync latch.
         row = _get_active_campaign()
-        campaign = row["campaign"] if row is not None else str(frag.get("campaign") or "")
+        campaign = row["campaign"] if row is not None else firmware_campaign
         campaign_payload = row["payload"] if row is not None else {}
 
-        # --- Final court before any Pi-owned state or recovery latch mutates ---
-        system_time_utc = datetime.now(timezone.utc)
-        system_time_str = system_time_utc.isoformat(timespec="microseconds")
+        # Final court works on a transient normalized view.  Durable state keeps
+        # raw TEMPEST_FRAGMENT_V1 unchanged.
         court_timebase = {
-            "schema": "TIMEBASE_V3",
-            "timebase_message_version": frag.get("timebase_message_version"),
-            "timebase_pair_version": frag.get("timebase_pair_version"),
+            "schema": "TIMEBASE_COURT_V4",
             "campaign": campaign,
-            "teensy_pps_vclock_count": int(pps_vclock_count),
-            "teensy_pps_count": int(pps_vclock_count),
-            "pps_count": int(pps_vclock_count),
+            "sequence": int(state_sequence),
+            "public_count": int(public_count),
             "fragment": frag,
-            "forensics": forensics,
         }
 
         firmware_exclusion = _firmware_science_exclusion(frag)
         if firmware_exclusion:
             _diag["firmware_science_exclude_received"] += 1
-            if firmware_exclusion.get("legacy_disposition"):
-                _diag["firmware_science_exclude_legacy_received"] += 1
             _diag["last_firmware_science_exclude"] = {
                 "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "campaign": campaign,
-                "teensy_pps_vclock_count": int(pps_vclock_count),
+                "public_count": int(public_count),
                 **firmware_exclusion,
             }
-            raw_cycles = frag.get("raw_cycles")
-            if not isinstance(raw_cycles, dict):
-                raw_cycles = {}
+            raw_cycles = _path_get(clocks_fragment, "clocks.raw_cycles")
+            raw_cycles = raw_cycles if isinstance(raw_cycles, dict) else {}
 
             def _cycle_evidence(lane: str) -> str:
                 sample = raw_cycles.get(lane)
@@ -6060,22 +5609,17 @@ def _process_loop() -> None:
                     f"res={sample.get('residual_cycles')}]"
                 )
 
-            cycle_evidence = " ".join(
-                _cycle_evidence(lane)
-                for lane in ("pps", "vclock", "ocxo1", "ocxo2")
-            )
             logging.warning(
-                "🧪 [clocks] firmware science exclusion retained for TIMEBASE: "
-                "campaign=%s count=%d reason=%s mask=0x%08x objections=%d "
-                "raw_cycles=%s",
+                "🧪 [clocks] firmware science exclusion retained: "
+                "campaign=%s public_count=%d reason=%s raw_cycles=%s",
                 campaign,
-                int(pps_vclock_count),
+                int(public_count),
                 firmware_exclusion.get("reason"),
-                int(firmware_exclusion.get("reject_mask") or 0),
-                int(firmware_exclusion.get("objection_count") or 1),
-                cycle_evidence,
+                " ".join(
+                    _cycle_evidence(lane)
+                    for lane in ("pps", "vclock", "ocxo1", "ocxo2")
+                ),
             )
-
 
         _diag["timebase_final_court_checks"] += 1
         court_ok, court_verdict = _timebase_final_court_evaluate(court_timebase)
@@ -6095,15 +5639,12 @@ def _process_loop() -> None:
                 court_verdict.get("science_violation_count") or 0
             )
 
-        sync_matched = _signal_sync_candidate_if_needed(frag, pps_vclock_count)
+        sync_matched = _signal_sync_candidate_if_needed(frag, public_count)
         if sync_matched and not _campaign_active:
-            # RECOVER waits for the first Pi-accepted candidate, not merely the
-            # first transport message.  Pi-owned recovery state is restored
-            # before this accepted row is allowed to persist.
             if not _sync_resume_event.wait(timeout=SYNC_RECOVER_TIMEOUT_S):
                 logging.error(
-                    "💥 [recovery] timed out reopening processor for first accepted candidate count=%d",
-                    int(pps_vclock_count),
+                    "💥 [recovery] timed out reopening processor for first accepted candidate public_count=%d",
+                    int(public_count),
                 )
                 continue
 
@@ -6112,8 +5653,6 @@ def _process_loop() -> None:
             _diag["timebase_candidates_ignored_no_campaign"] += 1
             continue
 
-        # Refresh after a recovery sync because the control thread may have
-        # activated or switched the campaign while this processor was paused.
         row = _get_active_campaign()
         if row is None:
             _diag["hard_fault_no_active_campaign"] += 1
@@ -6121,8 +5660,8 @@ def _process_loop() -> None:
                 _hard_fault(
                     "no_active_campaign",
                     {
-                        "teensy_pps_vclock_count": int(pps_vclock_count),
-                        "pps_count": int(pps_vclock_count),
+                        "sequence": int(state_sequence),
+                        "public_count": int(public_count),
                     },
                 )
             except RuntimeError:
@@ -6130,7 +5669,7 @@ def _process_loop() -> None:
 
         campaign = row["campaign"]
         campaign_payload = row["payload"]
-        if campaign != court_timebase["campaign"]:
+        if firmware_campaign and firmware_campaign != campaign:
             court_timebase["campaign"] = campaign
             _diag["timebase_final_court_checks"] += 1
             court_ok, court_verdict = _timebase_final_court_evaluate(court_timebase)
@@ -6147,46 +5686,33 @@ def _process_loop() -> None:
         science_excluded = bool(court_verdict.get("science_excluded"))
 
         _diag["fragments_processed"] += 1
-        _note_pps_vclock_count(pps_vclock_count)
+        _note_pps_vclock_count(public_count)
 
-        # --- Accept Teensy PPS/VCLOCK count as observed truth ---
-        #
-        # Do not compare this candidate against an armed/expected Pi-side count.
-        # The Pi is the final TIMEBASE arbiter here, not a campaign-count authority.
-        _accepted_pps_vclock_count = int(pps_vclock_count)
+        # Internal historical variable name: this is campaign public_count.
+        _accepted_pps_vclock_count = int(public_count)
         _diag["accepted_pps_count"] = _accepted_pps_vclock_count
         _diag["accepted_pps_vclock_count"] = _accepted_pps_vclock_count
 
         _mark_start_first_fragment_if_needed(
             campaign=campaign,
-            pps_vclock_count=int(pps_vclock_count),
+            pps_vclock_count=int(public_count),
         )
 
-        # --- Extract GNSS ns for stream health canary ---
-        # V7 keeps gnss_ns temporarily, but gnss.ns is the canonical ledger.
-        gnss_ns = _fragment_ns(frag, "gnss.ns", "gnss_ns", default=0)
-
-        # --- GNSS stream health canary (Pi-side diagnostic only) ---
+        gnss_ns = _fragment_ns(frag, "gnss_ns", default=0)
         if gnss_ns > 0:
             _gnss_canary_update(gnss_ns)
 
-        # --- Same-second contextual state pulled once by the CLOCKS state worker ---
-        env_snapshot = _environment_from_system_report(system_context, clocks_fragment)
+        env_snapshot = _environment_from_system_report(system_context)
         gnss_info = _system_gnss_info(system_context)
-
-        # --- GNSS_RAW synthetic clock ---
         gnss_raw_drift_ppb = _gnss_raw_drift_from_info(gnss_info)
 
-        # The campaign-relative synthetic clock is a scientific accumulator.
-        # Preserve its current value on an audit-only row; its admitted N may
-        # therefore be lower than the PPS/VCLOCK timeline count. The independent
-        # always-on GNSS_RAW sampler remains observational and continues above.
         if science_eligible:
             _gnss_raw_ns += NS_PER_SECOND + (
                 gnss_raw_drift_ppb if gnss_raw_drift_ppb is not None else 0.0
             )
             _gnss_raw_n += 1
             _gnss_raw_valid = True
+
         gnss_raw_ns_int = int(round(_gnss_raw_ns))
         gnss_raw_ref_ns = _gnss_raw_n * NS_PER_SECOND
         gnss_raw_welford = _gnss_raw_welford_snapshot()
@@ -6195,18 +5721,16 @@ def _process_loop() -> None:
             gnss_raw_instrument_n = int(_gnss_raw_instrument_n)
             gnss_raw_instrument_valid = bool(_gnss_raw_instrument_valid)
 
-        # --- Build TIMEBASE record ---
-        persisted_frag = _decorate_persisted_fragment_ppb_buckets(
-            frag,
-            ppb_buckets,
-        )
+        system_time_utc = datetime.now(timezone.utc)
+        system_time_str = system_time_utc.isoformat(timespec="microseconds")
+
         timebase = {
-            "schema": "TIMEBASE_V3",
+            "schema": "TIMEBASE_V4",
             "campaign_type": CAMPAIGN_TYPE_TEMPEST,
-            "timebase_message_version": frag.get("timebase_message_version"),
-            "timebase_pair_version": frag.get("timebase_pair_version"),
             "campaign": campaign,
-            "campaign_elapsed": _seconds_to_hms(int(pps_vclock_count)),
+            "sequence": int(state_sequence),
+            "public_count": int(public_count),
+            "campaign_elapsed": _seconds_to_hms(int(public_count)),
             "science_eligible": science_eligible,
             "control_eligible": control_eligible,
             "persist": True,
@@ -6214,27 +5738,17 @@ def _process_loop() -> None:
             "candidate_use": "AUDIT_ONLY" if science_excluded else "SCIENCE_AND_CONTROL",
             "final_court": court_verdict,
             "location": campaign_payload.get("location"),
-
             "system_time_utc": system_time_str,
             "gnss_time_utc": (
                 gnss_info.get("gnss_time_utc") if isinstance(gnss_info, dict) else None
             ),
-
-            "teensy_pps_vclock_count": int(pps_vclock_count),
-            "teensy_pps_count": int(pps_vclock_count),   # legacy alias
-            "pps_count": int(pps_vclock_count),          # legacy alias
-
-            # Compatible durable shape reconstructed from one Teensy message.
-            "fragment": persisted_frag,
-            "forensics": forensics,
-
-            # Environment snapshot (correlated with this PPS edge)
+            # Exact firmware campaign delta; no duplicated live instrument state.
+            "fragment": copy.deepcopy(raw_campaign),
+            # Campaign master/read-model and recovery helpers may inspect the
+            # canonical live instrument without manufacturing restore_state.
+            "clocks": copy.deepcopy(clocks_fragment.get("clocks") or {}),
             "environment": env_snapshot,
-
-            # GF-8802 discipline snapshot (correlated with this PPS edge)
             "gnss": gnss_info,
-
-            # Pi-side synthetic clocks (not representable in TIMEBASE_FRAGMENT)
             "extra_clocks": {
                 "gnss_raw_ns": gnss_raw_ns_int,
                 "gnss_raw_ref_ns": gnss_raw_ref_ns,
@@ -6243,8 +5757,10 @@ def _process_loop() -> None:
                 "gnss_raw_instrument_n": gnss_raw_instrument_n,
                 "gnss_raw_instrument_valid": gnss_raw_instrument_valid,
                 "gnss_raw_drift_ppb": gnss_raw_drift_ppb,
-                "gnss_raw_tau": round(_compute_tau(gnss_raw_ns_int, gnss_raw_ref_ns), 12) if _gnss_raw_valid else None,
-                "gnss_raw_ppb": round(_compute_ppb(gnss_raw_ns_int, gnss_raw_ref_ns), 3) if _gnss_raw_valid else None,
+                "gnss_raw_tau": round(_compute_tau(gnss_raw_ns_int, gnss_raw_ref_ns), 12)
+                    if _gnss_raw_valid else None,
+                "gnss_raw_ppb": round(_compute_ppb(gnss_raw_ns_int, gnss_raw_ref_ns), 3)
+                    if _gnss_raw_valid else None,
                 "gnss_raw_welford_n": gnss_raw_welford["n"],
                 "gnss_raw_welford_mean": gnss_raw_welford["mean"],
                 "gnss_raw_welford_m2": gnss_raw_welford["m2"],
@@ -6254,11 +5770,6 @@ def _process_loop() -> None:
                 "gnss_raw_welford_max": round(gnss_raw_welford["max"], 3),
             },
         }
-
-        if restore_state is not None:
-            # Same-second firmware-authored sufficient state remains ordinary,
-            # inspectable JSON and becomes the cold-recovery authority.
-            timebase["restore_state"] = copy.deepcopy(restore_state)
 
         publish("TIMEBASE", timebase)
         _attach_tempest_to_state_detail(timebase)
@@ -6279,10 +5790,10 @@ def _process_loop() -> None:
             _post_recovery_first_public_pps_vclock_count = None
             logging.info(
                 "🏁 [recovery] campaign '%s' fully recovered — first "
-                "science-and-control eligible row accepted and persisted at count=%d "
-                "(timeline resumed at count=%s); normal TEMPEST operation is restored",
+                "science-and-control eligible row accepted at public_count=%d "
+                "(timeline resumed at public_count=%s)",
                 campaign,
-                int(pps_vclock_count),
+                int(public_count),
                 str(recovery_first_count),
             )
 
@@ -6336,7 +5847,7 @@ class TeensyStartRejected(RuntimeError):
 
 
 # START is asynchronous.  These statuses mean that firmware accepted the
-# lifecycle request; they do not claim that the first public CLOCKS_FRAGMENT campaign row has
+# lifecycle request; they do not claim that the first public CLOCKS_FRAGMENT campaign delta has
 # already been emitted.  Keep the legacy SmartZero/Flash Cut vocabulary for
 # older firmware while accepting the current always-on recording-boundary
 # contract returned by CLOCKS.START.
@@ -6549,7 +6060,7 @@ def cmd_start(args: Optional[dict]) -> dict:
     START — asynchronous cold START or hot Flash Cut.
 
     The Pi prepares DB state and accepted-row ingress before arming Teensy, then
-    accepts the very first CLOCKS_FRAGMENT campaign row. There is no Pi-side warmup
+    accepts the very first CLOCKS_FRAGMENT campaign delta. There is no Pi-side warmup
     or skipped-row model; if row #1 is unhealthy, the readiness gates or Teensy
     handoff should be fixed.
     """
@@ -6681,7 +6192,7 @@ def cmd_start(args: Optional[dict]) -> dict:
 
     drained = _reset_trackers()
     if drained:
-        logging.info("🧹 [start] drained %d stale CLOCKS_FRAGMENT campaign row(s) before arm", drained)
+        logging.info("🧹 [start] drained %d stale CLOCKS_FRAGMENT campaign delta(s) before arm", drained)
     _clear_sync_wait()
 
     _accepted_pps_vclock_count = None
@@ -6792,7 +6303,7 @@ def cmd_start(args: Optional[dict]) -> dict:
     )
     logging.info(
         "✅ [start] @%s %s accepted by Teensy — campaign='%s' status='%s'; "
-        "awaiting first CLOCKS_FRAGMENT campaign row",
+        "awaiting first CLOCKS_FRAGMENT campaign delta",
         system_time_z(),
         "FLASH_CUT" if flash_cut else "START",
         campaign,
@@ -6884,36 +6395,44 @@ def cmd_stop(_: Optional[dict]) -> dict:
 
 
 def _gnss_raw_clock_snapshot() -> Dict[str, Any]:
-    """Return one coherent Pi-owned GNSS_RAW clockface/statistics snapshot."""
-    with _gnss_raw_stats_lock:
-        latest_info = dict(_gnss_raw_latest_info)
-        latest_received = _gnss_raw_latest_info_monotonic
-    welford = _gnss_raw_welford_snapshot()
-    ref_ns = int(_gnss_raw_n) * NS_PER_SECOND
-    raw_ns = int(round(_gnss_raw_ns))
-    age_s = (
-        None
-        if latest_received is None
-        else max(0.0, time.monotonic() - latest_received)
-    )
-    monitor_snapshot = _gnss_raw_state_snapshot()
-    return {
-        "owner": "PI",
-        "clock": "GNSS_RAW",
-        "always_on_statistics": True,
-        "clockface_campaign_relative": True,
-        "instrument": monitor_snapshot.get("instrument", {}),
-        "presentation": monitor_snapshot.get("presentation", {}),
-        "valid": bool(_gnss_raw_valid),
-        "ns": raw_ns,
-        "ref_ns": ref_ns,
+    """Return operator-facing GNSS_RAW state; campaign presentation is derived here."""
+    canonical = _gnss_raw_state_snapshot()
+    instrument = copy.deepcopy(canonical.get("instrument") or {})
+    campaign_ref_ns = int(_gnss_raw_n) * NS_PER_SECOND
+    campaign_ns = int(round(_gnss_raw_ns))
+    campaign_valid = bool(_campaign_active and _gnss_raw_valid and campaign_ref_ns > 0)
+    campaign = {
+        "valid": campaign_valid,
+        "ns": campaign_ns,
+        "ref_ns": campaign_ref_ns,
         "clockface_n": int(_gnss_raw_n),
-        "tau": round(_compute_tau(raw_ns, ref_ns), 12) if _gnss_raw_valid and ref_ns > 0 else None,
-        "ppb": round(_compute_ppb(raw_ns, ref_ns), 3) if _gnss_raw_valid and ref_ns > 0 else None,
-        "drift_ppb": _gnss_raw_drift_from_info(latest_info),
-        "welford": welford,
-        "latest_info_age_s": None if age_s is None else round(age_s, 3),
-        "latest_info_fresh": bool(age_s is not None and age_s <= GNSS_RAW_INFO_MAX_AGE_S),
+        "tau": (
+            round(_compute_tau(campaign_ns, campaign_ref_ns), 12)
+            if campaign_valid else None
+        ),
+        "ppb": (
+            round(_compute_ppb(campaign_ns, campaign_ref_ns), 3)
+            if campaign_valid else None
+        ),
+    }
+    presentation = campaign if campaign_valid else instrument
+    return {
+        **canonical,
+        "clockface_campaign_relative": True,
+        "campaign": campaign,
+        "presentation": {
+            "mode": "CAMPAIGN" if campaign_valid else "INSTRUMENT",
+            "basis": "CAMPAIGN_RELATIVE" if campaign_valid else "PI_PROCESS_LIFETIME",
+            **copy.deepcopy(presentation),
+        },
+        # Compact legacy report surface remains derived, never persisted as
+        # canonical restore authority.
+        "valid": campaign_valid,
+        "ns": campaign_ns,
+        "ref_ns": campaign_ref_ns,
+        "clockface_n": int(_gnss_raw_n),
+        "tau": campaign.get("tau"),
+        "ppb": campaign.get("ppb"),
     }
 
 
@@ -7435,7 +6954,7 @@ def _restore_active_campaign_state() -> Dict[str, Any]:
 
         drained = _reset_trackers()
         if drained:
-            logging.info("🧹 [recovery/cold] drained %d stale CLOCKS_FRAGMENT campaign row(s)", drained)
+            logging.info("🧹 [recovery/cold] drained %d stale CLOCKS_FRAGMENT campaign delta(s)", drained)
         _clear_sync_wait()
 
         # Campaign recovery is recording-only. The live DAC, servo, and dither
@@ -7451,7 +6970,7 @@ def _restore_active_campaign_state() -> Dict[str, Any]:
         # Cold recovery has no prior TEMPEST detail to recover from.  Treat it as
         # an async START of the existing active campaign, matching cmd_start().
         # The normal processor thread will accept the first
-        # CLOCKS_FRAGMENT campaign row whenever it arrives.
+        # CLOCKS_FRAGMENT campaign delta whenever it arrives.
         _campaign_active = True
         _arm_timebase_silence_watch("RECOVERY_COLD_START")
 
@@ -7476,7 +6995,7 @@ def _restore_active_campaign_state() -> Dict[str, Any]:
         )
         logging.info(
             "✅ [recovery/cold] START accepted: campaign='%s' status='%s'; "
-            "awaiting first CLOCKS_FRAGMENT campaign row",
+            "awaiting first CLOCKS_FRAGMENT campaign delta",
             campaign_name, teensy_start_status,
         )
 
@@ -7507,9 +7026,9 @@ def _restore_active_campaign_state() -> Dict[str, Any]:
     last_gnss_raw_ref_ns = int(recovery_snapshot.get("last_gnss_raw_ref_ns") or (last_pps_vclock_count * NS_PER_SECOND))
     last_gnss_raw_welford_mean = float(recovery_snapshot.get("last_gnss_raw_welford_mean") or 0.0)
     last_gnss_time_str = str(recovery_snapshot["last_gnss_time_str"])
-    restore_state = recovery_snapshot.get("restore_state")
-    if not isinstance(restore_state, dict):
-        restore_state = None
+    canonical_recovery_clocks = recovery_snapshot.get("canonical_clocks")
+    if not isinstance(canonical_recovery_clocks, dict):
+        canonical_recovery_clocks = {}
 
     if not recovery_snapshot.get("recoverable"):
         raise RuntimeError(
@@ -7601,7 +7120,7 @@ def _restore_active_campaign_state() -> Dict[str, Any]:
 
     _drained = _drain_timebase_ingress()
     if _drained > 0:
-        logging.info("🧹 [recovery] drained %d stale CLOCKS_FRAGMENT campaign row(s)", _drained)
+        logging.info("🧹 [recovery] drained %d stale CLOCKS_FRAGMENT campaign delta(s)", _drained)
 
     now_frac = time.time() % 1.0
     sleep_to_boundary = (1.0 - now_frac) + 0.050
@@ -7740,28 +7259,15 @@ def _restore_active_campaign_state() -> Dict[str, Any]:
         "ocxo2_ns": str(int(projected_ocxo2_ns)),
     }
 
-    if isinstance(restore_state, dict):
-        teensy_recover_args.update(
-            _structured_restore_args(restore_state, include_control=False)
-        )
-        _diag["last_recovery"]["structured_restore_present"] = True
-        _diag["last_recovery"]["restore_schema_version"] = 2
-        recovered_welford_count = 0
-        logging.info(
-            "📊 [recovery] using structured TIMEBASE state for Teensy "
-            "statistics restoration; live DAC/servo state is preserved"
-        )
-    else:
-        _diag["last_recovery"]["structured_restore_present"] = False
-        recovered_welford_count = _add_welford_recovery_args(
-            teensy_recover_args,
-            last_tb=last_tb,
-            last_frag=last_frag,
-        )
-        logging.info(
-            "📊 [recovery] restored %d legacy Teensy Welford payload(s) into RECOVER args",
-            recovered_welford_count,
-        )
+    teensy_recover_args.update(
+        _canonical_restore_args(canonical_recovery_clocks, include_control=False)
+    )
+    _diag["last_recovery"]["canonical_restore_present"] = True
+    _diag["last_recovery"]["restore_schema_version"] = 2
+    logging.info(
+        "📊 [recovery] restoring Teensy statistics directly from canonical "
+        "CLOCKS clocks.stats; live DAC/servo state remains untouched"
+    )
 
     teensy_recover_resp = _request_teensy_recover(
         int(recover_base_pps_vclock_count),
@@ -7883,7 +7389,12 @@ def _restore_active_campaign_state() -> Dict[str, Any]:
 
         _raise_if_recovery_interrupted("post_sync_row_before_admission_verdict")
 
-        teensy_pps_vclock_count = _extract_teensy_pps_vclock_count(frag)
+        teensy_pps_vclock_count = _as_int(frag.get("public_count"))
+        if teensy_pps_vclock_count is None or teensy_pps_vclock_count <= 0:
+            raise RecoveryRetryableFailure(
+                "recovery_row_missing_public_count",
+                {"fragment": frag},
+            )
         first_public_offset = teensy_pps_vclock_count - expected_first_public_pps_vclock_count
         recovery_status = _fetch_teensy_recovery_status()
         admissible, recovery_admission_verdict = _recovery_admission_verdict(
@@ -8747,10 +8258,8 @@ def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
             "stopped_at": payload.get("stopped_at"),
             "resumed_at": payload.get("resumed_at"),
             "location": payload.get("location"),
-            "teensy_pps_vclock_count": (
-                report.get("teensy_pps_vclock_count") or report.get("pps_count")
-            ),
-            "pps_count": report.get("pps_count"),
+            "public_count": report.get("public_count"),
+            "sequence": report.get("sequence"),
         }
         campaigns.append(entry)
 
@@ -8792,7 +8301,7 @@ def cmd_clocks_info(_: Optional[dict]) -> Dict[str, Any]:
             "admission_authority": "CLOCKS.features",
             "firmware_policy_gate_used": False,
             "firmware_start_contract": (
-                "COMMAND_STATE_NUMERIC_DAC_SMARTZERO_PRIVATE_HANDOFF"
+                "COMMAND_STATE_EPOCH_PRIVATE_HANDOFF"
             ),
         },
         "timebase_silence_monitor": {
@@ -8848,49 +8357,6 @@ def _parse_dac_arg(args: Dict[str, Any], label: str, *aliases: str) -> Tuple[boo
         raise ValueError(f"{label} value {value} out of range (0–65535)")
 
     return True, value, matched
-
-
-
-
-
-
-def _get_campaign_row_by_name(campaign_name: str) -> Optional[Dict[str, Any]]:
-    """Return the newest TEMPEST campaign master row with decoded payload."""
-    with open_db(row_dict=True) as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT id, campaign_type, campaign, active, ts, payload
-            FROM campaign_master
-            WHERE campaign_type = %s
-              AND campaign = %s
-            ORDER BY ts DESC
-            LIMIT 1
-            """,
-            (CAMPAIGN_TYPE_TEMPEST, campaign_name),
-        )
-        row = cur.fetchone()
-
-    if row is None:
-        return None
-
-    payload = row["payload"]
-    if isinstance(payload, str):
-        payload = json.loads(payload)
-
-    return {
-        "id": row["id"],
-        "campaign_type": row["campaign_type"],
-        "campaign": row["campaign"],
-        "active": bool(row["active"]),
-        "ts": row.get("ts") if isinstance(row, dict) else None,
-        "payload": payload if isinstance(payload, dict) else {},
-    }
-
-
-
-
-
 
 
 

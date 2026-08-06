@@ -41,7 +41,7 @@ LANE_MICRO_PREFIXES = {"ocxo1": "o1", "ocxo2": "o2"}
 CAMPAIGN_TYPE = "TEMPEST"
 PPS_COUNT_SQL = """
 NULLIF(
-    payload #>> '{campaign,tempest,teensy_pps_vclock_count}',
+    payload #>> '{campaign,public_count}',
     ''
 )::bigint
 """
@@ -61,7 +61,7 @@ def fetch_timebase(campaign: str) -> List[Dict[str, Any]]:
             FROM campaign_detail
             WHERE campaign_type = %s
               AND campaign = %s
-              AND payload #> '{{campaign,tempest}}' IS NOT NULL
+              AND payload #>> '{{campaign,schema}}' = 'TEMPEST_FRAGMENT_V1'
               AND {PPS_COUNT_SQL} IS NOT NULL
             ORDER BY {PPS_COUNT_SQL} ASC, id ASC
             """,
@@ -78,9 +78,8 @@ def fetch_timebase(campaign: str) -> List[Dict[str, Any]]:
             continue
 
         root = _root(payload)
-        frag = _frag(payload)
-        forensic = _forensics_root(payload)
-        payload_count = pps_count_from_schema(root, frag, forensic)
+        campaign = _campaign(payload)
+        payload_count = pps_count_from_schema(campaign)
         db_count = int(row["pps_count"])
         if payload_count is not None and payload_count != db_count:
             raise ValueError(
@@ -92,61 +91,28 @@ def fetch_timebase(campaign: str) -> List[Dict[str, Any]]:
 
 
 def _root(rec: Dict[str, Any]) -> Dict[str, Any]:
-    """Return the persisted record, unwrapping only a true outer envelope.
-
-    A unified MONITOR_V2 detail legitimately has a top-level ``payload`` field
-    containing Payload subsystem diagnostics.  That field is not an envelope
-    and must never replace the complete state record.
-    """
+    """Return one persisted CLOCKS_V4 state detail."""
     if not isinstance(rec, dict):
         return {}
-    if any(
-        key in rec
-        for key in ("schema", "monitor_fragment", "fragment", "campaign_row", "campaign")
-    ):
+    if rec.get("schema") == "CLOCKS_V4":
         return rec
-
     inner = rec.get("payload")
-    return inner if isinstance(inner, dict) else rec
+    return inner if isinstance(inner, dict) and inner.get("schema") == "CLOCKS_V4" else rec
 
 
-def _tempest_decoration(rec: Dict[str, Any]) -> Dict[str, Any]:
-    root = _root(rec)
-    campaign = root.get("campaign")
-    if not isinstance(campaign, dict):
-        return {}
-    tempest = campaign.get("tempest")
-    return tempest if isinstance(tempest, dict) else {}
+def _campaign(rec: Dict[str, Any]) -> Dict[str, Any]:
+    campaign = _root(rec).get("campaign")
+    return campaign if isinstance(campaign, dict) and campaign.get("schema") == "TEMPEST_FRAGMENT_V1" else {}
 
 
-def _frag(rec: Dict[str, Any]) -> Dict[str, Any]:
-    """Return one merged TEMPEST campaign view from a unified state detail."""
-    root = _root(rec)
-    direct = root.get("fragment") or root.get("campaign_row")
-    direct = direct if isinstance(direct, dict) else {}
-
-    monitor_fragment = root.get("monitor_fragment")
-    monitor_fragment = monitor_fragment if isinstance(monitor_fragment, dict) else {}
-    embedded = monitor_fragment.get("campaign_row")
-    embedded = embedded if isinstance(embedded, dict) else {}
-
-    decoration = _tempest_decoration(rec)
-    source = embedded or direct
-    if source or decoration:
-        merged = dict(source)
-        merged.update(decoration)
-        return merged
-    return {}
+def _clocks(rec: Dict[str, Any]) -> Dict[str, Any]:
+    clocks = _root(rec).get("clocks")
+    return clocks if isinstance(clocks, dict) else {}
 
 
-def _forensics_root(rec: Dict[str, Any]) -> Dict[str, Any]:
-    root = _root(rec)
-    forensic = root.get("forensics")
-    if isinstance(forensic, dict):
-        return forensic
-    frag = _frag(rec)
-    forensic = frag.get("forensics")
-    return forensic if isinstance(forensic, dict) else {}
+def _adjudication(rec: Dict[str, Any]) -> Dict[str, Any]:
+    adjudication = _campaign(rec).get("adjudication")
+    return adjudication if isinstance(adjudication, dict) else {}
 
 
 def _nested_get(obj: Dict[str, Any], *path: str) -> Any:
@@ -194,18 +160,18 @@ def _first_float(*values: Any) -> Optional[float]:
 
 def _fmt_int(v: Optional[int], width: int = 0, signed: bool = False) -> str:
     if v is None:
-        s = "---"
+        text = "---"
     else:
-        s = f"{v:+,d}" if signed else f"{v:,d}"
-    return f"{s:>{width}s}" if width else s
+        text = f"{v:+,d}" if signed else f"{v:,d}"
+    return f"{text:>{width}s}" if width else text
 
 
 def _fmt_float(v: Optional[float], width: int = 0, decimals: int = 3, signed: bool = False) -> str:
     if v is None:
-        s = "---"
+        text = "---"
     else:
-        s = f"{v:+,.{decimals}f}" if signed else f"{v:,.{decimals}f}"
-    return f"{s:>{width}s}" if width else s
+        text = f"{v:+,.{decimals}f}" if signed else f"{v:,.{decimals}f}"
+    return f"{text:>{width}s}" if width else text
 
 
 def _round_nearest_int(value: float) -> int:
@@ -215,124 +181,51 @@ def _round_nearest_int(value: float) -> int:
     return int(math.ceil(value - 0.5))
 
 
-# -----------------------------------------------------------------------------
-# TIMEBASE extraction
-# -----------------------------------------------------------------------------
+def pps_count_from_schema(campaign: Dict[str, Any]) -> Optional[int]:
+    """Return TEMPEST campaign-relative public identity."""
+    return _as_int(campaign.get("public_count"))
 
 
-def pps_count_from_schema(root: Dict[str, Any],
-                          frag: Dict[str, Any],
-                          forensic: Dict[str, Any]) -> Optional[int]:
-    return _first_int(
-        # The merged TEMPEST fragment carries campaign-public identity.
-        # MONITOR root counts are the always-on physical SYSTEM sequence.
-        frag.get("teensy_pps_vclock_count"),
-        frag.get("pps_count"),
-        frag.get("teensy_pps_count"),
-        forensic.get("teensy_pps_vclock_count"),
-        forensic.get("pps_count"),
-        forensic.get("teensy_pps_count"),
-        root.get("teensy_pps_vclock_count"),
-        root.get("pps_count"),
-    )
+def selected_reference_cycles(root: Dict[str, Any]) -> Optional[int]:
+    """Return canonical same-second VCLOCK raw DWT interval."""
+    return _as_int(_nested_get(_clocks(root), "raw_cycles", "vclock", "observed_cycles"))
 
 
-def selected_reference_cycles(root: Dict[str, Any],
-                              frag: Dict[str, Any],
-                              forensic: Dict[str, Any]) -> Optional[int]:
-    """Selected PPS/VCLOCK DWT edge interval for residual fallback."""
-    return _first_int(
-        _nested_get(forensic, "pps_vclock_edge", "dwt_cycles_between_edges"),
-        _nested_get(frag, "pps_vclock_edge", "dwt_cycles_between_edges"),
-        forensic.get("dwt_cycles_between_pps_vclock"),
-        frag.get("dwt_cycles_between_pps_vclock"),
-        root.get("dwt_cycles_between_pps_vclock"),
-        _nested_get(frag, "dwt", "cycles_between_pps_vclock"),
-        _nested_get(forensic, "pps_vclock_edge", "effective_dwt_cycles_per_second"),
-    )
-
-
-def science_from_schema(frag: Dict[str, Any], clock: str) -> Dict[str, Any]:
+def science_from_schema(campaign: Dict[str, Any], clock: str) -> Dict[str, Any]:
     key = LANE_KEYS.get(clock)
     if not key:
         return {}
-    obj = _nested_get(frag, key, "science")
+    obj = _nested_get(campaign, key, "science")
     return obj if isinstance(obj, dict) else {}
 
 
-def lane_alpha_forensics(root: Dict[str, Any],
-                         frag: Dict[str, Any],
-                         forensic: Dict[str, Any],
-                         lane: str) -> Dict[str, Any]:
-    candidates = (
-        _nested_get(forensic, lane, "forensics"),
-        _nested_get(frag, lane, "forensics"),
-        _nested_get(root, lane, "forensics"),
-        _nested_get(forensic, lane, "dwt_forensics"),
-        _nested_get(frag, lane, "dwt_forensics"),
-        _nested_get(root, "clock_forensics", lane, "alpha_event"),
-        _nested_get(frag, "clock_forensics", lane, "alpha_event"),
-        _nested_get(forensic, lane, "alpha_event"),
-        _nested_get(frag, lane, "alpha_event"),
-    )
-    for c in candidates:
-        if isinstance(c, dict):
-            return c
-    return {}
-
-
-def _micro_first_int(root: Dict[str, Any],
-                     frag: Dict[str, Any],
-                     forensic: Dict[str, Any],
-                     lane: str,
-                     *suffixes: str) -> Optional[int]:
-    prefix = LANE_MICRO_PREFIXES.get(lane)
-    if not prefix:
-        return None
-
-    values: List[Any] = []
-    for suffix in suffixes:
-        key = f"{prefix}_{suffix}"
-        for source in (forensic, frag, root):
-            if isinstance(source, dict):
-                values.append(source.get(key))
-    return _first_int(*values)
-
-
-def gnss_discipline_fields(root: Dict[str, Any],
-                           frag: Dict[str, Any]) -> Dict[str, Optional[float]]:
-    """GNSS receiver discipline fields retained as contextual telemetry."""
+def gnss_discipline_fields(root: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    """GNSS receiver telemetry plus campaign-relative GNSS_RAW adjudication."""
     gnss = root.get("gnss") if isinstance(root.get("gnss"), dict) else {}
-    frag_gnss = frag.get("gnss") if isinstance(frag.get("gnss"), dict) else {}
     discipline = gnss.get("discipline") if isinstance(gnss.get("discipline"), dict) else {}
     pps = gnss.get("pps") if isinstance(gnss.get("pps"), dict) else {}
     clock = gnss.get("clock") if isinstance(gnss.get("clock"), dict) else {}
-    extra = frag.get("extra_clocks") if isinstance(frag.get("extra_clocks"), dict) else {}
-    if not extra:
-        extra = root.get("extra_clocks") if isinstance(root.get("extra_clocks"), dict) else {}
+    adjudication = _adjudication(root)
+    extra = adjudication.get("extra_clocks") if isinstance(adjudication.get("extra_clocks"), dict) else {}
+    live_gnss_raw = _nested_get(_clocks(root), "gnss_raw")
+    live_gnss_raw = live_gnss_raw if isinstance(live_gnss_raw, dict) else {}
 
     return {
         "pps_err": _first_float(
-            gnss.get("pps_timing_error_ns"),
-            discipline.get("pps_timing_error_ns"),
-            frag_gnss.get("pps_timing_error_ns"),
+            gnss.get("pps_timing_error_ns"), discipline.get("pps_timing_error_ns")
         ),
         "g_acc": _first_float(
-            gnss.get("estimated_accuracy_ns"),
-            pps.get("estimated_accuracy_ns"),
-            frag_gnss.get("estimated_accuracy_ns"),
+            gnss.get("estimated_accuracy_ns"), pps.get("estimated_accuracy_ns")
         ),
         "g_frq": _first_float(
-            gnss.get("freq_error_ppb"),
-            discipline.get("freq_error_ppb"),
-            frag_gnss.get("freq_error_ppb"),
+            gnss.get("freq_error_ppb"), discipline.get("freq_error_ppb")
         ),
         "g_clk": _first_float(
-            gnss.get("clock_drift_ppb"),
-            clock.get("drift_ppb"),
-            frag_gnss.get("clock_drift_ppb"),
+            gnss.get("clock_drift_ppb"), clock.get("drift_ppb")
         ),
-        "g_raw": _first_float(extra.get("gnss_raw_drift_ppb")),
+        "g_raw": _first_float(
+            extra.get("gnss_raw_drift_ppb"), live_gnss_raw.get("drift_ppb")
+        ),
     }
 
 
@@ -344,32 +237,17 @@ def fast_residual_ns(reference_cycles: Optional[int], clock_cycles: Optional[int
     return _round_nearest_int(exact)
 
 
-def ocxo_residual(root: Dict[str, Any],
-                  frag: Dict[str, Any],
-                  forensic: Dict[str, Any],
-                  clock: str,
-                  fallback_ref_cycles: Optional[int]) -> Optional[int]:
-    lane = LANE_KEYS[clock]
-    sci = science_from_schema(frag, clock)
-    f = lane_alpha_forensics(root, frag, forensic, lane)
-
+def ocxo_residual(campaign: Dict[str, Any], clock: str, fallback_ref_cycles: Optional[int]) -> Optional[int]:
+    """Return canonical firmware fast residual; raw cycle math is fallback only."""
+    sci = science_from_schema(campaign, clock)
     residual = _first_int(
         sci.get("delta_raw_fast_residual_ns"),
         sci.get("fast_residual_ns"),
-        _nested_get(frag, lane, "pps_residual", "fast_residual_ns"),
-        _nested_get(root, "fragment", lane, "pps_residual", "fast_residual_ns"),
     )
     if residual is not None:
         return residual
 
-    cycles = _first_int(
-        sci.get("delta_raw_clock_interval_cycles"),
-        sci.get("clock_observed_interval_cycles"),
-        sci.get("clock_floorline_interval_cycles"),
-        _micro_first_int(root, frag, forensic, lane, "pub_cyc", "eff"),
-        f.get("dwt_cycles_between_edges"),
-        _nested_get(f, "dwt_interval_gate", "effective_cycles"),
-    )
+    cycles = _first_int(sci.get("delta_raw_clock_interval_cycles"))
     ref = _first_int(sci.get("delta_raw_reference_interval_cycles"), fallback_ref_cycles)
     return fast_residual_ns(ref, cycles)
 
@@ -408,9 +286,8 @@ def collect_rows(records: Iterable[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]
     for rec in records:
         stats["records_seen"] += 1
         root = _root(rec)
-        frag = _frag(rec)
-        forensic = _forensics_root(rec)
-        pps = pps_count_from_schema(root, frag, forensic)
+        campaign = _campaign(rec)
+        pps = pps_count_from_schema(campaign)
         if pps is None:
             continue
 
@@ -418,10 +295,10 @@ def collect_rows(records: Iterable[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]
         if gap:
             stats["gaps"] += 1
 
-        ref = selected_reference_cycles(root, frag, forensic)
-        o1_res = ocxo_residual(root, frag, forensic, "OCXO1", ref)
-        o2_res = ocxo_residual(root, frag, forensic, "OCXO2", ref)
-        g = gnss_discipline_fields(root, frag)
+        ref = selected_reference_cycles(root)
+        o1_res = ocxo_residual(campaign, "OCXO1", ref)
+        o2_res = ocxo_residual(campaign, "OCXO2", ref)
+        g = gnss_discipline_fields(root)
 
         row: Dict[str, Any] = {
             "pps": pps,
@@ -512,7 +389,7 @@ def analyze(campaign: str) -> None:
     print("  • g_acc (estimated_accuracy_ns) is the receiver's time-accuracy estimate.")
     print("  • g_frq (freq_error_ppb) is the receiver's coarse output-frequency-error")
     print("    estimate.")
-    print("  • g_clk (clock_drift_ppb) and g_raw (extra_clocks.gnss_raw_drift_ppb) are")
+    print("  • g_clk (clock_drift_ppb) and g_raw (campaign.adjudication.extra_clocks, with live GNSS_RAW fallback) are")
     print("    receiver-crystal drift measures — thermal proxies, useful when deciding")
     print("    whether slow common-mode wander is GNSS or enclosure temperature.")
     print("  • Positive residual means the OCXO is running fast (project convention).")

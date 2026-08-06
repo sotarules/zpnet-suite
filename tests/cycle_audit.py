@@ -33,7 +33,7 @@ PREFIXES = {"PPS": "p", "VCLOCK": "v", "OCXO1": "o1", "OCXO2": "o2"}
 CAMPAIGN_TYPE = "TEMPEST"
 PPS_COUNT_SQL = """
 NULLIF(
-    payload #>> '{campaign,tempest,teensy_pps_vclock_count}',
+    payload #>> '{campaign,public_count}',
     ''
 )::bigint
 """
@@ -53,52 +53,30 @@ def _as_int(value: Any) -> Optional[int]:
 
 
 def _root(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Return the persisted detail, unwrapping only a true outer envelope."""
-    if any(
-        key in payload
-        for key in ("schema", "monitor_fragment", "fragment", "campaign_row", "campaign")
-    ):
+    """Return one persisted CLOCKS_V4 state detail."""
+    if not isinstance(payload, dict):
+        return {}
+    if payload.get("schema") == "CLOCKS_V4":
         return payload
     inner = _dict(payload.get("payload"))
-    return inner or payload
+    return inner if inner.get("schema") == "CLOCKS_V4" else payload
 
 
-def _tempest_decoration(payload: Dict[str, Any]) -> Dict[str, Any]:
-    root = _root(payload)
-    return _dict(_dict(root.get("campaign")).get("tempest"))
+def _campaign(payload: Dict[str, Any]) -> Dict[str, Any]:
+    campaign = _dict(_root(payload).get("campaign"))
+    return campaign if campaign.get("schema") == "TEMPEST_FRAGMENT_V1" else {}
 
 
-def _fragment(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Return the merged immutable campaign row plus final TEMPEST decoration."""
-    root = _root(payload)
-    direct = _dict(root.get("fragment")) or _dict(root.get("campaign_row"))
-    monitor = _dict(root.get("monitor_fragment"))
-    embedded = _dict(monitor.get("campaign_row"))
-    decoration = _tempest_decoration(payload)
-    source = embedded or direct
-    if source or decoration:
-        merged = dict(source)
-        merged.update(decoration)
-        return merged
-    return root
+def _clocks(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return _dict(_root(payload).get("clocks"))
 
 
-def _payload_pps(payload: Dict[str, Any], frag: Dict[str, Any]) -> Optional[int]:
-    root = _root(payload)
-    for value in (
-        frag.get("teensy_pps_vclock_count"),
-        frag.get("pps_count"),
-        root.get("teensy_pps_vclock_count"),
-        root.get("pps_count"),
-    ):
-        parsed = _as_int(value)
-        if parsed is not None:
-            return parsed
-    return None
+def _payload_pps(payload: Dict[str, Any], campaign: Dict[str, Any]) -> Optional[int]:
+    return _as_int(campaign.get("public_count"))
 
 
 def fetch_timebase(campaign: str) -> List[Dict[str, Any]]:
-    """Fetch completed TEMPEST details in campaign-public PPS order."""
+    """Fetch completed TEMPEST details in campaign-public-count order."""
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
         cur.execute(
@@ -107,7 +85,7 @@ def fetch_timebase(campaign: str) -> List[Dict[str, Any]]:
             FROM campaign_detail
             WHERE campaign_type = %s
               AND campaign = %s
-              AND payload #> '{{campaign,tempest}}' IS NOT NULL
+              AND payload #>> '{{campaign,schema}}' = 'TEMPEST_FRAGMENT_V1'
               AND {PPS_COUNT_SQL} IS NOT NULL
             ORDER BY {PPS_COUNT_SQL} ASC, id ASC
             """,
@@ -124,8 +102,8 @@ def fetch_timebase(campaign: str) -> List[Dict[str, Any]]:
             continue
 
         db_pps = int(row["pps_count"])
-        frag = _fragment(payload)
-        payload_pps = _payload_pps(payload, frag)
+        campaign_view = _campaign(payload)
+        payload_pps = _payload_pps(payload, campaign_view)
         if payload_pps is not None and payload_pps != db_pps:
             raise ValueError(
                 "campaign_detail campaign PPS mismatch: "
@@ -161,8 +139,7 @@ def collect(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int, int,
         if count is None or not payload:
             continue
 
-        frag = _fragment(payload)
-        raw = _dict(frag.get("raw_cycles"))
+        raw = _dict(_clocks(payload).get("raw_cycles"))
         gap = previous_pps is not None and count != previous_pps + 1
         if gap:
             gaps += 1

@@ -11,7 +11,7 @@ Stdout contains one JSON document containing:
   - campaign
   - requested range
   - record count
-  - the complete unified campaign_detail payload for every matching row
+  - the complete CLOCKS_V4 campaign_detail payload for every matching row
   - database id/timestamp metadata
 
 No fields are filtered or normalized.
@@ -32,7 +32,7 @@ CAMPAIGN_TYPE = "TEMPEST"
 
 PPS_COUNT_SQL = """
 NULLIF(
-    payload #>> '{campaign,tempest,teensy_pps_vclock_count}',
+    payload #>> '{campaign,public_count}',
     ''
 )::bigint
 """
@@ -93,11 +93,14 @@ def fetch_timebase_window(campaign: str, start: int, end: int) -> List[Dict[str,
         SELECT
             id,
             ts,
-            {PPS_COUNT_SQL} AS pps_count,
+            sequence,
+            pps_count AS physical_pps_count,
+            {PPS_COUNT_SQL} AS campaign_public_count,
             payload
         FROM campaign_detail
         WHERE campaign_type = %s
           AND campaign = %s
+          AND payload #>> '{{campaign,schema}}' = 'TEMPEST_FRAGMENT_V1'
           AND {PPS_COUNT_SQL} BETWEEN %s AND %s
         ORDER BY {PPS_COUNT_SQL} ASC, id ASC
     """
@@ -117,7 +120,12 @@ def fetch_timebase_window(campaign: str, start: int, end: int) -> List[Dict[str,
             {
                 "_db_id": row["id"],
                 "_db_ts": str(row["ts"]),
-                "_pps_count": int(row["pps_count"]),
+                "_physical_sequence": int(row["sequence"]),
+                "_physical_pps_count": int(row["physical_pps_count"]),
+                "_campaign_public_count": int(row["campaign_public_count"]),
+                # Compatibility label for the tool's CLI/output vocabulary: this
+                # is campaign-relative public_count, not physical pps_count.
+                "_pps_count": int(row["campaign_public_count"]),
                 "payload": payload,
             }
         )

@@ -5,8 +5,8 @@ This replaces the old "tail zpnet-pubsub.log | grep TOPIC" style debugging
 loop with a live subscription to PUBSUB's observer-only tap socket.
 
 Usage:
-    python tests/pubsub_listen.py MONITOR
-    python tests/pubsub_listen.py CLOCKS_DAC_TICK SYSTEM_FEATURES_TICK
+    python tests/pubsub_listen.py CLOCKS
+    python tests/pubsub_listen.py CLOCKS_FRAGMENT CLOCKS
     python tests/pubsub_listen.py '*' --pretty
 
 The program prints one JSON object per matching publication.  Control-plane
@@ -49,7 +49,7 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument(
         "topics",
         nargs="+",
-        help="topic name(s) to listen for, for example MONITOR or CLOCKS_DAC_TICK; '*' listens to all topics",
+        help="topic name(s) to listen for, for example CLOCKS_FRAGMENT or CLOCKS; '*' listens to all topics",
     )
     parser.add_argument(
         "--socket",

@@ -253,13 +253,9 @@ _GNSS_ANNOUNCEMENT_FALLBACK_MATCHES = 0
 
 FEATURE_STATUSES = {"INITIALIZING", "NOMINAL", "HOLD", "ANOMALY"}
 
-# CLOCKS.features is the mission-readiness surface.  The raw QTimer/DWT
-# interval witness remains available through Teensy INTERRUPT diagnostics, but
-# its ISR-displacement-sensitive state is intentionally not an annunciator.
-_PUBLIC_FEATURE_EXCLUSIONS = {
-    ("TEENSY", "INTERRUPT", "QTIMER_DWT_RULER"),
-}
-
+# CLOCKS.features is the mission-readiness surface. SYSTEM publishes only
+# independently meaningful Pi readiness leaves; it does not publish a
+# self-referential PI.SYSTEM.FEATURE_STATUS aggregate.
 
 _FEATURE_LOCK = threading.Lock()
 _PI_FEATURES: Dict[str, Dict[str, Dict[str, str]]] = {"PI": {}}
@@ -312,8 +308,6 @@ def _copy_feature_tree(tree: Any) -> Dict[str, Dict[str, Dict[str, str]]]:
                 feature_key = str(feature).strip().upper()
                 if not feature_key:
                     continue
-                if (machine_key, subsystem_key, feature_key) in _PUBLIC_FEATURE_EXCLUSIONS:
-                    continue
                 if isinstance(entry, dict):
                     status = entry.get("status")
                 else:
@@ -345,7 +339,6 @@ def _update_builtin_pi_features(*,
                                 gnss_payload: Dict[str, Any],
                                 power_payload: Dict[str, Any],
                                 battery_payload: Dict[str, Any]) -> None:
-    set_pi_feature("SYSTEM", "FEATURE_STATUS", "NOMINAL")
     set_pi_feature("SYSTEM", "HOST", _health_to_feature_status(pi_payload.get("health_state")))
     set_pi_feature("SYSTEM", "NETWORK", _health_to_feature_status(network_payload.get("network_status")))
     set_pi_feature("SYSTEM", "SENSORS", _health_to_feature_status(sensor_payload.get("health_state")))
@@ -354,8 +347,6 @@ def _update_builtin_pi_features(*,
     set_pi_feature("SYSTEM", "POWER", _health_to_feature_status(power_payload.get("health_state")))
     set_pi_feature("SYSTEM", "BATTERY", _health_to_feature_status(battery_payload.get("health_state")))
 
-
-set_pi_feature("SYSTEM", "FEATURE_STATUS", "NOMINAL")
 
 # ------------------------------------------------------------------
 # ZPNet Server reachability state (speed tests only)
