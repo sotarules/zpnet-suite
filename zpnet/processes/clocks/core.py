@@ -204,8 +204,8 @@ INVALID_TIMEBASE_LOG_BACKUP_COUNT = 4
 # it evaluates the fully assembled TIMEBASE dictionary immediately before the
 # row is published/persisted, so corruption introduced during final structure
 # formation is caught before it becomes durable campaign truth.
-TIMEBASE_FINAL_COURT_SOURCE = "PI_CLOCKS_FINAL_TIMEBASE_COURT"
-TIMEBASE_FINAL_COURT_REASON = "timebase_final_court_violation"
+TIMEBASE_FINAL_COURT_SOURCE = "PI_CLOCKS_FINAL_TEMPEST_COURT"
+TIMEBASE_FINAL_COURT_VIOLATION_REASON = "tempest_final_court_violation"
 
 # First final-court rule: if an OCXO Delta Raw interval is marked valid, then
 # the final JSON must contain physically plausible one-second DWT intervals.
@@ -275,7 +275,7 @@ FLASH_CUT_FIRST_FRAGMENT_TIMEOUT_S = 180.0
 # startup handoff.  STATIC_PREDICTION remains post-start evidence.
 #
 # Pi CLOCKS owns the one global policy gate.  Teensy CLOCKS does not mirror or
-# re-evaluate MONITOR policy; it enforces command/state integrity, SmartZero,
+# re-evaluate CLOCKS policy; it enforces command/state integrity, SmartZero,
 # private PPS0/PhaseLedger maturity, watchdog custody, and the actual lifecycle
 # command verdict.
 FEATURE_PREFLIGHT_PROFILE = "CAMPAIGN_PREFLIGHT"
@@ -328,7 +328,7 @@ _diag: Dict[str, Any] = {
     "timebase_rows_completed": 0,
     "timebase_pairs_completed": 0,               # legacy alias for rows completed
 
-    # Unified state-detail attachment. CLOCKS decorates the SYSTEM-owned MONITOR
+    # Unified state-detail attachment. CLOCKS decorates the SYSTEM-owned CLOCKS
     # row instead of inserting a second TEMPEST row for the same physical second.
     "campaign_detail_attach_attempts": 0,
     "campaign_detail_attach_retries": 0,
@@ -519,7 +519,7 @@ _diag: Dict[str, Any] = {
     "recovery_stalled_event_enqueue_failures": 0,
     "last_recovery_stalled": {},
 
-    # SYSTEM-owned MONITOR recovery may hand the Pi-owned GNSS_RAW state back
+    # SYSTEM-owned CLOCKS recovery may hand the Pi-owned GNSS_RAW state back
     # to CLOCKS before CLOCKS startup campaign reconciliation completes.
     "gnss_raw_monitor_restore_requests": 0,
     "gnss_raw_monitor_restore_success": 0,
@@ -1783,7 +1783,7 @@ def _monitor_clocks_payload(monitor: Optional[Dict[str, Any]]) -> Dict[str, Any]
 
 
 def _monitor_restore_state(monitor: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Return firmware-authored structured sufficient state from MONITOR."""
+    """Return firmware-authored structured sufficient state from CLOCKS."""
     state = _monitor_clocks_payload(monitor).get("restore_state")
     if not isinstance(state, dict):
         return None
@@ -1803,7 +1803,7 @@ def _structured_restore_args(
 ) -> Dict[str, Any]:
     """Flatten structured state into ordinary CLOCKS command fields.
 
-    Generalized MONITOR restore includes DAC/servo control state. Campaign
+    Generalized CLOCKS restore includes DAC/servo control state. Campaign
     RECOVER deliberately excludes it: campaigns restore timeline/statistics
     only and leave the live instrument control plane untouched.
     """
@@ -1996,7 +1996,7 @@ def _attach_tempest_to_state_detail(detail: Dict[str, Any]) -> None:
 
     SYSTEM persists the common always-on TEMPEST snapshot first. CLOCKS then identifies
     that row by the immutable campaign-row PPS/VCLOCK identity already carried
-    inside ``monitor_fragment.campaign_row`` and adds only the type-owned
+    inside ``clocks_fragment.campaign_row`` and adds only the type-owned
     TEMPEST decoration. No second campaign_detail row is created.
     """
     pps_count = _extract_teensy_pps_vclock_count(
@@ -2046,7 +2046,10 @@ def _attach_tempest_to_state_detail(detail: Dict[str, Any]) -> None:
                         FROM campaign_detail
                         WHERE campaign_type = %s
                           AND campaign = %s
-                          AND payload #>> '{monitor_fragment,campaign_row,teensy_pps_vclock_count}' = %s
+                          AND COALESCE(
+                                  payload #>> '{clocks_fragment,campaign_row,teensy_pps_vclock_count}',
+                                  payload #>> '{monitor_fragment,campaign_row,teensy_pps_vclock_count}'
+                              ) = %s
                         ORDER BY id DESC
                         LIMIT 1
                     )
@@ -2096,7 +2099,7 @@ def _attach_tempest_to_state_detail(detail: Dict[str, Any]) -> None:
                 "teensy_pps_vclock_count": int(pps_count),
                 "attempts": attempts,
                 "success": False,
-                "error": str(last_error) if last_error is not None else "matching MONITOR detail not found",
+                "error": str(last_error) if last_error is not None else "matching CLOCKS detail not found",
             }
             logging.error(
                 "⚠️ [clocks] failed to attach TEMPEST decoration to unified "
@@ -2104,7 +2107,7 @@ def _attach_tempest_to_state_detail(detail: Dict[str, Any]) -> None:
                 campaign,
                 int(pps_count),
                 attempts,
-                str(last_error) if last_error is not None else "matching MONITOR detail not found",
+                str(last_error) if last_error is not None else "matching CLOCKS detail not found",
             )
             return
 
@@ -4285,7 +4288,7 @@ def _timebase_final_court_evaluate(timebase: Dict[str, Any]) -> Tuple[bool, Dict
     )
 
     verdict: Dict[str, Any] = {
-        "schema": "PI_TIMEBASE_FINAL_COURT_V4",
+        "schema": "PI_TEMPEST_FINAL_COURT_V1",
         "valid": accepted,
         "continuity_valid": accepted,
         "science_valid": not science_excluded,
@@ -4295,12 +4298,18 @@ def _timebase_final_court_evaluate(timebase: Dict[str, Any]) -> Tuple[bool, Dict
         "science_excluded": science_excluded,
         "candidate_use": "AUDIT_ONLY" if science_excluded else "SCIENCE_AND_CONTROL",
         "classification": classification,
-        "reason": TIMEBASE_FINAL_COURT_REASON,
+        "reason": (
+            TIMEBASE_FINAL_COURT_VIOLATION_REASON
+            if not accepted
+            else "science_excluded"
+            if science_excluded
+            else "candidate_accepted"
+        ),
         "primary_rule": primary.get("rule"),
         "rationale": primary.get("message") if primary else "candidate accepted",
         "source": TIMEBASE_FINAL_COURT_SOURCE,
         "source_process": "CLOCKS",
-        "source_report": "TIMEBASE_FINAL_COURT",
+        "source_report": "TEMPEST_FINAL_COURT",
         "campaign": timebase.get("campaign"),
         "teensy_pps_vclock_count": count,
         "teensy_pps_count": count,
@@ -4561,11 +4570,19 @@ def _recovery_timebase_snapshot(tb: Dict[str, Any]) -> Dict[str, Any]:
 
 
 
+def _state_clocks_fragment(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the canonical CLOCKS fragment, accepting the previous persisted key."""
+    fragment = state.get("clocks_fragment")
+    if not isinstance(fragment, dict):
+        fragment = state.get("monitor_fragment")
+    return fragment if isinstance(fragment, dict) else {}
+
+
 def _tempest_detail_from_state_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
     """Reconstruct the established TEMPEST report view from one unified snapshot.
 
     Storage remains nonredundant: the raw firmware candidate, common clocks,
-    environment, GNSS, and restore state stay in their ordinary MONITOR homes.
+    environment, GNSS, and restore state stay in their ordinary CLOCKS homes.
     This adapter presents the former report shape only to existing TEMPEST
     recovery calculations while they are moved behind generalized state recovery.
     """
@@ -4579,12 +4596,12 @@ def _tempest_detail_from_state_snapshot(state: Dict[str, Any]) -> Dict[str, Any]
     if not isinstance(tempest, dict):
         raise ValueError("state detail has no TEMPEST decoration")
 
-    monitor_fragment = state.get("monitor_fragment")
-    if not isinstance(monitor_fragment, dict):
-        raise ValueError("state detail has no monitor_fragment")
-    candidate = monitor_fragment.get("campaign_row")
+    clocks_fragment = _state_clocks_fragment(state)
+    if not clocks_fragment:
+        raise ValueError("state detail has no clocks_fragment")
+    candidate = clocks_fragment.get("campaign_row")
     if not isinstance(candidate, dict):
-        raise ValueError("state detail has no monitor_fragment.campaign_row")
+        raise ValueError("state detail has no clocks_fragment.campaign_row")
 
     fragment = copy.deepcopy(candidate)
     embedded_forensics = fragment.pop("forensics", None)
@@ -4605,7 +4622,7 @@ def _tempest_detail_from_state_snapshot(state: Dict[str, Any]) -> Dict[str, Any]
     clocks = clocks if isinstance(clocks, dict) else {}
     fragment = _decorate_persisted_fragment_ppb_buckets(
         fragment,
-        _monitor_fragment_ppb_buckets({"clocks": clocks}),
+        _clocks_fragment_ppb_buckets({"clocks": clocks}),
     )
 
     campaign = str(campaign_context.get("campaign") or tempest.get("campaign") or "")
@@ -5016,7 +5033,7 @@ def _mark_start_first_fragment_if_needed(
     )
 
     logging.info(
-        "✅ [start] @%s first MONITOR campaign row accepted "
+        "✅ [start] @%s first CLOCKS campaign row accepted "
         "(campaign='%s', pps_vclock_count=%d, waited=%.3fs)",
         system_time_z(), campaign, int(pps_vclock_count), float(waited_s),
     )
@@ -5295,7 +5312,7 @@ def _drain_timebase_ingress() -> int:
 # ---------------------------------------------------------------------
 
 
-def _monitor_fragment_ppb_buckets(monitor_fragment: Dict[str, Any]) -> Dict[str, Any]:
+def _clocks_fragment_ppb_buckets(clocks_fragment: Dict[str, Any]) -> Dict[str, Any]:
     """Return same-second producer-authored PPB buckets from CLOCKS_FRAGMENT.
 
     The always-on bucket family lives under ``CLOCKS_FRAGMENT.clocks.stats``.
@@ -5306,7 +5323,7 @@ def _monitor_fragment_ppb_buckets(monitor_fragment: Dict[str, Any]) -> Dict[str,
     This function runs for every CLOCKS_FRAGMENT containing ``campaign_row``;
     no startup-only latch or logging throttle controls persistence cadence.
     """
-    clocks = monitor_fragment.get("clocks")
+    clocks = clocks_fragment.get("clocks")
     stats = clocks.get("stats") if isinstance(clocks, dict) else None
     if not isinstance(stats, dict):
         return {}
@@ -5347,7 +5364,7 @@ def _decorate_persisted_fragment_ppb_buckets(
     return decorated
 
 
-def on_monitor_fragment(payload: Payload) -> None:
+def on_clocks_fragment(payload: Payload) -> None:
     """Consume the raw Teensy CLOCKS_FRAGMENT and enqueue campaign decoration.
 
     Observation-only fragments are intentionally ignored by the TIMEBASE path.
@@ -5355,19 +5372,19 @@ def on_monitor_fragment(payload: Payload) -> None:
     TIMEBASE_FRAGMENT_V7 candidate and enters the existing final court verbatim.
     """
     if not isinstance(payload, dict):
-        _diag["monitor_fragments_malformed"] = _diag.get("monitor_fragments_malformed", 0) + 1
+        _diag["clocks_fragments_malformed"] = _diag.get("clocks_fragments_malformed", 0) + 1
         return
 
-    monitor_fragment = dict(payload)
-    candidate = monitor_fragment.get("campaign_row")
+    clocks_fragment = dict(payload)
+    candidate = clocks_fragment.get("campaign_row")
     if not isinstance(candidate, dict):
-        _diag["monitor_fragments_observation_only"] = (
-            _diag.get("monitor_fragments_observation_only", 0) + 1
+        _diag["clocks_fragments_observation_only"] = (
+            _diag.get("clocks_fragments_observation_only", 0) + 1
         )
         return
 
-    _diag["monitor_fragments_with_campaign_row"] = (
-        _diag.get("monitor_fragments_with_campaign_row", 0) + 1
+    _diag["clocks_fragments_with_campaign_row"] = (
+        _diag.get("clocks_fragments_with_campaign_row", 0) + 1
     )
     _diag["timebase_candidates_received"] += 1
     _diag["fragments_received"] += 1
@@ -5388,8 +5405,8 @@ def on_monitor_fragment(payload: Payload) -> None:
     _enqueue_timebase_piece(
         TIMEBASE_FRAGMENT_TOPIC,
         candidate,
-        restore_state=_monitor_restore_state(monitor_fragment),
-        ppb_buckets=_monitor_fragment_ppb_buckets(monitor_fragment),
+        restore_state=_monitor_restore_state(clocks_fragment),
+        ppb_buckets=_clocks_fragment_ppb_buckets(clocks_fragment),
     )
     _diag["timebase_candidates_queued"] += 1
     _diag["fragments_queued"] += 1
@@ -6529,7 +6546,7 @@ def cmd_stats_reset(_: Optional[dict]) -> Dict[str, Any]:
 
 
 def cmd_restore_gnss_raw(args: Optional[dict]) -> Dict[str, Any]:
-    """Restore Pi-owned GNSS_RAW state under SYSTEM-owned MONITOR recovery."""
+    """Restore Pi-owned GNSS_RAW state under SYSTEM-owned CLOCKS recovery."""
     _diag["gnss_raw_monitor_restore_requests"] += 1
     raw_state: Any = (args or {}).get("state")
     if isinstance(raw_state, str):
@@ -6960,7 +6977,7 @@ def _recover_campaign() -> None:
         _clear_sync_wait()
 
         # Campaign recovery is recording-only. The live DAC, servo, and dither
-        # state is generalized MONITOR state and is not re-authored here.
+        # state is generalized CLOCKS state and is not re-authored here.
         teensy_args: Dict[str, Any] = {"campaign": campaign_name}
 
         _accepted_pps_vclock_count = None
@@ -7073,7 +7090,7 @@ def _recover_campaign() -> None:
     except Exception as e:
         raise RuntimeError(f"recovery failed: {e}")
 
-    # Warm recovery deliberately bypasses the full START MONITOR profile:
+    # Warm recovery deliberately bypasses the full START CLOCKS profile:
     # SmartZero/Alpha-epoch/OCXO-origin leaves may be exactly what RECOVER must
     # reconstruct after a Teensy reboot.  Requiring them here would create a
     # circular wait.
@@ -7669,7 +7686,7 @@ def cmd_set_baseline(args: Optional[dict]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------
 
 
-def on_monitor(payload: Optional[dict]) -> None:
+def on_clocks(payload: Optional[dict]) -> None:
     """Cache the latest unified CLOCKS heartbeat for campaign preflight."""
     global _latest_monitor
     global _latest_monitor_received_monotonic
@@ -7753,7 +7770,7 @@ def _check_feature_preflight(context: str) -> tuple[bool, list[str]]:
             "status": "UNAVAILABLE",
             "error": str(e),
         }
-        return False, [f"{FEATURE_PREFLIGHT_PROFILE}: MONITOR feature tree unavailable ({e})"]
+        return False, [f"{FEATURE_PREFLIGHT_PROFILE}: CLOCKS feature tree unavailable ({e})"]
 
     raw_blockers = blocking_features(features, FEATURE_PREFLIGHT_REQUIRED)
     compact_raw_blockers = [
@@ -7794,7 +7811,7 @@ def _check_feature_preflight(context: str) -> tuple[bool, list[str]]:
 
 
 def _preflight_wait_items(reasons: list[str]) -> list[str]:
-    """Return a compact, stable list of pending MONITOR prerequisites."""
+    """Return a compact, stable list of pending CLOCKS prerequisites."""
     items: list[str] = []
 
     feature_gate = _diag.get("last_preflight_feature_gate") or {}
@@ -7832,7 +7849,7 @@ def _preflight_wait_items(reasons: list[str]) -> list[str]:
 
 
 def _check_preflight(context: str = "campaign") -> tuple[bool, list[str]]:
-    """Check the MONITOR policy gate plus fresh local Pi prerequisites.
+    """Check the CLOCKS policy gate plus fresh local Pi prerequisites.
 
     This path is used for cold START, Flash Cut, and zero-row cold recovery.
     Warm recovery has its own narrower lifecycle contract.
@@ -8618,8 +8635,8 @@ def run() -> None:
         subsystem="CLOCKS",
         commands=COMMANDS,
         subscriptions={
-            CLOCKS_TOPIC: on_monitor,
-            CLOCKS_FRAGMENT_TOPIC: on_monitor_fragment,
+            CLOCKS_TOPIC: on_clocks,
+            CLOCKS_FRAGMENT_TOPIC: on_clocks_fragment,
             GNSS_ANNOUNCEMENT_TOPIC: on_gnss_announcement,
             "WATCHDOG_ANOMALY": on_watchdog_anomaly,
             CLOCKS_RECOVERY_STALLED_TOPIC: on_recovery_stalled,

@@ -623,13 +623,13 @@ static clocks_alpha_ocxo_counterledger_snapshot_t
 // lives in RAM2 so the completed-row path never places the handoff object on the
 // scarce DTCM stack.  SYSTEM consumes it only when the requested PPS sequence
 // matches exactly; an unconsumed record is never overwritten.
-static clocks_monitor_campaign_snapshot_t
-    g_monitor_campaign_record DMAMEM = {};
-static bool     g_monitor_campaign_record_pending = false;
-static uint32_t g_monitor_campaign_record_sequence = 0U;
-static uint32_t g_monitor_campaign_record_stage_count = 0U;
-static uint32_t g_monitor_campaign_record_take_count = 0U;
-static uint32_t g_monitor_campaign_record_backlog_count = 0U;
+static clocks_fragment_campaign_snapshot_t
+    g_clocks_fragment_campaign_record DMAMEM = {};
+static bool     g_clocks_fragment_campaign_record_pending = false;
+static uint32_t g_clocks_fragment_campaign_record_sequence = 0U;
+static uint32_t g_clocks_fragment_campaign_record_stage_count = 0U;
+static uint32_t g_clocks_fragment_campaign_record_take_count = 0U;
+static uint32_t g_clocks_fragment_campaign_record_backlog_count = 0U;
 
 // SYSTEM publication is normally armed by the first readiness notification.
 // Keep one bounded second-chance notification inside the same public second so
@@ -638,48 +638,48 @@ static uint32_t g_monitor_campaign_record_backlog_count = 0U;
 static constexpr uint64_t CAMPAIGN_RECORD_READY_RETRY_NS = 100000000ULL;
 static constexpr const char* CAMPAIGN_RECORD_READY_RETRY_TIMER =
     "clocks-monitor-campaign-ready-retry";
-static timepop_handle_t g_monitor_campaign_record_ready_retry_handle =
+static timepop_handle_t g_clocks_fragment_campaign_record_ready_retry_handle =
     TIMEPOP_INVALID_HANDLE;
-static uint32_t g_monitor_campaign_record_ready_retry_arm_count = 0U;
-static uint32_t g_monitor_campaign_record_ready_retry_arm_failure_count = 0U;
-static uint32_t g_monitor_campaign_record_ready_retry_fire_count = 0U;
-static uint32_t g_monitor_campaign_record_ready_retry_cancel_count = 0U;
+static uint32_t g_clocks_fragment_campaign_record_ready_retry_arm_count = 0U;
+static uint32_t g_clocks_fragment_campaign_record_ready_retry_arm_failure_count = 0U;
+static uint32_t g_clocks_fragment_campaign_record_ready_retry_fire_count = 0U;
+static uint32_t g_clocks_fragment_campaign_record_ready_retry_cancel_count = 0U;
 
-static void monitor_campaign_record_ready_retry_cancel(void) {
-  if (g_monitor_campaign_record_ready_retry_handle == TIMEPOP_INVALID_HANDLE) {
+static void clocks_fragment_campaign_record_ready_retry_cancel(void) {
+  if (g_clocks_fragment_campaign_record_ready_retry_handle == TIMEPOP_INVALID_HANDLE) {
     return;
   }
-  (void)timepop_cancel(g_monitor_campaign_record_ready_retry_handle);
-  g_monitor_campaign_record_ready_retry_handle = TIMEPOP_INVALID_HANDLE;
-  g_monitor_campaign_record_ready_retry_cancel_count++;
+  (void)timepop_cancel(g_clocks_fragment_campaign_record_ready_retry_handle);
+  g_clocks_fragment_campaign_record_ready_retry_handle = TIMEPOP_INVALID_HANDLE;
+  g_clocks_fragment_campaign_record_ready_retry_cancel_count++;
 }
 
-static void monitor_campaign_record_ready_retry_callback(
+static void clocks_fragment_campaign_record_ready_retry_callback(
     timepop_ctx_t*, timepop_diag_t*, void*) {
-  g_monitor_campaign_record_ready_retry_handle = TIMEPOP_INVALID_HANDLE;
-  if (!g_monitor_campaign_record_pending ||
-      g_monitor_campaign_record_sequence == 0U) {
+  g_clocks_fragment_campaign_record_ready_retry_handle = TIMEPOP_INVALID_HANDLE;
+  if (!g_clocks_fragment_campaign_record_pending ||
+      g_clocks_fragment_campaign_record_sequence == 0U) {
     return;
   }
 
-  g_monitor_campaign_record_ready_retry_fire_count++;
-  system_monitor_campaign_row_ready(g_monitor_campaign_record_sequence);
+  g_clocks_fragment_campaign_record_ready_retry_fire_count++;
+  system_clocks_fragment_campaign_row_ready(g_clocks_fragment_campaign_record_sequence);
 }
 
-static void monitor_campaign_record_ready_retry_arm(void) {
-  monitor_campaign_record_ready_retry_cancel();
-  g_monitor_campaign_record_ready_retry_handle =
+static void clocks_fragment_campaign_record_ready_retry_arm(void) {
+  clocks_fragment_campaign_record_ready_retry_cancel();
+  g_clocks_fragment_campaign_record_ready_retry_handle =
       timepop_arm(CAMPAIGN_RECORD_READY_RETRY_NS,
                   false,
-                  monitor_campaign_record_ready_retry_callback,
+                  clocks_fragment_campaign_record_ready_retry_callback,
                   nullptr,
                   CAMPAIGN_RECORD_READY_RETRY_TIMER);
-  if (g_monitor_campaign_record_ready_retry_handle ==
+  if (g_clocks_fragment_campaign_record_ready_retry_handle ==
       TIMEPOP_INVALID_HANDLE) {
-    g_monitor_campaign_record_ready_retry_arm_failure_count++;
+    g_clocks_fragment_campaign_record_ready_retry_arm_failure_count++;
     return;
   }
-  g_monitor_campaign_record_ready_retry_arm_count++;
+  g_clocks_fragment_campaign_record_ready_retry_arm_count++;
 }
 
 // Command-report construction is a serialized foreground service. Priority-0
@@ -708,28 +708,28 @@ static Payload g_report_child_dac DMAMEM;
 // Dedicated CLOCKS snapshot scratch. The 1 Hz side rail never borrows command
 // report Payload headers and never constructs transport objects inside CLOCKS.
 static clocks_instrument_stats_snapshot_t
-    g_beta_monitor_instrument_stats DMAMEM = {};
+    g_beta_clocks_fragment_instrument_stats DMAMEM = {};
 static clocks_static_prediction_snapshot_t
-    g_beta_monitor_pps_prediction DMAMEM = {};
+    g_beta_clocks_fragment_pps_prediction DMAMEM = {};
 static clocks_static_prediction_snapshot_t
-    g_beta_monitor_vclock_prediction DMAMEM = {};
+    g_beta_clocks_fragment_vclock_prediction DMAMEM = {};
 static clocks_static_prediction_snapshot_t
-    g_beta_monitor_ocxo1_prediction DMAMEM = {};
+    g_beta_clocks_fragment_ocxo1_prediction DMAMEM = {};
 static clocks_static_prediction_snapshot_t
-    g_beta_monitor_ocxo2_prediction DMAMEM = {};
+    g_beta_clocks_fragment_ocxo2_prediction DMAMEM = {};
 static clocks_alpha_lane_forensics_t
-    g_beta_monitor_vclock_forensics DMAMEM = {};
+    g_beta_clocks_fragment_vclock_forensics DMAMEM = {};
 static clocks_alpha_lane_forensics_t
-    g_beta_monitor_ocxo1_forensics DMAMEM = {};
+    g_beta_clocks_fragment_ocxo1_forensics DMAMEM = {};
 static clocks_alpha_lane_forensics_t
-    g_beta_monitor_ocxo2_forensics DMAMEM = {};
+    g_beta_clocks_fragment_ocxo2_forensics DMAMEM = {};
 
 
-static FLASHMEM void clocks_monitor_stats_snapshot_from_instrument(
-    clocks_monitor_stats_snapshot_t& out,
+static FLASHMEM void clocks_fragment_stats_snapshot_from_instrument(
+    clocks_fragment_stats_snapshot_t& out,
     const clocks_instrument_stats_snapshot_t& instrument);
-static FLASHMEM void clocks_monitor_dac_snapshot(
-    clocks_monitor_dac_snapshot_t& out);
+static FLASHMEM void clocks_fragment_dac_snapshot(
+    clocks_fragment_dac_snapshot_t& out);
 
 // ============================================================================
 // Durable structured recovery state
@@ -751,20 +751,20 @@ struct clocks_recovery_restore_state_t {
 
   clocks_instrument_stats_snapshot_t stats{};
   bool control_present = false;
-  clocks_monitor_dither_lane_t ocxo1_dac{};
-  clocks_monitor_dither_lane_t ocxo2_dac{};
+  clocks_fragment_dither_lane_t ocxo1_dac{};
+  clocks_fragment_dither_lane_t ocxo2_dac{};
   servo_mode_t servo_mode = servo_mode_t::OFF;
   bool dither_operator_enabled = false;
 };
 
 static clocks_recovery_restore_state_t
-    g_monitor_restore_state DMAMEM = {};
+    g_clocks_restore_state DMAMEM = {};
 static clocks_recovery_restore_state_t
     g_campaign_restore_state DMAMEM = {};
-static volatile bool g_monitor_restore_requested = false;
-static uint32_t g_monitor_restore_request_count = 0U;
-static uint32_t g_monitor_restore_commit_count = 0U;
-static uint32_t g_monitor_restore_failure_count = 0U;
+static volatile bool g_clocks_restore_requested = false;
+static uint32_t g_clocks_restore_request_count = 0U;
+static uint32_t g_clocks_restore_commit_count = 0U;
+static uint32_t g_clocks_restore_failure_count = 0U;
 static uint32_t g_campaign_restore_count = 0U;
 static uint32_t g_campaign_restore_failure_count = 0U;
 static uint32_t g_campaign_restore_ignored_live_count = 0U;
@@ -798,7 +798,7 @@ static inline void clocks_report_irq_restore(uint32_t prior_basepri) {
 }
 
 static bool clocks_recovery_dac_lane_valid(
-    const clocks_monitor_dither_lane_t& state) {
+    const clocks_fragment_dither_lane_t& state) {
   return isfinite(state.value) &&
          state.value >= 0.0 &&
          state.value <= (double)OCXO_DAC_SAFE_MAX_HW_CODE &&
@@ -943,7 +943,7 @@ static bool restore_parse_tau(const Payload& args,
 
 static bool restore_parse_dac_lane(const Payload& args,
                                    const char* prefix,
-                                   clocks_monitor_dither_lane_t& out) {
+                                   clocks_fragment_dither_lane_t& out) {
   char key[80];
 #define RESTORE_DAC_DBL(field) \
   do { snprintf(key, sizeof(key), "%s_" #field, prefix); \
@@ -1062,13 +1062,13 @@ static bool clocks_recovery_state_from_args(
 
 
 static void clocks_recovery_state_snapshot(
-    clocks_monitor_restore_state_t& out,
+    clocks_fragment_restore_state_t& out,
     const clocks_instrument_stats_snapshot_t& instrument,
     uint64_t logical_gnss_ns,
     uint64_t logical_dwt_cycles,
     uint64_t logical_ocxo1_ns,
     uint64_t logical_ocxo2_ns) {
-  out = clocks_monitor_restore_state_t{};
+  out = clocks_fragment_restore_state_t{};
   out.present = instrument.valid && logical_gnss_ns != 0ULL &&
                 logical_dwt_cycles != 0ULL && logical_ocxo1_ns != 0ULL &&
                 logical_ocxo2_ns != 0ULL;
@@ -1077,8 +1077,8 @@ static void clocks_recovery_state_snapshot(
   out.instrument_dwt_cycles = logical_dwt_cycles;
   out.instrument_ocxo1_ns = logical_ocxo1_ns;
   out.instrument_ocxo2_ns = logical_ocxo2_ns;
-  clocks_monitor_stats_snapshot_from_instrument(out.stats, instrument);
-  clocks_monitor_dac_snapshot(out.dac);
+  clocks_fragment_stats_snapshot_from_instrument(out.stats, instrument);
+  clocks_fragment_dac_snapshot(out.dac);
 }
 
 
@@ -1167,10 +1167,10 @@ static void clocks_beta_features_mark_initializing(void) {
 
 void clocks_beta_features_init(void) {
   clocks_beta_cold_diagnostics_init();
-  memset(&g_monitor_campaign_record, 0,
-         sizeof(g_monitor_campaign_record));
-  g_monitor_campaign_record_pending = false;
-  g_monitor_campaign_record_sequence = 0U;
+  memset(&g_clocks_fragment_campaign_record, 0,
+         sizeof(g_clocks_fragment_campaign_record));
+  g_clocks_fragment_campaign_record_pending = false;
+  g_clocks_fragment_campaign_record_sequence = 0U;
   g_report_clocks_payload.clear();
   g_report_stats_payload.clear();
   g_report_child_clocks.clear();
@@ -1750,8 +1750,8 @@ static int64_t beta_round_double_to_i64(double value);
 struct delta_clock_candidate_state_t {
   bool seeded = false;
   bool continuity_valid = false;
-  clocks_monitor_clock_candidate_status_t status =
-      clocks_monitor_clock_candidate_status_t::UNAVAILABLE;
+  clocks_fragment_clock_candidate_status_t status =
+      clocks_fragment_clock_candidate_status_t::UNAVAILABLE;
   uint32_t start_public_count = 0;
   uint32_t last_public_count = 0;
   uint32_t interval_count = 0;
@@ -1779,7 +1779,7 @@ static void delta_clock_candidate_seed(delta_clock_candidate_state_t& state,
   state = delta_clock_candidate_state_t{};
   state.seeded = true;
   state.continuity_valid = true;
-  state.status = clocks_monitor_clock_candidate_status_t::SEEDED;
+  state.status = clocks_fragment_clock_candidate_status_t::SEEDED;
   state.start_public_count = public_count;
   state.last_public_count = public_count;
   state.ns = ns;
@@ -1996,7 +1996,7 @@ static bool delta_clock_candidate_capture_geometry(
 
 static void delta_clock_candidate_fail(
     delta_clock_candidate_state_t& state,
-    clocks_monitor_clock_candidate_status_t status,
+    clocks_fragment_clock_candidate_status_t status,
     uint32_t public_count) {
   state.continuity_valid = false;
   state.geometry_valid = false;
@@ -2032,7 +2032,7 @@ static bool delta_clock_candidate_reanchor(
   state.last_residual_available = false;
   state.last_residual_ns = 0;
   state.last_residual_ns_exact = 0.0;
-  state.status = clocks_monitor_clock_candidate_status_t::SEEDED;
+  state.status = clocks_fragment_clock_candidate_status_t::SEEDED;
   return true;
 }
 
@@ -2044,7 +2044,7 @@ static void delta_clock_candidate_advance(
     uint64_t phaseledger_ns,
     bool phaseledger_clockface_valid) {
   if (!state.seeded) {
-    state.status = clocks_monitor_clock_candidate_status_t::UNAVAILABLE;
+    state.status = clocks_fragment_clock_candidate_status_t::UNAVAILABLE;
     state.last_public_count = public_count;
     return;
   }
@@ -2059,7 +2059,7 @@ static void delta_clock_candidate_advance(
   if (public_count != state.last_public_count + 1U) {
     delta_clock_candidate_fail(
         state,
-        clocks_monitor_clock_candidate_status_t::PUBLIC_COUNT_GAP,
+        clocks_fragment_clock_candidate_status_t::PUBLIC_COUNT_GAP,
         public_count);
     return;
   }
@@ -2079,7 +2079,7 @@ static void delta_clock_candidate_advance(
       !current_geometry_valid) {
     delta_clock_candidate_fail(
         state,
-        clocks_monitor_clock_candidate_status_t::DELTA_INVALID,
+        clocks_fragment_clock_candidate_status_t::DELTA_INVALID,
         public_count);
     return;
   }
@@ -2094,7 +2094,7 @@ static void delta_clock_candidate_advance(
             current_interval_cycles)) {
       delta_clock_candidate_fail(
           state,
-          clocks_monitor_clock_candidate_status_t::DELTA_INVALID,
+          clocks_fragment_clock_candidate_status_t::DELTA_INVALID,
           public_count);
     }
     return;
@@ -2129,7 +2129,7 @@ static void delta_clock_candidate_advance(
       !delta_raw_interval_cycles_plausible(current_interval_cycles)) {
     delta_clock_candidate_fail(
         state,
-        clocks_monitor_clock_candidate_status_t::DELTA_INVALID,
+        clocks_fragment_clock_candidate_status_t::DELTA_INVALID,
         public_count);
     return;
   }
@@ -2153,7 +2153,7 @@ static void delta_clock_candidate_advance(
       increment_with_carry < 1.0) {
     delta_clock_candidate_fail(
         state,
-        clocks_monitor_clock_candidate_status_t::ARITHMETIC_FAILURE,
+        clocks_fragment_clock_candidate_status_t::ARITHMETIC_FAILURE,
         public_count);
     return;
   }
@@ -2163,7 +2163,7 @@ static void delta_clock_candidate_advance(
       UINT64_MAX - state.ns < (uint64_t)increment_ns) {
     delta_clock_candidate_fail(
         state,
-        clocks_monitor_clock_candidate_status_t::ARITHMETIC_FAILURE,
+        clocks_fragment_clock_candidate_status_t::ARITHMETIC_FAILURE,
         public_count);
     return;
   }
@@ -2178,7 +2178,7 @@ static void delta_clock_candidate_advance(
       exact_increment_ns - (double)CLOCKS_BETA_NS_PER_SECOND;
   state.last_residual_ns =
       beta_round_double_to_i64(state.last_residual_ns_exact);
-  state.status = clocks_monitor_clock_candidate_status_t::ADVANCED;
+  state.status = clocks_fragment_clock_candidate_status_t::ADVANCED;
 
   if (!delta_clock_candidate_capture_geometry(
           state,
@@ -2187,7 +2187,7 @@ static void delta_clock_candidate_advance(
           current_interval_cycles)) {
     delta_clock_candidate_fail(
         state,
-        clocks_monitor_clock_candidate_status_t::DELTA_INVALID,
+        clocks_fragment_clock_candidate_status_t::DELTA_INVALID,
         public_count);
   }
 }
@@ -5005,9 +5005,9 @@ static FLASHMEM void report_add_stats_summary_from_snapshot(
   stats.clear();
 }
 
-static FLASHMEM clocks_monitor_welford_snapshot_t clocks_monitor_welford_snapshot(
+static FLASHMEM clocks_fragment_welford_snapshot_t clocks_fragment_welford_snapshot(
     const welford_t& w) {
-  clocks_monitor_welford_snapshot_t out{};
+  clocks_fragment_welford_snapshot_t out{};
   out.n = w.n;
   out.mean = w.mean;
   out.m2 = w.m2;
@@ -5018,54 +5018,54 @@ static FLASHMEM clocks_monitor_welford_snapshot_t clocks_monitor_welford_snapsho
   return out;
 }
 
-static FLASHMEM clocks_monitor_stats_clock_snapshot_t clocks_monitor_stats_clock(
+static FLASHMEM clocks_fragment_stats_clock_snapshot_t clocks_fragment_stats_clock(
     const welford_t& w,
     bool frequency_present,
     double ppb) {
-  clocks_monitor_stats_clock_snapshot_t out{};
-  out.welford = clocks_monitor_welford_snapshot(w);
+  clocks_fragment_stats_clock_snapshot_t out{};
+  out.welford = clocks_fragment_welford_snapshot(w);
   out.frequency_present = frequency_present;
   out.ppb = frequency_present ? ppb : 0.0;
   out.tau = frequency_present ? (1.0 + ppb / 1.0e9) : 1.0;
   return out;
 }
 
-static FLASHMEM clocks_monitor_ppb_value_snapshot_t clocks_monitor_ppb_value(
+static FLASHMEM clocks_fragment_ppb_value_snapshot_t clocks_fragment_ppb_value(
     const clocks_instrument_ppb_value_snapshot_t& source) {
-  clocks_monitor_ppb_value_snapshot_t out{};
+  clocks_fragment_ppb_value_snapshot_t out{};
   out.sample_count = source.sample_count;
   out.ppb = source.sample_count != 0ULL ? source.ppb : 0.0;
   return out;
 }
 
-static FLASHMEM clocks_monitor_ppb_buckets_snapshot_t clocks_monitor_ppb_buckets(
+static FLASHMEM clocks_fragment_ppb_buckets_snapshot_t clocks_fragment_ppb_buckets(
     const clocks_instrument_ppb_buckets_snapshot_t& source) {
-  clocks_monitor_ppb_buckets_snapshot_t out{};
-  out.minute_10 = clocks_monitor_ppb_value(source.minute_10);
-  out.minute_60 = clocks_monitor_ppb_value(source.minute_60);
-  out.hour_8 = clocks_monitor_ppb_value(source.hour_8);
-  out.hour_24 = clocks_monitor_ppb_value(source.hour_24);
-  out.total = clocks_monitor_ppb_value(source.total);
+  clocks_fragment_ppb_buckets_snapshot_t out{};
+  out.minute_10 = clocks_fragment_ppb_value(source.minute_10);
+  out.minute_60 = clocks_fragment_ppb_value(source.minute_60);
+  out.hour_8 = clocks_fragment_ppb_value(source.hour_8);
+  out.hour_24 = clocks_fragment_ppb_value(source.hour_24);
+  out.total = clocks_fragment_ppb_value(source.total);
   return out;
 }
 
-static void clocks_monitor_campaign_ppb_set(
-    clocks_monitor_stats_clock_snapshot_t& clock,
+static void clocks_fragment_campaign_ppb_set(
+    clocks_fragment_stats_clock_snapshot_t& clock,
     uint64_t sample_count,
     double ppb) {
   clock.ppb_buckets.campaign.sample_count = sample_count;
   clock.ppb_buckets.campaign.ppb = sample_count != 0ULL ? ppb : 0.0;
 }
 
-static double clocks_monitor_campaign_dwt_ppb(uint64_t gnss_ns,
+static double clocks_fragment_campaign_dwt_ppb(uint64_t gnss_ns,
                                                uint64_t dwt_cycles) {
   const double expected_cycles =
       ((double)gnss_ns * (double)DWT_EXPECTED_PER_PPS) / 1.0e9;
   return ((double)dwt_cycles / expected_cycles - 1.0) * 1.0e9;
 }
 
-static void clocks_monitor_stats_apply_campaign_ppb(
-    clocks_monitor_stats_snapshot_t& stats,
+static void clocks_fragment_stats_apply_campaign_ppb(
+    clocks_fragment_stats_snapshot_t& stats,
     uint64_t sample_count,
     uint64_t gnss_ns,
     uint64_t dwt_cycles,
@@ -5074,24 +5074,24 @@ static void clocks_monitor_stats_apply_campaign_ppb(
   if (sample_count == 0ULL || gnss_ns == 0ULL) return;
 
   // GNSS and VCLOCK are the campaign reference identity.
-  clocks_monitor_campaign_ppb_set(stats.gnss, sample_count, 0.0);
-  clocks_monitor_campaign_ppb_set(stats.vclock, sample_count, 0.0);
+  clocks_fragment_campaign_ppb_set(stats.gnss, sample_count, 0.0);
+  clocks_fragment_campaign_ppb_set(stats.vclock, sample_count, 0.0);
 
   if (dwt_cycles != 0ULL) {
-    clocks_monitor_campaign_ppb_set(
+    clocks_fragment_campaign_ppb_set(
         stats.dwt,
         sample_count,
-        clocks_monitor_campaign_dwt_ppb(gnss_ns, dwt_cycles));
+        clocks_fragment_campaign_dwt_ppb(gnss_ns, dwt_cycles));
   }
   if (ocxo1_ns != 0ULL) {
-    clocks_monitor_campaign_ppb_set(
+    clocks_fragment_campaign_ppb_set(
         stats.ocxo1,
         sample_count,
         campaign_total_ppb_from_tau(
             campaign_total_tau_from_ratio(gnss_ns, ocxo1_ns)));
   }
   if (ocxo2_ns != 0ULL) {
-    clocks_monitor_campaign_ppb_set(
+    clocks_fragment_campaign_ppb_set(
         stats.ocxo2,
         sample_count,
         campaign_total_ppb_from_tau(
@@ -5099,10 +5099,10 @@ static void clocks_monitor_stats_apply_campaign_ppb(
   }
 }
 
-static FLASHMEM clocks_monitor_tau_recovery_snapshot_t
-clocks_monitor_tau_recovery_snapshot(
+static FLASHMEM clocks_fragment_tau_recovery_snapshot_t
+clocks_fragment_tau_recovery_snapshot(
     const clocks_alpha_tau_snapshot_t& state) {
-  clocks_monitor_tau_recovery_snapshot_t out{};
+  clocks_fragment_tau_recovery_snapshot_t out{};
   out.valid = state.valid;
   out.reset_count = state.reset_count;
   out.sample_count = state.sample_count;
@@ -5127,8 +5127,8 @@ clocks_monitor_tau_recovery_snapshot(
   return out;
 }
 
-static FLASHMEM void clocks_monitor_stats_snapshot_from_instrument(
-    clocks_monitor_stats_snapshot_t& out,
+static FLASHMEM void clocks_fragment_stats_snapshot_from_instrument(
+    clocks_fragment_stats_snapshot_t& out,
     const clocks_instrument_stats_snapshot_t& instrument) {
   memset(&out, 0, sizeof(out));
   out.snapshot_ok = instrument.snapshot_ok;
@@ -5138,41 +5138,41 @@ static FLASHMEM void clocks_monitor_stats_snapshot_from_instrument(
   out.last_pps_sequence = instrument.last_pps_sequence;
   out.completed_row_coherent = instrument.completed_row_coherent;
 
-  out.gnss = clocks_monitor_stats_clock(instrument.gnss_welford, true, 0.0);
-  out.dwt = clocks_monitor_stats_clock(
+  out.gnss = clocks_fragment_stats_clock(instrument.gnss_welford, true, 0.0);
+  out.dwt = clocks_fragment_stats_clock(
       instrument.dwt_welford,
       instrument.dwt_frequency.valid,
       instrument.dwt_frequency.ppb);
-  out.vclock = clocks_monitor_stats_clock(
+  out.vclock = clocks_fragment_stats_clock(
       instrument.vclock_welford,
       instrument.vclock_frequency.valid,
       instrument.vclock_frequency.ppb);
-  out.ocxo1 = clocks_monitor_stats_clock(
+  out.ocxo1 = clocks_fragment_stats_clock(
       instrument.ocxo1_welford,
       instrument.ocxo1_frequency.valid,
       instrument.ocxo1_frequency.ppb);
-  out.ocxo2 = clocks_monitor_stats_clock(
+  out.ocxo2 = clocks_fragment_stats_clock(
       instrument.ocxo2_welford,
       instrument.ocxo2_frequency.valid,
       instrument.ocxo2_frequency.ppb);
-  out.pps_witness = clocks_monitor_stats_clock(
+  out.pps_witness = clocks_fragment_stats_clock(
       instrument.pps_witness_welford, false, 0.0);
 
-  out.dwt.ppb_buckets = clocks_monitor_ppb_buckets(
+  out.dwt.ppb_buckets = clocks_fragment_ppb_buckets(
       instrument.dwt_frequency.ppb_buckets);
-  out.vclock.ppb_buckets = clocks_monitor_ppb_buckets(
+  out.vclock.ppb_buckets = clocks_fragment_ppb_buckets(
       instrument.vclock_frequency.ppb_buckets);
-  out.ocxo1.ppb_buckets = clocks_monitor_ppb_buckets(
+  out.ocxo1.ppb_buckets = clocks_fragment_ppb_buckets(
       instrument.ocxo1_frequency.ppb_buckets);
-  out.ocxo2.ppb_buckets = clocks_monitor_ppb_buckets(
+  out.ocxo2.ppb_buckets = clocks_fragment_ppb_buckets(
       instrument.ocxo2_frequency.ppb_buckets);
   if (instrument.gnss_welford.n != 0ULL) {
     out.gnss.ppb_buckets.total.sample_count = instrument.gnss_welford.n;
     out.gnss.ppb_buckets.total.ppb = 0.0;
   }
-  out.ocxo1_tau_state = clocks_monitor_tau_recovery_snapshot(
+  out.ocxo1_tau_state = clocks_fragment_tau_recovery_snapshot(
       instrument.ocxo1_tau_state);
-  out.ocxo2_tau_state = clocks_monitor_tau_recovery_snapshot(
+  out.ocxo2_tau_state = clocks_fragment_tau_recovery_snapshot(
       instrument.ocxo2_tau_state);
 
   out.maturity_gnss_samples = instrument.gnss_welford.n;
@@ -5191,8 +5191,8 @@ static FLASHMEM void clocks_monitor_stats_snapshot_from_instrument(
   out.vclock_reject_count = instrument.vclock_interval_reject_count;
   out.ocxo1_reject_count = instrument.ocxo1_interval_reject_count;
   out.ocxo2_reject_count = instrument.ocxo2_interval_reject_count;
-  out.ocxo1_dac = clocks_monitor_welford_snapshot(instrument.ocxo1_dac_welford);
-  out.ocxo2_dac = clocks_monitor_welford_snapshot(instrument.ocxo2_dac_welford);
+  out.ocxo1_dac = clocks_fragment_welford_snapshot(instrument.ocxo1_dac_welford);
+  out.ocxo2_dac = clocks_fragment_welford_snapshot(instrument.ocxo2_dac_welford);
 }
 
 
@@ -5269,8 +5269,8 @@ static FLASHMEM void clocks_beta_cold_diagnostics_init(void) {
   g_beta_probe_science_totals_o2 = ocxo_science_totals_t{};
   g_beta_instrument_stats = clocks_instrument_stats_snapshot_t{};
   g_beta_report_instrument_stats = clocks_instrument_stats_snapshot_t{};
-  g_beta_monitor_instrument_stats = clocks_instrument_stats_snapshot_t{};
-  g_monitor_restore_state = clocks_recovery_restore_state_t{};
+  g_beta_clocks_fragment_instrument_stats = clocks_instrument_stats_snapshot_t{};
+  g_clocks_restore_state = clocks_recovery_restore_state_t{};
   g_campaign_restore_state = clocks_recovery_restore_state_t{};
   g_clocks_report_build_active = false;
   g_clocks_report_build_count = 0U;
@@ -6293,31 +6293,31 @@ static bool campaign_start_prologue_should_hold(
 }
 
 
-static FLASHMEM void clocks_monitor_copy_text(char* dst,
+static FLASHMEM void clocks_fragment_copy_text(char* dst,
                                      size_t capacity,
                                      const char* src) {
   if (!dst || capacity == 0U) return;
   safeCopy(dst, capacity, src ? src : "");
 }
 
-static FLASHMEM void clocks_monitor_clock_candidates_snapshot_from_row(
-    clocks_monitor_clock_candidates_snapshot_t& out,
+static FLASHMEM void clocks_fragment_clock_candidates_snapshot_from_row(
+    clocks_fragment_clock_candidates_snapshot_t& out,
     const delta_clock_candidate_state_t& delta_state,
     uint32_t public_count,
     uint64_t phaseledger_ns,
     bool phaseledger_clockface_valid,
     const clocks_alpha_ocxo_counterledger_snapshot_t& phaseledger,
     const clock_science_row_t& delta_row) {
-  out = clocks_monitor_clock_candidates_snapshot_t{};
-  clocks_monitor_copy_text(out.published_source,
+  out = clocks_fragment_clock_candidates_snapshot_t{};
+  clocks_fragment_copy_text(out.published_source,
                            sizeof(out.published_source),
                            "COUNTERLEDGER_PHASELEDGER");
 
   out.phaseledger.available = phaseledger_clockface_valid;
   out.phaseledger.continuity_valid = phaseledger_clockface_valid;
   out.phaseledger.status = phaseledger_clockface_valid
-      ? clocks_monitor_clock_candidate_status_t::ADVANCED
-      : clocks_monitor_clock_candidate_status_t::UNAVAILABLE;
+      ? clocks_fragment_clock_candidate_status_t::ADVANCED
+      : clocks_fragment_clock_candidate_status_t::UNAVAILABLE;
   out.phaseledger.start_public_count = delta_state.start_public_count;
   out.phaseledger.last_public_count = public_count;
   out.phaseledger.interval_count =
@@ -6372,10 +6372,10 @@ static FLASHMEM void clocks_monitor_clock_candidates_snapshot_from_row(
           : 0.0;
 }
 
-static FLASHMEM void clocks_monitor_science_snapshot_from_row(
-    clocks_monitor_science_snapshot_t& out,
+static FLASHMEM void clocks_fragment_science_snapshot_from_row(
+    clocks_fragment_science_snapshot_t& out,
     const clock_science_row_t& row) {
-  out = clocks_monitor_science_snapshot_t{};
+  out = clocks_fragment_science_snapshot_t{};
   out.valid = row.valid;
   out.science_worthy = row.science_worthy;
   out.antecedents_complete = row.antecedents_complete;
@@ -6390,12 +6390,12 @@ static FLASHMEM void clocks_monitor_science_snapshot_from_row(
   out.delta_raw_fast_residual_cycles = row.delta_raw_fast_residual_cycles;
 }
 
-static FLASHMEM void clocks_monitor_raw_cycles_lane_snapshot(
-    clocks_monitor_raw_cycles_lane_t& out,
+static FLASHMEM void clocks_fragment_raw_cycles_lane_snapshot(
+    clocks_fragment_raw_cycles_lane_t& out,
     const clocks_static_prediction_snapshot_t& sample,
     bool forensics_snapshot_ok,
     const interrupt_delay_forensics_t& delay) {
-  out = clocks_monitor_raw_cycles_lane_t{};
+  out = clocks_fragment_raw_cycles_lane_t{};
   out.snapshot_ok = sample.snapshot_ok;
   out.forensics_snapshot_ok = forensics_snapshot_ok;
   out.valid = sample.snapshot_ok && sample.valid;
@@ -6405,7 +6405,7 @@ static FLASHMEM void clocks_monitor_raw_cycles_lane_snapshot(
   out.residual_cycles = sample.static_residual_cycles;
 
   if (!forensics_snapshot_ok) {
-    clocks_monitor_copy_text(out.delay_status,
+    clocks_fragment_copy_text(out.delay_status,
                              sizeof(out.delay_status),
                              "SNAPSHOT_UNAVAILABLE");
     out.delay_detail_present = false;
@@ -6413,7 +6413,7 @@ static FLASHMEM void clocks_monitor_raw_cycles_lane_snapshot(
   }
 
   const char* delay_status = interrupt_delay_verdict_str(delay.verdict);
-  clocks_monitor_copy_text(out.delay_status,
+  clocks_fragment_copy_text(out.delay_status,
                            sizeof(out.delay_status),
                            delay_status);
   out.delay_detail_present = true;
@@ -6433,7 +6433,7 @@ static FLASHMEM void clocks_monitor_raw_cycles_lane_snapshot(
       ? (uint32_t)(-(int64_t)residual_after_delay)
       : (uint32_t)residual_after_delay;
 
-  clocks_monitor_copy_text(
+  clocks_fragment_copy_text(
       out.delay_by,
       sizeof(out.delay_by),
       (delay.valid && delay.delayed)
@@ -6442,7 +6442,7 @@ static FLASHMEM void clocks_monitor_raw_cycles_lane_snapshot(
   out.residual_delay_cycles = out.residual_delay_valid
       ? delay.residual_delay_cycles
       : 0;
-  clocks_monitor_copy_text(
+  clocks_fragment_copy_text(
       out.residual_delay_by,
       sizeof(out.residual_delay_by),
       out.residual_delay_valid
@@ -6454,8 +6454,8 @@ static FLASHMEM void clocks_monitor_raw_cycles_lane_snapshot(
           CAMPAIGN_RECORD_ISR_DELAY_EXPLANATION_GATE_CYCLES;
 }
 
-static FLASHMEM void clocks_monitor_raw_cycles_snapshot(
-    clocks_monitor_raw_cycles_snapshot_t& out,
+static FLASHMEM void clocks_fragment_raw_cycles_snapshot(
+    clocks_fragment_raw_cycles_snapshot_t& out,
     const clocks_static_prediction_snapshot_t& pps,
     const clocks_static_prediction_snapshot_t& vclock,
     const clocks_static_prediction_snapshot_t& ocxo1,
@@ -6465,14 +6465,14 @@ static FLASHMEM void clocks_monitor_raw_cycles_snapshot(
     const clocks_alpha_lane_forensics_t& ocxo1_forensics,
     const clocks_alpha_lane_forensics_t& ocxo2_forensics) {
   memset(&out, 0, sizeof(out));
-  clocks_monitor_raw_cycles_lane_snapshot(out.pps, pps, true, pps_delay);
-  clocks_monitor_raw_cycles_lane_snapshot(
+  clocks_fragment_raw_cycles_lane_snapshot(out.pps, pps, true, pps_delay);
+  clocks_fragment_raw_cycles_lane_snapshot(
       out.vclock, vclock, vclock_forensics.snapshot_ok,
       vclock_forensics.interrupt_delay);
-  clocks_monitor_raw_cycles_lane_snapshot(
+  clocks_fragment_raw_cycles_lane_snapshot(
       out.ocxo1, ocxo1, ocxo1_forensics.snapshot_ok,
       ocxo1_forensics.interrupt_delay);
-  clocks_monitor_raw_cycles_lane_snapshot(
+  clocks_fragment_raw_cycles_lane_snapshot(
       out.ocxo2, ocxo2, ocxo2_forensics.snapshot_ok,
       ocxo2_forensics.interrupt_delay);
 }
@@ -6904,7 +6904,7 @@ static void clocks_commit_pending_servo_mode_change(void) {
 
 static void clocks_recovery_restore_dac_lane_runtime(
     ocxo_dac_state_t& dst,
-    const clocks_monitor_dither_lane_t& src) {
+    const clocks_fragment_dither_lane_t& src) {
   dst.servo_last_step = src.servo_last_step;
   dst.servo_last_residual = src.servo_last_residual;
   dst.servo_settle_count = src.servo_settle_count;
@@ -7465,7 +7465,7 @@ static void flash_cut_clear_pending(void) {
 
 static bool flash_cut_busy(void) {
   return request_flash_cut || request_start || request_stop ||
-         request_recover || request_zero || g_monitor_restore_requested ||
+         request_recover || request_zero || g_clocks_restore_requested ||
          interrupt_smartzero_running() ||
          clocks_alpha_epoch_install_in_progress();
 }
@@ -7668,10 +7668,10 @@ static bool clocks_servo_active(void) {
 }
 
 
-static FLASHMEM void clocks_monitor_dac_lane_snapshot(
-    clocks_monitor_dither_lane_t& out,
+static FLASHMEM void clocks_fragment_dac_lane_snapshot(
+    clocks_fragment_dither_lane_t& out,
     const ocxo_dac_state_t& dac) {
-  out = clocks_monitor_dither_lane_t{};
+  out = clocks_fragment_dither_lane_t{};
   out.value = ocxo_dac_fractional_snapshot(dac);
   out.hw_code = dac.dac_hw_code;
   out.readback_valid = dac.hw_readback_valid;
@@ -7693,58 +7693,58 @@ static FLASHMEM void clocks_monitor_dac_lane_snapshot(
   out.servo_predictor_updates = dac.servo_predictor_updates;
 }
 
-static FLASHMEM void clocks_monitor_dac_snapshot(
-    clocks_monitor_dac_snapshot_t& out) {
+static FLASHMEM void clocks_fragment_dac_snapshot(
+    clocks_fragment_dac_snapshot_t& out) {
   memset(&out, 0, sizeof(out));
-  clocks_monitor_copy_text(out.servo_mode,
+  clocks_fragment_copy_text(out.servo_mode,
                            sizeof(out.servo_mode),
                            servo_mode_str(calibrate_ocxo_mode));
   out.servo_active = clocks_servo_active();
-  clocks_monitor_copy_text(out.realization_mode,
+  clocks_fragment_copy_text(out.realization_mode,
                            sizeof(out.realization_mode),
                            ocxo_dac_realization_mode_runtime());
   out.dither_operator_enabled = clocks_ocxo_dac_dither_operator_enabled();
   out.servo_request_pending =
       ocxo1_dac.pacing_pending || ocxo2_dac.pacing_pending;
   out.actuator_service_pending = clocks_ocxo_dac_actuator_service_pending();
-  clocks_monitor_dac_lane_snapshot(out.ocxo1, ocxo1_dac);
-  clocks_monitor_dac_lane_snapshot(out.ocxo2, ocxo2_dac);
+  clocks_fragment_dac_lane_snapshot(out.ocxo1, ocxo1_dac);
+  clocks_fragment_dac_lane_snapshot(out.ocxo2, ocxo2_dac);
 }
 
-static FLASHMEM void clocks_monitor_refresh_prediction_snapshots(void) {
-  prediction_snapshot_for_pps(g_beta_monitor_pps_prediction);
+static FLASHMEM void clocks_fragment_refresh_prediction_snapshots(void) {
+  prediction_snapshot_for_pps(g_beta_clocks_fragment_pps_prediction);
   prediction_snapshot_for_clock(
-      time_clock_id_t::VCLOCK, g_beta_monitor_vclock_prediction);
+      time_clock_id_t::VCLOCK, g_beta_clocks_fragment_vclock_prediction);
   prediction_snapshot_for_clock(
-      time_clock_id_t::OCXO1, g_beta_monitor_ocxo1_prediction);
+      time_clock_id_t::OCXO1, g_beta_clocks_fragment_ocxo1_prediction);
   prediction_snapshot_for_clock(
-      time_clock_id_t::OCXO2, g_beta_monitor_ocxo2_prediction);
+      time_clock_id_t::OCXO2, g_beta_clocks_fragment_ocxo2_prediction);
 
-  g_beta_monitor_vclock_forensics = clocks_alpha_lane_forensics_t{};
-  g_beta_monitor_ocxo1_forensics = clocks_alpha_lane_forensics_t{};
-  g_beta_monitor_ocxo2_forensics = clocks_alpha_lane_forensics_t{};
+  g_beta_clocks_fragment_vclock_forensics = clocks_alpha_lane_forensics_t{};
+  g_beta_clocks_fragment_ocxo1_forensics = clocks_alpha_lane_forensics_t{};
+  g_beta_clocks_fragment_ocxo2_forensics = clocks_alpha_lane_forensics_t{};
   if (!clocks_alpha_lane_forensics(
-          time_clock_id_t::VCLOCK, &g_beta_monitor_vclock_forensics)) {
-    g_beta_monitor_vclock_forensics = clocks_alpha_lane_forensics_t{};
+          time_clock_id_t::VCLOCK, &g_beta_clocks_fragment_vclock_forensics)) {
+    g_beta_clocks_fragment_vclock_forensics = clocks_alpha_lane_forensics_t{};
   }
   if (!clocks_alpha_lane_forensics(
-          time_clock_id_t::OCXO1, &g_beta_monitor_ocxo1_forensics)) {
-    g_beta_monitor_ocxo1_forensics = clocks_alpha_lane_forensics_t{};
+          time_clock_id_t::OCXO1, &g_beta_clocks_fragment_ocxo1_forensics)) {
+    g_beta_clocks_fragment_ocxo1_forensics = clocks_alpha_lane_forensics_t{};
   }
   if (!clocks_alpha_lane_forensics(
-          time_clock_id_t::OCXO2, &g_beta_monitor_ocxo2_forensics)) {
-    g_beta_monitor_ocxo2_forensics = clocks_alpha_lane_forensics_t{};
+          time_clock_id_t::OCXO2, &g_beta_clocks_fragment_ocxo2_forensics)) {
+    g_beta_clocks_fragment_ocxo2_forensics = clocks_alpha_lane_forensics_t{};
   }
 }
 
-static FLASHMEM void clocks_monitor_live_snapshot_fill(
-    clocks_monitor_live_snapshot_t& out) {
+static FLASHMEM void clocks_fragment_live_snapshot_fill(
+    clocks_fragment_live_snapshot_t& out) {
   memset(&out, 0, sizeof(out));
-  g_beta_monitor_instrument_stats = clocks_instrument_stats_snapshot_t{};
+  g_beta_clocks_fragment_instrument_stats = clocks_instrument_stats_snapshot_t{};
   out.snapshot_ok = clocks_alpha_instrument_stats_snapshot(
-      &g_beta_monitor_instrument_stats);
+      &g_beta_clocks_fragment_instrument_stats);
   const clocks_instrument_stats_snapshot_t& instrument =
-      g_beta_monitor_instrument_stats;
+      g_beta_clocks_fragment_instrument_stats;
 
   const bool campaign_bound =
       campaign_state != clocks_campaign_state_t::STOPPED &&
@@ -7767,26 +7767,26 @@ static FLASHMEM void clocks_monitor_live_snapshot_fill(
   out.instrument_age_seconds =
       (uint32_t)(logical_instrument_gnss_ns / CLOCKS_BETA_NS_PER_SECOND);
 
-  clocks_monitor_copy_text(out.campaign_state,
+  clocks_fragment_copy_text(out.campaign_state,
                            sizeof(out.campaign_state),
                            clocks_campaign_state_name(campaign_state));
   out.recording = campaign_state == clocks_campaign_state_t::STARTED;
   out.campaign_present = campaign_bound;
-  clocks_monitor_copy_text(out.campaign,
+  clocks_fragment_copy_text(out.campaign,
                            sizeof(out.campaign),
                            campaign_bound ? campaign_name : "");
-  clocks_monitor_copy_text(out.last_campaign,
+  clocks_fragment_copy_text(out.last_campaign,
                            sizeof(out.last_campaign),
                            campaign_name);
   out.campaign_seconds = campaign_seconds;
   out.campaign_presentation_ready = campaign_presentation_ready;
-  clocks_monitor_copy_text(
+  clocks_fragment_copy_text(
       out.presentation_mode,
       sizeof(out.presentation_mode),
       campaign_presentation_ready
           ? "CAMPAIGN"
           : (campaign_bound ? "CAMPAIGN_ARMING" : "INSTRUMENT"));
-  clocks_monitor_copy_text(
+  clocks_fragment_copy_text(
       out.presentation_basis,
       sizeof(out.presentation_basis),
       campaign_presentation_ready
@@ -7840,20 +7840,20 @@ static FLASHMEM void clocks_monitor_live_snapshot_fill(
   out.ocxo1_interval_cycles = instrument.ocxo1_interval_cycles;
   out.ocxo2_interval_cycles = instrument.ocxo2_interval_cycles;
 
-  clocks_monitor_refresh_prediction_snapshots();
-  clocks_monitor_raw_cycles_snapshot(
+  clocks_fragment_refresh_prediction_snapshots();
+  clocks_fragment_raw_cycles_snapshot(
       out.raw_cycles,
-      g_beta_monitor_pps_prediction,
-      g_beta_monitor_vclock_prediction,
-      g_beta_monitor_ocxo1_prediction,
-      g_beta_monitor_ocxo2_prediction,
+      g_beta_clocks_fragment_pps_prediction,
+      g_beta_clocks_fragment_vclock_prediction,
+      g_beta_clocks_fragment_ocxo1_prediction,
+      g_beta_clocks_fragment_ocxo2_prediction,
       g_pps_witness_diag.interrupt_delay,
-      g_beta_monitor_vclock_forensics,
-      g_beta_monitor_ocxo1_forensics,
-      g_beta_monitor_ocxo2_forensics);
-  clocks_monitor_stats_snapshot_from_instrument(out.stats, instrument);
+      g_beta_clocks_fragment_vclock_forensics,
+      g_beta_clocks_fragment_ocxo1_forensics,
+      g_beta_clocks_fragment_ocxo2_forensics);
+  clocks_fragment_stats_snapshot_from_instrument(out.stats, instrument);
   if (campaign_presentation_ready) {
-    clocks_monitor_stats_apply_campaign_ppb(
+    clocks_fragment_stats_apply_campaign_ppb(
         out.stats,
         campaign_seconds,
         out.presentation_gnss_ns,
@@ -7861,7 +7861,7 @@ static FLASHMEM void clocks_monitor_live_snapshot_fill(
         out.presentation_ocxo1_ns,
         out.presentation_ocxo2_ns);
   }
-  clocks_monitor_dac_snapshot(out.dac);
+  clocks_fragment_dac_snapshot(out.dac);
   clocks_recovery_state_snapshot(
       out.restore_state,
       instrument,
@@ -7871,22 +7871,22 @@ static FLASHMEM void clocks_monitor_live_snapshot_fill(
       logical_instrument_ocxo2_ns);
 }
 
-FLASHMEM bool clocks_monitor_snapshot_take(
+FLASHMEM bool clocks_fragment_snapshot_take(
     uint32_t completed_second_sequence,
-    clocks_monitor_snapshot_t* out) {
+    clocks_fragment_snapshot_t* out) {
   if (!out) return false;
   memset(out, 0, sizeof(*out));
-  clocks_monitor_live_snapshot_fill(out->live);
+  clocks_fragment_live_snapshot_fill(out->live);
 
-  if (g_monitor_campaign_record_pending &&
-      g_monitor_campaign_record_sequence == completed_second_sequence) {
-    out->campaign = g_monitor_campaign_record;
-    memset(&g_monitor_campaign_record, 0,
-           sizeof(g_monitor_campaign_record));
-    g_monitor_campaign_record_pending = false;
-    g_monitor_campaign_record_sequence = 0U;
-    g_monitor_campaign_record_take_count++;
-    monitor_campaign_record_ready_retry_cancel();
+  if (g_clocks_fragment_campaign_record_pending &&
+      g_clocks_fragment_campaign_record_sequence == completed_second_sequence) {
+    out->campaign = g_clocks_fragment_campaign_record;
+    memset(&g_clocks_fragment_campaign_record, 0,
+           sizeof(g_clocks_fragment_campaign_record));
+    g_clocks_fragment_campaign_record_pending = false;
+    g_clocks_fragment_campaign_record_sequence = 0U;
+    g_clocks_fragment_campaign_record_take_count++;
+    clocks_fragment_campaign_record_ready_retry_cancel();
   }
 
   return true;
@@ -8076,7 +8076,7 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
     return;
   }
 
-  if (g_monitor_restore_requested) {
+  if (g_clocks_restore_requested) {
     campaign_record_stage(CAMPAIGN_RECORD_STAGE_RECOVER_GATE);
     if (!clocks_alpha_installed_smartzero_backing_epoch() ||
         clocks_alpha_epoch_install_in_progress()) {
@@ -8085,17 +8085,17 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
     }
 
     if (!clocks_recovery_commit_statistics_and_clockfaces(
-            g_monitor_restore_state)) {
-      g_monitor_restore_requested = false;
-      g_monitor_restore_failure_count++;
+            g_clocks_restore_state)) {
+      g_clocks_restore_requested = false;
+      g_clocks_restore_failure_count++;
       clocks_apply_servo_mode_now(servo_mode_t::OFF);
       publish_dac_tick("MONITOR_RESTORE_COMMIT_FAILED");
       return;
     }
 
-    g_monitor_restore_requested = false;
-    g_monitor_restore_commit_count++;
-    g_monitor_restore_state = clocks_recovery_restore_state_t{};
+    g_clocks_restore_requested = false;
+    g_clocks_restore_commit_count++;
+    g_clocks_restore_state = clocks_recovery_restore_state_t{};
     clocks_row_objection_clear();
     publish_dac_tick("MONITOR_RESTORE_COMMITTED");
     return;
@@ -8753,35 +8753,35 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
 
   // Never overwrite an unconsumed record. Transport pressure must become an
   // explicit structural failure rather than silent campaign data loss.
-  if (g_monitor_campaign_record_pending) {
+  if (g_clocks_fragment_campaign_record_pending) {
     campaign_record_stage(CAMPAIGN_RECORD_STAGE_HANDOFF_BACKLOG);
-    g_monitor_campaign_record_backlog_count++;
-    clocks_watchdog_anomaly("monitor_campaign_record_backlog",
-                            g_monitor_campaign_record_sequence,
+    g_clocks_fragment_campaign_record_backlog_count++;
+    clocks_watchdog_anomaly("clocks_fragment_campaign_record_backlog",
+                            g_clocks_fragment_campaign_record_sequence,
                             completed_pps_sequence,
-                            g_monitor_campaign_record_backlog_count,
+                            g_clocks_fragment_campaign_record_backlog_count,
                             public_count);
     return;
   }
 
-  clocks_monitor_campaign_snapshot_t& record = g_monitor_campaign_record;
+  clocks_fragment_campaign_snapshot_t& record = g_clocks_fragment_campaign_record;
   memset(&record, 0, sizeof(record));
   record.present = true;
   record.completed_second_sequence = completed_pps_sequence;
-  clocks_monitor_copy_text(record.campaign,
+  clocks_fragment_copy_text(record.campaign,
                            sizeof(record.campaign),
                            campaign_name);
-  clocks_monitor_copy_text(record.campaign_state,
+  clocks_fragment_copy_text(record.campaign_state,
                            sizeof(record.campaign_state),
                            clocks_campaign_state_name(campaign_state));
   record.public_count = public_count;
   record.gnss_ns = public_gnss_ns;
-  clocks_monitor_copy_text(record.disposition,
+  clocks_fragment_copy_text(record.disposition,
                            sizeof(record.disposition),
                            candidate_science_excluded
                                ? "SCIENCE_EXCLUDE"
                                : "ACCEPT");
-  clocks_monitor_copy_text(record.servo_mode,
+  clocks_fragment_copy_text(record.servo_mode,
                            sizeof(record.servo_mode),
                            servo_mode_str(calibrate_ocxo_mode));
   record.timeline_valid = recover_timeline_ready;
@@ -8796,7 +8796,7 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   if (candidate_science_excluded) {
     record.rejection.present = true;
     record.rejection.reason_code = (uint32_t)candidate_objection.reason;
-    clocks_monitor_copy_text(
+    clocks_fragment_copy_text(
         record.rejection.reason_name,
         sizeof(record.rejection.reason_name),
         clocks_row_objection_reason_name(candidate_objection.reason));
@@ -8804,7 +8804,7 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
         record.rejection.reason,
         sizeof(record.rejection.reason),
         candidate_objection);
-    clocks_monitor_copy_text(
+    clocks_fragment_copy_text(
         record.rejection.source,
         sizeof(record.rejection.source),
         clocks_row_objection_source_name(candidate_objection.source));
@@ -8859,7 +8859,7 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
     record.recovery.degraded_active = g_recover_reattach_degraded_active;
     record.recovery.degraded_science_hold = recover_degraded_science_hold;
     record.recovery.reattach_stalled = g_recover_reattach_stalled;
-    clocks_monitor_copy_text(
+    clocks_fragment_copy_text(
         record.recovery.reattach_reason,
         sizeof(record.recovery.reattach_reason),
         g_recover_reattach_last_reason);
@@ -8870,7 +8870,7 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
       (uint32_t)g_dwt_cycles_between_pps_vclock;
   record.dwt_at_pps_vclock = (uint32_t)g_dwt_at_pps_vclock;
   record.counter32_at_pps_vclock = (uint32_t)g_counter32_at_pps_vclock;
-  clocks_monitor_raw_cycles_snapshot(
+  clocks_fragment_raw_cycles_snapshot(
       record.raw_cycles,
       g_beta_pps_cycle_prediction,
       g_beta_vclock_cycle_prediction,
@@ -8883,7 +8883,7 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
 
   record.ocxo1_ns = public_ocxo1_ns;
   record.ocxo1_clockface_valid = ocxo1_clockface_valid;
-  clocks_monitor_clock_candidates_snapshot_from_row(
+  clocks_fragment_clock_candidates_snapshot_from_row(
       record.ocxo1_clock_candidates,
       g_delta_clock_candidate_ocxo1,
       public_count,
@@ -8891,11 +8891,11 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
       ocxo1_clockface_valid,
       ocxo1_counterledger,
       ocxo1_science);
-  clocks_monitor_science_snapshot_from_row(
+  clocks_fragment_science_snapshot_from_row(
       record.ocxo1_science, ocxo1_science);
   record.ocxo2_ns = public_ocxo2_ns;
   record.ocxo2_clockface_valid = ocxo2_clockface_valid;
-  clocks_monitor_clock_candidates_snapshot_from_row(
+  clocks_fragment_clock_candidates_snapshot_from_row(
       record.ocxo2_clock_candidates,
       g_delta_clock_candidate_ocxo2,
       public_count,
@@ -8903,7 +8903,7 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
       ocxo2_clockface_valid,
       ocxo2_counterledger,
       ocxo2_science);
-  clocks_monitor_science_snapshot_from_row(
+  clocks_fragment_science_snapshot_from_row(
       record.ocxo2_science, ocxo2_science);
 
   if (!instrument_stats_ready) {
@@ -8913,9 +8913,9 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
     instrument_stats_ready =
         instrument_stats_snapshot_ok && g_beta_instrument_stats.valid;
   }
-  clocks_monitor_stats_snapshot_from_instrument(
+  clocks_fragment_stats_snapshot_from_instrument(
       record.stats, g_beta_instrument_stats);
-  clocks_monitor_stats_apply_campaign_ppb(
+  clocks_fragment_stats_apply_campaign_ppb(
       record.stats,
       public_count,
       public_gnss_ns,
@@ -8926,23 +8926,23 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   // DAC/servo state is scientific context regardless of whether a servo is
   // active. Campaigns observe it; they never own it.
   record.dac_present = true;
-  clocks_monitor_dac_snapshot(record.dac);
+  clocks_fragment_dac_snapshot(record.dac);
 
   clocks_stack_witness_note_hot(CLOCKS_STACK_CONTEXT_BETA_PPS_PUBLISH);
-  g_monitor_campaign_record_sequence = completed_pps_sequence;
-  g_monitor_campaign_record_pending = true;
-  g_monitor_campaign_record_stage_count++;
+  g_clocks_fragment_campaign_record_sequence = completed_pps_sequence;
+  g_clocks_fragment_campaign_record_pending = true;
+  g_clocks_fragment_campaign_record_stage_count++;
   campaign_record_stage(CAMPAIGN_RECORD_STAGE_HANDOFF_READY);
 
   // The interrupt-owned tick normally already has this sequence pending. This
   // call coalesces the completed record into that publication, or schedules a
   // same-sequence copy if the observation-only fragment already escaped.
-  system_monitor_campaign_row_ready(completed_pps_sequence);
+  system_clocks_fragment_campaign_row_ready(completed_pps_sequence);
 
   // A second notification 100 ms later is idempotent when SYSTEM consumed the
   // row normally. If SYSTEM's first ALAP arm was orphaned, the repeated signal
   // lets SYSTEM replace that stale arm before the next campaign candidate exists.
-  monitor_campaign_record_ready_retry_arm();
+  clocks_fragment_campaign_record_ready_retry_arm();
 
   clocks_beta_feature_set_cached("CAMPAIGN_RECORD_HANDOFF",
                                  g_clocks_feature_campaign_record,
@@ -9229,7 +9229,7 @@ static FLASHMEM Payload cmd_flash_cut(const Payload& args) {
 
 
 static FLASHMEM Payload cmd_start(const Payload& args) {
-  if (g_monitor_restore_requested) {
+  if (g_clocks_restore_requested) {
     Payload err;
     err.add("error", "MONITOR restore is pending");
     err.add("status", "start_rejected_monitor_restore_pending");
@@ -9308,8 +9308,8 @@ static FLASHMEM Payload cmd_start(const Payload& args) {
 
 
 static FLASHMEM Payload cmd_stop(const Payload&) {
-  g_monitor_restore_requested = false;
-  g_monitor_restore_state = clocks_recovery_restore_state_t{};
+  g_clocks_restore_requested = false;
+  g_clocks_restore_state = clocks_recovery_restore_state_t{};
   const bool had_live_smartzero = interrupt_smartzero_running();
   const bool had_pending_start = request_start;
   const bool had_pending_zero = request_zero;
@@ -9364,8 +9364,8 @@ static FLASHMEM Payload cmd_stop(const Payload&) {
 
 
 static FLASHMEM Payload cmd_zero(const Payload&) {
-  g_monitor_restore_requested = false;
-  g_monitor_restore_state = clocks_recovery_restore_state_t{};
+  g_clocks_restore_requested = false;
+  g_clocks_restore_state = clocks_recovery_restore_state_t{};
   if (clocks_campaign_recovery_lifecycle_active() || request_recover) {
     recover_lifecycle_abort("zero_command_abort_recover");
   }
@@ -9409,7 +9409,7 @@ static FLASHMEM Payload cmd_zero(const Payload&) {
 static FLASHMEM Payload cmd_restore_monitor(const Payload& args) {
   if (campaign_state != clocks_campaign_state_t::STOPPED ||
       request_start || request_stop || request_recover || request_zero ||
-      request_flash_cut || g_monitor_restore_requested ||
+      request_flash_cut || g_clocks_restore_requested ||
       clocks_campaign_recovery_lifecycle_active()) {
     Payload err;
     err.add("error", "instrument lifecycle busy");
@@ -9418,10 +9418,10 @@ static FLASHMEM Payload cmd_restore_monitor(const Payload& args) {
     return err;
   }
 
-  g_monitor_restore_state = clocks_recovery_restore_state_t{};
+  g_clocks_restore_state = clocks_recovery_restore_state_t{};
   if (!clocks_recovery_state_from_args(
-          args, g_monitor_restore_state, true)) {
-    g_monitor_restore_failure_count++;
+          args, g_clocks_restore_state, true)) {
+    g_clocks_restore_failure_count++;
     Payload err;
     err.add("error", "invalid structured recovery state");
     err.add("status", "monitor_restore_rejected_state");
@@ -9429,9 +9429,9 @@ static FLASHMEM Payload cmd_restore_monitor(const Payload& args) {
     return err;
   }
 
-  if (!clocks_recovery_install_dac_control(g_monitor_restore_state)) {
-    g_monitor_restore_state = clocks_recovery_restore_state_t{};
-    g_monitor_restore_failure_count++;
+  if (!clocks_recovery_install_dac_control(g_clocks_restore_state)) {
+    g_clocks_restore_state = clocks_recovery_restore_state_t{};
+    g_clocks_restore_failure_count++;
     Payload err;
     err.add("error", "failed to restore DAC/control state");
     err.add("status", "monitor_restore_rejected_dac");
@@ -9444,8 +9444,8 @@ static FLASHMEM Payload cmd_restore_monitor(const Payload& args) {
       !interrupt_smartzero_complete() &&
       !clocks_alpha_epoch_install_in_progress()) {
     if (!clocks_alpha_begin_smartzero_epoch("monitor_restore")) {
-      g_monitor_restore_state = clocks_recovery_restore_state_t{};
-      g_monitor_restore_failure_count++;
+      g_clocks_restore_state = clocks_recovery_restore_state_t{};
+      g_clocks_restore_failure_count++;
       clocks_apply_servo_mode_now(servo_mode_t::OFF);
       Payload err;
       err.add("error", "failed to start SmartZero for monitor restore");
@@ -9454,14 +9454,14 @@ static FLASHMEM Payload cmd_restore_monitor(const Payload& args) {
     }
   }
 
-  g_monitor_restore_requested = true;
-  g_monitor_restore_request_count++;
+  g_clocks_restore_requested = true;
+  g_clocks_restore_request_count++;
 
   Payload p;
   p.add("status", "monitor_restore_requested");
   p.add("boundary", "next_completed_pps_after_epoch_ready");
   p.add("restore_schema_version", CLOCKS_STRUCTURED_RESTORE_VERSION);
-  p.add("request_count", g_monitor_restore_request_count);
+  p.add("request_count", g_clocks_restore_request_count);
   p.add("epoch_ready", clocks_alpha_installed_smartzero_backing_epoch());
   p.add("smartzero_running", interrupt_smartzero_running());
   p.add("servo_mode", servo_mode_str(calibrate_ocxo_mode));
@@ -9477,7 +9477,7 @@ static FLASHMEM Payload cmd_restore_monitor(const Payload& args) {
 static FLASHMEM Payload cmd_recover(const Payload& args) {
   clocks_payload_numeric_integrity_reset();
 
-  if (g_monitor_restore_requested) {
+  if (g_clocks_restore_requested) {
     Payload err;
     err.add("error", "MONITOR restore is pending");
     err.add("status", "recover_rejected_monitor_restore_pending");
@@ -9936,25 +9936,25 @@ static FLASHMEM Payload cmd_report_recovery(const Payload&) {
   p.add("campaign_record_last_stage", g_campaign_record_last_stage);
   p.add("campaign_record_last_stage_name",
         campaign_record_stage_name(g_campaign_record_last_stage));
-  p.add("campaign_record_pending", g_monitor_campaign_record_pending);
+  p.add("campaign_record_pending", g_clocks_fragment_campaign_record_pending);
   p.add("campaign_record_pending_sequence",
-        g_monitor_campaign_record_sequence);
+        g_clocks_fragment_campaign_record_sequence);
   p.add("campaign_record_stage_count",
-        g_monitor_campaign_record_stage_count);
+        g_clocks_fragment_campaign_record_stage_count);
   p.add("campaign_record_take_count",
-        g_monitor_campaign_record_take_count);
+        g_clocks_fragment_campaign_record_take_count);
   p.add("campaign_record_backlog_count",
-        g_monitor_campaign_record_backlog_count);
+        g_clocks_fragment_campaign_record_backlog_count);
   p.add("campaign_record_ready_retry_armed",
-        g_monitor_campaign_record_ready_retry_handle != TIMEPOP_INVALID_HANDLE);
+        g_clocks_fragment_campaign_record_ready_retry_handle != TIMEPOP_INVALID_HANDLE);
   p.add("campaign_record_ready_retry_arm_count",
-        g_monitor_campaign_record_ready_retry_arm_count);
+        g_clocks_fragment_campaign_record_ready_retry_arm_count);
   p.add("campaign_record_ready_retry_arm_failure_count",
-        g_monitor_campaign_record_ready_retry_arm_failure_count);
+        g_clocks_fragment_campaign_record_ready_retry_arm_failure_count);
   p.add("campaign_record_ready_retry_fire_count",
-        g_monitor_campaign_record_ready_retry_fire_count);
+        g_clocks_fragment_campaign_record_ready_retry_fire_count);
   p.add("campaign_record_ready_retry_cancel_count",
-        g_monitor_campaign_record_ready_retry_cancel_count);
+        g_clocks_fragment_campaign_record_ready_retry_cancel_count);
 
   p.add("recover_reattach_active", (bool)g_recover_reattach_active);
   p.add("recover_reattach_degraded_active",

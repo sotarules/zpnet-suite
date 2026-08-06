@@ -317,7 +317,7 @@ bool clocks_alpha_tau_snapshot(time_clock_id_t clock,
 // immutable domain facts only: no Payload objects, field names, or nested
 // serialized fragments cross the subsystem boundary.
 //
-// clocks_monitor_snapshot_take() returns whether the typed handoff package was
+// clocks_fragment_snapshot_take() returns whether the typed handoff package was
 // constructed.  live.snapshot_ok separately reports whether Alpha supplied a
 // coherent live instrument snapshot; SYSTEM may therefore publish explicit
 // unavailability instead of suppressing the heartbeat.  If Beta has completed
@@ -325,12 +325,12 @@ bool clocks_alpha_tau_snapshot(time_clock_id_t clock,
 // into campaign and atomically consumed. A later SYSTEM publication therefore
 // cannot accidentally combine campaign facts from different completed seconds.
 
-static constexpr size_t CLOCKS_MONITOR_CAMPAIGN_NAME_MAX = 64U;
-static constexpr size_t CLOCKS_MONITOR_STATE_NAME_MAX = 40U;
-static constexpr size_t CLOCKS_MONITOR_REASON_MAX = 160U;
-static constexpr size_t CLOCKS_MONITOR_DELAY_NAME_MAX = 40U;
+static constexpr size_t CLOCKS_FRAGMENT_CAMPAIGN_NAME_MAX = 64U;
+static constexpr size_t CLOCKS_FRAGMENT_STATE_NAME_MAX = 40U;
+static constexpr size_t CLOCKS_FRAGMENT_REASON_MAX = 160U;
+static constexpr size_t CLOCKS_FRAGMENT_DELAY_NAME_MAX = 40U;
 
-struct clocks_monitor_welford_snapshot_t {
+struct clocks_fragment_welford_snapshot_t {
   uint64_t n = 0;
   double mean = 0.0;
 
@@ -348,7 +348,7 @@ struct clocks_monitor_welford_snapshot_t {
 // Pi can restore the instrument after a non-campaign reboot without reducing a
 // mature slope estimator to its displayed tau/ppb result.  Seqlock state and
 // other transient writer custody are intentionally excluded.
-struct clocks_monitor_tau_recovery_snapshot_t {
+struct clocks_fragment_tau_recovery_snapshot_t {
   bool valid = false;
   uint32_t reset_count = 0;
   uint32_t sample_count = 0;
@@ -377,7 +377,7 @@ struct clocks_monitor_tau_recovery_snapshot_t {
 
 // One explicitly named PPB population. A zero sample count means that the
 // population is not yet available; numeric zero remains a legitimate PPB value.
-struct clocks_monitor_ppb_value_snapshot_t {
+struct clocks_fragment_ppb_value_snapshot_t {
   uint64_t sample_count = 0;
   double ppb = 0.0;
 };
@@ -386,24 +386,24 @@ struct clocks_monitor_ppb_value_snapshot_t {
 // the authoritative boot/statistics-reset population. CAMP is populated only
 // while a campaign is active. The legacy scalar tau/ppb fields below remain
 // aliases of TOTAL so baseline and control consumers retain their meaning.
-struct clocks_monitor_ppb_buckets_snapshot_t {
-  clocks_monitor_ppb_value_snapshot_t minute_10{};
-  clocks_monitor_ppb_value_snapshot_t minute_60{};
-  clocks_monitor_ppb_value_snapshot_t hour_8{};
-  clocks_monitor_ppb_value_snapshot_t hour_24{};
-  clocks_monitor_ppb_value_snapshot_t total{};
-  clocks_monitor_ppb_value_snapshot_t campaign{};
+struct clocks_fragment_ppb_buckets_snapshot_t {
+  clocks_fragment_ppb_value_snapshot_t minute_10{};
+  clocks_fragment_ppb_value_snapshot_t minute_60{};
+  clocks_fragment_ppb_value_snapshot_t hour_8{};
+  clocks_fragment_ppb_value_snapshot_t hour_24{};
+  clocks_fragment_ppb_value_snapshot_t total{};
+  clocks_fragment_ppb_value_snapshot_t campaign{};
 };
 
-struct clocks_monitor_stats_clock_snapshot_t {
-  clocks_monitor_welford_snapshot_t welford{};
+struct clocks_fragment_stats_clock_snapshot_t {
+  clocks_fragment_welford_snapshot_t welford{};
   bool frequency_present = false;
   double tau = 1.0;
   double ppb = 0.0;
-  clocks_monitor_ppb_buckets_snapshot_t ppb_buckets{};
+  clocks_fragment_ppb_buckets_snapshot_t ppb_buckets{};
 };
 
-struct clocks_monitor_stats_snapshot_t {
+struct clocks_fragment_stats_snapshot_t {
   bool snapshot_ok = false;
   bool valid = false;
   uint32_t reset_count = 0;
@@ -411,18 +411,18 @@ struct clocks_monitor_stats_snapshot_t {
   uint32_t last_pps_sequence = 0;
   bool completed_row_coherent = false;
 
-  clocks_monitor_stats_clock_snapshot_t gnss{};
-  clocks_monitor_stats_clock_snapshot_t dwt{};
-  clocks_monitor_stats_clock_snapshot_t vclock{};
-  clocks_monitor_stats_clock_snapshot_t ocxo1{};
-  clocks_monitor_stats_clock_snapshot_t ocxo2{};
-  clocks_monitor_stats_clock_snapshot_t pps_witness{};
+  clocks_fragment_stats_clock_snapshot_t gnss{};
+  clocks_fragment_stats_clock_snapshot_t dwt{};
+  clocks_fragment_stats_clock_snapshot_t vclock{};
+  clocks_fragment_stats_clock_snapshot_t ocxo1{};
+  clocks_fragment_stats_clock_snapshot_t ocxo2{};
+  clocks_fragment_stats_clock_snapshot_t pps_witness{};
 
   // Raw always-on OCXO frequency estimators.  These are persistence state, not
   // a second scientific authority; the displayed frequency fields above remain
   // the canonical read surface.
-  clocks_monitor_tau_recovery_snapshot_t ocxo1_tau_state{};
-  clocks_monitor_tau_recovery_snapshot_t ocxo2_tau_state{};
+  clocks_fragment_tau_recovery_snapshot_t ocxo1_tau_state{};
+  clocks_fragment_tau_recovery_snapshot_t ocxo2_tau_state{};
 
   uint64_t maturity_gnss_samples = 0;
   uint64_t maturity_dwt_samples = 0;
@@ -441,11 +441,11 @@ struct clocks_monitor_stats_snapshot_t {
   uint32_t ocxo1_reject_count = 0;
   uint32_t ocxo2_reject_count = 0;
 
-  clocks_monitor_welford_snapshot_t ocxo1_dac{};
-  clocks_monitor_welford_snapshot_t ocxo2_dac{};
+  clocks_fragment_welford_snapshot_t ocxo1_dac{};
+  clocks_fragment_welford_snapshot_t ocxo2_dac{};
 };
 
-struct clocks_monitor_raw_cycles_lane_t {
+struct clocks_fragment_raw_cycles_lane_t {
   bool snapshot_ok = false;
   bool forensics_snapshot_ok = false;
   bool valid = false;
@@ -454,23 +454,23 @@ struct clocks_monitor_raw_cycles_lane_t {
   uint32_t previous_observed_cycles = 0;
   int32_t residual_cycles = 0;
 
-  char delay_status[CLOCKS_MONITOR_DELAY_NAME_MAX] = {0};
+  char delay_status[CLOCKS_FRAGMENT_DELAY_NAME_MAX] = {0};
   bool delay_detail_present = false;
-  char delay_by[CLOCKS_MONITOR_DELAY_NAME_MAX] = {0};
+  char delay_by[CLOCKS_FRAGMENT_DELAY_NAME_MAX] = {0};
   bool residual_delay_valid = false;
   int32_t residual_delay_cycles = 0;
-  char residual_delay_by[CLOCKS_MONITOR_DELAY_NAME_MAX] = {0};
+  char residual_delay_by[CLOCKS_FRAGMENT_DELAY_NAME_MAX] = {0};
   bool delay_explains_residual = false;
 };
 
-struct clocks_monitor_raw_cycles_snapshot_t {
-  clocks_monitor_raw_cycles_lane_t pps{};
-  clocks_monitor_raw_cycles_lane_t vclock{};
-  clocks_monitor_raw_cycles_lane_t ocxo1{};
-  clocks_monitor_raw_cycles_lane_t ocxo2{};
+struct clocks_fragment_raw_cycles_snapshot_t {
+  clocks_fragment_raw_cycles_lane_t pps{};
+  clocks_fragment_raw_cycles_lane_t vclock{};
+  clocks_fragment_raw_cycles_lane_t ocxo1{};
+  clocks_fragment_raw_cycles_lane_t ocxo2{};
 };
 
-struct clocks_monitor_dither_lane_t {
+struct clocks_fragment_dither_lane_t {
   double value = 0.0;
   uint16_t hw_code = 0;
   bool readback_valid = false;
@@ -500,22 +500,22 @@ struct clocks_monitor_dither_lane_t {
   uint32_t servo_predictor_updates = 0;
 };
 
-struct clocks_monitor_dac_snapshot_t {
-  char servo_mode[CLOCKS_MONITOR_STATE_NAME_MAX] = {0};
+struct clocks_fragment_dac_snapshot_t {
+  char servo_mode[CLOCKS_FRAGMENT_STATE_NAME_MAX] = {0};
   bool servo_active = false;
-  char realization_mode[CLOCKS_MONITOR_STATE_NAME_MAX] = {0};
+  char realization_mode[CLOCKS_FRAGMENT_STATE_NAME_MAX] = {0};
   bool dither_operator_enabled = false;
   bool servo_request_pending = false;
   bool actuator_service_pending = false;
-  clocks_monitor_dither_lane_t ocxo1{};
-  clocks_monitor_dither_lane_t ocxo2{};
+  clocks_fragment_dither_lane_t ocxo1{};
+  clocks_fragment_dither_lane_t ocxo2{};
 };
 
 // Two independent OCXO clock constructions carried in every campaign row.
 // CounterLedger/PhaseLedger remains the initial published authority; Delta Cycles
 // advances a separate campaign clock from the same-row differential residual.
 // Neither candidate repairs or overwrites the other.
-enum class clocks_monitor_clock_candidate_status_t : uint8_t {
+enum class clocks_fragment_clock_candidate_status_t : uint8_t {
   UNAVAILABLE        = 0,
   SEEDED             = 1,
   ADVANCED           = 2,
@@ -524,11 +524,11 @@ enum class clocks_monitor_clock_candidate_status_t : uint8_t {
   ARITHMETIC_FAILURE = 5,
 };
 
-struct clocks_monitor_clock_candidate_t {
+struct clocks_fragment_clock_candidate_t {
   bool available = false;
   bool continuity_valid = false;
-  clocks_monitor_clock_candidate_status_t status =
-      clocks_monitor_clock_candidate_status_t::UNAVAILABLE;
+  clocks_fragment_clock_candidate_status_t status =
+      clocks_fragment_clock_candidate_status_t::UNAVAILABLE;
   uint32_t start_public_count = 0;
   uint32_t last_public_count = 0;
   uint32_t interval_count = 0;
@@ -539,17 +539,17 @@ struct clocks_monitor_clock_candidate_t {
   double residual_ns_exact = 0.0;
 };
 
-struct clocks_monitor_clock_candidates_snapshot_t {
-  char published_source[CLOCKS_MONITOR_STATE_NAME_MAX] = {0};
-  clocks_monitor_clock_candidate_t phaseledger{};
-  clocks_monitor_clock_candidate_t delta_cycles{};
+struct clocks_fragment_clock_candidates_snapshot_t {
+  char published_source[CLOCKS_FRAGMENT_STATE_NAME_MAX] = {0};
+  clocks_fragment_clock_candidate_t phaseledger{};
+  clocks_fragment_clock_candidate_t delta_cycles{};
   bool comparable = false;
   int64_t delta_cycles_minus_phaseledger_ns = 0;
   bool residuals_comparable = false;
   double delta_cycles_minus_phaseledger_residual_ns_exact = 0.0;
 };
 
-struct clocks_monitor_science_snapshot_t {
+struct clocks_fragment_science_snapshot_t {
   bool valid = false;
   bool science_worthy = false;
   bool antecedents_complete = false;
@@ -563,12 +563,12 @@ struct clocks_monitor_science_snapshot_t {
   int64_t delta_raw_fast_residual_cycles = 0;
 };
 
-struct clocks_monitor_rejection_snapshot_t {
+struct clocks_fragment_rejection_snapshot_t {
   bool present = false;
   uint32_t reason_code = 0;
-  char reason_name[CLOCKS_MONITOR_STATE_NAME_MAX] = {0};
-  char reason[CLOCKS_MONITOR_REASON_MAX] = {0};
-  char source[CLOCKS_MONITOR_STATE_NAME_MAX] = {0};
+  char reason_name[CLOCKS_FRAGMENT_STATE_NAME_MAX] = {0};
+  char reason[CLOCKS_FRAGMENT_REASON_MAX] = {0};
+  char source[CLOCKS_FRAGMENT_STATE_NAME_MAX] = {0};
   uint32_t lane = 0;
   uint32_t detail0 = 0;
   uint32_t detail1 = 0;
@@ -578,7 +578,7 @@ struct clocks_monitor_rejection_snapshot_t {
   uint32_t objection_count = 0;
 };
 
-struct clocks_monitor_recovery_snapshot_t {
+struct clocks_fragment_recovery_snapshot_t {
   bool present = false;
   uint32_t generation = 0;
   bool transition_active = false;
@@ -597,13 +597,13 @@ struct clocks_monitor_recovery_snapshot_t {
   bool degraded_active = false;
   bool degraded_science_hold = false;
   bool reattach_stalled = false;
-  char reattach_reason[CLOCKS_MONITOR_REASON_MAX] = {0};
+  char reattach_reason[CLOCKS_FRAGMENT_REASON_MAX] = {0};
 };
 
 // Human-readable sufficient state for cold instrument resurrection.  Every
 // floating quantity is published through Payload fixed-decimal JSON numbers;
 // no opaque binary representation exists at any layer.
-struct clocks_monitor_restore_state_t {
+struct clocks_fragment_restore_state_t {
   bool present = false;
   uint32_t schema_version = 2;
 
@@ -612,19 +612,19 @@ struct clocks_monitor_restore_state_t {
   uint64_t instrument_ocxo1_ns = 0;
   uint64_t instrument_ocxo2_ns = 0;
 
-  clocks_monitor_stats_snapshot_t stats{};
-  clocks_monitor_dac_snapshot_t dac{};
+  clocks_fragment_stats_snapshot_t stats{};
+  clocks_fragment_dac_snapshot_t dac{};
 };
 
-struct clocks_monitor_campaign_snapshot_t {
+struct clocks_fragment_campaign_snapshot_t {
   bool present = false;
   uint32_t completed_second_sequence = 0;
-  char campaign[CLOCKS_MONITOR_CAMPAIGN_NAME_MAX] = {0};
-  char campaign_state[CLOCKS_MONITOR_STATE_NAME_MAX] = {0};
+  char campaign[CLOCKS_FRAGMENT_CAMPAIGN_NAME_MAX] = {0};
+  char campaign_state[CLOCKS_FRAGMENT_STATE_NAME_MAX] = {0};
   uint32_t public_count = 0;
   uint64_t gnss_ns = 0;
-  char disposition[CLOCKS_MONITOR_STATE_NAME_MAX] = {0};
-  char servo_mode[CLOCKS_MONITOR_STATE_NAME_MAX] = {0};
+  char disposition[CLOCKS_FRAGMENT_STATE_NAME_MAX] = {0};
+  char servo_mode[CLOCKS_FRAGMENT_STATE_NAME_MAX] = {0};
   bool timeline_valid = false;
   bool ocxo_clockface_valid = false;
   bool ocxo_science_valid = false;
@@ -633,45 +633,45 @@ struct clocks_monitor_campaign_snapshot_t {
   bool persist = true;
   bool science_excluded = false;
 
-  clocks_monitor_rejection_snapshot_t rejection{};
-  clocks_monitor_recovery_snapshot_t recovery{};
+  clocks_fragment_rejection_snapshot_t rejection{};
+  clocks_fragment_recovery_snapshot_t recovery{};
 
   uint64_t dwt_cycle_count_total = 0;
   uint32_t dwt_cycles_between_pps_vclock = 0;
   uint32_t dwt_at_pps_vclock = 0;
   uint32_t counter32_at_pps_vclock = 0;
-  clocks_monitor_raw_cycles_snapshot_t raw_cycles{};
+  clocks_fragment_raw_cycles_snapshot_t raw_cycles{};
 
   uint64_t ocxo1_ns = 0;
   bool ocxo1_clockface_valid = false;
-  clocks_monitor_clock_candidates_snapshot_t ocxo1_clock_candidates{};
-  clocks_monitor_science_snapshot_t ocxo1_science{};
+  clocks_fragment_clock_candidates_snapshot_t ocxo1_clock_candidates{};
+  clocks_fragment_science_snapshot_t ocxo1_science{};
   uint64_t ocxo2_ns = 0;
   bool ocxo2_clockface_valid = false;
-  clocks_monitor_clock_candidates_snapshot_t ocxo2_clock_candidates{};
-  clocks_monitor_science_snapshot_t ocxo2_science{};
+  clocks_fragment_clock_candidates_snapshot_t ocxo2_clock_candidates{};
+  clocks_fragment_science_snapshot_t ocxo2_science{};
 
-  clocks_monitor_stats_snapshot_t stats{};
+  clocks_fragment_stats_snapshot_t stats{};
   bool dac_present = false;
-  clocks_monitor_dac_snapshot_t dac{};
+  clocks_fragment_dac_snapshot_t dac{};
 };
 
-struct clocks_monitor_live_snapshot_t {
+struct clocks_fragment_live_snapshot_t {
   bool snapshot_ok = false;
   bool valid = false;
   bool completed_row_coherent = false;
   uint32_t completed_pps_sequence = 0;
   uint32_t instrument_age_seconds = 0;
 
-  char campaign_state[CLOCKS_MONITOR_STATE_NAME_MAX] = {0};
+  char campaign_state[CLOCKS_FRAGMENT_STATE_NAME_MAX] = {0};
   bool recording = false;
   bool campaign_present = false;
-  char campaign[CLOCKS_MONITOR_CAMPAIGN_NAME_MAX] = {0};
-  char last_campaign[CLOCKS_MONITOR_CAMPAIGN_NAME_MAX] = {0};
+  char campaign[CLOCKS_FRAGMENT_CAMPAIGN_NAME_MAX] = {0};
+  char last_campaign[CLOCKS_FRAGMENT_CAMPAIGN_NAME_MAX] = {0};
   uint64_t campaign_seconds = 0;
   bool campaign_presentation_ready = false;
-  char presentation_mode[CLOCKS_MONITOR_STATE_NAME_MAX] = {0};
-  char presentation_basis[CLOCKS_MONITOR_STATE_NAME_MAX] = {0};
+  char presentation_mode[CLOCKS_FRAGMENT_STATE_NAME_MAX] = {0};
+  char presentation_basis[CLOCKS_FRAGMENT_STATE_NAME_MAX] = {0};
   bool presentation_clockfaces_zeroed = false;
 
   uint32_t presentation_count = 0;
@@ -696,16 +696,16 @@ struct clocks_monitor_live_snapshot_t {
   uint32_t ocxo1_interval_cycles = 0;
   uint32_t ocxo2_interval_cycles = 0;
 
-  clocks_monitor_raw_cycles_snapshot_t raw_cycles{};
-  clocks_monitor_stats_snapshot_t stats{};
-  clocks_monitor_dac_snapshot_t dac{};
-  clocks_monitor_restore_state_t restore_state{};
+  clocks_fragment_raw_cycles_snapshot_t raw_cycles{};
+  clocks_fragment_stats_snapshot_t stats{};
+  clocks_fragment_dac_snapshot_t dac{};
+  clocks_fragment_restore_state_t restore_state{};
 };
 
-struct clocks_monitor_snapshot_t {
-  clocks_monitor_live_snapshot_t live{};
-  clocks_monitor_campaign_snapshot_t campaign{};
+struct clocks_fragment_snapshot_t {
+  clocks_fragment_live_snapshot_t live{};
+  clocks_fragment_campaign_snapshot_t campaign{};
 };
 
-bool clocks_monitor_snapshot_take(uint32_t completed_second_sequence,
-                                  clocks_monitor_snapshot_t* out);
+bool clocks_fragment_snapshot_take(uint32_t completed_second_sequence,
+                                  clocks_fragment_snapshot_t* out);

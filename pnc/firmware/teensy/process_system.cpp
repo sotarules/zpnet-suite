@@ -36,7 +36,7 @@ static constexpr uint64_t FLASH_DELAY_NS = 5000000000ULL;  // 5 seconds
 // retried after a short foreground delay. The delay gives USB/Transport time
 // to retire outstanding wire images without turning an admission failure into
 // a busy ALAP serialization loop.
-static constexpr uint64_t SYSTEM_MONITOR_RETRY_DELAY_NS = 25000000ULL;  // 25 ms
+static constexpr uint64_t SYSTEM_CLOCKS_FRAGMENT_RETRY_DELAY_NS = 25000000ULL;  // 25 ms
 
 // --------------------------------------------------------------
 // Forward declarations (terminal paths)
@@ -148,49 +148,49 @@ static uint32_t g_system_feature_handler_last_ipsr = 0;
 // complete CLOCKS_FRAGMENT, including optional campaign facts. The former CLOCKS
 // campaign-side tick remains as a compatibility entry point but is ignored after
 // the always-on interrupt owner is observed.
-static volatile uint32_t g_system_monitor_pending_sequence = 0U;
-static volatile bool g_system_monitor_pending = false;
-static volatile bool g_system_monitor_service_armed = false;
-static timepop_handle_t g_system_monitor_service_handle =
+static volatile uint32_t g_system_clocks_fragment_pending_sequence = 0U;
+static volatile bool g_system_clocks_fragment_pending = false;
+static volatile bool g_system_clocks_fragment_service_armed = false;
+static timepop_handle_t g_system_clocks_fragment_service_handle =
     TIMEPOP_INVALID_HANDLE;
-static uint32_t g_system_monitor_service_generation = 0U;
-static uint32_t g_system_monitor_service_armed_generation = 0U;
-static uint32_t g_system_monitor_service_forced_rearm_count = 0U;
-static uint32_t g_system_monitor_service_cancel_count = 0U;
-static uint32_t g_system_monitor_service_cancel_failure_count = 0U;
-static uint32_t g_system_monitor_service_stale_callback_count = 0U;
-static bool g_system_monitor_campaign_ready_last_valid = false;
-static uint32_t g_system_monitor_campaign_ready_last_sequence = 0U;
-static uint32_t g_system_monitor_campaign_ready_signal_count = 0U;
-static uint32_t g_system_monitor_campaign_ready_repeat_count = 0U;
-static uint32_t g_system_monitor_publish_count = 0U;
-static uint32_t g_system_monitor_publish_reject_count = 0U;
-static uint32_t g_system_monitor_coalesce_count = 0U;
-static uint32_t g_system_monitor_service_arm_failures = 0U;
-static uint32_t g_system_monitor_campaign_rows_embedded = 0U;
-static uint32_t g_system_monitor_campaign_ready_republish_count = 0U;
-static uint32_t g_system_monitor_campaign_retry_count = 0U;
-static uint32_t g_system_monitor_campaign_row_embed_fail_count = 0U;
-static bool g_system_monitor_retry_snapshot_valid = false;
-static bool g_system_monitor_retry_pi_only = false;
-static uint32_t g_system_monitor_retry_sequence = 0U;
-static uint32_t g_system_monitor_retry_attempt_count = 0U;
-static uint32_t g_system_monitor_retry_tick_hold_count = 0U;
-static uint32_t g_system_monitor_retry_schedule_count = 0U;
-static uint32_t g_system_monitor_retry_success_count = 0U;
-static bool g_system_monitor_interrupt_owner_seen = false;
-static bool g_system_monitor_last_tick_valid = false;
-static uint32_t g_system_monitor_last_tick_sequence = 0U;
+static uint32_t g_system_clocks_fragment_service_generation = 0U;
+static uint32_t g_system_clocks_fragment_service_armed_generation = 0U;
+static uint32_t g_system_clocks_fragment_service_forced_rearm_count = 0U;
+static uint32_t g_system_clocks_fragment_service_cancel_count = 0U;
+static uint32_t g_system_clocks_fragment_service_cancel_failure_count = 0U;
+static uint32_t g_system_clocks_fragment_service_stale_callback_count = 0U;
+static bool g_system_clocks_fragment_campaign_ready_last_valid = false;
+static uint32_t g_system_clocks_fragment_campaign_ready_last_sequence = 0U;
+static uint32_t g_system_clocks_fragment_campaign_ready_signal_count = 0U;
+static uint32_t g_system_clocks_fragment_campaign_ready_repeat_count = 0U;
+static uint32_t g_system_clocks_fragment_publish_count = 0U;
+static uint32_t g_system_clocks_fragment_publish_reject_count = 0U;
+static uint32_t g_system_clocks_fragment_coalesce_count = 0U;
+static uint32_t g_system_clocks_fragment_service_arm_failures = 0U;
+static uint32_t g_system_clocks_fragment_campaign_rows_embedded = 0U;
+static uint32_t g_system_clocks_fragment_campaign_ready_enrichment_retry_count = 0U;
+static uint32_t g_system_clocks_fragment_campaign_retry_count = 0U;
+static uint32_t g_system_clocks_fragment_campaign_row_embed_fail_count = 0U;
+static bool g_system_clocks_fragment_retry_snapshot_valid = false;
+static bool g_system_clocks_fragment_retry_pi_only = false;
+static uint32_t g_system_clocks_fragment_retry_sequence = 0U;
+static uint32_t g_system_clocks_fragment_retry_attempt_count = 0U;
+static uint32_t g_system_clocks_fragment_retry_tick_hold_count = 0U;
+static uint32_t g_system_clocks_fragment_retry_schedule_count = 0U;
+static uint32_t g_system_clocks_fragment_retry_success_count = 0U;
+static bool g_system_clocks_fragment_interrupt_owner_seen = false;
+static bool g_system_clocks_fragment_last_tick_valid = false;
+static uint32_t g_system_clocks_fragment_last_tick_sequence = 0U;
 
-static bool g_system_monitor_cpu_window_initialized = false;
-static uint64_t g_system_monitor_cpu_last_wall_cycles = 0U;
-static uint64_t g_system_monitor_cpu_last_idle_cycles = 0U;
+static bool g_system_clocks_fragment_cpu_window_initialized = false;
+static uint64_t g_system_clocks_fragment_cpu_last_wall_cycles = 0U;
+static uint64_t g_system_clocks_fragment_cpu_last_idle_cycles = 0U;
 
 // The CLOCKS handoff is intentionally large and must never become a foreground
 // stack local. SYSTEM owns this RAM2 snapshot and all serialization derived from it.
-static clocks_monitor_snapshot_t g_system_monitor_clocks_snapshot DMAMEM = {};
+static clocks_fragment_snapshot_t g_system_clocks_fragment_clocks_snapshot DMAMEM = {};
 
-static void system_monitor_schedule_publish(void);
+static void system_clocks_fragment_schedule_publish(void);
 
 // ================================================================
 // Feature status substrate
@@ -253,7 +253,7 @@ static bool system_cstr_equal_ci(const char* a, const char* b) {
   return *a == *b;
 }
 
-// The MONITOR feature tree is the mission-readiness annunciator, not a dump of
+// The CLOCKS feature tree is the mission-readiness annunciator, not a dump of
 // every diagnostic witness. QTIMER_DWT_RULER remains in the internal registry
 // and in INTERRUPT.REPORT_INTEGRITY, but its ISR-displacement-sensitive state
 // must not strobe the operator-facing feature tree.
@@ -3362,7 +3362,7 @@ static FLASHMEM Payload cmd_payload_info(const Payload& /*args*/) {
 // when recording, an optional completed campaign observation. SYSTEM renders both
 // the always-on clocks view and the compatibility campaign_row from that snapshot.
 
-static Payload system_monitor_teensy_payload(void) {
+static Payload system_clocks_fragment_teensy_payload(void) {
   Payload p;
   p.add("health_state", "NOMINAL");
   p.add("cpu_freq_mhz", (uint32_t)(F_CPU_ACTUAL / 1000000UL));
@@ -3380,9 +3380,9 @@ static Payload system_monitor_teensy_payload(void) {
   uint32_t work_pct_milli = 0U;
   uint32_t idle_pct_milli = 0U;
 
-  if (g_system_monitor_cpu_window_initialized) {
-    total = wall_now - g_system_monitor_cpu_last_wall_cycles;
-    idle_cycles = idle_now - g_system_monitor_cpu_last_idle_cycles;
+  if (g_system_clocks_fragment_cpu_window_initialized) {
+    total = wall_now - g_system_clocks_fragment_cpu_last_wall_cycles;
+    idle_cycles = idle_now - g_system_clocks_fragment_cpu_last_idle_cycles;
     if (idle_cycles > total) idle_cycles = total;
     work = total - idle_cycles;
     if (total != 0U) {
@@ -3392,11 +3392,11 @@ static Payload system_monitor_teensy_payload(void) {
           (uint32_t)((idle_cycles * 100000ULL + total / 2ULL) / total);
     }
   } else {
-    g_system_monitor_cpu_window_initialized = true;
+    g_system_clocks_fragment_cpu_window_initialized = true;
   }
 
-  g_system_monitor_cpu_last_wall_cycles = wall_now;
-  g_system_monitor_cpu_last_idle_cycles = idle_now;
+  g_system_clocks_fragment_cpu_last_wall_cycles = wall_now;
+  g_system_clocks_fragment_cpu_last_idle_cycles = idle_now;
   p.add("cpu_usage_pct_milli", work_pct_milli);
   p.add("cpu_work_pct_milli", work_pct_milli);
   p.add("cpu_idle_spin_pct_milli", idle_pct_milli);
@@ -3407,7 +3407,7 @@ static Payload system_monitor_teensy_payload(void) {
   return p;
 }
 
-static Payload system_monitor_process_payload(void) {
+static Payload system_clocks_fragment_process_payload(void) {
   process_rpc_info_t info{};
   process_get_rpc_info(&info);
 
@@ -3446,7 +3446,7 @@ static Payload system_monitor_process_payload(void) {
   return p;
 }
 
-static Payload system_monitor_transport_payload(void) {
+static Payload system_clocks_fragment_transport_payload(void) {
   transport_info_t info{};
   transport_get_info(&info);
 
@@ -3479,7 +3479,7 @@ static Payload system_monitor_transport_payload(void) {
   return p;
 }
 
-static Payload system_monitor_payload_payload(void) {
+static Payload system_clocks_fragment_payload_payload(void) {
   payload_info_t info{};
   payload_get_info(&info);
 
@@ -3526,10 +3526,10 @@ static constexpr uint32_t SYSTEM_MONITOR_INTERVAL_MIN_CYCLES = 900000000UL;
 static constexpr uint32_t SYSTEM_MONITOR_INTERVAL_MAX_CYCLES = 1100000000UL;
 static constexpr uint32_t SYSTEM_MONITOR_INTERVAL_SENTINEL = 0xFFFFFFFFUL;
 
-static void system_monitor_add_welford(
+static void system_clocks_fragment_add_welford(
     Payload& parent,
     const char* key,
-    const clocks_monitor_welford_snapshot_t& sample) {
+    const clocks_fragment_welford_snapshot_t& sample) {
   Payload value;
   value.add("n", sample.n);
   value.add("mean", toFixedDecimal(sample.mean, 12));
@@ -3541,58 +3541,58 @@ static void system_monitor_add_welford(
   parent.add_object(key, value);
 }
 
-enum class system_monitor_ppb_bucket_view_t : uint8_t {
+enum class system_clocks_fragment_ppb_bucket_view_t : uint8_t {
   NONE = 0,
   ALL = 1,
   CAMPAIGN_ONLY = 2,
 };
 
-static void system_monitor_add_ppb_bucket(
+static void system_clocks_fragment_add_ppb_bucket(
     Payload& buckets,
     const char* key,
-    const clocks_monitor_ppb_value_snapshot_t& sample) {
+    const clocks_fragment_ppb_value_snapshot_t& sample) {
   if (sample.sample_count == 0ULL) return;
   buckets.add(key, toFixedDecimal(sample.ppb, 6));
 }
 
-static void system_monitor_add_ppb_buckets(
+static void system_clocks_fragment_add_ppb_buckets(
     Payload& clock,
-    const clocks_monitor_ppb_buckets_snapshot_t& buckets,
-    system_monitor_ppb_bucket_view_t view) {
-  if (view == system_monitor_ppb_bucket_view_t::NONE) return;
+    const clocks_fragment_ppb_buckets_snapshot_t& buckets,
+    system_clocks_fragment_ppb_bucket_view_t view) {
+  if (view == system_clocks_fragment_ppb_bucket_view_t::NONE) return;
 
   Payload values;
-  if (view == system_monitor_ppb_bucket_view_t::ALL) {
-    system_monitor_add_ppb_bucket(values, "10_min", buckets.minute_10);
-    system_monitor_add_ppb_bucket(values, "60_min", buckets.minute_60);
-    system_monitor_add_ppb_bucket(values, "8_hour", buckets.hour_8);
-    system_monitor_add_ppb_bucket(values, "24_hour", buckets.hour_24);
-    system_monitor_add_ppb_bucket(values, "total", buckets.total);
+  if (view == system_clocks_fragment_ppb_bucket_view_t::ALL) {
+    system_clocks_fragment_add_ppb_bucket(values, "10_min", buckets.minute_10);
+    system_clocks_fragment_add_ppb_bucket(values, "60_min", buckets.minute_60);
+    system_clocks_fragment_add_ppb_bucket(values, "8_hour", buckets.hour_8);
+    system_clocks_fragment_add_ppb_bucket(values, "24_hour", buckets.hour_24);
+    system_clocks_fragment_add_ppb_bucket(values, "total", buckets.total);
   }
-  system_monitor_add_ppb_bucket(values, "campaign", buckets.campaign);
+  system_clocks_fragment_add_ppb_bucket(values, "campaign", buckets.campaign);
   clock.add_object("ppb_buckets", values);
 }
 
-static void system_monitor_add_stats_clock(
+static void system_clocks_fragment_add_stats_clock(
     Payload& parent,
     const char* key,
-    const clocks_monitor_stats_clock_snapshot_t& clock,
-    system_monitor_ppb_bucket_view_t bucket_view) {
+    const clocks_fragment_stats_clock_snapshot_t& clock,
+    system_clocks_fragment_ppb_bucket_view_t bucket_view) {
   Payload value;
-  system_monitor_add_welford(value, "welford", clock.welford);
+  system_clocks_fragment_add_welford(value, "welford", clock.welford);
   if (clock.frequency_present) {
     // Compatibility aliases. Both remain the authoritative TOTAL population.
     value.add("tau", toFixedDecimal(clock.tau, 12));
     value.add("ppb", toFixedDecimal(clock.ppb, 3));
   }
-  system_monitor_add_ppb_buckets(value, clock.ppb_buckets, bucket_view);
+  system_clocks_fragment_add_ppb_buckets(value, clock.ppb_buckets, bucket_view);
   parent.add_object(key, value);
 }
 
-static void system_monitor_add_tau_state(
+static void system_clocks_fragment_add_tau_state(
     Payload& parent,
     const char* key,
-    const clocks_monitor_tau_recovery_snapshot_t& state) {
+    const clocks_fragment_tau_recovery_snapshot_t& state) {
   Payload value;
   value.add("valid", state.valid);
   value.add("reset_count", state.reset_count);
@@ -3622,10 +3622,10 @@ static void system_monitor_add_tau_state(
   parent.add_object(key, value);
 }
 
-static void system_monitor_add_stats(
+static void system_clocks_fragment_add_stats(
     Payload& parent,
-    const clocks_monitor_stats_snapshot_t& snapshot,
-    system_monitor_ppb_bucket_view_t bucket_view) {
+    const clocks_fragment_stats_snapshot_t& snapshot,
+    system_clocks_fragment_ppb_bucket_view_t bucket_view) {
   Payload stats;
   stats.add("schema", "CLOCKS_INSTRUMENT_STATS_V2");
   stats.add("always_on", true);
@@ -3638,22 +3638,22 @@ static void system_monitor_add_stats(
   stats.add("last_pps_sequence", snapshot.last_pps_sequence);
   stats.add("completed_row_coherent", snapshot.completed_row_coherent);
 
-  system_monitor_add_stats_clock(
+  system_clocks_fragment_add_stats_clock(
       stats, "gnss", snapshot.gnss, bucket_view);
-  system_monitor_add_stats_clock(
+  system_clocks_fragment_add_stats_clock(
       stats, "dwt", snapshot.dwt, bucket_view);
-  system_monitor_add_stats_clock(
+  system_clocks_fragment_add_stats_clock(
       stats, "vclock", snapshot.vclock, bucket_view);
-  system_monitor_add_stats_clock(
+  system_clocks_fragment_add_stats_clock(
       stats, "ocxo1", snapshot.ocxo1, bucket_view);
-  system_monitor_add_stats_clock(
+  system_clocks_fragment_add_stats_clock(
       stats, "ocxo2", snapshot.ocxo2, bucket_view);
-  system_monitor_add_stats_clock(
+  system_clocks_fragment_add_stats_clock(
       stats, "pps_witness", snapshot.pps_witness,
-      system_monitor_ppb_bucket_view_t::NONE);
-  system_monitor_add_tau_state(
+      system_clocks_fragment_ppb_bucket_view_t::NONE);
+  system_clocks_fragment_add_tau_state(
       stats, "ocxo1_tau_state", snapshot.ocxo1_tau_state);
-  system_monitor_add_tau_state(
+  system_clocks_fragment_add_tau_state(
       stats, "ocxo2_tau_state", snapshot.ocxo2_tau_state);
 
   Payload maturity;
@@ -3680,17 +3680,17 @@ static void system_monitor_add_stats(
   stats.add_object("interval_admission", admission);
 
   Payload dac;
-  system_monitor_add_welford(dac, "ocxo1", snapshot.ocxo1_dac);
-  system_monitor_add_welford(dac, "ocxo2", snapshot.ocxo2_dac);
+  system_clocks_fragment_add_welford(dac, "ocxo1", snapshot.ocxo1_dac);
+  system_clocks_fragment_add_welford(dac, "ocxo2", snapshot.ocxo2_dac);
   stats.add_object("dac", dac);
 
   parent.add_object("stats", stats);
 }
 
-static void system_monitor_add_raw_cycles_lane(
+static void system_clocks_fragment_add_raw_cycles_lane(
     Payload& parent,
     const char* key,
-    const clocks_monitor_raw_cycles_lane_t& sample) {
+    const clocks_fragment_raw_cycles_lane_t& sample) {
   Payload lane;
   lane.add("snapshot_ok", sample.snapshot_ok);
   lane.add("forensics_snapshot_ok", sample.forensics_snapshot_ok);
@@ -3712,20 +3712,20 @@ static void system_monitor_add_raw_cycles_lane(
   parent.add_object(key, lane);
 }
 
-static void system_monitor_add_raw_cycles(
+static void system_clocks_fragment_add_raw_cycles(
     Payload& parent,
-    const clocks_monitor_raw_cycles_snapshot_t& snapshot) {
+    const clocks_fragment_raw_cycles_snapshot_t& snapshot) {
   Payload raw;
-  system_monitor_add_raw_cycles_lane(raw, "pps", snapshot.pps);
-  system_monitor_add_raw_cycles_lane(raw, "vclock", snapshot.vclock);
-  system_monitor_add_raw_cycles_lane(raw, "ocxo1", snapshot.ocxo1);
-  system_monitor_add_raw_cycles_lane(raw, "ocxo2", snapshot.ocxo2);
+  system_clocks_fragment_add_raw_cycles_lane(raw, "pps", snapshot.pps);
+  system_clocks_fragment_add_raw_cycles_lane(raw, "vclock", snapshot.vclock);
+  system_clocks_fragment_add_raw_cycles_lane(raw, "ocxo1", snapshot.ocxo1);
+  system_clocks_fragment_add_raw_cycles_lane(raw, "ocxo2", snapshot.ocxo2);
   parent.add_object("raw_cycles", raw);
 }
 
-static void system_monitor_add_science(
+static void system_clocks_fragment_add_science(
     Payload& parent,
-    const clocks_monitor_science_snapshot_t& science) {
+    const clocks_fragment_science_snapshot_t& science) {
   Payload value;
   value.add("valid", science.valid);
   value.add("science_worthy", science.science_worthy);
@@ -3745,17 +3745,17 @@ static void system_monitor_add_science(
   parent.add_object("science", value);
 }
 
-static bool system_monitor_interval_plausible(uint32_t cycles) {
+static bool system_clocks_fragment_interval_plausible(uint32_t cycles) {
   return cycles >= SYSTEM_MONITOR_INTERVAL_MIN_CYCLES &&
          cycles <= SYSTEM_MONITOR_INTERVAL_MAX_CYCLES &&
          cycles != SYSTEM_MONITOR_INTERVAL_SENTINEL;
 }
 
-static double system_monitor_fast_residual_ns_exact(
+static double system_clocks_fragment_fast_residual_ns_exact(
     uint32_t reference_cycles,
     uint32_t clock_cycles) {
-  if (!system_monitor_interval_plausible(reference_cycles) ||
-      !system_monitor_interval_plausible(clock_cycles)) {
+  if (!system_clocks_fragment_interval_plausible(reference_cycles) ||
+      !system_clocks_fragment_interval_plausible(clock_cycles)) {
     return 0.0;
   }
   return ((double)((int64_t)reference_cycles - (int64_t)clock_cycles) *
@@ -3763,28 +3763,28 @@ static double system_monitor_fast_residual_ns_exact(
          (double)reference_cycles;
 }
 
-static int64_t system_monitor_round_i64(double value) {
+static int64_t system_clocks_fragment_round_i64(double value) {
   return value >= 0.0
       ? (int64_t)(value + 0.5)
       : (int64_t)(value - 0.5);
 }
 
-static void system_monitor_add_live_residual(
+static void system_clocks_fragment_add_live_residual(
     Payload& parent,
     const char* key,
     uint32_t reference_cycles,
     uint32_t clock_cycles) {
   const bool valid =
-      system_monitor_interval_plausible(reference_cycles) &&
-      system_monitor_interval_plausible(clock_cycles);
+      system_clocks_fragment_interval_plausible(reference_cycles) &&
+      system_clocks_fragment_interval_plausible(clock_cycles);
   const int64_t fast_cycles = valid
       ? (int64_t)reference_cycles - (int64_t)clock_cycles
       : 0LL;
   const double fast_ns_exact = valid
-      ? system_monitor_fast_residual_ns_exact(reference_cycles, clock_cycles)
+      ? system_clocks_fragment_fast_residual_ns_exact(reference_cycles, clock_cycles)
       : 0.0;
   const int64_t fast_ns = valid
-      ? system_monitor_round_i64(fast_ns_exact)
+      ? system_clocks_fragment_round_i64(fast_ns_exact)
       : 0LL;
   const int64_t clock_interval_ns =
       (int64_t)SYSTEM_MONITOR_NS_PER_SECOND - fast_ns;
@@ -3811,10 +3811,10 @@ static void system_monitor_add_live_residual(
   parent.add_object(key, residual);
 }
 
-static void system_monitor_add_live_dither_lane(
+static void system_clocks_fragment_add_live_dither_lane(
     Payload& parent,
     const char* key,
-    const clocks_monitor_dither_lane_t& lane_snapshot,
+    const clocks_fragment_dither_lane_t& lane_snapshot,
     bool dither_operator_enabled) {
   Payload lane;
   lane.add("value", toFixedDecimal(lane_snapshot.value, 6));
@@ -3851,9 +3851,9 @@ static void system_monitor_add_live_dither_lane(
   parent.add_object(key, lane);
 }
 
-static void system_monitor_add_live_dac(
+static void system_clocks_fragment_add_live_dac(
     Payload& parent,
-    const clocks_monitor_dac_snapshot_t& snapshot) {
+    const clocks_fragment_dac_snapshot_t& snapshot) {
   Payload dac;
   dac.add("schema", "CLOCKS_LIVE_DAC_V1");
   dac.add("servo_mode", snapshot.servo_mode);
@@ -3864,16 +3864,16 @@ static void system_monitor_add_live_dac(
   dac.add("ocxo2_dac", toFixedDecimal(snapshot.ocxo2.value, 6));
   dac.add("ocxo1_hw_code", (uint32_t)snapshot.ocxo1.hw_code);
   dac.add("ocxo2_hw_code", (uint32_t)snapshot.ocxo2.hw_code);
-  system_monitor_add_live_dither_lane(
+  system_clocks_fragment_add_live_dither_lane(
       dac, "ocxo1", snapshot.ocxo1, snapshot.dither_operator_enabled);
-  system_monitor_add_live_dither_lane(
+  system_clocks_fragment_add_live_dither_lane(
       dac, "ocxo2", snapshot.ocxo2, snapshot.dither_operator_enabled);
   parent.add_object("dac", dac);
 }
 
-static void system_monitor_add_restore_state(
+static void system_clocks_fragment_add_restore_state(
     Payload& parent,
-    const clocks_monitor_restore_state_t& snapshot) {
+    const clocks_fragment_restore_state_t& snapshot) {
   if (!snapshot.present) return;
 
   Payload state;
@@ -3890,15 +3890,15 @@ static void system_monitor_add_restore_state(
 
   // Restore persists TOTAL through the existing scalar/Welford/TAU state.
   // Rolling membership and CAMP are intentionally not durable reboot state.
-  system_monitor_add_stats(
-      state, snapshot.stats, system_monitor_ppb_bucket_view_t::NONE);
-  system_monitor_add_live_dac(state, snapshot.dac);
+  system_clocks_fragment_add_stats(
+      state, snapshot.stats, system_clocks_fragment_ppb_bucket_view_t::NONE);
+  system_clocks_fragment_add_live_dac(state, snapshot.dac);
   parent.add_object("restore_state", state);
 }
 
-static void system_monitor_add_campaign_dac(
+static void system_clocks_fragment_add_campaign_dac(
     Payload& parent,
-    const clocks_monitor_dac_snapshot_t& snapshot) {
+    const clocks_fragment_dac_snapshot_t& snapshot) {
   Payload dac;
   dac.add("schema", "TIMEBASE_DAC_PERSISTENCE_V2");
   dac.add("servo_mode", snapshot.servo_mode);
@@ -3918,12 +3918,12 @@ static void system_monitor_add_campaign_dac(
   parent.add_object("dac", dac);
 }
 
-static void system_monitor_add_live_vclock(
+static void system_clocks_fragment_add_live_vclock(
     Payload& parent,
-    const clocks_monitor_live_snapshot_t& snapshot) {
+    const clocks_fragment_live_snapshot_t& snapshot) {
   Payload lane;
   lane.add("ns", snapshot.presentation_gnss_ns);
-  system_monitor_add_live_residual(
+  system_clocks_fragment_add_live_residual(
       lane,
       "pps_residual",
       snapshot.selected_reference_interval_cycles,
@@ -3931,7 +3931,7 @@ static void system_monitor_add_live_vclock(
   parent.add_object("vclock", lane);
 }
 
-static void system_monitor_add_live_ocxo(
+static void system_clocks_fragment_add_live_ocxo(
     Payload& parent,
     const char* key,
     uint64_t ns,
@@ -3941,13 +3941,13 @@ static void system_monitor_add_live_ocxo(
   Payload lane;
   lane.add("ns", ns);
   lane.add("clockface_valid", clockface_valid);
-  system_monitor_add_live_residual(
+  system_clocks_fragment_add_live_residual(
       lane, "science", reference_cycles, clock_cycles);
   parent.add_object(key, lane);
 }
 
-static Payload system_monitor_clocks_payload(
-    const clocks_monitor_live_snapshot_t& snapshot) {
+static Payload system_clocks_fragment_clocks_payload(
+    const clocks_fragment_live_snapshot_t& snapshot) {
   Payload clocks;
   clocks.add("schema", "CLOCKS_LIVE_TEENSY_V2");
   clocks.add("instrument_always_on", true);
@@ -3991,7 +3991,7 @@ static Payload system_monitor_clocks_payload(
   gnss.add("second_residual_ns", 0LL);
   clocks.add_object("gnss", gnss);
 
-  system_monitor_add_live_vclock(clocks, snapshot);
+  system_clocks_fragment_add_live_vclock(clocks, snapshot);
 
   Payload dwt;
   dwt.add("cycle_count_total", snapshot.presentation_dwt_cycles);
@@ -4000,14 +4000,14 @@ static Payload system_monitor_clocks_payload(
   dwt.add("counter32_at_pps_vclock", snapshot.counter32_at_pps_vclock);
   clocks.add_object("dwt", dwt);
 
-  system_monitor_add_live_ocxo(
+  system_clocks_fragment_add_live_ocxo(
       clocks,
       "ocxo1",
       snapshot.presentation_ocxo1_ns,
       snapshot.valid && snapshot.presentation_ocxo1_ns != 0ULL,
       snapshot.selected_reference_interval_cycles,
       snapshot.ocxo1_interval_cycles);
-  system_monitor_add_live_ocxo(
+  system_clocks_fragment_add_live_ocxo(
       clocks,
       "ocxo2",
       snapshot.presentation_ocxo2_ns,
@@ -4015,43 +4015,43 @@ static Payload system_monitor_clocks_payload(
       snapshot.selected_reference_interval_cycles,
       snapshot.ocxo2_interval_cycles);
 
-  system_monitor_add_raw_cycles(clocks, snapshot.raw_cycles);
-  system_monitor_add_stats(
-      clocks, snapshot.stats, system_monitor_ppb_bucket_view_t::ALL);
-  system_monitor_add_live_dac(clocks, snapshot.dac);
-  system_monitor_add_restore_state(clocks, snapshot.restore_state);
+  system_clocks_fragment_add_raw_cycles(clocks, snapshot.raw_cycles);
+  system_clocks_fragment_add_stats(
+      clocks, snapshot.stats, system_clocks_fragment_ppb_bucket_view_t::ALL);
+  system_clocks_fragment_add_live_dac(clocks, snapshot.dac);
+  system_clocks_fragment_add_restore_state(clocks, snapshot.restore_state);
   return clocks;
 }
 
-static const char* system_monitor_clock_candidate_status_name(
-    clocks_monitor_clock_candidate_status_t status) {
+static const char* system_clocks_fragment_clock_candidate_status_name(
+    clocks_fragment_clock_candidate_status_t status) {
   switch (status) {
-    case clocks_monitor_clock_candidate_status_t::SEEDED:
+    case clocks_fragment_clock_candidate_status_t::SEEDED:
       return "SEEDED";
-    case clocks_monitor_clock_candidate_status_t::ADVANCED:
+    case clocks_fragment_clock_candidate_status_t::ADVANCED:
       return "ADVANCED";
-    case clocks_monitor_clock_candidate_status_t::DELTA_INVALID:
+    case clocks_fragment_clock_candidate_status_t::DELTA_INVALID:
       return "DELTA_INVALID";
-    case clocks_monitor_clock_candidate_status_t::PUBLIC_COUNT_GAP:
+    case clocks_fragment_clock_candidate_status_t::PUBLIC_COUNT_GAP:
       return "PUBLIC_COUNT_GAP";
-    case clocks_monitor_clock_candidate_status_t::ARITHMETIC_FAILURE:
+    case clocks_fragment_clock_candidate_status_t::ARITHMETIC_FAILURE:
       return "ARITHMETIC_FAILURE";
-    case clocks_monitor_clock_candidate_status_t::UNAVAILABLE:
+    case clocks_fragment_clock_candidate_status_t::UNAVAILABLE:
     default:
       return "UNAVAILABLE";
   }
 }
 
-static void system_monitor_add_clock_candidate(
+static void system_clocks_fragment_add_clock_candidate(
     Payload& parent,
     const char* key,
-    const clocks_monitor_clock_candidate_t& candidate) {
+    const clocks_fragment_clock_candidate_t& candidate) {
   Payload out;
   out.add("available", candidate.available);
   out.add("continuity_valid", candidate.continuity_valid);
   out.add("status_id", (uint32_t)candidate.status);
   out.add("status",
-          system_monitor_clock_candidate_status_name(candidate.status));
+          system_clocks_fragment_clock_candidate_status_name(candidate.status));
   out.add("start_public_count", candidate.start_public_count);
   out.add("last_public_count", candidate.last_public_count);
   out.add("interval_count", candidate.interval_count);
@@ -4064,15 +4064,15 @@ static void system_monitor_add_clock_candidate(
   parent.add_object(key, out);
 }
 
-static void system_monitor_add_clock_candidates(
+static void system_clocks_fragment_add_clock_candidates(
     Payload& parent,
-    const clocks_monitor_clock_candidates_snapshot_t& snapshot) {
+    const clocks_fragment_clock_candidates_snapshot_t& snapshot) {
   Payload candidates;
   candidates.add("schema", "OCXO_CLOCK_CANDIDATES_V1");
   candidates.add("published_source", snapshot.published_source);
-  system_monitor_add_clock_candidate(
+  system_clocks_fragment_add_clock_candidate(
       candidates, "phaseledger", snapshot.phaseledger);
-  system_monitor_add_clock_candidate(
+  system_clocks_fragment_add_clock_candidate(
       candidates, "delta_cycles", snapshot.delta_cycles);
   candidates.add("comparable", snapshot.comparable);
   candidates.add("delta_cycles_minus_phaseledger_ns",
@@ -4085,23 +4085,23 @@ static void system_monitor_add_clock_candidates(
   parent.add_object("clock_candidates", candidates);
 }
 
-static void system_monitor_add_campaign_ocxo(
+static void system_clocks_fragment_add_campaign_ocxo(
     Payload& parent,
     const char* key,
     uint64_t ns,
     bool clockface_valid,
-    const clocks_monitor_clock_candidates_snapshot_t& clock_candidates,
-    const clocks_monitor_science_snapshot_t& science) {
+    const clocks_fragment_clock_candidates_snapshot_t& clock_candidates,
+    const clocks_fragment_science_snapshot_t& science) {
   Payload lane;
   lane.add("ns", ns);
   lane.add("clockface_valid", clockface_valid);
-  system_monitor_add_clock_candidates(lane, clock_candidates);
-  system_monitor_add_science(lane, science);
+  system_clocks_fragment_add_clock_candidates(lane, clock_candidates);
+  system_clocks_fragment_add_science(lane, science);
   parent.add_object(key, lane);
 }
 
-static Payload system_monitor_campaign_row_payload(
-    const clocks_monitor_campaign_snapshot_t& snapshot) {
+static Payload system_clocks_fragment_campaign_row_payload(
+    const clocks_fragment_campaign_snapshot_t& snapshot) {
   Payload row;
   row.add("schema", "TIMEBASE_FRAGMENT_V7");
   row.add("campaign", snapshot.campaign);
@@ -4180,15 +4180,15 @@ static Payload system_monitor_campaign_row_payload(
   dwt.add("counter32_at_pps_vclock", snapshot.counter32_at_pps_vclock);
   row.add_object("dwt", dwt);
 
-  system_monitor_add_raw_cycles(row, snapshot.raw_cycles);
-  system_monitor_add_campaign_ocxo(
+  system_clocks_fragment_add_raw_cycles(row, snapshot.raw_cycles);
+  system_clocks_fragment_add_campaign_ocxo(
       row,
       "ocxo1",
       snapshot.ocxo1_ns,
       snapshot.ocxo1_clockface_valid,
       snapshot.ocxo1_clock_candidates,
       snapshot.ocxo1_science);
-  system_monitor_add_campaign_ocxo(
+  system_clocks_fragment_add_campaign_ocxo(
       row,
       "ocxo2",
       snapshot.ocxo2_ns,
@@ -4197,33 +4197,33 @@ static Payload system_monitor_campaign_row_payload(
       snapshot.ocxo2_science);
   // The top-level live clock surface already carries all rolling buckets.
   // A durable campaign row needs only its campaign-scoped PPB decoration.
-  system_monitor_add_stats(
+  system_clocks_fragment_add_stats(
       row, snapshot.stats,
-      system_monitor_ppb_bucket_view_t::CAMPAIGN_ONLY);
+      system_clocks_fragment_ppb_bucket_view_t::CAMPAIGN_ONLY);
   if (snapshot.dac_present) {
-    system_monitor_add_campaign_dac(row, snapshot.dac);
+    system_clocks_fragment_add_campaign_dac(row, snapshot.dac);
   }
   return row;
 }
 
-static void system_monitor_publish_service(timepop_ctx_t*,
+static void system_clocks_fragment_publish_service(timepop_ctx_t*,
                                            timepop_diag_t*,
                                            void* user_data) {
   const uint32_t callback_generation =
       (uint32_t)(uintptr_t)user_data;
-  if (!g_system_monitor_service_armed ||
+  if (!g_system_clocks_fragment_service_armed ||
       callback_generation == 0U ||
-      callback_generation != g_system_monitor_service_armed_generation) {
-    g_system_monitor_service_stale_callback_count++;
+      callback_generation != g_system_clocks_fragment_service_armed_generation) {
+    g_system_clocks_fragment_service_stale_callback_count++;
     return;
   }
 
-  g_system_monitor_service_armed = false;
-  g_system_monitor_service_handle = TIMEPOP_INVALID_HANDLE;
+  g_system_clocks_fragment_service_armed = false;
+  g_system_clocks_fragment_service_handle = TIMEPOP_INVALID_HANDLE;
 
   const bool retrying_snapshot =
-      g_system_monitor_retry_snapshot_valid;
-  if (!retrying_snapshot && !g_system_monitor_pending) return;
+      g_system_clocks_fragment_retry_snapshot_valid;
+  if (!retrying_snapshot && !g_system_clocks_fragment_pending) return;
 
   system_dmamem_ensure_initialized();
 
@@ -4233,20 +4233,20 @@ static void system_monitor_publish_service(timepop_ctx_t*,
     // The prior attempt already captured the exact typed CLOCKS state and may
     // also have consumed Beta's immutable campaign record. Preserve and reuse
     // that snapshot until transport accepts custody.
-    sequence = g_system_monitor_retry_sequence;
+    sequence = g_system_clocks_fragment_retry_sequence;
     clocks_snapshot_ok = true;
   } else {
-    sequence = g_system_monitor_pending_sequence;
-    g_system_monitor_pending = false;
-    memset(&g_system_monitor_clocks_snapshot, 0,
-           sizeof(g_system_monitor_clocks_snapshot));
-    clocks_snapshot_ok = clocks_monitor_snapshot_take(
-        sequence, &g_system_monitor_clocks_snapshot);
+    sequence = g_system_clocks_fragment_pending_sequence;
+    g_system_clocks_fragment_pending = false;
+    memset(&g_system_clocks_fragment_clocks_snapshot, 0,
+           sizeof(g_system_clocks_fragment_clocks_snapshot));
+    clocks_snapshot_ok = clocks_fragment_snapshot_take(
+        sequence, &g_system_clocks_fragment_clocks_snapshot);
   }
 
   const bool campaign_row_available = clocks_snapshot_ok &&
-      g_system_monitor_clocks_snapshot.campaign.present &&
-      g_system_monitor_clocks_snapshot.campaign.completed_second_sequence ==
+      g_system_clocks_fragment_clocks_snapshot.campaign.present &&
+      g_system_clocks_fragment_clocks_snapshot.campaign.completed_second_sequence ==
           sequence;
 
   // Once public campaign presentation has begun, the interrupt tick can reach
@@ -4255,28 +4255,28 @@ static void system_monitor_publish_service(timepop_ctx_t*,
   // CAMPAIGN_ARMING, campaign_seconds is still zero and no public campaign row
   // exists by design, so publish the always-on observation without decoration.
   if (clocks_snapshot_ok &&
-      g_system_monitor_clocks_snapshot.live.campaign_presentation_ready &&
+      g_system_clocks_fragment_clocks_snapshot.live.campaign_presentation_ready &&
       !campaign_row_available) {
     // A retained snapshot from a public campaign second must already carry its
     // exact completed campaign row. Reaching this branch while retrying means
     // retained custody is incoherent; fail closed rather than emitting the
     // wrong observation.
     if (retrying_snapshot) {
-      g_system_monitor_publish_reject_count++;
-      g_system_monitor_retry_snapshot_valid = false;
-      g_system_monitor_retry_pi_only = false;
-      g_system_monitor_retry_sequence = 0U;
-      g_system_monitor_retry_attempt_count = 0U;
+      g_system_clocks_fragment_publish_reject_count++;
+      g_system_clocks_fragment_retry_snapshot_valid = false;
+      g_system_clocks_fragment_retry_pi_only = false;
+      g_system_clocks_fragment_retry_sequence = 0U;
+      g_system_clocks_fragment_retry_attempt_count = 0U;
     }
-    g_system_monitor_pending_sequence = sequence;
-    g_system_monitor_pending = true;
-    memset(&g_system_monitor_clocks_snapshot, 0,
-           sizeof(g_system_monitor_clocks_snapshot));
+    g_system_clocks_fragment_pending_sequence = sequence;
+    g_system_clocks_fragment_pending = true;
+    memset(&g_system_clocks_fragment_clocks_snapshot, 0,
+           sizeof(g_system_clocks_fragment_clocks_snapshot));
     return;
   }
 
   Payload fragment;
-  fragment.add("schema", "MONITOR_FRAGMENT_V2");
+  fragment.add("schema", "CLOCKS_FRAGMENT_V3");
   fragment.add("sequence", sequence);
   fragment.add("generated_dwt", ARM_DWT_CYCCNT);
 
@@ -4286,8 +4286,8 @@ static void system_monitor_publish_service(timepop_ctx_t*,
   bool campaign_row_embedded = false;
   if (campaign_row_available) {
     {
-      Payload campaign_row = system_monitor_campaign_row_payload(
-          g_system_monitor_clocks_snapshot.campaign);
+      Payload campaign_row = system_clocks_fragment_campaign_row_payload(
+          g_system_clocks_fragment_clocks_snapshot.campaign);
       campaign_row_embedded =
           fragment.add_object("campaign_row", campaign_row);
     }
@@ -4296,202 +4296,202 @@ static void system_monitor_publish_service(timepop_ctx_t*,
     // mutation succeeded. Preserve the immutable snapshot and retry rather than
     // publishing campaign_row_present=true without a campaign_row object.
     if (!campaign_row_embedded) {
-      g_system_monitor_publish_reject_count++;
-      g_system_monitor_campaign_row_embed_fail_count++;
+      g_system_clocks_fragment_publish_reject_count++;
+      g_system_clocks_fragment_campaign_row_embed_fail_count++;
 
       if (!retrying_snapshot) {
-        g_system_monitor_retry_snapshot_valid = true;
-        g_system_monitor_retry_pi_only = false;
-        g_system_monitor_retry_sequence = sequence;
-        g_system_monitor_retry_attempt_count = 1U;
-        g_system_monitor_campaign_retry_count++;
+        g_system_clocks_fragment_retry_snapshot_valid = true;
+        g_system_clocks_fragment_retry_pi_only = false;
+        g_system_clocks_fragment_retry_sequence = sequence;
+        g_system_clocks_fragment_retry_attempt_count = 1U;
+        g_system_clocks_fragment_campaign_retry_count++;
       } else {
-        g_system_monitor_retry_attempt_count++;
+        g_system_clocks_fragment_retry_attempt_count++;
       }
 
       // Retry after releasing both temporary Payload arenas. The bounded
       // timer prevents a serialization spin while preserving exact custody
       // independently of future PPS ticks.
-      g_system_monitor_retry_schedule_count++;
-      system_monitor_schedule_publish();
+      g_system_clocks_fragment_retry_schedule_count++;
+      system_clocks_fragment_schedule_publish();
       return;
     }
   }
 
-  const uint32_t next_publish_count = g_system_monitor_publish_count + 1U;
+  const uint32_t next_publish_count = g_system_clocks_fragment_publish_count + 1U;
   const uint32_t next_campaign_rows_embedded =
-      g_system_monitor_campaign_rows_embedded +
+      g_system_clocks_fragment_campaign_rows_embedded +
       (campaign_row_embedded ? 1U : 0U);
 
   fragment.add("campaign_row_present", campaign_row_embedded);
   fragment.add_object(
       "clocks",
-      system_monitor_clocks_payload(g_system_monitor_clocks_snapshot.live));
-  fragment.add_object("teensy", system_monitor_teensy_payload());
-  fragment.add_object("process", system_monitor_process_payload());
-  fragment.add_object("transport", system_monitor_transport_payload());
-  fragment.add_object("payload", system_monitor_payload_payload());
+      system_clocks_fragment_clocks_payload(g_system_clocks_fragment_clocks_snapshot.live));
+  fragment.add_object("teensy", system_clocks_fragment_teensy_payload());
+  fragment.add_object("process", system_clocks_fragment_process_payload());
+  fragment.add_object("transport", system_clocks_fragment_transport_payload());
+  fragment.add_object("payload", system_clocks_fragment_payload_payload());
   fragment.add_object("features", system_features_tree_payload());
-  fragment.add("monitor_publish_count", next_publish_count);
-  fragment.add("monitor_publish_reject_count",
-               g_system_monitor_publish_reject_count);
-  fragment.add("monitor_coalesce_count", g_system_monitor_coalesce_count);
-  fragment.add("monitor_service_arm_failures",
-               g_system_monitor_service_arm_failures);
-  fragment.add("monitor_service_armed", g_system_monitor_service_armed);
-  fragment.add("monitor_service_generation",
-               g_system_monitor_service_generation);
-  fragment.add("monitor_service_forced_rearm_count",
-               g_system_monitor_service_forced_rearm_count);
-  fragment.add("monitor_service_cancel_count",
-               g_system_monitor_service_cancel_count);
-  fragment.add("monitor_service_cancel_failure_count",
-               g_system_monitor_service_cancel_failure_count);
-  fragment.add("monitor_service_stale_callback_count",
-               g_system_monitor_service_stale_callback_count);
-  fragment.add("monitor_campaign_ready_signal_count",
-               g_system_monitor_campaign_ready_signal_count);
-  fragment.add("monitor_campaign_ready_repeat_count",
-               g_system_monitor_campaign_ready_repeat_count);
-  fragment.add("monitor_campaign_ready_last_sequence",
-               g_system_monitor_campaign_ready_last_valid
-                   ? g_system_monitor_campaign_ready_last_sequence
+  fragment.add("clocks_fragment_publish_count", next_publish_count);
+  fragment.add("clocks_fragment_publish_reject_count",
+               g_system_clocks_fragment_publish_reject_count);
+  fragment.add("clocks_fragment_coalesce_count", g_system_clocks_fragment_coalesce_count);
+  fragment.add("clocks_fragment_service_arm_failures",
+               g_system_clocks_fragment_service_arm_failures);
+  fragment.add("clocks_fragment_service_armed", g_system_clocks_fragment_service_armed);
+  fragment.add("clocks_fragment_service_generation",
+               g_system_clocks_fragment_service_generation);
+  fragment.add("clocks_fragment_service_forced_rearm_count",
+               g_system_clocks_fragment_service_forced_rearm_count);
+  fragment.add("clocks_fragment_service_cancel_count",
+               g_system_clocks_fragment_service_cancel_count);
+  fragment.add("clocks_fragment_service_cancel_failure_count",
+               g_system_clocks_fragment_service_cancel_failure_count);
+  fragment.add("clocks_fragment_service_stale_callback_count",
+               g_system_clocks_fragment_service_stale_callback_count);
+  fragment.add("clocks_fragment_campaign_ready_signal_count",
+               g_system_clocks_fragment_campaign_ready_signal_count);
+  fragment.add("clocks_fragment_campaign_ready_repeat_count",
+               g_system_clocks_fragment_campaign_ready_repeat_count);
+  fragment.add("clocks_fragment_campaign_ready_last_sequence",
+               g_system_clocks_fragment_campaign_ready_last_valid
+                   ? g_system_clocks_fragment_campaign_ready_last_sequence
                    : 0U);
-  fragment.add("monitor_campaign_rows_embedded",
+  fragment.add("clocks_fragment_campaign_rows_embedded",
                next_campaign_rows_embedded);
-  fragment.add("monitor_campaign_ready_republish_count",
-               g_system_monitor_campaign_ready_republish_count);
-  fragment.add("monitor_campaign_retry_count",
-               g_system_monitor_campaign_retry_count);
-  fragment.add("monitor_campaign_row_embed_fail_count",
-               g_system_monitor_campaign_row_embed_fail_count);
+  fragment.add("clocks_fragment_campaign_ready_enrichment_retry_count",
+               g_system_clocks_fragment_campaign_ready_enrichment_retry_count);
+  fragment.add("clocks_fragment_campaign_retry_count",
+               g_system_clocks_fragment_campaign_retry_count);
+  fragment.add("clocks_fragment_campaign_row_embed_fail_count",
+               g_system_clocks_fragment_campaign_row_embed_fail_count);
   // Compatibility alias retained; its meaning is now generalized custody.
-  fragment.add("monitor_retrying_campaign_row", retrying_snapshot);
-  fragment.add("monitor_retrying_snapshot", retrying_snapshot);
-  fragment.add("monitor_retry_attempt_count",
-               g_system_monitor_retry_attempt_count);
-  fragment.add("monitor_retry_tick_hold_count",
-               g_system_monitor_retry_tick_hold_count);
-  fragment.add("monitor_retry_schedule_count",
-               g_system_monitor_retry_schedule_count);
-  fragment.add("monitor_retry_success_count",
-               g_system_monitor_retry_success_count);
-  fragment.add("monitor_retry_delay_ns", SYSTEM_MONITOR_RETRY_DELAY_NS);
+  fragment.add("clocks_fragment_retrying_campaign_row", retrying_snapshot);
+  fragment.add("clocks_fragment_retrying_snapshot", retrying_snapshot);
+  fragment.add("clocks_fragment_retry_attempt_count",
+               g_system_clocks_fragment_retry_attempt_count);
+  fragment.add("clocks_fragment_retry_tick_hold_count",
+               g_system_clocks_fragment_retry_tick_hold_count);
+  fragment.add("clocks_fragment_retry_schedule_count",
+               g_system_clocks_fragment_retry_schedule_count);
+  fragment.add("clocks_fragment_retry_success_count",
+               g_system_clocks_fragment_retry_success_count);
+  fragment.add("clocks_fragment_retry_delay_ns", SYSTEM_CLOCKS_FRAGMENT_RETRY_DELAY_NS);
 
   // A transport retry is Pi-only because the original full publish may already
   // have reached local subscribers. An embed retry has never published at all,
   // so its first complete attempt uses the normal publication path.
   const bool publication_enqueued =
-      retrying_snapshot && g_system_monitor_retry_pi_only
+      retrying_snapshot && g_system_clocks_fragment_retry_pi_only
           ? publish_to_pi("CLOCKS_FRAGMENT", fragment)
           : publish("CLOCKS_FRAGMENT", fragment);
   fragment.clear();
 
   if (!publication_enqueued) {
-    g_system_monitor_publish_reject_count++;
+    g_system_clocks_fragment_publish_reject_count++;
 
     // Transport admission failure is not permission to discard an ambient
     // second. Retain the exact typed CLOCKS snapshot for every row and retry
     // until Transport accepts custody. The first full publish may already have
     // reached local subscribers, so all transport retries are Pi-only.
     if (!retrying_snapshot) {
-      g_system_monitor_retry_snapshot_valid = true;
-      g_system_monitor_retry_sequence = sequence;
-      g_system_monitor_retry_attempt_count = 1U;
+      g_system_clocks_fragment_retry_snapshot_valid = true;
+      g_system_clocks_fragment_retry_sequence = sequence;
+      g_system_clocks_fragment_retry_attempt_count = 1U;
       if (campaign_row_embedded) {
-        g_system_monitor_campaign_retry_count++;
+        g_system_clocks_fragment_campaign_retry_count++;
       }
     } else {
-      g_system_monitor_retry_attempt_count++;
+      g_system_clocks_fragment_retry_attempt_count++;
     }
-    g_system_monitor_retry_pi_only = true;
-    g_system_monitor_retry_schedule_count++;
-    system_monitor_schedule_publish();
+    g_system_clocks_fragment_retry_pi_only = true;
+    g_system_clocks_fragment_retry_schedule_count++;
+    system_clocks_fragment_schedule_publish();
     return;
   }
 
-  g_system_monitor_publish_count = next_publish_count;
-  g_system_monitor_campaign_rows_embedded = next_campaign_rows_embedded;
+  g_system_clocks_fragment_publish_count = next_publish_count;
+  g_system_clocks_fragment_campaign_rows_embedded = next_campaign_rows_embedded;
   if (retrying_snapshot) {
-    g_system_monitor_retry_success_count++;
+    g_system_clocks_fragment_retry_success_count++;
   }
-  g_system_monitor_retry_snapshot_valid = false;
-  g_system_monitor_retry_pi_only = false;
-  g_system_monitor_retry_sequence = 0U;
-  g_system_monitor_retry_attempt_count = 0U;
+  g_system_clocks_fragment_retry_snapshot_valid = false;
+  g_system_clocks_fragment_retry_pi_only = false;
+  g_system_clocks_fragment_retry_sequence = 0U;
+  g_system_clocks_fragment_retry_attempt_count = 0U;
 
-  memset(&g_system_monitor_clocks_snapshot, 0,
-         sizeof(g_system_monitor_clocks_snapshot));
-  if (g_system_monitor_pending) system_monitor_schedule_publish();
+  memset(&g_system_clocks_fragment_clocks_snapshot, 0,
+         sizeof(g_system_clocks_fragment_clocks_snapshot));
+  if (g_system_clocks_fragment_pending) system_clocks_fragment_schedule_publish();
 }
 
-static void system_monitor_schedule_publish(void) {
-  if ((!g_system_monitor_pending &&
-       !g_system_monitor_retry_snapshot_valid) ||
-      g_system_monitor_service_armed) {
+static void system_clocks_fragment_schedule_publish(void) {
+  if ((!g_system_clocks_fragment_pending &&
+       !g_system_clocks_fragment_retry_snapshot_valid) ||
+      g_system_clocks_fragment_service_armed) {
     return;
   }
 
-  uint32_t generation = g_system_monitor_service_generation + 1U;
+  uint32_t generation = g_system_clocks_fragment_service_generation + 1U;
   if (generation == 0U) generation = 1U;
 
   const bool delayed_retry =
-      g_system_monitor_retry_snapshot_valid &&
-      g_system_monitor_retry_attempt_count > 0U;
+      g_system_clocks_fragment_retry_snapshot_valid &&
+      g_system_clocks_fragment_retry_attempt_count > 0U;
   const timepop_handle_t handle = delayed_retry
-      ? timepop_arm(SYSTEM_MONITOR_RETRY_DELAY_NS,
+      ? timepop_arm(SYSTEM_CLOCKS_FRAGMENT_RETRY_DELAY_NS,
                     false,
-                    system_monitor_publish_service,
+                    system_clocks_fragment_publish_service,
                     (void*)(uintptr_t)generation,
                     "SYSTEM_MONITOR_FRAGMENT_RETRY")
-      : timepop_arm_alap(system_monitor_publish_service,
+      : timepop_arm_alap(system_clocks_fragment_publish_service,
                          (void*)(uintptr_t)generation,
                          "SYSTEM_MONITOR_FRAGMENT");
   if (handle == TIMEPOP_INVALID_HANDLE) {
-    g_system_monitor_service_arm_failures++;
+    g_system_clocks_fragment_service_arm_failures++;
     return;
   }
 
-  g_system_monitor_service_handle = handle;
-  g_system_monitor_service_generation = generation;
-  g_system_monitor_service_armed_generation = generation;
-  g_system_monitor_service_armed = true;
+  g_system_clocks_fragment_service_handle = handle;
+  g_system_clocks_fragment_service_generation = generation;
+  g_system_clocks_fragment_service_armed_generation = generation;
+  g_system_clocks_fragment_service_armed = true;
 }
 
-static void system_monitor_force_rearm(void) {
-  if (!g_system_monitor_service_armed) {
-    system_monitor_schedule_publish();
+static void system_clocks_fragment_force_rearm(void) {
+  if (!g_system_clocks_fragment_service_armed) {
+    system_clocks_fragment_schedule_publish();
     return;
   }
 
   bool cancelled = false;
-  if (g_system_monitor_service_handle != TIMEPOP_INVALID_HANDLE) {
-    cancelled = timepop_cancel(g_system_monitor_service_handle);
+  if (g_system_clocks_fragment_service_handle != TIMEPOP_INVALID_HANDLE) {
+    cancelled = timepop_cancel(g_system_clocks_fragment_service_handle);
   }
   if (cancelled) {
-    g_system_monitor_service_cancel_count++;
+    g_system_clocks_fragment_service_cancel_count++;
   } else {
-    g_system_monitor_service_cancel_failure_count++;
+    g_system_clocks_fragment_service_cancel_failure_count++;
   }
 
   // Generation-tagged callbacks make this safe even if the old handle was
   // already selected for dispatch and could not be cancelled. The replacement
   // arm advances the generation; any superseded callback becomes a no-op.
-  g_system_monitor_service_handle = TIMEPOP_INVALID_HANDLE;
-  g_system_monitor_service_armed = false;
-  g_system_monitor_service_forced_rearm_count++;
-  system_monitor_schedule_publish();
+  g_system_clocks_fragment_service_handle = TIMEPOP_INVALID_HANDLE;
+  g_system_clocks_fragment_service_armed = false;
+  g_system_clocks_fragment_service_forced_rearm_count++;
+  system_clocks_fragment_schedule_publish();
 }
 
-static void system_monitor_accept_tick(uint32_t completed_second_sequence) {
-  if (g_system_monitor_last_tick_valid &&
-      completed_second_sequence == g_system_monitor_last_tick_sequence) {
+static void system_clocks_fragment_accept_tick(uint32_t completed_second_sequence) {
+  if (g_system_clocks_fragment_last_tick_valid &&
+      completed_second_sequence == g_system_clocks_fragment_last_tick_sequence) {
     return;
   }
-  g_system_monitor_last_tick_sequence = completed_second_sequence;
-  g_system_monitor_last_tick_valid = true;
+  g_system_clocks_fragment_last_tick_sequence = completed_second_sequence;
+  g_system_clocks_fragment_last_tick_valid = true;
 
-  // A retained campaign retry already owns g_system_monitor_clocks_snapshot.
+  // A retained campaign retry already owns g_system_clocks_fragment_clocks_snapshot.
   // While that exact row remains in transport custody, a newer physical tick
   // must not replace the pending sequence selected by Beta's next immutable
   // campaign row. Doing so creates a permanent head-of-line mismatch: Beta
@@ -4499,89 +4499,89 @@ static void system_monitor_accept_tick(uint32_t completed_second_sequence) {
   //
   // The physical tick still drives retry progress. Once the retained row is
   // accepted, any campaign_row_ready() received during the retry remains in
-  // g_system_monitor_pending_sequence and is published next.
-  if (g_system_monitor_retry_snapshot_valid) {
-    g_system_monitor_retry_tick_hold_count++;
-    if (!g_system_monitor_pending) {
-      g_system_monitor_pending_sequence = completed_second_sequence;
-      g_system_monitor_pending = true;
-    } else if (g_system_monitor_pending_sequence != completed_second_sequence) {
+  // g_system_clocks_fragment_pending_sequence and is published next.
+  if (g_system_clocks_fragment_retry_snapshot_valid) {
+    g_system_clocks_fragment_retry_tick_hold_count++;
+    if (!g_system_clocks_fragment_pending) {
+      g_system_clocks_fragment_pending_sequence = completed_second_sequence;
+      g_system_clocks_fragment_pending = true;
+    } else if (g_system_clocks_fragment_pending_sequence != completed_second_sequence) {
       // One exact snapshot is in retry custody and one following identity is
       // reserved. A further arrival is visible as coalescing rather than
       // silently replacing the reserved successor. Under normal USB budget
       // pressure the 25 ms retry must clear long before this boundary.
-      g_system_monitor_coalesce_count++;
+      g_system_clocks_fragment_coalesce_count++;
     }
-    system_monitor_schedule_publish();
+    system_clocks_fragment_schedule_publish();
     return;
   }
 
-  if (g_system_monitor_pending) g_system_monitor_coalesce_count++;
-  g_system_monitor_pending_sequence = completed_second_sequence;
-  g_system_monitor_pending = true;
-  system_monitor_schedule_publish();
+  if (g_system_clocks_fragment_pending) g_system_clocks_fragment_coalesce_count++;
+  g_system_clocks_fragment_pending_sequence = completed_second_sequence;
+  g_system_clocks_fragment_pending = true;
+  system_clocks_fragment_schedule_publish();
 }
 
-void system_monitor_pps_tick_from_interrupt(
+void system_clocks_fragment_pps_tick_from_interrupt(
     uint32_t completed_second_sequence) {
   if (system_feature_current_ipsr() != 0U) return;
-  g_system_monitor_interrupt_owner_seen = true;
-  system_monitor_accept_tick(completed_second_sequence);
+  g_system_clocks_fragment_interrupt_owner_seen = true;
+  system_clocks_fragment_accept_tick(completed_second_sequence);
 }
 
-void system_monitor_pps_tick(uint32_t completed_second_sequence) {
+void system_clocks_fragment_pps_tick(uint32_t completed_second_sequence) {
   if (system_feature_current_ipsr() != 0U) return;
-  if (g_system_monitor_interrupt_owner_seen) return;
-  system_monitor_accept_tick(completed_second_sequence);
+  if (g_system_clocks_fragment_interrupt_owner_seen) return;
+  system_clocks_fragment_accept_tick(completed_second_sequence);
 }
 
-void system_monitor_campaign_row_ready(uint32_t completed_second_sequence) {
+void system_clocks_fragment_campaign_row_ready(uint32_t completed_second_sequence) {
   if (system_feature_current_ipsr() != 0U || completed_second_sequence == 0U) {
     return;
   }
 
-  g_system_monitor_campaign_ready_signal_count++;
+  g_system_clocks_fragment_campaign_ready_signal_count++;
   const bool repeated_signal =
-      g_system_monitor_campaign_ready_last_valid &&
-      g_system_monitor_campaign_ready_last_sequence ==
+      g_system_clocks_fragment_campaign_ready_last_valid &&
+      g_system_clocks_fragment_campaign_ready_last_sequence ==
           completed_second_sequence;
-  const bool service_was_armed = g_system_monitor_service_armed;
+  const bool service_was_armed = g_system_clocks_fragment_service_armed;
   if (repeated_signal) {
-    g_system_monitor_campaign_ready_repeat_count++;
+    g_system_clocks_fragment_campaign_ready_repeat_count++;
   }
-  g_system_monitor_campaign_ready_last_valid = true;
-  g_system_monitor_campaign_ready_last_sequence = completed_second_sequence;
+  g_system_clocks_fragment_campaign_ready_last_valid = true;
+  g_system_clocks_fragment_campaign_ready_last_sequence = completed_second_sequence;
 
   // If the canonical interrupt tick is still pending, keep one publication and
   // let the completed campaign observation ride along. If that sequence already
-  // published, arm a deliberate same-sequence decorated copy rather than losing
+  // published, arm a deliberate same-sequence enrichment copy rather than losing
   // durable truth.
-  if (g_system_monitor_pending &&
-      g_system_monitor_pending_sequence == completed_second_sequence) {
+  if (g_system_clocks_fragment_pending &&
+      g_system_clocks_fragment_pending_sequence == completed_second_sequence) {
     if (repeated_signal && service_was_armed) {
-      system_monitor_force_rearm();
+      system_clocks_fragment_force_rearm();
     } else {
-      system_monitor_schedule_publish();
+      system_clocks_fragment_schedule_publish();
     }
     return;
   }
 
-  if (g_system_monitor_last_tick_valid &&
-      g_system_monitor_last_tick_sequence == completed_second_sequence) {
-    g_system_monitor_campaign_ready_republish_count++;
-    g_system_monitor_pending_sequence = completed_second_sequence;
-    g_system_monitor_pending = true;
+  if (g_system_clocks_fragment_last_tick_valid &&
+      g_system_clocks_fragment_last_tick_sequence == completed_second_sequence) {
+    g_system_clocks_fragment_campaign_ready_enrichment_retry_count++;
+    g_system_clocks_fragment_pending_sequence = completed_second_sequence;
+    g_system_clocks_fragment_pending = true;
     if (repeated_signal && service_was_armed) {
-      system_monitor_force_rearm();
+      system_clocks_fragment_force_rearm();
     } else {
-      system_monitor_schedule_publish();
+      system_clocks_fragment_schedule_publish();
     }
     return;
   }
 
-  system_monitor_accept_tick(completed_second_sequence);
+  system_clocks_fragment_accept_tick(completed_second_sequence);
   if (repeated_signal && service_was_armed) {
-    system_monitor_force_rearm();
+    system_clocks_fragment_force_rearm();
   }
 }
 
@@ -4596,15 +4596,15 @@ static void system_dmamem_ensure_initialized(void) {
   // process_system_register().
   runtime_ledger_boot_latch();
   system_feature_registry_reset();
-  memset(&g_system_monitor_clocks_snapshot, 0,
-         sizeof(g_system_monitor_clocks_snapshot));
-  g_system_monitor_retry_snapshot_valid = false;
-  g_system_monitor_retry_pi_only = false;
-  g_system_monitor_retry_sequence = 0U;
-  g_system_monitor_retry_attempt_count = 0U;
-  g_system_monitor_retry_tick_hold_count = 0U;
-  g_system_monitor_retry_schedule_count = 0U;
-  g_system_monitor_retry_success_count = 0U;
+  memset(&g_system_clocks_fragment_clocks_snapshot, 0,
+         sizeof(g_system_clocks_fragment_clocks_snapshot));
+  g_system_clocks_fragment_retry_snapshot_valid = false;
+  g_system_clocks_fragment_retry_pi_only = false;
+  g_system_clocks_fragment_retry_sequence = 0U;
+  g_system_clocks_fragment_retry_attempt_count = 0U;
+  g_system_clocks_fragment_retry_tick_hold_count = 0U;
+  g_system_clocks_fragment_retry_schedule_count = 0U;
+  g_system_clocks_fragment_retry_success_count = 0U;
   memset(g_system_crash_report_text, 0, sizeof(g_system_crash_report_text));
   memset(g_system_debug_buffer, 0, sizeof(g_system_debug_buffer));
   memset((void*)&g_system_timepop_dispatch_trace_scratch, 0,

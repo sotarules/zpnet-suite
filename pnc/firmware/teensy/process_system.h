@@ -145,17 +145,17 @@ bool system_feature_is_nominal(const char* subsystem,
 // Foreground SYSTEM then takes one typed CLOCKS snapshot and authors the full
 // CLOCKS_FRAGMENT wire shape. The always-on clock view is observational; an
 // optional campaign observation is included only for a completed public record.
-void system_monitor_pps_tick_from_interrupt(
+void system_clocks_fragment_pps_tick_from_interrupt(
     uint32_t completed_second_sequence);
 
 // Transitional CLOCKS-side entry point. It remains source-compatible with the
 // campaign-coupled caller but is ignored after the canonical interrupt owner
 // has supplied its first tick.
-void system_monitor_pps_tick(uint32_t completed_second_sequence);
+void system_clocks_fragment_pps_tick(uint32_t completed_second_sequence);
 
 // CLOCKS/Beta calls this after it has frozen a typed public campaign observation
 // for the completed instrument sequence. Usually the interrupt-owned CLOCKS_FRAGMENT tick
 // is already pending and this merely coalesces into it. If SYSTEM already emitted
 // the observation-only fragment, this deliberately schedules one same-sequence
-// copy carrying the campaign facts so durable truth cannot be lost.
-void system_monitor_campaign_row_ready(uint32_t completed_second_sequence);
+// enrichment copy carrying the campaign facts so durable truth cannot be lost.
+void system_clocks_fragment_campaign_row_ready(uint32_t completed_second_sequence);

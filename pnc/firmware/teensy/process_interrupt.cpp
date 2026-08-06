@@ -5751,7 +5751,7 @@ void process_interrupt_foreground_service(void) {
   // matching TIMEBASE row may still be emitted first.
   uint32_t monitor_sequence = 0U;
   if (interrupt_monitor_take_pps_vclock(&monitor_sequence)) {
-    system_monitor_pps_tick_from_interrupt(monitor_sequence);
+    system_clocks_fragment_pps_tick_from_interrupt(monitor_sequence);
   }
   interrupt_dispatch_foreground_service();
   g_interrupt_foreground_forensic_live.subscriber_cycles =
