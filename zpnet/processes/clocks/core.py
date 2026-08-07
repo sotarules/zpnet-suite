@@ -507,6 +507,8 @@ _diag: Dict[str, Any] = {
     # initiates RECOVER; restarting would destroy the evidence being awaited.
     "recovery_stalled_events_received": 0,
     "recovery_stalled_event_enqueue_failures": 0,
+    "recovery_proof_search_exclusions_suppressed": 0,
+    "last_recovery_proof_warning": {},
     "last_recovery_stalled": {},
 
     # SYSTEM-owned CLOCKS recovery may hand the Pi-owned GNSS_RAW state back
@@ -677,6 +679,32 @@ def _firmware_science_exclusion(fragment: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+_EXPECTED_RECOVERY_PROOF_EXCLUSION_REASONS = {
+    "alpha_counterledger_capture",
+    "beta_recovery_science_hold",
+}
+
+def _firmware_exclusion_is_expected_recovery_proof_search(
+    fragment: Dict[str, Any],
+    exclusion: Dict[str, Any],
+) -> bool:
+    """True only for expected firmware custody holds during RECOVER proof search."""
+    reason = str(
+        exclusion.get("reason_name")
+        or exclusion.get("reason")
+        or ""
+    ).strip().lower()
+    if reason not in _EXPECTED_RECOVERY_PROOF_EXCLUSION_REASONS:
+        return False
+
+    # _tempest_candidate_view() adds recover_generation only when firmware
+    # attached recovery testimony to this exact row.  That includes the boundary
+    # row on which recovery state clears, so generation identity is a stronger and
+    # quieter discriminator than requiring one of the transient flags to remain true.
+    generation = _as_int(fragment.get("recover_generation"))
+    return generation is not None and generation > 0
+
+
 # ---------------------------------------------------------------------
 # GNSS stream health canary — lightweight Pi-side check
 # ---------------------------------------------------------------------
@@ -830,6 +858,25 @@ _post_recovery_first_public_pps_vclock_count: Optional[int] = None
 # transaction reaches a terminal outcome.
 _clocks_persistence_enabled = threading.Event()
 _clocks_persistence_lock = threading.Lock()
+# Fresh-instrument startup opens the persistence boundary before STATS_RESET,
+# then admits only the first row of the new Alpha statistics epoch.  This
+# prevents both an undurable epoch prefix and pre-reset startup rows from
+# becoming future holistic-restore authority.
+_clocks_epoch_birth_pending = threading.Event()
+_clocks_epoch_birth_committed = threading.Event()
+_clocks_epoch_birth_prior_reset_count = -1
+_clocks_epoch_birth_reset_count = -1
+
+# A cold holistic restore must not use an ephemeral CLOCKS row as its proof of
+# convergence.  While ordinary startup persistence remains closed, this narrow
+# custody lane admits the exact first restored statistics row (N+1) and every
+# following row in that restored epoch until general persistence opens.
+_clocks_holistic_restore_proof_pending = threading.Event()
+_clocks_holistic_restore_proof_committed = threading.Event()
+_clocks_holistic_restore_proof_expected: Dict[str, Any] = {}
+_clocks_holistic_restore_proof_reset_count = -1
+_clocks_holistic_restore_proof_update_count = -1
+_clocks_holistic_restore_proof_sequence: Optional[int] = None
 _clocks_state_worker_started = threading.Event()
 _clocks_state_enqueued = 0
 _clocks_state_published = 0
@@ -2186,6 +2233,41 @@ def _reconstruct_better_buckets_from_db(detail: Dict[str, Any]) -> Dict[str, Any
 
     with open_db(row_dict=True) as conn:
         conn.execute("SET TRANSACTION READ ONLY")
+
+        # reset_count is only unique inside one Teensy boot lifetime.  A later
+        # reboot can reuse the same value, so first bind replay to the durable
+        # statistics epoch containing the target row.  The nearest preceding
+        # update_count=1 row is that epoch's birth certificate.
+        birth_cur = conn.cursor()
+        birth_cur.execute(
+            """
+            SELECT id
+            FROM campaign_detail
+            WHERE campaign_type = %s
+              AND id <= %s
+              AND NOT (payload @> '{"holistic_restore_superseded":true}'::jsonb)
+              AND payload #>> '{schema}' = 'CLOCKS_V4'
+              AND payload #>> '{clocks,stats,schema}' = 'CLOCKS_INSTRUMENT_STATS_V4'
+              AND (payload #>> '{clocks,stats,reset_count}')::bigint = %s
+              AND (payload #>> '{clocks,stats,update_count}')::bigint = 1
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (
+                CAMPAIGN_TYPE_TEMPEST,
+                int(target_db_id),
+                int(reset_count),
+            ),
+        )
+        birth_row = birth_cur.fetchone()
+        if birth_row is None:
+            raise ValueError(
+                "Better-Buckets durable epoch birth missing: "
+                f"reset_count={reset_count} target_db_id={target_db_id} "
+                f"target_update_count={update_count}"
+            )
+        birth_db_id = int(birth_row["id"])
+
         cur = conn.cursor(name="clocks_ppb_restore_stream")
         cur.itersize = PPB_REPLAY_CURSOR_ITERSIZE
         cur.execute(
@@ -2205,7 +2287,7 @@ def _reconstruct_better_buckets_from_db(detail: Dict[str, Any]) -> Dict[str, Any
                 (payload #>> '{clocks,clockfaces,ocxo2_ns}')::bigint AS ocxo2_ns
             FROM campaign_detail
             WHERE campaign_type = %s
-              AND id <= %s
+              AND id BETWEEN %s AND %s
               AND NOT (payload @> '{"holistic_restore_superseded":true}'::jsonb)
               AND payload #>> '{schema}' = 'CLOCKS_V4'
               AND payload #>> '{clocks,stats,schema}' = 'CLOCKS_INSTRUMENT_STATS_V4'
@@ -2217,6 +2299,7 @@ def _reconstruct_better_buckets_from_db(detail: Dict[str, Any]) -> Dict[str, Any
             """,
             (
                 CAMPAIGN_TYPE_TEMPEST,
+                int(birth_db_id),
                 int(target_db_id),
                 int(reset_count),
                 int(lower_sequence),
@@ -2231,6 +2314,7 @@ def _reconstruct_better_buckets_from_db(detail: Dict[str, Any]) -> Dict[str, Any
         )
 
     replay["reset_count"] = int(reset_count)
+    replay["source_epoch_birth_db_detail_id"] = int(birth_db_id)
     replay["source_db_detail_id"] = int(target_db_id)
     replay["verification"] = _verify_better_buckets_replay(detail, replay)
     return replay
@@ -2910,6 +2994,27 @@ def _holistic_restore_pending_categories(
     return pending or ["FRESH_CLOCKS_PROOF"]
 
 
+def _arm_holistic_restore_persistence_proof(detail: Dict[str, Any]) -> None:
+    """Require the first post-restore Alpha row to become durable evidence."""
+    global _clocks_holistic_restore_proof_expected
+    global _clocks_holistic_restore_proof_reset_count
+    global _clocks_holistic_restore_proof_update_count
+    global _clocks_holistic_restore_proof_sequence
+
+    stats = _clocks_payload(detail).get("stats")
+    reset_count = _as_int(stats.get("reset_count")) if isinstance(stats, dict) else None
+    update_count = _as_int(stats.get("update_count")) if isinstance(stats, dict) else None
+    if reset_count is None or reset_count < 0 or update_count is None or update_count < 0:
+        raise RuntimeError("holistic restore source lacks usable statistics chronology")
+
+    _clocks_holistic_restore_proof_expected = _holistic_restore_probe(detail)
+    _clocks_holistic_restore_proof_reset_count = int(reset_count)
+    _clocks_holistic_restore_proof_update_count = int(update_count) + 1
+    _clocks_holistic_restore_proof_sequence = None
+    _clocks_holistic_restore_proof_committed.clear()
+    _clocks_holistic_restore_proof_pending.set()
+
+
 def _wait_for_holistic_restore(
     detail: Dict[str, Any],
     *,
@@ -2926,12 +3031,17 @@ def _wait_for_holistic_restore(
             received = _latest_clocks_received_monotonic
         if received is not None and received > requested_monotonic and current:
             last_observed = _holistic_restore_probe(current)
-            if _holistic_restore_probe_satisfied(expected, last_observed):
+            if (
+                _holistic_restore_probe_satisfied(expected, last_observed)
+                and _clocks_holistic_restore_proof_committed.is_set()
+            ):
                 return {
                     "proved": True,
+                    "durable": True,
                     "expected": expected,
                     "observed": last_observed,
                     "clocks_sequence": current.get("sequence"),
+                    "durable_proof_sequence": _clocks_holistic_restore_proof_sequence,
                     "waited_s": round(time.monotonic() - requested_monotonic, 3),
                 }
         now = time.monotonic()
@@ -2954,6 +3064,11 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
     gnss_raw = _clocks_gnss_raw_payload(detail)
     if not _canonical_instrument_restore_ready(clocks, include_control=True) or gnss_raw is None:
         raise RuntimeError("CLOCKS detail lacks valid canonical instrument/GNSS_RAW restore state")
+
+    # Arm durable proof custody before the first RESTORE_MONITOR probe.  The
+    # ordinary writer remains closed, so fresh-boot rows are still withheld; only
+    # the exact restored N+1 row can open this narrow path into PostgreSQL.
+    _arm_holistic_restore_persistence_proof(detail)
 
     # First use RESTORE_MONITOR as a lifecycle probe. A Pi-only restart while a
     # live campaign still owns the Teensy must not touch Alpha's healthy rolling
@@ -3074,13 +3189,16 @@ def _holistic_restore() -> Dict[str, Any]:
         else:
             logging.info(
                 "ℹ️ [holistic restore] no structured-recoverable CLOCKS detail; "
-                "continuing from live instrument state"
+                "establishing a fresh durable statistics epoch"
             )
+            result["instrument"] = _establish_fresh_durable_stats_epoch()
     finally:
-        # Persistence always resumes after the one restore transaction terminates.
-        # Recoverability scans skip incomplete rows, so a failed restore cannot
-        # permanently close the writer or erase older durable authority.
+        # Open the general writer before retiring the narrow restore-proof lane so
+        # no restored Alpha row can fall between the two custody regimes.  A failed
+        # fresh-epoch birth remains fail-closed because _clocks_epoch_birth_pending
+        # continues withholding rows until an update_count=1 reset epoch appears.
         _clocks_persistence_enabled.set()
+        _clocks_holistic_restore_proof_pending.clear()
 
     if active_campaign is not None:
         result["campaign"] = _restore_active_campaign_state()
@@ -5740,11 +5858,12 @@ def on_watchdog_anomaly(payload: Payload) -> None:
 
 
 def on_recovery_stalled(payload: Payload) -> None:
-    """Record a non-destructive OCXO recovery-liveness anomaly.
+    """Record a non-destructive OCXO recovery-proof/liveness anomaly.
 
-    This event means the Teensy timeline is alive but the OCXO science proof has
-    stopped advancing.  It is deliberately not WATCHDOG_ANOMALY: restarting
-    RECOVER here would destroy the very reattachment state being diagnosed.
+    This event means the Teensy timeline is alive but OCXO science proof either
+    exceeded its bounded proof-attempt expectation or stopped advancing.  It is
+    deliberately not WATCHDOG_ANOMALY: restarting RECOVER here would destroy the
+    very reattachment state being diagnosed.
     """
     _diag["recovery_stalled_events_received"] += 1
     # Compatibility counter: this is a science-cleanliness stall, but it no
@@ -5758,11 +5877,15 @@ def on_recovery_stalled(payload: Payload) -> None:
         "campaign": stalled.get("campaign"),
         "campaign_seconds": stalled.get("campaign_seconds"),
         "recovery_generation": stalled.get("recovery_generation"),
+        "proof_attempts": stalled.get("proof_attempts"),
+        "proof_warn_after_attempts": stalled.get("proof_warn_after_attempts"),
+        "last_attempt_pps_sequence": stalled.get("last_attempt_pps_sequence"),
         "no_progress_rows": stalled.get("no_progress_rows"),
         "stall_threshold_rows": stalled.get("stall_threshold_rows"),
         "last_progress_public_count": stalled.get("last_progress_public_count"),
         "clockface_ready": stalled.get("clockface_ready"),
         "science_ready": stalled.get("science_ready"),
+        "lanes": copy.deepcopy(stalled.get("lanes") or {}),
     }
     _diag["last_recovery_stalled"] = snapshot
 
@@ -5775,15 +5898,27 @@ def on_recovery_stalled(payload: Payload) -> None:
             CLOCKS_RECOVERY_STALLED_TOPIC,
         )
 
-    logging.error(
-        "🧭 [recovery] OCXO science reattachment reports no progress "
-        "(campaign=%s generation=%s rows=%s threshold=%s); "
-        "timeline publication continues and RECOVER is not restarted",
-        snapshot.get("campaign"),
-        snapshot.get("recovery_generation"),
-        snapshot.get("no_progress_rows"),
-        snapshot.get("stall_threshold_rows"),
-    )
+    if snapshot.get("reason") == "ocxo_science_proof_not_established":
+        _diag["last_recovery_proof_warning"] = snapshot
+        logging.error(
+            "🧭 [recovery] proof-driven OCXO science release not established "
+            "after %s attempt(s) (warn_after=%s, campaign=%s generation=%s); "
+            "timeline publication continues and RECOVER is not restarted",
+            snapshot.get("proof_attempts"),
+            snapshot.get("proof_warn_after_attempts"),
+            snapshot.get("campaign"),
+            snapshot.get("recovery_generation"),
+        )
+    else:
+        logging.error(
+            "🧭 [recovery] OCXO science reattachment reports no progress "
+            "(campaign=%s generation=%s rows=%s threshold=%s); "
+            "timeline publication continues and RECOVER is not restarted",
+            snapshot.get("campaign"),
+            snapshot.get("recovery_generation"),
+            snapshot.get("no_progress_rows"),
+            snapshot.get("stall_threshold_rows"),
+        )
 
 
 def _enqueue_timebase_piece(
@@ -6156,6 +6291,8 @@ def _queue_clocks_state(fragment: Dict[str, Any]) -> None:
 def _clocks_state_loop() -> None:
     """Build and publish CLOCKS_V4 without storage latency stalling the live feed."""
     global _clocks_state_published, _clocks_state_dropped
+    global _clocks_epoch_birth_reset_count
+    global _clocks_holistic_restore_proof_sequence
 
     _clocks_state_worker_started.set()
     logging.info("🚀 [clocks] canonical CLOCKS_V4 state worker started")
@@ -6193,8 +6330,77 @@ def _clocks_state_loop() -> None:
         publish(CLOCKS_TOPIC, state)
         _clocks_state_published += 1
 
-        if not _clocks_persistence_enabled.is_set():
+        restore_proof_custody = False
+        if _clocks_holistic_restore_proof_pending.is_set():
+            stats = _clocks_payload(state).get("stats")
+            update_count = (
+                _as_int(stats.get("update_count"))
+                if isinstance(stats, dict)
+                else None
+            )
+            reset_count = (
+                _as_int(stats.get("reset_count"))
+                if isinstance(stats, dict)
+                else None
+            )
+
+            if _clocks_holistic_restore_proof_sequence is None:
+                observed = _holistic_restore_probe(state)
+                if (
+                    reset_count == _clocks_holistic_restore_proof_reset_count
+                    and update_count == _clocks_holistic_restore_proof_update_count
+                    and _holistic_restore_probe_satisfied(
+                        _clocks_holistic_restore_proof_expected, observed
+                    )
+                ):
+                    _clocks_holistic_restore_proof_sequence = int(state.get("sequence") or 0)
+                    restore_proof_custody = True
+                    logging.info(
+                        "✅ [holistic restore] first restored statistics row entered "
+                        "persistence custody: reset_count=%s update_count=%s sequence=%s",
+                        reset_count,
+                        update_count,
+                        state.get("sequence"),
+                    )
+            else:
+                restore_proof_custody = bool(
+                    reset_count == _clocks_holistic_restore_proof_reset_count
+                    and update_count is not None
+                    and update_count >= _clocks_holistic_restore_proof_update_count
+                )
+
+            if not restore_proof_custody and not _clocks_persistence_enabled.is_set():
+                continue
+
+        if not restore_proof_custody and not _clocks_persistence_enabled.is_set():
             continue
+
+        if _clocks_epoch_birth_pending.is_set():
+            stats = _clocks_payload(state).get("stats")
+            update_count = (
+                _as_int(stats.get("update_count"))
+                if isinstance(stats, dict)
+                else None
+            )
+            reset_count = (
+                _as_int(stats.get("reset_count"))
+                if isinstance(stats, dict)
+                else None
+            )
+            if (
+                update_count != 1
+                or reset_count is None
+                or reset_count <= _clocks_epoch_birth_prior_reset_count
+            ):
+                continue
+            _clocks_epoch_birth_reset_count = int(reset_count)
+            _clocks_epoch_birth_pending.clear()
+            logging.info(
+                "✅ [clocks] fresh statistics epoch row 1 entered persistence custody: "
+                "reset_count=%s sequence=%s",
+                reset_count,
+                state.get("sequence"),
+            )
 
         _clocks_persist_queue.put({
             "state": state,
@@ -6229,6 +6435,26 @@ def _clocks_persistence_loop() -> None:
                     _clocks_state_merged += 1
                 else:
                     _clocks_state_inserted += 1
+
+                stats = _clocks_payload(state).get("stats")
+                if isinstance(stats, dict):
+                    persisted_update_count = _as_int(stats.get("update_count"))
+                    persisted_reset_count = _as_int(stats.get("reset_count"))
+                    if (
+                        persisted_update_count == 1
+                        and persisted_reset_count == _clocks_epoch_birth_reset_count
+                    ):
+                        _clocks_epoch_birth_committed.set()
+                    if (
+                        _clocks_holistic_restore_proof_sequence is not None
+                        and int(state.get("sequence") or 0)
+                            == int(_clocks_holistic_restore_proof_sequence)
+                        and persisted_reset_count
+                            == _clocks_holistic_restore_proof_reset_count
+                        and persisted_update_count
+                            == _clocks_holistic_restore_proof_update_count
+                    ):
+                        _clocks_holistic_restore_proof_committed.set()
                 break
             except Exception:
                 if not failure_logged:
@@ -6383,30 +6609,43 @@ def _process_loop() -> None:
                 "public_count": int(public_count),
                 **firmware_exclusion,
             }
-            raw_cycles = _path_get(clocks_fragment, "clocks.raw_cycles")
-            raw_cycles = raw_cycles if isinstance(raw_cycles, dict) else {}
-
-            def _cycle_evidence(lane: str) -> str:
-                sample = raw_cycles.get(lane)
-                if not isinstance(sample, dict):
-                    return f"{lane}=missing"
-                return (
-                    f"{lane}[obs={sample.get('observed_cycles')} "
-                    f"prev={sample.get('previous_observed_cycles')} "
-                    f"res={sample.get('residual_cycles')}]"
+            expected_proof_search = (
+                _firmware_exclusion_is_expected_recovery_proof_search(
+                    frag, firmware_exclusion
                 )
-
-            logging.warning(
-                "🧪 [clocks] firmware science exclusion retained: "
-                "campaign=%s public_count=%d reason=%s raw_cycles=%s",
-                campaign,
-                int(public_count),
-                firmware_exclusion.get("reason"),
-                " ".join(
-                    _cycle_evidence(lane)
-                    for lane in ("pps", "vclock", "ocxo1", "ocxo2")
-                ),
             )
+            if expected_proof_search:
+                # The row remains fully durable audit evidence.  Only the noisy
+                # per-second warning is suppressed while firmware searches for
+                # its first proof-driven post-recovery science interval.
+                _diag["recovery_proof_search_exclusions_suppressed"] = (
+                    _diag.get("recovery_proof_search_exclusions_suppressed", 0) + 1
+                )
+            else:
+                raw_cycles = _path_get(clocks_fragment, "clocks.raw_cycles")
+                raw_cycles = raw_cycles if isinstance(raw_cycles, dict) else {}
+
+                def _cycle_evidence(lane: str) -> str:
+                    sample = raw_cycles.get(lane)
+                    if not isinstance(sample, dict):
+                        return f"{lane}=missing"
+                    return (
+                        f"{lane}[obs={sample.get('observed_cycles')} "
+                        f"prev={sample.get('previous_observed_cycles')} "
+                        f"res={sample.get('residual_cycles')}]"
+                    )
+
+                logging.warning(
+                    "🧪 [clocks] firmware science exclusion retained: "
+                    "campaign=%s public_count=%d reason=%s raw_cycles=%s",
+                    campaign,
+                    int(public_count),
+                    firmware_exclusion.get("reason"),
+                    " ".join(
+                        _cycle_evidence(lane)
+                        for lane in ("pps", "vclock", "ocxo1", "ocxo2")
+                    ),
+                )
 
         _diag["timebase_final_court_checks"] += 1
         court_ok, court_verdict = _timebase_final_court_evaluate(court_timebase)
@@ -7316,21 +7555,28 @@ def cmd_report_stats(_: Optional[dict]) -> Dict[str, Any]:
     return response
 
 
-def cmd_stats_reset(_: Optional[dict]) -> Dict[str, Any]:
-    """Reset all CLOCKS statistical populations as one operator command.
+def _current_live_stats_reset_count() -> int:
+    """Return the reset_count of the latest canonical live CLOCKS state."""
+    with _clocks_lock:
+        state = copy.deepcopy(_latest_clocks)
+    stats = _clocks_payload(state).get("stats")
+    reset_count = (
+        _as_int(stats.get("reset_count"))
+        if isinstance(stats, dict)
+        else None
+    )
+    if reset_count is None or reset_count < 0:
+        raise RuntimeError("latest live CLOCKS state has no usable stats.reset_count")
+    return int(reset_count)
 
-    Teensy owns the real-clock Welfords; Pi owns GNSS_RAW.  Require the
-    Teensy reset to succeed before resetting Pi state so a transport failure
-    cannot silently split the statistical epoch.
-    """
-    _diag["stats_reset_requests"] = _diag.get("stats_reset_requests", 0) + 1
-    startup_busy = _startup_control_gate("STATS_RESET")
-    if startup_busy is not None:
-        return startup_busy
 
-    requested_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    pi_before = _gnss_raw_welford_snapshot()
-
+def _perform_transitive_stats_reset(
+    *,
+    requested_at: str,
+    pi_before: Dict[str, Any],
+    source: str,
+) -> Dict[str, Any]:
+    """Reset Teensy-owned and Pi-owned CLOCKS statistics as one transaction."""
     try:
         teensy_response = send_command(
             machine="TEENSY",
@@ -7345,6 +7591,7 @@ def cmd_stats_reset(_: Optional[dict]) -> Dict[str, Any]:
             "requested_at_utc": requested_at,
             "success": False,
             "stage": "TEENSY",
+            "source": source,
             "error": str(exc),
             "pi_gnss_raw_before": pi_before,
             "pi_reset_applied": False,
@@ -7366,6 +7613,7 @@ def cmd_stats_reset(_: Optional[dict]) -> Dict[str, Any]:
             "requested_at_utc": requested_at,
             "success": False,
             "stage": "TEENSY",
+            "source": source,
             "teensy_response": teensy_response,
             "pi_gnss_raw_before": pi_before,
             "pi_reset_applied": False,
@@ -7385,6 +7633,7 @@ def cmd_stats_reset(_: Optional[dict]) -> Dict[str, Any]:
         "requested_at_utc": requested_at,
         "completed_at_utc": completed_at,
         "success": True,
+        "source": source,
         "scope": "SYSTEMWIDE_CLOCK_STATISTICS",
         "campaign_unchanged": True,
         "clockfaces_unchanged": True,
@@ -7395,13 +7644,84 @@ def cmd_stats_reset(_: Optional[dict]) -> Dict[str, Any]:
     _diag["stats_reset_success"] = _diag.get("stats_reset_success", 0) + 1
     _diag["last_stats_reset"] = result
     logging.warning(
-        "📊 [clocks] transitive STATS_RESET complete: Teensy accepted; "
+        "📊 [clocks] transitive STATS_RESET complete (%s): Teensy accepted; "
         "GNSS_RAW N %d -> %d; campaign and clockfaces preserved",
+        source,
         int(pi_previous.get("n") or 0),
         int(pi_after.get("n") or 0),
     )
     return {"success": True, "message": "OK", "payload": result}
 
+
+def _establish_fresh_durable_stats_epoch() -> Dict[str, Any]:
+    """Align fresh Alpha epoch birth with the durable persistence boundary."""
+    global _clocks_epoch_birth_prior_reset_count
+    global _clocks_epoch_birth_reset_count
+
+    prior_reset_count = _current_live_stats_reset_count()
+    _clocks_epoch_birth_prior_reset_count = int(prior_reset_count)
+    _clocks_epoch_birth_reset_count = -1
+    _clocks_epoch_birth_committed.clear()
+
+    _diag["stats_reset_requests"] = _diag.get("stats_reset_requests", 0) + 1
+    requested_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    pi_before = _gnss_raw_welford_snapshot()
+
+    # Open the writer before reset, but hold all rows until Alpha publishes row 1
+    # of a strictly newer reset_count.  This removes both race directions:
+    # pre-reset startup rows cannot become durable, and new-epoch row 1 cannot
+    # disappear through a still-closed persistence boundary.
+    _clocks_epoch_birth_pending.set()
+    _clocks_persistence_enabled.set()
+
+    response = _perform_transitive_stats_reset(
+        requested_at=requested_at,
+        pi_before=pi_before,
+        source="HOLISTIC_RESTORE_EPOCH_BIRTH",
+    )
+    if not response.get("success"):
+        raise RuntimeError(
+            "fresh durable CLOCKS statistics epoch could not be established: "
+            f"{response.get('message') or response!r}"
+        )
+
+    if not _clocks_epoch_birth_committed.wait(timeout=HOLISTIC_RESTORE_TIMEOUT_S):
+        raise RuntimeError(
+            "fresh CLOCKS statistics epoch did not durably commit update_count=1 "
+            f"within {HOLISTIC_RESTORE_TIMEOUT_S:.1f}s "
+            f"(prior_reset_count={prior_reset_count}, "
+            f"observed_reset_count={_clocks_epoch_birth_reset_count})"
+        )
+
+    return {
+        "restored": False,
+        "fresh_epoch": True,
+        "persistence_open": True,
+        "reset_count": int(_clocks_epoch_birth_reset_count),
+        "first_durable_update_count": 1,
+        "stats_reset": response.get("payload") or {},
+    }
+
+
+def cmd_stats_reset(_: Optional[dict]) -> Dict[str, Any]:
+    """Reset all CLOCKS statistical populations as one operator command.
+
+    Teensy owns the real-clock Welfords; Pi owns GNSS_RAW.  Require the
+    Teensy reset to succeed before resetting Pi state so a transport failure
+    cannot silently split the statistical epoch.
+    """
+    _diag["stats_reset_requests"] = _diag.get("stats_reset_requests", 0) + 1
+    startup_busy = _startup_control_gate("STATS_RESET")
+    if startup_busy is not None:
+        return startup_busy
+
+    requested_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    pi_before = _gnss_raw_welford_snapshot()
+    return _perform_transitive_stats_reset(
+        requested_at=requested_at,
+        pi_before=pi_before,
+        source="CLOCKS.STATS_RESET",
+    )
 
 
 
@@ -8235,14 +8555,10 @@ def _restore_active_campaign_state() -> Dict[str, Any]:
                 _diag["recovery_degraded_rows_admitted"] = (
                     _diag.get("recovery_degraded_rows_admitted", 0) + 1
                 )
-                logging.warning(
-                    "⚠️ [recovery] truthful degraded timeline row admitted: "
-                    "count=%d expected=%d offset=%+d state=%s; OCXO science remains gated",
-                    teensy_pps_vclock_count,
-                    expected_first_public_pps_vclock_count,
-                    first_public_offset,
-                    recovery_admission_verdict.get("state_reasons"),
-                )
+                # Expected recovery proof search stays quiet.  The row is still
+                # persisted and the complete admission verdict remains in diagnostics;
+                # firmware emits CLOCKS_RECOVERY_STALLED if proof exceeds its bounded
+                # attempt threshold.
             break
 
         discarded_transitional_rows += 1
@@ -9380,6 +9696,10 @@ def run() -> None:
 
     _startup_control_ready.clear()
     _clocks_persistence_enabled.clear()
+    _clocks_epoch_birth_pending.clear()
+    _clocks_epoch_birth_committed.clear()
+    _clocks_holistic_restore_proof_pending.clear()
+    _clocks_holistic_restore_proof_committed.clear()
     _diag["startup_control_ready"] = False
 
     logging.info(
