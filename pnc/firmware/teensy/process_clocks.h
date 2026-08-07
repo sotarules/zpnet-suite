@@ -125,7 +125,7 @@ void process_clocks_register(void);
 // -----------------------------------------------------------------------------
 //
 // There is no runtime science/forensic mode. Every completed PPS second is
-// preserved for CLOCKS/TIMEBASE. Any layer may object while it still owns the
+// preserved for the canonical CLOCKS_FRAGMENT row. Any layer may object while it
 // evidence needed to adjudicate the second. A pending objection excludes the
 // whole PPS second from Welford, TAU/PPB, servo, and DAC-control math, but does
 // not suppress publication or PostgreSQL persistence.
@@ -458,7 +458,7 @@ struct clocks_fragment_raw_cycles_snapshot_t {
 
 // Durable DAC/control knowledge. In-flight request/service bookkeeping is not
 // persistent instrument state and is intentionally absent.
-struct clocks_fragment_dither_lane_t {
+struct clocks_fragment_dac_lane_t {
   double value = 0.0;
   uint16_t hw_code = 0;
   bool readback_valid = false;
@@ -477,13 +477,17 @@ struct clocks_fragment_dither_lane_t {
   uint32_t servo_predictor_updates = 0;
 };
 
+// Source-compatibility alias for older recovery/report code.  The lane persists
+// DAC and servo control state whether fractional dithering is enabled or not.
+using clocks_fragment_dither_lane_t = clocks_fragment_dac_lane_t;
+
 struct clocks_fragment_dac_snapshot_t {
   char servo_mode[CLOCKS_FRAGMENT_STATE_NAME_MAX] = {0};
   bool servo_active = false;
   char realization_mode[CLOCKS_FRAGMENT_STATE_NAME_MAX] = {0};
   bool dither_operator_enabled = false;
-  clocks_fragment_dither_lane_t ocxo1{};
-  clocks_fragment_dither_lane_t ocxo2{};
+  clocks_fragment_dac_lane_t ocxo1{};
+  clocks_fragment_dac_lane_t ocxo2{};
 };
 
 // TEMPEST-specific independent clock constructions.  These remain campaign

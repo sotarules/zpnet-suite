@@ -153,7 +153,7 @@ static constexpr uint32_t CAMPAIGN_RECORD_INVALID_OCXO2_CUSTODY =
 // Row objections are the only survivable-science disposition.  They are
 // authored as soon as a layer has enough evidence, consulted by Alpha before
 // Welford/TAU mutation, consumed by Beta at the completed-row boundary, and
-// always serialized for TIMEBASE.  There is no runtime gate mode.
+// always serialized with the canonical campaign row.  There is no runtime gate mode.
 
 // Defined with the watchdog/recovery state later in this translation unit.
 bool clocks_watchdog_campaign_armed(void);
@@ -189,7 +189,7 @@ static clocks_row_objection_record_t g_row_objection_last DMAMEM = {};
 // A rejected endpoint participates in two adjacent intervals.  When Alpha
 // excludes PPS X for a cycle/interval excursion, this one-shot holds PPS
 // X+1 out of science so no accumulator or servo consumes an interval whose
-// opening endpoint was already rejected.  TIMEBASE still persists the row.
+// opening endpoint was already rejected.  The canonical campaign row still persists.
 static volatile uint32_t g_row_antecedent_hold_target_pps = 0U;
 static volatile uint32_t g_row_antecedent_hold_source_pps = 0U;
 static volatile uint32_t g_row_antecedent_hold_lane_mask = 0U;
@@ -667,9 +667,9 @@ static FLASHMEM void clocks_fragment_dac_snapshot(
 // Durable structured recovery state
 // ============================================================================
 //
-// CLOCKS and TIMEBASE carry ordinary typed state.  Floating values cross the
-// Payload boundary as fixed-decimal JSON numbers; firmware never constructs,
-// stores, or accepts opaque binary recovery state.
+// CLOCKS recovery crosses the control boundary as ordinary typed state.
+// Floating values cross the Payload boundary as fixed-decimal JSON numbers;
+// firmware never constructs, stores, or accepts opaque binary recovery state.
 
 static constexpr uint32_t CLOCKS_STRUCTURED_RESTORE_VERSION = 3U;
 static constexpr uint32_t CLOCKS_PPB_RESTORE_CHUNK_MAX_ENDPOINTS = 4U;
@@ -684,8 +684,8 @@ struct clocks_recovery_restore_state_t {
 
   clocks_instrument_stats_snapshot_t stats{};
   bool control_present = false;
-  clocks_fragment_dither_lane_t ocxo1_dac{};
-  clocks_fragment_dither_lane_t ocxo2_dac{};
+  clocks_fragment_dac_lane_t ocxo1_dac{};
+  clocks_fragment_dac_lane_t ocxo2_dac{};
   servo_mode_t servo_mode = servo_mode_t::OFF;
   bool dither_operator_enabled = false;
 };
@@ -755,7 +755,7 @@ static inline void clocks_report_irq_restore(uint32_t prior_basepri) {
 }
 
 static bool clocks_recovery_dac_lane_valid(
-    const clocks_fragment_dither_lane_t& state) {
+    const clocks_fragment_dac_lane_t& state) {
   return isfinite(state.value) &&
          state.value >= 0.0 &&
          state.value <= (double)OCXO_DAC_SAFE_MAX_HW_CODE &&
@@ -913,7 +913,7 @@ static bool restore_parse_tau(const Payload& args,
 
 static bool restore_parse_dac_lane(const Payload& args,
                                    const char* prefix,
-                                   clocks_fragment_dither_lane_t& out) {
+                                   clocks_fragment_dac_lane_t& out) {
   char key[80];
 #define RESTORE_DAC_DBL(field) \
   do { snprintf(key, sizeof(key), "%s_" #field, prefix); \
@@ -1779,12 +1779,10 @@ static clocks_alpha_smartzero_delay_snapshot_t
     g_beta_report_smartzero_delay_scratch DMAMEM = {};
 static clocks_alpha_ocxo_visible_origin_snapshot_t
     g_beta_report_visible_origin_scratch DMAMEM = {};
-struct clock_science_row_t {
-  // valid means the row contains numeric material usable by the currently
-  // unified row-admission contract. science_worthy is the numeric court verdict.
-  bool     valid = false;
-  bool     science_worthy = false;
-  bool     antecedents_complete = false;
+// Beta extends the canonical fragment science value with private calculation
+// and comparison state.  Common published fields have one typed home.
+struct clock_science_row_t : clocks_fragment_science_snapshot_t {
+  // valid/science_worthy/antecedents_complete are inherited canonical fields.
   uint32_t clock_id = 0;
   uint32_t public_count = 0;
 
@@ -1802,15 +1800,11 @@ struct clock_science_row_t {
   // The *_residual_cycles fields are Dave-subtraction signed
   // (clock_interval - reference_interval).  The *_fast_residual_* mirrors
   // the project-wide sign convention: positive means the clock is fast.
-  bool     delta_raw_valid = false;
   bool     delta_raw_reference_plausible = false;
   bool     delta_raw_clock_plausible = false;
   uint32_t delta_reference_public_count = 0;
   uint32_t delta_publication_public_count = 0;
-  uint32_t delta_raw_reference_interval_cycles = 0;
-  uint32_t delta_raw_clock_interval_cycles = 0;
   int64_t  delta_raw_residual_cycles = 0;
-  int64_t  delta_raw_fast_residual_cycles = 0;
   int64_t  delta_raw_residual_ns = 0;
   int64_t  delta_raw_fast_residual_ns = 0;
   double   delta_raw_residual_ns_exact = 0.0;
@@ -1845,12 +1839,8 @@ struct clock_science_row_t {
   int64_t  current_edge_gnss_ns = 0;
   double   prior_edge_gnss_ns_exact = 0.0;
   double   current_edge_gnss_ns_exact = 0.0;
-  uint64_t gnss_interval_ns = 0;
-  uint64_t clock_interval_ns = 0;
-  int64_t  fast_residual_ns = 0;
   double   gnss_interval_ns_exact = 0.0;
   double   clock_interval_ns_exact = 0.0;
-  double   fast_residual_ns_exact = 0.0;
   double   tau_1s = 1.0;
   double   ppb_1s = 0.0;
 
@@ -2368,7 +2358,7 @@ static uint64_t science_render_legacy_clock_interval_ns(
     const clock_science_row_t& row) {
   if (!row.valid) return 0ULL;
 
-  if (clocks_ocxo_counterledger_mode_enabled()) {
+  if (clocks_ocxo_counterledger_mode()) {
     // CounterLedger mode changes public clockface authority, not this row's
     // canonical one-second residual.  The row is still the Delta rendering.
     return row.clock_interval_ns;
@@ -2385,7 +2375,7 @@ static uint64_t science_render_public_clock_ns(
     uint64_t public_gnss_ns,
     const clock_science_row_t& row,
     uint64_t fallback_public_ns) {
-  if (clocks_ocxo_counterledger_mode_enabled()) {
+  if (clocks_ocxo_counterledger_mode()) {
     // CounterLedger public ns is already authored by Alpha from the
     // PPS-captured OCXO counter.  Do not re-render it from Delta totals.
     (void)public_gnss_ns;
@@ -2440,14 +2430,12 @@ static uint64_t current_raw_gnss_ns(void) {
   return g_gnss_ns_at_pps_vclock;
 }
 
-static uint64_t current_raw_ocxo1_measured_ns(void) {
-  // Legacy measured GNSS-elapsed ledger retained as a diagnostic surface.
-  return clocks_ocxo1_measured_gnss_ns_now();
-}
-
-static uint64_t current_raw_ocxo2_measured_ns(void) {
-  // Legacy measured GNSS-elapsed ledger retained as a diagnostic surface.
-  return clocks_ocxo2_measured_gnss_ns_now();
+static uint64_t current_raw_ocxo_measured_ns(time_clock_id_t clock) {
+  switch (clock) {
+    case time_clock_id_t::OCXO1: return clocks_ocxo1_measured_gnss_ns_now();
+    case time_clock_id_t::OCXO2: return clocks_ocxo2_measured_gnss_ns_now();
+    default:                      return 0ULL;
+  }
 }
 
 static uint64_t current_raw_counterledger_ns(time_clock_id_t clock) {
@@ -2462,30 +2450,15 @@ static uint64_t current_raw_counterledger_ns(time_clock_id_t clock) {
       : g_beta_counterledger_raw_scratch.ns;
 }
 
-static uint64_t current_raw_ocxo1_ns(void) {
-  if (clocks_ocxo_counterledger_mode_enabled()) {
-    const uint64_t ns = current_raw_counterledger_ns(time_clock_id_t::OCXO1);
+static uint64_t current_raw_ocxo_ns(time_clock_id_t clock) {
+  if (clocks_ocxo_counterledger_mode()) {
+    const uint64_t ns = current_raw_counterledger_ns(clock);
     if (ns != 0ULL) return ns;
   }
 
   // Traditional authority uses Alpha's PPS-row measured/projection surface.
-  // CounterLedger mode falls back here only before the PPS-sampled ledger has
-  // produced its first valid row, which START gates prevent from becoming
-  // public campaign output.
-  return current_raw_ocxo1_measured_ns();
-}
-
-static uint64_t current_raw_ocxo2_ns(void) {
-  if (clocks_ocxo_counterledger_mode_enabled()) {
-    const uint64_t ns = current_raw_counterledger_ns(time_clock_id_t::OCXO2);
-    if (ns != 0ULL) return ns;
-  }
-
-  // Traditional authority uses Alpha's PPS-row measured/projection surface.
-  // CounterLedger mode falls back here only before the PPS-sampled ledger has
-  // produced its first valid row, which START gates prevent from becoming
-  // public campaign output.
-  return current_raw_ocxo2_measured_ns();
+  // CounterLedger mode falls back here only before that ledger has a valid row.
+  return current_raw_ocxo_measured_ns(clock);
 }
 
 static int64_t campaign_public_offset_for_recovered_value(uint64_t current,
@@ -2530,9 +2503,9 @@ static void instrument_continuity_install(
   g_instrument_dwt_offset = campaign_public_offset_for_recovered_value(
       g_dwt_cycle_count_total, state.instrument_dwt_cycles);
   g_instrument_ocxo1_offset = campaign_public_offset_for_recovered_value(
-      current_raw_ocxo1_measured_ns(), state.instrument_ocxo1_ns);
+      current_raw_ocxo_measured_ns(time_clock_id_t::OCXO1), state.instrument_ocxo1_ns);
   g_instrument_ocxo2_offset = campaign_public_offset_for_recovered_value(
-      current_raw_ocxo2_measured_ns(), state.instrument_ocxo2_ns);
+      current_raw_ocxo_measured_ns(time_clock_id_t::OCXO2), state.instrument_ocxo2_ns);
   g_instrument_continuity_active = true;
   g_instrument_continuity_install_count++;
 }
@@ -2546,18 +2519,6 @@ static uint64_t instrument_continuity_gnss_ns(uint64_t raw) {
 static uint64_t instrument_continuity_dwt_cycles(uint64_t raw) {
   return g_instrument_continuity_active
       ? campaign_public_from_offset(raw, g_instrument_dwt_offset)
-      : raw;
-}
-
-static uint64_t instrument_continuity_ocxo1_ns(uint64_t raw) {
-  return g_instrument_continuity_active
-      ? campaign_public_from_offset(raw, g_instrument_ocxo1_offset)
-      : raw;
-}
-
-static uint64_t instrument_continuity_ocxo2_ns(uint64_t raw) {
-  return g_instrument_continuity_active
-      ? campaign_public_from_offset(raw, g_instrument_ocxo2_offset)
       : raw;
 }
 
@@ -2620,13 +2581,13 @@ static void recover_continuity_align_if_pending(uint32_t public_count,
   const uint64_t raw_c2 =
       current_raw_counterledger_ns(time_clock_id_t::OCXO2);
   const bool counterledger_authority =
-      clocks_ocxo_counterledger_mode_enabled();
+      clocks_ocxo_counterledger_mode();
   const uint64_t raw_o1 = counterledger_authority
       ? raw_c1
-      : current_raw_ocxo1_ns();
+      : current_raw_ocxo_ns(time_clock_id_t::OCXO1);
   const uint64_t raw_o2 = counterledger_authority
       ? raw_c2
-      : current_raw_ocxo2_ns();
+      : current_raw_ocxo_ns(time_clock_id_t::OCXO2);
   const uint64_t target_o1 =
       campaign_recover_project_ocxo_to_public_gnss(public_gnss_ns,
                                                    recover_ocxo1_ns);
@@ -2666,8 +2627,8 @@ static void recover_continuity_align_if_pending(uint32_t public_count,
   g_campaign_public_ocxo2_offset =
       campaign_public_offset_for_recovered_value(raw_o2, target_o2);
 
-  const uint64_t raw_m1 = current_raw_ocxo1_measured_ns();
-  const uint64_t raw_m2 = current_raw_ocxo2_measured_ns();
+  const uint64_t raw_m1 = current_raw_ocxo_measured_ns(time_clock_id_t::OCXO1);
+  const uint64_t raw_m2 = current_raw_ocxo_measured_ns(time_clock_id_t::OCXO2);
   if (raw_m1 != 0ULL) {
     g_campaign_public_ocxo1_measured_offset =
         campaign_public_offset_for_recovered_value(raw_m1, target_o1);
@@ -2712,18 +2673,6 @@ static uint64_t campaign_public_counterledger_ns(time_clock_id_t clock,
   return raw ? campaign_public_from_offset(raw, offset) : 0ULL;
 }
 
-static uint64_t campaign_public_counterledger_ocxo1_ns(void) {
-  return campaign_public_counterledger_ns(
-      time_clock_id_t::OCXO1,
-      g_campaign_public_counterledger_ocxo1_offset);
-}
-
-static uint64_t campaign_public_counterledger_ocxo2_ns(void) {
-  return campaign_public_counterledger_ns(
-      time_clock_id_t::OCXO2,
-      g_campaign_public_counterledger_ocxo2_offset);
-}
-
 static void campaign_public_counterledger_offsets_reset_to_current(void) {
   const uint64_t o1 = current_raw_counterledger_ns(time_clock_id_t::OCXO1);
   const uint64_t o2 = current_raw_counterledger_ns(time_clock_id_t::OCXO2);
@@ -2746,16 +2695,6 @@ static void campaign_public_counterledger_offsets_reset_for_recover(void) {
       : 0;
 }
 
-static uint64_t campaign_public_ocxo1_measured_ns(void) {
-  return campaign_public_from_offset(current_raw_ocxo1_measured_ns(),
-                                     g_campaign_public_ocxo1_measured_offset);
-}
-
-static uint64_t campaign_public_ocxo2_measured_ns(void) {
-  return campaign_public_from_offset(current_raw_ocxo2_measured_ns(),
-                                     g_campaign_public_ocxo2_measured_offset);
-}
-
 static void campaign_public_offsets_reset_to_current(void) {
   recover_continuity_align_reset("offsets_reset_to_current");
   g_campaign_public_dwt_offset =
@@ -2763,13 +2702,13 @@ static void campaign_public_offsets_reset_to_current(void) {
   g_campaign_public_gnss_offset =
       campaign_public_offset_to_zero(current_raw_gnss_ns());
   g_campaign_public_ocxo1_offset =
-      campaign_public_offset_to_zero(current_raw_ocxo1_ns());
+      campaign_public_offset_to_zero(current_raw_ocxo_ns(time_clock_id_t::OCXO1));
   g_campaign_public_ocxo2_offset =
-      campaign_public_offset_to_zero(current_raw_ocxo2_ns());
+      campaign_public_offset_to_zero(current_raw_ocxo_ns(time_clock_id_t::OCXO2));
   g_campaign_public_ocxo1_measured_offset =
-      campaign_public_offset_to_zero(current_raw_ocxo1_measured_ns());
+      campaign_public_offset_to_zero(current_raw_ocxo_measured_ns(time_clock_id_t::OCXO1));
   g_campaign_public_ocxo2_measured_offset =
-      campaign_public_offset_to_zero(current_raw_ocxo2_measured_ns());
+      campaign_public_offset_to_zero(current_raw_ocxo_measured_ns(time_clock_id_t::OCXO2));
   campaign_public_counterledger_offsets_reset_to_current();
   delta_clock_candidates_seed_zero();
 }
@@ -2783,16 +2722,16 @@ static void campaign_public_offsets_reset_for_recover(void) {
       campaign_public_offset_for_recovered_value(current_raw_gnss_ns(),
                                                  recover_gnss_ns);
   g_campaign_public_ocxo1_offset =
-      campaign_public_offset_for_recovered_value(current_raw_ocxo1_ns(),
+      campaign_public_offset_for_recovered_value(current_raw_ocxo_ns(time_clock_id_t::OCXO1),
                                                  recover_ocxo1_ns);
   g_campaign_public_ocxo2_offset =
-      campaign_public_offset_for_recovered_value(current_raw_ocxo2_ns(),
+      campaign_public_offset_for_recovered_value(current_raw_ocxo_ns(time_clock_id_t::OCXO2),
                                                  recover_ocxo2_ns);
   g_campaign_public_ocxo1_measured_offset =
-      campaign_public_offset_for_recovered_value(current_raw_ocxo1_measured_ns(),
+      campaign_public_offset_for_recovered_value(current_raw_ocxo_measured_ns(time_clock_id_t::OCXO1),
                                                  recover_ocxo1_ns);
   g_campaign_public_ocxo2_measured_offset =
-      campaign_public_offset_for_recovered_value(current_raw_ocxo2_measured_ns(),
+      campaign_public_offset_for_recovered_value(current_raw_ocxo_measured_ns(time_clock_id_t::OCXO2),
                                                  recover_ocxo2_ns);
   campaign_public_counterledger_offsets_reset_for_recover();
   delta_clock_candidates_seed_recover();
@@ -2994,8 +2933,8 @@ static bool campaign_start_handoff_ready(void) {
   g_start_handoff_last_ocxo1_projection_ready = ocxo1_projection_ready;
   g_start_handoff_last_ocxo2_projection_ready = ocxo2_projection_ready;
   g_start_handoff_last_raw_gnss_ns = raw_gnss_ns;
-  g_start_handoff_last_raw_ocxo1_ns = current_raw_ocxo1_ns();
-  g_start_handoff_last_raw_ocxo2_ns = current_raw_ocxo2_ns();
+  g_start_handoff_last_raw_ocxo1_ns = current_raw_ocxo_ns(time_clock_id_t::OCXO1);
+  g_start_handoff_last_raw_ocxo2_ns = current_raw_ocxo_ns(time_clock_id_t::OCXO2);
   g_start_handoff_last_ocxo1_projected_ns =
       (ocxo1_projection_ok && ocxo1_projection.valid)
           ? ocxo1_projection.projected_ocxo_ns_at_pps
@@ -3009,7 +2948,7 @@ static bool campaign_start_handoff_ready(void) {
   g_start_handoff_last_ocxo2_projection_vclock_ns =
       ocxo2_projection_ok ? ocxo2_projection.pps_vclock_ns : 0ULL;
 
-  if (clocks_ocxo_counterledger_mode_enabled()) {
+  if (clocks_ocxo_counterledger_mode()) {
     const bool counterledger_ready =
         campaign_start_counterledger_maturity_ready();
     g_start_handoff_last_ready = origin_ready && counterledger_ready;
@@ -3597,7 +3536,7 @@ static bool campaign_warmup_consume_one_candidate_record(
   g_start_prologue_last_release_public_count = 1U;
   safeCopy(g_start_prologue_last_reason,
            sizeof(g_start_prologue_last_reason),
-           clocks_ocxo_counterledger_mode_enabled()
+           clocks_ocxo_counterledger_mode()
                ? "phaseledger_release_public_pps1"
                : "release_public_pps1");
   return false;
@@ -3762,16 +3701,6 @@ static uint64_t campaign_public_gnss_ns(uint32_t public_count) {
   // Rendering it directly from the public PPS identity prevents a warm
   // RECOVER splice from inheriting an ambient raw-ledger phase of +1 second.
   return (uint64_t)public_count * CLOCKS_BETA_NS_PER_SECOND;
-}
-
-static uint64_t campaign_public_ocxo1_ns(void) {
-  return campaign_public_from_offset(current_raw_ocxo1_ns(),
-                                     g_campaign_public_ocxo1_offset);
-}
-
-static uint64_t campaign_public_ocxo2_ns(void) {
-  return campaign_public_from_offset(current_raw_ocxo2_ns(),
-                                     g_campaign_public_ocxo2_offset);
 }
 
 static FLASHMEM bool recover_reattach_should_hold(void) {
@@ -5626,7 +5555,7 @@ static void clock_science_apply_counterledger_row(
     const clocks_alpha_ocxo_counterledger_snapshot_t& ledger,
     uint64_t public_gnss_ns) {
   (void)public_gnss_ns;
-  if (!clocks_ocxo_counterledger_mode_enabled()) return;
+  if (!clocks_ocxo_counterledger_mode()) return;
 
   const bool refined_interval_available =
       ledger.valid && ledger.refined_interval_valid &&
@@ -6262,13 +6191,13 @@ static bool campaign_start_prologue_should_hold(
     if (g_start_handoff_launch_wait_count >=
         CLOCKS_START_HANDOFF_TIMEOUT_CANDIDATES) {
       campaign_start_prologue_abort_launch(
-          clocks_ocxo_counterledger_mode_enabled()
+          clocks_ocxo_counterledger_mode()
               ? "phaseledger_start_handoff_timeout"
               : "start_handoff_timeout");
       return true;
     }
     campaign_start_prologue_set_reason(
-        clocks_ocxo_counterledger_mode_enabled()
+        clocks_ocxo_counterledger_mode()
             ? g_start_phaseledger_last_reason
             : "waiting_for_start_handoff");
     return true;
@@ -6298,7 +6227,7 @@ static bool campaign_start_prologue_should_hold(
           ocxo1_valid, ocxo1_f,
           ocxo2_valid, ocxo2_f)) {
     campaign_start_prologue_set_reason(
-        clocks_ocxo_counterledger_mode_enabled()
+        clocks_ocxo_counterledger_mode()
             ? "phaseledger_release_public_pps1"
             : "release_public_pps1");
     return false;
@@ -6320,10 +6249,10 @@ static bool campaign_start_prologue_should_hold(
       ocxo2_valid,
       ocxo2_f,
       g_start_prologue_reference_ready
-          ? (clocks_ocxo_counterledger_mode_enabled()
+          ? (clocks_ocxo_counterledger_mode()
                  ? "phaseledger_private_pps0_refreshed_after_probe_reject"
                  : "private_pps0_refreshed_after_probe_reject")
-          : (clocks_ocxo_counterledger_mode_enabled()
+          : (clocks_ocxo_counterledger_mode()
                  ? "phaseledger_private_pps0_seeded"
                  : "private_pps0_seeded"));
   return true;
@@ -6412,19 +6341,7 @@ static FLASHMEM void clocks_fragment_clock_candidates_snapshot_from_row(
 static FLASHMEM void clocks_fragment_science_snapshot_from_row(
     clocks_fragment_science_snapshot_t& out,
     const clock_science_row_t& row) {
-  out = clocks_fragment_science_snapshot_t{};
-  out.valid = row.valid;
-  out.science_worthy = row.science_worthy;
-  out.antecedents_complete = row.antecedents_complete;
-  out.gnss_interval_ns = row.gnss_interval_ns;
-  out.clock_interval_ns = row.clock_interval_ns;
-  out.fast_residual_ns = row.fast_residual_ns;
-  out.fast_residual_ns_exact = row.fast_residual_ns_exact;
-  out.delta_raw_valid = row.delta_raw_valid;
-  out.delta_raw_reference_interval_cycles =
-      row.delta_raw_reference_interval_cycles;
-  out.delta_raw_clock_interval_cycles = row.delta_raw_clock_interval_cycles;
-  out.delta_raw_fast_residual_cycles = row.delta_raw_fast_residual_cycles;
+  out = static_cast<const clocks_fragment_science_snapshot_t&>(row);
 }
 
 static FLASHMEM void clocks_fragment_raw_cycles_lane_snapshot(
@@ -6937,7 +6854,7 @@ static void clocks_commit_pending_servo_mode_change(void) {
 
 static void clocks_recovery_restore_dac_lane_runtime(
     ocxo_dac_state_t& dst,
-    const clocks_fragment_dither_lane_t& src) {
+    const clocks_fragment_dac_lane_t& src) {
   dst.servo_last_step = src.servo_last_step;
   dst.servo_last_residual = src.servo_last_residual;
   dst.servo_settle_count = src.servo_settle_count;
@@ -7506,8 +7423,8 @@ static void campaign_flash_cut_commit_at_pps(void) {
 
   g_flash_cut_last_raw_gnss_ns = current_raw_gnss_ns();
   g_flash_cut_last_raw_dwt_cycles = g_dwt_cycle_count_total;
-  g_flash_cut_last_raw_ocxo1_ns = current_raw_ocxo1_ns();
-  g_flash_cut_last_raw_ocxo2_ns = current_raw_ocxo2_ns();
+  g_flash_cut_last_raw_ocxo1_ns = current_raw_ocxo_ns(time_clock_id_t::OCXO1);
+  g_flash_cut_last_raw_ocxo2_ns = current_raw_ocxo_ns(time_clock_id_t::OCXO2);
   g_flash_cut_last_boundary_pps_count = (uint32_t)campaign_seconds;
 
   safeCopy(campaign_name, sizeof(campaign_name), flash_cut_campaign_name);
@@ -7698,9 +7615,9 @@ static bool clocks_servo_active(void) {
 
 
 static FLASHMEM void clocks_fragment_dac_lane_snapshot(
-    clocks_fragment_dither_lane_t& out,
+    clocks_fragment_dac_lane_t& out,
     const ocxo_dac_state_t& dac) {
-  out = clocks_fragment_dither_lane_t{};
+  out = clocks_fragment_dac_lane_t{};
   out.value = ocxo_dac_fractional_snapshot(dac);
   out.hw_code = dac.dac_hw_code;
   out.readback_valid = dac.hw_readback_valid;
@@ -7772,9 +7689,13 @@ static FLASHMEM void clocks_fragment_live_snapshot_fill(
   const uint64_t logical_instrument_dwt_cycles =
       instrument_continuity_dwt_cycles(instrument.dwt_cycles);
   const uint64_t logical_instrument_ocxo1_ns =
-      instrument_continuity_ocxo1_ns(instrument.ocxo1_ns);
+      g_instrument_continuity_active
+          ? campaign_public_from_offset(instrument.ocxo1_ns, g_instrument_ocxo1_offset)
+          : instrument.ocxo1_ns;
   const uint64_t logical_instrument_ocxo2_ns =
-      instrument_continuity_ocxo2_ns(instrument.ocxo2_ns);
+      g_instrument_continuity_active
+          ? campaign_public_from_offset(instrument.ocxo2_ns, g_instrument_ocxo2_offset)
+          : instrument.ocxo2_ns;
 
   out.valid = instrument.valid;
   out.completed_row_coherent = instrument.completed_row_coherent;
@@ -8234,8 +8155,10 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
 
   dwt_cycle_count_total = public_dwt_total;
   gnss_raw_64           = public_gnss_ns / 100ull;
-  ocxo1_measured_gnss_ticks_64        = campaign_public_ocxo1_ns() / 100ull;
-  ocxo2_measured_gnss_ticks_64        = campaign_public_ocxo2_ns() / 100ull;
+  ocxo1_measured_gnss_ticks_64        = campaign_public_from_offset(
+      current_raw_ocxo_ns(time_clock_id_t::OCXO1), g_campaign_public_ocxo1_offset) / 100ull;
+  ocxo2_measured_gnss_ticks_64        = campaign_public_from_offset(
+      current_raw_ocxo_ns(time_clock_id_t::OCXO2), g_campaign_public_ocxo2_offset) / 100ull;
 
   // Alpha already advanced the boot-lifetime instrument statistics for this
   // completed row before entering Beta.  The remaining work is campaign
@@ -8264,8 +8187,12 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   // public_gnss_ns/public_dwt_total and any RECOVER presentation transform
   // were captured before per-second consumers above.
 
-  const uint64_t public_ocxo1_measured_ns = campaign_public_ocxo1_measured_ns();
-  const uint64_t public_ocxo2_measured_ns = campaign_public_ocxo2_measured_ns();
+  const uint64_t public_ocxo1_measured_ns = campaign_public_from_offset(
+      current_raw_ocxo_measured_ns(time_clock_id_t::OCXO1),
+      g_campaign_public_ocxo1_measured_offset);
+  const uint64_t public_ocxo2_measured_ns = campaign_public_from_offset(
+      current_raw_ocxo_measured_ns(time_clock_id_t::OCXO2),
+      g_campaign_public_ocxo2_measured_offset);
 
   const bool ocxo1_pps_projected_valid =
       ocxo1_pps_projection_ok && ocxo1_pps_projection.valid &&
@@ -8329,24 +8256,26 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
       recover_reattach_degraded_science_hold_active();
 
   const uint64_t public_ocxo1_counterledger_ns =
-      campaign_public_counterledger_ocxo1_ns();
+      campaign_public_counterledger_ns(
+          time_clock_id_t::OCXO1, g_campaign_public_counterledger_ocxo1_offset);
   const uint64_t public_ocxo2_counterledger_ns =
-      campaign_public_counterledger_ocxo2_ns();
-  const uint64_t public_ocxo1_ns = clocks_ocxo_counterledger_mode_enabled()
+      campaign_public_counterledger_ns(
+          time_clock_id_t::OCXO2, g_campaign_public_counterledger_ocxo2_offset);
+  const uint64_t public_ocxo1_ns = clocks_ocxo_counterledger_mode()
       ? public_ocxo1_counterledger_ns
       : science_render_public_clock_ns(
             public_gnss_ns, ocxo1_science, public_ocxo1_measured_ns);
-  const uint64_t public_ocxo2_ns = clocks_ocxo_counterledger_mode_enabled()
+  const uint64_t public_ocxo2_ns = clocks_ocxo_counterledger_mode()
       ? public_ocxo2_counterledger_ns
       : science_render_public_clock_ns(
             public_gnss_ns, ocxo2_science, public_ocxo2_measured_ns);
 
-  const bool ocxo1_clockface_valid = clocks_ocxo_counterledger_mode_enabled()
+  const bool ocxo1_clockface_valid = clocks_ocxo_counterledger_mode()
       ? clocks_beta_counterledger_clockface_ready(ocxo1_counterledger,
                                                    completed_pps_sequence,
                                                    public_ocxo1_ns)
       : (public_ocxo1_ns != 0ULL && ocxo1_pps_projected_valid);
-  const bool ocxo2_clockface_valid = clocks_ocxo_counterledger_mode_enabled()
+  const bool ocxo2_clockface_valid = clocks_ocxo_counterledger_mode()
       ? clocks_beta_counterledger_clockface_ready(ocxo2_counterledger,
                                                    completed_pps_sequence,
                                                    public_ocxo2_ns)
@@ -8435,7 +8364,7 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
                                     ocxo2_science);
 
   // Preserve the pre-publication court as compact evidence. Every structurally
-  // coherent candidate becomes a durable TIMEBASE row; this court decides only
+  // coherent candidate becomes a durable campaign row; this court decides only
   // whether science/control consumers may use it.
   const uint32_t ocxo_science_invalid_mask =
       clocks_beta_public_ocxo_science_invalid_mask(
@@ -9529,7 +9458,7 @@ static FLASHMEM Payload cmd_ppb_restore_abort(const Payload&) {
   return p;
 }
 
-static FLASHMEM Payload cmd_restore_monitor(const Payload& args) {
+static FLASHMEM Payload cmd_restore_clocks_state(const Payload& args) {
   if (campaign_state != clocks_campaign_state_t::STOPPED ||
       request_start || request_stop || request_recover || request_zero ||
       request_flash_cut || g_clocks_restore_requested ||
@@ -9816,7 +9745,7 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
   if (g_recover_lifecycle_mode ==
           recover_lifecycle_mode_t::LIVE_REATTACH &&
       g_campaign_restore_state.valid) {
-    // The running Teensy is newer than the last durable TIMEBASE row. Preserve
+    // The running Teensy is newer than the last durable CLOCKS row. Preserve
     // its live statistics and all instrument control state.
     g_campaign_restore_ignored_live_count++;
     g_campaign_restore_state = clocks_recovery_restore_state_t{};
@@ -10514,7 +10443,7 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "PPB_RESTORE_CHUNK",   cmd_ppb_restore_chunk   },
   { "PPB_RESTORE_COMMIT",  cmd_ppb_restore_commit  },
   { "PPB_RESTORE_ABORT",   cmd_ppb_restore_abort   },
-  { "RESTORE_MONITOR",     cmd_restore_monitor     },
+  { "RESTORE_MONITOR",     cmd_restore_clocks_state     },
   { "RECOVER_ABORT",       cmd_recover_abort       },
   { "SERVOS",              cmd_servos              },
   { "REPORT_CLOCKS",       cmd_report_clocks       },

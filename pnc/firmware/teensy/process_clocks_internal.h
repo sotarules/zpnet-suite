@@ -4,7 +4,7 @@
 //
 // Doctrine:
 //
-//   Teensy owns every statistical quantity published in TIMEBASE_FRAGMENT.
+//   Teensy owns every statistical quantity published in CLOCKS_FRAGMENT.
 //   The Pi does not compute derived stats; it transcribes what the Teensy
 //   says.  This prevents diffusion of authority and gives every downstream
 //   consumer a single well-defined source of truth.
@@ -103,6 +103,7 @@
 #include "payload.h"
 #include "time.h"
 #include "process_interrupt.h"
+#include "process_clocks.h"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -242,7 +243,7 @@ static constexpr clocks_ocxo_public_ns_authority_t
         clocks_ocxo_public_ns_authority_t::PPS_COUNTERLEDGER;
 
 // Keep the full CounterLedger/PhaseLedger report surface enabled while it is
-// public authority; focused reports and TIMEBASE then expose the same lineage.
+// public authority; focused reports and CLOCKS_FRAGMENT then expose the same lineage.
 static constexpr bool CLOCKS_OCXO_COUNTERLEDGER_REPORT_ONLY_ENABLED = true;
 
 // CounterLedger frequency is fundamentally a long-baseline integer-tick
@@ -584,45 +585,8 @@ bool clocks_alpha_ocxo_counterledger_ready(void);
 // campaign boundaries and is reset only by reboot or CLOCKS.STATS_RESET.  The
 // PhaseLedger remains the clockface suffix authority, but campaign-independent
 // frequency maturity no longer depends on its refined-interval side rail.
-#ifndef CLOCKS_ALPHA_TAU_SNAPSHOT_T_DEFINED
-#define CLOCKS_ALPHA_TAU_SNAPSHOT_T_DEFINED
-struct clocks_alpha_tau_snapshot_t {
-  bool     snapshot_ok = false;
-  bool     valid = false;
-  uint32_t clock_id = 0;
-  uint32_t epoch_sequence = 0;
-  uint32_t reset_count = 0;
-  uint32_t sample_count = 0;
-  uint32_t interval_count = 0;
-  uint32_t reject_count = 0;
-  uint32_t gap_reset_count = 0;
-  uint32_t last_pps_sequence = 0;
-  uint32_t last_interval_pps_sequence = 0;
-  uint64_t first_refined_ns = 0;
-  uint64_t last_refined_ns = 0;
-  int64_t  last_fast_residual_ns = 0;
+// clocks_alpha_tau_snapshot_t is defined by process_clocks.h.
 
-  // Stable sufficient state for persistence/recovery.  Writer seqlock state is
-  // intentionally not exposed.
-  uint64_t cumulative_reference_ns = 0;
-  uint64_t cumulative_clock_ns = 0;
-  double   cumulative_clock_ns_exact = 0.0;
-  double   mean_x = 0.0;
-  double   mean_y = 0.0;
-  double   sxx = 0.0;
-  double   sxy = 0.0;
-  double   syy = 0.0;
-  double   interval_m2_ppb = 0.0;
-
-  double   tau = 1.0;
-  double   ppb = 0.0;
-  double   stderr_ppb = 0.0;
-  double   interval_mean_ppb = 0.0;
-  double   interval_stddev_ppb = 0.0;
-  double   interval_stderr_ppb = 0.0;
-  int64_t  intercept_ns = 0;
-};
-#endif
 
 bool clocks_alpha_ocxo_tau_snapshot(time_clock_id_t clock,
                                     clocks_alpha_tau_snapshot_t* out);
@@ -786,11 +750,9 @@ struct clocks_alpha_lane_forensics_t {
   uint64_t ns_between_edges;
   uint32_t dwt_cycles_between_edges;
 
-  // process_interrupt-authored DWT interval gate audit.  The normal Alpha
-  // timing path consumes last_event_dwt / dwt_cycles_between_edges as the
-  // effective subscriber coordinate.  These fields retain the raw observed
-  // endpoint/interval and the gate decision that decided whether the EMA was
-  // allowed to learn from that sample.
+  // Retired DWT-repair/predictor compatibility surface.  The observed-only
+  // interrupt path never synthesizes or replaces an endpoint; current code keeps
+  // these fields at their neutral/default values for old reports.
   bool     dwt_synthetic;
   bool     dwt_repair_candidate;
   uint32_t dwt_original_at_event;
@@ -839,11 +801,9 @@ struct clocks_alpha_lane_forensics_t {
   uint32_t dwt_interval_resync_count;
   uint32_t dwt_interval_reject_streak;
 
-  // process_interrupt-authored counter-adjacency audit.  For OCXO lanes this
-  // proves whether the DWT interval sample was formed from adjacent one-second
-  // target identities.  A rejected adjacency sample is custody evidence only:
-  // process_interrupt publishes the predicted DWT endpoint and preserves the
-  // observed endpoint here for TIMEBASE_FORENSICS/raw_cycles.
+  // Retired endpoint-replacement adjacency compatibility surface.  Counter
+  // lineage is still audited elsewhere, but no adjacency court may substitute a
+  // predicted DWT endpoint for the observed event coordinate.
   bool     dwt_interval_adjacency_gate_valid;
   bool     dwt_interval_adjacency_ok;
   bool     dwt_interval_adjacency_rejected;
@@ -851,10 +811,9 @@ struct clocks_alpha_lane_forensics_t {
   uint32_t dwt_interval_expected_counter_delta_ticks;
   uint32_t dwt_interval_adjacency_reject_count;
 
-  // process_interrupt-authored PPS-Yardstick inference audit (Stage 1 --
-  // observational rail).  dwt_at_event remains EMA-authored; these fields
-  // carry the parallel yardstick surface per row so TIMEBASE/raw_cycles can
-  // adjudicate the Stage 2 authority flip side-by-side with the EMA math.
+  // Retired PPS-Yardstick/EMA compatibility surface.  Current event authority is
+  // the observed interrupt-authored DWT coordinate; these fields remain only so
+  // historical reports keep their shape.
   bool     dwt_yardstick_valid;
   bool     dwt_yardstick_stale;
   bool     dwt_yardstick_seeded;
@@ -879,9 +838,9 @@ struct clocks_alpha_lane_forensics_t {
   int32_t  dwt_yardstick_auth_error_cycles;
   bool     dwt_yardstick_auth_anchor_applied;
 
-  // SlipLedger correction summary from process_interrupt.  The subscriber
-  // DWT value is already purified; these fields are the compact forensic
-  // trail for any historical signed hardware-counter phase correction.
+  // Retired SlipLedger compatibility surface.  process_interrupt no longer owns
+  // or applies a SlipLedger correction; these members remain neutral for old
+  // report/ABI consumers.
   bool     slipledger_active;
   bool     slipledger_event_corrected;
   bool     slipledger_event_violation;
@@ -973,7 +932,7 @@ struct clocks_alpha_lane_forensics_t {
   uint32_t spinidle_shadow_valid_threshold_cycles;
 
   // process_interrupt's integrated causal conclusion.  Alpha transports this
-  // verbatim; Beta renders it into each completed TIMEBASE row.
+  // verbatim; Beta renders it into each completed campaign row.
   interrupt_delay_forensics_t interrupt_delay{};
 
 };
@@ -1103,7 +1062,7 @@ bool clocks_alpha_integrity_snapshot(clocks_alpha_integrity_snapshot_t* out);
 // Report-only control-flow counters for diagnosing the handoff from
 // process_interrupt subscriber events into Alpha's per-lane measurement and
 // forensics stores. These fields are intentionally not published in
-// TIMEBASE_FRAGMENT; Beta exposes them through CLOCKS.REPORT_ALPHA_FLOW.
+// CLOCKS_FRAGMENT; Beta exposes them through CLOCKS.REPORT_ALPHA_FLOW.
 
 struct clocks_alpha_event_flow_snapshot_t {
   uint32_t clock_id;
@@ -1436,7 +1395,7 @@ bool clocks_alpha_recover_ocxo_reattach_ready(void);
 // Step A report-only surface for the coming PPS-founded OCXO nanosecond clock
 // standard.  Alpha computes what the OCXO clock value would be at the current
 // PPS/VCLOCK DWT coordinate from OCXO edge facts, but does not yet promote
-// that value into g_ocxo*_measured_gnss_ns_at_pps_vclock or TIMEBASE.
+// that value into g_ocxo*_measured_gnss_ns_at_pps_vclock or CLOCKS_FRAGMENT.
 
 struct clocks_alpha_ocxo_pps_projection_snapshot_t {
   bool     snapshot_ok = false;
@@ -1603,7 +1562,7 @@ struct ocxo_dac_state_t {
   double   servo_predicted_residual;
   uint32_t servo_predictor_updates;
 
-  // Servo/DAC ownership.  Beta's 1 Hz TIMEBASE path may only request a
+  // Servo/DAC ownership.  Beta's 1 Hz campaign path may only request a
   // real-valued DAC target.  The dither owner consumes the request at a frame
   // boundary, installs the fractional target, and owns every hardware-facing
   // low/high/static realization.
@@ -1772,7 +1731,7 @@ const char* clocks_ocxo_dac_actuator_context(void);
 // START forms the normal current-row forensic candidate before applying its
 // private prologue court. While the court holds, that candidate is consumed as
 // private PPS0 evidence: Alpha and Beta startup bookends advance, but
-// campaign_seconds remains zero and no TIMEBASE_FRAGMENT is published.
+// campaign_seconds remains zero and no campaign CLOCKS_FRAGMENT is published.
 //
 // The first following candidate that proves startup continuity is released as
 // public PPS1 (teensy_pps_vclock_count=1, gnss_ns=1e9). There is no fixed-N row
@@ -1820,7 +1779,7 @@ extern uint64_t recover_ocxo2_ns;
 //
 // Alpha-owned always-on Welford instances, one per published prefix.  Their
 // lifetime is boot-to-reboot; START, STOP, FLASH_CUT, and warm RECOVER never
-// reset or restore them.  Beta may read them for TIMEBASE/servo compatibility,
+// reset or restore them.  Beta may read them for campaign/servo compatibility,
 // but Alpha is the sole update/reset authority.
 //
 //   welford_gnss         — exact GNSS reference residual, always 0 ns
@@ -1865,7 +1824,7 @@ double welford_stderr(const welford_t& w);
 // a complete lawful PPS/VCLOCK + OCXO row exists, including while campaign_state
 // is STOPPED.  Campaign code may snapshot and serialize it, but must not rebase,
 // restore, or reset it as part of campaign lifecycle. Command reports and the
-// completed-row TIMEBASE path must use separate snapshot/Payload scratch. Report
+// completed-row campaign path must use separate snapshot/Payload scratch. Report
 // construction keeps Priority 0 capture live and excludes only the Priority 16
 // TimePop/handoff tier until the response has been fully copied.
 
@@ -1919,8 +1878,8 @@ struct clocks_instrument_stats_snapshot_t {
   uint64_t ocxo2_ns = 0;
 
   // Exact selected PPS/VCLOCK edge identity belonging to the same completed
-  // Alpha row as the clockfaces above.  The always-on MONITOR feed uses these
-  // fields instead of mixing ambient next-row globals into a coherent snapshot.
+  // Alpha row as the clockfaces above.  The always-on CLOCKS_FRAGMENT feed uses these
+  // fields instead of mixing next-row globals into a coherent snapshot.
   uint32_t dwt_at_pps_vclock = 0;
   uint32_t counter32_at_pps_vclock = 0;
 

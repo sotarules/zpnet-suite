@@ -72,6 +72,28 @@ static void alpha_row_exclude(clocks_row_objection_reason_t reason,
                      detail3);
 }
 
+template <typename T>
+static T* alpha_clock_store_for(time_clock_id_t clock,
+                                T* vclock,
+                                T* ocxo1,
+                                T* ocxo2) {
+  switch (clock) {
+    case time_clock_id_t::VCLOCK: return vclock;
+    case time_clock_id_t::OCXO1:  return ocxo1;
+    case time_clock_id_t::OCXO2:  return ocxo2;
+    default:                       return nullptr;
+  }
+}
+
+template <typename T>
+static T* alpha_ocxo_store_for(time_clock_id_t clock, T* ocxo1, T* ocxo2) {
+  switch (clock) {
+    case time_clock_id_t::OCXO1: return ocxo1;
+    case time_clock_id_t::OCXO2: return ocxo2;
+    default:                      return nullptr;
+  }
+}
+
 static_assert(NS_PER_SECOND_U64 ==
               (uint64_t)VCLOCK_COUNTS_PER_SECOND * 100ULL,
               "VCLOCK pulse identity broken: NS_PER_SECOND_U64 != "
@@ -232,7 +254,7 @@ static volatile uint32_t g_observed_vclock_dwt_cycles_between_edges = 0;
 static volatile uint32_t g_prev_pps_vclock_dwt_at_edge = 0;
 static volatile bool     g_prev_pps_vclock_dwt_at_edge_valid = false;
 
-// Physical PPS witness DWT audit surface for TIMEBASE.  This is the
+// Physical PPS witness DWT audit surface for the completed CLOCKS row.  This is the
 // physical GPIO PPS event-coordinate DWT captured by process_interrupt
 // and exposed through pps_edge_snapshot_t.  It is intentionally separate
 // from the canonical PPS/VCLOCK DWT edge.
@@ -1258,7 +1280,7 @@ bool ocxo_dac_set_desired(ocxo_dac_state_t& s, double value) {
     // AD5693R path has accepted the rounded code.  This keeps desired DAC state
     // from drifting away from the last confirmed hardware output after an I2C
     // failure.  Callers that need non-blocking behavior must queue through the
-    // dither-owned servo request path instead of calling this from TIMEBASE.
+    // dither-owned servo request path instead of calling this from the 1 Hz science path.
     if (!ocxo_dac_write_hw_code(s, hw_code, true)) {
       return false;
     }
@@ -1633,14 +1655,10 @@ static void alpha_integrity_record_ns_check(
 
 static clocks_alpha_integrity_ocxo_check_t*
 alpha_integrity_ocxo_store(time_clock_id_t clock) {
-  switch (clock) {
-    case time_clock_id_t::OCXO1:
-      return &g_alpha_integrity.ocxo1_projected_gnss_interval;
-    case time_clock_id_t::OCXO2:
-      return &g_alpha_integrity.ocxo2_projected_gnss_interval;
-    default:
-      return nullptr;
-  }
+  return alpha_ocxo_store_for(
+      clock,
+      &g_alpha_integrity.ocxo1_projected_gnss_interval,
+      &g_alpha_integrity.ocxo2_projected_gnss_interval);
 }
 
 static void alpha_integrity_note_vclock_gnss_self_map(uint32_t sequence,
@@ -1727,228 +1745,11 @@ FLASHMEM bool clocks_alpha_integrity_snapshot(clocks_alpha_integrity_snapshot_t*
 // event to process_time's generalized clock projection model.  This lets REPORT
 // distinguish event/zero-offset errors from projection-to-report-DWT errors.
 
-struct alpha_lane_forensics_store_t {
-  volatile uint32_t seq = 0;
-  bool     valid = false;
-  uint32_t update_count = 0;
-
-  uint32_t last_event_dwt = 0;
-  uint32_t last_event_counter32 = 0;
-
-  bool     zero_offset_valid = false;
-  uint32_t zero_offset_counter32 = 0;
-  uint32_t counter32_delta_since_zero_offset = 0;
-  uint32_t counter32_delta_since_previous_event = 0;
-  uint64_t logical_ticks64_since_zero = 0;
-  uint64_t nominal_ns64_since_zero = 0;
-
-  // Legacy names retained for report/back-compat surfaces.
-  uint32_t epoch_counter32 = 0;
-  uint32_t counter32_delta_since_epoch = 0;
-  uint64_t nominal_ns_from_counter32_epoch = 0;
-
-  // Compatibility mirror.  When process_interrupt supplies a direct
-  // GNSS timestamp, event_gnss_ns carries it; otherwise it falls back to
-  // the Alpha ledger coordinate used for this lane.
-  uint64_t event_gnss_ns = 0;
-  uint64_t previous_event_gnss_ns = 0;
-
-  // Process_interrupt-authored GNSS witness for the actual subscriber event
-  // sample.  For OCXO lanes this is the quiet-zone sample timestamp, not the
-  // Alpha phase-backprojected logical one-second boundary.  These fields are
-  // passive forensics only; they do not drive residuals or servo behavior.
-  bool     sample_gnss_ns_at_event_available = false;
-  bool     previous_sample_gnss_ns_at_event_available = false;
-  uint64_t sample_gnss_ns_at_event = 0;
-  uint64_t previous_sample_gnss_ns_at_event = 0;
-
-  int64_t  phase_offset_ns = 0;
-
-  uint64_t physical_measured_ns_at_edge = 0;
-  uint64_t visible_ns_at_edge = 0;
-  bool     visible_origin_phase_valid = false;
-  uint32_t visible_origin_phase_offset_ns = 0;
-
-  uint64_t counter_nominal_ns_between_edges = 0;
-  uint64_t bridge_gnss_ns_between_edges = 0;
-  int64_t  bridge_residual_ns = 0;
-  bool     bridge_interval_valid = false;
-  bool     bridge_anchored = false;
-  int32_t  bridge_phi_cycles = 0;
-  uint32_t bridge_span_cycles = 0;
-  uint32_t bridge_resolved_count = 0;
-  uint32_t bridge_fallback_count = 0;
-
-  uint64_t ns_between_edges = 0;
-  uint32_t dwt_cycles_between_edges = 0;
-
-  bool     dwt_synthetic = false;
-  bool     dwt_repair_candidate = false;
-  uint32_t dwt_original_at_event = 0;
-  uint32_t dwt_predicted_at_event = 0;
-  uint32_t dwt_used_at_event = 0;
-  uint32_t dwt_isr_entry_raw = 0;
-  uint32_t dwt_event_from_isr_entry_raw = 0;
-  int32_t  dwt_isr_entry_to_event_correction_cycles = 0;
-  int32_t  dwt_published_minus_event_cycles = 0;
-  int32_t  dwt_used_minus_event_cycles = 0;
-  int32_t  dwt_synthetic_error_cycles = 0;
-  uint32_t dwt_synthetic_threshold_cycles = 0;
-  // Final DWT-at-edge publication tribunal transcript copied from
-  // process_interrupt.  These fields do not authorize or repair anything in
-  // Alpha/Beta; they preserve the court verdict beside the observed edge surfaces
-  // so TIMEBASE_FORENSICS can explain raw_cycles excursions.
-  uint32_t dwt_publication_verdict_mask = 0;
-  uint32_t dwt_publication_verdict_reason_id = INTERRUPT_DWT_PUBLICATION_REASON_OK;
-  uint32_t dwt_publication_watchdog_count = 0;
-  uint32_t dwt_publication_gate_cycles = 0;
-  uint32_t dwt_publication_cross_rail_gate_cycles = 0;
-  uint32_t dwt_publication_service_offset_gate_ticks = 0;
-  uint32_t dwt_publication_expected_counter_delta_ticks = 0;
-  uint32_t dwt_publication_observed_counter_delta_ticks = 0;
-  uint32_t dwt_publication_expected_interval_cycles = 0;
-  uint32_t dwt_publication_published_interval_cycles = 0;
-  uint32_t dwt_publication_observed_interval_cycles = 0;
-  int32_t  dwt_publication_published_interval_error_cycles = 0;
-  int32_t  dwt_publication_observed_interval_error_cycles = 0;
-  int32_t  dwt_publication_published_minus_observed_cycles = 0;
-  int32_t  dwt_publication_service_offset_signed_ticks = 0;
-  int64_t  dwt_publication_vclock_gnss_error_ns = 0;
-
-  bool     dwt_interval_gate_valid = false;
-  bool     dwt_interval_sample_accepted = false;
-  bool     dwt_interval_sample_rejected = false;
-  bool     dwt_interval_ema_updated = false;
-  uint32_t dwt_interval_observed_cycles = 0;
-  uint32_t dwt_interval_prediction_cycles = 0;
-  uint32_t dwt_interval_effective_cycles = 0;
-  int32_t  dwt_interval_residual_cycles = 0;
-  uint32_t dwt_interval_gate_threshold_cycles = 0;
-  uint32_t dwt_interval_accept_count = 0;
-  uint32_t dwt_interval_reject_count = 0;
-  bool     dwt_interval_resync_applied = false;
-  uint32_t dwt_interval_resync_count = 0;
-  uint32_t dwt_interval_reject_streak = 0;
-
-  bool     dwt_interval_adjacency_gate_valid = false;
-  bool     dwt_interval_adjacency_ok = false;
-  bool     dwt_interval_adjacency_rejected = false;
-  uint32_t dwt_interval_counter_delta_ticks = 0;
-  uint32_t dwt_interval_expected_counter_delta_ticks = 0;
-  uint32_t dwt_interval_adjacency_reject_count = 0;
-
-  // process_interrupt-authored PPS-Yardstick inference audit (Stage 1 --
-  // observational rail).  dwt_at_event remains EMA-authored; these fields
-  // carry the parallel yardstick surface per row so TIMEBASE/raw_cycles can
-  // adjudicate the Stage 2 authority flip side-by-side with the EMA math.
-  bool     dwt_yardstick_valid = false;
-  bool     dwt_yardstick_stale = false;
-  bool     dwt_yardstick_seeded = false;
-  bool     dwt_yardstick_excursion = false;
-  uint32_t dwt_yardstick_pps_sequence = 0;
-  uint32_t dwt_yardstick_pps_seq_delta = 0;
-  uint32_t dwt_yardstick_g_now_cycles = 0;
-  uint32_t dwt_yardstick_g_prev_cycles = 0;
-  uint32_t dwt_yardstick_inferred_interval_cycles = 0;
-  uint32_t dwt_yardstick_observed_interval_cycles = 0;
-  int32_t  dwt_yardstick_inferred_minus_observed_cycles = 0;
-  uint32_t dwt_yardstick_inferred_endpoint_dwt = 0;
-  uint32_t dwt_yardstick_inferred_endpoint_frac_q16 = 0;
-  int32_t  dwt_yardstick_endpoint_minus_observed_cycles = 0;
-  uint32_t dwt_yardstick_gate_threshold_cycles = 0;
-  uint32_t dwt_yardstick_gate_agree_count = 0;
-  uint32_t dwt_yardstick_gate_excursion_count = 0;
-  bool     dwt_yardstick_authority = false;
-  uint32_t dwt_ema_dwt_at_event = 0;
-  uint32_t dwt_yardstick_auth_endpoint_dwt = 0;
-  uint32_t dwt_yardstick_auth_endpoint_frac_q16 = 0;
-  int32_t  dwt_yardstick_auth_error_cycles = 0;
-  bool     dwt_yardstick_auth_anchor_applied = false;
-
-  bool     slipledger_active = false;
-  bool     slipledger_event_corrected = false;
-  bool     slipledger_event_violation = false;
-  int32_t  slipledger_ticks = 0;
-  int32_t  slipledger_event_ticks = 0;
-  uint32_t slipledger_generation = 0;
-  uint32_t slipledger_observe_count = 0;
-  uint32_t slipledger_ok_count = 0;
-  uint32_t slipledger_violation_count = 0;
-  uint32_t slipledger_correction_count = 0;
-  uint32_t slipledger_noop_violation_count = 0;
-  uint32_t slipledger_early_count = 0;
-  uint32_t slipledger_late_count = 0;
-  uint32_t slipledger_one_second_observe_count = 0;
-  uint32_t slipledger_one_second_ok_count = 0;
-  uint32_t slipledger_one_second_violation_count = 0;
-  uint32_t slipledger_one_second_correction_count = 0;
-  uint32_t slipledger_last_expected_dwt = 0;
-  uint32_t slipledger_last_observed_dwt = 0;
-  uint32_t slipledger_last_authored_dwt = 0;
-  uint32_t slipledger_last_expected_interval_cycles = 0;
-  uint32_t slipledger_last_observed_interval_cycles = 0;
-  int32_t  slipledger_last_dwt_error_cycles = 0;
-  uint32_t slipledger_last_target_counter32 = 0;
-  uint16_t slipledger_last_hardware_target_low16 = 0;
-  uint16_t slipledger_last_ambient_low16 = 0;
-  uint32_t slipledger_last_tick_mod = 0;
-  uint32_t slipledger_reason_code = 0;
-  uint32_t slipledger_last_correction_reason_code = 0;
-  int32_t  slipledger_last_correction_ticks = 0;
-  int32_t  slipledger_last_correction_dwt_error_cycles = 0;
-
-  int64_t  second_residual_ns = 0;
-  int64_t  window_error_ns = 0;
-  uint32_t window_checks = 0;
-  uint32_t window_mismatches = 0;
-
-  uint32_t diag_anchor_sequence_used = 0;
-  uint32_t diag_anchor_age_slots = 0;
-  uint32_t diag_anchor_selection_kind = 0;
-  uint32_t diag_anchor_dwt_at_edge = 0;
-  int64_t  diag_anchor_gnss_ns_at_edge = -1;
-  uint32_t diag_anchor_cps = 0;
-  uint64_t diag_anchor_ns_delta = 0;
-  uint32_t diag_anchor_failure_mask = 0;
-
-  uint32_t diag_service_class = 0;
-  int32_t  diag_service_offset_signed_ticks = 0;
-  uint32_t diag_service_offset_abs_ticks = 0;
-  uint32_t diag_interpreted_late_ticks = 0;
-  uint32_t diag_early_ticks = 0;
-  uint32_t diag_target_delta_mod65536_ticks = 0;
-  uint32_t diag_arm_remaining_ticks = 0;
-  uint32_t diag_arm_to_isr_ticks = 0;
-  uint32_t diag_arm_to_isr_dwt_cycles = 0;
-
-  uint32_t diag_perishable_fact_sequence = 0;
-  int32_t  diag_service_correction_cycles = 0;
-  uint32_t diag_service_corrected_dwt_at_event = 0;
-  uint32_t diag_fact_ring_overflow_count = 0;
-  uint32_t diag_counter_delta_violation_count = 0;
-  uint32_t diag_last_bad_counter_delta = 0;
-  uint32_t diag_last_counter_delta_ticks = 0;
-
-  bool     diag_sample_phase_valid = false;
-  uint32_t diag_sample_phase_ticks = 0;
-  uint32_t diag_sample_phase_ns = 0;
-  uint32_t diag_sample_phase_us = 0;
-  uint32_t diag_sample_period_ticks = 0;
-  uint32_t diag_sample_dwt_at_event = 0;
-  uint32_t diag_sample_counter32_at_event = 0;
-  uint32_t diag_boundary_dwt_at_event = 0;
-  uint32_t diag_boundary_counter32_at_event = 0;
-  int32_t  diag_boundary_correction_cycles = 0;
-
-  interrupt_arrival_forensics_t arrival{};
-  interrupt_ocxo_compare_forensics_t ocxo_compare{};
-
-  bool     spinidle_shadow_valid = false;
-  uint32_t spinidle_shadow_dwt = 0;
-  uint32_t spinidle_shadow_to_isr_entry_cycles = 0;
-  uint32_t spinidle_shadow_valid_threshold_cycles = 0;
-  interrupt_delay_forensics_t interrupt_delay{};
-
+// Private writer store = canonical immutable forensic value + seqlock only.
+// The former private 179-field mirror duplicated clocks_alpha_lane_forensics_t
+// exactly and required manual field-by-field reset/copy code.
+struct alpha_lane_forensics_store_t : clocks_alpha_lane_forensics_t {
+  volatile uint32_t seq = 0U;
 };
 
 static alpha_lane_forensics_store_t g_vclock_forensics DMAMEM = {};
@@ -1959,7 +1760,7 @@ static alpha_lane_forensics_store_t g_ocxo2_forensics DMAMEM = {};
 // Report-only event-flow forensics.  These counters answer one narrow question:
 // did an interrupt-authored subscriber event reach Alpha, survive Alpha's gates,
 // update the lane measurement stores, publish Alpha forensics, and later get
-// snapshotted by Beta?  This surface deliberately stays out of TIMEBASE.
+// snapshotted by Beta?  This surface deliberately stays out of CLOCKS_FRAGMENT.
 static constexpr uint32_t ALPHA_FLOW_STAGE_NONE                 = 0;
 static constexpr uint32_t ALPHA_FLOW_STAGE_CALLBACK_ENTRY       = 1;
 static constexpr uint32_t ALPHA_FLOW_STAGE_REJECT_EPOCH         = 2;
@@ -2055,12 +1856,8 @@ static alpha_event_flow_store_t g_ocxo1_event_flow DMAMEM = {};
 static alpha_event_flow_store_t g_ocxo2_event_flow DMAMEM = {};
 
 static alpha_event_flow_store_t* alpha_event_flow_store(time_clock_id_t clock) {
-  switch (clock) {
-    case time_clock_id_t::VCLOCK: return &g_vclock_event_flow;
-    case time_clock_id_t::OCXO1:  return &g_ocxo1_event_flow;
-    case time_clock_id_t::OCXO2:  return &g_ocxo2_event_flow;
-    default:                     return nullptr;
-  }
+  return alpha_clock_store_for(
+      clock, &g_vclock_event_flow, &g_ocxo1_event_flow, &g_ocxo2_event_flow);
 }
 
 static void alpha_event_flow_note_callback(time_clock_id_t clock,
@@ -2588,17 +2385,17 @@ static alpha_pps_counterledger_lane_t g_ocxo2_pps_counterledger = {};
 // One practical PPS row may be in flight.  OCXO callbacks may run before or
 // after the PPS selector callback, so the latest per-lane PPS identities are
 // retained beside the row rather than queued.
-struct alpha_pending_timebase_row_t {
+struct alpha_pending_completed_row_t {
   bool     open = false;
   uint32_t pps_sequence = 0;
   bool     ocxo1_complete = false;
   bool     ocxo2_complete = false;
 };
 
-static alpha_pending_timebase_row_t g_alpha_pending_timebase_row = {};
+static alpha_pending_completed_row_t g_alpha_pending_completed_row = {};
 static uint32_t g_alpha_last_ocxo1_pps_sequence = 0U;
 static uint32_t g_alpha_last_ocxo2_pps_sequence = 0U;
-static uint32_t g_alpha_last_installed_timebase_pps_sequence = 0U;
+static uint32_t g_alpha_last_installed_completed_row_pps_sequence = 0U;
 
 // ============================================================================
 // Alpha-owned unified Welford accumulators
@@ -2712,19 +2509,11 @@ static alpha_tau_estimator_t g_ocxo1_tau = {};
 static alpha_tau_estimator_t g_ocxo2_tau = {};
 
 static alpha_tau_estimator_t* alpha_tau_store_mut(time_clock_id_t clock) {
-  switch (clock) {
-    case time_clock_id_t::OCXO1: return &g_ocxo1_tau;
-    case time_clock_id_t::OCXO2: return &g_ocxo2_tau;
-    default:                    return nullptr;
-  }
+  return alpha_ocxo_store_for(clock, &g_ocxo1_tau, &g_ocxo2_tau);
 }
 
 static const alpha_tau_estimator_t* alpha_tau_store(time_clock_id_t clock) {
-  switch (clock) {
-    case time_clock_id_t::OCXO1: return &g_ocxo1_tau;
-    case time_clock_id_t::OCXO2: return &g_ocxo2_tau;
-    default:                    return nullptr;
-  }
+  return alpha_ocxo_store_for(clock, &g_ocxo1_tau, &g_ocxo2_tau);
 }
 
 static void alpha_tau_reset_lane(alpha_tau_estimator_t& s,
@@ -4592,7 +4381,7 @@ static bool alpha_counterledger_commit_implied_pps_sample(
   if (implausible_reseed) {
     // Preserve the bad capture and re-seed this lane, but keep the campaign
     // timeline alive.  Beta will publish the next candidate as SCIENCE_EXCLUDE
-    // and the Pi will retain it only in the excluded TIMEBASE row.
+    // and the Pi will retain it only in the excluded campaign row.
     alpha_row_exclude(
         clocks_row_objection_reason_t::ALPHA_COUNTERLEDGER_INTERVAL,
         clock,
@@ -4728,11 +4517,8 @@ static bool alpha_counterledger_stage_pps_fact(
 
 static alpha_pps_counterledger_lane_t* alpha_counterledger_lane_mut(
     time_clock_id_t clock) {
-  switch (clock) {
-    case time_clock_id_t::OCXO1: return &g_ocxo1_pps_counterledger;
-    case time_clock_id_t::OCXO2: return &g_ocxo2_pps_counterledger;
-    default:                    return nullptr;
-  }
+  return alpha_ocxo_store_for(
+      clock, &g_ocxo1_pps_counterledger, &g_ocxo2_pps_counterledger);
 }
 
 static void alpha_counterledger_note_phase_resolve(
@@ -5151,12 +4937,9 @@ static alpha_static_prediction_store_t g_static_prediction_ocxo1 = {};
 static alpha_static_prediction_store_t g_static_prediction_ocxo2 = {};
 
 static alpha_static_prediction_store_t* alpha_static_prediction_store(time_clock_id_t clock) {
-  switch (clock) {
-    case time_clock_id_t::VCLOCK: return &g_static_prediction_vclock;
-    case time_clock_id_t::OCXO1:  return &g_static_prediction_ocxo1;
-    case time_clock_id_t::OCXO2:  return &g_static_prediction_ocxo2;
-    default:                     return nullptr;
-  }
+  return alpha_clock_store_for(
+      clock, &g_static_prediction_vclock,
+      &g_static_prediction_ocxo1, &g_static_prediction_ocxo2);
 }
 
 static void alpha_static_prediction_reset_store(alpha_static_prediction_store_t& s) {
@@ -5537,7 +5320,7 @@ static void alpha_row_adjudicate_cycle_integrity(uint32_t pps_sequence) {
 // edge facts and, once per PPS/VCLOCK row, computes what the OCXO
 // clock's own nanosecond ledger would have read at that PPS/VCLOCK DWT
 // coordinate.  This is not yet promoted into g_ocxo*_measured_gnss_ns_at_pps_vclock
-// and it does not feed TIMEBASE/Welfords/servo.
+// and it does not feed CLOCKS_FRAGMENT/Welfords/servo.
 
 static constexpr uint32_t ALPHA_OCXO_PPS_PROJECTION_SOURCE_NONE = 0;
 static constexpr uint32_t ALPHA_OCXO_PPS_PROJECTION_SOURCE_ACTUAL_BRACKET = 1;
@@ -5623,20 +5406,13 @@ static alpha_ocxo_pps_projection_guard_t g_ocxo1_pps_projection_guard DMAMEM = {
 static alpha_ocxo_pps_projection_guard_t g_ocxo2_pps_projection_guard DMAMEM = {};
 
 static alpha_ocxo_edge_history_t* alpha_ocxo_edge_history(time_clock_id_t clock) {
-  switch (clock) {
-    case time_clock_id_t::OCXO1: return &g_ocxo1_edge_history;
-    case time_clock_id_t::OCXO2: return &g_ocxo2_edge_history;
-    default:                    return nullptr;
-  }
+  return alpha_ocxo_store_for(clock, &g_ocxo1_edge_history, &g_ocxo2_edge_history);
 }
 
 static alpha_ocxo_pps_projection_store_t* alpha_ocxo_pps_projection_store(
     time_clock_id_t clock) {
-  switch (clock) {
-    case time_clock_id_t::OCXO1: return &g_ocxo1_pps_projection;
-    case time_clock_id_t::OCXO2: return &g_ocxo2_pps_projection;
-    default:                    return nullptr;
-  }
+  return alpha_ocxo_store_for(
+      clock, &g_ocxo1_pps_projection, &g_ocxo2_pps_projection);
 }
 
 static int64_t alpha_signed_delta_u64(uint64_t a, uint64_t b) {
@@ -5645,11 +5421,8 @@ static int64_t alpha_signed_delta_u64(uint64_t a, uint64_t b) {
 
 static alpha_ocxo_pps_projection_guard_t* alpha_ocxo_pps_projection_guard(
     time_clock_id_t clock) {
-  switch (clock) {
-    case time_clock_id_t::OCXO1: return &g_ocxo1_pps_projection_guard;
-    case time_clock_id_t::OCXO2: return &g_ocxo2_pps_projection_guard;
-    default:                    return nullptr;
-  }
+  return alpha_ocxo_store_for(
+      clock, &g_ocxo1_pps_projection_guard, &g_ocxo2_pps_projection_guard);
 }
 
 static uint64_t alpha_abs_u64_from_i64(int64_t value) {
@@ -6364,21 +6137,13 @@ static bool alpha_ocxo_pps_projection_visible_ns(time_clock_id_t clock,
 }
 
 static alpha_lane_forensics_store_t* alpha_forensics_store(time_clock_id_t clock) {
-  switch (clock) {
-    case time_clock_id_t::VCLOCK: return &g_vclock_forensics;
-    case time_clock_id_t::OCXO1:  return &g_ocxo1_forensics;
-    case time_clock_id_t::OCXO2:  return &g_ocxo2_forensics;
-    default:                     return nullptr;
-  }
+  return alpha_clock_store_for(
+      clock, &g_vclock_forensics, &g_ocxo1_forensics, &g_ocxo2_forensics);
 }
 
 static alpha_lane_logical_ticks_t* alpha_ticks64_store(time_clock_id_t clock) {
-  switch (clock) {
-    case time_clock_id_t::VCLOCK: return &g_vclock_ticks64;
-    case time_clock_id_t::OCXO1:  return &g_ocxo1_ticks64;
-    case time_clock_id_t::OCXO2:  return &g_ocxo2_ticks64;
-    default:                     return nullptr;
-  }
+  return alpha_clock_store_for(
+      clock, &g_vclock_ticks64, &g_ocxo1_ticks64, &g_ocxo2_ticks64);
 }
 
 static void alpha_ticks64_reset_store(alpha_lane_logical_ticks_t& s) {
@@ -6427,11 +6192,8 @@ static bool alpha_ticks64_apply_event(time_clock_id_t clock,
 
 static const alpha_pps_counterledger_lane_t* alpha_counterledger_lane(
     time_clock_id_t clock) {
-  switch (clock) {
-    case time_clock_id_t::OCXO1: return &g_ocxo1_pps_counterledger;
-    case time_clock_id_t::OCXO2: return &g_ocxo2_pps_counterledger;
-    default:                    return nullptr;
-  }
+  return alpha_ocxo_store_for(
+      clock, &g_ocxo1_pps_counterledger, &g_ocxo2_pps_counterledger);
 }
 
 bool clocks_alpha_ocxo_counterledger_snapshot(
@@ -6736,11 +6498,7 @@ static void alpha_measured_ns_reset_all(void) {
 }
 
 static alpha_measured_ns_clock_t* alpha_measured_ns_store(time_clock_id_t clock) {
-  switch (clock) {
-    case time_clock_id_t::OCXO1: return &g_ocxo1_measured_ns;
-    case time_clock_id_t::OCXO2: return &g_ocxo2_measured_ns;
-    default:                    return nullptr;
-  }
+  return alpha_ocxo_store_for(clock, &g_ocxo1_measured_ns, &g_ocxo2_measured_ns);
 }
 
 static uint64_t alpha_dwt_cycles_to_gnss_ns(uint32_t dwt_cycles) {
@@ -6799,11 +6557,8 @@ static void clocks_feature_update_ocxo_public_origin(void) {
 
 static alpha_ocxo_visible_origin_state_t* alpha_ocxo_visible_origin_store(
     time_clock_id_t clock) {
-  switch (clock) {
-    case time_clock_id_t::OCXO1: return &g_ocxo1_visible_origin;
-    case time_clock_id_t::OCXO2: return &g_ocxo2_visible_origin;
-    default:                    return nullptr;
-  }
+  return alpha_ocxo_store_for(
+      clock, &g_ocxo1_visible_origin, &g_ocxo2_visible_origin);
 }
 
 static uint32_t alpha_ocxo_visible_origin_clock_id(time_clock_id_t clock) {
@@ -7025,18 +6780,18 @@ static void alpha_ocxo_visible_origin_maybe_capture_public_origin(
   alpha_ocxo_visible_origin_refresh_public_ready();
 }
 
-static void alpha_timebase_row_clear(void) {
-  g_alpha_pending_timebase_row = alpha_pending_timebase_row_t{};
+static void alpha_completed_row_clear(void) {
+  g_alpha_pending_completed_row = alpha_pending_completed_row_t{};
 }
 
-static void alpha_timebase_row_reset_all(void) {
-  alpha_timebase_row_clear();
+static void alpha_completed_row_reset_all(void) {
+  alpha_completed_row_clear();
   g_alpha_last_ocxo1_pps_sequence = 0U;
   g_alpha_last_ocxo2_pps_sequence = 0U;
-  g_alpha_last_installed_timebase_pps_sequence = 0U;
+  g_alpha_last_installed_completed_row_pps_sequence = 0U;
 }
 
-static bool alpha_timebase_lane_counter_identity_ready(
+static bool alpha_completed_row_lane_counter_identity_ready(
     const alpha_pps_counterledger_lane_t& s,
     uint32_t pps_sequence) {
   return s.initialized && s.pps_sequence == pps_sequence &&
@@ -7044,25 +6799,25 @@ static bool alpha_timebase_lane_counter_identity_ready(
       s.phase_implied_counter32_at_pps == s.last_counter32;
 }
 
-static bool alpha_timebase_lane_ready(time_clock_id_t clock,
+static bool alpha_completed_row_lane_ready(time_clock_id_t clock,
                                       uint32_t pps_sequence) {
   const alpha_pps_counterledger_lane_t* s =
       alpha_counterledger_lane(clock);
-  return s && alpha_timebase_lane_counter_identity_ready(*s, pps_sequence) &&
+  return s && alpha_completed_row_lane_counter_identity_ready(*s, pps_sequence) &&
       s->phase_valid && s->phase_pps_sequence == pps_sequence &&
       !s->phase_pending && s->refined_valid &&
       s->refined_phase_pps_sequence == pps_sequence &&
       s->refined_ns != 0ULL;
 }
 
-static bool alpha_timebase_lane_waiting_for_phase(
+static bool alpha_completed_row_lane_waiting_for_phase(
     const alpha_pps_counterledger_lane_t& s,
     uint32_t pps_sequence) {
   return s.initialized && s.phase_pending &&
       s.pending_phase_pps_sequence == pps_sequence;
 }
 
-static uint32_t alpha_timebase_row_missing_mask(uint32_t pps_sequence) {
+static uint32_t alpha_completed_row_missing_mask(uint32_t pps_sequence) {
   uint32_t missing = 0U;
   if (!epoch_ready()) missing |= 1U << 0;
   if (pps_sequence == 0U) missing |= 1U << 1;
@@ -7073,26 +6828,26 @@ static uint32_t alpha_timebase_row_missing_mask(uint32_t pps_sequence) {
   if (g_gnss_ns_at_pps_vclock == 0ULL) missing |= 1U << 6;
 
   const bool ocxo1_ready =
-      alpha_timebase_lane_ready(time_clock_id_t::OCXO1, pps_sequence) ||
-      alpha_timebase_lane_waiting_for_phase(
+      alpha_completed_row_lane_ready(time_clock_id_t::OCXO1, pps_sequence) ||
+      alpha_completed_row_lane_waiting_for_phase(
           g_ocxo1_pps_counterledger, pps_sequence);
   const bool ocxo2_ready =
-      alpha_timebase_lane_ready(time_clock_id_t::OCXO2, pps_sequence) ||
-      alpha_timebase_lane_waiting_for_phase(
+      alpha_completed_row_lane_ready(time_clock_id_t::OCXO2, pps_sequence) ||
+      alpha_completed_row_lane_waiting_for_phase(
           g_ocxo2_pps_counterledger, pps_sequence);
   if (!ocxo1_ready) missing |= 1U << 7;
   if (!ocxo2_ready) missing |= 1U << 8;
   return missing;
 }
 
-static bool alpha_timebase_install_refined_clockfaces(
+static bool alpha_completed_row_install_refined_clockfaces(
     uint32_t pps_sequence) {
-  if (g_alpha_last_installed_timebase_pps_sequence == pps_sequence) {
+  if (g_alpha_last_installed_completed_row_pps_sequence == pps_sequence) {
     return true;
   }
 
-  if (!alpha_timebase_lane_ready(time_clock_id_t::OCXO1, pps_sequence) ||
-      !alpha_timebase_lane_ready(time_clock_id_t::OCXO2, pps_sequence) ||
+  if (!alpha_completed_row_lane_ready(time_clock_id_t::OCXO1, pps_sequence) ||
+      !alpha_completed_row_lane_ready(time_clock_id_t::OCXO2, pps_sequence) ||
       g_pps_witness_diag.pps_edge_sequence != pps_sequence ||
       g_gnss_ns_at_pps_vclock == 0ULL || g_dwt_at_pps_vclock == 0U) {
     return false;
@@ -7137,27 +6892,27 @@ static bool alpha_timebase_install_refined_clockfaces(
   (void)time_clock_update(time_clock_id_t::OCXO2,
                           g_dwt_at_pps_vclock,
                           ocxo2_public_ns);
-  g_alpha_last_installed_timebase_pps_sequence = pps_sequence;
+  g_alpha_last_installed_completed_row_pps_sequence = pps_sequence;
   return true;
 }
 
-static void alpha_timebase_row_try_complete(void) {
-  if (!g_alpha_pending_timebase_row.open ||
-      !g_alpha_pending_timebase_row.ocxo1_complete ||
-      !g_alpha_pending_timebase_row.ocxo2_complete) {
+static void alpha_completed_row_try_complete(void) {
+  if (!g_alpha_pending_completed_row.open ||
+      !g_alpha_pending_completed_row.ocxo1_complete ||
+      !g_alpha_pending_completed_row.ocxo2_complete) {
     return;
   }
 
   const uint32_t pps_sequence =
-      g_alpha_pending_timebase_row.pps_sequence;
-  if (!alpha_timebase_install_refined_clockfaces(pps_sequence)) {
+      g_alpha_pending_completed_row.pps_sequence;
+  if (!alpha_completed_row_install_refined_clockfaces(pps_sequence)) {
     clocks_watchdog_anomaly(
         "alpha_timebase_clockface_install_failed",
         pps_sequence,
         g_ocxo1_pps_counterledger.phase_pps_sequence,
         g_ocxo2_pps_counterledger.phase_pps_sequence,
         g_pps_witness_diag.pps_edge_sequence);
-    alpha_timebase_row_clear();
+    alpha_completed_row_clear();
     return;
   }
 
@@ -7170,21 +6925,21 @@ static void alpha_timebase_row_try_complete(void) {
 
   // Clear before entering Beta.  Publication may execute command/lifecycle
   // paths, but it cannot observe or overwrite an open Alpha row.
-  alpha_timebase_row_clear();
+  alpha_completed_row_clear();
   clocks_beta_pps(pps_sequence);
 }
 
-static void alpha_timebase_row_note_ocxo_event(
+static void alpha_completed_row_note_ocxo_event(
     time_clock_id_t clock,
     const interrupt_event_t& event) {
   uint32_t* latest_sequence = nullptr;
   bool* row_complete = nullptr;
   if (clock == time_clock_id_t::OCXO1) {
     latest_sequence = &g_alpha_last_ocxo1_pps_sequence;
-    row_complete = &g_alpha_pending_timebase_row.ocxo1_complete;
+    row_complete = &g_alpha_pending_completed_row.ocxo1_complete;
   } else if (clock == time_clock_id_t::OCXO2) {
     latest_sequence = &g_alpha_last_ocxo2_pps_sequence;
-    row_complete = &g_alpha_pending_timebase_row.ocxo2_complete;
+    row_complete = &g_alpha_pending_completed_row.ocxo2_complete;
   } else {
     return;
   }
@@ -7195,27 +6950,27 @@ static void alpha_timebase_row_note_ocxo_event(
   // Alpha clockfaces are always-on.  The later of the two OCXO callbacks
   // installs this exact PPS even when no campaign row is currently open; Beta
   // publication remains separately gated by the one-row state below.
-  (void)alpha_timebase_install_refined_clockfaces(event.pps_sequence);
+  (void)alpha_completed_row_install_refined_clockfaces(event.pps_sequence);
 
-  if (!g_alpha_pending_timebase_row.open) return;
+  if (!g_alpha_pending_completed_row.open) return;
 
-  if (event.pps_sequence != g_alpha_pending_timebase_row.pps_sequence) {
+  if (event.pps_sequence != g_alpha_pending_completed_row.pps_sequence) {
     clocks_watchdog_anomaly(
         "alpha_timebase_ocxo_sequence_mismatch",
         (uint32_t)((uint8_t)clock),
-        g_alpha_pending_timebase_row.pps_sequence,
+        g_alpha_pending_completed_row.pps_sequence,
         event.pps_sequence,
         event.counter32_at_event);
-    alpha_timebase_row_clear();
+    alpha_completed_row_clear();
     return;
   }
 
-  *row_complete = alpha_timebase_lane_ready(clock, event.pps_sequence);
-  alpha_timebase_row_try_complete();
+  *row_complete = alpha_completed_row_lane_ready(clock, event.pps_sequence);
+  alpha_completed_row_try_complete();
 }
 
-static void alpha_timebase_row_open(uint32_t pps_sequence) {
-  const uint32_t missing = alpha_timebase_row_missing_mask(pps_sequence);
+static void alpha_completed_row_open(uint32_t pps_sequence) {
+  const uint32_t missing = alpha_completed_row_missing_mask(pps_sequence);
   if (missing != 0U) {
     clocks_watchdog_anomaly(
         "alpha_timebase_row_inputs_missing",
@@ -7226,26 +6981,26 @@ static void alpha_timebase_row_open(uint32_t pps_sequence) {
     return;
   }
 
-  if (g_alpha_pending_timebase_row.open) {
+  if (g_alpha_pending_completed_row.open) {
     clocks_watchdog_anomaly(
         "alpha_timebase_row_overlap",
-        g_alpha_pending_timebase_row.pps_sequence,
+        g_alpha_pending_completed_row.pps_sequence,
         pps_sequence,
         g_alpha_last_ocxo1_pps_sequence,
         g_alpha_last_ocxo2_pps_sequence);
-    alpha_timebase_row_clear();
+    alpha_completed_row_clear();
     return;
   }
 
-  g_alpha_pending_timebase_row.open = true;
-  g_alpha_pending_timebase_row.pps_sequence = pps_sequence;
-  g_alpha_pending_timebase_row.ocxo1_complete =
+  g_alpha_pending_completed_row.open = true;
+  g_alpha_pending_completed_row.pps_sequence = pps_sequence;
+  g_alpha_pending_completed_row.ocxo1_complete =
       g_alpha_last_ocxo1_pps_sequence == pps_sequence &&
-      alpha_timebase_lane_ready(time_clock_id_t::OCXO1, pps_sequence);
-  g_alpha_pending_timebase_row.ocxo2_complete =
+      alpha_completed_row_lane_ready(time_clock_id_t::OCXO1, pps_sequence);
+  g_alpha_pending_completed_row.ocxo2_complete =
       g_alpha_last_ocxo2_pps_sequence == pps_sequence &&
-      alpha_timebase_lane_ready(time_clock_id_t::OCXO2, pps_sequence);
-  alpha_timebase_row_try_complete();
+      alpha_completed_row_lane_ready(time_clock_id_t::OCXO2, pps_sequence);
+  alpha_completed_row_try_complete();
 }
 
 static uint64_t alpha_ocxo_apply_measured_second(time_clock_id_t clock,
@@ -7467,193 +7222,15 @@ static uint64_t alpha_ocxo_project_measured_ns_to_dwt_live(time_clock_id_t clock
   return pending_gnss_ns + (uint64_t)delta_ns;
 }
 
-static void alpha_forensics_reset_store(alpha_lane_forensics_store_t& s) {
-  s.seq++;
+static void alpha_forensics_reset_store(alpha_lane_forensics_store_t& store) {
+  store.seq++;
   clocks_alpha_dmb();
-
-  s.valid = false;
-  s.update_count = 0;
-  s.last_event_dwt = 0;
-  s.last_event_counter32 = 0;
-  s.zero_offset_valid = false;
-  s.zero_offset_counter32 = 0;
-  s.counter32_delta_since_zero_offset = 0;
-  s.counter32_delta_since_previous_event = 0;
-  s.logical_ticks64_since_zero = 0;
-  s.nominal_ns64_since_zero = 0;
-  s.epoch_counter32 = 0;
-  s.counter32_delta_since_epoch = 0;
-  s.nominal_ns_from_counter32_epoch = 0;
-  s.event_gnss_ns = 0;
-  s.previous_event_gnss_ns = 0;
-  s.sample_gnss_ns_at_event_available = false;
-  s.previous_sample_gnss_ns_at_event_available = false;
-  s.sample_gnss_ns_at_event = 0;
-  s.previous_sample_gnss_ns_at_event = 0;
-  s.phase_offset_ns = 0;
-  s.physical_measured_ns_at_edge = 0;
-  s.visible_ns_at_edge = 0;
-  s.visible_origin_phase_valid = false;
-  s.visible_origin_phase_offset_ns = 0;
-  s.counter_nominal_ns_between_edges = 0;
-  s.bridge_gnss_ns_between_edges = 0;
-  s.bridge_residual_ns = 0;
-  s.bridge_interval_valid = false;
-  s.bridge_anchored = false;
-  s.bridge_phi_cycles = 0;
-  s.bridge_span_cycles = 0;
-  s.bridge_resolved_count = 0;
-  s.bridge_fallback_count = 0;
-  s.ns_between_edges = 0;
-  s.dwt_cycles_between_edges = 0;
-  s.dwt_synthetic = false;
-  s.dwt_repair_candidate = false;
-  s.dwt_original_at_event = 0;
-  s.dwt_predicted_at_event = 0;
-  s.dwt_used_at_event = 0;
-  s.dwt_isr_entry_raw = 0;
-  s.dwt_event_from_isr_entry_raw = 0;
-  s.dwt_isr_entry_to_event_correction_cycles = 0;
-  s.dwt_published_minus_event_cycles = 0;
-  s.dwt_used_minus_event_cycles = 0;
-  s.dwt_synthetic_error_cycles = 0;
-  s.dwt_synthetic_threshold_cycles = 0;
-  s.dwt_publication_verdict_mask = 0;
-  s.dwt_publication_verdict_reason_id = INTERRUPT_DWT_PUBLICATION_REASON_OK;
-  s.dwt_publication_watchdog_count = 0;
-  s.dwt_publication_gate_cycles = 0;
-  s.dwt_publication_cross_rail_gate_cycles = 0;
-  s.dwt_publication_service_offset_gate_ticks = 0;
-  s.dwt_publication_expected_counter_delta_ticks = 0;
-  s.dwt_publication_observed_counter_delta_ticks = 0;
-  s.dwt_publication_expected_interval_cycles = 0;
-  s.dwt_publication_published_interval_cycles = 0;
-  s.dwt_publication_observed_interval_cycles = 0;
-  s.dwt_publication_published_interval_error_cycles = 0;
-  s.dwt_publication_observed_interval_error_cycles = 0;
-  s.dwt_publication_published_minus_observed_cycles = 0;
-  s.dwt_publication_service_offset_signed_ticks = 0;
-  s.dwt_publication_vclock_gnss_error_ns = 0;
-  s.dwt_interval_gate_valid = false;
-  s.dwt_interval_sample_accepted = false;
-  s.dwt_interval_sample_rejected = false;
-  s.dwt_interval_ema_updated = false;
-  s.dwt_interval_observed_cycles = 0;
-  s.dwt_interval_prediction_cycles = 0;
-  s.dwt_interval_effective_cycles = 0;
-  s.dwt_interval_residual_cycles = 0;
-  s.dwt_interval_gate_threshold_cycles = 0;
-  s.dwt_interval_accept_count = 0;
-  s.dwt_interval_reject_count = 0;
-  s.dwt_interval_resync_applied = false;
-  s.dwt_interval_resync_count = 0;
-  s.dwt_interval_reject_streak = 0;
-  s.dwt_interval_adjacency_gate_valid = false;
-  s.dwt_interval_adjacency_ok = false;
-  s.dwt_interval_adjacency_rejected = false;
-  s.dwt_interval_counter_delta_ticks = 0;
-  s.dwt_interval_expected_counter_delta_ticks = 0;
-  s.dwt_interval_adjacency_reject_count = 0;
-  s.dwt_yardstick_valid = false;
-  s.dwt_yardstick_stale = false;
-  s.dwt_yardstick_seeded = false;
-  s.dwt_yardstick_excursion = false;
-  s.dwt_yardstick_pps_sequence = 0;
-  s.dwt_yardstick_pps_seq_delta = 0;
-  s.dwt_yardstick_g_now_cycles = 0;
-  s.dwt_yardstick_g_prev_cycles = 0;
-  s.dwt_yardstick_inferred_interval_cycles = 0;
-  s.dwt_yardstick_observed_interval_cycles = 0;
-  s.dwt_yardstick_inferred_minus_observed_cycles = 0;
-  s.dwt_yardstick_inferred_endpoint_dwt = 0;
-  s.dwt_yardstick_inferred_endpoint_frac_q16 = 0;
-  s.dwt_yardstick_endpoint_minus_observed_cycles = 0;
-  s.dwt_yardstick_gate_threshold_cycles = 0;
-  s.dwt_yardstick_gate_agree_count = 0;
-  s.dwt_yardstick_gate_excursion_count = 0;
-  s.dwt_yardstick_authority = false;
-  s.dwt_ema_dwt_at_event = 0;
-  s.dwt_yardstick_auth_endpoint_dwt = 0;
-  s.dwt_yardstick_auth_endpoint_frac_q16 = 0;
-  s.dwt_yardstick_auth_error_cycles = 0;
-  s.dwt_yardstick_auth_anchor_applied = false;
-  s.slipledger_active = false;
-  s.slipledger_event_corrected = false;
-  s.slipledger_event_violation = false;
-  s.slipledger_ticks = 0;
-  s.slipledger_event_ticks = 0;
-  s.slipledger_generation = 0;
-  s.slipledger_observe_count = 0;
-  s.slipledger_ok_count = 0;
-  s.slipledger_violation_count = 0;
-  s.slipledger_correction_count = 0;
-  s.slipledger_noop_violation_count = 0;
-  s.slipledger_early_count = 0;
-  s.slipledger_late_count = 0;
-  s.slipledger_one_second_observe_count = 0;
-  s.slipledger_one_second_ok_count = 0;
-  s.slipledger_one_second_violation_count = 0;
-  s.slipledger_one_second_correction_count = 0;
-  s.slipledger_last_expected_dwt = 0;
-  s.slipledger_last_observed_dwt = 0;
-  s.slipledger_last_authored_dwt = 0;
-  s.slipledger_last_expected_interval_cycles = 0;
-  s.slipledger_last_observed_interval_cycles = 0;
-  s.slipledger_last_dwt_error_cycles = 0;
-  s.slipledger_last_target_counter32 = 0;
-  s.slipledger_last_hardware_target_low16 = 0;
-  s.slipledger_last_ambient_low16 = 0;
-  s.slipledger_last_tick_mod = 0;
-  s.slipledger_reason_code = 0;
-  s.slipledger_last_correction_reason_code = 0;
-  s.slipledger_last_correction_ticks = 0;
-  s.slipledger_last_correction_dwt_error_cycles = 0;
-  s.second_residual_ns = 0;
-  s.window_error_ns = 0;
-  s.window_checks = 0;
-  s.window_mismatches = 0;
-  s.diag_anchor_sequence_used = 0;
-  s.diag_anchor_age_slots = 0;
-  s.diag_anchor_selection_kind = 0;
-  s.diag_anchor_dwt_at_edge = 0;
-  s.diag_anchor_gnss_ns_at_edge = -1;
-  s.diag_anchor_cps = 0;
-  s.diag_anchor_ns_delta = 0;
-  s.diag_anchor_failure_mask = 0;
-  s.diag_service_class = 0;
-  s.diag_service_offset_signed_ticks = 0;
-  s.diag_service_offset_abs_ticks = 0;
-  s.diag_interpreted_late_ticks = 0;
-  s.diag_early_ticks = 0;
-  s.diag_target_delta_mod65536_ticks = 0;
-  s.diag_arm_remaining_ticks = 0;
-  s.diag_arm_to_isr_ticks = 0;
-  s.diag_arm_to_isr_dwt_cycles = 0;
-  s.diag_perishable_fact_sequence = 0;
-  s.diag_service_correction_cycles = 0;
-  s.diag_service_corrected_dwt_at_event = 0;
-  s.diag_fact_ring_overflow_count = 0;
-  s.diag_counter_delta_violation_count = 0;
-  s.diag_last_bad_counter_delta = 0;
-  s.diag_last_counter_delta_ticks = 0;
-  s.diag_sample_phase_valid = false;
-  s.diag_sample_phase_ticks = 0;
-  s.diag_sample_phase_ns = 0;
-  s.diag_sample_phase_us = 0;
-  s.diag_sample_period_ticks = 0;
-  s.diag_sample_dwt_at_event = 0;
-  s.diag_sample_counter32_at_event = 0;
-  s.diag_boundary_dwt_at_event = 0;
-  s.diag_boundary_counter32_at_event = 0;
-  s.diag_boundary_correction_cycles = 0;
-  s.spinidle_shadow_valid = false;
-  s.spinidle_shadow_dwt = 0;
-  s.spinidle_shadow_to_isr_entry_cycles = 0;
-  s.spinidle_shadow_valid_threshold_cycles = 0;
-  s.interrupt_delay = interrupt_delay_forensics_t{};
-
+  static_cast<clocks_alpha_lane_forensics_t&>(store) =
+      clocks_alpha_lane_forensics_t{};
+  // Preserve the historical unknown-anchor sentinel used by reports.
+  store.diag_anchor_gnss_ns_at_edge = -1;
   clocks_alpha_dmb();
-  s.seq++;
+  store.seq++;
 }
 
 static void alpha_forensics_reset_all(void) {
@@ -8102,244 +7679,29 @@ bool clocks_alpha_lane_forensics(time_clock_id_t clock,
   if (!out) return false;
   *out = clocks_alpha_lane_forensics_t{};
   alpha_event_flow_note_snapshot_request(clock);
-  alpha_lane_forensics_store_t* s = alpha_forensics_store(clock);
-  if (!s) {
+  alpha_lane_forensics_store_t* store = alpha_forensics_store(clock);
+  if (!store) {
     alpha_event_flow_note_snapshot_missing_store(clock);
     return false;
   }
 
-  for (int attempt = 0; attempt < 4; attempt++) {
-    const uint32_t seq1 = s->seq;
+  for (int attempt = 0; attempt < 4; ++attempt) {
+    const uint32_t seq1 = store->seq;
     clocks_alpha_dmb();
-
-    out->valid = s->valid;
-    out->update_count = s->update_count;
-    out->last_event_dwt = s->last_event_dwt;
-    out->last_event_counter32 = s->last_event_counter32;
-    out->zero_offset_valid = s->zero_offset_valid;
-    out->zero_offset_counter32 = s->zero_offset_counter32;
-    out->counter32_delta_since_zero_offset = s->counter32_delta_since_zero_offset;
-    out->counter32_delta_since_previous_event = s->counter32_delta_since_previous_event;
-    out->logical_ticks64_since_zero = s->logical_ticks64_since_zero;
-    out->nominal_ns64_since_zero = s->nominal_ns64_since_zero;
-    out->epoch_counter32 = s->epoch_counter32;
-    out->counter32_delta_since_epoch = s->counter32_delta_since_epoch;
-    out->nominal_ns_from_counter32_epoch = s->nominal_ns_from_counter32_epoch;
-    out->event_gnss_ns = s->event_gnss_ns;
-    out->previous_event_gnss_ns = s->previous_event_gnss_ns;
-    out->sample_gnss_ns_at_event_available =
-        s->sample_gnss_ns_at_event_available;
-    out->previous_sample_gnss_ns_at_event_available =
-        s->previous_sample_gnss_ns_at_event_available;
-    out->sample_gnss_ns_at_event = s->sample_gnss_ns_at_event;
-    out->previous_sample_gnss_ns_at_event =
-        s->previous_sample_gnss_ns_at_event;
-    out->phase_offset_ns = s->phase_offset_ns;
-    out->physical_measured_ns_at_edge = s->physical_measured_ns_at_edge;
-    out->visible_ns_at_edge = s->visible_ns_at_edge;
-    out->visible_origin_phase_valid = s->visible_origin_phase_valid;
-    out->visible_origin_phase_offset_ns = s->visible_origin_phase_offset_ns;
-    out->counter_nominal_ns_between_edges = s->counter_nominal_ns_between_edges;
-    out->bridge_gnss_ns_between_edges = s->bridge_gnss_ns_between_edges;
-    out->bridge_residual_ns = s->bridge_residual_ns;
-    out->bridge_interval_valid = s->bridge_interval_valid;
-    out->bridge_anchored = s->bridge_anchored;
-    out->bridge_phi_cycles = s->bridge_phi_cycles;
-    out->bridge_span_cycles = s->bridge_span_cycles;
-    out->bridge_resolved_count = s->bridge_resolved_count;
-    out->bridge_fallback_count = s->bridge_fallback_count;
-    out->ns_between_edges = s->ns_between_edges;
-    out->dwt_cycles_between_edges = s->dwt_cycles_between_edges;
-    out->dwt_synthetic = s->dwt_synthetic;
-    out->dwt_repair_candidate = s->dwt_repair_candidate;
-    out->dwt_original_at_event = s->dwt_original_at_event;
-    out->dwt_predicted_at_event = s->dwt_predicted_at_event;
-    out->dwt_used_at_event = s->dwt_used_at_event;
-    out->dwt_isr_entry_raw = s->dwt_isr_entry_raw;
-    out->dwt_event_from_isr_entry_raw = s->dwt_event_from_isr_entry_raw;
-    out->dwt_isr_entry_to_event_correction_cycles =
-        s->dwt_isr_entry_to_event_correction_cycles;
-    out->dwt_published_minus_event_cycles =
-        s->dwt_published_minus_event_cycles;
-    out->dwt_used_minus_event_cycles = s->dwt_used_minus_event_cycles;
-    out->dwt_synthetic_error_cycles = s->dwt_synthetic_error_cycles;
-    out->dwt_synthetic_threshold_cycles = s->dwt_synthetic_threshold_cycles;
-    out->dwt_publication_verdict_mask =
-        s->dwt_publication_verdict_mask;
-    out->dwt_publication_verdict_reason_id =
-        s->dwt_publication_verdict_reason_id;
-    out->dwt_publication_watchdog_count =
-        s->dwt_publication_watchdog_count;
-    out->dwt_publication_gate_cycles =
-        s->dwt_publication_gate_cycles;
-    out->dwt_publication_cross_rail_gate_cycles =
-        s->dwt_publication_cross_rail_gate_cycles;
-    out->dwt_publication_service_offset_gate_ticks =
-        s->dwt_publication_service_offset_gate_ticks;
-    out->dwt_publication_expected_counter_delta_ticks =
-        s->dwt_publication_expected_counter_delta_ticks;
-    out->dwt_publication_observed_counter_delta_ticks =
-        s->dwt_publication_observed_counter_delta_ticks;
-    out->dwt_publication_expected_interval_cycles =
-        s->dwt_publication_expected_interval_cycles;
-    out->dwt_publication_published_interval_cycles =
-        s->dwt_publication_published_interval_cycles;
-    out->dwt_publication_observed_interval_cycles =
-        s->dwt_publication_observed_interval_cycles;
-    out->dwt_publication_published_interval_error_cycles =
-        s->dwt_publication_published_interval_error_cycles;
-    out->dwt_publication_observed_interval_error_cycles =
-        s->dwt_publication_observed_interval_error_cycles;
-    out->dwt_publication_published_minus_observed_cycles =
-        s->dwt_publication_published_minus_observed_cycles;
-    out->dwt_publication_service_offset_signed_ticks =
-        s->dwt_publication_service_offset_signed_ticks;
-    out->dwt_publication_vclock_gnss_error_ns =
-        s->dwt_publication_vclock_gnss_error_ns;
-    out->dwt_interval_gate_valid = s->dwt_interval_gate_valid;
-    out->dwt_interval_sample_accepted = s->dwt_interval_sample_accepted;
-    out->dwt_interval_sample_rejected = s->dwt_interval_sample_rejected;
-    out->dwt_interval_ema_updated = s->dwt_interval_ema_updated;
-    out->dwt_interval_observed_cycles = s->dwt_interval_observed_cycles;
-    out->dwt_interval_prediction_cycles = s->dwt_interval_prediction_cycles;
-    out->dwt_interval_effective_cycles = s->dwt_interval_effective_cycles;
-    out->dwt_interval_residual_cycles = s->dwt_interval_residual_cycles;
-    out->dwt_interval_gate_threshold_cycles = s->dwt_interval_gate_threshold_cycles;
-    out->dwt_interval_accept_count = s->dwt_interval_accept_count;
-    out->dwt_interval_reject_count = s->dwt_interval_reject_count;
-    out->dwt_interval_resync_applied = s->dwt_interval_resync_applied;
-    out->dwt_interval_resync_count = s->dwt_interval_resync_count;
-    out->dwt_interval_reject_streak = s->dwt_interval_reject_streak;
-    out->dwt_interval_adjacency_gate_valid =
-        s->dwt_interval_adjacency_gate_valid;
-    out->dwt_interval_adjacency_ok = s->dwt_interval_adjacency_ok;
-    out->dwt_interval_adjacency_rejected =
-        s->dwt_interval_adjacency_rejected;
-    out->dwt_interval_counter_delta_ticks =
-        s->dwt_interval_counter_delta_ticks;
-    out->dwt_interval_expected_counter_delta_ticks =
-        s->dwt_interval_expected_counter_delta_ticks;
-    out->dwt_interval_adjacency_reject_count =
-        s->dwt_interval_adjacency_reject_count;
-    out->dwt_yardstick_valid = s->dwt_yardstick_valid;
-    out->dwt_yardstick_stale = s->dwt_yardstick_stale;
-    out->dwt_yardstick_seeded = s->dwt_yardstick_seeded;
-    out->dwt_yardstick_excursion = s->dwt_yardstick_excursion;
-    out->dwt_yardstick_pps_sequence = s->dwt_yardstick_pps_sequence;
-    out->dwt_yardstick_pps_seq_delta = s->dwt_yardstick_pps_seq_delta;
-    out->dwt_yardstick_g_now_cycles = s->dwt_yardstick_g_now_cycles;
-    out->dwt_yardstick_g_prev_cycles = s->dwt_yardstick_g_prev_cycles;
-    out->dwt_yardstick_inferred_interval_cycles = s->dwt_yardstick_inferred_interval_cycles;
-    out->dwt_yardstick_observed_interval_cycles = s->dwt_yardstick_observed_interval_cycles;
-    out->dwt_yardstick_inferred_minus_observed_cycles = s->dwt_yardstick_inferred_minus_observed_cycles;
-    out->dwt_yardstick_inferred_endpoint_dwt = s->dwt_yardstick_inferred_endpoint_dwt;
-    out->dwt_yardstick_inferred_endpoint_frac_q16 = s->dwt_yardstick_inferred_endpoint_frac_q16;
-    out->dwt_yardstick_endpoint_minus_observed_cycles = s->dwt_yardstick_endpoint_minus_observed_cycles;
-    out->dwt_yardstick_gate_threshold_cycles = s->dwt_yardstick_gate_threshold_cycles;
-    out->dwt_yardstick_gate_agree_count = s->dwt_yardstick_gate_agree_count;
-    out->dwt_yardstick_gate_excursion_count = s->dwt_yardstick_gate_excursion_count;
-    out->dwt_yardstick_authority = s->dwt_yardstick_authority;
-    out->dwt_ema_dwt_at_event = s->dwt_ema_dwt_at_event;
-    out->dwt_yardstick_auth_endpoint_dwt = s->dwt_yardstick_auth_endpoint_dwt;
-    out->dwt_yardstick_auth_endpoint_frac_q16 = s->dwt_yardstick_auth_endpoint_frac_q16;
-    out->dwt_yardstick_auth_error_cycles = s->dwt_yardstick_auth_error_cycles;
-    out->dwt_yardstick_auth_anchor_applied = s->dwt_yardstick_auth_anchor_applied;
-
-    out->slipledger_active = s->slipledger_active;
-    out->slipledger_event_corrected = s->slipledger_event_corrected;
-    out->slipledger_event_violation = s->slipledger_event_violation;
-    out->slipledger_ticks = s->slipledger_ticks;
-    out->slipledger_event_ticks = s->slipledger_event_ticks;
-    out->slipledger_generation = s->slipledger_generation;
-    out->slipledger_observe_count = s->slipledger_observe_count;
-    out->slipledger_ok_count = s->slipledger_ok_count;
-    out->slipledger_violation_count = s->slipledger_violation_count;
-    out->slipledger_correction_count = s->slipledger_correction_count;
-    out->slipledger_noop_violation_count = s->slipledger_noop_violation_count;
-    out->slipledger_early_count = s->slipledger_early_count;
-    out->slipledger_late_count = s->slipledger_late_count;
-    out->slipledger_one_second_observe_count = s->slipledger_one_second_observe_count;
-    out->slipledger_one_second_ok_count = s->slipledger_one_second_ok_count;
-    out->slipledger_one_second_violation_count = s->slipledger_one_second_violation_count;
-    out->slipledger_one_second_correction_count = s->slipledger_one_second_correction_count;
-    out->slipledger_last_expected_dwt = s->slipledger_last_expected_dwt;
-    out->slipledger_last_observed_dwt = s->slipledger_last_observed_dwt;
-    out->slipledger_last_authored_dwt = s->slipledger_last_authored_dwt;
-    out->slipledger_last_expected_interval_cycles = s->slipledger_last_expected_interval_cycles;
-    out->slipledger_last_observed_interval_cycles = s->slipledger_last_observed_interval_cycles;
-    out->slipledger_last_dwt_error_cycles = s->slipledger_last_dwt_error_cycles;
-    out->slipledger_last_target_counter32 = s->slipledger_last_target_counter32;
-    out->slipledger_last_hardware_target_low16 = s->slipledger_last_hardware_target_low16;
-    out->slipledger_last_ambient_low16 = s->slipledger_last_ambient_low16;
-    out->slipledger_last_tick_mod = s->slipledger_last_tick_mod;
-    out->slipledger_reason_code = s->slipledger_reason_code;
-    out->slipledger_last_correction_reason_code = s->slipledger_last_correction_reason_code;
-    out->slipledger_last_correction_ticks = s->slipledger_last_correction_ticks;
-    out->slipledger_last_correction_dwt_error_cycles = s->slipledger_last_correction_dwt_error_cycles;
-    out->second_residual_ns = s->second_residual_ns;
-    out->window_error_ns = s->window_error_ns;
-    out->window_checks = s->window_checks;
-    out->window_mismatches = s->window_mismatches;
-    out->diag_anchor_sequence_used = s->diag_anchor_sequence_used;
-    out->diag_anchor_age_slots = s->diag_anchor_age_slots;
-    out->diag_anchor_selection_kind = s->diag_anchor_selection_kind;
-    out->diag_anchor_dwt_at_edge = s->diag_anchor_dwt_at_edge;
-    out->diag_anchor_gnss_ns_at_edge = s->diag_anchor_gnss_ns_at_edge;
-    out->diag_anchor_cps = s->diag_anchor_cps;
-    out->diag_anchor_ns_delta = s->diag_anchor_ns_delta;
-    out->diag_anchor_failure_mask = s->diag_anchor_failure_mask;
-    out->diag_service_class = s->diag_service_class;
-    out->diag_service_offset_signed_ticks =
-        s->diag_service_offset_signed_ticks;
-    out->diag_service_offset_abs_ticks = s->diag_service_offset_abs_ticks;
-    out->diag_interpreted_late_ticks = s->diag_interpreted_late_ticks;
-    out->diag_early_ticks = s->diag_early_ticks;
-    out->diag_target_delta_mod65536_ticks =
-        s->diag_target_delta_mod65536_ticks;
-    out->diag_arm_remaining_ticks = s->diag_arm_remaining_ticks;
-    out->diag_arm_to_isr_ticks = s->diag_arm_to_isr_ticks;
-    out->diag_arm_to_isr_dwt_cycles = s->diag_arm_to_isr_dwt_cycles;
-    out->diag_perishable_fact_sequence = s->diag_perishable_fact_sequence;
-    out->diag_service_correction_cycles = s->diag_service_correction_cycles;
-    out->diag_service_corrected_dwt_at_event =
-        s->diag_service_corrected_dwt_at_event;
-    out->diag_fact_ring_overflow_count = s->diag_fact_ring_overflow_count;
-    out->diag_counter_delta_violation_count =
-        s->diag_counter_delta_violation_count;
-    out->diag_last_bad_counter_delta = s->diag_last_bad_counter_delta;
-    out->diag_last_counter_delta_ticks = s->diag_last_counter_delta_ticks;
-    out->diag_sample_phase_valid = s->diag_sample_phase_valid;
-    out->diag_sample_phase_ticks = s->diag_sample_phase_ticks;
-    out->diag_sample_phase_ns = s->diag_sample_phase_ns;
-    out->diag_sample_phase_us = s->diag_sample_phase_us;
-    out->diag_sample_period_ticks = s->diag_sample_period_ticks;
-    out->diag_sample_dwt_at_event = s->diag_sample_dwt_at_event;
-    out->diag_sample_counter32_at_event = s->diag_sample_counter32_at_event;
-    out->diag_boundary_dwt_at_event = s->diag_boundary_dwt_at_event;
-    out->diag_boundary_counter32_at_event = s->diag_boundary_counter32_at_event;
-    out->diag_boundary_correction_cycles = s->diag_boundary_correction_cycles;
-    out->arrival = s->arrival;
-    out->ocxo_compare = s->ocxo_compare;
-    out->spinidle_shadow_valid = s->spinidle_shadow_valid;
-    out->spinidle_shadow_dwt = s->spinidle_shadow_dwt;
-    out->spinidle_shadow_to_isr_entry_cycles =
-        s->spinidle_shadow_to_isr_entry_cycles;
-    out->spinidle_shadow_valid_threshold_cycles =
-        s->spinidle_shadow_valid_threshold_cycles;
-    out->interrupt_delay = s->interrupt_delay;
-
+    clocks_alpha_lane_forensics_t value =
+        static_cast<const clocks_alpha_lane_forensics_t&>(*store);
     clocks_alpha_dmb();
-    const uint32_t seq2 = s->seq;
-    if (seq1 == seq2 && (seq1 & 1u) == 0u) {
-      out->snapshot_ok = true;
-      alpha_event_flow_note_snapshot(clock, true, true, out->valid,
-                                     out->update_count, seq2);
+    const uint32_t seq2 = store->seq;
+    if (seq1 == seq2 && (seq1 & 1U) == 0U) {
+      value.snapshot_ok = true;
+      *out = value;
+      alpha_event_flow_note_snapshot(
+          clock, true, true, value.valid, value.update_count, seq2);
       return true;
     }
   }
 
-  *out = clocks_alpha_lane_forensics_t{};
-  alpha_event_flow_note_snapshot(clock, false, false, false, 0, 0);
+  alpha_event_flow_note_snapshot(clock, false, false, false, 0U, 0U);
   return false;
 }
 
@@ -9086,7 +8448,7 @@ void clocks_alpha_recover_reprime_ocxo_state(void) {
   // replacement chain.  The first post-recovery edge becomes the new left
   // bookend; the following adjacent edge forms the first lawful interval.
 
-  alpha_timebase_row_reset_all();         // no pre-recovery PPS row may survive
+  alpha_completed_row_reset_all();         // no pre-recovery PPS row may survive
   alpha_measured_ns_reset_all();          // bridge anchors + pending OCXO edges
   alpha_ocxo_pps_projection_reset_all();  // PPS-row OCXO projection history
   alpha_counterledger_reprime_all_for_recover();
@@ -9559,7 +8921,7 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   g_ocxo2_interrupt_diag = {};
   alpha_forensics_reset_all();
   alpha_ticks64_reset_all();
-  alpha_timebase_row_reset_all();
+  alpha_completed_row_reset_all();
   alpha_counterledger_reset_all();
   alpha_measured_ns_reset_all();
   alpha_ocxo_pps_projection_reset_all();
@@ -10049,7 +9411,7 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
     //
     //   measured_visible_ns
     //     Legacy bridge-resolved forensic ledger.  It may lag one edge, but it
-    //     no longer authors Delta Cycles, Welfords, servo input, or TIMEBASE.
+    //     no longer authors Delta Cycles, Welfords, servo input, or CLOCKS_FRAGMENT.
     //
     //   public_edge_ns_for_history
     //     The OCXO clock-domain edge ledger: synthetic 10 MHz ticks since the
@@ -10215,7 +9577,7 @@ static void apply_ocxo_event(clock_state_t& clock,
   alpha_event_flow_note_callback_accepted(time_clock);
   clocks_apply_epoch_counter_edge(clock, meas, event, diag,
                                   epoch_counter32, time_clock);
-  alpha_timebase_row_note_ocxo_event(time_clock, event);
+  alpha_completed_row_note_ocxo_event(time_clock, event);
 }
 
 static void vclock_callback(const interrupt_event_t& event,
@@ -10556,7 +9918,7 @@ static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& sna
                                             vclock_ns);
 
   // Traditional projection mode still installs OCXO time immediately.  In
-  // CounterLedger mode alpha_timebase_install_refined_clockfaces() performs the
+  // CounterLedger mode alpha_completed_row_install_refined_clockfaces() performs the
   // only OCXO install after both exact PhaseLedger results have matured.
   if (!clocks_ocxo_counterledger_mode()) {
     (void)time_clock_update(time_clock_id_t::OCXO1, snap.dwt_at_edge, ocxo1_ns);
@@ -10665,7 +10027,7 @@ static void update_pps_vclock_bridge_anchor(const pps_edge_snapshot_t& snap) {
   // If both post-PPS OCXO callbacks ran before this selector continuation, the
   // cached edge-pair catch-up above has already resolved exact PhaseLedger.
   // Install the always-on clockfaces now that this PPS DWT/GNSS identity is live.
-  (void)alpha_timebase_install_refined_clockfaces(snap.sequence);
+  (void)alpha_completed_row_install_refined_clockfaces(snap.sequence);
 
   time_pps_vclock_update(snap.dwt_at_edge,
                   dwt_effective_cycles_per_pps_vclock_second(),
@@ -10704,22 +10066,22 @@ static void pps_selector_callback(const pps_edge_snapshot_t& snap) {
   // completion.  The failure being recovered may be precisely the loss of the
   // OCXO one-second ferry, so consume the request directly from sovereign PPS.
   if (request_recover) {
-    alpha_timebase_row_clear();
+    alpha_completed_row_clear();
     clocks_beta_pps(0U);
     return;
   }
 
   // There is one practical row and no queue.  A new PPS cannot overwrite an
   // older row that is still waiting for either OCXO lane.
-  if (g_alpha_pending_timebase_row.open &&
-      g_alpha_pending_timebase_row.pps_sequence != snap.sequence) {
+  if (g_alpha_pending_completed_row.open &&
+      g_alpha_pending_completed_row.pps_sequence != snap.sequence) {
     clocks_watchdog_anomaly(
         "alpha_timebase_row_overlap",
-        g_alpha_pending_timebase_row.pps_sequence,
+        g_alpha_pending_completed_row.pps_sequence,
         snap.sequence,
         g_alpha_last_ocxo1_pps_sequence,
         g_alpha_last_ocxo2_pps_sequence);
-    alpha_timebase_row_clear();
+    alpha_completed_row_clear();
     return;
   }
 
@@ -10733,9 +10095,9 @@ static void pps_selector_callback(const pps_edge_snapshot_t& snap) {
 
   // Cold or preserved SmartZero control still needs a PPS heartbeat before an
   // Alpha row can exist.  Sequence zero tells Beta to service START/ZERO only;
-  // it can never publish a TIMEBASE candidate.
+  // it can never publish a campaign candidate.
   if (request_start || request_zero) {
-    alpha_timebase_row_clear();
+    alpha_completed_row_clear();
     clocks_beta_pps(0U);
     return;
   }
@@ -10752,7 +10114,7 @@ static void pps_selector_callback(const pps_edge_snapshot_t& snap) {
 
   // PPS opens one row.  The first post-PPS OCXO edge from each lane resolves
   // the exact PhaseLedger suffix; the later lane synchronously releases Beta.
-  alpha_timebase_row_open(snap.sequence);
+  alpha_completed_row_open(snap.sequence);
 }
 
 // ============================================================================
