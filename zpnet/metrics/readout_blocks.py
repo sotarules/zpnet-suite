@@ -20,7 +20,8 @@ Clock row doctrine:
   The dense operator table shows GNSS, VCLOCK, OCXO1, and OCXO2 only.
   GN_RAW and DWT remain available in CLOCKS/focused diagnostics but are omitted
   here because they are not primary TEMPEST science clocks.
-  VALUE is the canonical 64-bit clock value.
+  VALUE is the Beta-authored campaign-relative clockface while a campaign is
+  active; otherwise it is the canonical always-on instrument clockface.
   10-MIN/60-MIN/8-HOUR/24-HOUR are firmware/Pi-producer-authored rolling PPB
   buckets.  Metrics never estimates a rolling population from repaint history.
   TOTAL is the always-on population since boot or the last statistics reset.
@@ -1328,18 +1329,27 @@ def campaigns_readout() -> list[str]:
 
 
 def _clockface_value(r: dict, lane: str):
-    """Return the canonical CLOCKS_V4 always-on clockface for VALUE."""
+    """Return the operator clockface in the currently active coordinate scope."""
     if lane == "vclock":
         # V4 deliberately has no duplicate VCLOCK ns clockface; GNSS is the
-        # canonical disciplined nanosecond reference.
+        # canonical disciplined nanosecond reference in both coordinate scopes.
         lane = "gnss"
-    path = {
-        "gnss": "clockfaces.gnss_ns",
-        "ocxo1": "clockfaces.ocxo1_ns",
-        "ocxo2": "clockfaces.ocxo2_ns",
-        "dwt": "clockfaces.dwt_cycles",
+
+    field = {
+        "gnss": "gnss_ns",
+        "ocxo1": "ocxo1_ns",
+        "ocxo2": "ocxo2_ns",
+        "dwt": "dwt_cycles",
     }.get(lane)
-    return _to_int(_field(r, path, default=None)) if path else None
+    if field is None:
+        return None
+
+    campaign = r.get("campaign_delta") if isinstance(r.get("campaign_delta"), dict) else {}
+    if r.get("campaign_present"):
+        clockfaces = campaign.get("clockfaces") if isinstance(campaign.get("clockfaces"), dict) else {}
+        return _to_int(clockfaces.get(field))
+
+    return _to_int(_field(r, f"clockfaces.{field}", default=None))
 
 def _campaign_ppb(r: dict, lane: str):
     """Return firmware-authored TEMPEST campaign PPB from the optional delta."""

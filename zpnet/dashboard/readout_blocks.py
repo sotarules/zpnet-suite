@@ -177,21 +177,9 @@ def _clock_report() -> tuple[dict | None, str]:
     if not report:
         return None, "CLOCKS: FEED UNAVAILABLE"
 
-    state = str(report.get("campaign_state") or ("STARTED" if report.get("campaign_present") else "STOPPED")).upper()
-    count = _to_int(_field(
-        report, "instrument_count", "instrument_seconds",
-        "stats.ocxo1.welford.n", "stats.ocxo1.n",
-        "teensy_pps_vclock_count", "pps_count",
-    )) or 0
-    if state == "STARTED" or report.get("campaign_present"):
-        campaign_type = str(report.get("campaign_type") or "CAMPAIGN").upper()
-        campaign = report.get("campaign", "?")
-        elapsed = report.get("campaign_elapsed", "00:00:00")
-        header = f"CLOCKS: {campaign_type}/{campaign} {elapsed} n={count}"
-    else:
-        elapsed = report.get("instrument_elapsed", "00:00:00")
-        header = f"CLOCKS: INSTRUMENT {elapsed} n={count}"
-    return report, header
+    # Dashboard titles already identify the panel. Keep the subtitle row as
+    # intentional whitespace between the title and body.
+    return report, ""
 
 
 def _frequency(report: dict, lane: str) -> tuple[float | None, float | None]:
@@ -205,15 +193,25 @@ def _frequency(report: dict, lane: str) -> tuple[float | None, float | None]:
     )
 
 def _clockface_value(report: dict, lane: str):
+    """Return the operator clockface in the currently active coordinate scope."""
     if lane == "vclock":
         lane = "gnss"
-    path = {
-        "gnss": "clockfaces.gnss_ns",
-        "ocxo1": "clockfaces.ocxo1_ns",
-        "ocxo2": "clockfaces.ocxo2_ns",
-        "dwt": "clockfaces.dwt_cycles",
+
+    field = {
+        "gnss": "gnss_ns",
+        "ocxo1": "ocxo1_ns",
+        "ocxo2": "ocxo2_ns",
+        "dwt": "dwt_cycles",
     }.get(lane)
-    return _to_int(_field(report, path)) if path else None
+    if field is None:
+        return None
+
+    campaign = report.get("campaign_delta") if isinstance(report.get("campaign_delta"), dict) else {}
+    if report.get("campaign_present"):
+        clockfaces = campaign.get("clockfaces") if isinstance(campaign.get("clockfaces"), dict) else {}
+        return _to_int(clockfaces.get(field))
+
+    return _to_int(_field(report, f"clockfaces.{field}"))
 
 def _campaign_ppb(report: dict, lane: str):
     campaign = report.get("campaign_delta") if isinstance(report.get("campaign_delta"), dict) else {}
@@ -310,24 +308,27 @@ def gnss_report_readout() -> Generator[str, None, None]:
 
 def clocks_tau_readout() -> Generator[str, None, None]:
     report, header = _clock_report()
-    yield header
+    if header:
+        yield header
     if report is None:
         return
-    yield f"{'CLK':<7}{'TAU':>17}{'PPB':>12}{'CAMP PPB':>12}{'N':>8}"
+    yield f"{'CLK':<7}{'VALUE':>20}{'TAU':>17}{'PPB':>12}{'CAMP PPB':>12}{'N':>8}"
     for label, lane in (("GNSS", "gnss"), ("VCLOCK", "vclock"), ("OCXO1", "ocxo1"),
                         ("OCXO2", "ocxo2"), ("GN_RAW", "gnss_raw"), ("DWT", "dwt")):
+        value_text = _integer(_clockface_value(report, lane), comma=True)
         tau, ppb = _frequency(report, lane)
         tau_text = "---" if tau is None else f"{tau:.12f}"
         ppb_text = "---" if ppb is None else f"{ppb:+.3f}"
         campaign_ppb = _campaign_ppb(report, lane)
         campaign_ppb_text = "---" if campaign_ppb is None else f"{campaign_ppb:+.3f}"
         sample_n = _to_int(_welford(report, lane, "n"))
-        yield f"{label:<7}{tau_text:>17}{ppb_text:>12}{campaign_ppb_text:>12}{_integer(sample_n):>8}"
+        yield f"{label:<7}{value_text:>20}{tau_text:>17}{ppb_text:>12}{campaign_ppb_text:>12}{_integer(sample_n):>8}"
 
 
 def clocks_prediction_readout() -> Generator[str, None, None]:
     report, header = _clock_report()
-    yield header
+    if header:
+        yield header
     if report is None:
         return
     yield "STATIC PREDICTION (prior interval -> current)"
@@ -343,7 +344,8 @@ def clocks_prediction_readout() -> Generator[str, None, None]:
 
 def clocks_comparison_readout() -> Generator[str, None, None]:
     report, header = _clock_report()
-    yield header
+    if header:
+        yield header
     if report is None:
         return
     baseline = _get_clocks_baseline()
@@ -364,7 +366,8 @@ def clocks_comparison_readout() -> Generator[str, None, None]:
 
 def clocks_servo_readout() -> Generator[str, None, None]:
     report, header = _clock_report()
-    yield header
+    if header:
+        yield header
     if report is None:
         return
     yield f"SERVO: {_servo_mode(report)}"
@@ -383,7 +386,8 @@ def clocks_servo_readout() -> Generator[str, None, None]:
 
 def clocks_dac_welford_readout() -> Generator[str, None, None]:
     report, header = _clock_report()
-    yield header
+    if header:
+        yield header
     if report is None:
         return
     yield "DAC WELFORD (always-on cumulative)"
