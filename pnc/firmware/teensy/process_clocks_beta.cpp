@@ -628,6 +628,7 @@ static clocks_instrument_stats_snapshot_t
     g_beta_report_instrument_stats DMAMEM = {};
 static Payload g_report_clocks_payload DMAMEM;
 static Payload g_report_stats_payload DMAMEM;
+static Payload g_report_smartzero_payload DMAMEM;
 static Payload g_report_child_clocks DMAMEM;
 static Payload g_report_child_stats DMAMEM;
 static Payload g_report_child_clock DMAMEM;
@@ -1098,6 +1099,7 @@ void clocks_beta_features_init(void) {
   g_clocks_fragment_campaign_record_sequence = 0U;
   g_report_clocks_payload.clear();
   g_report_stats_payload.clear();
+  g_report_smartzero_payload.clear();
   g_report_child_clocks.clear();
   g_report_child_stats.clear();
   g_report_child_clock.clear();
@@ -10210,6 +10212,30 @@ static FLASHMEM void report_add_common_metadata(
   p.add("report_max_duration_cycles", g_clocks_report_max_duration_cycles);
 }
 
+static FLASHMEM Payload cmd_report_smartzero(const Payload&) {
+  clocks_report_build_guard_t guard;
+  if (!guard.acquired) return clocks_report_busy_response("CLOCKS_SMARTZERO");
+
+  Payload& built = g_report_smartzero_payload;
+  built.clear();
+  built.add("report", "CLOCKS_SMARTZERO");
+  built.add("schema", "CLOCKS_SMARTZERO_REPORT_V1");
+  built.add("read_only", true);
+  built.add("campaign_state", clocks_campaign_state_name(campaign_state));
+  built.add("campaign", campaign_name);
+  built.add("campaign_seconds", campaign_seconds);
+  built.add("zero_request_pending", (bool)request_zero);
+  built.add("epoch_ready", clocks_alpha_installed_smartzero_backing_epoch());
+  built.add("epoch_sequence", clocks_alpha_epoch_sequence());
+  built.add("report_priority0_capture_live", true);
+  built.add("report_priority16_excluded", true);
+  payload_add_smartzero_summary(built);
+
+  Payload response = built;
+  built.clear();
+  return response;
+}
+
 static FLASHMEM Payload cmd_report_clocks(const Payload&) {
   clocks_report_build_guard_t guard;
   if (!guard.acquired) return clocks_report_busy_response("CLOCKS_INSTRUMENT");
@@ -10493,6 +10519,7 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "SERVOS",              cmd_servos              },
   { "REPORT_CLOCKS",       cmd_report_clocks       },
   { "REPORT_STATS",        cmd_report_stats        },
+  { "REPORT_SMARTZERO",    cmd_report_smartzero    },
   { "STATS_RESET",         cmd_stats_reset         },
   { "REPORT_RECOVERY",     cmd_report_recovery     },
   { "STACK_WITNESS_RESET", cmd_stack_witness_reset },
