@@ -9,7 +9,7 @@ Key invariants:
   • WebSocket failures must never affect UI
   • Dashboard is an observer, not an instrument
   • Dashboard must never initialize host audio
-  • Unified MONITOR owns platform health and live always-on clock science
+  • CLOCKS_V4 owns platform context and live always-on clock science
 
 Author: The Mule + GPT
 """
@@ -101,12 +101,11 @@ def header_readout(prefix: str = "") -> list[str]:
     remaining_pct = battery.get("remaining_pct")
     batt_str = f"{remaining_pct:.1f}%" if isinstance(remaining_pct, (int, float)) else "N/A"
 
-    clocks = system.get("clocks", {}) if isinstance(system.get("clocks"), dict) else {}
-    campaign_present = bool(clocks.get("campaign_present"))
-    if campaign_present:
-        campaign_type = str(clocks.get("campaign_type") or "CAMPAIGN").upper()
-        campaign = str(clocks.get("campaign") or "?")
-        stream_context = f"CAMPAIGN: {campaign_type}/{campaign}"
+    campaign = system.get("campaign") if isinstance(system.get("campaign"), dict) else {}
+    if campaign and str(campaign.get("state") or "STOPPED").upper() != "STOPPED":
+        campaign_type = "TEMPEST" if campaign.get("schema") == "TEMPEST_FRAGMENT_V1" else "CAMPAIGN"
+        campaign_name = str(campaign.get("name") or "?")
+        stream_context = f"CAMPAIGN: {campaign_type}/{campaign_name}"
     else:
         stream_context = "STREAM: AMBIENT"
 
@@ -131,9 +130,7 @@ from zpnet.dashboard.readout_blocks import (
     battery_status_readout,
     power_status_readout,
     network_status_readout,
-    teensy_status_readout,
     raspberry_pi_status_readout,
-    teensy_metrics_readout,
 )
 
 Readout = Generator[str, None, None]
@@ -150,9 +147,7 @@ READOUTS: list[Callable[[], Readout]] = [
     battery_status_readout,
     power_status_readout,
     network_status_readout,
-    teensy_status_readout,
     raspberry_pi_status_readout,
-    teensy_metrics_readout,
 ]
 
 # ---------------------------------------------------------------------

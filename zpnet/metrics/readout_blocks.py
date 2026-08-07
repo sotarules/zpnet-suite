@@ -2,14 +2,14 @@
 ZPNet Metrics Readout Blocks — Generalized Campaign Detail Edition
 
 Data source:
-  The unified CLOCKS heartbeat owns the live operator view.  Clock science is
-  read from CLOCKS.clocks, including the always-on instrument clockfaces,
-  Alpha statistics, raw-cycle evidence, DAC state, campaign decoration, and
-  baseline comparison.  Metrics never waits for or reads TIMEBASE.
+  The CLOCKS_V4 heartbeat owns the live operator view.  ``clocks`` is the
+  canonical always-on instrument; optional top-level ``campaign`` is TEMPEST
+  enrichment; baseline and platform context remain top-level CLOCKS surfaces.
+  Metrics never waits for or reads TIMEBASE.
 
 Stats policy (Pi is a stenographer):
   Every statistical quantity shown in this panel is read verbatim from the
-  Teensy-authored TIMEBASE_FRAGMENT, including the GNSS reference Welford.
+  Teensy-authored CLOCKS instrument/campaign surfaces, including the GNSS reference Welford.
   GNSS residual samples are definitionally zero, but its N is the real
   Alpha-owned always-on Welford population, never campaign PPS count.
   No Pi-side means, stddevs, stderrs, PPB windows, or campaign frequencies are
@@ -73,20 +73,16 @@ FEATURE_STATUS_GRID = (
     ("GNSS", "PI.GNSS.REPORT"),
     ("PI_HOST", "PI.SYSTEM.HOST"),
     ("POWER", "PI.SYSTEM.POWER"),
-    ("T_IMPORT", "PI.SYSTEM.TEENSY_FEATURE_IMPORT"),
-    ("T_FEATURE", "TEENSY.SYSTEM.FEATURE_STATUS"),
-    ("PPS/V_AUTH", "TEENSY.INTERRUPT.PPS_VCLOCK_AUTHORITY"),
-    ("QTIMER_CNT", "TEENSY.INTERRUPT.QTIMER_COUNTER_CUSTODY"),
-    ("CTR32_LINE", "TEENSY.INTERRUPT.COUNTER32_LINEAGE"),
-    ("DWT_CAL", "TEENSY.CLOCKS.DWT_CALIBRATION"),
-    ("STATIC_PRED", "TEENSY.CLOCKS.STATIC_PREDICTION"),
-    ("SMARTZERO", "TEENSY.CLOCKS.SMARTZERO"),
-    ("ALPHA_EPOCH", "TEENSY.CLOCKS.ALPHA_EPOCH"),
-    ("OCXO_ORIGIN", "TEENSY.CLOCKS.OCXO_PUBLIC_ORIGIN"),
-    ("SCI_RES", "TEENSY.CLOCKS.SCIENCE_RESIDUALS"),
-    ("TEMP_PUB", "TEENSY.CLOCKS.TIMEBASE_PUBLICATION"),
     ("ENV", "PI.SYSTEM.ENVIRONMENT"),
     ("SENSORS", "PI.SYSTEM.SENSORS"),
+    ("OBS_EDGE", "TEENSY.INTERRUPT.OBSERVED_EDGE_AUTHORITY"),
+    ("QTIMER_CNT", "TEENSY.INTERRUPT.QTIMER_COUNTER_CUSTODY"),
+    ("CTR32_LINE", "TEENSY.INTERRUPT.COUNTER32_LINEAGE"),
+    ("PPS/V_AUTH", "TEENSY.INTERRUPT.PPS_VCLOCK_AUTHORITY"),
+    ("ALPHA_EPOCH", "TEENSY.CLOCKS.ALPHA_EPOCH"),
+    ("DWT_CAL", "TEENSY.CLOCKS.DWT_CALIBRATION"),
+    ("STATIC_PRED", "TEENSY.CLOCKS.STATIC_PREDICTION"),
+    ("OCXO_ORIGIN", "TEENSY.CLOCKS.OCXO_PUBLIC_ORIGIN"),
 )
 
 
@@ -122,37 +118,45 @@ def _monitor_root() -> dict:
 
 
 def _get_pi_clocks_report() -> dict:
-    """Return the live CLOCKS.clocks surface without command/response traffic."""
+    """Return one presentation view over the canonical CLOCKS_V4 surfaces."""
     root = _monitor_root()
     clocks = root.get("clocks")
     if not isinstance(clocks, dict):
         return {}
 
-    # Keep CLOCKS's ownership boundaries visible while presenting a convenient
-    # report-like object to the existing pure formatting helpers.
     report = dict(clocks)
-    for key in (
-        "campaign", "campaign_state", "campaign_present", "campaign_elapsed",
-        "instrument_elapsed", "instrument_always_on", "gnss_time_utc",
-        "system_time_utc", "published_at_utc",
-    ):
-        if report.get(key) is None and root.get(key) is not None:
-            report[key] = root.get(key)
+    campaign = root.get("campaign") if isinstance(root.get("campaign"), dict) else {}
+    public_count = _to_int(campaign.get("public_count"))
+    state = str(campaign.get("state") or "STOPPED").upper()
+
+    report["campaign_delta"] = campaign
+    report["campaign_present"] = bool(campaign) and state != "STOPPED"
+    report["campaign_state"] = state
+    report["campaign"] = campaign.get("name") if campaign else None
+    report["campaign_type"] = "TEMPEST" if campaign.get("schema") == "TEMPEST_FRAGMENT_V1" else None
+    report["campaign_elapsed"] = _seconds_to_hms(public_count) if public_count is not None else "00:00:00"
+    report["instrument_elapsed"] = _seconds_to_hms(_to_int(clocks.get("instrument_age_seconds")) or 0)
+    report["baseline"] = root.get("baseline") if isinstance(root.get("baseline"), dict) else None
+    report["published_at_utc"] = root.get("published_at_utc")
     return report
 
-
 def _get_pi_clocks_report_dac() -> dict:
-    # CLOCKS.clocks.dac is already folded into the live report surface.
+    # CLOCKS_V4 control is already part of the canonical live report.
     return {}
 
-
 def _get_clocks_baseline() -> dict | None:
-    """Return the baseline embedded in CLOCKS.clocks, never an RPC query."""
-    clocks = _get_pi_clocks_report()
-    baseline = clocks.get("baseline")
+    """Return the top-level CLOCKS_V4 baseline read model."""
+    root = _monitor_root()
+    baseline = root.get("baseline")
     if not isinstance(baseline, dict) or not baseline.get("baseline_set"):
         return None
     return baseline
+
+def _seconds_to_hms(seconds) -> str:
+    value = _to_int(seconds)
+    if value is None or value < 0:
+        value = 0
+    return f"{value // 3600:02d}:{(value % 3600) // 60:02d}:{value % 60:02d}"
 
 
 # ---------------------------------------------------------------------
@@ -322,26 +326,15 @@ def _path_get(obj, path: str, default=None):
 
 
 def _payload_root(r: dict) -> dict:
-    if isinstance(r, dict) and isinstance(r.get("payload"), dict):
-        return r["payload"]
+    # UI helpers receive the already-normalized CLOCKS.clocks presentation view.
     return r if isinstance(r, dict) else {}
 
-
 def _fragment_root(r: dict) -> dict:
-    # CLOCKS.clocks is already the canonical live clock root.  Retain support
-    # for historical report-shaped dictionaries used by campaign-history code.
-    root = _payload_root(r)
-    frag = root.get("fragment")
-    return frag if isinstance(frag, dict) else root
-
+    # CLOCKS_V4 has no embedded TIMEBASE/fragment mirror in the live instrument.
+    return _payload_root(r)
 
 def _frag(r: dict, key: str, default=None):
-    """Read a TIMEBASE field from hierarchical V2 or legacy flat layouts.
-
-    key may be either a legacy flat key ("ocxo1_ns") or a dotted V2 path
-    ("ocxo1.pps_residual.fast_residual_ns").  The fragment object is searched
-    first, then the surrounding TIMEBASE/CLOCKS report object.
-    """
+    """Read one dotted field from the canonical CLOCKS_V4 presentation view."""
     root = _payload_root(r)
     frag = _fragment_root(root)
     for source in (frag, root):
@@ -353,34 +346,27 @@ def _frag(r: dict, key: str, default=None):
 
 def _extra(r: dict, key: str, default=None):
     root = _payload_root(r)
-    ec = root.get("extra_clocks")
-    if isinstance(ec, dict):
-        val = _path_get(ec, key, None)
+    gnss_raw = root.get("gnss_raw")
+    if not isinstance(gnss_raw, dict):
+        return default
+    aliases = {
+        "gnss_raw_ns": ("instrument.ns",),
+        "gnss_raw_ref_ns": ("instrument.ref_ns",),
+        "gnss_raw_tau": ("instrument.tau",),
+        "gnss_raw_ppb": ("instrument.ppb",),
+        "gnss_raw_drift_ppb": ("drift_ppb",),
+        "gnss_raw_welford_n": ("welford.n",),
+        "gnss_raw_welford_mean": ("welford.mean",),
+        "gnss_raw_welford_stddev": ("welford.stddev",),
+        "gnss_raw_welford_stderr": ("welford.stderr",),
+        "gnss_raw_welford_min": ("welford.min",),
+        "gnss_raw_welford_max": ("welford.max",),
+    }
+    for path in aliases.get(key, (key,)):
+        val = _path_get(gnss_raw, path, None)
         if val is not None:
             return val
-
-    # Pi-owned GNSS_RAW is a first-class CLOCKS clock, not a TIMEBASE extra.
-    gnss_raw = root.get("gnss_raw")
-    if isinstance(gnss_raw, dict):
-        aliases = {
-            "gnss_raw_ns": ("presentation.ns", "instrument.ns", "ns"),
-            "gnss_raw_ref_ns": ("presentation.ref_ns", "instrument.ref_ns", "ref_ns"),
-            "gnss_raw_tau": ("presentation.tau", "instrument.tau", "tau"),
-            "gnss_raw_ppb": ("presentation.ppb", "instrument.ppb", "ppb"),
-            "gnss_raw_drift_ppb": ("drift_ppb",),
-            "gnss_raw_welford_n": ("welford.n",),
-            "gnss_raw_welford_mean": ("welford.mean",),
-            "gnss_raw_welford_stddev": ("welford.stddev",),
-            "gnss_raw_welford_stderr": ("welford.stderr",),
-            "gnss_raw_welford_min": ("welford.min",),
-            "gnss_raw_welford_max": ("welford.max",),
-        }
-        for path in aliases.get(key, (key,)):
-            val = _path_get(gnss_raw, path, None)
-            if val is not None:
-                return val
     return default
-
 
 def _field(r: dict, *keys, default=None):
     for key in keys:
@@ -455,40 +441,8 @@ def _ppb_cols_fragment(r: dict, lane: str, width: int) -> str:
 def _welford_value(r: dict, prefix: str, field: str):
     if prefix.endswith("_dac"):
         lane = prefix[:-4]
-        keys = (
-            f"stats.dac.{lane}.{field}",
-            f"stats.{prefix}.welford.{field}",
-            f"{prefix}_welford_{field}",
-        )
-    else:
-        keys = (
-            f"stats.{prefix}.welford.{field}",
-            f"stats.{prefix}.pps_residual.welford.{field}",
-            f"stats.{prefix}_pps_residual.welford.{field}",
-            f"stats.pps_{prefix}.welford.{field}",
-            f"stats.pps_{prefix}.{field}",
-            f"stats.{prefix}.{field}",
-            f"{prefix}_welford_{field}",
-        )
-        if prefix == "vclock":
-            keys += (
-                f"stats.pps_vclock.welford.{field}",
-                f"stats.pps_vclock.{field}",
-                f"stats.pps_v.welford.{field}",
-                f"stats.pps_v.{field}",
-                f"stats.ppsv.welford.{field}",
-                f"stats.ppsv.{field}",
-                f"vclock.pps_residual.welford.{field}",
-                f"pps_vclock_welford_{field}",
-                f"pps_v_welford_{field}",
-                f"vclock_residual_welford_{field}",
-            )
-    for key in keys:
-        val = _frag(r, key, None)
-        if val is not None:
-            return val
-    return None
-
+        return _field(r, f"stats.auxiliary_welford.{lane}_dac.{field}", default=None)
+    return _field(r, f"stats.{prefix}.welford.{field}", default=None)
 
 def _to_float(v):
     if v is None:
@@ -536,57 +490,29 @@ def _ns_interval_from_residual(residual_ns):
 
 
 def _vclock_interval_ns(r: dict):
-    """Return VCLOCK nanoseconds added during the prior PPS second."""
-    direct = _to_int(_field(
-        r,
-        "vclock.pps_residual.clock_interval_ns",
-        "vclock.measurement.clock_interval_ns",
-        "vclock.measurement.gnss_ns_between_edges",
-        "vclock.interval.clock_interval_ns",
-        "vclock.interval.gnss_ns_between_edges",
-        "vclock_gnss_ns_between_edges",
-    ))
-    if direct is not None:
-        return direct
-    return _ns_interval_from_residual(_field(
-        r,
-        "vclock.pps_residual.fast_residual_ns",
-        "vclock.measurement.second_residual_ns",
-        "vclock_second_residual_ns",
-    ))
-
+    # VCLOCK is the disciplined reference in V4; its nanosecond interval is exact.
+    return 1_000_000_000
 
 def _vclock_residual_ns(r: dict):
-    return _to_int(_field(
-        r,
-        "vclock.pps_residual.fast_residual_ns",
-        "vclock.measurement.second_residual_ns",
-        "vclock_second_residual_ns",
-    ))
-
+    return 0
 
 def _ocxo_interval_ns(r: dict, key: str):
-    return _to_int(_field(
-        r,
-        f"{key}.pps_residual.clock_interval_ns",
-        f"{key}.science.clock_interval_ns",
-        f"{key}.measurement.clock_interval_ns",
-        f"{key}.measurement.gnss_ns_between_edges",
-        f"{key}.interval.clock_interval_ns",
-        f"{key}.interval.bridge_gnss_ns_between_edges",
-        f"{key}_gnss_ns_between_edges",
-    ))
-
+    campaign = r.get("campaign_delta") if isinstance(r.get("campaign_delta"), dict) else {}
+    science = _path_get(campaign, f"{key}.science", {})
+    direct = _to_int(science.get("clock_interval_ns")) if isinstance(science, dict) else None
+    if direct is not None:
+        return direct
+    residual = _ocxo_residual_ns(r, key)
+    return _ns_interval_from_residual(-residual) if residual is not None else None
 
 def _ocxo_residual_ns(r: dict, key: str):
-    return _to_int(_field(
-        r,
-        f"{key}.pps_residual.fast_residual_ns",
-        f"{key}.science.fast_residual_ns",
-        f"{key}.measurement.second_residual_ns",
-        f"{key}_second_residual_ns",
-    ))
-
+    campaign = r.get("campaign_delta") if isinstance(r.get("campaign_delta"), dict) else {}
+    science = _path_get(campaign, f"{key}.science", {})
+    if isinstance(science, dict):
+        value = _to_int(science.get("fast_residual_ns"))
+        if value is not None:
+            return value
+    return _to_int(_field(r, f"stats.{key}_tau_state.last_fast_residual_ns", default=None))
 
 def _prediction_value(r: dict, lane: str, field: str, default=None):
     """Read the static-prediction surface for a clock lane.
@@ -647,105 +573,11 @@ def _derived_tau_ppb(actual_cycles, prediction_cycles):
 
 
 def _servo_state(r: dict) -> str:
-    """Return the best available OCXO servo state for the header.
-
-    Prefer explicit firmware-authored servo_mode / servo_active fields.  DAC
-    persistence is no longer proof that the servo is active: current TIMEBASE
-    rows publish DAC values and dither realization even when servo_mode is OFF.
-    ACTIVE is therefore reserved for explicit servo_active=true without a named
-    mode, or for truly old rows that have DAC persistence but no explicit servo
-    state at all.
-    """
-    keys = (
-        "dac.calibrate_ocxo",
-        "dac.servo_mode",
-        "dac.mode",
-        "servo.mode",
-        "servo_mode",
-        "calibrate_ocxo",
-        "forensics.dac.calibrate_ocxo",
-        "forensics.dac.servo_mode",
-        "forensics.dac.mode",
-        "forensics.servo.mode",
-        "forensics.servo_mode",
-        "forensics.calibrate_ocxo",
-        "environmental.calibrate_ocxo",
-        "forensics.environmental.calibrate_ocxo",
-    )
-    saw_explicit_state = False
-    saw_explicit_off = False
-    for key in keys:
-        val = _field(r, key, default=None)
-        if val is None:
-            continue
-        s = str(val).strip().upper()
-        if not s:
-            continue
-        saw_explicit_state = True
-        if s in ("OFF", "NONE", "IDLE"):
-            saw_explicit_off = True
-            continue
-        return s
-
-    # servo_active is the strongest boolean state.  If it is explicitly false,
-    # do not infer ACTIVE later from DAC persistence; DAC is now always visible
-    # campaign telemetry, not proof of servo ownership.
-    for key in ("servo_active", "dac.servo_active", "forensics.servo_active", "forensics.dac.servo_active"):
-        val = _field(r, key, default=None)
-        b = _to_bool(val)
-        if b is True:
-            return "ACTIVE"
-        if b is False:
-            saw_explicit_state = True
-            saw_explicit_off = True
-
-    if saw_explicit_off:
+    control = r.get("control") if isinstance(r.get("control"), dict) else {}
+    mode = str(control.get("servo_mode") or "OFF").strip().upper()
+    if mode in ("OFF", "NONE", "IDLE"):
         return "IDLE"
-
-    # Last-ditch inference from any published servo-input source.  This covers
-    # detailed CLOCKS.REPORT_DAC-style payloads and older TIMEBASE builds that
-    # carried the selected input surface.
-    for lane in ("ocxo1", "ocxo2"):
-        for key in (
-            f"dac.{lane}.servo_input.selected_source",
-            f"dac.{lane}.servo_input.selected_source_id",
-            f"{lane}.servo_input.selected_source",
-            f"{lane}.servo_input.selected_source_id",
-            f"forensics.dac.{lane}.servo_input.selected_source",
-            f"forensics.dac.{lane}.servo_input.selected_source_id",
-            f"forensics.{lane}.servo_input.selected_source",
-            f"forensics.{lane}.servo_input.selected_source_id",
-        ):
-            val = _field(r, key, default=None)
-            if val is None:
-                continue
-
-            # Refactored firmware mode ids:
-            #   1 = MEAN, 2 = TOTAL.  Older builds used id 1 for TOTAL and
-            #   id 2 for NOW, so prefer string names when available.
-            if isinstance(val, (int, float)):
-                if int(val) == 1:
-                    return "MEAN"
-                if int(val) == 2:
-                    return "TOTAL"
-
-            s = str(val).strip().upper()
-            if "TOTAL" in s or "TAU" in s:
-                return "TOTAL"
-            if "MEAN" in s or "WELFORD" in s:
-                return "MEAN"
-
-    # Legacy TIMEBASE_FRAGMENT_V3 only included fragment.dac while
-    # clocks_servo_active() was true.  Treat that as ACTIVE only when the row
-    # has no explicit servo state at all.  Modern always-DAC rows with
-    # servo_mode=OFF or servo_active=false were already returned as IDLE above.
-    dac_o1 = _dac_value(r, "ocxo1")
-    dac_o2 = _dac_value(r, "ocxo2")
-    if not saw_explicit_state and (dac_o1 is not None or dac_o2 is not None):
-        return "ACTIVE"
-
-    return "IDLE"
-
+    return mode
 
 # ---------------------------------------------------------------------
 # DAC presentation helpers
@@ -757,32 +589,7 @@ DAC_VOLTAGE_EXTRA_DECIMALS = DAC_VOLTAGE_DECIMALS - 6
 
 
 def _dac_value(r: dict, lane: str):
-    """Return the firmware-published AD5693R DAC fractional code.
-
-    Active-servo builds publish the live output under fragment.dac.*.  Current
-    always-dither builds also publish the campaign DAC fractional code through
-    the Teensy-owned DAC Welford surface even when servo_mode is OFF.  Metrics
-    treats that Welford mean as the campaign-public DAC value for display and
-    keyboard nudging; it is still firmware-authored TIMEBASE data, not a
-    Pi-side servo reconstruction.
-    """
-    return _to_float(_field(
-        r,
-        f"dac.{lane}_dac",
-        f"dac.{lane}.value",
-        f"dac.{lane}.dac",
-        f"dac.{lane}.code",
-        f"dac.{lane}.dac_code",
-        f"stats.dac.{lane}.value",
-        f"stats.dac.{lane}.dac",
-        f"stats.dac.{lane}.code",
-        f"stats.dac.{lane}.mean",
-        f"stats.{lane}_dac.welford.mean",
-        f"{lane}_dac",
-        f"{lane}_dac_code",
-        f"{lane}_dac_welford_mean",
-    ))
-
+    return _to_float(_field(r, f"control.{lane}.target_code", default=None))
 
 def _dac_voltage(dac_code):
     code = _to_float(dac_code)
@@ -826,7 +633,7 @@ def _dac_report_voltage(report_dac: dict | None, lane: str):
     obj = _dac_report_lane(report_dac, lane)
 
     # Retained only for explicit REPORT_DAC/back-compat payloads.  The normal
-    # metrics path now reads DAC code from TIMEBASE and computes presentation
+    # metrics path now reads DAC code from CLOCKS and computes presentation
     # voltage locally from the firmware DAC doctrine above.
     for key in ("v_eff", "v_target", "v", "dac_voltage"):
         val = _to_float(obj.get(key))
@@ -954,66 +761,15 @@ def _dac_dither_summary_from_fractional_code(dac_code) -> str:
 
 
 def _dac_timebase_dither_summary(r: dict, lane: str, dac_now=None) -> str:
-    """Read or derive the active TIMEBASE dither realization for a DAC lane."""
-    enabled = _to_bool(_field(
-        r,
-        f"dac.{lane}.dither.enabled",
-        f"dac.{lane}.dither_enabled",
-        f"dither.{lane}.enabled",
-        f"{lane}_dac_dither_enabled",
-        default=None,
-    ))
-    if enabled is False:
+    """Render the canonical CLOCKS_V4 control realization."""
+    control = r.get("control") if isinstance(r.get("control"), dict) else {}
+    enabled = _to_bool(control.get("dither_operator_enabled"))
+    realization = str(control.get("realization_mode") or "").upper()
+    if enabled is False or realization == "STATIC_ROUNDED":
         return "OFF"
-
-    low_code = _to_int(_field(
-        r,
-        f"dac.{lane}.dither.low_code",
-        f"dac.{lane}.dither.lo",
-        f"dac.{lane}.lo",
-        f"dither.{lane}.low_code",
-        f"{lane}_dac_dither_low_code",
-        default=None,
-    ))
-    high_code = _to_int(_field(
-        r,
-        f"dac.{lane}.dither.high_code",
-        f"dac.{lane}.dither.hi",
-        f"dac.{lane}.hi",
-        f"dither.{lane}.high_code",
-        f"{lane}_dac_dither_high_code",
-        default=None,
-    ))
-    high_ms = _to_int(_field(
-        r,
-        f"dac.{lane}.dither.high_ms",
-        f"dac.{lane}.hi_ms",
-        f"dither.{lane}.high_ms",
-        f"{lane}_dac_dither_high_ms",
-        default=None,
-    ))
-    low_ms = _to_int(_field(
-        r,
-        f"dac.{lane}.dither.low_ms",
-        f"dac.{lane}.lo_ms",
-        f"dither.{lane}.low_ms",
-        f"{lane}_dac_dither_low_ms",
-        default=None,
-    ))
-
-    if low_code is not None and high_code is not None:
-        if high_ms is not None:
-            low_ms = 1000 - high_ms if low_ms is None else low_ms
-        elif low_ms is not None:
-            high_ms = 1000 - low_ms
-        if low_ms is not None and high_ms is not None:
-            return f"{low_code}:{max(0, low_ms):03d} {high_code}:{max(0, high_ms):03d}"
-        return f"{low_code} {high_code}"
-
     return _dac_dither_summary_from_fractional_code(
         dac_now if dac_now is not None else _dac_value(r, lane)
-    )
-
+    ) or (realization or "ON")
 
 def _dac_report_dither_summary(r: dict, report_dac: dict | None, lane: str, dac_now=None) -> str:
     tick = _dac_tick_payload(report_dac)
@@ -1188,6 +944,28 @@ def feature_status_grid_lines() -> list[str]:
     return lines
 
 
+def _feature_subtree_health(tree: dict, path: str) -> str:
+    node = _path_get(tree, path, None)
+    if not isinstance(node, dict) or not node:
+        return "?"
+    leaves = []
+    stack = [node]
+    while stack:
+        item = stack.pop()
+        for value in item.values():
+            if isinstance(value, dict):
+                stack.append(value)
+            else:
+                leaves.append(str(value).strip().upper())
+    if not leaves:
+        return "?"
+    if any(value in {"ANOMALY", "DOWN"} for value in leaves):
+        return "ANOMALY"
+    if any(value in {"HOLD", "INITIALIZING"} for value in leaves):
+        return "HOLD"
+    return "NOMINAL" if all(value == "NOMINAL" for value in leaves) else "?"
+
+
 # ---------------------------------------------------------------------
 # Status header
 # ---------------------------------------------------------------------
@@ -1195,10 +973,10 @@ def feature_status_grid_lines() -> list[str]:
 def status_header() -> str:
     try:
         s = _get_system_snapshot()
-
         net = s.get("network", {}).get("network_status", "?")
         pi_health = s.get("pi", {}).get("health_state", "?")
-        teensy_health = s.get("teensy", {}).get("health_state", "?")
+        features = s.get("features") if isinstance(s.get("features"), dict) else {}
+        teensy_health = _feature_subtree_health(features, "TEENSY")
         try:
             clocks_report = _get_pi_clocks_report()
         except Exception:
@@ -1209,15 +987,14 @@ def status_header() -> str:
         bat_v = "?"
         power = s.get("power", {})
         for bus_key, devices in power.items():
-            if not bus_key.startswith("i2c-"):
+            if not str(bus_key).startswith("i2c-") or not isinstance(devices, dict):
                 continue
-            if isinstance(devices, dict):
-                for rail in devices.values():
-                    if isinstance(rail, dict) and rail.get("label", "").lower() == "battery":
-                        bat_v = f"{rail['volts']:.2f}V"
+            for rail in devices.values():
+                if isinstance(rail, dict) and str(rail.get("label", "")).lower() == "battery":
+                    volts = _to_float(rail.get("volts"))
+                    if volts is not None:
+                        bat_v = f"{volts:.2f}V"
 
-        battery = s.get("battery", {})
-        pct = battery.get("remaining_pct")
         return (
             f" NET: {net}"
             f"  BAT: {bat_v}"
@@ -1225,10 +1002,8 @@ def status_header() -> str:
             f"  TEENSY: {teensy_health}"
             f"  GNSS: {gnss_lock}"
         )
-
     except Exception:
         return " STATUS: UNAVAILABLE"
-
 
 # ---------------------------------------------------------------------
 # Baseline comparison helper
@@ -1321,7 +1096,7 @@ def _welford_cols_fragment_or_zero(r, prefix, w_mean, w_sd, w_se, w_n, mean_deci
 def _dwt_expected_cycles(r: dict):
     """Return the firmware-authored PPS static prediction in DWT cycles.
 
-    TIMEBASE_FRAGMENT_V5 carries this as
+    CLOCKS_V4 carries this as
     raw_cycles.pps.previous_observed_cycles. Older prediction/FloorLine aliases
     remain readable, but the current ACTUAL interval is never used as EXPECTED.
     """
@@ -1386,71 +1161,63 @@ def _get_campaign_rows() -> list[dict]:
                     master.payload ? 'report' AS report_present,
                     (master.payload #>> '{report,science_eligible}')::boolean
                         AS viable,
-                    master.payload #>> '{report,teensy_pps_vclock_count}'
+                    master.payload #>> '{report,sequence}'
                         AS sequence,
-                    master.payload #>> '{report,pps_count}'
+                    master.payload #>> '{report,public_count}'
                         AS pps_count,
 
-                    master.payload #>> '{report,fragment,ocxo1,ns}'
+                    master.payload #>> '{report,fragment,clockfaces,ocxo1_ns}'
                         AS ocxo1_ns,
-                    master.payload #>> '{report,fragment,stats,ocxo1,ppb_buckets,10_min}'
+                    master.payload #>> '{report,clocks,stats,ocxo1,ppb_buckets,10_min}'
                         AS ocxo1_ppb_10_min,
-                    master.payload #>> '{report,fragment,stats,ocxo1,ppb_buckets,60_min}'
+                    master.payload #>> '{report,clocks,stats,ocxo1,ppb_buckets,60_min}'
                         AS ocxo1_ppb_60_min,
-                    master.payload #>> '{report,fragment,stats,ocxo1,ppb_buckets,8_hour}'
+                    master.payload #>> '{report,clocks,stats,ocxo1,ppb_buckets,8_hour}'
                         AS ocxo1_ppb_8_hour,
-                    master.payload #>> '{report,fragment,stats,ocxo1,ppb_buckets,24_hour}'
+                    master.payload #>> '{report,clocks,stats,ocxo1,ppb_buckets,24_hour}'
                         AS ocxo1_ppb_24_hour,
                     COALESCE(
-                        master.payload #>> '{report,fragment,stats,ocxo1,ppb_buckets,total}',
-                        master.payload #>> '{report,fragment,stats,ocxo1,ppb}'
+                        master.payload #>> '{report,clocks,stats,ocxo1,ppb_buckets,total}',
+                        master.payload #>> '{report,clocks,stats,ocxo1,ppb}'
                     ) AS ocxo1_ppb_total,
-                    COALESCE(
-                        master.payload #>> '{report,fragment,stats,ocxo1,ppb_buckets,campaign}',
-                        master.payload #>> '{report,fragment,ocxo1,science,total_ppb}'
-                    ) AS ocxo1_ppb_campaign,
-                    COALESCE(
-                        master.payload #>> '{report,fragment,ocxo1,pps_residual,fast_residual_ns}',
-                        master.payload #>> '{report,fragment,ocxo1,science,fast_residual_ns}'
-                    ) AS ocxo1_residual,
-                    master.payload #>> '{report,fragment,stats,ocxo1,welford,mean}'
+                    master.payload #>> '{report,fragment,stats,ppb,ocxo1}'
+                        AS ocxo1_ppb_campaign,
+                    master.payload #>> '{report,fragment,ocxo1,science,fast_residual_ns}'
+                        AS ocxo1_residual,
+                    master.payload #>> '{report,clocks,stats,ocxo1,welford,mean}'
                         AS ocxo1_mean,
-                    master.payload #>> '{report,fragment,stats,ocxo1,welford,stddev}'
+                    master.payload #>> '{report,clocks,stats,ocxo1,welford,stddev}'
                         AS ocxo1_stddev,
-                    master.payload #>> '{report,fragment,stats,ocxo1,welford,stderr}'
+                    master.payload #>> '{report,clocks,stats,ocxo1,welford,stderr}'
                         AS ocxo1_stderr,
-                    master.payload #>> '{report,fragment,stats,ocxo1,welford,n}'
+                    master.payload #>> '{report,clocks,stats,ocxo1,welford,n}'
                         AS ocxo1_n,
 
-                    master.payload #>> '{report,fragment,ocxo2,ns}'
+                    master.payload #>> '{report,fragment,clockfaces,ocxo2_ns}'
                         AS ocxo2_ns,
-                    master.payload #>> '{report,fragment,stats,ocxo2,ppb_buckets,10_min}'
+                    master.payload #>> '{report,clocks,stats,ocxo2,ppb_buckets,10_min}'
                         AS ocxo2_ppb_10_min,
-                    master.payload #>> '{report,fragment,stats,ocxo2,ppb_buckets,60_min}'
+                    master.payload #>> '{report,clocks,stats,ocxo2,ppb_buckets,60_min}'
                         AS ocxo2_ppb_60_min,
-                    master.payload #>> '{report,fragment,stats,ocxo2,ppb_buckets,8_hour}'
+                    master.payload #>> '{report,clocks,stats,ocxo2,ppb_buckets,8_hour}'
                         AS ocxo2_ppb_8_hour,
-                    master.payload #>> '{report,fragment,stats,ocxo2,ppb_buckets,24_hour}'
+                    master.payload #>> '{report,clocks,stats,ocxo2,ppb_buckets,24_hour}'
                         AS ocxo2_ppb_24_hour,
                     COALESCE(
-                        master.payload #>> '{report,fragment,stats,ocxo2,ppb_buckets,total}',
-                        master.payload #>> '{report,fragment,stats,ocxo2,ppb}'
+                        master.payload #>> '{report,clocks,stats,ocxo2,ppb_buckets,total}',
+                        master.payload #>> '{report,clocks,stats,ocxo2,ppb}'
                     ) AS ocxo2_ppb_total,
-                    COALESCE(
-                        master.payload #>> '{report,fragment,stats,ocxo2,ppb_buckets,campaign}',
-                        master.payload #>> '{report,fragment,ocxo2,science,total_ppb}'
-                    ) AS ocxo2_ppb_campaign,
-                    COALESCE(
-                        master.payload #>> '{report,fragment,ocxo2,pps_residual,fast_residual_ns}',
-                        master.payload #>> '{report,fragment,ocxo2,science,fast_residual_ns}'
-                    ) AS ocxo2_residual,
-                    master.payload #>> '{report,fragment,stats,ocxo2,welford,mean}'
+                    master.payload #>> '{report,fragment,stats,ppb,ocxo2}'
+                        AS ocxo2_ppb_campaign,
+                    master.payload #>> '{report,fragment,ocxo2,science,fast_residual_ns}'
+                        AS ocxo2_residual,
+                    master.payload #>> '{report,clocks,stats,ocxo2,welford,mean}'
                         AS ocxo2_mean,
-                    master.payload #>> '{report,fragment,stats,ocxo2,welford,stddev}'
+                    master.payload #>> '{report,clocks,stats,ocxo2,welford,stddev}'
                         AS ocxo2_stddev,
-                    master.payload #>> '{report,fragment,stats,ocxo2,welford,stderr}'
+                    master.payload #>> '{report,clocks,stats,ocxo2,welford,stderr}'
                         AS ocxo2_stderr,
-                    master.payload #>> '{report,fragment,stats,ocxo2,welford,n}'
+                    master.payload #>> '{report,clocks,stats,ocxo2,welford,n}'
                         AS ocxo2_n
                 FROM campaign_master AS master
                 WHERE master.campaign_type = 'TEMPEST'
@@ -1561,58 +1328,34 @@ def campaigns_readout() -> list[str]:
 
 
 def _clockface_value(r: dict, lane: str):
-    """Return the always-on CLOCKS clockface used by the VALUE column."""
-    for path in (
-        f"instrument_clockfaces.{lane}",
-        f"presentation_clockfaces.{lane}",
-        f"clockfaces.{lane}",
-        f"{lane}.presentation.ns",
-        f"{lane}.instrument.ns",
-        f"{lane}.ns",
-    ):
-        value = _field(r, path, default=None)
-        if isinstance(value, dict):
-            value = value.get("ns") if value.get("ns") is not None else value.get("value")
-        if value is not None:
-            return _to_int(value)
-    return None
-
+    """Return the canonical CLOCKS_V4 always-on clockface for VALUE."""
+    if lane == "vclock":
+        # V4 deliberately has no duplicate VCLOCK ns clockface; GNSS is the
+        # canonical disciplined nanosecond reference.
+        lane = "gnss"
+    path = {
+        "gnss": "clockfaces.gnss_ns",
+        "ocxo1": "clockfaces.ocxo1_ns",
+        "ocxo2": "clockfaces.ocxo2_ns",
+        "dwt": "clockfaces.dwt_cycles",
+    }.get(lane)
+    return _to_int(_field(r, path, default=None)) if path else None
 
 def _campaign_ppb(r: dict, lane: str):
-    """Return the firmware-authored campaign PPB bucket.
-
-    CAMP exists only while a campaign is active.  Missing publication remains
-    missing; metrics never substitutes TOTAL or reconstructs a ratio from
-    clockfaces.
-    """
-    state = str(
-        r.get("campaign_state")
-        or ("STARTED" if r.get("campaign_present") else "STOPPED")
-    ).upper()
-    if state != "STARTED" and not r.get("campaign_present"):
+    """Return firmware-authored TEMPEST campaign PPB from the optional delta."""
+    campaign = r.get("campaign_delta") if isinstance(r.get("campaign_delta"), dict) else {}
+    if not campaign or str(campaign.get("state") or "STOPPED").upper() != "STARTED":
         return None
-
     if lane == "gnss_raw":
-        return _to_float(_extra(r, "gnss_raw_ppb_buckets.campaign"))
-
-    return _to_float(_field(
-        r,
-        f"stats.{lane}.ppb_buckets.campaign",
-        default=None,
-    ))
-
+        adjudication = campaign.get("adjudication") if isinstance(campaign.get("adjudication"), dict) else {}
+        return _to_float(_path_get(adjudication, "extra_clocks.gnss_raw_ppb", None))
+    return _to_float(_path_get(campaign, f"stats.ppb.{lane}", None))
 
 def _monitor_count(r: dict) -> int:
-    for path in (
-        "instrument_count", "instrument_seconds", "clockface_n",
-        "stats.ocxo1.welford.n", "stats.ocxo1.n",
-        "teensy_pps_vclock_count", "pps_count",
-    ):
-        value = _to_int(_field(r, path, default=None))
-        if value is not None:
-            return value
-    return 0
-
+    value = _to_int(_field(r, "stats.ocxo1.welford.n", default=None))
+    if value is not None:
+        return value
+    return _to_int(r.get("instrument_age_seconds")) or 0
 
 # ---------------------------------------------------------------------
 # Combined clocks readout
@@ -1754,12 +1497,7 @@ def clocks_combined_readout() -> list[str]:
     lines.append("")
 
     # ── DWT detail ──
-    dwt_actual = _to_int(_field(
-        r,
-        "dwt.cycles_between_pps_vclock",
-        "dwt_cycles_between_pps_vclock",
-        "dwt_cycle_count_between_pps",
-    ))
+    dwt_actual = _to_int(_field(r, "raw_cycles.pps.observed_cycles", default=None))
     dwt_residual = _to_int(_field(
         r,
         "dwt.second_residual_cycles",
@@ -1772,18 +1510,8 @@ def clocks_combined_readout() -> list[str]:
     # older rows may still expose an explicit prediction or FloorLine witness.
     dwt_expected = _dwt_expected_cycles(r)
 
-    dwt_at_anchor = _field(
-        r,
-        "dwt.at_pps_vclock",
-        "dwt_at_pps_vclock",
-        "dwt_cycle_count_at_pps",
-    )
-    counter32 = _field(
-        r,
-        "dwt.counter32_at_pps_vclock",
-        "counter32_at_pps_vclock",
-        "qtimer_at_pps",
-    )
+    dwt_at_anchor = _field(r, "anchor.dwt_at_pps_vclock", default=None)
+    counter32 = _field(r, "anchor.counter32_at_pps_vclock", default=None)
     if any(v is not None for v in [dwt_actual, dwt_expected, dwt_at_anchor, counter32]):
         dwt_label_w = 12
         dwt_num_w = 20

@@ -2,9 +2,9 @@
 ZPNet Dashboard Readout Blocks — Generalized Campaign Detail Edition
 
 The rotating pygame dashboard is an observer.  Both platform state and live
-clock science are read from the unified CLOCKS heartbeat.  CLOCKS.clocks is
-the always-on instrument surface; campaign state merely decorates it.  No
-dashboard panel reads TIMEBASE or polls Teensy CLOCKS imperatively.
+clock science are read from CLOCKS_V4.  Top-level ``clocks`` is the always-on
+instrument; optional top-level ``campaign`` is TEMPEST enrichment.  No dashboard
+panel reads TIMEBASE or polls Teensy CLOCKS imperatively.
 """
 from __future__ import annotations
 
@@ -38,29 +38,39 @@ def _monitor_root() -> dict:
 
 
 def get_pi_clocks_report() -> dict:
-    """Return the live CLOCKS.clocks surface without issuing a command."""
+    """Return one presentation view over canonical CLOCKS_V4 surfaces."""
     root = _monitor_root()
     clocks = root.get("clocks")
     if not isinstance(clocks, dict):
         return {}
     report = dict(clocks)
-    for key in (
-        "campaign_type", "campaign", "campaign_state", "campaign_present", "campaign_elapsed",
-        "instrument_elapsed", "instrument_always_on", "gnss_time_utc",
-        "system_time_utc", "published_at_utc",
-    ):
-        if report.get(key) is None and root.get(key) is not None:
-            report[key] = root.get(key)
+    campaign = root.get("campaign") if isinstance(root.get("campaign"), dict) else {}
+    state = str(campaign.get("state") or "STOPPED").upper()
+    public_count = _to_int(campaign.get("public_count"))
+    report["campaign_delta"] = campaign
+    report["campaign_present"] = bool(campaign) and state != "STOPPED"
+    report["campaign_state"] = state
+    report["campaign"] = campaign.get("name") if campaign else None
+    report["campaign_type"] = "TEMPEST" if campaign.get("schema") == "TEMPEST_FRAGMENT_V1" else None
+    report["campaign_elapsed"] = _seconds_to_hms(public_count) if public_count is not None else "00:00:00"
+    report["instrument_elapsed"] = _seconds_to_hms(_to_int(clocks.get("instrument_age_seconds")) or 0)
+    report["baseline"] = root.get("baseline") if isinstance(root.get("baseline"), dict) else None
+    report["published_at_utc"] = root.get("published_at_utc")
     return report
 
-
 def _get_clocks_baseline() -> dict | None:
-    baseline = get_pi_clocks_report().get("baseline")
-    return baseline if isinstance(baseline, dict) and baseline.get("baseline_set") else None
-
+    baseline = _dict(_monitor_root().get("baseline"))
+    return baseline if baseline.get("baseline_set") else None
 
 def _dict(value) -> dict:
     return value if isinstance(value, dict) else {}
+
+
+def _seconds_to_hms(seconds) -> str:
+    value = _to_int(seconds)
+    if value is None or value < 0:
+        value = 0
+    return f"{value // 3600:02d}:{(value % 3600) // 60:02d}:{value % 60:02d}"
 
 
 def _path_get(obj, path: str, default=None):
@@ -73,13 +83,10 @@ def _path_get(obj, path: str, default=None):
 
 
 def _payload_root(report: dict) -> dict:
-    return _dict(report.get("payload")) or _dict(report)
-
+    return _dict(report)
 
 def _fragment_root(report: dict) -> dict:
-    root = _payload_root(report)
-    return _dict(root.get("fragment")) or root
-
+    return _payload_root(report)
 
 def _field(report: dict, *paths, default=None):
     root = _payload_root(report)
@@ -94,15 +101,12 @@ def _field(report: dict, *paths, default=None):
 
 def _extra(report: dict, path: str, default=None):
     root = _payload_root(report)
-    value = _path_get(_dict(root.get("extra_clocks")), path, None)
-    if value is not None:
-        return value
     gnss_raw = _dict(root.get("gnss_raw"))
     aliases = {
-        "gnss_raw_ns": ("presentation.ns", "instrument.ns", "ns"),
-        "gnss_raw_ref_ns": ("presentation.ref_ns", "instrument.ref_ns", "ref_ns"),
-        "gnss_raw_tau": ("presentation.tau", "instrument.tau", "tau"),
-        "gnss_raw_ppb": ("presentation.ppb", "instrument.ppb", "ppb"),
+        "gnss_raw_ns": ("instrument.ns",),
+        "gnss_raw_ref_ns": ("instrument.ref_ns",),
+        "gnss_raw_tau": ("instrument.tau",),
+        "gnss_raw_ppb": ("instrument.ppb",),
         "gnss_raw_drift_ppb": ("drift_ppb",),
         "gnss_raw_welford_n": ("welford.n",),
         "gnss_raw_welford_mean": ("welford.mean",),
@@ -116,7 +120,6 @@ def _extra(report: dict, path: str, default=None):
         if value is not None:
             return value
     return default
-
 
 def _to_int(value):
     try:
@@ -195,72 +198,39 @@ def _frequency(report: dict, lane: str) -> tuple[float | None, float | None]:
     if lane == "gnss":
         return 1.0, 0.0
     if lane == "gnss_raw":
-        tau = _to_float(_extra(report, "gnss_raw_tau"))
-        ppb = _to_float(_extra(report, "gnss_raw_ppb"))
-        return tau, ppb
-    tau = _to_float(_field(report, f"stats.{lane}.tau", f"{lane}_tau"))
-    ppb = _to_float(_field(report, f"stats.{lane}.ppb", f"{lane}_ppb"))
-    return tau, ppb
-
+        return _to_float(_extra(report, "gnss_raw_tau")), _to_float(_extra(report, "gnss_raw_ppb"))
+    return (
+        _to_float(_field(report, f"stats.{lane}.tau")),
+        _to_float(_field(report, f"stats.{lane}.ppb")),
+    )
 
 def _clockface_value(report: dict, lane: str):
-    """Return the CLOCKS campaign/presentation clockface for one lane."""
-    for path in (
-        f"presentation_clockfaces.{lane}",
-        f"clockfaces.{lane}",
-        f"{lane}.presentation.ns",
-        f"{lane}.ns",
-    ):
-        value = _field(report, path)
-        if isinstance(value, dict):
-            value = value.get("ns") if value.get("ns") is not None else value.get("value")
-        if value is not None:
-            return _to_int(value)
-    return None
-
+    if lane == "vclock":
+        lane = "gnss"
+    path = {
+        "gnss": "clockfaces.gnss_ns",
+        "ocxo1": "clockfaces.ocxo1_ns",
+        "ocxo2": "clockfaces.ocxo2_ns",
+        "dwt": "clockfaces.dwt_cycles",
+    }.get(lane)
+    return _to_int(_field(report, path)) if path else None
 
 def _campaign_ppb(report: dict, lane: str):
-    """Return campaign PPB from the active campaign clockface identity."""
-    state = str(
-        report.get("campaign_state")
-        or ("STARTED" if report.get("campaign_present") else "STOPPED")
-    ).upper()
-    if state != "STARTED" and not report.get("campaign_present"):
+    campaign = report.get("campaign_delta") if isinstance(report.get("campaign_delta"), dict) else {}
+    if not campaign or str(campaign.get("state") or "STOPPED").upper() != "STARTED":
         return None
-
-    if lane == "gnss":
-        return 0.0
     if lane == "gnss_raw":
-        return _to_float(_extra(report, "gnss_raw_ppb"))
-    if lane == "dwt":
-        return None
-
-    explicit = _to_float(_field(
-        report,
-        f"{lane}.science.total_ppb",
-        f"{lane}.campaign.ppb",
-        f"campaign.{lane}.ppb",
-    ))
-    if explicit is not None:
-        return explicit
-
-    gnss_ns = _clockface_value(report, "gnss")
-    clock_ns = _clockface_value(report, lane)
-    if gnss_ns is None or clock_ns is None or gnss_ns <= 0:
-        return None
-
-    return float(clock_ns - gnss_ns) * 1_000_000_000.0 / float(gnss_ns)
-
+        adjudication = _dict(campaign.get("adjudication"))
+        return _to_float(_path_get(adjudication, "extra_clocks.gnss_raw_ppb", None))
+    return _to_float(_path_get(campaign, f"stats.ppb.{lane}", None))
 
 def _welford(report: dict, lane: str, field: str):
     if lane == "gnss_raw":
         return _extra(report, f"gnss_raw_welford_{field}")
-    paths = [f"stats.{lane}.welford.{field}", f"stats.{lane}.{field}", f"{lane}_welford_{field}"]
     if lane.endswith("_dac"):
         clock = lane[:-4]
-        paths.insert(0, f"stats.dac.{clock}.{field}")
-    return _field(report, *paths)
-
+        return _field(report, f"stats.auxiliary_welford.{clock}_dac.{field}")
+    return _field(report, f"stats.{lane}.welford.{field}")
 
 def _prediction(report: dict, lane: str, field: str):
     # The TEMPEST campaign fragment folds the former prediction object into raw_cycles.
@@ -291,21 +261,14 @@ def _prediction(report: dict, lane: str, field: str):
 
 
 def _ocxo_residual(report: dict, lane: str):
-    return _field(report,
-                  f"{lane}.pps_residual.fast_residual_ns",
-                  f"{lane}.science.fast_residual_ns",
-                  f"{lane}_second_residual_ns")
-
+    campaign = report.get("campaign_delta") if isinstance(report.get("campaign_delta"), dict) else {}
+    value = _path_get(campaign, f"{lane}.science.fast_residual_ns", None)
+    if value is not None:
+        return value
+    return _field(report, f"stats.{lane}_tau_state.last_fast_residual_ns")
 
 def _dac_value(report: dict, lane: str):
-    return _to_float(_field(report,
-                            f"dac.{lane}_dac",
-                            f"dac.{lane}.value",
-                            f"dac.{lane}.dac",
-                            f"stats.dac.{lane}.value",
-                            f"stats.dac.{lane}.mean",
-                            f"{lane}_dac"))
-
+    return _to_float(_field(report, f"control.{lane}.target_code"))
 
 def _dac_voltage(code) -> float | None:
     value = _to_float(code)
@@ -313,13 +276,8 @@ def _dac_voltage(code) -> float | None:
 
 
 def _servo_mode(report: dict) -> str:
-    for path in ("dac.servo_mode", "dac.calibrate_ocxo", "servo.mode", "servo_mode", "calibrate_ocxo"):
-        value = _field(report, path)
-        if value is not None and str(value).strip():
-            text = str(value).strip().upper()
-            return "IDLE" if text in {"OFF", "NONE", "IDLE"} else text
-    return "IDLE"
-
+    mode = str(_field(report, "control.servo_mode", default="OFF") or "OFF").strip().upper()
+    return "IDLE" if mode in {"OFF", "NONE", "IDLE"} else mode
 
 def _dither_label(code) -> str:
     value = _to_float(code)
@@ -417,7 +375,10 @@ def clocks_servo_readout() -> Generator[str, None, None]:
         _, ppb = _frequency(report, lane)
         residual = _to_int(_ocxo_residual(report, lane))
         yield f"{label:<6}{_num(code):>10}{_num(volts, 6):>9}{_integer(residual, False, True):>9}{_num(ppb, 3, True):>9}"
-        yield f"  DITHER: {_dither_label(code)}"
+        dither_enabled = _to_bool(_field(report, "control.dither_operator_enabled"))
+        realization = str(_field(report, "control.realization_mode", default="") or "").upper()
+        dither = "OFF" if dither_enabled is False or realization == "STATIC_ROUNDED" else _dither_label(code)
+        yield f"  DITHER: {dither}"
 
 
 def clocks_dac_welford_readout() -> Generator[str, None, None]:
@@ -433,22 +394,20 @@ def clocks_dac_welford_readout() -> Generator[str, None, None]:
 
 
 _FEATURE_CELLS = (
-    ("T SYS", "TEENSY.SYSTEM.FEATURE_STATUS"),
     ("OBS EDGE", "TEENSY.INTERRUPT.OBSERVED_EDGE_AUTHORITY"),
     ("PPS/V", "TEENSY.INTERRUPT.PPS_VCLOCK_AUTHORITY"),
     ("QTIMER", "TEENSY.INTERRUPT.QTIMER_COUNTER_CUSTODY"),
     ("CTR32", "TEENSY.INTERRUPT.COUNTER32_LINEAGE"),
     ("DWT CAL", "TEENSY.CLOCKS.DWT_CALIBRATION"),
     ("PRED", "TEENSY.CLOCKS.STATIC_PREDICTION"),
-    ("SMARTZERO", "TEENSY.CLOCKS.SMARTZERO"),
     ("EPOCH", "TEENSY.CLOCKS.ALPHA_EPOCH"),
     ("ORIGIN", "TEENSY.CLOCKS.OCXO_PUBLIC_ORIGIN"),
-    ("SCIENCE", "TEENSY.CLOCKS.SCIENCE_RESIDUALS"),
-    ("TEMPEST", "TEENSY.CLOCKS.TIMEBASE_PUBLICATION"),
     ("PI NET", "PI.SYSTEM.NETWORK"),
     ("PI GNSS", "PI.GNSS.REPORT"),
     ("PI POWER", "PI.SYSTEM.POWER"),
     ("PI HOST", "PI.SYSTEM.HOST"),
+    ("PI ENV", "PI.SYSTEM.ENVIRONMENT"),
+    ("PI SENS", "PI.SYSTEM.SENSORS"),
 )
 
 
@@ -529,18 +488,6 @@ def battery_status_readout() -> Generator[str, None, None]:
     yield f"SAMPLES: {_integer(battery.get('samples_used'))}"
 
 
-def teensy_status_readout() -> Generator[str, None, None]:
-    teensy = _dict(get_system_snapshot().get("teensy"))
-    usage_milli = _to_float(teensy.get("cpu_usage_pct_milli"))
-    idle_milli = _to_float(teensy.get("cpu_idle_spin_pct_milli"))
-    yield f"TEENSY STATUS: {teensy.get('health_state', 'UNKNOWN')}"
-    yield f"CPU: {_integer(teensy.get('cpu_freq_mhz'))} MHZ"
-    yield f"WORK: {'---' if usage_milli is None else f'{usage_milli/1000.0:.3f}%'}  IDLE: {'---' if idle_milli is None else f'{idle_milli/1000.0:.3f}%'}"
-    yield f"WALL CYCLES: {_integer(teensy.get('cpu_wall_cycles'), True)}"
-    yield f"CRASH REPORT: {'PRESENT' if teensy.get('crash_report_present') else 'NONE'}"
-    yield f"FEATURE COURT: {'OK' if teensy.get('feature_status_foreground_court_ok') else 'ANOMALY'}"
-
-
 def raspberry_pi_status_readout() -> Generator[str, None, None]:
     pi = _dict(get_system_snapshot().get("pi"))
     memory = _dict(pi.get("memory"))
@@ -560,50 +507,3 @@ def raspberry_pi_status_readout() -> Generator[str, None, None]:
         yield "UNDERVOLTAGE: RECOVERED"
     else:
         yield "UNDERVOLTAGE: NONE"
-
-
-def _process_health(proc: dict) -> str:
-    checks = ("rpc_counter_order_ok", "invariant_received_ok", "invariant_routed_ok",
-              "invariant_handler_ok", "invariant_response_ok")
-    return "NOMINAL" if all(proc.get(key) is True for key in checks) else "ANOMALY"
-
-
-def _transport_health(tx: dict) -> str:
-    failures = sum(_to_int(tx.get(key)) or 0 for key in (
-        "tx_alloc_fail", "tx_budget_fail", "tx_queue_full", "tx_rr_drop_count",
-        "rx_bad_stx", "rx_bad_etx", "rx_len_overflow", "rx_guard_failure_count"))
-    return "NOMINAL" if failures == 0 and tx.get("rx_buffer_alignment_ok") is not False else "ANOMALY"
-
-
-def _payload_health(payload: dict) -> str:
-    failures = sum(_to_int(payload.get(key)) or 0 for key in (
-        "payload_entry_alloc_fail", "payload_entry_overflow", "payload_arena_alloc_fail",
-        "payload_serialize_overflow", "payload_to_json_fail", "payload_parse_error"))
-    expected_alive = (_to_int(payload.get("payload_instances_constructed")) or 0) - (_to_int(payload.get("payload_instances_destroyed")) or 0)
-    alive = _to_int(payload.get("payload_alive_now")) or 0
-    return "NOMINAL" if failures == 0 and expected_alive == alive else "ANOMALY"
-
-
-def teensy_metrics_readout() -> Generator[str, None, None]:
-    snapshot = get_system_snapshot()
-    proc = _dict(snapshot.get("process"))
-    tx = _dict(snapshot.get("transport"))
-    payload = _dict(snapshot.get("payload"))
-    p_health = _process_health(proc)
-    t_health = _transport_health(tx)
-    a_health = _payload_health(payload)
-    overall = "NOMINAL" if p_health == t_health == a_health == "NOMINAL" else "ANOMALY"
-
-    yield f"TEENSY PIPELINE: {overall}"
-    yield f"RPC {p_health}: RX {_integer(proc.get('rpc_received'))} ROUTED {_integer(proc.get('rpc_routed'))} SENT {_integer(proc.get('rpc_response_sent'))}"
-    yield f"RPC INFLIGHT: {_integer(proc.get('rpc_handler_inflight'))}  PENDING: {_integer(proc.get('rpc_response_pending'))}  PS: {_integer(proc.get('ps_dispatched'))}"
-    rpc_errors = sum(_to_int(proc.get(key)) or 0 for key in ("rpc_err_missing_fields", "rpc_err_unknown_subsys", "rpc_err_unknown_command"))
-    yield f"RPC ERRORS: {rpc_errors}"
-    yield f"TX {t_health}: JOBS {_integer(tx.get('tx_jobs_sent'))}/{_integer(tx.get('tx_jobs_enqueued'))}  QUEUE {_integer(tx.get('tx_job_count'))}"
-    yield f"RX: FRAMES {_integer(tx.get('rx_frames_dispatched'))}/{_integer(tx.get('rx_frames_complete'))}  OVERLAP {_integer(tx.get('rx_overlap'))}"
-    framing = sum(_to_int(tx.get(key)) or 0 for key in ("rx_bad_stx", "rx_bad_etx", "rx_len_overflow"))
-    yield f"RX ERRORS: {framing}  GUARD: {_integer(tx.get('rx_guard_failure_count'))}  DMAMEM: {_yes_no(tx.get('rx_buffer_in_dmamem'))}"
-    yield f"PAYLOAD {a_health}: ALIVE {_integer(payload.get('payload_alive_now'))}  HWM {_integer(payload.get('payload_alive_high_water'))}"
-    yield f"HEAP: {_integer(payload.get('payload_heap_bytes_alive'), True)} / HWM {_integer(payload.get('payload_heap_bytes_high_water'), True)}"
-    payload_faults = sum(_to_int(payload.get(key)) or 0 for key in ("payload_entry_alloc_fail", "payload_entry_overflow", "payload_arena_alloc_fail", "payload_serialize_overflow", "payload_to_json_fail", "payload_parse_error"))
-    yield f"PAYLOAD FAULTS: {payload_faults}"

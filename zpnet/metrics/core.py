@@ -2,7 +2,7 @@
 ZPNet Metrics — Full-Screen Generalized Campaign Display
 
 Green-screen curses application for SSH-based system monitoring.
-Consumes the unified MONITOR heartbeat; campaign_master/campaign_detail schema
+Consumes the canonical CLOCKS_V4 heartbeat; campaign_master/campaign_detail schema
 interpretation remains isolated in readout_blocks and is not a repaint-engine concern.
 Designed for the road: run from a ThinkPad over SSH, maximized
 in Putty with 3270 font.
