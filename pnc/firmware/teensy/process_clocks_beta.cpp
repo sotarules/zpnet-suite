@@ -663,7 +663,8 @@ static FLASHMEM void clocks_fragment_dac_snapshot(
 // Payload boundary as fixed-decimal JSON numbers; firmware never constructs,
 // stores, or accepts opaque binary recovery state.
 
-static constexpr uint32_t CLOCKS_STRUCTURED_RESTORE_VERSION = 2U;
+static constexpr uint32_t CLOCKS_STRUCTURED_RESTORE_VERSION = 3U;
+static constexpr uint32_t CLOCKS_PPB_RESTORE_CHUNK_MAX_ENDPOINTS = 4U;
 
 struct clocks_recovery_restore_state_t {
   bool valid = false;
@@ -692,6 +693,30 @@ static uint32_t g_clocks_restore_failure_count = 0U;
 static uint32_t g_campaign_restore_count = 0U;
 static uint32_t g_campaign_restore_failure_count = 0U;
 static uint32_t g_campaign_restore_ignored_live_count = 0U;
+
+// Better-Buckets replay is a recovery-only staging transaction. Pi CLOCKS
+// reconstructs Alpha's bounded histories from durable CLOCKS rows and sends
+// them in small idempotent chunks before structured restore may consume them.
+static bool g_ppb_restore_protocol_active = false;
+static bool g_ppb_restore_protocol_committed = false;
+static uint32_t g_ppb_restore_protocol_sequence = 0U;
+static uint32_t g_ppb_restore_second_expected = 0U;
+static uint32_t g_ppb_restore_second_accepted = 0U;
+static uint32_t g_ppb_restore_minute_expected = 0U;
+static uint32_t g_ppb_restore_minute_accepted = 0U;
+
+static void clocks_ppb_restore_protocol_clear(bool abort_alpha) {
+  if (abort_alpha && g_ppb_restore_protocol_active) {
+    clocks_alpha_ppb_restore_abort();
+  }
+  g_ppb_restore_protocol_active = false;
+  g_ppb_restore_protocol_committed = false;
+  g_ppb_restore_protocol_sequence = 0U;
+  g_ppb_restore_second_expected = 0U;
+  g_ppb_restore_second_accepted = 0U;
+  g_ppb_restore_minute_expected = 0U;
+  g_ppb_restore_minute_accepted = 0U;
+}
 
 // Campaign-neutral presentation transform.  The fresh SmartZero epoch remains
 // Alpha's physical coordinate; this transform makes the durable instrument
@@ -762,6 +787,19 @@ static bool restore_get_u32(const Payload& args, const char* key,
                             uint32_t& out, bool required = true) {
   if (!args.has(key)) return !required;
   return args.tryGetUInt(key, out);
+}
+
+static bool restore_get_i64(const Payload& args, const char* key,
+                            int64_t& out, bool required = true) {
+  if (!args.has(key)) return !required;
+  const char* token = args.getString(key);
+  if (!token || !*token) return false;
+  errno = 0;
+  char* end = nullptr;
+  const long long parsed = strtoll(token, &end, 10);
+  if (errno == ERANGE || !end || *end != '\0') return false;
+  out = (int64_t)parsed;
+  return true;
 }
 
 static bool restore_get_double(const Payload& args, const char* key,
@@ -974,6 +1012,9 @@ static bool clocks_recovery_state_from_args(
   }
 
   out.stats.last_pps_sequence = 0U;
+  out.stats.rolling_ppb_current_sequence = 0U;
+  out.stats.rolling_ppb_endpoint_admitted = false;
+  out.stats.rolling_ppb_interval_advanced = false;
   out.stats.gnss_ns = out.instrument_gnss_ns;
   out.stats.dwt_cycles = out.instrument_dwt_cycles;
   out.stats.ocxo1_ns = out.instrument_ocxo1_ns;
@@ -4994,6 +5035,11 @@ static FLASHMEM void clocks_fragment_stats_snapshot_from_instrument(
   out.reset_count = instrument.reset_count;
   out.update_count = instrument.update_count;
   out.last_pps_sequence = instrument.last_pps_sequence;
+  out.rolling_ppb_current_sequence = instrument.rolling_ppb_current_sequence;
+  out.rolling_ppb_endpoint_admitted =
+      instrument.rolling_ppb_endpoint_admitted;
+  out.rolling_ppb_interval_advanced =
+      instrument.rolling_ppb_interval_advanced;
   out.completed_row_coherent = instrument.completed_row_coherent;
 
   out.gnss = clocks_fragment_stats_clock(instrument.gnss_welford, true, 0.0);
@@ -7782,11 +7828,13 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
       if (!clocks_recovery_commit_statistics_and_clockfaces(
               g_campaign_restore_state)) {
         g_campaign_restore_failure_count++;
+        clocks_ppb_restore_protocol_clear(true);
         recover_lifecycle_abort("recover_state_commit_failed");
         publish_dac_tick("RECOVER_STATE_COMMIT_FAILED");
         return;
       }
       g_campaign_restore_count++;
+      clocks_ppb_restore_protocol_clear(false);
     }
 
     dwt_cycle_count_total = dwt_ns_to_cycles(recover_dwt_ns);
@@ -7844,6 +7892,7 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
             g_clocks_restore_state)) {
       g_clocks_restore_requested = false;
       g_clocks_restore_failure_count++;
+      clocks_ppb_restore_protocol_clear(true);
       clocks_apply_servo_mode_now(servo_mode_t::OFF);
       publish_dac_tick("MONITOR_RESTORE_COMMIT_FAILED");
       return;
@@ -7852,6 +7901,7 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
     g_clocks_restore_requested = false;
     g_clocks_restore_commit_count++;
     g_clocks_restore_state = clocks_recovery_restore_state_t{};
+    clocks_ppb_restore_protocol_clear(false);
     clocks_row_objection_clear();
     publish_dac_tick("MONITOR_RESTORE_COMMITTED");
     return;
@@ -8912,6 +8962,12 @@ static FLASHMEM Payload cmd_flash_cut(const Payload& args) {
 
 
 static FLASHMEM Payload cmd_start(const Payload& args) {
+  if (g_ppb_restore_protocol_active) {
+    Payload err;
+    err.add("error", "Better-Buckets restore is staged");
+    err.add("status", "start_rejected_ppb_restore_pending");
+    return err;
+  }
   if (g_clocks_restore_requested) {
     Payload err;
     err.add("error", "MONITOR restore is pending");
@@ -8991,6 +9047,7 @@ static FLASHMEM Payload cmd_start(const Payload& args) {
 
 
 static FLASHMEM Payload cmd_stop(const Payload&) {
+  clocks_ppb_restore_protocol_clear(true);
   g_clocks_restore_requested = false;
   g_clocks_restore_state = clocks_recovery_restore_state_t{};
   const bool had_live_smartzero = interrupt_smartzero_running();
@@ -9047,6 +9104,7 @@ static FLASHMEM Payload cmd_stop(const Payload&) {
 
 
 static FLASHMEM Payload cmd_zero(const Payload&) {
+  clocks_ppb_restore_protocol_clear(true);
   g_clocks_restore_requested = false;
   g_clocks_restore_state = clocks_recovery_restore_state_t{};
   if (clocks_campaign_recovery_lifecycle_active() || request_recover) {
@@ -9089,6 +9147,237 @@ static FLASHMEM Payload cmd_zero(const Payload&) {
   return p;
 }
 
+static bool clocks_ppb_restore_lifecycle_idle(void) {
+  return campaign_state == clocks_campaign_state_t::STOPPED &&
+         !request_start && !request_stop && !request_recover && !request_zero &&
+         !request_flash_cut && !g_clocks_restore_requested &&
+         !clocks_campaign_recovery_lifecycle_active();
+}
+
+static bool clocks_ppb_restore_parse_endpoint(
+    const Payload& args,
+    const char* prefix,
+    clocks_alpha_ppb_cumulative_endpoint_snapshot_t& out) {
+  char key[80];
+  out = clocks_alpha_ppb_cumulative_endpoint_snapshot_t{};
+
+  snprintf(key, sizeof(key), "%s_reference_ns", prefix);
+  if (!restore_get_u64(args, key, out.reference_ns)) return false;
+  snprintf(key, sizeof(key), "%s_dwt_error_cycles", prefix);
+  if (!restore_get_double(args, key, out.dwt_error_cycles)) return false;
+  snprintf(key, sizeof(key), "%s_ocxo1_error_ns", prefix);
+  if (!restore_get_i64(args, key, out.ocxo1_error_ns)) return false;
+  snprintf(key, sizeof(key), "%s_ocxo2_error_ns", prefix);
+  if (!restore_get_i64(args, key, out.ocxo2_error_ns)) return false;
+  snprintf(key, sizeof(key), "%s_rolling_sequence", prefix);
+  if (!restore_get_u32(args, key, out.rolling_sequence)) return false;
+  snprintf(key, sizeof(key), "%s_interval_count", prefix);
+  if (!restore_get_u32(args, key, out.interval_count)) return false;
+  return true;
+}
+
+static FLASHMEM Payload cmd_ppb_restore_begin(const Payload& args) {
+  if (!clocks_ppb_restore_lifecycle_idle()) {
+    Payload err;
+    err.add("error", "instrument lifecycle busy");
+    err.add("status", "ppb_restore_begin_rejected_busy");
+    return err;
+  }
+
+  clocks_alpha_ppb_restore_abort();
+  clocks_ppb_restore_protocol_clear(false);
+
+  clocks_alpha_ppb_restore_snapshot_t state{};
+  if (!restore_get_u32(args, "rolling_sequence", state.rolling_sequence) ||
+      !restore_get_u32(args, "second_count", state.expected_second_count) ||
+      !restore_get_u32(args, "minute_count", state.expected_minute_count) ||
+      !restore_get_u32(args, "last_minute_key", state.last_minute_key) ||
+      !restore_get_bool(args, "origin_valid", state.origin_valid) ||
+      !clocks_ppb_restore_parse_endpoint(args, "current", state.current) ||
+      (state.origin_valid &&
+       !clocks_ppb_restore_parse_endpoint(args, "origin", state.origin))) {
+    Payload err;
+    err.add("error", "invalid Better-Buckets restore metadata");
+    err.add("status", "ppb_restore_begin_rejected_state");
+    return err;
+  }
+
+  if (!clocks_alpha_ppb_restore_begin(&state)) {
+    Payload err;
+    err.add("error", "Alpha rejected Better-Buckets restore metadata");
+    err.add("status", "ppb_restore_begin_rejected_alpha");
+    return err;
+  }
+
+  g_ppb_restore_protocol_active = true;
+  g_ppb_restore_protocol_committed = false;
+  g_ppb_restore_protocol_sequence = state.rolling_sequence;
+  g_ppb_restore_second_expected = state.expected_second_count;
+  g_ppb_restore_minute_expected = state.expected_minute_count;
+
+  Payload p;
+  p.add("status", "ppb_restore_staging");
+  p.add("rolling_sequence", state.rolling_sequence);
+  p.add("second_count", state.expected_second_count);
+  p.add("minute_count", state.expected_minute_count);
+  p.add("second_capacity", clocks_alpha_ppb_second_capacity());
+  p.add("minute_capacity", clocks_alpha_ppb_minute_capacity());
+  p.add("chunk_max_endpoints", CLOCKS_PPB_RESTORE_CHUNK_MAX_ENDPOINTS);
+  return p;
+}
+
+static FLASHMEM Payload cmd_ppb_restore_chunk(const Payload& args) {
+  if (!g_ppb_restore_protocol_active || g_ppb_restore_protocol_committed) {
+    Payload err;
+    err.add("error", "Better-Buckets restore is not accepting chunks");
+    err.add("status", "ppb_restore_chunk_rejected_state");
+    return err;
+  }
+
+  const char* history = args.getString("history");
+  uint32_t offset = 0U;
+  uint32_t count = 0U;
+  if (!history || !*history ||
+      !restore_get_u32(args, "offset", offset) ||
+      !restore_get_u32(args, "count", count) ||
+      count == 0U || count > CLOCKS_PPB_RESTORE_CHUNK_MAX_ENDPOINTS) {
+    Payload err;
+    err.add("error", "invalid Better-Buckets chunk header");
+    err.add("status", "ppb_restore_chunk_rejected_header");
+    return err;
+  }
+
+  const bool seconds = strcmp(history, "SECOND") == 0;
+  const bool minutes = strcmp(history, "MINUTE") == 0;
+  if (!seconds && !minutes) {
+    Payload err;
+    err.add("error", "history must be SECOND or MINUTE");
+    err.add("status", "ppb_restore_chunk_rejected_history");
+    return err;
+  }
+
+  uint32_t& accepted = seconds
+      ? g_ppb_restore_second_accepted : g_ppb_restore_minute_accepted;
+  const uint32_t expected = seconds
+      ? g_ppb_restore_second_expected : g_ppb_restore_minute_expected;
+
+  // Command transport may retry after a lost response. A chunk wholly below
+  // the accepted frontier is already committed and therefore idempotent.
+  if (offset < accepted && offset + count <= accepted) {
+    Payload p;
+    p.add("status", "ppb_restore_chunk_duplicate");
+    p.add("history", history);
+    p.add("accepted", accepted);
+    p.add("expected", expected);
+    return p;
+  }
+  if (offset != accepted || offset + count > expected) {
+    Payload err;
+    err.add("error", "Better-Buckets chunk is out of order");
+    err.add("status", "ppb_restore_chunk_rejected_order");
+    err.add("history", history);
+    err.add("offset", offset);
+    err.add("accepted", accepted);
+    err.add("expected", expected);
+    return err;
+  }
+
+  clocks_alpha_ppb_cumulative_endpoint_snapshot_t endpoints[
+      CLOCKS_PPB_RESTORE_CHUNK_MAX_ENDPOINTS]{};
+  for (uint32_t i = 0U; i < count; ++i) {
+    char prefix[16];
+    snprintf(prefix, sizeof(prefix), "e%lu", (unsigned long)i);
+    if (!clocks_ppb_restore_parse_endpoint(args, prefix, endpoints[i])) {
+      clocks_ppb_restore_protocol_clear(true);
+      Payload err;
+      err.add("error", "invalid Better-Buckets endpoint");
+      err.add("status", "ppb_restore_chunk_rejected_endpoint");
+      err.add("index", i);
+      return err;
+    }
+  }
+
+  for (uint32_t i = 0U; i < count; ++i) {
+    const bool ok = seconds
+        ? clocks_alpha_ppb_restore_append_second(&endpoints[i])
+        : clocks_alpha_ppb_restore_append_minute(&endpoints[i]);
+    if (!ok) {
+      clocks_ppb_restore_protocol_clear(true);
+      Payload err;
+      err.add("error", "Alpha rejected Better-Buckets endpoint");
+      err.add("status", "ppb_restore_chunk_rejected_alpha");
+      err.add("index", i);
+      return err;
+    }
+  }
+  accepted += count;
+
+  Payload p;
+  p.add("status", "ppb_restore_chunk_accepted");
+  p.add("history", history);
+  p.add("accepted", accepted);
+  p.add("expected", expected);
+  return p;
+}
+
+static FLASHMEM Payload cmd_ppb_restore_commit(const Payload& args) {
+  uint32_t rolling_sequence = 0U;
+  if (!restore_get_u32(args, "rolling_sequence", rolling_sequence)) {
+    Payload err;
+    err.add("error", "missing rolling_sequence");
+    err.add("status", "ppb_restore_commit_rejected_header");
+    return err;
+  }
+
+  if (g_ppb_restore_protocol_committed &&
+      rolling_sequence == g_ppb_restore_protocol_sequence) {
+    Payload p;
+    p.add("status", "ppb_restore_committed");
+    p.add("rolling_sequence", rolling_sequence);
+    p.add("duplicate", true);
+    return p;
+  }
+
+  if (!g_ppb_restore_protocol_active ||
+      rolling_sequence != g_ppb_restore_protocol_sequence ||
+      g_ppb_restore_second_accepted != g_ppb_restore_second_expected ||
+      g_ppb_restore_minute_accepted != g_ppb_restore_minute_expected) {
+    Payload err;
+    err.add("error", "Better-Buckets restore is incomplete");
+    err.add("status", "ppb_restore_commit_rejected_incomplete");
+    err.add("second_accepted", g_ppb_restore_second_accepted);
+    err.add("second_expected", g_ppb_restore_second_expected);
+    err.add("minute_accepted", g_ppb_restore_minute_accepted);
+    err.add("minute_expected", g_ppb_restore_minute_expected);
+    return err;
+  }
+
+  if (!clocks_alpha_ppb_restore_commit(rolling_sequence)) {
+    clocks_ppb_restore_protocol_clear(true);
+    Payload err;
+    err.add("error", "Alpha rejected Better-Buckets commit");
+    err.add("status", "ppb_restore_commit_rejected_alpha");
+    return err;
+  }
+
+  g_ppb_restore_protocol_committed = true;
+  Payload p;
+  p.add("status", "ppb_restore_committed");
+  p.add("rolling_sequence", rolling_sequence);
+  p.add("second_count", g_ppb_restore_second_accepted);
+  p.add("minute_count", g_ppb_restore_minute_accepted);
+  return p;
+}
+
+static FLASHMEM Payload cmd_ppb_restore_abort(const Payload&) {
+  const uint32_t prior_sequence = g_ppb_restore_protocol_sequence;
+  clocks_ppb_restore_protocol_clear(true);
+  Payload p;
+  p.add("status", "ppb_restore_aborted");
+  p.add("rolling_sequence", prior_sequence);
+  return p;
+}
+
 static FLASHMEM Payload cmd_restore_monitor(const Payload& args) {
   if (campaign_state != clocks_campaign_state_t::STOPPED ||
       request_start || request_stop || request_recover || request_zero ||
@@ -9112,6 +9401,17 @@ static FLASHMEM Payload cmd_restore_monitor(const Payload& args) {
     return err;
   }
 
+  if (g_clocks_restore_state.stats.update_count != 0U &&
+      !clocks_alpha_ppb_restore_ready(g_clocks_restore_state.stats.update_count)) {
+    const uint32_t rolling_sequence = g_clocks_restore_state.stats.update_count;
+    g_clocks_restore_state = clocks_recovery_restore_state_t{};
+    Payload pending;
+    pending.add("status", "monitor_restore_requires_ppb_state");
+    pending.add("rolling_sequence", rolling_sequence);
+    pending.add("restore_schema_version", CLOCKS_STRUCTURED_RESTORE_VERSION);
+    return pending;
+  }
+
   if (!clocks_recovery_install_dac_control(g_clocks_restore_state)) {
     g_clocks_restore_state = clocks_recovery_restore_state_t{};
     g_clocks_restore_failure_count++;
@@ -9129,6 +9429,7 @@ static FLASHMEM Payload cmd_restore_monitor(const Payload& args) {
     if (!clocks_alpha_begin_smartzero_epoch("monitor_restore")) {
       g_clocks_restore_state = clocks_recovery_restore_state_t{};
       g_clocks_restore_failure_count++;
+      clocks_ppb_restore_protocol_clear(true);
       clocks_apply_servo_mode_now(servo_mode_t::OFF);
       Payload err;
       err.add("error", "failed to start SmartZero for monitor restore");
@@ -9183,7 +9484,6 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
     err.add("restore_schema_version", CLOCKS_STRUCTURED_RESTORE_VERSION);
     return err;
   }
-
   uint64_t dwt_ns = 0ULL;
   uint64_t gnss_ns = 0ULL;
   uint64_t ocxo1_ns = 0ULL;
@@ -9369,6 +9669,28 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
     // its live statistics and all instrument control state.
     g_campaign_restore_ignored_live_count++;
     g_campaign_restore_state = clocks_recovery_restore_state_t{};
+  }
+
+  if (g_recover_lifecycle_mode == recover_lifecycle_mode_t::COLD_BOOTSTRAP) {
+    if (!g_campaign_restore_state.valid) {
+      recover_lifecycle_abort("recover_cold_bootstrap_requires_structured_state");
+      Payload err;
+      err.add("error", "cold bootstrap requires structured instrument state");
+      err.add("status", "recover_rejected_cold_bootstrap_requires_state");
+      err.add("recover_mode", "COLD_BOOTSTRAP");
+      return err;
+    }
+    if (g_campaign_restore_state.stats.update_count != 0U &&
+        !clocks_alpha_ppb_restore_ready(
+            g_campaign_restore_state.stats.update_count)) {
+      g_campaign_restore_state = clocks_recovery_restore_state_t{};
+      recover_lifecycle_abort("recover_cold_bootstrap_requires_ppb_state");
+      Payload err;
+      err.add("error", "cold bootstrap requires committed Better-Buckets state");
+      err.add("status", "recover_rejected_cold_bootstrap_requires_ppb_state");
+      err.add("recover_mode", "COLD_BOOTSTRAP");
+      return err;
+    }
   }
 
   Payload p;
@@ -9795,6 +10117,7 @@ static FLASHMEM Payload cmd_report_stats(const Payload&) {
 }
 
 static FLASHMEM Payload cmd_stats_reset(const Payload&) {
+  clocks_ppb_restore_protocol_clear(true);
   clocks_alpha_instrument_stats_reset();
 
   // Keep reset acknowledgment tiny. The operator may request REPORT_CLOCKS or
@@ -10005,6 +10328,10 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "STOP",                cmd_stop                },
   { "ZERO",                cmd_zero                },
   { "RECOVER",             cmd_recover             },
+  { "PPB_RESTORE_BEGIN",   cmd_ppb_restore_begin   },
+  { "PPB_RESTORE_CHUNK",   cmd_ppb_restore_chunk   },
+  { "PPB_RESTORE_COMMIT",  cmd_ppb_restore_commit  },
+  { "PPB_RESTORE_ABORT",   cmd_ppb_restore_abort   },
   { "RESTORE_MONITOR",     cmd_restore_monitor     },
   { "RECOVER_ABORT",       cmd_recover_abort       },
   { "SERVOS",              cmd_servos              },

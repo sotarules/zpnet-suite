@@ -3059,7 +3059,7 @@ static constexpr size_t ALPHA_PPB_HISTORY_RAM2_BUDGET_BYTES = 90000U;
 
 struct alpha_ppb_raw_endpoint_t {
   bool valid = false;
-  uint32_t pps_sequence = 0U;
+  uint32_t rolling_sequence = 0U;
   uint64_t gnss_ns = 0ULL;
   uint64_t dwt_cycles = 0ULL;
   uint64_t ocxo1_ns = 0ULL;
@@ -3071,7 +3071,7 @@ struct alpha_ppb_cumulative_endpoint_t {
   double dwt_error_cycles = 0.0;
   int64_t ocxo1_error_ns = 0LL;
   int64_t ocxo2_error_ns = 0LL;
-  uint32_t pps_sequence = 0U;
+  uint32_t rolling_sequence = 0U;
   uint32_t interval_count = 0U;
 };
 
@@ -3096,8 +3096,20 @@ static alpha_ppb_raw_endpoint_t g_alpha_ppb_previous_raw{};
 static alpha_ppb_cumulative_endpoint_t g_alpha_ppb_current{};
 static alpha_ppb_cumulative_endpoint_t g_alpha_ppb_origin{};
 static bool g_alpha_ppb_origin_valid = false;
+static bool g_alpha_ppb_last_endpoint_admitted = false;
+static bool g_alpha_ppb_last_interval_advanced = false;
 
-static void alpha_ppb_windows_reset(void) {
+// SQL replay stages reconstructed rolling history directly into Alpha's bounded
+// rings.  While staging is active, live rows may continue updating other
+// instrument statistics but must not mutate Better Buckets. RESTORE_MONITOR
+// later consumes the committed stage atomically with restored statistics.
+static volatile bool g_alpha_ppb_restore_staging = false;
+static bool g_alpha_ppb_restore_ready_state = false;
+static clocks_alpha_ppb_restore_snapshot_t g_alpha_ppb_restore_metadata{};
+static uint32_t g_alpha_ppb_restore_second_received = 0U;
+static uint32_t g_alpha_ppb_restore_minute_received = 0U;
+
+static void alpha_ppb_windows_reset_history(void) {
   for (size_t i = 0; i < ALPHA_PPB_SECOND_CAPACITY; i++) {
     g_alpha_ppb_seconds[i] = alpha_ppb_cumulative_endpoint_t{};
   }
@@ -3113,10 +3125,192 @@ static void alpha_ppb_windows_reset(void) {
   g_alpha_ppb_current = alpha_ppb_cumulative_endpoint_t{};
   g_alpha_ppb_origin = alpha_ppb_cumulative_endpoint_t{};
   g_alpha_ppb_origin_valid = false;
+  g_alpha_ppb_last_endpoint_admitted = false;
+  g_alpha_ppb_last_interval_advanced = false;
 }
 
-static uint32_t alpha_ppb_minute_key(uint32_t pps_sequence) {
-  return ((pps_sequence - 1U) / 60U) + 1U;
+static void alpha_ppb_windows_reset(void) {
+  alpha_ppb_windows_reset_history();
+  g_alpha_ppb_restore_staging = false;
+  g_alpha_ppb_restore_ready_state = false;
+  g_alpha_ppb_restore_metadata = clocks_alpha_ppb_restore_snapshot_t{};
+  g_alpha_ppb_restore_second_received = 0U;
+  g_alpha_ppb_restore_minute_received = 0U;
+}
+
+static uint32_t alpha_ppb_minute_key(uint32_t rolling_sequence) {
+  return ((rolling_sequence - 1U) / 60U) + 1U;
+}
+
+static constexpr uint32_t ALPHA_PPB_RESTORE_BASEPRI_GUARD = 16U;
+
+static uint32_t alpha_ppb_restore_irq_save(void) {
+  uint32_t prior_basepri = 0U;
+  __asm__ volatile ("mrs %0, basepri" : "=r" (prior_basepri) :: "memory");
+  if (prior_basepri == 0U || prior_basepri > ALPHA_PPB_RESTORE_BASEPRI_GUARD) {
+    __asm__ volatile ("msr basepri, %0"
+                      :: "r" (ALPHA_PPB_RESTORE_BASEPRI_GUARD) : "memory");
+  }
+  clocks_alpha_dmb();
+  return prior_basepri;
+}
+
+static void alpha_ppb_restore_irq_restore(uint32_t prior_basepri) {
+  clocks_alpha_dmb();
+  __asm__ volatile ("msr basepri, %0" :: "r" (prior_basepri) : "memory");
+}
+
+static bool alpha_ppb_restore_endpoint_valid(
+    const clocks_alpha_ppb_cumulative_endpoint_snapshot_t& endpoint,
+    uint32_t rolling_sequence) {
+  return isfinite(endpoint.dwt_error_cycles) &&
+         endpoint.rolling_sequence <= rolling_sequence;
+}
+
+static alpha_ppb_cumulative_endpoint_t alpha_ppb_restore_endpoint(
+    const clocks_alpha_ppb_cumulative_endpoint_snapshot_t& source) {
+  alpha_ppb_cumulative_endpoint_t out{};
+  out.reference_ns = source.reference_ns;
+  out.dwt_error_cycles = source.dwt_error_cycles;
+  out.ocxo1_error_ns = source.ocxo1_error_ns;
+  out.ocxo2_error_ns = source.ocxo2_error_ns;
+  out.rolling_sequence = source.rolling_sequence;
+  out.interval_count = source.interval_count;
+  return out;
+}
+
+uint32_t clocks_alpha_ppb_second_capacity(void) {
+  return (uint32_t)ALPHA_PPB_SECOND_CAPACITY;
+}
+
+uint32_t clocks_alpha_ppb_minute_capacity(void) {
+  return (uint32_t)ALPHA_PPB_MINUTE_CAPACITY;
+}
+
+bool clocks_alpha_ppb_restore_begin(
+    const clocks_alpha_ppb_restore_snapshot_t* state) {
+  if (!state || state->rolling_sequence == 0U ||
+      state->expected_second_count > ALPHA_PPB_SECOND_CAPACITY ||
+      state->expected_minute_count > ALPHA_PPB_MINUTE_CAPACITY ||
+      !alpha_ppb_restore_endpoint_valid(state->current,
+                                        state->rolling_sequence) ||
+      (state->origin_valid &&
+       !alpha_ppb_restore_endpoint_valid(state->origin,
+                                         state->rolling_sequence))) {
+    return false;
+  }
+
+  const uint32_t prior_basepri = alpha_ppb_restore_irq_save();
+  g_alpha_ppb_restore_staging = true;
+  g_alpha_ppb_restore_ready_state = false;
+  alpha_ppb_windows_reset_history();
+  g_alpha_ppb_restore_metadata = *state;
+  g_alpha_ppb_restore_second_received = 0U;
+  g_alpha_ppb_restore_minute_received = 0U;
+  alpha_ppb_restore_irq_restore(prior_basepri);
+  return true;
+}
+
+static bool alpha_ppb_restore_append(
+    const clocks_alpha_ppb_cumulative_endpoint_snapshot_t* endpoint,
+    bool second_history) {
+  if (!endpoint) return false;
+
+  const uint32_t prior_basepri = alpha_ppb_restore_irq_save();
+  bool ok = g_alpha_ppb_restore_staging &&
+      !g_alpha_ppb_restore_ready_state &&
+      alpha_ppb_restore_endpoint_valid(
+          *endpoint, g_alpha_ppb_restore_metadata.rolling_sequence);
+
+  alpha_ppb_cumulative_endpoint_t* ring = second_history
+      ? g_alpha_ppb_seconds : g_alpha_ppb_minutes;
+  const size_t capacity = second_history
+      ? ALPHA_PPB_SECOND_CAPACITY : ALPHA_PPB_MINUTE_CAPACITY;
+  uint32_t& received = second_history
+      ? g_alpha_ppb_restore_second_received
+      : g_alpha_ppb_restore_minute_received;
+  const uint32_t expected = second_history
+      ? g_alpha_ppb_restore_metadata.expected_second_count
+      : g_alpha_ppb_restore_metadata.expected_minute_count;
+
+  if (ok && (received >= expected || received >= capacity)) ok = false;
+  if (ok && received != 0U) {
+    const uint32_t previous_sequence = ring[received - 1U].rolling_sequence;
+    if (endpoint->rolling_sequence <= previous_sequence) ok = false;
+  }
+  if (ok) {
+    ring[received] = alpha_ppb_restore_endpoint(*endpoint);
+    received++;
+  }
+
+  alpha_ppb_restore_irq_restore(prior_basepri);
+  return ok;
+}
+
+bool clocks_alpha_ppb_restore_append_second(
+    const clocks_alpha_ppb_cumulative_endpoint_snapshot_t* endpoint) {
+  return alpha_ppb_restore_append(endpoint, true);
+}
+
+bool clocks_alpha_ppb_restore_append_minute(
+    const clocks_alpha_ppb_cumulative_endpoint_snapshot_t* endpoint) {
+  return alpha_ppb_restore_append(endpoint, false);
+}
+
+bool clocks_alpha_ppb_restore_commit(uint32_t rolling_sequence) {
+  const uint32_t prior_basepri = alpha_ppb_restore_irq_save();
+  bool ok = g_alpha_ppb_restore_staging &&
+      !g_alpha_ppb_restore_ready_state &&
+      rolling_sequence == g_alpha_ppb_restore_metadata.rolling_sequence &&
+      g_alpha_ppb_restore_second_received ==
+          g_alpha_ppb_restore_metadata.expected_second_count &&
+      g_alpha_ppb_restore_minute_received ==
+          g_alpha_ppb_restore_metadata.expected_minute_count;
+
+  if (ok) {
+    g_alpha_ppb_second_count = g_alpha_ppb_restore_second_received;
+    g_alpha_ppb_second_head =
+        g_alpha_ppb_second_count % ALPHA_PPB_SECOND_CAPACITY;
+    g_alpha_ppb_minute_count = g_alpha_ppb_restore_minute_received;
+    g_alpha_ppb_minute_head =
+        g_alpha_ppb_minute_count % ALPHA_PPB_MINUTE_CAPACITY;
+    g_alpha_ppb_last_minute_key =
+        g_alpha_ppb_restore_metadata.last_minute_key;
+    g_alpha_ppb_current = alpha_ppb_restore_endpoint(
+        g_alpha_ppb_restore_metadata.current);
+    g_alpha_ppb_origin = alpha_ppb_restore_endpoint(
+        g_alpha_ppb_restore_metadata.origin);
+    g_alpha_ppb_origin_valid = g_alpha_ppb_restore_metadata.origin_valid;
+
+    // Never bridge a physical reboot with a synthetic clock interval. The
+    // historical rings are exact; the first post-restore admitted row is a new
+    // raw antecedent, matching TAU's fresh-adjacency doctrine.
+    g_alpha_ppb_previous_raw = alpha_ppb_raw_endpoint_t{};
+    g_alpha_ppb_last_endpoint_admitted = false;
+    g_alpha_ppb_last_interval_advanced = false;
+    g_alpha_ppb_restore_ready_state = true;
+  }
+
+  alpha_ppb_restore_irq_restore(prior_basepri);
+  return ok;
+}
+
+void clocks_alpha_ppb_restore_abort(void) {
+  const uint32_t prior_basepri = alpha_ppb_restore_irq_save();
+  alpha_ppb_windows_reset_history();
+  g_alpha_ppb_restore_staging = false;
+  g_alpha_ppb_restore_ready_state = false;
+  g_alpha_ppb_restore_metadata = clocks_alpha_ppb_restore_snapshot_t{};
+  g_alpha_ppb_restore_second_received = 0U;
+  g_alpha_ppb_restore_minute_received = 0U;
+  alpha_ppb_restore_irq_restore(prior_basepri);
+}
+
+bool clocks_alpha_ppb_restore_ready(uint32_t rolling_sequence) {
+  return g_alpha_ppb_restore_staging &&
+         g_alpha_ppb_restore_ready_state &&
+         rolling_sequence != 0U &&
+         rolling_sequence == g_alpha_ppb_restore_metadata.rolling_sequence;
 }
 
 static void alpha_ppb_ring_append(
@@ -3146,9 +3340,11 @@ static bool alpha_ppb_raw_monotonic(
          current.ocxo2_ns > previous.ocxo2_ns;
 }
 
-static void alpha_ppb_windows_note_endpoint(uint32_t pps_sequence,
+static void alpha_ppb_windows_note_endpoint(uint32_t rolling_sequence,
                                             bool admitted) {
-  if (!admitted || pps_sequence == 0U) {
+  g_alpha_ppb_last_endpoint_admitted = admitted && rolling_sequence != 0U;
+  g_alpha_ppb_last_interval_advanced = false;
+  if (!admitted || rolling_sequence == 0U) {
     // A rejected endpoint cannot bookend the following interval.  The next
     // admitted row seeds fresh adjacency instead of spanning the excluded gap.
     g_alpha_ppb_previous_raw = alpha_ppb_raw_endpoint_t{};
@@ -3157,18 +3353,19 @@ static void alpha_ppb_windows_note_endpoint(uint32_t pps_sequence,
 
   alpha_ppb_raw_endpoint_t raw{};
   raw.valid = true;
-  raw.pps_sequence = pps_sequence;
+  raw.rolling_sequence = rolling_sequence;
   raw.gnss_ns = g_gnss_ns_at_pps_vclock;
   raw.dwt_cycles = g_dwt_cycle_count_total;
   raw.ocxo1_ns = g_ocxo1_measured_gnss_ns_at_pps_vclock;
   raw.ocxo2_ns = g_ocxo2_measured_gnss_ns_at_pps_vclock;
 
   alpha_ppb_cumulative_endpoint_t next = g_alpha_ppb_current;
-  next.pps_sequence = pps_sequence;
+  next.rolling_sequence = rolling_sequence;
 
   const bool adjacent = g_alpha_ppb_previous_raw.valid &&
-      pps_sequence == g_alpha_ppb_previous_raw.pps_sequence + 1U &&
+      rolling_sequence == g_alpha_ppb_previous_raw.rolling_sequence + 1U &&
       alpha_ppb_raw_monotonic(g_alpha_ppb_previous_raw, raw);
+  g_alpha_ppb_last_interval_advanced = adjacent;
   if (adjacent) {
     const uint64_t reference_delta =
         raw.gnss_ns - g_alpha_ppb_previous_raw.gnss_ns;
@@ -3203,7 +3400,7 @@ static void alpha_ppb_windows_note_endpoint(uint32_t pps_sequence,
                         g_alpha_ppb_second_count,
                         next);
 
-  const uint32_t minute_key = alpha_ppb_minute_key(pps_sequence);
+  const uint32_t minute_key = alpha_ppb_minute_key(rolling_sequence);
   if (minute_key != g_alpha_ppb_last_minute_key) {
     alpha_ppb_ring_append(g_alpha_ppb_minutes,
                           ALPHA_PPB_MINUTE_CAPACITY,
@@ -3221,16 +3418,16 @@ static bool alpha_ppb_find_anchor(
     size_t capacity,
     size_t head,
     size_t count,
-    uint32_t target_pps_sequence,
-    uint32_t current_pps_sequence,
+    uint32_t target_rolling_sequence,
+    uint32_t current_rolling_sequence,
     alpha_ppb_cumulative_endpoint_t& out) {
   if (!ring || count == 0U) return false;
   const size_t oldest = (head + capacity - count) % capacity;
   for (size_t i = 0; i < count; i++) {
     const alpha_ppb_cumulative_endpoint_t& endpoint =
         ring[(oldest + i) % capacity];
-    if (endpoint.pps_sequence >= target_pps_sequence &&
-        endpoint.pps_sequence < current_pps_sequence) {
+    if (endpoint.rolling_sequence >= target_rolling_sequence &&
+        endpoint.rolling_sequence < current_rolling_sequence) {
       out = endpoint;
       return true;
     }
@@ -3242,26 +3439,27 @@ static bool alpha_ppb_window_anchor(
     uint32_t window_seconds,
     bool exact_second_history,
     alpha_ppb_cumulative_endpoint_t& out) {
+  if (g_alpha_ppb_restore_staging) return false;
   if (!g_alpha_ppb_origin_valid ||
-      g_alpha_ppb_current.pps_sequence == 0U ||
-      g_alpha_ppb_origin.pps_sequence >= g_alpha_ppb_current.pps_sequence) {
+      g_alpha_ppb_current.rolling_sequence == 0U ||
+      g_alpha_ppb_origin.rolling_sequence >= g_alpha_ppb_current.rolling_sequence) {
     return false;
   }
 
-  if (g_alpha_ppb_current.pps_sequence <= window_seconds) {
+  if (g_alpha_ppb_current.rolling_sequence <= window_seconds) {
     out = g_alpha_ppb_origin;
     return true;
   }
 
   const uint32_t target =
-      g_alpha_ppb_current.pps_sequence - window_seconds;
+      g_alpha_ppb_current.rolling_sequence - window_seconds;
   if (exact_second_history) {
     return alpha_ppb_find_anchor(g_alpha_ppb_seconds,
                                  ALPHA_PPB_SECOND_CAPACITY,
                                  g_alpha_ppb_second_head,
                                  g_alpha_ppb_second_count,
                                  target,
-                                 g_alpha_ppb_current.pps_sequence,
+                                 g_alpha_ppb_current.rolling_sequence,
                                  out);
   }
   return alpha_ppb_find_anchor(g_alpha_ppb_minutes,
@@ -3269,7 +3467,7 @@ static bool alpha_ppb_window_anchor(
                                g_alpha_ppb_minute_head,
                                g_alpha_ppb_minute_count,
                                target,
-                               g_alpha_ppb_current.pps_sequence,
+                               g_alpha_ppb_current.rolling_sequence,
                                out);
 }
 
@@ -3341,8 +3539,8 @@ static clocks_instrument_ppb_buckets_snapshot_t alpha_ppb_windows_snapshot(
 static void alpha_ppb_attach_windows(
     clocks_instrument_frequency_snapshot_t& frequency,
     alpha_ppb_lane_t lane,
-    uint32_t current_pps_sequence) {
-  (void)current_pps_sequence;
+    uint32_t current_rolling_sequence) {
+  (void)current_rolling_sequence;
   clocks_instrument_ppb_buckets_snapshot_t buckets =
       alpha_ppb_windows_snapshot(lane);
   if (frequency.valid) {
@@ -3510,7 +3708,16 @@ static void alpha_instrument_stats_note_completed_row(
       alpha_instrument_interval_plausible(vclock_cycles) &&
       alpha_instrument_interval_plausible(ocxo1_cycles) &&
       alpha_instrument_interval_plausible(ocxo2_cycles);
-  alpha_ppb_windows_note_endpoint(pps_sequence, rolling_endpoint_admitted);
+
+  if (!g_alpha_ppb_restore_staging) {
+    const uint32_t rolling_sequence = g_instrument_stats_update_count + 1U;
+    alpha_ppb_windows_note_endpoint(rolling_sequence,
+                                    rolling_endpoint_admitted);
+  } else {
+    // A staged SQL replay owns Better Buckets until RESTORE_MONITOR consumes it.
+    g_alpha_ppb_last_endpoint_admitted = false;
+    g_alpha_ppb_last_interval_advanced = false;
+  }
 
   // Freeze one coherent completed-row clockface under the same sequence lock
   // as the statistics.  REPORT_CLOCKS must never mix the next PPS bookend with
@@ -3552,6 +3759,12 @@ FLASHMEM bool clocks_alpha_instrument_stats_snapshot(
     local.reset_count = g_instrument_stats_reset_count;
     local.update_count = g_instrument_stats_update_count;
     local.last_pps_sequence = g_instrument_stats_last_pps_sequence;
+    local.rolling_ppb_current_sequence =
+        g_alpha_ppb_current.rolling_sequence;
+    local.rolling_ppb_endpoint_admitted =
+        g_alpha_ppb_last_endpoint_admitted;
+    local.rolling_ppb_interval_advanced =
+        g_alpha_ppb_last_interval_advanced;
     local.completed_row_coherent =
         g_instrument_stats_completed_row_coherent;
     local.gnss_ns = g_instrument_stats_gnss_ns;
@@ -3645,6 +3858,10 @@ bool clocks_alpha_instrument_stats_restore(
           time_clock_id_t::OCXO2, state->ocxo2_tau_state)) {
     return false;
   }
+  if (state->update_count != 0U &&
+      !clocks_alpha_ppb_restore_ready(state->update_count)) {
+    return false;
+  }
 
   g_instrument_stats_seq++;
   clocks_alpha_dmb();
@@ -3662,9 +3879,12 @@ bool clocks_alpha_instrument_stats_restore(
   (void)clocks_alpha_ocxo_tau_restore(
       time_clock_id_t::OCXO2, &state->ocxo2_tau_state);
 
-  // Recovery restores TOTAL's sufficient state exactly. Rolling membership is
-  // deliberately restarted because no per-second history crosses the reboot.
-  alpha_ppb_windows_reset();
+  // Rolling history is staged from PostgreSQL before structured restore. Do not
+  // reset it here: consuming that stage is what makes 10m/60m/8h/24h continue
+  // across reboot without carrying the rings in every CLOCKS row.
+  if (state->update_count == 0U) {
+    alpha_ppb_windows_reset();
+  }
 
   g_instrument_stats_reset_count = state->reset_count;
   g_instrument_stats_update_count = state->update_count;
@@ -3701,6 +3921,16 @@ bool clocks_alpha_instrument_stats_restore(
       state->ocxo1_interval_reject_count;
   g_instrument_stats_ocxo2_interval_reject_count =
       state->ocxo2_interval_reject_count;
+
+  if (state->update_count != 0U) {
+    g_alpha_ppb_last_endpoint_admitted = false;
+    g_alpha_ppb_last_interval_advanced = false;
+    g_alpha_ppb_restore_staging = false;
+    g_alpha_ppb_restore_ready_state = false;
+    g_alpha_ppb_restore_metadata = clocks_alpha_ppb_restore_snapshot_t{};
+    g_alpha_ppb_restore_second_received = 0U;
+    g_alpha_ppb_restore_minute_received = 0U;
+  }
 
   clocks_alpha_dmb();
   g_instrument_stats_seq++;

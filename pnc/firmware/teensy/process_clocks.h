@@ -403,6 +403,13 @@ struct clocks_fragment_stats_snapshot_t {
   uint32_t reset_count = 0;
   uint32_t update_count = 0;
   uint32_t last_pps_sequence = 0;
+
+  // Recovery-only Better-Buckets witnesses. update_count is the logical rolling
+  // chronology; current_sequence identifies the latest admitted endpoint.
+  uint32_t rolling_ppb_current_sequence = 0;
+  bool rolling_ppb_endpoint_admitted = false;
+  bool rolling_ppb_interval_advanced = false;
+
   bool completed_row_coherent = false;
 
   clocks_fragment_stats_clock_snapshot_t gnss{};

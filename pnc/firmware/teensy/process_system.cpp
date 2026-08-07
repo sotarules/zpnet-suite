@@ -3448,12 +3448,18 @@ static void system_clocks_fragment_add_stats(
     Payload& parent,
     const clocks_fragment_stats_snapshot_t& snapshot) {
   Payload stats;
-  stats.add("schema", "CLOCKS_INSTRUMENT_STATS_V3");
+  stats.add("schema", "CLOCKS_INSTRUMENT_STATS_V4");
   stats.add("snapshot_ok", snapshot.snapshot_ok);
   stats.add("valid", snapshot.valid);
   stats.add("reset_count", snapshot.reset_count);
   stats.add("update_count", snapshot.update_count);
   stats.add("last_pps_sequence", snapshot.last_pps_sequence);
+  stats.add("rolling_ppb_current_sequence",
+            snapshot.rolling_ppb_current_sequence);
+  stats.add("rolling_ppb_endpoint_admitted",
+            snapshot.rolling_ppb_endpoint_admitted);
+  stats.add("rolling_ppb_interval_advanced",
+            snapshot.rolling_ppb_interval_advanced);
   stats.add("completed_row_coherent", snapshot.completed_row_coherent);
 
   system_clocks_fragment_add_stats_clock(stats, "gnss", snapshot.gnss);

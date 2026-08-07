@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import copy
 import json
+from collections import deque
 import logging
 import math
 import os
@@ -230,6 +231,20 @@ PREFLIGHT_LOG_PREFIX = "🛡️ [preflight]"
 STARTUP_TEENSY_QUIET_DELAY_S = 20.0
 HOLISTIC_RESTORE_TIMEOUT_S = 60.0
 HOLISTIC_RESTORE_COMMAND_RETRY_S = 10.0
+
+# Better-Buckets restore replay. Alpha keeps exact-second endpoints for 10m and
+# one first-admitted endpoint per minute for the longer windows. PostgreSQL is
+# scanned only on recovery; ordinary CLOCKS remains lean.
+PPB_REPLAY_10_MIN_SECONDS = 10 * 60
+PPB_REPLAY_60_MIN_SECONDS = 60 * 60
+PPB_REPLAY_8_HOUR_SECONDS = 8 * 60 * 60
+PPB_REPLAY_24_HOUR_SECONDS = 24 * 60 * 60
+PPB_REPLAY_MARGIN_SECONDS = 60
+PPB_REPLAY_SECOND_CAPACITY = PPB_REPLAY_10_MIN_SECONDS + 1
+PPB_REPLAY_MINUTE_CAPACITY = 24 * 60 + 2
+PPB_REPLAY_CURSOR_ITERSIZE = 2048
+PPB_RESTORE_CHUNK_ENDPOINTS = 4
+PPB_REPLAY_VERIFY_TOLERANCE_PPB = 0.00001
 TIMEBASE_SILENCE_TIMEOUT_S = 30.0
 TIMEBASE_SILENCE_MONITOR_POLL_S = 1.0
 TEENSY_HEALTH_RETRY_S = 60.0
@@ -1772,6 +1787,669 @@ def _clocks_payload(monitor: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return clocks if isinstance(clocks, dict) else {}
 
 
+
+def _ppb_replay_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _ppb_zero_endpoint() -> Dict[str, Any]:
+    return {
+        "reference_ns": 0,
+        "dwt_error_cycles": 0.0,
+        "ocxo1_error_ns": 0,
+        "ocxo2_error_ns": 0,
+        "rolling_sequence": 0,
+        "interval_count": 0,
+    }
+
+
+def _ppb_minute_key(rolling_sequence: int) -> int:
+    return ((int(rolling_sequence) - 1) // 60) + 1 if rolling_sequence > 0 else 0
+
+
+def _ppb_signed_delta(clock_delta: int, reference_delta: int) -> int:
+    return (
+        int(clock_delta - reference_delta)
+        if clock_delta >= reference_delta
+        else -int(reference_delta - clock_delta)
+    )
+
+
+def _ppb_raw_monotonic(previous: Dict[str, int], current: Dict[str, int]) -> bool:
+    return (
+        current["gnss_ns"] > previous["gnss_ns"]
+        and current["dwt_cycles"] > previous["dwt_cycles"]
+        and current["ocxo1_ns"] > previous["ocxo1_ns"]
+        and current["ocxo2_ns"] > previous["ocxo2_ns"]
+    )
+
+
+def _replay_better_buckets_rows(
+    rows,
+    *,
+    lower_sequence: int,
+    target_update_count: int,
+    target_current_sequence: int,
+) -> Dict[str, Any]:
+    """Reconstruct Alpha's bounded Better-Buckets state in one forward pass.
+
+    rolling_sequence is canonical stats.update_count.  The first cursor row may
+    begin before the oldest 24-hour anchor rather than at statistical epoch zero;
+    any omitted cumulative prefix is a harmless common offset that cancels from
+    every rolling subtraction.  interval_advanced preserves deliberate reboot /
+    rejection cuts so continuity-adjusted clockfaces are never joined by guess.
+    """
+    if target_update_count < 0 or target_current_sequence < 0:
+        raise ValueError("invalid Better-Buckets target chronology")
+    if target_current_sequence > target_update_count:
+        raise ValueError(
+            "Better-Buckets current sequence exceeds stats update_count: "
+            f"current={target_current_sequence} update_count={target_update_count}"
+        )
+
+    current = _ppb_zero_endpoint()
+    origin: Optional[Dict[str, Any]] = None
+    second_history = deque(maxlen=PPB_REPLAY_SECOND_CAPACITY)
+    minute_history = deque(maxlen=PPB_REPLAY_MINUTE_CAPACITY)
+    previous_raw: Optional[Dict[str, int]] = None
+    last_admitted_sequence = 0
+    last_minute_key = 0
+    expected_sequence = int(lower_sequence)
+    rows_scanned = 0
+    admitted_rows = 0
+    advanced_intervals = 0
+    omitted_prefix_interval = False
+
+    for row in rows:
+        sequence = int(row["update_count"])
+        if sequence != expected_sequence:
+            raise ValueError(
+                "Better-Buckets durable chronology gap: "
+                f"expected={expected_sequence} observed={sequence}"
+            )
+        expected_sequence += 1
+        rows_scanned += 1
+
+        current_witness = int(row.get("current_sequence") or 0)
+        admitted = _ppb_replay_bool(row.get("endpoint_admitted"))
+        interval_advanced = _ppb_replay_bool(row.get("interval_advanced"))
+        if interval_advanced and not admitted:
+            raise ValueError(
+                f"Better-Buckets row {sequence} advances interval while endpoint is excluded"
+            )
+
+        if not admitted:
+            if last_admitted_sequence == 0:
+                last_admitted_sequence = current_witness
+            elif current_witness != last_admitted_sequence:
+                raise ValueError(
+                    "Better-Buckets excluded-row current-sequence drift: "
+                    f"row={sequence} expected={last_admitted_sequence} "
+                    f"observed={current_witness}"
+                )
+            previous_raw = None
+            continue
+
+        if current_witness != sequence:
+            raise ValueError(
+                "Better-Buckets admitted row does not own current sequence: "
+                f"row={sequence} current={current_witness}"
+            )
+
+        raw = {
+            "rolling_sequence": sequence,
+            "gnss_ns": int(row["gnss_ns"]),
+            "dwt_cycles": int(row["dwt_cycles"]),
+            "ocxo1_ns": int(row["ocxo1_ns"]),
+            "ocxo2_ns": int(row["ocxo2_ns"]),
+        }
+        if min(raw["gnss_ns"], raw["dwt_cycles"], raw["ocxo1_ns"], raw["ocxo2_ns"]) <= 0:
+            raise ValueError(f"Better-Buckets row {sequence} has nonpositive clockface")
+
+        next_endpoint = dict(current)
+        next_endpoint["rolling_sequence"] = sequence
+
+        if interval_advanced:
+            if previous_raw is None:
+                # A bounded replay may omit the interval entering its first row.
+                # lower_sequence is at least one full minute before the oldest
+                # possible 24h anchor, so this becomes only a common cumulative
+                # offset and cannot affect any reconstructed rolling subtraction.
+                if rows_scanned == 1 and lower_sequence > 1:
+                    omitted_prefix_interval = True
+                else:
+                    raise ValueError(
+                        f"Better-Buckets row {sequence} advances without an antecedent"
+                    )
+            else:
+                if sequence != previous_raw["rolling_sequence"] + 1:
+                    raise ValueError(
+                        "Better-Buckets advanced interval is not adjacent: "
+                        f"previous={previous_raw['rolling_sequence']} current={sequence}"
+                    )
+                if not _ppb_raw_monotonic(previous_raw, raw):
+                    raise ValueError(
+                        f"Better-Buckets row {sequence} claims advance across nonmonotonic clocks"
+                    )
+                reference_delta = raw["gnss_ns"] - previous_raw["gnss_ns"]
+                dwt_delta = raw["dwt_cycles"] - previous_raw["dwt_cycles"]
+                ocxo1_delta = raw["ocxo1_ns"] - previous_raw["ocxo1_ns"]
+                ocxo2_delta = raw["ocxo2_ns"] - previous_raw["ocxo2_ns"]
+                expected_dwt_delta = (
+                    float(reference_delta) * float(DWT_EXPECTED_PER_PPS)
+                ) / float(NS_PER_SECOND)
+                next_endpoint["reference_ns"] += reference_delta
+                next_endpoint["dwt_error_cycles"] += (
+                    float(dwt_delta) - expected_dwt_delta
+                )
+                next_endpoint["ocxo1_error_ns"] += _ppb_signed_delta(
+                    ocxo1_delta, reference_delta
+                )
+                next_endpoint["ocxo2_error_ns"] += _ppb_signed_delta(
+                    ocxo2_delta, reference_delta
+                )
+                next_endpoint["interval_count"] += 1
+                advanced_intervals += 1
+        current = next_endpoint
+        if origin is None:
+            origin = dict(current)
+
+        second_history.append(dict(current))
+        minute_key = _ppb_minute_key(sequence)
+        if minute_key != last_minute_key:
+            minute_history.append(dict(current))
+            last_minute_key = minute_key
+
+        previous_raw = raw
+        last_admitted_sequence = sequence
+        admitted_rows += 1
+
+    if target_current_sequence > 0:
+        if rows_scanned == 0:
+            raise ValueError("Better-Buckets replay returned no durable rows")
+        if expected_sequence != target_current_sequence + 1:
+            raise ValueError(
+                "Better-Buckets replay ended before current endpoint: "
+                f"next={expected_sequence} current={target_current_sequence}"
+            )
+        if last_admitted_sequence != target_current_sequence:
+            raise ValueError(
+                "Better-Buckets replay current endpoint mismatch: "
+                f"replayed={last_admitted_sequence} target={target_current_sequence}"
+            )
+        if int(current.get("rolling_sequence") or 0) != target_current_sequence:
+            raise ValueError("Better-Buckets cumulative current sequence mismatch")
+        if origin is None:
+            raise ValueError("Better-Buckets replay has current endpoint but no origin")
+
+    return {
+        "schema": "PI_BETTER_BUCKETS_RESTORE_V1",
+        "rolling_sequence": int(target_update_count),
+        "current_sequence": int(target_current_sequence),
+        "lower_sequence": int(lower_sequence),
+        "rows_scanned": int(rows_scanned),
+        "admitted_rows": int(admitted_rows),
+        "advanced_intervals": int(advanced_intervals),
+        "omitted_prefix_interval": bool(omitted_prefix_interval),
+        "last_minute_key": int(last_minute_key),
+        "origin_valid": origin is not None,
+        "origin": dict(origin) if origin is not None else _ppb_zero_endpoint(),
+        "current": dict(current),
+        "second_history": list(second_history),
+        "minute_history": list(minute_history),
+    }
+
+
+def _ppb_replay_anchor(
+    replay: Dict[str, Any],
+    window_seconds: int,
+    *,
+    exact_second_history: bool,
+) -> Optional[Dict[str, Any]]:
+    current = replay.get("current") if isinstance(replay, dict) else None
+    origin = replay.get("origin") if isinstance(replay, dict) else None
+    if not isinstance(current, dict) or not replay.get("origin_valid"):
+        return None
+    current_sequence = int(current.get("rolling_sequence") or 0)
+    origin_sequence = int(origin.get("rolling_sequence") or 0) if isinstance(origin, dict) else 0
+    if current_sequence == 0 or origin_sequence >= current_sequence:
+        return None
+    if current_sequence <= int(window_seconds):
+        return origin if isinstance(origin, dict) else None
+
+    target = current_sequence - int(window_seconds)
+    history = replay.get(
+        "second_history" if exact_second_history else "minute_history"
+    )
+    if not isinstance(history, list):
+        return None
+    for endpoint in history:
+        if not isinstance(endpoint, dict):
+            continue
+        sequence = int(endpoint.get("rolling_sequence") or 0)
+        if sequence >= target and sequence < current_sequence:
+            return endpoint
+    return None
+
+
+def _ppb_replay_bucket_value(
+    replay: Dict[str, Any],
+    lane: str,
+    window_seconds: int,
+    *,
+    exact_second_history: bool,
+) -> Optional[float]:
+    current = replay.get("current")
+    if not isinstance(current, dict):
+        return None
+    anchor = _ppb_replay_anchor(
+        replay, window_seconds, exact_second_history=exact_second_history
+    )
+    if not isinstance(anchor, dict):
+        return None
+
+    interval_count = int(current["interval_count"]) - int(anchor["interval_count"])
+    reference_ns = int(current["reference_ns"]) - int(anchor["reference_ns"])
+    if interval_count <= 0 or reference_ns <= 0:
+        return None
+
+    if lane == "dwt":
+        expected_cycles = (
+            float(reference_ns) * float(DWT_EXPECTED_PER_PPS)
+        ) / float(NS_PER_SECOND)
+        if expected_cycles <= 0.0:
+            return None
+        error_cycles = (
+            float(current["dwt_error_cycles"])
+            - float(anchor["dwt_error_cycles"])
+        )
+        return error_cycles * 1.0e9 / expected_cycles
+    if lane == "vclock":
+        return 0.0
+    if lane == "ocxo1":
+        error_ns = int(current["ocxo1_error_ns"]) - int(anchor["ocxo1_error_ns"])
+        return float(error_ns) * 1.0e9 / float(reference_ns)
+    if lane == "ocxo2":
+        error_ns = int(current["ocxo2_error_ns"]) - int(anchor["ocxo2_error_ns"])
+        return float(error_ns) * 1.0e9 / float(reference_ns)
+    raise ValueError(f"unsupported Better-Buckets lane {lane!r}")
+
+
+def _verify_better_buckets_replay(
+    detail: Dict[str, Any],
+    replay: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Prove reconstructed rings reproduce Alpha's last durable bucket values."""
+    stats = _path_get(detail, "clocks.stats")
+    if not isinstance(stats, dict):
+        raise ValueError("Better-Buckets replay verification missing canonical stats")
+
+    windows = (
+        ("10_min", PPB_REPLAY_10_MIN_SECONDS, True),
+        ("60_min", PPB_REPLAY_60_MIN_SECONDS, False),
+        ("8_hour", PPB_REPLAY_8_HOUR_SECONDS, False),
+        ("24_hour", PPB_REPLAY_24_HOUR_SECONDS, False),
+    )
+    checked = 0
+    comparisons: Dict[str, Any] = {}
+    for lane in ("dwt", "vclock", "ocxo1", "ocxo2"):
+        lane_out: Dict[str, Any] = {}
+        for key, seconds, exact in windows:
+            computed = _ppb_replay_bucket_value(
+                replay, lane, seconds, exact_second_history=exact
+            )
+            recorded = _path_get(stats, f"{lane}.ppb_buckets.{key}")
+            if computed is None and recorded is None:
+                lane_out[key] = None
+                continue
+            if computed is None or recorded is None:
+                raise ValueError(
+                    "Better-Buckets replay availability mismatch: "
+                    f"lane={lane} window={key} computed={computed!r} recorded={recorded!r}"
+                )
+            recorded_value = float(recorded)
+            delta = float(computed) - recorded_value
+            if abs(delta) > PPB_REPLAY_VERIFY_TOLERANCE_PPB:
+                raise ValueError(
+                    "Better-Buckets replay value mismatch: "
+                    f"lane={lane} window={key} computed={computed:.9f} "
+                    f"recorded={recorded_value:.9f} delta={delta:.9f}"
+                )
+            lane_out[key] = {
+                "computed": round(float(computed), 9),
+                "recorded": round(recorded_value, 9),
+                "delta": round(delta, 9),
+            }
+            checked += 1
+        comparisons[lane] = lane_out
+    return {"checked": checked, "comparisons": comparisons}
+
+
+def _reconstruct_better_buckets_from_db(detail: Dict[str, Any]) -> Dict[str, Any]:
+    clocks = _clocks_payload(detail)
+    stats = clocks.get("stats") if isinstance(clocks, dict) else None
+    if not isinstance(stats, dict):
+        raise ValueError("canonical CLOCKS missing stats for Better-Buckets replay")
+
+    reset_count = _as_int(stats.get("reset_count"))
+    update_count = _as_int(stats.get("update_count"))
+    current_sequence = _as_int(stats.get("rolling_ppb_current_sequence"))
+    target_db_id = _as_int(detail.get("_db_detail_id"))
+    if reset_count is None or reset_count < 0:
+        raise ValueError("Better-Buckets replay missing reset_count")
+    if update_count is None or update_count < 0:
+        raise ValueError("Better-Buckets replay missing update_count")
+    if current_sequence is None or current_sequence < 0 or current_sequence > update_count:
+        raise ValueError("Better-Buckets replay missing/invalid current sequence")
+    if target_db_id is None or target_db_id <= 0:
+        raise ValueError("Better-Buckets replay missing durable campaign_detail id")
+
+    if update_count == 0:
+        return {
+            "schema": "PI_BETTER_BUCKETS_RESTORE_V1",
+            "rolling_sequence": 0,
+            "current_sequence": 0,
+            "lower_sequence": 0,
+            "rows_scanned": 0,
+            "admitted_rows": 0,
+            "advanced_intervals": 0,
+            "omitted_prefix_interval": False,
+            "last_minute_key": 0,
+            "origin_valid": False,
+            "origin": _ppb_zero_endpoint(),
+            "current": _ppb_zero_endpoint(),
+            "second_history": [],
+            "minute_history": [],
+            "verification": {"checked": 0, "comparisons": {}},
+        }
+
+    if current_sequence == 0:
+        replay = _replay_better_buckets_rows(
+            [],
+            lower_sequence=1,
+            target_update_count=update_count,
+            target_current_sequence=0,
+        )
+        replay["verification"] = _verify_better_buckets_replay(detail, replay)
+        return replay
+
+    lower_sequence = max(
+        1,
+        int(current_sequence)
+        - PPB_REPLAY_24_HOUR_SECONDS
+        - PPB_REPLAY_MARGIN_SECONDS,
+    )
+
+    with open_db(row_dict=True) as conn:
+        conn.execute("SET TRANSACTION READ ONLY")
+        cur = conn.cursor(name="clocks_ppb_restore_stream")
+        cur.itersize = PPB_REPLAY_CURSOR_ITERSIZE
+        cur.execute(
+            """
+            SELECT
+                id,
+                (payload #>> '{clocks,stats,update_count}')::bigint AS update_count,
+                (payload #>> '{clocks,stats,rolling_ppb_current_sequence}')::bigint
+                    AS current_sequence,
+                payload #>> '{clocks,stats,rolling_ppb_endpoint_admitted}'
+                    AS endpoint_admitted,
+                payload #>> '{clocks,stats,rolling_ppb_interval_advanced}'
+                    AS interval_advanced,
+                (payload #>> '{clocks,clockfaces,gnss_ns}')::bigint AS gnss_ns,
+                (payload #>> '{clocks,clockfaces,dwt_cycles}')::bigint AS dwt_cycles,
+                (payload #>> '{clocks,clockfaces,ocxo1_ns}')::bigint AS ocxo1_ns,
+                (payload #>> '{clocks,clockfaces,ocxo2_ns}')::bigint AS ocxo2_ns
+            FROM campaign_detail
+            WHERE campaign_type = %s
+              AND id <= %s
+              AND NOT (payload @> '{"holistic_restore_superseded":true}'::jsonb)
+              AND payload #>> '{schema}' = 'CLOCKS_V4'
+              AND payload #>> '{clocks,stats,schema}' = 'CLOCKS_INSTRUMENT_STATS_V4'
+              AND (payload #>> '{clocks,stats,reset_count}')::bigint = %s
+              AND (payload #>> '{clocks,stats,update_count}')::bigint
+                    BETWEEN %s AND %s
+            ORDER BY (payload #>> '{clocks,stats,update_count}')::bigint ASC,
+                     id ASC
+            """,
+            (
+                CAMPAIGN_TYPE_TEMPEST,
+                int(target_db_id),
+                int(reset_count),
+                int(lower_sequence),
+                int(current_sequence),
+            ),
+        )
+        replay = _replay_better_buckets_rows(
+            cur,
+            lower_sequence=int(lower_sequence),
+            target_update_count=int(update_count),
+            target_current_sequence=int(current_sequence),
+        )
+
+    replay["reset_count"] = int(reset_count)
+    replay["source_db_detail_id"] = int(target_db_id)
+    replay["verification"] = _verify_better_buckets_replay(detail, replay)
+    return replay
+
+
+def _supersede_cold_bootstrap_rows(
+    *,
+    base_detail_id: int,
+    campaign_name: str,
+    first_public_count: int,
+) -> Dict[str, Any]:
+    """Mark pre-restore fresh-boot rows non-viable without deleting evidence.
+
+    The first recovered campaign row has already passed through canonical CLOCKS
+    persistence before the recovery processor signals it.  Every TEMPEST row
+    inserted after the durable recovery source but before that row belongs to
+    the superseded fresh-boot instrument and must never participate in a later
+    Holistic Restore replay. ``viable`` remains campaign-science semantics; the
+    explicit payload marker is the instrument-restore exclusion authority.
+    """
+    base_detail_id = int(base_detail_id)
+    first_public_count = int(first_public_count)
+    if base_detail_id <= 0 or first_public_count <= 0:
+        raise ValueError("invalid cold-bootstrap supersede boundary")
+
+    with _clocks_persistence_lock:
+        with open_db(row_dict=True) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT id
+                FROM campaign_detail
+                WHERE campaign_type = %s
+                  AND campaign = %s
+                  AND payload #>> '{campaign,public_count}' = %s
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (CAMPAIGN_TYPE_TEMPEST, campaign_name, str(first_public_count)),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise RuntimeError(
+                    "first recovered campaign row is not durably identifiable"
+                )
+            recovered_detail_id = int(row["id"])
+            if recovered_detail_id <= base_detail_id:
+                raise RuntimeError(
+                    "cold-bootstrap recovered row does not follow recovery source"
+                )
+            cur.execute(
+                """
+                UPDATE campaign_detail
+                SET viable = false,
+                    payload = payload || jsonb_build_object(
+                        'holistic_restore_superseded', true,
+                        'holistic_restore_superseded_by_detail_id', %s::bigint
+                    )
+                WHERE campaign_type = %s
+                  AND id > %s
+                  AND id < %s
+                """,
+                (
+                    recovered_detail_id,
+                    CAMPAIGN_TYPE_TEMPEST,
+                    base_detail_id,
+                    recovered_detail_id,
+                ),
+            )
+            superseded = int(cur.rowcount or 0)
+
+    return {
+        "base_detail_id": base_detail_id,
+        "recovered_detail_id": recovered_detail_id,
+        "rows_marked_nonviable": superseded,
+    }
+
+
+def _ppb_endpoint_command_args(prefix: str, endpoint: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        f"{prefix}_reference_ns": int(endpoint.get("reference_ns") or 0),
+        f"{prefix}_dwt_error_cycles": float(endpoint.get("dwt_error_cycles") or 0.0),
+        f"{prefix}_ocxo1_error_ns": int(endpoint.get("ocxo1_error_ns") or 0),
+        f"{prefix}_ocxo2_error_ns": int(endpoint.get("ocxo2_error_ns") or 0),
+        f"{prefix}_rolling_sequence": int(endpoint.get("rolling_sequence") or 0),
+        f"{prefix}_interval_count": int(endpoint.get("interval_count") or 0),
+    }
+
+
+def _send_teensy_ppb_restore_command(
+    command: str,
+    args: Dict[str, Any],
+    accepted_statuses: Tuple[str, ...],
+) -> Dict[str, Any]:
+    response = send_command(
+        machine="TEENSY",
+        subsystem="CLOCKS",
+        command=command,
+        args=args,
+    )
+    outer_success = isinstance(response, dict) and bool(response.get("success"))
+    payload = response.get("payload") if isinstance(response, dict) else None
+    payload = payload if isinstance(payload, dict) else {}
+    status = str(payload.get("status") or "")
+    if not outer_success or status not in accepted_statuses:
+        raise RuntimeError(
+            f"Teensy {command} rejected: status={status or 'missing'} "
+            f"response={response!r}"
+        )
+    return payload
+
+
+def _abort_teensy_ppb_restore_best_effort() -> None:
+    try:
+        send_command(
+            machine="TEENSY",
+            subsystem="CLOCKS",
+            command="PPB_RESTORE_ABORT",
+            retries=1,
+            retry_delay_s=0.0,
+        )
+    except Exception:
+        logging.debug("⚠️ [holistic restore] PPB_RESTORE_ABORT failed (ignored)")
+
+
+def _stage_teensy_better_buckets(replay: Dict[str, Any]) -> Dict[str, Any]:
+    rolling_sequence = int(replay.get("rolling_sequence") or 0)
+    if rolling_sequence == 0:
+        return {"staged": False, "reason": "empty_statistics_epoch"}
+
+    second_history = replay.get("second_history")
+    minute_history = replay.get("minute_history")
+    if not isinstance(second_history, list) or not isinstance(minute_history, list):
+        raise ValueError("Better-Buckets replay missing history arrays")
+
+    begin_args: Dict[str, Any] = {
+        "rolling_sequence": rolling_sequence,
+        "second_count": len(second_history),
+        "minute_count": len(minute_history),
+        "last_minute_key": int(replay.get("last_minute_key") or 0),
+        "origin_valid": bool(replay.get("origin_valid")),
+    }
+    begin_args.update(_ppb_endpoint_command_args("current", replay["current"]))
+    if replay.get("origin_valid"):
+        begin_args.update(_ppb_endpoint_command_args("origin", replay["origin"]))
+
+    started = time.monotonic()
+    try:
+        begin_payload = _send_teensy_ppb_restore_command(
+            "PPB_RESTORE_BEGIN",
+            begin_args,
+            ("ppb_restore_staging",),
+        )
+        firmware_chunk_max = _as_int(begin_payload.get("chunk_max_endpoints")) or 1
+        chunk_size = max(1, min(PPB_RESTORE_CHUNK_ENDPOINTS, firmware_chunk_max))
+        chunks = 0
+
+        for history_name, history in (
+            ("SECOND", second_history),
+            ("MINUTE", minute_history),
+        ):
+            for offset in range(0, len(history), chunk_size):
+                batch = history[offset:offset + chunk_size]
+                chunk_args: Dict[str, Any] = {
+                    "history": history_name,
+                    "offset": int(offset),
+                    "count": len(batch),
+                }
+                for index, endpoint in enumerate(batch):
+                    chunk_args.update(
+                        _ppb_endpoint_command_args(f"e{index}", endpoint)
+                    )
+                _send_teensy_ppb_restore_command(
+                    "PPB_RESTORE_CHUNK",
+                    chunk_args,
+                    ("ppb_restore_chunk_accepted", "ppb_restore_chunk_duplicate"),
+                )
+                chunks += 1
+
+        commit_payload = _send_teensy_ppb_restore_command(
+            "PPB_RESTORE_COMMIT",
+            {"rolling_sequence": rolling_sequence},
+            ("ppb_restore_committed",),
+        )
+        return {
+            "staged": True,
+            "rolling_sequence": rolling_sequence,
+            "second_count": len(second_history),
+            "minute_count": len(minute_history),
+            "chunks": chunks,
+            "chunk_size": chunk_size,
+            "waited_s": round(time.monotonic() - started, 3),
+            "teensy": commit_payload,
+            "replay_rows": int(replay.get("rows_scanned") or 0),
+            "verification_checks": int(
+                (replay.get("verification") or {}).get("checked") or 0
+            ),
+        }
+    except Exception:
+        _abort_teensy_ppb_restore_best_effort()
+        raise
+
+
+def _probe_teensy_recovery_epoch_ready() -> bool:
+    """Return explicit Teensy epoch custody; never guess cold/live on no report."""
+    last_status: Dict[str, Any] = {}
+    for _ in range(4):
+        status = _fetch_teensy_recovery_status()
+        if status:
+            last_status = status
+            if "recover_epoch_ready" in status:
+                return _recovery_bool(status.get("recover_epoch_ready"))
+        time.sleep(0.25)
+    raise RecoveryRetryableFailure(
+        "recovery_epoch_probe_unavailable",
+        {"report_recovery": last_status},
+    )
+
+
 def _canonical_restore_args(
     clocks: Dict[str, Any],
     *,
@@ -1801,7 +2479,7 @@ def _canonical_restore_args(
         raise ValueError("canonical CLOCKS restore missing control")
 
     out: Dict[str, Any] = {
-        "restore_schema_version": 2,
+        "restore_schema_version": 3,
         "restore_instrument_gnss_ns": instrument.get("gnss_ns"),
         "restore_instrument_dwt_cycles": instrument.get("dwt_cycles"),
         "restore_instrument_ocxo1_ns": instrument.get("ocxo1_ns"),
@@ -1811,7 +2489,7 @@ def _canonical_restore_args(
         "restore_stats_reset_count": stats.get("reset_count"),
         "restore_stats_update_count": stats.get("update_count"),
         # These counters are non-scientific diagnostics and are no longer
-        # serialized in CLOCKS_INSTRUMENT_STATS_V3.
+        # serialized in CLOCKS_INSTRUMENT_STATS_V4.
         "restore_stats_vclock_interval_reject_count": 0,
         "restore_stats_ocxo1_interval_reject_count": 0,
         "restore_stats_ocxo2_interval_reject_count": 0,
@@ -1905,11 +2583,30 @@ def _canonical_instrument_restore_ready(
         return False
     if not isinstance(stats, dict):
         return False
+    if stats.get("schema") != "CLOCKS_INSTRUMENT_STATS_V4":
+        return False
     if not bool(stats.get("snapshot_ok")) or not bool(stats.get("valid")):
         return False
     if not bool(stats.get("completed_row_coherent")):
         return False
     if _as_int(stats.get("last_pps_sequence")) != completed:
+        return False
+
+    update_count = _as_int(stats.get("update_count"))
+    current_sequence = _as_int(stats.get("rolling_ppb_current_sequence"))
+    if update_count is None or update_count < 0:
+        return False
+    if current_sequence is None or current_sequence < 0 or current_sequence > update_count:
+        return False
+    if "rolling_ppb_endpoint_admitted" not in stats:
+        return False
+    if "rolling_ppb_interval_advanced" not in stats:
+        return False
+    endpoint_admitted = bool(stats.get("rolling_ppb_endpoint_admitted"))
+    interval_advanced = bool(stats.get("rolling_ppb_interval_advanced"))
+    if interval_advanced and not endpoint_admitted:
+        return False
+    if endpoint_admitted and current_sequence != update_count:
         return False
     if _as_int(clockfaces.get("pps_sequence")) != completed:
         return False
@@ -2007,9 +2704,10 @@ def _read_latest_recoverable_clocks_state(
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT payload
+            SELECT id, payload
             FROM campaign_detail
             WHERE campaign_type = %s
+              AND NOT (payload @> '{"holistic_restore_superseded":true}'::jsonb)
             ORDER BY id DESC
             LIMIT %s
             """,
@@ -2018,7 +2716,7 @@ def _read_latest_recoverable_clocks_state(
         rows = cur.fetchall()
 
     for skipped, row in enumerate(rows):
-        state = row.get("payload") if isinstance(row, dict) else row[0]
+        state = row.get("payload") if isinstance(row, dict) else row[1]
         if isinstance(state, str):
             try:
                 state = json.loads(state)
@@ -2031,9 +2729,10 @@ def _read_latest_recoverable_clocks_state(
             continue
         if _clocks_gnss_raw_payload(state) is None:
             continue
-        return copy.deepcopy(state), int(skipped)
+        restored = copy.deepcopy(state)
+        restored["_db_detail_id"] = int(row.get("id") if isinstance(row, dict) else row[0])
+        return restored, int(skipped)
     return None, len(rows)
-
 
 def _seed_clocks_from_detail(detail: Dict[str, Any]) -> None:
     """Publish and cache the last durable CLOCKS state without persisting it again."""
@@ -2046,8 +2745,18 @@ def _seed_clocks_from_detail(detail: Dict[str, Any]) -> None:
     publish(CLOCKS_TOPIC, seeded)
 
 
-def _request_teensy_holistic_restore(clocks: Dict[str, Any]) -> Dict[str, Any]:
-    """Stage one complete firmware CLOCKS restore from canonical instrument state."""
+def _request_teensy_holistic_restore(
+    clocks: Dict[str, Any],
+    *,
+    allow_ppb_stage_required: bool = False,
+) -> Dict[str, Any]:
+    """Request one complete firmware CLOCKS restore from canonical instrument state.
+
+    With allow_ppb_stage_required=True this also acts as the lifecycle probe used
+    before SQL replay: an idle V3 firmware may truthfully answer that Better-
+    Buckets history must be staged first, while a live campaign still returns its
+    ordinary busy/live-custody verdict without Alpha being touched.
+    """
     deadline = time.monotonic() + HOLISTIC_RESTORE_COMMAND_RETRY_S
     restore_args = _canonical_restore_args(clocks, include_control=True)
     last_response: Any = None
@@ -2064,6 +2773,12 @@ def _request_teensy_holistic_restore(clocks: Dict[str, Any]) -> Dict[str, Any]:
         status = str(payload.get("status") or "") if isinstance(payload, dict) else ""
         if outer_success and status in _TEENSY_MONITOR_RESTORE_ACCEPTED_STATUSES:
             return response
+        if (
+            outer_success
+            and allow_ppb_stage_required
+            and status == "monitor_restore_requires_ppb_state"
+        ):
+            return response
         if outer_success and status == "monitor_restore_rejected_busy":
             campaign_state = str(payload.get("campaign_state") or "").strip().upper()
             if campaign_state == "STARTED":
@@ -2075,7 +2790,6 @@ def _request_teensy_holistic_restore(clocks: Dict[str, Any]) -> Dict[str, Any]:
             "Teensy CLOCKS holistic restore rejected: "
             f"status={status or 'missing_handler_status'} response={last_response!r}"
         )
-
 
 def _holistic_restore_probe(state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Project the canonical V4 sufficient state used to prove restore convergence."""
@@ -2241,9 +2955,15 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
     if not _canonical_instrument_restore_ready(clocks, include_control=True) or gnss_raw is None:
         raise RuntimeError("CLOCKS detail lacks valid canonical instrument/GNSS_RAW restore state")
 
-    _seed_clocks_from_detail(detail)
+    # First use RESTORE_MONITOR as a lifecycle probe. A Pi-only restart while a
+    # live campaign still owns the Teensy must not touch Alpha's healthy rolling
+    # history. An idle rebooted Teensy explicitly answers that Better-Buckets
+    # state is required, and only then does the Pi replay PostgreSQL history.
     requested_monotonic = time.monotonic()
-    teensy_response = _request_teensy_holistic_restore(clocks)
+    teensy_response = _request_teensy_holistic_restore(
+        clocks,
+        allow_ppb_stage_required=True,
+    )
     payload = teensy_response.get("payload") if isinstance(teensy_response, dict) else None
     payload = payload if isinstance(payload, dict) else {}
     status = str(payload.get("status") or "")
@@ -2256,8 +2976,62 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
             "proof": {"proved": True, "basis": "TEENSY_LIVE_CAMPAIGN_CUSTODY"},
         }
 
+    ppb_stage: Dict[str, Any]
+    if status == "monitor_restore_requires_ppb_state":
+        # The durable row remains the UI seed while the one-time cursor replay
+        # and bounded chunk transfer reconstruct Alpha's volatile rings.
+        _seed_clocks_from_detail(detail)
+        ppb_replay = _reconstruct_better_buckets_from_db(detail)
+        ppb_stage = _stage_teensy_better_buckets(ppb_replay)
+        logging.info(
+            "♻️ [holistic restore] Better-Buckets replay: rows=%d admitted=%d "
+            "second=%d minute=%d checks=%d stage_s=%s",
+            int(ppb_replay.get("rows_scanned") or 0),
+            int(ppb_replay.get("admitted_rows") or 0),
+            len(ppb_replay.get("second_history") or []),
+            len(ppb_replay.get("minute_history") or []),
+            int((ppb_replay.get("verification") or {}).get("checked") or 0),
+            ppb_stage.get("waited_s"),
+        )
+
+        requested_monotonic = time.monotonic()
+        try:
+            teensy_response = _request_teensy_holistic_restore(clocks)
+        except Exception:
+            _abort_teensy_ppb_restore_best_effort()
+            raise
+        payload = (
+            teensy_response.get("payload")
+            if isinstance(teensy_response, dict)
+            else None
+        )
+        payload = payload if isinstance(payload, dict) else {}
+        status = str(payload.get("status") or "")
+    else:
+        # update_count==0 needs no rolling history. An immediately accepted V3
+        # restore with a mature population can also mean a prior interrupted Pi
+        # attempt already committed the exact Alpha stage; do not replay it twice.
+        _seed_clocks_from_detail(detail)
+        stats_update_count = _as_int(_path_get(clocks, "stats.update_count")) or 0
+        ppb_stage = {
+            "staged": bool(stats_update_count > 0),
+            "reason": (
+                "already_committed_on_teensy"
+                if stats_update_count > 0
+                else "empty_statistics_epoch"
+            ),
+            "rolling_sequence": int(stats_update_count),
+        }
+
+    if status not in _TEENSY_MONITOR_RESTORE_ACCEPTED_STATUSES:
+        raise RuntimeError(
+            "Teensy CLOCKS holistic restore did not reach requested state: "
+            f"status={status or 'missing_handler_status'} payload={payload!r}"
+        )
+
     gnss_raw_result = _restore_gnss_raw_payload(gnss_raw)
     if not gnss_raw_result.get("restored"):
+        _abort_teensy_ppb_restore_best_effort()
         raise RuntimeError(f"GNSS_RAW restore failed: {gnss_raw_result}")
     proof = _wait_for_holistic_restore(
         detail,
@@ -2268,6 +3042,7 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
         "mode": "HOLISTIC_INSTRUMENT",
         "teensy": payload,
         "gnss_raw": gnss_raw_result,
+        "better_buckets": ppb_stage,
         "proof": proof,
     }
 
@@ -4539,10 +5314,11 @@ def _load_last_recoverable_tempest_detail(
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT payload
+            SELECT id, payload
             FROM campaign_detail
             WHERE campaign_type = %s
               AND campaign = %s
+              AND viable = true
               AND payload #> '{campaign,adjudication}' IS NOT NULL
             ORDER BY id DESC
             LIMIT %s
@@ -4571,6 +5347,7 @@ def _load_last_recoverable_tempest_detail(
 
         try:
             detail = _tempest_detail_from_state_snapshot(state)
+            detail["_db_detail_id"] = int(row["id"])
             snapshot = _recovery_timebase_snapshot(detail)
         except Exception as exc:
             if newest_error is None:
@@ -4604,16 +5381,6 @@ def _load_last_recoverable_tempest_detail(
         "recovery failed: no parseable unified TEMPEST state details "
         f"({newest_error or 'unknown error'})"
     )
-
-
-
-
-
-
-
-
-
-
 
 def _first_float(*values: Any) -> Optional[float]:
     for value in values:
@@ -5204,6 +5971,26 @@ def _validate_clocks_fragment_v4(
             "CLOCKS_FRAGMENT_V4 identity/coherence violation: "
             f"outer={sequence} completed={completed} clockface={clockface_sequence} "
             f"coherent={teensy_clocks.get('completed_row_coherent')!r}"
+        )
+
+    stats = teensy_clocks.get("stats")
+    if not isinstance(stats, dict) or stats.get("schema") != "CLOCKS_INSTRUMENT_STATS_V4":
+        raise ValueError("CLOCKS_FRAGMENT_V4 missing CLOCKS_INSTRUMENT_STATS_V4")
+    update_count = _as_int(stats.get("update_count"))
+    current_sequence = _as_int(stats.get("rolling_ppb_current_sequence"))
+    if update_count is None or update_count < 0:
+        raise ValueError("CLOCKS_FRAGMENT_V4 invalid stats.update_count")
+    if current_sequence is None or current_sequence < 0 or current_sequence > update_count:
+        raise ValueError("CLOCKS_FRAGMENT_V4 invalid rolling_ppb_current_sequence")
+    if "rolling_ppb_endpoint_admitted" not in stats or "rolling_ppb_interval_advanced" not in stats:
+        raise ValueError("CLOCKS_FRAGMENT_V4 missing Better-Buckets custody witnesses")
+    endpoint_admitted = bool(stats.get("rolling_ppb_endpoint_admitted"))
+    interval_advanced = bool(stats.get("rolling_ppb_interval_advanced"))
+    if interval_advanced and not endpoint_admitted:
+        raise ValueError("CLOCKS_FRAGMENT_V4 interval advanced on excluded endpoint")
+    if endpoint_admitted and current_sequence != update_count:
+        raise ValueError(
+            "CLOCKS_FRAGMENT_V4 admitted Better-Buckets endpoint does not own update_count"
         )
     return int(sequence), teensy_clocks
 
@@ -6032,6 +6819,7 @@ def _cleanup_after_recovery_failure(reason: str, details: Dict[str, Any]) -> Non
     _clear_flash_cut_wait_state()
     drained = _drain_timebase_ingress()
     _request_teensy_recover_abort_best_effort(reason, details)
+    _abort_teensy_ppb_restore_best_effort()
     _diag["last_recovery_abort"] = {
         **(_diag.get("last_recovery_abort") or {}),
         "pi_cleanup_reason": reason,
@@ -7043,16 +7831,16 @@ def _restore_active_campaign_state() -> Dict[str, Any]:
         last_gnss_ns = last_dwt_ns
 
     logging.info(
-        "📐 [recovery] LAST TIMEBASE:\n"
-        "    pps_vclock_count = %d\n"
-        "    gnss_ns    = %d\n"
-        "    dwt_cycles = %d\n"
-        "    dwt_ns_arg = %d\n"
-        "    ocxo1_ns   = %d\n"
-        "    ocxo2_ns   = %d\n"
-        "    gn_raw_ns  = %d\n"
-        "    gn_raw_ref = %d\n"
-        "    gn_raw_mean_ppb = %.6f\n"
+        "📐 [recovery] LAST TIMEBASE:\r\n"
+        "    pps_vclock_count = %d\r\n"
+        "    gnss_ns    = %d\r\n"
+        "    dwt_cycles = %d\r\n"
+        "    dwt_ns_arg = %d\r\n"
+        "    ocxo1_ns   = %d\r\n"
+        "    ocxo2_ns   = %d\r\n"
+        "    gn_raw_ns  = %d\r\n"
+        "    gn_raw_ref = %d\r\n"
+        "    gn_raw_mean_ppb = %.6f\r\n"
         "    gnss_time  = %s",
         last_pps_vclock_count, last_gnss_ns, last_dwt_cycles, last_dwt_ns,
         last_ocxo1_ns, last_ocxo2_ns, last_gnss_raw_ns, last_gnss_raw_ref_ns,
@@ -7147,9 +7935,9 @@ def _restore_active_campaign_state() -> Dict[str, Any]:
         )
 
     logging.info(
-        "📐 [recovery] GNSS ELAPSED:\n"
-        "    last_gnss_time    = %s\n"
-        "    current_gnss_time = %s\n"
+        "📐 [recovery] GNSS ELAPSED:\r\n"
+        "    last_gnss_time    = %s\r\n"
+        "    current_gnss_time = %s\r\n"
         "    elapsed_seconds   = %d",
         last_gnss_time_str, current_gnss_time_str, elapsed_seconds,
     )
@@ -7211,9 +7999,11 @@ def _restore_active_campaign_state() -> Dict[str, Any]:
         projected_ocxo2_ns,
     )
 
+    recovery_source_db_id = _as_int(last_tb.get("_db_detail_id"))
     _diag["last_recovery"] = {
         "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "campaign": campaign_name,
+        "recovery_source_db_id": recovery_source_db_id,
         "last_pps_vclock_count": int(last_pps_vclock_count),
         "last_gnss_time": last_gnss_time_str,
         "current_gnss_time": current_gnss_time_str,
@@ -7259,20 +8049,44 @@ def _restore_active_campaign_state() -> Dict[str, Any]:
         "ocxo2_ns": str(int(projected_ocxo2_ns)),
     }
 
-    teensy_recover_args.update(
-        _canonical_restore_args(canonical_recovery_clocks, include_control=False)
+    epoch_ready_before_recover = _probe_teensy_recovery_epoch_ready()
+    _diag["last_recovery"]["teensy_epoch_ready_before_recover"] = bool(
+        epoch_ready_before_recover
     )
-    _diag["last_recovery"]["canonical_restore_present"] = True
-    _diag["last_recovery"]["restore_schema_version"] = 2
-    logging.info(
-        "📊 [recovery] restoring Teensy statistics directly from canonical "
-        "CLOCKS clocks.stats; live DAC/servo state remains untouched"
-    )
+    cold_ppb_stage: Optional[Dict[str, Any]] = None
+    if epoch_ready_before_recover:
+        _diag["last_recovery"]["canonical_restore_present"] = False
+        _diag["last_recovery"]["restore_schema_version"] = None
+        logging.info(
+            "📊 [recovery] live Alpha epoch confirmed; preserving Better Buckets "
+            "and all global instrument statistics during LIVE_REATTACH"
+        )
+    else:
+        cold_ppb_replay = _reconstruct_better_buckets_from_db(last_tb)
+        cold_ppb_stage = _stage_teensy_better_buckets(cold_ppb_replay)
+        teensy_recover_args.update(
+            _canonical_restore_args(canonical_recovery_clocks, include_control=False)
+        )
+        _diag["last_recovery"]["canonical_restore_present"] = True
+        _diag["last_recovery"]["restore_schema_version"] = 3
+        _diag["last_recovery"]["better_buckets_restore"] = cold_ppb_stage
+        logging.info(
+            "📊 [recovery] cold Alpha epoch detected; staged Better Buckets "
+            "rows=%d second=%d minute=%d before structured RECOVER",
+            int(cold_ppb_replay.get("rows_scanned") or 0),
+            len(cold_ppb_replay.get("second_history") or []),
+            len(cold_ppb_replay.get("minute_history") or []),
+        )
 
-    teensy_recover_resp = _request_teensy_recover(
-        int(recover_base_pps_vclock_count),
-        teensy_recover_args,
-    )
+    try:
+        teensy_recover_resp = _request_teensy_recover(
+            int(recover_base_pps_vclock_count),
+            teensy_recover_args,
+        )
+    except Exception:
+        if cold_ppb_stage is not None:
+            _abort_teensy_ppb_restore_best_effort()
+        raise
     teensy_recover_payload = (
         teensy_recover_resp.get("payload", {})
         if isinstance(teensy_recover_resp, dict)
@@ -7452,6 +8266,29 @@ def _restore_active_campaign_state() -> Dict[str, Any]:
         _sync_resume_event.set()
         time.sleep(0.05)
         _begin_sync_wait(expected_pps=int(teensy_pps_vclock_count) + 1)
+
+    cold_bootstrap_supersede: Optional[Dict[str, Any]] = None
+    if cold_bootstrap:
+        if recovery_source_db_id is None or recovery_source_db_id <= 0:
+            raise RecoveryRetryableFailure(
+                "cold_bootstrap_missing_recovery_source_db_id",
+                {"campaign": campaign_name, "last_timebase": last_tb},
+            )
+        cold_bootstrap_supersede = _supersede_cold_bootstrap_rows(
+            base_detail_id=int(recovery_source_db_id),
+            campaign_name=campaign_name,
+            first_public_count=int(teensy_pps_vclock_count),
+        )
+        _diag["last_recovery"]["cold_bootstrap_supersede"] = (
+            cold_bootstrap_supersede
+        )
+        logging.info(
+            "🧹 [recovery] cold-bootstrap evidence boundary: kept source id=%d, "
+            "recovered id=%d, marked %d intervening row(s) non-viable",
+            int(cold_bootstrap_supersede["base_detail_id"]),
+            int(cold_bootstrap_supersede["recovered_detail_id"]),
+            int(cold_bootstrap_supersede["rows_marked_nonviable"]),
+        )
 
     # The processor is paused on this exact row. Restore Pi-owned state to
     # the identity immediately before it, then reopen campaign processing so

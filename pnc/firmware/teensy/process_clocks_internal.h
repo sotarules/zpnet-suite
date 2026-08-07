@@ -1901,6 +1901,14 @@ struct clocks_instrument_stats_snapshot_t {
   uint32_t update_count = 0;
   uint32_t last_pps_sequence = 0;
 
+  // Better Buckets uses update_count as its reboot-stable logical chronology.
+  // current_sequence is the most recent admitted endpoint currently driving the
+  // rolling windows; endpoint_admitted is Alpha's exact same-row admission
+  // verdict.  Together they bound SQL replay without carrying the rings at 1 Hz.
+  uint32_t rolling_ppb_current_sequence = 0;
+  bool     rolling_ppb_endpoint_admitted = false;
+  bool     rolling_ppb_interval_advanced = false;
+
   // All clock values below are captured atomically from the same completed
   // Alpha row.  They never mix the next PPS with prior OCXO completions.
   bool     completed_row_coherent = false;
@@ -1945,6 +1953,42 @@ struct clocks_instrument_stats_snapshot_t {
   welford_t ocxo1_dac_welford{};
   welford_t ocxo2_dac_welford{};
 };
+
+// Compact Better-Buckets state reconstructed by Pi CLOCKS from durable rows.
+// These are recovery/control-plane types only; ordinary CLOCKS_FRAGMENT does not
+// carry the rings. Endpoint rolling_sequence values are stats.update_count
+// identities from their source rows.
+struct clocks_alpha_ppb_cumulative_endpoint_snapshot_t {
+  uint64_t reference_ns = 0ULL;
+  double   dwt_error_cycles = 0.0;
+  int64_t  ocxo1_error_ns = 0LL;
+  int64_t  ocxo2_error_ns = 0LL;
+  uint32_t rolling_sequence = 0;
+  uint32_t interval_count = 0U;
+};
+
+struct clocks_alpha_ppb_restore_snapshot_t {
+  // Must equal the canonical stats.update_count being restored.
+  uint32_t rolling_sequence = 0U;
+  uint32_t expected_second_count = 0U;
+  uint32_t expected_minute_count = 0U;
+  uint32_t last_minute_key = 0U;
+  bool origin_valid = false;
+  clocks_alpha_ppb_cumulative_endpoint_snapshot_t current{};
+  clocks_alpha_ppb_cumulative_endpoint_snapshot_t origin{};
+};
+
+uint32_t clocks_alpha_ppb_second_capacity(void);
+uint32_t clocks_alpha_ppb_minute_capacity(void);
+bool clocks_alpha_ppb_restore_begin(
+    const clocks_alpha_ppb_restore_snapshot_t* state);
+bool clocks_alpha_ppb_restore_append_second(
+    const clocks_alpha_ppb_cumulative_endpoint_snapshot_t* endpoint);
+bool clocks_alpha_ppb_restore_append_minute(
+    const clocks_alpha_ppb_cumulative_endpoint_snapshot_t* endpoint);
+bool clocks_alpha_ppb_restore_commit(uint32_t rolling_sequence);
+void clocks_alpha_ppb_restore_abort(void);
+bool clocks_alpha_ppb_restore_ready(uint32_t rolling_sequence);
 
 bool clocks_alpha_instrument_stats_snapshot(
     clocks_instrument_stats_snapshot_t* out);
