@@ -4,8 +4,8 @@ ZPNet Metrics Readout Blocks — Generalized Campaign Detail Edition
 Data source:
   The CLOCKS_V4 heartbeat owns the live operator view.  ``clocks`` is the
   canonical always-on instrument; optional top-level ``campaign`` is TEMPEST
-  enrichment; baseline and platform context remain top-level CLOCKS surfaces.
-  Metrics never waits for or reads TIMEBASE.
+  enrichment. Baselines are campaign_master relationships resolved on demand;
+  they are not CLOCKS state. Metrics never waits for or reads TIMEBASE.
 
 Stats policy (Pi is a stenographer):
   Every statistical quantity shown in this panel is read verbatim from the
@@ -14,7 +14,7 @@ Stats policy (Pi is a stenographer):
   Alpha-owned always-on Welford population, never campaign PPS count.
   No Pi-side means, stddevs, stderrs, PPB windows, or campaign frequencies are
   computed here.  The only Pi-side arithmetic is deterministic presentation
-  conversion: DAC code → voltage and baseline delta (NOW - BASE).
+  conversion: DAC code → voltage and campaign baseline delta (NOW - BASE).
 
 Clock row doctrine:
   The dense operator table shows GNSS, VCLOCK, OCXO1, and OCXO2 only.
@@ -25,10 +25,10 @@ Clock row doctrine:
   10-MIN/60-MIN/8-HOUR/24-HOUR are firmware/Pi-producer-authored rolling PPB
   buckets.  Metrics never estimates a rolling population from repaint history.
   TOTAL is the always-on population since boot or the last statistics reset.
-  TOTAL owns the displayed Welford population, baseline NOW value, and the
-  legacy stats.<lane>.ppb fallback while producers migrate to ppb_buckets.
-  CAMP is the firmware-authored campaign population.  It is --- outside an
-  active campaign and is never reconstructed by the metrics process.
+  TOTAL owns the displayed Welford population and the legacy stats.<lane>.ppb
+  fallback while producers migrate to ppb_buckets.
+  CAMP is the firmware-authored campaign population. BASE/NOW/DELTA compare
+  the referenced campaign CAMP result to the active campaign CAMP result.
   RES is the firmware-published residual for the prior PPS interval.
 
 Column layout (CLK rows):
@@ -137,7 +137,6 @@ def _get_pi_clocks_report() -> dict:
     report["campaign_type"] = "TEMPEST" if campaign.get("schema") == "TEMPEST_FRAGMENT_V1" else None
     report["campaign_elapsed"] = _seconds_to_hms(public_count) if public_count is not None else "00:00:00"
     report["instrument_elapsed"] = _seconds_to_hms(_to_int(clocks.get("instrument_age_seconds")) or 0)
-    report["baseline"] = root.get("baseline") if isinstance(root.get("baseline"), dict) else None
     report["published_at_utc"] = root.get("published_at_utc")
     return report
 
@@ -146,12 +145,20 @@ def _get_pi_clocks_report_dac() -> dict:
     return {}
 
 def _get_clocks_baseline() -> dict | None:
-    """Return the top-level CLOCKS_V4 baseline read model."""
-    root = _monitor_root()
-    baseline = root.get("baseline")
-    if not isinstance(baseline, dict) or not baseline.get("baseline_set"):
+    """Return the active campaign's referenced baseline campaign read model."""
+    resp = send_command(
+        machine="PI",
+        subsystem="CLOCKS",
+        command="BASELINE_INFO",
+        retries=1,
+        retry_delay_s=0.0,
+    )
+    if not isinstance(resp, dict) or not resp.get("success"):
         return None
-    return baseline
+    payload = resp.get("payload")
+    if not isinstance(payload, dict) or not payload.get("baseline_set"):
+        return None
+    return payload
 
 def _seconds_to_hms(seconds) -> str:
     value = _to_int(seconds)
@@ -857,11 +864,12 @@ def _dac_detail_lines(r: dict, baseline: dict | None, report_dac: dict | None) -
         dac_voltage = _dac_current_voltage(r, report_dac, key)
         dither_summary = _dac_report_dither_summary(r, report_dac, key, dac_now)
 
-        base_dac = None
-        if baseline:
-            base_dac = baseline.get("baseline_dac", {}).get(key)
-            if base_dac is None:
-                base_dac = baseline.get("baseline_dac_mean", {}).get(key)
+        baseline_report = (
+            baseline.get("baseline_report")
+            if isinstance(baseline, dict)
+            else None
+        )
+        base_dac = _campaign_dac_from_master_report(baseline_report, key)
 
         mean = _to_float(_welford_value(r, f"{key}_dac", "mean"))
         sd = _to_float(_welford_value(r, f"{key}_dac", "stddev"))
@@ -1361,6 +1369,20 @@ def _campaign_ppb(r: dict, lane: str):
         return _to_float(_path_get(adjudication, "extra_clocks.gnss_raw_ppb", None))
     return _to_float(_path_get(campaign, f"stats.ppb.{lane}", None))
 
+
+def _campaign_ppb_from_master_report(master_report: dict, lane: str):
+    """Read one CAMP PPB value from campaign_master.payload.report."""
+    if not isinstance(master_report, dict):
+        return None
+    if lane == "gnss_raw":
+        return _to_float(_path_get(master_report, "extra_clocks.gnss_raw_ppb", None))
+    return _to_float(_path_get(master_report, f"fragment.stats.ppb.{lane}", None))
+
+
+def _campaign_dac_from_master_report(master_report: dict, lane: str):
+    """Read the latest DAC target carried by a campaign master report."""
+    return _to_float(_path_get(master_report, f"clocks.control.{lane}.target_code", None))
+
 def _monitor_count(r: dict) -> int:
     value = _to_int(_field(r, "stats.ocxo1.welford.n", default=None))
     if value is not None:
@@ -1399,12 +1421,15 @@ def clocks_combined_readout() -> list[str]:
     servo_state = str(report_dac.get("servo") or _servo_state(r)).upper() if isinstance(report_dac, dict) else _servo_state(r)
 
     baseline = _get_clocks_baseline()
-    baseline_ppb = baseline.get("baseline_ppb", {}) if baseline else {}
-    baseline_id = baseline.get("baseline_id", "?") if baseline else None
-    baseline_campaign = baseline.get("baseline_campaign", "?") if baseline else None
+    baseline_report = (
+        baseline.get("baseline_report")
+        if isinstance(baseline, dict)
+        else None
+    )
+    baseline_campaign = baseline.get("baseline_campaign") if baseline else None
 
     servo_str = servo_state
-    baseline_str = f"BASELINE: {baseline_campaign}" if baseline_id else "BASELINE: NONE"
+    baseline_str = f"BASELINE: {baseline_campaign}" if baseline_campaign else "BASELINE: NONE"
 
     if state == "STARTED" or r.get("campaign_present"):
         identity = f"CAMPAIGN: {campaign}  ELAPSED: {elapsed}  n={n}"
@@ -1449,24 +1474,34 @@ def clocks_combined_readout() -> list[str]:
 
     # ── GNSS (reference nanosecond clock) ──
     gnss_ns = _clockface_value(r, "gnss")
-    gnss_total_ppb = _ppb_bucket(r, "gnss", "total")
+    gnss_campaign_ppb = _campaign_ppb(r, "gnss")
     gnss_res = _to_int(_field(r, "gnss.second_residual_ns", "gnss_residual_ns")) or 0
+    gnss_baseline_comp = _baseline_comp(
+        _campaign_ppb_from_master_report(baseline_report, "gnss"),
+        gnss_campaign_ppb,
+        W_BASE,
+    )
     lines.append(
         f"{'GNSS':<{W_NAME}}"
         f"{_comma_int(gnss_ns, W_VALUE)}"
         f"{_ppb_cols_fragment(r, 'gnss', W_PPB_BUCKET)}"
         f"{_sign_int(gnss_res, W_RES)}"
         f"{_welford_cols_fragment(r, 'gnss', W_MEAN, W_SD, W_SE, W_N)}"
-        f" {_baseline_comp(baseline_ppb.get('gnss'), gnss_total_ppb, W_BASE)}"
+        f" {gnss_baseline_comp}"
     )
 
     # ── VCLOCK (GNSS-disciplined nanosecond clock) ──
     vclock_ns  = _clockface_value(r, "vclock")
-    vclock_total_ppb = _ppb_bucket(r, "vclock", "total")
+    vclock_campaign_ppb = _campaign_ppb(r, "vclock")
     vclock_res = _vclock_residual_ns(r)
 
     if vclock_res is None:
         vclock_res = 0
+    vclock_baseline_comp = _baseline_comp(
+        _campaign_ppb_from_master_report(baseline_report, "vclock"),
+        vclock_campaign_ppb,
+        W_BASE,
+    )
 
     lines.append(
         f"{'VCLOCK':<{W_NAME}}"
@@ -1474,21 +1509,26 @@ def clocks_combined_readout() -> list[str]:
         f"{_ppb_cols_fragment(r, 'vclock', W_PPB_BUCKET)}"
         f"{_sign_int(vclock_res, W_RES)}"
         f"{_welford_cols_fragment_or_zero(r, 'vclock', W_MEAN, W_SD, W_SE, W_N)}"
-        f" {_baseline_comp(baseline_ppb.get('vclock'), vclock_total_ppb, W_BASE)}"
+        f" {vclock_baseline_comp}"
     )
 
     # ── OCXO1, OCXO2 (nanosecond clocks) ──
     for name, key in [("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
         ocxo_ns = _clockface_value(r, key)
-        total_ppb = _ppb_bucket(r, key, "total")
+        campaign_ppb = _campaign_ppb(r, key)
         res          = _ocxo_residual_ns(r, key)
+        campaign_baseline_comp = _baseline_comp(
+            _campaign_ppb_from_master_report(baseline_report, key),
+            campaign_ppb,
+            W_BASE,
+        )
         lines.append(
             f"{name:<{W_NAME}}"
             f"{_comma_int(ocxo_ns, W_VALUE)}"
             f"{_ppb_cols_fragment(r, key, W_PPB_BUCKET)}"
             f"{_sign_int(res, W_RES)}"
             f"{_welford_cols_fragment(r, key, W_MEAN, W_SD, W_SE, W_N)}"
-            f" {_baseline_comp(baseline_ppb.get(key), total_ppb, W_BASE)}"
+            f" {campaign_baseline_comp}"
         )
 
     # GN_RAW and DWT remain available in CLOCKS and focused reports, but are

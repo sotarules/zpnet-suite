@@ -54,13 +54,24 @@ def get_pi_clocks_report() -> dict:
     report["campaign_type"] = "TEMPEST" if campaign.get("schema") == "TEMPEST_FRAGMENT_V1" else None
     report["campaign_elapsed"] = _seconds_to_hms(public_count) if public_count is not None else "00:00:00"
     report["instrument_elapsed"] = _seconds_to_hms(_to_int(clocks.get("instrument_age_seconds")) or 0)
-    report["baseline"] = root.get("baseline") if isinstance(root.get("baseline"), dict) else None
     report["published_at_utc"] = root.get("published_at_utc")
     return report
 
 def _get_clocks_baseline() -> dict | None:
-    baseline = _dict(_monitor_root().get("baseline"))
-    return baseline if baseline.get("baseline_set") else None
+    """Return the active campaign's referenced baseline campaign read model."""
+    resp = send_command(
+        machine="PI",
+        subsystem="CLOCKS",
+        command="BASELINE_INFO",
+        retries=1,
+        retry_delay_s=0.0,
+    )
+    if not isinstance(resp, dict) or not resp.get("success"):
+        return None
+    payload = resp.get("payload")
+    if not isinstance(payload, dict) or not payload.get("baseline_set"):
+        return None
+    return payload
 
 def _dict(value) -> dict:
     return value if isinstance(value, dict) else {}
@@ -222,6 +233,15 @@ def _campaign_ppb(report: dict, lane: str):
         return _to_float(_path_get(adjudication, "extra_clocks.gnss_raw_ppb", None))
     return _to_float(_path_get(campaign, f"stats.ppb.{lane}", None))
 
+
+def _campaign_ppb_from_master_report(master_report: dict, lane: str):
+    """Read one CAMP PPB value from campaign_master.payload.report."""
+    if not isinstance(master_report, dict):
+        return None
+    if lane == "gnss_raw":
+        return _to_float(_path_get(master_report, "extra_clocks.gnss_raw_ppb", None))
+    return _to_float(_path_get(master_report, f"fragment.stats.ppb.{lane}", None))
+
 def _welford(report: dict, lane: str, field: str):
     if lane == "gnss_raw":
         return _extra(report, f"gnss_raw_welford_{field}")
@@ -351,15 +371,17 @@ def clocks_comparison_readout() -> Generator[str, None, None]:
     baseline = _get_clocks_baseline()
     if not baseline:
         yield "NO BASELINE SET"
-        yield "USE: .pc clocks set_baseline id=<N>"
+        yield "USE: .pc clocks set_baseline campaign=<NAME>"
         return
-    yield f"BASELINE: {baseline.get('baseline_campaign', '?')} (#{baseline.get('baseline_id', '?')})"
+
+    baseline_report = _dict(baseline.get("baseline_report"))
+    yield f"BASELINE: {baseline.get('baseline_campaign', '?')}"
+    yield f"CAMPAIGN: {report.get('campaign') or '?'}"
     yield f"{'CLK':<7}{'BASE':>10}{'NOW':>10}{'DELTA':>10}"
-    baseline_ppb = _dict(baseline.get("baseline_ppb"))
     for label, lane in (("GNSS", "gnss"), ("VCLK", "vclock"), ("OCXO1", "ocxo1"),
                         ("OCXO2", "ocxo2"), ("GN_RAW", "gnss_raw"), ("DWT", "dwt")):
-        _, now = _frequency(report, lane)
-        base = _to_float(baseline_ppb.get(lane))
+        base = _campaign_ppb_from_master_report(baseline_report, lane)
+        now = _campaign_ppb(report, lane)
         delta = None if base is None or now is None else now - base
         yield f"{label:<7}{_num(base):>10}{_num(now):>10}{_num(delta, 3, True):>10}"
 

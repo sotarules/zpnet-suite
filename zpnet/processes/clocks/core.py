@@ -170,7 +170,6 @@ CLOCKS_STATE_RETRY_S = 0.25
 TIMEBASE_FRAGMENT_TOPIC = "CLOCKS_FRAGMENT.campaign"
 CLOCKS_FRAGMENT_TOPIC = "CLOCKS_FRAGMENT"
 CLOCKS_TOPIC = "CLOCKS"
-CLOCKS_BASELINE_REFRESH_S = 30.0
 CLOCKS_PREFLIGHT_MAX_AGE_S = 5.0
 CLOCKS_RECOVERY_STALLED_TOPIC = "CLOCKS_RECOVERY_STALLED"
 TIMEBASE_CANDIDATE_ACCEPT = "ACCEPT"
@@ -481,8 +480,6 @@ _diag: Dict[str, Any] = {
     "gnss_raw_stats_sample_count": 0,
     "gnss_raw_stats_missing_count": 0,
     "last_gnss_raw_stats_sample": {},
-    "clocks_baseline_refresh_count": 0,
-    "clocks_baseline_refresh_failures": 0,
     "stats_reset_requests": 0,
     "stats_reset_success": 0,
     "stats_reset_teensy_failures": 0,
@@ -792,11 +789,6 @@ _gnss_raw_valid: bool = False
 _gnss_raw_instrument_ns: float = 0.0
 _gnss_raw_instrument_n: int = 0
 _gnss_raw_instrument_valid: bool = False
-
-# Cached baseline decoration for canonical CLOCKS. Refreshing this slow-changing
-# DB state is bounded and never occurs in a display repaint path.
-_clocks_baseline_cache: Dict[str, Any] = {}
-_clocks_baseline_refreshed_monotonic: Optional[float] = None
 
 # GNSS_RAW statistics are Pi-owned and always-on. Campaign lifecycle may
 # rebase the synthetic clockface, but it never resets this population.
@@ -3331,8 +3323,8 @@ def _attach_tempest_to_state_detail(detail: Dict[str, Any]) -> None:
     campaign = str(detail["campaign"])
     adjudication = _tempest_adjudication(detail)
 
-    # campaign_master is an intentional read model and may retain the complete
-    # accepted TIMEBASE report for list/baseline presentation.
+    # campaign_master is an intentional read model and retains the latest accepted
+    # campaign report. Baseline comparisons reference another master row by ID.
     report = dict(detail)
     report["campaign_type"] = CAMPAIGN_TYPE_TEMPEST
     report["campaign_state"] = "STARTED"
@@ -3700,30 +3692,8 @@ def _gnss_raw_welford_snapshot() -> Dict[str, Any]:
 
 
 
-def _clocks_baseline_set_cache(value: Optional[Dict[str, Any]]) -> None:
-    global _clocks_baseline_cache
-    global _clocks_baseline_refreshed_monotonic
-    _clocks_baseline_cache = dict(value or {})
-    _clocks_baseline_refreshed_monotonic = time.monotonic()
 
 
-def _clocks_baseline_snapshot(*, force: bool = False) -> Dict[str, Any]:
-    """Return bounded-refresh baseline state for the ephemeral monitor feed."""
-    now = time.monotonic()
-    due = (
-        force
-        or _clocks_baseline_refreshed_monotonic is None
-        or now - _clocks_baseline_refreshed_monotonic
-            >= CLOCKS_BASELINE_REFRESH_S
-    )
-    if due:
-        try:
-            _clocks_baseline_set_cache(_get_baseline_from_config())
-            _diag["clocks_baseline_refresh_count"] += 1
-        except Exception:
-            _diag["clocks_baseline_refresh_failures"] += 1
-            logging.debug("CLOCKS baseline refresh failed", exc_info=True)
-    return dict(_clocks_baseline_cache)
 
 
 def _gnss_raw_state_snapshot() -> Dict[str, Any]:
@@ -5513,129 +5483,22 @@ def _first_float(*values: Any) -> Optional[float]:
     return None
 
 
-def _rounded(value: Optional[float], digits: int) -> Optional[float]:
-    return None if value is None else round(float(value), digits)
 
 
-def _gnss_raw_baseline_ppb_from_report(report: Dict[str, Any]) -> Optional[float]:
-    """Return the baseline PPB value for the Pi-owned GNSS_RAW pseudo-clock.
-
-    GNSS_RAW's accumulated tau/ppb can be invalid in older baseline rows when
-    the synthetic ledger and reference ledger were restored with different
-    cardinalities.  The Welford mean is the stable baseline statistic for the
-    receiver-reported drift stream, and it is what the metrics panel already
-    exposes as GN_RAW MEAN.
-    """
-    extra = _report_extra_clocks(report)
-    return _first_float(
-        extra.get("gnss_raw_welford_mean"),
-        report.get("gnss_raw_welford_mean"),
-        extra.get("gnss_raw_drift_ppb"),
-        report.get("gnss_raw_drift_ppb"),
-        extra.get("gnss_raw_ppb"),
-        report.get("gnss_raw_ppb"),
-    )
 
 
-def _tau_from_ppb(ppb: Optional[float]) -> Optional[float]:
-    if ppb is None:
-        return None
-    return 1.0 + float(ppb) / 1.0e9
 
 
-def _firmware_total_ppb(
-    fragment: Dict[str, Any],
-    report: Dict[str, Any],
-    lane: str,
-) -> Optional[float]:
-    """Return canonical always-on firmware TOTAL PPB for one lane."""
-    return _first_float(
-        _path_get(report, f"clocks.stats.{lane}.ppb_buckets.total"),
-        _path_get(report, f"clocks.stats.{lane}.ppb"),
-        _path_get(fragment, f"stats.{lane}.ppb_buckets.total"),
-    )
 
 
-def _baseline_ppb_from_report(report: Dict[str, Any]) -> Dict[str, float]:
-    """Extract explicit TOTAL PPB values from a TIMEBASE-shaped report."""
-    frag = _report_fragment(report)
-
-    candidates = {
-        "gnss": 0.0,
-        "vclock": _firmware_total_ppb(frag, report, "vclock"),
-        "gnss_raw": _gnss_raw_baseline_ppb_from_report(report),
-        "dwt": _firmware_total_ppb(frag, report, "dwt"),
-        "ocxo1": _firmware_total_ppb(frag, report, "ocxo1"),
-        "ocxo2": _firmware_total_ppb(frag, report, "ocxo2"),
-    }
-
-    return {k: round(v, 3) for k, v in candidates.items() if v is not None}
 
 
-def _baseline_tau_from_report(report: Dict[str, Any]) -> Dict[str, float]:
-    """Extract tau values derived from the same explicit TOTAL population."""
-    frag = _report_fragment(report)
-    extra = _report_extra_clocks(report)
-    gnss_raw_ppb = _gnss_raw_baseline_ppb_from_report(report)
-
-    candidates = {
-        "gnss": 1.0,
-        "vclock": _tau_from_ppb(_firmware_total_ppb(frag, report, "vclock")),
-        "gnss_raw": _first_float(extra.get("gnss_raw_tau"), report.get("gnss_raw_tau")),
-        "dwt": _tau_from_ppb(_firmware_total_ppb(frag, report, "dwt")),
-        "ocxo1": _tau_from_ppb(_firmware_total_ppb(frag, report, "ocxo1")),
-        "ocxo2": _tau_from_ppb(_firmware_total_ppb(frag, report, "ocxo2")),
-    }
-    candidates["gnss_raw"] = _tau_from_ppb(gnss_raw_ppb) or candidates.get("gnss_raw")
-
-    return {k: round(v, 12) for k, v in candidates.items() if v is not None}
 
 
-def _baseline_dac_from_report(report: Dict[str, Any]) -> Dict[str, float]:
-    """Extract canonical instantaneous DAC targets from TIMEBASE_V4.clocks.control."""
-    out: Dict[str, float] = {}
-    for key in ("ocxo1", "ocxo2"):
-        value = _first_float(_path_get(report, f"clocks.control.{key}.target_code"))
-        if value is not None:
-            out[key] = round(value, 6)
-    return out
 
 
-def _baseline_dac_mean_from_report(report: Dict[str, Any]) -> Dict[str, float]:
-    """Extract canonical DAC Welford means, falling back to live target code."""
-    current = _baseline_dac_from_report(report)
-    out: Dict[str, float] = {}
-    for key in ("ocxo1", "ocxo2"):
-        current_v = current.get(key)
-        value = _first_float(
-            _path_get(report, f"clocks.stats.auxiliary_welford.{key}_dac.mean"),
-            current_v,
-        )
-        if value == 0.0 and current_v is not None and current_v > 0.0:
-            value = current_v
-        if value is not None:
-            out[key] = round(value, 6)
-    return out
 
 
-def _baseline_dac_stats_from_report(report: Dict[str, Any]) -> Dict[str, Dict[str, float | int]]:
-    """Extract canonical DAC Welford blocks for baseline audit/display."""
-    out: Dict[str, Dict[str, float | int]] = {}
-    for key in ("ocxo1", "ocxo2"):
-        wf = _path_get(report, f"clocks.stats.auxiliary_welford.{key}_dac")
-        if not isinstance(wf, dict):
-            continue
-        stats: Dict[str, float | int] = {}
-        n = _as_int(wf.get("n"))
-        if n is not None:
-            stats["n"] = int(n)
-        for field in ("mean", "stddev", "stderr", "min", "max"):
-            value = _first_float(wf.get(field))
-            if value is not None:
-                stats[field] = round(value, 6)
-        if stats:
-            out[key] = stats
-    return out
 
 
 def _normalize_start_args(args: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -6062,16 +5925,9 @@ def _advance_gnss_raw_instrument(
 def _pi_clocks_state_snapshot() -> Dict[str, Any]:
     """Return Pi-owned CLOCKS enrichment without mirroring Teensy instrument state."""
     gnss_raw = _gnss_raw_state_snapshot()
-    baseline = _clocks_baseline_snapshot()
-    baseline_payload = (
-        {"baseline_set": True, **baseline}
-        if baseline
-        else {"baseline_set": False}
-    )
     return {
         "schema": "PI_CLOCKS_STATE_V4",
         "gnss_raw": gnss_raw,
-        "baseline": baseline_payload,
         "stats_reset": {
             "requests": int(_diag.get("stats_reset_requests") or 0),
             "success": int(_diag.get("stats_reset_success") or 0),
@@ -6186,7 +6042,6 @@ def _build_canonical_clocks_state(
         "battery": copy.deepcopy(system_context.get("battery") or {}),
         "clocks": clocks,
         "features": features,
-        "baseline": copy.deepcopy(pi_clocks.get("baseline") or {}),
         "stats_reset": copy.deepcopy(pi_clocks.get("stats_reset") or {}),
         "startup": copy.deepcopy(pi_clocks.get("startup") or {}),
         "complete_for_display": bool(teensy_clocks and pi_clocks.get("gnss_raw")),
@@ -8695,135 +8550,208 @@ def _restore_active_campaign_state() -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------
-# BASELINE — persist and retrieve baseline campaign for comparison
+# BASELINE — campaign-to-campaign relationship
 # ---------------------------------------------------------------------
 
 
-def _get_baseline_from_config() -> Optional[Dict[str, Any]]:
-    try:
-        with open_db(row_dict=True) as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT payload FROM config WHERE config_key = 'SYSTEM'")
-            row = cur.fetchone()
-            if row and row["payload"].get("baseline_id") is not None:
-                payload = row["payload"]
-                return {
-                    "baseline_id": payload["baseline_id"],
-                    "baseline_ppb": payload.get("baseline_ppb", {}),
-                    "baseline_tau": payload.get("baseline_tau", {}),
-                    "baseline_dac": payload.get("baseline_dac", {}),
-                    "baseline_dac_mean": payload.get("baseline_dac_mean", {}),
-                    "baseline_dac_stats": payload.get("baseline_dac_stats", {}),
-                    "baseline_campaign": payload.get("baseline_campaign"),
-                    "baseline_pps_vclock_n": payload.get("baseline_pps_vclock_n"),
-                    "baseline_pps_n": payload.get("baseline_pps_n"),
-                }
-    except Exception:
-        logging.exception("⚠️ [clocks] failed to read baseline from config")
-    return None
-
-
-def cmd_set_baseline(args: Optional[dict]) -> Dict[str, Any]:
-    if not args:
-        return {"success": False, "message": "SET_BASELINE requires 'id' or 'campaign' argument"}
-
-    baseline_id = args.get("id")
-    campaign_name = args.get("campaign")
-
-    if baseline_id is None and campaign_name is None:
-        return {"success": False, "message": "SET_BASELINE requires 'id' or 'campaign' argument"}
-
+def _baseline_relation_for_active_campaign() -> Optional[Dict[str, Any]]:
+    """Return the active campaign and its referenced baseline campaign, if any."""
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
-        if baseline_id is not None:
-            try:
-                baseline_id = int(baseline_id)
-            except (ValueError, TypeError):
-                return {"success": False, "message": f"Invalid baseline id: {args['id']}"}
-            cur.execute(
-                """
-                SELECT id, campaign, payload
-                FROM campaign_master
-                WHERE campaign_type = %s AND id = %s
-                """,
-                (CAMPAIGN_TYPE_TEMPEST, baseline_id),
-            )
-        else:
-            cur.execute(
-                """
-                SELECT id, campaign, payload
-                FROM campaign_master
-                WHERE campaign_type = %s AND campaign = %s
-                ORDER BY ts DESC
-                LIMIT 1
-                """,
-                (CAMPAIGN_TYPE_TEMPEST, campaign_name),
-            )
+        cur.execute(
+            """
+            SELECT
+                current.campaign AS campaign,
+                baseline.campaign AS baseline_campaign,
+                baseline.payload AS baseline_payload
+            FROM campaign_master AS current
+            JOIN campaign_master AS baseline
+              ON baseline.id = (current.payload ->> 'baseline_campaign_id')::bigint
+             AND baseline.campaign_type = current.campaign_type
+            WHERE current.campaign_type = %s
+              AND current.active = true
+            ORDER BY current.ts DESC, current.id DESC
+            LIMIT 1
+            """,
+            (CAMPAIGN_TYPE_TEMPEST,),
+        )
         row = cur.fetchone()
 
     if row is None:
-        lookup = f"id={baseline_id}" if baseline_id is not None else f"campaign='{campaign_name}'"
-        return {"success": False, "message": f"No campaign with {lookup}"}
+        return None
 
-    baseline_id = row["id"]
-
-    payload = row["payload"]
+    payload = row["baseline_payload"]
     if isinstance(payload, str):
         payload = json.loads(payload)
+    if not isinstance(payload, dict):
+        raise RuntimeError("baseline campaign payload is not an object")
 
     report = payload.get("report")
     if not isinstance(report, dict) or not report:
-        return {"success": False, "message": f"Campaign {baseline_id} ('{row['campaign']}') has no report"}
+        raise RuntimeError(
+            f"Baseline campaign '{row['baseline_campaign']}' has no report"
+        )
 
-    baseline_ppb = _baseline_ppb_from_report(report)
-    if not baseline_ppb:
-        return {"success": False, "message": f"Campaign {baseline_id} ('{row['campaign']}') report has no PPB data"}
-
-    baseline_tau = _baseline_tau_from_report(report)
-    baseline_dac = _baseline_dac_from_report(report)
-    baseline_dac_mean = _baseline_dac_mean_from_report(report)
-    baseline_dac_stats = _baseline_dac_stats_from_report(report)
-
-    baseline_pps_vclock_n = _extract_last_timebase_count(report, _report_fragment(report))
-
-    # DAC values remain baseline science/metrics only. They do not become a
-    # second persistence authority for the live instrument control plane.
-
-    baseline_blob: Dict[str, Any] = {
-        "baseline_id": baseline_id,
-        "baseline_ppb": baseline_ppb,
-        "baseline_tau": baseline_tau,
-        "baseline_dac": baseline_dac,
-        "baseline_dac_mean": baseline_dac_mean,
-        "baseline_dac_stats": baseline_dac_stats,
-        "baseline_campaign_type": CAMPAIGN_TYPE_TEMPEST,
-        "baseline_campaign": row["campaign"],
-        "baseline_pps_vclock_n": baseline_pps_vclock_n,
-        "baseline_pps_n": baseline_pps_vclock_n,  # legacy alias
+    return {
+        "campaign": row["campaign"],
+        "baseline_campaign": row["baseline_campaign"],
+        "baseline_report": report,
+        "baseline_location": payload.get("location"),
+        "baseline_started_at": payload.get("started_at"),
     }
 
+
+def _remove_legacy_baseline_config(cur) -> None:
+    """Remove retired copied-baseline fields while preserving other SYSTEM config."""
+    cur.execute(
+        """
+        UPDATE config
+        SET payload = payload
+            - 'baseline_id'
+            - 'baseline_ppb'
+            - 'baseline_tau'
+            - 'baseline_dac'
+            - 'baseline_dac_mean'
+            - 'baseline_dac_stats'
+            - 'baseline_campaign_type'
+            - 'baseline_campaign'
+            - 'baseline_pps_vclock_n'
+            - 'baseline_pps_n'
+        WHERE config_key = 'SYSTEM'
+        """
+    )
+
+
+def cmd_set_baseline(args: Optional[dict]) -> Dict[str, Any]:
+    """Relate the active campaign to another campaign selected by name."""
+    if not args or not str(args.get("campaign") or "").strip():
+        return {"success": False, "message": "SET_BASELINE requires 'campaign' argument"}
+
+    baseline_name = str(args["campaign"]).strip()
+
     try:
-        with open_db() as conn:
+        with open_db(row_dict=True) as conn:
             cur = conn.cursor()
             cur.execute(
                 """
-                UPDATE config
-                SET payload = payload || %s::jsonb
-                WHERE config_key = 'SYSTEM'
+                SELECT id, campaign
+                FROM campaign_master
+                WHERE campaign_type = %s
+                  AND active = true
+                ORDER BY ts DESC, id DESC
+                LIMIT 1
                 """,
-                (json.dumps(baseline_blob),),
+                (CAMPAIGN_TYPE_TEMPEST,),
             )
-    except Exception:
-        logging.exception("❌ [clocks] failed to persist baseline to config")
-        return {"success": False, "message": "Failed to persist baseline to config"}
+            current = cur.fetchone()
+            if current is None:
+                return {
+                    "success": False,
+                    "message": "SET_BASELINE requires an active campaign",
+                }
 
-    _clocks_baseline_set_cache(baseline_blob)
+            cur.execute(
+                """
+                SELECT id, campaign, payload
+                FROM campaign_master
+                WHERE campaign_type = %s
+                  AND campaign = %s
+                ORDER BY ts DESC, id DESC
+                LIMIT 1
+                """,
+                (CAMPAIGN_TYPE_TEMPEST, baseline_name),
+            )
+            baseline = cur.fetchone()
+            if baseline is None:
+                return {
+                    "success": False,
+                    "message": f"No campaign named '{baseline_name}'",
+                }
+
+            if int(baseline["id"]) == int(current["id"]):
+                return {
+                    "success": False,
+                    "message": "A campaign cannot use itself as its baseline",
+                }
+
+            baseline_payload = baseline["payload"]
+            if isinstance(baseline_payload, str):
+                baseline_payload = json.loads(baseline_payload)
+            baseline_report = (
+                baseline_payload.get("report")
+                if isinstance(baseline_payload, dict)
+                else None
+            )
+            if not isinstance(baseline_report, dict) or not baseline_report:
+                return {
+                    "success": False,
+                    "message": f"Campaign '{baseline['campaign']}' has no report",
+                }
+
+            cur.execute(
+                """
+                UPDATE campaign_master
+                SET payload = jsonb_set(
+                    payload,
+                    '{baseline_campaign_id}',
+                    to_jsonb(%s::bigint),
+                    true
+                )
+                WHERE id = %s
+                """,
+                (int(baseline["id"]), int(current["id"])),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("active campaign baseline relationship was not updated")
+
+            _remove_legacy_baseline_config(cur)
+
+    except Exception as exc:
+        logging.exception("❌ [clocks] failed to establish campaign baseline relationship")
+        return {"success": False, "message": str(exc)}
 
     logging.info(
-        "✅ [clocks] baseline set: id=%d campaign='%s' ppb=%s dac_mean=%s",
-        baseline_id, row["campaign"], baseline_ppb, baseline_dac_mean,
+        "✅ [clocks] campaign '%s' baseline -> '%s'",
+        current["campaign"],
+        baseline["campaign"],
     )
-    return {"success": True, "message": "OK", "payload": baseline_blob}
+    return {
+        "success": True,
+        "message": "OK",
+        "payload": {
+            "campaign": current["campaign"],
+            "baseline_campaign": baseline["campaign"],
+        },
+    }
+
+
+def cmd_baseline_info(_: Optional[dict]) -> Dict[str, Any]:
+    """Return the active campaign's baseline relationship and referenced report."""
+    try:
+        relation = _baseline_relation_for_active_campaign()
+    except Exception as exc:
+        logging.exception("❌ [clocks] BASELINE_INFO failed")
+        return {"success": False, "message": str(exc)}
+
+    if relation is None:
+        return {
+            "success": True,
+            "message": "OK",
+            "payload": {"baseline_set": False},
+        }
+
+    return {
+        "success": True,
+        "message": "OK",
+        "payload": {
+            "baseline_set": True,
+            **relation,
+        },
+    }
+
+
+
+
 
 # ---------------------------------------------------------------------
 # Feature-status preflight gate
@@ -9131,48 +9059,6 @@ def _wait_for_preflight(context: str = "recovery") -> None:
         time.sleep(PREFLIGHT_POLL_INTERVAL_S)
 
 
-def cmd_baseline_info(_: Optional[dict]) -> Dict[str, Any]:
-    info = _get_baseline_from_config()
-    if info is None:
-        return {"success": True, "message": "OK", "payload": {"baseline_set": False}}
-
-    baseline_id = info["baseline_id"]
-    result: Dict[str, Any] = {
-        "baseline_set": True,
-        "baseline_id": baseline_id,
-        "baseline_ppb": info.get("baseline_ppb", {}),
-        "baseline_tau": info.get("baseline_tau", {}),
-        "baseline_dac": info.get("baseline_dac", {}),
-        "baseline_dac_mean": info.get("baseline_dac_mean", {}),
-        "baseline_dac_stats": info.get("baseline_dac_stats", {}),
-        "baseline_campaign_type": CAMPAIGN_TYPE_TEMPEST,
-        "baseline_campaign": info.get("baseline_campaign"),
-        "baseline_pps_vclock_n": info.get("baseline_pps_vclock_n"),
-        "baseline_pps_n": info.get("baseline_pps_n"),
-    }
-
-    try:
-        with open_db(row_dict=True) as conn:
-            cur = conn.cursor()
-            cur.execute(
-                """
-                SELECT id, campaign, payload
-                FROM campaign_master
-                WHERE campaign_type = %s AND id = %s
-                """,
-                (CAMPAIGN_TYPE_TEMPEST, baseline_id),
-            )
-            row = cur.fetchone()
-        if row:
-            cpayload = row["payload"]
-            if isinstance(cpayload, str):
-                cpayload = json.loads(cpayload)
-            result["baseline_location"] = cpayload.get("location")
-            result["baseline_started_at"] = cpayload.get("started_at")
-    except Exception:
-        pass
-
-    return {"success": True, "message": "OK", "payload": result}
 
 
 def cmd_delete(args: Optional[dict]) -> Dict[str, Any]:
@@ -9190,8 +9076,30 @@ def cmd_delete(args: Optional[dict]) -> Dict[str, Any]:
         }
 
     try:
-        with open_db() as conn:
+        with open_db(row_dict=True) as conn:
             cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT DISTINCT ref.campaign
+                FROM campaign_master AS target
+                JOIN campaign_master AS ref
+                  ON (ref.payload ->> 'baseline_campaign_id')::bigint = target.id
+                WHERE target.campaign_type = %s
+                  AND target.campaign = %s
+                ORDER BY ref.campaign
+                """,
+                (CAMPAIGN_TYPE_TEMPEST, campaign_name),
+            )
+            referenced_by = [str(row["campaign"]) for row in cur.fetchall()]
+            if referenced_by:
+                return {
+                    "success": False,
+                    "message": (
+                        f"Campaign '{campaign_name}' is used as a baseline by: "
+                        + ", ".join(referenced_by)
+                    ),
+                }
+
             cur.execute(
                 """
                 DELETE FROM campaign_detail
@@ -9372,19 +9280,25 @@ def cmd_truncate(args: Optional[dict]) -> Dict[str, Any]:
 
 
 def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
-    """List TEMPEST campaign master rows."""
-    baseline_info = _get_baseline_from_config()
-    baseline_campaign = baseline_info.get("baseline_campaign") if baseline_info else None
-
+    """List TEMPEST campaigns with each campaign's baseline relationship by name."""
     try:
         with open_db(row_dict=True) as conn:
             cur = conn.cursor()
             cur.execute(
                 """
-                SELECT id, campaign_type, campaign, active, ts, payload
-                FROM campaign_master
-                WHERE campaign_type = %s
-                ORDER BY ts ASC
+                SELECT
+                    master.campaign_type,
+                    master.campaign,
+                    master.active,
+                    master.ts,
+                    master.payload,
+                    baseline.campaign AS baseline_campaign
+                FROM campaign_master AS master
+                LEFT JOIN campaign_master AS baseline
+                  ON baseline.id = (master.payload ->> 'baseline_campaign_id')::bigint
+                 AND baseline.campaign_type = master.campaign_type
+                WHERE master.campaign_type = %s
+                ORDER BY master.ts ASC, master.id ASC
                 """,
                 (CAMPAIGN_TYPE_TEMPEST,),
             )
@@ -9400,13 +9314,12 @@ def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
             payload = json.loads(payload)
 
         report = payload.get("report", {})
-        is_baseline = row["campaign"] == baseline_campaign
 
         entry: Dict[str, Any] = {
             "campaign_type": row["campaign_type"],
             "campaign": row["campaign"],
             "active": bool(row["active"]),
-            "baseline": is_baseline,
+            "baseline_campaign": row.get("baseline_campaign"),
             "started_at": payload.get("started_at"),
             "stopped_at": payload.get("stopped_at"),
             "resumed_at": payload.get("resumed_at"),
