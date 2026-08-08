@@ -1545,9 +1545,34 @@ def on_gnss_announcement(payload: Optional[dict]) -> None:
 # ------------------------------------------------------------------
 
 def cmd_report(_: Optional[dict]) -> Dict:
-    """Return the current Pi-owned platform context."""
+    """Return the current Pi-owned platform context.
+
+    Slow platform telemetry remains owned by the 30-second SYSTEM poller.
+    GNSS is different: GNSS_ANNOUNCEMENT arrives every second and is already
+    retained in memory. Overlay that live announcement-derived status here so
+    SYSTEM.REPORT does not expose a GNSS snapshot that is up to one platform
+    poll interval old.
+    """
     with _SYSTEM_LOCK:
         snapshot = copy.deepcopy(SYSTEM)
+
+    # SYSTEM.REPORT is the current-context boundary consumed by CLOCKS. Do not
+    # make its 1 Hz GNSS identity wait for the intentionally slow platform poll.
+    gnss_payload = build_gnss_status()
+    snapshot["gnss"] = gnss_payload
+
+    # Keep the returned readiness tree coherent with the live GNSS overlay
+    # without mutating the process-wide feature registry from a read command.
+    features = snapshot.get("features")
+    if isinstance(features, dict):
+        pi_features = features.setdefault("PI", {})
+        if isinstance(pi_features, dict):
+            gnss_features = pi_features.setdefault("GNSS", {})
+            if isinstance(gnss_features, dict):
+                gnss_features["REPORT"] = _health_to_feature_status(
+                    gnss_payload.get("health_state")
+                )
+
     return {
         "success": True,
         "message": "OK",
