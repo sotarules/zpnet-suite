@@ -108,19 +108,36 @@ static Payload make_error_payload(const char* msg) {
     return p;
 }
 
-static void copy_request_metadata_into_response(const Payload& request, Payload& response) {
-    if (request.has("req_id")) {
-        response.add("req_id", request.getUInt("req_id"));
+static bool copy_request_metadata_into_response(const Payload& request,
+                                                Payload& response) {
+    uint32_t req_id = 0U;
+    if (!request.tryGetUInt("req_id", req_id) || req_id == 0U) {
+        debug_log("process.rpc_metadata_invalid_req_id", request);
+        return false;
     }
 
-    if (request.has("req_ts_ms")) {
-        response.add("req_ts_ms", request.getUInt("req_ts_ms"));
+    uint64_t req_ts_ms = 0ULL;
+    if (!request.tryGetUInt64("req_ts_ms", req_ts_ms)) {
+        debug_log("process.rpc_metadata_invalid_req_ts", request);
+        return false;
     }
+
+    // Request identity is a protocol invariant. Never manufacture a fallback
+    // identity (especially req_id=0) from malformed input.
+    if (!response.add("req_id", req_id) ||
+        !response.add("req_ts_ms", req_ts_ms)) {
+        debug_log("process.rpc_metadata_response_add_failed", request);
+        return false;
+    }
+
+    return true;
 }
 
 static void send_overflow_response(const Payload& request) {
     Payload response;
-    copy_request_metadata_into_response(request, response);
+    if (!copy_request_metadata_into_response(request, response)) {
+        debug_log("process.rpc_overflow_metadata_lost", request);
+    }
     response.add("success", false);
     response.add("message", "OVERFLOW");
     response.add_object("payload", make_error_payload("payload_overflow"));
@@ -231,7 +248,19 @@ void process_command(const Payload& request) {
     rpc_received++;
 
     Payload response;
-    copy_request_metadata_into_response(request, response);
+    if (!copy_request_metadata_into_response(request, response)) {
+        // Defenseless protocol boundary: malformed request identity is itself
+        // the failure. Do not invoke a subsystem handler and do not synthesize
+        // req_id=0. The Pi will log the identity-less response immediately.
+        response.clear();
+        response.add("success", false);
+        response.add("message", "RPC_METADATA_INVALID");
+        response.add_object("payload",
+                            make_error_payload("invalid request metadata"));
+        transport_send(TRAFFIC_REQUEST_RESPONSE, response);
+        rpc_error_response_sent++;
+        return;
+    }
 
     const char* subsystem_c = request.getString("subsystem");
     const char* command_c   = request.getString("command");

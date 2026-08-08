@@ -367,6 +367,19 @@ static volatile uint32_t rx_dispatch_alap_arm_fail = 0;
 static volatile uint32_t rx_dispatch_invalid_callback = 0;
 static volatile uint32_t rx_dispatch_stack_mismatch = 0;
 
+// A complete frame must not overwrite the one-slot semantic-dispatch mailbox
+// before ALAP has taken custody.  For now this is forensic only: record the
+// exact collision and leave behavior unchanged so the instrument can tell us
+// whether this boundary participates in the sparse RPC anomaly.
+static volatile uint32_t rx_dispatch_pending_collision_count = 0;
+static volatile uint32_t rx_dispatch_pending_collision_dwt = 0;
+static volatile uint32_t rx_dispatch_pending_collision_pending_traffic = 0;
+static volatile uint32_t rx_dispatch_pending_collision_incoming_traffic = 0;
+static volatile uint32_t rx_dispatch_pending_collision_pending_req_id = 0;
+static volatile uint32_t rx_dispatch_pending_collision_incoming_req_id = 0;
+static volatile uint32_t rx_dispatch_pending_collision_pending_req_id_valid = 0;
+static volatile uint32_t rx_dispatch_pending_collision_incoming_req_id_valid = 0;
+
 static constexpr uint32_t RX_DISPATCH_BREADCRUMB_MAGIC = 0x5A505258UL;
 alignas(32) static transport_rx_dispatch_breadcrumb_t
     g_rx_dispatch_breadcrumb_live[2] DMAMEM;
@@ -1157,6 +1170,30 @@ static bool dispatch_if_complete() {
     return false;
   }
 
+  if (rx_dispatch_pending) {
+    uint32_t pending_req_id = 0U;
+    uint32_t incoming_req_id = 0U;
+    const bool pending_req_id_valid =
+        rx_dispatch_payload.tryGetUInt("req_id", pending_req_id) &&
+        pending_req_id != 0U;
+    const bool incoming_req_id_valid =
+        parsed.tryGetUInt("req_id", incoming_req_id) &&
+        incoming_req_id != 0U;
+
+    rx_dispatch_pending_collision_count++;
+    rx_dispatch_pending_collision_dwt = ARM_DWT_CYCCNT;
+    rx_dispatch_pending_collision_pending_traffic = rx_dispatch_traffic;
+    rx_dispatch_pending_collision_incoming_traffic = rx_traffic;
+    rx_dispatch_pending_collision_pending_req_id =
+        pending_req_id_valid ? pending_req_id : 0U;
+    rx_dispatch_pending_collision_incoming_req_id =
+        incoming_req_id_valid ? incoming_req_id : 0U;
+    rx_dispatch_pending_collision_pending_req_id_valid =
+        pending_req_id_valid ? 1U : 0U;
+    rx_dispatch_pending_collision_incoming_req_id_valid =
+        incoming_req_id_valid ? 1U : 0U;
+  }
+
   rx_dispatch_traffic = rx_traffic;
   rx_dispatch_payload = static_cast<Payload&&>(parsed);
   rx_dispatch_pending = true;
@@ -1279,6 +1316,49 @@ void transport_rx_dispatch_snapshot(transport_rx_dispatch_snapshot_t* out) {
   }
   if (rx_dispatch_breadcrumb_valid(g_rx_dispatch_breadcrumb_retained)) {
     out->retained_valid = true; out->retained = g_rx_dispatch_breadcrumb_retained;
+  }
+}
+
+// =============================================================
+// RX deferred-dispatch mailbox forensic snapshot
+// =============================================================
+
+void transport_get_rx_dispatch_mailbox_info(
+    uint32_t* pending_now,
+    uint32_t* alap_arm_fail,
+    uint32_t* collision_count,
+    uint32_t* collision_dwt,
+    uint32_t* pending_traffic,
+    uint32_t* incoming_traffic,
+    uint32_t* pending_req_id_valid,
+    uint32_t* pending_req_id,
+    uint32_t* incoming_req_id_valid,
+    uint32_t* incoming_req_id) {
+  if (pending_now) *pending_now = rx_dispatch_pending ? 1U : 0U;
+  if (alap_arm_fail) *alap_arm_fail = rx_dispatch_alap_arm_fail;
+  if (collision_count) {
+    *collision_count = rx_dispatch_pending_collision_count;
+  }
+  if (collision_dwt) *collision_dwt = rx_dispatch_pending_collision_dwt;
+  if (pending_traffic) {
+    *pending_traffic = rx_dispatch_pending_collision_pending_traffic;
+  }
+  if (incoming_traffic) {
+    *incoming_traffic = rx_dispatch_pending_collision_incoming_traffic;
+  }
+  if (pending_req_id_valid) {
+    *pending_req_id_valid =
+        rx_dispatch_pending_collision_pending_req_id_valid;
+  }
+  if (pending_req_id) {
+    *pending_req_id = rx_dispatch_pending_collision_pending_req_id;
+  }
+  if (incoming_req_id_valid) {
+    *incoming_req_id_valid =
+        rx_dispatch_pending_collision_incoming_req_id_valid;
+  }
+  if (incoming_req_id) {
+    *incoming_req_id = rx_dispatch_pending_collision_incoming_req_id;
   }
 }
 

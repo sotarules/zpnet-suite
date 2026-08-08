@@ -30,6 +30,18 @@
 #include <string.h>
 #include <CrashReport.h>
 
+extern void transport_get_rx_dispatch_mailbox_info(
+    uint32_t* pending_now,
+    uint32_t* alap_arm_fail,
+    uint32_t* collision_count,
+    uint32_t* collision_dwt,
+    uint32_t* pending_traffic,
+    uint32_t* incoming_traffic,
+    uint32_t* pending_req_id_valid,
+    uint32_t* pending_req_id,
+    uint32_t* incoming_req_id_valid,
+    uint32_t* incoming_req_id);
+
 static constexpr uint64_t FLASH_DELAY_NS = 5000000000ULL;  // 5 seconds
 
 // A rejected CLOCKS_FRAGMENT remains in exact typed-snapshot custody and is
@@ -2964,6 +2976,51 @@ static FLASHMEM Payload cmd_transport_info(const Payload& /*args*/) {
   p.add("rx_expected_traffic_missing", info.rx_expected_traffic_missing);
   p.add("rx_dispatch_invalid_callback", info.rx_dispatch_invalid_callback);
   p.add("rx_dispatch_stack_mismatch", info.rx_dispatch_stack_mismatch);
+
+  const uint32_t rx_dispatch_backlog =
+      info.rx_frames_complete >= info.rx_frames_dispatched
+          ? (info.rx_frames_complete - info.rx_frames_dispatched)
+          : 0xFFFFFFFFUL;
+  p.add("rx_dispatch_backlog", rx_dispatch_backlog);
+  p.add("rx_dispatch_balance_ok",
+        info.rx_frames_complete >= info.rx_frames_dispatched &&
+        rx_dispatch_backlog <= 1U);
+
+  uint32_t mailbox_pending_now = 0U;
+  uint32_t mailbox_alap_arm_fail = 0U;
+  uint32_t mailbox_collision_count = 0U;
+  uint32_t mailbox_collision_dwt = 0U;
+  uint32_t mailbox_pending_traffic = 0U;
+  uint32_t mailbox_incoming_traffic = 0U;
+  uint32_t mailbox_pending_req_id_valid = 0U;
+  uint32_t mailbox_pending_req_id = 0U;
+  uint32_t mailbox_incoming_req_id_valid = 0U;
+  uint32_t mailbox_incoming_req_id = 0U;
+  transport_get_rx_dispatch_mailbox_info(
+      &mailbox_pending_now,
+      &mailbox_alap_arm_fail,
+      &mailbox_collision_count,
+      &mailbox_collision_dwt,
+      &mailbox_pending_traffic,
+      &mailbox_incoming_traffic,
+      &mailbox_pending_req_id_valid,
+      &mailbox_pending_req_id,
+      &mailbox_incoming_req_id_valid,
+      &mailbox_incoming_req_id);
+
+  p.add("rx_dispatch_mailbox_pending_now", mailbox_pending_now != 0U);
+  p.add("rx_dispatch_alap_arm_fail", mailbox_alap_arm_fail);
+  p.add("rx_dispatch_mailbox_collision_count", mailbox_collision_count);
+  p.add("rx_dispatch_mailbox_collision_seen", mailbox_collision_count != 0U);
+  p.add("rx_dispatch_mailbox_collision_dwt", mailbox_collision_dwt);
+  p.add("rx_dispatch_mailbox_pending_traffic", mailbox_pending_traffic);
+  p.add("rx_dispatch_mailbox_incoming_traffic", mailbox_incoming_traffic);
+  p.add("rx_dispatch_mailbox_pending_req_id_valid",
+        mailbox_pending_req_id_valid != 0U);
+  p.add("rx_dispatch_mailbox_pending_req_id", mailbox_pending_req_id);
+  p.add("rx_dispatch_mailbox_incoming_req_id_valid",
+        mailbox_incoming_req_id_valid != 0U);
+  p.add("rx_dispatch_mailbox_incoming_req_id", mailbox_incoming_req_id);
 
   // ==========================================================
   // RX — Guarded RAM2 placement experiment

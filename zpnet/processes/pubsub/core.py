@@ -127,8 +127,70 @@ TEENSY_ROUTE_MONITOR_INTERVAL_S = 30.0
 # Global state
 # ---------------------------------------------------------------------
 
-pending_replies: Dict[int, Queue] = {}
+# Request IDs are a wire-level uint32 contract with Teensy.  Keep allocation
+# explicit and observable: diagnostics must never advance the sequence, and an
+# exhausted uint32 space is a hard protocol failure rather than silent wrap.
+pending_replies: Dict[int, Dict[str, Any]] = {}
+recent_replies: Dict[int, Dict[str, Any]] = {}
+recent_reply_order = Queue()
+RECENT_REPLY_HISTORY_MAX = 64
+
 req_id_counter = itertools.count(1)
+req_id_last_issued = 0
+req_id_lock = threading.Lock()
+
+
+def _next_req_id() -> int:
+    global req_id_last_issued
+
+    with req_id_lock:
+        req_id = next(req_id_counter)
+        if req_id <= 0 or req_id > 0xFFFFFFFF:
+            raise RuntimeError(
+                f"PUBSUB request-id space exhausted/corrupt: req_id={req_id}"
+            )
+        req_id_last_issued = req_id
+        return req_id
+
+
+def _remember_reply_state(req_id: int, entry: Dict[str, Any], outcome: str) -> None:
+    snapshot = dict(entry)
+    snapshot.pop("queue", None)
+    snapshot["outcome"] = outcome
+    snapshot["retired_monotonic"] = time.monotonic()
+
+    with state_lock:
+        recent_replies[req_id] = snapshot
+        recent_reply_order.put(req_id)
+
+        while recent_reply_order.qsize() > RECENT_REPLY_HISTORY_MAX:
+            old_req_id = recent_reply_order.get_nowait()
+            if old_req_id != req_id:
+                recent_replies.pop(old_req_id, None)
+
+
+def _register_pending_reply(
+    *,
+    req_id: int,
+    queue: Queue,
+    subsystem: str,
+    command: str,
+    attempt: int,
+    source: str,
+    req_ts_ms: int,
+) -> Dict[str, Any]:
+    entry = {
+        "queue": queue,
+        "subsystem": subsystem,
+        "command": command,
+        "attempt": attempt,
+        "source": source,
+        "req_ts_ms": req_ts_ms,
+        "sent_monotonic": time.monotonic(),
+    }
+    with state_lock:
+        pending_replies[req_id] = entry
+    return entry
 
 # ---------------------------------------------------------------------
 # Routing table (cartesian subscription edges)
@@ -286,27 +348,68 @@ def on_receive_debug(payload: Dict[str, Any]) -> None:
 def on_receive_request_response(payload: Dict[str, Any]) -> None:
     req_id = payload.get("req_id")
     if req_id is None:
-        logging.warning("⚠️ response missing req_id — discarded")
+        logging.error(
+            "❌ [rpc] Teensy response missing req_id — protocol identity lost; "
+            "req_ts_ms=%r success=%r message=%r",
+            payload.get("req_ts_ms"),
+            payload.get("success"),
+            payload.get("message"),
+        )
         return
 
     with state_lock:
-        q = pending_replies.pop(req_id, None)
+        entry = pending_replies.pop(req_id, None)
+        retired = recent_replies.get(req_id)
 
-    if q is None:
-        logging.warning("⚠️ [on_receive_request_response] late or duplicate response req_id=%d (discarded)", req_id)
+    if entry is None:
+        if retired is None:
+            logging.error(
+                "❌ [rpc] response for UNKNOWN req_id=%r — discarded; "
+                "req_ts_ms=%r success=%r message=%r",
+                req_id,
+                payload.get("req_ts_ms"),
+                payload.get("success"),
+                payload.get("message"),
+            )
+        else:
+            age_ms = int(
+                (time.monotonic() - retired["sent_monotonic"]) * 1000
+            )
+            logging.warning(
+                "⚠️ [rpc] response for RETIRED req_id=%r classification=%s "
+                "source=%s target=%s.%s attempt=%d age_ms=%d "
+                "req_ts_ms=%r success=%r message=%r — discarded",
+                req_id,
+                retired.get("outcome"),
+                retired.get("source"),
+                retired.get("subsystem"),
+                retired.get("command"),
+                retired.get("attempt"),
+                age_ms,
+                payload.get("req_ts_ms"),
+                payload.get("success"),
+                payload.get("message"),
+            )
         return
 
     sent_ms = payload.get("req_ts_ms")
     if sent_ms is None:
-        logging.warning("⚠️ response missing req_ts_ms — discarded")
+        _remember_reply_state(req_id, entry, "RESPONSE_MISSING_REQ_TS")
+        logging.error(
+            "❌ [rpc] response missing req_ts_ms req_id=%r source=%s "
+            "target=%s.%s attempt=%d — discarded",
+            req_id,
+            entry["source"],
+            entry["subsystem"],
+            entry["command"],
+            entry["attempt"],
+        )
         return
 
-    now_ms = int(time.monotonic() * 1000)
-    latency = now_ms - sent_ms
-
+    latency = int(time.monotonic() * 1000) - sent_ms
     payload["latency"] = latency
-
-    q.put(payload)
+    _remember_reply_state(req_id, entry, "DELIVERED")
+    entry["queue"].put(payload)
 
 def on_receive_publish_subscribe(payload: Dict[str, Any]) -> None:
     # Message originated from Teensy. Never forward back to Teensy.
@@ -326,14 +429,21 @@ def handle_client(conn: socket.socket) -> None:
         req_id = None
 
         for attempt in range(MAX_TEENSY_RETRIES):
-            # NEW: fresh req_id per attempt
-            req_id = next(req_id_counter)
+            req_id = _next_req_id()
+            req_ts_ms = int(time.monotonic() * 1000)
             req["req_id"] = req_id
-            req["req_ts_ms"] = int(time.monotonic() * 1000)
+            req["req_ts_ms"] = req_ts_ms
 
             q = Queue(maxsize=1)
-            with state_lock:
-                pending_replies[req_id] = q
+            _register_pending_reply(
+                req_id=req_id,
+                queue=q,
+                subsystem=str(req.get("subsystem") or ""),
+                command=str(req.get("command") or ""),
+                attempt=attempt + 1,
+                source="PI_RPC",
+                req_ts_ms=req_ts_ms,
+            )
 
             try:
                 transport_send(TRAFFIC_REQUEST_RESPONSE, req)
@@ -345,9 +455,20 @@ def handle_client(conn: socket.socket) -> None:
                 return
 
             except Empty:
-                # Timeout on this attempt — clean up and retry
                 with state_lock:
-                    pending_replies.pop(req_id, None)
+                    timed_out = pending_replies.pop(req_id, None)
+                if timed_out is not None:
+                    _remember_reply_state(req_id, timed_out, "TIMEOUT")
+                    logging.warning(
+                        "⏱️ [rpc] Teensy timeout req_id=%d source=%s "
+                        "target=%s.%s attempt=%d timeout_s=%.1f",
+                        req_id,
+                        timed_out["source"],
+                        timed_out["subsystem"],
+                        timed_out["command"],
+                        timed_out["attempt"],
+                        REPLY_TIMEOUT_S,
+                    )
                 continue
 
         # All retries exhausted
@@ -1066,6 +1187,8 @@ def _server_command_to_teensy(
     subsystem: str,
     command: str,
     args: Optional[Dict[str, Any]],
+    *,
+    source: str = "SERVER_RPC",
 ) -> Dict[str, Any]:
     """
     Route a SERVER-originated command to TEENSY via the RPC path.
@@ -1082,13 +1205,21 @@ def _server_command_to_teensy(
         req["args"] = args
 
     for attempt in range(MAX_TEENSY_RETRIES):
-        req_id = next(req_id_counter)
+        req_id = _next_req_id()
+        req_ts_ms = int(time.monotonic() * 1000)
         req["req_id"] = req_id
-        req["req_ts_ms"] = int(time.monotonic() * 1000)
+        req["req_ts_ms"] = req_ts_ms
 
         q = Queue(maxsize=1)
-        with state_lock:
-            pending_replies[req_id] = q
+        _register_pending_reply(
+            req_id=req_id,
+            queue=q,
+            subsystem=subsystem,
+            command=command,
+            attempt=attempt + 1,
+            source=source,
+            req_ts_ms=req_ts_ms,
+        )
 
         try:
             transport_send(TRAFFIC_REQUEST_RESPONSE, req)
@@ -1097,7 +1228,19 @@ def _server_command_to_teensy(
 
         except Empty:
             with state_lock:
-                pending_replies.pop(req_id, None)
+                timed_out = pending_replies.pop(req_id, None)
+            if timed_out is not None:
+                _remember_reply_state(req_id, timed_out, "TIMEOUT")
+                logging.warning(
+                    "⏱️ [rpc] Teensy timeout req_id=%d source=%s "
+                    "target=%s.%s attempt=%d timeout_s=%.1f",
+                    req_id,
+                    timed_out["source"],
+                    timed_out["subsystem"],
+                    timed_out["command"],
+                    timed_out["attempt"],
+                    REPLY_TIMEOUT_S,
+                )
             continue
 
     return {
@@ -1367,6 +1510,30 @@ def cmd_diagnostics(_: Optional[dict]) -> Dict[str, Any]:
     with state_lock:
         pending_count = len(pending_replies)
         pending_ids = list(pending_replies.keys())
+        pending_detail = [
+            {
+                "req_id": req_id,
+                "source": entry["source"],
+                "subsystem": entry["subsystem"],
+                "command": entry["command"],
+                "attempt": entry["attempt"],
+                "age_ms": int(
+                    (time.monotonic() - entry["sent_monotonic"]) * 1000
+                ),
+            }
+            for req_id, entry in pending_replies.items()
+        ]
+        recent_detail = [
+            {
+                "req_id": req_id,
+                "outcome": entry.get("outcome"),
+                "source": entry.get("source"),
+                "subsystem": entry.get("subsystem"),
+                "command": entry.get("command"),
+                "attempt": entry.get("attempt"),
+            }
+            for req_id, entry in list(recent_replies.items())[-16:]
+        ]
         server_cmd_pending = len(server_pending_commands)
         adhoc_client_count = len(adhoc_clients)
         adhoc_topic_count = len(adhoc_by_topic)
@@ -1407,7 +1574,9 @@ def cmd_diagnostics(_: Optional[dict]) -> Dict[str, Any]:
         "payload": {
             "pending_reply_count": pending_count,
             "pending_req_ids": pending_ids[:50],  # cap for sanity
-            "req_id_current": next(req_id_counter),
+            "pending_reply_detail": pending_detail[:50],
+            "recent_reply_detail": recent_detail,
+            "req_id_last_issued": req_id_last_issued,
             "routes_topic_count": len(routes_by_topic),
             "applied_topic_count": applied_topic_count,
             "applied_subscription_count": applied_subscription_count,
@@ -1676,7 +1845,9 @@ def _teensy_route_report() -> Optional[Dict[str, Any]]:
     reachable / not ready.  Failures are intentionally quiet because this
     thread is a background custody probe.
     """
-    resp = _server_command_to_teensy("PUBSUB", "REPORT", None)
+    resp = _server_command_to_teensy(
+        "PUBSUB", "REPORT", None, source="ROUTE_MONITOR"
+    )
     if not resp.get("success"):
         return None
     payload = resp.get("payload")
@@ -1692,7 +1863,9 @@ def _teensy_route_reapply_cached_union(union_payload: Dict[str, Any]) -> bool:
     """
     Reapply the cached Pi-side union to Teensy with SETSUBSCRIPTIONS.
     """
-    resp = _server_command_to_teensy("PUBSUB", "SETSUBSCRIPTIONS", union_payload)
+    resp = _server_command_to_teensy(
+        "PUBSUB", "SETSUBSCRIPTIONS", union_payload, source="ROUTE_MONITOR_REAPPLY"
+    )
     return bool(resp.get("success"))
 
 
