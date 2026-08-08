@@ -16,7 +16,7 @@ Process model:
   • One systemd service
   • One acquisition thread (UART read)
   • One blocking command socket (REPORT, GET_TIME, GET_GNSS_INFO,
-    PROFILE_LOCATION, MODE)
+    PROFILE_LOCATION/CAPTURE_LOCATION, LOCATION_INFO, LIST_LOCATIONS, MODE)
   • One blocking stream socket (fan-out)
 
 UART ownership:
@@ -145,15 +145,17 @@ TRAIM_NAMES = {
 # Profile location configuration
 # ------------------------------------------------------------------
 
-# Minimum quality thresholds for accepting a location profile
+# Minimum receiver-state thresholds for accepting a location profile.
+# Location capture is a geodetic operation, not merely a generic "good GNSS"
+# observation: the GF-8802 must be back in ordinary NAV positioning and its
+# TPS4 frequency loop must explicitly report FINE_LOCK before coordinates can
+# become durable location truth.
 PROFILE_MIN_SATELLITES = 12
 PROFILE_MAX_HDOP = 1.5
-PROFILE_MIN_LOCK_QUALITY = "MEDIUM"   # MEDIUM or STRONG
+PROFILE_REQUIRED_FREQ_MODE = 3        # TPS4: FINE_LOCK
+PROFILE_REQUIRED_POS_MODE = 0         # TPS3: NAV
 PROFILE_POLL_INTERVAL_S = 1.0
 PROFILE_DEFAULT_TIMEOUT_S = 300       # 5 minutes
-
-# Lock quality ranking for comparison
-_LOCK_QUALITY_RANK = {"WEAK": 0, "MEDIUM": 1, "STRONG": 2}
 
 # ------------------------------------------------------------------
 # MODE command configuration
@@ -936,65 +938,97 @@ def publish_gnss_announcement() -> None:
 # PROFILE_LOCATION — quality gate check
 # ------------------------------------------------------------------
 
+
+def _profile_gate_snapshot() -> Dict[str, object]:
+    """Return the exact GF-8802 evidence required to capture a location."""
+    latitude_ok = not math.isnan(GNSS.latitude_deg)
+    longitude_ok = not math.isnan(GNSS.longitude_deg)
+    altitude_ok = not math.isnan(GNSS.altitude_m)
+    hdop_ok = not math.isnan(GNSS.hdop) and GNSS.hdop <= PROFILE_MAX_HDOP
+    satellites_ok = GNSS.satellites >= PROFILE_MIN_SATELLITES
+    position_mode_ok = GNSS.tps3_pos_mode == PROFILE_REQUIRED_POS_MODE
+    frequency_mode_ok = GNSS.tps4_freq_mode == PROFILE_REQUIRED_FREQ_MODE
+
+    ready = bool(
+        GNSS.has_position
+        and latitude_ok
+        and longitude_ok
+        and altitude_ok
+        and hdop_ok
+        and satellites_ok
+        and position_mode_ok
+        and frequency_mode_ok
+    )
+
+    return {
+        "ready": ready,
+        "has_position": bool(GNSS.has_position),
+        "satellites": int(GNSS.satellites),
+        "hdop": None if math.isnan(GNSS.hdop) else float(GNSS.hdop),
+        "latitude_available": latitude_ok,
+        "longitude_available": longitude_ok,
+        "altitude_available": altitude_ok,
+        "position_mode": int(GNSS.tps3_pos_mode),
+        "position_mode_name": GNSS.tps3_pos_mode_name or POS_MODE_NAMES.get(GNSS.tps3_pos_mode, "?"),
+        "required_position_mode": PROFILE_REQUIRED_POS_MODE,
+        "required_position_mode_name": POS_MODE_NAMES[PROFILE_REQUIRED_POS_MODE],
+        "freq_mode": int(GNSS.tps4_freq_mode),
+        "freq_mode_name": GNSS.tps4_freq_mode_name or FREQ_MODE_NAMES.get(GNSS.tps4_freq_mode, "?"),
+        "required_freq_mode": PROFILE_REQUIRED_FREQ_MODE,
+        "required_freq_mode_name": FREQ_MODE_NAMES[PROFILE_REQUIRED_FREQ_MODE],
+        "lock_quality": derive_lock_quality(),
+    }
+
+
 def _fix_quality_acceptable() -> bool:
-    """
-    Return True if the current GNSS state meets the quality
-    thresholds required to accept a location profile.
-
-    Requirements:
-      • Valid position (has_position)
-      • Satellites >= PROFILE_MIN_SATELLITES
-      • HDOP <= PROFILE_MAX_HDOP
-      • Lock quality >= PROFILE_MIN_LOCK_QUALITY
-      • Altitude available (not NaN)
-    """
-    if not GNSS.has_position:
-        return False
-
-    if GNSS.satellites < PROFILE_MIN_SATELLITES:
-        return False
-
-    if math.isnan(GNSS.hdop) or GNSS.hdop > PROFILE_MAX_HDOP:
-        return False
-
-    quality = derive_lock_quality()
-    min_rank = _LOCK_QUALITY_RANK.get(PROFILE_MIN_LOCK_QUALITY, 1)
-    if _LOCK_QUALITY_RANK.get(quality, 0) < min_rank:
-        return False
-
-    if math.isnan(GNSS.latitude_deg) or math.isnan(GNSS.longitude_deg):
-        return False
-
-    if math.isnan(GNSS.altitude_m):
-        return False
-
-    return True
+    """Return True only when the GF-8802 is ready to author location truth."""
+    return bool(_profile_gate_snapshot()["ready"])
 
 # ------------------------------------------------------------------
 # PROFILE_LOCATION — database persistence (JSONB)
 # ------------------------------------------------------------------
 
+
 def _persist_location(location: str) -> Dict:
-    """
-    Snapshot current GNSS state into the locations table.
-
-    Creates the row if it doesn't exist, updates it if it does.
-    All variable data is stored in the JSONB payload column.
-    The 'location' column is retained as a relational key (UNIQUE).
-
-    Returns the persisted location facts.
-    """
+    """Persist one receiver-proven location profile into the locations table."""
     from datetime import datetime, timezone
 
-    now = datetime.now(timezone.utc)
+    gate = _profile_gate_snapshot()
+    if not gate.get("ready"):
+        raise RuntimeError(f"GF-8802 location capture gate is not satisfied: {gate}")
 
+    now = datetime.now(timezone.utc)
     facts = {
-        "latitude":    round(GNSS.latitude_deg, 9),
-        "longitude":   round(GNSS.longitude_deg, 9),
-        "altitude":    round(GNSS.altitude_m, 3),
-        "hdop":        round(GNSS.hdop, 2) if not math.isnan(GNSS.hdop) else None,
-        "satellites":  GNSS.satellites,
+        "schema": "GNSS_LOCATION_V2",
+        "source": "GF-8802",
+        "latitude": round(GNSS.latitude_deg, 9),
+        "longitude": round(GNSS.longitude_deg, 9),
+        "altitude": round(GNSS.altitude_m, 3),
+        "geoid_sep_m": (
+            None if math.isnan(GNSS.geoid_sep_m) else round(GNSS.geoid_sep_m, 3)
+        ),
+        "ellipsoid_height_m": (
+            None if math.isnan(GNSS.ellipsoid_height_m)
+            else round(GNSS.ellipsoid_height_m, 3)
+        ),
+        "hdop": round(GNSS.hdop, 2),
+        "satellites": int(GNSS.satellites),
         "profiled_at": now.isoformat().replace("+00:00", "Z"),
+        "receiver": {
+            "position_quality": int(GNSS.position_quality),
+            "position_type": int(GNSS.position_type),
+            "nmea_position_mode": GNSS.position_mode or None,
+            "position_mode": int(GNSS.tps3_pos_mode),
+            "position_mode_name": GNSS.tps3_pos_mode_name,
+            "freq_mode": int(GNSS.tps4_freq_mode),
+            "freq_mode_name": GNSS.tps4_freq_mode_name,
+            "lock_quality": derive_lock_quality(),
+            "traim": GNSS.tps3_traim_name,
+            "pps_timing_error_ns": int(GNSS.tps4_pps_timing_error_ns),
+            "freq_error_ppb": int(GNSS.tps4_freq_error_ppb),
+            "time_status": GNSS.tps1_time_status_name or None,
+            "pps_sync": GNSS.tps1_pps_status_name or None,
+        },
     }
 
     with open_db() as conn:
@@ -1012,15 +1046,18 @@ def _persist_location(location: str) -> Dict:
         )
 
     logging.info(
-        "📍 [gnss] location '%s' profiled: lat=%.6f lon=%.6f alt=%.1f hdop=%.2f sats=%d",
+        "📍 [gnss] location '%s' captured from GF-8802: "
+        "lat=%.9f lon=%.9f alt=%.3f hdop=%.2f sats=%d "
+        "pos_mode=%s freq_mode=%s",
         location,
         facts["latitude"],
         facts["longitude"],
         facts["altitude"],
-        facts["hdop"] or 0.0,
+        facts["hdop"],
         facts["satellites"],
+        facts["receiver"]["position_mode_name"],
+        facts["receiver"]["freq_mode_name"],
     )
-
     return facts
 
 # ------------------------------------------------------------------
@@ -1198,115 +1235,94 @@ def cmd_get_gnss_info(_: Optional[dict]) -> Dict:
     }
 
 
+
 def cmd_profile_location(args: Optional[dict]) -> Dict:
-    """
-    PROFILE_LOCATION — block until GNSS achieves a quality fix,
-    then snapshot the position into the locations table.
-
-    Args:
-        location (str):       Location name (required)
-        timeout_s (int):      Max seconds to wait for fix (default: 300)
-
-    Semantics:
-      • Blocking (holds the command socket until complete or timeout)
-      • Polls GNSS state at 1 Hz
-      • Quality gate: satellites, HDOP, lock quality, altitude
-      • Upserts into locations table (idempotent on location name)
-      • Returns profiled facts on success
-    """
+    """Capture and persist a named location from a receiver-proven NAV/FINE_LOCK fix."""
     if not args or "location" not in args:
         return {
             "success": False,
             "message": "PROFILE_LOCATION requires 'location' argument",
         }
 
-    location = args["location"].strip()
-    if not location:
+    location = str(args["location"]).strip()
+    if not location or location.upper() == "NONE":
         return {
             "success": False,
-            "message": "location name must not be empty",
+            "message": "PROFILE_LOCATION requires a non-NONE location name",
         }
 
     timeout_s = int(args.get("timeout_s", PROFILE_DEFAULT_TIMEOUT_S))
+    if timeout_s <= 0:
+        return {"success": False, "message": "timeout_s must be positive"}
+
+    # A fixed TO position is not evidence for discovering where the antenna is.
+    # Explicitly return the receiver to ordinary NAV first and verify TPS3 before
+    # admitting any positional sample into the capture gate.
+    mode_response = cmd_mode({"mode": "NORMAL"})
+    if not mode_response.get("success"):
+        return {
+            "success": False,
+            "message": (
+                "PROFILE_LOCATION could not establish GF-8802 NAV mode: "
+                f"{mode_response.get('message', '?')}"
+            ),
+            "payload": {"location": location, "mode_response": mode_response},
+        }
 
     logging.info(
-        "📍 [gnss] PROFILE_LOCATION '%s' started (timeout=%ds)",
-        location, timeout_s,
+        "📍 [gnss] PROFILE_LOCATION '%s' waiting for GF-8802 NAV + FINE_LOCK "
+        "(timeout=%ds, min_sats=%d, max_hdop=%.2f)",
+        location,
+        timeout_s,
+        PROFILE_MIN_SATELLITES,
+        PROFILE_MAX_HDOP,
     )
 
     deadline = time.monotonic() + timeout_s
-    poll_count = 0
+    polls = 0
+    last_gate = _profile_gate_snapshot()
 
     while time.monotonic() < deadline:
-
-        if _fix_quality_acceptable():
+        last_gate = _profile_gate_snapshot()
+        if last_gate["ready"]:
             facts = _persist_location(location)
             return {
                 "success": True,
                 "message": "OK",
                 "payload": {
                     "location": location,
-                    "polls": poll_count,
+                    "polls": polls,
+                    "capture_gate": last_gate,
                     **facts,
                 },
             }
 
-        poll_count += 1
+        polls += 1
         time.sleep(PROFILE_POLL_INTERVAL_S)
 
-    # Timeout — report what we had at the end
     logging.warning(
-        "⏰ [gnss] PROFILE_LOCATION '%s' timed out after %ds "
-        "(sats=%d hdop=%.2f quality=%s has_pos=%s)",
+        "⏰ [gnss] PROFILE_LOCATION '%s' timed out after %ds; gate=%s",
         location,
         timeout_s,
-        GNSS.satellites,
-        GNSS.hdop if not math.isnan(GNSS.hdop) else -1,
-        derive_lock_quality(),
-        GNSS.has_position,
+        last_gate,
     )
-
     return {
         "success": False,
-        "message": f"PROFILE_LOCATION timed out after {timeout_s}s",
+        "message": (
+            f"PROFILE_LOCATION timed out after {timeout_s}s waiting for "
+            "GF-8802 NAV/FINE_LOCK location capture gate"
+        ),
         "payload": {
             "location": location,
-            "polls": poll_count,
-            "last_satellites": GNSS.satellites,
-            "last_hdop": GNSS.hdop if not math.isnan(GNSS.hdop) else None,
-            "last_lock_quality": derive_lock_quality(),
-            "has_position": GNSS.has_position,
+            "polls": polls,
+            "capture_gate": last_gate,
         },
     }
 
 
+
 def cmd_mode(args: Optional[dict]) -> Dict:
-    """
-    MODE — switch the GF-8802 between NAV and Time Only modes.
-
-    Usage:
-      MODE mode=TO location=<name>     Switch to Time Only at profiled location
-      MODE mode=NORMAL                 Return to normal navigation (CSS)
-
-    Semantics:
-      • Looks up location coordinates from the locations table
-      • Sends $PERDAPI,SURVEY command to GF-8802 via UART
-      • Blocks and polls TPS3 (pos_mode) to verify the mode change
-      • Updates Pi-side commanded mode state
-      • Returns both the command sent and the verified receiver state
-
-    Furuno protocol (GT-87/GF-88xx eSIP):
-      TO mode:   $PERDAPI,SURVEY,3,0,0,<lat>,<lon>,<alt>*XX
-      NAV mode:  $PERDAPI,SURVEY,0*XX
-      CSS mode:  $PERDAPI,SURVEY,2*XX
-
-    Coordinates are decimal degrees (positive=N/E, negative=S/W).
-    Altitude is meters above mean sea level.
-
-    Verification:
-      TPS3 ($PERDCRY) field 2 reports pos_mode:
-        0=NAV, 1=SS, 2=CSS, 3=TO
-    """
+    """Switch the GF-8802 between fixed Time Only and ordinary NAV modes."""
     global _commanded_mode, _commanded_location, _commanded_at
 
     if not args or "mode" not in args:
@@ -1315,17 +1331,14 @@ def cmd_mode(args: Optional[dict]) -> Dict:
             "message": "MODE requires 'mode' argument (TO or NORMAL)",
         }
 
-    mode = args["mode"].strip().upper()
+    mode = str(args["mode"]).strip().upper()
 
     if mode == "TO":
-        # ----------------------------------------------------------
-        # TIME ONLY mode — requires a profiled location
-        # ----------------------------------------------------------
-        location_name = (args.get("location") or "").strip()
-        if not location_name:
+        location_name = str(args.get("location") or "").strip()
+        if not location_name or location_name.upper() == "NONE":
             return {
                 "success": False,
-                "message": "MODE=TO requires 'location' argument",
+                "message": "MODE=TO requires a named profiled location",
             }
 
         loc = _lookup_location(location_name)
@@ -1335,49 +1348,50 @@ def cmd_mode(args: Optional[dict]) -> Dict:
                 "message": f"location '{location_name}' not found — run PROFILE_LOCATION first",
             }
 
+        missing = [key for key in ("latitude", "longitude", "altitude") if loc.get(key) is None]
+        if missing:
+            return {
+                "success": False,
+                "message": (
+                    f"location '{location_name}' is not TO-capable; "
+                    f"missing {', '.join(missing)}"
+                ),
+            }
+
         lat = float(loc["latitude"])
         lon = float(loc["longitude"])
         alt = float(loc["altitude"])
-
-        # Format: $PERDAPI,SURVEY,3,0,0,<lat>,<lon>,<alt>*XX
-        # Lat/lon as decimal degrees, alt in meters
         body = f"PERDAPI,SURVEY,3,0,0,{lat:.4f},{lon:.4f},{alt:.1f}"
 
         logging.info(
             "📡 [gnss] MODE=TO location='%s' lat=%.4f lon=%.4f alt=%.1f",
             location_name, lat, lon, alt,
         )
-
         if not _send_nmea(body):
             return {
                 "success": False,
-                "message": "failed to write SURVEY command to UART",
+                "message": "failed to write SURVEY TO command to UART",
             }
 
-        expected_pos_mode = 3   # TO
+        expected_pos_mode = 3
         _commanded_mode = "TO"
         _commanded_location = location_name
         _commanded_at = time.monotonic()
 
     elif mode == "NORMAL":
-        # ----------------------------------------------------------
-        # Return to CSS (continual self-survey) mode
-        #
-        # We use CSS (mode 2) rather than NAV (mode 0) because CSS
-        # preserves the survey position across power cycles and
-        # continues refining it — better for a timing receiver.
-        # ----------------------------------------------------------
-        body = "PERDAPI,SURVEY,2"
-
-        logging.info("📡 [gnss] MODE=NORMAL (CSS)")
+        # NONE/current-location-clear means genuine ordinary navigation.  Do not
+        # retain the historical CSS policy here: the operator explicitly asked
+        # the receiver to resume normal position solving.
+        body = "PERDAPI,SURVEY,0"
+        logging.info("📡 [gnss] MODE=NORMAL (NAV)")
 
         if not _send_nmea(body):
             return {
                 "success": False,
-                "message": "failed to write SURVEY command to UART",
+                "message": "failed to write SURVEY NAV command to UART",
             }
 
-        expected_pos_mode = 2   # CSS
+        expected_pos_mode = 0
         _commanded_mode = "NORMAL"
         _commanded_location = None
         _commanded_at = time.monotonic()
@@ -1388,20 +1402,20 @@ def cmd_mode(args: Optional[dict]) -> Dict:
             "message": f"unknown mode '{mode}' — use TO or NORMAL",
         }
 
-    # ----------------------------------------------------------
-    # Verify: poll TPS3 pos_mode until it matches or timeout
-    # ----------------------------------------------------------
     time.sleep(MODE_WRITE_SETTLE_S)
-
     deadline = time.monotonic() + MODE_VERIFY_TIMEOUT_S
     polls = 0
 
     while time.monotonic() < deadline:
         if GNSS.tps3_pos_mode == expected_pos_mode:
+            verified_name = POS_MODE_NAMES.get(GNSS.tps3_pos_mode, "?")
             logging.info(
-                "✅ [gnss] MODE verified: pos_mode=%d (%s) after %d polls",
+                "✅ [gnss] MODE verified: requested=%s location=%s "
+                "pos_mode=%d (%s) after %d polls",
+                mode,
+                _commanded_location or "NONE",
                 GNSS.tps3_pos_mode,
-                POS_MODE_NAMES.get(GNSS.tps3_pos_mode, "?"),
+                verified_name,
                 polls,
             )
             return {
@@ -1411,7 +1425,9 @@ def cmd_mode(args: Optional[dict]) -> Dict:
                     "mode": mode,
                     "location": _commanded_location,
                     "verified_pos_mode": GNSS.tps3_pos_mode,
-                    "verified_pos_mode_name": POS_MODE_NAMES.get(GNSS.tps3_pos_mode, "?"),
+                    "verified_pos_mode_name": verified_name,
+                    "freq_mode": GNSS.tps4_freq_mode,
+                    "freq_mode_name": GNSS.tps4_freq_mode_name or None,
                     "polls": polls,
                 },
             }
@@ -1419,23 +1435,23 @@ def cmd_mode(args: Optional[dict]) -> Dict:
         polls += 1
         time.sleep(MODE_VERIFY_POLL_S)
 
-    # Timeout — command was sent but receiver hasn't confirmed
+    actual_name = POS_MODE_NAMES.get(GNSS.tps3_pos_mode, "?")
     logging.warning(
         "⏰ [gnss] MODE verification timed out after %.1fs "
-        "(expected=%d actual=%d/%s)",
+        "(requested=%s location=%s expected=%d actual=%d/%s)",
         MODE_VERIFY_TIMEOUT_S,
+        mode,
+        _commanded_location or "NONE",
         expected_pos_mode,
         GNSS.tps3_pos_mode,
-        POS_MODE_NAMES.get(GNSS.tps3_pos_mode, "?"),
+        actual_name,
     )
-
     return {
         "success": False,
         "message": (
             f"MODE command sent but verification timed out after "
             f"{MODE_VERIFY_TIMEOUT_S}s — receiver reports "
-            f"pos_mode={GNSS.tps3_pos_mode} "
-            f"({POS_MODE_NAMES.get(GNSS.tps3_pos_mode, '?')}), "
+            f"pos_mode={GNSS.tps3_pos_mode} ({actual_name}), "
             f"expected {expected_pos_mode}"
         ),
         "payload": {
@@ -1444,18 +1460,75 @@ def cmd_mode(args: Optional[dict]) -> Dict:
             "command_sent": True,
             "verified": False,
             "actual_pos_mode": GNSS.tps3_pos_mode,
-            "actual_pos_mode_name": POS_MODE_NAMES.get(GNSS.tps3_pos_mode, "?"),
+            "actual_pos_mode_name": actual_name,
             "expected_pos_mode": expected_pos_mode,
+            "freq_mode": GNSS.tps4_freq_mode,
+            "freq_mode_name": GNSS.tps4_freq_mode_name or None,
             "polls": polls,
         },
     }
 
+
+
+def cmd_location_info(args: Optional[dict]) -> Dict:
+    """Return one persisted location profile without interpreting it outside GNSS."""
+    name = str((args or {}).get("location") or "").strip()
+    if not name or name.upper() == "NONE":
+        return {"success": False, "message": "LOCATION_INFO requires a named location"}
+
+    payload = _lookup_location(name)
+    if payload is None:
+        return {"success": False, "message": f"location '{name}' not found"}
+
+    return {
+        "success": True,
+        "message": "OK",
+        "payload": {
+            "location": name,
+            "to_capable": all(payload.get(key) is not None for key in ("latitude", "longitude", "altitude")),
+            "profile": payload,
+        },
+    }
+
+
+def cmd_list_locations(_: Optional[dict]) -> Dict:
+    """Return persisted location profiles ordered by name."""
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT location, ts, payload
+            FROM locations
+            ORDER BY location
+            """
+        )
+        rows = cur.fetchall()
+
+    locations = []
+    for row in rows:
+        payload = row["payload"]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        locations.append({
+            "location": row["location"],
+            "ts": row["ts"].isoformat() if hasattr(row["ts"], "isoformat") else str(row["ts"]),
+            "to_capable": bool(
+                isinstance(payload, dict)
+                and all(payload.get(key) is not None for key in ("latitude", "longitude", "altitude"))
+            ),
+            "profile": payload if isinstance(payload, dict) else {},
+        })
+
+    return {"success": True, "message": "OK", "payload": {"locations": locations}}
 
 COMMANDS = {
     "REPORT": cmd_report,
     "GET_TIME": cmd_get_time,
     "GET_GNSS_INFO": cmd_get_gnss_info,
     "PROFILE_LOCATION": cmd_profile_location,
+    "CAPTURE_LOCATION": cmd_profile_location,
+    "LOCATION_INFO": cmd_location_info,
+    "LIST_LOCATIONS": cmd_list_locations,
     "MODE": cmd_mode,
 }
 

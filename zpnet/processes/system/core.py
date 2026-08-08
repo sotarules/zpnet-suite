@@ -4,6 +4,8 @@ ZPNet SYSTEM Process (Pi-side platform-context authority)
 Responsibilities:
   • Collect Raspberry Pi host, network, sensor, environment, power, and battery state
   • Fold the current GNSS receiver announcement into the platform context
+  • Own the operator-selected current location and its durable SYSTEM config state
+  • Coordinate named-location capture/selection with the GNSS receiver authority
   • Maintain the Pi-authored feature tree
   • Publish no CLOCKS-domain stream and own no CLOCKS persistence or recovery
   • Expose the complete current platform context through SYSTEM.REPORT
@@ -236,6 +238,12 @@ POWER_SAMPLE_STEP = 5                # same semantics as before
 SYSTEM: Dict[str, object] = {}
 
 _SYSTEM_LOCK = threading.Lock()
+
+# SYSTEM owns the operator-selected physical location.  The durable value lives
+# in config.SYSTEM.current_location; the process-local copy is loaded once at
+# startup and updated only by SYSTEM.SET_LOCATION.
+_CURRENT_LOCATION_LOCK = threading.Lock()
+_CURRENT_LOCATION: Optional[str] = None
 
 # GNSS publishes predictive TPS1 announcements.  Retain a short history so
 # CLOCKS can select the announcement naming its completed UTC second rather
@@ -1541,28 +1549,163 @@ def on_gnss_announcement(payload: Optional[dict]) -> None:
 
 
 # ------------------------------------------------------------------
+# Location ownership / GNSS realization
+# ------------------------------------------------------------------
+
+def _load_current_location_from_config() -> Optional[str]:
+    """Load config.SYSTEM.current_location into SYSTEM-owned process state."""
+    global _CURRENT_LOCATION
+
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT payload FROM config WHERE config_key = 'SYSTEM'")
+        row = cur.fetchone()
+
+    if row is None:
+        raise RuntimeError("config.SYSTEM row is required for current_location ownership")
+
+    payload = normalize_payload(row["payload"])
+    raw = payload.get("current_location") if isinstance(payload, dict) else None
+    location = str(raw).strip() if raw is not None else ""
+    selected = location if location and location.upper() != "NONE" else None
+
+    with _CURRENT_LOCATION_LOCK:
+        _CURRENT_LOCATION = selected
+
+    logging.info(
+        "📍 [system] restored current_location=%s from config.SYSTEM",
+        selected or "NONE",
+    )
+    return selected
+
+
+def _current_location() -> Optional[str]:
+    with _CURRENT_LOCATION_LOCK:
+        return _CURRENT_LOCATION
+
+
+def _persist_current_location(location: Optional[str]) -> None:
+    """Persist the selected location only after GNSS has verified its mode."""
+    with open_db() as conn:
+        cur = conn.cursor()
+        if location is None:
+            cur.execute(
+                """
+                UPDATE config
+                SET payload = payload - 'current_location'
+                WHERE config_key = 'SYSTEM'
+                """
+            )
+        else:
+            cur.execute(
+                """
+                UPDATE config
+                SET payload = payload
+                    || jsonb_build_object('current_location', to_jsonb(%s::text))
+                WHERE config_key = 'SYSTEM'
+                """,
+                (location,),
+            )
+        if cur.rowcount != 1:
+            raise RuntimeError("config.SYSTEM row is missing; current_location was not persisted")
+
+
+def _set_current_location_cache(location: Optional[str]) -> None:
+    global _CURRENT_LOCATION
+    with _CURRENT_LOCATION_LOCK:
+        _CURRENT_LOCATION = location
+
+
+def _apply_current_location_to_gnss(*, context: str) -> Dict[str, Any]:
+    """Make receiver mode agree with SYSTEM.current_location and return testimony."""
+    location = _current_location()
+    args = (
+        {"mode": "TO", "location": location}
+        if location is not None
+        else {"mode": "NORMAL"}
+    )
+
+    logging.info(
+        "📍 [system/location] %s: applying current_location=%s -> GF-8802 mode=%s",
+        context,
+        location or "NONE",
+        "TO" if location is not None else "NAV",
+    )
+    response = send_command(
+        machine="PI",
+        subsystem="GNSS",
+        command="MODE",
+        args=args,
+    )
+    if not isinstance(response, dict) or not response.get("success"):
+        raise RuntimeError(
+            f"GNSS.MODE failed while applying current_location={location or 'NONE'}: "
+            f"{response!r}"
+        )
+
+    payload = response.get("payload")
+    payload = payload if isinstance(payload, dict) else {}
+    verified = str(payload.get("verified_pos_mode_name") or "?")
+    freq_mode = str(payload.get("freq_mode_name") or "?")
+    logging.info(
+        "✅ [system/location] %s: current_location=%s verified GF-8802 "
+        "position_mode=%s freq_mode=%s",
+        context,
+        location or "NONE",
+        verified,
+        freq_mode,
+    )
+    return {
+        "current_location": location,
+        "requested_mode": "TO" if location is not None else "NORMAL",
+        "verified_pos_mode": payload.get("verified_pos_mode"),
+        "verified_pos_mode_name": payload.get("verified_pos_mode_name"),
+        "freq_mode": payload.get("freq_mode"),
+        "freq_mode_name": payload.get("freq_mode_name"),
+        "gnss": payload,
+    }
+
+
+def _location_context(gnss_payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the SYSTEM-owned location selection plus receiver testimony."""
+    selected = _current_location()
+    survey = (
+        gnss_payload.get("survey_mode")
+        if isinstance(gnss_payload.get("survey_mode"), dict)
+        else {}
+    )
+    integrity = (
+        gnss_payload.get("integrity")
+        if isinstance(gnss_payload.get("integrity"), dict)
+        else {}
+    )
+    return {
+        "current_location": selected,
+        "selection": selected or "NONE",
+        "requested_mode": "TO" if selected is not None else "NORMAL",
+        "receiver_mode": (
+            survey.get("receiver_mode")
+            or integrity.get("pos_mode")
+        ),
+        "commanded_mode": survey.get("commanded_mode"),
+        "commanded_location": survey.get("commanded_location"),
+    }
+
+
+# ------------------------------------------------------------------
 # Command handlers
 # ------------------------------------------------------------------
 
-def cmd_report(_: Optional[dict]) -> Dict:
-    """Return the current Pi-owned platform context.
 
-    Slow platform telemetry remains owned by the 30-second SYSTEM poller.
-    GNSS is different: GNSS_ANNOUNCEMENT arrives every second and is already
-    retained in memory. Overlay that live announcement-derived status here so
-    SYSTEM.REPORT does not expose a GNSS snapshot that is up to one platform
-    poll interval old.
-    """
+def cmd_report(_: Optional[dict]) -> Dict:
+    """Return current Pi platform context plus SYSTEM-owned location identity."""
     with _SYSTEM_LOCK:
         snapshot = copy.deepcopy(SYSTEM)
 
-    # SYSTEM.REPORT is the current-context boundary consumed by CLOCKS. Do not
-    # make its 1 Hz GNSS identity wait for the intentionally slow platform poll.
     gnss_payload = build_gnss_status()
     snapshot["gnss"] = gnss_payload
+    snapshot["location"] = _location_context(gnss_payload)
 
-    # Keep the returned readiness tree coherent with the live GNSS overlay
-    # without mutating the process-wide feature registry from a read command.
     features = snapshot.get("features")
     if isinstance(features, dict):
         pi_features = features.setdefault("PI", {})
@@ -1601,6 +1744,190 @@ def _refresh_feature_payload_from_registry() -> dict:
     with _SYSTEM_LOCK:
         system_features = SYSTEM.get("features")
     return _copy_feature_tree(system_features)
+
+
+def cmd_set_location(args: Optional[dict]) -> Dict:
+    """Select a named fixed location, or NONE for ordinary GF-8802 navigation."""
+    if not args or "location" not in args:
+        return {"success": False, "message": "SET_LOCATION requires 'location'"}
+
+    raw = str(args["location"]).strip()
+    if not raw:
+        return {"success": False, "message": "location must not be empty"}
+
+    selected = None if raw.upper() == "NONE" else raw
+    previous = _current_location()
+    mode_args = (
+        {"mode": "TO", "location": selected}
+        if selected is not None
+        else {"mode": "NORMAL"}
+    )
+
+    logging.info(
+        "📍 [system/location] SET_LOCATION %s -> %s; commanding GF-8802 %s",
+        previous or "NONE",
+        selected or "NONE",
+        "TO" if selected is not None else "NAV",
+    )
+
+    response = send_command(
+        machine="PI",
+        subsystem="GNSS",
+        command="MODE",
+        args=mode_args,
+    )
+    if not isinstance(response, dict) or not response.get("success"):
+        return {
+            "success": False,
+            "message": (
+                f"SET_LOCATION rejected because GF-8802 mode change was not verified: "
+                f"{response.get('message', '?') if isinstance(response, dict) else response!r}"
+            ),
+            "payload": {"requested_location": selected, "gnss": response},
+        }
+
+    try:
+        _persist_current_location(selected)
+    except Exception as exc:
+        logging.exception(
+            "💥 [system/location] GF-8802 mode changed but current_location persistence failed"
+        )
+        return {
+            "success": False,
+            "message": f"GF-8802 mode changed but current_location persistence failed: {exc}",
+            "payload": {"requested_location": selected, "gnss": response},
+        }
+
+    _set_current_location_cache(selected)
+    payload = response.get("payload") if isinstance(response.get("payload"), dict) else {}
+    logging.info(
+        "✅ [system/location] current_location=%s committed; GF-8802 position_mode=%s freq_mode=%s",
+        selected or "NONE",
+        payload.get("verified_pos_mode_name") or "?",
+        payload.get("freq_mode_name") or "?",
+    )
+    return {
+        "success": True,
+        "message": "OK",
+        "payload": {
+            "current_location": selected,
+            "selection": selected or "NONE",
+            "gnss": payload,
+        },
+    }
+
+
+def cmd_capture_location(args: Optional[dict]) -> Dict:
+    """Capture a named GF-8802 location while SYSTEM explicitly owns NONE."""
+    if not args or "location" not in args:
+        return {"success": False, "message": "CAPTURE_LOCATION requires 'location'"}
+
+    name = str(args["location"]).strip()
+    if not name or name.upper() == "NONE":
+        return {"success": False, "message": "CAPTURE_LOCATION requires a non-NONE location name"}
+
+    selected = _current_location()
+    if selected is not None:
+        return {
+            "success": False,
+            "message": (
+                f"current_location is '{selected}'. "
+                "SET_LOCATION location=NONE before capturing a physical location"
+            ),
+        }
+
+    forward_args: Dict[str, Any] = {"location": name}
+    if "timeout_s" in args:
+        forward_args["timeout_s"] = args["timeout_s"]
+
+    logging.info(
+        "📍 [system/location] CAPTURE_LOCATION '%s': current_location=NONE; "
+        "delegating receiver-proven capture to GNSS",
+        name,
+    )
+    response = send_command(
+        machine="PI",
+        subsystem="GNSS",
+        command="CAPTURE_LOCATION",
+        args=forward_args,
+    )
+    if not isinstance(response, dict):
+        return {"success": False, "message": f"malformed GNSS capture response: {response!r}"}
+    return response
+
+
+def cmd_location_info(args: Optional[dict]) -> Dict:
+    """Return current selection, live receiver mode, and an optional named profile."""
+    selected = _current_location()
+    requested = str((args or {}).get("location") or selected or "").strip()
+
+    gnss_response = send_command(
+        machine="PI",
+        subsystem="GNSS",
+        command="REPORT",
+    )
+    if not isinstance(gnss_response, dict) or not gnss_response.get("success"):
+        return {"success": False, "message": f"GNSS.REPORT unavailable: {gnss_response!r}"}
+
+    gnss_payload = gnss_response.get("payload")
+    gnss_payload = gnss_payload if isinstance(gnss_payload, dict) else {}
+    result: Dict[str, Any] = {
+        "current_location": selected,
+        "selection": selected or "NONE",
+        "receiver": _location_context(gnss_payload),
+    }
+
+    if requested and requested.upper() != "NONE":
+        profile_response = send_command(
+            machine="PI",
+            subsystem="GNSS",
+            command="LOCATION_INFO",
+            args={"location": requested},
+        )
+        if not isinstance(profile_response, dict) or not profile_response.get("success"):
+            return {
+                "success": False,
+                "message": profile_response.get("message", "location profile unavailable")
+                if isinstance(profile_response, dict)
+                else f"malformed GNSS location response: {profile_response!r}",
+                "payload": result,
+            }
+        result["profile"] = profile_response.get("payload")
+
+    return {"success": True, "message": "OK", "payload": result}
+
+
+def cmd_list_locations(_: Optional[dict]) -> Dict:
+    """Return GNSS-owned persisted location profiles with SYSTEM selection identity."""
+    response = send_command(
+        machine="PI",
+        subsystem="GNSS",
+        command="LIST_LOCATIONS",
+    )
+    if not isinstance(response, dict) or not response.get("success"):
+        return {
+            "success": False,
+            "message": response.get("message", "LIST_LOCATIONS failed")
+            if isinstance(response, dict)
+            else f"malformed GNSS location response: {response!r}",
+        }
+
+    payload = response.get("payload")
+    payload = dict(payload) if isinstance(payload, dict) else {}
+    payload["current_location"] = _current_location()
+    payload["selection"] = _current_location() or "NONE"
+    return {"success": True, "message": "OK", "payload": payload}
+
+
+def cmd_ensure_location(args: Optional[dict]) -> Dict:
+    """Reassert the durable SYSTEM location selection on the GF-8802."""
+    context = str((args or {}).get("context") or "SYSTEM.ENSURE_LOCATION").strip()
+    try:
+        payload = _apply_current_location_to_gnss(context=context)
+    except Exception as exc:
+        logging.exception("💥 [system/location] %s failed", context)
+        return {"success": False, "message": str(exc)}
+    return {"success": True, "message": "OK", "payload": payload}
 
 def cmd_features(_: Optional[dict]) -> Dict:
     return {
@@ -1679,6 +2006,11 @@ def cmd_swap_battery(_: Optional[dict]) -> Dict:
 
 COMMANDS = {
     "REPORT": cmd_report,
+    "SET_LOCATION": cmd_set_location,
+    "CAPTURE_LOCATION": cmd_capture_location,
+    "LOCATION_INFO": cmd_location_info,
+    "LIST_LOCATIONS": cmd_list_locations,
+    "ENSURE_LOCATION": cmd_ensure_location,
     "FEATURES": cmd_features,
     "REPORT_FEATURES": cmd_features,
     "GET_FEATURE": cmd_get_feature,
@@ -1707,6 +2039,8 @@ def startup_teensy_quiet_delay() -> None:
 def run() -> None:
     setup_logging()
     try:
+        _load_current_location_from_config()
+
         server_setup(
             subsystem="SYSTEM",
             commands=COMMANDS,

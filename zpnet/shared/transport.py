@@ -86,10 +86,10 @@ _RETRY_MAX_SLEEP_S = 0.50
 
 # USB CDC attach is not atomic from the application protocol's point of view:
 # opening the serial device can coincide with Teensy reboot/setup traffic and
-# with stale bytes buffered by the host driver.  Do not allow the first
-# application command to race that window.  Drain and settle before declaring
-# the transport ready for Pi->Teensy writes.
-_ATTACH_DRAIN_S = 1.00
+# with bytes already buffered by the host driver.  Do not discard that stream:
+# callbacks are installed before transport_init(), so parse/deliver every valid
+# frame during the settle window before declaring Pi->Teensy writes ready.
+_ATTACH_INGEST_S = 1.00
 _READY_SEND_TIMEOUT_S = 10.0
 
 # ---------------------------------------------------------------------
@@ -105,7 +105,7 @@ _transport_ready = threading.Event()
 _transport_ready_lock = threading.Lock()
 _transport_ready_generation = 0
 _transport_attach_count = 0
-_transport_attach_drain_bytes = 0
+_transport_attach_ingest_bytes = 0
 _transport_last_ready_ts: Optional[float] = None
 
 # ---------------------------------------------------------------------
@@ -177,30 +177,31 @@ def _reset_host_rx_state() -> None:
     _rx_reset()
 
 
-def _serial_reset_buffers() -> None:
+def _serial_reset_output_buffer() -> None:
+    """Discard only stale host TX bytes; inbound Teensy evidence is never flushed."""
     ser = _ser
     if ser is None:
         return
 
-    for name in ("reset_input_buffer", "reset_output_buffer"):
-        fn = getattr(ser, name, None)
-        if fn is None:
-            continue
-        try:
-            fn()
-        except Exception:
-            logging.debug("[transport] %s failed during attach", name, exc_info=True)
+    fn = getattr(ser, "reset_output_buffer", None)
+    if fn is None:
+        return
+    try:
+        fn()
+    except Exception:
+        logging.debug("[transport] reset_output_buffer failed during attach", exc_info=True)
 
 
-def _drain_attach_noise() -> int:
-    global _transport_attach_count, _transport_attach_drain_bytes
+def _ingest_attach_stream() -> int:
+    """Parse/deliver all bytes observed during the USB attach settle window."""
+    global _transport_attach_count, _transport_attach_ingest_bytes
 
     ser = _ser
     if ser is None:
         return 0
 
-    deadline = time.monotonic() + _ATTACH_DRAIN_S
-    drained = 0
+    deadline = time.monotonic() + _ATTACH_INGEST_S
+    ingested = 0
 
     while time.monotonic() < deadline:
         try:
@@ -210,7 +211,8 @@ def _drain_attach_noise() -> int:
 
         if waiting:
             chunk = ser.read(waiting)
-            drained += len(chunk)
+            ingested += len(chunk)
+            _serial_rx_consume(chunk)
             continue
 
         time.sleep(0.02)
@@ -218,18 +220,21 @@ def _drain_attach_noise() -> int:
     try:
         waiting = getattr(ser, "in_waiting", 0)
         if waiting:
-            drained += len(ser.read(waiting))
-        reset_input = getattr(ser, "reset_input_buffer", None)
-        if reset_input is not None:
-            reset_input()
+            chunk = ser.read(waiting)
+            ingested += len(chunk)
+            _serial_rx_consume(chunk)
     except Exception:
-        logging.debug("[transport] final attach drain failed", exc_info=True)
+        logging.debug("[transport] final attach ingest failed", exc_info=True)
 
     _transport_attach_count += 1
-    _transport_attach_drain_bytes += drained
-    if drained:
-        logging.info("[transport] drained %d startup attach bytes before ready", drained)
-    return drained
+    _transport_attach_ingest_bytes += ingested
+    if ingested:
+        logging.info(
+            "[transport] ingested %d startup attach bytes before ready",
+            ingested,
+        )
+    return ingested
+
 
 # ---------------------------------------------------------------------
 # Raw wire logging
@@ -468,42 +473,44 @@ def _dispatch_if_complete() -> None:
     _rx_reset()
 
 
-def _serial_rx_loop() -> None:
-    _rx_reset()
-
-    while True:
-        data = _serial_read_some()
-        for b in data:
-            if not rx_have_traffic:
-                if b in _VALID_TRAFFIC:
-                    _rx_begin(b)
-                continue
-
-            # Recover from orphan traffic bytes / partial prior frames.  Once
-            # STX is established, valid traffic-looking bytes are payload bytes;
-            # before STX is established, they are fresh frame boundaries.
-            if _rx_should_resync(b):
-                logging.debug(
-                    "[transport] RX resync on traffic=0x%02X discarded_prefix=%r",
-                    b,
-                    bytes(rx_buf),
-                )
+def _serial_rx_consume(data: bytes) -> None:
+    """Feed one byte chunk through the canonical frame parser."""
+    for b in data:
+        if not rx_have_traffic:
+            if b in _VALID_TRAFFIC:
                 _rx_begin(b)
-                continue
+            continue
 
-            rx_buf.append(b)
+        # Recover from orphan traffic bytes / partial prior frames.  Once
+        # STX is established, valid traffic-looking bytes are payload bytes;
+        # before STX is established, they are fresh frame boundaries.
+        if _rx_should_resync(b):
+            logging.debug(
+                "[transport] RX resync on traffic=0x%02X discarded_prefix=%r",
+                b,
+                bytes(rx_buf),
+            )
+            _rx_begin(b)
+            continue
 
-            if len(rx_buf) > RX_BUF_MAX:
-                logging.info("🧩 transport receive buffer overflow: len=%d", len(rx_buf))
-                _rx_reset()
-                continue
+        rx_buf.append(b)
 
-            if len(rx_buf) <= len(STX_PREFIX) and not STX_PREFIX.startswith(bytes(rx_buf)):
-                logging.info("🧩 transport detected incorrectly formatted frame: %r", bytes(rx_buf))
-                _rx_reset()
-                continue
+        if len(rx_buf) > RX_BUF_MAX:
+            logging.info("🧩 transport receive buffer overflow: len=%d", len(rx_buf))
+            _rx_reset()
+            continue
 
-            _dispatch_if_complete()
+        if len(rx_buf) <= len(STX_PREFIX) and not STX_PREFIX.startswith(bytes(rx_buf)):
+            logging.info("🧩 transport detected incorrectly formatted frame: %r", bytes(rx_buf))
+            _rx_reset()
+            continue
+
+        _dispatch_if_complete()
+
+
+def _serial_rx_loop() -> None:
+    while True:
+        _serial_rx_consume(_serial_read_some())
 
 # ---------------------------------------------------------------------
 # Supervisor
@@ -518,8 +525,8 @@ def _supervisor_loop() -> None:
             _transport_mark_not_ready()
             _open_serial(TEENSY_SERIAL_PATH)
             _reset_host_rx_state()
-            _serial_reset_buffers()
-            _drain_attach_noise()
+            _serial_reset_output_buffer()
+            _ingest_attach_stream()
             if announced:
                 logging.info("✅ [transport] SERIAL device available — RX loop starting")
                 announced = False
@@ -560,7 +567,7 @@ def transport_diagnostics() -> dict:
             "ready": _transport_ready.is_set(),
             "ready_generation": _transport_ready_generation,
             "attach_count": _transport_attach_count,
-            "attach_drain_bytes": _transport_attach_drain_bytes,
+            "attach_ingest_bytes": _transport_attach_ingest_bytes,
             "last_ready_ts": _transport_last_ready_ts,
         }
 

@@ -17,7 +17,8 @@ Core contract:
     • Pi owns: GNSS_RAW, GF-8802 correlation, environment correlation,
       campaign lifecycle, final acceptance court, recovery orchestration,
       and PostgreSQL persistence.
-    • SYSTEM owns: current Pi/GNSS/environment/power context exposed by SYSTEM.REPORT.
+    • SYSTEM owns: current Pi/GNSS/environment/power context and selected physical
+      location, exposed by SYSTEM.REPORT and realized through GNSS.
 
   START behavior:
 
@@ -515,6 +516,14 @@ _diag: Dict[str, Any] = {
     "startup_control_ready": False,
     "startup_control_busy_rejections": 0,
     "last_startup_control_rejection": {},
+    "startup_custody_active": True,
+    "startup_custody_depth": 0,
+    "startup_custody_retained": 0,
+    "startup_custody_released": 0,
+    "startup_custody_retired": 0,
+    "startup_custody_last_sequence": None,
+    "last_startup_custody_release": {},
+    "last_startup_custody_retire": {},
 
     # CLOCKS_FRAGMENT silence / Teensy restart detection
     "timebase_silence_monitor_started": False,
@@ -537,6 +546,8 @@ _diag: Dict[str, Any] = {
     "flash_cut_first_fragment_wait_s": None,
     "flash_cut_first_fragment_pps_vclock_count": None,
     "flash_cut_cold_recovery_deferred": 0,
+    "flash_cut_pre_cut_tail_retired": 0,
+    "last_flash_cut_pre_cut_tail": {},
     "last_flash_cut": {},
 }
 
@@ -881,6 +892,14 @@ _last_clocks_state_monotonic: Optional[float] = None
 _last_tempest_candidate_identity: Optional[Tuple[str, int]] = None
 _last_tempest_candidate_monotonic: Optional[float] = None
 
+# Startup persistence custody.  Valid CLOCKS rows may arrive while holistic
+# restore deliberately keeps the ordinary writer closed.  Retain those exact
+# canonical rows until the Teensy lifecycle probe tells us whether they belong
+# to a still-live instrument epoch or to a superseded cold/full-restore epoch.
+_startup_custody_lock = threading.Lock()
+_startup_custody_active = True
+_startup_custody_backlog = deque()
+
 # The command server is exposed early so PUBSUB can discover subscriptions, but
 # START/RESUME must not race holistic startup reconciliation.
 _startup_control_ready = threading.Event()
@@ -1141,6 +1160,39 @@ def _clear_flash_cut_wait_state() -> None:
     _diag["flash_cut_waiting"] = False
     _diag["flash_cut_from"] = None
     _diag["flash_cut_to"] = None
+
+
+def _flash_cut_pre_cut_tail_authority(
+    *,
+    firmware_campaign: str,
+    active_campaign: str,
+    active_campaign_payload: Dict[str, Any],
+) -> Optional[str]:
+    """Return the authority proving a lawful predecessor tail, or None.
+
+    The active campaign_master transition is the atomic Flash Cut authority.
+    Process-local wait state is armed only after that DB transaction commits, so
+    it is a useful witness but cannot be the sole court during the cutover race.
+    """
+    if _campaign_payload_is_pending_flash_cut(active_campaign_payload):
+        durable_from = str(active_campaign_payload.get("flash_cut_from") or "")
+        if (
+            durable_from
+            and firmware_campaign == durable_from
+            and active_campaign != durable_from
+        ):
+            return "CAMPAIGN_MASTER"
+
+    if (
+        _flash_cut_pending
+        and _flash_cut_from_campaign
+        and _flash_cut_to_campaign
+        and firmware_campaign == _flash_cut_from_campaign
+        and active_campaign == _flash_cut_to_campaign
+    ):
+        return "PROCESS_LOCAL"
+
+    return None
 
 
 def _mark_flash_cut_committed_if_needed(*, campaign: str, pps_vclock_count: int) -> None:
@@ -1712,111 +1764,47 @@ def _get_active_campaign() -> Optional[Dict[str, Any]]:
 
 
 
-def _get_system_config() -> Dict[str, Any]:
-    """Return SYSTEM config payload, or {} if unavailable."""
-    try:
-        with open_db(row_dict=True) as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT payload FROM config WHERE config_key = 'SYSTEM'")
-            row = cur.fetchone()
-    except Exception:
-        logging.exception("⚠️ [clocks] failed to read SYSTEM config")
-        return {}
 
-    if row is None:
-        return {}
-
-    payload = row["payload"]
-    if isinstance(payload, str):
-        payload = json.loads(payload)
-
-    return payload if isinstance(payload, dict) else {}
-
-
-def _get_current_location() -> Optional[str]:
-    """Return the authoritative system-level current location, if set."""
-    cfg = _get_system_config()
-    location = cfg.get("current_location")
-    if isinstance(location, str):
-        location = location.strip()
-        return location or None
-    return None
-
-
-def _get_location_record(location: Optional[str]) -> Optional[Dict[str, Any]]:
-    """Return a location row and decoded payload, or None if not found."""
-    if not location:
-        return None
-
-    try:
-        with open_db(row_dict=True) as conn:
-            cur = conn.cursor()
-            cur.execute(
-                """
-                SELECT location, payload
-                FROM locations
-                WHERE location = %s
-                LIMIT 1
-                """,
-                (location,),
-            )
-            row = cur.fetchone()
-    except Exception:
-        logging.exception("⚠️ [clocks] failed to read location record for '%s'", location)
-        return None
-
-    if row is None:
-        return None
-
-    payload = row["payload"]
-    if isinstance(payload, str):
-        payload = json.loads(payload)
-
-    return {
-        "location": row["location"],
-        "payload": payload if isinstance(payload, dict) else {},
-    }
-
-
-def _location_has_time_only_profile(location: Optional[str]) -> bool:
-    """
-    True if the location record contains the geodetic facts needed
-    to command GNSS into Time Only mode.
-    """
-    row = _get_location_record(location)
-    if row is None:
-        return False
-
-    payload = row["payload"]
-    return (
-        payload.get("latitude") is not None
-        and payload.get("longitude") is not None
-        and payload.get("altitude") is not None
+def _ensure_system_location(*, context: str) -> Dict[str, Any]:
+    """Ask SYSTEM to reassert its durable location selection on the GF-8802."""
+    response = send_command(
+        machine="PI",
+        subsystem="SYSTEM",
+        command="ENSURE_LOCATION",
+        args={"context": context},
     )
+    if not isinstance(response, dict) or not response.get("success"):
+        raise RuntimeError(
+            f"SYSTEM.ENSURE_LOCATION failed during {context}: {response!r}"
+        )
+
+    payload = response.get("payload")
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            f"SYSTEM.ENSURE_LOCATION returned malformed payload during {context}: "
+            f"{response!r}"
+        )
+
+    location = payload.get("current_location")
+    verified_mode = str(payload.get("verified_pos_mode_name") or "?")
+    freq_mode = str(payload.get("freq_mode_name") or "?")
+    logging.info(
+        "📍 [clocks/location] %s: SYSTEM current_location=%s; "
+        "GF-8802 verified position_mode=%s freq_mode=%s",
+        context,
+        location or "NONE",
+        verified_mode,
+        freq_mode,
+    )
+    return payload
 
 
-def _ensure_gnss_mode_for_current_location() -> Optional[str]:
-    """
-    Keep GNSS in TO mode whenever the authoritative current location
-    has a usable profile; otherwise place GNSS in NORMAL mode.
 
-    Returns the current system location (which may be None).
-    Raises RuntimeError only if a GNSS MODE command is explicitly rejected.
-    """
-    location = _get_current_location()
 
-    if location and _location_has_time_only_profile(location):
-        logging.info("📡 [clocks] ensuring GNSS -> TO mode for current location '%s'", location)
-        gnss_resp = _set_gnss_mode_to(location)
-        if not gnss_resp.get("success"):
-            raise RuntimeError(f"GNSS MODE=TO failed for '{location}': {gnss_resp.get('message', '?')}")
-        return location
 
-    logging.info("📡 [clocks] ensuring GNSS -> NORMAL mode (no TO-capable current location)")
-    gnss_resp = _set_gnss_mode_normal()
-    if not gnss_resp.get("success"):
-        raise RuntimeError(f"GNSS MODE=NORMAL failed: {gnss_resp.get('message', '?')}")
-    return location
+
+
+
 
 
 def _clocks_payload(monitor: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -3076,12 +3064,19 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
     status = str(payload.get("status") or "")
     campaign_state = str(payload.get("campaign_state") or "").strip().upper()
     if status == "monitor_restore_rejected_busy" and campaign_state == "STARTED":
+        startup_custody = _release_startup_clocks_custody_live()
         return {
             "success": True,
             "mode": "LIVE_CAMPAIGN_CUSTODY",
             "teensy": payload,
+            "startup_custody": startup_custody,
             "proof": {"proved": True, "basis": "TEENSY_LIVE_CAMPAIGN_CUSTODY"},
         }
+
+    # The Teensy does not own a live campaign epoch.  Startup rows observed before
+    # this verdict belong to the fresh/superseded instrument and must not be
+    # persisted across the restore boundary.
+    _retire_startup_clocks_custody("instrument_restore_required")
 
     ppb_stage: Dict[str, Any]
     if status == "monitor_restore_requires_ppb_state":
@@ -3166,9 +3161,22 @@ def _holistic_restore() -> Dict[str, Any]:
         "schema": "PI_CLOCKS_HOLISTIC_RESTORE_V1",
         "active_campaign": active_campaign.get("campaign") if active_campaign else None,
         "skipped_unrecoverable_details": int(skipped),
+        "location": None,
         "instrument": None,
         "campaign": None,
     }
+
+    if active_campaign is None:
+        logging.info(
+            "📍 [holistic restore] no active campaign; restoring SYSTEM location/GF-8802 mode"
+        )
+        result["location"] = _ensure_system_location(context="HOLISTIC_RESTORE_IDLE")
+    else:
+        logging.info(
+            "📍 [holistic restore] active campaign '%s'; location/GF-8802 mode "
+            "will be verified by campaign recovery",
+            active_campaign.get("campaign"),
+        )
 
     try:
         if detail is not None:
@@ -3183,13 +3191,15 @@ def _holistic_restore() -> Dict[str, Any]:
                 "ℹ️ [holistic restore] no structured-recoverable CLOCKS detail; "
                 "establishing a fresh durable statistics epoch"
             )
+            _retire_startup_clocks_custody("fresh_statistics_epoch")
             result["instrument"] = _establish_fresh_durable_stats_epoch()
     finally:
-        # Open the general writer before retiring the narrow restore-proof lane so
-        # no restored Alpha row can fall between the two custody regimes.  A failed
-        # fresh-epoch birth remains fail-closed because _clocks_epoch_birth_pending
-        # continues withholding rows until an update_count=1 reset epoch appears.
-        _clocks_persistence_enabled.set()
+        # Open the general writer only after startup custody has been classified.
+        # A command/RPC failure before the Teensy lifecycle verdict must leave the
+        # retained prefix fail-closed rather than silently creating another durable
+        # chronology hole.
+        if not _startup_clocks_custody_unresolved():
+            _clocks_persistence_enabled.set()
         _clocks_holistic_restore_proof_pending.clear()
 
     if active_campaign is not None:
@@ -3569,18 +3579,8 @@ def _wait_for_gnss_time() -> str:
 
 
 
-def _set_gnss_mode_to(location: str) -> Dict[str, Any]:
-    return send_command(
-        machine="PI", subsystem="GNSS", command="MODE",
-        args={"mode": "TO", "location": location},
-    )
 
 
-def _set_gnss_mode_normal() -> Dict[str, Any]:
-    return send_command(
-        machine="PI", subsystem="GNSS", command="MODE",
-        args={"mode": "NORMAL"},
-    )
 
 
 
@@ -6026,6 +6026,7 @@ def _build_canonical_clocks_state(
         "network": copy.deepcopy(system_context.get("network") or {}),
         "sensors": copy.deepcopy(system_context.get("sensors") or {}),
         "environment": copy.deepcopy(system_context.get("environment") or {}),
+        "location": copy.deepcopy(system_context.get("location") or {}),
         "gnss": gnss,
         "gnss_monitor": {
             "source": "SYSTEM.REPORT",
@@ -6143,6 +6144,140 @@ def _queue_clocks_state(fragment: Dict[str, Any]) -> None:
         )
 
 
+def _reset_startup_clocks_custody() -> None:
+    global _startup_custody_active
+    with _startup_custody_lock:
+        _startup_custody_backlog.clear()
+        _startup_custody_active = True
+        _diag["startup_custody_active"] = True
+        _diag["startup_custody_depth"] = 0
+        _diag["startup_custody_retained"] = 0
+        _diag["startup_custody_released"] = 0
+        _diag["startup_custody_retired"] = 0
+        _diag["startup_custody_last_sequence"] = None
+        _diag["last_startup_custody_release"] = {}
+        _diag["last_startup_custody_retire"] = {}
+
+
+def _retain_startup_clocks_item(item: Dict[str, Any]) -> bool:
+    """Retain one exact canonical row while startup persistence is closed."""
+    with _startup_custody_lock:
+        if not _startup_custody_active or _clocks_persistence_enabled.is_set():
+            return False
+        _startup_custody_backlog.append(item)
+        _diag["startup_custody_retained"] += 1
+        _diag["startup_custody_depth"] = len(_startup_custody_backlog)
+        _diag["startup_custody_last_sequence"] = item["state"].get("sequence")
+        return True
+
+
+def _release_startup_clocks_custody_live() -> Dict[str, Any]:
+    """Durably flush retained live-Teensy rows before campaign reconciliation."""
+    global _startup_custody_active
+
+    completion: Optional[threading.Event] = None
+    with _startup_custody_lock:
+        if not _startup_custody_active:
+            return {"released": 0, "already_resolved": True}
+
+        count = len(_startup_custody_backlog)
+        first_sequence = (
+            _startup_custody_backlog[0]["state"].get("sequence")
+            if count
+            else None
+        )
+        last_sequence = (
+            _startup_custody_backlog[-1]["state"].get("sequence")
+            if count
+            else None
+        )
+
+        for index, retained in enumerate(_startup_custody_backlog):
+            item = dict(retained)
+            # These rows preserve instrument chronology only.  Pi campaign
+            # adjudication/context was offline, so do not replay historical
+            # campaign candidates into the live TEMPEST processor.
+            item["release_campaign_candidate"] = False
+            if index == count - 1:
+                completion = threading.Event()
+                item["persistence_completion"] = completion
+            _clocks_persist_queue.put(item)
+
+        _startup_custody_backlog.clear()
+        _startup_custody_active = False
+        _diag["startup_custody_active"] = False
+        _diag["startup_custody_depth"] = 0
+
+        # All retained rows are already ahead of any future live row in the
+        # persistence queue.  Open ordinary persistence only after that order is
+        # established.
+        _clocks_persistence_enabled.set()
+
+    if completion is not None and not completion.wait(timeout=HOLISTIC_RESTORE_TIMEOUT_S):
+        raise RuntimeError(
+            "startup CLOCKS custody did not durably flush before campaign recovery "
+            f"within {HOLISTIC_RESTORE_TIMEOUT_S:.1f}s "
+            f"(count={count} first_sequence={first_sequence} last_sequence={last_sequence})"
+        )
+
+    result = {
+        "released": count,
+        "first_sequence": first_sequence,
+        "last_sequence": last_sequence,
+        "instrument_only": True,
+    }
+    _diag["startup_custody_released"] += count
+    _diag["last_startup_custody_release"] = dict(result)
+    logging.info(
+        "✅ [holistic restore] startup CLOCKS custody committed before campaign recovery: "
+        "rows=%d first_sequence=%s last_sequence=%s",
+        count, first_sequence, last_sequence,
+    )
+    return result
+
+
+def _retire_startup_clocks_custody(reason: str) -> Dict[str, Any]:
+    """Retire pre-restore rows that do not belong to the restored instrument epoch."""
+    global _startup_custody_active
+
+    with _startup_custody_lock:
+        count = len(_startup_custody_backlog)
+        first_sequence = (
+            _startup_custody_backlog[0]["state"].get("sequence")
+            if count
+            else None
+        )
+        last_sequence = (
+            _startup_custody_backlog[-1]["state"].get("sequence")
+            if count
+            else None
+        )
+        _startup_custody_backlog.clear()
+        _startup_custody_active = False
+        _diag["startup_custody_active"] = False
+        _diag["startup_custody_depth"] = 0
+
+    result = {
+        "retired": count,
+        "first_sequence": first_sequence,
+        "last_sequence": last_sequence,
+        "reason": reason,
+    }
+    _diag["startup_custody_retired"] += count
+    _diag["last_startup_custody_retire"] = dict(result)
+    logging.info(
+        "🧹 [holistic restore] startup CLOCKS custody retired before epoch replacement: "
+        "rows=%d first_sequence=%s last_sequence=%s reason=%s",
+        count, first_sequence, last_sequence, reason,
+    )
+    return result
+
+
+def _startup_clocks_custody_unresolved() -> bool:
+    with _startup_custody_lock:
+        return bool(_startup_custody_active)
+
+
 def _clocks_state_loop() -> None:
     """Build and publish CLOCKS_V4 without storage latency stalling the live feed."""
     global _clocks_state_published, _clocks_state_dropped
@@ -6185,6 +6320,21 @@ def _clocks_state_loop() -> None:
         publish(CLOCKS_TOPIC, state)
         _clocks_state_published += 1
 
+        item = {
+            "state": state,
+            "system_context": system_context,
+            "clocks_fragment": clocks_fragment,
+        }
+
+        # Until the Teensy lifecycle probe classifies this startup as live
+        # continuation or cold/full restore, every valid row stays in exact
+        # startup custody.  In particular, do not let an apparent N+1 row enter
+        # the narrow restore-proof lane before we know an instrument restore is
+        # actually required.
+        if not _clocks_persistence_enabled.is_set():
+            if _retain_startup_clocks_item(item):
+                continue
+
         restore_proof_custody = False
         if _clocks_holistic_restore_proof_pending.is_set():
             stats = _clocks_payload(state).get("stats")
@@ -6224,10 +6374,10 @@ def _clocks_state_loop() -> None:
                     and update_count >= _clocks_holistic_restore_proof_update_count
                 )
 
-            if not restore_proof_custody and not _clocks_persistence_enabled.is_set():
-                continue
-
         if not restore_proof_custody and not _clocks_persistence_enabled.is_set():
+            # A cold/full restore has classified and retired startup custody but
+            # still keeps ordinary persistence closed.  Preserve the existing
+            # narrow restore-proof/epoch-birth gates; do not splice transitional rows.
             continue
 
         if _clocks_epoch_birth_pending.is_set():
@@ -6257,11 +6407,7 @@ def _clocks_state_loop() -> None:
                 state.get("sequence"),
             )
 
-        _clocks_persist_queue.put({
-            "state": state,
-            "system_context": system_context,
-            "clocks_fragment": clocks_fragment,
-        })
+        _clocks_persist_queue.put(item)
 
 
 def _clocks_persistence_loop() -> None:
@@ -6275,6 +6421,8 @@ def _clocks_persistence_loop() -> None:
         state = copy.deepcopy(item["state"])
         system_context = item["system_context"]
         clocks_fragment = item["clocks_fragment"]
+        release_campaign_candidate = bool(item.get("release_campaign_candidate", True))
+        persistence_completion = item.get("persistence_completion")
         state_clocks = state.get("clocks")
         if isinstance(state_clocks, dict):
             state_clocks["persisted"] = True
@@ -6319,6 +6467,12 @@ def _clocks_persistence_loop() -> None:
                     )
                     failure_logged = True
                 time.sleep(CLOCKS_STATE_RETRY_S)
+
+        if persistence_completion is not None:
+            persistence_completion.set()
+
+        if not release_campaign_candidate:
+            continue
 
         candidate = clocks_fragment.get("campaign")
         if not isinstance(candidate, dict):
@@ -6379,9 +6533,16 @@ def on_clocks_fragment(payload: Payload) -> None:
         )
         try:
             public_count = _tempest_public_count(campaign)
+            campaign_name = _tempest_campaign_name(campaign)
         except ValueError:
             public_count = None
-        _note_timebase_activity(TIMEBASE_FRAGMENT_TOPIC, public_count)
+            campaign_name = ""
+        if not (
+            _flash_cut_pending
+            and _flash_cut_from_campaign
+            and campaign_name == _flash_cut_from_campaign
+        ):
+            _note_timebase_activity(TIMEBASE_FRAGMENT_TOPIC, public_count)
     else:
         _diag["clocks_fragments_observation_only"] = (
             _diag.get("clocks_fragments_observation_only", 0) + 1
@@ -6444,6 +6605,33 @@ def _process_loop() -> None:
         row = _get_active_campaign()
         campaign = row["campaign"] if row is not None else firmware_campaign
         campaign_payload = row["payload"] if row is not None else {}
+
+        pre_cut_tail_authority = _flash_cut_pre_cut_tail_authority(
+            firmware_campaign=firmware_campaign,
+            active_campaign=campaign,
+            active_campaign_payload=campaign_payload,
+        )
+        if pre_cut_tail_authority is not None:
+            _diag["flash_cut_pre_cut_tail_retired"] = (
+                _diag.get("flash_cut_pre_cut_tail_retired", 0) + 1
+            )
+            tail = {
+                "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "from": firmware_campaign,
+                "to": campaign,
+                "state_sequence": int(state_sequence),
+                "public_count": int(public_count),
+                "classification": "LAWFUL_PRE_CUT_TAIL",
+                "authority": pre_cut_tail_authority,
+            }
+            _diag["last_flash_cut_pre_cut_tail"] = tail
+            logging.info(
+                "⚡ [flash cut] retiring lawful pre-cut tail after canonical persistence: "
+                "from=%s to=%s sequence=%d public_count=%d authority=%s",
+                firmware_campaign, campaign, int(state_sequence), int(public_count),
+                pre_cut_tail_authority,
+            )
+            continue
 
         # Final court works on a transient normalized view.  Durable state keeps
         # raw TEMPEST_FRAGMENT_V1 unchanged.
@@ -6980,15 +7168,15 @@ def cmd_start(args: Optional[dict]) -> dict:
     active_row = _get_active_campaign()
     flash_cut = active_row is not None
     prev_campaign = active_row["campaign"] if flash_cut else None
-    prev_payload = active_row["payload"] if flash_cut and isinstance(active_row.get("payload"), dict) else {}
-
-    current_location = _get_current_location()
 
     try:
-        _ensure_gnss_mode_for_current_location()
+        location_status = _ensure_system_location(
+            context="FLASH_CUT_START" if flash_cut else "CAMPAIGN_START"
+        )
     except Exception as e:
         return {"success": False, "message": str(e)}
 
+    location = location_status.get("current_location")
     _wait_for_preflight("flash_cut" if flash_cut else "start")
 
     with open_db(row_dict=True) as conn:
@@ -7014,13 +7202,8 @@ def cmd_start(args: Optional[dict]) -> dict:
             "message": f"Campaign '{campaign}' already exists (id={existing['id']}) — DELETE it first or choose a new name",
         }
 
-    location = current_location
-
-    if flash_cut:
-        prev_location = prev_payload.get("location")
-        if location is None and prev_location:
-            location = prev_location
-
+    # Campaign provenance snapshots the SYSTEM selection exactly.  NONE remains
+    # NONE; a Flash Cut must never resurrect the previous campaign's location.
     try:
         _wait_for_timebase_routes(context="flash_cut" if flash_cut else "start")
     except Exception as e:
@@ -7221,7 +7404,7 @@ def cmd_stop(_: Optional[dict]) -> dict:
     stop_location = (
         row["payload"].get("location")
         if row and isinstance(row.get("payload"), dict)
-        else _get_current_location()
+        else None
     )
 
     _request_teensy_stop_best_effort()
@@ -7260,17 +7443,16 @@ def cmd_stop(_: Optional[dict]) -> dict:
     _reset_trackers()
 
     try:
-        effective_location = _ensure_gnss_mode_for_current_location()
-        if effective_location:
-            logging.info(
-                "📡 [clocks] stop complete — GNSS kept in TO mode for current location '%s' (campaign snapshot was '%s')",
-                effective_location,
-                stop_location,
-            )
-        else:
-            logging.info("📡 [clocks] stop complete — GNSS returned to NORMAL mode")
+        location_status = _ensure_system_location(context="CAMPAIGN_STOP")
+        logging.info(
+            "📍 [clocks] stop location reconciliation complete: "
+            "SYSTEM=%s campaign_snapshot=%s GF-8802=%s",
+            location_status.get("current_location") or "NONE",
+            stop_location or "NONE",
+            location_status.get("verified_pos_mode_name") or "?",
+        )
     except Exception:
-        logging.exception("⚠️ [clocks] failed to reconcile GNSS mode at stop (ignored)")
+        logging.exception("⚠️ [clocks] failed to reconcile SYSTEM location at stop (ignored)")
 
     logging.info("⏹️ [clocks] campaign stopped")
     return {"success": True, "message": "OK"}
@@ -7860,14 +8042,21 @@ def _restore_active_campaign_state() -> Dict[str, Any]:
     campaign_name = row["campaign"]
     campaign_payload = row["payload"]
     campaign_location = campaign_payload.get("location")
-    system_location = _get_current_location()
-    effective_location = campaign_location or system_location
 
+    try:
+        location_status = _ensure_system_location(context="CAMPAIGN_RECOVERY")
+    except Exception as e:
+        raise RuntimeError(f"recovery failed while restoring SYSTEM location: {e}")
+
+    system_location = location_status.get("current_location")
     logging.info(
-        "🔍 [recovery] active campaign found: '%s' (campaign location: %s, system location: %s)",
+        "🔍 [recovery] active campaign='%s' campaign_location=%s "
+        "SYSTEM current_location=%s GF-8802 position_mode=%s freq_mode=%s",
         campaign_name,
-        campaign_location or "none",
-        system_location or "none",
+        campaign_location or "NONE",
+        system_location or "NONE",
+        location_status.get("verified_pos_mode_name") or "?",
+        location_status.get("freq_mode_name") or "?",
     )
 
     # ------------------------------------------------------------------
@@ -7901,15 +8090,6 @@ def _restore_active_campaign_state() -> Dict[str, Any]:
 
         # Cold restart
         _wait_for_preflight("recovery/cold")
-
-        try:
-            effective_location = _ensure_gnss_mode_for_current_location()
-            if effective_location:
-                logging.info("📡 [recovery/cold] GNSS ensured in TO mode for '%s'", effective_location)
-            else:
-                logging.info("📡 [recovery/cold] GNSS ensured in NORMAL mode")
-        except Exception as e:
-            raise RuntimeError(f"recovery/cold failed: {e}")
 
         _wait_for_timebase_routes(context="recovery/cold")
 
@@ -8025,15 +8205,6 @@ def _restore_active_campaign_state() -> Dict[str, Any]:
     # ------------------------------------------------------------------
     # Step 2: Wait for preflight
     # ------------------------------------------------------------------
-    try:
-        effective_location = _ensure_gnss_mode_for_current_location()
-        if effective_location:
-            logging.info("📡 [recovery] GNSS ensured in TO mode for '%s'", effective_location)
-        else:
-            logging.info("📡 [recovery] GNSS ensured in NORMAL mode")
-    except Exception as e:
-        raise RuntimeError(f"recovery failed: {e}")
-
     # Warm recovery deliberately bypasses the full START CLOCKS profile:
     # SmartZero/Alpha-epoch/OCXO-origin leaves may be exactly what RECOVER must
     # reconstruct after a Teensy reboot.  Requiring them here would create a
@@ -9609,6 +9780,7 @@ def run() -> None:
 
     _startup_control_ready.clear()
     _clocks_persistence_enabled.clear()
+    _reset_startup_clocks_custody()
     _clocks_epoch_birth_pending.clear()
     _clocks_epoch_birth_committed.clear()
     _clocks_holistic_restore_proof_pending.clear()
@@ -9632,9 +9804,10 @@ def run() -> None:
         blocking=False,
     )
 
-    # Start the live data plane immediately. Persistence remains closed, so the
-    # startup stream can populate the UI and restore proof without authoring new
-    # durable state before the one holistic transaction has consumed the old one.
+    # Start the live data plane immediately. Ordinary persistence remains closed,
+    # but exact canonical rows are retained in startup custody until the Teensy
+    # lifecycle probe proves live continuation or a cold/full restore supersedes
+    # them. No valid startup second is silently discarded.
     threading.Thread(
         target=_clocks_state_loop,
         daemon=True,
@@ -9666,22 +9839,35 @@ def run() -> None:
             {"error": str(exc), "status": exc.status},
         )
     except Exception as exc:
+        unresolved_custody = _startup_clocks_custody_unresolved()
         logging.exception(
-            "💥 [holistic restore] failed; live CLOCKS persistence remains open and commands remain available"
+            "💥 [holistic restore] failed; startup CLOCKS custody %s",
+            "remains fail-closed" if unresolved_custody else "has been classified",
         )
-        _clocks_persistence_enabled.set()
+        if not unresolved_custody:
+            _clocks_persistence_enabled.set()
         try:
             _cleanup_after_recovery_failure(
                 "holistic_restore_failed",
-                {"error": str(exc)},
+                {"error": str(exc), "startup_custody_unresolved": unresolved_custody},
             )
         except Exception:
             logging.exception("⚠️ [holistic restore] cleanup also failed")
     finally:
-        _clocks_persistence_enabled.set()
-        _startup_control_ready.set()
-        _diag["startup_control_ready"] = True
-        logging.info("✅ [clocks] startup state reconciliation complete — START/RESUME enabled")
+        if _startup_clocks_custody_unresolved():
+            _startup_control_ready.clear()
+            _diag["startup_control_ready"] = False
+            logging.error(
+                "💥 [clocks] startup reconciliation incomplete — CLOCKS persistence and "
+                "START/RESUME remain closed while retained startup evidence is unresolved"
+            )
+        else:
+            _clocks_persistence_enabled.set()
+            _startup_control_ready.set()
+            _diag["startup_control_ready"] = True
+            logging.info(
+                "✅ [clocks] startup state reconciliation complete — START/RESUME enabled"
+            )
 
     threading.Thread(
         target=_timebase_silence_monitor_loop,

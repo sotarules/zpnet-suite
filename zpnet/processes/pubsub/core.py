@@ -123,6 +123,13 @@ ADHOC_RECV_TIMEOUT_S = 1.0
 # the Pi-side union remains valid.  Reapply the cached union when that happens.
 TEENSY_ROUTE_MONITOR_INTERVAL_S = 30.0
 
+# CLOCKS_FRAGMENT is continuous instrument evidence.  During PUBSUB startup the
+# transport may receive valid frames before CLOCKS has registered its formal
+# route.  Retain those frames until PI:CLOCKS is routable; do not let control-
+# plane convergence manufacture a hole in durable instrument chronology.
+STARTUP_CUSTODY_TOPIC = "CLOCKS_FRAGMENT"
+STARTUP_CUSTODY_SUBSYSTEM = "CLOCKS"
+
 # ---------------------------------------------------------------------
 # Global state
 # ---------------------------------------------------------------------
@@ -232,6 +239,19 @@ applied_union: Dict[str, Any] = {}
 
 state_lock = threading.Lock()
 debug_log_fh: Optional[TextIO] = None
+
+# Startup-only CLOCKS_FRAGMENT custody.  This lock serializes the final backlog
+# flush against the transport RX callback so no live frame can overtake retained
+# attach-time evidence.  The list is intentionally unbounded: at 1 Hz, failure
+# to establish the CLOCKS route must remain visible as retained evidence rather
+# than becoming another silent drop policy.
+startup_custody_lock = threading.Lock()
+startup_custody_active = True
+startup_custody_backlog: List[Dict[str, Any]] = []
+startup_custody_retained = 0
+startup_custody_released = 0
+startup_custody_release_failures = 0
+startup_custody_last_sequence: Optional[int] = None
 
 # ---------------------------------------------------------------------
 # SERVER connection state
@@ -411,8 +431,37 @@ def on_receive_request_response(payload: Dict[str, Any]) -> None:
     _remember_reply_state(req_id, entry, "DELIVERED")
     entry["queue"].put(payload)
 
+def _startup_custody_sequence(msg: Dict[str, Any]) -> Optional[int]:
+    payload = msg.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("sequence")
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _retain_startup_clocks_fragment(msg: Dict[str, Any]) -> bool:
+    """Retain CLOCKS_FRAGMENT until the formal PI:CLOCKS route exists."""
+    global startup_custody_retained, startup_custody_last_sequence
+
+    if msg.get("topic") != STARTUP_CUSTODY_TOPIC:
+        return False
+
+    with startup_custody_lock:
+        if not startup_custody_active:
+            return False
+        startup_custody_backlog.append(msg)
+        startup_custody_retained += 1
+        startup_custody_last_sequence = _startup_custody_sequence(msg)
+        return True
+
+
 def on_receive_publish_subscribe(payload: Dict[str, Any]) -> None:
     # Message originated from Teensy. Never forward back to Teensy.
+    if _retain_startup_clocks_fragment(payload):
+        return
     route_publish(payload, forward_to_teensy=False)
 
 # ---------------------------------------------------------------------
@@ -867,6 +916,54 @@ def _fanout_to_pi(topic: str, subsystem: str, raw: bytes) -> bool:
             exc,
         )
         return False
+
+
+def _release_startup_clocks_custody_if_routed() -> bool:
+    """Flush retained CLOCKS_FRAGMENT directly to CLOCKS in original order."""
+    global startup_custody_active, startup_custody_released
+    global startup_custody_release_failures
+
+    with state_lock:
+        targets = set(routes_by_topic.get(STARTUP_CUSTODY_TOPIC, set()))
+    if ("PI", STARTUP_CUSTODY_SUBSYSTEM) not in targets:
+        return False
+
+    # Hold the custody lock through the complete flush.  The transport RX callback
+    # blocks here, so a newly arriving live CLOCKS_FRAGMENT cannot overtake the
+    # retained prefix.
+    with startup_custody_lock:
+        if not startup_custody_active:
+            return True
+
+        released_now = 0
+        while startup_custody_backlog:
+            msg = startup_custody_backlog[0]
+            raw = payload_to_json_bytes(msg)
+            if not _fanout_to_pi(STARTUP_CUSTODY_TOPIC, STARTUP_CUSTODY_SUBSYSTEM, raw):
+                startup_custody_release_failures += 1
+                logging.error(
+                    "💥 [pubsub] startup CLOCKS_FRAGMENT custody release blocked: "
+                    "retained=%d released_now=%d next_sequence=%s",
+                    len(startup_custody_backlog),
+                    released_now,
+                    _startup_custody_sequence(msg),
+                )
+                return False
+
+            log_pubsub(msg)
+            _route_publish_to_adhoc(STARTUP_CUSTODY_TOPIC, msg)
+            startup_custody_backlog.pop(0)
+            startup_custody_released += 1
+            released_now += 1
+
+        startup_custody_active = False
+        logging.info(
+            "✅ [pubsub] startup CLOCKS_FRAGMENT custody released in order: "
+            "count=%d last_sequence=%s",
+            released_now,
+            startup_custody_last_sequence,
+        )
+        return True
 
 
 # ---------------------------------------------------------------------
@@ -1548,6 +1645,16 @@ def cmd_diagnostics(_: Optional[dict]) -> Dict[str, Any]:
             }
             for client in adhoc_clients.values()
         ]
+        startup_custody = {
+            "topic": STARTUP_CUSTODY_TOPIC,
+            "target": f"PI:{STARTUP_CUSTODY_SUBSYSTEM}",
+            "active": startup_custody_active,
+            "backlog_depth": len(startup_custody_backlog),
+            "retained": startup_custody_retained,
+            "released": startup_custody_released,
+            "release_failures": startup_custody_release_failures,
+            "last_sequence": startup_custody_last_sequence,
+        }
         route_monitor = {
             "interval_s": TEENSY_ROUTE_MONITOR_INTERVAL_S,
             "probe_count": teensy_route_monitor_probe_count,
@@ -1593,6 +1700,7 @@ def cmd_diagnostics(_: Optional[dict]) -> Dict[str, Any]:
             "adhoc_publish_drop_count": adhoc_publish_drop_count,
             "adhoc_routes": adhoc_routes,
             "teensy_route_monitor": route_monitor,
+            "startup_clocks_fragment_custody": startup_custody,
         },
     }
 
@@ -1812,6 +1920,8 @@ def cmd_refresh(_: Optional[dict]) -> Dict[str, Any]:
         applied_union.update(union_payload)
 
         logging.info("🚀 [pubsub] routes updated (%d topics)", len(routes_by_topic))
+
+    _release_startup_clocks_custody_if_routed()
 
     # 5) Return committed truth
     return {
