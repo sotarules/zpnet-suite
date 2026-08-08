@@ -1546,39 +1546,41 @@ def clocks_combined_readout() -> list[str]:
     lines.append(f"TIME  GNSS: {gnss_time}    SYSTEM: {system_time}")
     lines.append("")
 
-    # ── DWT detail ──
-    dwt_actual = _to_int(_field(r, "raw_cycles.pps.observed_cycles", default=None))
-    dwt_residual = _to_int(_field(
-        r,
-        "dwt.second_residual_cycles",
-        "raw_cycles.pps.residual_cycles",
-        "dwt_second_residual_cycles",
-    ))
+    # ── Raw cycle static prediction ──
+    raw_cycle_rows = (
+        ("GNSS", "pps"),
+        ("VCLOCK", "vclock"),
+        ("OCXO1", "ocxo1"),
+        ("OCXO2", "ocxo2"),
+    )
+    raw_cycle_values = []
+    for name, lane in raw_cycle_rows:
+        valid = _to_bool(_prediction_value(r, lane, "valid"))
+        predicted = _to_int(_prediction_value(r, lane, "prediction_cycles"))
+        actual = _to_int(_prediction_value(r, lane, "actual_cycles"))
+        residual = _to_int(_prediction_value(r, lane, "residual_cycles"))
+        if valid is not True:
+            predicted = actual = residual = None
+        raw_cycle_values.append((name, predicted, actual, residual))
 
-    # EXPECTED is the next-second DWT-cycle prediction.  Contemporary firmware
-    # uses the prior completed GNSS/PPS interval as its static prediction, while
-    # older rows may still expose an explicit prediction or FloorLine witness.
-    dwt_expected = _dwt_expected_cycles(r)
-
-    dwt_at_anchor = _field(r, "anchor.dwt_at_pps_vclock", default=None)
-    counter32 = _field(r, "anchor.counter32_at_pps_vclock", default=None)
-    if any(v is not None for v in [dwt_actual, dwt_expected, dwt_at_anchor, counter32]):
-        dwt_label_w = 12
-        dwt_num_w = 20
-        edge_label_w = 11
-        edge_num_w = 14
+    if any(value is not None for _, predicted, actual, residual in raw_cycle_values
+           for value in (predicted, actual, residual)):
+        cycle_name_w = 7
+        cycle_count_w = 20
+        cycle_res_w = 8
         lines.append(
-            f"DWT   "
-            f"{'EXPECTED:':>{dwt_label_w}} {_comma_int(dwt_expected, dwt_num_w)}"
-            f"    {'':<{dwt_label_w}} {'':>{dwt_num_w}}"
-            f"    {'DWT@PPS/V:':<{edge_label_w}} {_comma_int(dwt_at_anchor, edge_num_w)}"
+            f"{'CLK':<{cycle_name_w}}"
+            f"{'PREDICTED':>{cycle_count_w}}"
+            f"{'ACTUAL':>{cycle_count_w}}"
+            f"{'RES':>{cycle_res_w}}"
         )
-        lines.append(
-            f"      "
-            f"{'ACTUAL:':>{dwt_label_w}} {_comma_int(dwt_actual, dwt_num_w)}"
-            f"    {'':<{dwt_label_w}} {'':>{dwt_num_w}}"
-            f"    {'CTR32:':<{edge_label_w}} {_comma_int(counter32, edge_num_w)}"
-        )
+        for name, predicted, actual, residual in raw_cycle_values:
+            lines.append(
+                f"{name:<{cycle_name_w}}"
+                f"{_comma_int(predicted, cycle_count_w)}"
+                f"{_comma_int(actual, cycle_count_w)}"
+                f"{_sign_int(residual, cycle_res_w)}"
+            )
         lines.append("")
 
     # ── GNSS status ──
