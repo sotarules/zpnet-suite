@@ -76,6 +76,11 @@ def _normalized_row(payload: Dict[str, Any], db_pps: int, db_ts: str) -> Dict[st
     campaign = _campaign(payload)
     clocks = _clocks(payload)
     clockfaces = _dict(campaign.get("clockfaces"))
+    stats = _dict(clocks.get("stats"))
+    o1_stats = _dict(stats.get("ocxo1"))
+    o2_stats = _dict(stats.get("ocxo2"))
+    o1_ppb_buckets = _dict(o1_stats.get("ppb_buckets"))
+    o2_ppb_buckets = _dict(o2_stats.get("ppb_buckets"))
     control = _dict(clocks.get("control"))
     live_o1 = _dict(control.get("ocxo1"))
     live_o2 = _dict(control.get("ocxo2"))
@@ -111,6 +116,8 @@ def _normalized_row(payload: Dict[str, Any], db_pps: int, db_ts: str) -> Dict[st
         "teensy_gnss_ns": safe_int(clockfaces.get("gnss_ns")),
         "teensy_ocxo1_ns": safe_int(clockfaces.get("ocxo1_ns")),
         "teensy_ocxo2_ns": safe_int(clockfaces.get("ocxo2_ns")),
+        "ocxo1_total_ppb": safe_float(_first(o1_ppb_buckets.get("total"), o1_stats.get("ppb"))),
+        "ocxo2_total_ppb": safe_float(_first(o2_ppb_buckets.get("total"), o2_stats.get("ppb"))),
         "ocxo1_fast_residual_ns": safe_int(o1_science.get("fast_residual_ns")),
         "ocxo2_fast_residual_ns": safe_int(o2_science.get("fast_residual_ns")),
         "ocxo1_servo_adjustments": safe_int(live_o1_servo.get("adjustments")),
@@ -247,7 +254,7 @@ class WindowAccum:
         self.dac1_stats = Welford()
         self.dac2_stats = Welford()
 
-        # PPB (cumulative, from campaign start)
+        # PPB (canonical always-on TOTAL population)
         self.ppb1_first: Optional[float] = None
         self.ppb1_last: Optional[float] = None
         self.ppb2_first: Optional[float] = None
@@ -292,23 +299,18 @@ class WindowAccum:
             if prev_dac2 is not None:
                 self.dac2_delta_stats.update(dac2 - prev_dac2)
 
-        gnss_ns = safe_int(row.get("teensy_gnss_ns"))
-        ocxo1_ns = safe_int(row.get("teensy_ocxo1_ns"))
-        ocxo2_ns = safe_int(row.get("teensy_ocxo2_ns"))
+        ppb1 = safe_float(row.get("ocxo1_total_ppb"))
+        ppb2 = safe_float(row.get("ocxo2_total_ppb"))
 
-        if gnss_ns and ocxo1_ns:
-            ppb1 = compute_ppb(ocxo1_ns, gnss_ns)
-            if ppb1 is not None:
-                if self.ppb1_first is None:
-                    self.ppb1_first = ppb1
-                self.ppb1_last = ppb1
+        if ppb1 is not None:
+            if self.ppb1_first is None:
+                self.ppb1_first = ppb1
+            self.ppb1_last = ppb1
 
-        if gnss_ns and ocxo2_ns:
-            ppb2 = compute_ppb(ocxo2_ns, gnss_ns)
-            if ppb2 is not None:
-                if self.ppb2_first is None:
-                    self.ppb2_first = ppb2
-                self.ppb2_last = ppb2
+        if ppb2 is not None:
+            if self.ppb2_first is None:
+                self.ppb2_first = ppb2
+            self.ppb2_last = ppb2
 
         res1 = safe_int(row.get("ocxo1_fast_residual_ns"))
         res2 = safe_int(row.get("ocxo2_fast_residual_ns"))
@@ -374,17 +376,12 @@ def analyze(campaign: str, window_seconds: int = 600) -> None:
         if d2 is not None:
             all_dac2.append(d2)
 
-        gnss_ns = safe_int(row.get("teensy_gnss_ns"))
-        o1_ns = safe_int(row.get("teensy_ocxo1_ns"))
-        o2_ns = safe_int(row.get("teensy_ocxo2_ns"))
-        if gnss_ns and o1_ns:
-            ppb = compute_ppb(o1_ns, gnss_ns)
-            if ppb is not None:
-                all_ppb1.append((pps, ppb))
-        if gnss_ns and o2_ns:
-            ppb = compute_ppb(o2_ns, gnss_ns)
-            if ppb is not None:
-                all_ppb2.append((pps, ppb))
+        o1_total_ppb = safe_float(row.get("ocxo1_total_ppb"))
+        o2_total_ppb = safe_float(row.get("ocxo2_total_ppb"))
+        if o1_total_ppb is not None:
+            all_ppb1.append((pps, o1_total_ppb))
+        if o2_total_ppb is not None:
+            all_ppb2.append((pps, o2_total_ppb))
 
     print()
     print("-" * 90)
@@ -436,7 +433,7 @@ def analyze(campaign: str, window_seconds: int = 600) -> None:
 
     print()
     print("-" * 90)
-    print("PPB TRAJECTORY (cumulative rate error vs GNSS)")
+    print("TOTAL PPB TRAJECTORY (always-on cumulative rate error vs GNSS)")
     print("-" * 90)
 
     for label, ppb_data in [("OCXO1", all_ppb1), ("OCXO2", all_ppb2)]:
