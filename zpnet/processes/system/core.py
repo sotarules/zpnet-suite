@@ -142,8 +142,8 @@ I2C_SENSORS_BY_BUS = {
         0x44: "INA260 0x44 (12v Rail)",
         0x66: "EV5491 0x66 (Laser Controller)",
         0x76: "BME280 0x76 (Environment)",
-        0x4C: "AD5693R 0x4C (OCXO1 DAC)",
-        0x4E: "AD5693R 0x4E (OCXO2 DAC)",
+        0x4C: "AD5693R 0x4C (OCXO2 DAC)",
+        0x4E: "AD5693R 0x4E (OCXO1 DAC)",
         # 0x57 will appear via scan but is ignored (EEPROM)
     },
 
@@ -187,7 +187,7 @@ REG_DATA      = 0xF7
 EXPECTED_CHIP_ID = 0x60
 SEA_LEVEL_PRESSURE_HPA = 1013.25
 
-# BME280 is on the shared legacy SMBus with the OCXO DACs.  SyncDAC keeps DAC
+# BME280 is on the shared legacy SMBus with the OCXO DACs.  Pi CLOCKS keeps DAC
 # writes sparse, but the BME280 calibration/data read is still a multi-register
 # transaction and can occasionally lose arbitration / NACK mid-sequence.  Treat
 # environmental telemetry as best-effort context: retry a few times, then
@@ -206,7 +206,7 @@ REG_VOLTAGE = 0x02
 REG_POWER   = 0x03
 
 # INA260s share SMBus surfaces with other active devices.  Individual register
-# reads are short, but sparse SyncDAC writes or other bus activity can still
+# reads are short, but sparse Pi CLOCKS DAC writes or other bus activity can still
 # collide with a read_word_data transaction.  Treat power telemetry as
 # best-effort context: retry transient I/O errors and publish stale/error rail
 # payloads instead of terminating the SYSTEM poller.

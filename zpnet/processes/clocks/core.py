@@ -13,7 +13,7 @@ Core contract:
 
   Architecture:
     • Teensy owns: physical PPS identity, GNSS/DWT/OCXO clockfaces,
-      raw-cycle evidence, firmware statistics/control state, and TEMPEST science.
+      raw-cycle evidence, firmware statistics, and TEMPEST science.
     • Pi owns: GNSS_RAW, GF-8802 correlation, environment correlation,
       campaign lifecycle, final acceptance court, recovery orchestration,
       and PostgreSQL persistence.
@@ -62,6 +62,7 @@ from __future__ import annotations
 import copy
 import json
 from collections import deque
+from dataclasses import dataclass, field
 import logging
 import math
 import os
@@ -72,6 +73,8 @@ import time
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from typing import Dict, Any, List, Optional, Tuple
+
+from smbus2 import SMBus, i2c_msg
 
 from zpnet.processes.processes import (
     server_setup,
@@ -89,6 +92,70 @@ from zpnet.shared.events import create_event
 # ---------------------------------------------------------------------
 
 NS_PER_SECOND = 1_000_000_000
+
+# OCXO DAC custody moved from Teensy CLOCKS to Pi CLOCKS.  These addresses are
+# authoritative ZPNet pin-map identities: 0x4E -> OCXO1, 0x4C -> OCXO2.
+DAC_I2C_BUS = 1
+AD5693R_ADDR_OCXO1 = 0x4E
+AD5693R_ADDR_OCXO2 = 0x4C
+AD5693R_CMD_WRITE_INPUT_REG = 0x10
+AD5693R_CMD_UPDATE_DAC_REG = 0x20
+AD5693R_CMD_WRITE_DAC_AND_INPUT = 0x30
+AD5693R_CMD_WRITE_CONTROL = 0x40
+AD5693R_CTRL_INTERNAL_VREF_2X = 0x0800
+AD5693R_INTERNAL_REF_VOLTAGE = 2.5
+AD5693R_OUTPUT_GAIN = 2.0
+AD5693R_OUTPUT_FULL_SCALE_VOLTAGE = 5.0
+AD5693R_SAFE_MAX_OUTPUT_VOLTAGE = 3.3
+AD5693R_CODE_SCALE = 65536.0
+AD5693R_SAFE_MAX_HW_CODE = int(
+    (AD5693R_SAFE_MAX_OUTPUT_VOLTAGE / AD5693R_OUTPUT_FULL_SCALE_VOLTAGE)
+    * AD5693R_CODE_SCALE
+)
+
+# Mechanical port of the Teensy servo/dither tuning.  The dither waveform is
+# one low-first one-second frame: floor(target), then at most one transition to
+# floor(target)+1 for the fractional high dwell.  Thus each lane authors at
+# most two DAC codes per second.
+DAC_DITHER_FRAME_S = 1.0
+DAC_DITHER_SLOTS_PER_FRAME = 1000
+DAC_STATIC_SERVO_SERVICE_DELAY_S = 0.250
+SERVO_MAX_STEP = 64.0
+SERVO_SETTLE_SECONDS = 5
+SERVO_MIN_SAMPLES = 10
+SERVO_PPB_PER_DAC_LSB_ESTIMATE = 100.0
+SERVO_CONTROL_DEADBAND_PPB = 3.0
+SERVO_SOFT_LANDING_PPB = 300.0
+SERVO_MEAN_FILTER_ALPHA = 0.35
+SERVO_MEAN_GAIN = 1.0
+SERVO_NOW_FILTER_ALPHA = 1.0
+SERVO_NOW_GAIN = 1.0
+SERVO_NOW_DEADBAND_PPB = 0.5
+SERVO_DITHER_OWNER_SETTLE_QUARANTINE_ROWS = 2
+SERVO_DITHER_OWNER_FAILURE_BACKOFF_ROWS = 3
+SERVO_TOTAL_RECENT_WINDOW_SAMPLES = 30
+SERVO_TOTAL_COARSE_MIN_SAMPLES = 10
+SERVO_TOTAL_FINE_MIN_SAMPLES = 30
+SERVO_TOTAL_COARSE_THRESHOLD_PPB = 50.0
+SERVO_TOTAL_COARSE_EXIT_PPB = 5.0
+SERVO_TOTAL_COARSE_RATE_ENTRY_PPB = 100.0
+SERVO_TOTAL_COARSE_RATE_EXIT_PPB = 20.0
+SERVO_TOTAL_COARSE_HORIZON_SECONDS = 300.0
+SERVO_TOTAL_FINE_HORIZON_SECONDS = 450.0
+SERVO_TOTAL_COARSE_MAX_RATE_PPB = 400.0
+SERVO_TOTAL_FINE_MAX_RATE_PPB = 20.0
+SERVO_TOTAL_COARSE_MAX_STEP_LSB = 4.0
+SERVO_TOTAL_FINE_MAX_STEP_LSB = 0.25
+SERVO_TOTAL_COARSE_ACTUATOR_GAIN = 1.0
+SERVO_TOTAL_FINE_ACTUATOR_GAIN = 0.75
+SERVO_TOTAL_COARSE_RATE_DEADBAND_PPB = 8.0
+SERVO_TOTAL_FINE_RATE_DEADBAND_PPB = 0.5
+SERVO_TOTAL_COARSE_STDERR_MULTIPLIER = 3.0
+SERVO_TOTAL_FINE_STDERR_MULTIPLIER = 1.5
+SERVO_TOTAL_POSITION_HOLD_PPB = 0.005
+SERVO_TOTAL_NEAR_ZERO_RATE_HOLD_PPB = 2.0
+SERVO_TOTAL_ZERO_CROSSING_LOOKAHEAD_SECONDS = 60.0
+SERVO_TOTAL_DAC_CHANGE_EPSILON_LSB = 0.000001
 
 CAMPAIGN_TYPE_TEMPEST = "TEMPEST"
 CAMPAIGN_DETAIL_ATTACH_TIMEOUT_S = 5.0
@@ -777,6 +844,1253 @@ def _gnss_canary_reset() -> None:
     global _gnss_last_ns, _gnss_residual_valid
     _gnss_last_ns = 0
     _gnss_residual_valid = False
+
+# ---------------------------------------------------------------------
+# Pi-owned OCXO DAC / servo / dither authority
+# ---------------------------------------------------------------------
+#
+# Custody rule:
+#   Teensy determines what happened; Pi CLOCKS determines what to do about it.
+# Teensy CLOCKS_FRAGMENT supplies only timing/science evidence.  Pi CLOCKS owns
+# AD5693R configuration/readback, DAC targets, servo state, fractional dither,
+# control commands, and restart continuity.  Canonical CLOCKS is decorated with
+# the familiar CLOCKS_CONTROL_V1 surface so downstream consumers need not care
+# that actuator custody moved across the machine boundary.
+
+DAC_AUTHOR_NONE = 0
+DAC_AUTHOR_STARTUP_OBSERVED = 1
+DAC_AUTHOR_EXPLICIT_COMMAND = 2
+DAC_AUTHOR_SERVO = 3
+
+SERVO_HOLD_NONE = 0
+SERVO_HOLD_PENDING_COMMIT = 1
+SERVO_HOLD_SETTLE_QUARANTINE = 2
+SERVO_HOLD_COMMIT_FAULT_BACKOFF = 3
+SERVO_HOLD_SMALL_STATIC_DELTA = 4
+
+
+@dataclass
+class _DacWelford:
+    n: int = 0
+    mean: float = 0.0
+    m2: float = 0.0
+    min_value: float = 0.0
+    max_value: float = 0.0
+
+    def reset(self) -> None:
+        self.n = 0
+        self.mean = 0.0
+        self.m2 = 0.0
+        self.min_value = 0.0
+        self.max_value = 0.0
+
+    def update(self, value: float) -> None:
+        value = float(value)
+        if self.n == 0:
+            self.n = 1
+            self.mean = value
+            self.m2 = 0.0
+            self.min_value = value
+            self.max_value = value
+            return
+        self.n += 1
+        delta = value - self.mean
+        self.mean += delta / float(self.n)
+        delta2 = value - self.mean
+        self.m2 += delta * delta2
+        self.min_value = min(self.min_value, value)
+        self.max_value = max(self.max_value, value)
+
+    def restore(self, payload: Any) -> None:
+        if not isinstance(payload, dict):
+            self.reset()
+            return
+        try:
+            n = int(payload.get("n") or 0)
+            mean = float(payload.get("mean") or 0.0)
+            m2 = float(payload.get("m2") or 0.0)
+            min_value = float(payload.get("min") or 0.0)
+            max_value = float(payload.get("max") or 0.0)
+        except (TypeError, ValueError):
+            self.reset()
+            return
+        if n < 0 or not all(math.isfinite(v) for v in (mean, m2, min_value, max_value)):
+            self.reset()
+            return
+        self.n = n
+        self.mean = mean
+        self.m2 = max(0.0, m2)
+        self.min_value = min_value if n else 0.0
+        self.max_value = max_value if n else 0.0
+
+    def snapshot(self) -> Dict[str, Any]:
+        n = int(self.n)
+        variance = self.m2 / float(n - 1) if n > 1 else 0.0
+        stddev = math.sqrt(max(0.0, variance))
+        stderr = stddev / math.sqrt(float(n)) if n else 0.0
+        return {
+            "n": n,
+            "mean": float(self.mean) if n else 0.0,
+            "m2": float(self.m2) if n else 0.0,
+            "stddev": float(stddev),
+            "stderr": float(stderr),
+            "min": float(self.min_value) if n else 0.0,
+            "max": float(self.max_value) if n else 0.0,
+        }
+
+
+@dataclass
+class _DacLaneState:
+    name: str
+    address: int
+    target_code: float = 0.0
+    hw_code: int = 0
+    readback_valid: bool = False
+    readback_code: int = 0
+    reset_signature: bool = False
+    configured: bool = False
+    readback_count: int = 0
+    readback_failures: int = 0
+    adopt_count: int = 0
+    same_code_skip_count: int = 0
+    last_author_source: int = DAC_AUTHOR_NONE
+    write_attempts: int = 0
+    write_successes: int = 0
+    write_failures: int = 0
+    last_write_ok: bool = True
+    last_failure_stage: int = 0
+    last_attempted_hw_code: int = 0
+    last_good_hw_code: int = 0
+
+    dither_enabled: bool = False
+    dither_active_this_frame: bool = False
+    dither_current_phase_high: bool = False
+    dither_low_code: int = 0
+    dither_high_code: int = 0
+    dither_high_ms: int = 0
+    dither_last_frame_high_ms: int = 0
+    dither_transition_due: Optional[float] = None
+    dither_frame_count: int = 0
+    dither_transition_count: int = 0
+    dither_write_count: int = 0
+    dither_write_failure_count: int = 0
+    dither_skip_same_code_count: int = 0
+
+    servo_last_step: float = 0.0
+    servo_last_residual: float = 0.0
+    servo_settle_count: int = 0
+    servo_adjustments: int = 0
+    servo_predictor_initialized: bool = False
+    servo_last_raw_residual: float = 0.0
+    servo_filtered_residual: float = 0.0
+    servo_filtered_slope: float = 0.0
+    servo_predicted_residual: float = 0.0
+    servo_predictor_updates: int = 0
+    servo_hold_count: int = 0
+    servo_hold_reason: int = SERVO_HOLD_NONE
+    servo_quarantine_reason: int = SERVO_HOLD_NONE
+    servo_quarantine_remaining: int = 0
+    servo_quarantine_begin_count: int = 0
+    servo_quarantine_consumed_count: int = 0
+    servo_commit_fault_hold_count: int = 0
+
+    pacing_pending: bool = False
+    pacing_pending_target: float = 0.0
+    pacing_pending_step: float = 0.0
+    pacing_pending_hw_code: int = 0
+    pacing_pending_since_second: int = 0
+    pacing_last_request_second: int = 0
+    pacing_last_commit_second: int = 0
+    pacing_intents: int = 0
+    pacing_deferred_count: int = 0
+    pacing_commit_count: int = 0
+    pacing_skip_small_delta_count: int = 0
+    static_service_due: Optional[float] = None
+
+    total_initialized: bool = False
+    total_basis: int = 0
+    total_last_commit_count: int = 0
+    total_last_dac_value: float = 0.0
+    total_last_population_seconds: int = 0
+    total_last_sample_control_second: int = 0
+    total_recent: deque = field(
+        default_factory=lambda: deque(maxlen=SERVO_TOTAL_RECENT_WINDOW_SAMPLES)
+    )
+    total_samples_since_reset: int = 0
+    total_coarse_latched: bool = False
+
+    welford: _DacWelford = field(default_factory=_DacWelford)
+
+
+_dac_lock = threading.RLock()
+_dac_actuator_lock = threading.Lock()
+_dac_control_wakeup = threading.Event()
+_dac_control_thread_started = threading.Event()
+_dac_hardware_initialized = False
+_dac_dither_operator_enabled = False
+_dac_servo_mode = "OFF"
+_dac_next_frame_monotonic = 0.0
+_dac_last_processed_sequence = 0
+_dac_control_second = 0
+
+_dac_lanes: Dict[str, _DacLaneState] = {
+    "ocxo1": _DacLaneState("ocxo1", AD5693R_ADDR_OCXO1),
+    "ocxo2": _DacLaneState("ocxo2", AD5693R_ADDR_OCXO2),
+}
+
+
+def _dac_clamp_target(value: float) -> float:
+    value = float(value)
+    if not math.isfinite(value):
+        raise ValueError("DAC target must be finite")
+    return min(float(AD5693R_SAFE_MAX_HW_CODE), max(0.0, value))
+
+
+def _dac_rounded_hw_code(value: float) -> int:
+    return int(_dac_clamp_target(value) + 0.5)
+
+
+def _dac_voltage_from_code(value: float) -> float:
+    return (_dac_clamp_target(value) / AD5693R_CODE_SCALE) * AD5693R_OUTPUT_FULL_SCALE_VOLTAGE
+
+
+def _ad5693r_write_24(address: int, command: int, data: int) -> None:
+    value = int(data) & 0xFFFF
+    with SMBus(DAC_I2C_BUS) as bus:
+        msg = i2c_msg.write(
+            int(address),
+            [int(command) & 0xFF, (value >> 8) & 0xFF, value & 0xFF],
+        )
+        bus.i2c_rdwr(msg)
+
+
+def _ad5693r_write_command(address: int, command: int) -> None:
+    with SMBus(DAC_I2C_BUS) as bus:
+        msg = i2c_msg.write(int(address), [int(command) & 0xFF])
+        bus.i2c_rdwr(msg)
+
+
+def _ad5693r_read_input(address: int) -> int:
+    with SMBus(DAC_I2C_BUS) as bus:
+        msg = i2c_msg.read(int(address), 2)
+        bus.i2c_rdwr(msg)
+        data = list(msg)
+    if len(data) != 2:
+        raise OSError(f"AD5693R 0x{address:02X} returned {len(data)} bytes")
+    return ((int(data[0]) & 0xFF) << 8) | (int(data[1]) & 0xFF)
+
+
+def _dac_configure_lane(lane: _DacLaneState) -> bool:
+    try:
+        _ad5693r_write_24(
+            lane.address,
+            AD5693R_CMD_WRITE_CONTROL,
+            AD5693R_CTRL_INTERNAL_VREF_2X,
+        )
+    except Exception:
+        with _dac_lock:
+            lane.configured = False
+        logging.exception(
+            "❌ [clocks/dac] failed to configure %s AD5693R at 0x%02X",
+            lane.name,
+            lane.address,
+        )
+        return False
+    with _dac_lock:
+        lane.configured = True
+    return True
+
+
+def _dac_read_and_adopt_lane(lane: _DacLaneState) -> bool:
+    try:
+        code = _ad5693r_read_input(lane.address)
+    except Exception:
+        with _dac_lock:
+            lane.readback_failures += 1
+            lane.readback_valid = False
+        logging.exception(
+            "❌ [clocks/dac] failed to read %s AD5693R input register at 0x%02X",
+            lane.name,
+            lane.address,
+        )
+        return False
+
+    with _dac_lock:
+        lane.readback_count += 1
+        lane.readback_valid = True
+        lane.readback_code = int(code)
+        lane.hw_code = int(code)
+        lane.reset_signature = int(code) == 0
+        lane.target_code = _dac_clamp_target(float(code))
+        lane.adopt_count += 1
+        lane.last_author_source = DAC_AUTHOR_STARTUP_OBSERVED
+        lane.last_write_ok = True
+        lane.last_failure_stage = 0
+        lane.last_good_hw_code = int(code)
+    return True
+
+
+def _dac_initialize_hardware() -> Dict[str, Any]:
+    """Configure AD5693R control registers and adopt surviving input codes.
+
+    Initialization is deliberately non-authoring with respect to VOUT: it never
+    writes an input code and never issues UPDATE_DAC_REG.
+    """
+    global _dac_hardware_initialized
+    result: Dict[str, Any] = {}
+    all_ok = True
+    for name in ("ocxo1", "ocxo2"):
+        lane = _dac_lanes[name]
+        configured = _dac_configure_lane(lane)
+        observed = _dac_read_and_adopt_lane(lane) if configured else False
+        all_ok = all_ok and configured and observed
+        result[name] = {
+            "address": f"0x{lane.address:02X}",
+            "configured": bool(configured),
+            "readback_valid": bool(observed),
+            "readback_code": int(lane.readback_code) if observed else None,
+        }
+    _dac_hardware_initialized = bool(all_ok)
+    logging.info("🔧 [clocks/dac] Pi DAC custody initialized: %s", result)
+    return result
+
+
+def _dac_write_hw_code(
+    lane: _DacLaneState,
+    hw_code: int,
+    *,
+    author_source: int,
+    latch_fault: bool = False,
+) -> bool:
+    code = max(0, min(AD5693R_SAFE_MAX_HW_CODE, int(hw_code)))
+    with _dac_actuator_lock:
+        with _dac_lock:
+            lane.last_attempted_hw_code = code
+            if lane.readback_valid and code == lane.hw_code:
+                lane.same_code_skip_count += 1
+                lane.dither_skip_same_code_count += 1
+                lane.last_write_ok = True
+                lane.last_failure_stage = 0
+                return True
+            lane.write_attempts += 1
+            configured = lane.configured
+
+        if not configured and not _dac_configure_lane(lane):
+            with _dac_lock:
+                lane.write_failures += 1
+                lane.last_write_ok = False
+                lane.last_failure_stage = 3
+            return False
+
+        try:
+            _ad5693r_write_24(lane.address, AD5693R_CMD_WRITE_INPUT_REG, code)
+        except Exception:
+            with _dac_lock:
+                lane.write_failures += 1
+                lane.last_write_ok = False
+                lane.last_failure_stage = 1
+            logging.exception(
+                "❌ [clocks/dac] %s write-input failed code=%d", lane.name, code
+            )
+            return False
+
+        try:
+            _ad5693r_write_command(lane.address, AD5693R_CMD_UPDATE_DAC_REG)
+        except Exception:
+            with _dac_lock:
+                lane.write_failures += 1
+                lane.last_write_ok = False
+                lane.last_failure_stage = 2
+            logging.exception(
+                "❌ [clocks/dac] %s update-DAC failed code=%d", lane.name, code
+            )
+            return False
+
+        with _dac_lock:
+            lane.hw_code = code
+            lane.readback_valid = True
+            lane.readback_code = code
+            lane.reset_signature = code == 0
+            lane.last_author_source = int(author_source)
+            lane.last_write_ok = True
+            lane.last_failure_stage = 0
+            lane.write_successes += 1
+            lane.last_good_hw_code = code
+        _ = latch_fault  # retained semantic argument; Pi reports faults directly.
+        return True
+
+
+def _dac_clear_pending_locked(lane: _DacLaneState) -> None:
+    lane.pacing_pending = False
+    lane.pacing_pending_target = 0.0
+    lane.pacing_pending_step = 0.0
+    lane.pacing_pending_hw_code = 0
+    lane.pacing_pending_since_second = 0
+    lane.static_service_due = None
+
+
+def _dac_begin_quarantine_locked(lane: _DacLaneState, rows: int, reason: int) -> None:
+    lane.servo_quarantine_remaining = int(rows)
+    lane.servo_quarantine_reason = int(reason)
+    lane.servo_hold_reason = int(reason)
+    lane.servo_quarantine_begin_count += 1
+
+
+def _dac_install_pending_servo_locked(lane: _DacLaneState) -> bool:
+    if not lane.pacing_pending:
+        return False
+    target = lane.pacing_pending_target
+    step = lane.pacing_pending_step
+    request_second = lane.pacing_pending_since_second
+    _dac_clear_pending_locked(lane)
+    lane.target_code = target
+    lane.servo_last_step = step
+    lane.pacing_last_commit_second = request_second
+    lane.pacing_commit_count += 1
+    _dac_begin_quarantine_locked(
+        lane,
+        SERVO_DITHER_OWNER_SETTLE_QUARANTINE_ROWS,
+        SERVO_HOLD_SETTLE_QUARANTINE,
+    )
+    return True
+
+
+def _dac_queue_servo_target(lane: _DacLaneState, target: float, step: float) -> None:
+    target = _dac_clamp_target(target)
+    with _dac_lock:
+        if lane.pacing_pending:
+            lane.pacing_deferred_count += 1
+        lane.pacing_pending = True
+        lane.pacing_pending_target = target
+        lane.pacing_pending_step = float(step)
+        lane.pacing_pending_hw_code = _dac_rounded_hw_code(target)
+        lane.pacing_pending_since_second = int(_dac_control_second)
+        lane.pacing_last_request_second = int(_dac_control_second)
+        lane.pacing_intents += 1
+        lane.servo_last_step = float(step)
+        lane.servo_adjustments += 1
+        lane.servo_hold_reason = SERVO_HOLD_PENDING_COMMIT
+        lane.static_service_due = (
+            None
+            if _dac_dither_operator_enabled
+            else time.monotonic() + DAC_STATIC_SERVO_SERVICE_DELAY_S
+        )
+    _dac_control_wakeup.set()
+
+
+def _dac_set_target_explicit(lane: _DacLaneState, value: float) -> bool:
+    target = _dac_clamp_target(value)
+    with _dac_lock:
+        _dac_clear_pending_locked(lane)
+        dither = _dac_dither_operator_enabled
+    if dither:
+        with _dac_lock:
+            lane.target_code = target
+            lane.last_write_ok = True
+            lane.last_failure_stage = 0
+        _dac_control_wakeup.set()
+        return True
+
+    hw_code = _dac_rounded_hw_code(target)
+    if not _dac_write_hw_code(
+        lane,
+        hw_code,
+        author_source=DAC_AUTHOR_EXPLICIT_COMMAND,
+        latch_fault=True,
+    ):
+        return False
+    with _dac_lock:
+        lane.target_code = target
+    return True
+
+
+def _dac_program_dither_lane_locked(lane: _DacLaneState, frame_start: float) -> int:
+    target = _dac_clamp_target(lane.target_code)
+    low = int(math.floor(target))
+    high = min(AD5693R_SAFE_MAX_HW_CODE, low + 1)
+    frac = min(1.0, max(0.0, target - float(low)))
+    high_ms = int(frac * DAC_DITHER_SLOTS_PER_FRAME + 0.5)
+    if high_ms >= DAC_DITHER_SLOTS_PER_FRAME:
+        low = high
+        high_ms = 0
+    if high == low or high_ms == 0:
+        high = low
+        high_ms = 0
+
+    lane.dither_enabled = True
+    lane.dither_low_code = low
+    lane.dither_high_code = high
+    lane.dither_high_ms = high_ms
+    lane.dither_last_frame_high_ms = high_ms
+    lane.dither_active_this_frame = high_ms > 0 and high != low
+    lane.dither_current_phase_high = False
+    lane.dither_frame_count += 1
+    lane.dither_transition_due = (
+        frame_start + (DAC_DITHER_SLOTS_PER_FRAME - high_ms) / 1000.0
+        if lane.dither_active_this_frame
+        else None
+    )
+    return low
+
+
+def _dac_begin_dither_frame(frame_start: float) -> None:
+    writes: List[Tuple[_DacLaneState, int]] = []
+    with _dac_lock:
+        if not _dac_dither_operator_enabled:
+            return
+        for lane in _dac_lanes.values():
+            _dac_install_pending_servo_locked(lane)
+            writes.append((lane, _dac_program_dither_lane_locked(lane, frame_start)))
+
+    for lane, code in writes:
+        ok = _dac_write_hw_code(
+            lane,
+            code,
+            author_source=DAC_AUTHOR_SERVO if _dac_servo_mode != "OFF" else DAC_AUTHOR_EXPLICIT_COMMAND,
+        )
+        with _dac_lock:
+            if ok:
+                lane.dither_write_count += 1
+            else:
+                lane.dither_write_failure_count += 1
+                _dac_begin_quarantine_locked(
+                    lane,
+                    SERVO_DITHER_OWNER_FAILURE_BACKOFF_ROWS,
+                    SERVO_HOLD_COMMIT_FAULT_BACKOFF,
+                )
+
+
+def _dac_service_dither_transitions(now: float) -> None:
+    writes: List[Tuple[_DacLaneState, int]] = []
+    with _dac_lock:
+        if not _dac_dither_operator_enabled:
+            return
+        for lane in _dac_lanes.values():
+            due = lane.dither_transition_due
+            if due is None or due > now or lane.dither_current_phase_high:
+                continue
+            lane.dither_transition_due = None
+            lane.dither_current_phase_high = True
+            lane.dither_transition_count += 1
+            writes.append((lane, lane.dither_high_code))
+
+    for lane, code in writes:
+        ok = _dac_write_hw_code(
+            lane,
+            code,
+            author_source=DAC_AUTHOR_SERVO if _dac_servo_mode != "OFF" else DAC_AUTHOR_EXPLICIT_COMMAND,
+        )
+        with _dac_lock:
+            if ok:
+                lane.dither_write_count += 1
+            else:
+                lane.dither_write_failure_count += 1
+                _dac_begin_quarantine_locked(
+                    lane,
+                    SERVO_DITHER_OWNER_FAILURE_BACKOFF_ROWS,
+                    SERVO_HOLD_COMMIT_FAULT_BACKOFF,
+                )
+
+
+def _dac_service_static_servo(now: float) -> None:
+    writes: List[Tuple[_DacLaneState, int]] = []
+    with _dac_lock:
+        if _dac_dither_operator_enabled:
+            return
+        for lane in _dac_lanes.values():
+            if not lane.pacing_pending or lane.static_service_due is None:
+                continue
+            if lane.static_service_due > now:
+                continue
+            _dac_install_pending_servo_locked(lane)
+            writes.append((lane, _dac_rounded_hw_code(lane.target_code)))
+
+    for lane, code in writes:
+        ok = _dac_write_hw_code(lane, code, author_source=DAC_AUTHOR_SERVO)
+        if not ok:
+            with _dac_lock:
+                _dac_begin_quarantine_locked(
+                    lane,
+                    SERVO_DITHER_OWNER_FAILURE_BACKOFF_ROWS,
+                    SERVO_HOLD_COMMIT_FAULT_BACKOFF,
+                )
+
+
+def _dac_control_loop() -> None:
+    global _dac_next_frame_monotonic
+    _dac_control_thread_started.set()
+    while True:
+        now = time.monotonic()
+        with _dac_lock:
+            dither = _dac_dither_operator_enabled
+            next_frame = _dac_next_frame_monotonic
+
+        if dither:
+            if next_frame <= 0.0 or now >= next_frame:
+                frame_start = now
+                _dac_begin_dither_frame(frame_start)
+                with _dac_lock:
+                    _dac_next_frame_monotonic = frame_start + DAC_DITHER_FRAME_S
+                now = time.monotonic()
+            _dac_service_dither_transitions(now)
+        else:
+            _dac_service_static_servo(now)
+
+        with _dac_lock:
+            deadlines: List[float] = []
+            if _dac_dither_operator_enabled:
+                if _dac_next_frame_monotonic > 0.0:
+                    deadlines.append(_dac_next_frame_monotonic)
+                for lane in _dac_lanes.values():
+                    if lane.dither_transition_due is not None:
+                        deadlines.append(lane.dither_transition_due)
+            else:
+                for lane in _dac_lanes.values():
+                    if lane.pacing_pending and lane.static_service_due is not None:
+                        deadlines.append(lane.static_service_due)
+        timeout = 1.0
+        if deadlines:
+            timeout = max(0.001, min(deadlines) - time.monotonic())
+        _dac_control_wakeup.wait(timeout=timeout)
+        _dac_control_wakeup.clear()
+
+
+def _dac_start_control_thread() -> None:
+    if _dac_control_thread_started.is_set():
+        return
+    threading.Thread(
+        target=_dac_control_loop,
+        daemon=True,
+        name="clocks-dac-control",
+    ).start()
+
+
+def _dac_set_dither_enabled(enabled: bool) -> None:
+    global _dac_dither_operator_enabled, _dac_next_frame_monotonic
+    with _dac_lock:
+        _dac_dither_operator_enabled = bool(enabled)
+        if enabled:
+            _dac_next_frame_monotonic = time.monotonic()
+            for lane in _dac_lanes.values():
+                lane.dither_enabled = True
+                lane.dither_transition_due = None
+        else:
+            _dac_next_frame_monotonic = 0.0
+            for lane in _dac_lanes.values():
+                lane.dither_enabled = False
+                lane.dither_active_this_frame = False
+                lane.dither_current_phase_high = False
+                lane.dither_transition_due = None
+                _dac_clear_pending_locked(lane)
+    _dac_control_wakeup.set()
+
+
+def _dac_reset_total_state_locked(lane: _DacLaneState) -> None:
+    lane.total_initialized = False
+    lane.total_basis = 0
+    lane.total_last_commit_count = 0
+    lane.total_last_dac_value = 0.0
+    lane.total_last_population_seconds = 0
+    lane.total_last_sample_control_second = 0
+    lane.total_recent.clear()
+    lane.total_samples_since_reset = 0
+    lane.total_coarse_latched = False
+
+
+def _dac_reset_servo_predictor_locked(lane: _DacLaneState) -> None:
+    lane.servo_predictor_initialized = False
+    lane.servo_last_raw_residual = 0.0
+    lane.servo_filtered_residual = 0.0
+    lane.servo_filtered_slope = 0.0
+    lane.servo_predicted_residual = 0.0
+    lane.servo_predictor_updates = 0
+    lane.servo_settle_count = 0
+    lane.servo_hold_reason = SERVO_HOLD_NONE
+    lane.servo_quarantine_reason = SERVO_HOLD_NONE
+    lane.servo_quarantine_remaining = 0
+    _dac_reset_total_state_locked(lane)
+
+
+def _dac_set_servo_mode(mode: str) -> Tuple[str, str]:
+    global _dac_servo_mode
+    normalized = str(mode or "").strip().upper()
+    if normalized not in {"OFF", "MEAN", "TOTAL", "NOW"}:
+        raise ValueError("SERVOS mode must be OFF, NOW, MEAN, or TOTAL")
+    with _dac_lock:
+        previous = _dac_servo_mode
+        if previous != normalized:
+            for lane in _dac_lanes.values():
+                _dac_reset_servo_predictor_locked(lane)
+            _dac_servo_mode = normalized
+        if normalized == "OFF":
+            for lane in _dac_lanes.values():
+                _dac_clear_pending_locked(lane)
+                lane.servo_last_step = 0.0
+    _dac_control_wakeup.set()
+    return previous, normalized
+
+
+def _servo_hold_active_locked(lane: _DacLaneState) -> bool:
+    if lane.servo_quarantine_remaining:
+        reason = lane.servo_quarantine_reason or SERVO_HOLD_SETTLE_QUARANTINE
+        lane.servo_quarantine_remaining -= 1
+        lane.servo_quarantine_consumed_count += 1
+        lane.servo_hold_reason = reason
+        lane.servo_hold_count += 1
+        if reason == SERVO_HOLD_COMMIT_FAULT_BACKOFF:
+            lane.servo_commit_fault_hold_count += 1
+        return True
+    lane.servo_hold_reason = SERVO_HOLD_NONE
+    lane.servo_quarantine_reason = SERVO_HOLD_NONE
+    return False
+
+
+def _servo_soft_landing_scale(abs_ppb: float) -> float:
+    if abs_ppb >= SERVO_SOFT_LANDING_PPB:
+        return 1.0
+    return 0.25 + 0.75 * (abs_ppb / SERVO_SOFT_LANDING_PPB)
+
+
+def _servo_apply_step(lane: _DacLaneState, step: float) -> None:
+    with _dac_lock:
+        before = lane.target_code
+        target = _dac_clamp_target(before + step)
+        planned_step = target - before
+        target_hw_code = _dac_rounded_hw_code(target)
+        if abs(planned_step) < 0.000001:
+            lane.pacing_skip_small_delta_count += 1
+            lane.servo_last_step = 0.0
+            lane.servo_hold_reason = SERVO_HOLD_SMALL_STATIC_DELTA
+            return
+        if not _dac_dither_operator_enabled and target_hw_code == lane.hw_code:
+            lane.pacing_skip_small_delta_count += 1
+            lane.servo_last_step = 0.0
+            lane.servo_hold_reason = SERVO_HOLD_SMALL_STATIC_DELTA
+            return
+    _dac_queue_servo_target(lane, target, planned_step)
+
+
+def _servo_slope(
+    lane: _DacLaneState,
+    *,
+    selected_valid: bool,
+    selected_ppb: float,
+    filter_alpha: float,
+    gain: float,
+    deadband_ppb: float,
+    use_soft_landing: bool,
+) -> None:
+    if not selected_valid:
+        return
+    with _dac_lock:
+        if _servo_hold_active_locked(lane):
+            return
+        ppb = float(selected_ppb)
+        lane.servo_last_residual = ppb
+        if not lane.servo_predictor_initialized:
+            lane.servo_predictor_initialized = True
+            lane.servo_last_raw_residual = ppb
+            lane.servo_filtered_residual = ppb
+            lane.servo_filtered_slope = 0.0
+            lane.servo_predicted_residual = ppb
+            lane.servo_predictor_updates = 1
+        else:
+            raw_delta = ppb - lane.servo_last_raw_residual
+            lane.servo_last_raw_residual = ppb
+            lane.servo_filtered_residual = (
+                (1.0 - filter_alpha) * lane.servo_filtered_residual
+                + filter_alpha * ppb
+            )
+            lane.servo_filtered_slope = (
+                (1.0 - filter_alpha) * lane.servo_filtered_slope
+                + filter_alpha * raw_delta
+            )
+            lane.servo_predicted_residual = lane.servo_filtered_residual
+            lane.servo_predictor_updates += 1
+        control_ppb = lane.servo_predicted_residual
+
+    abs_ppb = abs(control_ppb)
+    if abs_ppb < deadband_ppb:
+        return
+    landing = _servo_soft_landing_scale(abs_ppb) if use_soft_landing else 1.0
+    step = -control_ppb / SERVO_PPB_PER_DAC_LSB_ESTIMATE
+    step *= gain * landing
+    step = max(-SERVO_MAX_STEP, min(SERVO_MAX_STEP, step))
+    if abs(step) < 0.000001:
+        return
+    _servo_apply_step(lane, step)
+
+
+def _servo_total_window_clear_locked(lane: _DacLaneState) -> None:
+    lane.total_recent.clear()
+    lane.total_samples_since_reset = 0
+    lane.total_last_sample_control_second = 0
+
+
+def _servo_total_state_reset_locked(
+    lane: _DacLaneState,
+    basis: int,
+    population_seconds: int,
+) -> None:
+    lane.total_initialized = True
+    lane.total_basis = int(basis)
+    lane.total_last_commit_count = int(lane.pacing_commit_count)
+    lane.total_last_dac_value = float(lane.target_code)
+    lane.total_last_population_seconds = int(population_seconds)
+    _servo_total_window_clear_locked(lane)
+    lane.total_coarse_latched = False
+
+
+def _servo_total_sync_operating_point_locked(
+    lane: _DacLaneState,
+    basis: int,
+    population_seconds: int,
+) -> bool:
+    if not lane.total_initialized:
+        _servo_total_state_reset_locked(lane, basis, population_seconds)
+        return False
+    changed = (
+        lane.total_basis != int(basis)
+        or int(population_seconds) < lane.total_last_population_seconds
+        or lane.total_last_commit_count != lane.pacing_commit_count
+        or abs(lane.target_code - lane.total_last_dac_value)
+        > SERVO_TOTAL_DAC_CHANGE_EPSILON_LSB
+    )
+    if changed:
+        _servo_total_state_reset_locked(lane, basis, population_seconds)
+        return True
+    lane.total_last_population_seconds = int(population_seconds)
+    return False
+
+
+def _servo_total_push_recent_locked(lane: _DacLaneState, sample_ppb: float) -> None:
+    if (
+        lane.total_last_sample_control_second
+        and _dac_control_second != lane.total_last_sample_control_second + 1
+    ):
+        _servo_total_window_clear_locked(lane)
+    lane.total_last_sample_control_second = int(_dac_control_second)
+    lane.total_recent.append(float(sample_ppb))
+    lane.total_samples_since_reset += 1
+
+
+def _servo_total_recent_mean_locked(lane: _DacLaneState) -> float:
+    return sum(lane.total_recent) / float(len(lane.total_recent)) if lane.total_recent else 0.0
+
+
+def _servo_total_recent_stderr_locked(lane: _DacLaneState) -> float:
+    n = len(lane.total_recent)
+    if n < 2:
+        return 0.0
+    mean = _servo_total_recent_mean_locked(lane)
+    variance = sum((x - mean) ** 2 for x in lane.total_recent) / float(n - 1)
+    return math.sqrt(max(0.0, variance) / float(n))
+
+
+def _servo_total_requested_rate(total_ppb: float, population_seconds: int, coarse: bool) -> float:
+    if population_seconds <= 0:
+        return 0.0
+    horizon = SERVO_TOTAL_COARSE_HORIZON_SECONDS if coarse else SERVO_TOTAL_FINE_HORIZON_SECONDS
+    max_rate = SERVO_TOTAL_COARSE_MAX_RATE_PPB if coarse else SERVO_TOTAL_FINE_MAX_RATE_PPB
+    requested = -float(total_ppb) * (float(population_seconds) / horizon)
+    return max(-max_rate, min(max_rate, requested))
+
+
+def _servo_total_crosses_zero(total_ppb: float, population_seconds: int, recent_mean_ppb: float) -> bool:
+    if (
+        population_seconds <= 0
+        or total_ppb == 0.0
+        or recent_mean_ppb == 0.0
+        or total_ppb * recent_mean_ppb >= 0.0
+    ):
+        return False
+    seconds_to_zero = -total_ppb * float(population_seconds) / recent_mean_ppb
+    return 0.0 <= seconds_to_zero <= SERVO_TOTAL_ZERO_CROSSING_LOOKAHEAD_SECONDS
+
+
+def _servo_total(
+    lane: _DacLaneState,
+    *,
+    total_valid: bool,
+    total_ppb: float,
+    population_seconds: int,
+    now_valid: bool,
+    now_ppb: float,
+) -> None:
+    if not total_valid or not now_valid or population_seconds <= 0:
+        return
+
+    with _dac_lock:
+        operating_point_changed = _servo_total_sync_operating_point_locked(
+            lane, 2, population_seconds
+        )
+        if lane.pacing_pending:
+            lane.servo_hold_reason = SERVO_HOLD_PENDING_COMMIT
+            lane.servo_hold_count += 1
+            return
+        if _servo_hold_active_locked(lane):
+            return
+        if operating_point_changed:
+            return
+
+        _servo_total_push_recent_locked(lane, now_ppb)
+        recent_mean = _servo_total_recent_mean_locked(lane)
+        recent_stderr = _servo_total_recent_stderr_locked(lane)
+        fine_required = abs(total_ppb) * (
+            float(population_seconds) / SERVO_TOTAL_FINE_HORIZON_SECONDS
+        )
+        if lane.total_coarse_latched:
+            if (
+                abs(total_ppb) <= SERVO_TOTAL_COARSE_EXIT_PPB
+                and abs(recent_mean) <= SERVO_TOTAL_COARSE_RATE_EXIT_PPB
+                and fine_required <= SERVO_TOTAL_FINE_MAX_RATE_PPB
+            ):
+                lane.total_coarse_latched = False
+        elif (
+            abs(total_ppb) >= SERVO_TOTAL_COARSE_THRESHOLD_PPB
+            or abs(recent_mean) >= SERVO_TOTAL_COARSE_RATE_ENTRY_PPB
+            or fine_required > SERVO_TOTAL_FINE_MAX_RATE_PPB
+        ):
+            lane.total_coarse_latched = True
+
+        coarse = lane.total_coarse_latched
+        required_samples = (
+            SERVO_TOTAL_COARSE_MIN_SAMPLES if coarse else SERVO_TOTAL_FINE_MIN_SAMPLES
+        )
+        lane.servo_last_residual = float(total_ppb)
+        lane.servo_last_raw_residual = float(now_ppb)
+        lane.servo_filtered_residual = float(recent_mean)
+        lane.servo_predictor_initialized = True
+        lane.servo_predictor_updates = int(lane.total_samples_since_reset)
+        lane.servo_settle_count = len(lane.total_recent)
+        if len(lane.total_recent) < required_samples:
+            lane.servo_filtered_slope = 0.0
+            lane.servo_predicted_residual = 0.0
+            return
+
+        requested_rate = _servo_total_requested_rate(total_ppb, population_seconds, coarse)
+        if _servo_total_crosses_zero(total_ppb, population_seconds, recent_mean):
+            requested_rate = 0.0
+        rate_error = recent_mean - requested_rate
+        stderr_multiplier = (
+            SERVO_TOTAL_COARSE_STDERR_MULTIPLIER
+            if coarse
+            else SERVO_TOTAL_FINE_STDERR_MULTIPLIER
+        )
+        floor_deadband = (
+            SERVO_TOTAL_COARSE_RATE_DEADBAND_PPB
+            if coarse
+            else SERVO_TOTAL_FINE_RATE_DEADBAND_PPB
+        )
+        rate_deadband = max(floor_deadband, stderr_multiplier * recent_stderr)
+        lane.servo_filtered_slope = float(requested_rate)
+        lane.servo_predicted_residual = float(rate_error)
+        near_zero_hold = max(rate_deadband, SERVO_TOTAL_NEAR_ZERO_RATE_HOLD_PPB)
+        if (
+            (abs(total_ppb) <= SERVO_TOTAL_POSITION_HOLD_PPB and abs(recent_mean) <= near_zero_hold)
+            or abs(rate_error) <= rate_deadband
+        ):
+            return
+        actuator_gain = (
+            SERVO_TOTAL_COARSE_ACTUATOR_GAIN if coarse else SERVO_TOTAL_FINE_ACTUATOR_GAIN
+        )
+        max_step = SERVO_TOTAL_COARSE_MAX_STEP_LSB if coarse else SERVO_TOTAL_FINE_MAX_STEP_LSB
+
+    step = -rate_error / SERVO_PPB_PER_DAC_LSB_ESTIMATE * actuator_gain
+    step = max(-max_step, min(max_step, step))
+    if abs(step) >= 0.000001:
+        _servo_apply_step(lane, step)
+
+
+def _dac_servo_inputs(clocks: Dict[str, Any], lane_name: str) -> Dict[str, Any]:
+    stats = clocks.get("stats") if isinstance(clocks, dict) else None
+    raw_cycles = clocks.get("raw_cycles") if isinstance(clocks, dict) else None
+    stats = stats if isinstance(stats, dict) else {}
+    raw_cycles = raw_cycles if isinstance(raw_cycles, dict) else {}
+    lane_stats = stats.get(lane_name)
+    lane_stats = lane_stats if isinstance(lane_stats, dict) else {}
+    welford = lane_stats.get("welford")
+    welford = welford if isinstance(welford, dict) else {}
+    buckets = lane_stats.get("ppb_buckets")
+    buckets = buckets if isinstance(buckets, dict) else {}
+    tau_state = stats.get(f"{lane_name}_tau_state")
+    tau_state = tau_state if isinstance(tau_state, dict) else {}
+    reference = raw_cycles.get("vclock")
+    observed = raw_cycles.get(lane_name)
+    reference = reference if isinstance(reference, dict) else {}
+    observed = observed if isinstance(observed, dict) else {}
+
+    try:
+        reference_cycles = int(reference.get("observed_cycles") or 0)
+        clock_cycles = int(observed.get("observed_cycles") or 0)
+    except (TypeError, ValueError):
+        reference_cycles = 0
+        clock_cycles = 0
+    interval_valid = bool(
+        reference.get("valid", reference_cycles > 0)
+        and observed.get("valid", clock_cycles > 0)
+        and reference_cycles > 0
+        and clock_cycles > 0
+    )
+    now_ppb = (
+        (float(reference_cycles - clock_cycles) * 1.0e9) / float(reference_cycles)
+        if interval_valid
+        else 0.0
+    )
+    try:
+        mean_n = int(welford.get("n") or 0)
+        mean_ppb = float(welford.get("mean") or 0.0)
+    except (TypeError, ValueError):
+        mean_n = 0
+        mean_ppb = 0.0
+    try:
+        total_ppb = float(buckets.get("total"))
+        total_finite = math.isfinite(total_ppb)
+    except (TypeError, ValueError):
+        total_ppb = 0.0
+        total_finite = False
+    try:
+        population = int(tau_state.get("sample_count") or 0)
+    except (TypeError, ValueError):
+        population = 0
+
+    return {
+        "now_valid": interval_valid,
+        "now_ppb": now_ppb,
+        "mean_valid": interval_valid and mean_n >= SERVO_MIN_SAMPLES,
+        "mean_ppb": mean_ppb,
+        "total_valid": interval_valid and total_finite and population >= SERVO_MIN_SAMPLES,
+        "total_ppb": total_ppb,
+        "total_population_seconds": population,
+    }
+
+
+def _dac_process_completed_row(teensy_clocks: Dict[str, Any], sequence: int) -> None:
+    global _dac_last_processed_sequence, _dac_control_second
+    stats = teensy_clocks.get("stats") if isinstance(teensy_clocks, dict) else None
+    if not isinstance(stats, dict):
+        return
+    if not bool(stats.get("rolling_ppb_endpoint_admitted")):
+        return
+    with _dac_lock:
+        if int(sequence) <= _dac_last_processed_sequence:
+            return
+        _dac_last_processed_sequence = int(sequence)
+        _dac_control_second = int(stats.get("update_count") or sequence)
+        for lane in _dac_lanes.values():
+            lane.welford.update(lane.target_code)
+        mode = _dac_servo_mode
+
+    if mode == "OFF":
+        return
+
+    for lane_name, lane in _dac_lanes.items():
+        inputs = _dac_servo_inputs(teensy_clocks, lane_name)
+        if mode == "MEAN":
+            if not inputs["mean_valid"]:
+                continue
+            with _dac_lock:
+                lane.servo_settle_count += 1
+                ready = lane.servo_settle_count >= SERVO_SETTLE_SECONDS
+                if ready:
+                    lane.servo_settle_count = 0
+            if ready:
+                _servo_slope(
+                    lane,
+                    selected_valid=True,
+                    selected_ppb=float(inputs["mean_ppb"]),
+                    filter_alpha=SERVO_MEAN_FILTER_ALPHA,
+                    gain=SERVO_MEAN_GAIN,
+                    deadband_ppb=SERVO_CONTROL_DEADBAND_PPB,
+                    use_soft_landing=True,
+                )
+        elif mode == "TOTAL":
+            _servo_total(
+                lane,
+                total_valid=bool(inputs["total_valid"]),
+                total_ppb=float(inputs["total_ppb"]),
+                population_seconds=int(inputs["total_population_seconds"]),
+                now_valid=bool(inputs["now_valid"]),
+                now_ppb=float(inputs["now_ppb"]),
+            )
+        elif mode == "NOW":
+            with _dac_lock:
+                lane.servo_settle_count = 0
+            _servo_slope(
+                lane,
+                selected_valid=bool(inputs["now_valid"]),
+                selected_ppb=float(inputs["now_ppb"]),
+                filter_alpha=SERVO_NOW_FILTER_ALPHA,
+                gain=SERVO_NOW_GAIN,
+                deadband_ppb=SERVO_NOW_DEADBAND_PPB,
+                use_soft_landing=False,
+            )
+
+
+def _dac_control_lane_snapshot(lane: _DacLaneState) -> Dict[str, Any]:
+    return {
+        "target_code": round(float(lane.target_code), 6),
+        "hw_code": int(lane.hw_code),
+        "readback_valid": bool(lane.readback_valid),
+        "readback_code": int(lane.readback_code),
+        "servo": {
+            "last_step": float(lane.servo_last_step),
+            "last_residual": float(lane.servo_last_residual),
+            "settle_count": int(lane.servo_settle_count),
+            "adjustments": int(lane.servo_adjustments),
+            "predictor_initialized": bool(lane.servo_predictor_initialized),
+            "last_raw_residual": float(lane.servo_last_raw_residual),
+            "filtered_residual": float(lane.servo_filtered_residual),
+            "filtered_slope": float(lane.servo_filtered_slope),
+            "predicted_residual": float(lane.servo_predicted_residual),
+            "predictor_updates": int(lane.servo_predictor_updates),
+        },
+    }
+
+
+def _dac_control_snapshot() -> Dict[str, Any]:
+    with _dac_lock:
+        return {
+            "schema": "CLOCKS_CONTROL_V1",
+            "servo_mode": _dac_servo_mode,
+            "servo_active": _dac_servo_mode != "OFF",
+            "realization_mode": (
+                "ONE_SECOND_FRACTIONAL_DITHER"
+                if _dac_dither_operator_enabled
+                else "STATIC_ROUNDED"
+            ),
+            "dither_operator_enabled": bool(_dac_dither_operator_enabled),
+            "ocxo1": _dac_control_lane_snapshot(_dac_lanes["ocxo1"]),
+            "ocxo2": _dac_control_lane_snapshot(_dac_lanes["ocxo2"]),
+        }
+
+
+def _dac_welford_snapshots() -> Dict[str, Dict[str, Any]]:
+    with _dac_lock:
+        return {
+            "ocxo1_dac": _dac_lanes["ocxo1"].welford.snapshot(),
+            "ocxo2_dac": _dac_lanes["ocxo2"].welford.snapshot(),
+        }
+
+
+def _dac_reset_statistics() -> Dict[str, Any]:
+    with _dac_lock:
+        before = _dac_welford_snapshots()
+        for lane in _dac_lanes.values():
+            lane.welford.reset()
+        after = _dac_welford_snapshots()
+    return {"before": before, "after": after}
+
+
+def _dac_restore_control_from_clocks(clocks: Dict[str, Any], *, realize: bool) -> Dict[str, Any]:
+    control = clocks.get("control") if isinstance(clocks, dict) else None
+    stats = clocks.get("stats") if isinstance(clocks, dict) else None
+    if not isinstance(control, dict) or control.get("schema") != "CLOCKS_CONTROL_V1":
+        raise ValueError("canonical CLOCKS restore missing Pi DAC control state")
+    stats = stats if isinstance(stats, dict) else {}
+    auxiliary = stats.get("auxiliary_welford")
+    auxiliary = auxiliary if isinstance(auxiliary, dict) else {}
+    mode = str(control.get("servo_mode") or "OFF").upper()
+    if mode not in {"OFF", "MEAN", "TOTAL", "NOW"}:
+        raise ValueError(f"invalid restored servo mode {mode!r}")
+    dither = bool(control.get("dither_operator_enabled"))
+
+    with _dac_lock:
+        global _dac_servo_mode, _dac_dither_operator_enabled, _dac_next_frame_monotonic
+        _dac_servo_mode = mode
+        _dac_dither_operator_enabled = dither
+        _dac_next_frame_monotonic = time.monotonic() if dither else 0.0
+        for lane_name, lane in _dac_lanes.items():
+            saved = control.get(lane_name)
+            saved = saved if isinstance(saved, dict) else {}
+            servo = saved.get("servo")
+            servo = servo if isinstance(servo, dict) else {}
+            lane.target_code = _dac_clamp_target(float(saved.get("target_code") or 0.0))
+            lane.servo_last_step = float(servo.get("last_step") or 0.0)
+            lane.servo_last_residual = float(servo.get("last_residual") or 0.0)
+            lane.servo_settle_count = int(servo.get("settle_count") or 0)
+            lane.servo_adjustments = int(servo.get("adjustments") or 0)
+            lane.servo_predictor_initialized = bool(servo.get("predictor_initialized"))
+            lane.servo_last_raw_residual = float(servo.get("last_raw_residual") or 0.0)
+            lane.servo_filtered_residual = float(servo.get("filtered_residual") or 0.0)
+            lane.servo_filtered_slope = float(servo.get("filtered_slope") or 0.0)
+            lane.servo_predicted_residual = float(servo.get("predicted_residual") or 0.0)
+            lane.servo_predictor_updates = int(servo.get("predictor_updates") or 0)
+            lane.dither_enabled = dither
+            lane.dither_transition_due = None
+            _dac_clear_pending_locked(lane)
+            _dac_reset_total_state_locked(lane)
+            lane.welford.restore(auxiliary.get(f"{lane_name}_dac"))
+
+    if realize:
+        if dither:
+            _dac_control_wakeup.set()
+        else:
+            for lane in _dac_lanes.values():
+                if not _dac_write_hw_code(
+                    lane,
+                    _dac_rounded_hw_code(lane.target_code),
+                    author_source=DAC_AUTHOR_EXPLICIT_COMMAND,
+                    latch_fault=True,
+                ):
+                    raise RuntimeError(f"failed to restore {lane.name} DAC hardware")
+    else:
+        _dac_control_wakeup.set()
+
+    return {
+        "restored": True,
+        "servo_mode": mode,
+        "dither_operator_enabled": dither,
+        "realized": bool(realize),
+        "control": _dac_control_snapshot(),
+    }
+
+
+def _dac_info_payload() -> Dict[str, Any]:
+    with _dac_lock:
+        lanes: Dict[str, Any] = {}
+        for name, lane in _dac_lanes.items():
+            lanes[name] = {
+                "address": f"0x{lane.address:02X}",
+                "readback_valid": bool(lane.readback_valid),
+                "readback_code": int(lane.readback_code),
+                "reset_signature": bool(lane.reset_signature),
+                "desired": float(lane.target_code),
+                "hw_code": int(lane.hw_code),
+                "safe_max_hw_code": int(AD5693R_SAFE_MAX_HW_CODE),
+                "request_pending": bool(lane.pacing_pending),
+                "pending_target": float(lane.pacing_pending_target),
+                "last_author_source": int(lane.last_author_source),
+                "readback_count": int(lane.readback_count),
+                "readback_failures": int(lane.readback_failures),
+                "adopt_count": int(lane.adopt_count),
+                "same_code_skip_count": int(lane.same_code_skip_count),
+                "write_attempts": int(lane.write_attempts),
+                "write_successes": int(lane.write_successes),
+                "write_failures": int(lane.write_failures),
+                "dither_low_code": int(lane.dither_low_code),
+                "dither_high_code": int(lane.dither_high_code),
+                "dither_high_ms": int(lane.dither_high_ms),
+                "dither_frame_count": int(lane.dither_frame_count),
+                "dither_transition_count": int(lane.dither_transition_count),
+            }
+        return {
+            "schema": "CLOCKS_DAC_CUSTODY_V1",
+            "status": "ok",
+            "owner": "PI.CLOCKS",
+            "i2c_bus": DAC_I2C_BUS,
+            "servo_mode": _dac_servo_mode,
+            "servo_active": _dac_servo_mode != "OFF",
+            "dither_operator_enabled": bool(_dac_dither_operator_enabled),
+            "realization_mode": (
+                "ONE_SECOND_FRACTIONAL_DITHER"
+                if _dac_dither_operator_enabled
+                else "STATIC_ROUNDED"
+            ),
+            "initialization_authored_output": False,
+            **lanes,
+        }
+
 
 # ---------------------------------------------------------------------
 # GNSS_RAW — synthetic clock from GF-8802 clock drift (TPS1)
@@ -2606,7 +3920,7 @@ def _canonical_restore_args(
         raise ValueError("canonical CLOCKS restore missing control")
 
     out: Dict[str, Any] = {
-        "restore_schema_version": 3,
+        "restore_schema_version": 4,
         "restore_instrument_gnss_ns": instrument.get("gnss_ns"),
         "restore_instrument_dwt_cycles": instrument.get("dwt_cycles"),
         "restore_instrument_ocxo1_ns": instrument.get("ocxo1_ns"),
@@ -2629,8 +3943,6 @@ def _canonical_restore_args(
         "ocxo1": _path_get(stats, "ocxo1.welford"),
         "ocxo2": _path_get(stats, "ocxo2.welford"),
         "pps_witness": auxiliary.get("pps_witness"),
-        "ocxo1_dac": auxiliary.get("ocxo1_dac"),
-        "ocxo2_dac": auxiliary.get("ocxo2_dac"),
     }
     for name, wf in welfords.items():
         if not isinstance(wf, dict):
@@ -2657,28 +3969,18 @@ def _canonical_restore_args(
             lane_state = control.get(lane)
             servo = lane_state.get("servo") if isinstance(lane_state, dict) else None
             if not isinstance(lane_state, dict) or not isinstance(servo, dict):
-                raise ValueError(f"canonical CLOCKS restore missing {lane} control/servo state")
-            out[f"restore_{lane}_dac_value"] = lane_state.get("target_code")
-            field_map = {
-                "servo_last_step": "last_step",
-                "servo_last_residual": "last_residual",
-                "servo_settle_count": "settle_count",
-                "servo_adjustments": "adjustments",
-                "servo_predictor_initialized": "predictor_initialized",
-                "servo_last_raw_residual": "last_raw_residual",
-                "servo_filtered_residual": "filtered_residual",
-                "servo_filtered_slope": "filtered_slope",
-                "servo_predicted_residual": "predicted_residual",
-                "servo_predictor_updates": "predictor_updates",
-            }
-            for command_field, json_field in field_map.items():
-                out[f"restore_{lane}_dac_{command_field}"] = servo.get(json_field)
+                raise ValueError(f"canonical CLOCKS restore missing {lane} Pi control/servo state")
+            try:
+                target = float(lane_state.get("target_code"))
+            except (TypeError, ValueError):
+                raise ValueError(f"canonical CLOCKS restore has invalid {lane} target_code")
+            if not math.isfinite(target) or not (0.0 <= target <= AD5693R_SAFE_MAX_HW_CODE):
+                raise ValueError(f"canonical CLOCKS restore has unsafe {lane} target_code")
 
     if include_control:
-        out["restore_servo_mode"] = control.get("servo_mode") or "OFF"
-        out["restore_dither_operator_enabled"] = control.get(
-            "dither_operator_enabled", False
-        )
+        mode = str(control.get("servo_mode") or "OFF").upper()
+        if mode not in {"OFF", "MEAN", "TOTAL", "NOW"}:
+            raise ValueError(f"canonical CLOCKS restore has invalid servo mode {mode!r}")
 
     missing = [key for key, value in out.items() if value is None]
     if missing:
@@ -2885,7 +4187,7 @@ def _request_teensy_holistic_restore(
     ordinary busy/live-custody verdict without Alpha being touched.
     """
     deadline = time.monotonic() + HOLISTIC_RESTORE_COMMAND_RETRY_S
-    restore_args = _canonical_restore_args(clocks, include_control=True)
+    restore_args = _canonical_restore_args(clocks, include_control=False)
     last_response: Any = None
     while True:
         response = send_command(
@@ -3127,11 +4429,13 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
     status = str(payload.get("status") or "")
     campaign_state = str(payload.get("campaign_state") or "").strip().upper()
     if status == "monitor_restore_rejected_busy" and campaign_state == "STARTED":
+        pi_control = _dac_restore_control_from_clocks(clocks, realize=True)
         startup_custody = _release_startup_clocks_custody_live()
         return {
             "success": True,
             "mode": "LIVE_CAMPAIGN_CUSTODY",
             "teensy": payload,
+            "pi_control": pi_control,
             "startup_custody": startup_custody,
             "proof": {"proved": True, "basis": "TEENSY_LIVE_CAMPAIGN_CUSTODY"},
         }
@@ -3140,6 +4444,7 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
     # this verdict belong to the fresh/superseded instrument and must not be
     # persisted across the restore boundary.
     _retire_startup_clocks_custody("instrument_restore_required")
+    pi_control = _dac_restore_control_from_clocks(clocks, realize=True)
 
     ppb_stage: Dict[str, Any]
     if status == "monitor_restore_requires_ppb_state":
@@ -3173,7 +4478,7 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
         payload = payload if isinstance(payload, dict) else {}
         status = str(payload.get("status") or "")
     else:
-        # update_count==0 needs no rolling history. An immediately accepted V3
+        # update_count==0 needs no rolling history. An immediately accepted restore
         # restore with a mature population can also mean a prior interrupted Pi
         # attempt already committed the exact Alpha stage; do not replay it twice.
         _seed_clocks_from_detail(detail)
@@ -3206,6 +4511,7 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
         "success": True,
         "mode": "HOLISTIC_INSTRUMENT",
         "teensy": payload,
+        "pi_control": pi_control,
         "gnss_raw": gnss_raw_result,
         "better_buckets": ppb_stage,
         "proof": proof,
@@ -6073,6 +7379,9 @@ def _build_canonical_clocks_state(
     sequence, teensy_clocks = _validate_clocks_fragment_v4(clocks_fragment)
 
     gnss = _system_gnss_info(system_context)
+
+    # Consume this lawful completed measurement before decorating canonical CLOCKS.
+    _dac_process_completed_row(teensy_clocks, sequence)
     pi_clocks = _pi_clocks_state_snapshot()
 
     # One canonical clocks object.  Teensy owns the real clocks; Pi adds only
@@ -6081,6 +7390,18 @@ def _build_canonical_clocks_state(
     clocks = copy.deepcopy(teensy_clocks)
     clocks["source_schema"] = teensy_clocks.get("schema")
     clocks["schema"] = "CLOCKS_INSTRUMENT_STATE_V1"
+
+    # DAC/control is Pi-authored.  Keep the established canonical JSON shape so
+    # front-end consumers do not care that CLOCKS_FRAGMENT stopped carrying it.
+    clocks["control"] = _dac_control_snapshot()
+    stats = clocks.get("stats")
+    if isinstance(stats, dict):
+        auxiliary = stats.get("auxiliary_welford")
+        if not isinstance(auxiliary, dict):
+            auxiliary = {}
+            stats["auxiliary_welford"] = auxiliary
+        auxiliary.update(_dac_welford_snapshots())
+
     clocks["gnss_raw"] = copy.deepcopy(pi_clocks.get("gnss_raw") or {})
     clocks["system_time_utc"] = published_at_utc
     clocks["gnss_time_utc"] = _system_gnss_time_utc(system_context)
@@ -7628,12 +8949,14 @@ def _combined_teensy_report(teensy_command: str, *, report_name: str) -> Dict[st
         ),
         "startup": _start_status_payload(),
         "owners": {
-            "teensy": ["GNSS", "VCLOCK", "DWT", "OCXO1", "OCXO2", "DAC"],
-            "pi": ["GNSS_RAW"],
+            "teensy": ["GNSS", "VCLOCK", "DWT", "OCXO1", "OCXO2"],
+            "pi": ["GNSS_RAW", "DAC", "SERVO", "DITHER"],
         },
         "teensy": teensy_response,
         "pi": {
             "gnss_raw": _gnss_raw_clock_snapshot(),
+            "control": _dac_control_snapshot(),
+            "dac": _dac_info_payload(),
             "stats_reset": {
                 "requests": int(_diag.get("stats_reset_requests") or 0),
                 "success": int(_diag.get("stats_reset_success") or 0),
@@ -7742,6 +9065,7 @@ def _perform_transitive_stats_reset(
 
     pi_previous = _gnss_raw_welford_reset()
     pi_after = _gnss_raw_welford_snapshot()
+    dac_stats = _dac_reset_statistics()
     completed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     result = {
         "requested_at_utc": requested_at,
@@ -7754,6 +9078,7 @@ def _perform_transitive_stats_reset(
         "teensy": teensy_response,
         "pi_gnss_raw_before": pi_previous,
         "pi_gnss_raw_after": pi_after,
+        "pi_dac_welford": dac_stats,
     }
     _diag["stats_reset_success"] = _diag.get("stats_reset_success", 0) + 1
     _diag["last_stats_reset"] = result
@@ -8497,7 +9822,7 @@ def _restore_active_campaign_state(
             _canonical_restore_args(canonical_recovery_clocks, include_control=False)
         )
         _diag["last_recovery"]["canonical_restore_present"] = True
-        _diag["last_recovery"]["restore_schema_version"] = 3
+        _diag["last_recovery"]["restore_schema_version"] = 4
         _diag["last_recovery"]["better_buckets_restore"] = cold_ppb_stage
         logging.info(
             "📊 [recovery] cold Alpha epoch detected; staged Better Buckets "
@@ -9725,16 +11050,15 @@ def _parse_dac_arg(args: Dict[str, Any], label: str, *aliases: str) -> Tuple[boo
 
 
 def cmd_set_dac(args: Optional[dict]) -> Dict[str, Any]:
-    """Set the live Teensy DAC target without creating a persistence side path."""
+    """Set Pi-owned OCXO DAC target(s); Teensy is not involved."""
     if not args:
         return {"success": False, "message": "SET_DAC requires DAC1 and/or DAC2"}
-
     if "campaign" in args:
         return {
             "success": False,
             "message": (
                 "SET_DAC campaign=... has been retired. DAC history remains "
-                "available in TIMEBASE, while current control is explicit."
+                "available in CLOCKS, while current control is explicit."
             ),
         }
 
@@ -9749,116 +11073,151 @@ def cmd_set_dac(args: Optional[dict]) -> Dict[str, Any]:
         )
     except ValueError as exc:
         return {"success": False, "message": str(exc)}
-
     if not has_dac1 and not has_dac2:
         return {"success": False, "message": "SET_DAC requires DAC1 and/or DAC2"}
 
-    teensy_args: Dict[str, Any] = {}
+    ok1 = True
+    ok2 = True
     if has_dac1 and dac1 is not None:
-        teensy_args["set_dac1"] = str(float(dac1))
+        ok1 = _dac_set_target_explicit(_dac_lanes["ocxo1"], dac1)
     if has_dac2 and dac2 is not None:
-        teensy_args["set_dac2"] = str(float(dac2))
+        ok2 = _dac_set_target_explicit(_dac_lanes["ocxo2"], dac2)
 
-    try:
-        response = send_command(
-            machine="TEENSY",
-            subsystem="CLOCKS",
-            command="SET_DAC",
-            args=teensy_args,
-        )
-    except Exception as exc:
-        logging.exception("❌ [clocks] live SET_DAC failed")
-        return {"success": False, "message": str(exc)}
-
-    payload = response.get("payload") if isinstance(response, dict) else None
-    result = {
-        "ocxo1_dac": float(dac1) if has_dac1 and dac1 is not None else None,
-        "ocxo2_dac": float(dac2) if has_dac2 and dac2 is not None else None,
-        "input_aliases": {
-            **({"dac1": alias1} if alias1 else {}),
-            **({"dac2": alias2} if alias2 else {}),
-        },
-        "persistence": "CLOCKS",
-        "teensy_message": response.get("message") if isinstance(response, dict) else None,
-        "teensy_payload": payload if isinstance(payload, dict) else {},
-    }
-    logging.info("🔧 [clocks] live SET_DAC: %s", result)
+    with _dac_lock:
+        lane1 = _dac_lanes["ocxo1"]
+        lane2 = _dac_lanes["ocxo2"]
+        result = {
+            "ocxo1_dac": round(lane1.target_code, 6),
+            "ocxo2_dac": round(lane2.target_code, 6),
+            "ocxo1_dac_last_write_ok": bool(lane1.last_write_ok),
+            "ocxo2_dac_last_write_ok": bool(lane2.last_write_ok),
+            "ocxo1_dac_hw_code": int(lane1.hw_code),
+            "ocxo2_dac_hw_code": int(lane2.hw_code),
+            "ocxo1_dac_voltage": _dac_voltage_from_code(lane1.hw_code),
+            "ocxo2_dac_voltage": _dac_voltage_from_code(lane2.hw_code),
+            "realization_mode": (
+                "ONE_SECOND_FRACTIONAL_DITHER"
+                if _dac_dither_operator_enabled
+                else "STATIC_ROUNDED"
+            ),
+            "reference_mode": "INTERNAL_VREF_2X",
+            "external_vref_used": False,
+            "internal_ref_voltage": AD5693R_INTERNAL_REF_VOLTAGE,
+            "output_gain": AD5693R_OUTPUT_GAIN,
+            "output_full_scale_voltage": AD5693R_OUTPUT_FULL_SCALE_VOLTAGE,
+            "dac_code_scale": AD5693R_CODE_SCALE,
+            "safe_max_output_voltage": AD5693R_SAFE_MAX_OUTPUT_VOLTAGE,
+            "safe_max_hw_code": AD5693R_SAFE_MAX_HW_CODE,
+            "static_rounded_only": not _dac_dither_operator_enabled,
+            "fractional_stream_possible": bool(_dac_dither_operator_enabled),
+            "recurring_timer_possible": bool(_dac_dither_operator_enabled),
+            "dither_operator_enabled": bool(_dac_dither_operator_enabled),
+            "owner": "PI.CLOCKS",
+            "input_aliases": {
+                **({"dac1": alias1} if alias1 else {}),
+                **({"dac2": alias2} if alias2 else {}),
+            },
+            "persistence": "CLOCKS",
+            "status": "ok" if ok1 and ok2 else "dac_write_fault",
+        }
+    logging.info("🔧 [clocks] Pi-owned SET_DAC: %s", result)
     return {
-        "success": bool(response.get("success")) if isinstance(response, dict) else False,
-        "message": response.get("message", "OK") if isinstance(response, dict) else "SET_DAC failed",
+        "success": bool(ok1 and ok2),
+        "message": "OK" if ok1 and ok2 else "DAC write fault",
         "payload": result,
     }
 
 
+def cmd_servos(args: Optional[dict]) -> Dict[str, Any]:
+    """Set the Pi-owned OCXO servo mode: OFF, NOW, MEAN, or TOTAL."""
+    args = args or {}
+    _, raw = _arg_first_present(
+        args,
+        "servos", "SERVOS", "servo", "SERVO", "mode", "MODE", "calibrate_ocxo",
+    )
+    if raw is None:
+        return {
+            "success": False,
+            "message": "SERVOS requires OFF, NOW, MEAN, or TOTAL",
+            "payload": {"servo_mode": _dac_servo_mode},
+        }
+    try:
+        previous, requested = _dac_set_servo_mode(str(raw))
+    except ValueError as exc:
+        return {"success": False, "message": str(exc), "payload": {"servo_mode": _dac_servo_mode}}
+    payload = {
+        "status": "servos_updated",
+        "previous_mode": previous,
+        "requested_mode": requested,
+        "servo_mode": requested,
+        "effective_mode": requested,
+        "pending_mode": requested,
+        "request_pending": False,
+        "owner": "PI.CLOCKS",
+    }
+    logging.info("🔧 [clocks] Pi-owned SERVOS: %s -> %s", previous, requested)
+    return {"success": True, "message": "OK", "payload": payload}
+
+
+def cmd_dither_enable(_: Optional[dict] = None) -> Dict[str, Any]:
+    _dac_set_dither_enabled(True)
+    payload = {
+        "status": "dither_enabled",
+        "enabled": True,
+        "started": True,
+        "service_pending": False,
+        "write_context": "PI_CLOCKS_ONE_SECOND_LOW_FIRST_FRAME",
+        "realization_mode": "ONE_SECOND_FRACTIONAL_DITHER",
+        "owner": "PI.CLOCKS",
+        "ocxo1": _dac_control_lane_snapshot(_dac_lanes["ocxo1"]),
+        "ocxo2": _dac_control_lane_snapshot(_dac_lanes["ocxo2"]),
+    }
+    return {"success": True, "message": "OK", "payload": payload}
+
+
+def cmd_dither_disable(_: Optional[dict] = None) -> Dict[str, Any]:
+    # Mechanical parity with the current no-surprise-disable doctrine: stop the
+    # waveform and clear queued motion without a final static DAC write.
+    _dac_set_dither_enabled(False)
+    payload = {
+        "status": "dither_disabled_no_dac_write",
+        "enabled": False,
+        "started": False,
+        "service_pending": False,
+        "write_context": "PI_CLOCKS_ONE_SECOND_LOW_FIRST_FRAME",
+        "realization_mode": "STATIC_ROUNDED",
+        "owner": "PI.CLOCKS",
+        "ocxo1": _dac_control_lane_snapshot(_dac_lanes["ocxo1"]),
+        "ocxo2": _dac_control_lane_snapshot(_dac_lanes["ocxo2"]),
+    }
+    return {"success": True, "message": "OK", "payload": payload}
+
 
 def cmd_set_dither(args: Optional[dict]) -> Dict[str, Any]:
-    """Set live Teensy dithering state; CLOCKS owns restart continuity."""
+    """Compatibility wrapper around Pi-owned DITHER_ENABLE/DITHER_DISABLE."""
     if not args or "dither" not in args:
         return {"success": False, "message": "DITHER requires 'dither' argument"}
-
     raw = args["dither"]
     if isinstance(raw, bool):
-        dither = raw
-    elif isinstance(raw, str):
-        lowered = raw.strip().lower()
-        if lowered in ("true", "1", "yes", "on"):
-            dither = True
-        elif lowered in ("false", "0", "no", "off"):
-            dither = False
-        else:
-            return {"success": False, "message": f"Invalid dither value: {raw}"}
+        enabled = raw
+    elif isinstance(raw, str) and raw.strip().lower() in ("true", "1", "yes", "on"):
+        enabled = True
+    elif isinstance(raw, str) and raw.strip().lower() in ("false", "0", "no", "off"):
+        enabled = False
     else:
         return {"success": False, "message": f"Invalid dither value: {raw}"}
 
-    rate_hz = None
-    for key in ("rate_hz", "hz", "frequency_hz"):
-        if key in args and args.get(key) is not None:
-            try:
-                rate_hz = int(args.get(key))
-            except (TypeError, ValueError):
-                return {
-                    "success": False,
-                    "message": f"Invalid dither rate for {key}: {args.get(key)!r}",
-                }
-            break
+    response = cmd_dither_enable() if enabled else cmd_dither_disable()
+    if isinstance(response.get("payload"), dict):
+        response["payload"]["persistence"] = "CLOCKS"
+        if any(key in args for key in ("rate_hz", "hz", "frequency_hz")):
+            response["payload"]["requested_rate_ignored"] = True
+            response["payload"]["effective_frame_hz"] = 1.0
+    return response
 
-    if rate_hz is not None and not (1 <= rate_hz <= 1000):
-        return {
-            "success": False,
-            "message": f"dither rate_hz must be 1..1000, got {rate_hz}",
-        }
 
-    teensy_args: Dict[str, Any] = {"dither": dither}
-    if rate_hz is not None:
-        teensy_args["rate_hz"] = int(rate_hz)
-
-    try:
-        response = send_command(
-            machine="TEENSY",
-            subsystem="CLOCKS",
-            command="DITHER",
-            args=teensy_args,
-        )
-    except Exception as exc:
-        logging.exception("❌ [clocks] live DITHER update failed")
-        return {"success": False, "message": str(exc)}
-
-    logging.info(
-        "🔧 [clocks] live DITHER: %s resp=%s",
-        teensy_args,
-        response.get("message", "?") if isinstance(response, dict) else "?",
-    )
-    return {
-        "success": bool(response.get("success")) if isinstance(response, dict) else False,
-        "message": response.get("message", "OK") if isinstance(response, dict) else "DITHER failed",
-        "payload": {
-            **teensy_args,
-            "persistence": "CLOCKS",
-            "teensy_payload": (
-                response.get("payload", {}) if isinstance(response, dict) else {}
-            ),
-        },
-    }
+def cmd_dac_info(_: Optional[dict] = None) -> Dict[str, Any]:
+    return {"success": True, "message": "OK", "payload": _dac_info_payload()}
 
 
 
@@ -9876,7 +11235,11 @@ COMMANDS = {
     "DELETE": cmd_delete,
     "TRUNCATE": cmd_truncate,
     "SET_DAC": cmd_set_dac,
+    "SERVOS": cmd_servos,
     "DITHER": cmd_set_dither,
+    "DITHER_ENABLE": cmd_dither_enable,
+    "DITHER_DISABLE": cmd_dither_disable,
+    "DAC_INFO": cmd_dac_info,
     "SET_BASELINE": cmd_set_baseline,
     "BASELINE_INFO": cmd_baseline_info,
     "LIST_CAMPAIGNS": cmd_list_campaigns,
@@ -9911,10 +11274,14 @@ def run() -> None:
     _clocks_holistic_restore_proof_committed.clear()
     _diag["startup_control_ready"] = False
 
+    _dac_start_control_thread()
+    _dac_initialize_hardware()
+
     logging.info(
         "🕐 [clocks] CLOCKS owns CLOCKS_FRAGMENT ingestion, SYSTEM.REPORT context pull, "
-        "canonical CLOCKS publication, campaign_detail persistence, TEMPEST adjudication, "
-        "and holistic subsystem restore. Campaign execution is restored as CLOCKS state."
+        "canonical CLOCKS publication, Pi-owned DAC/servo/dither actuation, campaign_detail "
+        "persistence, TEMPEST adjudication, and holistic subsystem restore. "
+        "Campaign execution is restored as CLOCKS state."
     )
 
     server_setup(

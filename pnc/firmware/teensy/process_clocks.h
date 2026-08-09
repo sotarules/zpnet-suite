@@ -28,8 +28,6 @@
 //   • Lossless per-second interrupt testimony: raw arrival/preemption context,
 //     software compare intent, physical COMP1/CMPLD1 readback, delayed/on-time
 //     verdict, endpoint delay, and signed interval contamination
-//   • Servo DAC intent planning with the dither owner performing all
-//     hardware-facing DAC realization
 //
 // Initialization is split into two phases:
 //
@@ -38,9 +36,8 @@
 //     Must be called before full process init so DWT timing is available.
 //
 //   Phase 2: process_clocks_init()
-//     Configures OCXO DAC control registers, observes their surviving input
-//     codes without updating VOUT, then initializes subscriptions and CLOCKS
-//     state.  Must be called AFTER timepop_init().
+//     Initializes subscriptions and CLOCKS state after TimePop is available.
+//     Must be called AFTER timepop_init().
 //
 // Completed campaign-row lifecycle:
 //
@@ -109,8 +106,7 @@ void process_clocks_init_hardware(void);
 // Initialization — Phase 2 (full lifecycle, requires TimePop)
 // -----------------------------------------------------------------------------
 
-/// Configure and observe OCXO DACs without authoring VOUT, then initialize
-/// subscriptions and CLOCKS state.
+/// Initialize CLOCKS subscriptions and state.
 /// Must be called after timepop_init().
 void process_clocks_init(void);
 
@@ -127,7 +123,7 @@ void process_clocks_register(void);
 // There is no runtime science/forensic mode. Every completed PPS second is
 // preserved for the canonical CLOCKS_FRAGMENT row. Any layer may object while it
 // evidence needed to adjudicate the second. A pending objection excludes the
-// whole PPS second from Welford, TAU/PPB, servo, and DAC-control math, but does
+// whole PPS second from Welford and TAU/PPB math, but does
 // not suppress publication or PostgreSQL persistence.
 //
 // WATCHDOG_ANOMALY is reserved for continuity surrender: the instrument can no
@@ -319,7 +315,7 @@ bool clocks_alpha_tau_snapshot(time_clock_id_t clock,
 //   live     = always-on instrument truth for one completed physical second
 //   campaign = optional campaign-relative state and TEMPEST-only interpretation
 //
-// Campaign state must not clone live raw cycles, DAC/control state, lifetime
+// Campaign state must not clone live raw cycles, lifetime
 // statistics, or instrument clockfaces.  Recovery consumes the same canonical
 // live state; there is no parallel restore-state mirror.
 //
@@ -422,8 +418,6 @@ struct clocks_fragment_stats_snapshot_t {
   clocks_fragment_tau_recovery_snapshot_t ocxo1_tau_state{};
   clocks_fragment_tau_recovery_snapshot_t ocxo2_tau_state{};
 
-  clocks_fragment_welford_snapshot_t ocxo1_dac{};
-  clocks_fragment_welford_snapshot_t ocxo2_dac{};
 };
 
 // raw_cycles is the permanent compact sanity-check surface.  Keep the integrated
@@ -454,40 +448,6 @@ struct clocks_fragment_raw_cycles_snapshot_t {
   clocks_fragment_raw_cycles_lane_t vclock{};
   clocks_fragment_raw_cycles_lane_t ocxo1{};
   clocks_fragment_raw_cycles_lane_t ocxo2{};
-};
-
-// Durable DAC/control knowledge. In-flight request/service bookkeeping is not
-// persistent instrument state and is intentionally absent.
-struct clocks_fragment_dac_lane_t {
-  double value = 0.0;
-  uint16_t hw_code = 0;
-  bool readback_valid = false;
-  uint16_t readback_code = 0;
-
-  double servo_last_step = 0.0;
-  double servo_last_residual = 0.0;
-  uint32_t servo_settle_count = 0;
-  uint32_t servo_adjustments = 0;
-
-  bool servo_predictor_initialized = false;
-  double servo_last_raw_residual = 0.0;
-  double servo_filtered_residual = 0.0;
-  double servo_filtered_slope = 0.0;
-  double servo_predicted_residual = 0.0;
-  uint32_t servo_predictor_updates = 0;
-};
-
-// Source-compatibility alias for older recovery/report code.  The lane persists
-// DAC and servo control state whether fractional dithering is enabled or not.
-using clocks_fragment_dither_lane_t = clocks_fragment_dac_lane_t;
-
-struct clocks_fragment_dac_snapshot_t {
-  char servo_mode[CLOCKS_FRAGMENT_STATE_NAME_MAX] = {0};
-  bool servo_active = false;
-  char realization_mode[CLOCKS_FRAGMENT_STATE_NAME_MAX] = {0};
-  bool dither_operator_enabled = false;
-  clocks_fragment_dac_lane_t ocxo1{};
-  clocks_fragment_dac_lane_t ocxo2{};
 };
 
 // TEMPEST-specific independent clock constructions.  These remain campaign
@@ -627,7 +587,6 @@ struct clocks_fragment_live_snapshot_t {
 
   clocks_fragment_raw_cycles_snapshot_t raw_cycles{};
   clocks_fragment_stats_snapshot_t stats{};
-  clocks_fragment_dac_snapshot_t dac{};
 };
 
 struct clocks_fragment_snapshot_t {

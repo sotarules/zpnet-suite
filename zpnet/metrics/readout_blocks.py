@@ -7,14 +7,17 @@ Data source:
   enrichment. Baselines are campaign_master relationships resolved on demand;
   they are not CLOCKS state. Metrics never waits for or reads TIMEBASE.
 
-Stats policy (Pi is a stenographer):
-  Every statistical quantity shown in this panel is read verbatim from the
-  Teensy-authored CLOCKS instrument/campaign surfaces, including the GNSS reference Welford.
-  GNSS residual samples are definitionally zero, but its N is the real
-  Alpha-owned always-on Welford population, never campaign PPS count.
-  No Pi-side means, stddevs, stderrs, PPB windows, or campaign frequencies are
-  computed here.  The only Pi-side arithmetic is deterministic presentation
-  conversion: DAC code → voltage and campaign baseline delta (NOW - BASE).
+Stats policy:
+  Clock/science statistics are read verbatim from the Teensy-authored
+  CLOCKS instrument/campaign surfaces, including the GNSS reference Welford.
+  DAC Welfords are Pi CLOCKS-owned actuator statistics carried in canonical
+  CLOCKS.clocks.stats.auxiliary_welford.  GNSS residual samples are
+  definitionally zero, but its N is the real Alpha-owned always-on Welford
+  population, never campaign PPS count.
+  Metrics computes no means, stddevs, stderrs, PPB windows, or campaign
+  frequencies.  Its arithmetic is deterministic presentation/control math:
+  DAC code → voltage, bounded keyboard nudge, and campaign baseline delta
+  (NOW - BASE).
 
 Clock row doctrine:
   The dense operator table shows GNSS, VCLOCK, OCXO1, and OCXO2 only.
@@ -47,15 +50,21 @@ import time
 from zpnet.processes.processes import create_pubsub_cache, send_command
 from zpnet.shared.db import open_db
 
-# AD5693R DAC doctrine mirrors firmware: internal 2.5 V reference with 2x
-# gain, yielding an effective 0..5 V code span.  This is presentation-only;
-# Teensy remains DAC authority.
-VREF = 5.0
+# AD5693R doctrine mirrors Pi CLOCKS, the sole actuator authority:
+# internal 2.5 V reference, 2x gain, nominal 0..5 V output span, with the
+# OCXO EFC path hard-limited to the 3.3 V equivalent code.
+DAC_INTERNAL_REF_VOLTAGE = 2.5
+DAC_OUTPUT_GAIN = 2.0
+DAC_OUTPUT_FULL_SCALE_VOLTAGE = 5.0
+DAC_SAFE_MAX_OUTPUT_VOLTAGE = 3.3
+DAC_CODE_SCALE = 65536.0
 
 DAC_FINE_STEP = 1.0
 DAC_COARSE_STEP = 10.0
 DAC_MIN_CODE = 0.0
-DAC_MAX_CODE = 65535.0
+DAC_MAX_CODE = float(
+    int((DAC_SAFE_MAX_OUTPUT_VOLTAGE / DAC_OUTPUT_FULL_SCALE_VOLTAGE) * DAC_CODE_SCALE)
+)
 
 FEATURE_GRID_COLUMNS = 4
 FEATURE_GRID_CELL_WIDTH = 39
@@ -139,10 +148,6 @@ def _get_pi_clocks_report() -> dict:
     report["instrument_elapsed"] = _seconds_to_hms(_to_int(clocks.get("instrument_age_seconds")) or 0)
     report["published_at_utc"] = root.get("published_at_utc")
     return report
-
-def _get_pi_clocks_report_dac() -> dict:
-    # CLOCKS_V4 control is already part of the canonical live report.
-    return {}
 
 def _get_clocks_baseline() -> dict | None:
     """Return the active campaign's referenced baseline campaign read model."""
@@ -591,7 +596,6 @@ def _servo_state(r: dict) -> str:
 # DAC presentation helpers
 # ---------------------------------------------------------------------
 
-DAC_CODE_SCALE = 65536.0
 DAC_VOLTAGE_DECIMALS = 9
 DAC_VOLTAGE_EXTRA_DECIMALS = DAC_VOLTAGE_DECIMALS - 6
 
@@ -603,9 +607,8 @@ def _dac_voltage(dac_code):
     code = _to_float(dac_code)
     if code is None:
         return None
-    # Presentation mirror of the firmware DAC doctrine: AD5693R internal 2.5 V
-    # reference with 2x gain, scaled by the 16-bit code span.
-    return code * VREF / DAC_CODE_SCALE
+    # Presentation mirror of Pi CLOCKS' AD5693R realization.
+    return code * DAC_OUTPUT_FULL_SCALE_VOLTAGE / DAC_CODE_SCALE
 
 
 def _dac_label(dac_code, dac_voltage=None):
@@ -618,50 +621,14 @@ def _dac_label(dac_code, dac_voltage=None):
     return f"{code:>.3f} {volts:.{DAC_VOLTAGE_DECIMALS}f}V"
 
 
-def _dac_tick_payload(report_dac: dict | None) -> dict:
-    if isinstance(report_dac, dict) and report_dac.get("schema") == "CLOCKS_DAC_TICK_V2":
-        return report_dac
-    return {}
-
-
-def _dac_report_lane(report_dac: dict | None, lane: str) -> dict:
-    if not isinstance(report_dac, dict):
-        return {}
-    obj = report_dac.get(lane)
-    return obj if isinstance(obj, dict) else {}
-
-
-def _dac_report_value(report_dac: dict | None, lane: str):
-    obj = _dac_report_lane(report_dac, lane)
-    dither = obj.get("dither") if isinstance(obj.get("dither"), dict) else {}
-    return _to_float(obj.get("dac") if obj.get("dac") is not None else dither.get("desired"))
-
-
-def _dac_report_voltage(report_dac: dict | None, lane: str):
-    obj = _dac_report_lane(report_dac, lane)
-
-    # Retained only for explicit REPORT_DAC/back-compat payloads.  The normal
-    # metrics path now reads DAC code from CLOCKS and computes presentation
-    # voltage locally from the firmware DAC doctrine above.
-    for key in ("v_eff", "v_target", "v", "dac_voltage"):
-        val = _to_float(obj.get(key))
-        if val is not None:
-            return val
-    return None
-
-
-def _dac_current_value(r: dict, report_dac: dict | None, lane: str):
-    tick_val = _dac_report_value(report_dac, lane)
-    if tick_val is not None:
-        return tick_val
+def _dac_current_value(r: dict, lane: str):
+    """Return the Pi-owned target code carried by canonical CLOCKS."""
     return _dac_value(r, lane)
 
 
-def _dac_current_voltage(r: dict, report_dac: dict | None, lane: str):
-    tick_volts = _dac_report_voltage(report_dac, lane)
-    if tick_volts is not None:
-        return tick_volts
-    return _dac_voltage(_dac_current_value(r, report_dac, lane))
+def _dac_current_voltage(r: dict, lane: str):
+    """Return presentation voltage for the canonical Pi-owned target."""
+    return _dac_voltage(_dac_current_value(r, lane))
 
 
 def _clamp_dac_code(value: float) -> float:
@@ -675,9 +642,8 @@ def _clamp_dac_code(value: float) -> float:
 def _manual_dac_current_value(lane: str) -> float:
     """Fetch the live DAC value for keyboard nudging.
 
-    Read the live DAC value from the current CLOCKS.clocks surface.
-    Metrics does not subscribe to CLOCKS_DAC_TICK and does not poll verbose
-    TEENSY REPORT_DAC during repaint or keyboard nudging.
+    Read the Pi-owned target from the current canonical CLOCKS.clocks.control
+    surface.  Keyboard nudging never polls or commands the Teensy.
     """
     report = {}
     try:
@@ -686,7 +652,7 @@ def _manual_dac_current_value(lane: str) -> float:
     except Exception:
         report = {}
 
-    current = _dac_current_value(report, {}, lane)
+    current = _dac_current_value(report, lane)
     if current is None:
         raise RuntimeError(f"{lane.upper()} DAC value unavailable")
 
@@ -694,11 +660,13 @@ def _manual_dac_current_value(lane: str) -> float:
 
 
 def adjust_ocxo_dac(*, lane: str, direction: int, step_kind: str) -> dict:
-    """Apply one keyboard DAC nudge through PI CLOCKS SET_DAC.
+    """Apply one keyboard DAC nudge through the sole PI CLOCKS actuator owner.
 
-    The Pi command is the authority for manual DAC updates: it persists the
-    SYSTEM config seed and best-effort pushes TEENSY CLOCKS SET_DAC.  Metrics
-    only selects the new value and invokes that control-plane command.
+    The current target is read from canonical CLOCKS.control. Metrics computes
+    one bounded coarse/fine target and sends exactly one PI CLOCKS SET_DAC
+    command. The response payload is then authoritative for the accepted
+    target, current hardware code, voltage, realization mode, and write status;
+    no Teensy command/response path participates.
     """
     if lane not in ("ocxo1", "ocxo2"):
         raise ValueError(f"unknown DAC lane: {lane!r}")
@@ -708,35 +676,69 @@ def adjust_ocxo_dac(*, lane: str, direction: int, step_kind: str) -> dict:
     coarse = "coarse" in str(step_kind).lower()
     step = DAC_COARSE_STEP if coarse else DAC_FINE_STEP
     old_value = _manual_dac_current_value(lane)
-    new_value = _clamp_dac_code(old_value + float(direction) * step)
+    requested_value = _clamp_dac_code(old_value + float(direction) * step)
 
     arg_name = "DAC1" if lane == "ocxo1" else "DAC2"
+    response_target_key = f"{lane}_dac"
+    response_hw_key = f"{lane}_dac_hw_code"
+    response_voltage_key = f"{lane}_dac_voltage"
+    response_write_key = f"{lane}_dac_last_write_ok"
+
     resp = send_command(
         machine="PI",
         subsystem="CLOCKS",
         command="SET_DAC",
-        args={arg_name: f"{new_value:.6f}"},
+        args={arg_name: f"{requested_value:.6f}"},
     )
 
-    ok = bool(resp.get("success"))
-    msg = resp.get("message") or ("OK" if ok else "FAILED")
-    payload = resp.get("payload", {}) if isinstance(resp.get("payload"), dict) else {}
-    teensy_pushed = payload.get("teensy_pushed_now")
+    if not isinstance(resp, dict):
+        raise RuntimeError("PI CLOCKS SET_DAC returned a malformed response")
 
-    volts = _dac_voltage(new_value)
-    voltage_text = f"{volts:.6f}V" if volts is not None else "---"
+    ok = bool(resp.get("success"))
+    msg = str(resp.get("message") or ("OK" if ok else "FAILED"))
+    payload = resp.get("payload") if isinstance(resp.get("payload"), dict) else {}
+
+    accepted_value = _to_float(payload.get(response_target_key))
+    if accepted_value is None:
+        accepted_value = requested_value
+
+    hw_code = _to_int(payload.get(response_hw_key))
+    volts = _to_float(payload.get(response_voltage_key))
+    if volts is None:
+        volts = _dac_voltage(accepted_value)
+
+    write_ok = _to_bool(payload.get(response_write_key))
+    realization = str(payload.get("realization_mode") or "").upper()
+    owner = str(payload.get("owner") or "PI.CLOCKS")
+
+    voltage_text = f"{volts:.9f}V" if volts is not None else "---"
+    hw_text = f" hw={hw_code}" if hw_code is not None else ""
+    realization_text = f" {realization}" if realization else ""
     prefix = "DAC" if ok else "DAC FAILED"
-    suffix = "" if teensy_pushed is not False else " (persisted; Teensy push not confirmed)"
+
+    if ok:
+        result_text = (
+            f"{prefix}: {lane.upper()} {step_kind} "
+            f"{old_value:.3f} -> {accepted_value:.3f}"
+            f"{hw_text} {voltage_text}{realization_text} [{owner}]"
+        )
+    else:
+        result_text = (
+            f"{prefix}: {lane.upper()} {step_kind} "
+            f"requested {requested_value:.3f}; {owner}: {msg}"
+        )
 
     return {
         "success": ok,
-        "message": (
-            f"{prefix}: {lane.upper()} {step_kind} "
-            f"{old_value:.3f} -> {new_value:.3f} ({voltage_text}) "
-            f"PI CLOCKS SET_DAC: {msg}{suffix}"
-        ),
+        "message": result_text,
         "old_value": old_value,
-        "new_value": new_value,
+        "requested_value": requested_value,
+        "new_value": accepted_value,
+        "hw_code": hw_code,
+        "voltage": volts,
+        "write_ok": write_ok,
+        "realization_mode": realization or None,
+        "owner": owner,
         "step": step,
         "lane": lane,
         "response": resp,
@@ -746,7 +748,7 @@ def adjust_ocxo_dac(*, lane: str, direction: int, step_kind: str) -> dict:
 def _dac_dither_summary_from_fractional_code(dac_code) -> str:
     """Format the two integer DAC codes used to realize a fractional code.
 
-    The firmware dither doctrine is a one-second fractional-code realization:
+    Pi CLOCKS uses a one-second fractional-code realization:
     low=floor(code), high=ceil(code), and the fractional part determines the
     high-code duty count over 1000 scheduler ticks.  This is presentation only;
     the desired fractional code itself still comes from CLOCKS.
@@ -779,51 +781,7 @@ def _dac_timebase_dither_summary(r: dict, lane: str, dac_now=None) -> str:
         dac_now if dac_now is not None else _dac_value(r, lane)
     ) or (realization or "ON")
 
-def _dac_report_dither_summary(r: dict, report_dac: dict | None, lane: str, dac_now=None) -> str:
-    tick = _dac_tick_payload(report_dac)
-    obj = _dac_report_lane(report_dac, lane)
-
-    if tick:
-        if _to_bool(tick.get("dither")) is not True:
-            return "OFF"
-        low_code = _to_int(obj.get("lo"))
-        high_code = _to_int(obj.get("hi"))
-        high_ms = _to_int(obj.get("hi_ms"))
-        if low_code is None or high_code is None or high_ms is None:
-            return _dac_timebase_dither_summary(r, lane, dac_now) or "ON"
-        low_ms = max(0, 1000 - high_ms)
-        return f"{low_code}:{low_ms:03d} {high_code}:{high_ms:03d}"
-
-    obj = _dac_report_lane(report_dac, lane)
-    d = obj.get("dither") if isinstance(obj.get("dither"), dict) else {}
-    if not d:
-        return _dac_timebase_dither_summary(r, lane, dac_now)
-
-    enabled = _to_bool(d.get("enabled"))
-    rate = _to_int(d.get("rate_hz"))
-    low = _to_int(d.get("last_window_low_count"))
-    high = _to_int(d.get("last_window_high_count"))
-    low_code = _to_int(d.get("last_window_low_code"))
-    high_code = _to_int(d.get("last_window_high_code"))
-
-    if enabled is not True:
-        return "OFF"
-    if rate is None and (low is None or high is None):
-        return _dac_timebase_dither_summary(r, lane, dac_now) or "ON"
-    if low is None or high is None:
-        tb = _dac_timebase_dither_summary(r, lane, dac_now)
-        return f"{rate}Hz {tb}" if tb else f"{rate}Hz"
-
-    low_s = f"{low:03d}"
-    high_s = f"{high:03d}"
-
-    if low_code is None or high_code is None:
-        return f"{rate}Hz {low_s}/{high_s}" if rate is not None else f"{low_s}/{high_s}"
-    prefix = f"{rate}Hz " if rate is not None else ""
-    return f"{prefix}{low_code}:{low_s} {high_code}:{high_s}"
-
-
-def _dac_detail_lines(r: dict, baseline: dict | None, report_dac: dict | None) -> list[str]:
+def _dac_detail_lines(r: dict, baseline: dict | None) -> list[str]:
     """Render DAC telemetry as a dedicated, spacious table.
 
     DAC rows no longer inherit the clock-table geometry. VALUE and VOUT are
@@ -860,9 +818,9 @@ def _dac_detail_lines(r: dict, baseline: dict | None, report_dac: dict | None) -
     )
 
     for name, key in (("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")):
-        dac_now = _dac_current_value(r, report_dac, key)
-        dac_voltage = _dac_current_voltage(r, report_dac, key)
-        dither_summary = _dac_report_dither_summary(r, report_dac, key, dac_now)
+        dac_now = _dac_current_value(r, key)
+        dac_voltage = _dac_current_voltage(r, key)
+        dither_summary = _dac_timebase_dither_summary(r, key, dac_now)
 
         baseline_report = (
             baseline.get("baseline_report")
@@ -1401,12 +1359,6 @@ def clocks_combined_readout() -> list[str]:
     except Exception:
         return ["CLOCKS: UNAVAILABLE"]
 
-    report_dac = None
-    try:
-        report_dac = _get_pi_clocks_report_dac()
-    except Exception:
-        report_dac = None
-
     report = p.get("report") if isinstance(p.get("report"), dict) else p
     if not isinstance(report, dict) or not report:
         return ["CLOCKS: FEED UNAVAILABLE", "", *feature_status_grid_lines()]
@@ -1418,7 +1370,7 @@ def clocks_combined_readout() -> list[str]:
     instrument_elapsed = r.get("instrument_elapsed") or "00:00:00"
     n = _monitor_count(r)
 
-    servo_state = str(report_dac.get("servo") or _servo_state(r)).upper() if isinstance(report_dac, dict) else _servo_state(r)
+    servo_state = _servo_state(r)
 
     baseline = _get_clocks_baseline()
     baseline_report = (
@@ -1536,7 +1488,7 @@ def clocks_combined_readout() -> list[str]:
 
     # ── DAC detail ──
     lines.append("")
-    lines.extend(_dac_detail_lines(r, baseline, report_dac))
+    lines.extend(_dac_detail_lines(r, baseline))
 
     lines.append("")
 

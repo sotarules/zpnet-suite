@@ -3535,10 +3535,6 @@ static void system_clocks_fragment_add_stats(
   Payload auxiliary_welford;
   system_clocks_fragment_add_welford(
       auxiliary_welford, "pps_witness", snapshot.pps_witness.welford);
-  system_clocks_fragment_add_welford(
-      auxiliary_welford, "ocxo1_dac", snapshot.ocxo1_dac);
-  system_clocks_fragment_add_welford(
-      auxiliary_welford, "ocxo2_dac", snapshot.ocxo2_dac);
   stats.add_object("auxiliary_welford", auxiliary_welford);
 
   parent.add_object("stats", stats);
@@ -3599,50 +3595,6 @@ static void system_clocks_fragment_add_science(
   parent.add_object("science", value);
 }
 
-static void system_clocks_fragment_add_control_lane(
-    Payload& parent,
-    const char* key,
-    const clocks_fragment_dither_lane_t& lane_snapshot) {
-  Payload lane;
-  lane.add("target_code", toFixedDecimal(lane_snapshot.value, 6));
-  lane.add("hw_code", (uint32_t)lane_snapshot.hw_code);
-  lane.add("readback_valid", lane_snapshot.readback_valid);
-  lane.add("readback_code", (uint32_t)lane_snapshot.readback_code);
-
-  Payload servo;
-  servo.add("last_step", toFixedDecimal(lane_snapshot.servo_last_step, 12));
-  servo.add("last_residual",
-            toFixedDecimal(lane_snapshot.servo_last_residual, 12));
-  servo.add("settle_count", lane_snapshot.servo_settle_count);
-  servo.add("adjustments", lane_snapshot.servo_adjustments);
-  servo.add("predictor_initialized", lane_snapshot.servo_predictor_initialized);
-  servo.add("last_raw_residual",
-            toFixedDecimal(lane_snapshot.servo_last_raw_residual, 12));
-  servo.add("filtered_residual",
-            toFixedDecimal(lane_snapshot.servo_filtered_residual, 12));
-  servo.add("filtered_slope",
-            toFixedDecimal(lane_snapshot.servo_filtered_slope, 12));
-  servo.add("predicted_residual",
-            toFixedDecimal(lane_snapshot.servo_predicted_residual, 12));
-  servo.add("predictor_updates", lane_snapshot.servo_predictor_updates);
-  lane.add_object("servo", servo);
-  parent.add_object(key, lane);
-}
-
-static void system_clocks_fragment_add_control(
-    Payload& parent,
-    const clocks_fragment_dac_snapshot_t& snapshot) {
-  Payload control;
-  control.add("schema", "CLOCKS_CONTROL_V1");
-  control.add("servo_mode", snapshot.servo_mode);
-  control.add("servo_active", snapshot.servo_active);
-  control.add("realization_mode", snapshot.realization_mode);
-  control.add("dither_operator_enabled", snapshot.dither_operator_enabled);
-  system_clocks_fragment_add_control_lane(control, "ocxo1", snapshot.ocxo1);
-  system_clocks_fragment_add_control_lane(control, "ocxo2", snapshot.ocxo2);
-  parent.add_object("control", control);
-}
-
 static Payload system_clocks_fragment_clocks_payload(
     const clocks_fragment_live_snapshot_t& snapshot) {
   Payload clocks;
@@ -3669,7 +3621,6 @@ static Payload system_clocks_fragment_clocks_payload(
 
   system_clocks_fragment_add_raw_cycles(clocks, snapshot.raw_cycles);
   system_clocks_fragment_add_stats(clocks, snapshot.stats);
-  system_clocks_fragment_add_control(clocks, snapshot.dac);
   return clocks;
 }
 

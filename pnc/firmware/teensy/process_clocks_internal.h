@@ -12,7 +12,7 @@
 // Candidate disposition:
 //
 //   After public PPS1, every survivable campaign second is published and
-//   persisted. ACCEPT candidates may advance Welford/TAU/PPB/servo state.
+//   persisted. ACCEPT candidates may advance Welford/TAU/PPB state.
 //   SCIENCE_EXCLUDE candidates retain the same campaign identity and complete
 //   testimony, but no scientific accumulator or control path may consume them.
 //   WATCHDOG_ANOMALY is reserved for continuity surrender when timeline or
@@ -45,15 +45,13 @@
 //     <prefix>_welford_min      - double, same unit
 //     <prefix>_welford_max      - double, same unit
 //
-//   Published Welford prefixes (seven total):
+//   Published Welford prefixes (five total):
 //
 //     dwt_welford         - Teensy CPU XTAL offset samples (ppb)
 //     vclock_welford      - bridge interpolation residual samples (ns)
 //     ocxo1_welford       - OCXO1 PPS-interval residual samples (ns)
 //     ocxo2_welford       - OCXO2 PPS-interval residual samples (ns)
 //     pps_witness_welford - reserved PPS/VCLOCK phase-error surface (ns)
-//     ocxo1_dac_welford   - OCXO1 DAC fractional code samples (LSB)
-//     ocxo2_dac_welford   - OCXO2 DAC fractional code samples (LSB)
 //
 // Authorship map:
 //
@@ -1047,8 +1045,8 @@ struct clocks_alpha_integrity_snapshot_t {
 
   // Consecutive OCXO one-second edges are projected into public GNSS ns through
   // time.h.  The interval between projections should remain identical
-  // second-to-second while the oscillator/servo state is unchanged.  Servo may
-  // make this diagnostic count bad samples; it still never mutates authority.
+  // second-to-second while the oscillator/actuator state is unchanged.  Pi-side
+  // actuation may make this diagnostic count bad samples; it still never mutates authority.
   clocks_alpha_integrity_ocxo_check_t ocxo1_projected_gnss_interval;
   clocks_alpha_integrity_ocxo_check_t ocxo2_projected_gnss_interval;
 };
@@ -1222,12 +1220,12 @@ uint32_t clocks_alpha_recover_reprime_count(void);
 // measurement custody.  Readiness is layered: a fresh integer clockface may be
 // published before the stricter PhaseLedger/refined-interval science proof is
 // complete.  Beta may therefore publish an explicitly degraded timeline row,
-// but Welford, PPB, and servo remain gated until science_ready is true for both
+// but Welford and PPB remain gated until science_ready is true for both
 // lanes.  This surface is report/control-plane evidence only.
 struct clocks_alpha_recover_reattach_snapshot_t {
   // Readiness is deliberately split.  clockface_ready proves that the lane
   // can publish a fresh post-RECOVER OCXO clockface.  science_ready additionally
-  // proves the PhaseLedger/refined interval required by Welford, PPB, and servo.
+  // proves the PhaseLedger/refined interval required by Welford and PPB.
   // ready remains a compatibility alias for science_ready.
   bool     ready = false;
   bool     clockface_ready = false;
@@ -1482,249 +1480,6 @@ static inline void clocks_capture_interrupt_diag(interrupt_capture_diag_t& dst,
 }
 
 // ============================================================================
-// AD5693R init
-// ============================================================================
-
-extern bool g_ad5693r_init_ok;
-
-// ============================================================================
-// OCXO DAC state — dual oscillator
-// ============================================================================
-
-struct ocxo_dac_state_t {
-  double   dac_fractional;
-  uint16_t dac_hw_code;
-
-  // Physical custody acquired at firmware startup by AD5693R register readback.
-  // These fields distinguish observed hardware from desired software intent.
-  bool     hw_readback_valid;
-  uint16_t hw_readback_code;
-  bool     hw_reset_signature;
-  uint32_t hw_readback_count;
-  uint32_t hw_readback_failures;
-  uint32_t hw_adopt_count;
-  uint32_t io_skip_same_code_count;
-  uint8_t  io_last_author_source;
-
-  uint32_t dac_min;
-  uint32_t dac_max;
-
-  // DAC authority.  The servo and Pi control plane keep a real-valued target.
-  // When dither is disabled, the AD5693R receives one static rounded integer
-  // code.  When dither is enabled, a foreground-serviced one-second realization
-  // alternates adjacent integer codes without performing I2C from TimePop's
-  // timed callback path.
-  bool     dither_enabled;
-  bool     dither_active_this_frame;
-  bool     dither_current_phase_high;
-  bool     dither_program_dirty;
-
-  uint16_t dither_low_code;
-  uint16_t dither_high_code;
-  uint16_t dither_high_ms;
-  uint16_t dither_last_frame_high_ms;
-
-  bool     dither_pending_hw_write;
-  uint16_t dither_pending_hw_code;
-  uint32_t dither_pending_request_count;
-  uint32_t dither_pending_overwrite_count;
-
-  uint32_t dither_frame_count;
-  uint32_t dither_transition_count;
-  uint32_t dither_write_count;
-  uint32_t dither_write_failure_count;
-  uint32_t dither_skip_same_code_count;
-  uint32_t dither_schedule_failure_count;
-
-  uint32_t dither_service_count;
-  uint32_t dither_service_write_count;
-  uint32_t dither_service_skip_same_count;
-  uint32_t dither_service_defer_count;
-
-  double   servo_last_step;
-  double   servo_last_residual;
-  uint32_t servo_settle_count;
-  uint32_t servo_adjustments;
-
-  // Mode-shared servo telemetry.  MEAN/NOW retain the historical filtered
-  // residual interpretation.  TOTAL uses these legacy field names as a compact
-  // cascaded-controller transcript:
-  //   last_residual        = long-baseline TOTAL PPB position
-  //   last_raw_residual    = newest admitted one-second residual
-  //   filtered_residual    = short-window residual mean (live rate)
-  //   filtered_slope       = requested live rate
-  //   predicted_residual   = live-rate error sent to the DAC controller
-  //   predictor_updates    = admitted samples since the current DAC point
-  bool     servo_predictor_initialized;
-  double   servo_last_raw_residual;
-  double   servo_filtered_residual;
-  double   servo_filtered_slope;
-  double   servo_predicted_residual;
-  uint32_t servo_predictor_updates;
-
-  // Servo/DAC ownership.  Beta's 1 Hz campaign path may only request a
-  // real-valued DAC target.  The dither owner consumes the request at a frame
-  // boundary, installs the fractional target, and owns every hardware-facing
-  // low/high/static realization.
-  uint32_t servo_hold_count;
-  uint8_t  servo_hold_reason;
-  uint8_t  servo_quarantine_reason;
-  uint32_t servo_quarantine_remaining;
-  uint32_t servo_quarantine_begin_count;
-  uint32_t servo_quarantine_consumed_count;
-  uint32_t servo_commit_fault_hold_count;
-  uint32_t servo_request_overwrite_count;
-  uint32_t servo_request_install_count;
-  uint32_t servo_request_dither_frame_install_count;
-  uint32_t servo_request_static_install_count;
-  uint32_t servo_request_static_write_failure_count;
-
-  bool     pacing_pending;
-  double   pacing_pending_target;
-  double   pacing_pending_step;
-  uint16_t pacing_pending_hw_code;
-  uint64_t pacing_pending_since_second;
-  uint64_t pacing_last_request_second;
-  uint64_t pacing_last_commit_second;
-  uint32_t pacing_intents;
-  uint32_t pacing_deferred_count;
-  uint32_t pacing_commit_count;
-  uint32_t pacing_skip_small_delta_count;
-
-  bool     io_last_write_ok;
-  bool     io_fault_latched;
-  uint32_t io_write_attempts;
-  uint32_t io_write_successes;
-  uint32_t io_write_failures;
-  uint16_t io_last_attempted_hw_code;
-  uint16_t io_last_good_hw_code;
-  uint8_t  io_last_failure_stage;
-};
-
-extern ocxo_dac_state_t ocxo1_dac;
-extern ocxo_dac_state_t ocxo2_dac;
-
-// ============================================================================
-// OCXO servo mode
-// ============================================================================
-
-enum class servo_mode_t : uint8_t {
-  OFF   = 0,
-  MEAN  = 1,
-  TOTAL = 2,
-  NOW   = 3,
-};
-
-extern servo_mode_t calibrate_ocxo_mode;
-
-const char* servo_mode_str(servo_mode_t mode);
-servo_mode_t servo_mode_parse(const char* s);
-
-static constexpr int32_t  SERVO_MAX_STEP                = 64;
-static constexpr uint32_t SERVO_SETTLE_SECONDS          = 5;
-static constexpr uint32_t SERVO_MIN_SAMPLES             = 10;
-static constexpr uint16_t SERVO_MIN_DAC_CODE_DELTA_LSB  = 1;
-
-static constexpr uint8_t SERVO_HOLD_NONE                 = 0;
-static constexpr uint8_t SERVO_HOLD_PENDING_COMMIT       = 1;
-static constexpr uint8_t SERVO_HOLD_SETTLE_QUARANTINE    = 2;
-static constexpr uint8_t SERVO_HOLD_COMMIT_FAULT_BACKOFF = 3;
-static constexpr uint8_t SERVO_HOLD_SMALL_STATIC_DELTA   = 4;
-
-static constexpr uint8_t OCXO_DAC_AUTHOR_NONE            = 0;
-static constexpr uint8_t OCXO_DAC_AUTHOR_STARTUP_OBSERVED = 1;
-static constexpr uint8_t OCXO_DAC_AUTHOR_EXPLICIT_COMMAND = 2;
-static constexpr uint8_t OCXO_DAC_AUTHOR_SERVO            = 3;
-
-static constexpr uint32_t SERVO_DITHER_OWNER_SETTLE_QUARANTINE_ROWS = 2U;
-static constexpr uint32_t SERVO_DITHER_OWNER_FAILURE_BACKOFF_ROWS    = 3U;
-
-// Servo control doctrine:
-//   positive ppb/tau>1 -> OCXO running fast  -> lower DAC code
-//   negative ppb/tau<1 -> OCXO running slow  -> raise DAC code
-// The DAC transfer is monotonic positive: higher DAC voltage makes the OCXO faster.
-//
-// DAC voltage doctrine:
-//   The AD5693R OCXO DACs are configured for internal 2.5 V reference with
-//   2× gain, giving an approximate 0..5 V hardware span.  OCXO EFC authority
-//   is intentionally hard-limited below 3.3 V at the DAC-code boundary.  This
-//   ceiling is a drop-dead hardware-protection invariant, not merely a UI hint.
-
-static constexpr double OCXO_DAC_INTERNAL_REF_VOLTAGE = 2.5;
-static constexpr double OCXO_DAC_OUTPUT_GAIN = 2.0;
-static constexpr double OCXO_DAC_OUTPUT_FULL_SCALE_VOLTAGE =
-    OCXO_DAC_INTERNAL_REF_VOLTAGE * OCXO_DAC_OUTPUT_GAIN;
-static constexpr double OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE = 3.3;
-static constexpr double OCXO_DAC_CODE_SCALE = 65536.0;
-static constexpr uint16_t OCXO_DAC_MAX_HW_CODE = 65535;
-static constexpr uint16_t OCXO_DAC_SAFE_MAX_HW_CODE =
-    (uint16_t)((OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE /
-                OCXO_DAC_OUTPUT_FULL_SCALE_VOLTAGE) *
-               OCXO_DAC_CODE_SCALE);
-
-static_assert(OCXO_DAC_OUTPUT_FULL_SCALE_VOLTAGE >
-              OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE,
-              "OCXO DAC safety ceiling must be below full scale");
-static_assert(OCXO_DAC_SAFE_MAX_HW_CODE < OCXO_DAC_MAX_HW_CODE,
-              "OCXO DAC safety ceiling must clamp the 0..5 V span");
-
-static inline double ocxo_dac_clamp_real_value(double value) {
-  if (value < 0.0) return 0.0;
-  if (value > (double)OCXO_DAC_SAFE_MAX_HW_CODE) {
-    return (double)OCXO_DAC_SAFE_MAX_HW_CODE;
-  }
-  return value;
-}
-
-static inline uint16_t ocxo_dac_rounded_hw_code_from_value(double value) {
-  const double clamped = ocxo_dac_clamp_real_value(value);
-  return (uint16_t)(clamped + 0.5);
-}
-
-static inline double ocxo_dac_voltage_from_code(double code) {
-  return (ocxo_dac_clamp_real_value(code) / OCXO_DAC_CODE_SCALE) *
-         OCXO_DAC_OUTPUT_FULL_SCALE_VOLTAGE;
-}
-
-bool ocxo_dac_set(ocxo_dac_state_t& s, double value);
-bool ocxo_dac_set_desired(ocxo_dac_state_t& s, double value);
-void ocxo_dac_request_servo_target(ocxo_dac_state_t& s,
-                                   double target,
-                                   double planned_step,
-                                   uint64_t request_second);
-void ocxo_dac_clear_servo_request(ocxo_dac_state_t& s);
-void clocks_ocxo_dac_cancel_all_motion(void);
-double ocxo_dac_fractional_snapshot(const ocxo_dac_state_t& s);
-bool ocxo_dac_write_hw_code(ocxo_dac_state_t& s,
-                            uint16_t hw_code,
-                            bool latch_fault = true);
-void ocxo_dac_predictor_reset(ocxo_dac_state_t& s);
-void ocxo_dac_io_reset(ocxo_dac_state_t& s);
-void ocxo_dac_retry_reset(ocxo_dac_state_t& s);
-
-bool clocks_ocxo_dac_dither_enable(void);
-bool clocks_ocxo_dac_dither_disable(void);
-bool clocks_ocxo_dac_dither_operator_enabled(void);
-bool clocks_ocxo_dac_dither_started(void);
-bool clocks_ocxo_dac_dither_service_pending(void);
-uint32_t clocks_ocxo_dac_dither_global_frame_count(void);
-uint32_t clocks_ocxo_dac_dither_global_schedule_failures(void);
-uint32_t clocks_ocxo_dac_dither_service_arm_count(void);
-uint32_t clocks_ocxo_dac_dither_service_arm_failures(void);
-const char* clocks_ocxo_dac_dither_context(void);
-
-// Dither-owned foreground DAC actuator service.
-// Servo/Beta queues intent only; this owner service owns dither-frame and
-// static hardware realization, including failure isolation.
-bool clocks_ocxo_dac_actuator_service_pending(void);
-uint32_t clocks_ocxo_dac_actuator_service_arm_count(void);
-uint32_t clocks_ocxo_dac_actuator_service_arm_failures(void);
-uint32_t clocks_ocxo_dac_actuator_commit_attempt_count(void);
-uint32_t clocks_ocxo_dac_actuator_commit_success_count(void);
-uint32_t clocks_ocxo_dac_actuator_commit_failure_count(void);
-const char* clocks_ocxo_dac_actuator_context(void);
-
-// ============================================================================
 // Campaign startup prologue
 // ============================================================================
 //
@@ -1775,11 +1530,11 @@ extern uint64_t recover_ocxo2_ns;
 //
 // One struct, one API, used for every published Welford accumulator.
 // Samples are stored in the semantic unit of the signal being measured
-// (ppb for frequency clocks, ns for phase offsets, LSB for DAC codes).
+// (ppb for frequency clocks and ns for phase offsets).
 //
 // Alpha-owned always-on Welford instances, one per published prefix.  Their
 // lifetime is boot-to-reboot; START, STOP, FLASH_CUT, and warm RECOVER never
-// reset or restore them.  Beta may read them for campaign/servo compatibility,
+// reset or restore them.  Beta may read them for campaign compatibility,
 // but Alpha is the sole update/reset authority.
 //
 //   welford_gnss         — exact GNSS reference residual, always 0 ns
@@ -1789,8 +1544,6 @@ extern uint64_t recover_ocxo2_ns;
 //   welford_ocxo2        — OCXO2 PPS-interval residual, in ns
 //   welford_pps_witness  — PPS/VCLOCK phase error, in ns
 //                          (counter32-based, ordering-independent)
-//   welford_ocxo1_dac    — OCXO1 DAC fractional code, in LSB
-//   welford_ocxo2_dac    — OCXO2 DAC fractional code, in LSB
 //
 
 struct welford_t {
@@ -1807,8 +1560,6 @@ extern welford_t welford_vclock;
 extern welford_t welford_ocxo1;
 extern welford_t welford_ocxo2;
 extern welford_t welford_pps_witness;
-extern welford_t welford_ocxo1_dac;
-extern welford_t welford_ocxo2_dac;
 
 void   welford_reset(welford_t& w);
 void   welford_update(welford_t& w, double sample);
@@ -1909,8 +1660,6 @@ struct clocks_instrument_stats_snapshot_t {
   welford_t ocxo1_welford{};
   welford_t ocxo2_welford{};
   welford_t pps_witness_welford{};
-  welford_t ocxo1_dac_welford{};
-  welford_t ocxo2_dac_welford{};
 };
 
 // Compact Better-Buckets state reconstructed by Pi CLOCKS from durable rows.
