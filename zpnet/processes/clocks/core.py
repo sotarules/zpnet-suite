@@ -121,16 +121,17 @@ DAC_DITHER_FRAME_S = 1.0
 DAC_DITHER_SLOTS_PER_FRAME = 1000
 DAC_STATIC_SERVO_SERVICE_DELAY_S = 0.250
 SERVO_MAX_STEP = 64.0
-SERVO_SETTLE_SECONDS = 5
-SERVO_MIN_SAMPLES = 10
+SERVO_TARGET_PPB = 0.100
+SERVO_CAMP_SETTLE_SECONDS = 5
+SERVO_TOTAL_MIN_SAMPLES = 10
 SERVO_PPB_PER_DAC_LSB_ESTIMATE = 100.0
-SERVO_CONTROL_DEADBAND_PPB = 3.0
+SERVO_CAMP_DEADBAND_PPB = 3.0
 SERVO_SOFT_LANDING_PPB = 300.0
-SERVO_MEAN_FILTER_ALPHA = 0.35
-SERVO_MEAN_GAIN = 1.0
-SERVO_NOW_FILTER_ALPHA = 1.0
-SERVO_NOW_GAIN = 1.0
-SERVO_NOW_DEADBAND_PPB = 0.5
+SERVO_CAMP_FILTER_ALPHA = 0.35
+SERVO_CAMP_GAIN = 1.0
+SERVO_10_MIN_FILTER_ALPHA = 1.0
+SERVO_10_MIN_GAIN = 1.0
+SERVO_10_MIN_DEADBAND_PPB = 0.025
 SERVO_DITHER_OWNER_SETTLE_QUARANTINE_ROWS = 1
 SERVO_DITHER_OWNER_FAILURE_BACKOFF_ROWS = 3
 SERVO_TOTAL_RECENT_WINDOW_SAMPLES = 30
@@ -158,8 +159,8 @@ SERVO_TOTAL_FINE_RATE_DEADBAND_PPB = 0.5
 SERVO_TOTAL_COARSE_STDERR_MULTIPLIER = 3.0
 SERVO_TOTAL_FINE_STDERR_MULTIPLIER = 1.5
 SERVO_TOTAL_POSITION_HOLD_PPB = 0.005
-SERVO_TOTAL_NEAR_ZERO_RATE_HOLD_PPB = 2.0
-SERVO_TOTAL_ZERO_CROSSING_LOOKAHEAD_SECONDS = 60.0
+SERVO_TOTAL_NEAR_TARGET_RATE_HOLD_PPB = 2.0
+SERVO_TOTAL_TARGET_CROSSING_LOOKAHEAD_SECONDS = 60.0
 SERVO_TOTAL_DAC_CHANGE_EPSILON_LSB = 0.000001
 
 CAMPAIGN_TYPE_TEMPEST = "TEMPEST"
@@ -1519,8 +1520,8 @@ def _dac_reset_servo_predictor_locked(lane: _DacLaneState) -> None:
 def _dac_set_servo_mode(mode: str) -> Tuple[str, str]:
     global _dac_servo_mode
     normalized = str(mode or "").strip().upper()
-    if normalized not in {"OFF", "MEAN", "TOTAL", "NOW"}:
-        raise ValueError("SERVOS mode must be OFF, NOW, MEAN, or TOTAL")
+    if normalized not in {"OFF", "TOTAL", "CAMP", "10-MIN"}:
+        raise ValueError("SERVOS mode must be OFF, TOTAL, CAMP, or 10-MIN")
     with _dac_lock:
         previous = _dac_servo_mode
         if previous != normalized:
@@ -1590,21 +1591,22 @@ def _servo_slope(
     with _dac_lock:
         if _servo_hold_active_locked(lane):
             return
-        ppb = float(selected_ppb)
-        lane.servo_last_residual = ppb
+        selected = float(selected_ppb)
+        error_ppb = selected - SERVO_TARGET_PPB
+        lane.servo_last_residual = selected
         if not lane.servo_predictor_initialized:
             lane.servo_predictor_initialized = True
-            lane.servo_last_raw_residual = ppb
-            lane.servo_filtered_residual = ppb
+            lane.servo_last_raw_residual = error_ppb
+            lane.servo_filtered_residual = error_ppb
             lane.servo_filtered_slope = 0.0
-            lane.servo_predicted_residual = ppb
+            lane.servo_predicted_residual = error_ppb
             lane.servo_predictor_updates = 1
         else:
-            raw_delta = ppb - lane.servo_last_raw_residual
-            lane.servo_last_raw_residual = ppb
+            raw_delta = error_ppb - lane.servo_last_raw_residual
+            lane.servo_last_raw_residual = error_ppb
             lane.servo_filtered_residual = (
                 (1.0 - filter_alpha) * lane.servo_filtered_residual
-                + filter_alpha * ppb
+                + filter_alpha * error_ppb
             )
             lane.servo_filtered_slope = (
                 (1.0 - filter_alpha) * lane.servo_filtered_slope
@@ -1694,23 +1696,36 @@ def _servo_total_recent_stderr_locked(lane: _DacLaneState) -> float:
 
 def _servo_total_requested_rate(total_ppb: float, population_seconds: int, coarse: bool) -> float:
     if population_seconds <= 0:
-        return 0.0
+        return SERVO_TARGET_PPB
     horizon = SERVO_TOTAL_COARSE_HORIZON_SECONDS if coarse else SERVO_TOTAL_FINE_HORIZON_SECONDS
     max_rate = SERVO_TOTAL_COARSE_MAX_RATE_PPB if coarse else SERVO_TOTAL_FINE_MAX_RATE_PPB
-    requested = -float(total_ppb) * (float(population_seconds) / horizon)
-    return max(-max_rate, min(max_rate, requested))
+    position_error = float(total_ppb) - SERVO_TARGET_PPB
+    correction_rate = -position_error * (float(population_seconds) / horizon)
+    correction_rate = max(-max_rate, min(max_rate, correction_rate))
+    return SERVO_TARGET_PPB + correction_rate
 
 
-def _servo_total_crosses_zero(total_ppb: float, population_seconds: int, recent_mean_ppb: float) -> bool:
+def _servo_total_crosses_target(
+    total_ppb: float,
+    population_seconds: int,
+    recent_mean_ppb: float,
+) -> bool:
+    position_error = float(total_ppb) - SERVO_TARGET_PPB
+    recent_rate_error = float(recent_mean_ppb) - SERVO_TARGET_PPB
     if (
         population_seconds <= 0
-        or total_ppb == 0.0
-        or recent_mean_ppb == 0.0
-        or total_ppb * recent_mean_ppb >= 0.0
+        or position_error == 0.0
+        or recent_rate_error == 0.0
+        or position_error * recent_rate_error >= 0.0
     ):
         return False
-    seconds_to_zero = -total_ppb * float(population_seconds) / recent_mean_ppb
-    return 0.0 <= seconds_to_zero <= SERVO_TOTAL_ZERO_CROSSING_LOOKAHEAD_SECONDS
+    seconds_to_target = (
+        -position_error * float(population_seconds) / recent_rate_error
+    )
+    return (
+        0.0 <= seconds_to_target
+        <= SERVO_TOTAL_TARGET_CROSSING_LOOKAHEAD_SECONDS
+    )
 
 
 def _servo_total(
@@ -1719,10 +1734,10 @@ def _servo_total(
     total_valid: bool,
     total_ppb: float,
     population_seconds: int,
-    now_valid: bool,
-    now_ppb: float,
+    interval_valid: bool,
+    interval_ppb: float,
 ) -> None:
-    if not total_valid or not now_valid or population_seconds <= 0:
+    if not total_valid or not interval_valid or population_seconds <= 0:
         return
 
     with _dac_lock:
@@ -1738,22 +1753,24 @@ def _servo_total(
         if operating_point_changed:
             return
 
-        _servo_total_push_recent_locked(lane, now_ppb)
+        _servo_total_push_recent_locked(lane, interval_ppb)
         recent_mean = _servo_total_recent_mean_locked(lane)
         recent_stderr = _servo_total_recent_stderr_locked(lane)
-        fine_required = abs(total_ppb) * (
+        position_error = float(total_ppb) - SERVO_TARGET_PPB
+        recent_rate_error = float(recent_mean) - SERVO_TARGET_PPB
+        fine_required = abs(position_error) * (
             float(population_seconds) / SERVO_TOTAL_FINE_HORIZON_SECONDS
         )
         if lane.total_coarse_latched:
             if (
-                abs(total_ppb) <= SERVO_TOTAL_COARSE_EXIT_PPB
-                and abs(recent_mean) <= SERVO_TOTAL_COARSE_RATE_EXIT_PPB
+                abs(position_error) <= SERVO_TOTAL_COARSE_EXIT_PPB
+                and abs(recent_rate_error) <= SERVO_TOTAL_COARSE_RATE_EXIT_PPB
                 and fine_required <= SERVO_TOTAL_FINE_MAX_RATE_PPB
             ):
                 lane.total_coarse_latched = False
         elif (
-            abs(total_ppb) >= SERVO_TOTAL_COARSE_THRESHOLD_PPB
-            or abs(recent_mean) >= SERVO_TOTAL_COARSE_RATE_ENTRY_PPB
+            abs(position_error) >= SERVO_TOTAL_COARSE_THRESHOLD_PPB
+            or abs(recent_rate_error) >= SERVO_TOTAL_COARSE_RATE_ENTRY_PPB
             or fine_required > SERVO_TOTAL_FINE_MAX_RATE_PPB
         ):
             lane.total_coarse_latched = True
@@ -1763,7 +1780,7 @@ def _servo_total(
             SERVO_TOTAL_COARSE_MIN_SAMPLES if coarse else SERVO_TOTAL_FINE_MIN_SAMPLES
         )
         lane.servo_last_residual = float(total_ppb)
-        lane.servo_last_raw_residual = float(now_ppb)
+        lane.servo_last_raw_residual = float(interval_ppb)
         lane.servo_filtered_residual = float(recent_mean)
         lane.servo_predictor_initialized = True
         lane.servo_predictor_updates = int(lane.total_samples_since_reset)
@@ -1774,8 +1791,8 @@ def _servo_total(
             return
 
         requested_rate = _servo_total_requested_rate(total_ppb, population_seconds, coarse)
-        if _servo_total_crosses_zero(total_ppb, population_seconds, recent_mean):
-            requested_rate = 0.0
+        if _servo_total_crosses_target(total_ppb, population_seconds, recent_mean):
+            requested_rate = SERVO_TARGET_PPB
         rate_error = recent_mean - requested_rate
         stderr_multiplier = (
             SERVO_TOTAL_COARSE_STDERR_MULTIPLIER
@@ -1790,9 +1807,14 @@ def _servo_total(
         rate_deadband = max(floor_deadband, stderr_multiplier * recent_stderr)
         lane.servo_filtered_slope = float(requested_rate)
         lane.servo_predicted_residual = float(rate_error)
-        near_zero_hold = max(rate_deadband, SERVO_TOTAL_NEAR_ZERO_RATE_HOLD_PPB)
+        near_target_hold = max(
+            rate_deadband, SERVO_TOTAL_NEAR_TARGET_RATE_HOLD_PPB
+        )
         if (
-            (abs(total_ppb) <= SERVO_TOTAL_POSITION_HOLD_PPB and abs(recent_mean) <= near_zero_hold)
+            (
+                abs(position_error) <= SERVO_TOTAL_POSITION_HOLD_PPB
+                and abs(recent_rate_error) <= near_target_hold
+            )
             or abs(rate_error) <= rate_deadband
         ):
             return
@@ -1807,19 +1829,27 @@ def _servo_total(
         _servo_apply_step(lane, step)
 
 
-def _dac_servo_inputs(clocks: Dict[str, Any], lane_name: str) -> Dict[str, Any]:
+def _dac_servo_inputs(
+    clocks: Dict[str, Any],
+    campaign: Optional[Dict[str, Any]],
+    lane_name: str,
+) -> Dict[str, Any]:
     stats = clocks.get("stats") if isinstance(clocks, dict) else None
     raw_cycles = clocks.get("raw_cycles") if isinstance(clocks, dict) else None
     stats = stats if isinstance(stats, dict) else {}
     raw_cycles = raw_cycles if isinstance(raw_cycles, dict) else {}
     lane_stats = stats.get(lane_name)
     lane_stats = lane_stats if isinstance(lane_stats, dict) else {}
-    welford = lane_stats.get("welford")
-    welford = welford if isinstance(welford, dict) else {}
     buckets = lane_stats.get("ppb_buckets")
     buckets = buckets if isinstance(buckets, dict) else {}
     tau_state = stats.get(f"{lane_name}_tau_state")
     tau_state = tau_state if isinstance(tau_state, dict) else {}
+    campaign = campaign if isinstance(campaign, dict) else {}
+    campaign_stats = campaign.get("stats")
+    campaign_stats = campaign_stats if isinstance(campaign_stats, dict) else {}
+    campaign_ppb = campaign_stats.get("ppb")
+    campaign_ppb = campaign_ppb if isinstance(campaign_ppb, dict) else {}
+    campaign_started = str(campaign.get("state") or "").strip().upper() == "STARTED"
     reference = raw_cycles.get("vclock")
     observed = raw_cycles.get(lane_name)
     reference = reference if isinstance(reference, dict) else {}
@@ -1837,17 +1867,17 @@ def _dac_servo_inputs(clocks: Dict[str, Any], lane_name: str) -> Dict[str, Any]:
         and reference_cycles > 0
         and clock_cycles > 0
     )
-    now_ppb = (
+    interval_ppb = (
         (float(reference_cycles - clock_cycles) * 1.0e9) / float(reference_cycles)
         if interval_valid
         else 0.0
     )
     try:
-        mean_n = int(welford.get("n") or 0)
-        mean_ppb = float(welford.get("mean") or 0.0)
+        ten_min_ppb = float(buckets.get("10_min"))
+        ten_min_finite = math.isfinite(ten_min_ppb)
     except (TypeError, ValueError):
-        mean_n = 0
-        mean_ppb = 0.0
+        ten_min_ppb = 0.0
+        ten_min_finite = False
     try:
         total_ppb = float(buckets.get("total"))
         total_finite = math.isfinite(total_ppb)
@@ -1855,22 +1885,36 @@ def _dac_servo_inputs(clocks: Dict[str, Any], lane_name: str) -> Dict[str, Any]:
         total_ppb = 0.0
         total_finite = False
     try:
+        camp_ppb = float(campaign_ppb.get(lane_name))
+        camp_finite = math.isfinite(camp_ppb)
+    except (TypeError, ValueError):
+        camp_ppb = 0.0
+        camp_finite = False
+    try:
         population = int(tau_state.get("sample_count") or 0)
     except (TypeError, ValueError):
         population = 0
 
     return {
-        "now_valid": interval_valid,
-        "now_ppb": now_ppb,
-        "mean_valid": interval_valid and mean_n >= SERVO_MIN_SAMPLES,
-        "mean_ppb": mean_ppb,
-        "total_valid": interval_valid and total_finite and population >= SERVO_MIN_SAMPLES,
+        "interval_valid": interval_valid,
+        "interval_ppb": interval_ppb,
+        "10_min_valid": interval_valid and ten_min_finite,
+        "10_min_ppb": ten_min_ppb,
+        "camp_valid": interval_valid and campaign_started and camp_finite,
+        "camp_ppb": camp_ppb,
+        "total_valid": (
+            interval_valid and total_finite and population >= SERVO_TOTAL_MIN_SAMPLES
+        ),
         "total_ppb": total_ppb,
         "total_population_seconds": population,
     }
 
 
-def _dac_process_completed_row(teensy_clocks: Dict[str, Any], sequence: int) -> None:
+def _dac_process_completed_row(
+    teensy_clocks: Dict[str, Any],
+    campaign: Optional[Dict[str, Any]],
+    sequence: int,
+) -> None:
     global _dac_last_processed_sequence, _dac_control_second
     stats = teensy_clocks.get("stats") if isinstance(teensy_clocks, dict) else None
     if not isinstance(stats, dict):
@@ -1890,23 +1934,23 @@ def _dac_process_completed_row(teensy_clocks: Dict[str, Any], sequence: int) -> 
         return
 
     for lane_name, lane in _dac_lanes.items():
-        inputs = _dac_servo_inputs(teensy_clocks, lane_name)
-        if mode == "MEAN":
-            if not inputs["mean_valid"]:
+        inputs = _dac_servo_inputs(teensy_clocks, campaign, lane_name)
+        if mode == "CAMP":
+            if not inputs["camp_valid"]:
                 continue
             with _dac_lock:
                 lane.servo_settle_count += 1
-                ready = lane.servo_settle_count >= SERVO_SETTLE_SECONDS
+                ready = lane.servo_settle_count >= SERVO_CAMP_SETTLE_SECONDS
                 if ready:
                     lane.servo_settle_count = 0
             if ready:
                 _servo_slope(
                     lane,
                     selected_valid=True,
-                    selected_ppb=float(inputs["mean_ppb"]),
-                    filter_alpha=SERVO_MEAN_FILTER_ALPHA,
-                    gain=SERVO_MEAN_GAIN,
-                    deadband_ppb=SERVO_CONTROL_DEADBAND_PPB,
+                    selected_ppb=float(inputs["camp_ppb"]),
+                    filter_alpha=SERVO_CAMP_FILTER_ALPHA,
+                    gain=SERVO_CAMP_GAIN,
+                    deadband_ppb=SERVO_CAMP_DEADBAND_PPB,
                     use_soft_landing=True,
                 )
         elif mode == "TOTAL":
@@ -1915,19 +1959,19 @@ def _dac_process_completed_row(teensy_clocks: Dict[str, Any], sequence: int) -> 
                 total_valid=bool(inputs["total_valid"]),
                 total_ppb=float(inputs["total_ppb"]),
                 population_seconds=int(inputs["total_population_seconds"]),
-                now_valid=bool(inputs["now_valid"]),
-                now_ppb=float(inputs["now_ppb"]),
+                interval_valid=bool(inputs["interval_valid"]),
+                interval_ppb=float(inputs["interval_ppb"]),
             )
-        elif mode == "NOW":
+        elif mode == "10-MIN":
             with _dac_lock:
                 lane.servo_settle_count = 0
             _servo_slope(
                 lane,
-                selected_valid=bool(inputs["now_valid"]),
-                selected_ppb=float(inputs["now_ppb"]),
-                filter_alpha=SERVO_NOW_FILTER_ALPHA,
-                gain=SERVO_NOW_GAIN,
-                deadband_ppb=SERVO_NOW_DEADBAND_PPB,
+                selected_valid=bool(inputs["10_min_valid"]),
+                selected_ppb=float(inputs["10_min_ppb"]),
+                filter_alpha=SERVO_10_MIN_FILTER_ALPHA,
+                gain=SERVO_10_MIN_GAIN,
+                deadband_ppb=SERVO_10_MIN_DEADBAND_PPB,
                 use_soft_landing=False,
             )
 
@@ -1958,6 +2002,7 @@ def _dac_control_snapshot() -> Dict[str, Any]:
         return {
             "schema": "CLOCKS_CONTROL_V1",
             "servo_mode": _dac_servo_mode,
+            "servo_target_ppb": float(SERVO_TARGET_PPB),
             "servo_active": _dac_servo_mode != "OFF",
             "realization_mode": (
                 "ONE_SECOND_FRACTIONAL_DITHER"
@@ -1996,7 +2041,7 @@ def _dac_restore_control_from_clocks(clocks: Dict[str, Any], *, realize: bool) -
     auxiliary = stats.get("auxiliary_welford")
     auxiliary = auxiliary if isinstance(auxiliary, dict) else {}
     mode = str(control.get("servo_mode") or "OFF").upper()
-    if mode not in {"OFF", "MEAN", "TOTAL", "NOW"}:
+    if mode not in {"OFF", "TOTAL", "CAMP", "10-MIN"}:
         raise ValueError(f"invalid restored servo mode {mode!r}")
     dither = bool(control.get("dither_operator_enabled"))
 
@@ -2085,6 +2130,7 @@ def _dac_info_payload() -> Dict[str, Any]:
             "owner": "PI.CLOCKS",
             "i2c_bus": DAC_I2C_BUS,
             "servo_mode": _dac_servo_mode,
+            "servo_target_ppb": float(SERVO_TARGET_PPB),
             "servo_active": _dac_servo_mode != "OFF",
             "dither_operator_enabled": bool(_dac_dither_operator_enabled),
             "realization_mode": (
@@ -3984,7 +4030,7 @@ def _canonical_restore_args(
 
     if include_control:
         mode = str(control.get("servo_mode") or "OFF").upper()
-        if mode not in {"OFF", "MEAN", "TOTAL", "NOW"}:
+        if mode not in {"OFF", "TOTAL", "CAMP", "10-MIN"}:
             raise ValueError(f"canonical CLOCKS restore has invalid servo mode {mode!r}")
 
     missing = [key for key, value in out.items() if value is None]
@@ -7386,7 +7432,11 @@ def _build_canonical_clocks_state(
     gnss = _system_gnss_info(system_context)
 
     # Consume this lawful completed measurement before decorating canonical CLOCKS.
-    _dac_process_completed_row(teensy_clocks, sequence)
+    _dac_process_completed_row(
+        teensy_clocks,
+        clocks_fragment.get("campaign"),
+        sequence,
+    )
     pi_clocks = _pi_clocks_state_snapshot()
 
     # One canonical clocks object.  Teensy owns the real clocks; Pi adds only
@@ -11134,7 +11184,7 @@ def cmd_set_dac(args: Optional[dict]) -> Dict[str, Any]:
 
 
 def cmd_servos(args: Optional[dict]) -> Dict[str, Any]:
-    """Set the Pi-owned OCXO servo mode: OFF, NOW, MEAN, or TOTAL."""
+    """Set the Pi-owned OCXO servo mode: OFF, TOTAL, CAMP, or 10-MIN."""
     args = args or {}
     _, raw = _arg_first_present(
         args,
@@ -11143,7 +11193,7 @@ def cmd_servos(args: Optional[dict]) -> Dict[str, Any]:
     if raw is None:
         return {
             "success": False,
-            "message": "SERVOS requires OFF, NOW, MEAN, or TOTAL",
+            "message": "SERVOS requires OFF, TOTAL, CAMP, or 10-MIN",
             "payload": {"servo_mode": _dac_servo_mode},
         }
     try:
@@ -11155,6 +11205,7 @@ def cmd_servos(args: Optional[dict]) -> Dict[str, Any]:
         "previous_mode": previous,
         "requested_mode": requested,
         "servo_mode": requested,
+        "servo_target_ppb": float(SERVO_TARGET_PPB),
         "effective_mode": requested,
         "pending_mode": requested,
         "request_pending": False,
