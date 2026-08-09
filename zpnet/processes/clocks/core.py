@@ -229,6 +229,9 @@ PREFLIGHT_QUIET_GRACE_S = 15.0
 PREFLIGHT_STATUS_LOG_INTERVAL_S = 30.0
 PREFLIGHT_LOG_PREFIX = "🛡️ [preflight]"
 STARTUP_TEENSY_QUIET_DELAY_S = 20.0
+STARTUP_LOCATION_RETRY_S = 5.0
+STARTUP_LOCATION_STATUS_LOG_INTERVAL_S = 30.0
+STARTUP_REQUIRED_GNSS_FREQ_MODE = 3       # GF-8802 TPS4 FINE_LOCK
 HOLISTIC_RESTORE_TIMEOUT_S = 60.0
 HOLISTIC_RESTORE_COMMAND_RETRY_S = 10.0
 
@@ -516,6 +519,9 @@ _diag: Dict[str, Any] = {
     "startup_control_ready": False,
     "startup_control_busy_rejections": 0,
     "last_startup_control_rejection": {},
+    "startup_location_waits": 0,
+    "startup_location_wait_seconds_last": 0.0,
+    "last_startup_location_wait": {},
     "startup_custody_active": True,
     "startup_custody_depth": 0,
     "startup_custody_retained": 0,
@@ -1805,6 +1811,63 @@ def _ensure_system_location(*, context: str) -> Dict[str, Any]:
 
 
 
+
+
+def _wait_for_startup_location() -> Dict[str, Any]:
+    """Patiently realize SYSTEM.current_location before cold-start admission."""
+    started = time.monotonic()
+    next_log = started
+    attempts = 0
+    last_error = "not attempted"
+    _diag["startup_location_waits"] = _diag.get("startup_location_waits", 0) + 1
+
+    while True:
+        attempts += 1
+        try:
+            payload = _ensure_system_location(context="COLD_START_ADMISSION")
+            waited = time.monotonic() - started
+            result = {
+                "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "status": "READY",
+                "attempts": int(attempts),
+                "waited_s": round(float(waited), 3),
+                "current_location": payload.get("current_location"),
+                "verified_pos_mode_name": payload.get("verified_pos_mode_name"),
+                "freq_mode_name": payload.get("freq_mode_name"),
+            }
+            _diag["startup_location_wait_seconds_last"] = float(waited)
+            _diag["last_startup_location_wait"] = result
+            logging.info(
+                "✅ [clocks/startup] SYSTEM location realized after %.1fs: "
+                "current_location=%s GF-8802=%s freq_mode=%s",
+                waited,
+                payload.get("current_location") or "NONE",
+                payload.get("verified_pos_mode_name") or "?",
+                payload.get("freq_mode_name") or "?",
+            )
+            return payload
+        except Exception as exc:
+            last_error = str(exc)
+
+        now = time.monotonic()
+        waited = now - started
+        _diag["last_startup_location_wait"] = {
+            "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "status": "WAITING",
+            "attempts": int(attempts),
+            "waited_s": round(float(waited), 3),
+            "last_error": last_error,
+        }
+        if now >= next_log:
+            logging.info(
+                "⏳ [clocks/startup] waiting for SYSTEM/GF-8802 location realization "
+                "(%.0fs, attempt=%d): %s",
+                waited,
+                attempts,
+                last_error,
+            )
+            next_log = now + STARTUP_LOCATION_STATUS_LOG_INTERVAL_S
+        time.sleep(STARTUP_LOCATION_RETRY_S)
 
 
 def _clocks_payload(monitor: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -3149,7 +3212,10 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _holistic_restore() -> Dict[str, Any]:
+def _holistic_restore(
+    *,
+    preverified_location: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """Restore the CLOCKS subsystem from one canonical state record.
 
     Campaign execution is not a separate startup recovery universe.  It is one
@@ -3166,15 +3232,24 @@ def _holistic_restore() -> Dict[str, Any]:
         "campaign": None,
     }
 
+    if preverified_location is not None:
+        result["location"] = copy.deepcopy(preverified_location)
+
     if active_campaign is None:
-        logging.info(
-            "📍 [holistic restore] no active campaign; restoring SYSTEM location/GF-8802 mode"
-        )
-        result["location"] = _ensure_system_location(context="HOLISTIC_RESTORE_IDLE")
+        if preverified_location is None:
+            logging.info(
+                "📍 [holistic restore] no active campaign; restoring SYSTEM location/GF-8802 mode"
+            )
+            result["location"] = _ensure_system_location(context="HOLISTIC_RESTORE_IDLE")
+        else:
+            logging.info(
+                "📍 [holistic restore] no active campaign; using cold-start verified "
+                "SYSTEM location/GF-8802 testimony"
+            )
     else:
         logging.info(
-            "📍 [holistic restore] active campaign '%s'; location/GF-8802 mode "
-            "will be verified by campaign recovery",
+            "📍 [holistic restore] active campaign '%s'; using cold-start location "
+            "testimony when available",
             active_campaign.get("campaign"),
         )
 
@@ -3203,7 +3278,9 @@ def _holistic_restore() -> Dict[str, Any]:
         _clocks_holistic_restore_proof_pending.clear()
 
     if active_campaign is not None:
-        result["campaign"] = _restore_active_campaign_state()
+        result["campaign"] = _restore_active_campaign_state(
+            preverified_location=preverified_location,
+        )
 
     result["completed_at_utc"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     return result
@@ -8011,7 +8088,10 @@ def cmd_resume(args: Optional[dict]) -> dict:
 
 
 
-def _restore_active_campaign_state() -> Dict[str, Any]:
+def _restore_active_campaign_state(
+    *,
+    preverified_location: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """
     RECOVER — v7 exact-first-row architecture.
     """
@@ -8043,10 +8123,13 @@ def _restore_active_campaign_state() -> Dict[str, Any]:
     campaign_payload = row["payload"]
     campaign_location = campaign_payload.get("location")
 
-    try:
-        location_status = _ensure_system_location(context="CAMPAIGN_RECOVERY")
-    except Exception as e:
-        raise RuntimeError(f"recovery failed while restoring SYSTEM location: {e}")
+    if preverified_location is not None:
+        location_status = copy.deepcopy(preverified_location)
+    else:
+        try:
+            location_status = _ensure_system_location(context="CAMPAIGN_RECOVERY")
+        except Exception as e:
+            raise RuntimeError(f"recovery failed while restoring SYSTEM location: {e}")
 
     system_location = location_status.get("current_location")
     logging.info(
@@ -9074,7 +9157,13 @@ def _preflight_wait_items(reasons: list[str]) -> list[str]:
 # ---------------------------------------------------------------------
 
 
-def _check_preflight(context: str = "campaign") -> tuple[bool, list[str]]:
+def _check_preflight(
+    context: str = "campaign",
+    *,
+    required_gnss_freq_mode: Optional[int] = None,
+    required_gnss_freq_mode_name: Optional[str] = None,
+    required_receiver_mode: Optional[str] = None,
+) -> tuple[bool, list[str]]:
     """Check the CLOCKS policy gate plus fresh local Pi prerequisites.
 
     This path is used for cold START, Flash Cut, and zero-row cold recovery.
@@ -9112,12 +9201,36 @@ def _check_preflight(context: str = "campaign") -> tuple[bool, list[str]]:
                 reasons.append("GNSS PPS not valid (discipline loop not active)")
             else:
                 discipline = gnss.get("discipline", {})
-                freq_mode = discipline.get("freq_mode", -1) if isinstance(discipline, dict) else -1
-                freq_mode_name = discipline.get("freq_mode_name", "UNKNOWN") if isinstance(discipline, dict) else "UNKNOWN"
-                if int(freq_mode) < 2:
+                freq_mode = (
+                    _as_int(discipline.get("freq_mode"))
+                    if isinstance(discipline, dict)
+                    else None
+                )
+                freq_mode_name = (
+                    str(discipline.get("freq_mode_name") or "UNKNOWN")
+                    if isinstance(discipline, dict)
+                    else "UNKNOWN"
+                )
+                if required_gnss_freq_mode is None:
+                    if freq_mode is None or freq_mode < 2:
+                        reasons.append(
+                            f"GNSS discipline not locked "
+                            f"(freq_mode={freq_mode} '{freq_mode_name}', need at least COARSE_LOCK)"
+                        )
+                elif freq_mode != int(required_gnss_freq_mode):
+                    required_name = required_gnss_freq_mode_name or str(required_gnss_freq_mode)
                     reasons.append(
-                        f"GNSS discipline not locked "
-                        f"(freq_mode={freq_mode} '{freq_mode_name}', need at least COARSE_LOCK)"
+                        f"GNSS discipline not ready for {context} "
+                        f"(freq_mode={freq_mode} '{freq_mode_name}', need {required_name})"
+                    )
+
+            if required_receiver_mode is not None:
+                location = latest.get("location") if isinstance(latest.get("location"), dict) else {}
+                receiver_mode = str(location.get("receiver_mode") or "UNKNOWN").upper()
+                expected_mode = str(required_receiver_mode).upper()
+                if receiver_mode != expected_mode:
+                    reasons.append(
+                        f"GF-8802 receiver mode is {receiver_mode}; need {expected_mode} for {context}"
                     )
     except Exception as e:
         reasons.append(f"SYSTEM.REPORT GNSS preflight failed: {e}")
@@ -9160,7 +9273,13 @@ def _check_preflight(context: str = "campaign") -> tuple[bool, list[str]]:
     return ready, reasons
 
 
-def _wait_for_preflight(context: str = "recovery") -> None:
+def _wait_for_preflight(
+    context: str = "recovery",
+    *,
+    required_gnss_freq_mode: Optional[int] = None,
+    required_gnss_freq_mode_name: Optional[str] = None,
+    required_receiver_mode: Optional[str] = None,
+) -> None:
     """Wait quietly until the unified CLOCKS readiness profile is open.
 
     Readiness is polled frequently so startup proceeds promptly.  The log is
@@ -9175,7 +9294,12 @@ def _wait_for_preflight(context: str = "recovery") -> None:
     logged_wait = False
 
     while True:
-        ready, reasons = _check_preflight(context)
+        ready, reasons = _check_preflight(
+            context,
+            required_gnss_freq_mode=required_gnss_freq_mode,
+            required_gnss_freq_mode_name=required_gnss_freq_mode_name,
+            required_receiver_mode=required_receiver_mode,
+        )
         now = time.monotonic()
         elapsed = now - t0
 
@@ -9764,13 +9888,13 @@ COMMANDS = {
 # ---------------------------------------------------------------------
 
 def startup_teensy_quiet_delay() -> None:
-    """Let PubSub, SYSTEM, and Teensy CLOCKS reach a queryable startup state."""
+    """Give routing a short head start; readiness is proved afterward from live evidence."""
     logging.info(
-        "⏳ [clocks] waiting %.1fs for pubsub routing, SYSTEM context, and Teensy initialization",
+        "⏳ [clocks] waiting %.1fs for initial routing/context startup before readiness admission",
         STARTUP_TEENSY_QUIET_DELAY_S,
     )
     time.sleep(STARTUP_TEENSY_QUIET_DELAY_S)
-    logging.info("✅ [clocks] startup quiet delay complete — holistic restore may begin")
+    logging.info("✅ [clocks] startup quiet delay complete — proving cold-start readiness")
 
 
 
@@ -9826,8 +9950,23 @@ def run() -> None:
 
     startup_teensy_quiet_delay()
 
+    # Cold power-up is physical, not a timer contract.  First make the durable
+    # SYSTEM location real on the GF-8802, then wait without a deadline until
+    # the existing CLOCKS preflight proves a fresh canonical heartbeat, chrony
+    # PPS selection, and exact TPS4 FINE_LOCK.
+    startup_location = _wait_for_startup_location()
+    required_receiver_mode = str(
+        startup_location.get("verified_pos_mode_name") or ""
+    ).upper()
+    _wait_for_preflight(
+        "holistic_startup",
+        required_gnss_freq_mode=STARTUP_REQUIRED_GNSS_FREQ_MODE,
+        required_gnss_freq_mode_name="FINE_LOCK",
+        required_receiver_mode=required_receiver_mode,
+    )
+
     try:
-        result = _holistic_restore()
+        result = _holistic_restore(preverified_location=startup_location)
         logging.info("✅ [holistic restore] complete: %s", result)
     except TeensyStartRejected as exc:
         logging.error(

@@ -5121,27 +5121,16 @@ static void clocks_feature_update_static_prediction(void) {
           : system_feature_status_t::INITIALIZING);
 }
 
-// First reject any impossible one-second interval as a whole-row science
-// exclusion. Then compare the four static residuals to their median: a common-
-// mode DWT step can move every rail together without implying a bad clock
-// sample, while a lane-specific excursion remains visible. 256 cycles is far
-// above the normal few-cycle lattice while catching the observed +1480/+9844
-// pathology.
+// Absolute one-second periods are lane-local physics, not a cross-rail identity
+// test. PPS/VCLOCK and the two free-running OCXOs may legitimately differ by
+// many ppm. First reject only impossible per-lane intervals. Once all four
+// predictors have their own lawful antecedent, compare the second-to-second
+// static residuals to their median; that detects a lane-specific DWT excursion
+// without rejecting the oscillator frequency difference ZPNet is measuring.
+// 256 cycles is far above the normal few-cycle lattice while catching the
+// observed +1480/+9844 interval-discontinuity pathology.
 static constexpr uint32_t ALPHA_ROW_CYCLE_EXCURSION_GATE_CYCLES = 256U;
 
-static uint32_t alpha_cycle_actual_median4(const uint32_t values[4]) {
-  uint32_t sorted[4] = {values[0], values[1], values[2], values[3]};
-  for (uint32_t i = 1U; i < 4U; ++i) {
-    const uint32_t value = sorted[i];
-    uint32_t j = i;
-    while (j != 0U && sorted[j - 1U] > value) {
-      sorted[j] = sorted[j - 1U];
-      --j;
-    }
-    sorted[j] = value;
-  }
-  return (uint32_t)(((uint64_t)sorted[1] + (uint64_t)sorted[2]) / 2ULL);
-}
 
 static void alpha_static_prediction_forget_antecedent(uint32_t lane_bit) {
   alpha_static_prediction_store_t* store = nullptr;
@@ -5159,7 +5148,7 @@ static void alpha_static_prediction_forget_antecedent(uint32_t lane_bit) {
   store->seq++;
   clocks_alpha_dmb();
   // Preserve this row's actual/prediction/residual testimony, but do not let
-  // an interval rejected by the four-rail court become next second's prior.
+  // an interval rejected by the cycle-integrity court become next second's prior.
   store->last_actual_cycles = 0U;
   clocks_alpha_dmb();
   store->seq++;
@@ -5246,40 +5235,8 @@ static void alpha_row_adjudicate_cycle_integrity(uint32_t pps_sequence) {
     return;
   }
 
-  // Absolute plausibility alone is not enough during startup/recovery. A
-  // truncated interval can still land inside 900M..1.1B while disagreeing by
-  // tens of millions of cycles with the other three rails. Preserve that raw
-  // value, exclude the row, and force only the incoherent rail to reseed.
-  const uint32_t actual_median = alpha_cycle_actual_median4(actual_cycles);
-  uint32_t actual_incoherent_lane_mask = 0U;
-  for (uint32_t i = 0U; i < 4U; ++i) {
-    const int64_t delta =
-        (int64_t)actual_cycles[i] - (int64_t)actual_median;
-    const uint32_t abs_delta = delta < 0
-        ? (uint32_t)(-delta)
-        : (uint32_t)delta;
-    if (abs_delta > ALPHA_ROW_CYCLE_EXCURSION_GATE_CYCLES) {
-      actual_incoherent_lane_mask |= lane_bits[i];
-    }
-  }
-  if (actual_incoherent_lane_mask != 0U) {
-    const uint32_t actual_span = max_actual - min_actual;
-    clocks_row_exclude(
-        clocks_row_objection_source_t::ALPHA,
-        clocks_row_objection_reason_t::ALPHA_CYCLE_EXCURSION,
-        actual_incoherent_lane_mask,
-        pps_sequence,
-        actual_span,
-        ALPHA_ROW_CYCLE_EXCURSION_GATE_CYCLES,
-        actual_median);
-    for (uint32_t i = 0U; i < 4U; ++i) {
-      if ((actual_incoherent_lane_mask & lane_bits[i]) != 0U) {
-        alpha_static_prediction_forget_antecedent(lane_bits[i]);
-      }
-    }
-    return;
-  }
-
+  // Each rail must first acquire its own two-interval static predictor. A valid
+  // OCXO prediction is relative to that OCXO's prior period, never to PPS.
   if (!pps.valid || !vclock.valid || !ocxo1.valid || !ocxo2.valid) return;
 
   const int32_t median = alpha_cycle_residual_median4(residuals);
@@ -5310,6 +5267,11 @@ static void alpha_row_adjudicate_cycle_integrity(uint32_t pps_sequence) {
       span,
       ALPHA_ROW_CYCLE_EXCURSION_GATE_CYCLES,
       (uint32_t)median);
+  for (uint32_t i = 0U; i < 4U; ++i) {
+    if ((lane_mask & lane_bits[i]) != 0U) {
+      alpha_static_prediction_forget_antecedent(lane_bits[i]);
+    }
+  }
 }
 
 // ============================================================================

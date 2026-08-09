@@ -1537,12 +1537,10 @@ COMMANDS = {
 # ------------------------------------------------------------------
 
 def startup_teensy_quiet_delay() -> None:
-    """
-    Let pubsub discover this process' command/subscription surface first.
-    """
+    """Let PubSub/Teensy routing settle while GF-8802 acquisition is already live."""
     logging.info(
-        "⏳ [gnss] waiting %.1fs for pubsub routing and Teensy initialization "
-        "before active work",
+        "⏳ [gnss] observing GF-8802 during %.1fs startup quiet window for "
+        "pubsub routing and Teensy initialization",
         STARTUP_TEENSY_QUIET_DELAY_S,
     )
     time.sleep(STARTUP_TEENSY_QUIET_DELAY_S)
@@ -1559,10 +1557,20 @@ def run() -> None:
     try:
         server_setup(subsystem="GNSS", commands=COMMANDS, blocking=False)
 
-        startup_teensy_quiet_delay()
+        # Observation is not active control.  Open the GF-8802 UART immediately
+        # so cold-start WARMUP/PULLIN/LOCK progress overlaps software startup.
+        threading.Thread(
+            target=gnss_reader,
+            daemon=True,
+            name="gnss-reader",
+        ).start()
+        threading.Thread(
+            target=stream_server,
+            daemon=True,
+            name="gnss-stream",
+        ).start()
 
-        threading.Thread(target=gnss_reader, daemon=True).start()
-        threading.Thread(target=stream_server, daemon=True).start()
+        startup_teensy_quiet_delay()
 
         logging.info("🏁 [gnss] entering main loop")
         while True:
