@@ -86,17 +86,27 @@ static const int LD_ON_PIN          = 30;
 static const int LASER_MONITOR_PIN  = 20;
 
 // --------------------------------------------------------------
-// Photodiode (TDM split-pin design)
+// Koheron PD200T optical receiver
 // --------------------------------------------------------------
 //
+// Both PD200T signal cables are coaxial (black).
+//
 // PHOTODIODE_EDGE_PIN:
-//   Fast digital edge suitable for interrupts
+//   PD200T TTL comparator output.
+//   Fast digital photodetector timing edge owned by process_interrupt.
+//   This is the authoritative optical timing signal.
 //
-// PHOTODIODE_ANALOG_PIN:
-//   Continuous analog voltage while light is present
+// PHOTODIODE_MON_PIN:
+//   PD200T MON comparator-threshold output.
+//   Slow analog instrument/configuration telemetry on Teensy 4.1 A14.
+//   This value is never a timing endpoint.
 //
-static const int PHOTODIODE_EDGE_PIN   = 34;
-static const int PHOTODIODE_ANALOG_PIN = 22;
+// The PD200T high-bandwidth analog PD out waveform is intentionally not
+// connected to the Teensy ADC in the current architecture.
+//
+
+static const int PHOTODIODE_EDGE_PIN = 34;
+static const int PHOTODIODE_MON_PIN  = 38;  // Teensy 4.1 A14
 
 // --------------------------------------------------------------
 // GNSS timing pins
@@ -192,18 +202,15 @@ static const unsigned long GNSS_SILENCE_FLUSH_MS = 50;
 static const uint32_t PPS_EMIT_INTERVAL_MS = 10000;
 
 // --------------------------------------------------------------
-// Photodiode episode detection parameters
+// PD200T analog monitor
 // --------------------------------------------------------------
 //
-// Hysteresis thresholds (volts)
+// PHOTODIODE_MON_PIN reports the PD200T comparator threshold through A14.
+// It is slow telemetry only; optical presence and timing are declared by the
+// TTL comparator output on PHOTODIODE_EDGE_PIN.
 //
-static const float PHOTODIODE_ON_THRESHOLD_V  = 0.20f;
-static const float PHOTODIODE_OFF_THRESHOLD_V = 0.05f;
-
+// The former split-pin analog light-level episode detector is retired.
 //
-// Darkness stability window (milliseconds)
-//
-static const uint32_t PHOTODIODE_OFF_STABLE_MS = 20;
 
 // --------------------------------------------------------------
 // ADC scaling assumptions:

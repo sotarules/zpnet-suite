@@ -100,7 +100,8 @@ GND           Black         GND                Battery branching ground         
 
 23            Green         DAC_VREF_OUT       AD5693R VREF (both)
 32            Orange        GNSS_PPS_RELAY     GPIO relay to Pi
-34            Orange        PHOTODIODE_INT     Photodiode interrupt
+34            Coax          PHOTODIODE_INT     Koheron PD200T TTL out                Comparator timing output / GPIO IRQ
+38            Coax          PHOTODIODE_MON_IN  Koheron PD200T MON                    Comparator threshold monitor / A14 ADC
 
 30            Green         LASER_EN           EV5491-C-00A EN pin
 
@@ -168,7 +169,34 @@ the channel number is pin-routing-specific.
 =============================================================================*/
 
 /*=============================================================================
- (4) LASER DIODE MODULE — FFIME LSDLD131
+ (4) OPTICAL RECEIVER — KOHERON PD200T
+-------------------------------------------------------------------------------
+
+Device:
+Koheron PD200T
+Function: Optical pulse detection and comparator timing
+
+Used outputs:
+
+Output / Signal      Teensy Pin    ZPNet Signal Name       Purpose
+---------------------------------------------------------------------------
+TTL out              34            PHOTODIODE_INT          Comparator timing edge / GPIO IRQ
+MON                  38 / A14      PHOTODIODE_MON_IN       Comparator threshold monitor / ADC
+
+Notes:
+• TTL out is the authoritative digital photodetector timing signal presented
+  to process_interrupt for DWT-at-edge capture.
+• MON is a slow analog instrument-state measurement of the comparator threshold.
+• Pin 38 is used through its Teensy 4.1 A14 analog-input function.
+• PD out is the high-bandwidth analog photodetector waveform and is not connected
+  to the Teensy ADC in the current architecture.
+• PHOTODIODE_MON_IN is telemetry/configuration testimony only and is never a
+  timing endpoint.
+=============================================================================*/
+
+
+/*=============================================================================
+ (5) LASER DIODE MODULE — FFIME LSDLD131
 -------------------------------------------------------------------------------
 
 Device:
@@ -197,7 +225,7 @@ Notes:
 =============================================================================*/
 
 /*=============================================================================
- (5) CONTROLLER MODULE — EV5491-C-00A LASER DRIVER (USED CONNECTIONS)
+ (6) CONTROLLER MODULE — EV5491-C-00A LASER DRIVER (USED CONNECTIONS)
 -------------------------------------------------------------------------------
 
 Controller:
@@ -248,7 +276,7 @@ Notes:
 =============================================================================*/
 
 /*=============================================================================
- (6) CONTROLLER MODULE — GF-8802 GNSS DISCIPLINED OSCILLATOR
+ (7) CONTROLLER MODULE — GF-8802 GNSS DISCIPLINED OSCILLATOR
 -------------------------------------------------------------------------------
 
 Device:

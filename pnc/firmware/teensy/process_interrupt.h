@@ -68,6 +68,7 @@ enum class interrupt_subscriber_kind_t : uint8_t {
   OCXO1,
   OCXO2,
   TIMEPOP,
+  PHOTODIODE,
 };
 
 enum class interrupt_provider_kind_t : uint8_t {
@@ -89,7 +90,9 @@ enum class interrupt_lane_t : uint8_t {
   QTIMER3_CH0_COMP,
   QTIMER3_CH1_COMP,
   QTIMER3_CH3_COMP,
-  GPIO_EDGE,
+  GPIO_EDGE,               // compatibility/generic GPIO identity
+  GPIO_PPS_EDGE,
+  GPIO_PHOTODIODE_EDGE,
 };
 
 enum class interrupt_event_status_t : uint8_t {
@@ -1162,6 +1165,91 @@ struct interrupt_pps_edge_heartbeat_t {
 };
 
 interrupt_pps_edge_heartbeat_t interrupt_pps_edge_heartbeat(void);
+
+// ============================================================================
+// High-rate photodiode edge subscription
+// ============================================================================
+//
+// The PD200T comparator is not an ordinary foreground subscriber.  Its edge
+// rate may approach hundreds of kHz, so its callback runs synchronously from
+// the eventual photodiode GPIO ISR after the first-instruction DWT capture.
+// The callback must remain bounded, allocation-free, and ISR-safe.  It may hand
+// the immutable edge fact to process_photons, but process_interrupt owns the
+// physical interrupt and capture coordinate.
+//
+// dwt_at_edge is the latency-adjusted physical-edge coordinate.  Until the
+// PD200T GPIO path has its own measured floor calibration, the correction is
+// zero; isr_entry_dwt_raw is always preserved so later calibration cannot erase
+// the original observation.
+struct interrupt_photodiode_edge_t {
+  uint32_t sequence = 0;
+  uint32_t dwt_at_edge = 0;
+  uint32_t isr_entry_dwt_raw = 0;
+  int32_t  isr_entry_to_edge_correction_cycles = 0;
+  uint32_t pps_sequence = 0;
+};
+
+struct interrupt_photodiode_diag_t {
+  bool subscribed = false;
+  bool active = false;
+
+  interrupt_subscriber_kind_t kind =
+      interrupt_subscriber_kind_t::PHOTODIODE;
+  interrupt_provider_kind_t provider =
+      interrupt_provider_kind_t::GPIO6789;
+  interrupt_lane_t lane =
+      interrupt_lane_t::GPIO_PHOTODIODE_EDGE;
+
+  uint32_t start_count = 0;
+  uint32_t stop_count = 0;
+  uint32_t irq_count = 0;
+  uint32_t callback_count = 0;
+  uint32_t callback_missing_count = 0;
+  uint32_t inactive_edge_count = 0;
+
+  uint32_t source_pin = 0;
+  uint32_t last_sequence = 0;
+  uint32_t last_pps_sequence = 0;
+  uint32_t last_isr_entry_dwt_raw = 0;
+  uint32_t last_dwt_at_edge = 0;
+  int32_t  isr_entry_to_edge_correction_cycles = 0;
+
+  bool previous_edge_valid = false;
+  uint32_t last_interval_cycles = 0;
+  uint32_t min_interval_cycles = 0;
+  uint32_t max_interval_cycles = 0;
+
+  uint32_t last_callback_wall_cycles = 0;
+  uint32_t min_callback_wall_cycles = 0;
+  uint32_t max_callback_wall_cycles = 0;
+
+  uint32_t last_isr_entry_basepri = 0;
+  uint32_t last_isr_entry_primask = 0;
+  uint32_t last_isr_entry_ipsr = 0;
+};
+
+using interrupt_photodiode_edge_fn =
+    void (*)(const interrupt_photodiode_edge_t& edge,
+             const interrupt_photodiode_diag_t& diag,
+             void* user_data);
+
+struct interrupt_photodiode_subscription_t {
+  interrupt_photodiode_edge_fn on_edge = nullptr;
+  void* user_data = nullptr;
+};
+
+bool interrupt_photodiode_subscribe(
+    const interrupt_photodiode_subscription_t& subscription);
+void interrupt_photodiode_unsubscribe(void);
+
+// Coherent enough for foreground reporting: the photodiode callback updates this
+// scalar diagnostic surface monotonically from its single GPIO source.
+bool interrupt_photodiode_snapshot(interrupt_photodiode_diag_t* out);
+
+// ISR custody boundary used by the eventual pin-34 hardware vector and by
+// deterministic synthetic-edge tests. Caller supplies the first-instruction
+// ARM_DWT_CYCCNT value; this function never rereads DWT as event identity.
+void process_interrupt_photodiode_gpio_irq(uint32_t isr_entry_dwt_raw);
 
 using interrupt_subscriber_event_fn =
     void (*)(const interrupt_event_t& event,

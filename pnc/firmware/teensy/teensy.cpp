@@ -17,6 +17,7 @@
 
 #include "process_interrupt.h"
 #include "process_clocks.h"
+#include "process_photons.h"
 #include "process_events.h"
 #include "process_timepop.h"
 #include "process_laser.h"
@@ -294,6 +295,18 @@ void setup() {
   debug_log("boot", "process_clocks_register");
   process_clocks_register();
   debug_log("boot", "process_clocks_register done");
+
+  // ----------------------------------------------------------
+  // PHOTONS scaffold
+  // ----------------------------------------------------------
+
+  debug_log("boot", "process_photons_init");
+  process_photons_init();
+  debug_log("boot", "process_photons_init done");
+
+  debug_log("boot", "process_photons_register");
+  process_photons_register();
+  debug_log("boot", "process_photons_register done");
 
   // ----------------------------------------------------------
   // Remaining subsystems

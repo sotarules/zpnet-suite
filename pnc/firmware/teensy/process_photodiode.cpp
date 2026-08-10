@@ -4,125 +4,70 @@
 #include "events.h"
 #include "payload.h"
 #include "process.h"
+#include "process_interrupt.h"
 #include "util.h"
 
 #include <Arduino.h>
 
 // ================================================================
-// ISR-driven edge visibility
+// PHOTODIODE compatibility shim
+// ================================================================
+//
+// This legacy process remains temporarily available while PHOTONS takes over
+// optical timing custody.
+//
+// Important boundary:
+//   • process_interrupt owns PHOTODIODE_EDGE_PIN and all PD200T edge timing.
+//   • process_photodiode NEVER attaches an ISR and NEVER resets interrupt state.
+//   • PHOTODIODE_MON_PIN is sampled only as slow PD200T comparator-threshold
+//     telemetry.
+//
+// The command surface is retained so existing tools continue to work during
+// migration.  COUNT reflects process_interrupt's observed PHOTODIODE IRQ count.
+// CLEAR is intentionally a no-op because this compatibility layer has no
+// authority to erase process_interrupt evidence.
 // ================================================================
 
-static volatile bool     pd_edge_seen        = false;
-static volatile bool     pd_episode_latched  = false;
-static volatile uint32_t pd_episode_count    = 0;
-
-static volatile uint32_t pd_isr_count        = 0;
-static int  last_edge_level                  = -1;
-static bool edge_level_changed               = false;
-
-// ================================================================
-// ISR
-// ================================================================
-
-static void photodiodeISR() {
-  pd_isr_count++;
-  pd_edge_seen = true;
-}
-
-// ================================================================
-// Photodiode State (authoritative snapshot)
-// ================================================================
-
-struct photodiode_state_t {
-  uint32_t edge_pulse_count = 0;
-  int      edge_level       = 0;
-
-  uint16_t analog_raw = 0;
-  float    analog_v   = NAN;
+struct photodiode_compat_state_t {
+  int      edge_level = 0;
+  uint16_t mon_raw = 0;
+  float    mon_v = NAN;
 };
 
-static photodiode_state_t PD;
+static photodiode_compat_state_t PD;
 
 // ================================================================
-// Snapshot / Update Logic
+// Snapshot
 // ================================================================
 
 static void photodiode_snapshot(void) {
-
-  // --- Sample analog channel ---
   analogReadResolution(12);
-  PD.analog_raw = analogRead(PHOTODIODE_ANALOG_PIN);
-  PD.analog_v   = (PD.analog_raw / 4095.0f) * 3.3f;
 
-  static bool     light_present = false;
-  static uint32_t dark_since_ms = 0;
+  PD.mon_raw = analogRead(PHOTODIODE_MON_PIN);
+  PD.mon_v = (PD.mon_raw / ADC_FS_COUNTS) * ADC_FS_VOLTS;
 
-  uint32_t now = millis();
-
-  // --- Hysteresis-based light presence ---
-  if (!light_present) {
-    if (PD.analog_v >= PHOTODIODE_ON_THRESHOLD_V) {
-      light_present = true;
-    }
-  } else {
-    if (PD.analog_v <= PHOTODIODE_OFF_THRESHOLD_V) {
-      light_present = false;
-    }
-  }
-
-  // --- Dark stability / latch reset ---
-  if (!light_present) {
-    if (dark_since_ms == 0) {
-      dark_since_ms = now;
-    }
-    if (now - dark_since_ms >= PHOTODIODE_OFF_STABLE_MS) {
-      pd_episode_latched = false;
-    }
-  } else {
-    dark_since_ms = 0;
-
-    // --- Episode detection ---
-    if (pd_edge_seen && !pd_episode_latched) {
-      pd_episode_latched = true;
-      pd_episode_count++;
-    }
-  }
-
-  pd_edge_seen = false;
-
-  PD.edge_pulse_count = pd_episode_count;
-
-  int level = digitalRead(PHOTODIODE_EDGE_PIN);
-  if (last_edge_level != -1 && level != last_edge_level) {
-    edge_level_changed = true;
-  }
-  last_edge_level = level;
-
-  PD.edge_level = level;
+  // Ambient GPIO level is compatibility telemetry only.  It is not timing
+  // evidence and must never substitute for process_interrupt's edge capture.
+  PD.edge_level = digitalRead(PHOTODIODE_EDGE_PIN);
 }
 
 // ================================================================
-// Explicit initialization (authoritative, idempotent)
+// Explicit initialization — compatibility only
 // ================================================================
 
 void process_photodiode_init(void) {
-
   pinMode(PHOTODIODE_EDGE_PIN, INPUT);
-  pinMode(PHOTODIODE_ANALOG_PIN, INPUT);
+  pinMode(PHOTODIODE_MON_PIN, INPUT);
+  analogReadResolution(12);
 
-  attachInterrupt(
-    digitalPinToInterrupt(PHOTODIODE_EDGE_PIN),
-    photodiodeISR,
-    CHANGE
-  );
-
-  pd_edge_seen       = false;
-  pd_episode_latched = false;
-  pd_episode_count   = 0;
+  // DO NOT attachInterrupt() here.
+  // process_interrupt is the sole owner of PD200T comparator edge custody.
 
   Payload ev;
+  ev.add("compatibility_shim", true);
   ev.add("edge_pin", PHOTODIODE_EDGE_PIN);
-  ev.add("analog_pin", PHOTODIODE_ANALOG_PIN);
+  ev.add("mon_pin", PHOTODIODE_MON_PIN);
+  ev.add("interrupt_owner", "PROCESS_INTERRUPT");
   enqueueEvent("PHOTODIODE_INITIALIZATION", ev);
 }
 
@@ -130,67 +75,59 @@ void process_photodiode_init(void) {
 // Commands
 // ================================================================
 
-// ------------------------------------------------------------
-// INIT — explicit hardware initialization wrapper
-// ------------------------------------------------------------
 static Payload cmd_init(const Payload& /*args*/) {
   process_photodiode_init();
   return ok_payload();
 }
 
-// ------------------------------------------------------------
-// REPORT — return current photodiode state snapshot
-// ------------------------------------------------------------
 static Payload cmd_report(const Payload& /*args*/) {
-
   photodiode_snapshot();
 
-  Payload p;
+  interrupt_photodiode_diag_t diag{};
+  const bool diag_ok = interrupt_photodiode_snapshot(&diag);
 
+  Payload p;
+  p.add("compatibility_shim", true);
+
+  p.add("edge_pin", PHOTODIODE_EDGE_PIN);
   p.add("edge_level", PD.edge_level);
-  p.add("edge_pulse_count", PD.edge_pulse_count);
-  p.add("analog_raw", PD.analog_raw);
-  p.add("analog_v", toFixedDecimal(PD.analog_v, 6));
 
-  {
-    uint32_t count;
-    count = pd_isr_count;
-    p.add("isr_count", count);
-  }
+  p.add("mon_pin", PHOTODIODE_MON_PIN);
+  p.add("mon_raw", PD.mon_raw);
+  p.add("mon_v", toFixedDecimal(PD.mon_v, 6));
 
-  p.add("edge_level_changed", edge_level_changed);
+  p.add("interrupt_diag_ok", diag_ok);
+  p.add("interrupt_subscribed", diag.subscribed);
+  p.add("interrupt_active", diag.active);
+  p.add("interrupt_irq_count", diag.irq_count);
+  p.add("interrupt_callback_count", diag.callback_count);
+  p.add("interrupt_callback_missing_count", diag.callback_missing_count);
+  p.add("interrupt_inactive_edge_count", diag.inactive_edge_count);
+  p.add("interrupt_last_isr_entry_dwt_raw", diag.last_isr_entry_dwt_raw);
+  p.add("interrupt_last_dwt_at_edge", diag.last_dwt_at_edge);
 
   return p;
 }
 
-// ------------------------------------------------------------
-// COUNT — episode counter snapshot
-// ------------------------------------------------------------
 static Payload cmd_count(const Payload& /*args*/) {
-
-  uint32_t count;
-  count = pd_episode_count;
+  interrupt_photodiode_diag_t diag{};
+  const bool diag_ok = interrupt_photodiode_snapshot(&diag);
 
   Payload p;
-  p.add("count", count);
-
+  p.add("compatibility_shim", true);
+  p.add("snapshot_ok", diag_ok);
+  p.add("count", diag.irq_count);
   return p;
 }
 
-// ------------------------------------------------------------
-// CLEAR — reset episode counter
-// ------------------------------------------------------------
 static Payload cmd_clear(const Payload& /*args*/) {
-
-  pd_episode_count   = 0;
-  pd_episode_latched = false;
-  pd_edge_seen       = false;
-
-  Payload ev;
-  ev.add("action", "counter_reset");
-  enqueueEvent("PHOTODIODE_CLEAR", ev);
-
-  return ok_payload();
+  // Compatibility no-op.  This process no longer owns any edge counter or ISR
+  // state, and therefore has nothing lawful to clear.
+  Payload p = ok_payload();
+  p.add("compatibility_shim", true);
+  p.add("cleared", false);
+  p.add("reason", "interrupt custody owned by PROCESS_INTERRUPT");
+  return p;
 }
 
 // ================================================================
@@ -202,16 +139,15 @@ static const process_command_entry_t PHOTODIODE_COMMANDS[] = {
   { "REPORT", cmd_report },
   { "COUNT",  cmd_count  },
   { "CLEAR",  cmd_clear  },
-  { nullptr,  nullptr }   // sentinel
+  { nullptr, nullptr }
 };
 
 static const process_vtable_t PHOTODIODE_PROCESS = {
-  .process_id    = "PHOTODIODE",
-  .commands      = PHOTODIODE_COMMANDS,
+  .process_id = "PHOTODIODE",
+  .commands = PHOTODIODE_COMMANDS,
   .subscriptions = nullptr,
 };
 
 void process_photodiode_register(void) {
   process_register("PHOTODIODE", &PHOTODIODE_PROCESS);
 }
-

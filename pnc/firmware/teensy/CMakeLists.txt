@@ -72,6 +72,7 @@ set(ZPNET_SOURCES
     process_laser.cpp
     process_performance.cpp
     process_photodiode.cpp
+    process_photons.cpp
     process_pubsub.cpp
     process_system.cpp
     process_timepop.cpp
@@ -100,6 +101,7 @@ set(ZPNET_HEADERS
     process_laser.h
     process_performance.h
     process_photodiode.h
+    process_photons.h
     process_pubsub.h
     process_system.h
     process_timepop.h

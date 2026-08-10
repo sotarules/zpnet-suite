@@ -465,6 +465,26 @@ struct observed_anchor_t {
 };
 static observed_anchor_t g_observed_anchor{};
 
+// High-rate PD200T comparator subscription. This is deliberately separate from
+// ordinary foreground subscriber machinery: a 100-200 kHz optical edge stream
+// cannot occupy one deferred foreground slot per edge.
+struct photodiode_subscription_runtime_t {
+  volatile interrupt_photodiode_edge_fn callback = nullptr;
+  void* volatile user_data = nullptr;
+  volatile uint32_t binding_generation = 0U;
+  volatile uint32_t sequence = 0U;
+  volatile bool subscribed = false;
+  volatile bool active = false;
+  uint32_t previous_dwt_at_edge = 0U;
+  interrupt_photodiode_diag_t diag{};
+};
+
+static photodiode_subscription_runtime_t g_photodiode_subscription{};
+
+// Preserve raw first-instruction DWT until the dedicated PD200T GPIO entry
+// latency floor has been measured on the final interrupt vector.
+static constexpr int32_t PHOTODIODE_ISR_ENTRY_TO_EDGE_CORRECTION_CYCLES = 0;
+
 void interrupt_pps_vclock_label_anchor(uint32_t sequence,
                                        uint32_t counter32_at_edge,
                                        uint64_t gnss_ns_at_edge,
@@ -616,6 +636,13 @@ struct interrupt_subscriber_descriptor_t {
   const char* name = nullptr;
   interrupt_provider_kind_t provider = interrupt_provider_kind_t::NONE;
   interrupt_lane_t lane = interrupt_lane_t::NONE;
+};
+
+static constexpr interrupt_subscriber_descriptor_t PHOTODIODE_DESCRIPTOR{
+  interrupt_subscriber_kind_t::PHOTODIODE,
+  "PHOTODIODE",
+  interrupt_provider_kind_t::GPIO6789,
+  interrupt_lane_t::GPIO_PHOTODIODE_EDGE,
 };
 
 struct interrupt_deferred_dispatch_t {
@@ -5340,12 +5367,137 @@ uint32_t interrupt_recover_publication_custody_reset_count(void) {
 }
 
 // ============================================================================
+// High-rate PD200T comparator subscription
+// ============================================================================
+
+bool interrupt_photodiode_subscribe(
+    const interrupt_photodiode_subscription_t& subscription) {
+  if (!g_interrupt_runtime_ready || !subscription.on_edge ||
+      !interrupt_callback_address_executable((uintptr_t)subscription.on_edge)) {
+    return false;
+  }
+
+  const uint32_t prior = interrupt_priority0_guard_enter();
+  g_photodiode_subscription.binding_generation++;
+  if (g_photodiode_subscription.binding_generation == 0U) {
+    g_photodiode_subscription.binding_generation = 1U;
+  }
+  g_photodiode_subscription.user_data = subscription.user_data;
+  g_photodiode_subscription.subscribed = true;
+  g_photodiode_subscription.diag.subscribed = true;
+  dmb_barrier();
+  g_photodiode_subscription.callback = subscription.on_edge;
+  interrupt_priority0_guard_exit(prior);
+  return true;
+}
+
+void interrupt_photodiode_unsubscribe(void) {
+  const uint32_t prior = interrupt_priority0_guard_enter();
+  g_photodiode_subscription.callback = nullptr;
+  dmb_barrier();
+  g_photodiode_subscription.user_data = nullptr;
+  g_photodiode_subscription.subscribed = false;
+  g_photodiode_subscription.active = false;
+  g_photodiode_subscription.diag.subscribed = false;
+  g_photodiode_subscription.diag.active = false;
+  g_photodiode_subscription.binding_generation++;
+  if (g_photodiode_subscription.binding_generation == 0U) {
+    g_photodiode_subscription.binding_generation = 1U;
+  }
+  interrupt_priority0_guard_exit(prior);
+}
+
+bool interrupt_photodiode_snapshot(interrupt_photodiode_diag_t* out) {
+  if (!out) return false;
+  const uint32_t prior = interrupt_priority0_guard_enter();
+  *out = g_photodiode_subscription.diag;
+  interrupt_priority0_guard_exit(prior);
+  return true;
+}
+
+void process_interrupt_photodiode_gpio_irq(uint32_t isr_entry_dwt_raw) {
+  interrupt_photodiode_diag_t& diag = g_photodiode_subscription.diag;
+  diag.kind = PHOTODIODE_DESCRIPTOR.kind;
+  diag.provider = PHOTODIODE_DESCRIPTOR.provider;
+  diag.lane = PHOTODIODE_DESCRIPTOR.lane;
+  diag.subscribed = g_photodiode_subscription.subscribed;
+  diag.active = g_photodiode_subscription.active;
+  diag.irq_count++;
+  diag.source_pin = (uint32_t)PHOTODIODE_EDGE_PIN;
+  diag.last_isr_entry_dwt_raw = isr_entry_dwt_raw;
+  diag.isr_entry_to_edge_correction_cycles =
+      PHOTODIODE_ISR_ENTRY_TO_EDGE_CORRECTION_CYCLES;
+  diag.last_isr_entry_basepri = interrupt_basepri();
+  diag.last_isr_entry_primask = interrupt_primask();
+  diag.last_isr_entry_ipsr = interrupt_ipsr();
+
+  interrupt_photodiode_edge_t edge{};
+  edge.sequence = ++g_photodiode_subscription.sequence;
+  if (edge.sequence == 0U) edge.sequence = ++g_photodiode_subscription.sequence;
+  edge.isr_entry_dwt_raw = isr_entry_dwt_raw;
+  edge.isr_entry_to_edge_correction_cycles =
+      PHOTODIODE_ISR_ENTRY_TO_EDGE_CORRECTION_CYCLES;
+  edge.dwt_at_edge = PHOTODIODE_ISR_ENTRY_TO_EDGE_CORRECTION_CYCLES <= 0
+      ? isr_entry_dwt_raw -
+            (uint32_t)(-PHOTODIODE_ISR_ENTRY_TO_EDGE_CORRECTION_CYCLES)
+      : isr_entry_dwt_raw +
+            (uint32_t)PHOTODIODE_ISR_ENTRY_TO_EDGE_CORRECTION_CYCLES;
+  edge.pps_sequence =
+      g_last_pps_witness_valid ? g_last_pps_witness.sequence : 0U;
+
+  diag.last_sequence = edge.sequence;
+  diag.last_pps_sequence = edge.pps_sequence;
+  diag.last_dwt_at_edge = edge.dwt_at_edge;
+  if (g_photodiode_subscription.previous_dwt_at_edge != 0U) {
+    const uint32_t interval =
+        edge.dwt_at_edge - g_photodiode_subscription.previous_dwt_at_edge;
+    diag.previous_edge_valid = true;
+    diag.last_interval_cycles = interval;
+    if (diag.min_interval_cycles == 0U || interval < diag.min_interval_cycles) {
+      diag.min_interval_cycles = interval;
+    }
+    if (interval > diag.max_interval_cycles) {
+      diag.max_interval_cycles = interval;
+    }
+  }
+  g_photodiode_subscription.previous_dwt_at_edge = edge.dwt_at_edge;
+
+  if (!g_photodiode_subscription.active) {
+    diag.inactive_edge_count++;
+    return;
+  }
+
+  const interrupt_photodiode_edge_fn callback =
+      g_photodiode_subscription.callback;
+  void* const user_data =
+      g_photodiode_subscription.user_data;
+  if (!interrupt_callback_address_executable((uintptr_t)callback)) {
+    diag.callback_missing_count++;
+    return;
+  }
+
+  const uint32_t callback_start_dwt = ARM_DWT_CYCCNT;
+  diag.callback_count++;
+  callback(edge, diag, user_data);
+  const uint32_t callback_cycles = ARM_DWT_CYCCNT - callback_start_dwt;
+  diag.last_callback_wall_cycles = callback_cycles;
+  if (diag.min_callback_wall_cycles == 0U ||
+      callback_cycles < diag.min_callback_wall_cycles) {
+    diag.min_callback_wall_cycles = callback_cycles;
+  }
+  if (callback_cycles > diag.max_callback_wall_cycles) {
+    diag.max_callback_wall_cycles = callback_cycles;
+  }
+}
+
+// ============================================================================
 // Subscription / service lifecycle
 // ============================================================================
 
 bool interrupt_subscribe(const interrupt_subscription_t& subscription) {
   if (!g_interrupt_runtime_ready) return false;
   if (subscription.kind == interrupt_subscriber_kind_t::NONE ||
+      subscription.kind == interrupt_subscriber_kind_t::PHOTODIODE ||
       !subscription.on_event) {
     return false;
   }
@@ -5360,6 +5512,17 @@ bool interrupt_subscribe(const interrupt_subscription_t& subscription) {
 }
 
 bool interrupt_start(interrupt_subscriber_kind_t kind) {
+  if (kind == interrupt_subscriber_kind_t::PHOTODIODE) {
+    const uint32_t prior = interrupt_priority0_guard_enter();
+    const bool ready = g_photodiode_subscription.subscribed &&
+        interrupt_callback_address_executable(
+            (uintptr_t)g_photodiode_subscription.callback);
+    g_photodiode_subscription.active = ready;
+    g_photodiode_subscription.diag.active = ready;
+    if (ready) g_photodiode_subscription.diag.start_count++;
+    interrupt_priority0_guard_exit(prior);
+    return ready;
+  }
   interrupt_subscriber_runtime_t* rt = runtime_for(kind);
   if (!rt || !rt->desc) return false;
   const uint32_t prior = interrupt_priority0_guard_enter();
@@ -5379,6 +5542,10 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
 }
 
 bool interrupt_ensure_service(interrupt_subscriber_kind_t kind) {
+  if (kind == interrupt_subscriber_kind_t::PHOTODIODE) {
+    if (g_photodiode_subscription.active) return true;
+    return interrupt_start(kind);
+  }
   interrupt_subscriber_runtime_t* rt = runtime_for(kind);
   if (!rt || !rt->subscribed || !rt->sub.on_event) return false;
   if (kind == interrupt_subscriber_kind_t::VCLOCK) {
@@ -5609,6 +5776,14 @@ bool interrupt_recover_rebootstrap_ocxo_service(
 }
 
 bool interrupt_stop(interrupt_subscriber_kind_t kind) {
+  if (kind == interrupt_subscriber_kind_t::PHOTODIODE) {
+    const uint32_t prior = interrupt_priority0_guard_enter();
+    g_photodiode_subscription.active = false;
+    g_photodiode_subscription.diag.active = false;
+    g_photodiode_subscription.diag.stop_count++;
+    interrupt_priority0_guard_exit(prior);
+    return true;
+  }
   interrupt_subscriber_runtime_t* rt = runtime_for(kind);
   if (!rt || !rt->desc) return false;
   const uint32_t prior = interrupt_priority0_guard_enter();
@@ -6170,6 +6345,13 @@ void process_interrupt_init(void) {
   g_interrupt_foreground_service_running = false;
   g_clocks_fragment_tick_mailbox =
       interrupt_clocks_fragment_tick_mailbox_t{};
+  g_photodiode_subscription = photodiode_subscription_runtime_t{};
+  g_photodiode_subscription.diag.kind = PHOTODIODE_DESCRIPTOR.kind;
+  g_photodiode_subscription.diag.provider = PHOTODIODE_DESCRIPTOR.provider;
+  g_photodiode_subscription.diag.lane = PHOTODIODE_DESCRIPTOR.lane;
+  g_photodiode_subscription.diag.source_pin = (uint32_t)PHOTODIODE_EDGE_PIN;
+  g_photodiode_subscription.diag.isr_entry_to_edge_correction_cycles =
+      PHOTODIODE_ISR_ENTRY_TO_EDGE_CORRECTION_CYCLES;
   g_interrupt_foreground_forensics =
       interrupt_foreground_forensic_runtime_t{};
   g_interrupt_foreground_forensic_live =
@@ -6400,6 +6582,74 @@ static FLASHMEM void add_irq_priority_report(
           (uint32_t)diag.preempted_by_higher_tier_count);
 }
 
+static FLASHMEM void add_photodiode_report(Payload& payload,
+                                           const char* prefix) {
+  interrupt_photodiode_diag_t diag{};
+  (void)interrupt_photodiode_snapshot(&diag);
+  char key[80];
+
+  auto add_bool = [&](const char* suffix, bool value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    payload.add(key, value);
+  };
+  auto add_u32 = [&](const char* suffix, uint32_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    payload.add(key, value);
+  };
+  auto add_i32 = [&](const char* suffix, int32_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    payload.add(key, value);
+  };
+  auto add_string = [&](const char* suffix, const char* value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    payload.add(key, value);
+  };
+
+  add_string("kind", interrupt_subscriber_kind_str(diag.kind));
+  add_string("provider", interrupt_provider_kind_str(diag.provider));
+  add_string("lane", interrupt_lane_str(diag.lane));
+  add_bool("subscribed", diag.subscribed);
+  add_bool("active", diag.active);
+  add_u32("source_pin", diag.source_pin);
+  add_u32("start_count", diag.start_count);
+  add_u32("stop_count", diag.stop_count);
+  add_u32("irq_count", diag.irq_count);
+  add_u32("callback_count", diag.callback_count);
+  add_u32("callback_missing_count", diag.callback_missing_count);
+  add_u32("inactive_edge_count", diag.inactive_edge_count);
+  add_u32("last_sequence", diag.last_sequence);
+  add_u32("last_pps_sequence", diag.last_pps_sequence);
+  add_u32("last_isr_entry_dwt_raw", diag.last_isr_entry_dwt_raw);
+  add_u32("last_dwt_at_edge", diag.last_dwt_at_edge);
+  add_i32("isr_entry_to_edge_correction_cycles",
+          diag.isr_entry_to_edge_correction_cycles);
+  add_bool("previous_edge_valid", diag.previous_edge_valid);
+  add_u32("last_interval_cycles", diag.last_interval_cycles);
+  add_u32("min_interval_cycles", diag.min_interval_cycles);
+  add_u32("max_interval_cycles", diag.max_interval_cycles);
+  add_u32("last_callback_wall_cycles", diag.last_callback_wall_cycles);
+  add_u32("min_callback_wall_cycles", diag.min_callback_wall_cycles);
+  add_u32("max_callback_wall_cycles", diag.max_callback_wall_cycles);
+  add_u32("last_isr_entry_basepri", diag.last_isr_entry_basepri);
+  add_u32("last_isr_entry_primask", diag.last_isr_entry_primask);
+  add_u32("last_isr_entry_ipsr", diag.last_isr_entry_ipsr);
+
+  // Pin 34 currently shares the Arduino GPIO6789 NVIC vector used by PPS.
+  // Until a separate lower-priority physical entry path is installed, do not
+  // claim that the photodiode has an independently enforceable NVIC priority.
+  add_bool("physical_irq_installed", false);
+  add_bool("shared_gpio6789_vector_with_pps", true);
+  add_bool("independent_priority_ready", false);
+  add_string("dispatch_class", "SYNCHRONOUS_HIGH_RATE_ISR_SAFE_CALLBACK");
+}
+
+static FLASHMEM Payload cmd_report_photodiode(const Payload&) {
+  Payload payload;
+  payload.add("report", "INTERRUPT_PHOTODIODE");
+  add_photodiode_report(payload, "photodiode");
+  return payload;
+}
+
 static FLASHMEM Payload cmd_report_priorities(const Payload&) {
   Payload payload;
   payload.add("report", "INTERRUPT_PRIORITIES");
@@ -6434,6 +6684,12 @@ static FLASHMEM Payload cmd_report_priorities(const Payload&) {
       payload, "pps", (uint32_t)IRQ_GPIO6789,
       INTERRUPT_PRIORITY_SCIENCE,
       g_interrupt_priority_runtime.pps);
+  payload.add("photodiode_kind", "PHOTODIODE");
+  payload.add("photodiode_provider", "GPIO6789");
+  payload.add("photodiode_lane", "GPIO_PHOTODIODE_EDGE");
+  payload.add("photodiode_physical_irq_installed", false);
+  payload.add("photodiode_shared_gpio6789_vector_with_pps", true);
+  payload.add("photodiode_independent_priority_ready", false);
   add_irq_priority_report(
       payload, "continuation", INTERRUPT_HANDOFF_IRQ_NUMBER,
       INTERRUPT_PRIORITY_CONTINUATION,
@@ -6493,6 +6749,7 @@ static FLASHMEM Payload cmd_report_status(const Payload&) {
       payload, "ocxo1", runtime_for(interrupt_subscriber_kind_t::OCXO1));
   add_runtime_summary(
       payload, "ocxo2", runtime_for(interrupt_subscriber_kind_t::OCXO2));
+  add_photodiode_report(payload, "photodiode");
   return payload;
 }
 
@@ -7133,6 +7390,7 @@ static FLASHMEM Payload cmd_report_lanes(const Payload&) {
       payload, "vclock", runtime_for(interrupt_subscriber_kind_t::VCLOCK));
   add_ocxo_lane_report(payload, "ocxo1", OCXO1_BINDING);
   add_ocxo_lane_report(payload, "ocxo2", OCXO2_BINDING);
+  add_photodiode_report(payload, "photodiode");
   return payload;
 }
 
@@ -7166,6 +7424,12 @@ static FLASHMEM Payload cmd_report_lane(const Payload& args) {
     add_ocxo_lane_report(payload, "ocxo2", OCXO2_BINDING);
     return payload;
   }
+  if (interrupt_cstr_equal_ci(lane, "PHOTODIODE") ||
+      interrupt_cstr_equal_ci(lane, "PD") ||
+      interrupt_cstr_equal_ci(lane, "PD200T")) {
+    add_photodiode_report(payload, "photodiode");
+    return payload;
+  }
   payload.add("error", "unknown lane");
   return payload;
 }
@@ -7176,6 +7440,7 @@ static const process_command_entry_t INTERRUPT_COMMANDS[] = {
   { "REPORT_FPU_CONTEXT", cmd_report_fpu_context },
   { "REPORT_PRIORITIES", cmd_report_priorities },
   { "REPORT_PPS", cmd_report_pps },
+  { "REPORT_PHOTODIODE", cmd_report_photodiode },
   { "REPORT_CADENCE", cmd_report_cadence },
   { "REPORT_SMARTZERO", cmd_report_smartzero },
   { "REPORT_HANDOFF", cmd_report_handoff },
@@ -7206,6 +7471,7 @@ const char* interrupt_subscriber_kind_str(interrupt_subscriber_kind_t kind) {
     case interrupt_subscriber_kind_t::OCXO1: return "OCXO1";
     case interrupt_subscriber_kind_t::OCXO2: return "OCXO2";
     case interrupt_subscriber_kind_t::TIMEPOP: return "TIMEPOP";
+    case interrupt_subscriber_kind_t::PHOTODIODE: return "PHOTODIODE";
     default: return "NONE";
   }
 }
@@ -7232,6 +7498,9 @@ const char* interrupt_lane_str(interrupt_lane_t lane) {
     case interrupt_lane_t::QTIMER3_CH1_COMP: return "QTIMER3_CH1_COMP";
     case interrupt_lane_t::QTIMER3_CH3_COMP: return "QTIMER3_CH3_COMP";
     case interrupt_lane_t::GPIO_EDGE: return "GPIO_EDGE";
+    case interrupt_lane_t::GPIO_PPS_EDGE: return "GPIO_PPS_EDGE";
+    case interrupt_lane_t::GPIO_PHOTODIODE_EDGE:
+      return "GPIO_PHOTODIODE_EDGE";
     default: return "NONE";
   }
 }
