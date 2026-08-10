@@ -1,12 +1,16 @@
 #include "process_photons.h"
 
+#include "config.h"
+#include "events.h"
 #include "payload.h"
 #include "process.h"
 #include "process_interrupt.h"
 #include "publish.h"
 #include "timepop.h"
+#include "util.h"
 
 #include <Arduino.h>
+#include <Wire.h>
 
 // ============================================================================
 // PHOTONS scaffold doctrine
@@ -26,6 +30,131 @@
 // ============================================================================
 
 static constexpr uint64_t PHOTONS_FRAGMENT_PERIOD_NS = 1000000000ULL;
+
+
+// ============================================================================
+// Optical device control / telemetry
+// ============================================================================
+//
+// PHOTONS is the umbrella owner for photon-producing and photon-detecting
+// devices. process_interrupt still owns PD200T comparator edge custody.
+//
+// Laser driver: MP5491 / EV5491-C-00A
+//
+static constexpr uint8_t MP5491_ADDR = 0x66;
+
+static constexpr uint8_t MP5491_REG_CTL0    = 0x00;
+static constexpr uint8_t MP5491_REG_CTL1    = 0x01;
+static constexpr uint8_t MP5491_REG_ID1_MSB = 0x07;
+static constexpr uint8_t MP5491_REG_ID1_LSB = 0x08;
+
+static constexpr uint8_t MP5491_SYSEN_BIT  = 0x80;
+static constexpr uint8_t MP5491_ID_EN_BIT  = 0x80;
+static constexpr uint8_t MP5491_ID1_EN_BIT = 0x08;
+
+// Existing authoritative laser setting: ID1 = 20 mA, 0.25 mA / LSB.
+static constexpr uint8_t PHOTONS_LASER_ID1_CURRENT_MSB = 0x14;
+static constexpr uint8_t PHOTONS_LASER_ID1_CURRENT_LSB = 0x00;
+
+static constexpr float PHOTONS_LASER_EMIT_THRESHOLD_V = 0.75f;
+
+struct photons_device_snapshot_t {
+  bool     laser_enabled = false;
+  uint16_t laser_id1_raw = 0;
+  float    laser_id1_current_ma = 0.0f;
+  uint16_t laser_monitor_raw = 0;
+  float    laser_monitor_v = 0.0f;
+  bool     laser_emitting = false;
+
+  int      photodiode_edge_level = 0;
+  uint16_t photodiode_mon_raw = 0;
+  float    photodiode_mon_v = 0.0f;
+};
+
+static void photons_i2c_write(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(MP5491_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  Wire.endTransmission();
+}
+
+static uint8_t photons_i2c_read(uint8_t reg) {
+  Wire.beginTransmission(MP5491_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MP5491_ADDR, (uint8_t)1);
+  return Wire.available() ? Wire.read() : 0xFF;
+}
+
+static float photons_adc_voltage(uint16_t raw) {
+  return (raw / ADC_FS_COUNTS) * ADC_FS_VOLTS;
+}
+
+static void photons_laser_inhibit(void) {
+  digitalWrite(LD_ON_PIN, LOW);
+}
+
+static void photons_laser_initialize_hardware(void) {
+  pinMode(LD_ON_PIN, OUTPUT);
+  photons_laser_inhibit();
+
+  pinMode(LASER_MONITOR_PIN, INPUT);
+  pinMode(PHOTODIODE_MON_PIN, INPUT);
+  analogReadResolution(12);
+
+  photons_i2c_write(MP5491_REG_CTL0, MP5491_SYSEN_BIT);
+
+  const uint8_t ctl1 = photons_i2c_read(MP5491_REG_CTL1);
+  photons_i2c_write(
+      MP5491_REG_CTL1,
+      MP5491_ID_EN_BIT | MP5491_ID1_EN_BIT | (ctl1 & 0x07));
+
+  photons_i2c_write(
+      MP5491_REG_ID1_MSB,
+      PHOTONS_LASER_ID1_CURRENT_MSB);
+
+  const uint8_t lsb = photons_i2c_read(MP5491_REG_ID1_LSB);
+  photons_i2c_write(
+      MP5491_REG_ID1_LSB,
+      (lsb & ~0x03U) | PHOTONS_LASER_ID1_CURRENT_LSB);
+}
+
+static photons_device_snapshot_t photons_device_snapshot(void) {
+  photons_device_snapshot_t out{};
+
+  const uint8_t msb = photons_i2c_read(MP5491_REG_ID1_MSB);
+  const uint8_t lsb = photons_i2c_read(MP5491_REG_ID1_LSB);
+  out.laser_id1_raw = ((uint16_t)msb << 2) | (lsb & 0x03U);
+  out.laser_id1_current_ma = out.laser_id1_raw * 0.25f;
+
+  out.laser_enabled = digitalRead(LD_ON_PIN) == HIGH;
+
+  out.laser_monitor_raw = analogRead(LASER_MONITOR_PIN);
+  out.laser_monitor_v = photons_adc_voltage(out.laser_monitor_raw);
+  out.laser_emitting =
+      out.laser_monitor_v > PHOTONS_LASER_EMIT_THRESHOLD_V;
+
+  // Ambient pin level is diagnostic only. Timing evidence comes exclusively
+  // from process_interrupt's PHOTODIODE edge capture.
+  out.photodiode_edge_level = digitalRead(PHOTODIODE_EDGE_PIN);
+
+  out.photodiode_mon_raw = analogRead(PHOTODIODE_MON_PIN);
+  out.photodiode_mon_v = photons_adc_voltage(out.photodiode_mon_raw);
+
+  return out;
+}
+
+static void photons_emit_laser_initialization_event(void) {
+  const photons_device_snapshot_t device = photons_device_snapshot();
+
+  Payload p;
+  p.add("id1_raw", device.laser_id1_raw);
+  p.add("id1_current_ma",
+        toFixedDecimal(device.laser_id1_current_ma, 6));
+  p.add("pd_voltage", toFixedDecimal(device.laser_monitor_v, 6));
+  p.add("laser_emitting", device.laser_emitting);
+  enqueueEvent("LASER_INITIALIZATION", p);
+}
 
 // -----------------------------------------------------------------------------
 // ISR-authored live state
@@ -263,6 +392,9 @@ void process_photons_init(void) {
   g_publish_reject_count = 0U;
   g_last_published_edge_count = 0U;
 
+  photons_laser_initialize_hardware();
+  photons_emit_laser_initialization_event();
+
   interrupt_photodiode_subscription_t subscription{};
   subscription.on_edge = photons_on_photodiode_edge;
   subscription.user_data = nullptr;
@@ -296,6 +428,8 @@ static Payload cmd_report(const Payload& /*args*/) {
   interrupt_photodiode_diag_t interrupt_diag{};
   (void)interrupt_photodiode_snapshot(&interrupt_diag);
 
+  const photons_device_snapshot_t device = photons_device_snapshot();
+
   Payload p;
 
   p.add("initialized", g_initialized);
@@ -303,6 +437,22 @@ static Payload cmd_report(const Payload& /*args*/) {
   p.add("interrupt_started", g_interrupt_started);
   p.add("fragment_timer_armed",
         g_fragment_timer != TIMEPOP_INVALID_HANDLE);
+
+  p.add("laser_enabled", device.laser_enabled);
+  p.add("laser_id1_raw", device.laser_id1_raw);
+  p.add("laser_id1_current_ma",
+        toFixedDecimal(device.laser_id1_current_ma, 6));
+  p.add("laser_monitor_raw", device.laser_monitor_raw);
+  p.add("laser_monitor_v",
+        toFixedDecimal(device.laser_monitor_v, 6));
+  p.add("laser_emitting", device.laser_emitting);
+
+  p.add("photodiode_edge_pin", PHOTODIODE_EDGE_PIN);
+  p.add("photodiode_edge_level", device.photodiode_edge_level);
+  p.add("photodiode_mon_pin", PHOTODIODE_MON_PIN);
+  p.add("photodiode_mon_raw", device.photodiode_mon_raw);
+  p.add("photodiode_mon_v",
+        toFixedDecimal(device.photodiode_mon_v, 6));
 
   p.add("capture_edge_count", capture.edge_count);
   p.add("capture_last_edge_sequence", capture.last_edge_sequence);
@@ -344,12 +494,41 @@ static Payload cmd_report(const Payload& /*args*/) {
   return p;
 }
 
+static Payload cmd_init(const Payload& /*args*/) {
+  photons_laser_initialize_hardware();
+  photons_emit_laser_initialization_event();
+  return ok_payload();
+}
+
+static Payload cmd_on(const Payload& /*args*/) {
+  digitalWrite(LD_ON_PIN, HIGH);
+
+  Payload ev;
+  ev.add("action", "allow_emission");
+  enqueueEvent("LASER_ON", ev);
+
+  return ok_payload();
+}
+
+static Payload cmd_off(const Payload& /*args*/) {
+  photons_laser_inhibit();
+
+  Payload ev;
+  ev.add("action", "inhibit_emission");
+  enqueueEvent("LASER_OFF", ev);
+
+  return ok_payload();
+}
+
 // ============================================================================
 // Registration
 // ============================================================================
 
 static const process_command_entry_t PHOTONS_COMMANDS[] = {
+  { "INIT",   cmd_init   },
   { "REPORT", cmd_report },
+  { "ON",     cmd_on     },
+  { "OFF",    cmd_off    },
   { nullptr, nullptr }
 };
 

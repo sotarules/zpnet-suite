@@ -3,21 +3,28 @@
 #include <stdint.h>
 
 // ============================================================================
-// PHOTONS — skeletal optical timing subsystem
+// PHOTONS — optical instrument subsystem
 // ============================================================================
 //
-// This is intentionally a scaffold, not the final PHOTONS scientific contract.
-// Its immediate purpose is to validate:
+// PHOTONS is the Teensy umbrella for photon-producing and photon-detecting
+// hardware used by LANTERN and related fiber-optic experiments.
 //
-//   PD200T comparator edge
-//       -> process_interrupt PHOTODIODE subscription
-//       -> process_photons ISR-safe capture
-//       -> 1 Hz foreground aggregation
-//       -> PHOTONS_FRAGMENT publication
+// Ownership:
+//   • PHOTONS owns laser driver configuration/control and optical-device
+//     telemetry.
+//   • process_interrupt owns PD200T comparator edge capture and immutable
+//     DWT-at-edge custody.
+//   • PHOTONS consumes those edge facts and publishes PHOTONS_FRAGMENT.
 //
-// The toy structures below are deliberately small and disposable.  They give
-// REPORT and PHOTONS_FRAGMENT enough shape to exercise custody and transport
-// before the real pulse-train / lap / statistics model is implemented.
+// The current measurement structures remain intentionally toy/scaffold state.
+// They exist to validate custody and transport before the final pulse-train,
+// lap, timeout, statistics, recovery, and LANTERN campaign model is installed.
+//
+// Commands:
+//   • INIT   — reinitialize PHOTONS-owned optical hardware; laser is inhibited
+//   • REPORT — unified laser, PD200T, interrupt, and toy-measurement report
+//   • ON     — permit laser emission through LD_ON
+//   • OFF    — inhibit laser emission through LD_ON
 // ============================================================================
 
 // Cumulative ISR-authored optical-edge state.
@@ -67,8 +74,7 @@ struct photons_toy_fragment_t {
 // Must run after process_interrupt_init() and timepop_init().
 void process_photons_init(void);
 
-// Register the PHOTONS process command surface.  The scaffold intentionally
-// exposes only PHOTONS.REPORT.
+// Register the PHOTONS process command surface.
 void process_photons_register(void);
 
 // Foreground/test accessors.  They return a coherent snapshot of the current

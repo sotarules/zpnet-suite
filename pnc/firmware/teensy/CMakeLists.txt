@@ -69,9 +69,7 @@ set(ZPNET_SOURCES
     process_clocks_gamma.cpp
     process_events.cpp
     process_interrupt.cpp
-    process_laser.cpp
     process_performance.cpp
-    process_photodiode.cpp
     process_photons.cpp
     process_pubsub.cpp
     process_system.cpp
@@ -98,9 +96,7 @@ set(ZPNET_HEADERS
     process_clocks_internal.h
     process_events.h
     process_interrupt.h
-    process_laser.h
     process_performance.h
-    process_photodiode.h
     process_photons.h
     process_pubsub.h
     process_system.h

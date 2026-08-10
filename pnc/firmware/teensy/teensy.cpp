@@ -20,8 +20,6 @@
 #include "process_photons.h"
 #include "process_events.h"
 #include "process_timepop.h"
-#include "process_laser.h"
-#include "process_photodiode.h"
 #include "process_system.h"
 #include "process_pubsub.h"
 #include "process_performance.h"
@@ -297,7 +295,7 @@ void setup() {
   debug_log("boot", "process_clocks_register done");
 
   // ----------------------------------------------------------
-  // PHOTONS scaffold
+  // PHOTONS optical subsystem
   // ----------------------------------------------------------
 
   debug_log("boot", "process_photons_init");
@@ -311,22 +309,6 @@ void setup() {
   // ----------------------------------------------------------
   // Remaining subsystems
   // ----------------------------------------------------------
-
-  debug_log("boot", "process_laser_init");
-  process_laser_init();
-  debug_log("boot", "process_laser_init done");
-
-  debug_log("boot", "process_laser_register");
-  process_laser_register();
-  debug_log("boot", "process_laser_register done");
-
-  debug_log("boot", "process_photodiode_init");
-  process_photodiode_init();
-  debug_log("boot", "process_photodiode_init done");
-
-  debug_log("boot", "process_photodiode_register");
-  process_photodiode_register();
-  debug_log("boot", "process_photodiode_register done");
 
   debug_log("boot", "process_pubsub_register");
   process_pubsub_register();
