@@ -309,8 +309,11 @@ HOLISTIC_RESTORE_TIMEOUT_S = 60.0
 HOLISTIC_RESTORE_COMMAND_RETRY_S = 10.0
 
 # Better-Buckets restore replay. Alpha keeps exact-second endpoints for 10m and
-# one first-admitted endpoint per minute for the longer windows. PostgreSQL is
-# scanned only on recovery; ordinary CLOCKS remains lean.
+# one first-admitted endpoint per minute for the longer windows. Window widths
+# are maxima, not minimum-population requirements: if durable history contains
+# a gap, recovery uses the latest contiguous suffix and lets every bucket mature
+# from that truthful post-gap origin. PostgreSQL is scanned only on recovery;
+# ordinary CLOCKS remains lean.
 PPB_REPLAY_10_MIN_SECONDS = 10 * 60
 PPB_REPLAY_60_MIN_SECONDS = 60 * 60
 PPB_REPLAY_8_HOUR_SECONDS = 8 * 60 * 60
@@ -3292,11 +3295,17 @@ def _replay_better_buckets_rows(
 ) -> Dict[str, Any]:
     """Reconstruct Alpha's bounded Better-Buckets state in one forward pass.
 
-    rolling_sequence is canonical stats.update_count.  The first cursor row may
-    begin before the oldest 24-hour anchor rather than at statistical epoch zero;
-    any omitted cumulative prefix is a harmless common offset that cancels from
-    every rolling subtraction.  interval_advanced preserves deliberate reboot /
-    rejection cuts so continuity-adjusted clockfaces are never joined by guess.
+    rolling_sequence is canonical stats.update_count.  The requested SQL range
+    begins before the oldest possible 24-hour anchor, but durable CLOCKS history
+    is allowed to contain gaps.  A gap is a hard evidence boundary: discard the
+    older partial replay and restart the rolling origin at the first durable row
+    after the gap.  This preserves the latest contiguous suffix without ever
+    manufacturing an interval across missing evidence.
+
+    The resulting buckets therefore keep Alpha's normal startup semantics:
+    each named window uses all available contiguous population up to its nominal
+    maximum width.  interval_advanced remains authoritative for deliberate
+    science exclusions inside the durable suffix.
     """
     if target_update_count < 0 or target_current_sequence < 0:
         raise ValueError("invalid Better-Buckets target chronology")
@@ -3306,6 +3315,8 @@ def _replay_better_buckets_rows(
             f"current={target_current_sequence} update_count={target_update_count}"
         )
 
+    requested_lower_sequence = int(lower_sequence)
+    effective_lower_sequence = requested_lower_sequence
     current = _ppb_zero_endpoint()
     origin: Optional[Dict[str, Any]] = None
     second_history = deque(maxlen=PPB_REPLAY_SECOND_CAPACITY)
@@ -3313,20 +3324,49 @@ def _replay_better_buckets_rows(
     previous_raw: Optional[Dict[str, int]] = None
     last_admitted_sequence = 0
     last_minute_key = 0
-    expected_sequence = int(lower_sequence)
+    expected_sequence = requested_lower_sequence
+    rows_scanned_total = 0
     rows_scanned = 0
     admitted_rows = 0
     advanced_intervals = 0
     omitted_prefix_interval = False
+    chronology_gap_count = 0
+    last_chronology_gap: Optional[Dict[str, int]] = None
 
     for row in rows:
         sequence = int(row["update_count"])
-        if sequence != expected_sequence:
+        if sequence < expected_sequence:
             raise ValueError(
-                "Better-Buckets durable chronology gap: "
-                f"expected={expected_sequence} observed={sequence}"
+                "Better-Buckets durable chronology duplicate/regression: "
+                f"expected>={expected_sequence} observed={sequence}"
             )
-        expected_sequence += 1
+
+        if sequence > expected_sequence:
+            # Missing durable rows do not invalidate later evidence.  They do,
+            # however, terminate every rolling population that would cross the
+            # missing interval.  Restart from the first observed row after the
+            # gap exactly as Alpha starts a young statistics population.
+            chronology_gap_count += 1
+            last_chronology_gap = {
+                "expected_sequence": int(expected_sequence),
+                "observed_sequence": int(sequence),
+                "missing_rows": int(sequence - expected_sequence),
+            }
+            effective_lower_sequence = int(sequence)
+            current = _ppb_zero_endpoint()
+            origin = None
+            second_history.clear()
+            minute_history.clear()
+            previous_raw = None
+            last_admitted_sequence = 0
+            last_minute_key = 0
+            rows_scanned = 0
+            admitted_rows = 0
+            advanced_intervals = 0
+            omitted_prefix_interval = False
+
+        expected_sequence = sequence + 1
+        rows_scanned_total += 1
         rows_scanned += 1
 
         current_witness = int(row.get("current_sequence") or 0)
@@ -3370,11 +3410,10 @@ def _replay_better_buckets_rows(
 
         if interval_advanced:
             if previous_raw is None:
-                # A bounded replay may omit the interval entering its first row.
-                # lower_sequence is at least one full minute before the oldest
-                # possible 24h anchor, so this becomes only a common cumulative
-                # offset and cannot affect any reconstructed rolling subtraction.
-                if rows_scanned == 1 and lower_sequence > 1:
+                # The interval entering the first row of a bounded or post-gap
+                # suffix is unknowable from durable evidence.  Drop exactly that
+                # interval and use this row as the new rolling origin.
+                if rows_scanned == 1 and effective_lower_sequence > 1:
                     omitted_prefix_interval = True
                 else:
                     raise ValueError(
@@ -3424,7 +3463,7 @@ def _replay_better_buckets_rows(
         admitted_rows += 1
 
     if target_current_sequence > 0:
-        if rows_scanned == 0:
+        if rows_scanned_total == 0:
             raise ValueError("Better-Buckets replay returned no durable rows")
         if expected_sequence != target_current_sequence + 1:
             raise ValueError(
@@ -3441,14 +3480,40 @@ def _replay_better_buckets_rows(
         if origin is None:
             raise ValueError("Better-Buckets replay has current endpoint but no origin")
 
+    origin_sequence = (
+        int(origin.get("rolling_sequence") or 0)
+        if isinstance(origin, dict)
+        else 0
+    )
+    current_sequence = int(current.get("rolling_sequence") or 0)
+    available_span_seconds = max(0, current_sequence - origin_sequence)
+    available_population_seconds = (
+        max(
+            0,
+            int(current.get("interval_count") or 0)
+            - int(origin.get("interval_count") or 0),
+        )
+        if isinstance(origin, dict)
+        else 0
+    )
+
     return {
         "schema": "PI_BETTER_BUCKETS_RESTORE_V1",
         "rolling_sequence": int(target_update_count),
         "current_sequence": int(target_current_sequence),
-        "lower_sequence": int(lower_sequence),
+        "lower_sequence": int(requested_lower_sequence),
+        "effective_lower_sequence": int(effective_lower_sequence),
         "rows_scanned": int(rows_scanned),
+        "rows_scanned_total": int(rows_scanned_total),
         "admitted_rows": int(admitted_rows),
         "advanced_intervals": int(advanced_intervals),
+        "available_span_seconds": int(available_span_seconds),
+        "available_population_seconds": int(available_population_seconds),
+        "history_truncated": bool(chronology_gap_count),
+        "chronology_gap_count": int(chronology_gap_count),
+        "last_chronology_gap": (
+            dict(last_chronology_gap) if last_chronology_gap is not None else None
+        ),
         "omitted_prefix_interval": bool(omitted_prefix_interval),
         "last_minute_key": int(last_minute_key),
         "origin_valid": origin is not None,
@@ -3473,7 +3538,11 @@ def _ppb_replay_anchor(
     origin_sequence = int(origin.get("rolling_sequence") or 0) if isinstance(origin, dict) else 0
     if current_sequence == 0 or origin_sequence >= current_sequence:
         return None
-    if current_sequence <= int(window_seconds):
+
+    # Window names are maximum widths, not minimum-population requirements.
+    # If the contiguous replay suffix is younger than the nominal window, use
+    # its truthful origin exactly as Alpha does for a young statistics epoch.
+    if current_sequence - origin_sequence <= int(window_seconds):
         return origin if isinstance(origin, dict) else None
 
     target = current_sequence - int(window_seconds)
@@ -3489,6 +3558,27 @@ def _ppb_replay_anchor(
         if sequence >= target and sequence < current_sequence:
             return endpoint
     return None
+
+
+def _ppb_replay_window_truncated(
+    replay: Dict[str, Any],
+    window_seconds: int,
+) -> bool:
+    """True when a durable gap shortens this recovered window's ancestry."""
+    if not bool(replay.get("history_truncated")):
+        return False
+    current = replay.get("current")
+    origin = replay.get("origin")
+    if not isinstance(current, dict) or not isinstance(origin, dict):
+        return True
+    current_sequence = int(current.get("rolling_sequence") or 0)
+    origin_sequence = int(origin.get("rolling_sequence") or 0)
+    if current_sequence <= 0 or origin_sequence <= 0:
+        return True
+    if current_sequence <= int(window_seconds):
+        return True
+    required_anchor = current_sequence - int(window_seconds)
+    return origin_sequence > required_anchor
 
 
 def _ppb_replay_bucket_value(
@@ -3538,7 +3628,13 @@ def _verify_better_buckets_replay(
     detail: Dict[str, Any],
     replay: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Prove reconstructed rings reproduce Alpha's last durable bucket values."""
+    """Verify every bucket whose durable ancestry is fully reconstructible.
+
+    A window shortened by a durable chronology gap is not compared with the
+    pre-restart scalar because the populations are intentionally different.
+    Its recovered value is still reported as testimony; the gap itself is the
+    authority for using the latest contiguous suffix.
+    """
     stats = _path_get(detail, "clocks.stats")
     if not isinstance(stats, dict):
         raise ValueError("Better-Buckets replay verification missing canonical stats")
@@ -3550,6 +3646,7 @@ def _verify_better_buckets_replay(
         ("24_hour", PPB_REPLAY_24_HOUR_SECONDS, False),
     )
     checked = 0
+    truncated_comparisons = 0
     comparisons: Dict[str, Any] = {}
     for lane in ("dwt", "vclock", "ocxo1", "ocxo2"):
         lane_out: Dict[str, Any] = {}
@@ -3558,6 +3655,31 @@ def _verify_better_buckets_replay(
                 replay, lane, seconds, exact_second_history=exact
             )
             recorded = _path_get(stats, f"{lane}.ppb_buckets.{key}")
+            truncated = _ppb_replay_window_truncated(replay, seconds)
+
+            if truncated:
+                computed_value = (
+                    round(float(computed), 9) if computed is not None else None
+                )
+                try:
+                    recorded_value = (
+                        round(float(recorded), 9) if recorded is not None else None
+                    )
+                except (TypeError, ValueError):
+                    recorded_value = None
+                lane_out[key] = {
+                    "computed": computed_value,
+                    "recorded": recorded_value,
+                    "delta": (
+                        round(float(computed) - float(recorded), 9)
+                        if computed is not None and recorded_value is not None
+                        else None
+                    ),
+                    "comparison": "SKIPPED_TRUNCATED_CONTIGUOUS_SUFFIX",
+                }
+                truncated_comparisons += 1
+                continue
+
             if computed is None and recorded is None:
                 lane_out[key] = None
                 continue
@@ -3578,11 +3700,163 @@ def _verify_better_buckets_replay(
                 "computed": round(float(computed), 9),
                 "recorded": round(recorded_value, 9),
                 "delta": round(delta, 9),
+                "comparison": "VERIFIED",
             }
             checked += 1
         comparisons[lane] = lane_out
-    return {"checked": checked, "comparisons": comparisons}
+    return {
+        "checked": checked,
+        "truncated_comparisons": truncated_comparisons,
+        "history_truncated": bool(replay.get("history_truncated")),
+        "available_span_seconds": int(replay.get("available_span_seconds") or 0),
+        "available_population_seconds": int(
+            replay.get("available_population_seconds") or 0
+        ),
+        "comparisons": comparisons,
+    }
 
+
+def _discover_better_buckets_target_lineage(
+    rows,
+    *,
+    target_db_id: int,
+    target_update_count: int,
+    lower_sequence: int,
+) -> Dict[str, Any]:
+    """Find the latest contiguous durable suffix owned by the restore target.
+
+    Recovery only needs the newest contiguous Better-Buckets ancestry ending at
+    the exact restore target.  Walking farther left after the first durable gap
+    cannot change any reconstructed rolling window: that gap is already the hard
+    bookend for every restored population.
+
+    ``reset_count`` is not boot-unique and update_count=1 is not guaranteed to
+    become durable.  Therefore the scan still begins at the target and follows
+    actual PostgreSQL insertion order backward.  Exact update_count adjacency is
+    the continuity authority.  A forward durable gap ends the useful scan
+    immediately; an update-count regression fences an older reused-reset
+    lifetime; exact duplicate counts remain fatal.
+
+    Physical CLOCKS sequence normally decreases as this backward walk proceeds.
+    The one lawful rebase is an exact N -> N+1 statistics continuation across
+    Holistic Restore, whose durable proof deliberately survives a physical
+    sequence reset.
+    """
+    target_db_id = int(target_db_id)
+    target_update_count = int(target_update_count)
+    lower_sequence = int(lower_sequence)
+    if target_db_id <= 0 or target_update_count < 0 or lower_sequence < 1:
+        raise ValueError("invalid Better-Buckets lineage discovery target")
+
+    lineage_start_db_id = target_db_id
+    lineage_start_update_count = target_update_count
+    rows_scanned = 0
+    physical_rebase_count = 0
+    target_seen = False
+    newer_db_id = target_db_id
+    newer_update_count: Optional[int] = None
+    newer_physical_sequence: Optional[int] = None
+    boundary: Optional[Dict[str, Any]] = None
+
+    for row in rows:
+        row_id = int(row["id"])
+        update = int(row["update_count"])
+        physical = int(row["physical_sequence"])
+        if update < 0 or physical <= 0:
+            raise ValueError(
+                "Better-Buckets lineage row has invalid identity: "
+                f"id={row_id} update_count={update} physical_sequence={physical}"
+            )
+
+        if not target_seen:
+            if row_id != target_db_id or update != target_update_count:
+                raise ValueError(
+                    "Better-Buckets lineage scan did not begin at restore target: "
+                    f"expected_id={target_db_id} observed_id={row_id} "
+                    f"expected_update={target_update_count} observed_update={update}"
+                )
+            target_seen = True
+            rows_scanned = 1
+            lineage_start_db_id = row_id
+            lineage_start_update_count = update
+            newer_db_id = row_id
+            newer_update_count = update
+            newer_physical_sequence = physical
+            if update <= lower_sequence:
+                break
+            continue
+
+        assert newer_update_count is not None
+        assert newer_physical_sequence is not None
+        update_delta = int(newer_update_count - update)
+        physical_delta = int(newer_physical_sequence - physical)
+
+        if update_delta < 0:
+            # In forward DB order the statistics count fell.  This is the exact
+            # reused-reset_count pathology seen after a fresh Teensy lifetime.
+            boundary = {
+                "reason": "UPDATE_COUNT_REGRESSION",
+                "older_db_id": row_id,
+                "older_update_count": update,
+                "older_physical_sequence": physical,
+                "newer_db_id": newer_db_id,
+                "newer_update_count": int(newer_update_count),
+                "newer_physical_sequence": int(newer_physical_sequence),
+            }
+            break
+
+        if update_delta == 0:
+            raise ValueError(
+                "Better-Buckets durable duplicate update_count while discovering "
+                f"target lineage: older_id={row_id} newer_id={newer_db_id} "
+                f"update_count={update}"
+            )
+
+        if update_delta > 1:
+            # This is the most recent forward durable gap.  Nothing to its left
+            # can contribute to a restored rolling population, so stop here
+            # instead of scanning historical evidence that replay must discard.
+            boundary = {
+                "reason": "DURABLE_FORWARD_GAP",
+                "older_db_id": row_id,
+                "older_update_count": update,
+                "older_physical_sequence": physical,
+                "newer_db_id": newer_db_id,
+                "newer_update_count": int(newer_update_count),
+                "newer_physical_sequence": int(newer_physical_sequence),
+                "expected_sequence": int(update + 1),
+                "observed_sequence": int(newer_update_count),
+                "missing_rows": int(update_delta - 1),
+            }
+            break
+
+        if physical_delta <= 0:
+            # Exact +1 statistics continuity is allowed to cross a physical
+            # sequence rebase created by a successful Holistic Restore.
+            physical_rebase_count += 1
+
+        lineage_start_db_id = row_id
+        lineage_start_update_count = update
+        rows_scanned += 1
+        newer_db_id = row_id
+        newer_update_count = update
+        newer_physical_sequence = physical
+
+        # Once the suffix reaches the oldest sequence needed by the bounded
+        # replay, older ancestry cannot affect any restored window.
+        if update <= lower_sequence:
+            break
+
+    if not target_seen:
+        raise ValueError("Better-Buckets lineage scan returned no restore target row")
+
+    return {
+        "lineage_start_db_detail_id": int(lineage_start_db_id),
+        "lineage_start_update_count": int(lineage_start_update_count),
+        "lineage_scan_rows": int(rows_scanned),
+        "lineage_physical_rebase_count": int(physical_rebase_count),
+        "lineage_boundary": dict(boundary) if boundary is not None else None,
+    }
 
 def _reconstruct_better_buckets_from_db(detail: Dict[str, Any]) -> Dict[str, Any]:
     clocks = _clocks_payload(detail)
@@ -3609,9 +3883,16 @@ def _reconstruct_better_buckets_from_db(detail: Dict[str, Any]) -> Dict[str, Any
             "rolling_sequence": 0,
             "current_sequence": 0,
             "lower_sequence": 0,
+            "effective_lower_sequence": 0,
             "rows_scanned": 0,
+            "rows_scanned_total": 0,
             "admitted_rows": 0,
             "advanced_intervals": 0,
+            "available_span_seconds": 0,
+            "available_population_seconds": 0,
+            "history_truncated": False,
+            "chronology_gap_count": 0,
+            "last_chronology_gap": None,
             "omitted_prefix_interval": False,
             "last_minute_key": 0,
             "origin_valid": False,
@@ -3642,14 +3923,19 @@ def _reconstruct_better_buckets_from_db(detail: Dict[str, Any]) -> Dict[str, Any
     with open_db(row_dict=True) as conn:
         conn.execute("SET TRANSACTION READ ONLY")
 
-        # reset_count is only unique inside one Teensy boot lifetime.  A later
-        # reboot can reuse the same value, so first bind replay to the durable
-        # statistics epoch containing the target row.  The nearest preceding
-        # update_count=1 row is that epoch's birth certificate.
-        birth_cur = conn.cursor()
-        birth_cur.execute(
+        # Discover only the latest contiguous target-owned suffix.  The first
+        # durable gap encountered while walking backward is already the hard left
+        # boundary for every rolling window, so scanning older history would add
+        # latency without changing the reconstructed state.
+        lineage_started = time.monotonic()
+        lineage_cur = conn.cursor(name="clocks_ppb_lineage_scan")
+        lineage_cur.itersize = PPB_REPLAY_CURSOR_ITERSIZE
+        lineage_cur.execute(
             """
-            SELECT id
+            SELECT
+                id,
+                sequence::bigint AS physical_sequence,
+                (payload #>> '{clocks,stats,update_count}')::bigint AS update_count
             FROM campaign_detail
             WHERE campaign_type = %s
               AND id <= %s
@@ -3657,9 +3943,7 @@ def _reconstruct_better_buckets_from_db(detail: Dict[str, Any]) -> Dict[str, Any
               AND payload #>> '{schema}' = 'CLOCKS_V4'
               AND payload #>> '{clocks,stats,schema}' = 'CLOCKS_INSTRUMENT_STATS_V4'
               AND (payload #>> '{clocks,stats,reset_count}')::bigint = %s
-              AND (payload #>> '{clocks,stats,update_count}')::bigint = 1
             ORDER BY id DESC
-            LIMIT 1
             """,
             (
                 CAMPAIGN_TYPE_TEMPEST,
@@ -3667,15 +3951,20 @@ def _reconstruct_better_buckets_from_db(detail: Dict[str, Any]) -> Dict[str, Any
                 int(reset_count),
             ),
         )
-        birth_row = birth_cur.fetchone()
-        if birth_row is None:
-            raise ValueError(
-                "Better-Buckets durable epoch birth missing: "
-                f"reset_count={reset_count} target_db_id={target_db_id} "
-                f"target_update_count={update_count}"
-            )
-        birth_db_id = int(birth_row["id"])
+        lineage = _discover_better_buckets_target_lineage(
+            lineage_cur,
+            target_db_id=int(target_db_id),
+            target_update_count=int(update_count),
+            lower_sequence=int(lower_sequence),
+        )
+        lineage_scan_s = time.monotonic() - lineage_started
+        lineage_start_db_id = int(lineage["lineage_start_db_detail_id"])
+        lineage_start_update_count = int(lineage["lineage_start_update_count"])
+        replay_lower_sequence = max(
+            int(lower_sequence), int(lineage_start_update_count)
+        )
 
+        replay_started = time.monotonic()
         cur = conn.cursor(name="clocks_ppb_restore_stream")
         cur.itersize = PPB_REPLAY_CURSOR_ITERSIZE
         cur.execute(
@@ -3707,26 +3996,95 @@ def _reconstruct_better_buckets_from_db(detail: Dict[str, Any]) -> Dict[str, Any
             """,
             (
                 CAMPAIGN_TYPE_TEMPEST,
-                int(birth_db_id),
+                int(lineage_start_db_id),
                 int(target_db_id),
                 int(reset_count),
-                int(lower_sequence),
+                int(replay_lower_sequence),
                 int(current_sequence),
             ),
         )
         replay = _replay_better_buckets_rows(
             cur,
-            lower_sequence=int(lower_sequence),
+            lower_sequence=int(replay_lower_sequence),
             target_update_count=int(update_count),
             target_current_sequence=int(current_sequence),
         )
+        replay_scan_s = time.monotonic() - replay_started
+
+    # Preserve the nominal requested horizon separately from the effective
+    # suffix start.  If discovery stopped to the right of requested_lower, the
+    # omitted prefix is unavailable durable ancestry exactly like a replay-time
+    # chronology gap and must truncate any window that would cross it.
+    replay["lower_sequence"] = int(lower_sequence)
+    replay["effective_lower_sequence"] = max(
+        int(replay.get("effective_lower_sequence") or 0),
+        int(lineage_start_update_count),
+    )
+    prefix_truncated = int(lineage_start_update_count) > int(lower_sequence)
+    if prefix_truncated:
+        boundary = lineage.get("lineage_boundary")
+        if isinstance(boundary, dict) and boundary.get("reason") == "DURABLE_FORWARD_GAP":
+            prefix_gap = {
+                "expected_sequence": int(
+                    boundary.get("expected_sequence")
+                    or (int(boundary.get("older_update_count") or 0) + 1)
+                ),
+                "observed_sequence": int(
+                    boundary.get("observed_sequence")
+                    or lineage_start_update_count
+                ),
+                "missing_rows": int(
+                    boundary.get("missing_rows")
+                    or max(0, lineage_start_update_count - lower_sequence)
+                ),
+            }
+        else:
+            prefix_gap = {
+                "expected_sequence": int(lower_sequence),
+                "observed_sequence": int(lineage_start_update_count),
+                "missing_rows": int(lineage_start_update_count - lower_sequence),
+            }
+        replay["history_truncated"] = True
+        replay["chronology_gap_count"] = (
+            int(replay.get("chronology_gap_count") or 0) + 1
+        )
+        if replay.get("last_chronology_gap") is None:
+            replay["last_chronology_gap"] = prefix_gap
 
     replay["reset_count"] = int(reset_count)
-    replay["source_epoch_birth_db_detail_id"] = int(birth_db_id)
+    replay["source_lineage_start_db_detail_id"] = int(lineage_start_db_id)
+    replay["source_lineage_start_update_count"] = int(lineage_start_update_count)
+    replay["lineage_scan_rows"] = int(lineage.get("lineage_scan_rows") or 0)
+    replay["lineage_scan_s"] = round(float(lineage_scan_s), 3)
+    replay["replay_scan_s"] = round(float(replay_scan_s), 3)
+    replay["lineage_physical_rebase_count"] = int(
+        lineage.get("lineage_physical_rebase_count") or 0
+    )
+    replay["lineage_boundary"] = copy.deepcopy(lineage.get("lineage_boundary"))
     replay["source_db_detail_id"] = int(target_db_id)
     replay["verification"] = _verify_better_buckets_replay(detail, replay)
+    if replay.get("lineage_boundary"):
+        logging.warning(
+            "⚠️ [holistic restore] Better-Buckets target suffix bounded by durable "
+            "chronology: start_id=%d start_update=%d scan_rows=%d scan_s=%.3f "
+            "boundary=%s",
+            int(replay.get("source_lineage_start_db_detail_id") or 0),
+            int(replay.get("source_lineage_start_update_count") or 0),
+            int(replay.get("lineage_scan_rows") or 0),
+            float(replay.get("lineage_scan_s") or 0.0),
+            replay.get("lineage_boundary"),
+        )
+    if replay.get("history_truncated"):
+        logging.warning(
+            "⚠️ [holistic restore] Better-Buckets durable gap accepted as rolling "
+            "history boundary: requested_lower=%d effective_lower=%d "
+            "available_population=%ds last_gap=%s",
+            int(replay.get("lower_sequence") or 0),
+            int(replay.get("effective_lower_sequence") or 0),
+            int(replay.get("available_population_seconds") or 0),
+            replay.get("last_chronology_gap"),
+        )
     return replay
-
 
 def _supersede_cold_bootstrap_rows(
     *,
@@ -3917,8 +4275,38 @@ def _stage_teensy_better_buckets(replay: Dict[str, Any]) -> Dict[str, Any]:
             "waited_s": round(time.monotonic() - started, 3),
             "teensy": commit_payload,
             "replay_rows": int(replay.get("rows_scanned") or 0),
+            "replay_rows_scanned_total": int(
+                replay.get("rows_scanned_total") or replay.get("rows_scanned") or 0
+            ),
+            "source_lineage_start_db_detail_id": int(
+                replay.get("source_lineage_start_db_detail_id") or 0
+            ),
+            "source_lineage_start_update_count": int(
+                replay.get("source_lineage_start_update_count") or 0
+            ),
+            "lineage_scan_rows": int(replay.get("lineage_scan_rows") or 0),
+            "lineage_scan_s": float(replay.get("lineage_scan_s") or 0.0),
+            "replay_scan_s": float(replay.get("replay_scan_s") or 0.0),
+            "lineage_physical_rebase_count": int(
+                replay.get("lineage_physical_rebase_count") or 0
+            ),
+            "lineage_boundary": copy.deepcopy(replay.get("lineage_boundary")),
+            "history_truncated": bool(replay.get("history_truncated")),
+            "chronology_gap_count": int(replay.get("chronology_gap_count") or 0),
+            "effective_lower_sequence": int(
+                replay.get("effective_lower_sequence") or 0
+            ),
+            "available_span_seconds": int(
+                replay.get("available_span_seconds") or 0
+            ),
+            "available_population_seconds": int(
+                replay.get("available_population_seconds") or 0
+            ),
             "verification_checks": int(
                 (replay.get("verification") or {}).get("checked") or 0
+            ),
+            "verification_truncated_comparisons": int(
+                (replay.get("verification") or {}).get("truncated_comparisons") or 0
             ),
         }
     except Exception:
@@ -4505,13 +4893,30 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
         ppb_replay = _reconstruct_better_buckets_from_db(detail)
         ppb_stage = _stage_teensy_better_buckets(ppb_replay)
         logging.info(
-            "♻️ [holistic restore] Better-Buckets replay: rows=%d admitted=%d "
-            "second=%d minute=%d checks=%d stage_s=%s",
+            "♻️ [holistic restore] Better-Buckets replay: rows=%d/%d admitted=%d "
+            "second=%d minute=%d lineage_start=%d/%d lineage_scan=%d "
+            "lineage_s=%.3f replay_s=%.3f rebases=%d gaps=%d effective_lower=%d "
+            "available=%ds checks=%d truncated_checks=%d stage_s=%s",
             int(ppb_replay.get("rows_scanned") or 0),
+            int(ppb_replay.get("rows_scanned_total") or 0),
             int(ppb_replay.get("admitted_rows") or 0),
             len(ppb_replay.get("second_history") or []),
             len(ppb_replay.get("minute_history") or []),
+            int(ppb_replay.get("source_lineage_start_db_detail_id") or 0),
+            int(ppb_replay.get("source_lineage_start_update_count") or 0),
+            int(ppb_replay.get("lineage_scan_rows") or 0),
+            float(ppb_replay.get("lineage_scan_s") or 0.0),
+            float(ppb_replay.get("replay_scan_s") or 0.0),
+            int(ppb_replay.get("lineage_physical_rebase_count") or 0),
+            int(ppb_replay.get("chronology_gap_count") or 0),
+            int(ppb_replay.get("effective_lower_sequence") or 0),
+            int(ppb_replay.get("available_population_seconds") or 0),
             int((ppb_replay.get("verification") or {}).get("checked") or 0),
+            int(
+                (ppb_replay.get("verification") or {}).get(
+                    "truncated_comparisons"
+                ) or 0
+            ),
             ppb_stage.get("waited_s"),
         )
 
@@ -10566,7 +10971,9 @@ def _check_preflight(
             latest = copy.deepcopy(_latest_clocks)
         gnss = latest.get("gnss") if isinstance(latest.get("gnss"), dict) else {}
         if not gnss:
-            reasons.append("SYSTEM.REPORT GNSS context unavailable")
+            reasons.append(
+                "canonical CLOCKS live GNSS telemetry not yet populated from SYSTEM.REPORT"
+            )
         else:
             if not gnss.get("time_valid"):
                 reasons.append("GNSS time not valid (no satellite time/date)")
@@ -10663,7 +11070,8 @@ def _wait_for_preflight(
     """Wait quietly until the unified CLOCKS readiness profile is open.
 
     Readiness is polled frequently so startup proceeds promptly.  The log is
-    intentionally sparse: no normal-path success line, and while blocked only
+    intentionally sparse: no success line when the gate is immediately open.
+    After a logged wait, emit one admission summary; while blocked, emit only
     one compact pending summary after the grace period, when the pending set
     changes, or once per status interval.
     """
@@ -10693,8 +11101,13 @@ def _wait_for_preflight(
             }
             if logged_wait:
                 logging.info(
-                    "%s prerequisites ready for %s after %.1fs",
-                    PREFLIGHT_LOG_PREFIX, context, elapsed,
+                    "%s %s admitted after %.1fs: %s features NOMINAL; "
+                    "CLOCKS heartbeat fresh; SYSTEM.REPORT live GNSS telemetry ready; "
+                    "chrony PPS selected",
+                    PREFLIGHT_LOG_PREFIX,
+                    context,
+                    elapsed,
+                    FEATURE_PREFLIGHT_PROFILE,
                 )
             return
 
