@@ -165,6 +165,7 @@ static constexpr bool OCXO2_DISABLED = false;
 static bool g_interrupt_hw_ready = false;
 static bool g_interrupt_runtime_ready = false;
 static bool g_interrupt_irqs_enabled = false;
+static bool g_photodiode_physical_irq_installed = false;
 volatile bool g_process_interrupt_foreground_pending = false;
 
 struct interrupt_isr_runtime_diag_t {
@@ -5191,6 +5192,14 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
       interrupt_execution_source_t::PPS, isr_entry_dwt_raw, arrival);
 }
 
+static void photodiode_gpio_isr(void) {
+  // Pin 34 currently shares IRQ_GPIO6789 with sovereign PPS.  Keep this entry
+  // microscopic: capture DWT immediately and hand the immutable edge fact to
+  // the dedicated high-rate PHOTODIODE custody path.
+  const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;
+  process_interrupt_photodiode_gpio_irq(isr_entry_dwt_raw);
+}
+
 static void pps_gpio_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;
   const interrupt_arrival_capture_t arrival =
@@ -6395,6 +6404,19 @@ void process_interrupt_enable_irqs(void) {
 
   pinMode(GNSS_PPS_PIN, INPUT);
   attachInterrupt(digitalPinToInterrupt(GNSS_PPS_PIN), pps_gpio_isr, RISING);
+
+  // Bring-up PHOTODIODE path. Pin 34 is physically independent at the GPIO pin
+  // but shares the Arduino GPIO6789 NVIC vector with PPS. The shared vector
+  // therefore remains Priority 0; independent lower-priority enforcement is
+  // not yet available. This is sufficient to exercise real pin-34 custody
+  // during emulator bring-up while keeping the limitation explicit in reports.
+  pinMode(PHOTODIODE_EDGE_PIN, INPUT);
+  attachInterrupt(
+      digitalPinToInterrupt(PHOTODIODE_EDGE_PIN),
+      photodiode_gpio_isr,
+      RISING);
+  g_photodiode_physical_irq_installed = true;
+
   NVIC_SET_PRIORITY(IRQ_GPIO6789, INTERRUPT_PRIORITY_SCIENCE);
   g_interrupt_irqs_enabled = true;
   interrupt_priority_verify_live();
@@ -6634,10 +6656,9 @@ static FLASHMEM void add_photodiode_report(Payload& payload,
   add_u32("last_isr_entry_primask", diag.last_isr_entry_primask);
   add_u32("last_isr_entry_ipsr", diag.last_isr_entry_ipsr);
 
-  // Pin 34 currently shares the Arduino GPIO6789 NVIC vector used by PPS.
-  // Until a separate lower-priority physical entry path is installed, do not
-  // claim that the photodiode has an independently enforceable NVIC priority.
-  add_bool("physical_irq_installed", false);
+  // Pin 34 is physically installed, but it still shares the Arduino GPIO6789
+  // NVIC vector and therefore the Priority-0 execution class used by PPS.
+  add_bool("physical_irq_installed", g_photodiode_physical_irq_installed);
   add_bool("shared_gpio6789_vector_with_pps", true);
   add_bool("independent_priority_ready", false);
   add_string("dispatch_class", "SYNCHRONOUS_HIGH_RATE_ISR_SAFE_CALLBACK");
@@ -6687,7 +6708,8 @@ static FLASHMEM Payload cmd_report_priorities(const Payload&) {
   payload.add("photodiode_kind", "PHOTODIODE");
   payload.add("photodiode_provider", "GPIO6789");
   payload.add("photodiode_lane", "GPIO_PHOTODIODE_EDGE");
-  payload.add("photodiode_physical_irq_installed", false);
+  payload.add("photodiode_physical_irq_installed",
+              g_photodiode_physical_irq_installed);
   payload.add("photodiode_shared_gpio6789_vector_with_pps", true);
   payload.add("photodiode_independent_priority_ready", false);
   add_irq_priority_report(

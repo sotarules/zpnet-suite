@@ -1172,7 +1172,7 @@ interrupt_pps_edge_heartbeat_t interrupt_pps_edge_heartbeat(void);
 //
 // The PD200T comparator is not an ordinary foreground subscriber.  Its edge
 // rate may approach hundreds of kHz, so its callback runs synchronously from
-// the eventual photodiode GPIO ISR after the first-instruction DWT capture.
+// the physical pin-34 GPIO ISR after the first-instruction DWT capture.
 // The callback must remain bounded, allocation-free, and ISR-safe.  It may hand
 // the immutable edge fact to process_photons, but process_interrupt owns the
 // physical interrupt and capture coordinate.
@@ -1246,8 +1246,10 @@ void interrupt_photodiode_unsubscribe(void);
 // scalar diagnostic surface monotonically from its single GPIO source.
 bool interrupt_photodiode_snapshot(interrupt_photodiode_diag_t* out);
 
-// ISR custody boundary used by the eventual pin-34 hardware vector and by
-// deterministic synthetic-edge tests. Caller supplies the first-instruction
+// ISR custody boundary used by the installed pin-34 GPIO path and by
+// deterministic synthetic-edge tests. Pin 34 currently shares IRQ_GPIO6789
+// with PPS, so the physical vector remains Priority 0 until a future independent
+// lower-priority entry path is available. Caller supplies the first-instruction
 // ARM_DWT_CYCCNT value; this function never rereads DWT as event identity.
 void process_interrupt_photodiode_gpio_irq(uint32_t isr_entry_dwt_raw);
 

@@ -20,6 +20,16 @@
 // They exist to validate custody and transport before the final pulse-train,
 // lap, timeout, statistics, recovery, and LANTERN campaign model is installed.
 //
+// Temporary bring-up emulator:
+//   • pin 33 is a detector-emulator output physically looped to pin 34;
+//   • process_interrupt still timestamps the resulting real pin-34 GPIO edge;
+//   • PHOTONS emits real short LD_ON launch pulses and schedules 3-5 synthetic
+//     ~4.9 us returns through TimePop;
+//   • one expected return is omitted at the end of each train before relaunch;
+//   • pin 38/A14 MON telemetry is synthesized and is not ADC-read while the
+//     emulator is installed.
+//   • the emulator is always on and independent of campaign state.
+//
 // Commands:
 //   • INIT   — reinitialize PHOTONS-owned optical hardware; laser is inhibited
 //   • REPORT — unified laser, PD200T, interrupt, and toy-measurement report
@@ -70,7 +80,8 @@ struct photons_toy_fragment_t {
 };
 
 // Initialize PHOTONS runtime state, subscribe to the process_interrupt
-// PHOTODIODE lane, start that lane, and arm the 1 Hz toy fragment publisher.
+// PHOTODIODE lane, start that lane, arm the 1 Hz toy fragment publisher, and
+// start the temporary always-on detector emulator.
 // Must run after process_interrupt_init() and timepop_init().
 void process_photons_init(void);
 
