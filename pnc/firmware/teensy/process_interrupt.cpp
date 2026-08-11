@@ -14,10 +14,7 @@
 // Priority 16 owns the shared QTimer1 capture vector:
 //   * native VCLOCK CH0 and TimePop CH2 necessarily share one NVIC priority;
 //   * Priority 0 science captures may preempt this vector;
-//   * ordinary QTimer1 work captures/defuses only and pends Priority 32;
-//   * TimePop PRECISE is the explicit white-glove exception: after a lawful
-//     CH2 rendezvous is defused, TimePop may remain in Priority 16, SpinDry to
-//     an authored DWT target, and synchronously invoke one bounded ISR callback.
+//   * QTimer1 captures/defuses only and pends Priority 32 continuation.
 //
 // Priority 32 owns continuation:
 //   * the native VCLOCK heartbeat extends all three 16-bit timer domains;
@@ -29,8 +26,7 @@
 //   * immutable CH2 and subscriber work is transferred to foreground-owned
 //     service without entering TimePop or invoking application behavior.
 //
-// Foreground owns ordinary TimePop scheduling policy and application callbacks.
-// The sole exception is the explicitly armed PRECISE/SpinDry execution class.
+// Foreground owns TimePop scheduling policy and all application callbacks.
 //
 // There is no alternative endpoint estimator, repair candidate, FloorLine, or
 // alternative publication court in this module.  OCXO compare custody is 1 Hz;
@@ -2384,18 +2380,6 @@ static volatile uint32_t g_qtimer1_ch2_target_mismatch_count = 0U;
 static volatile uint32_t g_qtimer1_ch2_unexpected_capture_count = 0U;
 static volatile interrupt_qtimer1_ch1_handler_fn g_qtimer1_ch1_handler = nullptr;
 
-// TimePop PRECISE rendezvous hook.  This is intentionally a single scalar
-// binding rather than another subscriber lane: it is entered synchronously
-// from IRQ_QTIMER1 at Priority 16 after CH2 hardware identity has been proven
-// and defused.  Priority-0 science remains able to preempt the entire call.
-static volatile interrupt_timepop_precise_rendezvous_fn
-    g_timepop_precise_rendezvous_handler = nullptr;
-static volatile uint32_t g_timepop_precise_rendezvous_attempt_count = 0U;
-static volatile uint32_t g_timepop_precise_rendezvous_consumed_count = 0U;
-static volatile uint32_t g_timepop_precise_rendezvous_fallthrough_count = 0U;
-static volatile uint32_t g_timepop_precise_rendezvous_last_target_counter32 = 0U;
-static volatile uint32_t g_timepop_precise_rendezvous_last_isr_entry_dwt_raw = 0U;
-
 static volatile bool g_pps_relay_active = false;
 static volatile uint32_t g_pps_relay_countdown_cells = 0U;
 static volatile uint32_t g_pps_relay_assert_count = 0U;
@@ -2416,16 +2400,6 @@ void interrupt_register_qtimer1_ch1_handler(
       interrupt_callback_address_executable((uintptr_t)callback)
           ? callback
           : nullptr;
-}
-
-void interrupt_register_timepop_precise_rendezvous_handler(
-    interrupt_timepop_precise_rendezvous_fn callback) {
-  const uint32_t prior = interrupt_priority0_guard_enter();
-  g_timepop_precise_rendezvous_handler =
-      interrupt_callback_address_executable((uintptr_t)callback)
-          ? callback
-          : nullptr;
-  interrupt_priority0_guard_exit(prior);
 }
 
 bool interrupt_qtimer1_ch1_arm_compare(uint32_t) {
@@ -4974,39 +4948,15 @@ qtimer1_service_ch2_flag_priority16(uint32_t isr_entry_dwt_raw,
   const uint32_t target_counter32 =
       g_qtimer1_ch2_armed_target_counter32;
 
-  // Seize and defuse the physically proven CH2 identity before either execution
-  // class is entered.  While this Priority-16 handler is active, foreground and
-  // Priority 32 cannot run; Priority 0 remains deliberately unmasked.
+  // Transfer the physically armed identity into one-shot fact custody before
+  // any lower execution class can author another target.
   g_qtimer1_ch2_compare_armed = false;
   g_qtimer1_ch2_armed_target_counter32 = 0U;
   g_qtimer1_ch2_armed_target_low16 = 0U;
+  g_qtimer1_ch2_fact_outstanding = true;
   dmb_barrier();
   qtimer1_defuse_timepop_priority16();
   g_qtimer1_ch2_valid_capture_count++;
-
-  // PRECISE is an explicit Priority-16 exception to the ordinary immutable-fact
-  // handoff.  TimePop may recognize this CH2 target as a coarse rendezvous,
-  // SpinDry to its finer DWT target, and invoke the bounded PRECISE callback
-  // synchronously.  true means TimePop consumed this rendezvous completely;
-  // no conventional CH2 fact is authored for the same hardware edge.
-  const interrupt_timepop_precise_rendezvous_fn precise_handler =
-      g_timepop_precise_rendezvous_handler;
-  if (interrupt_callback_address_executable((uintptr_t)precise_handler)) {
-    g_timepop_precise_rendezvous_attempt_count++;
-    g_timepop_precise_rendezvous_last_target_counter32 = target_counter32;
-    g_timepop_precise_rendezvous_last_isr_entry_dwt_raw = isr_entry_dwt_raw;
-    if (precise_handler(target_counter32, isr_entry_dwt_raw)) {
-      g_timepop_precise_rendezvous_consumed_count++;
-      return false;
-    }
-    g_timepop_precise_rendezvous_fallthrough_count++;
-  }
-
-  // Conventional CH2 custody is unchanged when PRECISE does not claim the
-  // rendezvous.  Publish fact_outstanding before handing the immutable packet
-  // to Priority 32 so lower execution classes cannot replace its identity.
-  g_qtimer1_ch2_fact_outstanding = true;
-  dmb_barrier();
 
   ch2_capture_packet_t packet{};
   packet.isr_entry_dwt_raw = isr_entry_dwt_raw;
@@ -6805,21 +6755,6 @@ static FLASHMEM Payload cmd_report_status(const Payload&) {
               INTERRUPT_PRIORITY_VCLOCK_TIMEPOP);
   payload.add("priority32_continuation",
               INTERRUPT_PRIORITY_CONTINUATION);
-  payload.add("timepop_precise_priority", INTERRUPT_PRIORITY_VCLOCK_TIMEPOP);
-  payload.add("timepop_precise_priority0_preemptable", true);
-  payload.add("timepop_precise_rendezvous_hook_registered",
-              interrupt_callback_address_executable(
-                  (uintptr_t)g_timepop_precise_rendezvous_handler));
-  payload.add("timepop_precise_rendezvous_attempt_count",
-              (uint32_t)g_timepop_precise_rendezvous_attempt_count);
-  payload.add("timepop_precise_rendezvous_consumed_count",
-              (uint32_t)g_timepop_precise_rendezvous_consumed_count);
-  payload.add("timepop_precise_rendezvous_fallthrough_count",
-              (uint32_t)g_timepop_precise_rendezvous_fallthrough_count);
-  payload.add("timepop_precise_rendezvous_last_target_counter32",
-              (uint32_t)g_timepop_precise_rendezvous_last_target_counter32);
-  payload.add("timepop_precise_rendezvous_last_isr_entry_dwt_raw",
-              (uint32_t)g_timepop_precise_rendezvous_last_isr_entry_dwt_raw);
   payload.add("basepri_science_guard",
               INTERRUPT_PRIORITY0_PRESERVING_BASEPRI);
   payload.add("priority_readback_all_match",
