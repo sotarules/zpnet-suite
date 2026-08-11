@@ -22,6 +22,9 @@
 //   • absolute scheduling        — timepop_arm_at(target_gnss_ns, ...)
 //   • anchor-relative scheduling — timepop_arm_from_anchor(anchor_gnss_ns, offset_gnss_ns, ...)
 //   • caller-owned exact path    — timepop_arm_ns(target_gnss_ns, target_dwt, ...)
+//   • PRECISE / SpinDry          — timepop_arm_precise(target_gnss_ns, target_dwt, ...)
+//     CH2 is an early Priority-16 rendezvous only; the authored DWT target is
+//     the fine appointment.  Priority-0 science may preempt the spin/callback.
 //   • timed slot priority       — lower numeric priority runs first when
 //     multiple timed slots share one captured CH2 fire fact. ASAP/ALAP are
 //     fixed deferred lanes and intentionally do not participate.
@@ -62,10 +65,11 @@
 //
 // Dispatch timing:
 //
-//   process_interrupt owns QTimer1 hardware.  Priority 16 captures/defuses the
-//   shared QTimer1 CH2 event, Priority 32 transfers its normalized fact into a
-//   process_interrupt-owned foreground mailbox, and the ordinary loop then
-//   invokes TimePop with that immutable counter/DWT event identity.
+//   process_interrupt owns QTimer1 hardware.  Ordinary Priority-16 CH2 events
+//   are captured/defused and transferred through Priority 32 into foreground.
+//   PRECISE is the explicit exception: a registered TimePop rendezvous hook may
+//   consume a proven CH2 target in Priority 16, SpinDry to target_dwt, and call
+//   one bounded ISR-safe callback before returning to process_interrupt.
 //   TimePop uses the foreground-delivered event fact to expire slots.
 //   It does not reinterpret PPS/VCLOCK phase and it does not read timer
 //   hardware directly.
@@ -124,6 +128,18 @@ static constexpr uint32_t MIN_DELAY_TICKS = 2;
 // A deadline closer than this is treated as already missed/too-close;
 // TimePop must not arm CH2 at-or-inside the hardware race window.
 static constexpr uint32_t SCHEDULE_MIN_ARM_LEAD_TICKS = 64;
+// PRECISE uses CH2 only as an early rendezvous.  Sixteen VCLOCK ticks leaves
+// roughly 1.6 us for Priority-16 entry/validation before SpinDry reaches the
+// caller-owned DWT target.  The rendezvous itself still obeys the physical CH2
+// programming margin; the final DWT target does not pass through that court.
+static constexpr uint32_t PRECISE_RENDEZVOUS_LEAD_TICKS = 16U;
+// A PRECISE callback already executing at Priority 16 may author a follow-up
+// whose rendezvous is too close for CH2.  Keep such direct SpinDry continuations
+// bounded to about 20 us so PRECISE cannot accidentally become a permanent ISR.
+static constexpr uint32_t PRECISE_MAX_DIRECT_SPIN_CYCLES =
+    (uint32_t)DWT_EXPECTED_PER_PPS / 50000U;
+static_assert(PRECISE_MAX_DIRECT_SPIN_CYCLES != 0U,
+              "PRECISE direct spin budget must be nonzero");
 static constexpr uint32_t HEARTBEAT_TICKS = 10000;
 static constexpr uint32_t PREDICT_MAX_QTIMER_ELAPSED = 15000000U;
 static constexpr uint32_t ONE_HZ_TICKS = 10000000U;
@@ -259,6 +275,15 @@ struct timepop_slot_t {
 
   uint32_t            predicted_dwt;
   bool                prediction_valid;
+
+  // PRECISE/SpinDry identity.  For a PRECISE slot, deadline is the coarse CH2
+  // rendezvous, precise_target_counter32 is the VCLOCK lattice coordinate of
+  // the requested event, and predicted_dwt is the authoritative fine target.
+  bool                precise;
+  bool                precise_direct;
+  uint32_t            precise_target_counter32;
+  uint32_t            precise_rendezvous_lead_ticks;
+
   bool                isr_callback;
   bool                isr_callback_fired;
   bool                rearm_in_isr;
@@ -889,6 +914,34 @@ static volatile uint32_t diag_isr_callbacks      = 0;
 static volatile uint32_t diag_isr_recurring_rearmed = 0;
 static volatile uint32_t diag_isr_recurring_rearm_failures = 0;
 
+// PRECISE / SpinDry diagnostics are intentionally separate from conventional
+// CH2 pressure.  A final DWT target is never condemned by the 64-tick scheduler
+// race court; only its coarse rendezvous must be physically armable.
+static volatile bool     g_precise_priority16_active = false;
+static volatile int64_t  g_precise_current_target_gnss_ns = -1;
+static volatile uint32_t g_precise_current_target_counter32 = 0U;
+static volatile bool     g_precise_reconcile_pending = false;
+static volatile uint32_t diag_precise_arm_count = 0U;
+static volatile uint32_t diag_precise_arm_failures = 0U;
+static volatile uint32_t diag_precise_dispatch_context_reject_count = 0U;
+static volatile uint32_t diag_precise_direct_arm_count = 0U;
+static volatile uint32_t diag_precise_rendezvous_count = 0U;
+static volatile uint32_t diag_precise_rendezvous_miss_count = 0U;
+static volatile uint32_t diag_precise_rendezvous_collision_count = 0U;
+static volatile uint32_t diag_precise_callback_count = 0U;
+static volatile uint32_t diag_precise_late_callback_count = 0U;
+static volatile uint32_t diag_precise_max_late_cycles = 0U;
+static volatile uint32_t diag_precise_last_target_dwt = 0U;
+static volatile uint32_t diag_precise_last_callback_dwt = 0U;
+static volatile int32_t  diag_precise_last_error_cycles = 0;
+static volatile uint32_t diag_precise_last_rendezvous_counter32 = 0U;
+static volatile uint32_t diag_precise_last_rendezvous_isr_dwt = 0U;
+static volatile uint32_t diag_precise_priority16_rearm_count = 0U;
+static volatile uint32_t diag_precise_priority16_heartbeat_rearm_count = 0U;
+static volatile uint32_t diag_precise_priority16_reconcile_count = 0U;
+static volatile uint32_t diag_precise_orphan_direct_count = 0U;
+static volatile const char* diag_precise_last_failure = nullptr;
+
 static volatile uint32_t diag_schedule_next_calls_total = 0;
 static volatile uint32_t diag_schedule_next_calls_from_dispatch = 0;
 static volatile uint32_t diag_schedule_next_calls_from_other = 0;
@@ -1134,6 +1187,17 @@ struct timepop_health_snapshot_t {
 // conceptual layer without C++ declaration-order surprises.
 
 static void schedule_next(void);
+static bool timepop_precise_rendezvous_priority16(
+    uint32_t rendezvous_counter32,
+    uint32_t isr_entry_dwt_raw);
+static void timepop_precise_rearm_priority16(void);
+static timepop_handle_t arm_precise_slot_internal(
+    int64_t target_gnss_ns,
+    uint32_t target_dwt,
+    timepop_callback_t callback,
+    void* user_data,
+    const char* name,
+    timepop_priority_t priority);
 
 static void timepop_record_anchor_snapshot(const time_anchor_snapshot_t& snap,
                                            const char* context);
@@ -2848,6 +2912,437 @@ static inline void ch2_arm_compare(uint32_t target_counter32) {
 }
 
 // ============================================================================
+// PRECISE / SpinDry helpers
+// ============================================================================
+
+static inline bool precise_dwt_future(uint32_t target_dwt,
+                                      uint32_t now_dwt,
+                                      uint32_t& distance_cycles) {
+  distance_cycles = target_dwt - now_dwt;
+  return distance_cycles != 0U && distance_cycles <= 0x7FFFFFFFUL;
+}
+
+static inline bool precise_rendezvous_future_and_safe(uint32_t rendezvous,
+                                                      uint32_t now_counter32) {
+  const uint32_t distance = rendezvous - now_counter32;
+  return distance != 0U &&
+      distance <= MAX_DELAY_TICKS &&
+      distance >= SCHEDULE_MIN_ARM_LEAD_TICKS;
+}
+
+static void precise_cancel_slot(timepop_slot_t& slot, const char* reason) {
+  if (!slot.active || !slot.precise) return;
+  slot = {};
+  diag_precise_rendezvous_miss_count++;
+  diag_precise_last_failure = reason;
+}
+
+static bool precise_has_conventional_collision(uint32_t rendezvous) {
+  for (uint32_t i = 0U; i < MAX_SLOTS; ++i) {
+    if (!slots[i].active || slots[i].expired) continue;
+    if (slots[i].precise) continue;
+    if (slots[i].deadline == rendezvous) return true;
+  }
+  return false;
+}
+
+static uint32_t precise_select_priority16_slot(uint32_t rendezvous_counter32,
+                                               bool direct_only,
+                                               uint32_t& selected_distance) {
+  const uint32_t now_dwt = ARM_DWT_CYCCNT;
+  uint32_t best = MAX_SLOTS;
+  uint32_t best_distance = UINT32_MAX;
+
+  for (uint32_t i = 0U; i < MAX_SLOTS; ++i) {
+    if (!slots[i].active || slots[i].expired || !slots[i].precise) continue;
+    if (direct_only) {
+      if (!slots[i].precise_direct) continue;
+    } else {
+      if (slots[i].precise_direct ||
+          slots[i].deadline != rendezvous_counter32) {
+        continue;
+      }
+    }
+
+    const uint32_t distance = slots[i].predicted_dwt - now_dwt;
+    // A rendezvous may legitimately arrive after target_dwt because Priority 0
+    // preempted the spin lane.  Treat already-past targets as immediately due;
+    // they are still called and their positive lateness becomes testimony.
+    const bool future = distance != 0U && distance <= 0x7FFFFFFFUL;
+    const uint32_t ordering_distance = future ? distance : 0U;
+    if (best == MAX_SLOTS || ordering_distance < best_distance) {
+      best = i;
+      best_distance = ordering_distance;
+    }
+  }
+
+  selected_distance = best == MAX_SLOTS ? 0U : best_distance;
+  return best;
+}
+
+static void precise_build_ctx_diag(const timepop_slot_t& slot,
+                                   uint32_t callback_dwt,
+                                   uint32_t isr_entry_dwt_raw,
+                                   timepop_ctx_t& ctx,
+                                   timepop_diag_t& diag) {
+  ctx.handle = slot.handle;
+  ctx.fire_vclock_raw = slot.precise_target_counter32;
+  ctx.fire_dwt_cyccnt = callback_dwt;
+  ctx.deadline = slot.precise_target_counter32;
+  ctx.fire_gnss_error_ns = 0;
+  ctx.fire_gnss_ns = slot.target_gnss_ns;
+
+  diag.dwt_at_isr_entry = isr_entry_dwt_raw;
+  diag.dwt_at_fire = callback_dwt;
+  diag.predicted_dwt = slot.predicted_dwt;
+  diag.prediction_valid = true;
+  diag.spin_error_cycles = (int32_t)(callback_dwt - slot.predicted_dwt);
+  diag.anchor_pps_count = slot.anchor_pps_count;
+  diag.anchor_qtimer_at_pps = slot.anchor_qtimer_at_pps;
+  diag.anchor_dwt_at_pps = slot.anchor_dwt_at_pps;
+  diag.anchor_dwt_cycles_per_s = slot.anchor_dwt_cycles_per_s;
+  diag.anchor_valid = slot.anchor_valid;
+}
+
+static void precise_retire_named_slots_priority16(const char* name) {
+  if (!name || !*name) return;
+  for (uint32_t i = 0U; i < MAX_SLOTS; ++i) {
+    if (!slots[i].active || !slots[i].precise || !slots[i].name[0]) continue;
+    if (strcmp(slots[i].name, name) != 0) continue;
+    slots[i] = {};
+    note_named_replacement(name);
+  }
+}
+
+// Bounded Priority-16 compare selection after a PRECISE callback chain.
+// No time-anchor, Payload, mutation-queue, or user code is touched here.
+// Conventional stale/too-close slots are left for foreground schedule_next()
+// to adjudicate; PRECISE direct slots should have been consumed before entry.
+static void timepop_precise_rearm_priority16(void) {
+  const uint32_t now = vclock_count();
+  uint32_t soonest = 0U;
+  uint32_t soonest_distance = UINT32_MAX;
+  bool found = false;
+  bool reconcile = false;
+
+  for (uint32_t i = 0U; i < MAX_SLOTS; ++i) {
+    if (!slots[i].active || slots[i].expired) continue;
+
+    if (slots[i].precise_direct) {
+      // Direct work belongs to the current Priority-16 SpinDry chain.  If one
+      // escaped that chain, quarantine it rather than exposing it to foreground.
+      slots[i] = {};
+      diag_precise_orphan_direct_count++;
+      diag_precise_last_failure = "orphan_direct";
+      continue;
+    }
+
+    const uint32_t distance = slots[i].deadline - now;
+    if (distance == 0U ||
+        distance > MAX_DELAY_TICKS ||
+        distance < SCHEDULE_MIN_ARM_LEAD_TICKS) {
+      if (slots[i].precise) {
+        precise_cancel_slot(slots[i], "priority16_rearm_rendezvous_too_close");
+      } else {
+        reconcile = true;
+      }
+      continue;
+    }
+
+    if (!found || distance < soonest_distance) {
+      found = true;
+      soonest = slots[i].deadline;
+      soonest_distance = distance;
+    }
+  }
+
+  if (found) {
+    interrupt_qtimer1_ch2_arm_compare(soonest);
+    diag_precise_priority16_rearm_count++;
+  } else {
+    interrupt_qtimer1_ch2_arm_compare(now + HEARTBEAT_TICKS);
+    diag_precise_priority16_heartbeat_rearm_count++;
+  }
+
+  if (reconcile) {
+    g_precise_reconcile_pending = true;
+    timepop_pending = true;
+    diag_precise_priority16_reconcile_count++;
+  }
+}
+
+// Registered directly with process_interrupt.  This function is entered only
+// from IRQ_QTIMER1 at Priority 16 after the CH2 hardware/software identity court
+// has passed and the compare source has been defused.  It never masks Priority 0.
+static bool timepop_precise_rendezvous_priority16(
+    uint32_t rendezvous_counter32,
+    uint32_t isr_entry_dwt_raw) {
+  if (timepop_dispatch_trace_ipsr() == 0U) {
+    diag_precise_last_failure = "rendezvous_not_handler";
+    return false;
+  }
+
+  uint32_t ignored_distance = 0U;
+  uint32_t first =
+      precise_select_priority16_slot(rendezvous_counter32, false, ignored_distance);
+  if (first >= MAX_SLOTS) return false;
+
+  // One physical CH2 edge has one custody species.  Do not service PRECISE on a
+  // rendezvous that a conventional slot also names; leave that edge on the
+  // established Priority32/foreground path and quarantine the PRECISE contenders.
+  if (precise_has_conventional_collision(rendezvous_counter32)) {
+    diag_precise_rendezvous_collision_count++;
+    diag_precise_last_failure = "conventional_rendezvous_collision";
+    for (uint32_t i = 0U; i < MAX_SLOTS; ++i) {
+      if (slots[i].active && slots[i].precise &&
+          !slots[i].precise_direct &&
+          slots[i].deadline == rendezvous_counter32) {
+        slots[i] = {};
+        diag_precise_rendezvous_miss_count++;
+      }
+    }
+    return false;
+  }
+
+  g_precise_priority16_active = true;
+  diag_precise_rendezvous_count++;
+  diag_precise_last_rendezvous_counter32 = rendezvous_counter32;
+  diag_precise_last_rendezvous_isr_dwt = isr_entry_dwt_raw;
+
+  // Service every PRECISE appointment attached to this rendezvous, then any
+  // short follow-ups armed synchronously by those callbacks.  The table is fixed
+  // at MAX_SLOTS, and every callback retires its slot before user code runs.
+  bool service_rendezvous_slots = true;
+  for (;;) {
+    uint32_t distance = 0U;
+    const uint32_t index = precise_select_priority16_slot(
+        rendezvous_counter32, !service_rendezvous_slots, distance);
+
+    if (index >= MAX_SLOTS) {
+      if (service_rendezvous_slots) {
+        service_rendezvous_slots = false;
+        continue;
+      }
+      break;
+    }
+
+    timepop_slot_t local = slots[index];
+    slots[index] = {};
+
+    g_precise_current_target_gnss_ns = local.target_gnss_ns;
+    g_precise_current_target_counter32 = local.precise_target_counter32;
+
+    // SpinDry.  No BASEPRI/PRIMASK manipulation is performed: Priority 0 science
+    // may preempt at any point.  Returning from such a preemption simply makes
+    // callback_dwt late, which is recorded rather than repaired.
+    while ((int32_t)(local.predicted_dwt - ARM_DWT_CYCCNT) > 0) {
+      __asm__ volatile("nop");
+    }
+
+    const uint32_t callback_dwt = ARM_DWT_CYCCNT;
+    const int32_t error_cycles =
+        (int32_t)(callback_dwt - local.predicted_dwt);
+    diag_precise_last_target_dwt = local.predicted_dwt;
+    diag_precise_last_callback_dwt = callback_dwt;
+    diag_precise_last_error_cycles = error_cycles;
+    if (error_cycles > 0) {
+      diag_precise_late_callback_count++;
+      if ((uint32_t)error_cycles > diag_precise_max_late_cycles) {
+        diag_precise_max_late_cycles = (uint32_t)error_cycles;
+      }
+    }
+
+    timepop_ctx_t ctx;
+    timepop_diag_t diag;
+    precise_build_ctx_diag(local, callback_dwt, isr_entry_dwt_raw, ctx, diag);
+    diag_precise_callback_count++;
+    local.callback(&ctx, &diag, local.user_data);
+  }
+
+  g_precise_current_target_gnss_ns = -1;
+  g_precise_current_target_counter32 = 0U;
+  g_precise_priority16_active = false;
+
+  // The current CH2 rail was consumed rather than handed to foreground.  Select
+  // and physically arm the next safe raw deadline before leaving Priority 16 so
+  // a 10-us optical inter-train gap does not depend on loop latency.
+  timepop_precise_rearm_priority16();
+  return true;
+}
+
+static timepop_handle_t arm_precise_slot_internal(
+    int64_t target_gnss_ns,
+    uint32_t target_dwt,
+    timepop_callback_t callback,
+    void* user_data,
+    const char* name,
+    timepop_priority_t priority) {
+  if (!callback || target_gnss_ns <= 0 || target_dwt == 0U) {
+    diag_precise_arm_failures++;
+    diag_precise_last_failure = "invalid_arguments";
+    return TIMEPOP_INVALID_HANDLE;
+  }
+
+  if (dispatch_depth != 0U && !g_precise_priority16_active) {
+    // Do not silently route PRECISE through the ordinary foreground mutation
+    // queue; that queue has conventional scheduling semantics.
+    diag_precise_dispatch_context_reject_count++;
+    diag_precise_arm_failures++;
+    diag_precise_last_failure = "foreground_dispatch_context";
+    return TIMEPOP_INVALID_HANDLE;
+  }
+
+  char owned_name[MAX_TIMEPOP_NAME + 1] = {};
+  if (!timepop_copy_name(owned_name, name)) {
+    diag_precise_arm_failures++;
+    diag_name_too_long++;
+    diag_precise_last_failure = "name_too_long";
+    return TIMEPOP_INVALID_HANDLE;
+  }
+  const char* const owned_name_ptr = timepop_name_or_null(owned_name);
+
+  const uint32_t now_dwt = ARM_DWT_CYCCNT;
+  uint32_t dwt_distance = 0U;
+  if (!precise_dwt_future(target_dwt, now_dwt, dwt_distance)) {
+    diag_precise_arm_failures++;
+    diag_precise_last_failure = "target_dwt_not_future";
+    return TIMEPOP_INVALID_HANDLE;
+  }
+
+  uint32_t target_counter32 = 0U;
+  time_anchor_snapshot_t snap{};
+  bool anchor_available = false;
+
+  if (g_precise_priority16_active) {
+    // Derive a new coarse VCLOCK target from the already-authored current
+    // PRECISE pair.  This avoids calling time_anchor_snapshot()/TIME from ISR.
+    if (g_precise_current_target_gnss_ns <= 0 ||
+        target_gnss_ns <= g_precise_current_target_gnss_ns) {
+      diag_precise_arm_failures++;
+      diag_precise_last_failure = "priority16_target_not_forward";
+      return TIMEPOP_INVALID_HANDLE;
+    }
+    const int64_t current_tick = g_precise_current_target_gnss_ns / (int64_t)NS_PER_TICK;
+    const int64_t target_tick = target_gnss_ns / (int64_t)NS_PER_TICK;
+    const int64_t delta_ticks = target_tick - current_tick;
+    if (delta_ticks <= 0 || delta_ticks > (int64_t)MAX_DELAY_TICKS) {
+      diag_precise_arm_failures++;
+      diag_precise_last_failure = "priority16_target_tick_range";
+      return TIMEPOP_INVALID_HANDLE;
+    }
+    target_counter32 =
+        g_precise_current_target_counter32 + (uint32_t)delta_ticks;
+  } else {
+    snap = timepop_anchor_snapshot("arm_precise");
+    anchor_available = snap.ok && snap.valid && snap.pps_count >= 1U &&
+        snap.dwt_cycles_per_s != 0U;
+    if (!anchor_available ||
+        !gnss_ns_to_vclock_deadline(target_gnss_ns, snap, target_counter32)) {
+      diag_precise_arm_failures++;
+      diag_precise_last_failure = "target_counter_conversion";
+      return TIMEPOP_INVALID_HANDLE;
+    }
+  }
+
+  const uint32_t rendezvous =
+      target_counter32 - PRECISE_RENDEZVOUS_LEAD_TICKS;
+  const uint32_t now_counter32 = vclock_count();
+  const bool rendezvous_safe =
+      precise_rendezvous_future_and_safe(rendezvous, now_counter32);
+
+  bool direct = false;
+  if (!rendezvous_safe) {
+    if (!g_precise_priority16_active ||
+        dwt_distance > PRECISE_MAX_DIRECT_SPIN_CYCLES) {
+      diag_precise_arm_failures++;
+      diag_precise_rendezvous_miss_count++;
+      diag_precise_last_failure = "rendezvous_not_safely_armable";
+      return TIMEPOP_INVALID_HANDLE;
+    }
+    direct = true;
+  }
+
+  if (!direct && precise_has_conventional_collision(rendezvous)) {
+    diag_precise_arm_failures++;
+    diag_precise_rendezvous_collision_count++;
+    diag_precise_last_failure = "rendezvous_collision_at_arm";
+    return TIMEPOP_INVALID_HANDLE;
+  }
+
+  uint32_t saved = 0U;
+  if (!g_precise_priority16_active) saved = critical_enter();
+
+  if (g_precise_priority16_active) {
+    precise_retire_named_slots_priority16(owned_name_ptr);
+  } else {
+    const bool retired_named = retire_existing_named_slots(owned_name_ptr);
+    if (retired_named) {
+      diag_schedule_next_calls_from_other++;
+      schedule_next();
+    }
+  }
+
+  for (uint32_t i = 0U; i < MAX_SLOTS; ++i) {
+    if (slots[i].active) continue;
+
+    const timepop_handle_t h = allocate_handle_unlocked();
+    slots[i] = {};
+    slots[i].active = true;
+    slots[i].expired = false;
+    slots[i].recurring = false;
+    slots[i].is_absolute = true;
+    slots[i].recurrence_mode = timepop_recurrence_mode_t::NONE;
+    slots[i].handle = h;
+    slots[i].deadline = rendezvous;
+    slots[i].target_gnss_ns = target_gnss_ns;
+    slots[i].callback = callback;
+    slots[i].user_data = user_data;
+    timepop_copy_owned_name(slots[i].name, owned_name);
+    slots[i].priority = priority;
+    slots[i].predicted_dwt = target_dwt;
+    slots[i].prediction_valid = true;
+    slots[i].precise = true;
+    slots[i].precise_direct = direct;
+    slots[i].precise_target_counter32 = target_counter32;
+    slots[i].precise_rendezvous_lead_ticks =
+        PRECISE_RENDEZVOUS_LEAD_TICKS;
+    slots[i].isr_callback = true;
+    slots[i].isr_callback_fired = false;
+    slots[i].rearm_in_isr = false;
+    slots[i].fire_gnss_ns = -1;
+
+    if (anchor_available) {
+      slots[i].anchor_dwt_at_pps = snap.dwt_at_pps;
+      slots[i].anchor_dwt_cycles_per_s = snap.dwt_cycles_per_s;
+      slots[i].anchor_qtimer_at_pps = snap.qtimer_at_pps;
+      slots[i].anchor_pps_count = snap.pps_count;
+      slots[i].anchor_valid = true;
+    }
+
+    record_slot_arm_diag(slots[i],
+                         timepop_arm_source_t::EXACT_ARM,
+                         !direct,
+                         now_counter32,
+                         target_gnss_ns);
+    diag_precise_arm_count++;
+    if (direct) diag_precise_direct_arm_count++;
+    update_slot_high_water();
+
+    if (!g_precise_priority16_active) {
+      diag_schedule_next_calls_from_other++;
+      schedule_next();
+      critical_exit(saved);
+    }
+    return h;
+  }
+
+  diag_precise_arm_failures++;
+  diag_precise_last_failure = "slot_table_full";
+  if (!g_precise_priority16_active) critical_exit(saved);
+  return TIMEPOP_INVALID_HANDLE;
+}
+
+// ============================================================================
 // schedule_next
 // ============================================================================
 //
@@ -2867,10 +3362,39 @@ static void schedule_next(void) {
   const bool scheduler_time_valid = time_valid();
 
   uint32_t soonest = 0;
+  uint32_t soonest_slot = UINT32_MAX;
   bool found = false;
 
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (!slots[i].active || slots[i].expired) continue;
+
+    if (slots[i].precise) {
+      // PRECISE's slot deadline is only the CH2 rendezvous.  Never pass the
+      // final DWT appointment through conventional missed-deadline quarantine.
+      if (slots[i].precise_direct) {
+        precise_cancel_slot(slots[i], "direct_slot_seen_in_foreground");
+        diag_precise_orphan_direct_count++;
+        continue;
+      }
+      if (!scheduler_time_valid) {
+        precise_cancel_slot(slots[i], "precise_time_invalid");
+        continue;
+      }
+      const uint32_t distance = slots[i].deadline - now;
+      const bool rendezvous_bad =
+          distance == 0U || distance > MAX_DELAY_TICKS ||
+          distance < SCHEDULE_MIN_ARM_LEAD_TICKS;
+      if (rendezvous_bad) {
+        precise_cancel_slot(slots[i], "precise_rendezvous_missed_foreground");
+        continue;
+      }
+      if (!found || distance < (soonest - now)) {
+        soonest = slots[i].deadline;
+        soonest_slot = i;
+        found = true;
+      }
+      continue;
+    }
 
     // During SmartZero / epoch reacquisition, the public TIME anchor is
     // intentionally invalid.  Old absolute deadlines are old-coordinate facts;
@@ -2966,6 +3490,7 @@ static void schedule_next(void) {
 
     if (!found || (post_distance < (soonest - now))) {
       soonest = slots[i].deadline;
+      soonest_slot = i;
       found = true;
     }
   }
@@ -2988,6 +3513,10 @@ static void schedule_next(void) {
   // If the chosen target became too close while we were scanning, use a
   // heartbeat compare instead of risking an immediate/missed-compare storm.
   if ((target - now) < SCHEDULE_MIN_ARM_LEAD_TICKS) {
+    if (soonest_slot < MAX_SLOTS && slots[soonest_slot].precise) {
+      precise_cancel_slot(slots[soonest_slot],
+                          "precise_rendezvous_became_too_close");
+    }
     target = now + HEARTBEAT_TICKS;
     diag_heartbeat_rearms++;
     diag_schedule_next_final_safety_count++;
@@ -3198,7 +3727,7 @@ static void timepop_process_ch2_event_foreground(
   // coordinate to that old deadline; re-author recurring slots and cancel
   // one-shots instead.
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
-    if (!slots[i].active || slots[i].expired) continue;
+    if (!slots[i].active || slots[i].expired || slots[i].precise) continue;
     if (!deadline_passed(slots[i].deadline, now)) continue;
 
     const uint32_t late_ticks = deadline_lateness_ticks(slots[i].deadline, now);
@@ -3238,7 +3767,7 @@ static void timepop_process_ch2_event_foreground(
   }
 
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
-    if (!slots[i].active || slots[i].expired) continue;
+    if (!slots[i].active || slots[i].expired || slots[i].precise) continue;
     if (slots[i].deadline != now) continue;
 
     const uint32_t late_ticks = 0;
@@ -3755,6 +4284,31 @@ void timepop_init(void) {
   diag_ch2_reentry_reject_count = 0;
   diag_ch2_capture_loss_recover_count = 0;
 
+  g_precise_priority16_active = false;
+  g_precise_current_target_gnss_ns = -1;
+  g_precise_current_target_counter32 = 0U;
+  g_precise_reconcile_pending = false;
+  diag_precise_arm_count = 0U;
+  diag_precise_arm_failures = 0U;
+  diag_precise_dispatch_context_reject_count = 0U;
+  diag_precise_direct_arm_count = 0U;
+  diag_precise_rendezvous_count = 0U;
+  diag_precise_rendezvous_miss_count = 0U;
+  diag_precise_rendezvous_collision_count = 0U;
+  diag_precise_callback_count = 0U;
+  diag_precise_late_callback_count = 0U;
+  diag_precise_max_late_cycles = 0U;
+  diag_precise_last_target_dwt = 0U;
+  diag_precise_last_callback_dwt = 0U;
+  diag_precise_last_error_cycles = 0;
+  diag_precise_last_rendezvous_counter32 = 0U;
+  diag_precise_last_rendezvous_isr_dwt = 0U;
+  diag_precise_priority16_rearm_count = 0U;
+  diag_precise_priority16_heartbeat_rearm_count = 0U;
+  diag_precise_priority16_reconcile_count = 0U;
+  diag_precise_orphan_direct_count = 0U;
+  diag_precise_last_failure = nullptr;
+
   diag_asap_armed = 0;
   diag_asap_dispatched = 0;
   diag_asap_arm_failures = 0;
@@ -3873,10 +4427,11 @@ void timepop_init(void) {
   diag_epoch_last_anchor_counter32_at_pps_vclock = 0;
   diag_epoch_last_schedule_next_calls_before = 0;
   diag_epoch_last_schedule_next_calls_after = 0;
-  // QTimer1 hardware and both interrupt tiers are owned by process_interrupt.
-  // The ordinary loop delivers immutable CH2 facts through
-  // timepop_accept_ch2_event_foreground(); TimePop registers no interrupt or
-  // handoff callback.
+  // QTimer1 vector/hardware custody remains in process_interrupt.  Register the
+  // one explicit Priority-16 PRECISE rendezvous hook; conventional CH2 facts
+  // continue through timepop_accept_ch2_event_foreground().
+  interrupt_register_timepop_precise_rendezvous_handler(
+      timepop_precise_rendezvous_priority16);
 
   const uint32_t saved = critical_enter();
   diag_schedule_next_calls_from_other++;
@@ -4680,6 +5235,49 @@ timepop_handle_t timepop_arm_ns_with_priority(
                                     priority);
 }
 
+
+// ============================================================================
+// Arm — PRECISE / SpinDry
+// ============================================================================
+//
+// Unlike timepop_arm_ns(), this is an execution-class promise, not merely an
+// exact-target annotation.  target_gnss_ns identifies the requested appointment;
+// target_dwt is the authoritative fine coordinate.  CH2 is armed early only to
+// enter Priority 16.  A PRECISE callback may call timepop_arm_precise() again:
+// if the next target is too close for another lawful CH2 arm, TimePop remains in
+// the current Priority-16 handler and performs a bounded direct SpinDry follow-up.
+
+timepop_handle_t timepop_arm_precise(
+  int64_t             target_gnss_ns,
+  uint32_t            target_dwt,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name
+) {
+  return timepop_arm_precise_with_priority(target_gnss_ns,
+                                           target_dwt,
+                                           callback,
+                                           user_data,
+                                           name,
+                                           TIMEPOP_PRIORITY_DEFAULT);
+}
+
+timepop_handle_t timepop_arm_precise_with_priority(
+  int64_t             target_gnss_ns,
+  uint32_t            target_dwt,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name,
+  timepop_priority_t  priority
+) {
+  return arm_precise_slot_internal(target_gnss_ns,
+                                   target_dwt,
+                                   callback,
+                                   user_data,
+                                   name,
+                                   priority);
+}
+
 // ============================================================================
 // Cancel
 // ============================================================================
@@ -4765,6 +5363,14 @@ uint32_t timepop_cancel_by_name(const char* name) {
 // ============================================================================
 
 void timepop_dispatch(void) {
+  if (g_precise_reconcile_pending) {
+    const uint32_t saved = critical_enter();
+    g_precise_reconcile_pending = false;
+    diag_schedule_next_calls_from_other++;
+    schedule_next();
+    critical_exit(saved);
+  }
+
   {
     const uint32_t saved = critical_enter();
     if (!timepop_pending) {
@@ -5413,6 +6019,48 @@ static FLASHMEM Payload cmd_report(const Payload&) {
   out.add("slot_priority_default", (uint32_t)TIMEPOP_PRIORITY_DEFAULT);
   out.add("slot_priority_last", (uint32_t)TIMEPOP_PRIORITY_LAST);
 
+  out.add("precise_supported", true);
+  out.add("precise_execution_priority", 16U);
+  out.add("precise_priority0_preemptable", true);
+  out.add("precise_rendezvous_lead_ticks",
+          PRECISE_RENDEZVOUS_LEAD_TICKS);
+  out.add("precise_rendezvous_lead_ns",
+          PRECISE_RENDEZVOUS_LEAD_TICKS * (uint32_t)NS_PER_TICK);
+  out.add("precise_direct_spin_max_cycles",
+          PRECISE_MAX_DIRECT_SPIN_CYCLES);
+  out.add("precise_priority16_active", (bool)g_precise_priority16_active);
+  out.add("precise_arm_count", (uint32_t)diag_precise_arm_count);
+  out.add("precise_arm_failures", (uint32_t)diag_precise_arm_failures);
+  out.add("precise_dispatch_context_reject_count",
+          (uint32_t)diag_precise_dispatch_context_reject_count);
+  out.add("precise_direct_arm_count", (uint32_t)diag_precise_direct_arm_count);
+  out.add("precise_rendezvous_count", (uint32_t)diag_precise_rendezvous_count);
+  out.add("precise_rendezvous_miss_count",
+          (uint32_t)diag_precise_rendezvous_miss_count);
+  out.add("precise_rendezvous_collision_count",
+          (uint32_t)diag_precise_rendezvous_collision_count);
+  out.add("precise_callback_count", (uint32_t)diag_precise_callback_count);
+  out.add("precise_late_callback_count",
+          (uint32_t)diag_precise_late_callback_count);
+  out.add("precise_max_late_cycles", (uint32_t)diag_precise_max_late_cycles);
+  out.add("precise_last_target_dwt", (uint32_t)diag_precise_last_target_dwt);
+  out.add("precise_last_callback_dwt", (uint32_t)diag_precise_last_callback_dwt);
+  out.add("precise_last_error_cycles", (int32_t)diag_precise_last_error_cycles);
+  out.add("precise_last_rendezvous_counter32",
+          (uint32_t)diag_precise_last_rendezvous_counter32);
+  out.add("precise_last_rendezvous_isr_dwt",
+          (uint32_t)diag_precise_last_rendezvous_isr_dwt);
+  out.add("precise_priority16_rearm_count",
+          (uint32_t)diag_precise_priority16_rearm_count);
+  out.add("precise_priority16_heartbeat_rearm_count",
+          (uint32_t)diag_precise_priority16_heartbeat_rearm_count);
+  out.add("precise_priority16_reconcile_count",
+          (uint32_t)diag_precise_priority16_reconcile_count);
+  out.add("precise_orphan_direct_count",
+          (uint32_t)diag_precise_orphan_direct_count);
+  out.add("precise_last_failure",
+          (const char*)(diag_precise_last_failure ? diag_precise_last_failure : ""));
+
   out.add("anchor_snapshot_count", diag_anchor_snapshot_count);
   out.add("anchor_snapshot_ok_count", diag_anchor_snapshot_ok_count);
   out.add("anchor_snapshot_not_ok_count", diag_anchor_snapshot_not_ok_count);
@@ -5774,6 +6422,12 @@ static FLASHMEM void add_timers_array(Payload& out) {
     entry.add("recurring_last_skipped_intervals", slots[i].recurring_last_skipped_intervals);
     entry.add("recurring_total_skipped_intervals", slots[i].recurring_total_skipped_intervals);
     entry.add("is_absolute", slots[i].is_absolute);
+    entry.add("precise", slots[i].precise);
+    entry.add("precise_direct", slots[i].precise_direct);
+    entry.add("precise_target_counter32", slots[i].precise_target_counter32);
+    entry.add("precise_target_dwt", slots[i].predicted_dwt);
+    entry.add("precise_rendezvous_lead_ticks",
+              slots[i].precise_rendezvous_lead_ticks);
     entry.add("isr_cb",    slots[i].isr_callback);
     entry.add("rearm_in_isr", slots[i].rearm_in_isr);
 

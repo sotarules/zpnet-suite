@@ -8,9 +8,10 @@
 //
 // Execution tiers:
 //   Priority 0  — PPS, OCXO1, OCXO2 sovereign science capture
-//   Priority 16 — shared QTimer1 VCLOCK + TimePop CH2 capture
+//   Priority 16 — shared QTimer1 VCLOCK + TimePop CH2 capture; explicit
+//                 TimePop PRECISE/SpinDry callbacks are the sole exception
 //   Priority 32 — continuation/handoff and compare rearm
-//   Foreground  — TimePop policy and application callbacks
+//   Foreground  — ordinary TimePop policy and application callbacks
 // ============================================================================
 
 #pragma once
@@ -20,9 +21,10 @@
 #include <stdbool.h>
 
 // Foreground loop service.  Call once per loop() pass before timepop_dispatch().
-// It drains immutable CH2 fire facts, executes application subscriber callbacks,
-// and flushes scalar feature state.  No TimePop scheduler mutation or application
-// behavior is performed by Priority 0, Priority 16, or Priority 32.
+// It drains immutable conventional CH2 fire facts, executes application subscriber
+// callbacks, and flushes scalar feature state.  Priority 0 and Priority 32 never
+// execute TimePop application behavior; Priority 16 does so only for the explicit,
+// bounded PRECISE/SpinDry execution class documented below.
 void process_interrupt_foreground_service(void);
 
 // Optional TimePop pressure marker.  The recorder itself remains owned by
@@ -1372,12 +1374,32 @@ uint16_t interrupt_qtimer1_ch1_csctrl_now(void);
 
 uint32_t interrupt_vclock_counter32_observe_ambient(void);
 
+// Priority-16 TimePop PRECISE rendezvous boundary.
+//
+// The registered function is called synchronously from IRQ_QTIMER1 only after a
+// CH2 flag has passed the normal hardware/software identity court and the compare
+// source has been defused.  It may recognize the counter32 target as a PRECISE
+// rendezvous, remain in Priority 16, SpinDry to a finer DWT target, and invoke one
+// bounded ISR-safe callback.  Priority-0 PPS/OCXO science remains unmasked and may
+// preempt the rendezvous, spin, or callback.  The callback must never disable
+// Priority 0.
+//
+// Return true only when TimePop completely consumed this CH2 edge as a PRECISE
+// rendezvous.  A true return prevents creation of the ordinary Priority-32 /
+// foreground CH2 fire fact.  Return false for every conventional CH2 target.
+using interrupt_timepop_precise_rendezvous_fn =
+    bool (*)(uint32_t rendezvous_counter32, uint32_t isr_entry_dwt_raw);
+
+void interrupt_register_timepop_precise_rendezvous_handler(
+    interrupt_timepop_precise_rendezvous_fn callback);
+
 // Request the next TimePop CH2 deadline.  process_interrupt separates requested,
 // deferred, and physically armed identities.  The shared QTimer1 vector runs at
 // Priority 16 so Priority 0 PPS/OCXO science captures can preempt it.  On that
-// shared vector, a
-// CH2 status flag is accepted only when TCF1EN, software arm custody, programmed
-// COMP1 identity, and the no-outstanding-fact invariant all agree.
+// shared vector, a CH2 status flag is accepted only when TCF1EN, software arm
+// custody, programmed COMP1 identity, and the no-outstanding-fact invariant all
+// agree.  Conventional deadlines continue through Priority 32/foreground; an
+// explicitly recognized PRECISE rendezvous may be consumed at Priority 16.
 void     interrupt_qtimer1_ch2_arm_compare(uint32_t target_counter32);
 
 struct interrupt_clock_snapshot_t {

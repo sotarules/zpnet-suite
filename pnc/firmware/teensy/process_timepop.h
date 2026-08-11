@@ -10,6 +10,8 @@
 //   • shared captured fire facts for same-event timed clients
 //   • critical recurring scheduler clients that callback/rearm in foreground
 //     before schedule_next
+//   • explicit PRECISE/SpinDry appointments entered through process_interrupt's
+//     Priority-16 CH2 rendezvous hook
 //   • fixed non-slot foreground deferred callback dispatch
 //   • instrumentation / reports
 //   • scheduler policy for QTimer1 CH2 compare deadlines
@@ -23,10 +25,11 @@
 //   • QTimer1 CH0/CH2 hardware mode init — process_interrupt does
 //     the one-time CTRL/SCTRL/CSCTRL/COMP1/CMPLD1 setup
 //
-// Those are owned by process_interrupt. TimePop also does not own a private
-// scheduler IRQ / priority-handoff tier; Priority 16 captures QTimer1, Priority 32
-// transfers immutable facts, and all TimePop scheduler processing runs in
-// foreground after process_interrupt drains its mailbox.
+// Those are owned by process_interrupt. TimePop does not own IRQ_QTIMER1 or a
+// private NVIC tier.  Ordinary CH2 work remains Priority16 capture -> Priority32
+// transfer -> foreground.  PRECISE is the sole explicit exception: after a CH2
+// target passes process_interrupt's identity court and is defused, process_interrupt
+// may call TimePop's registered rendezvous hook synchronously at Priority 16.
 //
 // QTimer1 CH2 foreground-ingress API (TimePop is the hosted client):
 //
@@ -104,12 +107,10 @@
 //   mutation barrier: cancelling an already-absent handle or name is a
 //   successful no-op, not a scheduler failure.
 //
-//   Critical recurring scheduler clients are the white-glove exception for tiny
-//   substrate-maintenance work.  They are still ordinary TimePop slots and
-//   share CH2 fire facts, but their callbacks and recurring rearm happen in the
-//   foreground CH2 scheduler pass before schedule_next() selects the next compare.
-//   The legacy ISR API names remain source-compatible but no callback executes
-//   in Priority 0, Priority 16, or Priority 32.
+//   Critical recurring scheduler clients remain foreground white-glove work.
+//   The legacy ISR API names are source-compatible and do not imply handler
+//   execution.  Only an explicitly armed PRECISE/SpinDry callback executes in
+//   Priority 16; no TimePop callback ever executes in Priority 0 or Priority 32.
 //
 //   Timed slots may also carry a service priority. Lower numeric priority runs
 //   first when multiple timed slots share one exact CH2 fire fact. Priority
@@ -396,6 +397,41 @@ timepop_handle_t timepop_arm_ns_with_priority(
   void*               user_data,
   const char*         name,
   bool                isr_callback,
+  timepop_priority_t  priority
+);
+
+// Explicit PRECISE / SpinDry execution class.
+//
+// target_gnss_ns is the requested GNSS nanosecond appointment. target_dwt is
+// the authoritative fine DWT coordinate. TimePop converts the GNSS target into
+// a coarse VCLOCK coordinate, arms CH2 early enough to enter IRQ_QTIMER1 at
+// Priority 16, then spins on ARM_DWT_CYCCNT until target_dwt and invokes the
+// callback synchronously. The CH2 rendezvous is not the event identity.
+//
+// Priority-0 PPS/OCXO science is deliberately never masked and may preempt the
+// rendezvous, SpinDry interval, or callback. Such a preemption can make callback
+// entry late; TimePop reports the signed DWT error and never repairs it.
+//
+// A PRECISE callback must be bounded, allocation-free, and ISR-safe. It may call
+// timepop_arm_precise[_with_priority]() to author a follow-up. If that follow-up
+// is too close for a lawful CH2 re-arm, TimePop keeps custody in the current
+// Priority-16 handler and performs a bounded direct SpinDry continuation.
+// Ordinary TimePop arm/cancel APIs retain their foreground execution contract and
+// should not be called from a PRECISE callback.
+timepop_handle_t timepop_arm_precise(
+  int64_t             target_gnss_ns,
+  uint32_t            target_dwt,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name
+);
+
+timepop_handle_t timepop_arm_precise_with_priority(
+  int64_t             target_gnss_ns,
+  uint32_t            target_dwt,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name,
   timepop_priority_t  priority
 );
 
