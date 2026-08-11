@@ -7,10 +7,12 @@
 #include "process_interrupt.h"
 #include "publish.h"
 #include "timepop.h"
+#include "time.h"
 #include "util.h"
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <math.h>
 
 // ============================================================================
 // PHOTONS scaffold doctrine
@@ -20,16 +22,39 @@
 // first-instruction DWT coordinate.
 //
 // PHOTONS consumes that immutable edge fact through the specialized high-rate
-// PHOTODIODE subscription.  The ISR callback below is intentionally tiny:
-// scalar updates only, no Payload, no publication, no CLOCKS call, no TimePop
-// mutation.
+// PHOTODIODE subscription.  The ISR callback below remains intentionally tiny:
+// scalar/ring updates only, no Payload, no publication, no CLOCKS/TIME call,
+// no floating-point statistics, and no TimePop mutation.
 //
-// Once per second a normal foreground TimePop callback snapshots the toy state
-// and publishes PHOTONS_FRAGMENT.  This is scaffolding for validating custody,
-// not the final optical science implementation.
+// Once per second a normal foreground TimePop callback drains completed raw lap
+// records, projects each pair of observed DWT endpoints through the cached
+// PPS/VCLOCK GNSS ruler, advances canonical Welford/ratio state, and publishes
+// PHOTONS_FRAGMENT_V1.  Physical/raw evidence is never erased by interpretation.
 // ============================================================================
 
 static constexpr uint64_t PHOTONS_FRAGMENT_PERIOD_NS = 1000000000ULL;
+static constexpr uint64_t PHOTONS_NS_PER_SECOND = 1000000000ULL;
+
+// Bring-up raw-lap handoff.  At the current 10 ms emulator cadence this holds
+// several seconds of completed laps.  A future high-rate PD200T engine may
+// replace this ring with a batch sufficient-statistics path; overflow is
+// explicit science data loss and therefore invalidates the lifetime stats.
+static constexpr uint32_t PHOTONS_LAP_RING_CAPACITY = 256U;
+static constexpr uint32_t PHOTONS_LAP_RING_MASK =
+    PHOTONS_LAP_RING_CAPACITY - 1U;
+static_assert((PHOTONS_LAP_RING_CAPACITY &
+               (PHOTONS_LAP_RING_CAPACITY - 1U)) == 0U,
+              "PHOTONS lap ring capacity must be a power of two");
+
+static constexpr uint64_t PHOTONS_PROJECTION_MAX_AGE_NS = 3000000000ULL;
+
+// Science admission is deliberately much broader than expected optical noise.
+// Its job is structural: prevent obvious scheduler/edge-lineage injuries from
+// entering Welford without cosmetically selecting "pretty" observations.
+// Match CLOCKS' broad raw-interval plausibility philosophy: +/-10%.
+// Gate = max(last science-accepted raw lap / 10, 64 cycles).
+static constexpr uint32_t PHOTONS_SCIENCE_GATE_DIVISOR = 10U;
+static constexpr uint32_t PHOTONS_SCIENCE_GATE_MIN_CYCLES = 64U;
 
 
 // ============================================================================
@@ -184,6 +209,634 @@ struct photons_device_snapshot_t {
   uint16_t photodiode_mon_raw = 0;
   float    photodiode_mon_v = 0.0f;
 };
+
+// ============================================================================
+// Canonical raw-lap handoff / projection / statistics state
+// ============================================================================
+
+static inline void photons_memory_barrier(void) {
+  __asm__ volatile("dmb" ::: "memory");
+}
+
+
+struct photons_projection_anchor_cache_t {
+  volatile uint32_t seq = 0U;
+  bool valid = false;
+  uint32_t dwt_at_pps_vclock = 0U;
+  uint32_t dwt_cycles_per_second = 0U;
+  uint32_t pps_count = 0U;
+};
+
+
+struct photons_projection_anchor_value_t {
+  bool valid = false;
+  uint32_t dwt_at_pps_vclock = 0U;
+  uint32_t dwt_cycles_per_second = 0U;
+  uint32_t pps_count = 0U;
+};
+
+
+struct photons_raw_lap_record_t {
+  uint32_t start_dwt = 0U;
+  uint32_t end_dwt = 0U;
+  uint32_t raw_cycles = 0U;
+  uint32_t pps_sequence = 0U;
+
+  bool anchor_valid = false;
+  uint32_t anchor_dwt_at_pps_vclock = 0U;
+  uint32_t anchor_dwt_cycles_per_second = 0U;
+  uint32_t anchor_pps_count = 0U;
+};
+
+
+struct photons_welford_state_t {
+  uint64_t n = 0ULL;
+  double mean = 0.0;
+  double m2 = 0.0;
+  double min_val = 0.0;
+  double max_val = 0.0;
+};
+
+
+struct photons_lap_science_candidate_t {
+  bool valid = false;
+  uint64_t candidate_index = 0ULL;
+  uint32_t pps_sequence = 0U;
+  uint32_t raw_cycles = 0U;
+  uint64_t lap_gnss_ns = 0ULL;
+};
+
+
+static photons_projection_anchor_cache_t g_projection_anchor_cache{};
+static photons_raw_lap_record_t
+    g_raw_lap_ring[PHOTONS_LAP_RING_CAPACITY] DMAMEM = {};
+static volatile uint32_t g_raw_lap_ring_write = 0U;
+static volatile uint32_t g_raw_lap_ring_read = 0U;
+static volatile uint32_t g_raw_lap_ring_overflow_count = 0U;
+static volatile bool g_raw_lap_ring_data_loss = false;
+
+static photons_fragment_raw_cycles_snapshot_t g_raw_cycles_state{};
+static photons_fragment_projection_snapshot_t g_projection_state{};
+static photons_lap_science_snapshot_t g_photons_lap_science_state{};
+static photons_lap_science_candidate_t g_photons_lap_science_seed_pending{};
+static photons_welford_state_t g_lap_time_welford{};
+static uint64_t g_total_lap_gnss_ns = 0ULL;
+
+static bool g_previous_fragment_mean_cycles_valid = false;
+static double g_previous_fragment_mean_cycles = 0.0;
+
+
+static void photons_welford_reset(photons_welford_state_t& w) {
+  w.n = 0ULL;
+  w.mean = 0.0;
+  w.m2 = 0.0;
+  w.min_val = 1.0e300;
+  w.max_val = -1.0e300;
+}
+
+
+static void photons_welford_update(photons_welford_state_t& w, double sample) {
+  w.n++;
+  const double d1 = sample - w.mean;
+  w.mean += d1 / (double)w.n;
+  const double d2 = sample - w.mean;
+  w.m2 += d1 * d2;
+  if (sample < w.min_val) w.min_val = sample;
+  if (sample > w.max_val) w.max_val = sample;
+}
+
+
+static double photons_welford_stddev(const photons_welford_state_t& w) {
+  return (w.n >= 2ULL) ? sqrt(w.m2 / (double)(w.n - 1ULL)) : 0.0;
+}
+
+
+static double photons_welford_stderr(const photons_welford_state_t& w) {
+  return (w.n >= 2ULL)
+      ? photons_welford_stddev(w) / sqrt((double)w.n)
+      : 0.0;
+}
+
+
+static photons_fragment_welford_snapshot_t photons_welford_snapshot(
+    const photons_welford_state_t& w) {
+  photons_fragment_welford_snapshot_t out{};
+  out.n = w.n;
+  out.mean = w.mean;
+  out.m2 = w.m2;
+  out.stddev = photons_welford_stddev(w);
+  out.stderr_value = photons_welford_stderr(w);
+  out.min = (w.n != 0ULL) ? w.min_val : 0.0;
+  out.max = (w.n != 0ULL) ? w.max_val : 0.0;
+  return out;
+}
+
+
+static void photons_projection_anchor_refresh(void) {
+  const time_anchor_snapshot_t anchor = time_anchor_snapshot();
+
+  g_projection_anchor_cache.seq++;
+  photons_memory_barrier();
+
+  g_projection_anchor_cache.valid =
+      anchor.ok &&
+      anchor.valid &&
+      anchor.pps_vclock_count != 0U &&
+      anchor.dwt_cycles_per_pps_vclock_s != 0U;
+  g_projection_anchor_cache.dwt_at_pps_vclock =
+      anchor.dwt_at_pps_vclock;
+  g_projection_anchor_cache.dwt_cycles_per_second =
+      anchor.dwt_cycles_per_pps_vclock_s;
+  g_projection_anchor_cache.pps_count = anchor.pps_vclock_count;
+
+  photons_memory_barrier();
+  g_projection_anchor_cache.seq++;
+}
+
+
+static bool photons_projection_anchor_snapshot(
+    photons_projection_anchor_value_t& out) {
+  out = photons_projection_anchor_value_t{};
+
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    const uint32_t before = g_projection_anchor_cache.seq;
+    if (before & 1U) continue;
+
+    photons_memory_barrier();
+    photons_projection_anchor_value_t local{};
+    local.valid = g_projection_anchor_cache.valid;
+    local.dwt_at_pps_vclock =
+        g_projection_anchor_cache.dwt_at_pps_vclock;
+    local.dwt_cycles_per_second =
+        g_projection_anchor_cache.dwt_cycles_per_second;
+    local.pps_count = g_projection_anchor_cache.pps_count;
+    photons_memory_barrier();
+
+    const uint32_t after = g_projection_anchor_cache.seq;
+    if (before == after && !(after & 1U)) {
+      out = local;
+      return true;
+    }
+  }
+
+  return false;
+}
+
+
+static bool photons_raw_lap_enqueue(uint32_t start_dwt,
+                                    uint32_t end_dwt,
+                                    uint32_t raw_cycles,
+                                    uint32_t pps_sequence) {
+  const uint32_t write = g_raw_lap_ring_write;
+  const uint32_t next = (write + 1U) & PHOTONS_LAP_RING_MASK;
+
+  if (next == g_raw_lap_ring_read) {
+    g_raw_lap_ring_overflow_count++;
+    g_raw_lap_ring_data_loss = true;
+    return false;
+  }
+
+  photons_projection_anchor_value_t anchor{};
+  const bool anchor_snapshot_ok =
+      photons_projection_anchor_snapshot(anchor);
+
+  photons_raw_lap_record_t record{};
+  record.start_dwt = start_dwt;
+  record.end_dwt = end_dwt;
+  record.raw_cycles = raw_cycles;
+  record.pps_sequence = pps_sequence;
+  record.anchor_valid = anchor_snapshot_ok && anchor.valid;
+  record.anchor_dwt_at_pps_vclock = anchor.dwt_at_pps_vclock;
+  record.anchor_dwt_cycles_per_second = anchor.dwt_cycles_per_second;
+  record.anchor_pps_count = anchor.pps_count;
+
+  g_raw_lap_ring[write] = record;
+  photons_memory_barrier();
+  g_raw_lap_ring_write = next;
+  return true;
+}
+
+
+static bool photons_project_raw_lap(
+    const photons_raw_lap_record_t& record,
+    uint64_t& start_gnss_ns,
+    uint64_t& end_gnss_ns,
+    uint64_t& lap_gnss_ns) {
+  start_gnss_ns = 0ULL;
+  end_gnss_ns = 0ULL;
+  lap_gnss_ns = 0ULL;
+
+  if (!record.anchor_valid ||
+      record.anchor_pps_count == 0U ||
+      record.anchor_dwt_cycles_per_second == 0U) {
+    return false;
+  }
+
+  const uint32_t cps = record.anchor_dwt_cycles_per_second;
+  const uint32_t start_elapsed =
+      record.start_dwt - record.anchor_dwt_at_pps_vclock;
+  const uint32_t end_elapsed =
+      record.end_dwt - record.anchor_dwt_at_pps_vclock;
+
+  const uint64_t max_age_cycles =
+      ((uint64_t)cps * PHOTONS_PROJECTION_MAX_AGE_NS +
+       PHOTONS_NS_PER_SECOND - 1ULL) /
+      PHOTONS_NS_PER_SECOND;
+
+  if ((uint64_t)start_elapsed > max_age_cycles ||
+      (uint64_t)end_elapsed > max_age_cycles) {
+    return false;
+  }
+
+  const uint64_t base_gnss_ns =
+      (uint64_t)(record.anchor_pps_count - 1U) *
+      PHOTONS_NS_PER_SECOND;
+
+  const uint64_t start_offset_ns =
+      ((uint64_t)start_elapsed * PHOTONS_NS_PER_SECOND +
+       (uint64_t)cps / 2ULL) /
+      (uint64_t)cps;
+  const uint64_t end_offset_ns =
+      ((uint64_t)end_elapsed * PHOTONS_NS_PER_SECOND +
+       (uint64_t)cps / 2ULL) /
+      (uint64_t)cps;
+
+  start_gnss_ns = base_gnss_ns + start_offset_ns;
+  end_gnss_ns = base_gnss_ns + end_offset_ns;
+  if (end_gnss_ns < start_gnss_ns) return false;
+
+  lap_gnss_ns = end_gnss_ns - start_gnss_ns;
+  return lap_gnss_ns != 0ULL;
+}
+
+
+static const char* photons_lap_science_disposition_name(uint8_t id) {
+  switch ((photons_lap_science_disposition_t)id) {
+    case photons_lap_science_disposition_t::ACCEPT:
+      return "ACCEPT";
+    case photons_lap_science_disposition_t::SCIENCE_EXCLUDE:
+      return "SCIENCE_EXCLUDE";
+    case photons_lap_science_disposition_t::PENDING_SEED:
+      return "PENDING_SEED";
+    default:
+      return "NONE";
+  }
+}
+
+
+static const char* photons_lap_science_reason_name(uint16_t code) {
+  switch ((photons_lap_science_exclusion_reason_t)code) {
+    case photons_lap_science_exclusion_reason_t::PROJECTION_INVALID:
+      return "projection_invalid";
+    case photons_lap_science_exclusion_reason_t::SEED_DISAGREEMENT:
+      return "seed_disagreement";
+    case photons_lap_science_exclusion_reason_t::RAW_CYCLE_EXCURSION:
+      return "raw_cycle_excursion";
+    default:
+      return "none";
+  }
+}
+
+
+static uint32_t photons_lap_science_gate_cycles(uint32_t prediction_cycles) {
+  uint32_t gate = prediction_cycles / PHOTONS_SCIENCE_GATE_DIVISOR;
+  if (gate < PHOTONS_SCIENCE_GATE_MIN_CYCLES) {
+    gate = PHOTONS_SCIENCE_GATE_MIN_CYCLES;
+  }
+  return gate;
+}
+
+
+static int32_t photons_lap_science_signed_delta(uint32_t observed,
+                                            uint32_t predicted) {
+  const int64_t delta = (int64_t)(uint64_t)observed -
+                        (int64_t)(uint64_t)predicted;
+  if (delta > 2147483647LL) return 2147483647;
+  if (delta < -2147483647LL - 1LL) return (-2147483647 - 1);
+  return (int32_t)delta;
+}
+
+
+static uint64_t photons_lap_science_abs_delta(uint32_t observed,
+                                          uint32_t predicted) {
+  return (observed >= predicted)
+      ? (uint64_t)(observed - predicted)
+      : (uint64_t)(predicted - observed);
+}
+
+
+static void photons_lap_science_note_last(
+    const photons_lap_science_candidate_t& candidate,
+    photons_lap_science_disposition_t disposition,
+    photons_lap_science_exclusion_reason_t reason,
+    bool projection_valid,
+    uint32_t prediction_cycles,
+    int32_t residual_cycles,
+    uint32_t gate_cycles) {
+  g_photons_lap_science_state.last_candidate_index = candidate.candidate_index;
+  g_photons_lap_science_state.last_disposition_id = (uint8_t)disposition;
+  g_photons_lap_science_state.last_reason_code = (uint16_t)reason;
+  g_photons_lap_science_state.last_science_worthy =
+      disposition == photons_lap_science_disposition_t::ACCEPT;
+  g_photons_lap_science_state.last_projection_valid = projection_valid;
+  g_photons_lap_science_state.last_pps_sequence = candidate.pps_sequence;
+  g_photons_lap_science_state.last_observed_cycles = candidate.raw_cycles;
+  g_photons_lap_science_state.last_prediction_cycles = prediction_cycles;
+  g_photons_lap_science_state.last_residual_cycles = residual_cycles;
+  g_photons_lap_science_state.last_gate_cycles = gate_cycles;
+  g_photons_lap_science_state.last_lap_gnss_ns =
+      projection_valid ? candidate.lap_gnss_ns : 0ULL;
+}
+
+
+static void photons_lap_science_refresh_seed_snapshot(void) {
+  g_photons_lap_science_state.seed_pending = g_photons_lap_science_seed_pending.valid;
+  g_photons_lap_science_state.seed_pending_candidate_index =
+      g_photons_lap_science_seed_pending.valid
+          ? g_photons_lap_science_seed_pending.candidate_index
+          : 0ULL;
+  g_photons_lap_science_state.seed_pending_raw_cycles =
+      g_photons_lap_science_seed_pending.valid
+          ? g_photons_lap_science_seed_pending.raw_cycles
+          : 0U;
+  g_photons_lap_science_state.seed_pending_lap_gnss_ns =
+      g_photons_lap_science_seed_pending.valid
+          ? g_photons_lap_science_seed_pending.lap_gnss_ns
+          : 0ULL;
+}
+
+
+static void photons_lap_science_accept(
+    const photons_lap_science_candidate_t& candidate,
+    uint32_t prediction_cycles,
+    int32_t residual_cycles,
+    uint32_t gate_cycles) {
+  g_photons_lap_science_state.accept_count++;
+  g_photons_lap_science_state.accepted_this_fragment++;
+  g_photons_lap_science_state.reject_streak = 0U;
+
+  g_total_lap_gnss_ns += candidate.lap_gnss_ns;
+  photons_welford_update(
+      g_lap_time_welford, (double)candidate.lap_gnss_ns);
+
+  g_photons_lap_science_state.predictor_valid = true;
+  g_photons_lap_science_state.predictor_cycles = candidate.raw_cycles;
+  g_photons_lap_science_state.gate_cycles =
+      photons_lap_science_gate_cycles(candidate.raw_cycles);
+
+  photons_lap_science_note_last(
+      candidate,
+      photons_lap_science_disposition_t::ACCEPT,
+      photons_lap_science_exclusion_reason_t::NONE,
+      true,
+      prediction_cycles,
+      residual_cycles,
+      gate_cycles);
+}
+
+
+static void photons_lap_science_exclude(
+    const photons_lap_science_candidate_t& candidate,
+    photons_lap_science_exclusion_reason_t reason,
+    bool projection_valid,
+    uint32_t prediction_cycles,
+    int32_t residual_cycles,
+    uint32_t gate_cycles) {
+  g_photons_lap_science_state.exclude_count++;
+  g_photons_lap_science_state.excluded_this_fragment++;
+  g_photons_lap_science_state.reject_streak++;
+  if (g_photons_lap_science_state.reject_streak > g_photons_lap_science_state.max_reject_streak) {
+    g_photons_lap_science_state.max_reject_streak = g_photons_lap_science_state.reject_streak;
+  }
+
+  photons_lap_science_note_last(
+      candidate,
+      photons_lap_science_disposition_t::SCIENCE_EXCLUDE,
+      reason,
+      projection_valid,
+      prediction_cycles,
+      residual_cycles,
+      gate_cycles);
+}
+
+
+static void photons_lap_science_projected_candidate(
+    const photons_lap_science_candidate_t& candidate) {
+  if (!g_photons_lap_science_state.predictor_valid) {
+    if (!g_photons_lap_science_seed_pending.valid) {
+      g_photons_lap_science_seed_pending = candidate;
+      photons_lap_science_refresh_seed_snapshot();
+      return;
+    }
+
+    const uint32_t prediction = g_photons_lap_science_seed_pending.raw_cycles;
+    const uint32_t gate = photons_lap_science_gate_cycles(prediction);
+    const int32_t residual =
+        photons_lap_science_signed_delta(candidate.raw_cycles, prediction);
+    const bool agrees =
+        photons_lap_science_abs_delta(candidate.raw_cycles, prediction) <=
+        (uint64_t)gate;
+
+    if (agrees) {
+      const photons_lap_science_candidate_t seed = g_photons_lap_science_seed_pending;
+      g_photons_lap_science_seed_pending = photons_lap_science_candidate_t{};
+      photons_lap_science_refresh_seed_snapshot();
+
+      // The agreeing pair jointly establishes lineage.  Both projected laps
+      // become science observations; the second becomes the carry-forward
+      // static predictor for the next candidate.
+      photons_lap_science_accept(seed, 0U, 0, 0U);
+      photons_lap_science_accept(candidate, prediction, residual, gate);
+      return;
+    }
+
+    // Neither member of a disagreeing seed pair is privileged.  Preserve both
+    // as explicit exclusions and restart acquisition from the next candidate.
+    const photons_lap_science_candidate_t seed = g_photons_lap_science_seed_pending;
+    g_photons_lap_science_seed_pending = photons_lap_science_candidate_t{};
+    photons_lap_science_refresh_seed_snapshot();
+
+    photons_lap_science_exclude(
+        seed,
+        photons_lap_science_exclusion_reason_t::SEED_DISAGREEMENT,
+        true,
+        candidate.raw_cycles,
+        photons_lap_science_signed_delta(seed.raw_cycles,
+                                     candidate.raw_cycles),
+        photons_lap_science_gate_cycles(candidate.raw_cycles));
+    photons_lap_science_exclude(
+        candidate,
+        photons_lap_science_exclusion_reason_t::SEED_DISAGREEMENT,
+        true,
+        prediction,
+        residual,
+        gate);
+    return;
+  }
+
+  const uint32_t prediction = g_photons_lap_science_state.predictor_cycles;
+  const uint32_t gate = photons_lap_science_gate_cycles(prediction);
+  const int32_t residual =
+      photons_lap_science_signed_delta(candidate.raw_cycles, prediction);
+
+  if (photons_lap_science_abs_delta(candidate.raw_cycles, prediction) <=
+      (uint64_t)gate) {
+    photons_lap_science_accept(candidate, prediction, residual, gate);
+    return;
+  }
+
+  // Rejected observations never advance the predictor, so a single excursion
+  // cannot poison the reference used to adjudicate the next physical lap.
+  photons_lap_science_exclude(
+      candidate,
+      photons_lap_science_exclusion_reason_t::RAW_CYCLE_EXCURSION,
+      true,
+      prediction,
+      residual,
+      gate);
+}
+
+
+struct photons_fragment_drain_result_t {
+  uint32_t raw_laps = 0U;
+  uint32_t projected_laps = 0U;
+  uint64_t total_cycles = 0ULL;
+  uint32_t min_cycles = 0U;
+  uint32_t max_cycles = 0U;
+};
+
+
+static photons_fragment_drain_result_t photons_drain_raw_laps(void) {
+  photons_fragment_drain_result_t result{};
+
+  g_photons_lap_science_state.candidates_this_fragment = 0U;
+  g_photons_lap_science_state.accepted_this_fragment = 0U;
+  g_photons_lap_science_state.excluded_this_fragment = 0U;
+
+  photons_memory_barrier();
+  const uint32_t write_snapshot = g_raw_lap_ring_write;
+
+  while (g_raw_lap_ring_read != write_snapshot) {
+    photons_memory_barrier();
+    const photons_raw_lap_record_t record =
+        g_raw_lap_ring[g_raw_lap_ring_read];
+    g_raw_lap_ring_read =
+        (g_raw_lap_ring_read + 1U) & PHOTONS_LAP_RING_MASK;
+
+    result.raw_laps++;
+    result.total_cycles += (uint64_t)record.raw_cycles;
+    if (result.min_cycles == 0U || record.raw_cycles < result.min_cycles) {
+      result.min_cycles = record.raw_cycles;
+    }
+    if (record.raw_cycles > result.max_cycles) {
+      result.max_cycles = record.raw_cycles;
+    }
+
+    g_raw_cycles_state.completed_lap_count++;
+    if (g_raw_cycles_state.completed_lap_count > 1ULL) {
+      g_raw_cycles_state.static_prediction_valid = true;
+      g_raw_cycles_state.previous_observed_cycles =
+          g_raw_cycles_state.observed_cycles;
+      g_raw_cycles_state.static_prediction_cycles =
+          g_raw_cycles_state.previous_observed_cycles;
+      g_raw_cycles_state.observed_cycles = record.raw_cycles;
+      g_raw_cycles_state.static_residual_cycles =
+          (int32_t)((int64_t)record.raw_cycles -
+                    (int64_t)g_raw_cycles_state.static_prediction_cycles);
+    } else {
+      g_raw_cycles_state.static_prediction_valid = false;
+      g_raw_cycles_state.previous_observed_cycles = 0U;
+      g_raw_cycles_state.static_prediction_cycles = 0U;
+      g_raw_cycles_state.observed_cycles = record.raw_cycles;
+      g_raw_cycles_state.static_residual_cycles = 0;
+    }
+
+    g_projection_state.attempt_count++;
+    g_photons_lap_science_state.candidate_count++;
+    g_photons_lap_science_state.candidates_this_fragment++;
+    photons_lap_science_candidate_t science_candidate{};
+    science_candidate.valid = true;
+    science_candidate.candidate_index = g_photons_lap_science_state.candidate_count;
+    science_candidate.pps_sequence = record.pps_sequence;
+    science_candidate.raw_cycles = record.raw_cycles;
+
+    uint64_t start_gnss_ns = 0ULL;
+    uint64_t end_gnss_ns = 0ULL;
+    uint64_t lap_gnss_ns = 0ULL;
+    if (!photons_project_raw_lap(
+            record, start_gnss_ns, end_gnss_ns, lap_gnss_ns)) {
+      g_projection_state.reject_count++;
+      photons_lap_science_exclude(
+          science_candidate,
+          photons_lap_science_exclusion_reason_t::PROJECTION_INVALID,
+          false,
+          g_photons_lap_science_state.predictor_valid
+              ? g_photons_lap_science_state.predictor_cycles
+              : 0U,
+          0,
+          g_photons_lap_science_state.predictor_valid
+              ? photons_lap_science_gate_cycles(
+                    g_photons_lap_science_state.predictor_cycles)
+              : 0U);
+      continue;
+    }
+
+    g_projection_state.success_count++;
+    g_projection_state.last_valid = true;
+    g_projection_state.last_pps_sequence = record.pps_sequence;
+    g_projection_state.last_start_dwt = record.start_dwt;
+    g_projection_state.last_end_dwt = record.end_dwt;
+    g_projection_state.last_raw_cycles = record.raw_cycles;
+    g_projection_state.last_start_gnss_ns = start_gnss_ns;
+    g_projection_state.last_end_gnss_ns = end_gnss_ns;
+    g_projection_state.last_lap_gnss_ns = lap_gnss_ns;
+
+    science_candidate.lap_gnss_ns = lap_gnss_ns;
+    photons_lap_science_projected_candidate(science_candidate);
+    result.projected_laps++;
+  }
+
+  g_raw_cycles_state.valid =
+      g_raw_cycles_state.completed_lap_count != 0ULL;
+  g_raw_cycles_state.laps_this_fragment = result.raw_laps;
+  g_raw_cycles_state.total_cycles_this_fragment = result.total_cycles;
+  g_raw_cycles_state.min_cycles_this_fragment = result.min_cycles;
+  g_raw_cycles_state.max_cycles_this_fragment = result.max_cycles;
+  g_raw_cycles_state.mean_cycles_this_fragment =
+      (result.raw_laps != 0U)
+          ? (double)result.total_cycles / (double)result.raw_laps
+          : 0.0;
+
+  g_raw_cycles_state.previous_fragment_mean_valid =
+      g_previous_fragment_mean_cycles_valid;
+  g_raw_cycles_state.previous_fragment_mean_cycles =
+      g_previous_fragment_mean_cycles;
+  g_raw_cycles_state.fragment_mean_residual_cycles =
+      (result.raw_laps != 0U && g_previous_fragment_mean_cycles_valid)
+          ? g_raw_cycles_state.mean_cycles_this_fragment -
+                g_previous_fragment_mean_cycles
+          : 0.0;
+
+  if (result.raw_laps != 0U) {
+    g_previous_fragment_mean_cycles =
+        g_raw_cycles_state.mean_cycles_this_fragment;
+    g_previous_fragment_mean_cycles_valid = true;
+  }
+
+  g_projection_state.queue_overflow_count =
+      (uint64_t)g_raw_lap_ring_overflow_count;
+
+  photons_lap_science_refresh_seed_snapshot();
+  g_photons_lap_science_state.valid = g_photons_lap_science_state.candidate_count != 0ULL;
+  g_photons_lap_science_state.science_worthy =
+      g_photons_lap_science_state.candidates_this_fragment != 0U &&
+      g_photons_lap_science_state.excluded_this_fragment == 0U &&
+      !g_photons_lap_science_state.seed_pending &&
+      !g_raw_lap_ring_data_loss;
+
+  return result;
+}
+
 
 static void photons_i2c_write(uint8_t reg, uint8_t val) {
   Wire.beginTransmission(MP5491_ADDR);
@@ -453,6 +1106,7 @@ static photons_live_state_t g_photons_live{};
 // -----------------------------------------------------------------------------
 
 static photons_toy_fragment_t g_last_fragment{};
+static photons_fragment_snapshot_t g_last_photons_fragment{};
 static uint32_t g_fragment_sequence = 0;
 static uint32_t g_publish_count = 0;
 static uint32_t g_publish_reject_count = 0;
@@ -494,8 +1148,14 @@ static void photons_emulator_observe_edge(
         g_photons_emulator.unexpected_edge_count++;
         return;
       }
-      g_photons_emulator.lap1_last_cycles =
-          edge.dwt_at_edge - g_photons_emulator.previous_lap_endpoint_dwt;
+      {
+        const uint32_t start_dwt =
+            g_photons_emulator.previous_lap_endpoint_dwt;
+        const uint32_t raw_cycles = edge.dwt_at_edge - start_dwt;
+        g_photons_emulator.lap1_last_cycles = raw_cycles;
+        (void)photons_raw_lap_enqueue(
+            start_dwt, edge.dwt_at_edge, raw_cycles, edge.pps_sequence);
+      }
       g_photons_emulator.previous_lap_endpoint_dwt = edge.dwt_at_edge;
       g_photons_emulator.lap1_complete_count++;
       return;
@@ -506,8 +1166,14 @@ static void photons_emulator_observe_edge(
         g_photons_emulator.unexpected_edge_count++;
         return;
       }
-      g_photons_emulator.lap2_last_cycles =
-          edge.dwt_at_edge - g_photons_emulator.previous_lap_endpoint_dwt;
+      {
+        const uint32_t start_dwt =
+            g_photons_emulator.previous_lap_endpoint_dwt;
+        const uint32_t raw_cycles = edge.dwt_at_edge - start_dwt;
+        g_photons_emulator.lap2_last_cycles = raw_cycles;
+        (void)photons_raw_lap_enqueue(
+            start_dwt, edge.dwt_at_edge, raw_cycles, edge.pps_sequence);
+      }
       g_photons_emulator.previous_lap_endpoint_dwt = edge.dwt_at_edge;
       g_photons_emulator.lap2_complete_count++;
       return;
@@ -518,8 +1184,14 @@ static void photons_emulator_observe_edge(
         g_photons_emulator.unexpected_edge_count++;
         return;
       }
-      g_photons_emulator.lap3_last_cycles =
-          edge.dwt_at_edge - g_photons_emulator.previous_lap_endpoint_dwt;
+      {
+        const uint32_t start_dwt =
+            g_photons_emulator.previous_lap_endpoint_dwt;
+        const uint32_t raw_cycles = edge.dwt_at_edge - start_dwt;
+        g_photons_emulator.lap3_last_cycles = raw_cycles;
+        (void)photons_raw_lap_enqueue(
+            start_dwt, edge.dwt_at_edge, raw_cycles, edge.pps_sequence);
+      }
       g_photons_emulator.previous_lap_endpoint_dwt = edge.dwt_at_edge;
       g_photons_emulator.lap3_complete_count++;
       return;
@@ -626,54 +1298,248 @@ bool photons_toy_fragment_snapshot(photons_toy_fragment_t* out) {
   return true;
 }
 
-// ============================================================================
-// PHOTONS_FRAGMENT toy publication
-// ============================================================================
 
-static Payload photons_fragment_payload(const photons_toy_fragment_t& f) {
-  Payload p;
-
-  p.add("schema", "PHOTONS_FRAGMENT_TOY_V0");
-  p.add("sequence", f.sequence);
-  p.add("publish_count", f.publish_count);
-
-  p.add("edge_count_total", f.edge_count_total);
-  p.add("edges_this_second", f.edges_this_second);
-
-  p.add("last_edge_sequence", f.capture.last_edge_sequence);
-  p.add("last_pps_sequence", f.capture.last_pps_sequence);
-  p.add("last_dwt_at_edge", f.capture.last_dwt_at_edge);
-  p.add("last_isr_entry_dwt_raw", f.capture.last_isr_entry_dwt_raw);
-  p.add("isr_entry_to_edge_correction_cycles",
-        f.capture.isr_entry_to_edge_correction_cycles);
-
-  p.add("interval_valid", f.capture.interval_valid);
-  p.add("last_interval_cycles", f.capture.last_interval_cycles);
-  p.add("min_interval_cycles", f.capture.min_interval_cycles);
-  p.add("max_interval_cycles", f.capture.max_interval_cycles);
-
-  p.add("prediction_valid", f.capture.prediction_valid);
-  p.add("prediction_cycles", f.capture.prediction_cycles);
-  p.add("residual_cycles", f.capture.residual_cycles);
-
-  p.add("interrupt_irq_count", f.interrupt_irq_count);
-  p.add("interrupt_callback_count", f.interrupt_callback_count);
-  p.add("interrupt_callback_missing_count",
-        f.interrupt_callback_missing_count);
-  p.add("interrupt_inactive_edge_count", f.interrupt_inactive_edge_count);
-  p.add("interrupt_source_pin", f.interrupt_source_pin);
-  p.add("interrupt_last_callback_wall_cycles",
-        f.interrupt_last_callback_wall_cycles);
-  p.add("interrupt_max_callback_wall_cycles",
-        f.interrupt_max_callback_wall_cycles);
-
-  return p;
+bool photons_fragment_snapshot(photons_fragment_snapshot_t* out) {
+  if (!out) return false;
+  *out = g_last_photons_fragment;
+  return out->snapshot_ok;
 }
+
+// ============================================================================
+// PHOTONS_FRAGMENT canonical publication
+// ============================================================================
+
+// Reused RAM2 Payload headers.  CLOCKS learned the hard way that rich nested
+// diagnostics do not belong on the small DTCM stack.
+static Payload g_photons_fragment_root DMAMEM;
+static Payload g_photons_fragment_instrument DMAMEM;
+static Payload g_photons_fragment_raw_cycles DMAMEM;
+static Payload g_photons_fragment_projection DMAMEM;
+static Payload g_photons_fragment_science DMAMEM;
+static Payload g_photons_fragment_stats DMAMEM;
+static Payload g_photons_fragment_welford DMAMEM;
+static Payload g_photons_fragment_baseline DMAMEM;
+static Payload g_photons_fragment_interrupt DMAMEM;
+
+
+static void photons_payload_add_welford(
+    Payload& parent,
+    const photons_fragment_welford_snapshot_t& w) {
+  Payload& obj = g_photons_fragment_welford;
+  obj.clear();
+  obj.add("n", w.n);
+  obj.add("mean", toFixedDecimal(w.mean, 6));
+  obj.add("m2", toFixedDecimal(w.m2, 6));
+  obj.add("stddev", toFixedDecimal(w.stddev, 6));
+  obj.add("stderr", toFixedDecimal(w.stderr_value, 6));
+  obj.add("min", toFixedDecimal(w.min, 6));
+  obj.add("max", toFixedDecimal(w.max, 6));
+  parent.add_object("lap_time", obj);
+  obj.clear();
+}
+
+
+static Payload& photons_fragment_payload(
+    const photons_fragment_snapshot_t& f) {
+  Payload& root = g_photons_fragment_root;
+  Payload& instrument = g_photons_fragment_instrument;
+  Payload& raw = g_photons_fragment_raw_cycles;
+  Payload& projection = g_photons_fragment_projection;
+  Payload& science = g_photons_fragment_science;
+  Payload& stats = g_photons_fragment_stats;
+  Payload& baseline = g_photons_fragment_baseline;
+  Payload& interrupt = g_photons_fragment_interrupt;
+
+  root.clear();
+  instrument.clear();
+  raw.clear();
+  projection.clear();
+  science.clear();
+  stats.clear();
+  baseline.clear();
+  interrupt.clear();
+
+  root.add("schema", "PHOTONS_FRAGMENT_V1");
+  root.add("sequence", f.sequence);
+  root.add("publish_count", f.publish_count);
+
+  instrument.add("schema", "PHOTONS_INSTRUMENT_V1");
+  instrument.add("snapshot_ok", f.snapshot_ok);
+  instrument.add("valid", f.valid);
+  instrument.add("fragment_period_ns", f.fragment_period_ns);
+  instrument.add("source",
+                 PHOTONS_EMULATOR_ENABLED ? "EMULATOR" : "PD200T");
+  instrument.add("edge_count_total", f.edge_count_total);
+  instrument.add("edges_this_fragment", f.edges_this_fragment);
+  instrument.add("train_count", f.train_count);
+  instrument.add("dead_lap_count", f.dead_lap_count);
+  instrument.add("raw_lap_count", f.raw_lap_count);
+  instrument.add("projected_laps_this_fragment",
+                 f.projected_laps_this_fragment);
+
+  raw.add("valid", f.raw_cycles.valid);
+  raw.add("completed_lap_count", f.raw_cycles.completed_lap_count);
+  raw.add("static_prediction_valid",
+          f.raw_cycles.static_prediction_valid);
+  raw.add("static_prediction_cycles",
+          f.raw_cycles.static_prediction_cycles);
+  raw.add("observed_cycles", f.raw_cycles.observed_cycles);
+  raw.add("previous_observed_cycles",
+          f.raw_cycles.previous_observed_cycles);
+  raw.add("static_residual_cycles",
+          f.raw_cycles.static_residual_cycles);
+  raw.add("laps_this_fragment", f.raw_cycles.laps_this_fragment);
+  raw.add("total_cycles_this_fragment",
+          f.raw_cycles.total_cycles_this_fragment);
+  raw.add("mean_cycles_this_fragment",
+          toFixedDecimal(f.raw_cycles.mean_cycles_this_fragment, 6));
+  raw.add("min_cycles_this_fragment",
+          f.raw_cycles.min_cycles_this_fragment);
+  raw.add("max_cycles_this_fragment",
+          f.raw_cycles.max_cycles_this_fragment);
+  raw.add("previous_fragment_mean_valid",
+          f.raw_cycles.previous_fragment_mean_valid);
+  raw.add("previous_fragment_mean_cycles",
+          toFixedDecimal(f.raw_cycles.previous_fragment_mean_cycles, 6));
+  raw.add("fragment_mean_residual_cycles",
+          toFixedDecimal(f.raw_cycles.fragment_mean_residual_cycles, 6));
+  instrument.add_object("raw_cycles", raw);
+  raw.clear();
+
+  projection.add("anchor_cache_valid",
+                 f.projection.anchor_cache_valid);
+  projection.add("anchor_pps_count",
+                 f.projection.anchor_pps_count);
+  projection.add("anchor_dwt_at_pps_vclock",
+                 f.projection.anchor_dwt_at_pps_vclock);
+  projection.add("anchor_dwt_cycles_per_second",
+                 f.projection.anchor_dwt_cycles_per_second);
+  projection.add("attempt_count", f.projection.attempt_count);
+  projection.add("success_count", f.projection.success_count);
+  projection.add("reject_count", f.projection.reject_count);
+  projection.add("queue_overflow_count",
+                 f.projection.queue_overflow_count);
+  projection.add("last_valid", f.projection.last_valid);
+  projection.add("last_pps_sequence",
+                 f.projection.last_pps_sequence);
+  projection.add("last_start_dwt", f.projection.last_start_dwt);
+  projection.add("last_end_dwt", f.projection.last_end_dwt);
+  projection.add("last_raw_cycles", f.projection.last_raw_cycles);
+  projection.add("last_start_gnss_ns",
+                 f.projection.last_start_gnss_ns);
+  projection.add("last_end_gnss_ns",
+                 f.projection.last_end_gnss_ns);
+  projection.add("last_lap_gnss_ns",
+                 f.projection.last_lap_gnss_ns);
+  instrument.add_object("projection", projection);
+  projection.clear();
+
+  science.add("schema", "PHOTONS_SCIENCE_V1");
+  science.add("valid", f.science.valid);
+  science.add("science_worthy", f.science.science_worthy);
+  science.add("candidate_count", f.science.candidate_count);
+  science.add("accept_count", f.science.accept_count);
+  science.add("exclude_count", f.science.exclude_count);
+  science.add("candidates_this_fragment",
+              f.science.candidates_this_fragment);
+  science.add("accepted_this_fragment",
+              f.science.accepted_this_fragment);
+  science.add("excluded_this_fragment",
+              f.science.excluded_this_fragment);
+  science.add("predictor_valid", f.science.predictor_valid);
+  science.add("predictor_cycles", f.science.predictor_cycles);
+  science.add("gate_cycles", f.science.gate_cycles);
+  science.add("reject_streak", f.science.reject_streak);
+  science.add("max_reject_streak", f.science.max_reject_streak);
+  science.add("seed_pending", f.science.seed_pending);
+  science.add("seed_pending_candidate_index",
+              f.science.seed_pending_candidate_index);
+  science.add("seed_pending_raw_cycles",
+              f.science.seed_pending_raw_cycles);
+  science.add("seed_pending_lap_gnss_ns",
+              f.science.seed_pending_lap_gnss_ns);
+  science.add("last_candidate_index",
+              f.science.last_candidate_index);
+  science.add("last_disposition_id",
+              (uint32_t)f.science.last_disposition_id);
+  science.add("last_disposition",
+              photons_lap_science_disposition_name(
+                  f.science.last_disposition_id));
+  science.add("last_reason_code",
+              (uint32_t)f.science.last_reason_code);
+  science.add("last_reason",
+              photons_lap_science_reason_name(
+                  f.science.last_reason_code));
+  science.add("last_science_worthy",
+              f.science.last_science_worthy);
+  science.add("last_projection_valid",
+              f.science.last_projection_valid);
+  science.add("last_pps_sequence",
+              f.science.last_pps_sequence);
+  science.add("last_observed_cycles",
+              f.science.last_observed_cycles);
+  science.add("last_prediction_cycles",
+              f.science.last_prediction_cycles);
+  science.add("last_residual_cycles",
+              f.science.last_residual_cycles);
+  science.add("last_gate_cycles",
+              f.science.last_gate_cycles);
+  science.add("last_lap_gnss_ns",
+              f.science.last_lap_gnss_ns);
+  instrument.add_object("science", science);
+  science.clear();
+
+  stats.add("schema", "PHOTONS_INSTRUMENT_STATS_V1");
+  stats.add("valid", f.stats.valid);
+  stats.add("lap_count", f.stats.lap_count);
+  stats.add("total_lap_gnss_ns", f.stats.total_lap_gnss_ns);
+  stats.add("mean_lap_ns", toFixedDecimal(f.stats.mean_lap_ns, 6));
+  photons_payload_add_welford(stats, f.stats.lap_time_welford);
+  instrument.add_object("stats", stats);
+  stats.clear();
+
+  baseline.add("present", f.baseline.present);
+  baseline.add("residual_valid", f.baseline.residual_valid);
+  if (f.baseline.present) {
+    baseline.add("baseline_mean_lap_ns",
+                 toFixedDecimal(f.baseline.baseline_mean_lap_ns, 6));
+  }
+  if (f.baseline.residual_valid) {
+    baseline.add("mean_residual_ps",
+                 toFixedDecimal(f.baseline.mean_residual_ps, 3));
+  }
+  instrument.add_object("baseline", baseline);
+  baseline.clear();
+
+  interrupt.add("irq_count", f.interrupt_irq_count);
+  interrupt.add("callback_count", f.interrupt_callback_count);
+  interrupt.add("callback_missing_count",
+                f.interrupt_callback_missing_count);
+  interrupt.add("inactive_edge_count",
+                f.interrupt_inactive_edge_count);
+  interrupt.add("source_pin", f.interrupt_source_pin);
+  interrupt.add("last_callback_wall_cycles",
+                f.interrupt_last_callback_wall_cycles);
+  interrupt.add("max_callback_wall_cycles",
+                f.interrupt_max_callback_wall_cycles);
+  instrument.add_object("interrupt", interrupt);
+  interrupt.clear();
+
+  root.add_object("photons", instrument);
+  instrument.clear();
+  return root;
+}
+
 
 static void photons_fragment_tick(
     timepop_ctx_t* /*ctx*/,
     timepop_diag_t* /*diag*/,
     void* /*user_data*/) {
+
+  // Refresh the PHOTONS-owned immutable copy for laps that will arrive after
+  // this boundary.  Records already in the ring carry the anchor that was
+  // current when their physical DWT endpoints were observed.
+  photons_projection_anchor_refresh();
 
   photons_toy_capture_t capture{};
   if (!photons_toy_capture_snapshot(&capture)) return;
@@ -681,15 +1547,55 @@ static void photons_fragment_tick(
   interrupt_photodiode_diag_t interrupt_diag{};
   (void)interrupt_photodiode_snapshot(&interrupt_diag);
 
-  photons_toy_fragment_t fragment{};
+  const photons_fragment_drain_result_t drain =
+      photons_drain_raw_laps();
+
+  photons_projection_anchor_value_t current_anchor{};
+  const bool current_anchor_snapshot_ok =
+      photons_projection_anchor_snapshot(current_anchor);
+  g_projection_state.anchor_cache_valid =
+      current_anchor_snapshot_ok && current_anchor.valid;
+  g_projection_state.anchor_pps_count = current_anchor.pps_count;
+  g_projection_state.anchor_dwt_at_pps_vclock =
+      current_anchor.dwt_at_pps_vclock;
+  g_projection_state.anchor_dwt_cycles_per_second =
+      current_anchor.dwt_cycles_per_second;
+
+  photons_fragment_snapshot_t fragment{};
+  fragment.snapshot_ok = true;
   fragment.sequence = ++g_fragment_sequence;
   fragment.publish_count = g_publish_count + 1U;
+  fragment.fragment_period_ns = PHOTONS_FRAGMENT_PERIOD_NS;
 
   fragment.edge_count_total = capture.edge_count;
-  fragment.edges_this_second =
+  fragment.edges_this_fragment =
       capture.edge_count - g_last_published_edge_count;
 
-  fragment.capture = capture;
+  fragment.train_count = g_photons_emulator.train_count;
+  fragment.dead_lap_count = g_photons_emulator.dead_lap_count;
+  fragment.raw_lap_count = g_raw_cycles_state.completed_lap_count;
+  fragment.projected_laps_this_fragment = drain.projected_laps;
+
+  fragment.raw_cycles = g_raw_cycles_state;
+  fragment.projection = g_projection_state;
+  fragment.science = g_photons_lap_science_state;
+
+  fragment.stats.lap_count = g_lap_time_welford.n;
+  fragment.stats.total_lap_gnss_ns = g_total_lap_gnss_ns;
+  fragment.stats.mean_lap_ns =
+      (g_lap_time_welford.n != 0ULL)
+          ? (double)g_total_lap_gnss_ns /
+                (double)g_lap_time_welford.n
+          : 0.0;
+  fragment.stats.lap_time_welford =
+      photons_welford_snapshot(g_lap_time_welford);
+  fragment.stats.valid =
+      g_lap_time_welford.n != 0ULL &&
+      !g_raw_lap_ring_data_loss;
+
+  // Baseline control/provenance is deliberately deferred.  False validity is
+  // part of the canonical schema rather than a fabricated zero baseline.
+  fragment.baseline = photons_fragment_baseline_snapshot_t{};
 
   fragment.interrupt_irq_count = interrupt_diag.irq_count;
   fragment.interrupt_callback_count = interrupt_diag.callback_count;
@@ -703,19 +1609,47 @@ static void photons_fragment_tick(
   fragment.interrupt_max_callback_wall_cycles =
       interrupt_diag.max_callback_wall_cycles;
 
-  // Author the foreground snapshot before transport admission so REPORT can
+  fragment.valid =
+      fragment.stats.valid &&
+      fragment.projection.anchor_cache_valid &&
+      fragment.interrupt_callback_missing_count == 0U &&
+      fragment.interrupt_inactive_edge_count == 0U;
+
+  // Keep the historical toy snapshot alive only as a compatibility shell.
+  photons_toy_fragment_t toy{};
+  toy.sequence = fragment.sequence;
+  toy.publish_count = fragment.publish_count;
+  toy.edge_count_total = capture.edge_count;
+  toy.edges_this_second = fragment.edges_this_fragment;
+  toy.capture = capture;
+  toy.interrupt_irq_count = interrupt_diag.irq_count;
+  toy.interrupt_callback_count = interrupt_diag.callback_count;
+  toy.interrupt_callback_missing_count =
+      interrupt_diag.callback_missing_count;
+  toy.interrupt_inactive_edge_count =
+      interrupt_diag.inactive_edge_count;
+  toy.interrupt_source_pin = interrupt_diag.source_pin;
+  toy.interrupt_last_callback_wall_cycles =
+      interrupt_diag.last_callback_wall_cycles;
+  toy.interrupt_max_callback_wall_cycles =
+      interrupt_diag.max_callback_wall_cycles;
+
+  // Author both foreground snapshots before transport admission so REPORT can
   // show exactly what PHOTONS attempted to publish.
-  g_last_fragment = fragment;
+  g_last_fragment = toy;
+  g_last_photons_fragment = fragment;
   g_last_published_edge_count = capture.edge_count;
 
-  Payload payload = photons_fragment_payload(fragment);
+  Payload& payload = photons_fragment_payload(fragment);
   if (publish("PHOTONS_FRAGMENT", payload)) {
     g_publish_count++;
     g_last_fragment.publish_count = g_publish_count;
+    g_last_photons_fragment.publish_count = g_publish_count;
   } else {
     g_publish_reject_count++;
   }
 }
+
 
 // ============================================================================
 // Initialization
@@ -726,10 +1660,25 @@ void process_photons_init(void) {
 
   g_photons_live = photons_live_state_t{};
   g_last_fragment = photons_toy_fragment_t{};
+  g_last_photons_fragment = photons_fragment_snapshot_t{};
   g_fragment_sequence = 0U;
   g_publish_count = 0U;
   g_publish_reject_count = 0U;
   g_last_published_edge_count = 0U;
+
+  g_projection_anchor_cache = photons_projection_anchor_cache_t{};
+  g_raw_lap_ring_write = 0U;
+  g_raw_lap_ring_read = 0U;
+  g_raw_lap_ring_overflow_count = 0U;
+  g_raw_lap_ring_data_loss = false;
+  g_raw_cycles_state = photons_fragment_raw_cycles_snapshot_t{};
+  g_projection_state = photons_fragment_projection_snapshot_t{};
+  g_photons_lap_science_state = photons_lap_science_snapshot_t{};
+  g_photons_lap_science_seed_pending = photons_lap_science_candidate_t{};
+  photons_welford_reset(g_lap_time_welford);
+  g_total_lap_gnss_ns = 0ULL;
+  g_previous_fragment_mean_cycles_valid = false;
+  g_previous_fragment_mean_cycles = 0.0;
 
   photons_emulator_prepare();
   photons_laser_initialize_hardware();
@@ -743,6 +1692,11 @@ void process_photons_init(void) {
   g_interrupt_started =
       g_subscription_ok &&
       interrupt_start(interrupt_subscriber_kind_t::PHOTODIODE);
+
+  // Prime the PHOTONS-owned projection cache before the emulator begins.  TIME
+  // may still be initializing; invalidity is preserved and early laps are
+  // rejected rather than projected through an invented ruler.
+  photons_projection_anchor_refresh();
 
   g_fragment_timer = timepop_arm(
       PHOTONS_FRAGMENT_PERIOD_NS,
@@ -768,6 +1722,9 @@ static Payload cmd_report(const Payload& /*args*/) {
   photons_toy_fragment_t fragment{};
   (void)photons_toy_fragment_snapshot(&fragment);
 
+  photons_fragment_snapshot_t canonical{};
+  (void)photons_fragment_snapshot(&canonical);
+
   interrupt_photodiode_diag_t interrupt_diag{};
   (void)interrupt_photodiode_snapshot(&interrupt_diag);
 
@@ -780,6 +1737,122 @@ static Payload cmd_report(const Payload& /*args*/) {
   p.add("interrupt_started", g_interrupt_started);
   p.add("fragment_timer_armed",
         g_fragment_timer != TIMEPOP_INVALID_HANDLE);
+
+  p.add("fragment_schema", "PHOTONS_FRAGMENT_V1");
+  p.add("fragment_snapshot_ok", canonical.snapshot_ok);
+  p.add("fragment_valid", canonical.valid);
+  p.add("fragment_raw_lap_count", canonical.raw_lap_count);
+  p.add("fragment_projected_laps_this_fragment",
+        canonical.projected_laps_this_fragment);
+
+  p.add("raw_cycles_completed_lap_count",
+        canonical.raw_cycles.completed_lap_count);
+  p.add("raw_cycles_observed_cycles",
+        canonical.raw_cycles.observed_cycles);
+  p.add("raw_cycles_previous_observed_cycles",
+        canonical.raw_cycles.previous_observed_cycles);
+  p.add("raw_cycles_static_prediction_valid",
+        canonical.raw_cycles.static_prediction_valid);
+  p.add("raw_cycles_static_prediction_cycles",
+        canonical.raw_cycles.static_prediction_cycles);
+  p.add("raw_cycles_static_residual_cycles",
+        canonical.raw_cycles.static_residual_cycles);
+  p.add("raw_cycles_mean_cycles_this_fragment",
+        toFixedDecimal(canonical.raw_cycles.mean_cycles_this_fragment, 6));
+  p.add("raw_cycles_previous_fragment_mean_valid",
+        canonical.raw_cycles.previous_fragment_mean_valid);
+  p.add("raw_cycles_previous_fragment_mean_cycles",
+        toFixedDecimal(canonical.raw_cycles.previous_fragment_mean_cycles, 6));
+  p.add("raw_cycles_fragment_mean_residual_cycles",
+        toFixedDecimal(canonical.raw_cycles.fragment_mean_residual_cycles, 6));
+
+  p.add("projection_anchor_cache_valid",
+        canonical.projection.anchor_cache_valid);
+  p.add("projection_anchor_pps_count",
+        canonical.projection.anchor_pps_count);
+  p.add("projection_anchor_dwt_cycles_per_second",
+        canonical.projection.anchor_dwt_cycles_per_second);
+  p.add("projection_attempt_count",
+        canonical.projection.attempt_count);
+  p.add("projection_success_count",
+        canonical.projection.success_count);
+  p.add("projection_reject_count",
+        canonical.projection.reject_count);
+  p.add("projection_queue_overflow_count",
+        canonical.projection.queue_overflow_count);
+  p.add("projection_last_valid",
+        canonical.projection.last_valid);
+  p.add("projection_last_start_dwt",
+        canonical.projection.last_start_dwt);
+  p.add("projection_last_end_dwt",
+        canonical.projection.last_end_dwt);
+  p.add("projection_last_lap_gnss_ns",
+        canonical.projection.last_lap_gnss_ns);
+
+  p.add("science_valid", canonical.science.valid);
+  p.add("science_worthy", canonical.science.science_worthy);
+  p.add("science_candidate_count",
+        canonical.science.candidate_count);
+  p.add("science_accept_count",
+        canonical.science.accept_count);
+  p.add("science_exclude_count",
+        canonical.science.exclude_count);
+  p.add("science_candidates_this_fragment",
+        canonical.science.candidates_this_fragment);
+  p.add("science_accepted_this_fragment",
+        canonical.science.accepted_this_fragment);
+  p.add("science_excluded_this_fragment",
+        canonical.science.excluded_this_fragment);
+  p.add("science_predictor_valid",
+        canonical.science.predictor_valid);
+  p.add("science_predictor_cycles",
+        canonical.science.predictor_cycles);
+  p.add("science_gate_cycles",
+        canonical.science.gate_cycles);
+  p.add("science_reject_streak",
+        canonical.science.reject_streak);
+  p.add("science_max_reject_streak",
+        canonical.science.max_reject_streak);
+  p.add("science_seed_pending",
+        canonical.science.seed_pending);
+  p.add("science_last_disposition",
+        photons_lap_science_disposition_name(
+            canonical.science.last_disposition_id));
+  p.add("science_last_reason",
+        photons_lap_science_reason_name(
+            canonical.science.last_reason_code));
+  p.add("science_last_observed_cycles",
+        canonical.science.last_observed_cycles);
+  p.add("science_last_prediction_cycles",
+        canonical.science.last_prediction_cycles);
+  p.add("science_last_residual_cycles",
+        canonical.science.last_residual_cycles);
+  p.add("science_last_gate_cycles",
+        canonical.science.last_gate_cycles);
+
+  p.add("stats_valid", canonical.stats.valid);
+  p.add("stats_lap_count", canonical.stats.lap_count);
+  p.add("stats_total_lap_gnss_ns",
+        canonical.stats.total_lap_gnss_ns);
+  p.add("stats_mean_lap_ns",
+        toFixedDecimal(canonical.stats.mean_lap_ns, 6));
+  p.add("stats_lap_welford_n",
+        canonical.stats.lap_time_welford.n);
+  p.add("stats_lap_welford_mean",
+        toFixedDecimal(canonical.stats.lap_time_welford.mean, 6));
+  p.add("stats_lap_welford_m2",
+        toFixedDecimal(canonical.stats.lap_time_welford.m2, 6));
+  p.add("stats_lap_welford_stddev",
+        toFixedDecimal(canonical.stats.lap_time_welford.stddev, 6));
+  p.add("stats_lap_welford_stderr",
+        toFixedDecimal(canonical.stats.lap_time_welford.stderr_value, 6));
+  p.add("stats_lap_welford_min",
+        toFixedDecimal(canonical.stats.lap_time_welford.min, 6));
+  p.add("stats_lap_welford_max",
+        toFixedDecimal(canonical.stats.lap_time_welford.max, 6));
+  p.add("baseline_present", canonical.baseline.present);
+  p.add("baseline_residual_valid",
+        canonical.baseline.residual_valid);
 
   p.add("laser_enabled", device.laser_enabled);
   p.add("laser_id1_raw", device.laser_id1_raw);

@@ -16,9 +16,16 @@
 //     DWT-at-edge custody.
 //   • PHOTONS consumes those edge facts and publishes PHOTONS_FRAGMENT.
 //
-// The current measurement structures remain intentionally toy/scaffold state.
-// They exist to validate custody and transport before the final pulse-train,
-// lap, timeout, statistics, recovery, and LANTERN campaign model is installed.
+// PHOTONS_FRAGMENT is now the canonical once-per-second optical instrument
+// handoff.  As in CLOCKS, physical testimony and interpreted statistics remain
+// separate: raw DWT lap intervals are preserved beside GNSS-projected lap time,
+// science-admission testimony, Welford sufficient state, and recovery totals.
+//
+// A projected lap is never silently discarded.  PHOTONS applies a CLOCKS-style
+// ACCEPT / SCIENCE_EXCLUDE court before mutating scientific statistics.  Raw and
+// projection testimony survives either verdict so downstream/Python analysis can
+// inspect excluded observations.  The temporary emulator remains only a source
+// of physical pin-34 edge facts while the PD200T is unavailable.
 //
 // Temporary bring-up emulator:
 //   • pin 33 is a detector-emulator output physically looped to pin 34;
@@ -88,6 +95,190 @@ struct photons_toy_fragment_t {
   uint32_t interrupt_max_callback_wall_cycles = 0;
 };
 
+// Canonical statistical sufficient state.  This mirrors the CLOCKS Welford
+// publication contract: n/mean/m2/min/max are sufficient for exact resurrection;
+// stddev/stderr are derived convenience values carried in each fragment.
+struct photons_fragment_welford_snapshot_t {
+  uint64_t n = 0;
+  double mean = 0.0;
+  double m2 = 0.0;
+  double stddev = 0.0;
+  double stderr_value = 0.0;
+  double min = 0.0;
+  double max = 0.0;
+};
+
+
+// Compact raw-cycle courtroom.  The last-lap static prediction answers the
+// immediate "does this lap look like the prior lap?" question.  The fragment
+// mean comparison is the optical analogue of CLOCKS raw_cycles at 1 Hz: a
+// second-scale sanity surface that should remain very boring in steady state.
+struct photons_fragment_raw_cycles_snapshot_t {
+  bool valid = false;
+  uint64_t completed_lap_count = 0;
+
+  bool static_prediction_valid = false;
+  uint32_t static_prediction_cycles = 0;
+  uint32_t observed_cycles = 0;
+  uint32_t previous_observed_cycles = 0;
+  int32_t static_residual_cycles = 0;
+
+  uint32_t laps_this_fragment = 0;
+  uint64_t total_cycles_this_fragment = 0;
+  double mean_cycles_this_fragment = 0.0;
+  uint32_t min_cycles_this_fragment = 0;
+  uint32_t max_cycles_this_fragment = 0;
+
+  bool previous_fragment_mean_valid = false;
+  double previous_fragment_mean_cycles = 0.0;
+  double fragment_mean_residual_cycles = 0.0;
+};
+
+
+// Projection testimony for the most recently accepted lap plus lifetime
+// admission counters.  PHOTONS consumes a cached immutable PPS/VCLOCK anchor;
+// the detector ISR never calls TIME/CLOCKS or performs Payload/statistical work.
+struct photons_fragment_projection_snapshot_t {
+  bool anchor_cache_valid = false;
+  uint32_t anchor_pps_count = 0;
+  uint32_t anchor_dwt_at_pps_vclock = 0;
+  uint32_t anchor_dwt_cycles_per_second = 0;
+
+  uint64_t attempt_count = 0;
+  uint64_t success_count = 0;
+  uint64_t reject_count = 0;
+  uint64_t queue_overflow_count = 0;
+
+  bool last_valid = false;
+  uint32_t last_pps_sequence = 0;
+  uint32_t last_start_dwt = 0;
+  uint32_t last_end_dwt = 0;
+  uint32_t last_raw_cycles = 0;
+  uint64_t last_start_gnss_ns = 0;
+  uint64_t last_end_gnss_ns = 0;
+  uint64_t last_lap_gnss_ns = 0;
+};
+
+
+// Lap-level science court.  This deliberately mirrors CLOCKS disposition:
+// every survivable candidate remains visible, but only ACCEPT mutates the
+// scientific numerator/Welford.  The raw-cycle court is intentionally broad;
+// it rejects structural timing injuries, not ordinary optical noise.
+enum class photons_lap_science_disposition_t : uint8_t {
+  NONE = 0,
+  ACCEPT = 1,
+  SCIENCE_EXCLUDE = 2,
+  PENDING_SEED = 3,
+};
+
+enum class photons_lap_science_exclusion_reason_t : uint16_t {
+  NONE = 0,
+  PROJECTION_INVALID = 100,
+  SEED_DISAGREEMENT = 200,
+  RAW_CYCLE_EXCURSION = 300,
+};
+
+
+struct photons_lap_science_snapshot_t {
+  bool valid = false;
+
+  uint64_t candidate_count = 0;
+  uint64_t accept_count = 0;
+  uint64_t exclude_count = 0;
+
+  uint32_t candidates_this_fragment = 0;
+  uint32_t accepted_this_fragment = 0;
+  uint32_t excluded_this_fragment = 0;
+
+  // A clean fragment has no excluded/raw-unprojectable candidates in this
+  // one-second cohort.  The fragment is still published when false.
+  bool science_worthy = false;
+
+  // Two agreeing projected laps establish the initial raw-cycle lineage.
+  bool predictor_valid = false;
+  uint32_t predictor_cycles = 0;
+  uint32_t gate_cycles = 0;
+  uint32_t reject_streak = 0;
+  uint32_t max_reject_streak = 0;
+
+  bool seed_pending = false;
+  uint64_t seed_pending_candidate_index = 0;
+  uint32_t seed_pending_raw_cycles = 0;
+  uint64_t seed_pending_lap_gnss_ns = 0;
+
+  // Last finalized candidate verdict.  A PENDING_SEED candidate is separately
+  // visible above and has not yet mutated either accept or exclude totals.
+  uint64_t last_candidate_index = 0;
+  uint8_t last_disposition_id = 0;
+  uint16_t last_reason_code = 0;
+  bool last_science_worthy = false;
+  bool last_projection_valid = false;
+  uint32_t last_pps_sequence = 0;
+  uint32_t last_observed_cycles = 0;
+  uint32_t last_prediction_cycles = 0;
+  int32_t last_residual_cycles = 0;
+  uint32_t last_gate_cycles = 0;
+  uint64_t last_lap_gnss_ns = 0;
+};
+
+
+// Always-on optical statistics.  lap_count + total_lap_gnss_ns is the
+// authoritative grand ratio for mean lap time.  Welford independently carries
+// variance and doubles as a consistency witness for that ratio.
+struct photons_fragment_stats_snapshot_t {
+  bool valid = false;
+  uint64_t lap_count = 0;
+  uint64_t total_lap_gnss_ns = 0;
+  double mean_lap_ns = 0.0;
+  photons_fragment_welford_snapshot_t lap_time_welford{};
+};
+
+
+// Baseline comparison is intentionally present in the schema before baseline
+// control exists.  No fake zero baseline is authored: present/residual_valid
+// remain false until a future LANTERN/baseline command supplies provenance.
+struct photons_fragment_baseline_snapshot_t {
+  bool present = false;
+  bool residual_valid = false;
+  double baseline_mean_lap_ns = 0.0;
+  double mean_residual_ps = 0.0;
+};
+
+
+// Canonical once-per-second PHOTONS handoff.  This is deliberately instrument
+// state, not campaign state.  A future Pi-side PHOTONS service may decorate it
+// with LANTERN campaign identity exactly as SYSTEM decorates CLOCKS live state.
+struct photons_fragment_snapshot_t {
+  bool snapshot_ok = false;
+  bool valid = false;
+  uint32_t sequence = 0;
+  uint32_t publish_count = 0;
+  uint64_t fragment_period_ns = 0;
+
+  uint32_t edge_count_total = 0;
+  uint32_t edges_this_fragment = 0;
+
+  uint32_t train_count = 0;
+  uint32_t dead_lap_count = 0;
+  uint64_t raw_lap_count = 0;
+  uint32_t projected_laps_this_fragment = 0;
+
+  photons_fragment_raw_cycles_snapshot_t raw_cycles{};
+  photons_fragment_projection_snapshot_t projection{};
+  photons_lap_science_snapshot_t science{};
+  photons_fragment_stats_snapshot_t stats{};
+  photons_fragment_baseline_snapshot_t baseline{};
+
+  // Snapshot of process_interrupt's PHOTODIODE lane testimony.
+  uint32_t interrupt_irq_count = 0;
+  uint32_t interrupt_callback_count = 0;
+  uint32_t interrupt_callback_missing_count = 0;
+  uint32_t interrupt_inactive_edge_count = 0;
+  uint32_t interrupt_source_pin = 0;
+  uint32_t interrupt_last_callback_wall_cycles = 0;
+  uint32_t interrupt_max_callback_wall_cycles = 0;
+};
+
 // Initialize PHOTONS runtime state, subscribe to the process_interrupt
 // PHOTODIODE lane, start that lane, arm the 1 Hz toy fragment publisher, and
 // start the temporary always-on detector emulator.
@@ -97,7 +288,9 @@ void process_photons_init(void);
 // Register the PHOTONS process command surface.
 void process_photons_register(void);
 
-// Foreground/test accessors.  They return a coherent snapshot of the current
-// toy structures without changing PHOTONS state.
+// Foreground/test accessors.  They return coherent snapshots without changing
+// PHOTONS state.  The toy accessors are retained temporarily for compatibility;
+// new consumers should use photons_fragment_snapshot().
 bool photons_toy_capture_snapshot(photons_toy_capture_t* out);
 bool photons_toy_fragment_snapshot(photons_toy_fragment_t* out);
+bool photons_fragment_snapshot(photons_fragment_snapshot_t* out);
