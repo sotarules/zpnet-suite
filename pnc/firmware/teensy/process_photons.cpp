@@ -72,16 +72,27 @@ static constexpr float PHOTONS_LASER_EMIT_THRESHOLD_V = 0.75f;
 // is a real electrical rising edge on pin 34 and therefore enters through
 // process_interrupt exactly as the future PD200T comparator will.
 //
-// The optical launch itself is also real: LD_ON is pulsed for approximately
-// 20 ns.  The light currently goes nowhere useful, but the launch-control path
-// is exercised.  A near-immediate pin-33 edge represents the local splitter
-// response.  TimePop then authors 3-5 synthetic 1 km returns at approximately
-// 4.9 us spacing with +/-2 ns jitter.
+// The optical launch itself is real: LD_ON is pulsed for approximately 20 ns.
+// Detector timing is deliberately synthetic.  One ordinary recurring TimePop
+// timer provides a fixed 10 ms emulator cadence; its callback advances state only
+// and never mutates TimePop scheduling.
 //
-// After the final return, one expected lap is deliberately left empty.  PHOTONS
-// waits through that missing-return deadline, then waits another ~5 us before
-// launching the next train.  This mirrors the future "predicted return absent ->
-// relaunch" lifecycle without teaching PHOTONS that a timeout is a photon.
+// One emulator train is fixed and explicit:
+//
+//   laser pulse
+//   hit 1  -- physical pin-33 -> pin-34 edge; ignored by lap semantics
+//   hit 2  -- lap start
+//   hit 3  -- lap 1 end
+//   hit 4  -- lap 2 end
+//   hit 5  -- lap 3 end
+//   dead lap -- one full synthetic-lap delay with no detector edge
+//   repeat at the next laser pulse
+//
+// Each cadence tick advances exactly one state.  Hit 1 is emitted immediately
+// after the real laser pulse; hit 2 follows on the next cadence tick.  After hit 5,
+// the next tick is the dead lap: no detector edge is emitted and the following
+// train begins on that same tick.  Every hit still traverses the physical pin-33
+// jumper and real pin-34 ISR.
 //
 // PD200T MON on pin 38/A14 is not sampled while this emulator is installed.
 // Instead a plausible synthetic ADC value is maintained as slow telemetry.
@@ -91,59 +102,72 @@ static constexpr float PHOTONS_LASER_EMIT_THRESHOLD_V = 0.75f;
 static constexpr bool PHOTONS_EMULATOR_ENABLED = true;
 static constexpr int PHOTONS_EMULATOR_EDGE_OUTPUT_PIN = 33;
 static constexpr uint32_t PHOTONS_EMULATOR_LASER_PULSE_CYCLES = 20U;
-static constexpr uint32_t PHOTONS_EMULATOR_LAP_NS = 4900U;
-static constexpr int32_t PHOTONS_EMULATOR_JITTER_NS = 2;
-static constexpr uint32_t PHOTONS_EMULATOR_MIN_RETURNS = 3U;
-static constexpr uint32_t PHOTONS_EMULATOR_MAX_RETURNS = 5U;
-static constexpr uint32_t PHOTONS_EMULATOR_RELAUNCH_AFTER_MISSING_NS = 5000U;
-static constexpr uint32_t PHOTONS_EMULATOR_INITIAL_LAUNCH_DELAY_NS = 1000000U;
+static constexpr uint32_t PHOTONS_EMULATOR_CADENCE_NS = 10000000U;  // synthetic 10 ms
+static constexpr uint32_t PHOTONS_EMULATOR_HITS_PER_TRAIN = 5U;
+static constexpr uint32_t PHOTONS_EMULATOR_MEASURED_LAPS = 3U;
 
 // Provisional PD200T MON range for bring-up only.  1200-1800 ADC counts maps to
 // roughly 0.97-1.45 V on the Teensy 3.3 V / 12-bit ADC scale.
 static constexpr uint16_t PHOTONS_EMULATOR_MON_RAW_MIN = 1200U;
 static constexpr uint16_t PHOTONS_EMULATOR_MON_RAW_MAX = 1800U;
 
+enum class photons_emulator_stage_t : uint8_t {
+  IDLE = 0,
+  WAIT_HIT2,
+  WAIT_HIT3,
+  WAIT_HIT4,
+  WAIT_HIT5,
+  DEAD_LAP,
+};
+
+
 struct photons_emulator_state_t {
   bool initialized = false;
   bool train_active = false;
 
-  uint32_t prng_state = 0U;
-  timepop_handle_t timer = TIMEPOP_INVALID_HANDLE;
-  uint32_t timer_arm_count = 0U;
-  uint32_t timer_arm_fail_count = 0U;
+  timepop_handle_t cadence_timer = TIMEPOP_INVALID_HANDLE;
+  uint32_t cadence_timer_arm_count = 0U;
+  uint32_t cadence_timer_arm_fail_count = 0U;
+  uint32_t cadence_tick_count = 0U;
 
+  photons_emulator_stage_t stage = photons_emulator_stage_t::IDLE;
   uint32_t train_count = 0U;
   uint32_t relaunch_count = 0U;
+
   uint32_t laser_pulse_count = 0U;
   uint32_t last_laser_pulse_cycles = 0U;
+  uint32_t max_laser_pulse_cycles = 0U;
 
   uint32_t generated_edge_count = 0U;
-  uint32_t local_edge_count = 0U;
-  uint32_t return_edge_count = 0U;
+  uint32_t expected_hit_ordinal = 0U;
+  uint32_t unexpected_edge_count = 0U;
+  uint32_t state_error_count = 0U;
 
-  uint32_t current_returns_planned = 0U;
-  uint32_t current_returns_emitted = 0U;
-  uint32_t last_train_returns = 0U;
+  uint32_t hit1_count = 0U;
+  uint32_t hit2_count = 0U;
+  uint32_t hit3_count = 0U;
+  uint32_t hit4_count = 0U;
+  uint32_t hit5_count = 0U;
 
-  uint32_t missing_lap_count = 0U;
-  uint32_t last_lap_delay_ns = 0U;
-  uint32_t last_missing_lap_delay_ns = 0U;
-  uint32_t last_relaunch_delay_ns = 0U;
+  uint32_t lap_start_count = 0U;
+  uint32_t lap1_complete_count = 0U;
+  uint32_t lap2_complete_count = 0U;
+  uint32_t lap3_complete_count = 0U;
+  uint32_t dead_lap_count = 0U;
 
-  int32_t last_jitter_ns = 0;
-  int32_t min_jitter_ns = PHOTONS_EMULATOR_JITTER_NS;
-  int32_t max_jitter_ns = -PHOTONS_EMULATOR_JITTER_NS;
+  uint32_t lap_start_dwt = 0U;
+  uint32_t previous_lap_endpoint_dwt = 0U;
+  uint32_t lap1_last_cycles = 0U;
+  uint32_t lap2_last_cycles = 0U;
+  uint32_t lap3_last_cycles = 0U;
 
   uint16_t mon_raw = PHOTONS_EMULATOR_MON_RAW_MIN;
 };
 
+
 static photons_emulator_state_t g_photons_emulator{};
 
-static void photons_emulator_launch_tick(
-    timepop_ctx_t* ctx,
-    timepop_diag_t* diag,
-    void* user_data);
-static void photons_emulator_return_tick(
+static void photons_emulator_cadence_tick(
     timepop_ctx_t* ctx,
     timepop_diag_t* diag,
     void* user_data);
@@ -185,66 +209,36 @@ static void photons_laser_inhibit(void) {
 }
 
 
-static uint32_t photons_emulator_random_u32(void) {
-  // Tiny xorshift32 generator.  Statistical quality is irrelevant here; the
-  // emulator needs bounded, non-repeating bring-up variation without importing
-  // another subsystem or touching an ADC merely to seed randomness.
-  uint32_t x = g_photons_emulator.prng_state;
-  x ^= x << 13;
-  x ^= x >> 17;
-  x ^= x << 5;
-  g_photons_emulator.prng_state = x;
-  return x;
+static const char* photons_emulator_stage_name(
+    photons_emulator_stage_t stage) {
+  switch (stage) {
+    case photons_emulator_stage_t::IDLE:      return "IDLE";
+    case photons_emulator_stage_t::WAIT_HIT2: return "WAIT_HIT2";
+    case photons_emulator_stage_t::WAIT_HIT3: return "WAIT_HIT3";
+    case photons_emulator_stage_t::WAIT_HIT4: return "WAIT_HIT4";
+    case photons_emulator_stage_t::WAIT_HIT5: return "WAIT_HIT5";
+    case photons_emulator_stage_t::DEAD_LAP:  return "DEAD_LAP";
+    default:                                  return "UNKNOWN";
+  }
 }
 
-static uint32_t photons_emulator_random_range(
-    uint32_t minimum,
-    uint32_t maximum) {
-  return minimum +
-      photons_emulator_random_u32() % (maximum - minimum + 1U);
-}
 
 static void photons_emulator_refresh_mon(void) {
-  g_photons_emulator.mon_raw = (uint16_t)photons_emulator_random_range(
-      PHOTONS_EMULATOR_MON_RAW_MIN,
-      PHOTONS_EMULATOR_MON_RAW_MAX);
+  // Slow synthetic telemetry only.  Deterministic bounded variation avoids
+  // touching an ADC merely to make the temporary PD200T MON surface move.
+  static uint16_t step = 0U;
+  const uint16_t span =
+      PHOTONS_EMULATOR_MON_RAW_MAX - PHOTONS_EMULATOR_MON_RAW_MIN + 1U;
+  step = (uint16_t)((step + 137U) % span);
+  g_photons_emulator.mon_raw =
+      (uint16_t)(PHOTONS_EMULATOR_MON_RAW_MIN + step);
 }
 
-static uint32_t photons_emulator_random_lap_delay_ns(void) {
-  const int32_t jitter =
-      (int32_t)photons_emulator_random_range(
-          0U, (uint32_t)(PHOTONS_EMULATOR_JITTER_NS * 2)) -
-      PHOTONS_EMULATOR_JITTER_NS;
 
-  g_photons_emulator.last_jitter_ns = jitter;
-  if (jitter < g_photons_emulator.min_jitter_ns) {
-    g_photons_emulator.min_jitter_ns = jitter;
-  }
-  if (jitter > g_photons_emulator.max_jitter_ns) {
-    g_photons_emulator.max_jitter_ns = jitter;
-  }
-
-  const uint32_t delay_ns =
-      (uint32_t)((int32_t)PHOTONS_EMULATOR_LAP_NS + jitter);
-  g_photons_emulator.last_lap_delay_ns = delay_ns;
-  return delay_ns;
-}
-
-static void photons_emulator_arm(
-    uint32_t delay_ns,
-    timepop_callback_t callback,
-    const char* name) {
-  g_photons_emulator.timer_arm_count++;
-  g_photons_emulator.timer =
-      timepop_arm(delay_ns, false, callback, nullptr, name);
-  if (g_photons_emulator.timer == TIMEPOP_INVALID_HANDLE) {
-    g_photons_emulator.timer_arm_fail_count++;
-  }
-}
-
-static void photons_emulator_emit_detector_edge(void) {
-  // Pin 33 is physically looped to pin 34.  Keep pin 34 input-only and let
-  // process_interrupt own the resulting rising-edge timestamp.
+static void photons_emulator_emit_detector_edge(uint32_t hit_ordinal) {
+  // The ordinal is emulator intent only.  The resulting observation is still a
+  // real electrical edge on pin 34 whose timestamp belongs to process_interrupt.
+  g_photons_emulator.expected_hit_ordinal = hit_ordinal;
   digitalWriteFast(PHOTONS_EMULATOR_EDGE_OUTPUT_PIN, HIGH);
   digitalWriteFast(PHOTONS_EMULATOR_EDGE_OUTPUT_PIN, LOW);
   g_photons_emulator.generated_edge_count++;
@@ -252,99 +246,102 @@ static void photons_emulator_emit_detector_edge(void) {
 
 static void photons_emulator_emit_laser_pulse(void) {
   // DWT runs at approximately 1.008 GHz, so twenty cycles is approximately
-  // 19.8 ns.  Busy-waiting is deliberate here: a 20 ns pulse is far shorter
-  // than a useful scheduler round trip and this callback already owns foreground.
+  // 19.8 ns.  Measure the complete commanded HIGH/LOW transaction, not merely
+  // the busy-wait body, so REPORT shows the actual software pulse wall time.
+  const uint32_t pulse_start = ARM_DWT_CYCCNT;
   digitalWriteFast(LD_ON_PIN, HIGH);
-  const uint32_t start = ARM_DWT_CYCCNT;
-  while ((uint32_t)(ARM_DWT_CYCCNT - start) <
+  const uint32_t high_start = ARM_DWT_CYCCNT;
+  while ((uint32_t)(ARM_DWT_CYCCNT - high_start) <
          PHOTONS_EMULATOR_LASER_PULSE_CYCLES) {
   }
-  const uint32_t elapsed = ARM_DWT_CYCCNT - start;
   digitalWriteFast(LD_ON_PIN, LOW);
+  const uint32_t pulse_cycles = ARM_DWT_CYCCNT - pulse_start;
 
   g_photons_emulator.laser_pulse_count++;
-  g_photons_emulator.last_laser_pulse_cycles = elapsed;
+  g_photons_emulator.last_laser_pulse_cycles = pulse_cycles;
+  if (pulse_cycles > g_photons_emulator.max_laser_pulse_cycles) {
+    g_photons_emulator.max_laser_pulse_cycles = pulse_cycles;
+  }
 }
 
-static void photons_emulator_launch_tick(
-    timepop_ctx_t* /*ctx*/,
-    timepop_diag_t* /*diag*/,
-    void* /*user_data*/) {
-  g_photons_emulator.timer = TIMEPOP_INVALID_HANDLE;
-
+static void photons_emulator_begin_train(void) {
   if (g_photons_emulator.train_count != 0U) {
     g_photons_emulator.relaunch_count++;
   }
+
   g_photons_emulator.train_count++;
   g_photons_emulator.train_active = true;
-  g_photons_emulator.current_returns_planned =
-      photons_emulator_random_range(
-          PHOTONS_EMULATOR_MIN_RETURNS,
-          PHOTONS_EMULATOR_MAX_RETURNS);
-  g_photons_emulator.current_returns_emitted = 0U;
+  g_photons_emulator.stage = photons_emulator_stage_t::WAIT_HIT2;
+  g_photons_emulator.expected_hit_ordinal = 0U;
+  g_photons_emulator.lap_start_dwt = 0U;
+  g_photons_emulator.previous_lap_endpoint_dwt = 0U;
 
   photons_emulator_refresh_mon();
 
-  // Real launch-control pulse, followed almost immediately by the local
-  // splitter-response detector edge.
+  // Step 1: real laser pulse.
   photons_emulator_emit_laser_pulse();
-  photons_emulator_emit_detector_edge();
-  g_photons_emulator.local_edge_count++;
 
-  photons_emulator_arm(
-      photons_emulator_random_lap_delay_ns(),
-      photons_emulator_return_tick,
-      "PHOTONS_EMULATOR_RETURN");
+  // Step 2: hit 1.  It remains a real pin-34 observation but is intentionally
+  // ignored as a lap endpoint by photons_emulator_observe_edge().
+  photons_emulator_emit_detector_edge(1U);
 }
 
-static void photons_emulator_return_tick(
+
+static void photons_emulator_cadence_tick(
     timepop_ctx_t* /*ctx*/,
     timepop_diag_t* /*diag*/,
     void* /*user_data*/) {
-  g_photons_emulator.timer = TIMEPOP_INVALID_HANDLE;
+  g_photons_emulator.cadence_tick_count++;
 
-  photons_emulator_refresh_mon();
-  photons_emulator_emit_detector_edge();
-  g_photons_emulator.return_edge_count++;
-  g_photons_emulator.current_returns_emitted++;
+  switch (g_photons_emulator.stage) {
+    case photons_emulator_stage_t::IDLE:
+      photons_emulator_begin_train();
+      return;
 
-  if (g_photons_emulator.current_returns_emitted <
-      g_photons_emulator.current_returns_planned) {
-    photons_emulator_arm(
-        photons_emulator_random_lap_delay_ns(),
-        photons_emulator_return_tick,
-        "PHOTONS_EMULATOR_RETURN");
-    return;
+    case photons_emulator_stage_t::WAIT_HIT2:
+      photons_emulator_refresh_mon();
+      photons_emulator_emit_detector_edge(2U);
+      g_photons_emulator.stage = photons_emulator_stage_t::WAIT_HIT3;
+      return;
+
+    case photons_emulator_stage_t::WAIT_HIT3:
+      photons_emulator_refresh_mon();
+      photons_emulator_emit_detector_edge(3U);
+      g_photons_emulator.stage = photons_emulator_stage_t::WAIT_HIT4;
+      return;
+
+    case photons_emulator_stage_t::WAIT_HIT4:
+      photons_emulator_refresh_mon();
+      photons_emulator_emit_detector_edge(4U);
+      g_photons_emulator.stage = photons_emulator_stage_t::WAIT_HIT5;
+      return;
+
+    case photons_emulator_stage_t::WAIT_HIT5:
+      photons_emulator_refresh_mon();
+      photons_emulator_emit_detector_edge(5U);
+      g_photons_emulator.train_active = false;
+      g_photons_emulator.stage = photons_emulator_stage_t::DEAD_LAP;
+      return;
+
+    case photons_emulator_stage_t::DEAD_LAP:
+      // This cadence cell deliberately emits no detector edge.  It represents
+      // the missing fourth lap, then starts the next train immediately.
+      g_photons_emulator.dead_lap_count++;
+      photons_emulator_begin_train();
+      return;
+
+    default:
+      g_photons_emulator.state_error_count++;
+      g_photons_emulator.train_active = false;
+      g_photons_emulator.expected_hit_ordinal = 0U;
+      g_photons_emulator.stage = photons_emulator_stage_t::IDLE;
+      return;
   }
-
-  // The train is intentionally allowed to die.  No edge is generated for the
-  // next expected lap.  Wait through that missing-return deadline, then another
-  // ~5 us before launching the next train.
-  g_photons_emulator.train_active = false;
-  g_photons_emulator.last_train_returns =
-      g_photons_emulator.current_returns_emitted;
-  g_photons_emulator.missing_lap_count++;
-
-  const uint32_t missing_lap_delay_ns =
-      photons_emulator_random_lap_delay_ns();
-  const uint32_t relaunch_delay_ns =
-      missing_lap_delay_ns +
-      PHOTONS_EMULATOR_RELAUNCH_AFTER_MISSING_NS;
-  g_photons_emulator.last_missing_lap_delay_ns = missing_lap_delay_ns;
-  g_photons_emulator.last_relaunch_delay_ns = relaunch_delay_ns;
-
-  photons_emulator_arm(
-      relaunch_delay_ns,
-      photons_emulator_launch_tick,
-      "PHOTONS_EMULATOR_RELAUNCH");
 }
+
 
 static void photons_emulator_prepare(void) {
   g_photons_emulator = photons_emulator_state_t{};
-  g_photons_emulator.prng_state = ARM_DWT_CYCCNT ^ 0x9E3779B9U;
-  if (g_photons_emulator.prng_state == 0U) {
-    g_photons_emulator.prng_state = 0xA341316CU;
-  }
 
   pinMode(PHOTONS_EMULATOR_EDGE_OUTPUT_PIN, OUTPUT);
   digitalWriteFast(PHOTONS_EMULATOR_EDGE_OUTPUT_PIN, LOW);
@@ -353,10 +350,17 @@ static void photons_emulator_prepare(void) {
 }
 
 static void photons_emulator_start(void) {
-  photons_emulator_arm(
-      PHOTONS_EMULATOR_INITIAL_LAUNCH_DELAY_NS,
-      photons_emulator_launch_tick,
-      "PHOTONS_EMULATOR_INITIAL_LAUNCH");
+  g_photons_emulator.cadence_timer_arm_count++;
+  g_photons_emulator.cadence_timer =
+      timepop_arm(
+          PHOTONS_EMULATOR_CADENCE_NS,
+          true,
+          photons_emulator_cadence_tick,
+          nullptr,
+          "PHOTONS_EMULATOR_CADENCE");
+  if (g_photons_emulator.cadence_timer == TIMEPOP_INVALID_HANDLE) {
+    g_photons_emulator.cadence_timer_arm_fail_count++;
+  }
 }
 
 static void photons_laser_initialize_hardware(void) {
@@ -464,6 +468,72 @@ static inline void photons_compiler_barrier(void) {
   __asm__ volatile("" ::: "memory");
 }
 
+static void photons_emulator_observe_edge(
+    const interrupt_photodiode_edge_t& edge) {
+  if (!PHOTONS_EMULATOR_ENABLED) return;
+
+  const uint32_t hit = g_photons_emulator.expected_hit_ordinal;
+  g_photons_emulator.expected_hit_ordinal = 0U;
+
+  switch (hit) {
+    case 1U:
+      g_photons_emulator.hit1_count++;
+      // Deliberately ignored for lap measurement.
+      return;
+
+    case 2U:
+      g_photons_emulator.hit2_count++;
+      g_photons_emulator.lap_start_count++;
+      g_photons_emulator.lap_start_dwt = edge.dwt_at_edge;
+      g_photons_emulator.previous_lap_endpoint_dwt = edge.dwt_at_edge;
+      return;
+
+    case 3U:
+      g_photons_emulator.hit3_count++;
+      if (g_photons_emulator.previous_lap_endpoint_dwt == 0U) {
+        g_photons_emulator.unexpected_edge_count++;
+        return;
+      }
+      g_photons_emulator.lap1_last_cycles =
+          edge.dwt_at_edge - g_photons_emulator.previous_lap_endpoint_dwt;
+      g_photons_emulator.previous_lap_endpoint_dwt = edge.dwt_at_edge;
+      g_photons_emulator.lap1_complete_count++;
+      return;
+
+    case 4U:
+      g_photons_emulator.hit4_count++;
+      if (g_photons_emulator.previous_lap_endpoint_dwt == 0U) {
+        g_photons_emulator.unexpected_edge_count++;
+        return;
+      }
+      g_photons_emulator.lap2_last_cycles =
+          edge.dwt_at_edge - g_photons_emulator.previous_lap_endpoint_dwt;
+      g_photons_emulator.previous_lap_endpoint_dwt = edge.dwt_at_edge;
+      g_photons_emulator.lap2_complete_count++;
+      return;
+
+    case 5U:
+      g_photons_emulator.hit5_count++;
+      if (g_photons_emulator.previous_lap_endpoint_dwt == 0U) {
+        g_photons_emulator.unexpected_edge_count++;
+        return;
+      }
+      g_photons_emulator.lap3_last_cycles =
+          edge.dwt_at_edge - g_photons_emulator.previous_lap_endpoint_dwt;
+      g_photons_emulator.previous_lap_endpoint_dwt = edge.dwt_at_edge;
+      g_photons_emulator.lap3_complete_count++;
+      return;
+
+    default:
+      // A physical photodiode edge without an emulator-authored role is still
+      // preserved by the ordinary PHOTONS capture path below.  It is merely
+      // unexpected with respect to this temporary state machine.
+      g_photons_emulator.unexpected_edge_count++;
+      return;
+  }
+}
+
+
 // ============================================================================
 // High-rate PHOTODIODE subscriber
 // ============================================================================
@@ -478,6 +548,8 @@ static void photons_on_photodiode_edge(
   photons_compiler_barrier();
 
   photons_toy_capture_t& c = g_photons_live.capture;
+
+  photons_emulator_observe_edge(edge);
 
   c.edge_count++;
   c.last_edge_sequence = edge.sequence;
@@ -730,36 +802,66 @@ static Payload cmd_report(const Payload& /*args*/) {
   p.add("emulator_initialized", g_photons_emulator.initialized);
   p.add("emulator_edge_output_pin", PHOTONS_EMULATOR_EDGE_OUTPUT_PIN);
   p.add("emulator_loopback_input_pin", PHOTODIODE_EDGE_PIN);
+  p.add("emulator_timing_fidelity", "SYNTHETIC_NOT_OPTICAL");
+  p.add("emulator_cadence_strategy", "ONE_RECURRING_TIMEPOP_TIMER");
+  p.add("emulator_nominal_lap_ns", PHOTONS_EMULATOR_CADENCE_NS);
+  p.add("emulator_cadence_period_ns", PHOTONS_EMULATOR_CADENCE_NS);
+  p.add("emulator_cadence_tick_count", g_photons_emulator.cadence_tick_count);
+  p.add("emulator_hits_per_train", PHOTONS_EMULATOR_HITS_PER_TRAIN);
+  p.add("emulator_measured_laps", PHOTONS_EMULATOR_MEASURED_LAPS);
+  p.add("emulator_stage", photons_emulator_stage_name(g_photons_emulator.stage));
   p.add("emulator_train_active", g_photons_emulator.train_active);
   p.add("emulator_train_count", g_photons_emulator.train_count);
   p.add("emulator_relaunch_count", g_photons_emulator.relaunch_count);
+
+  p.add("emulator_laser_pulse_requested_cycles",
+        PHOTONS_EMULATOR_LASER_PULSE_CYCLES);
   p.add("emulator_laser_pulse_count", g_photons_emulator.laser_pulse_count);
   p.add("emulator_last_laser_pulse_cycles",
         g_photons_emulator.last_laser_pulse_cycles);
+  p.add("emulator_max_laser_pulse_cycles",
+        g_photons_emulator.max_laser_pulse_cycles);
+
   p.add("emulator_generated_edge_count",
         g_photons_emulator.generated_edge_count);
-  p.add("emulator_local_edge_count", g_photons_emulator.local_edge_count);
-  p.add("emulator_return_edge_count", g_photons_emulator.return_edge_count);
-  p.add("emulator_current_returns_planned",
-        g_photons_emulator.current_returns_planned);
-  p.add("emulator_current_returns_emitted",
-        g_photons_emulator.current_returns_emitted);
-  p.add("emulator_last_train_returns",
-        g_photons_emulator.last_train_returns);
-  p.add("emulator_missing_lap_count", g_photons_emulator.missing_lap_count);
-  p.add("emulator_last_lap_delay_ns", g_photons_emulator.last_lap_delay_ns);
-  p.add("emulator_last_missing_lap_delay_ns",
-        g_photons_emulator.last_missing_lap_delay_ns);
-  p.add("emulator_last_relaunch_delay_ns",
-        g_photons_emulator.last_relaunch_delay_ns);
-  p.add("emulator_last_jitter_ns", g_photons_emulator.last_jitter_ns);
-  p.add("emulator_min_jitter_ns", g_photons_emulator.min_jitter_ns);
-  p.add("emulator_max_jitter_ns", g_photons_emulator.max_jitter_ns);
-  p.add("emulator_timer_arm_count", g_photons_emulator.timer_arm_count);
-  p.add("emulator_timer_arm_fail_count",
-        g_photons_emulator.timer_arm_fail_count);
-  p.add("emulator_timer_armed",
-        g_photons_emulator.timer != TIMEPOP_INVALID_HANDLE);
+  p.add("emulator_expected_hit_ordinal",
+        g_photons_emulator.expected_hit_ordinal);
+  p.add("emulator_unexpected_edge_count",
+        g_photons_emulator.unexpected_edge_count);
+  p.add("emulator_state_error_count",
+        g_photons_emulator.state_error_count);
+  p.add("emulator_hit1_count", g_photons_emulator.hit1_count);
+  p.add("emulator_hit2_count", g_photons_emulator.hit2_count);
+  p.add("emulator_hit3_count", g_photons_emulator.hit3_count);
+  p.add("emulator_hit4_count", g_photons_emulator.hit4_count);
+  p.add("emulator_hit5_count", g_photons_emulator.hit5_count);
+  const uint32_t emulator_observed_hit_count =
+      g_photons_emulator.hit1_count +
+      g_photons_emulator.hit2_count +
+      g_photons_emulator.hit3_count +
+      g_photons_emulator.hit4_count +
+      g_photons_emulator.hit5_count;
+  p.add("emulator_observed_hit_count", emulator_observed_hit_count);
+
+  p.add("emulator_lap_start_count", g_photons_emulator.lap_start_count);
+  p.add("emulator_lap1_complete_count",
+        g_photons_emulator.lap1_complete_count);
+  p.add("emulator_lap2_complete_count",
+        g_photons_emulator.lap2_complete_count);
+  p.add("emulator_lap3_complete_count",
+        g_photons_emulator.lap3_complete_count);
+  p.add("emulator_dead_lap_count", g_photons_emulator.dead_lap_count);
+  p.add("emulator_lap_start_dwt", g_photons_emulator.lap_start_dwt);
+  p.add("emulator_lap1_last_cycles", g_photons_emulator.lap1_last_cycles);
+  p.add("emulator_lap2_last_cycles", g_photons_emulator.lap2_last_cycles);
+  p.add("emulator_lap3_last_cycles", g_photons_emulator.lap3_last_cycles);
+
+  p.add("emulator_cadence_timer_arm_count",
+        g_photons_emulator.cadence_timer_arm_count);
+  p.add("emulator_cadence_timer_arm_fail_count",
+        g_photons_emulator.cadence_timer_arm_fail_count);
+  p.add("emulator_cadence_timer_handle_valid",
+        g_photons_emulator.cadence_timer != TIMEPOP_INVALID_HANDLE);
 
   p.add("capture_edge_count", capture.edge_count);
   p.add("capture_last_edge_sequence", capture.last_edge_sequence);
@@ -797,6 +899,16 @@ static Payload cmd_report(const Payload& /*args*/) {
         interrupt_diag.last_callback_wall_cycles);
   p.add("interrupt_max_callback_wall_cycles",
         interrupt_diag.max_callback_wall_cycles);
+
+  p.add("emulator_custody_counts_match",
+        g_photons_emulator.generated_edge_count ==
+            interrupt_diag.irq_count &&
+        g_photons_emulator.generated_edge_count ==
+            interrupt_diag.callback_count &&
+        g_photons_emulator.generated_edge_count ==
+            capture.edge_count &&
+        g_photons_emulator.generated_edge_count ==
+            emulator_observed_hit_count);
 
   return p;
 }

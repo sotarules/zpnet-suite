@@ -22,13 +22,22 @@
 //
 // Temporary bring-up emulator:
 //   • pin 33 is a detector-emulator output physically looped to pin 34;
-//   • process_interrupt still timestamps the resulting real pin-34 GPIO edge;
-//   • PHOTONS emits real short LD_ON launch pulses and schedules 3-5 synthetic
-//     ~4.9 us returns through TimePop;
-//   • one expected return is omitted at the end of each train before relaunch;
+//   • process_interrupt still timestamps every resulting real pin-34 GPIO edge;
+//   • PHOTONS emits a real ~20-DWT-cycle LD_ON launch pulse;
+//   • one ordinary recurring TimePop timer supplies a synthetic 10 ms cadence;
+//     its callback advances emulator state only and never arms/cancels TimePop;
+//   • each train emits exactly five physical detector edges:
+//       hit 1 ignored by lap semantics,
+//       hit 2 lap start,
+//       hit 3 lap 1 end,
+//       hit 4 lap 2 end,
+//       hit 5 lap 3 end;
+//   • the cadence tick after hit 5 is lap 4: no detector edge is emitted and
+//     the next real laser pulse/train begins on that same recurring tick;
 //   • pin 38/A14 MON telemetry is synthesized and is not ADC-read while the
-//     emulator is installed.
-//   • the emulator is always on and independent of campaign state.
+//     emulator is installed;
+//   • the emulator is always on and independent of campaign state;
+//   • the synthetic 10 ms interval is bring-up timing, not optical truth.
 //
 // Commands:
 //   • INIT   — reinitialize PHOTONS-owned optical hardware; laser is inhibited
