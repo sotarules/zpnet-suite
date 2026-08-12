@@ -160,10 +160,16 @@ struct photons_fragment_projection_snapshot_t {
 };
 
 
-// Lap-level science court.  This deliberately mirrors CLOCKS disposition:
-// every survivable candidate remains visible, but only ACCEPT mutates the
-// scientific numerator/Welford.  The raw-cycle court is intentionally broad;
-// it rejects structural timing injuries, not ordinary optical noise.
+// Lap-level science court.  The lap is the unit of scientific admission; the
+// once-per-second PHOTONS_FRAGMENT is only a batch/custody envelope.  Every
+// survivable candidate remains visible, but only ACCEPT mutates the canonical
+// scientific numerator/Welford and predictor.
+//
+// Accepted and excluded populations are both characterized.  The accepted
+// projected-lap Welford is the same scientific population published in
+// photons_fragment_stats_snapshot_t; excluded projected-lap statistics exist
+// only when projection itself succeeded.  Raw-cycle statistics exist for both
+// populations so rejected timing injuries remain quantitatively observable.
 enum class photons_lap_science_disposition_t : uint8_t {
   NONE = 0,
   ACCEPT = 1,
@@ -179,20 +185,39 @@ enum class photons_lap_science_exclusion_reason_t : uint16_t {
 };
 
 
+struct photons_lap_science_population_snapshot_t {
+  uint64_t count = 0;
+  uint32_t count_this_fragment = 0;
+
+  // raw_cycles.n == count for every finalized candidate in this population.
+  photons_fragment_welford_snapshot_t raw_cycles{};
+
+  // Projection-invalid exclusions have no lawful GNSS duration, so for the
+  // excluded population projected_lap_ns.n may be smaller than count.
+  photons_fragment_welford_snapshot_t projected_lap_ns{};
+};
+
+
+struct photons_lap_science_reason_counts_snapshot_t {
+  uint64_t projection_invalid = 0;
+  uint64_t seed_disagreement = 0;
+  uint64_t raw_cycle_excursion = 0;
+
+  uint32_t projection_invalid_this_fragment = 0;
+  uint32_t seed_disagreement_this_fragment = 0;
+  uint32_t raw_cycle_excursion_this_fragment = 0;
+};
+
+
 struct photons_lap_science_snapshot_t {
   bool valid = false;
 
   uint64_t candidate_count = 0;
-  uint64_t accept_count = 0;
-  uint64_t exclude_count = 0;
-
   uint32_t candidates_this_fragment = 0;
-  uint32_t accepted_this_fragment = 0;
-  uint32_t excluded_this_fragment = 0;
 
-  // A clean fragment has no excluded/raw-unprojectable candidates in this
-  // one-second cohort.  The fragment is still published when false.
-  bool science_worthy = false;
+  photons_lap_science_population_snapshot_t accepted{};
+  photons_lap_science_population_snapshot_t excluded{};
+  photons_lap_science_reason_counts_snapshot_t exclusion_reasons{};
 
   // Two agreeing projected laps establish the initial raw-cycle lineage.
   bool predictor_valid = false;
@@ -207,11 +232,10 @@ struct photons_lap_science_snapshot_t {
   uint64_t seed_pending_lap_gnss_ns = 0;
 
   // Last finalized candidate verdict.  A PENDING_SEED candidate is separately
-  // visible above and has not yet mutated either accept or exclude totals.
+  // visible above and has not yet entered either finalized population.
   uint64_t last_candidate_index = 0;
   uint8_t last_disposition_id = 0;
   uint16_t last_reason_code = 0;
-  bool last_science_worthy = false;
   bool last_projection_valid = false;
   uint32_t last_pps_sequence = 0;
   uint32_t last_observed_cycles = 0;

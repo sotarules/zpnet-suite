@@ -48,11 +48,11 @@ static_assert((PHOTONS_LAP_RING_CAPACITY &
 
 static constexpr uint64_t PHOTONS_PROJECTION_MAX_AGE_NS = 3000000000ULL;
 
-// Science admission is deliberately much broader than expected optical noise.
-// Its job is structural: prevent obvious scheduler/edge-lineage injuries from
-// entering Welford without cosmetically selecting "pretty" observations.
-// Match CLOCKS' broad raw-interval plausibility philosophy: +/-10%.
-// Gate = max(last science-accepted raw lap / 10, 64 cycles).
+// Science admission is structural, not aesthetic.  Mirror CLOCKS philosophy:
+// ordinary timing variation remains science; only truly exceptional interval
+// injuries are excluded.  Use a deliberately broad +/-10% gate around the
+// last accepted raw lap so the court acts as an integrity gate, not a quality
+// filter.  Gate = max(last science-accepted raw lap / 10, 64 cycles).
 static constexpr uint32_t PHOTONS_SCIENCE_GATE_DIVISOR = 10U;
 static constexpr uint32_t PHOTONS_SCIENCE_GATE_MIN_CYCLES = 64U;
 
@@ -279,7 +279,14 @@ static photons_fragment_raw_cycles_snapshot_t g_raw_cycles_state{};
 static photons_fragment_projection_snapshot_t g_projection_state{};
 static photons_lap_science_snapshot_t g_photons_lap_science_state{};
 static photons_lap_science_candidate_t g_photons_lap_science_seed_pending{};
+
+// Accepted projected-lap time remains the canonical science population used by
+// fragment.stats.  The parallel raw-cycle and excluded populations are courtroom
+// testimony only; they never feed the scientific mean or predictor.
 static photons_welford_state_t g_lap_time_welford{};
+static photons_welford_state_t g_accepted_raw_cycles_welford{};
+static photons_welford_state_t g_excluded_raw_cycles_welford{};
+static photons_welford_state_t g_excluded_lap_time_welford{};
 static uint64_t g_total_lap_gnss_ns = 0ULL;
 
 static bool g_previous_fragment_mean_cycles_valid = false;
@@ -536,8 +543,6 @@ static void photons_lap_science_note_last(
   g_photons_lap_science_state.last_candidate_index = candidate.candidate_index;
   g_photons_lap_science_state.last_disposition_id = (uint8_t)disposition;
   g_photons_lap_science_state.last_reason_code = (uint16_t)reason;
-  g_photons_lap_science_state.last_science_worthy =
-      disposition == photons_lap_science_disposition_t::ACCEPT;
   g_photons_lap_science_state.last_projection_valid = projection_valid;
   g_photons_lap_science_state.last_pps_sequence = candidate.pps_sequence;
   g_photons_lap_science_state.last_observed_cycles = candidate.raw_cycles;
@@ -571,10 +576,12 @@ static void photons_lap_science_accept(
     uint32_t prediction_cycles,
     int32_t residual_cycles,
     uint32_t gate_cycles) {
-  g_photons_lap_science_state.accept_count++;
-  g_photons_lap_science_state.accepted_this_fragment++;
+  g_photons_lap_science_state.accepted.count++;
+  g_photons_lap_science_state.accepted.count_this_fragment++;
   g_photons_lap_science_state.reject_streak = 0U;
 
+  photons_welford_update(
+      g_accepted_raw_cycles_welford, (double)candidate.raw_cycles);
   g_total_lap_gnss_ns += candidate.lap_gnss_ns;
   photons_welford_update(
       g_lap_time_welford, (double)candidate.lap_gnss_ns);
@@ -595,6 +602,29 @@ static void photons_lap_science_accept(
 }
 
 
+static void photons_lap_science_count_exclusion_reason(
+    photons_lap_science_exclusion_reason_t reason) {
+  switch (reason) {
+    case photons_lap_science_exclusion_reason_t::PROJECTION_INVALID:
+      g_photons_lap_science_state.exclusion_reasons.projection_invalid++;
+      g_photons_lap_science_state.exclusion_reasons.projection_invalid_this_fragment++;
+      return;
+    case photons_lap_science_exclusion_reason_t::SEED_DISAGREEMENT:
+      g_photons_lap_science_state.exclusion_reasons.seed_disagreement++;
+      g_photons_lap_science_state.exclusion_reasons.seed_disagreement_this_fragment++;
+      return;
+    case photons_lap_science_exclusion_reason_t::RAW_CYCLE_EXCURSION:
+      g_photons_lap_science_state.exclusion_reasons.raw_cycle_excursion++;
+      g_photons_lap_science_state.exclusion_reasons.raw_cycle_excursion_this_fragment++;
+      return;
+    case photons_lap_science_exclusion_reason_t::NONE:
+    default:
+      // Exclusion without an authored reason is a courtroom integrity failure.
+      __builtin_trap();
+  }
+}
+
+
 static void photons_lap_science_exclude(
     const photons_lap_science_candidate_t& candidate,
     photons_lap_science_exclusion_reason_t reason,
@@ -602,8 +632,17 @@ static void photons_lap_science_exclude(
     uint32_t prediction_cycles,
     int32_t residual_cycles,
     uint32_t gate_cycles) {
-  g_photons_lap_science_state.exclude_count++;
-  g_photons_lap_science_state.excluded_this_fragment++;
+  g_photons_lap_science_state.excluded.count++;
+  g_photons_lap_science_state.excluded.count_this_fragment++;
+  photons_lap_science_count_exclusion_reason(reason);
+
+  photons_welford_update(
+      g_excluded_raw_cycles_welford, (double)candidate.raw_cycles);
+  if (projection_valid) {
+    photons_welford_update(
+        g_excluded_lap_time_welford, (double)candidate.lap_gnss_ns);
+  }
+
   g_photons_lap_science_state.reject_streak++;
   if (g_photons_lap_science_state.reject_streak > g_photons_lap_science_state.max_reject_streak) {
     g_photons_lap_science_state.max_reject_streak = g_photons_lap_science_state.reject_streak;
@@ -710,8 +749,11 @@ static photons_fragment_drain_result_t photons_drain_raw_laps(void) {
   photons_fragment_drain_result_t result{};
 
   g_photons_lap_science_state.candidates_this_fragment = 0U;
-  g_photons_lap_science_state.accepted_this_fragment = 0U;
-  g_photons_lap_science_state.excluded_this_fragment = 0U;
+  g_photons_lap_science_state.accepted.count_this_fragment = 0U;
+  g_photons_lap_science_state.excluded.count_this_fragment = 0U;
+  g_photons_lap_science_state.exclusion_reasons.projection_invalid_this_fragment = 0U;
+  g_photons_lap_science_state.exclusion_reasons.seed_disagreement_this_fragment = 0U;
+  g_photons_lap_science_state.exclusion_reasons.raw_cycle_excursion_this_fragment = 0U;
 
   photons_memory_barrier();
   const uint32_t write_snapshot = g_raw_lap_ring_write;
@@ -827,12 +869,20 @@ static photons_fragment_drain_result_t photons_drain_raw_laps(void) {
       (uint64_t)g_raw_lap_ring_overflow_count;
 
   photons_lap_science_refresh_seed_snapshot();
-  g_photons_lap_science_state.valid = g_photons_lap_science_state.candidate_count != 0ULL;
-  g_photons_lap_science_state.science_worthy =
-      g_photons_lap_science_state.candidates_this_fragment != 0U &&
-      g_photons_lap_science_state.excluded_this_fragment == 0U &&
-      !g_photons_lap_science_state.seed_pending &&
-      !g_raw_lap_ring_data_loss;
+  g_photons_lap_science_state.valid =
+      g_photons_lap_science_state.candidate_count != 0ULL;
+
+  // Snapshot the two courtroom populations.  Accepted projected-lap time is
+  // deliberately the same canonical Welford used by fragment.stats; no second
+  // accepted scientific population exists.
+  g_photons_lap_science_state.accepted.raw_cycles =
+      photons_welford_snapshot(g_accepted_raw_cycles_welford);
+  g_photons_lap_science_state.accepted.projected_lap_ns =
+      photons_welford_snapshot(g_lap_time_welford);
+  g_photons_lap_science_state.excluded.raw_cycles =
+      photons_welford_snapshot(g_excluded_raw_cycles_welford);
+  g_photons_lap_science_state.excluded.projected_lap_ns =
+      photons_welford_snapshot(g_excluded_lap_time_welford);
 
   return result;
 }
@@ -1316,6 +1366,9 @@ static Payload g_photons_fragment_instrument DMAMEM;
 static Payload g_photons_fragment_raw_cycles DMAMEM;
 static Payload g_photons_fragment_projection DMAMEM;
 static Payload g_photons_fragment_science DMAMEM;
+static Payload g_photons_fragment_science_accepted DMAMEM;
+static Payload g_photons_fragment_science_excluded DMAMEM;
+static Payload g_photons_fragment_science_reasons DMAMEM;
 static Payload g_photons_fragment_stats DMAMEM;
 static Payload g_photons_fragment_welford DMAMEM;
 static Payload g_photons_fragment_baseline DMAMEM;
@@ -1324,6 +1377,7 @@ static Payload g_photons_fragment_interrupt DMAMEM;
 
 static void photons_payload_add_welford(
     Payload& parent,
+    const char* name,
     const photons_fragment_welford_snapshot_t& w) {
   Payload& obj = g_photons_fragment_welford;
   obj.clear();
@@ -1334,7 +1388,7 @@ static void photons_payload_add_welford(
   obj.add("stderr", toFixedDecimal(w.stderr_value, 6));
   obj.add("min", toFixedDecimal(w.min, 6));
   obj.add("max", toFixedDecimal(w.max, 6));
-  parent.add_object("lap_time", obj);
+  parent.add_object(name, obj);
   obj.clear();
 }
 
@@ -1346,6 +1400,9 @@ static Payload& photons_fragment_payload(
   Payload& raw = g_photons_fragment_raw_cycles;
   Payload& projection = g_photons_fragment_projection;
   Payload& science = g_photons_fragment_science;
+  Payload& accepted = g_photons_fragment_science_accepted;
+  Payload& excluded = g_photons_fragment_science_excluded;
+  Payload& reasons = g_photons_fragment_science_reasons;
   Payload& stats = g_photons_fragment_stats;
   Payload& baseline = g_photons_fragment_baseline;
   Payload& interrupt = g_photons_fragment_interrupt;
@@ -1355,6 +1412,9 @@ static Payload& photons_fragment_payload(
   raw.clear();
   projection.clear();
   science.clear();
+  accepted.clear();
+  excluded.clear();
+  reasons.clear();
   stats.clear();
   baseline.clear();
   interrupt.clear();
@@ -1434,21 +1494,52 @@ static Payload& photons_fragment_payload(
   instrument.add_object("projection", projection);
   projection.clear();
 
-  science.add("schema", "PHOTONS_SCIENCE_V1");
+  science.add("schema", "PHOTONS_SCIENCE_V2");
   science.add("valid", f.science.valid);
-  science.add("science_worthy", f.science.science_worthy);
   science.add("candidate_count", f.science.candidate_count);
-  science.add("accept_count", f.science.accept_count);
-  science.add("exclude_count", f.science.exclude_count);
   science.add("candidates_this_fragment",
               f.science.candidates_this_fragment);
-  science.add("accepted_this_fragment",
-              f.science.accepted_this_fragment);
-  science.add("excluded_this_fragment",
-              f.science.excluded_this_fragment);
+
+  accepted.add("count", f.science.accepted.count);
+  accepted.add("count_this_fragment",
+               f.science.accepted.count_this_fragment);
+  photons_payload_add_welford(
+      accepted, "raw_cycles", f.science.accepted.raw_cycles);
+  photons_payload_add_welford(
+      accepted, "projected_lap_ns", f.science.accepted.projected_lap_ns);
+  science.add_object("accepted", accepted);
+  accepted.clear();
+
+  excluded.add("count", f.science.excluded.count);
+  excluded.add("count_this_fragment",
+               f.science.excluded.count_this_fragment);
+  photons_payload_add_welford(
+      excluded, "raw_cycles", f.science.excluded.raw_cycles);
+  photons_payload_add_welford(
+      excluded, "projected_lap_ns", f.science.excluded.projected_lap_ns);
+  science.add_object("excluded", excluded);
+  excluded.clear();
+
+  reasons.add("projection_invalid",
+              f.science.exclusion_reasons.projection_invalid);
+  reasons.add("seed_disagreement",
+              f.science.exclusion_reasons.seed_disagreement);
+  reasons.add("raw_cycle_excursion",
+              f.science.exclusion_reasons.raw_cycle_excursion);
+  reasons.add("projection_invalid_this_fragment",
+              f.science.exclusion_reasons.projection_invalid_this_fragment);
+  reasons.add("seed_disagreement_this_fragment",
+              f.science.exclusion_reasons.seed_disagreement_this_fragment);
+  reasons.add("raw_cycle_excursion_this_fragment",
+              f.science.exclusion_reasons.raw_cycle_excursion_this_fragment);
+  science.add_object("exclusion_reasons", reasons);
+  reasons.clear();
+
   science.add("predictor_valid", f.science.predictor_valid);
   science.add("predictor_cycles", f.science.predictor_cycles);
   science.add("gate_cycles", f.science.gate_cycles);
+  science.add("gate_divisor", PHOTONS_SCIENCE_GATE_DIVISOR);
+  science.add("gate_min_cycles", PHOTONS_SCIENCE_GATE_MIN_CYCLES);
   science.add("reject_streak", f.science.reject_streak);
   science.add("max_reject_streak", f.science.max_reject_streak);
   science.add("seed_pending", f.science.seed_pending);
@@ -1470,8 +1561,6 @@ static Payload& photons_fragment_payload(
   science.add("last_reason",
               photons_lap_science_reason_name(
                   f.science.last_reason_code));
-  science.add("last_science_worthy",
-              f.science.last_science_worthy);
   science.add("last_projection_valid",
               f.science.last_projection_valid);
   science.add("last_pps_sequence",
@@ -1494,7 +1583,8 @@ static Payload& photons_fragment_payload(
   stats.add("lap_count", f.stats.lap_count);
   stats.add("total_lap_gnss_ns", f.stats.total_lap_gnss_ns);
   stats.add("mean_lap_ns", toFixedDecimal(f.stats.mean_lap_ns, 6));
-  photons_payload_add_welford(stats, f.stats.lap_time_welford);
+  photons_payload_add_welford(
+      stats, "lap_time", f.stats.lap_time_welford);
   instrument.add_object("stats", stats);
   stats.clear();
 
@@ -1676,6 +1766,9 @@ void process_photons_init(void) {
   g_photons_lap_science_state = photons_lap_science_snapshot_t{};
   g_photons_lap_science_seed_pending = photons_lap_science_candidate_t{};
   photons_welford_reset(g_lap_time_welford);
+  photons_welford_reset(g_accepted_raw_cycles_welford);
+  photons_welford_reset(g_excluded_raw_cycles_welford);
+  photons_welford_reset(g_excluded_lap_time_welford);
   g_total_lap_gnss_ns = 0ULL;
   g_previous_fragment_mean_cycles_valid = false;
   g_previous_fragment_mean_cycles = 0.0;
@@ -1789,20 +1882,73 @@ static Payload cmd_report(const Payload& /*args*/) {
   p.add("projection_last_lap_gnss_ns",
         canonical.projection.last_lap_gnss_ns);
 
+  p.add("science_schema", "PHOTONS_SCIENCE_V2");
   p.add("science_valid", canonical.science.valid);
-  p.add("science_worthy", canonical.science.science_worthy);
   p.add("science_candidate_count",
         canonical.science.candidate_count);
-  p.add("science_accept_count",
-        canonical.science.accept_count);
-  p.add("science_exclude_count",
-        canonical.science.exclude_count);
   p.add("science_candidates_this_fragment",
         canonical.science.candidates_this_fragment);
+
+  p.add("science_accepted_count", canonical.science.accepted.count);
   p.add("science_accepted_this_fragment",
-        canonical.science.accepted_this_fragment);
+        canonical.science.accepted.count_this_fragment);
+  p.add("science_accepted_raw_cycles_n",
+        canonical.science.accepted.raw_cycles.n);
+  p.add("science_accepted_raw_cycles_mean",
+        toFixedDecimal(canonical.science.accepted.raw_cycles.mean, 6));
+  p.add("science_accepted_raw_cycles_stddev",
+        toFixedDecimal(canonical.science.accepted.raw_cycles.stddev, 6));
+  p.add("science_accepted_raw_cycles_min",
+        toFixedDecimal(canonical.science.accepted.raw_cycles.min, 6));
+  p.add("science_accepted_raw_cycles_max",
+        toFixedDecimal(canonical.science.accepted.raw_cycles.max, 6));
+  p.add("science_accepted_projected_lap_ns_n",
+        canonical.science.accepted.projected_lap_ns.n);
+  p.add("science_accepted_projected_lap_ns_mean",
+        toFixedDecimal(canonical.science.accepted.projected_lap_ns.mean, 6));
+  p.add("science_accepted_projected_lap_ns_stddev",
+        toFixedDecimal(canonical.science.accepted.projected_lap_ns.stddev, 6));
+  p.add("science_accepted_projected_lap_ns_min",
+        toFixedDecimal(canonical.science.accepted.projected_lap_ns.min, 6));
+  p.add("science_accepted_projected_lap_ns_max",
+        toFixedDecimal(canonical.science.accepted.projected_lap_ns.max, 6));
+
+  p.add("science_excluded_count", canonical.science.excluded.count);
   p.add("science_excluded_this_fragment",
-        canonical.science.excluded_this_fragment);
+        canonical.science.excluded.count_this_fragment);
+  p.add("science_excluded_raw_cycles_n",
+        canonical.science.excluded.raw_cycles.n);
+  p.add("science_excluded_raw_cycles_mean",
+        toFixedDecimal(canonical.science.excluded.raw_cycles.mean, 6));
+  p.add("science_excluded_raw_cycles_stddev",
+        toFixedDecimal(canonical.science.excluded.raw_cycles.stddev, 6));
+  p.add("science_excluded_raw_cycles_min",
+        toFixedDecimal(canonical.science.excluded.raw_cycles.min, 6));
+  p.add("science_excluded_raw_cycles_max",
+        toFixedDecimal(canonical.science.excluded.raw_cycles.max, 6));
+  p.add("science_excluded_projected_lap_ns_n",
+        canonical.science.excluded.projected_lap_ns.n);
+  p.add("science_excluded_projected_lap_ns_mean",
+        toFixedDecimal(canonical.science.excluded.projected_lap_ns.mean, 6));
+  p.add("science_excluded_projected_lap_ns_stddev",
+        toFixedDecimal(canonical.science.excluded.projected_lap_ns.stddev, 6));
+  p.add("science_excluded_projected_lap_ns_min",
+        toFixedDecimal(canonical.science.excluded.projected_lap_ns.min, 6));
+  p.add("science_excluded_projected_lap_ns_max",
+        toFixedDecimal(canonical.science.excluded.projected_lap_ns.max, 6));
+
+  p.add("science_exclusion_projection_invalid",
+        canonical.science.exclusion_reasons.projection_invalid);
+  p.add("science_exclusion_seed_disagreement",
+        canonical.science.exclusion_reasons.seed_disagreement);
+  p.add("science_exclusion_raw_cycle_excursion",
+        canonical.science.exclusion_reasons.raw_cycle_excursion);
+  p.add("science_exclusion_projection_invalid_this_fragment",
+        canonical.science.exclusion_reasons.projection_invalid_this_fragment);
+  p.add("science_exclusion_seed_disagreement_this_fragment",
+        canonical.science.exclusion_reasons.seed_disagreement_this_fragment);
+  p.add("science_exclusion_raw_cycle_excursion_this_fragment",
+        canonical.science.exclusion_reasons.raw_cycle_excursion_this_fragment);
   p.add("science_predictor_valid",
         canonical.science.predictor_valid);
   p.add("science_predictor_cycles",
