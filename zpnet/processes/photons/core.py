@@ -42,6 +42,7 @@ import queue
 import threading
 import time
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
 from zpnet.processes.processes import (
@@ -143,6 +144,10 @@ _last_structural_rejection: Optional[Dict[str, Any]] = None
 _last_system_report_failure: Optional[Dict[str, Any]] = None
 _last_persistence_failure: Optional[Dict[str, Any]] = None
 
+_standard_lap_ns: Optional[str] = None
+_standard_lap_ps: Optional[int] = None
+_teensy_standard_configured = False
+
 
 # ---------------------------------------------------------------------
 # Helpers
@@ -162,6 +167,98 @@ def _require_int(value: Any, path: str, *, minimum: int = 0) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
         raise ValueError(f"{path} must be an integer >= {minimum}; got {value!r}")
     return int(value)
+
+
+def _load_standard_lap_ns() -> Tuple[str, int]:
+    """Load the required config.PHOTONS optical reference exactly once at startup."""
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT payload ->> 'standard_lap_ns' AS standard_lap_ns
+            FROM config
+            WHERE config_key = 'PHOTONS'
+            """
+        )
+        row = cur.fetchone()
+
+    if row is None:
+        raise RuntimeError("config.PHOTONS row is required")
+
+    raw = row.get("standard_lap_ns")
+    if raw is None:
+        raise RuntimeError("config.PHOTONS.standard_lap_ns is required")
+
+    try:
+        value = Decimal(str(raw))
+    except (InvalidOperation, ValueError) as exc:
+        raise RuntimeError(
+            f"config.PHOTONS.standard_lap_ns is not decimal: {raw!r}"
+        ) from exc
+
+    if not value.is_finite() or value <= 0:
+        raise RuntimeError(
+            f"config.PHOTONS.standard_lap_ns must be finite and > 0; got {raw!r}"
+        )
+
+    quantum = Decimal("0.001")
+    normalized = value.quantize(quantum)
+    if normalized != value:
+        raise RuntimeError(
+            "config.PHOTONS.standard_lap_ns may have at most three decimal places; "
+            f"got {raw!r}"
+        )
+
+    standard_text = format(normalized, ".3f")
+    standard_ps = int(normalized * 1000)
+    if standard_ps <= 0:
+        raise RuntimeError("config.PHOTONS.standard_lap_ns resolved to nonpositive picoseconds")
+    return standard_text, standard_ps
+
+
+def _configure_teensy_standard_lap() -> None:
+    """Install config.PHOTONS.standard_lap_ns before firmware publication begins."""
+    global _standard_lap_ns
+    global _standard_lap_ps
+    global _teensy_standard_configured
+
+    standard_text, standard_ps = _load_standard_lap_ns()
+    response = send_command(
+        machine="TEENSY",
+        subsystem=SUBSYSTEM,
+        command="SET_STANDARD_LAP_NS",
+        args={"standard_lap_ns": standard_text},
+    )
+    payload = response.get("payload") if isinstance(response, dict) else None
+    if not isinstance(response, dict) or not response.get("success"):
+        raise RuntimeError(f"Teensy PHOTONS.SET_STANDARD_LAP_NS failed: {response!r}")
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            f"Teensy PHOTONS.SET_STANDARD_LAP_NS returned no payload: {response!r}"
+        )
+    if payload.get("standard_lap_configured") is not True:
+        raise RuntimeError(
+            f"Teensy did not confirm STANDARD_LAP_NS installation: {payload!r}"
+        )
+    echoed_ps = _require_int(
+        payload.get("standard_lap_ps"),
+        "PHOTONS.SET_STANDARD_LAP_NS.payload.standard_lap_ps",
+        minimum=1,
+    )
+    if echoed_ps != standard_ps:
+        raise RuntimeError(
+            "Teensy STANDARD_LAP_NS echo mismatch: "
+            f"configured_ps={standard_ps} echoed_ps={echoed_ps}"
+        )
+
+    _standard_lap_ns = standard_text
+    _standard_lap_ps = standard_ps
+    _teensy_standard_configured = True
+    logging.info(
+        "✅ [photons] installed STANDARD_LAP_NS=%s ns (%d ps) on Teensy",
+        standard_text,
+        standard_ps,
+    )
 
 
 def _fetch_system_report() -> Dict[str, Any]:
@@ -1357,6 +1454,9 @@ def cmd_report(_: Optional[dict]) -> dict:
             "last_structural_rejection": copy.deepcopy(_last_structural_rejection),
             "last_system_report_failure": copy.deepcopy(_last_system_report_failure),
             "last_persistence_failure": copy.deepcopy(_last_persistence_failure),
+            "standard_lap_ns": _standard_lap_ns,
+            "standard_lap_ps": _standard_lap_ps,
+            "teensy_standard_configured": _teensy_standard_configured,
             "latest_fragment": copy.deepcopy(_latest_fragment),
             "latest_photons": copy.deepcopy(_latest_photons),
         }
@@ -1420,6 +1520,11 @@ def run() -> None:
         subscriptions=SUBSCRIPTIONS,
         blocking=False,
     )
+
+    # Bring the local subscription surface online first, then install the required
+    # metrological reference.  The Teensy does not arm PHOTONS_FRAGMENT until this
+    # command succeeds, so every emitted fragment is born ready-to-eat.
+    _configure_teensy_standard_lap()
 
     # Phase 4 does not claim restart continuity.  Classify any stale active
     # LANTERN master before the state worker can decorate newly queued rows.

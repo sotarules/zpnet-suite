@@ -47,10 +47,12 @@
 //   • the synthetic 10 ms interval is bring-up timing, not optical truth.
 //
 // Commands:
-//   • INIT   — reinitialize PHOTONS-owned optical hardware; laser is inhibited
-//   • REPORT — unified laser, PD200T, interrupt, and toy-measurement report
-//   • ON     — permit laser emission through LD_ON
-//   • OFF    — inhibit laser emission through LD_ON
+//   • INIT                — reinitialize PHOTONS-owned optical hardware; laser is inhibited
+//   • SET_STANDARD_LAP_NS — install the required optical PPB reference; fragment publication
+//                           remains gated until this startup configuration is present
+//   • REPORT              — unified laser, PD200T, interrupt, and toy-measurement report
+//   • ON                  — permit laser emission through LD_ON
+//   • OFF                 — inhibit laser emission through LD_ON
 // ============================================================================
 
 // Cumulative ISR-authored optical-edge state.

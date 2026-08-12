@@ -1162,6 +1162,12 @@ static uint32_t g_publish_count = 0;
 static uint32_t g_publish_reject_count = 0;
 static uint32_t g_last_published_edge_count = 0;
 
+// PHOTONS PPB interpretation is undefined until the Pi installs the required
+// metrological standard from config.PHOTONS.  Store the authority exactly as
+// integer picoseconds; 0.001 ns is one picosecond.
+static bool g_standard_lap_configured = false;
+static uint64_t g_standard_lap_ps = 0ULL;
+
 static bool g_initialized = false;
 static bool g_subscription_ok = false;
 static bool g_interrupt_started = false;
@@ -1626,6 +1632,11 @@ static void photons_fragment_tick(
     timepop_diag_t* /*diag*/,
     void* /*user_data*/) {
 
+  // PHOTONS_FRAGMENT is ready-to-eat testimony.  Until the Pi supplies the
+  // required standard lap, PHOTONS has no authority to publish interpreted
+  // optical statistics.
+  if (!g_standard_lap_configured) return;
+
   // Refresh the PHOTONS-owned immutable copy for laps that will arrive after
   // this boundary.  Records already in the ring carry the anchor that was
   // current when their physical DWT endpoints were observed.
@@ -1755,6 +1766,8 @@ void process_photons_init(void) {
   g_publish_count = 0U;
   g_publish_reject_count = 0U;
   g_last_published_edge_count = 0U;
+  g_standard_lap_configured = false;
+  g_standard_lap_ps = 0ULL;
 
   g_projection_anchor_cache = photons_projection_anchor_cache_t{};
   g_raw_lap_ring_write = 0U;
@@ -1791,22 +1804,103 @@ void process_photons_init(void) {
   // rejected rather than projected through an invented ruler.
   photons_projection_anchor_refresh();
 
-  g_fragment_timer = timepop_arm(
-      PHOTONS_FRAGMENT_PERIOD_NS,
-      true,
-      photons_fragment_tick,
-      nullptr,
-      "PHOTONS_FRAGMENT");
+  // The fragment publisher and temporary emulator are intentionally not started
+  // here.  SET_STANDARD_LAP_NS establishes the statistics/publication origin.
 
+  // The temporary emulator is intentionally not started here.  Starting it
+  // before STANDARD_LAP_NS would create a hidden pre-configuration science
+  // population.  SET_STANDARD_LAP_NS establishes the statistics origin and
+  // starts the emulator exactly once.
   g_initialized = true;
-  if (PHOTONS_EMULATOR_ENABLED) {
-    photons_emulator_start();
-  }
 }
 
 // ============================================================================
 // Commands
 // ============================================================================
+
+// Parse the Pi-authored fixed-decimal nanosecond reference exactly into
+// picoseconds.  The command contract is deliberately strict: one or more
+// integer digits, '.', and exactly three fractional digits.
+static bool photons_parse_standard_lap_ns(const char* text,
+                                          uint64_t& standard_lap_ps) {
+  standard_lap_ps = 0ULL;
+  if (!text || !*text) return false;
+
+  const char* p = text;
+  uint64_t whole_ns = 0ULL;
+  uint32_t integer_digits = 0U;
+  while (*p >= '0' && *p <= '9') {
+    const uint32_t digit = (uint32_t)(*p - '0');
+    if (whole_ns > (UINT64_MAX - (uint64_t)digit) / 10ULL) {
+      return false;
+    }
+    whole_ns = whole_ns * 10ULL + (uint64_t)digit;
+    integer_digits++;
+    p++;
+  }
+  if (integer_digits == 0U || *p != '.') return false;
+  p++;
+
+  uint32_t fractional_ps = 0U;
+  for (uint32_t i = 0U; i < 3U; i++) {
+    if (*p < '0' || *p > '9') return false;
+    fractional_ps = fractional_ps * 10U + (uint32_t)(*p - '0');
+    p++;
+  }
+  if (*p != '\0') return false;
+  if (whole_ns > (UINT64_MAX - (uint64_t)fractional_ps) / 1000ULL) {
+    return false;
+  }
+
+  standard_lap_ps = whole_ns * 1000ULL + (uint64_t)fractional_ps;
+  return standard_lap_ps != 0ULL;
+}
+
+
+static Payload cmd_set_standard_lap_ns(const Payload& args) {
+  const char* text = args.getString("standard_lap_ns");
+  uint64_t requested_ps = 0ULL;
+  if (!photons_parse_standard_lap_ns(text, requested_ps)) {
+    // Malformed metrological configuration is a program/integration
+    // failure, not scientific invalidity.  Do not invent a default.
+    __builtin_trap();
+  }
+
+  if (g_standard_lap_configured) {
+    if (requested_ps != g_standard_lap_ps) {
+      // The reference is immutable for one Teensy runtime.  A changed
+      // standard requires a restart/new statistics lineage.
+      __builtin_trap();
+    }
+  } else {
+    g_standard_lap_ps = requested_ps;
+
+    g_fragment_timer = timepop_arm(
+        PHOTONS_FRAGMENT_PERIOD_NS,
+        true,
+        photons_fragment_tick,
+        nullptr,
+        "PHOTONS_FRAGMENT");
+    if (g_fragment_timer == TIMEPOP_INVALID_HANDLE) {
+      __builtin_trap();
+    }
+
+    photons_memory_barrier();
+    g_standard_lap_configured = true;
+
+    if (PHOTONS_EMULATOR_ENABLED) {
+      photons_emulator_start();
+    }
+  }
+
+  Payload p;
+  p.add("standard_lap_configured", true);
+  p.add("standard_lap_ps", g_standard_lap_ps);
+  p.add("standard_lap_ns",
+        toFixedDecimal((double)g_standard_lap_ps / 1000.0, 3));
+  return p;
+}
+
 
 static Payload cmd_report(const Payload& /*args*/) {
   photons_toy_capture_t capture{};
@@ -1830,6 +1924,13 @@ static Payload cmd_report(const Payload& /*args*/) {
   p.add("interrupt_started", g_interrupt_started);
   p.add("fragment_timer_armed",
         g_fragment_timer != TIMEPOP_INVALID_HANDLE);
+  p.add("standard_lap_configured", g_standard_lap_configured);
+  p.add("fragment_publication_ready", g_standard_lap_configured);
+  if (g_standard_lap_configured) {
+    p.add("standard_lap_ps", g_standard_lap_ps);
+    p.add("standard_lap_ns",
+          toFixedDecimal((double)g_standard_lap_ps / 1000.0, 3));
+  }
 
   p.add("fragment_schema", "PHOTONS_FRAGMENT_V1");
   p.add("fragment_snapshot_ok", canonical.snapshot_ok);
@@ -2163,10 +2264,11 @@ static Payload cmd_off(const Payload& /*args*/) {
 // ============================================================================
 
 static const process_command_entry_t PHOTONS_COMMANDS[] = {
-  { "INIT",   cmd_init   },
-  { "REPORT", cmd_report },
-  { "ON",     cmd_on     },
-  { "OFF",    cmd_off    },
+  { "INIT",                cmd_init                },
+  { "SET_STANDARD_LAP_NS", cmd_set_standard_lap_ns },
+  { "REPORT",              cmd_report              },
+  { "ON",                  cmd_on                  },
+  { "OFF",                 cmd_off                 },
   { nullptr, nullptr }
 };
 
