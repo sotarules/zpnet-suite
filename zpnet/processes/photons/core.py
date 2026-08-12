@@ -1,13 +1,14 @@
 """
 ZPNet PHOTONS Process — PHOTONS_FRAGMENT ingress + canonical PHOTONS persistence.
 
-Phase-1 contract:
+Phase-2 contract:
 
     Teensy process_photons
         -> PHOTONS_FRAGMENT_V1
-        -> Pi structural/accounting court
-        -> canonical PHOTONS_V1
+        -> Pi PUBSUB fast-path ingress queue
+        -> structural/accounting court + canonical PHOTONS_V1 worker
         -> PUBSUB PHOTONS
+        -> ordered persistence queue/worker
         -> campaign_detail
 
 The Teensy remains the optical-science authority.  The Pi does not recompute,
@@ -17,8 +18,13 @@ testimony is structurally self-consistent, then carries the exact Teensy-owned
 populations remain firmware facts; a fragment is not made non-viable merely
 because it contains excluded laps.
 
-LANTERN campaign semantics, SYSTEM context enrichment, asynchronous workers,
-and recovery remain intentionally deferred to later bounded phases.
+The PUBSUB callback never performs the structural court, publication, or database
+I/O.  One canonical-state worker owns validation/publication and one ordered
+persistence worker owns PostgreSQL writes with retry.  This mirrors the mature
+CLOCKS data-plane split while remaining campaign-neutral.
+
+LANTERN campaign semantics, SYSTEM context enrichment, and recovery remain
+intentionally deferred to later bounded phases.
 """
 
 from __future__ import annotations
@@ -26,7 +32,9 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import queue
 import threading
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
@@ -59,6 +67,13 @@ PHOTONS_INSTRUMENT_SCHEMA = "PHOTONS_INSTRUMENT_V1"
 PHOTONS_SCIENCE_SCHEMA = "PHOTONS_SCIENCE_V2"
 PHOTONS_STATS_SCHEMA = "PHOTONS_INSTRUMENT_STATS_V1"
 
+# Phase-2 live data-plane queues.  maxsize=0 is intentionally unbounded: at the
+# current 1 Hz instrument rate, temporary downstream stalls should create visible
+# backlog rather than block PUBSUB ingress or silently discard valid testimony.
+PHOTONS_INGRESS_QUEUE_MAXSIZE = 0
+PHOTONS_PERSIST_QUEUE_MAXSIZE = 0
+PHOTONS_PERSIST_RETRY_S = 0.25
+
 
 # ---------------------------------------------------------------------
 # Live state
@@ -66,14 +81,25 @@ PHOTONS_STATS_SCHEMA = "PHOTONS_INSTRUMENT_STATS_V1"
 
 _state_lock = threading.Lock()
 
+_fragment_queue: queue.Queue[Payload] = queue.Queue(maxsize=PHOTONS_INGRESS_QUEUE_MAXSIZE)
+_persist_queue: queue.Queue[Payload] = queue.Queue(maxsize=PHOTONS_PERSIST_QUEUE_MAXSIZE)
+_state_worker_started = threading.Event()
+_persistence_worker_started = threading.Event()
+
 _latest_fragment: Optional[Payload] = None
 _latest_photons: Optional[Payload] = None
 
 _fragments_received = 0
+_fragments_queued = 0
+_fragments_processed = 0
 _photons_published = 0
 _rows_persisted = 0
 _fragments_rejected = 0
+_ingress_queue_depth_max = 0
+_persist_queue_depth_max = 0
+_persistence_retry_count = 0
 _last_structural_rejection: Optional[Dict[str, Any]] = None
+_last_persistence_failure: Optional[Dict[str, Any]] = None
 
 
 # ---------------------------------------------------------------------
@@ -312,61 +338,140 @@ def _persist_photons(photons: Payload) -> None:
 
 
 # ---------------------------------------------------------------------
-# PHOTONS_FRAGMENT ingress
+# PHOTONS_FRAGMENT ingress + Phase-2 workers
 # ---------------------------------------------------------------------
 
+def _note_ingress_queue_depth() -> None:
+    global _ingress_queue_depth_max
+    depth = _fragment_queue.qsize()
+    with _state_lock:
+        if depth > _ingress_queue_depth_max:
+            _ingress_queue_depth_max = depth
+
+
+def _note_persist_queue_depth() -> None:
+    global _persist_queue_depth_max
+    depth = _persist_queue.qsize()
+    with _state_lock:
+        if depth > _persist_queue_depth_max:
+            _persist_queue_depth_max = depth
+
+
 def on_photons_fragment(fragment: Payload) -> None:
-    """
-    Receive one Teensy-authored PHOTONS_FRAGMENT.
-
-    Phase 1 deliberately keeps the synchronous execution path:
-
-        receive -> structural court -> canonicalize -> publish -> persist
-
-    Queue/worker decoupling belongs to Phase 2.
-    """
+    """PUBSUB fast path: copy one firmware fragment into the ingress queue."""
     global _latest_fragment
-    global _latest_photons
     global _fragments_received
-    global _photons_published
-    global _rows_persisted
-    global _fragments_rejected
-    global _last_structural_rejection
+    global _fragments_queued
 
+    copied = copy.deepcopy(fragment)
     with _state_lock:
         _fragments_received += 1
-        _latest_fragment = copy.deepcopy(fragment)
+        _latest_fragment = copied
 
-    try:
-        photons = _make_photons(fragment)
-    except Exception as exc:
-        rejection = {
-            "rejected_at_utc": _utc_now_z(),
-            "reason": str(exc),
-            "schema": fragment.get("schema") if isinstance(fragment, dict) else None,
-            "sequence": fragment.get("sequence") if isinstance(fragment, dict) else None,
-        }
+    # Both Phase-2 queues are unbounded, so put_nowait() does not turn a
+    # downstream stall into PUBSUB backpressure.  Memory growth is observable
+    # through REPORT queue-depth diagnostics.
+    _fragment_queue.put_nowait(copied)
+    with _state_lock:
+        _fragments_queued += 1
+    _note_ingress_queue_depth()
+
+
+def _state_loop() -> None:
+    """Validate, canonicalize, publish, then hand each row to ordered persistence."""
+    global _latest_photons
+    global _fragments_processed
+    global _fragments_rejected
+    global _photons_published
+    global _last_structural_rejection
+
+    _state_worker_started.set()
+    logging.info("🚀 [photons] canonical PHOTONS_V1 state worker started")
+
+    while True:
+        fragment = _fragment_queue.get()
         with _state_lock:
-            _fragments_rejected += 1
-            _last_structural_rejection = rejection
-        logging.exception(
-            "💥 [photons] PHOTONS_FRAGMENT rejected by structural/accounting court: %s",
-            rejection,
-        )
-        return
+            _fragments_processed += 1
 
-    with _state_lock:
-        _latest_photons = copy.deepcopy(photons)
+        try:
+            photons = _make_photons(fragment)
+        except Exception as exc:
+            rejection = {
+                "rejected_at_utc": _utc_now_z(),
+                "reason": str(exc),
+                "schema": fragment.get("schema") if isinstance(fragment, dict) else None,
+                "sequence": fragment.get("sequence") if isinstance(fragment, dict) else None,
+            }
+            with _state_lock:
+                _fragments_rejected += 1
+                _last_structural_rejection = rejection
+            logging.exception(
+                "💥 [photons] PHOTONS_FRAGMENT rejected by structural/accounting court: %s",
+                rejection,
+            )
+            continue
 
-    publish(PHOTONS_TOPIC, photons)
+        with _state_lock:
+            _latest_photons = copy.deepcopy(photons)
 
-    with _state_lock:
-        _photons_published += 1
+        publish(PHOTONS_TOPIC, photons)
+        with _state_lock:
+            _photons_published += 1
 
-    _persist_photons(photons)
+        _persist_queue.put_nowait(copy.deepcopy(photons))
+        _note_persist_queue_depth()
 
-    with _state_lock:
-        _rows_persisted += 1
+
+def _persistence_loop() -> None:
+    """Persist canonical PHOTONS rows in order, retrying transient DB failures."""
+    global _rows_persisted
+    global _persistence_retry_count
+    global _last_persistence_failure
+
+    _persistence_worker_started.set()
+    logging.info("🚀 [photons] ordered PHOTONS persistence worker started")
+
+    while True:
+        photons = _persist_queue.get()
+        failure_logged = False
+        while True:
+            try:
+                _persist_photons(photons)
+                with _state_lock:
+                    _rows_persisted += 1
+                break
+            except Exception as exc:
+                failure = {
+                    "failed_at_utc": _utc_now_z(),
+                    "sequence": photons.get("sequence") if isinstance(photons, dict) else None,
+                    "pps_count": photons.get("pps_count") if isinstance(photons, dict) else None,
+                    "reason": str(exc),
+                }
+                with _state_lock:
+                    _persistence_retry_count += 1
+                    _last_persistence_failure = failure
+                if not failure_logged:
+                    logging.exception(
+                        "⚠️ [photons] campaign_detail persistence failed for PHOTONS sequence=%s; retrying",
+                        failure["sequence"],
+                    )
+                    failure_logged = True
+                time.sleep(PHOTONS_PERSIST_RETRY_S)
+
+
+def _start_workers() -> None:
+    if not _state_worker_started.is_set():
+        threading.Thread(
+            target=_state_loop,
+            daemon=True,
+            name="photons-state",
+        ).start()
+    if not _persistence_worker_started.is_set():
+        threading.Thread(
+            target=_persistence_loop,
+            daemon=True,
+            name="photons-persistence",
+        ).start()
 
 
 SUBSCRIPTIONS = {
@@ -381,12 +486,22 @@ SUBSCRIPTIONS = {
 def cmd_report(_: Optional[dict]) -> dict:
     with _state_lock:
         payload = {
-            "schema": "PHOTONS_REPORT_V1",
+            "schema": "PHOTONS_REPORT_V2",
             "fragments_received": _fragments_received,
+            "fragments_queued": _fragments_queued,
+            "fragments_processed": _fragments_processed,
             "fragments_rejected": _fragments_rejected,
             "photons_published": _photons_published,
             "rows_persisted": _rows_persisted,
+            "ingress_queue_depth": _fragment_queue.qsize(),
+            "ingress_queue_depth_max": _ingress_queue_depth_max,
+            "persist_queue_depth": _persist_queue.qsize(),
+            "persist_queue_depth_max": _persist_queue_depth_max,
+            "persistence_retry_count": _persistence_retry_count,
+            "state_worker_started": _state_worker_started.is_set(),
+            "persistence_worker_started": _persistence_worker_started.is_set(),
             "last_structural_rejection": copy.deepcopy(_last_structural_rejection),
+            "last_persistence_failure": copy.deepcopy(_last_persistence_failure),
             "latest_fragment": copy.deepcopy(_latest_fragment),
             "latest_photons": copy.deepcopy(_latest_photons),
         }
@@ -411,8 +526,8 @@ def run() -> None:
     setup_logging()
 
     logging.info(
-        "[photons] starting canonical PHOTONS_V1 service "
-        "subscription=%s publication=%s campaign_type=%s",
+        "[photons] starting canonical PHOTONS_V1 service with CLOCKS-shaped "
+        "queued state/persistence workers subscription=%s publication=%s campaign_type=%s",
         PHOTONS_FRAGMENT_TOPIC,
         PHOTONS_TOPIC,
         CAMPAIGN_TYPE_PHOTONS,
@@ -422,8 +537,14 @@ def run() -> None:
         subsystem=SUBSYSTEM,
         commands=COMMANDS,
         subscriptions=SUBSCRIPTIONS,
-        blocking=True,
+        blocking=False,
     )
+
+    _start_workers()
+
+    logging.info("🏁 [photons] entering main loop")
+    while True:
+        time.sleep(3600)
 
 
 if __name__ == "__main__":
