@@ -1,36 +1,31 @@
 """
 ZPNet PHOTONS Process — canonical optical instrument + LANTERN campaign lifecycle.
 
-Phase-4 contract:
+Campaign symmetry contract:
 
-    Teensy process_photons
+    Pi LANTERN lifecycle authority
+        -> Teensy PHOTONS.START / PHOTONS.STOP
+        -> firmware-authored LANTERN_FRAGMENT_V1 boundary + CAMP statistics
         -> PHOTONS_FRAGMENT_V1
-        -> Pi PUBSUB fast-path ingress queue
-        -> authoritative SYSTEM.REPORT context
-        -> structural/accounting court + canonical PHOTONS_V1 worker
-        -> optional Pi-owned LANTERN campaign decoration
-        -> PUBSUB PHOTONS
-        -> ordered persistence queue/worker
-        -> campaign_detail + campaign_master read model
+        -> Pi structural/accounting court + SYSTEM context
+        -> Pi adds durable campaign ID/baseline provenance only
+        -> canonical PHOTONS_V1
+        -> ordered persistence + campaign_master read model
 
 The Teensy remains the optical-science authority and runs continuously.
-START/STOP never start or stop PHOTONS measurement and never mutate firmware
-science.  They only establish sequence-exact LANTERN labeling boundaries over
-the already-running canonical PHOTONS stream.
+START/STOP never start or stop physical PHOTONS measurement and never reset the
+always-on Welford/Better-Buckets population.  As in CLOCKS, START only tells the
+firmware which recording lifecycle is beginning; firmware snapshots its own
+cumulative accepted-lap N/T at a published boundary and authors CAMP PPB from
+that origin against STANDARD_LAP_NS.
 
-The Pi does not recompute, smooth, repair, or re-adjudicate lap science.
-Accepted and excluded lap populations remain firmware facts; a one-second batch
-is not made non-viable merely because it contains excluded laps.
+The Pi does not recompute, smooth, repair, or re-adjudicate lap or CAMP science.
+It owns campaign_master identity, baseline relationships, restart policy, and
+persistence.  Firmware owns the exact START/STOP measurement boundary.
 
-Campaign boundaries are physical-sequence boundaries, not worker timing:
-START labels only fragments strictly after the latest fragment already received;
-STOP labels through the latest fragment already received.  This preserves exact
-campaign custody even while SYSTEM or PostgreSQL backlog exists.
-
-Baselines are campaign-to-campaign relationships stored by campaign_master ID.
-No baseline statistics are copied into the active campaign and the firmware
-``photons.baseline`` object remains untouched.  Full optical/statistical restart
-recovery remains deferred to Phase 5.
+Baselines remain campaign-to-campaign relationships stored by campaign_master ID.
+No baseline statistics are copied into firmware and ``photons.baseline`` remains
+untouched.  Full optical/statistical restart recovery remains deferred to Phase 5.
 """
 
 from __future__ import annotations
@@ -70,6 +65,7 @@ PHOTONS_TOPIC = "PHOTONS"
 CAMPAIGN_TYPE_PHOTONS = "PHOTONS"  # legacy pre-Phase-4 detail type
 CAMPAIGN_TYPE_LANTERN = "LANTERN"
 LANTERN_CAMPAIGN_SCHEMA = "LANTERN_CAMPAIGN_V1"
+LANTERN_FRAGMENT_SCHEMA = "LANTERN_FRAGMENT_V1"
 LANTERN_MASTER_SCHEMA = "LANTERN_CAMPAIGN_MASTER_V1"
 LANTERN_REPORT_SCHEMA = "LANTERN_REPORT_V1"
 LANTERN_RESTART_INTERRUPTION_REASON = "PHASE4_NO_RESTART_RECOVERY"
@@ -80,6 +76,9 @@ PHOTONS_FRAGMENT_SCHEMA = "PHOTONS_FRAGMENT_V1"
 PHOTONS_INSTRUMENT_SCHEMA = "PHOTONS_INSTRUMENT_V1"
 PHOTONS_SCIENCE_SCHEMA = "PHOTONS_SCIENCE_V2"
 PHOTONS_STATS_SCHEMA = "PHOTONS_INSTRUMENT_STATS_V1"
+
+TEENSY_CAMPAIGN_START_ACCEPTED_STATUSES = {"start_requested"}
+TEENSY_CAMPAIGN_STOP_ACCEPTED_STATUSES = {"stop_requested"}
 
 # Phase-2 live data-plane queues.  maxsize=0 is intentionally unbounded: at the
 # current 1 Hz instrument rate, temporary downstream stalls should create visible
@@ -119,9 +118,9 @@ _campaign_control_ready = threading.Event()
 _latest_fragment: Optional[Payload] = None
 _latest_photons: Optional[Payload] = None
 
-# One active campaign plus any recently STOPped window whose final queued
-# pre-STOP fragments have not yet crossed the state worker.  Windows are
-# sequence-authored so worker/database latency cannot move campaign boundaries.
+# One active Pi lifecycle plus any STOP-requested lifecycle whose firmware-authored
+# final fragment has not yet crossed the state worker.  Teensy owns the actual
+# recording boundaries; these structures contribute only durable Pi provenance.
 _active_campaign: Optional[Dict[str, Any]] = None
 _closing_campaigns: List[Dict[str, Any]] = []
 
@@ -259,6 +258,147 @@ def _configure_teensy_standard_lap() -> None:
         standard_text,
         standard_ps,
     )
+
+
+def _request_teensy_campaign_command(
+    command: str,
+    *,
+    campaign: Optional[str] = None,
+    accepted_statuses: set[str],
+) -> Dict[str, Any]:
+    """Send one PHOTONS lifecycle command and require an explicit firmware verdict."""
+    args = {"campaign": campaign} if campaign is not None else None
+    if args is None:
+        response = send_command(
+            machine="TEENSY",
+            subsystem=SUBSYSTEM,
+            command=command,
+        )
+    else:
+        response = send_command(
+            machine="TEENSY",
+            subsystem=SUBSYSTEM,
+            command=command,
+            args=args,
+        )
+    payload = response.get("payload") if isinstance(response, dict) else None
+    status = str(payload.get("status") or "") if isinstance(payload, dict) else ""
+    if (
+        not isinstance(response, dict)
+        or not response.get("success")
+        or not isinstance(payload, dict)
+        or status not in accepted_statuses
+    ):
+        raise RuntimeError(
+            f"Teensy PHOTONS.{command} rejected: status={status!r} response={response!r}"
+        )
+    return response
+
+
+def _validate_firmware_campaign(
+    fragment: Payload,
+    sequence: int,
+) -> Optional[Dict[str, Any]]:
+    """Validate optional Teensy-authored LANTERN_FRAGMENT_V1 testimony."""
+    raw = fragment.get("campaign")
+    if raw is None:
+        return None
+    campaign = _require_dict(raw, "PHOTONS_FRAGMENT.campaign")
+    if campaign.get("schema") != LANTERN_FRAGMENT_SCHEMA:
+        raise ValueError(
+            f"unsupported PHOTONS campaign schema {campaign.get('schema')!r}"
+        )
+
+    name = str(campaign.get("campaign") or "").strip()
+    if not name:
+        raise ValueError("PHOTONS_FRAGMENT.campaign.campaign is required")
+
+    start_after = _require_int(
+        campaign.get("start_after_sequence"),
+        "PHOTONS_FRAGMENT.campaign.start_after_sequence",
+        minimum=1,
+    )
+    if start_after >= sequence:
+        raise ValueError(
+            "PHOTONS campaign boundary is not strictly before its public row: "
+            f"start_after_sequence={start_after} sequence={sequence}"
+        )
+
+    public_count = _require_int(
+        campaign.get("public_count"),
+        "PHOTONS_FRAGMENT.campaign.public_count",
+        minimum=1,
+    )
+    final = campaign.get("final")
+    if not isinstance(final, bool):
+        raise ValueError("PHOTONS_FRAGMENT.campaign.final must be boolean")
+
+    stop_after = campaign.get("stop_after_sequence")
+    if final:
+        stop_after = _require_int(
+            stop_after,
+            "PHOTONS_FRAGMENT.campaign.stop_after_sequence",
+            minimum=1,
+        )
+        if stop_after != sequence:
+            raise ValueError(
+                "final PHOTONS campaign row must own its STOP boundary: "
+                f"stop_after_sequence={stop_after} sequence={sequence}"
+            )
+    elif stop_after is not None:
+        raise ValueError(
+            "non-final PHOTONS campaign row must not publish stop_after_sequence"
+        )
+
+    stats = _require_dict(campaign.get("stats"), "PHOTONS_FRAGMENT.campaign.stats")
+    lap_count = _require_int(
+        stats.get("lap_count"),
+        "PHOTONS_FRAGMENT.campaign.stats.lap_count",
+    )
+    total_ns = _require_int(
+        stats.get("total_lap_gnss_ns"),
+        "PHOTONS_FRAGMENT.campaign.stats.total_lap_gnss_ns",
+    )
+    instrument = _require_dict(fragment.get("photons"), "PHOTONS_FRAGMENT.photons")
+    instrument_stats = _require_dict(
+        instrument.get("stats"), "PHOTONS_FRAGMENT.photons.stats"
+    )
+    lifetime_lap_count = _require_int(
+        instrument_stats.get("lap_count"), "PHOTONS_FRAGMENT.photons.stats.lap_count"
+    )
+    lifetime_total_ns = _require_int(
+        instrument_stats.get("total_lap_gnss_ns"),
+        "PHOTONS_FRAGMENT.photons.stats.total_lap_gnss_ns",
+    )
+    if lap_count > lifetime_lap_count or total_ns > lifetime_total_ns:
+        raise ValueError(
+            "PHOTONS campaign population exceeds always-on instrument population: "
+            f"campaign_n={lap_count} lifetime_n={lifetime_lap_count} "
+            f"campaign_total={total_ns} lifetime_total={lifetime_total_ns}"
+        )
+
+    if lap_count == 0:
+        if total_ns != 0:
+            raise ValueError("zero-lap PHOTONS campaign has nonzero total_lap_gnss_ns")
+        if stats.get("sample_count") is not None or stats.get("ppb") is not None:
+            raise ValueError("zero-lap PHOTONS campaign must not publish PPB testimony")
+    else:
+        if total_ns == 0:
+            raise ValueError("nonempty PHOTONS campaign has zero total_lap_gnss_ns")
+        sample_count = _require_int(
+            stats.get("sample_count"),
+            "PHOTONS_FRAGMENT.campaign.stats.sample_count",
+            minimum=1,
+        )
+        if sample_count != lap_count:
+            raise ValueError(
+                "PHOTONS campaign sample-count mismatch: "
+                f"lap_count={lap_count} sample_count={sample_count}"
+            )
+        if stats.get("mean_lap_ns") is None or stats.get("ppb") is None:
+            raise ValueError("nonempty PHOTONS campaign is missing mean_lap_ns/ppb")
+
+    return copy.deepcopy(campaign)
 
 
 def _fetch_system_report() -> Dict[str, Any]:
@@ -463,19 +603,6 @@ def _make_photons(fragment: Payload, system_context: Dict[str, Any]) -> Payload:
 # LANTERN campaign decoration + campaign_master read model
 # ---------------------------------------------------------------------
 
-def _latest_received_fragment_sequence() -> int:
-    """Return the newest PHOTONS_FRAGMENT sequence already accepted by PUBSUB."""
-    with _state_lock:
-        fragment = copy.deepcopy(_latest_fragment)
-    if not isinstance(fragment, dict):
-        raise RuntimeError("PHOTONS has not received a fragment yet")
-    return _require_int(
-        fragment.get("sequence"),
-        "latest PHOTONS_FRAGMENT.sequence",
-        minimum=1,
-    )
-
-
 def _latest_canonical_photons_snapshot() -> Dict[str, Any]:
     """Return the latest canonical PHOTONS observation or fail campaign admission."""
     with _state_lock:
@@ -490,15 +617,19 @@ def _latest_canonical_photons_snapshot() -> Dict[str, Any]:
 
 
 def _campaign_public_decoration(window: Dict[str, Any]) -> Dict[str, Any]:
-    """Return only the Pi-owned campaign facts carried on a canonical PHOTONS row."""
+    """Return Pi-owned durable identity/provenance for one LANTERN lifecycle."""
     out: Dict[str, Any] = {
         "schema": LANTERN_CAMPAIGN_SCHEMA,
         "campaign_type": CAMPAIGN_TYPE_LANTERN,
         "campaign": window["campaign"],
         "campaign_id": int(window["campaign_id"]),
         "started_at": window["started_at"],
-        "start_after_sequence": int(window["start_after_sequence"]),
     }
+    if window.get("stopped_at"):
+        out["stopped_at"] = str(window["stopped_at"])
+    start_after = window.get("start_after_sequence")
+    if start_after is not None:
+        out["start_after_sequence"] = int(start_after)
     stop_after = window.get("stop_after_sequence")
     if stop_after is not None:
         out["stop_after_sequence"] = int(stop_after)
@@ -511,37 +642,68 @@ def _campaign_public_decoration(window: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def _campaign_decoration_for_sequence(sequence: int) -> Optional[Dict[str, Any]]:
-    """Resolve one physical PHOTONS sequence against exact START/STOP windows."""
+def _campaign_decoration_from_firmware(
+    firmware_campaign: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Merge Teensy-authored boundary/science with Pi-owned durable provenance."""
     global _closing_campaigns
 
-    sequence = int(sequence)
+    name = str(firmware_campaign["campaign"])
+    start_after = int(firmware_campaign["start_after_sequence"])
+    public_count = int(firmware_campaign["public_count"])
+    final = bool(firmware_campaign["final"])
+
     with _campaign_lock:
-        selected: Optional[Dict[str, Any]] = None
+        window: Optional[Dict[str, Any]] = None
+        if _active_campaign is not None and _active_campaign.get("campaign") == name:
+            window = _active_campaign
+        if window is None:
+            for candidate in _closing_campaigns:
+                if candidate.get("campaign") == name:
+                    window = candidate
+                    break
+        if window is None:
+            raise ValueError(
+                f"Teensy published LANTERN campaign {name!r} with no Pi lifecycle owner"
+            )
 
-        # A STOPped campaign remains authoritative for any fragment that had
-        # already arrived when STOP captured its inclusive boundary.
-        for window in _closing_campaigns:
-            start_after = int(window["start_after_sequence"])
-            stop_after = int(window["stop_after_sequence"])
-            if start_after < sequence <= stop_after:
-                selected = _campaign_public_decoration(window)
-                break
+        known_start_after = window.get("start_after_sequence")
+        if known_start_after is None:
+            window["start_after_sequence"] = start_after
+        elif int(known_start_after) != start_after:
+            raise ValueError(
+                "Pi/Teensy LANTERN START boundary mismatch: "
+                f"pi={known_start_after} teensy={start_after} campaign={name!r}"
+            )
 
-        if selected is None and _active_campaign is not None:
-            start_after = int(_active_campaign["start_after_sequence"])
-            if sequence > start_after:
-                selected = _campaign_public_decoration(_active_campaign)
+        previous_public_count = int(window.get("firmware_public_count") or 0)
+        if public_count != previous_public_count + 1:
+            raise ValueError(
+                "PHOTONS campaign public-count discontinuity: "
+                f"previous={previous_public_count} current={public_count} campaign={name!r}"
+            )
+        window["firmware_public_count"] = public_count
 
-        # The state worker is ordered.  Once it reaches/passes a closed window's
-        # inclusive STOP boundary, no future item can belong to that window.
-        _closing_campaigns = [
-            window
-            for window in _closing_campaigns
-            if int(window["stop_after_sequence"]) > sequence
-        ]
+        if final:
+            stop_after = int(firmware_campaign["stop_after_sequence"])
+            window["stop_after_sequence"] = stop_after
+            window["firmware_final_seen"] = True
 
-        return copy.deepcopy(selected) if selected is not None else None
+        out = _campaign_public_decoration(window)
+        out["source_schema"] = firmware_campaign["schema"]
+        out["public_count"] = public_count
+        out["final"] = final
+        out["stats"] = copy.deepcopy(firmware_campaign.get("stats") or {})
+
+        if final:
+            closing_id = int(window["campaign_id"])
+            _closing_campaigns = [
+                candidate
+                for candidate in _closing_campaigns
+                if int(candidate["campaign_id"]) != closing_id
+            ]
+
+        return out
 
 
 def _lantern_report_from_photons(photons: Payload) -> Dict[str, Any]:
@@ -556,6 +718,8 @@ def _lantern_report_from_photons(photons: Payload) -> Dict[str, Any]:
     excluded = excluded if isinstance(excluded, dict) else {}
     stats = instrument.get("stats")
     stats = stats if isinstance(stats, dict) else {}
+    campaign_stats = campaign.get("stats")
+    campaign_stats = campaign_stats if isinstance(campaign_stats, dict) else {}
 
     return {
         "schema": LANTERN_REPORT_SCHEMA,
@@ -566,6 +730,9 @@ def _lantern_report_from_photons(photons: Payload) -> Dict[str, Any]:
         "pps_count": photons.get("pps_count"),
         "published_at_utc": photons.get("published_at_utc"),
         "instrument_source": instrument.get("source"),
+        "campaign_public_count": campaign.get("public_count"),
+        "campaign_final": campaign.get("final"),
+        "campaign_stats": copy.deepcopy(campaign_stats),
         # These are exact firmware cumulative/read-model facts, not Pi-authored
         # campaign-local statistics.
         "candidate_count": science.get("candidate_count"),
@@ -580,7 +747,7 @@ def _lantern_report_from_photons(photons: Payload) -> Dict[str, Any]:
 def _retire_stale_active_campaigns() -> None:
     """Fail closed across restart until Phase 5 can prove campaign continuation.
 
-    Phase 4 deliberately does not claim restart recovery.  If this Pi process is
+    Full campaign/statistical resurrection is still deferred.  If this Pi process is
     restarted while a LANTERN master is active, close that master explicitly
     before the state worker begins decorating new rows.  PUBSUB ingress is already
     online, so fragments accumulate in the unbounded ingress queue while a
@@ -636,6 +803,72 @@ def _retire_stale_active_campaigns() -> None:
             "Phase 5 restart recovery is not yet enabled",
             retired,
         )
+
+
+def _quiesce_stale_teensy_campaign() -> None:
+    """Fail closed on Pi restart until firmware has no orphan LANTERN lifecycle."""
+    deadline = time.monotonic() + 15.0
+    stop_requested = False
+    last_state = None
+
+    while time.monotonic() < deadline:
+        try:
+            response = send_command(
+                machine="TEENSY",
+                subsystem=SUBSYSTEM,
+                command="REPORT",
+                retries=1,
+                retry_delay_s=0.0,
+            )
+            payload = response.get("payload") if isinstance(response, dict) else None
+            if (
+                not isinstance(response, dict)
+                or not response.get("success")
+                or not isinstance(payload, dict)
+            ):
+                raise RuntimeError(f"Teensy PHOTONS.REPORT unavailable: {response!r}")
+            state = str(payload.get("campaign_state") or "").upper()
+        except Exception:
+            time.sleep(PHOTONS_STATE_RETRY_S)
+            continue
+
+        last_state = state
+        if state == "STOPPED":
+            return
+        if state == "START_PENDING":
+            # START commits only on a successful pre-campaign publication.  Wait
+            # for that lawful boundary rather than inventing a cancellation path.
+            time.sleep(PHOTONS_STATE_RETRY_S)
+            continue
+        if state == "ACTIVE" and not stop_requested:
+            _request_teensy_campaign_command(
+                "STOP",
+                accepted_statuses=TEENSY_CAMPAIGN_STOP_ACCEPTED_STATUSES,
+            )
+            stop_requested = True
+            time.sleep(PHOTONS_STATE_RETRY_S)
+            continue
+        if state == "STOP_PENDING":
+            stop_requested = True
+            time.sleep(PHOTONS_STATE_RETRY_S)
+            continue
+        raise RuntimeError(f"unknown Teensy PHOTONS campaign_state {state!r}")
+
+    raise RuntimeError(
+        f"timed out quiescing stale Teensy PHOTONS campaign; last_state={last_state!r}"
+    )
+
+
+def _drain_stale_fragment_ingress() -> int:
+    """Discard pre-worker restart backlog after stale firmware campaign closure."""
+    drained = 0
+    while True:
+        try:
+            _fragment_queue.get_nowait()
+        except queue.Empty:
+            break
+        drained += 1
+    return drained
 
 
 def _baseline_relation_for_active_campaign() -> Optional[Dict[str, Any]]:
@@ -747,6 +980,30 @@ def _persist_photons(photons: Payload) -> None:
 
         if campaign is not None:
             report = _lantern_report_from_photons(photons)
+            boundary_payload: Dict[str, Any] = {
+                "start_after_sequence": _require_int(
+                    campaign.get("start_after_sequence"),
+                    "PHOTONS.campaign.start_after_sequence",
+                    minimum=1,
+                ),
+                "firmware_public_count": _require_int(
+                    campaign.get("public_count"),
+                    "PHOTONS.campaign.public_count",
+                    minimum=1,
+                ),
+                "boundary_contract": "TEENSY_AUTHORED_PUBLISHED_FRAGMENT_BOUNDARY",
+                "start_boundary_pending": False,
+            }
+            if campaign.get("final") is True:
+                boundary_payload["stop_after_sequence"] = _require_int(
+                    campaign.get("stop_after_sequence"),
+                    "PHOTONS.campaign.stop_after_sequence",
+                    minimum=1,
+                )
+                boundary_payload["stop_boundary_pending"] = False
+                if campaign.get("stopped_at"):
+                    boundary_payload["stopped_at"] = str(campaign["stopped_at"])
+
             cur.execute(
                 """
                 UPDATE campaign_master
@@ -755,13 +1012,14 @@ def _persist_photons(photons: Payload) -> None:
                     '{report}',
                     %s::jsonb,
                     true
-                )
+                ) || %s::jsonb
                 WHERE id = %s
                   AND campaign_type = %s
                   AND campaign = %s
                 """,
                 (
                     json.dumps(report, separators=(",", ":")),
+                    json.dumps(boundary_payload, separators=(",", ":")),
                     int(campaign_id),
                     CAMPAIGN_TYPE_LANTERN,
                     campaign_name,
@@ -772,6 +1030,22 @@ def _persist_photons(photons: Payload) -> None:
                     "persisted LANTERN-labeled PHOTONS row has no matching campaign_master "
                     f"id={campaign_id} campaign={campaign_name!r}"
                 )
+
+            if campaign.get("final") is True:
+                cur.execute(
+                    """
+                    UPDATE campaign_master
+                    SET active = false
+                    WHERE id = %s
+                      AND campaign_type = %s
+                      AND campaign = %s
+                    """,
+                    (int(campaign_id), CAMPAIGN_TYPE_LANTERN, campaign_name),
+                )
+                if cur.rowcount != 1:
+                    raise RuntimeError(
+                        "final LANTERN firmware row did not close exactly one campaign_master"
+                    )
 
 
 # ---------------------------------------------------------------------
@@ -856,9 +1130,13 @@ def _state_loop() -> None:
 
         try:
             photons = _make_photons(fragment, system_context)
-            campaign = _campaign_decoration_for_sequence(int(photons["sequence"]))
-            if campaign is not None:
-                photons["campaign"] = campaign
+            firmware_campaign = _validate_firmware_campaign(
+                fragment, int(photons["sequence"])
+            )
+            if firmware_campaign is not None:
+                photons["campaign"] = _campaign_decoration_from_firmware(
+                    firmware_campaign
+                )
         except Exception as exc:
             rejection = {
                 "rejected_at_utc": _utc_now_z(),
@@ -957,7 +1235,7 @@ def _campaign_control_gate(command: str) -> Optional[Dict[str, Any]]:
 
 
 def cmd_start(args: Optional[dict]) -> dict:
-    """START one LANTERN label window over the already-running PHOTONS stream."""
+    """START one firmware-authored LANTERN recording population."""
     global _active_campaign
     global _campaign_start_count
     global _last_campaign_transition
@@ -984,15 +1262,11 @@ def cmd_start(args: Optional[dict]) -> dict:
                     "STOP it before starting another LANTERN campaign"
                 ),
             }
-
-        # Capture the exclusive boundary while holding the same lock used by the
-        # state worker's campaign resolver.  A newly arriving fragment may queue
-        # during the DB transaction, but it cannot be decorated until this
-        # transaction commits and the active window becomes visible.
-        try:
-            start_after_sequence = _latest_received_fragment_sequence()
-        except Exception as exc:
-            return {"success": False, "message": str(exc)}
+        if _closing_campaigns:
+            return {
+                "success": False,
+                "message": "Previous LANTERN STOP is still awaiting its final firmware row",
+            }
 
         started_at = _utc_now_z()
         start_location = copy.deepcopy(latest_photons.get("location") or {})
@@ -1046,8 +1320,8 @@ def cmd_start(args: Optional[dict]) -> dict:
                     "schema": LANTERN_MASTER_SCHEMA,
                     "campaign_type": CAMPAIGN_TYPE_LANTERN,
                     "started_at": started_at,
-                    "start_after_sequence": int(start_after_sequence),
-                    "boundary_contract": "START_EXCLUSIVE_LATEST_RECEIVED_SEQUENCE",
+                    "boundary_contract": "TEENSY_AUTHORED_PUBLISHED_FRAGMENT_BOUNDARY",
+                    "start_boundary_pending": True,
                     "instrument_always_on": True,
                     "starts_physical_measurement": False,
                     "location": start_location,
@@ -1073,35 +1347,75 @@ def cmd_start(args: Optional[dict]) -> dict:
                 if created is None:
                     raise RuntimeError("LANTERN campaign_master insert returned no id")
                 campaign_id = int(created["id"])
-
         except Exception as exc:
-            logging.exception("❌ [photons] LANTERN START failed")
+            logging.exception("❌ [photons] LANTERN START database preparation failed")
             return {"success": False, "message": str(exc)}
 
+        # Publish the Pi lifecycle owner before arming firmware.  The same lock is
+        # used by the ordered state worker, so no firmware campaign row can be
+        # merged before this identity exists.
         _active_campaign = {
             "campaign": campaign_name,
             "campaign_id": campaign_id,
             "started_at": started_at,
-            "start_after_sequence": int(start_after_sequence),
+            "start_after_sequence": None,
+            "firmware_public_count": 0,
         }
 
+        try:
+            teensy_response = _request_teensy_campaign_command(
+                "START",
+                campaign=campaign_name,
+                accepted_statuses=TEENSY_CAMPAIGN_START_ACCEPTED_STATUSES,
+            )
+        except Exception as exc:
+            _active_campaign = None
+            try:
+                with open_db() as conn:
+                    cur = conn.cursor()
+                    cur.execute(
+                        """
+                        DELETE FROM campaign_master
+                        WHERE id = %s
+                          AND campaign_type = %s
+                          AND campaign = %s
+                          AND active = true
+                        """,
+                        (campaign_id, CAMPAIGN_TYPE_LANTERN, campaign_name),
+                    )
+                    if cur.rowcount != 1:
+                        raise RuntimeError(
+                            "failed START rollback did not delete exactly one campaign_master"
+                        )
+            except Exception:
+                logging.exception(
+                    "💥 [photons] failed to roll back LANTERN master after Teensy START rejection"
+                )
+            logging.exception("❌ [photons] Teensy PHOTONS.START failed")
+            return {"success": False, "message": str(exc)}
+
+    teensy_payload = (
+        teensy_response.get("payload")
+        if isinstance(teensy_response.get("payload"), dict)
+        else {}
+    )
     transition = {
         "action": "START",
         "at_utc": started_at,
         "campaign": campaign_name,
         "campaign_id": campaign_id,
-        "start_after_sequence": int(start_after_sequence),
+        "boundary_pending": True,
+        "teensy_status": teensy_payload.get("status"),
     }
     with _state_lock:
         _campaign_start_count += 1
         _last_campaign_transition = copy.deepcopy(transition)
 
     logging.info(
-        "▶️ [photons] LANTERN START campaign='%s' id=%d after_sequence=%d "
-        "(PHOTONS measurement remains continuously on)",
+        "▶️ [photons] LANTERN START campaign='%s' id=%d armed on Teensy; "
+        "firmware boundary pending (PHOTONS measurement remains continuously on)",
         campaign_name,
         campaign_id,
-        start_after_sequence,
     )
     return {
         "success": True,
@@ -1110,8 +1424,8 @@ def cmd_start(args: Optional[dict]) -> dict:
             "campaign_type": CAMPAIGN_TYPE_LANTERN,
             "campaign": campaign_name,
             "campaign_id": campaign_id,
-            "start_after_sequence": int(start_after_sequence),
-            "first_labeled_sequence": int(start_after_sequence) + 1,
+            "boundary_pending": True,
+            "teensy_status": teensy_payload.get("status"),
             "instrument_always_on": True,
             "physical_measurement_changed": False,
         },
@@ -1119,7 +1433,7 @@ def cmd_start(args: Optional[dict]) -> dict:
 
 
 def cmd_stop(_: Optional[dict]) -> dict:
-    """STOP LANTERN labeling without stopping the PHOTONS instrument."""
+    """STOP after one final Teensy-authored LANTERN fragment."""
     global _active_campaign
     global _closing_campaigns
     global _campaign_stop_count
@@ -1133,15 +1447,25 @@ def cmd_stop(_: Optional[dict]) -> dict:
         if _active_campaign is None:
             return {"success": False, "message": "No active LANTERN campaign"}
 
+        closing = copy.deepcopy(_active_campaign)
+        stopped_at = _utc_now_z()
+        closing["stopped_at"] = stopped_at
+        closing["stop_boundary_pending"] = True
+
         try:
-            stop_after_sequence = _latest_received_fragment_sequence()
+            teensy_response = _request_teensy_campaign_command(
+                "STOP",
+                accepted_statuses=TEENSY_CAMPAIGN_STOP_ACCEPTED_STATUSES,
+            )
         except Exception as exc:
+            logging.exception("❌ [photons] Teensy PHOTONS.STOP failed")
             return {"success": False, "message": str(exc)}
 
-        stopped_at = _utc_now_z()
-        closing = copy.deepcopy(_active_campaign)
-        closing["stopped_at"] = stopped_at
-        closing["stop_after_sequence"] = int(stop_after_sequence)
+        # Firmware now owns the pending final boundary.  Move the Pi lifecycle to
+        # the closing set before releasing the lock so the ordered state worker can
+        # attach durable identity to that final firmware row.
+        _closing_campaigns.append(closing)
+        _active_campaign = None
 
         try:
             with open_db() as conn:
@@ -1152,9 +1476,9 @@ def cmd_stop(_: Optional[dict]) -> dict:
                     SET active = false,
                         payload = payload || jsonb_build_object(
                             'stopped_at', to_jsonb(%s::text),
-                            'stop_after_sequence', to_jsonb(%s::bigint),
+                            'stop_boundary_pending', to_jsonb(true),
                             'stop_boundary_contract',
-                                to_jsonb('STOP_INCLUSIVE_LATEST_RECEIVED_SEQUENCE'::text)
+                                to_jsonb('TEENSY_FINAL_PUBLISHED_CAMPAIGN_FRAGMENT'::text)
                         )
                     WHERE id = %s
                       AND campaign_type = %s
@@ -1163,7 +1487,6 @@ def cmd_stop(_: Optional[dict]) -> dict:
                     """,
                     (
                         stopped_at,
-                        int(stop_after_sequence),
                         int(closing["campaign_id"]),
                         CAMPAIGN_TYPE_LANTERN,
                         closing["campaign"],
@@ -1174,29 +1497,40 @@ def cmd_stop(_: Optional[dict]) -> dict:
                         "active LANTERN campaign_master was not stopped exactly once"
                     )
         except Exception as exc:
-            logging.exception("❌ [photons] LANTERN STOP failed")
-            return {"success": False, "message": str(exc)}
+            # The physical STOP has already been accepted.  Keep the closing
+            # lifecycle in memory so the final firmware row remains attributable;
+            # persistence of that row will also force the master inactive.
+            logging.exception(
+                "⚠️ [photons] LANTERN STOP DB update failed after firmware accepted STOP; "
+                "final campaign-row persistence will converge the master"
+            )
+            db_transition_error = str(exc)
+        else:
+            db_transition_error = None
 
-        _closing_campaigns.append(closing)
-        _active_campaign = None
-
+    teensy_payload = (
+        teensy_response.get("payload")
+        if isinstance(teensy_response.get("payload"), dict)
+        else {}
+    )
     transition = {
         "action": "STOP",
         "at_utc": stopped_at,
         "campaign": closing["campaign"],
         "campaign_id": int(closing["campaign_id"]),
-        "stop_after_sequence": int(stop_after_sequence),
+        "stop_boundary_pending": True,
+        "teensy_status": teensy_payload.get("status"),
+        "database_transition_error": db_transition_error,
     }
     with _state_lock:
         _campaign_stop_count += 1
         _last_campaign_transition = copy.deepcopy(transition)
 
     logging.info(
-        "⏹️ [photons] LANTERN STOP campaign='%s' id=%d through_sequence=%d "
-        "(PHOTONS measurement remains continuously on)",
+        "⏹️ [photons] LANTERN STOP campaign='%s' id=%d armed on Teensy; "
+        "final firmware boundary pending",
         closing["campaign"],
         int(closing["campaign_id"]),
-        int(stop_after_sequence),
     )
     return {
         "success": True,
@@ -1205,8 +1539,9 @@ def cmd_stop(_: Optional[dict]) -> dict:
             "campaign_type": CAMPAIGN_TYPE_LANTERN,
             "campaign": closing["campaign"],
             "campaign_id": int(closing["campaign_id"]),
-            "stop_after_sequence": int(stop_after_sequence),
-            "last_labeled_sequence": int(stop_after_sequence),
+            "stop_boundary_pending": True,
+            "teensy_status": teensy_payload.get("status"),
+            "database_transition_error": db_transition_error,
             "instrument_always_on": True,
             "physical_measurement_changed": False,
         },
@@ -1526,9 +1861,18 @@ def run() -> None:
     # command succeeds, so every emitted fragment is born ready-to-eat.
     _configure_teensy_standard_lap()
 
-    # Phase 4 does not claim restart continuity.  Classify any stale active
-    # LANTERN master before the state worker can decorate newly queued rows.
+    # Full campaign/statistical resurrection remains deferred.  Fail closed on a
+    # Pi-only restart: retire any stale DB master, bring any surviving Teensy
+    # LANTERN lifecycle to STOPPED, then discard the queued pre-classification
+    # backlog so the strict firmware/Pi campaign court starts from one clean row.
     _retire_stale_active_campaigns()
+    _quiesce_stale_teensy_campaign()
+    drained = _drain_stale_fragment_ingress()
+    if drained:
+        logging.warning(
+            "⚠️ [photons] drained %d stale PHOTONS_FRAGMENT row(s) after restart campaign cleanup",
+            drained,
+        )
     _campaign_control_ready.set()
     _start_workers()
 

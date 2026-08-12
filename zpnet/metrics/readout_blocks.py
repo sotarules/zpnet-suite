@@ -19,9 +19,10 @@ Stats policy:
   snapshots only to recover one-second accepted-lap populations for display;
   PostgreSQL is not in that live-tail path.  Durable campaign/baseline history
   remains a database read model.  This never synthesizes individual samples,
-  changes admission, or feeds science back into PHOTONS.  Other arithmetic is
-  deterministic presentation/control math such as DAC conversion/nudging and
-  baseline deltas.
+  changes admission, or feeds science back into PHOTONS.  PHOTONS CAMP is read
+  verbatim from the Teensy-authored campaign.stats.ppb surface.  PHOTONS RES_PS
+  is presentation math for the local accepted-lap mean minus STANDARD_LAP_NS;
+  baseline campaign comparisons remain a separate BASE/NOW/DELTA surface.
 
 Clock row doctrine:
   The dense operator table shows GNSS, VCLOCK, OCXO1, and OCXO2 only.
@@ -1877,6 +1878,22 @@ def _photons_producer_ppb_buckets(payload: dict | None) -> dict[str, float | Non
     return values
 
 
+def _photons_producer_campaign_stats(payload: dict | None) -> dict:
+    """Return the Teensy-authored LANTERN campaign statistics, if present."""
+    root = _json_object(payload)
+    campaign = root.get("campaign") if isinstance(root.get("campaign"), dict) else {}
+    stats = campaign.get("stats") if isinstance(campaign.get("stats"), dict) else {}
+    return stats
+
+
+def _photons_standard_lap_ns(payload: dict | None):
+    """Return the immutable PHOTONS metrological reference carried by the producer."""
+    root = _json_object(payload)
+    instrument = root.get("photons") if isinstance(root.get("photons"), dict) else {}
+    stats = instrument.get("stats") if isinstance(instrument.get("stats"), dict) else {}
+    return _to_float(stats.get("standard_lap_ns"))
+
+
 def _get_lantern_campaign_summaries() -> list[dict]:
     """Return LANTERN masters plus exact campaign-local accepted-lap statistics.
 
@@ -1947,6 +1964,7 @@ def _get_lantern_campaign_summaries() -> list[dict]:
         prior_payload = _json_object(row.get("prior_payload"))
         last_payload = _json_object(row.get("last_payload"))
         stats = _photons_population_delta(prior_payload, last_payload)
+        campaign_stats = _photons_producer_campaign_stats(last_payload)
         summaries.append({
             "id": _to_int(row.get("id")),
             "campaign": row.get("campaign"),
@@ -1962,6 +1980,9 @@ def _get_lantern_campaign_summaries() -> list[dict]:
             "baseline_campaign": row.get("baseline_campaign"),
             "stats": stats,
             "ppb_buckets": _photons_producer_ppb_buckets(last_payload),
+            "campaign_ppb": _to_float(campaign_stats.get("ppb")),
+            "campaign_mean_lap_ns": _to_float(campaign_stats.get("mean_lap_ns")),
+            "standard_lap_ns": _photons_standard_lap_ns(last_payload),
             # Private presentation helpers used to derive live campaign
             # populations. They are never rendered as instrument testimony.
             "_prior_payload": prior_payload,
@@ -1972,18 +1993,19 @@ def _get_lantern_campaign_summaries() -> list[dict]:
     for summary in summaries:
         base = by_id.get(summary.get("baseline_campaign_id"))
         base_stats = base.get("stats") if isinstance(base, dict) else None
-        stats = summary.get("stats")
         base_mean = base_stats.get("mean") if isinstance(base_stats, dict) else None
-        now_mean = stats.get("mean") if isinstance(stats, dict) else None
         summary["baseline_mean_lap_ns"] = base_mean
+
+        # RES_PS is the PHOTONS analogue of CLOCKS' immediate reference residual:
+        # campaign mean relative to the fixed STANDARD_LAP_NS.  Baseline deltas
+        # remain a separate relationship and are never substituted here.
+        campaign_mean = summary.get("campaign_mean_lap_ns")
+        standard_lap_ns = summary.get("standard_lap_ns")
         summary["residual_ps"] = (
-            (float(now_mean) - float(base_mean)) * 1000.0
-            if now_mean is not None and base_mean is not None
+            (float(campaign_mean) - float(standard_lap_ns)) * 1000.0
+            if campaign_mean is not None and standard_lap_ns is not None
             else None
         )
-        # CAMP PPB is intentionally absent until PHOTONS firmware authors a
-        # campaign population against STANDARD_LAP_NS.
-        summary["campaign_ppb"] = None
     return summaries
 
 
@@ -2000,8 +2022,8 @@ def _get_photons_rolling_payloads() -> list[dict]:
 def _photons_rolling_rows(live: dict, summaries: list[dict]) -> list[dict]:
     """Return oldest-to-newest one-second populations from the live PHOTONS tail."""
     _ = live
+    _ = summaries
     payloads = _get_photons_rolling_payloads()
-    by_id = {s.get("id"): s for s in summaries if s.get("id") is not None}
     rows: list[dict] = []
 
     for before, current in zip(payloads, payloads[1:]):
@@ -2030,13 +2052,9 @@ def _photons_rolling_rows(live: dict, summaries: list[dict]) -> list[dict]:
             else sequence
         )
 
-        summary = by_id.get(campaign_id)
-        baseline_mean = (
-            summary.get("baseline_mean_lap_ns")
-            if isinstance(summary, dict)
-            else None
-        )
         producer_ppb = _photons_producer_ppb_buckets(current)
+        producer_campaign_stats = _photons_producer_campaign_stats(current)
+        standard_lap_ns = _photons_standard_lap_ns(current)
 
         rows.append({
             "sequence": sequence,
@@ -2051,11 +2069,12 @@ def _photons_rolling_rows(live: dict, summaries: list[dict]) -> list[dict]:
             "ppb_8_hour": producer_ppb.get("8_hour"),
             "ppb_24_hour": producer_ppb.get("24_hour"),
             "ppb_total": producer_ppb.get("total"),
-            # CAMP remains missing until the Teensy owns that population.
-            "campaign_ppb": None,
+            "campaign_ppb": _to_float(producer_campaign_stats.get("ppb")),
+            # Local one-second residual to the fixed metrological reference.
+            # This remains meaningful with or without a campaign or baseline.
             "residual_ps": (
-                (float(second_stats["mean"]) - float(baseline_mean)) * 1000.0
-                if second_stats.get("mean") is not None and baseline_mean is not None
+                (float(second_stats["mean"]) - float(standard_lap_ns)) * 1000.0
+                if second_stats.get("mean") is not None and standard_lap_ns is not None
                 else None
             ),
             "mean": second_stats.get("mean"),
@@ -2125,22 +2144,28 @@ def photons_detail_readout() -> list[str]:
     )
     now_mean = current_stats.get("mean") if isinstance(current_stats, dict) else None
     current_ppb = _photons_producer_ppb_buckets(live)
-    campaign_ppb = None
+    campaign_ppb = _to_float(_photons_producer_campaign_stats(live).get("ppb"))
 
     try:
         rolling = _photons_rolling_rows(live, summaries)
     except Exception:
         rolling = []
-    latest_residual = rolling[-1].get("residual_ps") if rolling else None
 
-    W_NAME = 6
-    W_VALUE = 14
+    standard_lap_ns = _photons_standard_lap_ns(live)
+    current_residual_ps = (
+        (float(now_mean) - float(standard_lap_ns)) * 1000.0
+        if now_mean is not None and standard_lap_ns is not None
+        else None
+    )
+
+    W_NAME = 4
+    W_VALUE = 12
     W_PPB = 9
-    W_RES = 11
+    W_RES = 10
     W_MEAN = 12
-    W_SD = 10
-    W_SE = 10
-    W_N = 9
+    W_SD = 8
+    W_SE = 8
+    W_N = 7
     W_BASE = 12
     G = " "
 
@@ -2157,10 +2182,7 @@ def photons_detail_readout() -> list[str]:
         f"{'MEAN':>{W_MEAN}}{G}"
         f"{'SD':>{W_SD}}{G}"
         f"{'SE':>{W_SE}}{G}"
-        f"{'N':>{W_N}}{G}"
-        f"{'BASE':>{W_BASE}}{G}"
-        f"{'NOW':>{W_BASE}}{G}"
-        f"{'DELTA':>{W_BASE}}"
+        f"{'N':>{W_N}}"
     )
 
     if isinstance(current_stats, dict):
@@ -2174,15 +2196,25 @@ def photons_detail_readout() -> list[str]:
             f"{_fmt(now_mean, f'>{W_VALUE}.3f', W_VALUE)}{G}"
             f"{G.join(_fmt(current_ppb.get(key), f'>{W_PPB}.3f', W_PPB) for key in PPB_BUCKET_KEYS)}{G}"
             f"{_fmt(campaign_ppb, f'>{W_PPB}.3f', W_PPB)}{G}"
-            f"{_fmt(latest_residual, f'>+{W_RES}.3f', W_RES)}{G}"
+            f"{_fmt(current_residual_ps, f'>+{W_RES}.3f', W_RES)}{G}"
             f"{_fmt(current_stats.get('mean'), f'>{W_MEAN}.3f', W_MEAN)}{G}"
             f"{_fmt(current_stats.get('stddev'), f'>{W_SD}.3f', W_SD)}{G}"
             f"{_fmt(current_stats.get('stderr'), f'>{W_SE}.3f', W_SE)}{G}"
-            f"{_fmt(_to_int(current_stats.get('n')), f'>{W_N}d', W_N)}{G}"
-            f"{_fmt(baseline_mean, f'>{W_BASE}.3f', W_BASE)}{G}"
-            f"{_fmt(now_mean, f'>{W_BASE}.3f', W_BASE)}{G}"
-            f"{_fmt(baseline_delta, f'>+{W_BASE}.3f', W_BASE)}"
+            f"{_fmt(_to_int(current_stats.get('n')), f'>{W_N}d', W_N)}"
         )
+        if baseline_mean is not None and now_mean is not None:
+            lines.append(
+                f"{'BASELINE_NS':<12}{G}"
+                f"{'BASE':>{W_BASE}}{G}"
+                f"{'NOW':>{W_BASE}}{G}"
+                f"{'DELTA':>{W_BASE}}"
+            )
+            lines.append(
+                f"{'':<12}{G}"
+                f"{_fmt(baseline_mean, f'>{W_BASE}.3f', W_BASE)}{G}"
+                f"{_fmt(now_mean, f'>{W_BASE}.3f', W_BASE)}{G}"
+                f"{_fmt(baseline_delta, f'>+{W_BASE}.3f', W_BASE)}"
+            )
     else:
         lines.append("PHOTONS statistics unavailable")
 
@@ -2192,14 +2224,14 @@ def photons_detail_readout() -> list[str]:
         "(PUBSUB; newest at bottom)"
     )
 
-    W_SEC = 7
-    W_ACC = 8
-    W_EXCL = 8
-    W_ROLL_VALUE = 14
+    W_SEC = 6
+    W_ACC = 6
+    W_EXCL = 5
+    W_ROLL_VALUE = 12
     W_ROLL_MEAN = 12
-    W_ROLL_SD = 10
-    W_ROLL_SE = 10
-    W_ROLL_N = 8
+    W_ROLL_SD = 8
+    W_ROLL_SE = 8
+    W_ROLL_N = 7
 
     # Fixed header: this readout itself is not scrollable; each newly received
     # PHOTONS publication advances the in-memory tail beneath this line.
@@ -2264,14 +2296,14 @@ def photons_campaigns_readout() -> list[str]:
     newest_identity = str(rows[0].get("id")) if rows else "EMPTY"
     lines = [f"\0LANTERN_CAMPAIGN:{newest_identity}"]
 
-    W_CAMPAIGN = 20
-    W_VALUE = 14
-    W_PPB = 9
-    W_RES = 11
+    W_CAMPAIGN = 14
+    W_VALUE = 12
+    W_PPB = 8
+    W_RES = 8
     W_MEAN = 12
-    W_SD = 10
-    W_SE = 10
-    W_N = 9
+    W_SD = 7
+    W_SE = 7
+    W_N = 7
     W_BASELINE = 18
     G = " "
 

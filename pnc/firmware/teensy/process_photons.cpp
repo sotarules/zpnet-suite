@@ -13,6 +13,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <math.h>
+#include <string.h>
 
 // ============================================================================
 // PHOTONS scaffold doctrine
@@ -110,9 +111,12 @@ static constexpr float PHOTONS_LASER_EMIT_THRESHOLD_V = 0.75f;
 // process_interrupt exactly as the future PD200T comparator will.
 //
 // The optical launch itself is real: LD_ON is pulsed for approximately 20 ns.
-// Detector timing is deliberately synthetic.  One ordinary recurring TimePop
-// timer provides a fixed 10 ms emulator cadence; its callback advances state only
-// and never mutates TimePop scheduling.
+// One ordinary recurring TimePop timer provides only the coarse 10 ms physical
+// edge cadence.  Foreground scheduling latency is NOT optical propagation.
+// For emulator-only science, each completed physical loopback edge is paired
+// with a synthetic start coordinate whose DWT separation is STANDARD_LAP_NS
+// converted through the current GNSS/DWT ruler plus a tiny zero-mean cycle
+// dither.  Physical edge timing remains visible in emulator/capture telemetry.
 //
 // One emulator train is fixed and explicit:
 //
@@ -142,6 +146,19 @@ static constexpr uint32_t PHOTONS_EMULATOR_LASER_PULSE_CYCLES = 20U;
 static constexpr uint32_t PHOTONS_EMULATOR_CADENCE_NS = 10000000U;  // synthetic 10 ms
 static constexpr uint32_t PHOTONS_EMULATOR_HITS_PER_TRAIN = 5U;
 static constexpr uint32_t PHOTONS_EMULATOR_MEASURED_LAPS = 3U;
+
+// Temporary standard-locked science jitter.  One DWT cycle is approximately
+// one nanosecond on this build.  The pattern is deliberately tiny and has an
+// exact zero sum, so it exercises per-lap timing variation without building a
+// fake frequency offset into Better-Buckets.
+static constexpr int8_t PHOTONS_EMULATOR_LAP_JITTER_CYCLES[] = {
+  -3, 1, 2, -1, 3, -2, 0
+};
+static constexpr uint32_t PHOTONS_EMULATOR_LAP_JITTER_COUNT =
+    sizeof(PHOTONS_EMULATOR_LAP_JITTER_CYCLES) /
+    sizeof(PHOTONS_EMULATOR_LAP_JITTER_CYCLES[0]);
+static_assert((-3 + 1 + 2 - 1 + 3 - 2 + 0) == 0,
+              "PHOTONS emulator lap jitter must be zero-mean");
 
 // Provisional PD200T MON range for bring-up only.  1200-1800 ADC counts maps to
 // roughly 0.97-1.45 V on the Teensy 3.3 V / 12-bit ADC scale.
@@ -194,9 +211,20 @@ struct photons_emulator_state_t {
 
   uint32_t lap_start_dwt = 0U;
   uint32_t previous_lap_endpoint_dwt = 0U;
+  // Physical TimePop-to-TimePop loopback spacing.  These remain telemetry only;
+  // emulator science below is standard-locked and does not consume them.
   uint32_t lap1_last_cycles = 0U;
   uint32_t lap2_last_cycles = 0U;
   uint32_t lap3_last_cycles = 0U;
+
+  bool synthetic_lap_ready = false;
+  uint32_t synthetic_target_cycles = 0U;
+  int32_t synthetic_last_jitter_cycles = 0;
+  uint32_t synthetic_last_lap_cycles = 0U;
+  uint32_t synthetic_lap_count = 0U;
+  uint32_t synthetic_jitter_index = 0U;
+  uint32_t synthetic_target_unavailable_count = 0U;
+  uint32_t projection_wait_count = 0U;
 
   uint16_t mon_raw = PHOTONS_EMULATOR_MON_RAW_MIN;
 };
@@ -321,6 +349,28 @@ static uint64_t g_total_lap_gnss_ns = 0ULL;
 // fragment/statistics clock begins.
 static bool g_standard_lap_configured = false;
 static uint64_t g_standard_lap_ps = 0ULL;
+
+// LANTERN lifecycle mirrors CLOCKS Beta conceptually: Pi owns the campaign
+// lifecycle/name, while Teensy snapshots its own already-running cumulative
+// accepted-lap state at a published fragment boundary and authors CAMP PPB.
+enum class photons_campaign_state_t : uint8_t {
+  STOPPED = 0,
+  START_PENDING,
+  ACTIVE,
+  STOP_PENDING,
+};
+
+static photons_campaign_state_t g_photons_campaign_state =
+    photons_campaign_state_t::STOPPED;
+static char g_photons_campaign_name[64] = {0};
+static uint64_t g_photons_campaign_origin_lap_count = 0ULL;
+static uint64_t g_photons_campaign_origin_total_lap_gnss_ns = 0ULL;
+static uint32_t g_photons_campaign_start_after_sequence = 0U;
+static uint32_t g_photons_campaign_public_count = 0U;
+static uint32_t g_photons_campaign_start_request_count = 0U;
+static uint32_t g_photons_campaign_start_commit_count = 0U;
+static uint32_t g_photons_campaign_stop_request_count = 0U;
+static uint32_t g_photons_campaign_stop_commit_count = 0U;
 
 static photons_ppb_endpoint_t
     g_photons_ppb_seconds[PHOTONS_PPB_SECOND_CAPACITY] DMAMEM = {};
@@ -639,6 +689,111 @@ static photons_fragment_ppb_buckets_snapshot_t photons_ppb_buckets_snapshot(void
     __builtin_trap();
   }
   return out;
+}
+
+
+static const char* photons_campaign_state_name(photons_campaign_state_t state) {
+  switch (state) {
+    case photons_campaign_state_t::STOPPED:       return "STOPPED";
+    case photons_campaign_state_t::START_PENDING: return "START_PENDING";
+    case photons_campaign_state_t::ACTIVE:        return "ACTIVE";
+    case photons_campaign_state_t::STOP_PENDING:  return "STOP_PENDING";
+    default:                                      return "UNKNOWN";
+  }
+}
+
+
+static photons_fragment_campaign_snapshot_t photons_campaign_snapshot(
+    uint32_t fragment_sequence) {
+  photons_fragment_campaign_snapshot_t out{};
+
+  const bool active =
+      g_photons_campaign_state == photons_campaign_state_t::ACTIVE ||
+      g_photons_campaign_state == photons_campaign_state_t::STOP_PENDING;
+  if (!active) return out;
+
+  if (!g_photons_campaign_name[0] ||
+      g_photons_campaign_start_after_sequence == 0U ||
+      fragment_sequence <= g_photons_campaign_start_after_sequence ||
+      g_lap_time_welford.n < g_photons_campaign_origin_lap_count ||
+      g_total_lap_gnss_ns < g_photons_campaign_origin_total_lap_gnss_ns) {
+    __builtin_trap();
+  }
+
+  out.present = true;
+  out.final =
+      g_photons_campaign_state == photons_campaign_state_t::STOP_PENDING;
+  safeCopy(out.campaign, sizeof(out.campaign), g_photons_campaign_name);
+  out.start_after_sequence = g_photons_campaign_start_after_sequence;
+  out.stop_after_sequence = out.final ? fragment_sequence : 0U;
+  out.public_count = g_photons_campaign_public_count + 1U;
+  out.lap_count =
+      g_lap_time_welford.n - g_photons_campaign_origin_lap_count;
+  out.total_lap_gnss_ns =
+      g_total_lap_gnss_ns - g_photons_campaign_origin_total_lap_gnss_ns;
+
+  if (out.lap_count == 0ULL) {
+    if (out.total_lap_gnss_ns != 0ULL) __builtin_trap();
+    return out;
+  }
+  if (out.total_lap_gnss_ns == 0ULL) __builtin_trap();
+
+  out.mean_lap_ns =
+      (double)out.total_lap_gnss_ns / (double)out.lap_count;
+  out.ppb.sample_count = out.lap_count;
+  out.ppb.ppb =
+      photons_ppb_from_population(out.total_lap_gnss_ns, out.lap_count);
+  return out;
+}
+
+
+// Commit lifecycle transitions only after the corresponding fragment has been
+// accepted by PUBSUB.  START therefore uses one successfully published
+// pre-campaign fragment as its private boundary; the next fragment is CAMP #1.
+// STOP publishes one final campaign fragment, then closes the firmware window.
+static void photons_campaign_commit_after_publish(
+    const photons_fragment_snapshot_t& fragment) {
+  if (fragment.campaign.present) {
+    if (g_photons_campaign_state != photons_campaign_state_t::ACTIVE &&
+        g_photons_campaign_state != photons_campaign_state_t::STOP_PENDING) {
+      __builtin_trap();
+    }
+    if (fragment.campaign.public_count !=
+        g_photons_campaign_public_count + 1U ||
+        strcmp(fragment.campaign.campaign, g_photons_campaign_name) != 0) {
+      __builtin_trap();
+    }
+
+    g_photons_campaign_public_count = fragment.campaign.public_count;
+
+    if (fragment.campaign.final) {
+      if (g_photons_campaign_state != photons_campaign_state_t::STOP_PENDING ||
+          fragment.campaign.stop_after_sequence != fragment.sequence) {
+        __builtin_trap();
+      }
+      g_photons_campaign_stop_commit_count++;
+      g_photons_campaign_state = photons_campaign_state_t::STOPPED;
+      g_photons_campaign_name[0] = '\0';
+      g_photons_campaign_origin_lap_count = 0ULL;
+      g_photons_campaign_origin_total_lap_gnss_ns = 0ULL;
+      g_photons_campaign_start_after_sequence = 0U;
+      g_photons_campaign_public_count = 0U;
+    }
+    return;
+  }
+
+  if (g_photons_campaign_state == photons_campaign_state_t::START_PENDING) {
+    if (!g_photons_campaign_name[0] || fragment.sequence == 0U) {
+      __builtin_trap();
+    }
+    g_photons_campaign_origin_lap_count = fragment.stats.lap_count;
+    g_photons_campaign_origin_total_lap_gnss_ns =
+        fragment.stats.total_lap_gnss_ns;
+    g_photons_campaign_start_after_sequence = fragment.sequence;
+    g_photons_campaign_public_count = 0U;
+    g_photons_campaign_start_commit_count++;
+    g_photons_campaign_state = photons_campaign_state_t::ACTIVE;
+  }
 }
 
 
@@ -1240,6 +1395,86 @@ static void photons_emulator_refresh_mon(void) {
       (uint16_t)(PHOTONS_EMULATOR_MON_RAW_MIN + step);
 }
 
+static bool photons_emulator_projection_ready(void) {
+  if (!g_standard_lap_configured || g_standard_lap_ps == 0ULL) {
+    __builtin_trap();
+  }
+
+  photons_projection_anchor_value_t anchor{};
+  return photons_projection_anchor_snapshot(anchor) &&
+         anchor.valid &&
+         anchor.dwt_cycles_per_second != 0U;
+}
+
+
+static bool photons_emulator_prepare_synthetic_lap(void) {
+  if (!g_standard_lap_configured || g_standard_lap_ps == 0ULL) {
+    __builtin_trap();
+  }
+
+  photons_projection_anchor_value_t anchor{};
+  if (!photons_projection_anchor_snapshot(anchor) ||
+      !anchor.valid ||
+      anchor.dwt_cycles_per_second == 0U) {
+    g_photons_emulator.synthetic_lap_ready = false;
+    g_photons_emulator.synthetic_target_unavailable_count++;
+    return false;
+  }
+
+  // This floating conversion occurs in the ordinary foreground TimePop callback,
+  // never in the PHOTODIODE ISR callback.  Double precision is far below one
+  // DWT cycle at this scale; the rounded integer is what crosses into ISR state.
+  const double exact_target_cycles =
+      ((double)g_standard_lap_ps *
+       (double)anchor.dwt_cycles_per_second) / 1.0e12;
+  if (!(exact_target_cycles >= 1.0) ||
+      exact_target_cycles > 4294967290.0) {
+    __builtin_trap();
+  }
+
+  const uint32_t target_cycles = (uint32_t)(exact_target_cycles + 0.5);
+  const int32_t jitter_cycles =
+      (int32_t)PHOTONS_EMULATOR_LAP_JITTER_CYCLES[
+          g_photons_emulator.synthetic_jitter_index %
+          PHOTONS_EMULATOR_LAP_JITTER_COUNT];
+  g_photons_emulator.synthetic_jitter_index++;
+
+  const int64_t lap_cycles =
+      (int64_t)(uint64_t)target_cycles + (int64_t)jitter_cycles;
+  if (lap_cycles <= 0LL || lap_cycles > 4294967295LL) {
+    __builtin_trap();
+  }
+
+  g_photons_emulator.synthetic_target_cycles = target_cycles;
+  g_photons_emulator.synthetic_last_jitter_cycles = jitter_cycles;
+  g_photons_emulator.synthetic_last_lap_cycles = (uint32_t)lap_cycles;
+  g_photons_emulator.synthetic_lap_ready = true;
+  return true;
+}
+
+
+static void photons_emulator_enqueue_synthetic_lap(
+    const interrupt_photodiode_edge_t& edge) {
+  if (!g_photons_emulator.synthetic_lap_ready ||
+      g_photons_emulator.synthetic_last_lap_cycles == 0U) {
+    __builtin_trap();
+  }
+
+  // Anchor the synthetic interval at the real physical loopback edge.  Only the
+  // start coordinate is moved.  The raw-lap handoff and downstream projection
+  // therefore exercise the normal PHOTONS path with a realistic tiny interval
+  // error while the actual TimePop spacing remains separately observable.
+  const uint32_t end_dwt = edge.dwt_at_edge;
+  const uint32_t raw_cycles = g_photons_emulator.synthetic_last_lap_cycles;
+  const uint32_t start_dwt = end_dwt - raw_cycles;
+  if (photons_raw_lap_enqueue(
+          start_dwt, end_dwt, raw_cycles, edge.pps_sequence)) {
+    g_photons_emulator.synthetic_lap_count++;
+  }
+  g_photons_emulator.synthetic_lap_ready = false;
+}
+
+
 
 static void photons_emulator_emit_detector_edge(uint32_t hit_ordinal) {
   // The ordinal is emulator intent only.  The resulting observation is still a
@@ -1301,6 +1536,13 @@ static void photons_emulator_cadence_tick(
 
   switch (g_photons_emulator.stage) {
     case photons_emulator_stage_t::IDLE:
+      // Do not begin a synthetic train until the normal PHOTONS projection ruler
+      // exists.  This avoids manufacturing a startup population that is known
+      // to be unprojectable.
+      if (!photons_emulator_projection_ready()) {
+        g_photons_emulator.projection_wait_count++;
+        return;
+      }
       photons_emulator_begin_train();
       return;
 
@@ -1312,18 +1554,21 @@ static void photons_emulator_cadence_tick(
 
     case photons_emulator_stage_t::WAIT_HIT3:
       photons_emulator_refresh_mon();
+      if (!photons_emulator_prepare_synthetic_lap()) return;
       photons_emulator_emit_detector_edge(3U);
       g_photons_emulator.stage = photons_emulator_stage_t::WAIT_HIT4;
       return;
 
     case photons_emulator_stage_t::WAIT_HIT4:
       photons_emulator_refresh_mon();
+      if (!photons_emulator_prepare_synthetic_lap()) return;
       photons_emulator_emit_detector_edge(4U);
       g_photons_emulator.stage = photons_emulator_stage_t::WAIT_HIT5;
       return;
 
     case photons_emulator_stage_t::WAIT_HIT5:
       photons_emulator_refresh_mon();
+      if (!photons_emulator_prepare_synthetic_lap()) return;
       photons_emulator_emit_detector_edge(5U);
       g_photons_emulator.train_active = false;
       g_photons_emulator.stage = photons_emulator_stage_t::DEAD_LAP;
@@ -1506,8 +1751,7 @@ static void photons_emulator_observe_edge(
             g_photons_emulator.previous_lap_endpoint_dwt;
         const uint32_t raw_cycles = edge.dwt_at_edge - start_dwt;
         g_photons_emulator.lap1_last_cycles = raw_cycles;
-        (void)photons_raw_lap_enqueue(
-            start_dwt, edge.dwt_at_edge, raw_cycles, edge.pps_sequence);
+        photons_emulator_enqueue_synthetic_lap(edge);
       }
       g_photons_emulator.previous_lap_endpoint_dwt = edge.dwt_at_edge;
       g_photons_emulator.lap1_complete_count++;
@@ -1524,8 +1768,7 @@ static void photons_emulator_observe_edge(
             g_photons_emulator.previous_lap_endpoint_dwt;
         const uint32_t raw_cycles = edge.dwt_at_edge - start_dwt;
         g_photons_emulator.lap2_last_cycles = raw_cycles;
-        (void)photons_raw_lap_enqueue(
-            start_dwt, edge.dwt_at_edge, raw_cycles, edge.pps_sequence);
+        photons_emulator_enqueue_synthetic_lap(edge);
       }
       g_photons_emulator.previous_lap_endpoint_dwt = edge.dwt_at_edge;
       g_photons_emulator.lap2_complete_count++;
@@ -1542,8 +1785,7 @@ static void photons_emulator_observe_edge(
             g_photons_emulator.previous_lap_endpoint_dwt;
         const uint32_t raw_cycles = edge.dwt_at_edge - start_dwt;
         g_photons_emulator.lap3_last_cycles = raw_cycles;
-        (void)photons_raw_lap_enqueue(
-            start_dwt, edge.dwt_at_edge, raw_cycles, edge.pps_sequence);
+        photons_emulator_enqueue_synthetic_lap(edge);
       }
       g_photons_emulator.previous_lap_endpoint_dwt = edge.dwt_at_edge;
       g_photons_emulator.lap3_complete_count++;
@@ -1676,6 +1918,8 @@ static Payload g_photons_fragment_stats DMAMEM;
 static Payload g_photons_fragment_welford DMAMEM;
 static Payload g_photons_fragment_ppb_buckets DMAMEM;
 static Payload g_photons_fragment_ppb_value DMAMEM;
+static Payload g_photons_fragment_campaign DMAMEM;
+static Payload g_photons_fragment_campaign_stats DMAMEM;
 static Payload g_photons_fragment_baseline DMAMEM;
 static Payload g_photons_fragment_interrupt DMAMEM;
 
@@ -1725,6 +1969,8 @@ static Payload& photons_fragment_payload(
   Payload& reasons = g_photons_fragment_science_reasons;
   Payload& stats = g_photons_fragment_stats;
   Payload& ppb_buckets = g_photons_fragment_ppb_buckets;
+  Payload& campaign = g_photons_fragment_campaign;
+  Payload& campaign_stats = g_photons_fragment_campaign_stats;
   Payload& baseline = g_photons_fragment_baseline;
   Payload& interrupt = g_photons_fragment_interrupt;
 
@@ -1738,6 +1984,8 @@ static Payload& photons_fragment_payload(
   reasons.clear();
   stats.clear();
   ppb_buckets.clear();
+  campaign.clear();
+  campaign_stats.clear();
   baseline.clear();
   interrupt.clear();
 
@@ -1964,6 +2212,31 @@ static Payload& photons_fragment_payload(
 
   root.add_object("photons", instrument);
   instrument.clear();
+
+  if (f.campaign.present) {
+    campaign.add("schema", "LANTERN_FRAGMENT_V1");
+    campaign.add("campaign", f.campaign.campaign);
+    campaign.add("start_after_sequence", f.campaign.start_after_sequence);
+    campaign.add("public_count", f.campaign.public_count);
+    campaign.add("final", f.campaign.final);
+    if (f.campaign.final) {
+      campaign.add("stop_after_sequence", f.campaign.stop_after_sequence);
+    }
+
+    campaign_stats.add("lap_count", f.campaign.lap_count);
+    campaign_stats.add("total_lap_gnss_ns", f.campaign.total_lap_gnss_ns);
+    if (f.campaign.lap_count != 0ULL) {
+      campaign_stats.add("mean_lap_ns",
+                         toFixedDecimal(f.campaign.mean_lap_ns, 6));
+      campaign_stats.add("sample_count", f.campaign.ppb.sample_count);
+      campaign_stats.add("ppb", toFixedDecimal(f.campaign.ppb.ppb, 6));
+    }
+    campaign.add_object("stats", campaign_stats);
+    campaign_stats.clear();
+    root.add_object("campaign", campaign);
+    campaign.clear();
+  }
+
   return root;
 }
 
@@ -2058,6 +2331,12 @@ static void photons_fragment_tick(
   fragment.stats.rolling_ppb_interval_advanced =
       g_photons_ppb_interval_advanced;
 
+  // Optional LANTERN campaign testimony is firmware-authored from the same
+  // cumulative accepted-lap authority as TOTAL.  START/STOP never reset the
+  // always-on instrument; they only select a recording-relative subtraction
+  // origin, exactly like CLOCKS campaign offsets.
+  fragment.campaign = photons_campaign_snapshot(fragment.sequence);
+
   // Baseline control/provenance is deliberately deferred.  False validity is
   // part of the canonical schema rather than a fabricated zero baseline.
   fragment.baseline = photons_fragment_baseline_snapshot_t{};
@@ -2110,6 +2389,7 @@ static void photons_fragment_tick(
     g_publish_count++;
     g_last_fragment.publish_count = g_publish_count;
     g_last_photons_fragment.publish_count = g_publish_count;
+    photons_campaign_commit_after_publish(fragment);
   } else {
     g_publish_reject_count++;
   }
@@ -2132,6 +2412,16 @@ void process_photons_init(void) {
   g_last_published_edge_count = 0U;
   g_standard_lap_configured = false;
   g_standard_lap_ps = 0ULL;
+  g_photons_campaign_state = photons_campaign_state_t::STOPPED;
+  g_photons_campaign_name[0] = '\0';
+  g_photons_campaign_origin_lap_count = 0ULL;
+  g_photons_campaign_origin_total_lap_gnss_ns = 0ULL;
+  g_photons_campaign_start_after_sequence = 0U;
+  g_photons_campaign_public_count = 0U;
+  g_photons_campaign_start_request_count = 0U;
+  g_photons_campaign_start_commit_count = 0U;
+  g_photons_campaign_stop_request_count = 0U;
+  g_photons_campaign_stop_commit_count = 0U;
 
   g_projection_anchor_cache = photons_projection_anchor_cache_t{};
   g_raw_lap_ring_write = 0U;
@@ -2273,6 +2563,76 @@ static Payload cmd_set_standard_lap_ns(const Payload& args) {
 }
 
 
+static Payload cmd_start(const Payload& args) {
+  if (!g_standard_lap_configured) {
+    __builtin_trap();
+  }
+
+  const char* name = args.getString("campaign");
+  if (!name || !*name) {
+    Payload err;
+    err.add("status", "start_rejected_missing_campaign");
+    err.add("error", "missing campaign");
+    return err;
+  }
+  if (strlen(name) >= sizeof(g_photons_campaign_name)) {
+    Payload err;
+    err.add("status", "start_rejected_campaign_name_too_long");
+    err.add("error", "campaign name exceeds firmware capacity");
+    return err;
+  }
+  if (g_photons_campaign_state != photons_campaign_state_t::STOPPED) {
+    Payload err;
+    err.add("status", "start_rejected_campaign_busy");
+    err.add("state", photons_campaign_state_name(g_photons_campaign_state));
+    return err;
+  }
+
+  safeCopy(g_photons_campaign_name, sizeof(g_photons_campaign_name), name);
+  g_photons_campaign_start_request_count++;
+  g_photons_campaign_state = photons_campaign_state_t::START_PENDING;
+
+  Payload p;
+  p.add("status", "start_requested");
+  p.add("campaign", g_photons_campaign_name);
+  p.add("boundary_contract", "NEXT_SUCCESSFULLY_PUBLISHED_FRAGMENT_IS_PRIVATE_ORIGIN");
+  return p;
+}
+
+
+static Payload cmd_stop(const Payload& /*args*/) {
+  if (g_photons_campaign_state == photons_campaign_state_t::START_PENDING) {
+    Payload err;
+    err.add("status", "stop_rejected_start_pending");
+    err.add("campaign", g_photons_campaign_name);
+    return err;
+  }
+  if (g_photons_campaign_state == photons_campaign_state_t::STOPPED) {
+    Payload err;
+    err.add("status", "stop_rejected_no_campaign");
+    return err;
+  }
+  if (g_photons_campaign_state == photons_campaign_state_t::STOP_PENDING) {
+    Payload p;
+    p.add("status", "stop_requested");
+    p.add("campaign", g_photons_campaign_name);
+    return p;
+  }
+  if (g_photons_campaign_state != photons_campaign_state_t::ACTIVE) {
+    __builtin_trap();
+  }
+
+  g_photons_campaign_stop_request_count++;
+  g_photons_campaign_state = photons_campaign_state_t::STOP_PENDING;
+
+  Payload p;
+  p.add("status", "stop_requested");
+  p.add("campaign", g_photons_campaign_name);
+  p.add("boundary_contract", "NEXT_SUCCESSFULLY_PUBLISHED_CAMPAIGN_FRAGMENT_IS_FINAL");
+  return p;
+}
+
+
 static Payload cmd_report(const Payload& /*args*/) {
   photons_toy_capture_t capture{};
   (void)photons_toy_capture_snapshot(&capture);
@@ -2301,6 +2661,41 @@ static Payload cmd_report(const Payload& /*args*/) {
     p.add("standard_lap_ps", g_standard_lap_ps);
     p.add("standard_lap_ns",
           toFixedDecimal((double)g_standard_lap_ps / 1000.0, 3));
+  }
+
+  p.add("campaign_state", photons_campaign_state_name(g_photons_campaign_state));
+  p.add("campaign_active",
+        g_photons_campaign_state == photons_campaign_state_t::ACTIVE ||
+        g_photons_campaign_state == photons_campaign_state_t::STOP_PENDING);
+  if (g_photons_campaign_name[0]) {
+    p.add("campaign", g_photons_campaign_name);
+  }
+  p.add("campaign_start_after_sequence",
+        g_photons_campaign_start_after_sequence);
+  p.add("campaign_public_count", g_photons_campaign_public_count);
+  p.add("campaign_origin_lap_count", g_photons_campaign_origin_lap_count);
+  p.add("campaign_origin_total_lap_gnss_ns",
+        g_photons_campaign_origin_total_lap_gnss_ns);
+  p.add("campaign_start_request_count",
+        g_photons_campaign_start_request_count);
+  p.add("campaign_start_commit_count",
+        g_photons_campaign_start_commit_count);
+  p.add("campaign_stop_request_count",
+        g_photons_campaign_stop_request_count);
+  p.add("campaign_stop_commit_count",
+        g_photons_campaign_stop_commit_count);
+  if (canonical.campaign.present) {
+    p.add("campaign_snapshot_public_count", canonical.campaign.public_count);
+    p.add("campaign_snapshot_final", canonical.campaign.final);
+    p.add("campaign_snapshot_lap_count", canonical.campaign.lap_count);
+    p.add("campaign_snapshot_total_lap_gnss_ns",
+          canonical.campaign.total_lap_gnss_ns);
+    p.add("campaign_snapshot_mean_lap_ns",
+          toFixedDecimal(canonical.campaign.mean_lap_ns, 6));
+    if (canonical.campaign.ppb.sample_count != 0ULL) {
+      p.add("campaign_snapshot_ppb",
+            toFixedDecimal(canonical.campaign.ppb.ppb, 6));
+    }
   }
 
   p.add("fragment_schema", "PHOTONS_FRAGMENT_V1");
@@ -2533,10 +2928,26 @@ static Payload cmd_report(const Payload& /*args*/) {
   p.add("emulator_initialized", g_photons_emulator.initialized);
   p.add("emulator_edge_output_pin", PHOTONS_EMULATOR_EDGE_OUTPUT_PIN);
   p.add("emulator_loopback_input_pin", PHOTODIODE_EDGE_PIN);
-  p.add("emulator_timing_fidelity", "SYNTHETIC_NOT_OPTICAL");
+  p.add("emulator_timing_fidelity",
+        "STANDARD_LOCKED_SYNTHETIC_SCIENCE_WITH_PHYSICAL_EDGE_CUSTODY");
   p.add("emulator_cadence_strategy", "ONE_RECURRING_TIMEPOP_TIMER");
-  p.add("emulator_nominal_lap_ns", PHOTONS_EMULATOR_CADENCE_NS);
+  if (g_standard_lap_configured) {
+    p.add("emulator_nominal_lap_ns",
+          toFixedDecimal((double)g_standard_lap_ps / 1000.0, 3));
+  }
   p.add("emulator_cadence_period_ns", PHOTONS_EMULATOR_CADENCE_NS);
+  p.add("emulator_projection_wait_count",
+        g_photons_emulator.projection_wait_count);
+  p.add("emulator_synthetic_target_unavailable_count",
+        g_photons_emulator.synthetic_target_unavailable_count);
+  p.add("emulator_synthetic_target_cycles",
+        g_photons_emulator.synthetic_target_cycles);
+  p.add("emulator_synthetic_last_jitter_cycles",
+        g_photons_emulator.synthetic_last_jitter_cycles);
+  p.add("emulator_synthetic_last_lap_cycles",
+        g_photons_emulator.synthetic_last_lap_cycles);
+  p.add("emulator_synthetic_lap_count",
+        g_photons_emulator.synthetic_lap_count);
   p.add("emulator_cadence_tick_count", g_photons_emulator.cadence_tick_count);
   p.add("emulator_hits_per_train", PHOTONS_EMULATOR_HITS_PER_TRAIN);
   p.add("emulator_measured_laps", PHOTONS_EMULATOR_MEASURED_LAPS);
@@ -2677,6 +3088,8 @@ static Payload cmd_off(const Payload& /*args*/) {
 static const process_command_entry_t PHOTONS_COMMANDS[] = {
   { "INIT",                cmd_init                },
   { "SET_STANDARD_LAP_NS", cmd_set_standard_lap_ns },
+  { "START",               cmd_start               },
+  { "STOP",                cmd_stop                },
   { "REPORT",              cmd_report              },
   { "ON",                  cmd_on                  },
   { "OFF",                 cmd_off                 },

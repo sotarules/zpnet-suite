@@ -31,8 +31,12 @@
 //   • pin 33 is a detector-emulator output physically looped to pin 34;
 //   • process_interrupt still timestamps every resulting real pin-34 GPIO edge;
 //   • PHOTONS emits a real ~20-DWT-cycle LD_ON launch pulse;
-//   • one ordinary recurring TimePop timer supplies a synthetic 10 ms cadence;
+//   • one ordinary recurring TimePop timer supplies the coarse 10 ms edge cadence;
 //     its callback advances emulator state only and never arms/cancels TimePop;
+//   • physical loopback-edge timing remains visible as custody telemetry, while
+//     emulator-only science laps are synthesized around STANDARD_LAP_NS with a
+//     tiny bounded DWT-cycle variation so foreground scheduler jitter cannot
+//     masquerade as optical propagation;
 //   • each train emits exactly five physical detector edges:
 //       hit 1 ignored by lap semantics,
 //       hit 2 lap start,
@@ -44,13 +48,16 @@
 //   • pin 38/A14 MON telemetry is synthesized and is not ADC-read while the
 //     emulator is installed;
 //   • the emulator is always on and independent of campaign state;
-//   • the synthetic 10 ms interval is bring-up timing, not optical truth.
+//   • the TimePop cadence is bring-up transport timing, not optical truth.
 //
 // Commands:
 //   • INIT                — reinitialize PHOTONS-owned optical hardware; laser is inhibited
 //   • SET_STANDARD_LAP_NS — install the required optical PPB reference; fragment publication
 //                           remains gated until this startup configuration is present
-//   • REPORT              — unified laser, PD200T, interrupt, and toy-measurement report
+//   • START               — request a LANTERN recording boundary; firmware snapshots its own
+//                           cumulative accepted-lap state at the next published fragment boundary
+//   • STOP                — request campaign closure; the next published campaign fragment is final
+//   • REPORT              — unified laser, PD200T, interrupt, campaign, and measurement report
 //   • ON                  — permit laser emission through LD_ON
 //   • OFF                 — inhibit laser emission through LD_ON
 // ============================================================================
@@ -257,8 +264,9 @@ struct photons_fragment_ppb_value_snapshot_t {
 };
 
 
-// Instrument-owned PPB populations.  LANTERN campaign-relative PPB is
-// intentionally absent; campaigns remain a separate interpretation layer.
+// Instrument-owned rolling/lifetime PPB populations.  LANTERN CAMP PPB is a
+// separate firmware-authored campaign population below, matching CLOCKS' split
+// between always-on instrument buckets and campaign-relative statistics.
 struct photons_fragment_ppb_buckets_snapshot_t {
   photons_fragment_ppb_value_snapshot_t minute_10{};
   photons_fragment_ppb_value_snapshot_t minute_60{};
@@ -291,6 +299,26 @@ struct photons_fragment_stats_snapshot_t {
 };
 
 
+// Firmware-authored LANTERN campaign measurement.  Pi owns campaign lifecycle,
+// durable identity, and baseline relationships; PHOTONS owns the exact recording
+// boundary and CAMP statistics.  START snapshots the already-running cumulative
+// N/T population at a published fragment boundary.  Subsequent campaign N/T is
+// subtraction from that origin, so campaign transitions never reset or perturb
+// the always-on instrument statistics above.
+struct photons_fragment_campaign_snapshot_t {
+  bool present = false;
+  bool final = false;
+  char campaign[64] = {0};
+  uint32_t start_after_sequence = 0;
+  uint32_t stop_after_sequence = 0;
+  uint32_t public_count = 0;
+  uint64_t lap_count = 0;
+  uint64_t total_lap_gnss_ns = 0;
+  double mean_lap_ns = 0.0;
+  photons_fragment_ppb_value_snapshot_t ppb{};
+};
+
+
 // Baseline comparison is intentionally present in the schema before baseline
 // control exists.  No fake zero baseline is authored: present/residual_valid
 // remain false until a future LANTERN/baseline command supplies provenance.
@@ -302,9 +330,10 @@ struct photons_fragment_baseline_snapshot_t {
 };
 
 
-// Canonical once-per-second PHOTONS handoff.  This is deliberately instrument
-// state, not campaign state.  A future Pi-side PHOTONS service may decorate it
-// with LANTERN campaign identity exactly as SYSTEM decorates CLOCKS live state.
+// Canonical once-per-second PHOTONS handoff.  The always-on instrument subtree
+// remains authoritative and campaign-independent.  Optional campaign testimony
+// is a recording-relative sibling authored by firmware, matching CLOCKS_FRAGMENT:
+// Pi may add durable campaign ID/baseline provenance but never recomputes CAMP.
 struct photons_fragment_snapshot_t {
   bool snapshot_ok = false;
   bool valid = false;
@@ -324,6 +353,7 @@ struct photons_fragment_snapshot_t {
   photons_fragment_projection_snapshot_t projection{};
   photons_lap_science_snapshot_t science{};
   photons_fragment_stats_snapshot_t stats{};
+  photons_fragment_campaign_snapshot_t campaign{};
   photons_fragment_baseline_snapshot_t baseline{};
 
   // Snapshot of process_interrupt's PHOTODIODE lane testimony.
