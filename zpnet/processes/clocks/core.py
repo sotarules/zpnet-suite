@@ -43,7 +43,7 @@ Responsibilities:
   * Adjudicate each candidate: persist coherent audit rows and recover on structural loss.
   * Subscribe to predictive GF-8802 announcements and bind them to PPS-aligned rows.
   * Augment accepted rows with environment, GNSS_RAW, and system time.
-  * Publish the live TIMEBASE topic and attach TEMPEST facts to unified state details.
+  * Publish canonical CLOCKS and attach adjudicated TEMPEST facts to unified state details.
   * Denormalize the latest accepted TEMPEST detail into the active campaign master.
   * Recover clocks after restart if a campaign is active.
   * Subscribe to WATCHDOG_ANOMALY and initiate Pi-side campaign recovery.
@@ -8698,7 +8698,10 @@ def _process_loop() -> None:
             },
         }
 
-        publish("TIMEBASE", timebase)
+        # TIMEBASE_V4 is now only a transient TEMPEST adjudication/recovery view.
+        # CLOCKS is the sole public canonical clock feed; attach the Pi court
+        # result to the already-persisted same-sequence CLOCKS row instead of
+        # publishing a second legacy TIMEBASE topic.
         _attach_tempest_to_state_detail(timebase)
 
         if (
