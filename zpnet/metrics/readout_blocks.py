@@ -2,22 +2,23 @@
 ZPNet Metrics Readout Blocks — Generalized Campaign Detail Edition
 
 Data source:
-  The CLOCKS_V4 heartbeat owns the live operator view.  ``clocks`` is the
-  canonical always-on instrument; optional top-level ``campaign`` is TEMPEST
-  enrichment. Baselines are campaign_master relationships resolved on demand;
-  they are not CLOCKS state. Metrics never waits for or reads TIMEBASE.
+  CLOCKS_V4 owns the clock operator view and PHOTONS_V1 owns the optical
+  operator view.  Both are canonical always-on instruments with optional
+  campaign decoration. Baselines are campaign_master relationships resolved on
+  demand; they are not instrument state. Metrics never waits for or reads
+  TIMEBASE.
 
 Stats policy:
-  Clock/science statistics are read verbatim from the Teensy-authored
-  CLOCKS instrument/campaign surfaces, including the GNSS reference Welford.
-  DAC Welfords are Pi CLOCKS-owned actuator statistics carried in canonical
-  CLOCKS.clocks.stats.auxiliary_welford.  GNSS residual samples are
-  definitionally zero, but its N is the real Alpha-owned always-on Welford
-  population, never campaign PPS count.
-  Metrics computes no means, stddevs, stderrs, PPB windows, or campaign
-  frequencies.  Its arithmetic is deterministic presentation/control math:
-  DAC code → voltage, bounded keyboard nudge, and campaign baseline delta
-  (NOW - BASE).
+  CLOCKS statistics are read verbatim from the producer-authored instrument and
+  campaign surfaces, including the GNSS reference Welford and Pi-owned DAC
+  Welfords.  PHOTONS publishes cumulative accepted-lap Welford/grand-ratio
+  sufficient state; its Metrics panels may algebraically subtract two published
+  snapshots to recover a bounded one-second or campaign population for display.
+  This never synthesizes individual samples, changes admission, or feeds science
+  back into PHOTONS. Missing PHOTONS PPB buckets remain visibly missing; Metrics
+  never estimates rolling windows from repaint history.  Other arithmetic is
+  deterministic presentation/control math such as DAC conversion/nudging and
+  baseline deltas.
 
 Clock row doctrine:
   The dense operator table shows GNSS, VCLOCK, OCXO1, and OCXO2 only.
@@ -45,6 +46,7 @@ Column layout (INT rows):
   NAME   END_GNSS_NS   DELTA_NS
 """
 
+import math
 import time
 
 from zpnet.processes.processes import create_pubsub_cache, send_command
@@ -73,7 +75,12 @@ PPB_BUCKET_KEYS = ("10_min", "60_min", "8_hour", "24_hour", "total")
 PPB_VISIBLE_COLUMN_COUNT = len(PPB_BUCKET_KEYS) + 1  # + campaign
 
 CLOCKS_TOPIC = "CLOCKS"
+PHOTONS_TOPIC = "PHOTONS"
+CAMPAIGN_TYPE_LANTERN = "LANTERN"
+PHOTONS_ROLLING_ROWS = 25
+
 _LIVE_CACHE = create_pubsub_cache(CLOCKS_TOPIC)
+_PHOTONS_LIVE_CACHE = create_pubsub_cache(PHOTONS_TOPIC)
 
 # Mission-control readiness board. The feature payload remains scalar-only;
 # this table is just the operator-facing projection of CLOCKS.features.
@@ -103,6 +110,11 @@ FEATURE_STATUS_GRID = (
 def _get_system_snapshot() -> dict:
     """Return latest CLOCKS without command/response traffic."""
     return _LIVE_CACHE.get(CLOCKS_TOPIC) or {}
+
+
+def _get_photons_snapshot() -> dict:
+    """Return latest canonical PHOTONS without command/response traffic."""
+    return _PHOTONS_LIVE_CACHE.get(PHOTONS_TOPIC) or {}
 
 
 def _get_feature_status_payload(force: bool = False) -> tuple[dict, str | None]:
@@ -1606,7 +1618,630 @@ def clocks_combined_readout() -> list[str]:
     return lines
 
 
+# ---------------------------------------------------------------------
+# PHOTONS / LANTERN presentation
+# ---------------------------------------------------------------------
+
+
+def _json_object(value) -> dict:
+    """Normalize a JSONB/text payload into a dictionary for read-only display."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            import json
+            parsed = json.loads(value)
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _photons_cumulative_stats(payload: dict | None) -> dict | None:
+    """Return the firmware cumulative accepted-lap sufficient state."""
+    root = _json_object(payload)
+    instrument = root.get("photons") if isinstance(root.get("photons"), dict) else {}
+    stats = instrument.get("stats") if isinstance(instrument.get("stats"), dict) else {}
+    w = stats.get("lap_time") if isinstance(stats.get("lap_time"), dict) else {}
+    science = instrument.get("science") if isinstance(instrument.get("science"), dict) else {}
+    accepted = science.get("accepted") if isinstance(science.get("accepted"), dict) else {}
+    excluded = science.get("excluded") if isinstance(science.get("excluded"), dict) else {}
+
+    n = _to_int(w.get("n"))
+    if n is None:
+        n = _to_int(stats.get("lap_count"))
+    mean = _to_float(w.get("mean"))
+    m2 = _to_float(w.get("m2"))
+    total = _to_int(stats.get("total_lap_gnss_ns"))
+    accepted_total = _to_int(accepted.get("count"))
+    excluded_total = _to_int(excluded.get("count"))
+
+    if n is None or mean is None or m2 is None:
+        return None
+    return {
+        "n": n,
+        "mean": mean,
+        "m2": m2,
+        "total": total,
+        "accepted_total": accepted_total,
+        "excluded_total": excluded_total,
+    }
+
+
+def _photons_population_delta(before_payload: dict | None, after_payload: dict | None) -> dict | None:
+    """Reverse two cumulative Welford snapshots into their exact intervening population.
+
+    PHOTONS publishes sufficient state, so Metrics can reconstruct a campaign or
+    one-second population without inventing samples or averaging repaint history.
+    The grand-ratio total supplies the displayed mean when available; Welford
+    subtraction supplies M2/SD/SE.
+    """
+    before = _photons_cumulative_stats(before_payload)
+    after = _photons_cumulative_stats(after_payload)
+    if after is None:
+        return None
+
+    if before is None:
+        return None
+
+    n0 = int(before["n"])
+    n1 = int(after["n"])
+    n = n1 - n0
+    if n <= 0:
+        return None
+
+    # Reverse the Welford merge formula.  Use cumulative Welford means for the
+    # cross term, then prefer the integer grand-ratio difference for display.
+    if n0 == 0:
+        subset_mean_w = float(after["mean"])
+        subset_m2 = float(after["m2"])
+    else:
+        subset_mean_w = (
+            n1 * float(after["mean"]) - n0 * float(before["mean"])
+        ) / n
+        delta = subset_mean_w - float(before["mean"])
+        cross = delta * delta * n0 * n / n1
+        subset_m2 = float(after["m2"]) - float(before["m2"]) - cross
+
+    # Published doubles can leave a microscopic negative after subtraction.
+    if subset_m2 < 0.0 and abs(subset_m2) < 1.0e-6 * max(1.0, abs(float(after["m2"]))):
+        subset_m2 = 0.0
+    if subset_m2 < 0.0:
+        return None
+
+    total0 = before.get("total")
+    total1 = after.get("total")
+    if total0 is not None and total1 is not None and int(total1) >= int(total0):
+        mean = (int(total1) - int(total0)) / n
+    else:
+        mean = subset_mean_w
+
+    sd = math.sqrt(subset_m2 / (n - 1)) if n >= 2 else 0.0
+    se = sd / math.sqrt(n) if n >= 2 else 0.0
+
+    accepted0 = before.get("accepted_total")
+    accepted1 = after.get("accepted_total")
+    excluded0 = before.get("excluded_total")
+    excluded1 = after.get("excluded_total")
+
+    return {
+        "n": n,
+        "mean": mean,
+        "m2": subset_m2,
+        "stddev": sd,
+        "stderr": se,
+        "accepted": (
+            int(accepted1) - int(accepted0)
+            if accepted0 is not None and accepted1 is not None and int(accepted1) >= int(accepted0)
+            else n
+        ),
+        "excluded": (
+            int(excluded1) - int(excluded0)
+            if excluded0 is not None and excluded1 is not None and int(excluded1) >= int(excluded0)
+            else None
+        ),
+    }
+
+
+def _photons_instrument_stats(payload: dict | None) -> dict | None:
+    """Return the current always-on accepted-lap Welford without differencing."""
+    state = _photons_cumulative_stats(payload)
+    if state is None:
+        return None
+    n = int(state["n"])
+    sd = math.sqrt(float(state["m2"]) / (n - 1)) if n >= 2 else 0.0
+    se = sd / math.sqrt(n) if n >= 2 else 0.0
+    return {
+        "n": n,
+        "mean": float(state["mean"]),
+        "m2": float(state["m2"]),
+        "stddev": sd,
+        "stderr": se,
+        "accepted": state.get("accepted_total"),
+        "excluded": state.get("excluded_total"),
+    }
+
+
+def _photons_ppb(observed_mean, baseline_mean):
+    observed = _to_float(observed_mean)
+    baseline = _to_float(baseline_mean)
+    if observed is None or baseline is None or baseline == 0.0:
+        return None
+    return ((observed / baseline) - 1.0) * 1_000_000_000.0
+
+
+def _get_lantern_campaign_summaries() -> list[dict]:
+    """Return LANTERN masters plus exact campaign-local accepted-lap statistics.
+
+    campaign_master remains provenance/latest-read-model authority.  The local
+    Welford is reconstructed from the cumulative PHOTONS sufficient state at the
+    campaign's exclusive start boundary and its latest labeled durable row.
+    """
+    with open_db(row_dict=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    master.id,
+                    master.ts,
+                    master.campaign_type,
+                    master.campaign,
+                    master.active,
+                    master.payload,
+                    baseline.id AS baseline_campaign_id,
+                    baseline.campaign AS baseline_campaign,
+                    first_detail.sequence AS first_sequence,
+                    last_detail.sequence AS last_sequence,
+                    prior_detail.payload AS prior_payload,
+                    last_detail.payload AS last_payload
+                FROM campaign_master AS master
+                LEFT JOIN campaign_master AS baseline
+                  ON baseline.id = (master.payload ->> 'baseline_campaign_id')::bigint
+                 AND baseline.campaign_type = master.campaign_type
+                LEFT JOIN LATERAL (
+                    SELECT d.id, d.sequence, d.payload
+                    FROM campaign_detail AS d
+                    WHERE d.campaign_type = %s
+                      AND d.campaign = master.campaign
+                    ORDER BY d.id ASC
+                    LIMIT 1
+                ) AS first_detail ON true
+                LEFT JOIN LATERAL (
+                    SELECT d.id, d.sequence, d.payload
+                    FROM campaign_detail AS d
+                    WHERE d.campaign_type = %s
+                      AND d.campaign = master.campaign
+                    ORDER BY d.id DESC
+                    LIMIT 1
+                ) AS last_detail ON true
+                LEFT JOIN LATERAL (
+                    SELECT d.id, d.sequence, d.payload
+                    FROM campaign_detail AS d
+                    WHERE d.campaign_type = %s
+                      AND d.id < first_detail.id
+                    ORDER BY d.id DESC
+                    LIMIT 1
+                ) AS prior_detail ON true
+                WHERE master.campaign_type = %s
+                ORDER BY master.ts DESC, master.id DESC
+                """,
+                (
+                    CAMPAIGN_TYPE_LANTERN,
+                    CAMPAIGN_TYPE_LANTERN,
+                    CAMPAIGN_TYPE_LANTERN,
+                    CAMPAIGN_TYPE_LANTERN,
+                ),
+            )
+            rows = list(cur.fetchall())
+
+    summaries: list[dict] = []
+    for row in rows:
+        master_payload = _json_object(row.get("payload"))
+        prior_payload = _json_object(row.get("prior_payload"))
+        last_payload = _json_object(row.get("last_payload"))
+        stats = _photons_population_delta(prior_payload, last_payload)
+        summaries.append({
+            "id": _to_int(row.get("id")),
+            "campaign": row.get("campaign"),
+            "active": bool(row.get("active")),
+            "started_at": master_payload.get("started_at"),
+            "stopped_at": master_payload.get("stopped_at"),
+            "interrupted_at": master_payload.get("interrupted_at"),
+            "start_after_sequence": _to_int(master_payload.get("start_after_sequence")),
+            "stop_after_sequence": _to_int(master_payload.get("stop_after_sequence")),
+            "first_sequence": _to_int(row.get("first_sequence")),
+            "last_sequence": _to_int(row.get("last_sequence")),
+            "baseline_campaign_id": _to_int(row.get("baseline_campaign_id")),
+            "baseline_campaign": row.get("baseline_campaign"),
+            "stats": stats,
+            # Private presentation helpers used to derive live/rolling campaign
+            # populations. They are never rendered as instrument testimony.
+            "_prior_payload": prior_payload,
+            "_last_payload": last_payload,
+        })
+
+    by_id = {s["id"]: s for s in summaries if s.get("id") is not None}
+    for summary in summaries:
+        base = by_id.get(summary.get("baseline_campaign_id"))
+        base_stats = base.get("stats") if isinstance(base, dict) else None
+        stats = summary.get("stats")
+        base_mean = base_stats.get("mean") if isinstance(base_stats, dict) else None
+        now_mean = stats.get("mean") if isinstance(stats, dict) else None
+        summary["baseline_mean_lap_ns"] = base_mean
+        summary["residual_ps"] = (
+            (float(now_mean) - float(base_mean)) * 1000.0
+            if now_mean is not None and base_mean is not None
+            else None
+        )
+        summary["campaign_ppb"] = _photons_ppb(now_mean, base_mean)
+    return summaries
+
+
+def _get_photons_rolling_payloads(live: dict | None = None) -> list[dict]:
+    """Return enough newest durable rows to render 25 one-second populations."""
+    with open_db(row_dict=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, ts, campaign, sequence, pps_count, payload
+                FROM campaign_detail
+                WHERE campaign_type = %s
+                ORDER BY sequence DESC, id DESC
+                LIMIT %s
+                """,
+                (CAMPAIGN_TYPE_LANTERN, PHOTONS_ROLLING_ROWS + 1),
+            )
+            rows = list(cur.fetchall())
+
+    ordered: list[dict] = []
+    for row in reversed(rows):
+        payload = _json_object(row.get("payload"))
+        if payload:
+            ordered.append(payload)
+
+    # Persistence normally trails the live publication by only milliseconds. Add
+    # the live row only when it is newer than the newest durable physical row; do
+    # not sort by sequence because a future instrument epoch may legitimately
+    # restart its sequence counter.
+    live_payload = _json_object(live)
+    live_sequence = _to_int(live_payload.get("sequence"))
+    durable_sequence = _to_int(ordered[-1].get("sequence")) if ordered else None
+    if live_payload and live_sequence is not None and live_sequence != durable_sequence:
+        ordered.append(live_payload)
+
+    return ordered[-(PHOTONS_ROLLING_ROWS + 1):]
+
+
+def _photons_rolling_rows(live: dict, summaries: list[dict]) -> list[dict]:
+    """Return oldest-to-newest 1-second PHOTONS rows for the rolling table."""
+    payloads = _get_photons_rolling_payloads(live)
+    by_id = {s.get("id"): s for s in summaries if s.get("id") is not None}
+    rows: list[dict] = []
+
+    for before, current in zip(payloads, payloads[1:]):
+        second_stats = _photons_population_delta(before, current)
+        if second_stats is None:
+            continue
+
+        instrument = current.get("photons") if isinstance(current.get("photons"), dict) else {}
+        science = instrument.get("science") if isinstance(instrument.get("science"), dict) else {}
+        accepted = science.get("accepted") if isinstance(science.get("accepted"), dict) else {}
+        excluded = science.get("excluded") if isinstance(science.get("excluded"), dict) else {}
+        accepted_this = _to_int(accepted.get("count_this_fragment"))
+        excluded_this = _to_int(excluded.get("count_this_fragment"))
+        if accepted_this is None:
+            accepted_this = _to_int(second_stats.get("accepted"))
+        if excluded_this is None:
+            excluded_this = _to_int(second_stats.get("excluded"))
+
+        sequence = _to_int(current.get("sequence"))
+        campaign = current.get("campaign") if isinstance(current.get("campaign"), dict) else {}
+        campaign_id = _to_int(campaign.get("campaign_id"))
+        start_after = _to_int(campaign.get("start_after_sequence"))
+        second_number = (
+            sequence - start_after
+            if sequence is not None and start_after is not None and sequence > start_after
+            else sequence
+        )
+
+        summary = by_id.get(campaign_id)
+        baseline_mean = (
+            summary.get("baseline_mean_lap_ns")
+            if isinstance(summary, dict)
+            else None
+        )
+        campaign_to_date = None
+        if isinstance(summary, dict) and summary.get("_prior_payload"):
+            campaign_to_date = _photons_population_delta(
+                summary.get("_prior_payload"), current
+            )
+        campaign_mean = (
+            campaign_to_date.get("mean")
+            if isinstance(campaign_to_date, dict)
+            else None
+        )
+
+        rows.append({
+            "sequence": sequence,
+            "second": second_number,
+            "campaign_id": campaign_id,
+            "campaign": campaign.get("campaign"),
+            "value_ns": second_stats.get("mean"),
+            "accepted": accepted_this,
+            "excluded": excluded_this,
+            # Rolling PPB buckets do not exist yet. Keep them visibly absent.
+            "ppb_10_min": None,
+            "ppb_60_min": None,
+            "ppb_8_hour": None,
+            "ppb_24_hour": None,
+            "ppb_total": None,
+            "campaign_ppb": _photons_ppb(campaign_mean, baseline_mean),
+            "residual_ps": (
+                (float(second_stats["mean"]) - float(baseline_mean)) * 1000.0
+                if second_stats.get("mean") is not None and baseline_mean is not None
+                else None
+            ),
+            "mean": second_stats.get("mean"),
+            "stddev": second_stats.get("stddev"),
+            "stderr": second_stats.get("stderr"),
+            "n": second_stats.get("n"),
+        })
+
+    return rows[-PHOTONS_ROLLING_ROWS:]
+
+
+def photons_detail_readout() -> list[str]:
+    """Render the live optical detail plus a fixed-header 25-second rolling tail."""
+    live = _get_photons_snapshot()
+    if not isinstance(live, dict) or not live:
+        return ["PHOTONS: FEED UNAVAILABLE"]
+
+    try:
+        summaries = _get_lantern_campaign_summaries()
+    except Exception as exc:
+        summaries = []
+        campaign_error = str(exc)
+    else:
+        campaign_error = None
+
+    campaign = live.get("campaign") if isinstance(live.get("campaign"), dict) else {}
+    campaign_id = _to_int(campaign.get("campaign_id"))
+    summary_by_id = {s.get("id"): s for s in summaries}
+    active_summary = summary_by_id.get(campaign_id)
+
+    if campaign:
+        start_after = _to_int(campaign.get("start_after_sequence"))
+        sequence = _to_int(live.get("sequence"))
+        elapsed_s = (
+            max(0, sequence - start_after)
+            if sequence is not None and start_after is not None
+            else 0
+        )
+        campaign_name = str(campaign.get("campaign") or "?")
+        baseline_name = campaign.get("baseline_campaign") or (
+            active_summary.get("baseline_campaign") if isinstance(active_summary, dict) else None
+        )
+        identity = (
+            f"PHOTONS  CAMPAIGN: {campaign_name}  ELAPSED: {_seconds_to_hms(elapsed_s)}"
+            f"  BASELINE: {baseline_name or 'NONE'}"
+        )
+    else:
+        identity = "PHOTONS  CAMPAIGN: STOPPED  INSTRUMENT: ALWAYS ON  BASELINE: NONE"
+
+    lines = [identity]
+    if campaign_error:
+        lines.append(f"LANTERN READ MODEL: UNAVAILABLE: {campaign_error}")
+    lines.append("")
+
+    # Current campaign-local sufficient state when a campaign exists; otherwise
+    # show the authoritative always-on instrument Welford.
+    current_stats = None
+    if isinstance(active_summary, dict) and active_summary.get("_prior_payload"):
+        current_stats = _photons_population_delta(active_summary.get("_prior_payload"), live)
+    if current_stats is None:
+        current_stats = _photons_instrument_stats(live)
+
+    baseline_mean = (
+        active_summary.get("baseline_mean_lap_ns")
+        if isinstance(active_summary, dict)
+        else None
+    )
+    now_mean = current_stats.get("mean") if isinstance(current_stats, dict) else None
+    campaign_ppb = _photons_ppb(now_mean, baseline_mean)
+
+    try:
+        rolling = _photons_rolling_rows(live, summaries)
+    except Exception:
+        rolling = []
+    latest_residual = rolling[-1].get("residual_ps") if rolling else None
+
+    W_NAME = 6
+    W_VALUE = 14
+    W_PPB = 9
+    W_RES = 11
+    W_MEAN = 12
+    W_SD = 10
+    W_SE = 10
+    W_N = 9
+    W_BASE = 12
+    G = " "
+
+    lines.append(
+        f"{'LAP':<{W_NAME}}"
+        f"{'VALUE_NS':>{W_VALUE}}{G}"
+        f"{'10-MIN':>{W_PPB}}{G}"
+        f"{'60-MIN':>{W_PPB}}{G}"
+        f"{'8-HOUR':>{W_PPB}}{G}"
+        f"{'24-HOUR':>{W_PPB}}{G}"
+        f"{'TOTAL':>{W_PPB}}{G}"
+        f"{'CAMP':>{W_PPB}}{G}"
+        f"{'RES_PS':>{W_RES}}{G}"
+        f"{'MEAN':>{W_MEAN}}{G}"
+        f"{'SD':>{W_SD}}{G}"
+        f"{'SE':>{W_SE}}{G}"
+        f"{'N':>{W_N}}{G}"
+        f"{'BASE':>{W_BASE}}{G}"
+        f"{'NOW':>{W_BASE}}{G}"
+        f"{'DELTA':>{W_BASE}}"
+    )
+
+    if isinstance(current_stats, dict):
+        baseline_delta = (
+            float(now_mean) - float(baseline_mean)
+            if now_mean is not None and baseline_mean is not None
+            else None
+        )
+        lines.append(
+            f"{'LAP':<{W_NAME}}"
+            f"{_fmt(now_mean, f'>{W_VALUE}.3f', W_VALUE)}{G}"
+            f"{G.join(_fmt(None, f'>{W_PPB}.3f', W_PPB) for _ in range(5))}{G}"
+            f"{_fmt(campaign_ppb, f'>{W_PPB}.3f', W_PPB)}{G}"
+            f"{_fmt(latest_residual, f'>+{W_RES}.3f', W_RES)}{G}"
+            f"{_fmt(current_stats.get('mean'), f'>{W_MEAN}.3f', W_MEAN)}{G}"
+            f"{_fmt(current_stats.get('stddev'), f'>{W_SD}.3f', W_SD)}{G}"
+            f"{_fmt(current_stats.get('stderr'), f'>{W_SE}.3f', W_SE)}{G}"
+            f"{_fmt(_to_int(current_stats.get('n')), f'>{W_N}d', W_N)}{G}"
+            f"{_fmt(baseline_mean, f'>{W_BASE}.3f', W_BASE)}{G}"
+            f"{_fmt(now_mean, f'>{W_BASE}.3f', W_BASE)}{G}"
+            f"{_fmt(baseline_delta, f'>+{W_BASE}.3f', W_BASE)}"
+        )
+    else:
+        lines.append("PHOTONS statistics unavailable")
+
+    lines.append("")
+    lines.append(f"ROLLING {PHOTONS_ROLLING_ROWS}-SECOND ACCEPTED-LAP POPULATIONS  (newest at bottom)")
+
+    W_SEC = 7
+    W_ACC = 8
+    W_EXCL = 8
+    W_ROLL_VALUE = 14
+    W_ROLL_MEAN = 12
+    W_ROLL_SD = 10
+    W_ROLL_SE = 10
+    W_ROLL_N = 8
+
+    # Fixed header: this readout itself is not scrollable; the 25 data rows roll
+    # beneath this line as the durable/live tail advances once per second.
+    lines.append(
+        f"{'SEC':>{W_SEC}}{G}"
+        f"{'LAP_NS':>{W_ROLL_VALUE}}{G}"
+        f"{'ACCEPT':>{W_ACC}}{G}"
+        f"{'EXCL':>{W_EXCL}}{G}"
+        f"{'10-MIN':>{W_PPB}}{G}"
+        f"{'60-MIN':>{W_PPB}}{G}"
+        f"{'8-HOUR':>{W_PPB}}{G}"
+        f"{'24-HOUR':>{W_PPB}}{G}"
+        f"{'TOTAL':>{W_PPB}}{G}"
+        f"{'CAMP':>{W_PPB}}{G}"
+        f"{'RES_PS':>{W_RES}}{G}"
+        f"{'MEAN':>{W_ROLL_MEAN}}{G}"
+        f"{'SD':>{W_ROLL_SD}}{G}"
+        f"{'SE':>{W_ROLL_SE}}{G}"
+        f"{'N':>{W_ROLL_N}}"
+    )
+
+    if not rolling:
+        lines.append("ROLLING PHOTONS HISTORY UNAVAILABLE")
+        return lines
+
+    for row in rolling:
+        ppb_values = (
+            row.get("ppb_10_min"),
+            row.get("ppb_60_min"),
+            row.get("ppb_8_hour"),
+            row.get("ppb_24_hour"),
+            row.get("ppb_total"),
+            row.get("campaign_ppb"),
+        )
+        lines.append(
+            f"{_fmt(_to_int(row.get('second')), f'>{W_SEC}d', W_SEC)}{G}"
+            f"{_fmt(row.get('value_ns'), f'>{W_ROLL_VALUE}.3f', W_ROLL_VALUE)}{G}"
+            f"{_fmt(_to_int(row.get('accepted')), f'>{W_ACC}d', W_ACC)}{G}"
+            f"{_fmt(_to_int(row.get('excluded')), f'>{W_EXCL}d', W_EXCL)}{G}"
+            f"{G.join(_fmt(v, f'>{W_PPB}.3f', W_PPB) for v in ppb_values)}{G}"
+            f"{_fmt(row.get('residual_ps'), f'>+{W_RES}.3f', W_RES)}{G}"
+            f"{_fmt(row.get('mean'), f'>{W_ROLL_MEAN}.3f', W_ROLL_MEAN)}{G}"
+            f"{_fmt(row.get('stddev'), f'>{W_ROLL_SD}.3f', W_ROLL_SD)}{G}"
+            f"{_fmt(row.get('stderr'), f'>{W_ROLL_SE}.3f', W_ROLL_SE)}{G}"
+            f"{_fmt(_to_int(row.get('n')), f'>{W_ROLL_N}d', W_ROLL_N)}"
+        )
+
+    return lines
+
+
+def photons_campaigns_readout() -> list[str]:
+    """Render LANTERN campaign history with optical mean/Welford science."""
+    try:
+        rows = _get_lantern_campaign_summaries()
+    except Exception as exc:
+        return ["\0LANTERN_CAMPAIGNS:ERROR", f"LANTERN CAMPAIGNS: UNAVAILABLE: {exc}"]
+
+    newest_identity = str(rows[0].get("id")) if rows else "EMPTY"
+    lines = [f"\0LANTERN_CAMPAIGN:{newest_identity}"]
+
+    W_CAMPAIGN = 20
+    W_VALUE = 14
+    W_PPB = 9
+    W_RES = 11
+    W_MEAN = 12
+    W_SD = 10
+    W_SE = 10
+    W_N = 9
+    W_BASELINE = 18
+    G = " "
+
+    lines.append(
+        f"{'CAMPAIGN':<{W_CAMPAIGN}}{G}"
+        f"{'LAP_NS':>{W_VALUE}}{G}"
+        f"{'10-MIN':>{W_PPB}}{G}"
+        f"{'60-MIN':>{W_PPB}}{G}"
+        f"{'8-HOUR':>{W_PPB}}{G}"
+        f"{'24-HOUR':>{W_PPB}}{G}"
+        f"{'TOTAL':>{W_PPB}}{G}"
+        f"{'CAMP':>{W_PPB}}{G}"
+        f"{'RES_PS':>{W_RES}}{G}"
+        f"{'MEAN':>{W_MEAN}}{G}"
+        f"{'SD':>{W_SD}}{G}"
+        f"{'SE':>{W_SE}}{G}"
+        f"{'N':>{W_N}}{G}"
+        f"{'BASELINE':<{W_BASELINE}}"
+    )
+
+    if not rows:
+        lines.extend(["", "NO LANTERN CAMPAIGNS"])
+        return lines
+
+    for row in rows:
+        name = str(row.get("campaign") or "?")
+        if row.get("stats") is None:
+            name += " [WAIT]"
+        elif row.get("interrupted_at"):
+            name += " [INT]"
+        campaign_cell = _campaign_cell(name, bool(row.get("active")), W_CAMPAIGN)
+        stats = row.get("stats") if isinstance(row.get("stats"), dict) else {}
+        ppb_values = (None, None, None, None, None, row.get("campaign_ppb"))
+        baseline_name = str(row.get("baseline_campaign") or "---")
+        if len(baseline_name) > W_BASELINE:
+            baseline_name = baseline_name[:W_BASELINE - 1] + "~"
+
+        lines.append(
+            f"{campaign_cell}{G}"
+            f"{_fmt(stats.get('mean'), f'>{W_VALUE}.3f', W_VALUE)}{G}"
+            f"{G.join(_fmt(v, f'>{W_PPB}.3f', W_PPB) for v in ppb_values)}{G}"
+            f"{_fmt(row.get('residual_ps'), f'>+{W_RES}.3f', W_RES)}{G}"
+            f"{_fmt(stats.get('mean'), f'>{W_MEAN}.3f', W_MEAN)}{G}"
+            f"{_fmt(stats.get('stddev'), f'>{W_SD}.3f', W_SD)}{G}"
+            f"{_fmt(stats.get('stderr'), f'>{W_SE}.3f', W_SE)}{G}"
+            f"{_fmt(_to_int(stats.get('n')), f'>{W_N}d', W_N)}{G}"
+            f"{baseline_name:<{W_BASELINE}}"
+        )
+
+    return lines
+
+
 READOUTS = [
     ("CLOCKS", lambda: _safe_lines(clocks_combined_readout), False),
     ("CAMPAIGNS", lambda: _safe_lines(campaigns_readout), True),
+    ("PHOTONS", lambda: _safe_lines(photons_detail_readout), False),
+    ("PHOTON CAMPAIGNS", lambda: _safe_lines(photons_campaigns_readout), True),
 ]

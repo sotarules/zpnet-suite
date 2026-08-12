@@ -2,14 +2,16 @@
 ZPNet Metrics — Full-Screen Generalized Campaign Display
 
 Green-screen curses application for SSH-based system monitoring.
-Consumes the canonical CLOCKS_V4 heartbeat; campaign_master/campaign_detail schema
-interpretation remains isolated in readout_blocks and is not a repaint-engine concern.
+Consumes canonical CLOCKS_V4 and PHOTONS_V1 readouts; campaign_master/campaign_detail
+schema interpretation remains isolated in readout_blocks and is not a repaint-engine
+concern.
 Designed for the road: run from a ThinkPad over SSH, maximized
 in Putty with 3270 font.
 
 Controls:
   L        — Lock/unlock display on current readout
   SPACE    — Advance to next readout (when locked)
+  PGUP/PGDN — Scroll campaign-list readouts
   F9/F12   — OCXO1 DAC coarse down/up
   F10/F11  — OCXO1 DAC fine down/up
   F5/F8    — OCXO2 DAC coarse down/up
