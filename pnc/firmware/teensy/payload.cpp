@@ -7,7 +7,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
-#include <errno.h>
 #include <limits.h>
 #include <stddef.h>
 
@@ -6585,22 +6584,57 @@ const char* Payload::getString(const char* key) const {
     return _value_ptr(*e);
 }
 
-static bool payload_copy_token(const Payload* self,
-                               const char* key,
-                               const char* value,
-                               size_t value_len,
-                               uint32_t operation_id,
-                               char* out,
-                               size_t out_capacity) {
-    if (!out || out_capacity == 0) return false;
-    out[0] = '\0';
-    if (!value || value_len == 0 || value_len >= out_capacity) {
-        payload_note_bad_key(key);
-        payload_note_error(PAYLOAD_ERR_STRING_TOO_LONG, operation_id, self);
+static bool payload_parse_unsigned_decimal(const char* value,
+                                           size_t value_len,
+                                           uint64_t limit,
+                                           uint64_t* out) {
+    if (!value || value_len == 0U || !out) return false;
+
+    uint64_t parsed = 0ULL;
+    for (size_t i = 0U; i < value_len; ++i) {
+        const uint8_t ch = (uint8_t)value[i];
+        if (ch < (uint8_t)'0' || ch > (uint8_t)'9') return false;
+
+        const uint64_t digit = (uint64_t)(ch - (uint8_t)'0');
+        if (digit > limit || parsed > (limit - digit) / 10ULL) {
+            return false;
+        }
+        parsed = parsed * 10ULL + digit;
+    }
+
+    *out = parsed;
+    return true;
+}
+
+static bool payload_parse_int32_decimal(const char* value,
+                                        size_t value_len,
+                                        int32_t* out) {
+    if (!value || value_len == 0U || !out) return false;
+
+    const bool negative = value[0] == '-';
+    const size_t digits_begin = negative ? 1U : 0U;
+    if (digits_begin == value_len) return false;
+
+    const uint64_t magnitude_limit = negative
+        ? (uint64_t)INT32_MAX + 1ULL
+        : (uint64_t)INT32_MAX;
+    uint64_t magnitude = 0ULL;
+    if (!payload_parse_unsigned_decimal(value + digits_begin,
+                                        value_len - digits_begin,
+                                        magnitude_limit,
+                                        &magnitude)) {
         return false;
     }
-    memcpy(out, value, value_len);
-    out[value_len] = '\0';
+
+    if (negative) {
+        if (magnitude == (uint64_t)INT32_MAX + 1ULL) {
+            *out = INT32_MIN;
+        } else {
+            *out = (int32_t)(-(int64_t)magnitude);
+        }
+    } else {
+        *out = (int32_t)magnitude;
+    }
     return true;
 }
 
@@ -6629,21 +6663,7 @@ bool Payload::tryGetInt(const char* key, int32_t& out) const {
 
     const char* value = _value_ptr(*e);
     if (!json_number_token_valid(value, e->val_len)) return false;
-    char text[48];
-    if (!payload_copy_token(this, key, value, e->val_len,
-                            PAYLOAD_OP_TRY_INT_TOKEN, text, sizeof(text))) {
-        return false;
-    }
-
-    errno = 0;
-    char* end = nullptr;
-    const long long parsed = strtoll(text, &end, 10);
-    if (errno == ERANGE || !end || *end != '\0' ||
-        parsed < (long long)INT32_MIN || parsed > (long long)INT32_MAX) {
-        return false;
-    }
-    out = (int32_t)parsed;
-    return true;
+    return payload_parse_int32_decimal(value, e->val_len, &out);
 }
 
 bool Payload::tryGetUInt(const char* key, uint32_t& out) const {
@@ -6653,20 +6673,13 @@ bool Payload::tryGetUInt(const char* key, uint32_t& out) const {
     if (kind != ValueKind::NUMBER && kind != ValueKind::STRING) return false;
 
     const char* value = _value_ptr(*e);
-    if (e->val_len == 0 || value[0] == '-' ||
-        !json_number_token_valid(value, e->val_len)) {
-        return false;
-    }
-    char text[48];
-    if (!payload_copy_token(this, key, value, e->val_len,
-                            PAYLOAD_OP_TRY_UINT_TOKEN, text, sizeof(text))) {
-        return false;
-    }
+    if (!json_number_token_valid(value, e->val_len)) return false;
 
-    errno = 0;
-    char* end = nullptr;
-    const unsigned long long parsed = strtoull(text, &end, 10);
-    if (errno == ERANGE || !end || *end != '\0' || parsed > UINT32_MAX) {
+    uint64_t parsed = 0ULL;
+    if (!payload_parse_unsigned_decimal(value,
+                                        e->val_len,
+                                        (uint64_t)UINT32_MAX,
+                                        &parsed)) {
         return false;
     }
     out = (uint32_t)parsed;
@@ -6680,22 +6693,11 @@ bool Payload::tryGetUInt64(const char* key, uint64_t& out) const {
     if (kind != ValueKind::NUMBER && kind != ValueKind::STRING) return false;
 
     const char* value = _value_ptr(*e);
-    if (e->val_len == 0 || value[0] == '-' ||
-        !json_number_token_valid(value, e->val_len)) {
-        return false;
-    }
-    char text[48];
-    if (!payload_copy_token(this, key, value, e->val_len,
-                            PAYLOAD_OP_TRY_UINT64_TOKEN, text, sizeof(text))) {
-        return false;
-    }
-
-    errno = 0;
-    char* end = nullptr;
-    const unsigned long long parsed = strtoull(text, &end, 10);
-    if (errno == ERANGE || !end || *end != '\0') return false;
-    out = (uint64_t)parsed;
-    return true;
+    if (!json_number_token_valid(value, e->val_len)) return false;
+    return payload_parse_unsigned_decimal(value,
+                                          e->val_len,
+                                          UINT64_MAX,
+                                          &out);
 }
 
 bool Payload::getBool(const char* key, bool default_value) const {
