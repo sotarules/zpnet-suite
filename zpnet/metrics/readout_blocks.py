@@ -12,11 +12,13 @@ Stats policy:
   CLOCKS statistics are read verbatim from the producer-authored instrument and
   campaign surfaces, including the GNSS reference Welford and Pi-owned DAC
   Welfords.  PHOTONS publishes cumulative accepted-lap Welford/grand-ratio
-  sufficient state; its Metrics panels may algebraically subtract two published
-  snapshots to recover a bounded one-second or campaign population for display.
-  This never synthesizes individual samples, changes admission, or feeds science
-  back into PHOTONS. Missing PHOTONS PPB buckets remain visibly missing; Metrics
-  never estimates rolling windows from repaint history.  Other arithmetic is
+  sufficient state.  The live PHOTONS rolling tail retains actual PUBSUB
+  publications in memory and subtracts adjacent snapshots to recover one-second
+  populations for display; PostgreSQL is not in that live-tail path.  Durable
+  campaign/baseline history remains a database read model.  This never synthesizes
+  individual samples, changes admission, or feeds science back into PHOTONS.
+  Missing PHOTONS PPB buckets remain visibly missing; Metrics never estimates
+  rolling windows from repaint history.  Other arithmetic is
   deterministic presentation/control math such as DAC conversion/nudging and
   baseline deltas.
 
@@ -46,10 +48,14 @@ Column layout (INT rows):
   NAME   END_GNSS_NS   DELTA_NS
 """
 
+import json
 import math
+import socket
+import threading
 import time
+from collections import deque
 
-from zpnet.processes.processes import create_pubsub_cache, send_command
+from zpnet.processes.processes import PUBSUB_TAP_SOCKET, create_pubsub_cache, send_command
 from zpnet.shared.db import open_db
 
 # AD5693R doctrine mirrors Pi CLOCKS, the sole actuator authority:
@@ -80,7 +86,96 @@ CAMPAIGN_TYPE_LANTERN = "LANTERN"
 PHOTONS_ROLLING_ROWS = 25
 
 _LIVE_CACHE = create_pubsub_cache(CLOCKS_TOPIC)
-_PHOTONS_LIVE_CACHE = create_pubsub_cache(PHOTONS_TOPIC)
+
+
+class _RollingPubSubTap:
+    """Retain one topic's latest payload plus bounded arrival-ordered history."""
+
+    def __init__(self, topic: str, *, max_payloads: int, reconnect_s: float = 1.0):
+        if not str(topic):
+            raise ValueError("rolling PUBSUB tap requires a topic")
+        if int(max_payloads) < 2:
+            raise ValueError("rolling PUBSUB tap requires at least two payload slots")
+        self._topic = str(topic)
+        self._reconnect_s = float(reconnect_s)
+        self._lock = threading.Lock()
+        self._payloads = deque(maxlen=int(max_payloads))
+        self._error = None
+        self._thread = None
+
+    def start(self):
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return self
+            self._thread = threading.Thread(
+                target=self._listen_loop,
+                name=f"zpnet-metrics-tail-{self._topic.lower()}",
+                daemon=True,
+            )
+            self._thread.start()
+        return self
+
+    def get(self) -> dict | None:
+        self.start()
+        with self._lock:
+            return dict(self._payloads[-1]) if self._payloads else None
+
+    def history(self) -> list[dict]:
+        self.start()
+        with self._lock:
+            return [dict(payload) for payload in self._payloads]
+
+    def error(self) -> str | None:
+        self.start()
+        with self._lock:
+            return self._error
+
+    def _listen_loop(self) -> None:
+        subscribe = (
+            json.dumps(
+                {"type": "set_topics", "topics": [self._topic]},
+                separators=(",", ":"),
+            ).encode("utf-8")
+            + b"\n"
+        )
+
+        while True:
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(2.0)
+                    sock.connect(PUBSUB_TAP_SOCKET)
+                    sock.settimeout(None)
+                    with sock.makefile("rwb") as stream:
+                        stream.write(subscribe)
+                        stream.flush()
+                        with self._lock:
+                            self._error = None
+
+                        for raw in stream:
+                            try:
+                                msg = json.loads(raw.decode("utf-8"))
+                            except Exception:
+                                continue
+                            if not isinstance(msg, dict) or msg.get("type") != "publish":
+                                continue
+                            if str(msg.get("topic") or "") != self._topic:
+                                continue
+                            payload = msg.get("payload")
+                            if not isinstance(payload, dict):
+                                continue
+                            with self._lock:
+                                self._payloads.append(dict(payload))
+                                self._error = None
+            except Exception as exc:
+                with self._lock:
+                    self._error = str(exc)
+                time.sleep(self._reconnect_s)
+
+
+_PHOTONS_LIVE_TAP = _RollingPubSubTap(
+    PHOTONS_TOPIC,
+    max_payloads=PHOTONS_ROLLING_ROWS + 1,
+).start()
 
 # Mission-control readiness board. The feature payload remains scalar-only;
 # this table is just the operator-facing projection of CLOCKS.features.
@@ -113,8 +208,8 @@ def _get_system_snapshot() -> dict:
 
 
 def _get_photons_snapshot() -> dict:
-    """Return latest canonical PHOTONS without command/response traffic."""
-    return _PHOTONS_LIVE_CACHE.get(PHOTONS_TOPIC) or {}
+    """Return latest PHOTONS publication received by the live rolling tap."""
+    return _PHOTONS_LIVE_TAP.get() or {}
 
 
 def _get_feature_status_payload(force: bool = False) -> tuple[dict, str | None]:
@@ -1228,13 +1323,13 @@ def campaigns_readout() -> list[str]:
 
     W_CAMPAIGN = 20
     W_DEV = 6
-    W_VALUE = 19
+    W_VALUE = 20
     W_PPB_BUCKET = 9
     W_RES = 6
     W_MEAN = 9
     W_SD = 7
     W_SE = 7
-    W_N = 7
+    W_N = 8
     G = " "
 
     lines.append(
@@ -1404,13 +1499,13 @@ def clocks_combined_readout() -> list[str]:
 
     # ── Column widths ──
     W_NAME  = 6
-    W_VALUE = 19
+    W_VALUE = 20
     W_PPB_BUCKET = 9
     W_RES   = 6
     W_MEAN  = 9
     W_SD    = 7
     W_SE    = 7
-    W_N     = 6
+    W_N     = 7
     W_BASE  = 9
     W_NOW   = 9
     W_DELTA = 9
@@ -1877,44 +1972,20 @@ def _get_lantern_campaign_summaries() -> list[dict]:
     return summaries
 
 
-def _get_photons_rolling_payloads(live: dict | None = None) -> list[dict]:
-    """Return enough newest durable rows to render 25 one-second populations."""
-    with open_db(row_dict=True) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id, ts, campaign, sequence, pps_count, payload
-                FROM campaign_detail
-                WHERE campaign_type = %s
-                ORDER BY sequence DESC, id DESC
-                LIMIT %s
-                """,
-                (CAMPAIGN_TYPE_LANTERN, PHOTONS_ROLLING_ROWS + 1),
-            )
-            rows = list(cur.fetchall())
+def _get_photons_rolling_payloads() -> list[dict]:
+    """Return arrival-ordered PHOTONS publications seen by this Metrics process.
 
-    ordered: list[dict] = []
-    for row in reversed(rows):
-        payload = _json_object(row.get("payload"))
-        if payload:
-            ordered.append(payload)
-
-    # Persistence normally trails the live publication by only milliseconds. Add
-    # the live row only when it is newer than the newest durable physical row; do
-    # not sort by sequence because a future instrument epoch may legitimately
-    # restart its sequence counter.
-    live_payload = _json_object(live)
-    live_sequence = _to_int(live_payload.get("sequence"))
-    durable_sequence = _to_int(ordered[-1].get("sequence")) if ordered else None
-    if live_payload and live_sequence is not None and live_sequence != durable_sequence:
-        ordered.append(live_payload)
-
-    return ordered[-(PHOTONS_ROLLING_ROWS + 1):]
+    This is deliberately a live PUBSUB tail.  Metrics does not bootstrap or
+    repair it from campaign_detail: after Metrics starts, the window fills from
+    actual PHOTONS publications and stops moving immediately if the feed stops.
+    """
+    return _PHOTONS_LIVE_TAP.history()
 
 
 def _photons_rolling_rows(live: dict, summaries: list[dict]) -> list[dict]:
-    """Return oldest-to-newest 1-second PHOTONS rows for the rolling table."""
-    payloads = _get_photons_rolling_payloads(live)
+    """Return oldest-to-newest one-second populations from the live PHOTONS tail."""
+    _ = live
+    payloads = _get_photons_rolling_payloads()
     by_id = {s.get("id"): s for s in summaries if s.get("id") is not None}
     rows: list[dict] = []
 
@@ -2109,7 +2180,10 @@ def photons_detail_readout() -> list[str]:
         lines.append("PHOTONS statistics unavailable")
 
     lines.append("")
-    lines.append(f"ROLLING {PHOTONS_ROLLING_ROWS}-SECOND ACCEPTED-LAP POPULATIONS  (newest at bottom)")
+    lines.append(
+        f"LIVE {PHOTONS_ROLLING_ROWS}-SECOND ACCEPTED-LAP TAIL  "
+        "(PUBSUB; newest at bottom)"
+    )
 
     W_SEC = 7
     W_ACC = 8
@@ -2120,8 +2194,8 @@ def photons_detail_readout() -> list[str]:
     W_ROLL_SE = 10
     W_ROLL_N = 8
 
-    # Fixed header: this readout itself is not scrollable; the 25 data rows roll
-    # beneath this line as the durable/live tail advances once per second.
+    # Fixed header: this readout itself is not scrollable; each newly received
+    # PHOTONS publication advances the in-memory tail beneath this line.
     lines.append(
         f"{'SEC':>{W_SEC}}{G}"
         f"{'LAP_NS':>{W_ROLL_VALUE}}{G}"
@@ -2141,7 +2215,11 @@ def photons_detail_readout() -> list[str]:
     )
 
     if not rolling:
-        lines.append("ROLLING PHOTONS HISTORY UNAVAILABLE")
+        history_count = len(_get_photons_rolling_payloads())
+        lines.append(
+            f"WAITING FOR LIVE PHOTONS TAIL "
+            f"({history_count}/2 publications needed for first one-second row)"
+        )
         return lines
 
     for row in rolling:
