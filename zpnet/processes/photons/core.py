@@ -1,34 +1,36 @@
 """
-ZPNet PHOTONS Process — PHOTONS_FRAGMENT ingress + canonical PHOTONS persistence.
+ZPNet PHOTONS Process — canonical optical instrument + LANTERN campaign lifecycle.
 
-Phase-3 contract:
+Phase-4 contract:
 
     Teensy process_photons
         -> PHOTONS_FRAGMENT_V1
         -> Pi PUBSUB fast-path ingress queue
         -> authoritative SYSTEM.REPORT context
         -> structural/accounting court + canonical PHOTONS_V1 worker
+        -> optional Pi-owned LANTERN campaign decoration
         -> PUBSUB PHOTONS
         -> ordered persistence queue/worker
-        -> campaign_detail
+        -> campaign_detail + campaign_master read model
 
-The Teensy remains the optical-science authority.  The Pi does not recompute,
-smooth, repair, or re-adjudicate lap science.  It proves that the firmware
-testimony is structurally self-consistent, carries the exact Teensy-owned
-``photons`` subtree into canonical PHOTONS, and attaches only independently
-owned Pi SYSTEM context.  Accepted and excluded lap populations remain firmware
-facts; a fragment is not made non-viable merely because it contains excluded
-laps.
+The Teensy remains the optical-science authority and runs continuously.
+START/STOP never start or stop PHOTONS measurement and never mutate firmware
+science.  They only establish sequence-exact LANTERN labeling boundaries over
+the already-running canonical PHOTONS stream.
 
-The PUBSUB callback never performs the structural court, SYSTEM request,
-publication, or database I/O.  One canonical-state worker owns SYSTEM context
-acquisition, validation, and publication; one ordered persistence worker owns
-PostgreSQL writes with retry.  If SYSTEM.REPORT is temporarily unavailable, the
-current fragment remains in state-worker custody and is retried rather than
-published with fabricated or partial context.
+The Pi does not recompute, smooth, repair, or re-adjudicate lap science.
+Accepted and excluded lap populations remain firmware facts; a one-second batch
+is not made non-viable merely because it contains excluded laps.
 
-LANTERN campaign semantics and recovery remain intentionally deferred to later
-bounded phases.
+Campaign boundaries are physical-sequence boundaries, not worker timing:
+START labels only fragments strictly after the latest fragment already received;
+STOP labels through the latest fragment already received.  This preserves exact
+campaign custody even while SYSTEM or PostgreSQL backlog exists.
+
+Baselines are campaign-to-campaign relationships stored by campaign_master ID.
+No baseline statistics are copied into the active campaign and the firmware
+``photons.baseline`` object remains untouched.  Full optical/statistical restart
+recovery remains deferred to Phase 5.
 """
 
 from __future__ import annotations
@@ -40,7 +42,7 @@ import queue
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from zpnet.processes.processes import (
     publish,
@@ -60,10 +62,16 @@ SUBSYSTEM = "PHOTONS"
 PHOTONS_FRAGMENT_TOPIC = "PHOTONS_FRAGMENT"
 PHOTONS_TOPIC = "PHOTONS"
 
-# campaign_detail is the generalized durable state table.  PHOTONS is the
-# always-on optical instrument; LANTERN will later become optional campaign
-# interpretation rather than a second instrument authority.
-CAMPAIGN_TYPE_PHOTONS = "PHOTONS"
+# PHOTONS is the always-on optical instrument.  LANTERN is the optional
+# campaign interpretation layered over that stream.  Pre-Phase-4 rows used the
+# provisional PHOTONS campaign_type and remain valid historical bring-up data;
+# new generalized campaign_detail rows use LANTERN, matching CLOCKS/TEMPEST.
+CAMPAIGN_TYPE_PHOTONS = "PHOTONS"  # legacy pre-Phase-4 detail type
+CAMPAIGN_TYPE_LANTERN = "LANTERN"
+LANTERN_CAMPAIGN_SCHEMA = "LANTERN_CAMPAIGN_V1"
+LANTERN_MASTER_SCHEMA = "LANTERN_CAMPAIGN_MASTER_V1"
+LANTERN_REPORT_SCHEMA = "LANTERN_REPORT_V1"
+LANTERN_RESTART_INTERRUPTION_REASON = "PHASE4_NO_RESTART_RECOVERY"
 
 # Canonical Pi-side instrument schema and accepted firmware source schemas.
 PHOTONS_SCHEMA = "PHOTONS_V1"
@@ -99,14 +107,22 @@ SYSTEM_CONTEXT_FIELDS = (
 # ---------------------------------------------------------------------
 
 _state_lock = threading.Lock()
+_campaign_lock = threading.Lock()
 
 _fragment_queue: queue.Queue[Payload] = queue.Queue(maxsize=PHOTONS_INGRESS_QUEUE_MAXSIZE)
 _persist_queue: queue.Queue[Payload] = queue.Queue(maxsize=PHOTONS_PERSIST_QUEUE_MAXSIZE)
 _state_worker_started = threading.Event()
 _persistence_worker_started = threading.Event()
+_campaign_control_ready = threading.Event()
 
 _latest_fragment: Optional[Payload] = None
 _latest_photons: Optional[Payload] = None
+
+# One active campaign plus any recently STOPped window whose final queued
+# pre-STOP fragments have not yet crossed the state worker.  Windows are
+# sequence-authored so worker/database latency cannot move campaign boundaries.
+_active_campaign: Optional[Dict[str, Any]] = None
+_closing_campaigns: List[Dict[str, Any]] = []
 
 _fragments_received = 0
 _fragments_queued = 0
@@ -118,6 +134,11 @@ _ingress_queue_depth_max = 0
 _persist_queue_depth_max = 0
 _system_report_retry_count = 0
 _persistence_retry_count = 0
+_campaign_start_count = 0
+_campaign_stop_count = 0
+_baseline_set_count = 0
+_stale_campaign_retire_count = 0
+_last_campaign_transition: Optional[Dict[str, Any]] = None
 _last_structural_rejection: Optional[Dict[str, Any]] = None
 _last_system_report_failure: Optional[Dict[str, Any]] = None
 _last_persistence_failure: Optional[Dict[str, Any]] = None
@@ -340,16 +361,258 @@ def _make_photons(fragment: Payload, system_context: Dict[str, Any]) -> Payload:
     return state
 
 
-def _persist_photons(photons: Payload) -> None:
-    """
-    Persist one structurally coherent canonical PHOTONS row.
 
-    Phase 1 remains campaign-neutral.  ``viable`` means that the canonical
-    instrument record passed the Pi structural/accounting court; it does not mean
-    that every lap in the one-second batch entered the firmware science population.
+# ---------------------------------------------------------------------
+# LANTERN campaign decoration + campaign_master read model
+# ---------------------------------------------------------------------
+
+def _latest_received_fragment_sequence() -> int:
+    """Return the newest PHOTONS_FRAGMENT sequence already accepted by PUBSUB."""
+    with _state_lock:
+        fragment = copy.deepcopy(_latest_fragment)
+    if not isinstance(fragment, dict):
+        raise RuntimeError("PHOTONS has not received a fragment yet")
+    return _require_int(
+        fragment.get("sequence"),
+        "latest PHOTONS_FRAGMENT.sequence",
+        minimum=1,
+    )
+
+
+def _latest_canonical_photons_snapshot() -> Dict[str, Any]:
+    """Return the latest canonical PHOTONS observation or fail campaign admission."""
+    with _state_lock:
+        photons = copy.deepcopy(_latest_photons)
+    if not isinstance(photons, dict):
+        raise RuntimeError("PHOTONS canonical heartbeat is not available yet")
+    if photons.get("schema") != PHOTONS_SCHEMA:
+        raise RuntimeError(
+            f"latest PHOTONS heartbeat has unexpected schema {photons.get('schema')!r}"
+        )
+    return photons
+
+
+def _campaign_public_decoration(window: Dict[str, Any]) -> Dict[str, Any]:
+    """Return only the Pi-owned campaign facts carried on a canonical PHOTONS row."""
+    out: Dict[str, Any] = {
+        "schema": LANTERN_CAMPAIGN_SCHEMA,
+        "campaign_type": CAMPAIGN_TYPE_LANTERN,
+        "campaign": window["campaign"],
+        "campaign_id": int(window["campaign_id"]),
+        "started_at": window["started_at"],
+        "start_after_sequence": int(window["start_after_sequence"]),
+    }
+    stop_after = window.get("stop_after_sequence")
+    if stop_after is not None:
+        out["stop_after_sequence"] = int(stop_after)
+    baseline_id = window.get("baseline_campaign_id")
+    baseline_name = window.get("baseline_campaign")
+    if baseline_id is not None:
+        out["baseline_campaign_id"] = int(baseline_id)
+    if baseline_name:
+        out["baseline_campaign"] = str(baseline_name)
+    return out
+
+
+def _campaign_decoration_for_sequence(sequence: int) -> Optional[Dict[str, Any]]:
+    """Resolve one physical PHOTONS sequence against exact START/STOP windows."""
+    global _closing_campaigns
+
+    sequence = int(sequence)
+    with _campaign_lock:
+        selected: Optional[Dict[str, Any]] = None
+
+        # A STOPped campaign remains authoritative for any fragment that had
+        # already arrived when STOP captured its inclusive boundary.
+        for window in _closing_campaigns:
+            start_after = int(window["start_after_sequence"])
+            stop_after = int(window["stop_after_sequence"])
+            if start_after < sequence <= stop_after:
+                selected = _campaign_public_decoration(window)
+                break
+
+        if selected is None and _active_campaign is not None:
+            start_after = int(_active_campaign["start_after_sequence"])
+            if sequence > start_after:
+                selected = _campaign_public_decoration(_active_campaign)
+
+        # The state worker is ordered.  Once it reaches/passes a closed window's
+        # inclusive STOP boundary, no future item can belong to that window.
+        _closing_campaigns = [
+            window
+            for window in _closing_campaigns
+            if int(window["stop_after_sequence"]) > sequence
+        ]
+
+        return copy.deepcopy(selected) if selected is not None else None
+
+
+def _lantern_report_from_photons(photons: Payload) -> Dict[str, Any]:
+    """Build the campaign_master latest read model without recomputing science."""
+    campaign = _require_dict(photons.get("campaign"), "PHOTONS.campaign")
+    instrument = _require_dict(photons.get("photons"), "PHOTONS.photons")
+    science = instrument.get("science")
+    science = science if isinstance(science, dict) else {}
+    accepted = science.get("accepted")
+    accepted = accepted if isinstance(accepted, dict) else {}
+    excluded = science.get("excluded")
+    excluded = excluded if isinstance(excluded, dict) else {}
+    stats = instrument.get("stats")
+    stats = stats if isinstance(stats, dict) else {}
+
+    return {
+        "schema": LANTERN_REPORT_SCHEMA,
+        "campaign_type": CAMPAIGN_TYPE_LANTERN,
+        "campaign": campaign.get("campaign"),
+        "campaign_id": campaign.get("campaign_id"),
+        "sequence": photons.get("sequence"),
+        "pps_count": photons.get("pps_count"),
+        "published_at_utc": photons.get("published_at_utc"),
+        "instrument_source": instrument.get("source"),
+        # These are exact firmware cumulative/read-model facts, not Pi-authored
+        # campaign-local statistics.
+        "candidate_count": science.get("candidate_count"),
+        "accepted_count": accepted.get("count"),
+        "excluded_count": excluded.get("count"),
+        "instrument_stats": copy.deepcopy(stats),
+        "location": copy.deepcopy(photons.get("location") or {}),
+        "environment": copy.deepcopy(photons.get("environment") or {}),
+    }
+
+
+def _retire_stale_active_campaigns() -> None:
+    """Fail closed across restart until Phase 5 can prove campaign continuation.
+
+    Phase 4 deliberately does not claim restart recovery.  If this Pi process is
+    restarted while a LANTERN master is active, close that master explicitly
+    before the state worker begins decorating new rows.  PUBSUB ingress is already
+    online, so fragments accumulate in the unbounded ingress queue while a
+    temporary database outage is retried here.
+    """
+    global _stale_campaign_retire_count
+    global _last_campaign_transition
+
+    failure_logged = False
+    while True:
+        try:
+            interrupted_at = _utc_now_z()
+            with open_db() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    UPDATE campaign_master
+                    SET active = false,
+                        payload = payload || jsonb_build_object(
+                            'interrupted_at', to_jsonb(%s::text),
+                            'interruption_reason', to_jsonb(%s::text)
+                        )
+                    WHERE campaign_type = %s
+                      AND active = true
+                    """,
+                    (
+                        interrupted_at,
+                        LANTERN_RESTART_INTERRUPTION_REASON,
+                        CAMPAIGN_TYPE_LANTERN,
+                    ),
+                )
+                retired = int(cur.rowcount or 0)
+            break
+        except Exception:
+            if not failure_logged:
+                logging.exception(
+                    "⚠️ [photons] unable to classify stale active LANTERN campaign(s); retrying"
+                )
+                failure_logged = True
+            time.sleep(PHOTONS_PERSIST_RETRY_S)
+
+    if retired:
+        with _state_lock:
+            _stale_campaign_retire_count += retired
+            _last_campaign_transition = {
+                "action": "RESTART_INTERRUPT",
+                "at_utc": interrupted_at,
+                "campaigns_retired": retired,
+                "reason": LANTERN_RESTART_INTERRUPTION_REASON,
+            }
+        logging.warning(
+            "⚠️ [photons] retired %d active LANTERN campaign(s) at restart; "
+            "Phase 5 restart recovery is not yet enabled",
+            retired,
+        )
+
+
+def _baseline_relation_for_active_campaign() -> Optional[Dict[str, Any]]:
+    """Return the active LANTERN campaign and its referenced baseline, if any."""
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                current.id AS campaign_id,
+                current.campaign AS campaign,
+                baseline.id AS baseline_campaign_id,
+                baseline.campaign AS baseline_campaign,
+                baseline.payload AS baseline_payload
+            FROM campaign_master AS current
+            JOIN campaign_master AS baseline
+              ON baseline.id = (current.payload ->> 'baseline_campaign_id')::bigint
+             AND baseline.campaign_type = current.campaign_type
+            WHERE current.campaign_type = %s
+              AND current.active = true
+            ORDER BY current.ts DESC, current.id DESC
+            LIMIT 1
+            """,
+            (CAMPAIGN_TYPE_LANTERN,),
+        )
+        row = cur.fetchone()
+
+    if row is None:
+        return None
+
+    payload = row["baseline_payload"]
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    if not isinstance(payload, dict):
+        raise RuntimeError("baseline LANTERN campaign payload is not an object")
+
+    report = payload.get("report")
+    if not isinstance(report, dict) or not report:
+        raise RuntimeError(
+            f"Baseline campaign '{row['baseline_campaign']}' has no report"
+        )
+
+    return {
+        "campaign_id": int(row["campaign_id"]),
+        "campaign": row["campaign"],
+        "baseline_campaign_id": int(row["baseline_campaign_id"]),
+        "baseline_campaign": row["baseline_campaign"],
+        "baseline_report": report,
+        "baseline_started_at": payload.get("started_at"),
+        "baseline_stopped_at": payload.get("stopped_at"),
+    }
+
+
+def _persist_photons(photons: Payload) -> None:
+    """Persist one canonical PHOTONS row and advance the LANTERN read model.
+
+    ``viable`` remains structural: individual firmware lap exclusions never make
+    the one-second batch non-viable.  campaign_master is only a latest read model;
+    campaign_detail remains the durable observation history.
     """
     sequence = photons["sequence"]
     pps_count = photons.get("pps_count")
+    campaign = photons.get("campaign")
+    campaign = campaign if isinstance(campaign, dict) else None
+    campaign_name = (
+        str(campaign.get("campaign") or "").strip()
+        if campaign is not None
+        else ""
+    )
+    campaign_id = (
+        _require_int(campaign.get("campaign_id"), "PHOTONS.campaign.campaign_id", minimum=1)
+        if campaign is not None
+        else None
+    )
 
     with open_db() as conn:
         cur = conn.cursor()
@@ -376,14 +639,42 @@ def _persist_photons(photons: Payload) -> None:
             """,
             (
                 datetime.now(timezone.utc),
-                CAMPAIGN_TYPE_PHOTONS,
-                None,
+                CAMPAIGN_TYPE_LANTERN,
+                campaign_name or None,
                 True,
                 json.dumps(photons, separators=(",", ":")),
                 sequence,
                 pps_count,
             ),
         )
+
+        if campaign is not None:
+            report = _lantern_report_from_photons(photons)
+            cur.execute(
+                """
+                UPDATE campaign_master
+                SET payload = jsonb_set(
+                    payload,
+                    '{report}',
+                    %s::jsonb,
+                    true
+                )
+                WHERE id = %s
+                  AND campaign_type = %s
+                  AND campaign = %s
+                """,
+                (
+                    json.dumps(report, separators=(",", ":")),
+                    int(campaign_id),
+                    CAMPAIGN_TYPE_LANTERN,
+                    campaign_name,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError(
+                    "persisted LANTERN-labeled PHOTONS row has no matching campaign_master "
+                    f"id={campaign_id} campaign={campaign_name!r}"
+                )
 
 
 # ---------------------------------------------------------------------
@@ -468,6 +759,9 @@ def _state_loop() -> None:
 
         try:
             photons = _make_photons(fragment, system_context)
+            campaign = _campaign_decoration_for_sequence(int(photons["sequence"]))
+            if campaign is not None:
+                photons["campaign"] = campaign
         except Exception as exc:
             rejection = {
                 "rejected_at_utc": _utc_now_z(),
@@ -525,7 +819,7 @@ def _persistence_loop() -> None:
                     _last_persistence_failure = failure
                 if not failure_logged:
                     logging.exception(
-                        "⚠️ [photons] campaign_detail persistence failed for PHOTONS sequence=%s; retrying",
+                        "⚠️ [photons] LANTERN campaign_detail persistence failed for PHOTONS sequence=%s; retrying",
                         failure["sequence"],
                     )
                     failure_logged = True
@@ -556,10 +850,490 @@ SUBSCRIPTIONS = {
 # Commands
 # ---------------------------------------------------------------------
 
+def _campaign_control_gate(command: str) -> Optional[Dict[str, Any]]:
+    if _campaign_control_ready.is_set():
+        return None
+    return {
+        "success": False,
+        "message": f"{command} unavailable while LANTERN startup classification is in progress",
+    }
+
+
+def cmd_start(args: Optional[dict]) -> dict:
+    """START one LANTERN label window over the already-running PHOTONS stream."""
+    global _active_campaign
+    global _campaign_start_count
+    global _last_campaign_transition
+
+    busy = _campaign_control_gate("START")
+    if busy is not None:
+        return busy
+
+    campaign_name = str((args or {}).get("campaign") or "").strip()
+    if not campaign_name:
+        return {"success": False, "message": "START requires 'campaign' argument"}
+
+    try:
+        latest_photons = _latest_canonical_photons_snapshot()
+    except Exception as exc:
+        return {"success": False, "message": str(exc)}
+
+    with _campaign_lock:
+        if _active_campaign is not None:
+            return {
+                "success": False,
+                "message": (
+                    f"Campaign '{_active_campaign['campaign']}' is already active; "
+                    "STOP it before starting another LANTERN campaign"
+                ),
+            }
+
+        # Capture the exclusive boundary while holding the same lock used by the
+        # state worker's campaign resolver.  A newly arriving fragment may queue
+        # during the DB transaction, but it cannot be decorated until this
+        # transaction commits and the active window becomes visible.
+        try:
+            start_after_sequence = _latest_received_fragment_sequence()
+        except Exception as exc:
+            return {"success": False, "message": str(exc)}
+
+        started_at = _utc_now_z()
+        start_location = copy.deepcopy(latest_photons.get("location") or {})
+
+        try:
+            with open_db(row_dict=True) as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT id, campaign
+                    FROM campaign_master
+                    WHERE campaign_type = %s
+                      AND active = true
+                    ORDER BY ts DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (CAMPAIGN_TYPE_LANTERN,),
+                )
+                active = cur.fetchone()
+                if active is not None:
+                    return {
+                        "success": False,
+                        "message": (
+                            f"Database already has active LANTERN campaign "
+                            f"'{active['campaign']}' (id={active['id']})"
+                        ),
+                    }
+
+                cur.execute(
+                    """
+                    SELECT id, active
+                    FROM campaign_master
+                    WHERE campaign_type = %s
+                      AND campaign = %s
+                    ORDER BY ts DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (CAMPAIGN_TYPE_LANTERN, campaign_name),
+                )
+                existing = cur.fetchone()
+                if existing is not None:
+                    return {
+                        "success": False,
+                        "message": (
+                            f"Campaign '{campaign_name}' already exists "
+                            f"(id={existing['id']}); choose a new name"
+                        ),
+                    }
+
+                master_payload = {
+                    "schema": LANTERN_MASTER_SCHEMA,
+                    "campaign_type": CAMPAIGN_TYPE_LANTERN,
+                    "started_at": started_at,
+                    "start_after_sequence": int(start_after_sequence),
+                    "boundary_contract": "START_EXCLUSIVE_LATEST_RECEIVED_SEQUENCE",
+                    "instrument_always_on": True,
+                    "starts_physical_measurement": False,
+                    "location": start_location,
+                }
+                cur.execute(
+                    """
+                    INSERT INTO campaign_master (
+                        campaign_type,
+                        campaign,
+                        active,
+                        payload
+                    )
+                    VALUES (%s, %s, true, %s::jsonb)
+                    RETURNING id
+                    """,
+                    (
+                        CAMPAIGN_TYPE_LANTERN,
+                        campaign_name,
+                        json.dumps(master_payload, separators=(",", ":")),
+                    ),
+                )
+                created = cur.fetchone()
+                if created is None:
+                    raise RuntimeError("LANTERN campaign_master insert returned no id")
+                campaign_id = int(created["id"])
+
+        except Exception as exc:
+            logging.exception("❌ [photons] LANTERN START failed")
+            return {"success": False, "message": str(exc)}
+
+        _active_campaign = {
+            "campaign": campaign_name,
+            "campaign_id": campaign_id,
+            "started_at": started_at,
+            "start_after_sequence": int(start_after_sequence),
+        }
+
+    transition = {
+        "action": "START",
+        "at_utc": started_at,
+        "campaign": campaign_name,
+        "campaign_id": campaign_id,
+        "start_after_sequence": int(start_after_sequence),
+    }
+    with _state_lock:
+        _campaign_start_count += 1
+        _last_campaign_transition = copy.deepcopy(transition)
+
+    logging.info(
+        "▶️ [photons] LANTERN START campaign='%s' id=%d after_sequence=%d "
+        "(PHOTONS measurement remains continuously on)",
+        campaign_name,
+        campaign_id,
+        start_after_sequence,
+    )
+    return {
+        "success": True,
+        "message": "OK",
+        "payload": {
+            "campaign_type": CAMPAIGN_TYPE_LANTERN,
+            "campaign": campaign_name,
+            "campaign_id": campaign_id,
+            "start_after_sequence": int(start_after_sequence),
+            "first_labeled_sequence": int(start_after_sequence) + 1,
+            "instrument_always_on": True,
+            "physical_measurement_changed": False,
+        },
+    }
+
+
+def cmd_stop(_: Optional[dict]) -> dict:
+    """STOP LANTERN labeling without stopping the PHOTONS instrument."""
+    global _active_campaign
+    global _closing_campaigns
+    global _campaign_stop_count
+    global _last_campaign_transition
+
+    busy = _campaign_control_gate("STOP")
+    if busy is not None:
+        return busy
+
+    with _campaign_lock:
+        if _active_campaign is None:
+            return {"success": False, "message": "No active LANTERN campaign"}
+
+        try:
+            stop_after_sequence = _latest_received_fragment_sequence()
+        except Exception as exc:
+            return {"success": False, "message": str(exc)}
+
+        stopped_at = _utc_now_z()
+        closing = copy.deepcopy(_active_campaign)
+        closing["stopped_at"] = stopped_at
+        closing["stop_after_sequence"] = int(stop_after_sequence)
+
+        try:
+            with open_db() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    UPDATE campaign_master
+                    SET active = false,
+                        payload = payload || jsonb_build_object(
+                            'stopped_at', to_jsonb(%s::text),
+                            'stop_after_sequence', to_jsonb(%s::bigint),
+                            'stop_boundary_contract',
+                                to_jsonb('STOP_INCLUSIVE_LATEST_RECEIVED_SEQUENCE'::text)
+                        )
+                    WHERE id = %s
+                      AND campaign_type = %s
+                      AND campaign = %s
+                      AND active = true
+                    """,
+                    (
+                        stopped_at,
+                        int(stop_after_sequence),
+                        int(closing["campaign_id"]),
+                        CAMPAIGN_TYPE_LANTERN,
+                        closing["campaign"],
+                    ),
+                )
+                if cur.rowcount != 1:
+                    raise RuntimeError(
+                        "active LANTERN campaign_master was not stopped exactly once"
+                    )
+        except Exception as exc:
+            logging.exception("❌ [photons] LANTERN STOP failed")
+            return {"success": False, "message": str(exc)}
+
+        _closing_campaigns.append(closing)
+        _active_campaign = None
+
+    transition = {
+        "action": "STOP",
+        "at_utc": stopped_at,
+        "campaign": closing["campaign"],
+        "campaign_id": int(closing["campaign_id"]),
+        "stop_after_sequence": int(stop_after_sequence),
+    }
+    with _state_lock:
+        _campaign_stop_count += 1
+        _last_campaign_transition = copy.deepcopy(transition)
+
+    logging.info(
+        "⏹️ [photons] LANTERN STOP campaign='%s' id=%d through_sequence=%d "
+        "(PHOTONS measurement remains continuously on)",
+        closing["campaign"],
+        int(closing["campaign_id"]),
+        int(stop_after_sequence),
+    )
+    return {
+        "success": True,
+        "message": "OK",
+        "payload": {
+            "campaign_type": CAMPAIGN_TYPE_LANTERN,
+            "campaign": closing["campaign"],
+            "campaign_id": int(closing["campaign_id"]),
+            "stop_after_sequence": int(stop_after_sequence),
+            "last_labeled_sequence": int(stop_after_sequence),
+            "instrument_always_on": True,
+            "physical_measurement_changed": False,
+        },
+    }
+
+
+def cmd_set_baseline(args: Optional[dict]) -> Dict[str, Any]:
+    """Relate the active LANTERN campaign to another campaign by durable ID."""
+    global _baseline_set_count
+    global _last_campaign_transition
+
+    busy = _campaign_control_gate("SET_BASELINE")
+    if busy is not None:
+        return busy
+
+    baseline_name = str((args or {}).get("campaign") or "").strip()
+    if not baseline_name:
+        return {"success": False, "message": "SET_BASELINE requires 'campaign' argument"}
+
+    with _campaign_lock:
+        if _active_campaign is None:
+            return {
+                "success": False,
+                "message": "SET_BASELINE requires an active LANTERN campaign",
+            }
+
+        current = copy.deepcopy(_active_campaign)
+        try:
+            with open_db(row_dict=True) as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT id, campaign, active, payload
+                    FROM campaign_master
+                    WHERE campaign_type = %s
+                      AND campaign = %s
+                    ORDER BY ts DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (CAMPAIGN_TYPE_LANTERN, baseline_name),
+                )
+                baseline = cur.fetchone()
+                if baseline is None:
+                    return {
+                        "success": False,
+                        "message": f"No LANTERN campaign named '{baseline_name}'",
+                    }
+                if int(baseline["id"]) == int(current["campaign_id"]):
+                    return {
+                        "success": False,
+                        "message": "A campaign cannot use itself as its baseline",
+                    }
+                if bool(baseline["active"]):
+                    return {
+                        "success": False,
+                        "message": "Baseline campaign must be stopped before it can be referenced",
+                    }
+
+                baseline_payload = baseline["payload"]
+                if isinstance(baseline_payload, str):
+                    baseline_payload = json.loads(baseline_payload)
+                baseline_report = (
+                    baseline_payload.get("report")
+                    if isinstance(baseline_payload, dict)
+                    else None
+                )
+                if not isinstance(baseline_report, dict) or not baseline_report:
+                    return {
+                        "success": False,
+                        "message": f"Campaign '{baseline_name}' has no persisted PHOTONS report",
+                    }
+
+                cur.execute(
+                    """
+                    UPDATE campaign_master
+                    SET payload = jsonb_set(
+                        payload,
+                        '{baseline_campaign_id}',
+                        to_jsonb(%s::bigint),
+                        true
+                    )
+                    WHERE id = %s
+                      AND campaign_type = %s
+                      AND active = true
+                    """,
+                    (
+                        int(baseline["id"]),
+                        int(current["campaign_id"]),
+                        CAMPAIGN_TYPE_LANTERN,
+                    ),
+                )
+                if cur.rowcount != 1:
+                    raise RuntimeError(
+                        "active LANTERN baseline relationship was not updated exactly once"
+                    )
+
+        except Exception as exc:
+            logging.exception("❌ [photons] SET_BASELINE failed")
+            return {"success": False, "message": str(exc)}
+
+        _active_campaign["baseline_campaign_id"] = int(baseline["id"])
+        _active_campaign["baseline_campaign"] = str(baseline["campaign"])
+
+    transition = {
+        "action": "SET_BASELINE",
+        "at_utc": _utc_now_z(),
+        "campaign": current["campaign"],
+        "campaign_id": int(current["campaign_id"]),
+        "baseline_campaign": str(baseline["campaign"]),
+        "baseline_campaign_id": int(baseline["id"]),
+    }
+    with _state_lock:
+        _baseline_set_count += 1
+        _last_campaign_transition = copy.deepcopy(transition)
+
+    logging.info(
+        "✅ [photons] LANTERN campaign '%s' baseline -> '%s'",
+        current["campaign"],
+        baseline["campaign"],
+    )
+    return {"success": True, "message": "OK", "payload": transition}
+
+
+def cmd_baseline_info(_: Optional[dict]) -> Dict[str, Any]:
+    """Return the active LANTERN campaign's baseline relationship."""
+    try:
+        relation = _baseline_relation_for_active_campaign()
+    except Exception as exc:
+        logging.exception("❌ [photons] BASELINE_INFO failed")
+        return {"success": False, "message": str(exc)}
+
+    if relation is None:
+        return {
+            "success": True,
+            "message": "OK",
+            "payload": {"baseline_set": False},
+        }
+
+    return {
+        "success": True,
+        "message": "OK",
+        "payload": {"baseline_set": True, **relation},
+    }
+
+
+def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
+    """List LANTERN campaign masters and baseline relationships."""
+    try:
+        with open_db(row_dict=True) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT
+                    master.id,
+                    master.campaign_type,
+                    master.campaign,
+                    master.active,
+                    master.ts,
+                    master.payload,
+                    baseline.campaign AS baseline_campaign
+                FROM campaign_master AS master
+                LEFT JOIN campaign_master AS baseline
+                  ON baseline.id = (master.payload ->> 'baseline_campaign_id')::bigint
+                 AND baseline.campaign_type = master.campaign_type
+                WHERE master.campaign_type = %s
+                ORDER BY master.ts ASC, master.id ASC
+                """,
+                (CAMPAIGN_TYPE_LANTERN,),
+            )
+            rows = cur.fetchall()
+    except Exception as exc:
+        logging.exception("❌ [photons] LIST_CAMPAIGNS query failed")
+        return {"success": False, "message": str(exc)}
+
+    campaigns: List[Dict[str, Any]] = []
+    for row in rows:
+        payload = row["payload"]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        payload = payload if isinstance(payload, dict) else {}
+        report = payload.get("report")
+        report = report if isinstance(report, dict) else {}
+
+        campaigns.append(
+            {
+                "campaign_id": int(row["id"]),
+                "campaign_type": row["campaign_type"],
+                "campaign": row["campaign"],
+                "active": bool(row["active"]),
+                "baseline_campaign": row.get("baseline_campaign"),
+                "started_at": payload.get("started_at"),
+                "stopped_at": payload.get("stopped_at"),
+                "interrupted_at": payload.get("interrupted_at"),
+                "interruption_reason": payload.get("interruption_reason"),
+                "start_after_sequence": payload.get("start_after_sequence"),
+                "stop_after_sequence": payload.get("stop_after_sequence"),
+                "location": payload.get("location"),
+                "latest_sequence": report.get("sequence"),
+                "latest_pps_count": report.get("pps_count"),
+                "latest_accepted_count": report.get("accepted_count"),
+                "latest_excluded_count": report.get("excluded_count"),
+                "latest_mean_lap_ns": (
+                    (report.get("instrument_stats") or {}).get("mean_lap_ns")
+                    if isinstance(report.get("instrument_stats"), dict)
+                    else None
+                ),
+            }
+        )
+
+    return {
+        "success": True,
+        "message": "OK",
+        "payload": {
+            "campaign_type": CAMPAIGN_TYPE_LANTERN,
+            "count": len(campaigns),
+            "campaigns": campaigns,
+        },
+    }
+
+
 def cmd_report(_: Optional[dict]) -> dict:
     with _state_lock:
         payload = {
-            "schema": "PHOTONS_REPORT_V3",
+            "schema": "PHOTONS_REPORT_V4",
             "fragments_received": _fragments_received,
             "fragments_queued": _fragments_queued,
             "fragments_processed": _fragments_processed,
@@ -574,11 +1348,36 @@ def cmd_report(_: Optional[dict]) -> dict:
             "persistence_retry_count": _persistence_retry_count,
             "state_worker_started": _state_worker_started.is_set(),
             "persistence_worker_started": _persistence_worker_started.is_set(),
+            "campaign_control_ready": _campaign_control_ready.is_set(),
+            "campaign_start_count": _campaign_start_count,
+            "campaign_stop_count": _campaign_stop_count,
+            "baseline_set_count": _baseline_set_count,
+            "stale_campaign_retire_count": _stale_campaign_retire_count,
+            "last_campaign_transition": copy.deepcopy(_last_campaign_transition),
             "last_structural_rejection": copy.deepcopy(_last_structural_rejection),
             "last_system_report_failure": copy.deepcopy(_last_system_report_failure),
             "last_persistence_failure": copy.deepcopy(_last_persistence_failure),
             "latest_fragment": copy.deepcopy(_latest_fragment),
             "latest_photons": copy.deepcopy(_latest_photons),
+        }
+
+    with _campaign_lock:
+        payload["lantern"] = {
+            "campaign_type": CAMPAIGN_TYPE_LANTERN,
+            "active": _active_campaign is not None,
+            "active_campaign": (
+                _campaign_public_decoration(_active_campaign)
+                if _active_campaign is not None
+                else None
+            ),
+            "closing_window_count": len(_closing_campaigns),
+            "closing_windows": [
+                _campaign_public_decoration(window)
+                for window in _closing_campaigns
+            ],
+            "instrument_always_on": True,
+            "campaign_changes_physical_measurement": False,
+            "restart_recovery_enabled": False,
         }
 
     return {
@@ -589,7 +1388,12 @@ def cmd_report(_: Optional[dict]) -> dict:
 
 
 COMMANDS = {
+    "START": cmd_start,
+    "STOP": cmd_stop,
     "REPORT": cmd_report,
+    "SET_BASELINE": cmd_set_baseline,
+    "BASELINE_INFO": cmd_baseline_info,
+    "LIST_CAMPAIGNS": cmd_list_campaigns,
 }
 
 
@@ -599,14 +1403,15 @@ COMMANDS = {
 
 def run() -> None:
     setup_logging()
+    _campaign_control_ready.clear()
 
     logging.info(
-        "[photons] starting canonical PHOTONS_V1 service with authoritative SYSTEM context "
-        "and CLOCKS-shaped queued state/persistence workers "
+        "[photons] starting canonical PHOTONS_V1 service with authoritative SYSTEM context, "
+        "CLOCKS-shaped queued state/persistence workers, and Pi-owned LANTERN campaign labels "
         "subscription=%s publication=%s campaign_type=%s",
         PHOTONS_FRAGMENT_TOPIC,
         PHOTONS_TOPIC,
-        CAMPAIGN_TYPE_PHOTONS,
+        CAMPAIGN_TYPE_LANTERN,
     )
 
     server_setup(
@@ -616,6 +1421,10 @@ def run() -> None:
         blocking=False,
     )
 
+    # Phase 4 does not claim restart continuity.  Classify any stale active
+    # LANTERN master before the state worker can decorate newly queued rows.
+    _retire_stale_active_campaigns()
+    _campaign_control_ready.set()
     _start_workers()
 
     logging.info("🏁 [photons] entering main loop")
