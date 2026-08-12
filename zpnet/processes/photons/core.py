@@ -1,11 +1,12 @@
 """
 ZPNet PHOTONS Process — PHOTONS_FRAGMENT ingress + canonical PHOTONS persistence.
 
-Phase-2 contract:
+Phase-3 contract:
 
     Teensy process_photons
         -> PHOTONS_FRAGMENT_V1
         -> Pi PUBSUB fast-path ingress queue
+        -> authoritative SYSTEM.REPORT context
         -> structural/accounting court + canonical PHOTONS_V1 worker
         -> PUBSUB PHOTONS
         -> ordered persistence queue/worker
@@ -13,18 +14,21 @@ Phase-2 contract:
 
 The Teensy remains the optical-science authority.  The Pi does not recompute,
 smooth, repair, or re-adjudicate lap science.  It proves that the firmware
-testimony is structurally self-consistent, then carries the exact Teensy-owned
-``photons`` subtree into canonical PHOTONS.  Accepted and excluded lap
-populations remain firmware facts; a fragment is not made non-viable merely
-because it contains excluded laps.
+testimony is structurally self-consistent, carries the exact Teensy-owned
+``photons`` subtree into canonical PHOTONS, and attaches only independently
+owned Pi SYSTEM context.  Accepted and excluded lap populations remain firmware
+facts; a fragment is not made non-viable merely because it contains excluded
+laps.
 
-The PUBSUB callback never performs the structural court, publication, or database
-I/O.  One canonical-state worker owns validation/publication and one ordered
-persistence worker owns PostgreSQL writes with retry.  This mirrors the mature
-CLOCKS data-plane split while remaining campaign-neutral.
+The PUBSUB callback never performs the structural court, SYSTEM request,
+publication, or database I/O.  One canonical-state worker owns SYSTEM context
+acquisition, validation, and publication; one ordered persistence worker owns
+PostgreSQL writes with retry.  If SYSTEM.REPORT is temporarily unavailable, the
+current fragment remains in state-worker custody and is retried rather than
+published with fabricated or partial context.
 
-LANTERN campaign semantics, SYSTEM context enrichment, and recovery remain
-intentionally deferred to later bounded phases.
+LANTERN campaign semantics and recovery remain intentionally deferred to later
+bounded phases.
 """
 
 from __future__ import annotations
@@ -40,6 +44,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from zpnet.processes.processes import (
     publish,
+    send_command,
     server_setup,
 )
 from zpnet.shared.constants import Payload
@@ -72,7 +77,21 @@ PHOTONS_STATS_SCHEMA = "PHOTONS_INSTRUMENT_STATS_V1"
 # backlog rather than block PUBSUB ingress or silently discard valid testimony.
 PHOTONS_INGRESS_QUEUE_MAXSIZE = 0
 PHOTONS_PERSIST_QUEUE_MAXSIZE = 0
+PHOTONS_STATE_RETRY_S = 0.25
 PHOTONS_PERSIST_RETRY_S = 0.25
+
+# SYSTEM owns these platform/context objects.  PHOTONS copies them transitively
+# and does not derive replacement values or reinterpret their scientific meaning.
+SYSTEM_CONTEXT_FIELDS = (
+    "pi",
+    "network",
+    "sensors",
+    "environment",
+    "location",
+    "gnss",
+    "power",
+    "battery",
+)
 
 
 # ---------------------------------------------------------------------
@@ -97,8 +116,10 @@ _rows_persisted = 0
 _fragments_rejected = 0
 _ingress_queue_depth_max = 0
 _persist_queue_depth_max = 0
+_system_report_retry_count = 0
 _persistence_retry_count = 0
 _last_structural_rejection: Optional[Dict[str, Any]] = None
+_last_system_report_failure: Optional[Dict[str, Any]] = None
 _last_persistence_failure: Optional[Dict[str, Any]] = None
 
 
@@ -120,6 +141,21 @@ def _require_int(value: Any, path: str, *, minimum: int = 0) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
         raise ValueError(f"{path} must be an integer >= {minimum}; got {value!r}")
     return int(value)
+
+
+def _fetch_system_report() -> Dict[str, Any]:
+    """Pull the authoritative current platform context from Pi SYSTEM."""
+    response = send_command(
+        machine="PI",
+        subsystem="SYSTEM",
+        command="REPORT",
+        retries=1,
+        retry_delay_s=0.0,
+    )
+    payload = response.get("payload") if isinstance(response, dict) else None
+    if not isinstance(response, dict) or not response.get("success") or not isinstance(payload, dict):
+        raise RuntimeError(f"SYSTEM.REPORT unavailable: {response!r}")
+    return copy.deepcopy(payload)
 
 
 def _validate_photons_fragment(fragment: Payload) -> Tuple[int, int, Optional[int], Dict[str, Any]]:
@@ -277,18 +313,31 @@ def _validate_photons_fragment(fragment: Payload) -> Tuple[int, int, Optional[in
     return sequence, publish_count, (pps_count if pps_count > 0 else None), instrument
 
 
-def _make_photons(fragment: Payload) -> Payload:
-    """Form canonical PHOTONS_V1 from one structurally coherent firmware fragment."""
+def _make_photons(fragment: Payload, system_context: Dict[str, Any]) -> Payload:
+    """Form canonical PHOTONS_V1 from firmware testimony + authoritative SYSTEM context."""
     sequence, publish_count, pps_count, instrument = _validate_photons_fragment(fragment)
-    return {
+    system_context = _require_dict(system_context, "SYSTEM.REPORT.payload")
+
+    state: Payload = {
         "schema": PHOTONS_SCHEMA,
         "source_schema": fragment.get("schema"),
         "sequence": sequence,
         "publish_count": publish_count,
         "pps_count": pps_count,
         "published_at_utc": _utc_now_z(),
-        "photons": copy.deepcopy(instrument),
     }
+
+    # SYSTEM-owned source payloads remain transitive and structurally intact.
+    # Missing optional objects remain explicit empty objects; PHOTONS does not
+    # synthesize replacement environmental, GNSS, power, or platform testimony.
+    for field in SYSTEM_CONTEXT_FIELDS:
+        value = system_context.get(field)
+        state[field] = copy.deepcopy(value) if isinstance(value, dict) else {}
+
+    # Preserve the exact Teensy-owned instrument subtree.  Context enrichment
+    # never reaches inside or re-authors firmware optical science.
+    state["photons"] = copy.deepcopy(instrument)
+    return state
 
 
 def _persist_photons(photons: Payload) -> None:
@@ -378,12 +427,14 @@ def on_photons_fragment(fragment: Payload) -> None:
 
 
 def _state_loop() -> None:
-    """Validate, canonicalize, publish, then hand each row to ordered persistence."""
+    """Attach SYSTEM context, validate, publish, then hand each row to persistence."""
     global _latest_photons
     global _fragments_processed
     global _fragments_rejected
     global _photons_published
+    global _system_report_retry_count
     global _last_structural_rejection
+    global _last_system_report_failure
 
     _state_worker_started.set()
     logging.info("🚀 [photons] canonical PHOTONS_V1 state worker started")
@@ -393,8 +444,30 @@ def _state_loop() -> None:
         with _state_lock:
             _fragments_processed += 1
 
+        system_failure_logged = False
+        while True:
+            try:
+                system_context = _fetch_system_report()
+                break
+            except Exception as exc:
+                failure = {
+                    "failed_at_utc": _utc_now_z(),
+                    "sequence": fragment.get("sequence") if isinstance(fragment, dict) else None,
+                    "reason": str(exc),
+                }
+                with _state_lock:
+                    _system_report_retry_count += 1
+                    _last_system_report_failure = failure
+                if not system_failure_logged:
+                    logging.exception(
+                        "⚠️ [photons] SYSTEM.REPORT unavailable for PHOTONS sequence=%s; retrying",
+                        failure["sequence"],
+                    )
+                    system_failure_logged = True
+                time.sleep(PHOTONS_STATE_RETRY_S)
+
         try:
-            photons = _make_photons(fragment)
+            photons = _make_photons(fragment, system_context)
         except Exception as exc:
             rejection = {
                 "rejected_at_utc": _utc_now_z(),
@@ -486,7 +559,7 @@ SUBSCRIPTIONS = {
 def cmd_report(_: Optional[dict]) -> dict:
     with _state_lock:
         payload = {
-            "schema": "PHOTONS_REPORT_V2",
+            "schema": "PHOTONS_REPORT_V3",
             "fragments_received": _fragments_received,
             "fragments_queued": _fragments_queued,
             "fragments_processed": _fragments_processed,
@@ -497,10 +570,12 @@ def cmd_report(_: Optional[dict]) -> dict:
             "ingress_queue_depth_max": _ingress_queue_depth_max,
             "persist_queue_depth": _persist_queue.qsize(),
             "persist_queue_depth_max": _persist_queue_depth_max,
+            "system_report_retry_count": _system_report_retry_count,
             "persistence_retry_count": _persistence_retry_count,
             "state_worker_started": _state_worker_started.is_set(),
             "persistence_worker_started": _persistence_worker_started.is_set(),
             "last_structural_rejection": copy.deepcopy(_last_structural_rejection),
+            "last_system_report_failure": copy.deepcopy(_last_system_report_failure),
             "last_persistence_failure": copy.deepcopy(_last_persistence_failure),
             "latest_fragment": copy.deepcopy(_latest_fragment),
             "latest_photons": copy.deepcopy(_latest_photons),
@@ -526,8 +601,9 @@ def run() -> None:
     setup_logging()
 
     logging.info(
-        "[photons] starting canonical PHOTONS_V1 service with CLOCKS-shaped "
-        "queued state/persistence workers subscription=%s publication=%s campaign_type=%s",
+        "[photons] starting canonical PHOTONS_V1 service with authoritative SYSTEM context "
+        "and CLOCKS-shaped queued state/persistence workers "
+        "subscription=%s publication=%s campaign_type=%s",
         PHOTONS_FRAGMENT_TOPIC,
         PHOTONS_TOPIC,
         CAMPAIGN_TYPE_PHOTONS,
