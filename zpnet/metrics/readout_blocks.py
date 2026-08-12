@@ -12,13 +12,14 @@ Stats policy:
   CLOCKS statistics are read verbatim from the producer-authored instrument and
   campaign surfaces, including the GNSS reference Welford and Pi-owned DAC
   Welfords.  PHOTONS publishes cumulative accepted-lap Welford/grand-ratio
-  sufficient state.  The live PHOTONS rolling tail retains actual PUBSUB
-  publications in memory and subtracts adjacent snapshots to recover one-second
-  populations for display; PostgreSQL is not in that live-tail path.  Durable
-  campaign/baseline history remains a database read model.  This never synthesizes
-  individual samples, changes admission, or feeds science back into PHOTONS.
-  Missing PHOTONS PPB buckets remain visibly missing; Metrics never estimates
-  rolling windows from repaint history.  Other arithmetic is
+  sufficient state plus producer-authored 10-minute, 60-minute, 8-hour, 24-hour,
+  and TOTAL PPB buckets.  Metrics transcribes those PPB buckets verbatim; it does
+  not estimate rolling windows from repaint history.  The live PHOTONS rolling
+  tail retains actual PUBSUB publications in memory and subtracts adjacent
+  snapshots only to recover one-second accepted-lap populations for display;
+  PostgreSQL is not in that live-tail path.  Durable campaign/baseline history
+  remains a database read model.  This never synthesizes individual samples,
+  changes admission, or feeds science back into PHOTONS.  Other arithmetic is
   deterministic presentation/control math such as DAC conversion/nudging and
   baseline deltas.
 
@@ -1857,12 +1858,23 @@ def _photons_instrument_stats(payload: dict | None) -> dict | None:
     }
 
 
-def _photons_ppb(observed_mean, baseline_mean):
-    observed = _to_float(observed_mean)
-    baseline = _to_float(baseline_mean)
-    if observed is None or baseline is None or baseline == 0.0:
-        return None
-    return ((observed / baseline) - 1.0) * 1_000_000_000.0
+def _photons_producer_ppb_buckets(payload: dict | None) -> dict[str, float | None]:
+    """Return producer-authored PHOTONS PPB values without recomputation."""
+    root = _json_object(payload)
+    instrument = root.get("photons") if isinstance(root.get("photons"), dict) else {}
+    stats = instrument.get("stats") if isinstance(instrument.get("stats"), dict) else {}
+    buckets = stats.get("ppb_buckets") if isinstance(stats.get("ppb_buckets"), dict) else {}
+
+    values: dict[str, float | None] = {}
+    for key in PPB_BUCKET_KEYS:
+        item = buckets.get(key)
+        if isinstance(item, dict):
+            values[key] = _to_float(item.get("ppb"))
+        else:
+            # Transitional tolerance for a scalar producer spelling.  Metrics
+            # never substitutes or computes a missing bucket.
+            values[key] = _to_float(item)
+    return values
 
 
 def _get_lantern_campaign_summaries() -> list[dict]:
@@ -1949,7 +1961,8 @@ def _get_lantern_campaign_summaries() -> list[dict]:
             "baseline_campaign_id": _to_int(row.get("baseline_campaign_id")),
             "baseline_campaign": row.get("baseline_campaign"),
             "stats": stats,
-            # Private presentation helpers used to derive live/rolling campaign
+            "ppb_buckets": _photons_producer_ppb_buckets(last_payload),
+            # Private presentation helpers used to derive live campaign
             # populations. They are never rendered as instrument testimony.
             "_prior_payload": prior_payload,
             "_last_payload": last_payload,
@@ -1968,7 +1981,9 @@ def _get_lantern_campaign_summaries() -> list[dict]:
             if now_mean is not None and base_mean is not None
             else None
         )
-        summary["campaign_ppb"] = _photons_ppb(now_mean, base_mean)
+        # CAMP PPB is intentionally absent until PHOTONS firmware authors a
+        # campaign population against STANDARD_LAP_NS.
+        summary["campaign_ppb"] = None
     return summaries
 
 
@@ -2021,16 +2036,7 @@ def _photons_rolling_rows(live: dict, summaries: list[dict]) -> list[dict]:
             if isinstance(summary, dict)
             else None
         )
-        campaign_to_date = None
-        if isinstance(summary, dict) and summary.get("_prior_payload"):
-            campaign_to_date = _photons_population_delta(
-                summary.get("_prior_payload"), current
-            )
-        campaign_mean = (
-            campaign_to_date.get("mean")
-            if isinstance(campaign_to_date, dict)
-            else None
-        )
+        producer_ppb = _photons_producer_ppb_buckets(current)
 
         rows.append({
             "sequence": sequence,
@@ -2040,13 +2046,13 @@ def _photons_rolling_rows(live: dict, summaries: list[dict]) -> list[dict]:
             "value_ns": second_stats.get("mean"),
             "accepted": accepted_this,
             "excluded": excluded_this,
-            # Rolling PPB buckets do not exist yet. Keep them visibly absent.
-            "ppb_10_min": None,
-            "ppb_60_min": None,
-            "ppb_8_hour": None,
-            "ppb_24_hour": None,
-            "ppb_total": None,
-            "campaign_ppb": _photons_ppb(campaign_mean, baseline_mean),
+            "ppb_10_min": producer_ppb.get("10_min"),
+            "ppb_60_min": producer_ppb.get("60_min"),
+            "ppb_8_hour": producer_ppb.get("8_hour"),
+            "ppb_24_hour": producer_ppb.get("24_hour"),
+            "ppb_total": producer_ppb.get("total"),
+            # CAMP remains missing until the Teensy owns that population.
+            "campaign_ppb": None,
             "residual_ps": (
                 (float(second_stats["mean"]) - float(baseline_mean)) * 1000.0
                 if second_stats.get("mean") is not None and baseline_mean is not None
@@ -2118,7 +2124,8 @@ def photons_detail_readout() -> list[str]:
         else None
     )
     now_mean = current_stats.get("mean") if isinstance(current_stats, dict) else None
-    campaign_ppb = _photons_ppb(now_mean, baseline_mean)
+    current_ppb = _photons_producer_ppb_buckets(live)
+    campaign_ppb = None
 
     try:
         rolling = _photons_rolling_rows(live, summaries)
@@ -2165,7 +2172,7 @@ def photons_detail_readout() -> list[str]:
         lines.append(
             f"{'LAP':<{W_NAME}}"
             f"{_fmt(now_mean, f'>{W_VALUE}.3f', W_VALUE)}{G}"
-            f"{G.join(_fmt(None, f'>{W_PPB}.3f', W_PPB) for _ in range(5))}{G}"
+            f"{G.join(_fmt(current_ppb.get(key), f'>{W_PPB}.3f', W_PPB) for key in PPB_BUCKET_KEYS)}{G}"
             f"{_fmt(campaign_ppb, f'>{W_PPB}.3f', W_PPB)}{G}"
             f"{_fmt(latest_residual, f'>+{W_RES}.3f', W_RES)}{G}"
             f"{_fmt(current_stats.get('mean'), f'>{W_MEAN}.3f', W_MEAN)}{G}"
@@ -2297,7 +2304,10 @@ def photons_campaigns_readout() -> list[str]:
             name += " [INT]"
         campaign_cell = _campaign_cell(name, bool(row.get("active")), W_CAMPAIGN)
         stats = row.get("stats") if isinstance(row.get("stats"), dict) else {}
-        ppb_values = (None, None, None, None, None, row.get("campaign_ppb"))
+        producer_ppb = row.get("ppb_buckets") if isinstance(row.get("ppb_buckets"), dict) else {}
+        ppb_values = tuple(producer_ppb.get(key) for key in PPB_BUCKET_KEYS) + (
+            row.get("campaign_ppb"),
+        )
         baseline_name = str(row.get("baseline_campaign") or "---")
         if len(baseline_name) > W_BASELINE:
             baseline_name = baseline_name[:W_BASELINE - 1] + "~"

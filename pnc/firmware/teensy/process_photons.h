@@ -248,15 +248,46 @@ struct photons_lap_science_snapshot_t {
 };
 
 
+// One PHOTONS PPB population.  sample_count is accepted projected laps, not
+// elapsed seconds.  A zero sample_count means that bucket is scientifically
+// unavailable and must not be presented as a zero-PPB observation.
+struct photons_fragment_ppb_value_snapshot_t {
+  uint64_t sample_count = 0;
+  double ppb = 0.0;
+};
+
+
+// Instrument-owned PPB populations.  LANTERN campaign-relative PPB is
+// intentionally absent; campaigns remain a separate interpretation layer.
+struct photons_fragment_ppb_buckets_snapshot_t {
+  photons_fragment_ppb_value_snapshot_t minute_10{};
+  photons_fragment_ppb_value_snapshot_t minute_60{};
+  photons_fragment_ppb_value_snapshot_t hour_8{};
+  photons_fragment_ppb_value_snapshot_t hour_24{};
+  photons_fragment_ppb_value_snapshot_t total{};
+};
+
+
 // Always-on optical statistics.  lap_count + total_lap_gnss_ns is the
 // authoritative grand ratio for mean lap time.  Welford independently carries
-// variance and doubles as a consistency witness for that ratio.
+// variance and doubles as a consistency witness for that ratio.  update_count
+// is the boot-local logical chronology used by Better-Buckets and, later,
+// durable replay.
 struct photons_fragment_stats_snapshot_t {
   bool valid = false;
+  uint32_t update_count = 0;
+  uint64_t standard_lap_ps = 0;
   uint64_t lap_count = 0;
   uint64_t total_lap_gnss_ns = 0;
   double mean_lap_ns = 0.0;
   photons_fragment_welford_snapshot_t lap_time_welford{};
+  photons_fragment_ppb_buckets_snapshot_t ppb_buckets{};
+
+  // Recovery-only Better-Buckets witnesses.  update_count is the logical
+  // rolling chronology; current_sequence identifies the latest lawful endpoint.
+  uint32_t rolling_ppb_current_sequence = 0;
+  bool rolling_ppb_endpoint_admitted = false;
+  bool rolling_ppb_interval_advanced = false;
 };
 
 

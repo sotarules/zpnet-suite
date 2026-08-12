@@ -56,6 +56,18 @@ static constexpr uint64_t PHOTONS_PROJECTION_MAX_AGE_NS = 3000000000ULL;
 static constexpr uint32_t PHOTONS_SCIENCE_GATE_DIVISOR = 10U;
 static constexpr uint32_t PHOTONS_SCIENCE_GATE_MIN_CYCLES = 64U;
 
+// CLOCKS-shaped Better-Buckets geometry.  Keep exact one-second endpoints for
+// the trailing ten minutes and first-admitted-per-minute endpoints for the
+// longer windows.  Every bucket still evaluates against the live current-second
+// endpoint, so only the historical edge is minute-granular.
+static constexpr uint32_t PHOTONS_PPB_MINUTE_10_SECONDS = 10U * 60U;
+static constexpr uint32_t PHOTONS_PPB_MINUTE_60_SECONDS = 60U * 60U;
+static constexpr uint32_t PHOTONS_PPB_HOUR_8_SECONDS = 8U * 60U * 60U;
+static constexpr uint32_t PHOTONS_PPB_HOUR_24_SECONDS = 24U * 60U * 60U;
+static constexpr uint32_t PHOTONS_PPB_SECOND_CAPACITY =
+    PHOTONS_PPB_MINUTE_10_SECONDS + 1U;
+static constexpr uint32_t PHOTONS_PPB_MINUTE_CAPACITY = 24U * 60U + 2U;
+
 
 // ============================================================================
 // Optical device control / telemetry
@@ -258,6 +270,22 @@ struct photons_welford_state_t {
 };
 
 
+// One cumulative accepted-population endpoint.  Differences between two
+// endpoints are exact sufficient statistics for a PHOTONS PPB population; no
+// one-second means are averaged and no raw laps need to be retained.
+struct photons_ppb_endpoint_t {
+  uint32_t sequence = 0U;
+  uint64_t lap_count = 0ULL;
+  uint64_t total_lap_gnss_ns = 0ULL;
+};
+
+static_assert(
+    sizeof(photons_ppb_endpoint_t) *
+            (PHOTONS_PPB_SECOND_CAPACITY + PHOTONS_PPB_MINUTE_CAPACITY) <=
+        64U * 1024U,
+    "PHOTONS Better-Buckets history exceeds 64 KiB RAM2 budget");
+
+
 struct photons_lap_science_candidate_t {
   bool valid = false;
   uint64_t candidate_index = 0ULL;
@@ -288,6 +316,27 @@ static photons_welford_state_t g_accepted_raw_cycles_welford{};
 static photons_welford_state_t g_excluded_raw_cycles_welford{};
 static photons_welford_state_t g_excluded_lap_time_welford{};
 static uint64_t g_total_lap_gnss_ns = 0ULL;
+
+// Required metrological authority installed by SET_STANDARD_LAP_NS before the
+// fragment/statistics clock begins.
+static bool g_standard_lap_configured = false;
+static uint64_t g_standard_lap_ps = 0ULL;
+
+static photons_ppb_endpoint_t
+    g_photons_ppb_seconds[PHOTONS_PPB_SECOND_CAPACITY] DMAMEM = {};
+static photons_ppb_endpoint_t
+    g_photons_ppb_minutes[PHOTONS_PPB_MINUTE_CAPACITY] DMAMEM = {};
+static uint32_t g_photons_ppb_seconds_head = 0U;
+static uint32_t g_photons_ppb_seconds_count = 0U;
+static uint32_t g_photons_ppb_minutes_head = 0U;
+static uint32_t g_photons_ppb_minutes_count = 0U;
+static uint32_t g_photons_ppb_last_minute_key = 0U;
+static bool g_photons_ppb_previous_endpoint_valid = false;
+static photons_ppb_endpoint_t g_photons_ppb_previous_endpoint{};
+static uint32_t g_photons_stats_update_count = 0U;
+static uint32_t g_photons_ppb_current_sequence = 0U;
+static bool g_photons_ppb_endpoint_admitted = false;
+static bool g_photons_ppb_interval_advanced = false;
 
 static bool g_previous_fragment_mean_cycles_valid = false;
 static double g_previous_fragment_mean_cycles = 0.0;
@@ -335,6 +384,260 @@ static photons_fragment_welford_snapshot_t photons_welford_snapshot(
   out.stderr_value = photons_welford_stderr(w);
   out.min = (w.n != 0ULL) ? w.min_val : 0.0;
   out.max = (w.n != 0ULL) ? w.max_val : 0.0;
+  return out;
+}
+
+
+template <size_t N>
+static void photons_ppb_ring_append(photons_ppb_endpoint_t (&ring)[N],
+                                    uint32_t& head,
+                                    uint32_t& count,
+                                    const photons_ppb_endpoint_t& endpoint) {
+  static_assert(N > 0U, "PHOTONS PPB ring must not be empty");
+  if (count < (uint32_t)N) {
+    const uint32_t index = (head + count) % (uint32_t)N;
+    ring[index] = endpoint;
+    count++;
+    return;
+  }
+
+  ring[head] = endpoint;
+  head = (head + 1U) % (uint32_t)N;
+}
+
+
+template <size_t N>
+static bool photons_ppb_ring_find_anchor(
+    const photons_ppb_endpoint_t (&ring)[N],
+    uint32_t head,
+    uint32_t count,
+    uint32_t target_sequence,
+    uint32_t current_sequence,
+    photons_ppb_endpoint_t& out) {
+  if (count > (uint32_t)N) __builtin_trap();
+
+  for (uint32_t offset = 0U; offset < count; offset++) {
+    const photons_ppb_endpoint_t& candidate =
+        ring[(head + offset) % (uint32_t)N];
+    if (candidate.sequence >= target_sequence &&
+        candidate.sequence < current_sequence) {
+      out = candidate;
+      return true;
+    }
+  }
+  return false;
+}
+
+
+static uint32_t photons_ppb_minute_key(uint32_t sequence) {
+  return sequence == 0U ? 0U : ((sequence - 1U) / 60U) + 1U;
+}
+
+
+static void photons_ppb_windows_clear_history(void) {
+  g_photons_ppb_seconds_head = 0U;
+  g_photons_ppb_seconds_count = 0U;
+  g_photons_ppb_minutes_head = 0U;
+  g_photons_ppb_minutes_count = 0U;
+  g_photons_ppb_last_minute_key = 0U;
+  g_photons_ppb_previous_endpoint_valid = false;
+  g_photons_ppb_previous_endpoint = photons_ppb_endpoint_t{};
+  g_photons_ppb_current_sequence = 0U;
+  g_photons_ppb_endpoint_admitted = false;
+  g_photons_ppb_interval_advanced = false;
+}
+
+
+static void photons_ppb_windows_seed_origin(void) {
+  photons_ppb_windows_clear_history();
+
+  const photons_ppb_endpoint_t origin{};
+  photons_ppb_ring_append(
+      g_photons_ppb_seconds,
+      g_photons_ppb_seconds_head,
+      g_photons_ppb_seconds_count,
+      origin);
+  photons_ppb_ring_append(
+      g_photons_ppb_minutes,
+      g_photons_ppb_minutes_head,
+      g_photons_ppb_minutes_count,
+      origin);
+  g_photons_ppb_previous_endpoint = origin;
+  g_photons_ppb_previous_endpoint_valid = true;
+}
+
+
+static double photons_ppb_from_population(uint64_t total_lap_gnss_ns,
+                                          uint64_t lap_count) {
+  if (!g_standard_lap_configured || g_standard_lap_ps == 0ULL ||
+      lap_count == 0ULL || total_lap_gnss_ns == 0ULL) {
+    __builtin_trap();
+  }
+
+  // Divide first so TOTAL remains numerically well behaved after years of
+  // accumulation.  The quotient/remainder form avoids multiplying the lifetime
+  // nanosecond numerator by 1000 in uint64_t.
+  const uint64_t whole_ns = total_lap_gnss_ns / lap_count;
+  const uint64_t remainder_ns = total_lap_gnss_ns % lap_count;
+  const double observed_mean_ps =
+      (double)whole_ns * 1000.0 +
+      ((double)remainder_ns * 1000.0) / (double)lap_count;
+  return (observed_mean_ps / (double)g_standard_lap_ps - 1.0) * 1.0e9;
+}
+
+
+static photons_fragment_ppb_value_snapshot_t photons_ppb_bucket_between(
+    const photons_ppb_endpoint_t& anchor,
+    const photons_ppb_endpoint_t& current) {
+  if (current.sequence <= anchor.sequence ||
+      current.lap_count < anchor.lap_count ||
+      current.total_lap_gnss_ns < anchor.total_lap_gnss_ns) {
+    __builtin_trap();
+  }
+
+  const uint64_t lap_count = current.lap_count - anchor.lap_count;
+  const uint64_t total_ns =
+      current.total_lap_gnss_ns - anchor.total_lap_gnss_ns;
+  if (lap_count == 0ULL) {
+    if (total_ns != 0ULL) __builtin_trap();
+    return photons_fragment_ppb_value_snapshot_t{};
+  }
+  if (total_ns == 0ULL) __builtin_trap();
+
+  photons_fragment_ppb_value_snapshot_t out{};
+  out.sample_count = lap_count;
+  out.ppb = photons_ppb_from_population(total_ns, lap_count);
+  return out;
+}
+
+
+static void photons_ppb_windows_note_endpoint(uint32_t sequence,
+                                              bool admitted,
+                                              uint64_t lap_count,
+                                              uint64_t total_lap_gnss_ns) {
+  g_photons_ppb_endpoint_admitted = admitted;
+  g_photons_ppb_interval_advanced = false;
+
+  if (!admitted) {
+    // Loss of instrument custody is a hard rolling-history boundary.  Do not
+    // retain an older anchor that a future implementation could bridge across.
+    photons_ppb_windows_clear_history();
+    return;
+  }
+  if (sequence == 0U) __builtin_trap();
+
+  photons_ppb_endpoint_t endpoint{};
+  endpoint.sequence = sequence;
+  endpoint.lap_count = lap_count;
+  endpoint.total_lap_gnss_ns = total_lap_gnss_ns;
+
+  if (g_photons_ppb_previous_endpoint_valid) {
+    const photons_ppb_endpoint_t& previous = g_photons_ppb_previous_endpoint;
+    if (endpoint.sequence != previous.sequence + 1U ||
+        endpoint.lap_count < previous.lap_count ||
+        endpoint.total_lap_gnss_ns < previous.total_lap_gnss_ns) {
+      __builtin_trap();
+    }
+
+    const uint64_t delta_laps = endpoint.lap_count - previous.lap_count;
+    const uint64_t delta_ns =
+        endpoint.total_lap_gnss_ns - previous.total_lap_gnss_ns;
+    if (delta_laps == 0ULL) {
+      if (delta_ns != 0ULL) __builtin_trap();
+    } else {
+      if (delta_ns == 0ULL) __builtin_trap();
+      g_photons_ppb_interval_advanced = true;
+    }
+  }
+
+  photons_ppb_ring_append(
+      g_photons_ppb_seconds,
+      g_photons_ppb_seconds_head,
+      g_photons_ppb_seconds_count,
+      endpoint);
+
+  const uint32_t minute_key = photons_ppb_minute_key(sequence);
+  if (minute_key != g_photons_ppb_last_minute_key) {
+    photons_ppb_ring_append(
+        g_photons_ppb_minutes,
+        g_photons_ppb_minutes_head,
+        g_photons_ppb_minutes_count,
+        endpoint);
+    g_photons_ppb_last_minute_key = minute_key;
+  }
+
+  g_photons_ppb_previous_endpoint = endpoint;
+  g_photons_ppb_previous_endpoint_valid = true;
+  g_photons_ppb_current_sequence = sequence;
+}
+
+
+template <size_t N>
+static photons_fragment_ppb_value_snapshot_t photons_ppb_window_snapshot(
+    const photons_ppb_endpoint_t (&ring)[N],
+    uint32_t head,
+    uint32_t count,
+    uint32_t window_seconds,
+    const photons_ppb_endpoint_t& current) {
+  const uint32_t target_sequence =
+      current.sequence > window_seconds
+          ? current.sequence - window_seconds
+          : 0U;
+  photons_ppb_endpoint_t anchor{};
+  if (!photons_ppb_ring_find_anchor(
+          ring, head, count, target_sequence, current.sequence, anchor)) {
+    return photons_fragment_ppb_value_snapshot_t{};
+  }
+  return photons_ppb_bucket_between(anchor, current);
+}
+
+
+static photons_fragment_ppb_buckets_snapshot_t photons_ppb_buckets_snapshot(void) {
+  photons_fragment_ppb_buckets_snapshot_t out{};
+  if (!g_photons_ppb_endpoint_admitted ||
+      !g_photons_ppb_previous_endpoint_valid) {
+    return out;
+  }
+
+  const photons_ppb_endpoint_t current = g_photons_ppb_previous_endpoint;
+  if (current.sequence != g_photons_stats_update_count ||
+      current.lap_count != g_lap_time_welford.n ||
+      current.total_lap_gnss_ns != g_total_lap_gnss_ns) {
+    __builtin_trap();
+  }
+
+  out.minute_10 = photons_ppb_window_snapshot(
+      g_photons_ppb_seconds,
+      g_photons_ppb_seconds_head,
+      g_photons_ppb_seconds_count,
+      PHOTONS_PPB_MINUTE_10_SECONDS,
+      current);
+  out.minute_60 = photons_ppb_window_snapshot(
+      g_photons_ppb_minutes,
+      g_photons_ppb_minutes_head,
+      g_photons_ppb_minutes_count,
+      PHOTONS_PPB_MINUTE_60_SECONDS,
+      current);
+  out.hour_8 = photons_ppb_window_snapshot(
+      g_photons_ppb_minutes,
+      g_photons_ppb_minutes_head,
+      g_photons_ppb_minutes_count,
+      PHOTONS_PPB_HOUR_8_SECONDS,
+      current);
+  out.hour_24 = photons_ppb_window_snapshot(
+      g_photons_ppb_minutes,
+      g_photons_ppb_minutes_head,
+      g_photons_ppb_minutes_count,
+      PHOTONS_PPB_HOUR_24_SECONDS,
+      current);
+
+  if (current.lap_count != 0ULL) {
+    out.total.sample_count = current.lap_count;
+    out.total.ppb = photons_ppb_from_population(
+        current.total_lap_gnss_ns, current.lap_count);
+  } else if (current.total_lap_gnss_ns != 0ULL) {
+    __builtin_trap();
+  }
   return out;
 }
 
@@ -1162,12 +1465,6 @@ static uint32_t g_publish_count = 0;
 static uint32_t g_publish_reject_count = 0;
 static uint32_t g_last_published_edge_count = 0;
 
-// PHOTONS PPB interpretation is undefined until the Pi installs the required
-// metrological standard from config.PHOTONS.  Store the authority exactly as
-// integer picoseconds; 0.001 ns is one picosecond.
-static bool g_standard_lap_configured = false;
-static uint64_t g_standard_lap_ps = 0ULL;
-
 static bool g_initialized = false;
 static bool g_subscription_ok = false;
 static bool g_interrupt_started = false;
@@ -1377,6 +1674,8 @@ static Payload g_photons_fragment_science_excluded DMAMEM;
 static Payload g_photons_fragment_science_reasons DMAMEM;
 static Payload g_photons_fragment_stats DMAMEM;
 static Payload g_photons_fragment_welford DMAMEM;
+static Payload g_photons_fragment_ppb_buckets DMAMEM;
+static Payload g_photons_fragment_ppb_value DMAMEM;
 static Payload g_photons_fragment_baseline DMAMEM;
 static Payload g_photons_fragment_interrupt DMAMEM;
 
@@ -1399,6 +1698,21 @@ static void photons_payload_add_welford(
 }
 
 
+static void photons_payload_add_ppb_value(
+    Payload& parent,
+    const char* name,
+    const photons_fragment_ppb_value_snapshot_t& value) {
+  if (value.sample_count == 0ULL) return;
+
+  Payload& obj = g_photons_fragment_ppb_value;
+  obj.clear();
+  obj.add("sample_count", value.sample_count);
+  obj.add("ppb", toFixedDecimal(value.ppb, 6));
+  parent.add_object(name, obj);
+  obj.clear();
+}
+
+
 static Payload& photons_fragment_payload(
     const photons_fragment_snapshot_t& f) {
   Payload& root = g_photons_fragment_root;
@@ -1410,6 +1724,7 @@ static Payload& photons_fragment_payload(
   Payload& excluded = g_photons_fragment_science_excluded;
   Payload& reasons = g_photons_fragment_science_reasons;
   Payload& stats = g_photons_fragment_stats;
+  Payload& ppb_buckets = g_photons_fragment_ppb_buckets;
   Payload& baseline = g_photons_fragment_baseline;
   Payload& interrupt = g_photons_fragment_interrupt;
 
@@ -1422,6 +1737,7 @@ static Payload& photons_fragment_payload(
   excluded.clear();
   reasons.clear();
   stats.clear();
+  ppb_buckets.clear();
   baseline.clear();
   interrupt.clear();
 
@@ -1586,11 +1902,36 @@ static Payload& photons_fragment_payload(
 
   stats.add("schema", "PHOTONS_INSTRUMENT_STATS_V1");
   stats.add("valid", f.stats.valid);
+  stats.add("update_count", f.stats.update_count);
+  stats.add("standard_lap_ps", f.stats.standard_lap_ps);
+  stats.add("standard_lap_ns",
+            toFixedDecimal((double)f.stats.standard_lap_ps / 1000.0, 3));
   stats.add("lap_count", f.stats.lap_count);
   stats.add("total_lap_gnss_ns", f.stats.total_lap_gnss_ns);
   stats.add("mean_lap_ns", toFixedDecimal(f.stats.mean_lap_ns, 6));
   photons_payload_add_welford(
       stats, "lap_time", f.stats.lap_time_welford);
+
+  photons_payload_add_ppb_value(
+      ppb_buckets, "10_min", f.stats.ppb_buckets.minute_10);
+  photons_payload_add_ppb_value(
+      ppb_buckets, "60_min", f.stats.ppb_buckets.minute_60);
+  photons_payload_add_ppb_value(
+      ppb_buckets, "8_hour", f.stats.ppb_buckets.hour_8);
+  photons_payload_add_ppb_value(
+      ppb_buckets, "24_hour", f.stats.ppb_buckets.hour_24);
+  photons_payload_add_ppb_value(
+      ppb_buckets, "total", f.stats.ppb_buckets.total);
+  stats.add_object("ppb_buckets", ppb_buckets);
+  ppb_buckets.clear();
+
+  stats.add("rolling_ppb_current_sequence",
+            f.stats.rolling_ppb_current_sequence);
+  stats.add("rolling_ppb_endpoint_admitted",
+            f.stats.rolling_ppb_endpoint_admitted);
+  stats.add("rolling_ppb_interval_advanced",
+            f.stats.rolling_ppb_interval_advanced);
+
   instrument.add_object("stats", stats);
   stats.clear();
 
@@ -1681,6 +2022,8 @@ static void photons_fragment_tick(
   fragment.projection = g_projection_state;
   fragment.science = g_photons_lap_science_state;
 
+  fragment.stats.update_count = ++g_photons_stats_update_count;
+  fragment.stats.standard_lap_ps = g_standard_lap_ps;
   fragment.stats.lap_count = g_lap_time_welford.n;
   fragment.stats.total_lap_gnss_ns = g_total_lap_gnss_ns;
   fragment.stats.mean_lap_ns =
@@ -1693,6 +2036,27 @@ static void photons_fragment_tick(
   fragment.stats.valid =
       g_lap_time_welford.n != 0ULL &&
       !g_raw_lap_ring_data_loss;
+
+  // A lawful one-second cumulative endpoint may contain zero accepted laps.
+  // Ordinary SCIENCE_EXCLUDE observations therefore do not break rolling
+  // ancestry.  Actual custody loss does: raw-ring overflow or a missing/inactive
+  // PHOTODIODE callback clears the rolling history rather than bridging it.
+  const bool ppb_endpoint_admitted =
+      !g_raw_lap_ring_data_loss &&
+      interrupt_diag.callback_missing_count == 0U &&
+      interrupt_diag.inactive_edge_count == 0U;
+  photons_ppb_windows_note_endpoint(
+      fragment.stats.update_count,
+      ppb_endpoint_admitted,
+      fragment.stats.lap_count,
+      fragment.stats.total_lap_gnss_ns);
+  fragment.stats.ppb_buckets = photons_ppb_buckets_snapshot();
+  fragment.stats.rolling_ppb_current_sequence =
+      g_photons_ppb_current_sequence;
+  fragment.stats.rolling_ppb_endpoint_admitted =
+      g_photons_ppb_endpoint_admitted;
+  fragment.stats.rolling_ppb_interval_advanced =
+      g_photons_ppb_interval_advanced;
 
   // Baseline control/provenance is deliberately deferred.  False validity is
   // part of the canonical schema rather than a fabricated zero baseline.
@@ -1783,6 +2147,8 @@ void process_photons_init(void) {
   photons_welford_reset(g_excluded_raw_cycles_welford);
   photons_welford_reset(g_excluded_lap_time_welford);
   g_total_lap_gnss_ns = 0ULL;
+  g_photons_stats_update_count = 0U;
+  photons_ppb_windows_clear_history();
   g_previous_fragment_mean_cycles_valid = false;
   g_previous_fragment_mean_cycles = 0.0;
 
@@ -1874,6 +2240,11 @@ static Payload cmd_set_standard_lap_ns(const Payload& args) {
     }
   } else {
     g_standard_lap_ps = requested_ps;
+
+    // Configuration is the clean PHOTONS statistics origin.  The exact zero
+    // endpoint makes the first published second part of young rolling windows
+    // without inventing a pre-configuration population.
+    photons_ppb_windows_seed_origin();
 
     g_fragment_timer = timepop_arm(
         PHOTONS_FRAGMENT_PERIOD_NS,
@@ -2097,6 +2468,46 @@ static Payload cmd_report(const Payload& /*args*/) {
         toFixedDecimal(canonical.stats.lap_time_welford.min, 6));
   p.add("stats_lap_welford_max",
         toFixedDecimal(canonical.stats.lap_time_welford.max, 6));
+  p.add("stats_update_count", canonical.stats.update_count);
+  p.add("stats_rolling_ppb_current_sequence",
+        canonical.stats.rolling_ppb_current_sequence);
+  p.add("stats_rolling_ppb_endpoint_admitted",
+        canonical.stats.rolling_ppb_endpoint_admitted);
+  p.add("stats_rolling_ppb_interval_advanced",
+        canonical.stats.rolling_ppb_interval_advanced);
+  p.add("stats_ppb_second_history_count", g_photons_ppb_seconds_count);
+  p.add("stats_ppb_minute_history_count", g_photons_ppb_minutes_count);
+
+  p.add("stats_ppb_10_min_n",
+        canonical.stats.ppb_buckets.minute_10.sample_count);
+  if (canonical.stats.ppb_buckets.minute_10.sample_count != 0ULL) {
+    p.add("stats_ppb_10_min",
+          toFixedDecimal(canonical.stats.ppb_buckets.minute_10.ppb, 6));
+  }
+  p.add("stats_ppb_60_min_n",
+        canonical.stats.ppb_buckets.minute_60.sample_count);
+  if (canonical.stats.ppb_buckets.minute_60.sample_count != 0ULL) {
+    p.add("stats_ppb_60_min",
+          toFixedDecimal(canonical.stats.ppb_buckets.minute_60.ppb, 6));
+  }
+  p.add("stats_ppb_8_hour_n",
+        canonical.stats.ppb_buckets.hour_8.sample_count);
+  if (canonical.stats.ppb_buckets.hour_8.sample_count != 0ULL) {
+    p.add("stats_ppb_8_hour",
+          toFixedDecimal(canonical.stats.ppb_buckets.hour_8.ppb, 6));
+  }
+  p.add("stats_ppb_24_hour_n",
+        canonical.stats.ppb_buckets.hour_24.sample_count);
+  if (canonical.stats.ppb_buckets.hour_24.sample_count != 0ULL) {
+    p.add("stats_ppb_24_hour",
+          toFixedDecimal(canonical.stats.ppb_buckets.hour_24.ppb, 6));
+  }
+  p.add("stats_ppb_total_n",
+        canonical.stats.ppb_buckets.total.sample_count);
+  if (canonical.stats.ppb_buckets.total.sample_count != 0ULL) {
+    p.add("stats_ppb_total",
+          toFixedDecimal(canonical.stats.ppb_buckets.total.ppb, 6));
+  }
   p.add("baseline_present", canonical.baseline.present);
   p.add("baseline_residual_valid",
         canonical.baseline.residual_valid);
