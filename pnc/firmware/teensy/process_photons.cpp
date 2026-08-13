@@ -2811,7 +2811,7 @@ static void photons_start_publication(void) {
 // Initialization
 // ============================================================================
 
-void process_photons_init(void) {
+FLASHMEM void process_photons_init(void) {
   if (g_initialized) return;
 
   g_photons_live = photons_live_state_t{};
@@ -2938,7 +2938,7 @@ static bool photons_parse_standard_lap_ns(const char* text,
 }
 
 
-static Payload cmd_set_standard_lap_ns(const Payload& args) {
+static FLASHMEM Payload cmd_set_standard_lap_ns(const Payload& args) {
   const char* text = args.getString("standard_lap_ns");
   uint64_t requested_ps = 0ULL;
   if (!photons_parse_standard_lap_ns(text, requested_ps)) {
@@ -3060,7 +3060,7 @@ static Payload photons_recovery_reject(const char* status,
 }
 
 
-static Payload cmd_recovery_begin(const Payload& args) {
+static FLASHMEM Payload cmd_recovery_begin(const Payload& args) {
   if (!g_standard_lap_configured || g_standard_lap_ps == 0ULL) {
     return photons_recovery_reject(
         "recovery_begin_rejected_standard_missing",
@@ -3139,7 +3139,7 @@ static bool photons_recovery_endpoint_follows(
 }
 
 
-static Payload cmd_recovery_chunk(const Payload& args) {
+static FLASHMEM Payload cmd_recovery_chunk(const Payload& args) {
   photons_recovery_protocol_t& protocol = g_photons_recovery_protocol;
   if (!protocol.active || g_photons_recovery.publication_started) {
     return photons_recovery_reject(
@@ -3184,19 +3184,19 @@ static Payload cmd_recovery_chunk(const Payload& args) {
 
   for (uint32_t i = 0U; i < count; i++) {
     char key[64];
-    snprintf(key, sizeof(key), "e%u_sequence", i);
+    snprintf(key, sizeof(key), "e%u_sequence", (unsigned int)i);
     if (!photons_recovery_get_u32(args, key, endpoints[i].sequence)) {
       return photons_recovery_reject(
           "recovery_chunk_rejected_endpoint",
           "endpoint sequence is missing or malformed");
     }
-    snprintf(key, sizeof(key), "e%u_lap_count", i);
+    snprintf(key, sizeof(key), "e%u_lap_count", (unsigned int)i);
     if (!photons_recovery_get_u64(args, key, endpoints[i].lap_count)) {
       return photons_recovery_reject(
           "recovery_chunk_rejected_endpoint",
           "endpoint lap_count is missing or malformed");
     }
-    snprintf(key, sizeof(key), "e%u_total_lap_gnss_ns", i);
+    snprintf(key, sizeof(key), "e%u_total_lap_gnss_ns", (unsigned int)i);
     if (!photons_recovery_get_u64(
             args, key, endpoints[i].total_lap_gnss_ns)) {
       return photons_recovery_reject(
@@ -3237,7 +3237,7 @@ static Payload cmd_recovery_chunk(const Payload& args) {
 }
 
 
-static Payload cmd_recovery_abort(const Payload& /*args*/) {
+static FLASHMEM Payload cmd_recovery_abort(const Payload& /*args*/) {
   if (g_photons_recovery.publication_started) {
     return photons_recovery_reject(
         "recovery_abort_rejected_live",
@@ -3300,7 +3300,7 @@ static void photons_recovery_install_science_state(
 }
 
 
-static Payload cmd_recovery_commit(const Payload& args) {
+static FLASHMEM Payload cmd_recovery_commit(const Payload& args) {
   photons_recovery_protocol_t& protocol = g_photons_recovery_protocol;
   if (!protocol.active || g_photons_recovery.publication_started) {
     return photons_recovery_reject(
@@ -3553,7 +3553,7 @@ static Payload cmd_recovery_commit(const Payload& args) {
 }
 
 
-static Payload cmd_recovery_cold_start(const Payload& args) {
+static FLASHMEM Payload cmd_recovery_cold_start(const Payload& args) {
   if (!g_standard_lap_configured || g_standard_lap_ps == 0ULL) {
     return photons_recovery_reject(
         "recovery_cold_start_rejected_standard_missing",
@@ -3611,7 +3611,7 @@ static Payload cmd_recovery_cold_start(const Payload& args) {
 }
 
 
-static Payload cmd_recovery_proof_ack(const Payload& args) {
+static FLASHMEM Payload cmd_recovery_proof_ack(const Payload& args) {
   uint32_t generation = 0U;
   uint32_t sequence = 0U;
   uint32_t update_count = 0U;
@@ -3656,7 +3656,7 @@ static Payload cmd_recovery_proof_ack(const Payload& args) {
 }
 
 
-static Payload cmd_report_recovery(const Payload& /*args*/) {
+static FLASHMEM Payload cmd_report_recovery(const Payload& /*args*/) {
   Payload p;
   p.add("report", "PHOTONS_RECOVERY");
   p.add("schema", "PHOTONS_RECOVERY_REPORT_V1");
@@ -3725,7 +3725,7 @@ static Payload cmd_report_recovery(const Payload& /*args*/) {
 }
 
 
-static Payload cmd_flash_cut(const Payload& args) {
+static FLASHMEM Payload cmd_flash_cut(const Payload& args) {
   if (!g_photons_recovery.publication_started ||
       g_photons_recovery.proof_pending) {
     return photons_recovery_reject(
@@ -3780,7 +3780,7 @@ static Payload cmd_flash_cut(const Payload& args) {
 }
 
 
-static Payload cmd_start(const Payload& args) {
+static FLASHMEM Payload cmd_start(const Payload& args) {
   if (!g_photons_recovery.publication_started ||
       g_photons_recovery.proof_pending) {
     return photons_recovery_reject(
@@ -3823,7 +3823,7 @@ static Payload cmd_start(const Payload& args) {
 }
 
 
-static Payload cmd_stop(const Payload& /*args*/) {
+static FLASHMEM Payload cmd_stop(const Payload& /*args*/) {
   if (!g_photons_recovery.publication_started ||
       g_photons_recovery.proof_pending) {
     return photons_recovery_reject(
@@ -3883,7 +3883,7 @@ static void photons_payload_add_flat_ppb_bucket(
 }
 
 
-static Payload cmd_report_photons(const Payload& /*args*/) {
+static FLASHMEM Payload cmd_report_photons(const Payload& /*args*/) {
   photons_fragment_snapshot_t canonical{};
   (void)photons_fragment_snapshot(&canonical);
 
@@ -3940,7 +3940,7 @@ static Payload cmd_report_photons(const Payload& /*args*/) {
 }
 
 
-static Payload cmd_report_stats(const Payload& /*args*/) {
+static FLASHMEM Payload cmd_report_stats(const Payload& /*args*/) {
   photons_fragment_snapshot_t canonical{};
   (void)photons_fragment_snapshot(&canonical);
 
@@ -4016,7 +4016,7 @@ static Payload cmd_report_stats(const Payload& /*args*/) {
 }
 
 
-static Payload cmd_stats_reset(const Payload& /*args*/) {
+static FLASHMEM Payload cmd_stats_reset(const Payload& /*args*/) {
   if (!g_photons_recovery.publication_started ||
       g_photons_recovery.proof_pending) {
     return photons_recovery_reject(
@@ -4047,7 +4047,7 @@ static Payload cmd_stats_reset(const Payload& /*args*/) {
 }
 
 
-static Payload cmd_inject_problem(const Payload& args) {
+static FLASHMEM Payload cmd_inject_problem(const Payload& args) {
   if (!g_photons_recovery.publication_started ||
       g_photons_recovery.proof_pending) {
     return photons_recovery_reject(
@@ -4105,7 +4105,7 @@ static Payload cmd_inject_problem(const Payload& args) {
 }
 
 
-static Payload cmd_report(const Payload& /*args*/) {
+static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
   photons_toy_capture_t capture{};
   (void)photons_toy_capture_snapshot(&capture);
 
@@ -4567,13 +4567,13 @@ static Payload cmd_report(const Payload& /*args*/) {
   return p;
 }
 
-static Payload cmd_init(const Payload& /*args*/) {
+static FLASHMEM Payload cmd_init(const Payload& /*args*/) {
   photons_laser_initialize_hardware();
   photons_emit_laser_initialization_event();
   return ok_payload();
 }
 
-static Payload cmd_on(const Payload& /*args*/) {
+static FLASHMEM Payload cmd_on(const Payload& /*args*/) {
   digitalWrite(LD_ON_PIN, HIGH);
 
   Payload ev;
@@ -4583,7 +4583,7 @@ static Payload cmd_on(const Payload& /*args*/) {
   return ok_payload();
 }
 
-static Payload cmd_off(const Payload& /*args*/) {
+static FLASHMEM Payload cmd_off(const Payload& /*args*/) {
   photons_laser_inhibit();
 
   Payload ev;
@@ -4626,6 +4626,6 @@ static const process_vtable_t PHOTONS_PROCESS = {
   .subscriptions = nullptr,
 };
 
-void process_photons_register(void) {
+FLASHMEM void process_photons_register(void) {
   process_register("PHOTONS", &PHOTONS_PROCESS);
 }
