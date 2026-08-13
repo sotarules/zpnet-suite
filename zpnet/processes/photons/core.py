@@ -719,6 +719,10 @@ def _validate_photons_fragment(fragment: Payload) -> Tuple[int, int, Optional[in
             "photons.recovery.source_sequence",
             minimum=1,
         )
+        source_reset = _require_int(
+            recovery.get("source_reset_count"),
+            "photons.recovery.source_reset_count",
+        )
         source_update = _require_int(
             recovery.get("source_update_count"),
             "photons.recovery.source_update_count",
@@ -752,22 +756,47 @@ def _validate_photons_fragment(fragment: Payload) -> Tuple[int, int, Optional[in
             recovery.get("custody_lap_delta"),
             "photons.recovery.custody_lap_delta",
         )
-        if sequence <= source_sequence or stats_update_count <= source_update:
+        if sequence <= source_sequence or stats_reset_count < source_reset:
             raise ValueError(
-                "post-restore PHOTONS chronology did not advance beyond source: "
+                "post-restore PHOTONS chronology regressed behind source: "
                 f"generation={generation} sequence={sequence}/{source_sequence} "
-                f"update={stats_update_count}/{source_update}"
+                f"reset={stats_reset_count}/{source_reset}"
             )
+
         if (
-            stats_lap_count < source_laps
-            or stats_total_ns < source_total
-            or custody_lap_count < source_custody_laps
+            custody_lap_count < source_custody_laps
             or custody_total_ns < source_custody_total
-            or accepted_delta != stats_lap_count - source_laps
             or custody_delta != custody_lap_count - source_custody_laps
         ):
-            raise ValueError("PHOTONS recovery source/delta testimony does not close")
-        expected_advanced = accepted_delta > 0 and custody_delta > 0
+            raise ValueError("PHOTONS recovery custody testimony does not close")
+
+        if stats_reset_count == source_reset:
+            if stats_update_count <= source_update:
+                raise ValueError(
+                    "post-restore PHOTONS statistical chronology did not advance "
+                    "within recovered epoch: "
+                    f"generation={generation} reset={stats_reset_count} "
+                    f"update={stats_update_count}/{source_update}"
+                )
+            if (
+                stats_lap_count < source_laps
+                or stats_total_ns < source_total
+                or accepted_delta != stats_lap_count - source_laps
+                or accepted_delta != custody_delta
+            ):
+                raise ValueError(
+                    "PHOTONS same-epoch recovery source/delta testimony does not close"
+                )
+        else:
+            # STATS_RESET starts a new resettable statistical epoch.  The old
+            # recovery-source stats/update coordinates remain provenance only;
+            # monotonic accepted-lap custody is the cross-epoch recovery witness.
+            if accepted_delta != custody_delta:
+                raise ValueError(
+                    "PHOTONS cross-epoch recovery accepted/custody delta mismatch"
+                )
+
+        expected_advanced = custody_delta > 0
         if recovery_advanced != expected_advanced:
             raise ValueError("PHOTONS recovery proof_advanced verdict is inconsistent")
 

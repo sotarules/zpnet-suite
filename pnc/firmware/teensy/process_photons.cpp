@@ -1041,17 +1041,38 @@ static photons_fragment_recovery_snapshot_t photons_recovery_snapshot(void) {
   out.in_flight_train_restored = false;
 
   if (!out.restored) return out;
-  if (g_lap_time_welford.n < out.source_lap_count ||
-      g_total_lap_gnss_ns < out.source_total_lap_gnss_ns ||
+
+  // Recovery-source custody is permanently comparable because custody survives
+  // STATS_RESET.  The resettable instrument N/T is comparable only while the
+  // current statistical epoch is the epoch that was restored.  Once reset_count
+  // advances, the source stats remain historical provenance rather than a floor
+  // for the new epoch.
+  if (g_photons_stats_reset_count < out.source_reset_count ||
       g_photons_custody_lap_count < out.source_custody_lap_count ||
       g_photons_custody_total_lap_gnss_ns <
           out.source_custody_total_lap_gnss_ns) {
     __builtin_trap();
   }
 
-  out.accepted_lap_delta = g_lap_time_welford.n - out.source_lap_count;
   out.custody_lap_delta =
       g_photons_custody_lap_count - out.source_custody_lap_count;
+
+  const bool source_stats_epoch_current =
+      g_photons_stats_reset_count == out.source_reset_count;
+  if (source_stats_epoch_current) {
+    if (g_lap_time_welford.n < out.source_lap_count ||
+        g_total_lap_gnss_ns < out.source_total_lap_gnss_ns) {
+      __builtin_trap();
+    }
+    out.accepted_lap_delta = g_lap_time_welford.n - out.source_lap_count;
+    if (out.accepted_lap_delta != out.custody_lap_delta) __builtin_trap();
+  } else {
+    // Custody increments exactly once for every accepted lap and is not reset.
+    // It therefore remains the truthful accepted-lap delta after a later
+    // statistical reset, without manufacturing a comparison between epochs.
+    out.accepted_lap_delta = out.custody_lap_delta;
+  }
+
   out.proof_advanced =
       out.accepted_lap_delta != 0ULL && out.custody_lap_delta != 0ULL;
   return out;
