@@ -122,7 +122,7 @@ SYSTEM_CONTEXT_FIELDS = (
 
 _state_lock = threading.Lock()
 _campaign_lock = threading.Lock()
-_recovery_lock = threading.Lock()
+_recovery_lock = threading.RLock()
 # Serialize worker publication/persistence with destructive maintenance commands.
 # PHOTONS is only 1 Hz, so this intentionally favors an exact maintenance boundary
 # over parallelism that could let a pre-CLEAR campaign row reappear afterward.
@@ -187,6 +187,30 @@ _recovery_live_reattach_count = 0
 _recovery_cold_start_count = 0
 _recovery_failure_count = 0
 
+OPERATIONAL_STATE_SCHEMA = "PI_SUBSYSTEM_OPERATIONAL_STATE_V1"
+OPERATIONAL_STATE_STARTING = "STARTING"
+OPERATIONAL_STATE_RECOVERING = "RECOVERING"
+OPERATIONAL_STATE_RUNNING = "RUNNING"
+OPERATIONAL_STATE_HARD_FAILURE = "HARD_FAILURE"
+
+_operational_state_lock = threading.Lock()
+_operational_state: Dict[str, Any] = {
+    "schema": OPERATIONAL_STATE_SCHEMA,
+    "subsystem": "PHOTONS",
+    "state": OPERATIONAL_STATE_STARTING,
+    "entered_at_utc": None,
+    "reason": "process_initialization",
+    "source": "RUN",
+    "details": {},
+}
+_hard_failure_event = threading.Event()
+_hard_failure_lock = threading.Lock()
+_hard_failure_entries = 0
+_hard_failure_ingress_dropped = 0
+_hard_failure_state_dropped = 0
+_hard_failure_persistence_dropped = 0
+_last_hard_failure: Optional[Dict[str, Any]] = None
+
 _standard_lap_ns: Optional[str] = None
 _standard_lap_ps: Optional[int] = None
 _teensy_standard_configured = False
@@ -198,6 +222,119 @@ _teensy_standard_configured = False
 
 def _utc_now_z() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _operational_state_snapshot() -> Dict[str, Any]:
+    with _operational_state_lock:
+        return copy.deepcopy(_operational_state)
+
+
+def _hard_failure_active() -> bool:
+    return _hard_failure_event.is_set()
+
+
+def _set_operational_state(
+    state: str,
+    *,
+    reason: Optional[str] = None,
+    source: Optional[str] = None,
+    details: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Publish one process-local PHOTONS lifecycle state; HARD_FAILURE is latched."""
+    global _operational_state
+
+    normalized = str(state or "").strip().upper()
+    if normalized not in {
+        OPERATIONAL_STATE_STARTING,
+        OPERATIONAL_STATE_RECOVERING,
+        OPERATIONAL_STATE_RUNNING,
+        OPERATIONAL_STATE_HARD_FAILURE,
+    }:
+        raise ValueError(f"unsupported PHOTONS operational state {state!r}")
+
+    with _operational_state_lock:
+        if (
+            str(_operational_state.get("state") or "") == OPERATIONAL_STATE_HARD_FAILURE
+            and normalized != OPERATIONAL_STATE_HARD_FAILURE
+        ):
+            return copy.deepcopy(_operational_state)
+        _operational_state = {
+            "schema": OPERATIONAL_STATE_SCHEMA,
+            "subsystem": "PHOTONS",
+            "state": normalized,
+            "entered_at_utc": _utc_now_z(),
+            "reason": str(reason or ""),
+            "source": str(source or ""),
+            "details": copy.deepcopy(details or {}),
+        }
+        return copy.deepcopy(_operational_state)
+
+
+def _enter_hard_failure(
+    reason: str,
+    details: Dict[str, Any],
+    *,
+    source: str,
+) -> Dict[str, Any]:
+    """Latch PHOTONS inert without exiting so systemd cannot erase the failure."""
+    global _hard_failure_entries
+    global _last_hard_failure
+    global _recovery_status
+
+    with _hard_failure_lock:
+        if _hard_failure_active():
+            return _operational_state_snapshot()
+
+        context = {
+            "fragment_queue_depth": _fragment_queue.qsize(),
+            "persist_queue_depth": _persist_queue.qsize(),
+            "state_worker_started": _state_worker_started.is_set(),
+            "persistence_worker_started": _persistence_worker_started.is_set(),
+            "campaign_control_ready": _campaign_control_ready.is_set(),
+            "latest_fragment_sequence": (
+                _latest_fragment.get("sequence")
+                if isinstance(_latest_fragment, dict)
+                else None
+            ),
+            "latest_photons_sequence": (
+                _latest_photons.get("sequence")
+                if isinstance(_latest_photons, dict)
+                else None
+            ),
+        }
+        failure_details = {
+            "failure": copy.deepcopy(details or {}),
+            "context": context,
+            "action": (
+                "PHOTONS is latched in HARD_FAILURE. No new canonical/persistent testimony "
+                "or campaign mutation will occur. Read-only reports remain available."
+            ),
+        }
+
+        _hard_failure_event.set()
+        _campaign_control_ready.clear()
+        _hard_failure_entries += 1
+        snapshot = _set_operational_state(
+            OPERATIONAL_STATE_HARD_FAILURE,
+            reason=reason,
+            source=source,
+            details=failure_details,
+        )
+        _last_hard_failure = copy.deepcopy(snapshot)
+        with _recovery_lock:
+            _recovery_status = {
+                "schema": "PHOTONS_PI_RECOVERY_V1",
+                "enabled": True,
+                "state": OPERATIONAL_STATE_HARD_FAILURE,
+                "updated_at_utc": _utc_now_z(),
+                "error": str(reason),
+                "hard_failure": copy.deepcopy(snapshot),
+            }
+        logging.critical(
+            "🛑 [photons] HARD_FAILURE LATCHED — refusing automatic continuation. %s",
+            json.dumps(snapshot, sort_keys=True, separators=(",", ":"), default=str),
+        )
+        return snapshot
 
 
 def _require_dict(value: Any, path: str) -> Dict[str, Any]:
@@ -2933,6 +3070,12 @@ def on_photons_fragment(fragment: Payload) -> None:
     global _latest_fragment
     global _fragments_received
     global _fragments_queued
+    global _hard_failure_ingress_dropped
+
+    if _hard_failure_active():
+        with _state_lock:
+            _hard_failure_ingress_dropped += 1
+        return
 
     copied = copy.deepcopy(fragment)
     with _state_lock:
@@ -2957,6 +3100,7 @@ def _state_loop() -> None:
     global _system_report_retry_count
     global _last_structural_rejection
     global _last_system_report_failure
+    global _hard_failure_state_dropped
 
     _state_worker_started.set()
     logging.info("🚀 [photons] canonical PHOTONS_V1 state worker started")
@@ -2970,12 +3114,17 @@ def _state_loop() -> None:
                 pass
             if fragment is None:
                 pass
+            elif _hard_failure_active():
+                with _state_lock:
+                    _hard_failure_state_dropped += 1
             else:
                 with _state_lock:
                     _fragments_processed += 1
 
                 system_failure_logged = False
                 while True:
+                    if _hard_failure_active():
+                        break
                     try:
                         system_context = _fetch_system_report()
                         break
@@ -2995,6 +3144,11 @@ def _state_loop() -> None:
                             )
                             system_failure_logged = True
                         time.sleep(PHOTONS_STATE_RETRY_S)
+
+                if _hard_failure_active():
+                    with _state_lock:
+                        _hard_failure_state_dropped += 1
+                    continue
 
                 try:
                     photons = _make_photons(fragment, system_context)
@@ -3041,6 +3195,7 @@ def _persistence_loop() -> None:
     global _rows_persisted
     global _persistence_retry_count
     global _last_persistence_failure
+    global _hard_failure_persistence_dropped
 
     _persistence_worker_started.set()
     logging.info("🚀 [photons] ordered PHOTONS persistence worker started")
@@ -3054,6 +3209,9 @@ def _persistence_loop() -> None:
                 pass
             if photons is None:
                 pass
+            elif _hard_failure_active():
+                with _state_lock:
+                    _hard_failure_persistence_dropped += 1
             else:
                 failure_logged = False
                 while True:
@@ -3063,6 +3221,10 @@ def _persistence_loop() -> None:
                             _rows_persisted += 1
                         break
                     except Exception as exc:
+                        if _hard_failure_active():
+                            with _state_lock:
+                                _hard_failure_persistence_dropped += 1
+                            break
                         failure = {
                             "failed_at_utc": _utc_now_z(),
                             "sequence": photons.get("sequence") if isinstance(photons, dict) else None,
@@ -3110,6 +3272,12 @@ SUBSCRIPTIONS = {
 # ---------------------------------------------------------------------
 
 def _campaign_control_gate(command: str) -> Optional[Dict[str, Any]]:
+    if _hard_failure_active():
+        return {
+            "success": False,
+            "message": f"{command} unavailable while PHOTONS is latched in HARD_FAILURE",
+            "payload": {"operational_state": _operational_state_snapshot()},
+        }
     if _campaign_control_ready.is_set():
         return None
     return {
@@ -4047,6 +4215,12 @@ def _pi_report_surface() -> Dict[str, Any]:
             "standard_lap_ps": _standard_lap_ps,
             "teensy_standard_configured": _teensy_standard_configured,
             "latest_sequence": latest.get("sequence") if isinstance(latest, dict) else None,
+            "operational_state": _operational_state_snapshot(),
+            "hard_failure_entries": _hard_failure_entries,
+            "hard_failure_ingress_dropped": _hard_failure_ingress_dropped,
+            "hard_failure_state_dropped": _hard_failure_state_dropped,
+            "hard_failure_persistence_dropped": _hard_failure_persistence_dropped,
+            "last_hard_failure": copy.deepcopy(_last_hard_failure),
         }
     with _campaign_lock:
         state["lantern"] = {
@@ -4239,6 +4413,7 @@ def cmd_photons_info(_: Optional[dict]) -> Dict[str, Any]:
     with _state_lock:
         payload = {
             "schema": "PHOTONS_INFO_V1",
+            "operational_state": _operational_state_snapshot(),
             "instrument_always_on": True,
             "teensy_science_authority": True,
             "pi_campaign_lifecycle_authority": True,
@@ -4265,6 +4440,11 @@ def cmd_photons_info(_: Optional[dict]) -> Dict[str, Any]:
             "flash_cut_count": _flash_cut_count,
             "inject_problem_requests": _inject_problem_requests,
             "inject_problem_failures": _inject_problem_failures,
+            "hard_failure_entries": _hard_failure_entries,
+            "hard_failure_ingress_dropped": _hard_failure_ingress_dropped,
+            "hard_failure_state_dropped": _hard_failure_state_dropped,
+            "hard_failure_persistence_dropped": _hard_failure_persistence_dropped,
+            "last_hard_failure": copy.deepcopy(_last_hard_failure),
             "last_maintenance": copy.deepcopy(_last_maintenance),
             "last_campaign_transition": copy.deepcopy(_last_campaign_transition),
             "last_structural_rejection": copy.deepcopy(_last_structural_rejection),
@@ -4284,6 +4464,7 @@ def cmd_report(_: Optional[dict]) -> dict:
     with _state_lock:
         payload = {
             "schema": "PHOTONS_REPORT_V5",
+            "operational_state": _operational_state_snapshot(),
             "fragments_received": _fragments_received,
             "fragments_queued": _fragments_queued,
             "fragments_processed": _fragments_processed,
@@ -4372,6 +4553,38 @@ COMMANDS = {
     "PHOTONS_INFO": cmd_photons_info,
 }
 
+_HARD_FAILURE_READ_ONLY_COMMANDS = {
+    "REPORT",
+    "REPORT_PHOTONS",
+    "REPORT_STATS",
+    "REPORT_RECOVERY",
+    "BASELINE_INFO",
+    "LIST_CAMPAIGNS",
+    "PHOTONS_INFO",
+}
+
+
+def _hard_failure_guard_command(
+    command: str,
+    handler,
+):
+    def guarded(args: Optional[dict]) -> Dict[str, Any]:
+        if _hard_failure_active() and command not in _HARD_FAILURE_READ_ONLY_COMMANDS:
+            return {
+                "success": False,
+                "message": f"PHOTONS.{command} refused: subsystem is latched in HARD_FAILURE",
+                "payload": {"operational_state": _operational_state_snapshot()},
+            }
+        return handler(args)
+
+    return guarded
+
+
+COMMANDS = {
+    name: _hard_failure_guard_command(name, handler)
+    for name, handler in COMMANDS.items()
+}
+
 
 # ---------------------------------------------------------------------
 # Entrypoint
@@ -4379,6 +4592,12 @@ COMMANDS = {
 
 def run() -> None:
     setup_logging()
+    _hard_failure_event.clear()
+    _set_operational_state(
+        OPERATIONAL_STATE_STARTING,
+        reason="process_start",
+        source="RUN",
+    )
     _campaign_control_ready.clear()
     _recovery_proof_durable.clear()
 
@@ -4401,14 +4620,38 @@ def run() -> None:
     # Configuration is necessary but no longer sufficient to begin publication.
     # Firmware remains held until the Pi delivers one explicit recovery verdict:
     # aggregate restore, live reattachment, or scientifically empty cold start.
-    _configure_teensy_standard_lap()
-    recovery = _perform_phase5_recovery()
+    _set_operational_state(
+        OPERATIONAL_STATE_RECOVERING,
+        reason="phase5_startup_recovery",
+        source="RUN",
+    )
+    try:
+        _configure_teensy_standard_lap()
+        recovery = _perform_phase5_recovery()
+    except Exception as exc:
+        _enter_hard_failure(
+            "phase5_startup_recovery_failed",
+            {
+                "error": str(exc),
+                "recovery": _recovery_report_surface(),
+            },
+            source="PHOTONS_PHASE5_RECOVERY",
+        )
+    else:
+        # START/STOP/baseline/maintenance control opens only after an advancing
+        # post-restart row has crossed the complete ordered persistence transaction.
+        _campaign_control_ready.set()
+        _set_operational_state(
+            OPERATIONAL_STATE_RUNNING,
+            reason="phase5_recovery_complete",
+            source="RUN",
+        )
+        logging.info("✅ [photons] Phase-5 recovery complete: %s", recovery)
 
-    # START/STOP/baseline/maintenance control opens only after an advancing
-    # post-restart row has crossed the complete ordered persistence transaction.
-    _campaign_control_ready.set()
-    logging.info("✅ [photons] Phase-5 recovery complete: %s", recovery)
-    logging.info("🏁 [photons] entering main loop")
+    logging.info(
+        "🏁 [photons] entering main loop operational_state=%s",
+        _operational_state_snapshot().get("state"),
+    )
     while True:
         time.sleep(3600)
 

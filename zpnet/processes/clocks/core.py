@@ -467,6 +467,18 @@ _diag: Dict[str, Any] = {
     "recovery_abort_failures": 0,
     "last_recovery_abort": {},
 
+    # First-class subsystem operational state / terminal hard hold.
+    "hard_failure_entries": 0,
+    "hard_failure_ingress_dropped": 0,
+    "hard_failure_state_dropped": 0,
+    "hard_failure_persistence_dropped": 0,
+    "hard_failure_campaign_rows_dropped": 0,
+    "hard_failure_stats_repair_requests": 0,
+    "hard_failure_stats_repair_success": 0,
+    "hard_failure_stats_repair_failures": 0,
+    "last_hard_failure_stats_repair": {},
+    "last_hard_failure_hold": {},
+
     # Sync waits
     "sync_waits": 0,
     "sync_wait_success": 0,
@@ -1450,6 +1462,11 @@ def _dac_control_loop() -> None:
     global _dac_next_frame_monotonic
     _dac_control_thread_started.set()
     while True:
+        if _hard_failure_active():
+            _dac_control_wakeup.wait(timeout=1.0)
+            _dac_control_wakeup.clear()
+            continue
+
         now = time.monotonic()
         with _dac_lock:
             dither = _dac_dither_operator_enabled
@@ -2352,6 +2369,36 @@ def _gnss_raw_welford_reset() -> Dict[str, Any]:
 # Local state (process lifetime)
 # ---------------------------------------------------------------------
 
+OPERATIONAL_STATE_SCHEMA = "PI_SUBSYSTEM_OPERATIONAL_STATE_V1"
+OPERATIONAL_STATE_STARTING = "STARTING"
+OPERATIONAL_STATE_RECOVERING = "RECOVERING"
+OPERATIONAL_STATE_RUNNING = "RUNNING"
+OPERATIONAL_STATE_HARD_FAILURE = "HARD_FAILURE"
+
+_operational_state_lock = threading.Lock()
+_operational_state: Dict[str, Any] = {
+    "schema": OPERATIONAL_STATE_SCHEMA,
+    "subsystem": "CLOCKS",
+    "state": OPERATIONAL_STATE_STARTING,
+    "entered_at_utc": None,
+    "reason": "process_initialization",
+    "source": "RUN",
+    "details": {},
+}
+_hard_failure_event = threading.Event()
+_hard_failure_lock = threading.Lock()
+# HARD_FAILURE normally closes the entire scientific data plane.  One narrowly
+# scoped operator repair may temporarily reopen only enough CLOCKS ingress and
+# persistence to establish row 1 of a brand-new transitive statistics epoch.
+# The HARD_FAILURE latch itself is never cleared by this repair; a normal process
+# restart is still required before CLOCKS can resume ordinary authorship.
+_hard_failure_stats_repair_event = threading.Event()
+_hard_failure_stats_repair_lock = threading.Lock()
+_HARD_FAILURE_STATS_REPAIR_REASONS = {
+    "dac_restore_population_ancestry_impossible",
+    "dac_recovery_boundary_population_ancestry_impossible",
+}
+
 _campaign_active: bool = False
 
 # Warm recovery may resume on a truthful degraded timeline row while the
@@ -2481,6 +2528,150 @@ _auto_recovery_in_progress: bool = False
 _recovery_interruption_lock = threading.Lock()
 _recovery_interruption_pending: bool = False
 _recovery_interruption_details: Dict[str, Any] = {}
+
+
+class HardFailureRequired(RuntimeError):
+    """A proved condition for which CLOCKS must remain alive but stop authoring truth."""
+
+    def __init__(self, reason: str, details: Dict[str, Any]):
+        super().__init__(f"{reason}: {details}")
+        self.reason = str(reason)
+        self.details = copy.deepcopy(details)
+
+
+def _operational_state_snapshot() -> Dict[str, Any]:
+    with _operational_state_lock:
+        return copy.deepcopy(_operational_state)
+
+
+def _hard_failure_active() -> bool:
+    return _hard_failure_event.is_set()
+
+
+def _hard_failure_stats_repair_active() -> bool:
+    """True only while the explicit DAC-ancestry statistics repair owns the data plane."""
+    return _hard_failure_stats_repair_event.is_set()
+
+
+def _set_operational_state(
+    state: str,
+    *,
+    reason: Optional[str] = None,
+    source: Optional[str] = None,
+    details: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Publish one process-local CLOCKS lifecycle state; HARD_FAILURE is latched."""
+    global _operational_state
+
+    normalized = str(state or "").strip().upper()
+    if normalized not in {
+        OPERATIONAL_STATE_STARTING,
+        OPERATIONAL_STATE_RECOVERING,
+        OPERATIONAL_STATE_RUNNING,
+        OPERATIONAL_STATE_HARD_FAILURE,
+    }:
+        raise ValueError(f"unsupported CLOCKS operational state {state!r}")
+
+    with _operational_state_lock:
+        if (
+            str(_operational_state.get("state") or "") == OPERATIONAL_STATE_HARD_FAILURE
+            and normalized != OPERATIONAL_STATE_HARD_FAILURE
+        ):
+            return copy.deepcopy(_operational_state)
+        _operational_state = {
+            "schema": OPERATIONAL_STATE_SCHEMA,
+            "subsystem": "CLOCKS",
+            "state": normalized,
+            "entered_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "reason": str(reason or ""),
+            "source": str(source or ""),
+            "details": copy.deepcopy(details or {}),
+        }
+        return copy.deepcopy(_operational_state)
+
+
+def _enter_hard_failure(
+    reason: str,
+    details: Dict[str, Any],
+    *,
+    source: str,
+) -> Dict[str, Any]:
+    """Latch CLOCKS inert without exiting so systemd cannot erase the crime scene."""
+    global _campaign_active
+
+    with _hard_failure_lock:
+        if _hard_failure_active():
+            return _operational_state_snapshot()
+
+        context = {
+            "pid": os.getpid(),
+            "campaign_active_process_local": bool(_campaign_active),
+            "last_clocks_sequence": _last_clocks_state_sequence,
+            "last_pps_vclock_count_seen": _last_pps_vclock_count_seen,
+            "accepted_pps_vclock_count": _accepted_pps_vclock_count,
+            "dac_stats_reset_count": _dac_stats_reset_count,
+            "dac_stats_update_count": _dac_stats_update_count,
+            "dac_stats_last_sequence": _dac_stats_last_sequence,
+            "queues": {
+                "clocks_state": _clocks_state_queue.qsize(),
+                "clocks_persistence": _clocks_persist_queue.qsize(),
+                "tempest": _fragment_queue.qsize(),
+            },
+            # Diagnostic snapshots are intentionally lock-free: HARD_FAILURE may be
+            # entered while one of these custody locks is already held.
+            "startup_custody_active": bool(_startup_custody_active),
+            "startup_custody_depth": len(_startup_custody_backlog),
+            "recovery_custody": {
+                "active": bool(_recovery_custody_active),
+                "generation": _recovery_custody_generation,
+                "reason": _recovery_custody_reason,
+                "physical_sequence_regression": bool(
+                    _recovery_custody_physical_sequence_regression
+                ),
+                "regression_witness": copy.deepcopy(
+                    _recovery_custody_regression_witness
+                ),
+            },
+        }
+        failure_details = {
+            "failure": copy.deepcopy(details or {}),
+            "context": context,
+            "action": (
+                "CLOCKS is latched in HARD_FAILURE. No new CLOCKS/TEMPEST testimony, "
+                "automatic recovery, or DAC authorship will occur. Read-only reports remain available."
+            ),
+        }
+
+        _hard_failure_event.set()
+        _campaign_active = False
+        _startup_control_ready.clear()
+        _clocks_persistence_enabled.clear()
+        _diag["startup_control_ready"] = False
+        _diag["hard_failure_entries"] = _diag.get("hard_failure_entries", 0) + 1
+        _dac_control_wakeup.set()
+
+        snapshot = _set_operational_state(
+            OPERATIONAL_STATE_HARD_FAILURE,
+            reason=reason,
+            source=source,
+            details=failure_details,
+        )
+        _diag["last_hard_failure_hold"] = copy.deepcopy(snapshot)
+        logging.critical(
+            "🛑 [clocks] HARD_FAILURE LATCHED — refusing automatic continuation. %s",
+            json.dumps(snapshot, sort_keys=True, separators=(",", ":"), default=str),
+        )
+        return snapshot
+
+
+def _require_hard_failure(
+    reason: str,
+    details: Dict[str, Any],
+    *,
+    source: str,
+) -> None:
+    _enter_hard_failure(reason, details, source=source)
+    raise HardFailureRequired(reason, details)
 
 
 class RecoveryRetryableFailure(RuntimeError):
@@ -3066,7 +3257,27 @@ def _finalize_recovery_clocks_custody(
                 if not isinstance(boundary_state, dict):
                     raise RuntimeError("recovery custody boundary payload is not an object")
 
-                boundary_stats = _clocks_payload(boundary_state).get("stats")
+                boundary_clocks = _clocks_payload(boundary_state)
+                boundary_ancestry = _dac_restore_population_ancestry_court(
+                    boundary_clocks
+                )
+                if (
+                    boundary_ancestry.get("available")
+                    and not boundary_ancestry.get("valid")
+                ):
+                    _require_hard_failure(
+                        "dac_recovery_boundary_population_ancestry_impossible",
+                        {
+                            "court": "DAC_OCXO_WELFORD_POPULATION_ANCESTRY",
+                            "db_detail_id": boundary_id,
+                            "campaign": campaign_name,
+                            "generation": generation,
+                            **copy.deepcopy(boundary_ancestry),
+                        },
+                        source="CLOCKS_RECOVERY_CUSTODY_COURT",
+                    )
+
+                boundary_stats = boundary_clocks.get("stats")
                 if not isinstance(boundary_stats, dict):
                     raise RuntimeError("recovery custody boundary lacks CLOCKS statistics")
                 boundary_reset = _as_int(boundary_stats.get("reset_count"))
@@ -3314,10 +3525,17 @@ def _timebase_silence_recovery(reason: str, details: Dict[str, Any]) -> None:
                 _diag["timebase_silence_recovery_started"] += 1
                 try:
                     _restore_active_campaign_state()
+                    _set_operational_state(
+                        OPERATIONAL_STATE_RUNNING,
+                        reason="timebase_silence_recovery_complete",
+                        source="TIMEBASE_SILENCE_MONITOR",
+                    )
                     logging.info(
                         "✅ [clocks] @%s CLOCKS_FRAGMENT silence recovery complete",
                         system_time_z(),
                     )
+                    return
+                except HardFailureRequired:
                     return
                 except RecoveryRetryableFailure as e:
                     _diag["auto_recovery_failures"] = _diag.get("auto_recovery_failures", 0) + 1
@@ -3352,14 +3570,16 @@ def _timebase_silence_recovery(reason: str, details: Dict[str, Any]) -> None:
                         }
                         logging.error(
                             "💥 [clocks] CLOCKS_FRAGMENT silence recovery stopped after %d attempt(s): "
-                            "reason=%s status=%s. The Teensy is commandable but cannot "
-                            "re-enter RECOVER from its present interrupt-service state; "
-                            "the durable campaign remains available for recovery after "
-                            "firmware repair/reboot.",
+                            "reason=%s status=%s. Automatic continuation is no longer asserted.",
                             attempts,
                             e.reason,
                             status or "unknown",
                             exc_info=True,
+                        )
+                        _enter_hard_failure(
+                            "timebase_silence_recovery_exhausted",
+                            copy.deepcopy(_diag["last_auto_recovery_exhausted"]),
+                            source="TIMEBASE_SILENCE_RECOVERY",
                         )
                         return
 
@@ -3379,6 +3599,8 @@ def _timebase_silence_recovery(reason: str, details: Dict[str, Any]) -> None:
                     time.sleep(float(AUTO_RECOVERY_RETRY_DELAY_S))
                     continue
                 except Exception:
+                    if _hard_failure_active():
+                        return
                     _diag["auto_recovery_failures"] = _diag.get("auto_recovery_failures", 0) + 1
                     logging.exception(
                         "💥 [clocks] CLOCKS_FRAGMENT silence recovery failed — "
@@ -3401,6 +3623,8 @@ def _begin_timebase_silence_recovery(age_s: float, *, timeout_s: float, phase: s
     global _campaign_active, _auto_recovery_in_progress
     global _timebase_silence_recovery_active
 
+    if _hard_failure_active():
+        return False
     if _auto_recovery_in_progress or _timebase_silence_recovery_active:
         return False
 
@@ -3440,6 +3664,12 @@ def _begin_timebase_silence_recovery(age_s: float, *, timeout_s: float, phase: s
         str(_timebase_last_activity_pps_vclock_count),
     )
 
+    _set_operational_state(
+        OPERATIONAL_STATE_RECOVERING,
+        reason="timebase_silence",
+        source="TIMEBASE_SILENCE_MONITOR",
+        details=details,
+    )
     _begin_recovery_clocks_custody("timebase_silence", details)
     _campaign_active = False
     _auto_recovery_in_progress = True
@@ -3475,6 +3705,8 @@ def _timebase_silence_monitor_loop() -> None:
         time.sleep(TIMEBASE_SILENCE_MONITOR_POLL_S)
         _diag["timebase_silence_checks"] += 1
 
+        if _hard_failure_active():
+            continue
         if not _campaign_active:
             continue
         if _auto_recovery_in_progress or _timebase_silence_recovery_active:
@@ -3508,6 +3740,15 @@ def _begin_auto_recovery(reason: str, details: Dict[str, Any], *, source: str) -
     """
     global _campaign_active, _auto_recovery_in_progress
 
+    if _hard_failure_active():
+        return False
+
+    _set_operational_state(
+        OPERATIONAL_STATE_RECOVERING,
+        reason=reason,
+        source=source,
+        details=copy.deepcopy(details or {}),
+    )
     _diag["hard_faults_total"] = _diag.get("hard_faults_total", 0) + 1
     _diag["last_hard_fault"] = {
         "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -3548,6 +3789,11 @@ def _begin_auto_recovery(reason: str, details: Dict[str, Any], *, source: str) -
                         system_time_z(), attempt, int(AUTO_RECOVERY_MAX_ATTEMPTS),
                     )
                     _restore_active_campaign_state()
+                    _set_operational_state(
+                        OPERATIONAL_STATE_RUNNING,
+                        reason="auto_recovery_complete",
+                        source=source,
+                    )
                     logging.info("✅ [clocks] @%s auto-recovery complete", system_time_z())
                     return
                 except RecoveryRetryableFailure as e:
@@ -3566,13 +3812,23 @@ def _begin_auto_recovery(reason: str, details: Dict[str, Any], *, source: str) -
                     _diag["auto_recovery_retries"] = _diag.get("auto_recovery_retries", 0) + 1
                     time.sleep(float(AUTO_RECOVERY_RETRY_DELAY_S))
                     continue
+        except HardFailureRequired:
+            # The proving court already latched HARD_FAILURE with full evidence.
+            return
         except Exception as e:
-            logging.exception("💥 [clocks] auto-recovery FAILED — campaign deactivated")
+            logging.exception("💥 [clocks] auto-recovery FAILED — entering HARD_FAILURE")
             _diag["auto_recovery_failures"] = _diag.get("auto_recovery_failures", 0) + 1
-            _cleanup_after_recovery_failure(
-                "auto_recovery_failed",
-                {"error": str(e), "source": source, "reason": reason},
-            )
+            try:
+                _cleanup_after_recovery_failure(
+                    "auto_recovery_failed",
+                    {"error": str(e), "source": source, "reason": reason},
+                )
+            finally:
+                _enter_hard_failure(
+                    "auto_recovery_exhausted",
+                    {"error": str(e), "trigger_reason": reason, "trigger_source": source},
+                    source="AUTO_RECOVERY",
+                )
         finally:
             _auto_recovery_in_progress = False
 
@@ -5001,10 +5257,58 @@ def _canonical_restore_args(
     return out
 
 
+def _dac_restore_population_ancestry_court(clocks: Dict[str, Any]) -> Dict[str, Any]:
+    """Prove that Pi DAC Welfords cannot predate their corresponding OCXO population."""
+    stats = clocks.get("stats") if isinstance(clocks, dict) else None
+    stats = stats if isinstance(stats, dict) else {}
+    auxiliary = stats.get("auxiliary_welford")
+    auxiliary = auxiliary if isinstance(auxiliary, dict) else {}
+
+    lanes: Dict[str, Any] = {}
+    for lane in ("ocxo1", "ocxo2"):
+        ocxo_welford = _path_get(stats, f"{lane}.welford")
+        dac_welford = auxiliary.get(f"{lane}_dac")
+        if not isinstance(ocxo_welford, dict) or not isinstance(dac_welford, dict):
+            return {
+                "available": False,
+                "valid": False,
+                "reason": f"missing_{lane}_population_witness",
+                "lanes": lanes,
+            }
+        ocxo_n = _as_int(ocxo_welford.get("n"))
+        dac_n = _as_int(dac_welford.get("n"))
+        if ocxo_n is None or dac_n is None or ocxo_n < 0 or dac_n < 0:
+            return {
+                "available": False,
+                "valid": False,
+                "reason": f"invalid_{lane}_population_witness",
+                "lanes": lanes,
+            }
+        lanes[lane] = {
+            "ocxo_n": int(ocxo_n),
+            "dac_n": int(dac_n),
+            "dac_minus_ocxo": int(dac_n - ocxo_n),
+            "valid": bool(dac_n <= ocxo_n),
+        }
+
+    impossible = [lane for lane, witness in lanes.items() if not witness["valid"]]
+    return {
+        "available": True,
+        "valid": not impossible,
+        "reason": None if not impossible else "dac_population_exceeds_ocxo_population",
+        "reset_count": _as_int(stats.get("reset_count")),
+        "update_count": _as_int(stats.get("update_count")),
+        "completed_pps_sequence": _as_int(clocks.get("completed_pps_sequence")),
+        "lanes": lanes,
+        "impossible_lanes": impossible,
+    }
+
+
 def _canonical_instrument_restore_ready(
     clocks: Dict[str, Any],
     *,
     include_control: bool = True,
+    detail_id: Optional[int] = None,
 ) -> bool:
     """True only when canonical CLOCKS_V4 instrument state is restore authority."""
     if not isinstance(clocks, dict):
@@ -5058,6 +5362,28 @@ def _canonical_instrument_restore_ready(
             return False
 
     if include_control:
+        # Pi DAC Welfords are full holistic-control custody, not TEMPEST campaign
+        # chronology.  A campaign-only recovery may lawfully use older Teensy
+        # clock/statistics testimony without restoring the poisoned Pi DAC auxiliary
+        # state; the later recovery-boundary court still forbids that poison from
+        # becoming fresh restore authority.
+        ancestry = _dac_restore_population_ancestry_court(clocks)
+        if ancestry.get("available") and not ancestry.get("valid"):
+            details = {
+                "court": "DAC_OCXO_WELFORD_POPULATION_ANCESTRY",
+                "db_detail_id": int(detail_id) if detail_id is not None else None,
+                **copy.deepcopy(ancestry),
+            }
+            _require_hard_failure(
+                "dac_restore_population_ancestry_impossible",
+                details,
+                source="CLOCKS_RESTORE_COURT",
+            )
+        if not ancestry.get("available"):
+            # Pi DAC Welfords are part of full holistic restore authority. Older rows
+            # that predate this custody surface may be skipped, but never synthesized.
+            return False
+
         control = clocks.get("control")
         if not isinstance(control, dict) or control.get("schema") != "CLOCKS_CONTROL_V1":
             return False
@@ -5167,7 +5493,12 @@ def _read_latest_recoverable_clocks_state(
         if not isinstance(state, dict):
             continue
         clocks = _clocks_payload(state)
-        if not _canonical_instrument_restore_ready(clocks, include_control=True):
+        row_id = int(row.get("id") if isinstance(row, dict) else row[0])
+        if not _canonical_instrument_restore_ready(
+            clocks,
+            include_control=True,
+            detail_id=row_id,
+        ):
             continue
         if _clocks_gnss_raw_payload(state) is None:
             continue
@@ -5420,7 +5751,11 @@ def _wait_for_holistic_restore(
 def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
     clocks = _clocks_payload(detail)
     gnss_raw = _clocks_gnss_raw_payload(detail)
-    if not _canonical_instrument_restore_ready(clocks, include_control=True) or gnss_raw is None:
+    if not _canonical_instrument_restore_ready(
+        clocks,
+        include_control=True,
+        detail_id=_as_int(detail.get("_db_detail_id")),
+    ) or gnss_raw is None:
         raise RuntimeError("CLOCKS detail lacks valid canonical instrument/GNSS_RAW restore state")
 
     # Arm durable proof custody before the first RESTORE_MONITOR probe.  The
@@ -5609,7 +5944,7 @@ def _holistic_restore(
         # A command/RPC failure before the Teensy lifecycle verdict must leave the
         # retained prefix fail-closed rather than silently creating another durable
         # chronology hole.
-        if not _startup_clocks_custody_unresolved():
+        if not _hard_failure_active() and not _startup_clocks_custody_unresolved():
             _clocks_persistence_enabled.set()
         _clocks_holistic_restore_proof_pending.clear()
 
@@ -7692,6 +8027,7 @@ def _recovery_timebase_snapshot(tb: Dict[str, Any]) -> Dict[str, Any]:
     canonical_restore_ok = _canonical_instrument_restore_ready(
         canonical_clocks,
         include_control=False,
+        detail_id=_as_int(last_tb.get("_db_detail_id")),
     )
 
     recoverable = (
@@ -7851,6 +8187,8 @@ def _load_last_recoverable_tempest_detail(
             detail = _tempest_detail_from_state_snapshot(state)
             detail["_db_detail_id"] = int(row["id"])
             snapshot = _recovery_timebase_snapshot(detail)
+        except HardFailureRequired:
+            raise
         except Exception as exc:
             if newest_error is None:
                 newest_error = str(exc)
@@ -8044,6 +8382,12 @@ def _startup_control_gate(operation: str) -> Optional[Dict[str, Any]]:
     or the holistic startup restore. STOP, REPORT, CLEAR, and recovery
     abort remain available throughout startup.
     """
+    if _hard_failure_active():
+        return {
+            "success": False,
+            "message": f"{operation} unavailable while CLOCKS is latched in HARD_FAILURE",
+            "payload": {"operational_state": _operational_state_snapshot()},
+        }
     if _startup_control_ready.is_set():
         return None
 
@@ -8760,8 +9104,21 @@ def _clocks_state_loop() -> None:
     logging.info("🚀 [clocks] canonical CLOCKS_V4 state worker started")
     while True:
         clocks_fragment = _clocks_state_queue.get()
+        if _hard_failure_active() and not _hard_failure_stats_repair_active():
+            _clocks_state_dropped += 1
+            _diag["hard_failure_state_dropped"] = (
+                _diag.get("hard_failure_state_dropped", 0) + 1
+            )
+            continue
+
         failure_logged = False
         while True:
+            if _hard_failure_active() and not _hard_failure_stats_repair_active():
+                _clocks_state_dropped += 1
+                _diag["hard_failure_state_dropped"] = (
+                    _diag.get("hard_failure_state_dropped", 0) + 1
+                )
+                break
             try:
                 system_context = _fetch_system_report()
                 break
@@ -8773,6 +9130,9 @@ def _clocks_state_loop() -> None:
                     )
                     failure_logged = True
                 time.sleep(CLOCKS_STATE_RETRY_S)
+
+        if _hard_failure_active() and not _hard_failure_stats_repair_active():
+            continue
 
         sequence = _clocks_fragment_count(clocks_fragment)
         try:
@@ -8789,8 +9149,9 @@ def _clocks_state_loop() -> None:
             continue
 
         _cache_clocks_state(state)
-        publish(CLOCKS_TOPIC, state)
-        _clocks_state_published += 1
+        if not _hard_failure_active():
+            publish(CLOCKS_TOPIC, state)
+            _clocks_state_published += 1
 
         item = {
             "state": state,
@@ -8903,6 +9264,14 @@ def _clocks_persistence_loop() -> None:
         if recovery_barrier is not None:
             recovery_barrier.set()
             continue
+        if _hard_failure_active() and not _hard_failure_stats_repair_active():
+            completion = item.get("persistence_completion")
+            if completion is not None:
+                completion.set()
+            _diag["hard_failure_persistence_dropped"] = (
+                _diag.get("hard_failure_persistence_dropped", 0) + 1
+            )
+            continue
         state = copy.deepcopy(item["state"])
         system_context = item["system_context"]
         clocks_fragment = item["clocks_fragment"]
@@ -8945,6 +9314,11 @@ def _clocks_persistence_loop() -> None:
                         _clocks_holistic_restore_proof_committed.set()
                 break
             except Exception:
+                if _hard_failure_active() and not _hard_failure_stats_repair_active():
+                    _diag["hard_failure_persistence_dropped"] = (
+                        _diag.get("hard_failure_persistence_dropped", 0) + 1
+                    )
+                    break
                 if not failure_logged:
                     logging.exception(
                         "⚠️ [clocks] campaign_detail persistence failed for CLOCKS sequence=%s; retrying",
@@ -8952,6 +9326,11 @@ def _clocks_persistence_loop() -> None:
                     )
                     failure_logged = True
                 time.sleep(CLOCKS_STATE_RETRY_S)
+
+        if _hard_failure_active():
+            if persistence_completion is not None:
+                persistence_completion.set()
+            continue
 
         if persistence_completion is not None:
             persistence_completion.set()
@@ -8998,6 +9377,12 @@ def _clocks_persistence_loop() -> None:
 
 def on_clocks_fragment(payload: Payload) -> None:
     """Queue every exact CLOCKS_FRAGMENT_V4 for canonical CLOCKS construction."""
+    if _hard_failure_active() and not _hard_failure_stats_repair_active():
+        _diag["hard_failure_ingress_dropped"] = (
+            _diag.get("hard_failure_ingress_dropped", 0) + 1
+        )
+        return
+
     if not isinstance(payload, dict):
         _diag["clocks_fragments_malformed"] = _diag.get("clocks_fragments_malformed", 0) + 1
         return
@@ -9055,6 +9440,12 @@ def _process_loop() -> None:
         try:
             piece = _fragment_queue.get(timeout=0.25)
         except queue.Empty:
+            continue
+
+        if _hard_failure_active():
+            _diag["hard_failure_campaign_rows_dropped"] = (
+                _diag.get("hard_failure_campaign_rows_dropped", 0) + 1
+            )
             continue
 
         _diag["timebase_pieces_processed"] += 1
@@ -10007,6 +10398,7 @@ def _combined_teensy_report(teensy_command: str, *, report_name: str) -> Dict[st
                 "teensy_command": teensy_command,
                 "error": str(exc),
                 "pi_gnss_raw": _gnss_raw_clock_snapshot(),
+                "operational_state": _operational_state_snapshot(),
             },
         }
 
@@ -10022,6 +10414,7 @@ def _combined_teensy_report(teensy_command: str, *, report_name: str) -> Dict[st
                 "teensy_command": teensy_command,
                 "teensy": teensy_response,
                 "pi_gnss_raw": _gnss_raw_clock_snapshot(),
+                "operational_state": _operational_state_snapshot(),
             },
         }
 
@@ -10038,6 +10431,7 @@ def _combined_teensy_report(teensy_command: str, *, report_name: str) -> Dict[st
             "STARTED" if active else "IDLE"
         ),
         "startup": _start_status_payload(),
+        "operational_state": _operational_state_snapshot(),
         "owners": {
             "teensy": ["GNSS", "VCLOCK", "DWT", "OCXO1", "OCXO2"],
             "pi": ["GNSS_RAW", "DAC", "SERVO", "DITHER"],
@@ -10192,7 +10586,10 @@ def _perform_transitive_stats_reset(
     return {"success": True, "message": "OK", "payload": result}
 
 
-def _establish_fresh_durable_stats_epoch() -> Dict[str, Any]:
+def _establish_fresh_durable_stats_epoch(
+    *,
+    source: str = "HOLISTIC_RESTORE_EPOCH_BIRTH",
+) -> Dict[str, Any]:
     """Align fresh Alpha epoch birth with the durable persistence boundary."""
     global _clocks_epoch_birth_prior_reset_count
     global _clocks_epoch_birth_reset_count
@@ -10216,7 +10613,7 @@ def _establish_fresh_durable_stats_epoch() -> Dict[str, Any]:
     response = _perform_transitive_stats_reset(
         requested_at=requested_at,
         pi_before=pi_before,
-        source="HOLISTIC_RESTORE_EPOCH_BIRTH",
+        source=source,
     )
     if not response.get("success"):
         raise RuntimeError(
@@ -10264,6 +10661,193 @@ def cmd_stats_reset(_: Optional[dict]) -> Dict[str, Any]:
 
 
 
+def cmd_repair_stats_epoch(args: Optional[dict]) -> Dict[str, Any]:
+    """Repair only the proved historical DAC/OCXO population-ancestry failure.
+
+    This is deliberately not a generic HARD_FAILURE escape hatch.  The operator
+    must explicitly confirm destruction of the current statistical epoch.  CLOCKS
+    then performs the ordinary transitive STATS_RESET and temporarily reopens only
+    the epoch-birth persistence lane until update_count=1 is durably proved.
+
+    HARD_FAILURE remains latched after success.  The clean row becomes future
+    holistic-restore authority, and the operator restarts CLOCKS normally.
+    """
+    if not _hard_failure_active():
+        return {
+            "success": False,
+            "message": "REPAIR_STATS_EPOCH is available only while CLOCKS is in HARD_FAILURE",
+        }
+
+    state = _operational_state_snapshot()
+    failure_reason = str(state.get("reason") or "")
+    if failure_reason not in _HARD_FAILURE_STATS_REPAIR_REASONS:
+        return {
+            "success": False,
+            "message": (
+                "REPAIR_STATS_EPOCH refuses this HARD_FAILURE reason; "
+                "only proved DAC/OCXO population-ancestry corruption is repairable"
+            ),
+            "payload": {
+                "hard_failure_reason": failure_reason,
+                "repairable_reasons": sorted(_HARD_FAILURE_STATS_REPAIR_REASONS),
+                "operational_state": state,
+            },
+        }
+
+    confirmation = str((args or {}).get("confirm") or "").strip().upper()
+    if confirmation != "RESET_CLOCK_STATISTICS":
+        return {
+            "success": False,
+            "message": (
+                "REPAIR_STATS_EPOCH requires confirm=RESET_CLOCK_STATISTICS; "
+                "the repair intentionally starts a new systemwide CLOCKS statistics epoch"
+            ),
+            "payload": {
+                "hard_failure_reason": failure_reason,
+                "required_confirmation": "RESET_CLOCK_STATISTICS",
+            },
+        }
+
+    with _hard_failure_stats_repair_lock:
+        if _hard_failure_stats_repair_active():
+            return {
+                "success": False,
+                "message": "REPAIR_STATS_EPOCH is already in progress",
+            }
+        if _auto_recovery_in_progress or _timebase_silence_recovery_active:
+            return {
+                "success": False,
+                "message": "REPAIR_STATS_EPOCH refused while automatic recovery is still active",
+            }
+
+        requested_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        _diag["hard_failure_stats_repair_requests"] = (
+            _diag.get("hard_failure_stats_repair_requests", 0) + 1
+        )
+        repair_record: Dict[str, Any] = {
+            "schema": "PI_CLOCKS_HARD_FAILURE_STATS_REPAIR_V1",
+            "requested_at_utc": requested_at,
+            "hard_failure_reason": failure_reason,
+            "hard_failure_entered_at_utc": state.get("entered_at_utc"),
+            "confirmation": confirmation,
+            "success": False,
+            "hard_failure_remains_latched": True,
+            "restart_required": True,
+        }
+        _diag["last_hard_failure_stats_repair"] = copy.deepcopy(repair_record)
+
+        # Everything already retained belongs to the poisoned/pre-repair epoch.
+        # Keep it as historical DB evidence where it already exists, but never
+        # let the in-memory startup prefix cross the destructive reset boundary.
+        retired = _retire_startup_clocks_custody(
+            "hard_failure_dac_ancestry_stats_repair"
+        )
+        repair_record["startup_custody_retired"] = retired
+
+        # No stale holistic proof may share the one-row repair lane.
+        _clocks_holistic_restore_proof_pending.clear()
+        _clocks_holistic_restore_proof_committed.clear()
+        _hard_failure_stats_repair_event.set()
+
+        try:
+            epoch = _establish_fresh_durable_stats_epoch(
+                source="CLOCKS.REPAIR_STATS_EPOCH",
+            )
+            new_reset_count = int(epoch["reset_count"])
+
+            # The epoch-birth event is set only after PostgreSQL commits row 1.
+            # Re-read that exact durable witness and make the population court
+            # prove that the repair created lawful restore ancestry.
+            with open_db(row_dict=True) as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT id, payload
+                    FROM campaign_detail
+                    WHERE campaign_type = %s
+                      AND payload #>> '{schema}' = 'CLOCKS_V4'
+                      AND (payload #>> '{clocks,stats,reset_count}')::bigint = %s
+                      AND (payload #>> '{clocks,stats,update_count}')::bigint = 1
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (CAMPAIGN_TYPE_TEMPEST, new_reset_count),
+                )
+                row = cur.fetchone()
+
+            if row is None:
+                raise RuntimeError(
+                    "fresh statistics epoch reported durable row 1 but PostgreSQL witness is missing"
+                )
+            durable = row["payload"]
+            if isinstance(durable, str):
+                durable = json.loads(durable)
+            if not isinstance(durable, dict):
+                raise RuntimeError("fresh statistics epoch row 1 payload is not an object")
+
+            durable_clocks = _clocks_payload(durable)
+            ancestry = _dac_restore_population_ancestry_court(durable_clocks)
+            if not ancestry.get("available") or not ancestry.get("valid"):
+                raise RuntimeError(
+                    "fresh statistics epoch row 1 failed DAC/OCXO population ancestry court: "
+                    f"{ancestry!r}"
+                )
+
+            repair_record.update({
+                "completed_at_utc": datetime.now(timezone.utc)
+                    .isoformat().replace("+00:00", "Z"),
+                "success": True,
+                "new_reset_count": new_reset_count,
+                "first_durable_update_count": 1,
+                "first_durable_detail_id": int(row["id"]),
+                "population_ancestry": copy.deepcopy(ancestry),
+                "stats_reset": copy.deepcopy(epoch.get("stats_reset") or {}),
+                "next_action": (
+                    "Restart zpnet-clocks.service. HARD_FAILURE intentionally remains latched "
+                    "in this process; the new row 1 is the clean future restore authority."
+                ),
+            })
+            _diag["hard_failure_stats_repair_success"] = (
+                _diag.get("hard_failure_stats_repair_success", 0) + 1
+            )
+            _diag["last_hard_failure_stats_repair"] = copy.deepcopy(repair_record)
+            logging.critical(
+                "🧯 [clocks] HARD_FAILURE statistics repair proved a clean durable epoch: "
+                "reset_count=%d detail_id=%d ancestry=%s. HARD_FAILURE remains latched; "
+                "restart CLOCKS to resume normal operation.",
+                new_reset_count,
+                int(row["id"]),
+                ancestry,
+            )
+            return {"success": True, "message": "OK", "payload": repair_record}
+        except Exception as exc:
+            repair_record.update({
+                "completed_at_utc": datetime.now(timezone.utc)
+                    .isoformat().replace("+00:00", "Z"),
+                "success": False,
+                "error": str(exc),
+            })
+            _diag["hard_failure_stats_repair_failures"] = (
+                _diag.get("hard_failure_stats_repair_failures", 0) + 1
+            )
+            _diag["last_hard_failure_stats_repair"] = copy.deepcopy(repair_record)
+            logging.exception(
+                "🛑 [clocks] HARD_FAILURE statistics repair failed; hold remains latched"
+            )
+            return {
+                "success": False,
+                "message": f"REPAIR_STATS_EPOCH failed: {exc}",
+                "payload": repair_record,
+            }
+        finally:
+            # Repair never turns this process back into an author.  Close the
+            # exceptional data lane regardless of success and leave HARD_FAILURE
+            # latched until a normal operator restart re-enters the full courts.
+            _hard_failure_stats_repair_event.clear()
+            _clocks_persistence_enabled.clear()
+            _clocks_epoch_birth_pending.clear()
+
+
 def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
     row = _get_active_campaign()
     contract = {
@@ -10271,6 +10855,7 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
         "coherent_rows_persist": True,
         "science_exclusions_are_audit_only": True,
         "continuity_fatal_triggers_recovery": True,
+        "unprovable_continuity_latches_hard_failure": True,
     }
     if not row:
         return {
@@ -10281,6 +10866,7 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
                 "campaign_state": "IDLE",
                 "integrity_contract": contract,
                 "startup": _start_status_payload(),
+                "operational_state": _operational_state_snapshot(),
             },
         }
 
@@ -10289,6 +10875,7 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
     payload["campaign"] = row["campaign"]
     payload["integrity_contract"] = contract
     payload["startup"] = _start_status_payload()
+    payload["operational_state"] = _operational_state_snapshot()
     return {"success": True, "message": "OK", "payload": payload}
 
 
@@ -12151,11 +12738,13 @@ def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
 def cmd_clocks_info(_: Optional[dict]) -> Dict[str, Any]:
     payload = {
         "campaign_active": _campaign_active,
+        "operational_state": _operational_state_snapshot(),
         "integrity_contract": {
             "mode_free": True,
             "coherent_rows_persist": True,
             "science_exclusions_are_audit_only": True,
             "continuity_fatal_triggers_recovery": True,
+            "unprovable_continuity_latches_hard_failure": True,
         },
         "last_pps_vclock_count_seen": _last_pps_vclock_count_seen,
         "accepted_pps_vclock_count": _accepted_pps_vclock_count,
@@ -12414,6 +13003,7 @@ COMMANDS = {
     "REPORT_CLOCKS": cmd_report_clocks,
     "REPORT_STATS": cmd_report_stats,
     "STATS_RESET": cmd_stats_reset,
+    "REPAIR_STATS_EPOCH": cmd_repair_stats_epoch,
     "CLEAR": cmd_clear,
     "DELETE": cmd_delete,
     "TRUNCATE": cmd_truncate,
@@ -12427,6 +13017,45 @@ COMMANDS = {
     "BASELINE_INFO": cmd_baseline_info,
     "LIST_CAMPAIGNS": cmd_list_campaigns,
     "CLOCKS_INFO": cmd_clocks_info,
+}
+
+_HARD_FAILURE_READ_ONLY_COMMANDS = {
+    "REPORT",
+    "REPORT_CLOCKS",
+    "REPORT_STATS",
+    "DAC_INFO",
+    "BASELINE_INFO",
+    "LIST_CAMPAIGNS",
+    "CLOCKS_INFO",
+}
+_HARD_FAILURE_OPERATOR_REPAIR_COMMANDS = {
+    "REPAIR_STATS_EPOCH",
+}
+
+
+def _hard_failure_guard_command(
+    command: str,
+    handler,
+):
+    def guarded(args: Optional[dict]) -> Dict[str, Any]:
+        if (
+            _hard_failure_active()
+            and command not in _HARD_FAILURE_READ_ONLY_COMMANDS
+            and command not in _HARD_FAILURE_OPERATOR_REPAIR_COMMANDS
+        ):
+            return {
+                "success": False,
+                "message": f"CLOCKS.{command} refused: subsystem is latched in HARD_FAILURE",
+                "payload": {"operational_state": _operational_state_snapshot()},
+            }
+        return handler(args)
+
+    return guarded
+
+
+COMMANDS = {
+    name: _hard_failure_guard_command(name, handler)
+    for name, handler in COMMANDS.items()
 }
 
 # ---------------------------------------------------------------------
@@ -12447,6 +13076,13 @@ def startup_teensy_quiet_delay() -> None:
 def run() -> None:
     setup_logging()
     _setup_invalid_timebase_logger()
+    _hard_failure_event.clear()
+    _hard_failure_stats_repair_event.clear()
+    _set_operational_state(
+        OPERATIONAL_STATE_STARTING,
+        reason="process_start",
+        source="RUN",
+    )
 
     _startup_control_ready.clear()
     _clocks_persistence_enabled.clear()
@@ -12515,9 +13151,17 @@ def run() -> None:
         required_receiver_mode=required_receiver_mode,
     )
 
+    _set_operational_state(
+        OPERATIONAL_STATE_RECOVERING,
+        reason="startup_holistic_restore",
+        source="RUN",
+    )
     try:
         result = _holistic_restore(preverified_location=startup_location)
         logging.info("✅ [holistic restore] complete: %s", result)
+    except HardFailureRequired:
+        # The restore court has already latched HARD_FAILURE with exact evidence.
+        pass
     except TeensyStartRejected as exc:
         logging.error(
             "💥 [holistic restore] campaign START rejected (%s); live CLOCKS persistence remains open",
@@ -12543,7 +13187,15 @@ def run() -> None:
         except Exception:
             logging.exception("⚠️ [holistic restore] cleanup also failed")
     finally:
-        if _startup_clocks_custody_unresolved():
+        if _hard_failure_active():
+            _startup_control_ready.clear()
+            _clocks_persistence_enabled.clear()
+            _diag["startup_control_ready"] = False
+            logging.critical(
+                "🛑 [clocks] startup entered HARD_FAILURE — service remains alive "
+                "for read-only diagnostics; persistence/control stay closed"
+            )
+        elif _startup_clocks_custody_unresolved():
             _startup_control_ready.clear()
             _diag["startup_control_ready"] = False
             logging.error(
@@ -12554,6 +13206,11 @@ def run() -> None:
             _clocks_persistence_enabled.set()
             _startup_control_ready.set()
             _diag["startup_control_ready"] = True
+            _set_operational_state(
+                OPERATIONAL_STATE_RUNNING,
+                reason="startup_reconciliation_complete",
+                source="RUN",
+            )
             logging.info(
                 "✅ [clocks] startup state reconciliation complete — START/RESUME enabled"
             )
@@ -12564,7 +13221,10 @@ def run() -> None:
         name="clocks-timebase-silence-monitor",
     ).start()
 
-    logging.info("🏁 [clocks] entering main loop")
+    logging.info(
+        "🏁 [clocks] entering main loop operational_state=%s",
+        _operational_state_snapshot().get("state"),
+    )
     while True:
         time.sleep(3600)
 
