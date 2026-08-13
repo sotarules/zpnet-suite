@@ -199,6 +199,15 @@ def _register_pending_reply(
         pending_replies[req_id] = entry
     return entry
 
+
+def _retire_pending_reply(req_id: int, outcome: str) -> Optional[Dict[str, Any]]:
+    """Retire one request that will never receive another lawful response."""
+    with state_lock:
+        entry = pending_replies.pop(req_id, None)
+    if entry is not None:
+        _remember_reply_state(req_id, entry, outcome)
+    return entry
+
 # ---------------------------------------------------------------------
 # Routing table (cartesian subscription edges)
 # ---------------------------------------------------------------------
@@ -503,11 +512,24 @@ def handle_client(conn: socket.socket) -> None:
                 )
                 return
 
+            except RuntimeError as exc:
+                if str(exc) != "SERIAL transport is not ready":
+                    raise
+                _retire_pending_reply(req_id, "SEND_TRANSPORT_NOT_READY")
+                if transport_wait_ready(timeout_s=REPLY_TIMEOUT_S):
+                    continue
+                conn.sendall(
+                    json.dumps({
+                        "req_id": req_id,
+                        "success": False,
+                        "message": "TEENSY transport did not become ready",
+                    }, separators=(",", ":")).encode()
+                )
+                return
+
             except Empty:
-                with state_lock:
-                    timed_out = pending_replies.pop(req_id, None)
+                timed_out = _retire_pending_reply(req_id, "TIMEOUT")
                 if timed_out is not None:
-                    _remember_reply_state(req_id, timed_out, "TIMEOUT")
                     logging.warning(
                         "⏱️ [rpc] Teensy timeout req_id=%d source=%s "
                         "target=%s.%s attempt=%d timeout_s=%.1f",
@@ -1323,11 +1345,21 @@ def _server_command_to_teensy(
             reply = q.get(timeout=REPLY_TIMEOUT_S)
             return reply
 
+        except RuntimeError as exc:
+            if str(exc) != "SERIAL transport is not ready":
+                raise
+            _retire_pending_reply(req_id, "SEND_TRANSPORT_NOT_READY")
+            if transport_wait_ready(timeout_s=REPLY_TIMEOUT_S):
+                continue
+            return {
+                "success": False,
+                "message": "TEENSY transport did not become ready",
+                "payload": {},
+            }
+
         except Empty:
-            with state_lock:
-                timed_out = pending_replies.pop(req_id, None)
+            timed_out = _retire_pending_reply(req_id, "TIMEOUT")
             if timed_out is not None:
-                _remember_reply_state(req_id, timed_out, "TIMEOUT")
                 logging.warning(
                     "⏱️ [rpc] Teensy timeout req_id=%d source=%s "
                     "target=%s.%s attempt=%d timeout_s=%.1f",

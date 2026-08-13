@@ -418,6 +418,13 @@ def _validate_firmware_campaign(
         "PHOTONS_FRAGMENT.campaign.public_count",
         minimum=1,
     )
+    expected_public_count = sequence - start_after
+    if public_count != expected_public_count:
+        raise ValueError(
+            "PHOTONS campaign public-count/boundary arithmetic mismatch: "
+            f"public_count={public_count} expected={expected_public_count} "
+            f"sequence={sequence} start_after_sequence={start_after}"
+        )
     final = campaign.get("final")
     if not isinstance(final, bool):
         raise ValueError("PHOTONS_FRAGMENT.campaign.final must be boolean")
@@ -2219,11 +2226,16 @@ def _startup_held_restore(
 ) -> Dict[str, Any]:
     global _recovery_restore_count
     generation = _new_recovery_generation()
+    # HELD_RESTORE replaces physical ancestry rather than pretending the Pi saw
+    # every firmware publication during restart/reacquisition.  The first
+    # post-restore campaign row may therefore be a lawful forward splice from
+    # the durable public_count.  _validate_firmware_campaign() independently
+    # proves that the row still closes exactly against sequence-start_after.
     _rehydrate_pi_campaign(
         active_master,
         source=source,
         live_report=None,
-        allow_first_public_count_splice=False,
+        allow_first_public_count_splice=True,
     )
     drained = _drain_queue(_fragment_queue)
     expected = {

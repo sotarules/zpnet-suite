@@ -560,6 +560,8 @@ _diag: Dict[str, Any] = {
     "gnss_raw_stats_sample_count": 0,
     "gnss_raw_stats_missing_count": 0,
     "last_gnss_raw_stats_sample": {},
+    "gnss_raw_physical_sequence_rebases": 0,
+    "last_gnss_raw_physical_sequence_rebase": {},
     "stats_reset_requests": 0,
     "stats_reset_success": 0,
     "stats_reset_teensy_failures": 0,
@@ -617,6 +619,18 @@ _diag: Dict[str, Any] = {
     "teensy_health_probe_success": 0,
     "last_timebase_activity": {},
     "last_timebase_silence": {},
+
+    # Live recovery persistence custody. Rows observed after continuity surrender
+    # remain durable evidence, but are quarantined from restore authority until
+    # the recovery transaction classifies the instrument lineage.
+    "recovery_custody_active": False,
+    "recovery_custody_generation": None,
+    "recovery_custody_begin_count": 0,
+    "recovery_custody_rows_quarantined": 0,
+    "recovery_custody_rows_promoted": 0,
+    "recovery_custody_rows_superseded": 0,
+    "recovery_custody_physical_regressions": 0,
+    "last_recovery_custody": {},
 
     # Flash Cut lifecycle
     "flash_cut_requests": 0,
@@ -2274,6 +2288,20 @@ _startup_custody_lock = threading.Lock()
 _startup_custody_active = True
 _startup_custody_backlog = deque()
 
+# Live recovery has its own durable custody boundary. Unlike startup custody,
+# recovery candidates must still flow through canonical persistence before the
+# TEMPEST processor can adjudicate them. Therefore these rows are persisted with
+# an explicit restore-authority quarantine rather than held only in RAM. A Pi
+# restart during RECOVER can then see the evidence without ever mistaking it for
+# Alpha restore authority.
+_recovery_custody_lock = threading.Lock()
+_recovery_custody_active = False
+_recovery_custody_generation: Optional[str] = None
+_recovery_custody_entered_at_utc: Optional[str] = None
+_recovery_custody_reason: Optional[str] = None
+_recovery_custody_physical_sequence_regression = False
+_recovery_custody_regression_witness: Dict[str, Any] = {}
+
 # The command server is exposed early so PUBSUB can discover subscriptions, but
 # START/RESUME must not race holistic startup reconciliation.
 _startup_control_ready = threading.Event()
@@ -2696,28 +2724,447 @@ def _reattach_pending_flash_cut_without_recovery(
     )
     return True
 
+def _recovery_custody_snapshot_locked() -> Dict[str, Any]:
+    return {
+        "active": bool(_recovery_custody_active),
+        "generation": _recovery_custody_generation,
+        "entered_at_utc": _recovery_custody_entered_at_utc,
+        "reason": _recovery_custody_reason,
+        "physical_sequence_regression": bool(
+            _recovery_custody_physical_sequence_regression
+        ),
+        "regression_witness": copy.deepcopy(_recovery_custody_regression_witness),
+    }
+
+
+def _recovery_custody_snapshot() -> Dict[str, Any]:
+    with _recovery_custody_lock:
+        return _recovery_custody_snapshot_locked()
+
+
+def _begin_recovery_clocks_custody(
+    reason: str,
+    details: Dict[str, Any],
+    *,
+    physical_sequence_regression: bool = False,
+) -> Dict[str, Any]:
+    """Quarantine live-recovery CLOCKS rows from future restore authority.
+
+    This is the live analogue of startup custody, but rows remain durably
+    persisted because canonical CLOCKS persistence is the transport into the
+    TEMPEST recovery court. ``holistic_restore_superseded`` is the established
+    restore exclusion authority and makes a Pi crash during RECOVER fail-safe.
+    """
+    global _recovery_custody_active, _recovery_custody_generation
+    global _recovery_custody_entered_at_utc, _recovery_custody_reason
+    global _recovery_custody_physical_sequence_regression
+    global _recovery_custody_regression_witness
+
+    # Boot reconciliation already owns a stricter in-memory custody boundary.
+    # Do not create a second lifecycle while startup is still classifying Teensy.
+    if not _startup_control_ready.is_set():
+        return {
+            "active": False,
+            "basis": "STARTUP_CUSTODY",
+            "reason": str(reason),
+        }
+
+    now_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    with _recovery_custody_lock:
+        newly_started = not _recovery_custody_active
+        if newly_started:
+            _recovery_custody_active = True
+            _recovery_custody_generation = f"{os.getpid()}-{time.time_ns()}"
+            _recovery_custody_entered_at_utc = now_utc
+            _recovery_custody_reason = str(reason)
+            _recovery_custody_physical_sequence_regression = False
+            _recovery_custody_regression_witness = {}
+
+        newly_proved_physical_regression = False
+        if physical_sequence_regression:
+            if not _recovery_custody_physical_sequence_regression:
+                _diag["recovery_custody_physical_regressions"] = (
+                    _diag.get("recovery_custody_physical_regressions", 0) + 1
+                )
+                _recovery_custody_physical_sequence_regression = True
+                _recovery_custody_regression_witness = copy.deepcopy(details)
+                newly_proved_physical_regression = True
+
+        snapshot = _recovery_custody_snapshot_locked()
+
+    if newly_started:
+        _diag["recovery_custody_begin_count"] = (
+            _diag.get("recovery_custody_begin_count", 0) + 1
+        )
+        logging.warning(
+            "🧾 [recovery/custody] opened durable restore-authority quarantine: "
+            "generation=%s reason=%s",
+            snapshot.get("generation"),
+            reason,
+        )
+    elif newly_proved_physical_regression:
+        logging.error(
+            "🧾 [recovery/custody] physical CLOCKS sequence regression proves a new "
+            "Teensy lifetime inside custody: generation=%s witness=%s",
+            snapshot.get("generation"),
+            details,
+        )
+
+    _diag["recovery_custody_active"] = True
+    _diag["recovery_custody_generation"] = snapshot.get("generation")
+    _diag["last_recovery_custody"] = {
+        **snapshot,
+        "last_updated_at_utc": now_utc,
+        "last_reason": str(reason),
+    }
+    return snapshot
+
+
+def _recovery_custody_requires_cold_restore() -> bool:
+    with _recovery_custody_lock:
+        return bool(
+            _recovery_custody_active
+            and _recovery_custody_physical_sequence_regression
+        )
+
+
+def _decorate_recovery_custody_state_locked(state: Dict[str, Any]) -> bool:
+    """Persist one recovery-custody row as evidence but never as restore authority."""
+    if not _recovery_custody_active:
+        return False
+    if not _recovery_custody_generation:
+        raise RuntimeError("active recovery custody has no generation identity")
+
+    state["holistic_restore_superseded"] = True
+    state["recovery_custody"] = {
+        "schema": "PI_CLOCKS_RECOVERY_CUSTODY_V1",
+        "generation": _recovery_custody_generation,
+        "entered_at_utc": _recovery_custody_entered_at_utc,
+        "reason": _recovery_custody_reason,
+        "classification": "UNCLASSIFIED_RECOVERY",
+        "restore_authority": False,
+        "physical_sequence_regression": bool(
+            _recovery_custody_physical_sequence_regression
+        ),
+        "regression_witness": copy.deepcopy(_recovery_custody_regression_witness),
+    }
+    _diag["recovery_custody_rows_quarantined"] = (
+        _diag.get("recovery_custody_rows_quarantined", 0) + 1
+    )
+    return True
+
+
+def _wait_for_clocks_persistence_barrier_locked() -> None:
+    """Drain every CLOCKS persistence item routed before the held custody lock."""
+    completion = threading.Event()
+    _clocks_persist_queue.put({"recovery_custody_barrier": completion})
+    if not completion.wait(timeout=HOLISTIC_RESTORE_TIMEOUT_S):
+        raise RuntimeError(
+            "CLOCKS persistence did not reach recovery-custody classification barrier "
+            f"within {HOLISTIC_RESTORE_TIMEOUT_S:.1f}s"
+        )
+
+
+def _finalize_recovery_clocks_custody(
+    *,
+    last_tb: Dict[str, Any],
+    campaign_name: str,
+    first_public_count: int,
+    recover_mode: str,
+) -> Dict[str, Any]:
+    """Classify durable custody rows at the first admitted RECOVER boundary.
+
+    LIVE_REATTACH without a physical lifetime regression promotes the whole
+    custody generation: firmware has attested that Alpha remained live. A cold
+    bootstrap, or any observed physical sequence regression, keeps every
+    pre-boundary row superseded and promotes only the recovered boundary and
+    later rows. The latter path additionally requires monotonic sufficient-state
+    proof against the durable recovery source before restore authority is opened.
+    """
+    global _recovery_custody_active, _recovery_custody_generation
+    global _recovery_custody_entered_at_utc, _recovery_custody_reason
+    global _recovery_custody_physical_sequence_regression
+    global _recovery_custody_regression_witness
+
+    first_public_count = int(first_public_count)
+    if first_public_count <= 0:
+        raise ValueError("recovery custody finalization requires positive public_count")
+
+    with _recovery_custody_lock:
+        if not _recovery_custody_active:
+            return {"active": False, "classified": False, "reason": "no_live_custody"}
+        generation = _recovery_custody_generation
+        if not generation:
+            raise RuntimeError("active recovery custody has no generation identity")
+        physical_regression = bool(_recovery_custody_physical_sequence_regression)
+        entered_at_utc = _recovery_custody_entered_at_utc
+        initial_reason = _recovery_custody_reason
+        regression_witness = copy.deepcopy(_recovery_custody_regression_witness)
+
+        # State routing takes this same lock through its persistence-queue put.
+        # Holding it while waiting for the FIFO barrier therefore proves that no
+        # row in this generation can appear after the classification transaction.
+        _wait_for_clocks_persistence_barrier_locked()
+
+        source_stats = _clocks_payload(last_tb).get("stats")
+        if not isinstance(source_stats, dict):
+            raise RuntimeError("recovery custody source lacks canonical CLOCKS statistics")
+        source_reset = _as_int(source_stats.get("reset_count"))
+        source_update = _as_int(source_stats.get("update_count"))
+        if source_reset is None or source_update is None:
+            raise RuntimeError("recovery custody source lacks statistics chronology")
+
+        with _clocks_persistence_lock:
+            with open_db(row_dict=True) as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT id, payload
+                    FROM campaign_detail
+                    WHERE campaign_type = %s
+                      AND campaign = %s
+                      AND payload #>> '{recovery_custody,generation}' = %s
+                      AND payload #>> '{campaign,public_count}' = %s
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (
+                        CAMPAIGN_TYPE_TEMPEST,
+                        campaign_name,
+                        generation,
+                        str(first_public_count),
+                    ),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    raise RuntimeError(
+                        "first admitted recovery row is not durably present in recovery custody"
+                    )
+
+                boundary_id = int(row["id"])
+                boundary_state = row["payload"]
+                if isinstance(boundary_state, str):
+                    boundary_state = json.loads(boundary_state)
+                if not isinstance(boundary_state, dict):
+                    raise RuntimeError("recovery custody boundary payload is not an object")
+
+                boundary_stats = _clocks_payload(boundary_state).get("stats")
+                if not isinstance(boundary_stats, dict):
+                    raise RuntimeError("recovery custody boundary lacks CLOCKS statistics")
+                boundary_reset = _as_int(boundary_stats.get("reset_count"))
+                boundary_update = _as_int(boundary_stats.get("update_count"))
+
+                cold_or_rebased = bool(
+                    str(recover_mode).upper() == "COLD_BOOTSTRAP"
+                    or physical_regression
+                )
+                lineage_proved = True
+                if cold_or_rebased:
+                    source_probe = _holistic_restore_probe(last_tb)
+                    boundary_probe = _holistic_restore_probe(boundary_state)
+                    # Recovery lineage is Teensy instrument/statistics custody.
+                    # Pi DAC targets may lawfully move while RECOVER is active, so
+                    # remove control equality from this proof without weakening the
+                    # clockface/Welford monotonicity requirements.
+                    source_lineage_probe = copy.deepcopy(source_probe)
+                    source_lineage_probe["servo_mode"] = boundary_probe.get("servo_mode")
+                    source_lineage_probe["dither_operator_enabled"] = boundary_probe.get(
+                        "dither_operator_enabled"
+                    )
+                    source_lineage_probe["ocxo1_dac"] = None
+                    source_lineage_probe["ocxo2_dac"] = None
+                    lineage_proved = bool(
+                        boundary_reset == source_reset
+                        and boundary_update is not None
+                        and boundary_update > source_update
+                        and _holistic_restore_probe_satisfied(
+                            source_lineage_probe, boundary_probe
+                        )
+                    )
+                    if not lineage_proved:
+                        raise RecoveryRetryableFailure(
+                            "recovery_custody_instrument_lineage_not_restored",
+                            {
+                                "campaign": campaign_name,
+                                "generation": generation,
+                                "recover_mode": str(recover_mode).upper(),
+                                "physical_sequence_regression": physical_regression,
+                                "source_reset_count": source_reset,
+                                "source_update_count": source_update,
+                                "boundary_reset_count": boundary_reset,
+                                "boundary_update_count": boundary_update,
+                                "source_probe": source_probe,
+                                "boundary_probe": boundary_probe,
+                                "regression_witness": regression_witness,
+                            },
+                        )
+
+                classified_at = datetime.now(timezone.utc).isoformat().replace(
+                    "+00:00", "Z"
+                )
+                if cold_or_rebased:
+                    cur.execute(
+                        """
+                        UPDATE campaign_detail
+                        SET payload = jsonb_set(
+                            jsonb_set(
+                                payload,
+                                '{recovery_custody,classification}',
+                                to_jsonb(%s::text),
+                                true
+                            ),
+                            '{recovery_custody,classified_at_utc}',
+                            to_jsonb(%s::text),
+                            true
+                        )
+                        WHERE campaign_type = %s
+                          AND payload #>> '{recovery_custody,generation}' = %s
+                          AND id < %s
+                        """,
+                        (
+                            "SUPERSEDED_PRE_RECOVERY",
+                            classified_at,
+                            CAMPAIGN_TYPE_TEMPEST,
+                            generation,
+                            boundary_id,
+                        ),
+                    )
+                    superseded = int(cur.rowcount or 0)
+                    promoted_classification = "RESTORED_RECOVERY_LINEAGE"
+                    cur.execute(
+                        """
+                        UPDATE campaign_detail
+                        SET payload = jsonb_set(
+                            jsonb_set(
+                                jsonb_set(
+                                    payload - 'holistic_restore_superseded',
+                                    '{recovery_custody,classification}',
+                                    to_jsonb(%s::text),
+                                    true
+                                ),
+                                '{recovery_custody,classified_at_utc}',
+                                to_jsonb(%s::text),
+                                true
+                            ),
+                            '{recovery_custody,restore_authority}',
+                            'true'::jsonb,
+                            true
+                        )
+                        WHERE campaign_type = %s
+                          AND payload #>> '{recovery_custody,generation}' = %s
+                          AND id >= %s
+                        """,
+                        (
+                            promoted_classification,
+                            classified_at,
+                            CAMPAIGN_TYPE_TEMPEST,
+                            generation,
+                            boundary_id,
+                        ),
+                    )
+                    promoted = int(cur.rowcount or 0)
+                else:
+                    superseded = 0
+                    promoted_classification = "LIVE_REATTACH_CONTINUITY"
+                    cur.execute(
+                        """
+                        UPDATE campaign_detail
+                        SET payload = jsonb_set(
+                            jsonb_set(
+                                jsonb_set(
+                                    payload - 'holistic_restore_superseded',
+                                    '{recovery_custody,classification}',
+                                    to_jsonb(%s::text),
+                                    true
+                                ),
+                                '{recovery_custody,classified_at_utc}',
+                                to_jsonb(%s::text),
+                                true
+                            ),
+                            '{recovery_custody,restore_authority}',
+                            'true'::jsonb,
+                            true
+                        )
+                        WHERE campaign_type = %s
+                          AND payload #>> '{recovery_custody,generation}' = %s
+                        """,
+                        (
+                            promoted_classification,
+                            classified_at,
+                            CAMPAIGN_TYPE_TEMPEST,
+                            generation,
+                        ),
+                    )
+                    promoted = int(cur.rowcount or 0)
+
+        result = {
+            "active": False,
+            "classified": True,
+            "generation": generation,
+            "entered_at_utc": entered_at_utc,
+            "classified_at_utc": classified_at,
+            "reason": initial_reason,
+            "recover_mode": str(recover_mode).upper(),
+            "physical_sequence_regression": physical_regression,
+            "regression_witness": regression_witness,
+            "first_public_count": first_public_count,
+            "boundary_detail_id": boundary_id,
+            "source_reset_count": int(source_reset),
+            "source_update_count": int(source_update),
+            "boundary_reset_count": boundary_reset,
+            "boundary_update_count": boundary_update,
+            "lineage_proved": bool(lineage_proved),
+            "promoted_classification": promoted_classification,
+            "rows_promoted": promoted,
+            "rows_superseded": superseded,
+        }
+
+        _recovery_custody_active = False
+        _recovery_custody_generation = None
+        _recovery_custody_entered_at_utc = None
+        _recovery_custody_reason = None
+        _recovery_custody_physical_sequence_regression = False
+        _recovery_custody_regression_witness = {}
+
+    _diag["recovery_custody_active"] = False
+    _diag["recovery_custody_generation"] = None
+    _diag["recovery_custody_rows_promoted"] = (
+        _diag.get("recovery_custody_rows_promoted", 0) + int(promoted)
+    )
+    _diag["recovery_custody_rows_superseded"] = (
+        _diag.get("recovery_custody_rows_superseded", 0) + int(superseded)
+    )
+    _diag["last_recovery_custody"] = copy.deepcopy(result)
+    logging.info(
+        "✅ [recovery/custody] classified generation=%s mode=%s promoted=%d "
+        "superseded=%d boundary_id=%d lineage_proved=%s",
+        generation,
+        str(recover_mode).upper(),
+        promoted,
+        superseded,
+        boundary_id,
+        lineage_proved,
+    )
+    return result
+
+
 def _teensy_clocks_health_ok() -> bool:
     """
-    True when the Teensy CLOCKS command path responds to REPORT.
+    True when the Teensy CLOCKS recovery command surface is alive.
+
+    REPORT_RECOVERY is the firmware-owned liveness surface used throughout the
+    RECOVER lifecycle.  Do not probe the nonexistent generic CLOCKS.REPORT
+    command here: a fresh Teensy can be publishing CLOCKS_FRAGMENT normally while
+    that stale command name makes live silence recovery wait forever.
 
     Failed probes are deliberately silent in the log.  During a real Teensy
     reboot or USB/RawHID loss, this loop may run for minutes; the operator only
     needs the initial silence detection and the eventual recovery transition.
     """
     _diag["teensy_health_probe_attempts"] += 1
-    try:
-        resp = send_command(
-            machine="TEENSY",
-            subsystem="CLOCKS",
-            command="REPORT",
-            retries=1,
-            retry_delay_s=0.0,
-        )
-        if resp.get("success"):
-            _diag["teensy_health_probe_success"] += 1
-            return True
-    except Exception:
-        pass
+    if _fetch_teensy_recovery_status():
+        _diag["teensy_health_probe_success"] += 1
+        return True
 
     _diag["teensy_health_probe_failures"] += 1
     return False
@@ -2740,7 +3187,7 @@ def _timebase_silence_recovery(reason: str, details: Dict[str, Any]) -> None:
         while True:
             if _teensy_clocks_health_ok():
                 logging.info(
-                    "✅ [clocks] @%s Teensy CLOCKS REPORT responded after CLOCKS_FRAGMENT silence — "
+                    "✅ [clocks] @%s Teensy CLOCKS REPORT_RECOVERY responded after CLOCKS_FRAGMENT silence — "
                     "invoking campaign recovery",
                     system_time_z(),
                 )
@@ -2875,6 +3322,7 @@ def _begin_timebase_silence_recovery(age_s: float, *, timeout_s: float, phase: s
         str(_timebase_last_activity_pps_vclock_count),
     )
 
+    _begin_recovery_clocks_custody("timebase_silence", details)
     _campaign_active = False
     _auto_recovery_in_progress = True
     _timebase_silence_recovery_active = True
@@ -2950,6 +3398,10 @@ def _begin_auto_recovery(reason: str, details: Dict[str, Any], *, source: str) -
         "details": details,
     }
 
+    _begin_recovery_clocks_custody(
+        reason,
+        {"source": source, **dict(details or {})},
+    )
     _campaign_active = False
 
     if _auto_recovery_in_progress:
@@ -3021,6 +3473,10 @@ def _hard_fault(reason: str, details: Dict[str, Any]) -> None:
         "details": details,
     }
 
+    _begin_recovery_clocks_custody(
+        reason,
+        {"source": "HARD_FAULT", **dict(details or {})},
+    )
     _campaign_active = False
 
     if _auto_recovery_in_progress:
@@ -4314,15 +4770,15 @@ def _stage_teensy_better_buckets(replay: Dict[str, Any]) -> Dict[str, Any]:
         raise
 
 
-def _probe_teensy_recovery_epoch_ready() -> bool:
-    """Return explicit Teensy epoch custody; never guess cold/live on no report."""
+def _probe_teensy_recovery_epoch() -> Tuple[bool, Dict[str, Any]]:
+    """Return explicit Teensy epoch readiness together with its lifecycle testimony."""
     last_status: Dict[str, Any] = {}
     for _ in range(4):
         status = _fetch_teensy_recovery_status()
         if status:
             last_status = status
             if "recover_epoch_ready" in status:
-                return _recovery_bool(status.get("recover_epoch_ready"))
+                return _recovery_bool(status.get("recover_epoch_ready")), dict(status)
         time.sleep(0.25)
     raise RecoveryRetryableFailure(
         "recovery_epoch_probe_unavailable",
@@ -7246,6 +7702,7 @@ def _load_last_recoverable_tempest_detail(
             WHERE campaign_type = %s
               AND campaign = %s
               AND viable = true
+              AND NOT (payload @> '{"holistic_restore_superseded":true}'::jsonb)
               AND payload #> '{campaign,adjudication}' IS NOT NULL
             ORDER BY id DESC
             LIMIT %s
@@ -7702,7 +8159,7 @@ def _advance_gnss_raw_instrument(
     sequence: Optional[int],
     system_context: Dict[str, Any],
 ) -> None:
-    """Advance GNSS_RAW exactly once per physical CLOCKS_FRAGMENT sequence."""
+    """Advance Pi-owned GNSS_RAW exactly once per boot-local CLOCKS sequence."""
     global _last_clocks_state_sequence, _last_clocks_state_monotonic
     global _gnss_raw_welford_n, _gnss_raw_welford_mean, _gnss_raw_welford_m2
     global _gnss_raw_welford_min, _gnss_raw_welford_max
@@ -7717,13 +8174,52 @@ def _advance_gnss_raw_instrument(
             _last_clocks_state_monotonic = now
             return
         if int(sequence) < int(_last_clocks_state_sequence):
-            logging.warning(
-                "⚠️ [clocks] ignoring GNSS_RAW advance for regressed physical sequence "
-                "%d < %d",
-                int(sequence),
-                int(_last_clocks_state_sequence),
+            previous_sequence = int(_last_clocks_state_sequence)
+            regression = {
+                "observed_sequence": int(sequence),
+                "previous_sequence": previous_sequence,
+                "observed_at_utc": datetime.now(timezone.utc)
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+            }
+            recovery_context = bool(
+                _startup_control_ready.is_set()
+                and (
+                    _campaign_active
+                    or _auto_recovery_in_progress
+                    or _timebase_silence_recovery_active
+                )
             )
-            return
+            if recovery_context:
+                _begin_recovery_clocks_custody(
+                    "physical_sequence_regression",
+                    regression,
+                    physical_sequence_regression=True,
+                )
+
+            # CLOCKS_FRAGMENT.sequence is a Teensy-boot-local delivery identity.
+            # A regression therefore rebases only GNSS_RAW's exactly-once trigger;
+            # it does not surrender the Pi-owned always-on GNSS_RAW clock/statistics.
+            # This row is a real post-reboot observation, so consume it exactly once
+            # below and let the next physical sequence advance normally.
+            _last_clocks_state_sequence = int(sequence)
+            _last_clocks_state_monotonic = now
+            _diag["gnss_raw_physical_sequence_rebases"] = (
+                _diag.get("gnss_raw_physical_sequence_rebases", 0) + 1
+            )
+            _diag["last_gnss_raw_physical_sequence_rebase"] = {
+                **regression,
+                "recovery_context": bool(recovery_context),
+                "gnss_raw_population_preserved": True,
+                "first_new_lifetime_row_consumed": True,
+            }
+            logging.warning(
+                "🧭 [clocks] physical CLOCKS sequence rebased %d -> %d; "
+                "preserving Pi GNSS_RAW population and consuming the first "
+                "new-lifetime observation exactly once",
+                previous_sequence,
+                int(sequence),
+            )
 
     info = _system_gnss_info(system_context)
     sample = _gnss_raw_drift_from_info(info)
@@ -8184,88 +8680,97 @@ def _clocks_state_loop() -> None:
             "clocks_fragment": clocks_fragment,
         }
 
-        # Until the Teensy lifecycle probe classifies this startup as live
-        # continuation or cold/full restore, every valid row stays in exact
-        # startup custody.  In particular, do not let an apparent N+1 row enter
-        # the narrow restore-proof lane before we know an instrument restore is
-        # actually required.
-        if not _clocks_persistence_enabled.is_set():
-            if _retain_startup_clocks_item(item):
+        # Recovery custody and ordinary routing share one lock through the final
+        # persistence-queue put. A continuity-surrender thread therefore cannot
+        # open custody between our routing decision and durable enqueue.
+        with _recovery_custody_lock:
+            if _decorate_recovery_custody_state_locked(state):
+                item["state"] = state
+                _clocks_persist_queue.put(item)
                 continue
 
-        restore_proof_custody = False
-        if _clocks_holistic_restore_proof_pending.is_set():
-            stats = _clocks_payload(state).get("stats")
-            update_count = (
-                _as_int(stats.get("update_count"))
-                if isinstance(stats, dict)
-                else None
-            )
-            reset_count = (
-                _as_int(stats.get("reset_count"))
-                if isinstance(stats, dict)
-                else None
-            )
+            # Until the Teensy lifecycle probe classifies this startup as live
+            # continuation or cold/full restore, every valid row stays in exact
+            # startup custody.  In particular, do not let an apparent N+1 row enter
+            # the narrow restore-proof lane before we know an instrument restore is
+            # actually required.
+            if not _clocks_persistence_enabled.is_set():
+                if _retain_startup_clocks_item(item):
+                    continue
 
-            if _clocks_holistic_restore_proof_sequence is None:
-                observed = _holistic_restore_probe(state)
-                if (
-                    reset_count == _clocks_holistic_restore_proof_reset_count
-                    and update_count == _clocks_holistic_restore_proof_update_count
-                    and _holistic_restore_probe_satisfied(
-                        _clocks_holistic_restore_proof_expected, observed
-                    )
-                ):
-                    _clocks_holistic_restore_proof_sequence = int(state.get("sequence") or 0)
-                    restore_proof_custody = True
-                    logging.info(
-                        "✅ [holistic restore] first restored statistics row entered "
-                        "persistence custody: reset_count=%s update_count=%s sequence=%s",
-                        reset_count,
-                        update_count,
-                        state.get("sequence"),
-                    )
-            else:
-                restore_proof_custody = bool(
-                    reset_count == _clocks_holistic_restore_proof_reset_count
-                    and update_count is not None
-                    and update_count >= _clocks_holistic_restore_proof_update_count
+            restore_proof_custody = False
+            if _clocks_holistic_restore_proof_pending.is_set():
+                stats = _clocks_payload(state).get("stats")
+                update_count = (
+                    _as_int(stats.get("update_count"))
+                    if isinstance(stats, dict)
+                    else None
+                )
+                reset_count = (
+                    _as_int(stats.get("reset_count"))
+                    if isinstance(stats, dict)
+                    else None
                 )
 
-        if not restore_proof_custody and not _clocks_persistence_enabled.is_set():
-            # A cold/full restore has classified and retired startup custody but
-            # still keeps ordinary persistence closed.  Preserve the existing
-            # narrow restore-proof/epoch-birth gates; do not splice transitional rows.
-            continue
+                if _clocks_holistic_restore_proof_sequence is None:
+                    observed = _holistic_restore_probe(state)
+                    if (
+                        reset_count == _clocks_holistic_restore_proof_reset_count
+                        and update_count == _clocks_holistic_restore_proof_update_count
+                        and _holistic_restore_probe_satisfied(
+                            _clocks_holistic_restore_proof_expected, observed
+                        )
+                    ):
+                        _clocks_holistic_restore_proof_sequence = int(state.get("sequence") or 0)
+                        restore_proof_custody = True
+                        logging.info(
+                            "✅ [holistic restore] first restored statistics row entered "
+                            "persistence custody: reset_count=%s update_count=%s sequence=%s",
+                            reset_count,
+                            update_count,
+                            state.get("sequence"),
+                        )
+                else:
+                    restore_proof_custody = bool(
+                        reset_count == _clocks_holistic_restore_proof_reset_count
+                        and update_count is not None
+                        and update_count >= _clocks_holistic_restore_proof_update_count
+                    )
 
-        if _clocks_epoch_birth_pending.is_set():
-            stats = _clocks_payload(state).get("stats")
-            update_count = (
-                _as_int(stats.get("update_count"))
-                if isinstance(stats, dict)
-                else None
-            )
-            reset_count = (
-                _as_int(stats.get("reset_count"))
-                if isinstance(stats, dict)
-                else None
-            )
-            if (
-                update_count != 1
-                or reset_count is None
-                or reset_count <= _clocks_epoch_birth_prior_reset_count
-            ):
+            if not restore_proof_custody and not _clocks_persistence_enabled.is_set():
+                # A cold/full restore has classified and retired startup custody but
+                # still keeps ordinary persistence closed.  Preserve the existing
+                # narrow restore-proof/epoch-birth gates; do not splice transitional rows.
                 continue
-            _clocks_epoch_birth_reset_count = int(reset_count)
-            _clocks_epoch_birth_pending.clear()
-            logging.info(
-                "✅ [clocks] fresh statistics epoch row 1 entered persistence custody: "
-                "reset_count=%s sequence=%s",
-                reset_count,
-                state.get("sequence"),
-            )
 
-        _clocks_persist_queue.put(item)
+            if _clocks_epoch_birth_pending.is_set():
+                stats = _clocks_payload(state).get("stats")
+                update_count = (
+                    _as_int(stats.get("update_count"))
+                    if isinstance(stats, dict)
+                    else None
+                )
+                reset_count = (
+                    _as_int(stats.get("reset_count"))
+                    if isinstance(stats, dict)
+                    else None
+                )
+                if (
+                    update_count != 1
+                    or reset_count is None
+                    or reset_count <= _clocks_epoch_birth_prior_reset_count
+                ):
+                    continue
+                _clocks_epoch_birth_reset_count = int(reset_count)
+                _clocks_epoch_birth_pending.clear()
+                logging.info(
+                    "✅ [clocks] fresh statistics epoch row 1 entered persistence custody: "
+                    "reset_count=%s sequence=%s",
+                    reset_count,
+                    state.get("sequence"),
+                )
+
+            _clocks_persist_queue.put(item)
 
 
 def _clocks_persistence_loop() -> None:
@@ -8276,6 +8781,10 @@ def _clocks_persistence_loop() -> None:
     logging.info("🚀 [clocks] CLOCKS persistence worker started")
     while True:
         item = _clocks_persist_queue.get()
+        recovery_barrier = item.get("recovery_custody_barrier")
+        if recovery_barrier is not None:
+            recovery_barrier.set()
+            continue
         state = copy.deepcopy(item["state"])
         system_context = item["system_context"]
         clocks_fragment = item["clocks_fragment"]
@@ -10266,12 +10775,35 @@ def _restore_active_campaign_state(
         "ocxo2_ns": str(int(projected_ocxo2_ns)),
     }
 
-    epoch_ready_before_recover = _probe_teensy_recovery_epoch_ready()
+    epoch_ready_before_recover, recovery_status_before = _probe_teensy_recovery_epoch()
+    physical_reboot_custody = _recovery_custody_requires_cold_restore()
+    reported_campaign_state = str(
+        recovery_status_before.get("campaign_state") or ""
+    ).strip().upper()
+    lifecycle_lost_custody = bool(
+        _recovery_custody_snapshot().get("active")
+        and reported_campaign_state != "STARTED"
+    )
+    cold_restore_custody = bool(physical_reboot_custody or lifecycle_lost_custody)
+    # Pi/PostgreSQL is the durable ancestry authority.  Firmware may discover that
+    # it needs a cold bootstrap locally, but it may not override this requirement
+    # when Pi has already proved that the live Alpha lineage was surrendered.
+    teensy_recover_args["restore_alpha_required"] = bool(cold_restore_custody)
     _diag["last_recovery"]["teensy_epoch_ready_before_recover"] = bool(
         epoch_ready_before_recover
     )
+    _diag["last_recovery"]["teensy_campaign_state_before_recover"] = (
+        reported_campaign_state or None
+    )
+    _diag["last_recovery"]["physical_reboot_custody"] = bool(
+        physical_reboot_custody
+    )
+    _diag["last_recovery"]["lifecycle_lost_custody"] = bool(
+        lifecycle_lost_custody
+    )
+    _diag["last_recovery"]["restore_alpha_required"] = bool(cold_restore_custody)
     cold_ppb_stage: Optional[Dict[str, Any]] = None
-    if epoch_ready_before_recover:
+    if epoch_ready_before_recover and not cold_restore_custody:
         _diag["last_recovery"]["canonical_restore_present"] = False
         _diag["last_recovery"]["restore_schema_version"] = None
         logging.info(
@@ -10279,6 +10811,14 @@ def _restore_active_campaign_state(
             "and all global instrument statistics during LIVE_REATTACH"
         )
     else:
+        if cold_restore_custody and epoch_ready_before_recover:
+            logging.warning(
+                "🧾 [recovery/custody] ignoring fresh epoch_ready after live continuity "
+                "was surrendered (campaign_state=%s physical_regression=%s); "
+                "durable Alpha must be restored",
+                reported_campaign_state or "UNKNOWN",
+                physical_reboot_custody,
+            )
         cold_ppb_replay = _reconstruct_better_buckets_from_db(last_tb)
         cold_ppb_stage = _stage_teensy_better_buckets(cold_ppb_replay)
         teensy_recover_args.update(
@@ -10310,10 +10850,41 @@ def _restore_active_campaign_state(
         else {}
     )
 
+    teensy_restore_alpha_required = teensy_recover_payload.get(
+        "restore_alpha_required"
+    )
+    if (
+        not isinstance(teensy_restore_alpha_required, bool)
+        or teensy_restore_alpha_required != bool(cold_restore_custody)
+    ):
+        raise RecoveryRetryableFailure(
+            "recovery_restore_policy_echo_mismatch",
+            {
+                "campaign": campaign_name,
+                "requested_restore_alpha_required": bool(cold_restore_custody),
+                "teensy_restore_alpha_required": teensy_restore_alpha_required,
+                "custody": _recovery_custody_snapshot(),
+                "teensy_recover_payload": teensy_recover_payload,
+            },
+        )
+
     recover_mode = str(
         teensy_recover_payload.get("recover_mode") or "LIVE_REATTACH"
     ).strip().upper()
     cold_bootstrap = recover_mode == "COLD_BOOTSTRAP"
+    if cold_restore_custody and not cold_bootstrap:
+        raise RecoveryRetryableFailure(
+            "recovery_mode_conflicts_with_live_recovery_custody",
+            {
+                "campaign": campaign_name,
+                "recover_mode": recover_mode,
+                "physical_reboot_custody": physical_reboot_custody,
+                "lifecycle_lost_custody": lifecycle_lost_custody,
+                "teensy_campaign_state_before_recover": reported_campaign_state or None,
+                "custody": _recovery_custody_snapshot(),
+                "teensy_recover_payload": teensy_recover_payload,
+            },
+        )
     first_row_timeout_s = (
         RECOVERY_COLD_BOOTSTRAP_FIRST_ROW_TIMEOUT_S
         if cold_bootstrap
@@ -10323,6 +10894,8 @@ def _restore_active_campaign_state(
     _diag["last_recovery"].update({
         "recover_mode": recover_mode,
         "cold_bootstrap": bool(cold_bootstrap),
+        "restore_alpha_required": bool(cold_restore_custody),
+        "teensy_restore_alpha_required": bool(teensy_restore_alpha_required),
         "interrupt_service_preserved": not cold_bootstrap,
         "recover_cold_bootstrap_active": bool(
             teensy_recover_payload.get("recover_cold_bootstrap_active")
@@ -10353,6 +10926,8 @@ def _restore_active_campaign_state(
         "recover_status": teensy_recover_payload.get("status"),
         "recover_mode": recover_mode,
         "cold_bootstrap": bool(cold_bootstrap),
+        "restore_alpha_required": bool(cold_restore_custody),
+        "teensy_restore_alpha_required": bool(teensy_restore_alpha_required),
         "recover_cold_bootstrap_active": bool(
             teensy_recover_payload.get("recover_cold_bootstrap_active")
         ),
@@ -10502,6 +11077,14 @@ def _restore_active_campaign_state(
             int(cold_bootstrap_supersede["recovered_detail_id"]),
             int(cold_bootstrap_supersede["rows_marked_nonviable"]),
         )
+
+    recovery_custody = _finalize_recovery_clocks_custody(
+        last_tb=last_tb,
+        campaign_name=campaign_name,
+        first_public_count=int(teensy_pps_vclock_count),
+        recover_mode=recover_mode,
+    )
+    _diag["last_recovery"]["recovery_custody"] = recovery_custody
 
     # The processor is paused on this exact row. Restore Pi-owned state to
     # the identity immediately before it, then reopen campaign processing so

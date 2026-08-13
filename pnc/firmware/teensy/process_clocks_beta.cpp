@@ -2166,6 +2166,7 @@ static recover_reattach_progress_marker_t g_recover_reattach_progress_ocxo2 = {}
 static uint32_t          g_recover_request_count = 0;
 static char              g_recover_last_campaign[64] = {0};
 static bool              g_recover_last_campaign_supplied = false;
+static bool              g_recover_last_restore_alpha_required = false;
 static uint64_t          g_recover_last_base_count = 0;
 static uint64_t          g_recover_last_expected_first_public_count = 0;
 static uint64_t          g_recover_last_base_gnss_ns = 0;
@@ -3514,7 +3515,8 @@ static bool recover_lifecycle_prepare_cold_bootstrap(void) {
   return true;
 }
 
-static bool recover_lifecycle_enter_from_command(const char* reason) {
+static bool recover_lifecycle_enter_from_command(const char* reason,
+                                                 bool restore_alpha_required) {
   g_recover_lifecycle_begin_count++;
   g_recover_lifecycle_last_begin_campaign_seconds = (uint32_t)campaign_seconds;
   recover_lifecycle_set_reason(reason ? reason : "recover_command_armed");
@@ -3528,11 +3530,17 @@ static bool recover_lifecycle_enter_from_command(const char* reason) {
   interrupt_recover_reset_publication_custody();
   g_recover_lifecycle_command_custody_reset_count++;
 
-  // A flashed/rebooted Teensy has durable campaign state on the Pi but no
-  // installed local service epoch.  That is not a failed live rearm.  Preserve
-  // or start startup SmartZero, enter RECOVERING, and let sovereign PPS drive
-  // the epoch install before the ordinary RECOVER grid-rephase transaction.
-  if (!clocks_alpha_installed_smartzero_backing_epoch()) {
+  // Pi owns durable ancestry.  A fresh post-flash Alpha may already have a
+  // perfectly healthy local SmartZero epoch, but that does not make it the
+  // descendant of the durable Alpha population.  When Pi explicitly requires
+  // restoration, use the existing COLD_BOOTSTRAP transaction even if the local
+  // epoch is already ready; the PPS gate will consume the supplied structured
+  // statistics and Better-Buckets state into that fresh physical lifetime.
+  // Absent that explicit custody verdict, a Teensy with no installed epoch also
+  // needs the ordinary cold-bootstrap acquisition path.
+  const bool cold_bootstrap_required =
+      restore_alpha_required || !clocks_alpha_installed_smartzero_backing_epoch();
+  if (cold_bootstrap_required) {
     if (!recover_lifecycle_prepare_cold_bootstrap()) {
       recover_lifecycle_set_reason("recover_cold_bootstrap_start_failed");
       return false;
@@ -3542,7 +3550,10 @@ static bool recover_lifecycle_enter_from_command(const char* reason) {
     clocks_watchdog_clear_surrender_for_new_lifecycle();
     clocks_watchdog_disarm_campaign_publication();
     campaign_state = clocks_campaign_state_t::RECOVERING;
-    recover_lifecycle_set_reason("recover_cold_bootstrap_wait_smartzero");
+    recover_lifecycle_set_reason(
+        restore_alpha_required
+            ? "recover_durable_alpha_restore_required"
+            : "recover_cold_bootstrap_wait_smartzero");
     return true;
   }
 
@@ -7987,6 +7998,21 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
 
   g_campaign_restore_state = clocks_recovery_restore_state_t{};
   const bool recovery_state_supplied = args.has("restore_schema_version");
+  bool restore_alpha_required = false;
+  if (!restore_get_bool(args, "restore_alpha_required",
+                        restore_alpha_required, false)) {
+    Payload err;
+    err.add("error", "restore_alpha_required must be boolean");
+    err.add("status", "recover_rejected_restore_policy");
+    return err;
+  }
+  if (restore_alpha_required && !recovery_state_supplied) {
+    Payload err;
+    err.add("error", "durable Alpha restore requires structured recovery state");
+    err.add("status", "recover_rejected_restore_policy_requires_state");
+    err.add("restore_alpha_required", true);
+    return err;
+  }
   if (recovery_state_supplied &&
       !clocks_recovery_state_from_args(
           args, g_campaign_restore_state)) {
@@ -8065,6 +8091,7 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
       dwt_ns == g_recover_last_base_dwt_ns &&
       ocxo1_ns == g_recover_last_base_ocxo1_ns &&
       ocxo2_ns == g_recover_last_base_ocxo2_ns &&
+      restore_alpha_required == g_recover_last_restore_alpha_required &&
       strcmp(requested_campaign, g_recover_last_campaign) == 0;
 
   const bool recovery_control_active =
@@ -8099,6 +8126,8 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
     p.add("recover_science_ready",
           (bool)g_recover_reattach_science_ready);
     p.add("campaign_state", clocks_campaign_state_name(campaign_state));
+    p.add("restore_alpha_required", g_recover_last_restore_alpha_required);
+    p.add("requested_restore_alpha_required", restore_alpha_required);
     return p;
   }
 
@@ -8119,10 +8148,12 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
           g_recover_last_expected_first_public_count);
     p.add("last_public_count", g_campaign_record_last_public_count);
     p.add("campaign_state", clocks_campaign_state_name(campaign_state));
+    p.add("restore_alpha_required", g_recover_last_restore_alpha_required);
     return p;
   }
 
   g_recover_last_campaign_supplied = campaign_supplied;
+  g_recover_last_restore_alpha_required = restore_alpha_required;
   if (campaign_supplied) {
     safeCopy(campaign_name, sizeof(campaign_name), requested_campaign);
   }
@@ -8157,7 +8188,8 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
   request_zero    = false;
   flash_cut_clear_pending();
 
-  if (!recover_lifecycle_enter_from_command("recover_command_armed")) {
+  if (!recover_lifecycle_enter_from_command("recover_command_armed",
+                                            restore_alpha_required)) {
     recover_lifecycle_abort("recover_interrupt_service_rearm_failed");
 
     Payload err;
@@ -8177,6 +8209,19 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
   if (g_recover_lifecycle_mode ==
           recover_lifecycle_mode_t::LIVE_REATTACH &&
       g_campaign_restore_state.valid) {
+    // Only an unconstrained live reattach may prefer the newer running Alpha.
+    // If Pi asserted durable ancestry authority above, mode selection must have
+    // forced COLD_BOOTSTRAP and this branch is unreachable.
+    if (restore_alpha_required) {
+      recover_lifecycle_abort("recover_restore_alpha_required_mode_mismatch");
+      Payload err;
+      err.add("error", "durable Alpha restore was not honored by mode selection");
+      err.add("status", "recover_rejected_restore_policy_mode_mismatch");
+      err.add("restore_alpha_required", true);
+      err.add("recover_mode",
+              recover_lifecycle_mode_name(g_recover_lifecycle_mode));
+      return err;
+    }
     // The running Teensy is newer than the last durable CLOCKS row. Preserve
     // its live statistics and all instrument control state.
     g_campaign_restore_ignored_live_count++;
@@ -8210,7 +8255,7 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
   p.add("idempotent", false);
   p.add("recovery_generation", g_recover_request_count);
   p.add("instrument_statistics_preserved",
-        clocks_alpha_installed_smartzero_backing_epoch());
+        g_recover_lifecycle_mode == recover_lifecycle_mode_t::LIVE_REATTACH);
   p.add("instrument_statistics_restore_staged",
         g_recover_lifecycle_mode == recover_lifecycle_mode_t::COLD_BOOTSTRAP &&
         g_campaign_restore_state.valid);
@@ -8221,6 +8266,7 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
             ? "TIMEBASE_STRUCTURED_RESTORE"
             : "LIVE_ALPHA_OR_LEGACY_COLD_REFILL");
   p.add("recovery_state_supplied", recovery_state_supplied);
+  p.add("restore_alpha_required", restore_alpha_required);
   p.add("restore_schema_version", CLOCKS_STRUCTURED_RESTORE_VERSION);
   p.add("base_count", g_recover_last_base_count);
   p.add("expected_first_public_count",
@@ -8417,6 +8463,7 @@ static FLASHMEM Payload cmd_report_recovery(const Payload&) {
   p.add("recover_lifecycle_active", clocks_campaign_recovery_lifecycle_active());
   p.add("recover_lifecycle_reason", g_recover_lifecycle_reason);
   p.add("recover_mode", recover_lifecycle_mode_name(g_recover_lifecycle_mode));
+  p.add("restore_alpha_required", g_recover_last_restore_alpha_required);
   p.add("recover_cold_bootstrap_active",
         g_recover_lifecycle_mode == recover_lifecycle_mode_t::COLD_BOOTSTRAP &&
         clocks_campaign_recovery_lifecycle_active());
