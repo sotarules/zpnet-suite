@@ -54,10 +54,14 @@
 //   • INIT                — reinitialize PHOTONS-owned optical hardware; laser is inhibited
 //   • SET_STANDARD_LAP_NS — install the required optical PPB reference; fragment publication
 //                           remains gated until this startup configuration is present
-//   • START               — request a LANTERN recording boundary; firmware snapshots its own
-//                           cumulative accepted-lap state at the next published fragment boundary
+//   • START               — start a LANTERN campaign, or hot-cut an active campaign to a new name
+//   • FLASH_CUT           — explicit hot campaign boundary preserving the always-on instrument epoch
 //   • STOP                — request campaign closure; the next published campaign fragment is final
 //   • REPORT              — unified laser, PD200T, interrupt, campaign, and measurement report
+//   • REPORT_PHOTONS      — compact always-on instrument + current CAMP report
+//   • REPORT_STATS        — detailed statistical/court/Better-Buckets report
+//   • STATS_RESET         — reset the always-on statistical epoch without changing CAMP custody
+//   • INJECT_PROBLEM      — arm one synthetic lap excursion through the ordinary science court
 //   • ON                  — permit laser emission through LD_ON
 //   • OFF                 — inhibit laser emission through LD_ON
 // ============================================================================
@@ -278,11 +282,12 @@ struct photons_fragment_ppb_buckets_snapshot_t {
 
 // Always-on optical statistics.  lap_count + total_lap_gnss_ns is the
 // authoritative grand ratio for mean lap time.  Welford independently carries
-// variance and doubles as a consistency witness for that ratio.  update_count
-// is the boot-local logical chronology used by Better-Buckets and, later,
-// durable replay.
+// variance and doubles as a consistency witness for that ratio.  reset_count
+// identifies the statistical epoch; update_count is the within-epoch logical
+// chronology used by Better-Buckets and, later, durable replay.
 struct photons_fragment_stats_snapshot_t {
   bool valid = false;
+  uint32_t reset_count = 0;
   uint32_t update_count = 0;
   uint64_t standard_lap_ps = 0;
   uint64_t lap_count = 0;
@@ -301,10 +306,10 @@ struct photons_fragment_stats_snapshot_t {
 
 // Firmware-authored LANTERN campaign measurement.  Pi owns campaign lifecycle,
 // durable identity, and baseline relationships; PHOTONS owns the exact recording
-// boundary and CAMP statistics.  START snapshots the already-running cumulative
-// N/T population at a published fragment boundary.  Subsequent campaign N/T is
-// subtraction from that origin, so campaign transitions never reset or perturb
-// the always-on instrument statistics above.
+// boundary and CAMP statistics.  Campaign N/T is based on monotonic custody
+// totals that survive STATS_RESET, while the always-on statistical N/T above may
+// begin a fresh epoch.  Thus campaign transitions and statistics resets are
+// mutually non-destructive, matching CLOCKS Alpha/Beta ownership.
 struct photons_fragment_campaign_snapshot_t {
   bool present = false;
   bool final = false;
