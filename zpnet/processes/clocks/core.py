@@ -1047,13 +1047,20 @@ class _DacLaneState:
 
 _dac_lock = threading.RLock()
 _dac_actuator_lock = threading.Lock()
+# DAC Welford statistics belong to the Teensy CLOCKS statistics epoch.  This
+# lock serializes epoch transitions against the row consumer so a Teensy reset
+# cannot leave Pi-owned DAC ancestry attached to a new Alpha epoch.
+_dac_stats_epoch_lock = threading.Lock()
+_dac_stats_reset_count: Optional[int] = None
+_dac_stats_update_count: Optional[int] = None
+_dac_stats_last_sequence: Optional[int] = None
+_dac_stats_reset_fence_count: Optional[int] = None
 _dac_control_wakeup = threading.Event()
 _dac_control_thread_started = threading.Event()
 _dac_hardware_initialized = False
 _dac_dither_operator_enabled = False
 _dac_servo_mode = "OFF"
 _dac_next_frame_monotonic = 0.0
-_dac_last_processed_sequence = 0
 _dac_control_second = 0
 
 _dac_lanes: Dict[str, _DacLaneState] = {
@@ -1932,20 +1939,107 @@ def _dac_process_completed_row(
     campaign: Optional[Dict[str, Any]],
     sequence: int,
 ) -> None:
-    global _dac_last_processed_sequence, _dac_control_second
+    global _dac_control_second
+    global _dac_stats_reset_count, _dac_stats_update_count
+    global _dac_stats_last_sequence, _dac_stats_reset_fence_count
+
     stats = teensy_clocks.get("stats") if isinstance(teensy_clocks, dict) else None
     if not isinstance(stats, dict):
         return
-    if not bool(stats.get("rolling_ppb_endpoint_admitted")):
-        return
-    with _dac_lock:
-        if int(sequence) <= _dac_last_processed_sequence:
+
+    try:
+        reset_count = int(stats["reset_count"])
+        update_count = int(stats["update_count"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"DAC statistics row lacks valid Teensy statistics chronology: {exc}"
+        ) from exc
+    if reset_count < 0 or update_count < 0:
+        raise RuntimeError(
+            "DAC statistics row has negative Teensy statistics chronology: "
+            f"reset_count={reset_count} update_count={update_count}"
+        )
+
+    endpoint_admitted = bool(stats.get("rolling_ppb_endpoint_admitted"))
+
+    with _dac_stats_epoch_lock:
+        previous_reset = _dac_stats_reset_count
+        previous_update = _dac_stats_update_count
+        previous_sequence = _dac_stats_last_sequence
+
+        # An explicit transitive STATS_RESET fences queued rows from the old
+        # Teensy epoch.  Those rows remain valid historical testimony elsewhere,
+        # but they must never repopulate the freshly reset Pi DAC Welfords.
+        if _dac_stats_reset_fence_count is not None:
+            if reset_count == _dac_stats_reset_fence_count:
+                return
+            _dac_reset_statistics()
+            _dac_stats_reset_fence_count = None
+            previous_reset = None
+            previous_update = None
+            previous_sequence = None
+
+        epoch_replaced = bool(
+            previous_reset is not None
+            and previous_update is not None
+            and (
+                reset_count != previous_reset
+                or update_count < previous_update
+            )
+        )
+        if epoch_replaced:
+            reset = _dac_reset_statistics()
+            logging.warning(
+                "📊 [clocks/dac] Teensy statistics epoch replaced; resetting Pi DAC "
+                "Welfords before first row of new epoch: reset_count %s -> %s, "
+                "update_count %s -> %s, sequence=%s, DAC N %s/%s -> 0/0",
+                previous_reset,
+                reset_count,
+                previous_update,
+                update_count,
+                sequence,
+                _path_get(reset, "before.ocxo1_dac.n"),
+                _path_get(reset, "before.ocxo2_dac.n"),
+            )
+
+        if (
+            previous_reset is not None
+            and previous_update is not None
+            and not epoch_replaced
+        ):
+            # reset_count/update_count is the exactly-once statistical identity.
+            # Physical CLOCKS_FRAGMENT.sequence is boot-local and may lawfully
+            # rebase across a Teensy reboot while restored statistics continue N+1.
+            if update_count == previous_update:
+                if previous_sequence != int(sequence):
+                    raise RuntimeError(
+                        "Teensy statistics chronology repeated on a different physical row: "
+                        f"reset_count={reset_count} update_count={update_count} "
+                        f"previous_sequence={previous_sequence} sequence={sequence}"
+                    )
+                return
+            if previous_sequence == int(sequence):
+                raise RuntimeError(
+                    "Teensy statistics chronology advanced on the same physical row: "
+                    f"reset_count={reset_count} previous_update_count={previous_update} "
+                    f"update_count={update_count} sequence={sequence}"
+                )
+
+        _dac_stats_reset_count = int(reset_count)
+        _dac_stats_update_count = int(update_count)
+        _dac_stats_last_sequence = int(sequence)
+
+        if not endpoint_admitted:
             return
-        _dac_last_processed_sequence = int(sequence)
-        _dac_control_second = int(stats.get("update_count") or sequence)
-        for lane in _dac_lanes.values():
-            lane.welford.update(lane.target_code)
-        mode = _dac_servo_mode
+
+        # Statistical chronology above has already proved this is a new admitted
+        # observation.  Do not gate population custody on physical sequence: that
+        # identity restarts at a Teensy reboot while restored update_count continues.
+        with _dac_lock:
+            _dac_control_second = int(update_count)
+            for lane in _dac_lanes.values():
+                lane.welford.update(lane.target_code)
+            mode = _dac_servo_mode
 
     if mode == "OFF":
         return
@@ -2062,32 +2156,56 @@ def _dac_restore_control_from_clocks(clocks: Dict[str, Any], *, realize: bool) -
         raise ValueError(f"invalid restored servo mode {mode!r}")
     dither = bool(control.get("dither_operator_enabled"))
 
-    with _dac_lock:
-        global _dac_servo_mode, _dac_dither_operator_enabled, _dac_next_frame_monotonic
-        _dac_servo_mode = mode
-        _dac_dither_operator_enabled = dither
-        _dac_next_frame_monotonic = time.monotonic() if dither else 0.0
-        for lane_name, lane in _dac_lanes.items():
-            saved = control.get(lane_name)
-            saved = saved if isinstance(saved, dict) else {}
-            servo = saved.get("servo")
-            servo = servo if isinstance(servo, dict) else {}
-            lane.target_code = _dac_clamp_target(float(saved.get("target_code") or 0.0))
-            lane.servo_last_step = float(servo.get("last_step") or 0.0)
-            lane.servo_last_residual = float(servo.get("last_residual") or 0.0)
-            lane.servo_settle_count = int(servo.get("settle_count") or 0)
-            lane.servo_adjustments = int(servo.get("adjustments") or 0)
-            lane.servo_predictor_initialized = bool(servo.get("predictor_initialized"))
-            lane.servo_last_raw_residual = float(servo.get("last_raw_residual") or 0.0)
-            lane.servo_filtered_residual = float(servo.get("filtered_residual") or 0.0)
-            lane.servo_filtered_slope = float(servo.get("filtered_slope") or 0.0)
-            lane.servo_predicted_residual = float(servo.get("predicted_residual") or 0.0)
-            lane.servo_predictor_updates = int(servo.get("predictor_updates") or 0)
-            lane.dither_enabled = dither
-            lane.dither_transition_due = None
-            _dac_clear_pending_locked(lane)
-            _dac_reset_total_state_locked(lane)
-            lane.welford.restore(auxiliary.get(f"{lane_name}_dac"))
+    restore_reset_count = _as_int(stats.get("reset_count"))
+    restore_update_count = _as_int(stats.get("update_count"))
+    restore_sequence = _as_int(clocks.get("completed_pps_sequence"))
+    if (
+        restore_reset_count is None
+        or restore_reset_count < 0
+        or restore_update_count is None
+        or restore_update_count < 0
+        or restore_sequence is None
+        or restore_sequence <= 0
+    ):
+        raise ValueError("canonical CLOCKS restore missing DAC statistics epoch identity")
+
+    with _dac_stats_epoch_lock:
+        with _dac_lock:
+            global _dac_servo_mode, _dac_dither_operator_enabled, _dac_next_frame_monotonic
+            global _dac_stats_reset_count, _dac_stats_update_count
+            global _dac_stats_last_sequence, _dac_stats_reset_fence_count
+            _dac_servo_mode = mode
+            _dac_dither_operator_enabled = dither
+            _dac_next_frame_monotonic = time.monotonic() if dither else 0.0
+            for lane_name, lane in _dac_lanes.items():
+                saved = control.get(lane_name)
+                saved = saved if isinstance(saved, dict) else {}
+                servo = saved.get("servo")
+                servo = servo if isinstance(servo, dict) else {}
+                lane.target_code = _dac_clamp_target(float(saved.get("target_code") or 0.0))
+                lane.servo_last_step = float(servo.get("last_step") or 0.0)
+                lane.servo_last_residual = float(servo.get("last_residual") or 0.0)
+                lane.servo_settle_count = int(servo.get("settle_count") or 0)
+                lane.servo_adjustments = int(servo.get("adjustments") or 0)
+                lane.servo_predictor_initialized = bool(servo.get("predictor_initialized"))
+                lane.servo_last_raw_residual = float(servo.get("last_raw_residual") or 0.0)
+                lane.servo_filtered_residual = float(servo.get("filtered_residual") or 0.0)
+                lane.servo_filtered_slope = float(servo.get("filtered_slope") or 0.0)
+                lane.servo_predicted_residual = float(servo.get("predicted_residual") or 0.0)
+                lane.servo_predictor_updates = int(servo.get("predictor_updates") or 0)
+                lane.dither_enabled = dither
+                lane.dither_transition_due = None
+                _dac_clear_pending_locked(lane)
+                _dac_reset_total_state_locked(lane)
+                lane.welford.restore(auxiliary.get(f"{lane_name}_dac"))
+
+            # The restored DAC Welford belongs to this exact canonical Teensy
+            # statistics epoch.  Discard any startup/fresh-boot chronology that
+            # preceded the restore so the next N+1 row continues this ancestry.
+            _dac_stats_reset_count = int(restore_reset_count)
+            _dac_stats_update_count = int(restore_update_count)
+            _dac_stats_last_sequence = int(restore_sequence)
+            _dac_stats_reset_fence_count = None
 
     if realize:
         if dither:
@@ -9986,58 +10104,68 @@ def _perform_transitive_stats_reset(
     source: str,
 ) -> Dict[str, Any]:
     """Reset Teensy-owned and Pi-owned CLOCKS statistics as one transaction."""
-    try:
-        teensy_response = send_command(
-            machine="TEENSY",
-            subsystem="CLOCKS",
-            command="STATS_RESET",
-        )
-    except Exception as exc:
-        _diag["stats_reset_teensy_failures"] = (
-            _diag.get("stats_reset_teensy_failures", 0) + 1
-        )
-        failure = {
-            "requested_at_utc": requested_at,
-            "success": False,
-            "stage": "TEENSY",
-            "source": source,
-            "error": str(exc),
-            "pi_gnss_raw_before": pi_before,
-            "pi_reset_applied": False,
-        }
-        _diag["last_stats_reset"] = failure
-        logging.exception("❌ [clocks] transitive STATS_RESET failed at Teensy; Pi stats preserved")
-        return {
-            "success": False,
-            "message": f"Teensy CLOCKS.STATS_RESET failed: {exc}",
-            "payload": failure,
-        }
+    global _dac_stats_reset_fence_count
 
-    teensy_ok = isinstance(teensy_response, dict) and bool(teensy_response.get("success"))
-    if not teensy_ok:
-        _diag["stats_reset_teensy_failures"] = (
-            _diag.get("stats_reset_teensy_failures", 0) + 1
-        )
-        failure = {
-            "requested_at_utc": requested_at,
-            "success": False,
-            "stage": "TEENSY",
-            "source": source,
-            "teensy_response": teensy_response,
-            "pi_gnss_raw_before": pi_before,
-            "pi_reset_applied": False,
-        }
-        _diag["last_stats_reset"] = failure
-        logging.error("❌ [clocks] Teensy rejected STATS_RESET; Pi stats preserved: %s", teensy_response)
-        return {
-            "success": False,
-            "message": "Teensy CLOCKS.STATS_RESET rejected",
-            "payload": failure,
-        }
+    prior_reset_count = _current_live_stats_reset_count()
+    with _dac_stats_epoch_lock:
+        try:
+            teensy_response = send_command(
+                machine="TEENSY",
+                subsystem="CLOCKS",
+                command="STATS_RESET",
+            )
+        except Exception as exc:
+            _diag["stats_reset_teensy_failures"] = (
+                _diag.get("stats_reset_teensy_failures", 0) + 1
+            )
+            failure = {
+                "requested_at_utc": requested_at,
+                "success": False,
+                "stage": "TEENSY",
+                "source": source,
+                "error": str(exc),
+                "pi_gnss_raw_before": pi_before,
+                "pi_reset_applied": False,
+            }
+            _diag["last_stats_reset"] = failure
+            logging.exception("❌ [clocks] transitive STATS_RESET failed at Teensy; Pi stats preserved")
+            return {
+                "success": False,
+                "message": f"Teensy CLOCKS.STATS_RESET failed: {exc}",
+                "payload": failure,
+            }
 
-    pi_previous = _gnss_raw_welford_reset()
-    pi_after = _gnss_raw_welford_snapshot()
-    dac_stats = _dac_reset_statistics()
+        teensy_ok = isinstance(teensy_response, dict) and bool(teensy_response.get("success"))
+        if not teensy_ok:
+            _diag["stats_reset_teensy_failures"] = (
+                _diag.get("stats_reset_teensy_failures", 0) + 1
+            )
+            failure = {
+                "requested_at_utc": requested_at,
+                "success": False,
+                "stage": "TEENSY",
+                "source": source,
+                "teensy_response": teensy_response,
+                "pi_gnss_raw_before": pi_before,
+                "pi_reset_applied": False,
+            }
+            _diag["last_stats_reset"] = failure
+            logging.error("❌ [clocks] Teensy rejected STATS_RESET; Pi stats preserved: %s", teensy_response)
+            return {
+                "success": False,
+                "message": "Teensy CLOCKS.STATS_RESET rejected",
+                "payload": failure,
+            }
+
+        pi_previous = _gnss_raw_welford_reset()
+        pi_after = _gnss_raw_welford_snapshot()
+        dac_stats = _dac_reset_statistics()
+
+        # Keep pre-reset rows already queued in the Pi from repopulating the new
+        # DAC statistics epoch after this transaction releases the row consumer.
+        # The first row carrying a different Teensy reset_count clears the fence.
+        _dac_stats_reset_fence_count = int(prior_reset_count)
+
     completed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     result = {
         "requested_at_utc": requested_at,
