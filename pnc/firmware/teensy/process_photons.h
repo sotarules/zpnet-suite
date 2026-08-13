@@ -61,6 +61,13 @@
 //   • REPORT_PHOTONS      — compact always-on instrument + current CAMP report
 //   • REPORT_STATS        — detailed statistical/court/Better-Buckets report
 //   • STATS_RESET         — reset the always-on statistical epoch without changing CAMP custody
+//   • RECOVERY_BEGIN      — stage bounded Better-Buckets history while publication remains held
+//   • RECOVERY_CHUNK      — append one bounded SECOND or MINUTE endpoint chunk
+//   • RECOVERY_COMMIT     — atomically install durable aggregate/campaign state and start fresh ancestry
+//   • RECOVERY_ABORT      — discard staged recovery state without starting publication
+//   • RECOVERY_COLD_START — start a genuinely empty instrument when no durable state exists
+//   • RECOVERY_PROOF_ACK  — acknowledge that the first advancing post-restore row is durable
+//   • REPORT_RECOVERY     — report staging, restored source, and physical-ancestry testimony
 //   • INJECT_PROBLEM      — arm one synthetic lap excursion through the ordinary science court
 //   • ON                  — permit laser emission through LD_ON
 //   • OFF                 — inhibit laser emission through LD_ON
@@ -335,6 +342,34 @@ struct photons_fragment_baseline_snapshot_t {
 };
 
 
+// Durable recovery restores statistical sufficient state and logical chronology,
+// never physical edge ancestry.  These fields make that negative contract
+// directly testable in every post-restore PHOTONS_FRAGMENT.
+struct photons_fragment_recovery_snapshot_t {
+  bool restored = false;
+  bool proof_pending = false;
+  bool proof_advanced = false;
+  bool proof_committed = false;
+  uint32_t generation = 0;
+  uint32_t source_sequence = 0;
+  uint32_t source_publish_count = 0;
+  uint32_t source_reset_count = 0;
+  uint32_t source_update_count = 0;
+  uint64_t source_lap_count = 0;
+  uint64_t source_total_lap_gnss_ns = 0;
+  uint64_t source_custody_lap_count = 0;
+  uint64_t source_custody_total_lap_gnss_ns = 0;
+  uint64_t accepted_lap_delta = 0;
+  uint64_t custody_lap_delta = 0;
+  bool fresh_physical_ancestry = false;
+  bool raw_lap_ring_restored = false;
+  bool partial_lap_restored = false;
+  bool pending_seed_restored = false;
+  bool predictor_restored = false;
+  bool in_flight_train_restored = false;
+};
+
+
 // Canonical once-per-second PHOTONS handoff.  The always-on instrument subtree
 // remains authoritative and campaign-independent.  Optional campaign testimony
 // is a recording-relative sibling authored by firmware, matching CLOCKS_FRAGMENT:
@@ -360,6 +395,7 @@ struct photons_fragment_snapshot_t {
   photons_fragment_stats_snapshot_t stats{};
   photons_fragment_campaign_snapshot_t campaign{};
   photons_fragment_baseline_snapshot_t baseline{};
+  photons_fragment_recovery_snapshot_t recovery{};
 
   // Snapshot of process_interrupt's PHOTODIODE lane testimony.
   uint32_t interrupt_irq_count = 0;

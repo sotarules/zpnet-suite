@@ -25,7 +25,8 @@ persistence.  Firmware owns the exact START/STOP measurement boundary.
 
 Baselines remain campaign-to-campaign relationships stored by campaign_master ID.
 No baseline statistics are copied into firmware and ``photons.baseline`` remains
-untouched.  Full optical/statistical restart recovery remains deferred to Phase 5.
+untouched.  Durable recovery restores only aggregate sufficient state and bounded
+PPB endpoint history; physical edge ancestry is always reacquired after restart.
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
 import queue
 import threading
 import time
@@ -68,7 +70,6 @@ LANTERN_CAMPAIGN_SCHEMA = "LANTERN_CAMPAIGN_V1"
 LANTERN_FRAGMENT_SCHEMA = "LANTERN_FRAGMENT_V1"
 LANTERN_MASTER_SCHEMA = "LANTERN_CAMPAIGN_MASTER_V1"
 LANTERN_REPORT_SCHEMA = "LANTERN_REPORT_V1"
-LANTERN_RESTART_INTERRUPTION_REASON = "PHASE4_NO_RESTART_RECOVERY"
 
 # Canonical Pi-side instrument schema and accepted firmware source schemas.
 PHOTONS_SCHEMA = "PHOTONS_V1"
@@ -76,6 +77,19 @@ PHOTONS_FRAGMENT_SCHEMA = "PHOTONS_FRAGMENT_V1"
 PHOTONS_INSTRUMENT_SCHEMA = "PHOTONS_INSTRUMENT_V1"
 PHOTONS_SCIENCE_SCHEMA = "PHOTONS_SCIENCE_V2"
 PHOTONS_STATS_SCHEMA = "PHOTONS_INSTRUMENT_STATS_V1"
+
+PHOTONS_RECOVERY_SCHEMA_VERSION = 1
+PHOTONS_RECOVERY_CHUNK_MAX_ENDPOINTS = 4
+PHOTONS_RECOVERY_10_MIN_SECONDS = 10 * 60
+PHOTONS_RECOVERY_60_MIN_SECONDS = 60 * 60
+PHOTONS_RECOVERY_8_HOUR_SECONDS = 8 * 60 * 60
+PHOTONS_RECOVERY_24_HOUR_SECONDS = 24 * 60 * 60
+PHOTONS_RECOVERY_SECOND_CAPACITY = PHOTONS_RECOVERY_10_MIN_SECONDS + 1
+PHOTONS_RECOVERY_MINUTE_CAPACITY = 24 * 60 + 2
+PHOTONS_RECOVERY_REPLAY_MAX_ROWS = PHOTONS_RECOVERY_24_HOUR_SECONDS + 120
+PHOTONS_RECOVERY_CURSOR_ITERSIZE = 256
+PHOTONS_RECOVERY_PROOF_TIMEOUT_S = 180.0
+PHOTONS_RECOVERY_VERIFY_TOLERANCE = 1.0e-6
 
 TEENSY_CAMPAIGN_START_ACCEPTED_STATUSES = {"start_requested", "flash_cut_requested"}
 TEENSY_CAMPAIGN_STOP_ACCEPTED_STATUSES = {"stop_requested"}
@@ -108,6 +122,7 @@ SYSTEM_CONTEXT_FIELDS = (
 
 _state_lock = threading.Lock()
 _campaign_lock = threading.Lock()
+_recovery_lock = threading.Lock()
 # Serialize worker publication/persistence with destructive maintenance commands.
 # PHOTONS is only 1 Hz, so this intentionally favors an exact maintenance boundary
 # over parallelism that could let a pre-CLEAR campaign row reappear afterward.
@@ -118,6 +133,7 @@ _persist_queue: queue.Queue[Payload] = queue.Queue(maxsize=PHOTONS_PERSIST_QUEUE
 _state_worker_started = threading.Event()
 _persistence_worker_started = threading.Event()
 _campaign_control_ready = threading.Event()
+_recovery_proof_durable = threading.Event()
 
 _latest_fragment: Optional[Payload] = None
 _latest_photons: Optional[Payload] = None
@@ -158,6 +174,18 @@ _last_campaign_transition: Optional[Dict[str, Any]] = None
 _last_structural_rejection: Optional[Dict[str, Any]] = None
 _last_system_report_failure: Optional[Dict[str, Any]] = None
 _last_persistence_failure: Optional[Dict[str, Any]] = None
+_recovery_proof_expected: Optional[Dict[str, Any]] = None
+_recovery_proof_persisted: Optional[Dict[str, Any]] = None
+_recovery_status: Dict[str, Any] = {
+    "schema": "PHOTONS_PI_RECOVERY_V1",
+    "state": "NOT_STARTED",
+    "enabled": True,
+}
+_recovery_attempt_count = 0
+_recovery_restore_count = 0
+_recovery_live_reattach_count = 0
+_recovery_cold_start_count = 0
+_recovery_failure_count = 0
 
 _standard_lap_ns: Optional[str] = None
 _standard_lap_ps: Optional[int] = None
@@ -182,6 +210,51 @@ def _require_int(value: Any, path: str, *, minimum: int = 0) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
         raise ValueError(f"{path} must be an integer >= {minimum}; got {value!r}")
     return int(value)
+
+
+def _require_bool(value: Any, path: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{path} must be boolean; got {value!r}")
+    return bool(value)
+
+
+def _require_float(value: Any, path: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{path} must be numeric; got {value!r}")
+    out = float(value)
+    if not math.isfinite(out):
+        raise ValueError(f"{path} must be finite; got {value!r}")
+    return out
+
+
+def _validate_recovery_welford(value: Any, path: str) -> Dict[str, Any]:
+    obj = _require_dict(value, path)
+    n = _require_int(obj.get("n"), f"{path}.n")
+    mean = _require_float(obj.get("mean"), f"{path}.mean")
+    m2 = _require_float(obj.get("m2"), f"{path}.m2")
+    min_value = _require_float(obj.get("min"), f"{path}.min")
+    max_value = _require_float(obj.get("max"), f"{path}.max")
+    if n == 0:
+        if any(value != 0.0 for value in (mean, m2, min_value, max_value)):
+            raise ValueError(f"{path} empty Welford must publish zero values")
+    elif m2 < 0.0 or min_value > max_value or not (min_value <= mean <= max_value):
+        raise ValueError(f"{path} Welford geometry is invalid")
+    return {
+        "n": n,
+        "mean": mean,
+        "m2": m2,
+        "min": min_value,
+        "max": max_value,
+    }
+
+
+def _welford_equivalent(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    if int(a["n"]) != int(b["n"]):
+        return False
+    return all(
+        abs(float(a[key]) - float(b[key])) <= PHOTONS_RECOVERY_VERIFY_TOLERANCE
+        for key in ("mean", "m2", "min", "max")
+    )
 
 
 def _load_standard_lap_ns() -> Tuple[str, int]:
@@ -475,6 +548,7 @@ def _validate_photons_fragment(fragment: Payload) -> Tuple[int, int, Optional[in
         "photons.science.excluded.projected_lap_ns",
     )
     stats_lap_time = _require_dict(stats.get("lap_time"), "photons.stats.lap_time")
+    recovery = _require_dict(instrument.get("recovery"), "photons.recovery")
 
     if science.get("schema") != PHOTONS_SCIENCE_SCHEMA:
         raise ValueError(f"unsupported PHOTONS science schema {science.get('schema')!r}")
@@ -604,6 +678,99 @@ def _validate_photons_fragment(fragment: Payload) -> Tuple[int, int, Optional[in
             f"excluded_projected={excluded_projected_n} pending={pending_count}"
         )
 
+    recovery_restored = _require_bool(
+        recovery.get("restored"), "photons.recovery.restored"
+    )
+    recovery_pending = _require_bool(
+        recovery.get("proof_pending"), "photons.recovery.proof_pending"
+    )
+    recovery_advanced = _require_bool(
+        recovery.get("proof_advanced"), "photons.recovery.proof_advanced"
+    )
+    recovery_committed = _require_bool(
+        recovery.get("proof_committed"), "photons.recovery.proof_committed"
+    )
+    fresh_ancestry = _require_bool(
+        recovery.get("fresh_physical_ancestry"),
+        "photons.recovery.fresh_physical_ancestry",
+    )
+    if not fresh_ancestry:
+        raise ValueError("published PHOTONS fragment lacks fresh physical ancestry")
+    for field in (
+        "raw_lap_ring_restored",
+        "partial_lap_restored",
+        "pending_seed_restored",
+        "predictor_restored",
+        "in_flight_train_restored",
+    ):
+        if _require_bool(recovery.get(field), f"photons.recovery.{field}"):
+            raise ValueError(f"PHOTONS recovery illegally restored {field}")
+    if recovery_pending and recovery_committed:
+        raise ValueError("PHOTONS recovery proof cannot be pending and committed")
+    if recovery_advanced and not recovery_restored:
+        raise ValueError("cold PHOTONS lineage cannot claim restored proof advance")
+
+    if recovery_restored:
+        generation = _require_int(
+            recovery.get("generation"), "photons.recovery.generation", minimum=1
+        )
+        source_sequence = _require_int(
+            recovery.get("source_sequence"),
+            "photons.recovery.source_sequence",
+            minimum=1,
+        )
+        source_update = _require_int(
+            recovery.get("source_update_count"),
+            "photons.recovery.source_update_count",
+            minimum=1,
+        )
+        source_laps = _require_int(
+            recovery.get("source_lap_count"),
+            "photons.recovery.source_lap_count",
+            minimum=1,
+        )
+        source_total = _require_int(
+            recovery.get("source_total_lap_gnss_ns"),
+            "photons.recovery.source_total_lap_gnss_ns",
+            minimum=1,
+        )
+        source_custody_laps = _require_int(
+            recovery.get("source_custody_lap_count"),
+            "photons.recovery.source_custody_lap_count",
+            minimum=source_laps,
+        )
+        source_custody_total = _require_int(
+            recovery.get("source_custody_total_lap_gnss_ns"),
+            "photons.recovery.source_custody_total_lap_gnss_ns",
+            minimum=source_total,
+        )
+        accepted_delta = _require_int(
+            recovery.get("accepted_lap_delta"),
+            "photons.recovery.accepted_lap_delta",
+        )
+        custody_delta = _require_int(
+            recovery.get("custody_lap_delta"),
+            "photons.recovery.custody_lap_delta",
+        )
+        if sequence <= source_sequence or stats_update_count <= source_update:
+            raise ValueError(
+                "post-restore PHOTONS chronology did not advance beyond source: "
+                f"generation={generation} sequence={sequence}/{source_sequence} "
+                f"update={stats_update_count}/{source_update}"
+            )
+        if (
+            stats_lap_count < source_laps
+            or stats_total_ns < source_total
+            or custody_lap_count < source_custody_laps
+            or custody_total_ns < source_custody_total
+            or accepted_delta != stats_lap_count - source_laps
+            or custody_delta != custody_lap_count - source_custody_laps
+        ):
+            raise ValueError("PHOTONS recovery source/delta testimony does not close")
+        expected_advanced = accepted_delta > 0 and custody_delta > 0
+        if recovery_advanced != expected_advanced:
+            raise ValueError("PHOTONS recovery proof_advanced verdict is inconsistent")
+
     pps_count_raw = projection.get("last_pps_sequence")
     pps_count = _require_int(
         pps_count_raw, "photons.projection.last_pps_sequence", minimum=0
@@ -637,6 +804,1721 @@ def _make_photons(fragment: Payload, system_context: Dict[str, Any]) -> Payload:
     state["photons"] = copy.deepcopy(instrument)
     return state
 
+
+
+# ---------------------------------------------------------------------
+# Phase 5 durable recovery court + Better-Buckets replay
+# ---------------------------------------------------------------------
+
+def _recovery_status_set(state: str, **details: Any) -> None:
+    global _recovery_status
+    with _recovery_lock:
+        current = dict(_recovery_status)
+        current.update(details)
+        current["schema"] = "PHOTONS_PI_RECOVERY_V1"
+        current["enabled"] = True
+        current["state"] = str(state)
+        current["updated_at_utc"] = _utc_now_z()
+        _recovery_status = current
+
+
+def _new_recovery_generation() -> int:
+    generation = int(time.monotonic_ns() & 0xFFFFFFFF)
+    return generation if generation != 0 else 1
+
+
+def _load_active_lantern_master() -> Optional[Dict[str, Any]]:
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                master.id,
+                master.campaign,
+                master.ts,
+                master.payload,
+                baseline.id AS baseline_campaign_id,
+                baseline.campaign AS baseline_campaign
+            FROM campaign_master AS master
+            LEFT JOIN campaign_master AS baseline
+              ON baseline.id = (master.payload ->> 'baseline_campaign_id')::bigint
+             AND baseline.campaign_type = master.campaign_type
+            WHERE master.campaign_type = %s
+              AND master.active = true
+            ORDER BY master.ts DESC, master.id DESC
+            LIMIT 2
+            """,
+            (CAMPAIGN_TYPE_LANTERN,),
+        )
+        rows = cur.fetchall()
+
+    if len(rows) > 1:
+        raise RuntimeError("multiple active LANTERN campaign masters")
+    if not rows:
+        return None
+
+    row = rows[0]
+    payload = row["payload"]
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    payload = _require_dict(payload, "active LANTERN campaign_master.payload")
+    started_at = payload.get("started_at")
+    if not started_at:
+        raise RuntimeError("active LANTERN campaign master lacks started_at")
+
+    out: Dict[str, Any] = {
+        "campaign": str(row["campaign"]),
+        "campaign_id": int(row["id"]),
+        "started_at": str(started_at),
+        "master_payload": copy.deepcopy(payload),
+    }
+    if row.get("baseline_campaign_id") is not None:
+        out["baseline_campaign_id"] = int(row["baseline_campaign_id"])
+    if row.get("baseline_campaign"):
+        out["baseline_campaign"] = str(row["baseline_campaign"])
+    return out
+
+
+def _count_lantern_campaign_details(campaign_name: str) -> int:
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM campaign_detail
+            WHERE campaign_type = %s
+              AND campaign = %s
+            """,
+            (CAMPAIGN_TYPE_LANTERN, campaign_name),
+        )
+        row = cur.fetchone()
+    return int(row["count"] if row else 0)
+
+
+def _recovery_welford_args(prefix: str, state: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        f"{prefix}_n": int(state["n"]),
+        f"{prefix}_mean": format(float(state["mean"]), ".17g"),
+        f"{prefix}_m2": format(float(state["m2"]), ".17g"),
+        f"{prefix}_min": format(float(state["min"]), ".17g"),
+        f"{prefix}_max": format(float(state["max"]), ".17g"),
+    }
+
+
+def _canonical_recovery_state_from_row(
+    row: Dict[str, Any],
+    *,
+    active_master: Optional[Dict[str, Any]],
+    require_active_campaign: bool,
+) -> Dict[str, Any]:
+    if not bool(row.get("viable")):
+        raise ValueError("campaign_detail.viable is false")
+
+    payload = row.get("payload")
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    state = copy.deepcopy(_require_dict(payload, "campaign_detail.payload"))
+    if state.get("schema") != PHOTONS_SCHEMA:
+        raise ValueError(f"unsupported canonical schema {state.get('schema')!r}")
+
+    sequence = _require_int(state.get("sequence"), "PHOTONS.sequence", minimum=1)
+    publish_count = _require_int(
+        state.get("publish_count"), "PHOTONS.publish_count", minimum=1
+    )
+    db_sequence = row.get("sequence")
+    if db_sequence is not None and _require_int(
+        db_sequence, "campaign_detail.sequence", minimum=1
+    ) != sequence:
+        raise ValueError("campaign_detail sequence does not match canonical payload")
+    instrument = _require_dict(state.get("photons"), "PHOTONS.photons")
+    if instrument.get("schema") != PHOTONS_INSTRUMENT_SCHEMA:
+        raise ValueError("canonical PHOTONS instrument schema mismatch")
+    if _require_bool(instrument.get("snapshot_ok"), "PHOTONS.photons.snapshot_ok") is not True:
+        raise ValueError("canonical PHOTONS snapshot is not coherent")
+    if _require_bool(instrument.get("valid"), "PHOTONS.photons.valid") is not True:
+        raise ValueError("canonical PHOTONS instrument is invalid")
+
+    stats = _require_dict(instrument.get("stats"), "PHOTONS.photons.stats")
+    science = _require_dict(instrument.get("science"), "PHOTONS.photons.science")
+    projection = _require_dict(
+        instrument.get("projection"), "PHOTONS.photons.projection"
+    )
+    if stats.get("schema") != PHOTONS_STATS_SCHEMA:
+        raise ValueError("canonical PHOTONS stats schema mismatch")
+    if science.get("schema") != PHOTONS_SCIENCE_SCHEMA:
+        raise ValueError("canonical PHOTONS science schema mismatch")
+    if _require_bool(stats.get("valid"), "PHOTONS.photons.stats.valid") is not True:
+        raise ValueError("canonical PHOTONS statistics are invalid")
+
+    recovery = instrument.get("recovery")
+    if recovery is not None:
+        recovery = _require_dict(recovery, "PHOTONS.photons.recovery")
+        if not _require_bool(
+            recovery.get("fresh_physical_ancestry"),
+            "PHOTONS.photons.recovery.fresh_physical_ancestry",
+        ):
+            raise ValueError("durable PHOTONS row lacks fresh physical ancestry")
+        for field in (
+            "raw_lap_ring_restored",
+            "partial_lap_restored",
+            "pending_seed_restored",
+            "predictor_restored",
+            "in_flight_train_restored",
+        ):
+            if _require_bool(
+                recovery.get(field), f"PHOTONS.photons.recovery.{field}"
+            ):
+                raise ValueError(f"durable PHOTONS row illegally restored {field}")
+
+    standard_lap_ps = _require_int(
+        stats.get("standard_lap_ps"), "PHOTONS.photons.stats.standard_lap_ps", minimum=1
+    )
+    if _standard_lap_ps is None or standard_lap_ps != int(_standard_lap_ps):
+        raise ValueError(
+            "durable STANDARD_LAP_NS does not match config.PHOTONS: "
+            f"durable_ps={standard_lap_ps} config_ps={_standard_lap_ps}"
+        )
+
+    reset_count = _require_int(
+        stats.get("reset_count"), "PHOTONS.photons.stats.reset_count"
+    )
+    update_count = _require_int(
+        stats.get("update_count"), "PHOTONS.photons.stats.update_count", minimum=1
+    )
+    lap_count = _require_int(
+        stats.get("lap_count"), "PHOTONS.photons.stats.lap_count", minimum=1
+    )
+    total_ns = _require_int(
+        stats.get("total_lap_gnss_ns"),
+        "PHOTONS.photons.stats.total_lap_gnss_ns",
+        minimum=1,
+    )
+    custody_lap_count = _require_int(
+        stats.get("custody_lap_count"),
+        "PHOTONS.photons.stats.custody_lap_count",
+        minimum=lap_count,
+    )
+    custody_total_ns = _require_int(
+        stats.get("custody_total_lap_gnss_ns"),
+        "PHOTONS.photons.stats.custody_total_lap_gnss_ns",
+        minimum=total_ns,
+    )
+    recorded_mean = _require_float(
+        stats.get("mean_lap_ns"), "PHOTONS.photons.stats.mean_lap_ns"
+    )
+    ratio_mean = float(total_ns) / float(lap_count)
+    if abs(recorded_mean - ratio_mean) > PHOTONS_RECOVERY_VERIFY_TOLERANCE:
+        raise ValueError("canonical PHOTONS mean does not close with N/T")
+
+    stats_lap = _validate_recovery_welford(
+        stats.get("lap_time"), "PHOTONS.photons.stats.lap_time"
+    )
+    accepted = _require_dict(science.get("accepted"), "PHOTONS.science.accepted")
+    excluded = _require_dict(science.get("excluded"), "PHOTONS.science.excluded")
+    accepted_count = _require_int(
+        accepted.get("count"), "PHOTONS.science.accepted.count", minimum=1
+    )
+    excluded_count = _require_int(
+        excluded.get("count"), "PHOTONS.science.excluded.count"
+    )
+    accepted_raw = _validate_recovery_welford(
+        accepted.get("raw_cycles"), "PHOTONS.science.accepted.raw_cycles"
+    )
+    accepted_projected = _validate_recovery_welford(
+        accepted.get("projected_lap_ns"),
+        "PHOTONS.science.accepted.projected_lap_ns",
+    )
+    excluded_raw = _validate_recovery_welford(
+        excluded.get("raw_cycles"), "PHOTONS.science.excluded.raw_cycles"
+    )
+    excluded_projected = _validate_recovery_welford(
+        excluded.get("projected_lap_ns"),
+        "PHOTONS.science.excluded.projected_lap_ns",
+    )
+    if not _welford_equivalent(stats_lap, accepted_projected):
+        raise ValueError("stats and accepted projected-lap Welfords differ")
+    if (
+        accepted_count != lap_count
+        or accepted_raw["n"] != accepted_count
+        or accepted_projected["n"] != accepted_count
+        or excluded_raw["n"] != excluded_count
+        or excluded_projected["n"] > excluded_count
+    ):
+        raise ValueError("canonical PHOTONS Welford population accounting fails")
+    if abs(float(accepted_projected["mean"]) - ratio_mean) > PHOTONS_RECOVERY_VERIFY_TOLERANCE:
+        raise ValueError("accepted projected-lap Welford mean does not close with N/T")
+
+    seed_pending = _require_bool(
+        science.get("seed_pending"), "PHOTONS.science.seed_pending"
+    )
+    pending_count = 1 if seed_pending else 0
+    candidate_count = _require_int(
+        science.get("candidate_count"), "PHOTONS.science.candidate_count"
+    )
+    if candidate_count != accepted_count + excluded_count + pending_count:
+        raise ValueError("canonical PHOTONS candidate accounting fails")
+
+    reasons = _require_dict(
+        science.get("exclusion_reasons"), "PHOTONS.science.exclusion_reasons"
+    )
+    projection_invalid = _require_int(
+        reasons.get("projection_invalid"), "PHOTONS.reasons.projection_invalid"
+    )
+    seed_disagreement = _require_int(
+        reasons.get("seed_disagreement"), "PHOTONS.reasons.seed_disagreement"
+    )
+    raw_cycle_excursion = _require_int(
+        reasons.get("raw_cycle_excursion"), "PHOTONS.reasons.raw_cycle_excursion"
+    )
+    if projection_invalid + seed_disagreement + raw_cycle_excursion != excluded_count:
+        raise ValueError("canonical PHOTONS exclusion reasons do not close")
+
+    attempts = _require_int(
+        projection.get("attempt_count"), "PHOTONS.projection.attempt_count"
+    )
+    successes = _require_int(
+        projection.get("success_count"), "PHOTONS.projection.success_count"
+    )
+    rejects = _require_int(
+        projection.get("reject_count"), "PHOTONS.projection.reject_count"
+    )
+    if (
+        attempts != candidate_count
+        or attempts != successes + rejects
+        or rejects != projection_invalid
+        or successes != accepted_count + excluded_projected["n"] + pending_count
+    ):
+        raise ValueError("canonical PHOTONS projection accounting fails")
+
+    current_sequence = _require_int(
+        stats.get("rolling_ppb_current_sequence"),
+        "PHOTONS.stats.rolling_ppb_current_sequence",
+        minimum=1,
+    )
+    endpoint_admitted = _require_bool(
+        stats.get("rolling_ppb_endpoint_admitted"),
+        "PHOTONS.stats.rolling_ppb_endpoint_admitted",
+    )
+    if not endpoint_admitted or current_sequence != update_count:
+        raise ValueError("canonical PHOTONS row is not a lawful PPB endpoint")
+
+    total_bucket = _require_dict(
+        _require_dict(stats.get("ppb_buckets"), "PHOTONS.stats.ppb_buckets").get("total"),
+        "PHOTONS.stats.ppb_buckets.total",
+    )
+    total_bucket_n = _require_int(
+        total_bucket.get("sample_count"), "PHOTONS.stats.ppb_buckets.total.sample_count"
+    )
+    total_bucket_ppb = _require_float(
+        total_bucket.get("ppb"), "PHOTONS.stats.ppb_buckets.total.ppb"
+    )
+    expected_total_ppb = (
+        ((ratio_mean * 1000.0) / float(standard_lap_ps)) - 1.0
+    ) * 1.0e9
+    if total_bucket_n != lap_count or abs(total_bucket_ppb - expected_total_ppb) > PHOTONS_RECOVERY_VERIFY_TOLERANCE:
+        raise ValueError("canonical PHOTONS TOTAL PPB does not close")
+
+    campaign_restore: Optional[Dict[str, Any]] = None
+    campaign = state.get("campaign")
+    durable_campaign = str(row.get("campaign") or "")
+    canonical_campaign = (
+        str(campaign.get("campaign") or "") if isinstance(campaign, dict) else ""
+    )
+    if durable_campaign != canonical_campaign:
+        raise ValueError("campaign_detail label does not match canonical campaign")
+    if require_active_campaign:
+        if active_master is None:
+            raise ValueError("active campaign recovery requested without campaign master")
+        campaign = _require_dict(campaign, "PHOTONS.campaign")
+        if str(campaign.get("campaign") or "") != active_master["campaign"]:
+            raise ValueError("canonical PHOTONS campaign does not match active master")
+        campaign_id = _require_int(
+            campaign.get("campaign_id"), "PHOTONS.campaign.campaign_id", minimum=1
+        )
+        if campaign_id != int(active_master["campaign_id"]):
+            raise ValueError("canonical PHOTONS campaign ID does not match active master")
+        if _require_bool(campaign.get("final"), "PHOTONS.campaign.final"):
+            raise ValueError("active LANTERN recovery source is already final")
+        start_after = _require_int(
+            campaign.get("start_after_sequence"),
+            "PHOTONS.campaign.start_after_sequence",
+            minimum=1,
+        )
+        public_count = _require_int(
+            campaign.get("public_count"), "PHOTONS.campaign.public_count", minimum=1
+        )
+        if start_after >= sequence:
+            raise ValueError("active LANTERN start boundary is not before source row")
+        campaign_stats = _require_dict(
+            campaign.get("stats"), "PHOTONS.campaign.stats"
+        )
+        campaign_laps = _require_int(
+            campaign_stats.get("lap_count"), "PHOTONS.campaign.stats.lap_count", minimum=1
+        )
+        campaign_total = _require_int(
+            campaign_stats.get("total_lap_gnss_ns"),
+            "PHOTONS.campaign.stats.total_lap_gnss_ns",
+            minimum=1,
+        )
+        sample_count = _require_int(
+            campaign_stats.get("sample_count"),
+            "PHOTONS.campaign.stats.sample_count",
+            minimum=1,
+        )
+        if sample_count != campaign_laps or campaign_laps > custody_lap_count or campaign_total > custody_total_ns:
+            raise ValueError("active LANTERN campaign population is invalid")
+        campaign_restore = {
+            "campaign": active_master["campaign"],
+            "campaign_id": int(active_master["campaign_id"]),
+            "start_after_sequence": start_after,
+            "public_count": public_count,
+            "lap_count": campaign_laps,
+            "total_lap_gnss_ns": campaign_total,
+            "origin_lap_count": custody_lap_count - campaign_laps,
+            "origin_total_lap_gnss_ns": custody_total_ns - campaign_total,
+        }
+
+    restore_args: Dict[str, Any] = {
+        "restore_schema_version": PHOTONS_RECOVERY_SCHEMA_VERSION,
+        "source_sequence": sequence,
+        "source_publish_count": publish_count,
+        "source_reset_count": reset_count,
+        "source_update_count": update_count,
+        "standard_lap_ps": standard_lap_ps,
+        "stats_lap_count": lap_count,
+        "stats_total_lap_gnss_ns": total_ns,
+        "custody_lap_count": custody_lap_count,
+        "custody_total_lap_gnss_ns": custody_total_ns,
+        "accepted_count": accepted_count,
+        "excluded_count": excluded_count,
+        "projection_invalid": projection_invalid,
+        "seed_disagreement": seed_disagreement,
+        "raw_cycle_excursion": raw_cycle_excursion,
+        "dropped_pending_seed_count": pending_count,
+        "campaign_active": campaign_restore is not None,
+    }
+    restore_args.update(_recovery_welford_args("accepted_projected", accepted_projected))
+    restore_args.update(_recovery_welford_args("accepted_raw", accepted_raw))
+    restore_args.update(_recovery_welford_args("excluded_raw", excluded_raw))
+    restore_args.update(_recovery_welford_args("excluded_projected", excluded_projected))
+    if campaign_restore is not None:
+        restore_args.update(
+            {
+                "campaign": campaign_restore["campaign"],
+                "campaign_origin_lap_count": campaign_restore["origin_lap_count"],
+                "campaign_origin_total_lap_gnss_ns": campaign_restore[
+                    "origin_total_lap_gnss_ns"
+                ],
+                "campaign_start_after_sequence": campaign_restore[
+                    "start_after_sequence"
+                ],
+                "campaign_public_count": campaign_restore["public_count"],
+                "campaign_lap_count": campaign_restore["lap_count"],
+                "campaign_total_lap_gnss_ns": campaign_restore[
+                    "total_lap_gnss_ns"
+                ],
+            }
+        )
+
+    return {
+        "canonical": state,
+        "db_detail_id": int(row["id"]),
+        "db_ts": str(row.get("ts") or ""),
+        "sequence": sequence,
+        "publish_count": publish_count,
+        "reset_count": reset_count,
+        "update_count": update_count,
+        "lap_count": lap_count,
+        "total_lap_gnss_ns": total_ns,
+        "custody_lap_count": custody_lap_count,
+        "custody_total_lap_gnss_ns": custody_total_ns,
+        "restore_args": restore_args,
+        "campaign_restore": campaign_restore,
+        "pending_seed_dropped": pending_count,
+    }
+
+
+def _load_newest_recoverable_photons_state(
+    *,
+    active_master: Optional[Dict[str, Any]],
+    require_active_campaign: bool,
+) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]], int]:
+    skipped: List[Dict[str, Any]] = []
+    rows_seen = 0
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor(name="photons_recovery_source_scan")
+        cur.itersize = PHOTONS_RECOVERY_CURSOR_ITERSIZE
+        if require_active_campaign:
+            assert active_master is not None
+            cur.execute(
+                """
+                SELECT id, ts, campaign, viable, payload, sequence, pps_count
+                FROM campaign_detail
+                WHERE campaign_type = %s
+                  AND campaign = %s
+                ORDER BY id DESC
+                """,
+                (CAMPAIGN_TYPE_LANTERN, active_master["campaign"]),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT id, ts, campaign, viable, payload, sequence, pps_count
+                FROM campaign_detail
+                WHERE campaign_type = %s
+                ORDER BY id DESC
+                """,
+                (CAMPAIGN_TYPE_LANTERN,),
+            )
+        for row in cur:
+            rows_seen += 1
+            try:
+                source = _canonical_recovery_state_from_row(
+                    row,
+                    active_master=active_master,
+                    require_active_campaign=require_active_campaign,
+                )
+            except Exception as exc:
+                if len(skipped) < 32:
+                    skipped.append({"id": int(row["id"]), "reason": str(exc)})
+                continue
+            return source, skipped, rows_seen
+    return None, skipped, rows_seen
+
+
+def _recovery_replay_endpoint(payload: Any) -> Dict[str, Any]:
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    state = _require_dict(payload, "PPB replay payload")
+    if state.get("schema") != PHOTONS_SCHEMA:
+        raise ValueError("PPB replay canonical schema mismatch")
+    instrument = _require_dict(state.get("photons"), "PPB replay photons")
+    stats = _require_dict(instrument.get("stats"), "PPB replay stats")
+    return {
+        "reset_count": _require_int(stats.get("reset_count"), "PPB reset_count"),
+        "sequence": _require_int(stats.get("update_count"), "PPB update_count", minimum=1),
+        "current_sequence": _require_int(
+            stats.get("rolling_ppb_current_sequence"),
+            "PPB current_sequence",
+            minimum=1,
+        ),
+        "admitted": _require_bool(
+            stats.get("rolling_ppb_endpoint_admitted"), "PPB endpoint_admitted"
+        ),
+        "lap_count": _require_int(stats.get("lap_count"), "PPB lap_count", minimum=1),
+        "total_lap_gnss_ns": _require_int(
+            stats.get("total_lap_gnss_ns"), "PPB total_lap_gnss_ns", minimum=1
+        ),
+    }
+
+
+def _photon_ppb_from_endpoints(
+    anchor: Dict[str, Any], current: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    laps = int(current["lap_count"]) - int(anchor["lap_count"])
+    total_ns = int(current["total_lap_gnss_ns"]) - int(anchor["total_lap_gnss_ns"])
+    if laps == 0:
+        if total_ns != 0:
+            raise ValueError("PPB endpoint has zero laps and nonzero duration")
+        return None
+    if laps < 0 or total_ns <= 0 or _standard_lap_ps is None:
+        raise ValueError("PPB endpoint subtraction is invalid")
+    mean_ps = (float(total_ns) * 1000.0) / float(laps)
+    return {
+        "sample_count": laps,
+        "ppb": (mean_ps / float(_standard_lap_ps) - 1.0) * 1.0e9,
+    }
+
+
+def _recovery_bucket_from_history(
+    history: List[Dict[str, Any]],
+    current: Dict[str, Any],
+    window_seconds: int,
+) -> Optional[Dict[str, Any]]:
+    current_sequence = int(current["sequence"])
+    target = max(0, current_sequence - int(window_seconds))
+    for endpoint in history:
+        sequence = int(endpoint["sequence"])
+        if sequence >= target and sequence < current_sequence:
+            return _photon_ppb_from_endpoints(endpoint, current)
+    return None
+
+
+def _verify_photons_ppb_replay(
+    source: Dict[str, Any],
+    *,
+    all_history: List[Dict[str, Any]],
+    second_history: List[Dict[str, Any]],
+    minute_history: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    current = all_history[-1]
+    stats = _require_dict(
+        _require_dict(source["canonical"].get("photons"), "source photons").get("stats"),
+        "source stats",
+    )
+    recorded_buckets = _require_dict(stats.get("ppb_buckets"), "source ppb_buckets")
+    first_sequence = int(all_history[0]["sequence"])
+    comparisons: Dict[str, Any] = {}
+    checked = 0
+    truncated = 0
+    for name, seconds, history in (
+        ("10_min", PHOTONS_RECOVERY_10_MIN_SECONDS, second_history),
+        ("60_min", PHOTONS_RECOVERY_60_MIN_SECONDS, minute_history),
+        ("8_hour", PHOTONS_RECOVERY_8_HOUR_SECONDS, minute_history),
+        ("24_hour", PHOTONS_RECOVERY_24_HOUR_SECONDS, minute_history),
+    ):
+        current_sequence = int(current["sequence"])
+        target = max(0, current_sequence - seconds)
+        full_ancestry = first_sequence == 0 if target == 0 else first_sequence <= target
+        computed = _recovery_bucket_from_history(history, current, seconds)
+        recorded = recorded_buckets.get(name)
+        if not full_ancestry:
+            comparisons[name] = {
+                "comparison": "SKIPPED_TRUNCATED_CONTIGUOUS_SUFFIX",
+                "computed": copy.deepcopy(computed),
+                "recorded": copy.deepcopy(recorded),
+            }
+            truncated += 1
+            continue
+        if computed is None and recorded is None:
+            comparisons[name] = None
+            continue
+        if computed is None or not isinstance(recorded, dict):
+            raise ValueError(f"PPB replay availability mismatch for {name}")
+        recorded_n = _require_int(recorded.get("sample_count"), f"source {name}.sample_count")
+        recorded_ppb = _require_float(recorded.get("ppb"), f"source {name}.ppb")
+        if (
+            recorded_n != int(computed["sample_count"])
+            or abs(recorded_ppb - float(computed["ppb"])) > PHOTONS_RECOVERY_VERIFY_TOLERANCE
+        ):
+            raise ValueError(
+                f"PPB replay mismatch for {name}: computed={computed!r} recorded={recorded!r}"
+            )
+        comparisons[name] = {
+            "comparison": "VERIFIED",
+            "sample_count": recorded_n,
+            "delta_ppb": float(computed["ppb"]) - recorded_ppb,
+        }
+        checked += 1
+    return {
+        "checked": checked,
+        "truncated_comparisons": truncated,
+        "comparisons": comparisons,
+    }
+
+
+def _reconstruct_photons_ppb_history(source: Dict[str, Any]) -> Dict[str, Any]:
+    source_id = int(source["db_detail_id"])
+    source_reset = int(source["reset_count"])
+    source_update = int(source["update_count"])
+    expected_update = source_update
+    descending: List[Dict[str, Any]] = []
+    boundary: Optional[Dict[str, Any]] = None
+    rows_scanned = 0
+
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor(name="photons_ppb_recovery_scan")
+        cur.itersize = PHOTONS_RECOVERY_CURSOR_ITERSIZE
+        cur.execute(
+            """
+            SELECT id, payload
+            FROM campaign_detail
+            WHERE campaign_type = %s
+              AND id <= %s
+            ORDER BY id DESC
+            """,
+            (CAMPAIGN_TYPE_LANTERN, source_id),
+        )
+        for row in cur:
+            rows_scanned += 1
+            try:
+                endpoint = _recovery_replay_endpoint(row["payload"])
+            except Exception as exc:
+                boundary = {
+                    "reason": "UNRECOVERABLE_DURABLE_ROW",
+                    "id": int(row["id"]),
+                    "error": str(exc),
+                }
+                break
+            if int(endpoint["reset_count"]) != source_reset:
+                boundary = {
+                    "reason": "STATISTICS_EPOCH_BOUNDARY",
+                    "id": int(row["id"]),
+                }
+                break
+            observed_update = int(endpoint["sequence"])
+            if observed_update != expected_update:
+                boundary = {
+                    "reason": "DURABLE_UPDATE_GAP_OR_DUPLICATE",
+                    "id": int(row["id"]),
+                    "expected_update_count": expected_update,
+                    "observed_update_count": observed_update,
+                }
+                break
+            if not endpoint["admitted"] or int(endpoint["current_sequence"]) != observed_update:
+                boundary = {
+                    "reason": "ROLLING_ANCESTRY_BOUNDARY",
+                    "id": int(row["id"]),
+                    "update_count": observed_update,
+                }
+                break
+            descending.append(endpoint)
+            if observed_update == 1 or len(descending) >= PHOTONS_RECOVERY_REPLAY_MAX_ROWS:
+                break
+            expected_update -= 1
+
+    if not descending or int(descending[0]["sequence"]) != source_update:
+        raise RuntimeError("PPB replay did not begin at the selected recovery source")
+    all_history = list(reversed(descending))
+    for previous, current in zip(all_history, all_history[1:]):
+        if (
+            int(current["sequence"]) != int(previous["sequence"]) + 1
+            or int(current["lap_count"]) < int(previous["lap_count"])
+            or int(current["total_lap_gnss_ns"]) < int(previous["total_lap_gnss_ns"])
+        ):
+            raise RuntimeError("PPB replay forward chronology is invalid")
+
+    if int(all_history[0]["sequence"]) == 1:
+        all_history.insert(
+            0,
+            {"sequence": 0, "lap_count": 0, "total_lap_gnss_ns": 0},
+        )
+
+    current = all_history[-1]
+    if (
+        int(current["sequence"]) != source_update
+        or int(current["lap_count"]) != int(source["lap_count"])
+        or int(current["total_lap_gnss_ns"]) != int(source["total_lap_gnss_ns"])
+    ):
+        raise RuntimeError("PPB replay current endpoint does not match recovery source")
+
+    second_history = all_history[-PHOTONS_RECOVERY_SECOND_CAPACITY:]
+    minute_history_all: List[Dict[str, Any]] = []
+    last_key: Optional[int] = None
+    for endpoint in all_history:
+        sequence = int(endpoint["sequence"])
+        minute_key = 0 if sequence == 0 else ((sequence - 1) // 60) + 1
+        if minute_key != last_key:
+            minute_history_all.append(endpoint)
+            last_key = minute_key
+    minute_history = minute_history_all[-PHOTONS_RECOVERY_MINUTE_CAPACITY:]
+    verification = _verify_photons_ppb_replay(
+        source,
+        all_history=all_history,
+        second_history=second_history,
+        minute_history=minute_history,
+    )
+    return {
+        "schema": "PHOTONS_PPB_RESTORE_V1",
+        "source_db_detail_id": source_id,
+        "source_reset_count": source_reset,
+        "source_update_count": source_update,
+        "rows_scanned": rows_scanned,
+        "boundary": boundary,
+        "history_truncated": int(all_history[0]["sequence"]) != 0,
+        "second_history": copy.deepcopy(second_history),
+        "minute_history": copy.deepcopy(minute_history),
+        "verification": verification,
+    }
+
+
+
+# ---------------------------------------------------------------------
+# Phase 5 startup orchestration + durable proof custody
+# ---------------------------------------------------------------------
+
+def _count_current_lantern_details() -> int:
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT COUNT(*) AS count FROM campaign_detail WHERE campaign_type = %s",
+            (CAMPAIGN_TYPE_LANTERN,),
+        )
+        row = cur.fetchone()
+    return int(row["count"] if row else 0)
+
+
+def _send_teensy_recovery_command(
+    command: str,
+    *,
+    args: Optional[Dict[str, Any]] = None,
+    accepted_statuses: set[str],
+) -> Dict[str, Any]:
+    if args is None:
+        response = send_command(
+            machine="TEENSY",
+            subsystem=SUBSYSTEM,
+            command=command,
+        )
+    else:
+        response = send_command(
+            machine="TEENSY",
+            subsystem=SUBSYSTEM,
+            command=command,
+            args=args,
+        )
+    payload = response.get("payload") if isinstance(response, dict) else None
+    status = str(payload.get("status") or "") if isinstance(payload, dict) else ""
+    if (
+        not isinstance(response, dict)
+        or not response.get("success")
+        or not isinstance(payload, dict)
+        or status not in accepted_statuses
+    ):
+        raise RuntimeError(
+            f"Teensy PHOTONS.{command} rejected: status={status!r} response={response!r}"
+        )
+    return copy.deepcopy(payload)
+
+
+def _fetch_teensy_recovery_report() -> Dict[str, Any]:
+    response = send_command(
+        machine="TEENSY",
+        subsystem=SUBSYSTEM,
+        command="REPORT_RECOVERY",
+        retries=1,
+        retry_delay_s=0.0,
+    )
+    payload = response.get("payload") if isinstance(response, dict) else None
+    if not isinstance(response, dict) or not response.get("success") or not isinstance(payload, dict):
+        raise RuntimeError(f"Teensy PHOTONS.REPORT_RECOVERY unavailable: {response!r}")
+    if payload.get("schema") != "PHOTONS_RECOVERY_REPORT_V1":
+        raise RuntimeError(
+            f"unsupported Teensy PHOTONS recovery schema {payload.get('schema')!r}"
+        )
+    if _require_int(
+        payload.get("restore_schema_version"),
+        "PHOTONS.REPORT_RECOVERY.restore_schema_version",
+    ) != PHOTONS_RECOVERY_SCHEMA_VERSION:
+        raise RuntimeError("Teensy PHOTONS recovery schema version mismatch")
+    if not _require_bool(
+        payload.get("standard_lap_configured"),
+        "PHOTONS.REPORT_RECOVERY.standard_lap_configured",
+    ):
+        raise RuntimeError("Teensy PHOTONS recovery report lacks STANDARD_LAP_NS")
+    standard_ps = _require_int(
+        payload.get("standard_lap_ps"),
+        "PHOTONS.REPORT_RECOVERY.standard_lap_ps",
+        minimum=1,
+    )
+    if _standard_lap_ps is None or standard_ps != int(_standard_lap_ps):
+        raise RuntimeError(
+            "Teensy/config PHOTONS standard mismatch during recovery: "
+            f"teensy_ps={standard_ps} config_ps={_standard_lap_ps}"
+        )
+    for field in (
+        "publication_started",
+        "staging_active",
+        "restored",
+        "proof_pending",
+        "proof_committed",
+        "proof_advanced_published",
+        "fresh_physical_ancestry",
+        "raw_lap_ring_restored",
+        "partial_lap_restored",
+        "pending_seed_restored",
+        "predictor_restored",
+        "in_flight_train_restored",
+    ):
+        _require_bool(payload.get(field), f"PHOTONS.REPORT_RECOVERY.{field}")
+    for field in (
+        "raw_lap_ring_restored",
+        "partial_lap_restored",
+        "pending_seed_restored",
+        "predictor_restored",
+        "in_flight_train_restored",
+    ):
+        if payload[field]:
+            raise RuntimeError(f"Teensy recovery illegally restored {field}")
+    for field in (
+        "generation",
+        "source_sequence",
+        "source_publish_count",
+        "source_reset_count",
+        "source_update_count",
+        "proof_sequence",
+        "proof_update_count",
+        "fragment_sequence",
+        "publish_count",
+        "stats_reset_count",
+        "stats_update_count",
+        "campaign_public_count",
+    ):
+        _require_int(payload.get(field), f"PHOTONS.REPORT_RECOVERY.{field}")
+    for field in (
+        "source_lap_count",
+        "source_total_lap_gnss_ns",
+        "source_custody_lap_count",
+        "source_custody_total_lap_gnss_ns",
+        "stats_lap_count",
+        "stats_total_lap_gnss_ns",
+        "custody_lap_count",
+        "custody_total_lap_gnss_ns",
+    ):
+        _require_int(payload.get(field), f"PHOTONS.REPORT_RECOVERY.{field}")
+    if payload["publication_started"] and not payload["fresh_physical_ancestry"]:
+        raise RuntimeError("live PHOTONS recovery report lacks fresh physical ancestry")
+    return copy.deepcopy(payload)
+
+
+def _fetch_teensy_photons_report() -> Dict[str, Any]:
+    response = send_command(
+        machine="TEENSY",
+        subsystem=SUBSYSTEM,
+        command="REPORT",
+        retries=1,
+        retry_delay_s=0.0,
+    )
+    payload = response.get("payload") if isinstance(response, dict) else None
+    if not isinstance(response, dict) or not response.get("success") or not isinstance(payload, dict):
+        raise RuntimeError(f"Teensy PHOTONS.REPORT unavailable: {response!r}")
+    if not _require_bool(
+        payload.get("standard_lap_configured"),
+        "PHOTONS.REPORT.standard_lap_configured",
+    ):
+        raise RuntimeError("Teensy PHOTONS broad report lacks STANDARD_LAP_NS")
+    standard_ps = _require_int(
+        payload.get("standard_lap_ps"), "PHOTONS.REPORT.standard_lap_ps", minimum=1
+    )
+    if _standard_lap_ps is None or standard_ps != int(_standard_lap_ps):
+        raise RuntimeError("Teensy PHOTONS broad-report standard mismatch")
+    return copy.deepcopy(payload)
+
+
+def _rehydrate_pi_campaign(
+    active_master: Optional[Dict[str, Any]],
+    *,
+    source: Optional[Dict[str, Any]],
+    live_report: Optional[Dict[str, Any]],
+    allow_first_public_count_splice: bool,
+) -> None:
+    global _active_campaign
+    global _closing_campaigns
+
+    with _campaign_lock:
+        _closing_campaigns = []
+        if active_master is None:
+            _active_campaign = None
+            return
+
+        start_after: Optional[int] = None
+        public_count = 0
+        if source is not None and isinstance(source.get("campaign_restore"), dict):
+            campaign_restore = source["campaign_restore"]
+            start_after = int(campaign_restore["start_after_sequence"])
+            public_count = int(campaign_restore["public_count"])
+        elif live_report is not None:
+            state = str(live_report.get("campaign_state") or "").upper()
+            if state == "ACTIVE":
+                name = str(live_report.get("campaign") or "")
+                if name != active_master["campaign"]:
+                    raise RuntimeError(
+                        "live Teensy LANTERN campaign does not match active master: "
+                        f"teensy={name!r} db={active_master['campaign']!r}"
+                    )
+                start_after_raw = _require_int(
+                    live_report.get("campaign_start_after_sequence"),
+                    "PHOTONS.REPORT.campaign_start_after_sequence",
+                    minimum=1,
+                )
+                public_count = _require_int(
+                    live_report.get("campaign_public_count"),
+                    "PHOTONS.REPORT.campaign_public_count",
+                )
+                start_after = int(start_after_raw)
+            elif state == "START_PENDING":
+                name = str(live_report.get("campaign") or "")
+                if name != active_master["campaign"]:
+                    raise RuntimeError("live pending LANTERN campaign name mismatch")
+            elif state != "STOPPED":
+                raise RuntimeError(
+                    f"cannot reattach Pi ownership during Teensy campaign state {state!r}"
+                )
+        else:
+            master_payload = _require_dict(
+                active_master.get("master_payload"), "active campaign master payload"
+            )
+            report = master_payload.get("report")
+            report = report if isinstance(report, dict) else {}
+            raw_start = master_payload.get("start_after_sequence")
+            if raw_start is None:
+                raw_start = report.get("start_after_sequence")
+            if raw_start is not None:
+                start_after = _require_int(
+                    raw_start, "active campaign durable start_after_sequence", minimum=1
+                )
+            raw_public = master_payload.get("firmware_public_count")
+            if raw_public is None:
+                raw_public = report.get("campaign_public_count")
+            if raw_public is not None:
+                public_count = _require_int(
+                    raw_public, "active campaign durable public_count"
+                )
+
+        window: Dict[str, Any] = {
+            "campaign": active_master["campaign"],
+            "campaign_id": int(active_master["campaign_id"]),
+            "started_at": active_master["started_at"],
+            "start_after_sequence": start_after,
+            "firmware_public_count": public_count,
+        }
+        if active_master.get("baseline_campaign_id") is not None:
+            window["baseline_campaign_id"] = int(active_master["baseline_campaign_id"])
+        if active_master.get("baseline_campaign"):
+            window["baseline_campaign"] = str(active_master["baseline_campaign"])
+        if allow_first_public_count_splice:
+            window["restart_public_count_splice_pending"] = True
+        _active_campaign = window
+
+
+def _validate_live_teensy_against_durable_source(
+    report: Dict[str, Any],
+    source: Optional[Dict[str, Any]],
+) -> Dict[str, int]:
+    floor = {
+        "sequence": _require_int(
+            report.get("fragment_sequence"),
+            "PHOTONS.REPORT_RECOVERY.fragment_sequence",
+        ),
+        "publish_count": _require_int(
+            report.get("publish_count"), "PHOTONS.REPORT_RECOVERY.publish_count"
+        ),
+        "reset_count": _require_int(
+            report.get("stats_reset_count"),
+            "PHOTONS.REPORT_RECOVERY.stats_reset_count",
+        ),
+        "update_count": _require_int(
+            report.get("stats_update_count"),
+            "PHOTONS.REPORT_RECOVERY.stats_update_count",
+        ),
+        "lap_count": _require_int(
+            report.get("stats_lap_count"),
+            "PHOTONS.REPORT_RECOVERY.stats_lap_count",
+        ),
+        "total_lap_gnss_ns": _require_int(
+            report.get("stats_total_lap_gnss_ns"),
+            "PHOTONS.REPORT_RECOVERY.stats_total_lap_gnss_ns",
+        ),
+        "custody_lap_count": _require_int(
+            report.get("custody_lap_count"),
+            "PHOTONS.REPORT_RECOVERY.custody_lap_count",
+        ),
+        "custody_total_lap_gnss_ns": _require_int(
+            report.get("custody_total_lap_gnss_ns"),
+            "PHOTONS.REPORT_RECOVERY.custody_total_lap_gnss_ns",
+        ),
+    }
+    if source is None:
+        return floor
+    if (
+        floor["sequence"] < int(source["sequence"])
+        or floor["publish_count"] < int(source["publish_count"])
+        or floor["reset_count"] != int(source["reset_count"])
+        or floor["update_count"] < int(source["update_count"])
+        or floor["lap_count"] < int(source["lap_count"])
+        or floor["total_lap_gnss_ns"] < int(source["total_lap_gnss_ns"])
+        or floor["custody_lap_count"] < int(source["custody_lap_count"])
+        or floor["custody_total_lap_gnss_ns"]
+        < int(source["custody_total_lap_gnss_ns"])
+    ):
+        raise RuntimeError(
+            "live Teensy PHOTONS state is not descended from the newest durable source"
+        )
+    return floor
+
+
+def _recovery_proof_matches(
+    photons: Dict[str, Any], expected: Dict[str, Any]
+) -> bool:
+    instrument = photons.get("photons")
+    if not isinstance(instrument, dict):
+        return False
+    stats = instrument.get("stats")
+    recovery = instrument.get("recovery")
+    if not isinstance(stats, dict) or not isinstance(recovery, dict):
+        return False
+    try:
+        sequence = _require_int(photons.get("sequence"), "proof sequence", minimum=1)
+        update_count = _require_int(
+            stats.get("update_count"), "proof update_count", minimum=1
+        )
+        reset_count = _require_int(stats.get("reset_count"), "proof reset_count")
+        lap_count = _require_int(stats.get("lap_count"), "proof lap_count")
+        total_ns = _require_int(
+            stats.get("total_lap_gnss_ns"), "proof total_lap_gnss_ns"
+        )
+        custody_laps = _require_int(
+            stats.get("custody_lap_count"), "proof custody_lap_count"
+        )
+        custody_total = _require_int(
+            stats.get("custody_total_lap_gnss_ns"),
+            "proof custody_total_lap_gnss_ns",
+        )
+        fresh = _require_bool(
+            recovery.get("fresh_physical_ancestry"), "proof fresh_physical_ancestry"
+        )
+    except Exception:
+        return False
+    if not fresh:
+        return False
+
+    mode = str(expected["mode"])
+    if mode in {"HELD_RESTORE", "FIRMWARE_PENDING_PROOF"}:
+        try:
+            if not _require_bool(recovery.get("restored"), "proof restored"):
+                return False
+            if not _require_bool(recovery.get("proof_advanced"), "proof advanced"):
+                return False
+            if _require_int(recovery.get("generation"), "proof generation") != int(
+                expected["generation"]
+            ):
+                return False
+            for field in (
+                "source_sequence",
+                "source_update_count",
+                "source_lap_count",
+                "source_total_lap_gnss_ns",
+                "source_custody_lap_count",
+                "source_custody_total_lap_gnss_ns",
+            ):
+                if _require_int(recovery.get(field), f"proof {field}") != int(
+                    expected[field]
+                ):
+                    return False
+        except Exception:
+            return False
+        exact_sequence = expected.get("exact_sequence")
+        exact_update = expected.get("exact_update_count")
+        if exact_sequence is not None and sequence != int(exact_sequence):
+            return False
+        if exact_update is not None and update_count != int(exact_update):
+            return False
+        return (
+            sequence > int(expected["source_sequence"])
+            and update_count > int(expected["source_update_count"])
+            and lap_count > int(expected["source_lap_count"])
+            and total_ns > int(expected["source_total_lap_gnss_ns"])
+            and custody_laps > int(expected["source_custody_lap_count"])
+            and custody_total > int(expected["source_custody_total_lap_gnss_ns"])
+        )
+
+    if mode == "LIVE_REATTACH":
+        return (
+            reset_count == int(expected["reset_count"])
+            and sequence > int(expected["sequence"])
+            and update_count > int(expected["update_count"])
+            and lap_count > int(expected["lap_count"])
+            and total_ns > int(expected["total_lap_gnss_ns"])
+            and custody_laps > int(expected["custody_lap_count"])
+            and custody_total > int(expected["custody_total_lap_gnss_ns"])
+        )
+
+    if mode == "COLD_START":
+        try:
+            restored = _require_bool(recovery.get("restored"), "cold proof restored")
+            generation = _require_int(recovery.get("generation"), "cold proof generation")
+        except Exception:
+            return False
+        return (
+            not restored
+            and generation == int(expected["generation"])
+            and update_count >= 1
+            and lap_count >= 1
+            and total_ns >= 1
+            and custody_laps >= 1
+            and custody_total >= 1
+        )
+
+    raise RuntimeError(f"unknown PHOTONS recovery proof mode {mode!r}")
+
+
+def _arm_recovery_proof(expected: Dict[str, Any]) -> None:
+    global _recovery_proof_expected
+    global _recovery_proof_persisted
+    with _recovery_lock:
+        _recovery_proof_expected = copy.deepcopy(expected)
+        _recovery_proof_persisted = None
+        _recovery_proof_durable.clear()
+
+
+def _note_recovery_proof_persisted(
+    photons: Dict[str, Any], detail_id: int
+) -> None:
+    global _recovery_proof_persisted
+    with _recovery_lock:
+        expected = copy.deepcopy(_recovery_proof_expected)
+        if expected is None or _recovery_proof_durable.is_set():
+            return
+        if not _recovery_proof_matches(photons, expected):
+            return
+        instrument = _require_dict(photons.get("photons"), "persisted proof photons")
+        stats = _require_dict(instrument.get("stats"), "persisted proof stats")
+        recovery = _require_dict(instrument.get("recovery"), "persisted proof recovery")
+        _recovery_proof_persisted = {
+            "detail_id": int(detail_id),
+            "persisted_at_utc": _utc_now_z(),
+            "sequence": int(photons["sequence"]),
+            "reset_count": int(stats["reset_count"]),
+            "update_count": int(stats["update_count"]),
+            "lap_count": int(stats["lap_count"]),
+            "total_lap_gnss_ns": int(stats["total_lap_gnss_ns"]),
+            "custody_lap_count": int(stats["custody_lap_count"]),
+            "custody_total_lap_gnss_ns": int(
+                stats["custody_total_lap_gnss_ns"]
+            ),
+            "generation": int(recovery.get("generation") or 0),
+            "mode": expected["mode"],
+        }
+        _recovery_proof_durable.set()
+
+
+def _find_durable_firmware_proof(
+    *, generation: int, sequence: int, update_count: int
+) -> Optional[Dict[str, Any]]:
+    if generation <= 0 or sequence <= 0 or update_count <= 0:
+        return None
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, payload
+            FROM campaign_detail
+            WHERE campaign_type = %s
+              AND sequence = %s
+            ORDER BY id DESC
+            LIMIT 32
+            """,
+            (CAMPAIGN_TYPE_LANTERN, sequence),
+        )
+        rows = cur.fetchall()
+    for row in rows:
+        payload = row["payload"]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        if not isinstance(payload, dict):
+            continue
+        instrument = payload.get("photons")
+        recovery = instrument.get("recovery") if isinstance(instrument, dict) else None
+        stats = instrument.get("stats") if isinstance(instrument, dict) else None
+        if not isinstance(recovery, dict) or not isinstance(stats, dict):
+            continue
+        try:
+            if (
+                _require_int(recovery.get("generation"), "durable proof generation")
+                == generation
+                and _require_int(payload.get("sequence"), "durable proof sequence")
+                == sequence
+                and _require_int(stats.get("update_count"), "durable proof update")
+                == update_count
+                and _require_bool(recovery.get("proof_advanced"), "durable proof advanced")
+            ):
+                return {"detail_id": int(row["id"]), "canonical": copy.deepcopy(payload)}
+        except Exception:
+            continue
+    return None
+
+
+def _wait_for_recovery_proof(*, acknowledge_firmware: bool) -> Dict[str, Any]:
+    if not _recovery_proof_durable.wait(timeout=PHOTONS_RECOVERY_PROOF_TIMEOUT_S):
+        with _recovery_lock:
+            expected = copy.deepcopy(_recovery_proof_expected)
+        raise RuntimeError(
+            "timed out waiting for a durable advancing PHOTONS recovery proof: "
+            f"expected={expected!r}"
+        )
+    with _recovery_lock:
+        proof = copy.deepcopy(_recovery_proof_persisted)
+    if not isinstance(proof, dict):
+        raise RuntimeError("PHOTONS recovery proof event has no persisted identity")
+    if acknowledge_firmware:
+        _send_teensy_recovery_command(
+            "RECOVERY_PROOF_ACK",
+            args={
+                "generation": int(proof["generation"]),
+                "sequence": int(proof["sequence"]),
+                "update_count": int(proof["update_count"]),
+            },
+            accepted_statuses={"recovery_proof_committed"},
+        )
+    return proof
+
+
+def _stage_recovery_history(
+    *, generation: int, replay: Dict[str, Any]
+) -> Dict[str, Any]:
+    second_history = list(replay["second_history"])
+    minute_history = list(replay["minute_history"])
+    _send_teensy_recovery_command(
+        "RECOVERY_BEGIN",
+        args={
+            "restore_schema_version": PHOTONS_RECOVERY_SCHEMA_VERSION,
+            "generation": generation,
+            "second_count": len(second_history),
+            "minute_count": len(minute_history),
+        },
+        accepted_statuses={"recovery_staging"},
+    )
+    chunk_count = 0
+    for history_name, endpoints in (
+        ("SECOND", second_history),
+        ("MINUTE", minute_history),
+    ):
+        for offset in range(0, len(endpoints), PHOTONS_RECOVERY_CHUNK_MAX_ENDPOINTS):
+            chunk = endpoints[
+                offset : offset + PHOTONS_RECOVERY_CHUNK_MAX_ENDPOINTS
+            ]
+            args: Dict[str, Any] = {
+                "generation": generation,
+                "history": history_name,
+                "count": len(chunk),
+            }
+            for index, endpoint in enumerate(chunk):
+                args[f"e{index}_sequence"] = int(endpoint["sequence"])
+                args[f"e{index}_lap_count"] = int(endpoint["lap_count"])
+                args[f"e{index}_total_lap_gnss_ns"] = int(
+                    endpoint["total_lap_gnss_ns"]
+                )
+            _send_teensy_recovery_command(
+                "RECOVERY_CHUNK",
+                args=args,
+                accepted_statuses={"recovery_chunk_accepted"},
+            )
+            chunk_count += 1
+    return {
+        "second_count": len(second_history),
+        "minute_count": len(minute_history),
+        "chunk_count": chunk_count,
+    }
+
+
+def _best_effort_recovery_abort() -> None:
+    try:
+        _send_teensy_recovery_command(
+            "RECOVERY_ABORT",
+            accepted_statuses={"recovery_aborted"},
+        )
+    except Exception:
+        logging.exception("⚠️ [photons] unable to abort held PHOTONS recovery staging")
+
+
+def _mark_active_campaign_recovered(
+    active_master: Optional[Dict[str, Any]],
+    *,
+    mode: str,
+    generation: int,
+    source: Optional[Dict[str, Any]],
+    proof: Dict[str, Any],
+) -> None:
+    if active_master is None:
+        return
+    payload = {
+        "restart_recovery_enabled": True,
+        "recovered_at": _utc_now_z(),
+        "recovery_mode": mode,
+        "recovery_generation": generation,
+        "recovery_source_detail_id": (
+            int(source["db_detail_id"]) if source is not None else None
+        ),
+        "recovery_proof_detail_id": int(proof["detail_id"]),
+        "recovery_proof_sequence": int(proof["sequence"]),
+        "recovery_proof_update_count": int(proof["update_count"]),
+        "physical_ancestry_restored": False,
+    }
+    with open_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE campaign_master
+            SET payload = payload || %s::jsonb
+            WHERE id = %s
+              AND campaign_type = %s
+              AND campaign = %s
+              AND active = true
+            """,
+            (
+                json.dumps(payload, separators=(",", ":")),
+                int(active_master["campaign_id"]),
+                CAMPAIGN_TYPE_LANTERN,
+                active_master["campaign"],
+            ),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("active LANTERN recovery metadata did not update exactly once")
+
+
+def _arm_existing_active_campaign_after_instrument_recovery(
+    active_master: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    global _last_campaign_transition
+    if active_master is None:
+        return None
+    with _campaign_lock:
+        if _active_campaign is None:
+            raise RuntimeError("active LANTERN master was not rehydrated")
+        if _active_campaign.get("start_after_sequence") is not None:
+            return None
+        campaign_name = str(_active_campaign["campaign"])
+    response = _request_teensy_campaign_command(
+        "START",
+        campaign=campaign_name,
+        accepted_statuses=TEENSY_CAMPAIGN_START_ACCEPTED_STATUSES,
+    )
+    transition = {
+        "action": "RECOVERY_REARM_START",
+        "at_utc": _utc_now_z(),
+        "campaign": campaign_name,
+        "campaign_id": int(active_master["campaign_id"]),
+        "boundary_pending": True,
+        "teensy_status": (response.get("payload") or {}).get("status"),
+    }
+    with _state_lock:
+        _last_campaign_transition = copy.deepcopy(transition)
+    logging.warning(
+        "▶️ [photons] re-armed zero-row active LANTERN campaign '%s' after instrument recovery",
+        campaign_name,
+    )
+    return transition
+
+
+def _startup_held_restore(
+    *,
+    active_master: Optional[Dict[str, Any]],
+    source: Dict[str, Any],
+    replay: Dict[str, Any],
+    skipped: List[Dict[str, Any]],
+    rows_scanned: int,
+) -> Dict[str, Any]:
+    global _recovery_restore_count
+    generation = _new_recovery_generation()
+    _rehydrate_pi_campaign(
+        active_master,
+        source=source,
+        live_report=None,
+        allow_first_public_count_splice=False,
+    )
+    drained = _drain_queue(_fragment_queue)
+    expected = {
+        "mode": "HELD_RESTORE",
+        "generation": generation,
+        "source_sequence": int(source["sequence"]),
+        "source_update_count": int(source["update_count"]),
+        "source_lap_count": int(source["lap_count"]),
+        "source_total_lap_gnss_ns": int(source["total_lap_gnss_ns"]),
+        "source_custody_lap_count": int(source["custody_lap_count"]),
+        "source_custody_total_lap_gnss_ns": int(
+            source["custody_total_lap_gnss_ns"]
+        ),
+    }
+    _arm_recovery_proof(expected)
+    _recovery_status_set(
+        "STAGING_HELD_RESTORE",
+        mode="HELD_RESTORE",
+        generation=generation,
+        source_detail_id=int(source["db_detail_id"]),
+        source_sequence=int(source["sequence"]),
+        source_update_count=int(source["update_count"]),
+        damaged_rows_skipped=copy.deepcopy(skipped),
+        source_rows_scanned=rows_scanned,
+        ingress_rows_drained=drained,
+        ppb_replay={
+            "rows_scanned": replay["rows_scanned"],
+            "boundary": copy.deepcopy(replay["boundary"]),
+            "history_truncated": replay["history_truncated"],
+            "verification": copy.deepcopy(replay["verification"]),
+        },
+    )
+    try:
+        staged = _stage_recovery_history(generation=generation, replay=replay)
+        commit_args = dict(source["restore_args"])
+        commit_args["generation"] = generation
+        commit = _send_teensy_recovery_command(
+            "RECOVERY_COMMIT",
+            args=commit_args,
+            accepted_statuses={"recovery_committed"},
+        )
+    except Exception:
+        _best_effort_recovery_abort()
+        raise
+
+    _start_workers()
+    _recovery_status_set(
+        "WAITING_FOR_DURABLE_PROOF",
+        mode="HELD_RESTORE",
+        generation=generation,
+        source_detail_id=int(source["db_detail_id"]),
+        staged=staged,
+        firmware_commit=commit,
+    )
+    proof = _wait_for_recovery_proof(acknowledge_firmware=True)
+    _mark_active_campaign_recovered(
+        active_master,
+        mode="HELD_RESTORE",
+        generation=generation,
+        source=source,
+        proof=proof,
+    )
+    rearm = _arm_existing_active_campaign_after_instrument_recovery(active_master)
+    with _state_lock:
+        _recovery_restore_count += 1
+    result = {
+        "mode": "HELD_RESTORE",
+        "generation": generation,
+        "source_detail_id": int(source["db_detail_id"]),
+        "source_sequence": int(source["sequence"]),
+        "source_update_count": int(source["update_count"]),
+        "pending_seed_dropped": int(source["pending_seed_dropped"]),
+        "proof": proof,
+        "campaign_rearm": rearm,
+        "staged": staged,
+    }
+    _recovery_status_set("COMPLETE", **result)
+    return result
+
+
+def _startup_cold_start(
+    *, active_master: Optional[Dict[str, Any]], rows_seen: int
+) -> Dict[str, Any]:
+    global _recovery_cold_start_count
+    if rows_seen != 0:
+        raise RuntimeError("cold PHOTONS start was requested despite durable LANTERN rows")
+    generation = _new_recovery_generation()
+    _rehydrate_pi_campaign(
+        active_master,
+        source=None,
+        live_report=None,
+        allow_first_public_count_splice=False,
+    )
+    drained = _drain_queue(_fragment_queue)
+    _arm_recovery_proof({"mode": "COLD_START", "generation": generation})
+    _recovery_status_set(
+        "COLD_STARTING",
+        mode="COLD_START",
+        generation=generation,
+        ingress_rows_drained=drained,
+    )
+    cold = _send_teensy_recovery_command(
+        "RECOVERY_COLD_START",
+        args={"generation": generation},
+        accepted_statuses={"recovery_cold_start_committed"},
+    )
+    _start_workers()
+    proof = _wait_for_recovery_proof(acknowledge_firmware=False)
+    _mark_active_campaign_recovered(
+        active_master,
+        mode="COLD_START",
+        generation=generation,
+        source=None,
+        proof=proof,
+    )
+    rearm = _arm_existing_active_campaign_after_instrument_recovery(active_master)
+    with _state_lock:
+        _recovery_cold_start_count += 1
+    result = {
+        "mode": "COLD_START",
+        "generation": generation,
+        "firmware": cold,
+        "proof": proof,
+        "campaign_rearm": rearm,
+    }
+    _recovery_status_set("COMPLETE", **result)
+    return result
+
+
+def _startup_live_reattach(
+    *,
+    active_master: Optional[Dict[str, Any]],
+    source: Optional[Dict[str, Any]],
+    recovery_report: Dict[str, Any],
+    skipped: List[Dict[str, Any]],
+    rows_scanned: int,
+) -> Dict[str, Any]:
+    global _recovery_live_reattach_count
+    broad = _fetch_teensy_photons_report()
+    floor = _validate_live_teensy_against_durable_source(recovery_report, source)
+
+    campaign_state = str(recovery_report.get("campaign_state") or "").upper()
+    live_campaign = str(recovery_report.get("campaign") or "")
+    if active_master is None:
+        if campaign_state != "STOPPED" or live_campaign:
+            raise RuntimeError(
+                "live Teensy owns a LANTERN campaign but PostgreSQL has no active master"
+            )
+    else:
+        if campaign_state in {"ACTIVE", "START_PENDING"}:
+            if live_campaign != active_master["campaign"]:
+                raise RuntimeError("live Teensy/DB active LANTERN campaign mismatch")
+        elif campaign_state == "STOPPED":
+            if _count_lantern_campaign_details(active_master["campaign"]) != 0:
+                raise RuntimeError(
+                    "active durable LANTERN campaign has history but live Teensy is stopped"
+                )
+        else:
+            raise RuntimeError(
+                f"live reattachment refuses transitional campaign state {campaign_state!r}"
+            )
+
+    proof_pending = bool(recovery_report["proof_pending"])
+    proof_advanced = bool(recovery_report["proof_advanced_published"])
+    generation = int(recovery_report["generation"])
+
+    if proof_pending:
+        if source is None:
+            raise RuntimeError("live pending firmware proof has no durable recovery source")
+        expected = {
+            "mode": "FIRMWARE_PENDING_PROOF",
+            "generation": generation,
+            "source_sequence": int(recovery_report["source_sequence"]),
+            "source_update_count": int(recovery_report["source_update_count"]),
+            "source_lap_count": int(recovery_report["source_lap_count"]),
+            "source_total_lap_gnss_ns": int(
+                recovery_report["source_total_lap_gnss_ns"]
+            ),
+            "source_custody_lap_count": int(
+                recovery_report["source_custody_lap_count"]
+            ),
+            "source_custody_total_lap_gnss_ns": int(
+                recovery_report["source_custody_total_lap_gnss_ns"]
+            ),
+        }
+        first_proof_sequence = int(recovery_report["proof_sequence"])
+        first_proof_update_count = int(recovery_report["proof_update_count"])
+        _rehydrate_pi_campaign(
+            active_master,
+            source=source,
+            live_report=broad,
+            allow_first_public_count_splice=True,
+        )
+        _arm_recovery_proof(expected)
+        durable = None
+        if proof_advanced:
+            durable = _find_durable_firmware_proof(
+                generation=generation,
+                sequence=first_proof_sequence,
+                update_count=first_proof_update_count,
+            )
+        if durable is not None:
+            _note_recovery_proof_persisted(
+                durable["canonical"], int(durable["detail_id"])
+            )
+        _start_workers()
+        proof = _wait_for_recovery_proof(acknowledge_firmware=True)
+        mode = "LIVE_REATTACH_PENDING_PROOF"
+        drained = 0
+    else:
+        drained = _drain_queue(_fragment_queue)
+        recovery_report = _fetch_teensy_recovery_report()
+        broad = _fetch_teensy_photons_report()
+        floor = _validate_live_teensy_against_durable_source(recovery_report, source)
+        _rehydrate_pi_campaign(
+            active_master,
+            source=source,
+            live_report=broad,
+            allow_first_public_count_splice=True,
+        )
+        expected = {"mode": "LIVE_REATTACH", **floor}
+        _arm_recovery_proof(expected)
+        _start_workers()
+        proof = _wait_for_recovery_proof(acknowledge_firmware=False)
+        mode = "LIVE_REATTACH"
+
+    _mark_active_campaign_recovered(
+        active_master,
+        mode=mode,
+        generation=generation,
+        source=source,
+        proof=proof,
+    )
+    rearm = None
+    if campaign_state == "STOPPED":
+        rearm = _arm_existing_active_campaign_after_instrument_recovery(active_master)
+    with _state_lock:
+        _recovery_live_reattach_count += 1
+    result = {
+        "mode": mode,
+        "generation": generation,
+        "source_detail_id": int(source["db_detail_id"]) if source else None,
+        "source_rows_scanned": rows_scanned,
+        "damaged_rows_skipped": copy.deepcopy(skipped),
+        "ingress_rows_drained": drained,
+        "live_floor": floor,
+        "proof": proof,
+        "campaign_rearm": rearm,
+    }
+    _recovery_status_set("COMPLETE", **result)
+    return result
+
+
+def _perform_phase5_recovery() -> Dict[str, Any]:
+    global _recovery_attempt_count
+    global _recovery_failure_count
+
+    with _state_lock:
+        _recovery_attempt_count += 1
+    _recovery_status_set("CLASSIFYING")
+    try:
+        active_master = _load_active_lantern_master()
+        active_detail_count = (
+            _count_lantern_campaign_details(active_master["campaign"])
+            if active_master is not None
+            else 0
+        )
+        total_detail_count = _count_current_lantern_details()
+        require_active_campaign = active_master is not None and active_detail_count > 0
+        source, skipped, rows_scanned = _load_newest_recoverable_photons_state(
+            active_master=active_master,
+            require_active_campaign=require_active_campaign,
+        )
+        if source is None and total_detail_count != 0:
+            raise RuntimeError(
+                "durable PHOTONS history exists but no row satisfies the recovery court: "
+                f"rows_scanned={rows_scanned} skipped={skipped!r}"
+            )
+
+        report = _fetch_teensy_recovery_report()
+        if report["staging_active"] and not report["publication_started"]:
+            _best_effort_recovery_abort()
+            report = _fetch_teensy_recovery_report()
+        if report["staging_active"]:
+            raise RuntimeError("Teensy PHOTONS recovery staging remains active")
+
+        classification = {
+            "active_campaign": active_master["campaign"] if active_master else None,
+            "active_campaign_detail_count": active_detail_count,
+            "total_detail_count": total_detail_count,
+            "source_detail_id": int(source["db_detail_id"]) if source else None,
+            "damaged_rows_skipped": copy.deepcopy(skipped),
+            "rows_scanned": rows_scanned,
+            "teensy_publication_started": bool(report["publication_started"]),
+        }
+        _recovery_status_set("CLASSIFIED", **classification)
+
+        if report["publication_started"]:
+            return _startup_live_reattach(
+                active_master=active_master,
+                source=source,
+                recovery_report=report,
+                skipped=skipped,
+                rows_scanned=rows_scanned,
+            )
+        if source is None:
+            return _startup_cold_start(
+                active_master=active_master,
+                rows_seen=total_detail_count,
+            )
+        replay = _reconstruct_photons_ppb_history(source)
+        return _startup_held_restore(
+            active_master=active_master,
+            source=source,
+            replay=replay,
+            skipped=skipped,
+            rows_scanned=rows_scanned,
+        )
+    except Exception as exc:
+        with _state_lock:
+            _recovery_failure_count += 1
+        _recovery_status_set("FAILED", error=str(exc))
+        logging.exception("💥 [photons] Phase 5 durable recovery failed")
+        raise
 
 
 # ---------------------------------------------------------------------
@@ -682,6 +2564,9 @@ def _campaign_public_decoration(window: Dict[str, Any]) -> Dict[str, Any]:
     flash_cut_from = window.get("flash_cut_from")
     if flash_cut_from:
         out["flash_cut_from"] = str(flash_cut_from)
+    restart_gap = window.get("restart_public_count_gap")
+    if restart_gap is not None:
+        out["restart_public_count_gap"] = int(restart_gap)
     return out
 
 
@@ -720,11 +2605,18 @@ def _campaign_decoration_from_firmware(
             )
 
         previous_public_count = int(window.get("firmware_public_count") or 0)
+        splice_pending = bool(window.get("restart_public_count_splice_pending"))
         if public_count != previous_public_count + 1:
-            raise ValueError(
-                "PHOTONS campaign public-count discontinuity: "
-                f"previous={previous_public_count} current={public_count} campaign={name!r}"
+            if not splice_pending or public_count <= previous_public_count:
+                raise ValueError(
+                    "PHOTONS campaign public-count discontinuity: "
+                    f"previous={previous_public_count} current={public_count} campaign={name!r}"
+                )
+            window["restart_public_count_gap"] = (
+                public_count - previous_public_count - 1
             )
+        if splice_pending:
+            window.pop("restart_public_count_splice_pending", None)
         window["firmware_public_count"] = public_count
 
         if final:
@@ -785,133 +2677,6 @@ def _lantern_report_from_photons(photons: Payload) -> Dict[str, Any]:
         "location": copy.deepcopy(photons.get("location") or {}),
         "environment": copy.deepcopy(photons.get("environment") or {}),
     }
-
-
-def _retire_stale_active_campaigns() -> None:
-    """Fail closed across restart until Phase 5 can prove campaign continuation.
-
-    Full campaign/statistical resurrection is still deferred.  If this Pi process is
-    restarted while a LANTERN master is active, close that master explicitly
-    before the state worker begins decorating new rows.  PUBSUB ingress is already
-    online, so fragments accumulate in the unbounded ingress queue while a
-    temporary database outage is retried here.
-    """
-    global _stale_campaign_retire_count
-    global _last_campaign_transition
-
-    failure_logged = False
-    while True:
-        try:
-            interrupted_at = _utc_now_z()
-            with open_db() as conn:
-                cur = conn.cursor()
-                cur.execute(
-                    """
-                    UPDATE campaign_master
-                    SET active = false,
-                        payload = payload || jsonb_build_object(
-                            'interrupted_at', to_jsonb(%s::text),
-                            'interruption_reason', to_jsonb(%s::text)
-                        )
-                    WHERE campaign_type = %s
-                      AND active = true
-                    """,
-                    (
-                        interrupted_at,
-                        LANTERN_RESTART_INTERRUPTION_REASON,
-                        CAMPAIGN_TYPE_LANTERN,
-                    ),
-                )
-                retired = int(cur.rowcount or 0)
-            break
-        except Exception:
-            if not failure_logged:
-                logging.exception(
-                    "⚠️ [photons] unable to classify stale active LANTERN campaign(s); retrying"
-                )
-                failure_logged = True
-            time.sleep(PHOTONS_PERSIST_RETRY_S)
-
-    if retired:
-        with _state_lock:
-            _stale_campaign_retire_count += retired
-            _last_campaign_transition = {
-                "action": "RESTART_INTERRUPT",
-                "at_utc": interrupted_at,
-                "campaigns_retired": retired,
-                "reason": LANTERN_RESTART_INTERRUPTION_REASON,
-            }
-        logging.warning(
-            "⚠️ [photons] retired %d active LANTERN campaign(s) at restart; "
-            "Phase 5 restart recovery is not yet enabled",
-            retired,
-        )
-
-
-def _quiesce_stale_teensy_campaign() -> None:
-    """Fail closed on Pi restart until firmware has no orphan LANTERN lifecycle."""
-    deadline = time.monotonic() + 15.0
-    stop_requested = False
-    last_state = None
-
-    while time.monotonic() < deadline:
-        try:
-            response = send_command(
-                machine="TEENSY",
-                subsystem=SUBSYSTEM,
-                command="REPORT",
-                retries=1,
-                retry_delay_s=0.0,
-            )
-            payload = response.get("payload") if isinstance(response, dict) else None
-            if (
-                not isinstance(response, dict)
-                or not response.get("success")
-                or not isinstance(payload, dict)
-            ):
-                raise RuntimeError(f"Teensy PHOTONS.REPORT unavailable: {response!r}")
-            state = str(payload.get("campaign_state") or "").upper()
-        except Exception:
-            time.sleep(PHOTONS_STATE_RETRY_S)
-            continue
-
-        last_state = state
-        if state == "STOPPED":
-            return
-        if state == "START_PENDING":
-            # START commits only on a successful pre-campaign publication.  Wait
-            # for that lawful boundary rather than inventing a cancellation path.
-            time.sleep(PHOTONS_STATE_RETRY_S)
-            continue
-        if state == "ACTIVE" and not stop_requested:
-            _request_teensy_campaign_command(
-                "STOP",
-                accepted_statuses=TEENSY_CAMPAIGN_STOP_ACCEPTED_STATUSES,
-            )
-            stop_requested = True
-            time.sleep(PHOTONS_STATE_RETRY_S)
-            continue
-        if state == "STOP_PENDING":
-            stop_requested = True
-            time.sleep(PHOTONS_STATE_RETRY_S)
-            continue
-        raise RuntimeError(f"unknown Teensy PHOTONS campaign_state {state!r}")
-
-    raise RuntimeError(
-        f"timed out quiescing stale Teensy PHOTONS campaign; last_state={last_state!r}"
-    )
-
-
-def _drain_stale_fragment_ingress() -> int:
-    """Discard pre-worker restart backlog after stale firmware campaign closure."""
-    drained = 0
-    while True:
-        try:
-            _fragment_queue.get_nowait()
-        except queue.Empty:
-            break
-        drained += 1
-    return drained
 
 
 def _baseline_relation_for_active_campaign() -> Optional[Dict[str, Any]]:
@@ -987,7 +2752,8 @@ def _persist_photons(photons: Payload) -> None:
         else None
     )
 
-    with open_db() as conn:
+    detail_id = 0
+    with open_db(row_dict=True) as conn:
         cur = conn.cursor()
         cur.execute(
             """
@@ -1009,6 +2775,7 @@ def _persist_photons(photons: Payload) -> None:
                 %s,
                 %s
             )
+            RETURNING id
             """,
             (
                 datetime.now(timezone.utc),
@@ -1020,6 +2787,10 @@ def _persist_photons(photons: Payload) -> None:
                 pps_count,
             ),
         )
+        inserted = cur.fetchone()
+        if not isinstance(inserted, dict) or inserted.get("id") is None:
+            raise RuntimeError("PHOTONS campaign_detail insert returned no durable id")
+        detail_id = int(inserted["id"])
 
         if campaign is not None:
             report = _lantern_report_from_photons(photons)
@@ -1090,6 +2861,10 @@ def _persist_photons(photons: Payload) -> None:
                     raise RuntimeError(
                         "final LANTERN firmware row did not close exactly one campaign_master"
                     )
+
+    # The open_db context has committed successfully.  Only now may this row
+    # satisfy Phase-5 proof custody; an uncommitted INSERT is never a proof.
+    _note_recovery_proof_persisted(photons, detail_id)
 
 
 # ---------------------------------------------------------------------
@@ -2195,6 +3970,27 @@ def _latest_stats_epoch() -> Dict[str, int]:
     }
 
 
+def _recovery_report_surface() -> Dict[str, Any]:
+    with _recovery_lock:
+        payload = {
+            "status": copy.deepcopy(_recovery_status),
+            "proof_expected": copy.deepcopy(_recovery_proof_expected),
+            "proof_persisted": copy.deepcopy(_recovery_proof_persisted),
+            "proof_durable": _recovery_proof_durable.is_set(),
+        }
+    with _state_lock:
+        payload.update(
+            {
+                "attempt_count": _recovery_attempt_count,
+                "restore_count": _recovery_restore_count,
+                "live_reattach_count": _recovery_live_reattach_count,
+                "cold_start_count": _recovery_cold_start_count,
+                "failure_count": _recovery_failure_count,
+            }
+        )
+    return payload
+
+
 def _pi_report_surface() -> Dict[str, Any]:
     with _state_lock:
         latest = copy.deepcopy(_latest_photons)
@@ -2217,6 +4013,7 @@ def _pi_report_surface() -> Dict[str, Any]:
             "active_campaign": copy.deepcopy(_active_campaign),
             "closing_campaigns": copy.deepcopy(_closing_campaigns),
         }
+    state["recovery"] = _recovery_report_surface()
     return state
 
 
@@ -2387,6 +4184,16 @@ def cmd_inject_problem(args: Optional[dict]) -> Dict[str, Any]:
     return response
 
 
+def cmd_report_recovery(_: Optional[dict]) -> Dict[str, Any]:
+    response = _combined_teensy_report(
+        "REPORT_RECOVERY", report_name="PHOTONS_SYSTEM_RECOVERY"
+    )
+    payload = response.get("payload") if isinstance(response, dict) else None
+    if isinstance(payload, dict):
+        payload["recovery"] = _recovery_report_surface()
+    return response
+
+
 def cmd_photons_info(_: Optional[dict]) -> Dict[str, Any]:
     with _state_lock:
         payload = {
@@ -2421,12 +4228,13 @@ def cmd_photons_info(_: Optional[dict]) -> Dict[str, Any]:
             "last_campaign_transition": copy.deepcopy(_last_campaign_transition),
             "last_structural_rejection": copy.deepcopy(_last_structural_rejection),
         }
+    payload["recovery"] = _recovery_report_surface()
     with _campaign_lock:
         payload["lantern"] = {
             "active": _active_campaign is not None,
             "active_campaign": copy.deepcopy(_active_campaign),
             "closing_campaigns": copy.deepcopy(_closing_campaigns),
-            "restart_recovery_enabled": False,
+            "restart_recovery_enabled": True,
         }
     return {"success": True, "message": "OK", "payload": payload}
 
@@ -2434,7 +4242,7 @@ def cmd_photons_info(_: Optional[dict]) -> Dict[str, Any]:
 def cmd_report(_: Optional[dict]) -> dict:
     with _state_lock:
         payload = {
-            "schema": "PHOTONS_REPORT_V4",
+            "schema": "PHOTONS_REPORT_V5",
             "fragments_received": _fragments_received,
             "fragments_queued": _fragments_queued,
             "fragments_processed": _fragments_processed,
@@ -2477,6 +4285,7 @@ def cmd_report(_: Optional[dict]) -> dict:
             "latest_photons": copy.deepcopy(_latest_photons),
         }
 
+    payload["recovery"] = _recovery_report_surface()
     with _campaign_lock:
         payload["lantern"] = {
             "campaign_type": CAMPAIGN_TYPE_LANTERN,
@@ -2493,7 +4302,7 @@ def cmd_report(_: Optional[dict]) -> dict:
             ],
             "instrument_always_on": True,
             "campaign_changes_physical_measurement": False,
-            "restart_recovery_enabled": False,
+            "restart_recovery_enabled": True,
         }
 
     return {
@@ -2510,6 +4319,7 @@ COMMANDS = {
     "REPORT": cmd_report,
     "REPORT_PHOTONS": cmd_report_photons,
     "REPORT_STATS": cmd_report_stats,
+    "REPORT_RECOVERY": cmd_report_recovery,
     "STATS_RESET": cmd_stats_reset,
     "CLEAR": cmd_clear,
     "DELETE": cmd_delete,
@@ -2529,11 +4339,12 @@ COMMANDS = {
 def run() -> None:
     setup_logging()
     _campaign_control_ready.clear()
+    _recovery_proof_durable.clear()
 
     logging.info(
-        "[photons] starting canonical PHOTONS_V1 service with authoritative SYSTEM context, "
-        "CLOCKS-shaped queued state/persistence workers, and Pi-owned LANTERN campaign labels "
-        "subscription=%s publication=%s campaign_type=%s",
+        "[photons] starting canonical PHOTONS_V1 with Phase-5 durable recovery, "
+        "authoritative SYSTEM context, ordered state/persistence workers, and "
+        "Pi-owned LANTERN provenance subscription=%s publication=%s campaign_type=%s",
         PHOTONS_FRAGMENT_TOPIC,
         PHOTONS_TOPIC,
         CAMPAIGN_TYPE_LANTERN,
@@ -2546,26 +4357,16 @@ def run() -> None:
         blocking=False,
     )
 
-    # Bring the local subscription surface online first, then install the required
-    # metrological reference.  The Teensy does not arm PHOTONS_FRAGMENT until this
-    # command succeeds, so every emitted fragment is born ready-to-eat.
+    # Configuration is necessary but no longer sufficient to begin publication.
+    # Firmware remains held until the Pi delivers one explicit recovery verdict:
+    # aggregate restore, live reattachment, or scientifically empty cold start.
     _configure_teensy_standard_lap()
+    recovery = _perform_phase5_recovery()
 
-    # Full campaign/statistical resurrection remains deferred.  Fail closed on a
-    # Pi-only restart: retire any stale DB master, bring any surviving Teensy
-    # LANTERN lifecycle to STOPPED, then discard the queued pre-classification
-    # backlog so the strict firmware/Pi campaign court starts from one clean row.
-    _retire_stale_active_campaigns()
-    _quiesce_stale_teensy_campaign()
-    drained = _drain_stale_fragment_ingress()
-    if drained:
-        logging.warning(
-            "⚠️ [photons] drained %d stale PHOTONS_FRAGMENT row(s) after restart campaign cleanup",
-            drained,
-        )
+    # START/STOP/baseline/maintenance control opens only after an advancing
+    # post-restart row has crossed the complete ordered persistence transaction.
     _campaign_control_ready.set()
-    _start_workers()
-
+    logging.info("✅ [photons] Phase-5 recovery complete: %s", recovery)
     logging.info("🏁 [photons] entering main loop")
     while True:
         time.sleep(3600)

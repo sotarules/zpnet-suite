@@ -12,8 +12,10 @@
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <errno.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 // ============================================================================
@@ -69,6 +71,12 @@ static constexpr uint32_t PHOTONS_PPB_HOUR_24_SECONDS = 24U * 60U * 60U;
 static constexpr uint32_t PHOTONS_PPB_SECOND_CAPACITY =
     PHOTONS_PPB_MINUTE_10_SECONDS + 1U;
 static constexpr uint32_t PHOTONS_PPB_MINUTE_CAPACITY = 24U * 60U + 2U;
+
+// Durable recovery uses bounded, typed chunks so command Payload size remains
+// predictable.  Aggregate state is installed only by RECOVERY_COMMIT after both
+// histories have arrived and passed the firmware court.
+static constexpr uint32_t PHOTONS_RECOVERY_SCHEMA_VERSION = 1U;
+static constexpr uint32_t PHOTONS_RECOVERY_CHUNK_MAX_ENDPOINTS = 4U;
 
 
 // ============================================================================
@@ -398,6 +406,53 @@ static uint32_t g_photons_problem_injection_arm_count = 0U;
 static uint32_t g_photons_problem_injection_fire_count = 0U;
 static uint32_t g_photons_problem_injection_last_extra_cycles = 0U;
 
+// Recovery is a boot-local transaction.  A rebooted Teensy remains held after
+// STANDARD_LAP_NS installation until the Pi either commits durable state or
+// explicitly declares a cold start.  A Pi-only restart sees publication_started
+// and reattaches without touching healthy live state.
+struct photons_recovery_protocol_t {
+  bool active = false;
+  uint32_t generation = 0U;
+  uint32_t expected_second_count = 0U;
+  uint32_t accepted_second_count = 0U;
+  uint32_t expected_minute_count = 0U;
+  uint32_t accepted_minute_count = 0U;
+  bool previous_second_valid = false;
+  photons_ppb_endpoint_t previous_second{};
+  bool previous_minute_valid = false;
+  photons_ppb_endpoint_t previous_minute{};
+};
+
+struct photons_recovery_runtime_t {
+  bool publication_started = false;
+  bool restored = false;
+  bool proof_pending = false;
+  bool proof_committed = false;
+  bool proof_advanced_published = false;
+  uint32_t generation = 0U;
+  uint32_t source_sequence = 0U;
+  uint32_t source_publish_count = 0U;
+  uint32_t source_reset_count = 0U;
+  uint32_t source_update_count = 0U;
+  uint64_t source_lap_count = 0ULL;
+  uint64_t source_total_lap_gnss_ns = 0ULL;
+  uint64_t source_custody_lap_count = 0ULL;
+  uint64_t source_custody_total_lap_gnss_ns = 0ULL;
+  uint32_t proof_sequence = 0U;
+  uint32_t proof_update_count = 0U;
+  uint32_t dropped_pending_seed_count = 0U;
+  uint32_t begin_count = 0U;
+  uint32_t chunk_count = 0U;
+  uint32_t commit_count = 0U;
+  uint32_t abort_count = 0U;
+  uint32_t cold_start_count = 0U;
+  uint32_t proof_ack_count = 0U;
+  uint32_t reject_count = 0U;
+};
+
+static photons_recovery_protocol_t g_photons_recovery_protocol{};
+static photons_recovery_runtime_t g_photons_recovery{};
+
 static photons_ppb_endpoint_t
     g_photons_ppb_seconds[PHOTONS_PPB_SECOND_CAPACITY] DMAMEM = {};
 static photons_ppb_endpoint_t
@@ -540,6 +595,78 @@ static void photons_ppb_windows_seed_origin(void) {
       origin);
   g_photons_ppb_previous_endpoint = origin;
   g_photons_ppb_previous_endpoint_valid = true;
+}
+
+
+static void photons_recovery_protocol_clear(bool clear_histories) {
+  g_photons_recovery_protocol = photons_recovery_protocol_t{};
+  if (clear_histories) {
+    photons_ppb_windows_clear_history();
+  }
+}
+
+
+static bool photons_recovery_stage_endpoint(bool minute_history,
+                                            const photons_ppb_endpoint_t& endpoint) {
+  photons_recovery_protocol_t& protocol = g_photons_recovery_protocol;
+  if (!protocol.active) return false;
+
+  uint32_t& accepted = minute_history
+      ? protocol.accepted_minute_count
+      : protocol.accepted_second_count;
+  const uint32_t expected = minute_history
+      ? protocol.expected_minute_count
+      : protocol.expected_second_count;
+  if (accepted >= expected) return false;
+
+  bool& previous_valid = minute_history
+      ? protocol.previous_minute_valid
+      : protocol.previous_second_valid;
+  photons_ppb_endpoint_t& previous = minute_history
+      ? protocol.previous_minute
+      : protocol.previous_second;
+
+  if (endpoint.sequence == 0U) {
+    if (accepted != 0U || endpoint.lap_count != 0ULL ||
+        endpoint.total_lap_gnss_ns != 0ULL) {
+      return false;
+    }
+  } else if (endpoint.lap_count == 0ULL ||
+             endpoint.total_lap_gnss_ns == 0ULL) {
+    return false;
+  }
+
+  if (previous_valid) {
+    if (endpoint.sequence <= previous.sequence ||
+        endpoint.lap_count < previous.lap_count ||
+        endpoint.total_lap_gnss_ns < previous.total_lap_gnss_ns) {
+      return false;
+    }
+    if (minute_history && endpoint.sequence != 0U &&
+        photons_ppb_minute_key(endpoint.sequence) <=
+            photons_ppb_minute_key(previous.sequence)) {
+      return false;
+    }
+  }
+
+  if (minute_history) {
+    photons_ppb_ring_append(
+        g_photons_ppb_minutes,
+        g_photons_ppb_minutes_head,
+        g_photons_ppb_minutes_count,
+        endpoint);
+  } else {
+    photons_ppb_ring_append(
+        g_photons_ppb_seconds,
+        g_photons_ppb_seconds_head,
+        g_photons_ppb_seconds_count,
+        endpoint);
+  }
+
+  previous = endpoint;
+  previous_valid = true;
+  accepted++;
+  return true;
 }
 
 
@@ -883,6 +1010,51 @@ static void photons_instrument_statistics_reset_commit(void) {
 static void photons_stats_reset_commit_after_publish(void) {
   if (!g_photons_stats_reset_pending) return;
   photons_instrument_statistics_reset_commit();
+}
+
+
+static photons_fragment_recovery_snapshot_t photons_recovery_snapshot(void) {
+  photons_fragment_recovery_snapshot_t out{};
+  out.restored = g_photons_recovery.restored;
+  out.proof_pending = g_photons_recovery.proof_pending;
+  out.proof_committed = g_photons_recovery.proof_committed;
+  out.generation = g_photons_recovery.generation;
+  out.source_sequence = g_photons_recovery.source_sequence;
+  out.source_publish_count = g_photons_recovery.source_publish_count;
+  out.source_reset_count = g_photons_recovery.source_reset_count;
+  out.source_update_count = g_photons_recovery.source_update_count;
+  out.source_lap_count = g_photons_recovery.source_lap_count;
+  out.source_total_lap_gnss_ns =
+      g_photons_recovery.source_total_lap_gnss_ns;
+  out.source_custody_lap_count =
+      g_photons_recovery.source_custody_lap_count;
+  out.source_custody_total_lap_gnss_ns =
+      g_photons_recovery.source_custody_total_lap_gnss_ns;
+  out.fresh_physical_ancestry =
+      g_photons_recovery.publication_started;
+
+  // These false values are part of the scientific contract, not placeholders.
+  out.raw_lap_ring_restored = false;
+  out.partial_lap_restored = false;
+  out.pending_seed_restored = false;
+  out.predictor_restored = false;
+  out.in_flight_train_restored = false;
+
+  if (!out.restored) return out;
+  if (g_lap_time_welford.n < out.source_lap_count ||
+      g_total_lap_gnss_ns < out.source_total_lap_gnss_ns ||
+      g_photons_custody_lap_count < out.source_custody_lap_count ||
+      g_photons_custody_total_lap_gnss_ns <
+          out.source_custody_total_lap_gnss_ns) {
+    __builtin_trap();
+  }
+
+  out.accepted_lap_delta = g_lap_time_welford.n - out.source_lap_count;
+  out.custody_lap_delta =
+      g_photons_custody_lap_count - out.source_custody_lap_count;
+  out.proof_advanced =
+      out.accepted_lap_delta != 0ULL && out.custody_lap_delta != 0ULL;
+  return out;
 }
 
 
@@ -2027,6 +2199,7 @@ static Payload g_photons_fragment_ppb_value DMAMEM;
 static Payload g_photons_fragment_campaign DMAMEM;
 static Payload g_photons_fragment_campaign_stats DMAMEM;
 static Payload g_photons_fragment_baseline DMAMEM;
+static Payload g_photons_fragment_recovery DMAMEM;
 static Payload g_photons_fragment_interrupt DMAMEM;
 
 
@@ -2078,6 +2251,7 @@ static Payload& photons_fragment_payload(
   Payload& campaign = g_photons_fragment_campaign;
   Payload& campaign_stats = g_photons_fragment_campaign_stats;
   Payload& baseline = g_photons_fragment_baseline;
+  Payload& recovery = g_photons_fragment_recovery;
   Payload& interrupt = g_photons_fragment_interrupt;
 
   root.clear();
@@ -2093,6 +2267,7 @@ static Payload& photons_fragment_payload(
   campaign.clear();
   campaign_stats.clear();
   baseline.clear();
+  recovery.clear();
   interrupt.clear();
 
   root.add("schema", "PHOTONS_FRAGMENT_V1");
@@ -2305,6 +2480,38 @@ static Payload& photons_fragment_payload(
   instrument.add_object("baseline", baseline);
   baseline.clear();
 
+  recovery.add("restored", f.recovery.restored);
+  recovery.add("proof_pending", f.recovery.proof_pending);
+  recovery.add("proof_advanced", f.recovery.proof_advanced);
+  recovery.add("proof_committed", f.recovery.proof_committed);
+  recovery.add("generation", f.recovery.generation);
+  recovery.add("source_sequence", f.recovery.source_sequence);
+  recovery.add("source_publish_count", f.recovery.source_publish_count);
+  recovery.add("source_reset_count", f.recovery.source_reset_count);
+  recovery.add("source_update_count", f.recovery.source_update_count);
+  recovery.add("source_lap_count", f.recovery.source_lap_count);
+  recovery.add("source_total_lap_gnss_ns",
+               f.recovery.source_total_lap_gnss_ns);
+  recovery.add("source_custody_lap_count",
+               f.recovery.source_custody_lap_count);
+  recovery.add("source_custody_total_lap_gnss_ns",
+               f.recovery.source_custody_total_lap_gnss_ns);
+  recovery.add("accepted_lap_delta", f.recovery.accepted_lap_delta);
+  recovery.add("custody_lap_delta", f.recovery.custody_lap_delta);
+  recovery.add("fresh_physical_ancestry",
+               f.recovery.fresh_physical_ancestry);
+  recovery.add("raw_lap_ring_restored",
+               f.recovery.raw_lap_ring_restored);
+  recovery.add("partial_lap_restored",
+               f.recovery.partial_lap_restored);
+  recovery.add("pending_seed_restored",
+               f.recovery.pending_seed_restored);
+  recovery.add("predictor_restored", f.recovery.predictor_restored);
+  recovery.add("in_flight_train_restored",
+               f.recovery.in_flight_train_restored);
+  instrument.add_object("recovery", recovery);
+  recovery.clear();
+
   interrupt.add("irq_count", f.interrupt_irq_count);
   interrupt.add("callback_count", f.interrupt_callback_count);
   interrupt.add("callback_missing_count",
@@ -2358,7 +2565,8 @@ static void photons_fragment_tick(
   // PHOTONS_FRAGMENT is ready-to-eat testimony.  Until the Pi supplies the
   // required standard lap, PHOTONS has no authority to publish interpreted
   // optical statistics.
-  if (!g_standard_lap_configured) return;
+  if (!g_standard_lap_configured ||
+      !g_photons_recovery.publication_started) return;
 
   // Refresh the PHOTONS-owned immutable copy for laps that will arrive after
   // this boundary.  Records already in the ring carry the anchor that was
@@ -2450,6 +2658,7 @@ static void photons_fragment_tick(
   // Baseline control/provenance is deliberately deferred.  False validity is
   // part of the canonical schema rather than a fabricated zero baseline.
   fragment.baseline = photons_fragment_baseline_snapshot_t{};
+  fragment.recovery = photons_recovery_snapshot();
 
   fragment.interrupt_irq_count = interrupt_diag.irq_count;
   fragment.interrupt_callback_count = interrupt_diag.callback_count;
@@ -2499,10 +2708,80 @@ static void photons_fragment_tick(
     g_publish_count++;
     g_last_fragment.publish_count = g_publish_count;
     g_last_photons_fragment.publish_count = g_publish_count;
+    if (fragment.recovery.restored &&
+        fragment.recovery.proof_pending &&
+        fragment.recovery.proof_advanced &&
+        !g_photons_recovery.proof_advanced_published) {
+      g_photons_recovery.proof_sequence = fragment.sequence;
+      g_photons_recovery.proof_update_count = fragment.stats.update_count;
+      g_photons_recovery.proof_advanced_published = true;
+    }
     photons_campaign_commit_after_publish(fragment);
     photons_stats_reset_commit_after_publish();
   } else {
     g_publish_reject_count++;
+  }
+}
+
+
+static void photons_recovery_clear_physical_ancestry(void) {
+  // Discard every observation that could have begun before the recovery
+  // boundary.  Aggregate statistics are installed separately; none of these
+  // boot-local physical facts may cross the outage.
+  photons_memory_barrier();
+  g_raw_lap_ring_read = g_raw_lap_ring_write;
+  g_raw_lap_ring_overflow_count = 0U;
+  g_raw_lap_ring_data_loss = false;
+  g_photons_lap_science_seed_pending = photons_lap_science_candidate_t{};
+  g_previous_fragment_mean_cycles_valid = false;
+  g_previous_fragment_mean_cycles = 0.0;
+  __atomic_store_n(&g_photons_problem_injection_armed, 0U, __ATOMIC_RELEASE);
+
+  g_photons_live.generation++;
+  photons_compiler_barrier();
+  g_photons_live.previous_edge_valid = false;
+  g_photons_live.previous_dwt_at_edge = 0U;
+  g_photons_live.previous_interval_valid = false;
+  g_photons_live.previous_interval_cycles = 0U;
+  g_photons_live.capture.interval_valid = false;
+  g_photons_live.capture.last_interval_cycles = 0U;
+  g_photons_live.capture.prediction_valid = false;
+  g_photons_live.capture.prediction_cycles = 0U;
+  g_photons_live.capture.residual_cycles = 0;
+  photons_compiler_barrier();
+  g_photons_live.generation++;
+
+  photons_emulator_prepare();
+  g_projection_anchor_cache = photons_projection_anchor_cache_t{};
+  photons_projection_anchor_refresh();
+
+  photons_toy_capture_t capture{};
+  if (!photons_toy_capture_snapshot(&capture)) __builtin_trap();
+  g_last_published_edge_count = capture.edge_count;
+  g_last_fragment = photons_toy_fragment_t{};
+  g_last_photons_fragment = photons_fragment_snapshot_t{};
+}
+
+
+static void photons_start_publication(void) {
+  if (!g_standard_lap_configured || g_standard_lap_ps == 0ULL ||
+      g_photons_recovery.publication_started ||
+      g_fragment_timer != TIMEPOP_INVALID_HANDLE ||
+      !g_photons_ppb_previous_endpoint_valid) {
+    __builtin_trap();
+  }
+
+  g_fragment_timer = timepop_arm(
+      PHOTONS_FRAGMENT_PERIOD_NS,
+      true,
+      photons_fragment_tick,
+      nullptr,
+      "PHOTONS_FRAGMENT");
+  if (g_fragment_timer == TIMEPOP_INVALID_HANDLE) __builtin_trap();
+
+  g_photons_recovery.publication_started = true;
+  if (PHOTONS_EMULATOR_ENABLED) {
+    photons_emulator_start();
   }
 }
 
@@ -2521,6 +2800,9 @@ void process_photons_init(void) {
   g_publish_count = 0U;
   g_publish_reject_count = 0U;
   g_last_published_edge_count = 0U;
+  g_fragment_timer = TIMEPOP_INVALID_HANDLE;
+  g_photons_recovery_protocol = photons_recovery_protocol_t{};
+  g_photons_recovery = photons_recovery_runtime_t{};
   g_standard_lap_configured = false;
   g_standard_lap_ps = 0ULL;
   g_photons_campaign_state = photons_campaign_state_t::STOPPED;
@@ -2586,12 +2868,9 @@ void process_photons_init(void) {
   photons_projection_anchor_refresh();
 
   // The fragment publisher and temporary emulator are intentionally not started
-  // here.  SET_STANDARD_LAP_NS establishes the statistics/publication origin.
-
-  // The temporary emulator is intentionally not started here.  Starting it
-  // before STANDARD_LAP_NS would create a hidden pre-configuration science
-  // population.  SET_STANDARD_LAP_NS establishes the statistics origin and
-  // starts the emulator exactly once.
+  // here.  SET_STANDARD_LAP_NS installs only the immutable reference.  A later
+  // RECOVERY_COMMIT or RECOVERY_COLD_START establishes the statistical origin,
+  // clears boot-local physical ancestry, and starts publication exactly once.
   g_initialized = true;
 }
 
@@ -2655,41 +2934,783 @@ static Payload cmd_set_standard_lap_ns(const Payload& args) {
     }
   } else {
     g_standard_lap_ps = requested_ps;
-
-    // Configuration is the clean PHOTONS statistics origin.  The exact zero
-    // endpoint makes the first published second part of young rolling windows
-    // without inventing a pre-configuration population.
-    photons_ppb_windows_seed_origin();
-
-    g_fragment_timer = timepop_arm(
-        PHOTONS_FRAGMENT_PERIOD_NS,
-        true,
-        photons_fragment_tick,
-        nullptr,
-        "PHOTONS_FRAGMENT");
-    if (g_fragment_timer == TIMEPOP_INVALID_HANDLE) {
-      __builtin_trap();
-    }
-
     photons_memory_barrier();
     g_standard_lap_configured = true;
-
-    if (PHOTONS_EMULATOR_ENABLED) {
-      photons_emulator_start();
-    }
   }
 
   Payload p;
   p.add("standard_lap_configured", true);
+  p.add("publication_started",
+        g_photons_recovery.publication_started);
+  p.add("recovery_verdict_required",
+        !g_photons_recovery.publication_started);
   p.add("standard_lap_ps", g_standard_lap_ps);
   p.add("standard_lap_ns",
         toFixedDecimal((double)g_standard_lap_ps / 1000.0, 3));
   return p;
 }
 
+static bool photons_recovery_get_u32(const Payload& args,
+                                     const char* key,
+                                     uint32_t& out) {
+  return args.has(key) && args.tryGetUInt(key, out);
+}
+
+
+static bool photons_recovery_get_u64(const Payload& args,
+                                     const char* key,
+                                     uint64_t& out) {
+  return args.has(key) && args.tryGetUInt64(key, out);
+}
+
+
+static bool photons_recovery_get_bool(const Payload& args,
+                                      const char* key,
+                                      bool& out) {
+  return args.has(key) && args.tryGetBool(key, out);
+}
+
+
+static bool photons_recovery_get_double(const Payload& args,
+                                        const char* key,
+                                        double& out) {
+  if (!args.has(key)) return false;
+  const char* text = args.getString(key);
+  if (!text || !*text) return false;
+  errno = 0;
+  char* end = nullptr;
+  const double parsed = strtod(text, &end);
+  if (errno == ERANGE || !end || *end != '\0' || !isfinite(parsed)) {
+    return false;
+  }
+  out = parsed;
+  return true;
+}
+
+
+static bool photons_recovery_get_welford(const Payload& args,
+                                         const char* prefix,
+                                         photons_welford_state_t& out) {
+  char key[80];
+  uint64_t n = 0ULL;
+  double mean = 0.0;
+  double m2 = 0.0;
+  double min_val = 0.0;
+  double max_val = 0.0;
+
+  snprintf(key, sizeof(key), "%s_n", prefix);
+  if (!photons_recovery_get_u64(args, key, n)) return false;
+  snprintf(key, sizeof(key), "%s_mean", prefix);
+  if (!photons_recovery_get_double(args, key, mean)) return false;
+  snprintf(key, sizeof(key), "%s_m2", prefix);
+  if (!photons_recovery_get_double(args, key, m2)) return false;
+  snprintf(key, sizeof(key), "%s_min", prefix);
+  if (!photons_recovery_get_double(args, key, min_val)) return false;
+  snprintf(key, sizeof(key), "%s_max", prefix);
+  if (!photons_recovery_get_double(args, key, max_val)) return false;
+
+  if (n == 0ULL) {
+    photons_welford_reset(out);
+    return mean == 0.0 && m2 == 0.0 && min_val == 0.0 && max_val == 0.0;
+  }
+  if (m2 < 0.0 || min_val > max_val || mean < min_val || mean > max_val) {
+    return false;
+  }
+
+  out.n = n;
+  out.mean = mean;
+  out.m2 = m2;
+  out.min_val = min_val;
+  out.max_val = max_val;
+  return true;
+}
+
+
+static Payload photons_recovery_reject(const char* status,
+                                       const char* error) {
+  g_photons_recovery.reject_count++;
+  Payload p;
+  p.add("status", status ? status : "recovery_rejected");
+  p.add("error", error ? error : "recovery command rejected");
+  p.add("publication_started", g_photons_recovery.publication_started);
+  p.add("staging_active", g_photons_recovery_protocol.active);
+  p.add("generation", g_photons_recovery.generation);
+  return p;
+}
+
+
+static Payload cmd_recovery_begin(const Payload& args) {
+  if (!g_standard_lap_configured || g_standard_lap_ps == 0ULL) {
+    return photons_recovery_reject(
+        "recovery_begin_rejected_standard_missing",
+        "STANDARD_LAP_NS must be installed before recovery");
+  }
+  if (g_photons_recovery.publication_started) {
+    return photons_recovery_reject(
+        "recovery_begin_rejected_live",
+        "PHOTONS publication is already live; use live reattachment");
+  }
+  if (g_photons_recovery_protocol.active) {
+    return photons_recovery_reject(
+        "recovery_begin_rejected_staging_active",
+        "a recovery transaction is already staged");
+  }
+
+  uint32_t version = 0U;
+  uint32_t generation = 0U;
+  uint32_t second_count = 0U;
+  uint32_t minute_count = 0U;
+  if (!photons_recovery_get_u32(args, "restore_schema_version", version) ||
+      version != PHOTONS_RECOVERY_SCHEMA_VERSION ||
+      !photons_recovery_get_u32(args, "generation", generation) ||
+      generation == 0U ||
+      !photons_recovery_get_u32(args, "second_count", second_count) ||
+      second_count == 0U ||
+      second_count > PHOTONS_PPB_SECOND_CAPACITY ||
+      !photons_recovery_get_u32(args, "minute_count", minute_count) ||
+      minute_count == 0U ||
+      minute_count > PHOTONS_PPB_MINUTE_CAPACITY) {
+    return photons_recovery_reject(
+        "recovery_begin_rejected_contract",
+        "invalid recovery schema, generation, or history counts");
+  }
+
+  photons_recovery_protocol_clear(true);
+  g_photons_recovery_protocol.active = true;
+  g_photons_recovery_protocol.generation = generation;
+  g_photons_recovery_protocol.expected_second_count = second_count;
+  g_photons_recovery_protocol.expected_minute_count = minute_count;
+  g_photons_recovery.begin_count++;
+
+  Payload p;
+  p.add("status", "recovery_staging");
+  p.add("restore_schema_version", PHOTONS_RECOVERY_SCHEMA_VERSION);
+  p.add("generation", generation);
+  p.add("second_count", second_count);
+  p.add("minute_count", minute_count);
+  p.add("publication_started", false);
+  return p;
+}
+
+
+static bool photons_recovery_endpoint_follows(
+    bool minute_history,
+    const photons_ppb_endpoint_t& previous,
+    bool previous_valid,
+    uint32_t accepted_count,
+    const photons_ppb_endpoint_t& endpoint) {
+  if (endpoint.sequence == 0U) {
+    return accepted_count == 0U && endpoint.lap_count == 0ULL &&
+           endpoint.total_lap_gnss_ns == 0ULL;
+  }
+  if (endpoint.lap_count == 0ULL || endpoint.total_lap_gnss_ns == 0ULL) {
+    return false;
+  }
+  if (!previous_valid) return true;
+  if (endpoint.sequence <= previous.sequence ||
+      endpoint.lap_count < previous.lap_count ||
+      endpoint.total_lap_gnss_ns < previous.total_lap_gnss_ns) {
+    return false;
+  }
+  return !minute_history ||
+      photons_ppb_minute_key(endpoint.sequence) >
+          photons_ppb_minute_key(previous.sequence);
+}
+
+
+static Payload cmd_recovery_chunk(const Payload& args) {
+  photons_recovery_protocol_t& protocol = g_photons_recovery_protocol;
+  if (!protocol.active || g_photons_recovery.publication_started) {
+    return photons_recovery_reject(
+        "recovery_chunk_rejected_not_staging",
+        "RECOVERY_BEGIN must own a held transaction");
+  }
+
+  uint32_t generation = 0U;
+  uint32_t count = 0U;
+  const char* history = args.getString("history");
+  const bool minute_history = history && !strcmp(history, "MINUTE");
+  const bool second_history = history && !strcmp(history, "SECOND");
+  if ((!minute_history && !second_history) ||
+      !photons_recovery_get_u32(args, "generation", generation) ||
+      generation != protocol.generation ||
+      !photons_recovery_get_u32(args, "count", count) ||
+      count == 0U || count > PHOTONS_RECOVERY_CHUNK_MAX_ENDPOINTS) {
+    return photons_recovery_reject(
+        "recovery_chunk_rejected_contract",
+        "invalid history, generation, or chunk count");
+  }
+
+  const uint32_t accepted_before = minute_history
+      ? protocol.accepted_minute_count
+      : protocol.accepted_second_count;
+  const uint32_t expected = minute_history
+      ? protocol.expected_minute_count
+      : protocol.expected_second_count;
+  if (accepted_before + count > expected) {
+    return photons_recovery_reject(
+        "recovery_chunk_rejected_overflow",
+        "chunk exceeds the declared history count");
+  }
+
+  photons_ppb_endpoint_t endpoints[PHOTONS_RECOVERY_CHUNK_MAX_ENDPOINTS]{};
+  photons_ppb_endpoint_t previous = minute_history
+      ? protocol.previous_minute
+      : protocol.previous_second;
+  bool previous_valid = minute_history
+      ? protocol.previous_minute_valid
+      : protocol.previous_second_valid;
+
+  for (uint32_t i = 0U; i < count; i++) {
+    char key[64];
+    snprintf(key, sizeof(key), "e%u_sequence", i);
+    if (!photons_recovery_get_u32(args, key, endpoints[i].sequence)) {
+      return photons_recovery_reject(
+          "recovery_chunk_rejected_endpoint",
+          "endpoint sequence is missing or malformed");
+    }
+    snprintf(key, sizeof(key), "e%u_lap_count", i);
+    if (!photons_recovery_get_u64(args, key, endpoints[i].lap_count)) {
+      return photons_recovery_reject(
+          "recovery_chunk_rejected_endpoint",
+          "endpoint lap_count is missing or malformed");
+    }
+    snprintf(key, sizeof(key), "e%u_total_lap_gnss_ns", i);
+    if (!photons_recovery_get_u64(
+            args, key, endpoints[i].total_lap_gnss_ns)) {
+      return photons_recovery_reject(
+          "recovery_chunk_rejected_endpoint",
+          "endpoint total_lap_gnss_ns is missing or malformed");
+    }
+    if (!photons_recovery_endpoint_follows(
+            minute_history,
+            previous,
+            previous_valid,
+            accepted_before + i,
+            endpoints[i])) {
+      return photons_recovery_reject(
+          "recovery_chunk_rejected_chronology",
+          "endpoint chronology or cumulative population is invalid");
+    }
+    previous = endpoints[i];
+    previous_valid = true;
+  }
+
+  for (uint32_t i = 0U; i < count; i++) {
+    if (!photons_recovery_stage_endpoint(minute_history, endpoints[i])) {
+      __builtin_trap();
+    }
+  }
+  g_photons_recovery.chunk_count++;
+
+  Payload p;
+  p.add("status", "recovery_chunk_accepted");
+  p.add("generation", generation);
+  p.add("history", minute_history ? "MINUTE" : "SECOND");
+  p.add("chunk_count", count);
+  p.add("second_accepted", protocol.accepted_second_count);
+  p.add("second_expected", protocol.expected_second_count);
+  p.add("minute_accepted", protocol.accepted_minute_count);
+  p.add("minute_expected", protocol.expected_minute_count);
+  return p;
+}
+
+
+static Payload cmd_recovery_abort(const Payload& /*args*/) {
+  if (g_photons_recovery.publication_started) {
+    return photons_recovery_reject(
+        "recovery_abort_rejected_live",
+        "live PHOTONS state cannot be aborted");
+  }
+  photons_recovery_protocol_clear(true);
+  g_photons_recovery.abort_count++;
+  Payload p;
+  p.add("status", "recovery_aborted");
+  p.add("publication_started", false);
+  return p;
+}
+
+
+static void photons_recovery_install_science_state(
+    uint64_t accepted_count,
+    uint64_t excluded_count,
+    uint64_t projection_invalid,
+    uint64_t seed_disagreement,
+    uint64_t raw_cycle_excursion,
+    const photons_welford_state_t& accepted_projected,
+    const photons_welford_state_t& accepted_raw,
+    const photons_welford_state_t& excluded_raw,
+    const photons_welford_state_t& excluded_projected) {
+  if (UINT64_MAX - accepted_count < excluded_count) __builtin_trap();
+  const uint64_t candidate_count = accepted_count + excluded_count;
+
+  g_raw_cycles_state = photons_fragment_raw_cycles_snapshot_t{};
+  g_raw_cycles_state.valid = candidate_count != 0ULL;
+  g_raw_cycles_state.completed_lap_count = candidate_count;
+
+  g_projection_state = photons_fragment_projection_snapshot_t{};
+  g_projection_state.attempt_count = candidate_count;
+  g_projection_state.reject_count = projection_invalid;
+  g_projection_state.success_count = candidate_count - projection_invalid;
+
+  g_photons_lap_science_state = photons_lap_science_snapshot_t{};
+  g_photons_lap_science_state.valid = candidate_count != 0ULL;
+  g_photons_lap_science_state.candidate_count = candidate_count;
+  g_photons_lap_science_state.accepted.count = accepted_count;
+  g_photons_lap_science_state.excluded.count = excluded_count;
+  g_photons_lap_science_state.exclusion_reasons.projection_invalid =
+      projection_invalid;
+  g_photons_lap_science_state.exclusion_reasons.seed_disagreement =
+      seed_disagreement;
+  g_photons_lap_science_state.exclusion_reasons.raw_cycle_excursion =
+      raw_cycle_excursion;
+  g_photons_lap_science_state.accepted.raw_cycles =
+      photons_welford_snapshot(accepted_raw);
+  g_photons_lap_science_state.accepted.projected_lap_ns =
+      photons_welford_snapshot(accepted_projected);
+  g_photons_lap_science_state.excluded.raw_cycles =
+      photons_welford_snapshot(excluded_raw);
+  g_photons_lap_science_state.excluded.projected_lap_ns =
+      photons_welford_snapshot(excluded_projected);
+
+  // Predictor, last-candidate testimony, reject streak, and pending seed are
+  // intentionally fresh.  The first post-restart laps reacquire them physically.
+  g_photons_lap_science_seed_pending = photons_lap_science_candidate_t{};
+}
+
+
+static Payload cmd_recovery_commit(const Payload& args) {
+  photons_recovery_protocol_t& protocol = g_photons_recovery_protocol;
+  if (!protocol.active || g_photons_recovery.publication_started) {
+    return photons_recovery_reject(
+        "recovery_commit_rejected_not_staging",
+        "RECOVERY_BEGIN must own a complete held transaction");
+  }
+  if (protocol.accepted_second_count != protocol.expected_second_count ||
+      protocol.accepted_minute_count != protocol.expected_minute_count ||
+      !protocol.previous_second_valid || !protocol.previous_minute_valid) {
+    return photons_recovery_reject(
+        "recovery_commit_rejected_history_incomplete",
+        "declared Better-Buckets history is incomplete");
+  }
+
+  uint32_t version = 0U;
+  uint32_t generation = 0U;
+  uint32_t source_sequence = 0U;
+  uint32_t source_publish_count = 0U;
+  uint32_t source_reset_count = 0U;
+  uint32_t source_update_count = 0U;
+  uint64_t standard_lap_ps = 0ULL;
+  uint64_t stats_lap_count = 0ULL;
+  uint64_t stats_total_ns = 0ULL;
+  uint64_t custody_lap_count = 0ULL;
+  uint64_t custody_total_ns = 0ULL;
+  uint64_t accepted_count = 0ULL;
+  uint64_t excluded_count = 0ULL;
+  uint64_t projection_invalid = 0ULL;
+  uint64_t seed_disagreement = 0ULL;
+  uint64_t raw_cycle_excursion = 0ULL;
+  uint32_t dropped_pending_seed_count = 0U;
+  bool campaign_active = false;
+
+  photons_welford_state_t accepted_projected{};
+  photons_welford_state_t accepted_raw{};
+  photons_welford_state_t excluded_raw{};
+  photons_welford_state_t excluded_projected{};
+
+  const bool scalar_ok =
+      photons_recovery_get_u32(args, "restore_schema_version", version) &&
+      version == PHOTONS_RECOVERY_SCHEMA_VERSION &&
+      photons_recovery_get_u32(args, "generation", generation) &&
+      generation == protocol.generation &&
+      photons_recovery_get_u32(args, "source_sequence", source_sequence) &&
+      source_sequence != 0U &&
+      photons_recovery_get_u32(
+          args, "source_publish_count", source_publish_count) &&
+      source_publish_count != 0U &&
+      photons_recovery_get_u32(
+          args, "source_reset_count", source_reset_count) &&
+      photons_recovery_get_u32(
+          args, "source_update_count", source_update_count) &&
+      source_update_count != 0U &&
+      photons_recovery_get_u64(args, "standard_lap_ps", standard_lap_ps) &&
+      standard_lap_ps == g_standard_lap_ps &&
+      photons_recovery_get_u64(args, "stats_lap_count", stats_lap_count) &&
+      photons_recovery_get_u64(
+          args, "stats_total_lap_gnss_ns", stats_total_ns) &&
+      photons_recovery_get_u64(
+          args, "custody_lap_count", custody_lap_count) &&
+      photons_recovery_get_u64(
+          args, "custody_total_lap_gnss_ns", custody_total_ns) &&
+      photons_recovery_get_u64(args, "accepted_count", accepted_count) &&
+      photons_recovery_get_u64(args, "excluded_count", excluded_count) &&
+      photons_recovery_get_u64(
+          args, "projection_invalid", projection_invalid) &&
+      photons_recovery_get_u64(
+          args, "seed_disagreement", seed_disagreement) &&
+      photons_recovery_get_u64(
+          args, "raw_cycle_excursion", raw_cycle_excursion) &&
+      photons_recovery_get_u32(
+          args, "dropped_pending_seed_count", dropped_pending_seed_count) &&
+      dropped_pending_seed_count <= 1U &&
+      photons_recovery_get_bool(args, "campaign_active", campaign_active) &&
+      photons_recovery_get_welford(
+          args, "accepted_projected", accepted_projected) &&
+      photons_recovery_get_welford(args, "accepted_raw", accepted_raw) &&
+      photons_recovery_get_welford(args, "excluded_raw", excluded_raw) &&
+      photons_recovery_get_welford(
+          args, "excluded_projected", excluded_projected);
+  if (!scalar_ok) {
+    return photons_recovery_reject(
+        "recovery_commit_rejected_state",
+        "aggregate recovery state is missing, malformed, or mismatched");
+  }
+
+  if (accepted_count == 0ULL || stats_lap_count != accepted_count ||
+      stats_total_ns == 0ULL || custody_lap_count < stats_lap_count ||
+      custody_total_ns < stats_total_ns ||
+      accepted_projected.n != accepted_count ||
+      accepted_raw.n != accepted_count ||
+      excluded_raw.n != excluded_count ||
+      excluded_projected.n > excluded_count ||
+      projection_invalid > excluded_count ||
+      seed_disagreement > excluded_count ||
+      raw_cycle_excursion > excluded_count ||
+      projection_invalid + seed_disagreement + raw_cycle_excursion !=
+          excluded_count) {
+    return photons_recovery_reject(
+        "recovery_commit_rejected_accounting",
+        "aggregate population accounting does not close");
+  }
+
+  const double ratio_mean = (double)stats_total_ns / (double)stats_lap_count;
+  if (fabs(ratio_mean - accepted_projected.mean) > 0.000001) {
+    return photons_recovery_reject(
+        "recovery_commit_rejected_mean",
+        "accepted projected Welford does not close with N/T");
+  }
+
+  const photons_ppb_endpoint_t& current = protocol.previous_second;
+  if (current.sequence != source_update_count ||
+      current.lap_count != stats_lap_count ||
+      current.total_lap_gnss_ns != stats_total_ns ||
+      protocol.previous_minute.sequence > source_update_count) {
+    return photons_recovery_reject(
+        "recovery_commit_rejected_history_target",
+        "staged history does not terminate at the aggregate source state");
+  }
+
+  char campaign_name[64] = {0};
+  uint64_t campaign_origin_lap_count = 0ULL;
+  uint64_t campaign_origin_total_ns = 0ULL;
+  uint32_t campaign_start_after_sequence = 0U;
+  uint32_t campaign_public_count = 0U;
+  uint64_t campaign_lap_count = 0ULL;
+  uint64_t campaign_total_ns = 0ULL;
+  if (campaign_active) {
+    const char* supplied_name = args.getString("campaign");
+    if (!supplied_name || !*supplied_name ||
+        strlen(supplied_name) >= sizeof(campaign_name) ||
+        !photons_recovery_get_u64(
+            args, "campaign_origin_lap_count", campaign_origin_lap_count) ||
+        !photons_recovery_get_u64(
+            args, "campaign_origin_total_lap_gnss_ns",
+            campaign_origin_total_ns) ||
+        !photons_recovery_get_u32(
+            args, "campaign_start_after_sequence",
+            campaign_start_after_sequence) ||
+        campaign_start_after_sequence == 0U ||
+        campaign_start_after_sequence >= source_sequence ||
+        !photons_recovery_get_u32(
+            args, "campaign_public_count", campaign_public_count) ||
+        campaign_public_count == 0U ||
+        !photons_recovery_get_u64(
+            args, "campaign_lap_count", campaign_lap_count) ||
+        !photons_recovery_get_u64(
+            args, "campaign_total_lap_gnss_ns", campaign_total_ns) ||
+        campaign_origin_lap_count > custody_lap_count ||
+        campaign_origin_total_ns > custody_total_ns ||
+        custody_lap_count - campaign_origin_lap_count != campaign_lap_count ||
+        custody_total_ns - campaign_origin_total_ns != campaign_total_ns) {
+      return photons_recovery_reject(
+          "recovery_commit_rejected_campaign",
+          "active campaign recovery state does not close");
+    }
+    safeCopy(campaign_name, sizeof(campaign_name), supplied_name);
+  }
+
+  // All parsing and accounting courts have passed.  From here to publication
+  // start, installation is one foreground transaction and no PHOTONS timer runs.
+  g_lap_time_welford = accepted_projected;
+  g_accepted_raw_cycles_welford = accepted_raw;
+  g_excluded_raw_cycles_welford = excluded_raw;
+  g_excluded_lap_time_welford = excluded_projected;
+  g_total_lap_gnss_ns = stats_total_ns;
+  g_photons_custody_lap_count = custody_lap_count;
+  g_photons_custody_total_lap_gnss_ns = custody_total_ns;
+  g_photons_stats_reset_count = source_reset_count;
+  g_photons_stats_update_count = source_update_count;
+  g_photons_ppb_previous_endpoint = current;
+  g_photons_ppb_previous_endpoint_valid = true;
+  g_photons_ppb_current_sequence = source_update_count;
+  g_photons_ppb_endpoint_admitted = true;
+  g_photons_ppb_interval_advanced = false;
+  g_photons_ppb_last_minute_key = photons_ppb_minute_key(source_update_count);
+
+  photons_recovery_install_science_state(
+      accepted_count,
+      excluded_count,
+      projection_invalid,
+      seed_disagreement,
+      raw_cycle_excursion,
+      accepted_projected,
+      accepted_raw,
+      excluded_raw,
+      excluded_projected);
+
+  g_fragment_sequence = source_sequence;
+  g_publish_count = source_publish_count;
+  g_publish_reject_count = 0U;
+  g_photons_stats_reset_pending = false;
+
+  if (campaign_active) {
+    safeCopy(g_photons_campaign_name, sizeof(g_photons_campaign_name),
+             campaign_name);
+    g_photons_campaign_origin_lap_count = campaign_origin_lap_count;
+    g_photons_campaign_origin_total_lap_gnss_ns = campaign_origin_total_ns;
+    g_photons_campaign_start_after_sequence = campaign_start_after_sequence;
+    g_photons_campaign_public_count = campaign_public_count;
+    g_photons_campaign_state = photons_campaign_state_t::ACTIVE;
+  } else {
+    g_photons_campaign_state = photons_campaign_state_t::STOPPED;
+    g_photons_campaign_name[0] = '\0';
+    g_photons_campaign_origin_lap_count = 0ULL;
+    g_photons_campaign_origin_total_lap_gnss_ns = 0ULL;
+    g_photons_campaign_start_after_sequence = 0U;
+    g_photons_campaign_public_count = 0U;
+  }
+  g_photons_flash_cut_campaign_name[0] = '\0';
+
+  g_photons_recovery.restored = true;
+  g_photons_recovery.proof_pending = true;
+  g_photons_recovery.proof_committed = false;
+  g_photons_recovery.proof_advanced_published = false;
+  g_photons_recovery.generation = generation;
+  g_photons_recovery.source_sequence = source_sequence;
+  g_photons_recovery.source_publish_count = source_publish_count;
+  g_photons_recovery.source_reset_count = source_reset_count;
+  g_photons_recovery.source_update_count = source_update_count;
+  g_photons_recovery.source_lap_count = stats_lap_count;
+  g_photons_recovery.source_total_lap_gnss_ns = stats_total_ns;
+  g_photons_recovery.source_custody_lap_count = custody_lap_count;
+  g_photons_recovery.source_custody_total_lap_gnss_ns = custody_total_ns;
+  g_photons_recovery.proof_sequence = 0U;
+  g_photons_recovery.proof_update_count = 0U;
+  g_photons_recovery.dropped_pending_seed_count = dropped_pending_seed_count;
+  g_photons_recovery.commit_count++;
+
+  photons_recovery_protocol_clear(false);
+  photons_recovery_clear_physical_ancestry();
+  photons_start_publication();
+
+  Payload p;
+  p.add("status", "recovery_committed");
+  p.add("generation", generation);
+  p.add("source_sequence", source_sequence);
+  p.add("source_update_count", source_update_count);
+  p.add("restored_lap_count", stats_lap_count);
+  p.add("restored_total_lap_gnss_ns", stats_total_ns);
+  p.add("restored_custody_lap_count", custody_lap_count);
+  p.add("campaign_active", campaign_active);
+  if (campaign_active) p.add("campaign", campaign_name);
+  p.add("publication_started", true);
+  p.add("fresh_physical_ancestry", true);
+  p.add("pending_seed_restored", false);
+  p.add("raw_lap_ring_restored", false);
+  p.add("proof_pending", true);
+  return p;
+}
+
+
+static Payload cmd_recovery_cold_start(const Payload& args) {
+  if (!g_standard_lap_configured || g_standard_lap_ps == 0ULL) {
+    return photons_recovery_reject(
+        "recovery_cold_start_rejected_standard_missing",
+        "STANDARD_LAP_NS must be installed before cold start");
+  }
+  if (g_photons_recovery.publication_started ||
+      g_photons_recovery_protocol.active) {
+    return photons_recovery_reject(
+        "recovery_cold_start_rejected_busy",
+        "cold start requires a held instrument with no staged restore");
+  }
+
+  uint32_t generation = 0U;
+  if (!photons_recovery_get_u32(args, "generation", generation) ||
+      generation == 0U) {
+    return photons_recovery_reject(
+        "recovery_cold_start_rejected_generation",
+        "cold start requires a nonzero generation");
+  }
+  if (g_lap_time_welford.n != 0ULL || g_total_lap_gnss_ns != 0ULL ||
+      g_photons_custody_lap_count != 0ULL ||
+      g_photons_custody_total_lap_gnss_ns != 0ULL) {
+    __builtin_trap();
+  }
+
+  photons_ppb_windows_seed_origin();
+  g_photons_recovery.restored = false;
+  g_photons_recovery.proof_pending = false;
+  g_photons_recovery.proof_committed = false;
+  g_photons_recovery.proof_advanced_published = false;
+  g_photons_recovery.generation = generation;
+  g_photons_recovery.source_sequence = 0U;
+  g_photons_recovery.source_publish_count = 0U;
+  g_photons_recovery.source_reset_count = 0U;
+  g_photons_recovery.source_update_count = 0U;
+  g_photons_recovery.source_lap_count = 0ULL;
+  g_photons_recovery.source_total_lap_gnss_ns = 0ULL;
+  g_photons_recovery.source_custody_lap_count = 0ULL;
+  g_photons_recovery.source_custody_total_lap_gnss_ns = 0ULL;
+  g_photons_recovery.proof_sequence = 0U;
+  g_photons_recovery.proof_update_count = 0U;
+  g_photons_recovery.dropped_pending_seed_count = 0U;
+  g_photons_recovery.cold_start_count++;
+
+  photons_recovery_clear_physical_ancestry();
+  photons_start_publication();
+
+  Payload p;
+  p.add("status", "recovery_cold_start_committed");
+  p.add("generation", generation);
+  p.add("publication_started", true);
+  p.add("restored", false);
+  p.add("fresh_physical_ancestry", true);
+  return p;
+}
+
+
+static Payload cmd_recovery_proof_ack(const Payload& args) {
+  uint32_t generation = 0U;
+  uint32_t sequence = 0U;
+  uint32_t update_count = 0U;
+  const bool parsed =
+      photons_recovery_get_u32(args, "generation", generation) &&
+      photons_recovery_get_u32(args, "sequence", sequence) &&
+      photons_recovery_get_u32(args, "update_count", update_count);
+  const bool same_lineage =
+      parsed &&
+      g_photons_recovery.restored &&
+      g_photons_recovery.proof_pending &&
+      g_photons_recovery.proof_advanced_published &&
+      generation == g_photons_recovery.generation &&
+      sequence >= g_photons_recovery.proof_sequence &&
+      update_count >= g_photons_recovery.proof_update_count &&
+      sequence > g_photons_recovery.source_sequence &&
+      update_count > g_photons_recovery.source_update_count &&
+      sequence <= g_fragment_sequence &&
+      update_count <= g_photons_stats_update_count &&
+      sequence - g_photons_recovery.source_sequence ==
+          update_count - g_photons_recovery.source_update_count;
+  if (!same_lineage) {
+    return photons_recovery_reject(
+        "recovery_proof_ack_rejected",
+        "durable proof is not on or beyond the first advancing recovery row");
+  }
+
+  g_photons_recovery.proof_pending = false;
+  g_photons_recovery.proof_committed = true;
+  g_photons_recovery.proof_ack_count++;
+
+  Payload p;
+  p.add("status", "recovery_proof_committed");
+  p.add("generation", generation);
+  p.add("first_proof_sequence", g_photons_recovery.proof_sequence);
+  p.add("first_proof_update_count", g_photons_recovery.proof_update_count);
+  p.add("durable_proof_sequence", sequence);
+  p.add("durable_proof_update_count", update_count);
+  p.add("proof_pending", false);
+  p.add("proof_committed", true);
+  return p;
+}
+
+
+static Payload cmd_report_recovery(const Payload& /*args*/) {
+  Payload p;
+  p.add("report", "PHOTONS_RECOVERY");
+  p.add("schema", "PHOTONS_RECOVERY_REPORT_V1");
+  p.add("restore_schema_version", PHOTONS_RECOVERY_SCHEMA_VERSION);
+  p.add("standard_lap_configured", g_standard_lap_configured);
+  p.add("standard_lap_ps", g_standard_lap_ps);
+  p.add("publication_started", g_photons_recovery.publication_started);
+  p.add("staging_active", g_photons_recovery_protocol.active);
+  p.add("staging_generation", g_photons_recovery_protocol.generation);
+  p.add("staging_second_expected",
+        g_photons_recovery_protocol.expected_second_count);
+  p.add("staging_second_accepted",
+        g_photons_recovery_protocol.accepted_second_count);
+  p.add("staging_minute_expected",
+        g_photons_recovery_protocol.expected_minute_count);
+  p.add("staging_minute_accepted",
+        g_photons_recovery_protocol.accepted_minute_count);
+  p.add("restored", g_photons_recovery.restored);
+  p.add("proof_pending", g_photons_recovery.proof_pending);
+  p.add("proof_committed", g_photons_recovery.proof_committed);
+  p.add("proof_advanced_published",
+        g_photons_recovery.proof_advanced_published);
+  p.add("generation", g_photons_recovery.generation);
+  p.add("source_sequence", g_photons_recovery.source_sequence);
+  p.add("source_publish_count", g_photons_recovery.source_publish_count);
+  p.add("source_reset_count", g_photons_recovery.source_reset_count);
+  p.add("source_update_count", g_photons_recovery.source_update_count);
+  p.add("source_lap_count", g_photons_recovery.source_lap_count);
+  p.add("source_total_lap_gnss_ns",
+        g_photons_recovery.source_total_lap_gnss_ns);
+  p.add("source_custody_lap_count",
+        g_photons_recovery.source_custody_lap_count);
+  p.add("source_custody_total_lap_gnss_ns",
+        g_photons_recovery.source_custody_total_lap_gnss_ns);
+  p.add("proof_sequence", g_photons_recovery.proof_sequence);
+  p.add("proof_update_count", g_photons_recovery.proof_update_count);
+  p.add("dropped_pending_seed_count",
+        g_photons_recovery.dropped_pending_seed_count);
+  p.add("fresh_physical_ancestry",
+        g_photons_recovery.publication_started);
+  p.add("raw_lap_ring_restored", false);
+  p.add("partial_lap_restored", false);
+  p.add("pending_seed_restored", false);
+  p.add("predictor_restored", false);
+  p.add("in_flight_train_restored", false);
+  p.add("fragment_sequence", g_fragment_sequence);
+  p.add("publish_count", g_publish_count);
+  p.add("stats_reset_count", g_photons_stats_reset_count);
+  p.add("stats_update_count", g_photons_stats_update_count);
+  p.add("stats_lap_count", g_lap_time_welford.n);
+  p.add("stats_total_lap_gnss_ns", g_total_lap_gnss_ns);
+  p.add("custody_lap_count", g_photons_custody_lap_count);
+  p.add("custody_total_lap_gnss_ns",
+        g_photons_custody_total_lap_gnss_ns);
+  p.add("campaign_state", photons_campaign_state_name(g_photons_campaign_state));
+  p.add("campaign", g_photons_campaign_name);
+  p.add("campaign_public_count", g_photons_campaign_public_count);
+  p.add("begin_count", g_photons_recovery.begin_count);
+  p.add("chunk_count", g_photons_recovery.chunk_count);
+  p.add("commit_count", g_photons_recovery.commit_count);
+  p.add("abort_count", g_photons_recovery.abort_count);
+  p.add("cold_start_count", g_photons_recovery.cold_start_count);
+  p.add("proof_ack_count", g_photons_recovery.proof_ack_count);
+  p.add("reject_count", g_photons_recovery.reject_count);
+  return p;
+}
+
 
 static Payload cmd_flash_cut(const Payload& args) {
-  if (!g_standard_lap_configured) __builtin_trap();
+  if (!g_photons_recovery.publication_started ||
+      g_photons_recovery.proof_pending) {
+    return photons_recovery_reject(
+        "flash_cut_rejected_recovery_pending",
+        "PHOTONS recovery verdict is not complete");
+  }
 
   const char* name = args.getString("campaign");
   if (!name || !*name) {
@@ -2739,8 +3760,11 @@ static Payload cmd_flash_cut(const Payload& args) {
 
 
 static Payload cmd_start(const Payload& args) {
-  if (!g_standard_lap_configured) {
-    __builtin_trap();
+  if (!g_photons_recovery.publication_started ||
+      g_photons_recovery.proof_pending) {
+    return photons_recovery_reject(
+        "start_rejected_recovery_pending",
+        "PHOTONS recovery verdict is not complete");
   }
 
   const char* name = args.getString("campaign");
@@ -2779,6 +3803,12 @@ static Payload cmd_start(const Payload& args) {
 
 
 static Payload cmd_stop(const Payload& /*args*/) {
+  if (!g_photons_recovery.publication_started ||
+      g_photons_recovery.proof_pending) {
+    return photons_recovery_reject(
+        "stop_rejected_recovery_pending",
+        "PHOTONS recovery verdict is not complete");
+  }
   if (g_photons_campaign_state == photons_campaign_state_t::START_PENDING) {
     Payload err;
     err.add("status", "stop_rejected_start_pending");
@@ -2841,6 +3871,11 @@ static Payload cmd_report_photons(const Payload& /*args*/) {
   p.add("schema", "PHOTONS_INSTRUMENT_REPORT_V1");
   p.add("instrument_always_on", true);
   p.add("instrument_owner", "TEENSY.PHOTONS");
+  p.add("publication_started", g_photons_recovery.publication_started);
+  p.add("recovery_restored", g_photons_recovery.restored);
+  p.add("recovery_proof_pending", g_photons_recovery.proof_pending);
+  p.add("recovery_proof_committed", g_photons_recovery.proof_committed);
+  p.add("recovery_generation", g_photons_recovery.generation);
   p.add("snapshot_ok", canonical.snapshot_ok);
   p.add("valid", canonical.valid);
   p.add("standard_lap_configured", g_standard_lap_configured);
@@ -2891,6 +3926,12 @@ static Payload cmd_report_stats(const Payload& /*args*/) {
   Payload p;
   p.add("report", "PHOTONS_STATS");
   p.add("schema", "PHOTONS_INSTRUMENT_STATS_REPORT_V1");
+  p.add("publication_started", g_photons_recovery.publication_started);
+  p.add("recovery_restored", g_photons_recovery.restored);
+  p.add("recovery_proof_pending", g_photons_recovery.proof_pending);
+  p.add("recovery_proof_sequence", g_photons_recovery.proof_sequence);
+  p.add("recovery_proof_update_count",
+        g_photons_recovery.proof_update_count);
   p.add("snapshot_ok", canonical.snapshot_ok);
   p.add("valid", canonical.stats.valid);
   p.add("reset_count", canonical.stats.reset_count);
@@ -2955,7 +3996,12 @@ static Payload cmd_report_stats(const Payload& /*args*/) {
 
 
 static Payload cmd_stats_reset(const Payload& /*args*/) {
-  if (!g_standard_lap_configured) __builtin_trap();
+  if (!g_photons_recovery.publication_started ||
+      g_photons_recovery.proof_pending) {
+    return photons_recovery_reject(
+        "stats_reset_rejected_recovery_pending",
+        "PHOTONS recovery verdict is not complete");
+  }
 
   Payload p;
   if (g_photons_stats_reset_pending) {
@@ -2981,6 +4027,12 @@ static Payload cmd_stats_reset(const Payload& /*args*/) {
 
 
 static Payload cmd_inject_problem(const Payload& args) {
+  if (!g_photons_recovery.publication_started ||
+      g_photons_recovery.proof_pending) {
+    return photons_recovery_reject(
+        "inject_problem_rejected_recovery_pending",
+        "PHOTONS recovery verdict is not complete");
+  }
   const char* type = args.getString("type");
   if (!type || strcmp(type, "excursion") != 0) {
     Payload err;
@@ -3055,12 +4107,32 @@ static Payload cmd_report(const Payload& /*args*/) {
   p.add("fragment_timer_armed",
         g_fragment_timer != TIMEPOP_INVALID_HANDLE);
   p.add("standard_lap_configured", g_standard_lap_configured);
-  p.add("fragment_publication_ready", g_standard_lap_configured);
+  p.add("fragment_publication_ready",
+        g_standard_lap_configured &&
+        g_photons_recovery.publication_started &&
+        g_fragment_timer != TIMEPOP_INVALID_HANDLE);
   if (g_standard_lap_configured) {
     p.add("standard_lap_ps", g_standard_lap_ps);
     p.add("standard_lap_ns",
           toFixedDecimal((double)g_standard_lap_ps / 1000.0, 3));
   }
+  p.add("recovery_publication_started",
+        g_photons_recovery.publication_started);
+  p.add("recovery_staging_active",
+        g_photons_recovery_protocol.active);
+  p.add("recovery_restored", g_photons_recovery.restored);
+  p.add("recovery_proof_pending", g_photons_recovery.proof_pending);
+  p.add("recovery_proof_committed", g_photons_recovery.proof_committed);
+  p.add("recovery_generation", g_photons_recovery.generation);
+  p.add("recovery_source_sequence",
+        g_photons_recovery.source_sequence);
+  p.add("recovery_source_update_count",
+        g_photons_recovery.source_update_count);
+  p.add("recovery_proof_sequence", g_photons_recovery.proof_sequence);
+  p.add("recovery_proof_update_count",
+        g_photons_recovery.proof_update_count);
+  p.add("recovery_dropped_pending_seed_count",
+        g_photons_recovery.dropped_pending_seed_count);
 
   p.add("campaign_state", photons_campaign_state_name(g_photons_campaign_state));
   p.add("campaign_active",
@@ -3514,6 +4586,13 @@ static const process_command_entry_t PHOTONS_COMMANDS[] = {
   { "REPORT_PHOTONS",      cmd_report_photons      },
   { "REPORT_STATS",        cmd_report_stats        },
   { "STATS_RESET",         cmd_stats_reset         },
+  { "RECOVERY_BEGIN",      cmd_recovery_begin      },
+  { "RECOVERY_CHUNK",      cmd_recovery_chunk      },
+  { "RECOVERY_COMMIT",     cmd_recovery_commit     },
+  { "RECOVERY_ABORT",      cmd_recovery_abort      },
+  { "RECOVERY_COLD_START", cmd_recovery_cold_start },
+  { "RECOVERY_PROOF_ACK",  cmd_recovery_proof_ack  },
+  { "REPORT_RECOVERY",     cmd_report_recovery     },
   { "INJECT_PROBLEM",      cmd_inject_problem      },
   { "ON",                  cmd_on                  },
   { "OFF",                 cmd_off                 },
