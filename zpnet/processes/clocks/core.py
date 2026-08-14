@@ -31,10 +31,12 @@ Core contract:
 
   RECOVER behavior:
 
-    RECOVER uses the last durable unified state detail with TEMPEST decoration as the public base, sends a
-    recover command to the Teensy, waits for the first Pi-accepted public row,
-    and restores Pi-owned GNSS_RAW/Welford state immediately before that row is
-    persisted. Timeline rows may be admitted while OCXO science is explicitly
+    RECOVER uses the last durable unified state detail with TEMPEST decoration as the public base. Exact
+    Alpha resurrection consumes the literal Pi Better-Buckets checkpoint already
+    embedded in that one CLOCKS row; PostgreSQL history is never replayed to
+    reconstruct firmware statistics. The Pi sends RECOVER, waits for the first
+    accepted public row, and restores Pi-owned GNSS_RAW/Welford state immediately
+    before that row is persisted. Timeline rows may be admitted while OCXO science is explicitly
     degraded/quarantined, but the final court still rejects malformed or
     incoherent candidates.
 
@@ -308,22 +310,22 @@ STARTUP_REQUIRED_GNSS_FREQ_MODE = 3       # GF-8802 TPS4 FINE_LOCK
 HOLISTIC_RESTORE_TIMEOUT_S = 60.0
 HOLISTIC_RESTORE_COMMAND_RETRY_S = 10.0
 
-# Better-Buckets restore replay. Alpha keeps exact-second endpoints for 10m and
-# one first-admitted endpoint per minute for the longer windows. Window widths
-# are maxima, not minimum-population requirements: if durable history contains
-# a gap, recovery uses the latest contiguous suffix and lets every bucket mature
-# from that truthful post-gap origin. PostgreSQL is scanned only on recovery;
-# ordinary CLOCKS remains lean.
-PPB_REPLAY_10_MIN_SECONDS = 10 * 60
-PPB_REPLAY_60_MIN_SECONDS = 60 * 60
-PPB_REPLAY_8_HOUR_SECONDS = 8 * 60 * 60
-PPB_REPLAY_24_HOUR_SECONDS = 24 * 60 * 60
-PPB_REPLAY_MARGIN_SECONDS = 60
-PPB_REPLAY_SECOND_CAPACITY = PPB_REPLAY_10_MIN_SECONDS + 1
-PPB_REPLAY_MINUTE_CAPACITY = 24 * 60 + 2
-PPB_REPLAY_CURSOR_ITERSIZE = 2048
+# Better-Buckets recovery custody. Firmware publishes one compact, authoritative
+# CLOCKS_PPB_CHECKPOINT_DELTA_V1 proof/delta on every CLOCKS_FRAGMENT. Pi CLOCKS
+# validates that testimony, maintains the literal bounded endpoint rings, and
+# embeds a complete synthetic recovery image in every canonical CLOCKS row.
+# Recovery consumes that one saved image directly; raw PostgreSQL history is
+# never replayed to reconstruct Alpha state.
+PPB_10_MIN_SECONDS = 10 * 60
+PPB_60_MIN_SECONDS = 60 * 60
+PPB_8_HOUR_SECONDS = 8 * 60 * 60
+PPB_24_HOUR_SECONDS = 24 * 60 * 60
+PPB_SECOND_CAPACITY = PPB_10_MIN_SECONDS + 1
+PPB_MINUTE_CAPACITY = 24 * 60 + 2
 PPB_RESTORE_CHUNK_ENDPOINTS = 4
-PPB_REPLAY_VERIFY_TOLERANCE_PPB = 0.00001
+PPB_PROOF_VERIFY_TOLERANCE_PPB = 0.00001
+PPB_FIRMWARE_DELTA_SCHEMA = "CLOCKS_PPB_CHECKPOINT_DELTA_V1"
+PPB_PI_CHECKPOINT_SCHEMA = "PI_CLOCKS_PPB_RESTORE_CHECKPOINT_V1"
 TIMEBASE_SILENCE_TIMEOUT_S = 30.0
 TIMEBASE_SILENCE_MONITOR_POLL_S = 1.0
 TEENSY_HEALTH_RETRY_S = 60.0
@@ -522,6 +524,21 @@ _diag: Dict[str, Any] = {
     "recovery_missing_last_pps_count": 0,        # legacy diagnostic alias
     "recovery_missing_last_pps_vclock_count": 0,
     "recovery_elapsed_seconds_nonpositive": 0,
+
+    # Better-Buckets checkpoint custody. These counters describe validation and
+    # completeness of the Pi-owned literal restore image; they never redefine
+    # the Teensy statistical population.
+    "ppb_checkpoint_rows_verified": 0,
+    "ppb_checkpoint_recoverable_rows": 0,
+    "ppb_checkpoint_warming_rows": 0,
+    "ppb_checkpoint_gap_count": 0,
+    "ppb_checkpoint_epoch_rebases": 0,
+    "ppb_checkpoint_seed_loaded": 0,
+    "ppb_checkpoint_seed_missing": 0,
+    "ppb_restore_transition_rows_discarded": 0,
+    "last_ppb_restore_transition_row": {},
+    "last_ppb_checkpoint": {},
+
     "recovery_last_timebase_unrecoverable": 0,
     "recovery_last_timebase_scan_count": 0,
     "last_recovery": {},
@@ -2445,6 +2462,21 @@ _last_clocks_state_monotonic: Optional[float] = None
 _last_tempest_candidate_identity: Optional[Tuple[str, int]] = None
 _last_tempest_candidate_monotonic: Optional[float] = None
 
+# Pi-owned Better-Buckets resurrection image. The live object is guarded because
+# startup reconciliation/recovery threads may reseed it while the CLOCKS state
+# worker is ingesting producer-authored deltas. It contains only firmware facts
+# and Pi custody metadata; no bucket value is authored here.
+_ppb_checkpoint_lock = threading.RLock()
+_ppb_checkpoint_runtime: Optional[Dict[str, Any]] = None
+
+# While Pi CLOCKS is explicitly staging PPB_RESTORE_* into Alpha, firmware
+# truthfully withholds a coherent rolling_ppb_checkpoint snapshot. The ingress
+# handler tags rows received inside that transaction so the state worker can
+# retire only those known transitional rows even if queue latency carries them
+# past PPB_RESTORE_COMMIT. Outside this owned transaction, checkpoint valid=false
+# remains an ordinary validation failure.
+_ppb_restore_transaction_active = threading.Event()
+
 # Startup persistence custody.  Valid CLOCKS rows may arrive while holistic
 # restore deliberately keeps the ordinary writer closed.  Retain those exact
 # canonical rows until the Teensy lifecycle probe tells us whether they belong
@@ -3287,6 +3319,43 @@ def _finalize_recovery_clocks_custody(
                     str(recover_mode).upper() == "COLD_BOOTSTRAP"
                     or physical_regression
                 )
+                boundary_ppb_checkpoint: Optional[Dict[str, Any]] = None
+                if cold_or_rebased:
+                    try:
+                        boundary_ppb_checkpoint = _normalize_saved_ppb_checkpoint(
+                            _ppb_restore_checkpoint_from_clocks(boundary_clocks)
+                        )
+                    except (TypeError, ValueError) as exc:
+                        raise RecoveryRetryableFailure(
+                            "recovery_boundary_ppb_checkpoint_invalid",
+                            {
+                                "campaign": campaign_name,
+                                "generation": generation,
+                                "recover_mode": str(recover_mode).upper(),
+                                "boundary_detail_id": boundary_id,
+                                "error": str(exc),
+                            },
+                        ) from exc
+                    if not boundary_ppb_checkpoint.get("recoverable"):
+                        raise RecoveryRetryableFailure(
+                            "recovery_boundary_ppb_checkpoint_not_recoverable",
+                            {
+                                "campaign": campaign_name,
+                                "generation": generation,
+                                "recover_mode": str(recover_mode).upper(),
+                                "boundary_detail_id": boundary_id,
+                                "checkpoint_status": boundary_ppb_checkpoint.get("status"),
+                                "second_count": boundary_ppb_checkpoint.get("second_count"),
+                                "expected_second_count": boundary_ppb_checkpoint.get(
+                                    "expected_second_count"
+                                ),
+                                "minute_count": boundary_ppb_checkpoint.get("minute_count"),
+                                "expected_minute_count": boundary_ppb_checkpoint.get(
+                                    "expected_minute_count"
+                                ),
+                            },
+                        )
+
                 lineage_proved = True
                 if cold_or_rebased:
                     source_probe = _holistic_restore_probe(last_tb)
@@ -3442,6 +3511,11 @@ def _finalize_recovery_clocks_custody(
             "source_update_count": int(source_update),
             "boundary_reset_count": boundary_reset,
             "boundary_update_count": boundary_update,
+            "boundary_ppb_checkpoint_recoverable": bool(
+                boundary_ppb_checkpoint.get("recoverable")
+                if isinstance(boundary_ppb_checkpoint, dict)
+                else not cold_or_rebased
+            ),
             "lineage_proved": bool(lineage_proved),
             "promoted_classification": promoted_classification,
             "rows_promoted": promoted,
@@ -4076,14 +4150,6 @@ def _clocks_payload(monitor: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 
-def _ppb_replay_bool(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return False
-    return str(value).strip().lower() in ("1", "true", "yes", "on")
-
-
 def _ppb_zero_endpoint() -> Dict[str, Any]:
     return {
         "reference_ns": 0,
@@ -4099,345 +4165,71 @@ def _ppb_minute_key(rolling_sequence: int) -> int:
     return ((int(rolling_sequence) - 1) // 60) + 1 if rolling_sequence > 0 else 0
 
 
-def _ppb_signed_delta(clock_delta: int, reference_delta: int) -> int:
-    return (
-        int(clock_delta - reference_delta)
-        if clock_delta >= reference_delta
-        else -int(reference_delta - clock_delta)
-    )
-
-
-def _ppb_raw_monotonic(previous: Dict[str, int], current: Dict[str, int]) -> bool:
-    return (
-        current["gnss_ns"] > previous["gnss_ns"]
-        and current["dwt_cycles"] > previous["dwt_cycles"]
-        and current["ocxo1_ns"] > previous["ocxo1_ns"]
-        and current["ocxo2_ns"] > previous["ocxo2_ns"]
-    )
-
-
-def _replay_better_buckets_rows(
-    rows,
-    *,
-    lower_sequence: int,
-    target_update_count: int,
-    target_current_sequence: int,
-) -> Dict[str, Any]:
-    """Reconstruct Alpha's bounded Better-Buckets state in one forward pass.
-
-    rolling_sequence is canonical stats.update_count.  The requested SQL range
-    begins before the oldest possible 24-hour anchor, but durable CLOCKS history
-    is allowed to contain gaps.  A gap is a hard evidence boundary: discard the
-    older partial replay and restart the rolling origin at the first durable row
-    after the gap.  This preserves the latest contiguous suffix without ever
-    manufacturing an interval across missing evidence.
-
-    The resulting buckets therefore keep Alpha's normal startup semantics:
-    each named window uses all available contiguous population up to its nominal
-    maximum width.  interval_advanced remains authoritative for deliberate
-    science exclusions inside the durable suffix.
-    """
-    if target_update_count < 0 or target_current_sequence < 0:
-        raise ValueError("invalid Better-Buckets target chronology")
-    if target_current_sequence > target_update_count:
-        raise ValueError(
-            "Better-Buckets current sequence exceeds stats update_count: "
-            f"current={target_current_sequence} update_count={target_update_count}"
+def _ppb_endpoint_from_payload(value: Any, *, path: str) -> Dict[str, Any]:
+    """Return one strict six-field producer endpoint, or raise on ambiguity."""
+    if not isinstance(value, dict):
+        raise ValueError(f"{path} is not an endpoint object")
+    missing = [
+        field
+        for field in (
+            "reference_ns", "dwt_error_cycles", "ocxo1_error_ns",
+            "ocxo2_error_ns", "rolling_sequence", "interval_count",
         )
-
-    requested_lower_sequence = int(lower_sequence)
-    effective_lower_sequence = requested_lower_sequence
-    current = _ppb_zero_endpoint()
-    origin: Optional[Dict[str, Any]] = None
-    second_history = deque(maxlen=PPB_REPLAY_SECOND_CAPACITY)
-    minute_history = deque(maxlen=PPB_REPLAY_MINUTE_CAPACITY)
-    previous_raw: Optional[Dict[str, int]] = None
-    last_admitted_sequence = 0
-    last_minute_key = 0
-    expected_sequence = requested_lower_sequence
-    rows_scanned_total = 0
-    rows_scanned = 0
-    admitted_rows = 0
-    advanced_intervals = 0
-    omitted_prefix_interval = False
-    chronology_gap_count = 0
-    last_chronology_gap: Optional[Dict[str, int]] = None
-
-    for row in rows:
-        sequence = int(row["update_count"])
-        if sequence < expected_sequence:
-            raise ValueError(
-                "Better-Buckets durable chronology duplicate/regression: "
-                f"expected>={expected_sequence} observed={sequence}"
-            )
-
-        if sequence > expected_sequence:
-            # Missing durable rows do not invalidate later evidence.  They do,
-            # however, terminate every rolling population that would cross the
-            # missing interval.  Restart from the first observed row after the
-            # gap exactly as Alpha starts a young statistics population.
-            chronology_gap_count += 1
-            last_chronology_gap = {
-                "expected_sequence": int(expected_sequence),
-                "observed_sequence": int(sequence),
-                "missing_rows": int(sequence - expected_sequence),
-            }
-            effective_lower_sequence = int(sequence)
-            current = _ppb_zero_endpoint()
-            origin = None
-            second_history.clear()
-            minute_history.clear()
-            previous_raw = None
-            last_admitted_sequence = 0
-            last_minute_key = 0
-            rows_scanned = 0
-            admitted_rows = 0
-            advanced_intervals = 0
-            omitted_prefix_interval = False
-
-        expected_sequence = sequence + 1
-        rows_scanned_total += 1
-        rows_scanned += 1
-
-        current_witness = int(row.get("current_sequence") or 0)
-        admitted = _ppb_replay_bool(row.get("endpoint_admitted"))
-        interval_advanced = _ppb_replay_bool(row.get("interval_advanced"))
-        if interval_advanced and not admitted:
-            raise ValueError(
-                f"Better-Buckets row {sequence} advances interval while endpoint is excluded"
-            )
-
-        if not admitted:
-            if last_admitted_sequence == 0:
-                last_admitted_sequence = current_witness
-            elif current_witness != last_admitted_sequence:
-                raise ValueError(
-                    "Better-Buckets excluded-row current-sequence drift: "
-                    f"row={sequence} expected={last_admitted_sequence} "
-                    f"observed={current_witness}"
-                )
-            previous_raw = None
-            continue
-
-        if current_witness != sequence:
-            raise ValueError(
-                "Better-Buckets admitted row does not own current sequence: "
-                f"row={sequence} current={current_witness}"
-            )
-
-        raw = {
-            "rolling_sequence": sequence,
-            "gnss_ns": int(row["gnss_ns"]),
-            "dwt_cycles": int(row["dwt_cycles"]),
-            "ocxo1_ns": int(row["ocxo1_ns"]),
-            "ocxo2_ns": int(row["ocxo2_ns"]),
+        if field not in value
+    ]
+    if missing:
+        raise ValueError(f"{path} missing endpoint fields {missing}")
+    try:
+        endpoint = {
+            "reference_ns": int(value["reference_ns"]),
+            "dwt_error_cycles": float(value["dwt_error_cycles"]),
+            "ocxo1_error_ns": int(value["ocxo1_error_ns"]),
+            "ocxo2_error_ns": int(value["ocxo2_error_ns"]),
+            "rolling_sequence": int(value["rolling_sequence"]),
+            "interval_count": int(value["interval_count"]),
         }
-        if min(raw["gnss_ns"], raw["dwt_cycles"], raw["ocxo1_ns"], raw["ocxo2_ns"]) <= 0:
-            raise ValueError(f"Better-Buckets row {sequence} has nonpositive clockface")
-
-        next_endpoint = dict(current)
-        next_endpoint["rolling_sequence"] = sequence
-
-        if interval_advanced:
-            if previous_raw is None:
-                # The interval entering the first row of a bounded or post-gap
-                # suffix is unknowable from durable evidence.  Drop exactly that
-                # interval and use this row as the new rolling origin.
-                if rows_scanned == 1 and effective_lower_sequence > 1:
-                    omitted_prefix_interval = True
-                else:
-                    raise ValueError(
-                        f"Better-Buckets row {sequence} advances without an antecedent"
-                    )
-            else:
-                if sequence != previous_raw["rolling_sequence"] + 1:
-                    raise ValueError(
-                        "Better-Buckets advanced interval is not adjacent: "
-                        f"previous={previous_raw['rolling_sequence']} current={sequence}"
-                    )
-                if not _ppb_raw_monotonic(previous_raw, raw):
-                    raise ValueError(
-                        f"Better-Buckets row {sequence} claims advance across nonmonotonic clocks"
-                    )
-                reference_delta = raw["gnss_ns"] - previous_raw["gnss_ns"]
-                dwt_delta = raw["dwt_cycles"] - previous_raw["dwt_cycles"]
-                ocxo1_delta = raw["ocxo1_ns"] - previous_raw["ocxo1_ns"]
-                ocxo2_delta = raw["ocxo2_ns"] - previous_raw["ocxo2_ns"]
-                expected_dwt_delta = (
-                    float(reference_delta) * float(DWT_EXPECTED_PER_PPS)
-                ) / float(NS_PER_SECOND)
-                next_endpoint["reference_ns"] += reference_delta
-                next_endpoint["dwt_error_cycles"] += (
-                    float(dwt_delta) - expected_dwt_delta
-                )
-                next_endpoint["ocxo1_error_ns"] += _ppb_signed_delta(
-                    ocxo1_delta, reference_delta
-                )
-                next_endpoint["ocxo2_error_ns"] += _ppb_signed_delta(
-                    ocxo2_delta, reference_delta
-                )
-                next_endpoint["interval_count"] += 1
-                advanced_intervals += 1
-        current = next_endpoint
-        if origin is None:
-            origin = dict(current)
-
-        second_history.append(dict(current))
-        minute_key = _ppb_minute_key(sequence)
-        if minute_key != last_minute_key:
-            minute_history.append(dict(current))
-            last_minute_key = minute_key
-
-        previous_raw = raw
-        last_admitted_sequence = sequence
-        admitted_rows += 1
-
-    if target_current_sequence > 0:
-        if rows_scanned_total == 0:
-            raise ValueError("Better-Buckets replay returned no durable rows")
-        if expected_sequence != target_current_sequence + 1:
-            raise ValueError(
-                "Better-Buckets replay ended before current endpoint: "
-                f"next={expected_sequence} current={target_current_sequence}"
-            )
-        if last_admitted_sequence != target_current_sequence:
-            raise ValueError(
-                "Better-Buckets replay current endpoint mismatch: "
-                f"replayed={last_admitted_sequence} target={target_current_sequence}"
-            )
-        if int(current.get("rolling_sequence") or 0) != target_current_sequence:
-            raise ValueError("Better-Buckets cumulative current sequence mismatch")
-        if origin is None:
-            raise ValueError("Better-Buckets replay has current endpoint but no origin")
-
-    origin_sequence = (
-        int(origin.get("rolling_sequence") or 0)
-        if isinstance(origin, dict)
-        else 0
-    )
-    current_sequence = int(current.get("rolling_sequence") or 0)
-    available_span_seconds = max(0, current_sequence - origin_sequence)
-    available_population_seconds = (
-        max(
-            0,
-            int(current.get("interval_count") or 0)
-            - int(origin.get("interval_count") or 0),
-        )
-        if isinstance(origin, dict)
-        else 0
-    )
-
-    return {
-        "schema": "PI_BETTER_BUCKETS_RESTORE_V1",
-        "rolling_sequence": int(target_update_count),
-        "current_sequence": int(target_current_sequence),
-        "lower_sequence": int(requested_lower_sequence),
-        "effective_lower_sequence": int(effective_lower_sequence),
-        "rows_scanned": int(rows_scanned),
-        "rows_scanned_total": int(rows_scanned_total),
-        "admitted_rows": int(admitted_rows),
-        "advanced_intervals": int(advanced_intervals),
-        "available_span_seconds": int(available_span_seconds),
-        "available_population_seconds": int(available_population_seconds),
-        "history_truncated": bool(chronology_gap_count),
-        "chronology_gap_count": int(chronology_gap_count),
-        "last_chronology_gap": (
-            dict(last_chronology_gap) if last_chronology_gap is not None else None
-        ),
-        "omitted_prefix_interval": bool(omitted_prefix_interval),
-        "last_minute_key": int(last_minute_key),
-        "origin_valid": origin is not None,
-        "origin": dict(origin) if origin is not None else _ppb_zero_endpoint(),
-        "current": dict(current),
-        "second_history": list(second_history),
-        "minute_history": list(minute_history),
-    }
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{path} has invalid endpoint scalar: {exc}") from exc
+    if not math.isfinite(endpoint["dwt_error_cycles"]):
+        raise ValueError(f"{path}.dwt_error_cycles is non-finite")
+    for field in ("reference_ns", "rolling_sequence", "interval_count"):
+        if endpoint[field] < 0:
+            raise ValueError(f"{path}.{field} is negative")
+    return endpoint
 
 
-def _ppb_replay_anchor(
-    replay: Dict[str, Any],
-    window_seconds: int,
-    *,
-    exact_second_history: bool,
-) -> Optional[Dict[str, Any]]:
-    current = replay.get("current") if isinstance(replay, dict) else None
-    origin = replay.get("origin") if isinstance(replay, dict) else None
-    if not isinstance(current, dict) or not replay.get("origin_valid"):
-        return None
-    current_sequence = int(current.get("rolling_sequence") or 0)
-    origin_sequence = int(origin.get("rolling_sequence") or 0) if isinstance(origin, dict) else 0
-    if current_sequence == 0 or origin_sequence >= current_sequence:
-        return None
-
-    # Window names are maximum widths, not minimum-population requirements.
-    # If the contiguous replay suffix is younger than the nominal window, use
-    # its truthful origin exactly as Alpha does for a young statistics epoch.
-    if current_sequence - origin_sequence <= int(window_seconds):
-        return origin if isinstance(origin, dict) else None
-
-    target = current_sequence - int(window_seconds)
-    history = replay.get(
-        "second_history" if exact_second_history else "minute_history"
-    )
-    if not isinstance(history, list):
-        return None
-    for endpoint in history:
-        if not isinstance(endpoint, dict):
-            continue
-        sequence = int(endpoint.get("rolling_sequence") or 0)
-        if sequence >= target and sequence < current_sequence:
-            return endpoint
-    return None
-
-
-def _ppb_replay_window_truncated(
-    replay: Dict[str, Any],
-    window_seconds: int,
-) -> bool:
-    """True when a durable gap shortens this recovered window's ancestry."""
-    if not bool(replay.get("history_truncated")):
+def _ppb_endpoints_equal(a: Any, b: Any) -> bool:
+    if not isinstance(a, dict) or not isinstance(b, dict):
         return False
-    current = replay.get("current")
-    origin = replay.get("origin")
-    if not isinstance(current, dict) or not isinstance(origin, dict):
-        return True
-    current_sequence = int(current.get("rolling_sequence") or 0)
-    origin_sequence = int(origin.get("rolling_sequence") or 0)
-    if current_sequence <= 0 or origin_sequence <= 0:
-        return True
-    if current_sequence <= int(window_seconds):
-        return True
-    required_anchor = current_sequence - int(window_seconds)
-    return origin_sequence > required_anchor
+    try:
+        return bool(
+            int(a["reference_ns"]) == int(b["reference_ns"])
+            and abs(float(a["dwt_error_cycles"]) - float(b["dwt_error_cycles"])) <= 1e-9
+            and int(a["ocxo1_error_ns"]) == int(b["ocxo1_error_ns"])
+            and int(a["ocxo2_error_ns"]) == int(b["ocxo2_error_ns"])
+            and int(a["rolling_sequence"]) == int(b["rolling_sequence"])
+            and int(a["interval_count"]) == int(b["interval_count"])
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
 
 
-def _ppb_replay_bucket_value(
-    replay: Dict[str, Any],
+def _ppb_window_value_from_endpoints(
+    current: Dict[str, Any],
+    anchor: Dict[str, Any],
     lane: str,
-    window_seconds: int,
-    *,
-    exact_second_history: bool,
-) -> Optional[float]:
-    current = replay.get("current")
-    if not isinstance(current, dict):
-        return None
-    anchor = _ppb_replay_anchor(
-        replay, window_seconds, exact_second_history=exact_second_history
-    )
-    if not isinstance(anchor, dict):
-        return None
-
+) -> float:
     interval_count = int(current["interval_count"]) - int(anchor["interval_count"])
     reference_ns = int(current["reference_ns"]) - int(anchor["reference_ns"])
     if interval_count <= 0 or reference_ns <= 0:
-        return None
-
+        raise ValueError(
+            f"Better-Buckets proof has nonpositive population lane={lane} "
+            f"interval_count={interval_count} reference_ns={reference_ns}"
+        )
     if lane == "dwt":
         expected_cycles = (
             float(reference_ns) * float(DWT_EXPECTED_PER_PPS)
         ) / float(NS_PER_SECOND)
-        if expected_cycles <= 0.0:
-            return None
         error_cycles = (
             float(current["dwt_error_cycles"])
             - float(anchor["dwt_error_cycles"])
@@ -4454,467 +4246,897 @@ def _ppb_replay_bucket_value(
     raise ValueError(f"unsupported Better-Buckets lane {lane!r}")
 
 
-def _verify_better_buckets_replay(
-    detail: Dict[str, Any],
-    replay: Dict[str, Any],
-) -> Dict[str, Any]:
-    """Verify every bucket whose durable ancestry is fully reconstructible.
+def _validate_firmware_ppb_checkpoint_delta(stats: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate one row-local firmware proof/delta without mutating Pi state."""
+    raw = stats.get("rolling_ppb_checkpoint") if isinstance(stats, dict) else None
+    if not isinstance(raw, dict):
+        raise ValueError("CLOCKS_FRAGMENT_V4 missing stats.rolling_ppb_checkpoint")
+    if raw.get("schema") != PPB_FIRMWARE_DELTA_SCHEMA:
+        raise ValueError(
+            "unsupported Better-Buckets checkpoint schema "
+            f"{raw.get('schema')!r}"
+        )
+    if not bool(raw.get("valid")):
+        raise ValueError("firmware Better-Buckets checkpoint testimony is not valid")
 
-    A window shortened by a durable chronology gap is not compared with the
-    pre-restart scalar because the populations are intentionally different.
-    Its recovered value is still reported as testimony; the gap itself is the
-    authority for using the latest contiguous suffix.
-    """
-    stats = _path_get(detail, "clocks.stats")
-    if not isinstance(stats, dict):
-        raise ValueError("Better-Buckets replay verification missing canonical stats")
-
-    windows = (
-        ("10_min", PPB_REPLAY_10_MIN_SECONDS, True),
-        ("60_min", PPB_REPLAY_60_MIN_SECONDS, False),
-        ("8_hour", PPB_REPLAY_8_HOUR_SECONDS, False),
-        ("24_hour", PPB_REPLAY_24_HOUR_SECONDS, False),
-    )
-    checked = 0
-    truncated_comparisons = 0
-    comparisons: Dict[str, Any] = {}
-    for lane in ("dwt", "vclock", "ocxo1", "ocxo2"):
-        lane_out: Dict[str, Any] = {}
-        for key, seconds, exact in windows:
-            computed = _ppb_replay_bucket_value(
-                replay, lane, seconds, exact_second_history=exact
-            )
-            recorded = _path_get(stats, f"{lane}.ppb_buckets.{key}")
-            truncated = _ppb_replay_window_truncated(replay, seconds)
-
-            if truncated:
-                computed_value = (
-                    round(float(computed), 9) if computed is not None else None
-                )
-                try:
-                    recorded_value = (
-                        round(float(recorded), 9) if recorded is not None else None
-                    )
-                except (TypeError, ValueError):
-                    recorded_value = None
-                lane_out[key] = {
-                    "computed": computed_value,
-                    "recorded": recorded_value,
-                    "delta": (
-                        round(float(computed) - float(recorded), 9)
-                        if computed is not None and recorded_value is not None
-                        else None
-                    ),
-                    "comparison": "SKIPPED_TRUNCATED_CONTIGUOUS_SUFFIX",
-                }
-                truncated_comparisons += 1
-                continue
-
-            if computed is None and recorded is None:
-                lane_out[key] = None
-                continue
-            if computed is None or recorded is None:
-                raise ValueError(
-                    "Better-Buckets replay availability mismatch: "
-                    f"lane={lane} window={key} computed={computed!r} recorded={recorded!r}"
-                )
-            recorded_value = float(recorded)
-            delta = float(computed) - recorded_value
-            if abs(delta) > PPB_REPLAY_VERIFY_TOLERANCE_PPB:
-                raise ValueError(
-                    "Better-Buckets replay value mismatch: "
-                    f"lane={lane} window={key} computed={computed:.9f} "
-                    f"recorded={recorded_value:.9f} delta={delta:.9f}"
-                )
-            lane_out[key] = {
-                "computed": round(float(computed), 9),
-                "recorded": round(recorded_value, 9),
-                "delta": round(delta, 9),
-                "comparison": "VERIFIED",
-            }
-            checked += 1
-        comparisons[lane] = lane_out
-    return {
-        "checked": checked,
-        "truncated_comparisons": truncated_comparisons,
-        "history_truncated": bool(replay.get("history_truncated")),
-        "available_span_seconds": int(replay.get("available_span_seconds") or 0),
-        "available_population_seconds": int(
-            replay.get("available_population_seconds") or 0
-        ),
-        "comparisons": comparisons,
-    }
-
-
-def _discover_better_buckets_target_lineage(
-    rows,
-    *,
-    target_db_id: int,
-    target_update_count: int,
-    lower_sequence: int,
-) -> Dict[str, Any]:
-    """Find the latest contiguous durable suffix owned by the restore target.
-
-    Recovery only needs the newest contiguous Better-Buckets ancestry ending at
-    the exact restore target.  Walking farther left after the first durable gap
-    cannot change any reconstructed rolling window: that gap is already the hard
-    bookend for every restored population.
-
-    ``reset_count`` is not boot-unique and update_count=1 is not guaranteed to
-    become durable.  Therefore the scan still begins at the target and follows
-    actual PostgreSQL insertion order backward.  Exact update_count adjacency is
-    the continuity authority.  A forward durable gap ends the useful scan
-    immediately; an update-count regression fences an older reused-reset
-    lifetime; exact duplicate counts remain fatal.
-
-    Physical CLOCKS sequence normally decreases as this backward walk proceeds.
-    The one lawful rebase is an exact N -> N+1 statistics continuation across
-    Holistic Restore, whose durable proof deliberately survives a physical
-    sequence reset.
-    """
-    target_db_id = int(target_db_id)
-    target_update_count = int(target_update_count)
-    lower_sequence = int(lower_sequence)
-    if target_db_id <= 0 or target_update_count < 0 or lower_sequence < 1:
-        raise ValueError("invalid Better-Buckets lineage discovery target")
-
-    lineage_start_db_id = target_db_id
-    lineage_start_update_count = target_update_count
-    rows_scanned = 0
-    physical_rebase_count = 0
-    target_seen = False
-    newer_db_id = target_db_id
-    newer_update_count: Optional[int] = None
-    newer_physical_sequence: Optional[int] = None
-    boundary: Optional[Dict[str, Any]] = None
-
-    for row in rows:
-        row_id = int(row["id"])
-        update = int(row["update_count"])
-        physical = int(row["physical_sequence"])
-        if update < 0 or physical <= 0:
-            raise ValueError(
-                "Better-Buckets lineage row has invalid identity: "
-                f"id={row_id} update_count={update} physical_sequence={physical}"
-            )
-
-        if not target_seen:
-            if row_id != target_db_id or update != target_update_count:
-                raise ValueError(
-                    "Better-Buckets lineage scan did not begin at restore target: "
-                    f"expected_id={target_db_id} observed_id={row_id} "
-                    f"expected_update={target_update_count} observed_update={update}"
-                )
-            target_seen = True
-            rows_scanned = 1
-            lineage_start_db_id = row_id
-            lineage_start_update_count = update
-            newer_db_id = row_id
-            newer_update_count = update
-            newer_physical_sequence = physical
-            if update <= lower_sequence:
-                break
-            continue
-
-        assert newer_update_count is not None
-        assert newer_physical_sequence is not None
-        update_delta = int(newer_update_count - update)
-        physical_delta = int(newer_physical_sequence - physical)
-
-        if update_delta < 0:
-            # In forward DB order the statistics count fell.  This is the exact
-            # reused-reset_count pathology seen after a fresh Teensy lifetime.
-            boundary = {
-                "reason": "UPDATE_COUNT_REGRESSION",
-                "older_db_id": row_id,
-                "older_update_count": update,
-                "older_physical_sequence": physical,
-                "newer_db_id": newer_db_id,
-                "newer_update_count": int(newer_update_count),
-                "newer_physical_sequence": int(newer_physical_sequence),
-            }
-            break
-
-        if update_delta == 0:
-            raise ValueError(
-                "Better-Buckets durable duplicate update_count while discovering "
-                f"target lineage: older_id={row_id} newer_id={newer_db_id} "
-                f"update_count={update}"
-            )
-
-        if update_delta > 1:
-            # This is the most recent forward durable gap.  Nothing to its left
-            # can contribute to a restored rolling population, so stop here
-            # instead of scanning historical evidence that replay must discard.
-            boundary = {
-                "reason": "DURABLE_FORWARD_GAP",
-                "older_db_id": row_id,
-                "older_update_count": update,
-                "older_physical_sequence": physical,
-                "newer_db_id": newer_db_id,
-                "newer_update_count": int(newer_update_count),
-                "newer_physical_sequence": int(newer_physical_sequence),
-                "expected_sequence": int(update + 1),
-                "observed_sequence": int(newer_update_count),
-                "missing_rows": int(update_delta - 1),
-            }
-            break
-
-        if physical_delta <= 0:
-            # Exact +1 statistics continuity is allowed to cross a physical
-            # sequence rebase created by a successful Holistic Restore.
-            physical_rebase_count += 1
-
-        lineage_start_db_id = row_id
-        lineage_start_update_count = update
-        rows_scanned += 1
-        newer_db_id = row_id
-        newer_update_count = update
-        newer_physical_sequence = physical
-
-        # Once the suffix reaches the oldest sequence needed by the bounded
-        # replay, older ancestry cannot affect any restored window.
-        if update <= lower_sequence:
-            break
-
-    if not target_seen:
-        raise ValueError("Better-Buckets lineage scan returned no restore target row")
-
-    return {
-        "lineage_start_db_detail_id": int(lineage_start_db_id),
-        "lineage_start_update_count": int(lineage_start_update_count),
-        "lineage_scan_rows": int(rows_scanned),
-        "lineage_physical_rebase_count": int(physical_rebase_count),
-        "lineage_boundary": dict(boundary) if boundary is not None else None,
-    }
-
-def _reconstruct_better_buckets_from_db(detail: Dict[str, Any]) -> Dict[str, Any]:
-    clocks = _clocks_payload(detail)
-    stats = clocks.get("stats") if isinstance(clocks, dict) else None
-    if not isinstance(stats, dict):
-        raise ValueError("canonical CLOCKS missing stats for Better-Buckets replay")
-
-    reset_count = _as_int(stats.get("reset_count"))
     update_count = _as_int(stats.get("update_count"))
     current_sequence = _as_int(stats.get("rolling_ppb_current_sequence"))
-    target_db_id = _as_int(detail.get("_db_detail_id"))
-    if reset_count is None or reset_count < 0:
-        raise ValueError("Better-Buckets replay missing reset_count")
-    if update_count is None or update_count < 0:
-        raise ValueError("Better-Buckets replay missing update_count")
+    reset_count = _as_int(stats.get("reset_count"))
+    if update_count is None or update_count < 0 or reset_count is None or reset_count < 0:
+        raise ValueError("firmware Better-Buckets testimony lacks statistics chronology")
     if current_sequence is None or current_sequence < 0 or current_sequence > update_count:
-        raise ValueError("Better-Buckets replay missing/invalid current sequence")
-    if target_db_id is None or target_db_id <= 0:
-        raise ValueError("Better-Buckets replay missing durable campaign_detail id")
+        raise ValueError("firmware Better-Buckets testimony has invalid current sequence")
 
-    if update_count == 0:
-        return {
-            "schema": "PI_BETTER_BUCKETS_RESTORE_V1",
-            "rolling_sequence": 0,
-            "current_sequence": 0,
-            "lower_sequence": 0,
-            "effective_lower_sequence": 0,
-            "rows_scanned": 0,
-            "rows_scanned_total": 0,
-            "admitted_rows": 0,
-            "advanced_intervals": 0,
-            "available_span_seconds": 0,
-            "available_population_seconds": 0,
-            "history_truncated": False,
-            "chronology_gap_count": 0,
-            "last_chronology_gap": None,
-            "omitted_prefix_interval": False,
-            "last_minute_key": 0,
-            "origin_valid": False,
-            "origin": _ppb_zero_endpoint(),
-            "current": _ppb_zero_endpoint(),
-            "second_history": [],
-            "minute_history": [],
-            "verification": {"checked": 0, "comparisons": {}},
+    rolling_sequence = _as_int(raw.get("rolling_sequence"))
+    second_count = _as_int(raw.get("second_count"))
+    minute_count = _as_int(raw.get("minute_count"))
+    last_minute_key = _as_int(raw.get("last_minute_key"))
+    if rolling_sequence is None or rolling_sequence < 0:
+        raise ValueError("firmware Better-Buckets checkpoint missing rolling_sequence")
+    if rolling_sequence != current_sequence:
+        raise ValueError(
+            "firmware Better-Buckets checkpoint current-sequence mismatch: "
+            f"stats={current_sequence} checkpoint={rolling_sequence}"
+        )
+    if second_count is None or not (0 <= second_count <= PPB_SECOND_CAPACITY):
+        raise ValueError(f"firmware Better-Buckets second_count invalid: {second_count}")
+    if minute_count is None or not (0 <= minute_count <= PPB_MINUTE_CAPACITY):
+        raise ValueError(f"firmware Better-Buckets minute_count invalid: {minute_count}")
+    if last_minute_key is None or last_minute_key < 0:
+        raise ValueError("firmware Better-Buckets last_minute_key invalid")
+
+    current = _ppb_endpoint_from_payload(raw.get("current"), path="rolling_ppb_checkpoint.current")
+    if int(current["rolling_sequence"]) != int(rolling_sequence):
+        raise ValueError("firmware Better-Buckets current endpoint identity mismatch")
+
+    origin_valid = bool(raw.get("origin_valid"))
+    origin = (
+        _ppb_endpoint_from_payload(raw.get("origin"), path="rolling_ppb_checkpoint.origin")
+        if origin_valid
+        else _ppb_zero_endpoint()
+    )
+    if origin_valid and int(origin["rolling_sequence"]) > int(current["rolling_sequence"]):
+        raise ValueError("firmware Better-Buckets origin follows current endpoint")
+
+    endpoint_admitted = bool(stats.get("rolling_ppb_endpoint_admitted"))
+    interval_advanced = bool(stats.get("rolling_ppb_interval_advanced"))
+    second_append_raw = raw.get("second_append")
+    minute_append_raw = raw.get("minute_append")
+    second_append_raw = second_append_raw if isinstance(second_append_raw, dict) else {}
+    minute_append_raw = minute_append_raw if isinstance(minute_append_raw, dict) else {}
+    second_append_valid = bool(second_append_raw.get("valid"))
+    minute_append_valid = bool(minute_append_raw.get("valid"))
+    second_append = (
+        _ppb_endpoint_from_payload(
+            second_append_raw.get("endpoint"),
+            path="rolling_ppb_checkpoint.second_append.endpoint",
+        )
+        if second_append_valid
+        else None
+    )
+    minute_append = (
+        _ppb_endpoint_from_payload(
+            minute_append_raw.get("endpoint"),
+            path="rolling_ppb_checkpoint.minute_append.endpoint",
+        )
+        if minute_append_valid
+        else None
+    )
+
+    if second_append_valid != endpoint_admitted:
+        raise ValueError(
+            "firmware Better-Buckets second append disagrees with endpoint admission: "
+            f"append={second_append_valid} admitted={endpoint_admitted}"
+        )
+    if interval_advanced and not endpoint_admitted:
+        raise ValueError("firmware Better-Buckets interval advanced on excluded endpoint")
+    if second_append_valid and not _ppb_endpoints_equal(second_append, current):
+        raise ValueError("firmware Better-Buckets second append is not the current endpoint")
+    if minute_append_valid and not second_append_valid:
+        raise ValueError("firmware Better-Buckets minute append exists without second append")
+    if minute_append_valid and not _ppb_endpoints_equal(minute_append, current):
+        raise ValueError("firmware Better-Buckets minute append is not the current endpoint")
+    if rolling_sequence > 0:
+        if second_count <= 0 or not origin_valid:
+            raise ValueError("firmware Better-Buckets nonempty state lacks ring/origin custody")
+        expected_minute_key = _ppb_minute_key(rolling_sequence)
+        if minute_count > 0 and last_minute_key != expected_minute_key:
+            raise ValueError(
+                "firmware Better-Buckets minute-key mismatch: "
+                f"expected={expected_minute_key} observed={last_minute_key}"
+            )
+    elif second_count != 0 or minute_count != 0:
+        raise ValueError("firmware Better-Buckets empty current sequence has nonempty rings")
+
+    windows = (
+        ("10_min", PPB_10_MIN_SECONDS),
+        ("60_min", PPB_60_MIN_SECONDS),
+        ("8_hour", PPB_8_HOUR_SECONDS),
+        ("24_hour", PPB_24_HOUR_SECONDS),
+    )
+    proof: Dict[str, Any] = {}
+    checked = 0
+    for key, _window_seconds in windows:
+        node_raw = raw.get(key)
+        if not isinstance(node_raw, dict):
+            raise ValueError(f"firmware Better-Buckets proof missing {key}")
+        valid = bool(node_raw.get("valid"))
+        sample_count = _as_int(node_raw.get("sample_count"))
+        anchor = None
+        if valid:
+            if sample_count is None or sample_count <= 0:
+                raise ValueError(f"firmware Better-Buckets {key} proof has invalid sample_count")
+            anchor = _ppb_endpoint_from_payload(
+                node_raw.get("anchor"), path=f"rolling_ppb_checkpoint.{key}.anchor"
+            )
+            expected_samples = int(current["interval_count"]) - int(anchor["interval_count"])
+            if expected_samples != sample_count:
+                raise ValueError(
+                    f"firmware Better-Buckets {key} proof sample-count mismatch: "
+                    f"published={sample_count} endpoint_delta={expected_samples}"
+                )
+        lane_results: Dict[str, Any] = {}
+        for lane in ("dwt", "vclock", "ocxo1", "ocxo2"):
+            buckets = _path_get(stats, f"{lane}.ppb_buckets")
+            buckets = buckets if isinstance(buckets, dict) else {}
+            recorded = buckets.get(key)
+            if not valid:
+                if recorded is not None:
+                    raise ValueError(
+                        f"firmware Better-Buckets {lane}.{key} exists without a valid proof"
+                    )
+                lane_results[lane] = None
+                continue
+            assert anchor is not None
+            computed = _ppb_window_value_from_endpoints(current, anchor, lane)
+            try:
+                recorded_value = float(recorded)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"firmware Better-Buckets {lane}.{key} missing/non-numeric published value"
+                ) from exc
+            if not math.isfinite(recorded_value):
+                raise ValueError(f"firmware Better-Buckets {lane}.{key} is non-finite")
+            delta_ppb = computed - recorded_value
+            if abs(delta_ppb) > PPB_PROOF_VERIFY_TOLERANCE_PPB:
+                raise ValueError(
+                    "firmware Better-Buckets row-local proof mismatch: "
+                    f"lane={lane} window={key} computed={computed:.9f} "
+                    f"recorded={recorded_value:.9f} delta={delta_ppb:.9f}"
+                )
+            lane_results[lane] = {
+                "computed": round(computed, 9),
+                "recorded": round(recorded_value, 9),
+                "delta": round(delta_ppb, 9),
+            }
+            checked += 1
+        proof[key] = {
+            "valid": valid,
+            "sample_count": int(sample_count or 0),
+            "anchor": copy.deepcopy(anchor) if anchor is not None else None,
+            "lanes": lane_results,
         }
 
-    if current_sequence == 0:
-        replay = _replay_better_buckets_rows(
-            [],
-            lower_sequence=1,
-            target_update_count=update_count,
-            target_current_sequence=0,
-        )
-        replay["verification"] = _verify_better_buckets_replay(detail, replay)
-        return replay
+    return {
+        "schema": PPB_FIRMWARE_DELTA_SCHEMA,
+        "reset_count": int(reset_count),
+        "update_count": int(update_count),
+        "rolling_sequence": int(rolling_sequence),
+        "second_count": int(second_count),
+        "minute_count": int(minute_count),
+        "last_minute_key": int(last_minute_key),
+        "origin_valid": bool(origin_valid),
+        "origin": origin,
+        "current": current,
+        "second_append_valid": bool(second_append_valid),
+        "second_append": second_append,
+        "minute_append_valid": bool(minute_append_valid),
+        "minute_append": minute_append,
+        "proof": proof,
+        "proof_checks": int(checked),
+    }
 
-    lower_sequence = max(
-        1,
-        int(current_sequence)
-        - PPB_REPLAY_24_HOUR_SECONDS
-        - PPB_REPLAY_MARGIN_SECONDS,
+
+def _ppb_checkpoint_delta_signature(delta: Dict[str, Any]) -> str:
+    stable = {
+        key: delta.get(key)
+        for key in (
+            "schema", "reset_count", "update_count", "rolling_sequence",
+            "second_count", "minute_count", "last_minute_key", "origin_valid",
+            "origin", "current", "second_append_valid", "second_append",
+            "minute_append_valid", "minute_append", "proof",
+        )
+    }
+    return json.dumps(stable, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _ppb_checkpoint_new_runtime(
+    *,
+    reason: str,
+    gap_count: int = 0,
+    last_gap: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return {
+        "reset_count": None,
+        "last_update_count": None,
+        "last_delta_signature": None,
+        # rolling_sequence is the PPB_RESTORE transaction identity and follows
+        # stats.update_count. current_sequence is the latest admitted endpoint;
+        # they differ lawfully when the newest statistical row is excluded.
+        "rolling_sequence": 0,
+        "current_sequence": 0,
+        "expected_second_count": 0,
+        "expected_minute_count": 0,
+        "last_minute_key": 0,
+        "origin_valid": False,
+        "origin": _ppb_zero_endpoint(),
+        "current": _ppb_zero_endpoint(),
+        "second_history": deque(maxlen=PPB_SECOND_CAPACITY),
+        "minute_history": deque(maxlen=PPB_MINUTE_CAPACITY),
+        "contiguous_from_update_count": None,
+        "gap_count": int(gap_count),
+        "last_gap": copy.deepcopy(last_gap),
+        "status_reason": str(reason),
+        "seeded_from_durable": False,
+        "seed_source_db_detail_id": None,
+        "proof_checks": 0,
+    }
+
+
+def _ppb_checkpoint_runtime_ensure_locked() -> Dict[str, Any]:
+    global _ppb_checkpoint_runtime
+    if _ppb_checkpoint_runtime is None:
+        _ppb_checkpoint_runtime = _ppb_checkpoint_new_runtime(reason="NO_DURABLE_CHECKPOINT_SEED")
+    return _ppb_checkpoint_runtime
+
+
+def _ppb_checkpoint_history_anchor_locked(
+    runtime: Dict[str, Any],
+    window_seconds: int,
+    *,
+    exact_second_history: bool,
+) -> Optional[Dict[str, Any]]:
+    current = runtime.get("current")
+    origin = runtime.get("origin")
+    if not isinstance(current, dict) or not runtime.get("origin_valid") or not isinstance(origin, dict):
+        return None
+    current_sequence = int(current.get("rolling_sequence") or 0)
+    origin_sequence = int(origin.get("rolling_sequence") or 0)
+    if current_sequence <= 0 or origin_sequence > current_sequence:
+        return None
+    if current_sequence - origin_sequence <= int(window_seconds):
+        return origin
+    target = current_sequence - int(window_seconds)
+    history = runtime["second_history"] if exact_second_history else runtime["minute_history"]
+    for endpoint in history:
+        sequence = int(endpoint.get("rolling_sequence") or 0)
+        if target <= sequence < current_sequence:
+            return endpoint
+    return None
+
+
+def _ppb_checkpoint_snapshot_locked(runtime: Dict[str, Any]) -> Dict[str, Any]:
+    second_history = [copy.deepcopy(value) for value in runtime["second_history"]]
+    minute_history = [copy.deepcopy(value) for value in runtime["minute_history"]]
+    expected_second = int(runtime.get("expected_second_count") or 0)
+    expected_minute = int(runtime.get("expected_minute_count") or 0)
+    rolling_sequence = int(runtime.get("rolling_sequence") or 0)
+    current_sequence = int(runtime.get("current_sequence") or 0)
+
+    complete_counts = (
+        len(second_history) == expected_second
+        and len(minute_history) == expected_minute
     )
+    structure_complete = complete_counts
+    if current_sequence > 0:
+        structure_complete = bool(
+            structure_complete
+            and runtime.get("origin_valid")
+            and second_history
+            and _ppb_endpoints_equal(second_history[-1], runtime.get("current"))
+            and (
+                not minute_history
+                or _ppb_minute_key(int(minute_history[-1]["rolling_sequence"]))
+                    == int(runtime.get("last_minute_key") or 0)
+            )
+            and int(runtime.get("last_minute_key") or 0) == _ppb_minute_key(current_sequence)
+        )
+    elif expected_second != 0 or expected_minute != 0 or runtime.get("origin_valid"):
+        structure_complete = False
 
+    recoverable = bool(structure_complete)
+    status = "RECOVERABLE" if recoverable else "WARMING_FOR_COMPLETE_FIRMWARE_HISTORY"
+    if runtime.get("last_gap") and not recoverable:
+        status = "WARMING_AFTER_OBSERVATION_GAP"
+
+    return {
+        "schema": PPB_PI_CHECKPOINT_SCHEMA,
+        "source_schema": PPB_FIRMWARE_DELTA_SCHEMA,
+        "valid": True,
+        "recoverable": recoverable,
+        "status": status,
+        "status_reason": runtime.get("status_reason"),
+        "reset_count": runtime.get("reset_count"),
+        "update_count": runtime.get("last_update_count"),
+        "rolling_sequence": rolling_sequence,
+        "current_sequence": current_sequence,
+        "last_minute_key": int(runtime.get("last_minute_key") or 0),
+        "origin_valid": bool(runtime.get("origin_valid")),
+        "origin": copy.deepcopy(runtime.get("origin") or _ppb_zero_endpoint()),
+        "current": copy.deepcopy(runtime.get("current") or _ppb_zero_endpoint()),
+        "expected_second_count": expected_second,
+        "expected_minute_count": expected_minute,
+        "second_count": len(second_history),
+        "minute_count": len(minute_history),
+        "second_history": second_history,
+        "minute_history": minute_history,
+        "contiguous_from_update_count": runtime.get("contiguous_from_update_count"),
+        "gap_count": int(runtime.get("gap_count") or 0),
+        "last_gap": copy.deepcopy(runtime.get("last_gap")),
+        "seeded_from_durable": bool(runtime.get("seeded_from_durable")),
+        "seed_source_db_detail_id": runtime.get("seed_source_db_detail_id"),
+        "last_delta_signature": runtime.get("last_delta_signature"),
+        "proof_checks": int(runtime.get("proof_checks") or 0),
+    }
+
+
+def _ppb_checkpoint_assert_history_matches_proof_locked(
+    runtime: Dict[str, Any],
+    delta: Dict[str, Any],
+) -> None:
+    windows = (
+        ("10_min", PPB_10_MIN_SECONDS, True),
+        ("60_min", PPB_60_MIN_SECONDS, False),
+        ("8_hour", PPB_8_HOUR_SECONDS, False),
+        ("24_hour", PPB_24_HOUR_SECONDS, False),
+    )
+    for key, seconds, exact in windows:
+        proof = (delta.get("proof") or {}).get(key)
+        if not isinstance(proof, dict) or not proof.get("valid"):
+            continue
+        expected_anchor = proof.get("anchor")
+        actual_anchor = _ppb_checkpoint_history_anchor_locked(
+            runtime, seconds, exact_second_history=exact
+        )
+        if not _ppb_endpoints_equal(expected_anchor, actual_anchor):
+            raise RuntimeError(
+                "Pi Better-Buckets checkpoint ring disagrees with producer proof: "
+                f"window={key} expected_anchor={expected_anchor!r} "
+                f"actual_anchor={actual_anchor!r}"
+            )
+
+
+def _ppb_checkpoint_ingest(stats: Dict[str, Any]) -> Dict[str, Any]:
+    """Fold one verified producer delta into the literal Pi restore image."""
+    global _ppb_checkpoint_runtime
+    delta = _validate_firmware_ppb_checkpoint_delta(stats)
+    signature = _ppb_checkpoint_delta_signature(delta)
+    reset_count = int(delta["reset_count"])
+    update_count = int(delta["update_count"])
+
+    with _ppb_checkpoint_lock:
+        runtime = _ppb_checkpoint_runtime_ensure_locked()
+        previous_reset = runtime.get("reset_count")
+        previous_update = runtime.get("last_update_count")
+
+        if previous_reset is not None and (
+            int(previous_reset) != reset_count
+            or (previous_update is not None and update_count < int(previous_update))
+        ):
+            prior_gap_count = int(runtime.get("gap_count") or 0)
+            last_gap = {
+                "reason": "STATISTICS_EPOCH_REPLACED",
+                "previous_reset_count": int(previous_reset),
+                "previous_update_count": int(previous_update or 0),
+                "observed_reset_count": reset_count,
+                "observed_update_count": update_count,
+            }
+            _ppb_checkpoint_runtime = _ppb_checkpoint_new_runtime(
+                reason="STATISTICS_EPOCH_REPLACED",
+                gap_count=prior_gap_count,
+                last_gap=last_gap,
+            )
+            runtime = _ppb_checkpoint_runtime
+            _diag["ppb_checkpoint_epoch_rebases"] = (
+                _diag.get("ppb_checkpoint_epoch_rebases", 0) + 1
+            )
+            previous_update = None
+
+        if previous_update is not None and update_count == int(previous_update):
+            prior_signature = runtime.get("last_delta_signature")
+            if prior_signature is not None and prior_signature != signature:
+                raise RuntimeError(
+                    "duplicate Better-Buckets statistics identity changed producer testimony: "
+                    f"reset_count={reset_count} update_count={update_count}"
+                )
+            runtime["last_delta_signature"] = signature
+            runtime["proof_checks"] = int(delta.get("proof_checks") or 0)
+            snapshot = _ppb_checkpoint_snapshot_locked(runtime)
+            _diag["ppb_checkpoint_rows_verified"] += 1
+            _diag["last_ppb_checkpoint"] = {
+                "reset_count": reset_count,
+                "update_count": update_count,
+                "rolling_sequence": snapshot.get("rolling_sequence"),
+                "recoverable": snapshot.get("recoverable"),
+                "status": snapshot.get("status"),
+                "duplicate": True,
+            }
+            return snapshot
+
+        if previous_update is not None and update_count > int(previous_update) + 1:
+            gap = {
+                "reason": "PI_OBSERVATION_GAP",
+                "expected_update_count": int(previous_update) + 1,
+                "observed_update_count": update_count,
+                "missing_rows": update_count - int(previous_update) - 1,
+            }
+            prior_gap_count = int(runtime.get("gap_count") or 0) + 1
+            _ppb_checkpoint_runtime = _ppb_checkpoint_new_runtime(
+                reason="PI_OBSERVATION_GAP",
+                gap_count=prior_gap_count,
+                last_gap=gap,
+            )
+            runtime = _ppb_checkpoint_runtime
+            _diag["ppb_checkpoint_gap_count"] = (
+                _diag.get("ppb_checkpoint_gap_count", 0) + 1
+            )
+
+        # A producer ring count may decrease only when Alpha's rolling state has
+        # been replaced. If our saved image is larger than the producer's current
+        # ring, discard it and warm again from authoritative appends.
+        if (
+            int(delta["second_count"]) < len(runtime["second_history"])
+            or int(delta["minute_count"]) < len(runtime["minute_history"])
+        ):
+            replacement = {
+                "reason": "PRODUCER_RING_REPLACED",
+                "previous_second_count": len(runtime["second_history"]),
+                "previous_minute_count": len(runtime["minute_history"]),
+                "observed_second_count": int(delta["second_count"]),
+                "observed_minute_count": int(delta["minute_count"]),
+                "observed_update_count": update_count,
+            }
+            prior_gap_count = int(runtime.get("gap_count") or 0)
+            _ppb_checkpoint_runtime = _ppb_checkpoint_new_runtime(
+                reason="PRODUCER_RING_REPLACED",
+                gap_count=prior_gap_count,
+                last_gap=replacement,
+            )
+            runtime = _ppb_checkpoint_runtime
+
+        if runtime.get("contiguous_from_update_count") is None:
+            runtime["contiguous_from_update_count"] = update_count
+
+        if delta.get("second_append_valid"):
+            endpoint = copy.deepcopy(delta["second_append"])
+            history = runtime["second_history"]
+            if history and int(endpoint["rolling_sequence"]) <= int(history[-1]["rolling_sequence"]):
+                raise RuntimeError(
+                    "Better-Buckets second append is not strictly newer than Pi checkpoint tail"
+                )
+            history.append(endpoint)
+
+        if delta.get("minute_append_valid"):
+            endpoint = copy.deepcopy(delta["minute_append"])
+            history = runtime["minute_history"]
+            if history and int(endpoint["rolling_sequence"]) <= int(history[-1]["rolling_sequence"]):
+                raise RuntimeError(
+                    "Better-Buckets minute append is not strictly newer than Pi checkpoint tail"
+                )
+            history.append(endpoint)
+
+        runtime["reset_count"] = reset_count
+        runtime["last_update_count"] = update_count
+        runtime["last_delta_signature"] = signature
+        runtime["rolling_sequence"] = update_count
+        runtime["current_sequence"] = int(delta["rolling_sequence"])
+        runtime["expected_second_count"] = int(delta["second_count"])
+        runtime["expected_minute_count"] = int(delta["minute_count"])
+        runtime["last_minute_key"] = int(delta["last_minute_key"])
+        runtime["origin_valid"] = bool(delta["origin_valid"])
+        runtime["origin"] = copy.deepcopy(delta["origin"])
+        runtime["current"] = copy.deepcopy(delta["current"])
+        runtime["proof_checks"] = int(delta.get("proof_checks") or 0)
+
+        if len(runtime["second_history"]) > int(delta["second_count"]):
+            raise RuntimeError("Pi Better-Buckets second history exceeds producer ring count")
+        if len(runtime["minute_history"]) > int(delta["minute_count"]):
+            raise RuntimeError("Pi Better-Buckets minute history exceeds producer ring count")
+
+        snapshot = _ppb_checkpoint_snapshot_locked(runtime)
+        if snapshot.get("recoverable"):
+            _ppb_checkpoint_assert_history_matches_proof_locked(runtime, delta)
+            runtime["status_reason"] = "COMPLETE_PRODUCER_RING_CUSTODY"
+            snapshot = _ppb_checkpoint_snapshot_locked(runtime)
+            _diag["ppb_checkpoint_recoverable_rows"] = (
+                _diag.get("ppb_checkpoint_recoverable_rows", 0) + 1
+            )
+        else:
+            runtime["status_reason"] = (
+                "WAITING_FOR_UNSEEN_PRODUCER_HISTORY_TO_ROLL_OUT"
+            )
+            snapshot = _ppb_checkpoint_snapshot_locked(runtime)
+            _diag["ppb_checkpoint_warming_rows"] = (
+                _diag.get("ppb_checkpoint_warming_rows", 0) + 1
+            )
+
+        _diag["ppb_checkpoint_rows_verified"] += 1
+        _diag["last_ppb_checkpoint"] = {
+            "reset_count": reset_count,
+            "update_count": update_count,
+            "rolling_sequence": snapshot.get("rolling_sequence"),
+            "current_sequence": snapshot.get("current_sequence"),
+            "recoverable": snapshot.get("recoverable"),
+            "status": snapshot.get("status"),
+            "second_count": snapshot.get("second_count"),
+            "expected_second_count": snapshot.get("expected_second_count"),
+            "minute_count": snapshot.get("minute_count"),
+            "expected_minute_count": snapshot.get("expected_minute_count"),
+            "gap_count": snapshot.get("gap_count"),
+        }
+        return snapshot
+
+
+def _normalize_saved_ppb_checkpoint(value: Any) -> Dict[str, Any]:
+    """Validate one persisted Pi checkpoint and return canonical scalars/lists."""
+    if not isinstance(value, dict) or value.get("schema") != PPB_PI_CHECKPOINT_SCHEMA:
+        raise ValueError("canonical CLOCKS missing PI_CLOCKS_PPB_RESTORE_CHECKPOINT_V1")
+    if not bool(value.get("valid")):
+        raise ValueError("persisted Pi Better-Buckets checkpoint is not valid")
+
+    reset_count = _as_int(value.get("reset_count"))
+    update_count = _as_int(value.get("update_count"))
+    rolling_sequence = _as_int(value.get("rolling_sequence"))
+    current_sequence = _as_int(value.get("current_sequence"))
+    expected_second = _as_int(value.get("expected_second_count"))
+    expected_minute = _as_int(value.get("expected_minute_count"))
+    last_minute_key = _as_int(value.get("last_minute_key"))
+    if reset_count is None or reset_count < 0:
+        raise ValueError("persisted Pi Better-Buckets checkpoint has invalid reset_count")
+    if update_count is None or update_count < 0:
+        raise ValueError("persisted Pi Better-Buckets checkpoint has invalid update_count")
+    if rolling_sequence is None or rolling_sequence < 0 or rolling_sequence != update_count:
+        raise ValueError("persisted Pi Better-Buckets checkpoint has invalid restore rolling_sequence")
+    if current_sequence is None or current_sequence < 0 or current_sequence > rolling_sequence:
+        raise ValueError("persisted Pi Better-Buckets checkpoint has invalid current_sequence")
+    if expected_second is None or not (0 <= expected_second <= PPB_SECOND_CAPACITY):
+        raise ValueError("persisted Pi Better-Buckets checkpoint has invalid expected_second_count")
+    if expected_minute is None or not (0 <= expected_minute <= PPB_MINUTE_CAPACITY):
+        raise ValueError("persisted Pi Better-Buckets checkpoint has invalid expected_minute_count")
+    if last_minute_key is None or last_minute_key < 0:
+        raise ValueError("persisted Pi Better-Buckets checkpoint has invalid last_minute_key")
+
+    current = _ppb_endpoint_from_payload(value.get("current"), path="ppb_restore_checkpoint.current")
+    origin_valid = bool(value.get("origin_valid"))
+    origin = (
+        _ppb_endpoint_from_payload(value.get("origin"), path="ppb_restore_checkpoint.origin")
+        if origin_valid
+        else _ppb_zero_endpoint()
+    )
+    if int(current["rolling_sequence"]) != current_sequence:
+        raise ValueError("persisted Pi Better-Buckets current identity mismatch")
+    if origin_valid and (
+        int(origin["rolling_sequence"]) > current_sequence
+        or int(origin["reference_ns"]) > int(current["reference_ns"])
+        or int(origin["interval_count"]) > int(current["interval_count"])
+    ):
+        raise ValueError("persisted Pi Better-Buckets origin follows current state")
+
+    def history(name: str, capacity: int) -> List[Dict[str, Any]]:
+        raw_history = value.get(name)
+        if not isinstance(raw_history, list) or len(raw_history) > capacity:
+            raise ValueError(f"persisted Pi Better-Buckets {name} is invalid")
+        out: List[Dict[str, Any]] = []
+        previous_sequence = -1
+        previous_reference = -1
+        previous_intervals = -1
+        for index, raw_endpoint in enumerate(raw_history):
+            endpoint = _ppb_endpoint_from_payload(
+                raw_endpoint, path=f"ppb_restore_checkpoint.{name}[{index}]"
+            )
+            sequence = int(endpoint["rolling_sequence"])
+            reference_ns = int(endpoint["reference_ns"])
+            interval_count = int(endpoint["interval_count"])
+            if sequence <= previous_sequence:
+                raise ValueError(f"persisted Pi Better-Buckets {name} is not chronological")
+            if reference_ns < previous_reference or interval_count < previous_intervals:
+                raise ValueError(f"persisted Pi Better-Buckets {name} cumulative state regresses")
+            if sequence > current_sequence:
+                raise ValueError(f"persisted Pi Better-Buckets {name} extends beyond current endpoint")
+            previous_sequence = sequence
+            previous_reference = reference_ns
+            previous_intervals = interval_count
+            out.append(endpoint)
+        return out
+
+    second_history = history("second_history", PPB_SECOND_CAPACITY)
+    minute_history = history("minute_history", PPB_MINUTE_CAPACITY)
+    if len(second_history) > expected_second or len(minute_history) > expected_minute:
+        raise ValueError("persisted Pi Better-Buckets checkpoint exceeds producer ring counts")
+    if rolling_sequence > 0 and second_history and not _ppb_endpoints_equal(second_history[-1], current):
+        raise ValueError("persisted Pi Better-Buckets second tail is not current")
+
+    computed_recoverable = bool(
+        len(second_history) == expected_second
+        and len(minute_history) == expected_minute
+        and (
+            current_sequence == 0
+            and expected_second == 0
+            and expected_minute == 0
+            and not origin_valid
+            or (
+                current_sequence > 0
+                and origin_valid
+                and bool(second_history)
+                and _ppb_endpoints_equal(second_history[-1], current)
+                and last_minute_key == _ppb_minute_key(current_sequence)
+                and (
+                    not minute_history
+                    or _ppb_minute_key(int(minute_history[-1]["rolling_sequence"]))
+                        == last_minute_key
+                )
+            )
+        )
+    )
+    if bool(value.get("recoverable")) != computed_recoverable:
+        raise ValueError(
+            "persisted Pi Better-Buckets recoverable flag disagrees with literal history"
+        )
+
+    return {
+        "schema": PPB_PI_CHECKPOINT_SCHEMA,
+        "source_schema": PPB_FIRMWARE_DELTA_SCHEMA,
+        "valid": True,
+        "recoverable": computed_recoverable,
+        "status": value.get("status"),
+        "status_reason": value.get("status_reason"),
+        "reset_count": int(reset_count),
+        "update_count": int(update_count),
+        "rolling_sequence": int(rolling_sequence),
+        "current_sequence": int(current_sequence),
+        "last_minute_key": int(last_minute_key),
+        "origin_valid": bool(origin_valid),
+        "origin": origin,
+        "current": current,
+        "expected_second_count": int(expected_second),
+        "expected_minute_count": int(expected_minute),
+        "second_count": len(second_history),
+        "minute_count": len(minute_history),
+        "second_history": second_history,
+        "minute_history": minute_history,
+        "contiguous_from_update_count": _as_int(value.get("contiguous_from_update_count")),
+        "gap_count": int(_as_int(value.get("gap_count")) or 0),
+        "last_gap": copy.deepcopy(value.get("last_gap")),
+        "seeded_from_durable": bool(value.get("seeded_from_durable")),
+        "seed_source_db_detail_id": _as_int(value.get("seed_source_db_detail_id")),
+        "last_delta_signature": value.get("last_delta_signature"),
+        "proof_checks": int(_as_int(value.get("proof_checks")) or 0),
+    }
+
+
+def _restore_ppb_checkpoint_runtime(
+    checkpoint: Dict[str, Any],
+    *,
+    source_db_detail_id: Optional[int],
+) -> Dict[str, Any]:
+    """Install one persisted literal checkpoint into Pi process custody."""
+    global _ppb_checkpoint_runtime
+    saved = _normalize_saved_ppb_checkpoint(checkpoint)
+    with _ppb_checkpoint_lock:
+        runtime = _ppb_checkpoint_new_runtime(
+            reason="RESTORED_FROM_DURABLE_CLOCKS",
+            gap_count=int(saved.get("gap_count") or 0),
+            last_gap=saved.get("last_gap") if isinstance(saved.get("last_gap"), dict) else None,
+        )
+        runtime["reset_count"] = int(saved["reset_count"])
+        runtime["last_update_count"] = int(saved["update_count"])
+        runtime["last_delta_signature"] = saved.get("last_delta_signature")
+        runtime["rolling_sequence"] = int(saved["rolling_sequence"])
+        runtime["current_sequence"] = int(saved["current_sequence"])
+        runtime["expected_second_count"] = int(saved["expected_second_count"])
+        runtime["expected_minute_count"] = int(saved["expected_minute_count"])
+        runtime["last_minute_key"] = int(saved["last_minute_key"])
+        runtime["origin_valid"] = bool(saved["origin_valid"])
+        runtime["origin"] = copy.deepcopy(saved["origin"])
+        runtime["current"] = copy.deepcopy(saved["current"])
+        runtime["second_history"].extend(copy.deepcopy(saved["second_history"]))
+        runtime["minute_history"].extend(copy.deepcopy(saved["minute_history"]))
+        runtime["contiguous_from_update_count"] = saved.get("contiguous_from_update_count")
+        runtime["seeded_from_durable"] = True
+        runtime["seed_source_db_detail_id"] = (
+            int(source_db_detail_id) if source_db_detail_id is not None else None
+        )
+        runtime["proof_checks"] = int(saved.get("proof_checks") or 0)
+        _ppb_checkpoint_runtime = runtime
+        return _ppb_checkpoint_snapshot_locked(runtime)
+
+
+def _seed_ppb_checkpoint_runtime_from_latest_durable() -> Dict[str, Any]:
+    """Resume Pi checkpoint custody from one saved CLOCKS row; never replay history."""
+    global _ppb_checkpoint_runtime
     with open_db(row_dict=True) as conn:
-        conn.execute("SET TRANSACTION READ ONLY")
-
-        # Discover only the latest contiguous target-owned suffix.  The first
-        # durable gap encountered while walking backward is already the hard left
-        # boundary for every rolling window, so scanning older history would add
-        # latency without changing the reconstructed state.
-        lineage_started = time.monotonic()
-        lineage_cur = conn.cursor(name="clocks_ppb_lineage_scan")
-        lineage_cur.itersize = PPB_REPLAY_CURSOR_ITERSIZE
-        lineage_cur.execute(
-            """
-            SELECT
-                id,
-                sequence::bigint AS physical_sequence,
-                (payload #>> '{clocks,stats,update_count}')::bigint AS update_count
-            FROM campaign_detail
-            WHERE campaign_type = %s
-              AND id <= %s
-              AND NOT (payload @> '{"holistic_restore_superseded":true}'::jsonb)
-              AND payload #>> '{schema}' = 'CLOCKS_V4'
-              AND payload #>> '{clocks,stats,schema}' = 'CLOCKS_INSTRUMENT_STATS_V4'
-              AND (payload #>> '{clocks,stats,reset_count}')::bigint = %s
-            ORDER BY id DESC
-            """,
-            (
-                CAMPAIGN_TYPE_TEMPEST,
-                int(target_db_id),
-                int(reset_count),
-            ),
-        )
-        lineage = _discover_better_buckets_target_lineage(
-            lineage_cur,
-            target_db_id=int(target_db_id),
-            target_update_count=int(update_count),
-            lower_sequence=int(lower_sequence),
-        )
-        lineage_scan_s = time.monotonic() - lineage_started
-        lineage_start_db_id = int(lineage["lineage_start_db_detail_id"])
-        lineage_start_update_count = int(lineage["lineage_start_update_count"])
-        replay_lower_sequence = max(
-            int(lower_sequence), int(lineage_start_update_count)
-        )
-
-        replay_started = time.monotonic()
-        cur = conn.cursor(name="clocks_ppb_restore_stream")
-        cur.itersize = PPB_REPLAY_CURSOR_ITERSIZE
+        cur = conn.cursor()
         cur.execute(
             """
-            SELECT
-                id,
-                (payload #>> '{clocks,stats,update_count}')::bigint AS update_count,
-                (payload #>> '{clocks,stats,rolling_ppb_current_sequence}')::bigint
-                    AS current_sequence,
-                payload #>> '{clocks,stats,rolling_ppb_endpoint_admitted}'
-                    AS endpoint_admitted,
-                payload #>> '{clocks,stats,rolling_ppb_interval_advanced}'
-                    AS interval_advanced,
-                (payload #>> '{clocks,clockfaces,gnss_ns}')::bigint AS gnss_ns,
-                (payload #>> '{clocks,clockfaces,dwt_cycles}')::bigint AS dwt_cycles,
-                (payload #>> '{clocks,clockfaces,ocxo1_ns}')::bigint AS ocxo1_ns,
-                (payload #>> '{clocks,clockfaces,ocxo2_ns}')::bigint AS ocxo2_ns
+            SELECT id, payload
             FROM campaign_detail
             WHERE campaign_type = %s
-              AND id BETWEEN %s AND %s
               AND NOT (payload @> '{"holistic_restore_superseded":true}'::jsonb)
               AND payload #>> '{schema}' = 'CLOCKS_V4'
-              AND payload #>> '{clocks,stats,schema}' = 'CLOCKS_INSTRUMENT_STATS_V4'
-              AND (payload #>> '{clocks,stats,reset_count}')::bigint = %s
-              AND (payload #>> '{clocks,stats,update_count}')::bigint
-                    BETWEEN %s AND %s
-            ORDER BY (payload #>> '{clocks,stats,update_count}')::bigint ASC,
-                     id ASC
+              AND payload #> '{clocks,ppb_restore_checkpoint}' IS NOT NULL
+            ORDER BY id DESC
+            LIMIT 1
             """,
-            (
-                CAMPAIGN_TYPE_TEMPEST,
-                int(lineage_start_db_id),
-                int(target_db_id),
-                int(reset_count),
-                int(replay_lower_sequence),
-                int(current_sequence),
+            (CAMPAIGN_TYPE_TEMPEST,),
+        )
+        row = cur.fetchone()
+
+    if row is None:
+        with _ppb_checkpoint_lock:
+            _ppb_checkpoint_runtime = _ppb_checkpoint_new_runtime(
+                reason="NO_DURABLE_CHECKPOINT_SEED"
+            )
+            snapshot = _ppb_checkpoint_snapshot_locked(_ppb_checkpoint_runtime)
+        _diag["ppb_checkpoint_seed_missing"] = (
+            _diag.get("ppb_checkpoint_seed_missing", 0) + 1
+        )
+        logging.warning(
+            "📦 [clocks/ppb] no durable synthetic Better-Buckets checkpoint exists yet; "
+            "Pi will warm from producer-authored endpoint appends without SQL replay"
+        )
+        return snapshot
+
+    state = row["payload"]
+    if isinstance(state, str):
+        state = json.loads(state)
+    if not isinstance(state, dict):
+        raise RuntimeError("latest durable Better-Buckets checkpoint row is malformed")
+    clocks = _clocks_payload(state)
+    checkpoint = clocks.get("ppb_restore_checkpoint") if isinstance(clocks, dict) else None
+    snapshot = _restore_ppb_checkpoint_runtime(
+        checkpoint,
+        source_db_detail_id=int(row["id"]),
+    )
+    _diag["ppb_checkpoint_seed_loaded"] = (
+        _diag.get("ppb_checkpoint_seed_loaded", 0) + 1
+    )
+    logging.info(
+        "📦 [clocks/ppb] restored Pi Better-Buckets checkpoint custody from detail_id=%d "
+        "update_count=%s recoverable=%s second=%d/%d minute=%d/%d",
+        int(row["id"]),
+        snapshot.get("update_count"),
+        snapshot.get("recoverable"),
+        int(snapshot.get("second_count") or 0),
+        int(snapshot.get("expected_second_count") or 0),
+        int(snapshot.get("minute_count") or 0),
+        int(snapshot.get("expected_minute_count") or 0),
+    )
+    return snapshot
+
+
+def _ppb_restore_checkpoint_from_clocks(clocks: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    checkpoint = clocks.get("ppb_restore_checkpoint") if isinstance(clocks, dict) else None
+    return copy.deepcopy(checkpoint) if isinstance(checkpoint, dict) else None
+
+
+def _require_recoverable_ppb_checkpoint(clocks: Dict[str, Any]) -> Dict[str, Any]:
+    checkpoint = _ppb_restore_checkpoint_from_clocks(clocks)
+    saved = _normalize_saved_ppb_checkpoint(checkpoint)
+    if not saved.get("recoverable"):
+        raise RuntimeError(
+            "canonical CLOCKS Better-Buckets checkpoint is not yet recoverable; "
+            f"status={saved.get('status')!r} "
+            f"second={saved.get('second_count')}/{saved.get('expected_second_count')} "
+            f"minute={saved.get('minute_count')}/{saved.get('expected_minute_count')} "
+            "raw PostgreSQL replay is intentionally unavailable"
+        )
+    return saved
+
+
+def _require_alpha_resurrection_checkpoint(
+    clocks: Dict[str, Any],
+    *,
+    campaign: str,
+    recovery_source_db_id: Optional[int],
+) -> Dict[str, Any]:
+    """Require exact durable Alpha state after live physical custody was lost.
+
+    Once a new Teensy lifetime has been proved, an incomplete/malformed checkpoint
+    cannot improve by retrying RECOVER: the missing producer-authored endpoints died
+    with the old Alpha RAM image.  Latch HARD_FAILURE immediately rather than
+    presenting an information-theoretic loss as a transient transport condition.
+    """
+    checkpoint = _ppb_restore_checkpoint_from_clocks(clocks)
+    try:
+        saved = _normalize_saved_ppb_checkpoint(checkpoint)
+    except (TypeError, ValueError) as exc:
+        details = {
+            "court": "ALPHA_DURABLE_RESURRECTION_AUTHORITY",
+            "campaign": str(campaign),
+            "recovery_source_db_id": recovery_source_db_id,
+            "checkpoint_schema": (
+                checkpoint.get("schema") if isinstance(checkpoint, dict) else None
             ),
+            "checkpoint_error": str(exc),
+            "physical_custody": _recovery_custody_snapshot(),
+            "raw_postgresql_replay_available": False,
+            "operator_action": (
+                "Exact Alpha resurrection is impossible from the available durable "
+                "state. Preserve this HARD_FAILURE evidence and explicitly begin a "
+                "new statistics/campaign epoch when ready."
+            ),
+        }
+        _clear_sync_wait()
+        logging.critical(
+            "🛑 [recovery] ALPHA RESURRECTION IMPOSSIBLE: durable Better-Buckets "
+            "checkpoint is missing or invalid after physical custody loss; "
+            "campaign=%s source_detail_id=%s error=%s. No automatic retry will occur.",
+            campaign,
+            recovery_source_db_id,
+            exc,
         )
-        replay = _replay_better_buckets_rows(
-            cur,
-            lower_sequence=int(replay_lower_sequence),
-            target_update_count=int(update_count),
-            target_current_sequence=int(current_sequence),
+        _require_hard_failure(
+            "alpha_resurrection_impossible_checkpoint_invalid",
+            details,
+            source="CLOCKS_ALPHA_RESURRECTION_COURT",
         )
-        replay_scan_s = time.monotonic() - replay_started
 
-    # Preserve the nominal requested horizon separately from the effective
-    # suffix start.  If discovery stopped to the right of requested_lower, the
-    # omitted prefix is unavailable durable ancestry exactly like a replay-time
-    # chronology gap and must truncate any window that would cross it.
-    replay["lower_sequence"] = int(lower_sequence)
-    replay["effective_lower_sequence"] = max(
-        int(replay.get("effective_lower_sequence") or 0),
-        int(lineage_start_update_count),
-    )
-    prefix_truncated = int(lineage_start_update_count) > int(lower_sequence)
-    if prefix_truncated:
-        boundary = lineage.get("lineage_boundary")
-        if isinstance(boundary, dict) and boundary.get("reason") == "DURABLE_FORWARD_GAP":
-            prefix_gap = {
-                "expected_sequence": int(
-                    boundary.get("expected_sequence")
-                    or (int(boundary.get("older_update_count") or 0) + 1)
-                ),
-                "observed_sequence": int(
-                    boundary.get("observed_sequence")
-                    or lineage_start_update_count
-                ),
-                "missing_rows": int(
-                    boundary.get("missing_rows")
-                    or max(0, lineage_start_update_count - lower_sequence)
-                ),
-            }
-        else:
-            prefix_gap = {
-                "expected_sequence": int(lower_sequence),
-                "observed_sequence": int(lineage_start_update_count),
-                "missing_rows": int(lineage_start_update_count - lower_sequence),
-            }
-        replay["history_truncated"] = True
-        replay["chronology_gap_count"] = (
-            int(replay.get("chronology_gap_count") or 0) + 1
-        )
-        if replay.get("last_chronology_gap") is None:
-            replay["last_chronology_gap"] = prefix_gap
+    if saved.get("recoverable"):
+        return saved
 
-    replay["reset_count"] = int(reset_count)
-    replay["source_lineage_start_db_detail_id"] = int(lineage_start_db_id)
-    replay["source_lineage_start_update_count"] = int(lineage_start_update_count)
-    replay["lineage_scan_rows"] = int(lineage.get("lineage_scan_rows") or 0)
-    replay["lineage_scan_s"] = round(float(lineage_scan_s), 3)
-    replay["replay_scan_s"] = round(float(replay_scan_s), 3)
-    replay["lineage_physical_rebase_count"] = int(
-        lineage.get("lineage_physical_rebase_count") or 0
+    second_count = int(saved.get("second_count") or 0)
+    expected_second = int(saved.get("expected_second_count") or 0)
+    minute_count = int(saved.get("minute_count") or 0)
+    expected_minute = int(saved.get("expected_minute_count") or 0)
+    details = {
+        "court": "ALPHA_DURABLE_RESURRECTION_AUTHORITY",
+        "campaign": str(campaign),
+        "recovery_source_db_id": recovery_source_db_id,
+        "checkpoint_schema": saved.get("schema"),
+        "checkpoint_status": saved.get("status"),
+        "checkpoint_status_reason": saved.get("status_reason"),
+        "checkpoint_reset_count": saved.get("reset_count"),
+        "checkpoint_update_count": saved.get("update_count"),
+        "second_count": second_count,
+        "expected_second_count": expected_second,
+        "missing_second_endpoints": max(0, expected_second - second_count),
+        "minute_count": minute_count,
+        "expected_minute_count": expected_minute,
+        "missing_minute_endpoints": max(0, expected_minute - minute_count),
+        "gap_count": int(saved.get("gap_count") or 0),
+        "last_gap": copy.deepcopy(saved.get("last_gap")),
+        "physical_custody": _recovery_custody_snapshot(),
+        "raw_postgresql_replay_available": False,
+        "information_loss_is_terminal": True,
+        "operator_action": (
+            "The previous Alpha RAM lifetime is gone and the durable checkpoint does "
+            "not contain every producer-authored endpoint required for exact restore. "
+            "Automatic recovery is permanently stopped for this lineage. Explicitly "
+            "start a new statistics/campaign epoch when ready."
+        ),
+    }
+    _clear_sync_wait()
+    logging.critical(
+        "🛑 [recovery] ALPHA RESURRECTION IMPOSSIBLE: physical Teensy custody was "
+        "lost and the durable Better-Buckets checkpoint is incomplete "
+        "(status=%s second=%d/%d missing=%d minute=%d/%d missing=%d). "
+        "The missing producer-authored endpoints no longer exist; raw PostgreSQL "
+        "reconstruction is prohibited. No automatic retry will occur.",
+        saved.get("status"),
+        second_count,
+        expected_second,
+        max(0, expected_second - second_count),
+        minute_count,
+        expected_minute,
+        max(0, expected_minute - minute_count),
     )
-    replay["lineage_boundary"] = copy.deepcopy(lineage.get("lineage_boundary"))
-    replay["source_db_detail_id"] = int(target_db_id)
-    replay["verification"] = _verify_better_buckets_replay(detail, replay)
-    if replay.get("lineage_boundary"):
-        logging.warning(
-            "⚠️ [holistic restore] Better-Buckets target suffix bounded by durable "
-            "chronology: start_id=%d start_update=%d scan_rows=%d scan_s=%.3f "
-            "boundary=%s",
-            int(replay.get("source_lineage_start_db_detail_id") or 0),
-            int(replay.get("source_lineage_start_update_count") or 0),
-            int(replay.get("lineage_scan_rows") or 0),
-            float(replay.get("lineage_scan_s") or 0.0),
-            replay.get("lineage_boundary"),
-        )
-    if replay.get("history_truncated"):
-        logging.warning(
-            "⚠️ [holistic restore] Better-Buckets durable gap accepted as rolling "
-            "history boundary: requested_lower=%d effective_lower=%d "
-            "available_population=%ds last_gap=%s",
-            int(replay.get("lower_sequence") or 0),
-            int(replay.get("effective_lower_sequence") or 0),
-            int(replay.get("available_population_seconds") or 0),
-            replay.get("last_chronology_gap"),
-        )
-    return replay
+    _require_hard_failure(
+        "alpha_resurrection_impossible_checkpoint_incomplete",
+        details,
+        source="CLOCKS_ALPHA_RESURRECTION_COURT",
+    )
+    raise AssertionError("unreachable after HARD_FAILURE")
+
 
 def _supersede_cold_bootstrap_rows(
     *,
@@ -5036,28 +5258,35 @@ def _abort_teensy_ppb_restore_best_effort() -> None:
         logging.debug("⚠️ [holistic restore] PPB_RESTORE_ABORT failed (ignored)")
 
 
-def _stage_teensy_better_buckets(replay: Dict[str, Any]) -> Dict[str, Any]:
-    rolling_sequence = int(replay.get("rolling_sequence") or 0)
+def _stage_teensy_better_buckets_checkpoint(checkpoint: Dict[str, Any]) -> Dict[str, Any]:
+    """Send one literal saved Pi checkpoint back through Alpha's existing restore court."""
+    saved = _normalize_saved_ppb_checkpoint(checkpoint)
+    if not saved.get("recoverable"):
+        raise ValueError("Better-Buckets checkpoint is not complete enough for Alpha restore")
+
+    rolling_sequence = int(saved.get("rolling_sequence") or 0)
     if rolling_sequence == 0:
-        return {"staged": False, "reason": "empty_statistics_epoch"}
+        return {
+            "staged": False,
+            "reason": "empty_statistics_epoch",
+            "checkpoint_schema": PPB_PI_CHECKPOINT_SCHEMA,
+        }
 
-    second_history = replay.get("second_history")
-    minute_history = replay.get("minute_history")
-    if not isinstance(second_history, list) or not isinstance(minute_history, list):
-        raise ValueError("Better-Buckets replay missing history arrays")
-
+    second_history = saved["second_history"]
+    minute_history = saved["minute_history"]
     begin_args: Dict[str, Any] = {
         "rolling_sequence": rolling_sequence,
         "second_count": len(second_history),
         "minute_count": len(minute_history),
-        "last_minute_key": int(replay.get("last_minute_key") or 0),
-        "origin_valid": bool(replay.get("origin_valid")),
+        "last_minute_key": int(saved.get("last_minute_key") or 0),
+        "origin_valid": bool(saved.get("origin_valid")),
     }
-    begin_args.update(_ppb_endpoint_command_args("current", replay["current"]))
-    if replay.get("origin_valid"):
-        begin_args.update(_ppb_endpoint_command_args("origin", replay["origin"]))
+    begin_args.update(_ppb_endpoint_command_args("current", saved["current"]))
+    if saved.get("origin_valid"):
+        begin_args.update(_ppb_endpoint_command_args("origin", saved["origin"]))
 
     started = time.monotonic()
+    _ppb_restore_transaction_active.set()
     try:
         begin_payload = _send_teensy_ppb_restore_command(
             "PPB_RESTORE_BEGIN",
@@ -5097,6 +5326,7 @@ def _stage_teensy_better_buckets(replay: Dict[str, Any]) -> Dict[str, Any]:
         )
         return {
             "staged": True,
+            "checkpoint_schema": PPB_PI_CHECKPOINT_SCHEMA,
             "rolling_sequence": rolling_sequence,
             "second_count": len(second_history),
             "minute_count": len(minute_history),
@@ -5104,44 +5334,16 @@ def _stage_teensy_better_buckets(replay: Dict[str, Any]) -> Dict[str, Any]:
             "chunk_size": chunk_size,
             "waited_s": round(time.monotonic() - started, 3),
             "teensy": commit_payload,
-            "replay_rows": int(replay.get("rows_scanned") or 0),
-            "replay_rows_scanned_total": int(
-                replay.get("rows_scanned_total") or replay.get("rows_scanned") or 0
-            ),
-            "source_lineage_start_db_detail_id": int(
-                replay.get("source_lineage_start_db_detail_id") or 0
-            ),
-            "source_lineage_start_update_count": int(
-                replay.get("source_lineage_start_update_count") or 0
-            ),
-            "lineage_scan_rows": int(replay.get("lineage_scan_rows") or 0),
-            "lineage_scan_s": float(replay.get("lineage_scan_s") or 0.0),
-            "replay_scan_s": float(replay.get("replay_scan_s") or 0.0),
-            "lineage_physical_rebase_count": int(
-                replay.get("lineage_physical_rebase_count") or 0
-            ),
-            "lineage_boundary": copy.deepcopy(replay.get("lineage_boundary")),
-            "history_truncated": bool(replay.get("history_truncated")),
-            "chronology_gap_count": int(replay.get("chronology_gap_count") or 0),
-            "effective_lower_sequence": int(
-                replay.get("effective_lower_sequence") or 0
-            ),
-            "available_span_seconds": int(
-                replay.get("available_span_seconds") or 0
-            ),
-            "available_population_seconds": int(
-                replay.get("available_population_seconds") or 0
-            ),
-            "verification_checks": int(
-                (replay.get("verification") or {}).get("checked") or 0
-            ),
-            "verification_truncated_comparisons": int(
-                (replay.get("verification") or {}).get("truncated_comparisons") or 0
-            ),
+            "source_reset_count": int(saved.get("reset_count") or 0),
+            "source_update_count": int(saved.get("update_count") or 0),
+            "source_gap_count": int(saved.get("gap_count") or 0),
+            "checkpoint_seed_source_db_detail_id": saved.get("seed_source_db_detail_id"),
         }
     except Exception:
         _abort_teensy_ppb_restore_best_effort()
         raise
+    finally:
+        _ppb_restore_transaction_active.clear()
 
 
 def _probe_teensy_recovery_epoch() -> Tuple[bool, Dict[str, Any]]:
@@ -5526,9 +5728,9 @@ def _request_teensy_holistic_restore(
     """Request one complete firmware CLOCKS restore from canonical instrument state.
 
     With allow_ppb_stage_required=True this also acts as the lifecycle probe used
-    before SQL replay: an idle V3 firmware may truthfully answer that Better-
-    Buckets history must be staged first, while a live campaign still returns its
-    ordinary busy/live-custody verdict without Alpha being touched.
+    before checkpoint resurrection: idle firmware may truthfully answer that
+    Better-Buckets state must be staged first, while a live campaign still returns
+    its ordinary busy/live-custody verdict without Alpha being touched.
     """
     deadline = time.monotonic() + HOLISTIC_RESTORE_COMMAND_RETRY_S
     restore_args = _canonical_restore_args(clocks, include_control=False)
@@ -5604,6 +5806,21 @@ def _holistic_restore_probe(state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             return None
         return result if math.isfinite(result) else None
 
+    ppb_checkpoint_recoverable = False
+    ppb_checkpoint_update_count = 0
+    ppb_checkpoint_current_sequence = 0
+    checkpoint = _ppb_restore_checkpoint_from_clocks(clocks)
+    if checkpoint is not None:
+        try:
+            normalized_checkpoint = _normalize_saved_ppb_checkpoint(checkpoint)
+            ppb_checkpoint_recoverable = bool(normalized_checkpoint.get("recoverable"))
+            ppb_checkpoint_update_count = int(normalized_checkpoint.get("update_count") or 0)
+            ppb_checkpoint_current_sequence = int(
+                normalized_checkpoint.get("current_sequence") or 0
+            )
+        except (TypeError, ValueError):
+            pass
+
     return {
         "instrument_gnss_ns": int_value(instrument.get("gnss_ns")),
         "instrument_dwt_cycles": int_value(instrument.get("dwt_cycles")),
@@ -5614,6 +5831,9 @@ def _holistic_restore_probe(state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "dither_operator_enabled": bool(control.get("dither_operator_enabled")),
         "ocxo1_dac": float_value(_path_get(control, "ocxo1.target_code")),
         "ocxo2_dac": float_value(_path_get(control, "ocxo2.target_code")),
+        "ppb_checkpoint_recoverable": ppb_checkpoint_recoverable,
+        "ppb_checkpoint_update_count": ppb_checkpoint_update_count,
+        "ppb_checkpoint_current_sequence": ppb_checkpoint_current_sequence,
     }
 
 
@@ -5635,6 +5855,17 @@ def _holistic_restore_probe_satisfied(
             target = int(target_value or 0)
             if target > 0 and int(observed_n.get(key) or 0) < target:
                 return False
+    if bool(expected.get("ppb_checkpoint_recoverable")):
+        if not bool(observed.get("ppb_checkpoint_recoverable")):
+            return False
+        expected_ppb_update = int(expected.get("ppb_checkpoint_update_count") or 0)
+        observed_ppb_update = int(observed.get("ppb_checkpoint_update_count") or 0)
+        if observed_ppb_update < expected_ppb_update:
+            return False
+        expected_ppb_current = int(expected.get("ppb_checkpoint_current_sequence") or 0)
+        observed_ppb_current = int(observed.get("ppb_checkpoint_current_sequence") or 0)
+        if observed_ppb_current < expected_ppb_current:
+            return False
     if str(observed.get("servo_mode") or "OFF").upper() != str(
         expected.get("servo_mode") or "OFF"
     ).upper():
@@ -5674,6 +5905,10 @@ def _holistic_restore_pending_categories(
         for key, target in expected_n.items()
     ):
         pending.append("STATISTICS")
+    if bool(expected.get("ppb_checkpoint_recoverable")) and not bool(
+        observed.get("ppb_checkpoint_recoverable")
+    ):
+        pending.append("BETTER_BUCKETS_CHECKPOINT")
     if not _holistic_restore_probe_satisfied(
         {**expected, "instrument_gnss_ns": 0, "instrument_dwt_cycles": 0,
          "instrument_ocxo1_ns": 0, "instrument_ocxo2_ns": 0, "welford_n": {}},
@@ -5748,6 +5983,137 @@ def _wait_for_holistic_restore(
     )
 
 
+def _alpha_survival_lineage_court(
+    durable_clocks: Dict[str, Any],
+    live_state: Dict[str, Any],
+    *,
+    live_age_s: Optional[float],
+) -> Dict[str, Any]:
+    """Prove that current Alpha state descends from the durable restore source.
+
+    REPORT_RECOVERY describes the Alpha that is alive *now*.  After a Teensy
+    reboot, a newborn Alpha can truthfully report ALPHA ownership, preserved
+    local statistics, and no pending restore obligation.  Those facts do not
+    prove that it is the same statistical lifetime PostgreSQL remembers.
+
+    Survival therefore requires an independent fresh canonical CLOCKS witness:
+    the durable statistics epoch must be unchanged, its monotonic population
+    identities must not regress, and the four instrument clockfaces must be at
+    or beyond their durable values.  Missing/ambiguous evidence fails closed into
+    the ordinary RESTORE_MONITOR/instrument-restore path.
+    """
+    reasons: List[str] = []
+    live_clocks = _clocks_payload(live_state)
+    durable_stats = durable_clocks.get("stats") if isinstance(durable_clocks, dict) else None
+    live_stats = live_clocks.get("stats") if isinstance(live_clocks, dict) else None
+    durable_faces = (
+        durable_clocks.get("clockfaces") if isinstance(durable_clocks, dict) else None
+    )
+    live_faces = live_clocks.get("clockfaces") if isinstance(live_clocks, dict) else None
+
+    if not isinstance(live_state, dict) or not live_state:
+        reasons.append("canonical_live_unavailable")
+    elif bool(live_state.get("restored_display_seed")):
+        reasons.append("canonical_live_is_durable_display_seed")
+    if live_age_s is None:
+        reasons.append("canonical_live_age_unknown")
+    elif live_age_s > CLOCKS_PREFLIGHT_MAX_AGE_S:
+        reasons.append("canonical_live_stale")
+
+    live_restore_ready = False
+    if isinstance(live_clocks, dict) and live_clocks:
+        try:
+            live_restore_ready = _canonical_instrument_restore_ready(
+                live_clocks, include_control=False
+            )
+        except HardFailureRequired:
+            raise
+        except Exception:
+            live_restore_ready = False
+    if not live_restore_ready:
+        reasons.append("canonical_live_not_coherent_instrument_state")
+
+    durable_reset = (
+        _as_int(durable_stats.get("reset_count"))
+        if isinstance(durable_stats, dict)
+        else None
+    )
+    durable_update = (
+        _as_int(durable_stats.get("update_count"))
+        if isinstance(durable_stats, dict)
+        else None
+    )
+    live_reset = (
+        _as_int(live_stats.get("reset_count"))
+        if isinstance(live_stats, dict)
+        else None
+    )
+    live_update = (
+        _as_int(live_stats.get("update_count"))
+        if isinstance(live_stats, dict)
+        else None
+    )
+
+    if durable_reset is None or durable_update is None:
+        reasons.append("durable_statistics_chronology_missing")
+    if live_reset is None or live_update is None:
+        reasons.append("canonical_live_statistics_chronology_missing")
+    if durable_reset is not None and live_reset is not None and live_reset != durable_reset:
+        reasons.append("statistics_reset_count_changed")
+    if durable_update is not None and live_update is not None and live_update < durable_update:
+        reasons.append("statistics_update_count_regressed")
+
+    durable_current = (
+        _as_int(durable_stats.get("rolling_ppb_current_sequence"))
+        if isinstance(durable_stats, dict)
+        else None
+    )
+    live_current = (
+        _as_int(live_stats.get("rolling_ppb_current_sequence"))
+        if isinstance(live_stats, dict)
+        else None
+    )
+    if durable_current is None or live_current is None:
+        reasons.append("better_buckets_current_sequence_missing")
+    elif live_current < durable_current:
+        reasons.append("better_buckets_current_sequence_regressed")
+
+    clockfaces: Dict[str, Any] = {}
+    for key in ("gnss_ns", "dwt_cycles", "ocxo1_ns", "ocxo2_ns"):
+        durable_value = (
+            _as_int(durable_faces.get(key)) if isinstance(durable_faces, dict) else None
+        )
+        live_value = _as_int(live_faces.get(key)) if isinstance(live_faces, dict) else None
+        monotonic = bool(
+            durable_value is not None
+            and durable_value > 0
+            and live_value is not None
+            and live_value >= durable_value
+        )
+        clockfaces[key] = {
+            "durable": durable_value,
+            "live": live_value,
+            "monotonic": monotonic,
+        }
+        if not monotonic:
+            reasons.append(f"clockface_regressed_or_missing:{key}")
+
+    return {
+        "proved": not reasons,
+        "reasons": reasons,
+        "durable_reset_count": durable_reset,
+        "durable_update_count": durable_update,
+        "live_reset_count": live_reset,
+        "live_update_count": live_update,
+        "durable_ppb_current_sequence": durable_current,
+        "live_ppb_current_sequence": live_current,
+        "live_sequence": _as_int(live_state.get("sequence")) if isinstance(live_state, dict) else None,
+        "live_age_s": None if live_age_s is None else round(float(live_age_s), 3),
+        "live_restore_ready": bool(live_restore_ready),
+        "clockfaces": clockfaces,
+    }
+
+
 def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
     clocks = _clocks_payload(detail)
     gnss_raw = _clocks_gnss_raw_payload(detail)
@@ -5758,15 +6124,231 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
     ) or gnss_raw is None:
         raise RuntimeError("CLOCKS detail lacks valid canonical instrument/GNSS_RAW restore state")
 
-    # Arm durable proof custody before the first RESTORE_MONITOR probe.  The
-    # ordinary writer remains closed, so fresh-boot rows are still withheld; only
-    # the exact restored N+1 row can open this narrow path into PostgreSQL.
+    def complete_surviving_alpha_reattach(
+        teensy_payload: Dict[str, Any],
+        *,
+        basis: str,
+    ) -> Dict[str, Any]:
+        """Restore only Pi-owned custody when firmware proves Alpha survived."""
+        pi_control = _dac_restore_control_from_clocks(clocks, realize=True)
+        gnss_raw_result = _restore_gnss_raw_payload(gnss_raw)
+        if not gnss_raw_result.get("restored"):
+            raise RuntimeError(f"GNSS_RAW surviving-Alpha restore failed: {gnss_raw_result}")
+
+        # Alpha was never restored in this branch.  Make the cold/full-restore
+        # proof lane inert before startup custody is classified so no coincident
+        # live row can be mistaken for an N+1 resurrection proof.
+        _clocks_holistic_restore_proof_pending.clear()
+        _clocks_holistic_restore_proof_committed.clear()
+        startup_custody = _retire_startup_clocks_custody(
+            "surviving_alpha_pi_state_not_yet_restored"
+        )
+        return {
+            "success": True,
+            "mode": "SURVIVING_ALPHA_CUSTODY",
+            "teensy": copy.deepcopy(teensy_payload),
+            "pi_control": pi_control,
+            "gnss_raw": gnss_raw_result,
+            "startup_custody": startup_custody,
+            "proof": {
+                "proved": True,
+                "basis": basis,
+                "startup_prefix_retired": True,
+                "canonical_gap_intentional": True,
+            },
+        }
+
+    # First ask the dedicated, non-mutating firmware lifecycle surface whether
+    # the same campaign is already alive.  This is the strongest Pi-only restart
+    # discriminator: if Alpha still owns that live campaign, Better-Buckets does
+    # not need resurrection at all and an as-yet-warming Pi checkpoint must not
+    # block restoration of Pi-owned DAC/GNSS_RAW custody.
+    active_campaign = _get_active_campaign()
+    active_campaign_name = (
+        str(active_campaign.get("campaign") or "").strip()
+        if isinstance(active_campaign, dict)
+        else ""
+    )
+    lifecycle_status = _fetch_teensy_recovery_status()
+    firmware_campaign = str(lifecycle_status.get("campaign") or "").strip()
+    firmware_campaign_state = str(
+        lifecycle_status.get("campaign_state") or ""
+    ).strip().upper()
+    firmware_recovery_active = bool(
+        _recovery_bool(lifecycle_status.get("recover_lifecycle_active"))
+        or _recovery_bool(lifecycle_status.get("recover_cold_bootstrap_active"))
+        or _recovery_bool(lifecycle_status.get("recover_reattach_active"))
+    )
+
+    # Temporary startup courtroom transcript.  Keep the ordinary CLOCKS stream
+    # beside REPORT_RECOVERY in the log so one restart tells us which authority
+    # is carrying the live campaign identity and why the command-side court did
+    # or did not admit the Pi-only reattach branch.
+    with _clocks_lock:
+        startup_live_clocks = copy.deepcopy(_latest_clocks)
+        startup_live_received_monotonic = _latest_clocks_received_monotonic
+        startup_live_received_utc = _latest_clocks_received_utc
+    startup_live_campaign = _state_campaign(startup_live_clocks)
+    startup_live_campaign_name = (
+        _tempest_campaign_name(startup_live_campaign)
+        if isinstance(startup_live_campaign, dict) and startup_live_campaign
+        else ""
+    )
+    startup_live_campaign_state = str(
+        startup_live_campaign.get("state")
+        if isinstance(startup_live_campaign, dict)
+        else ""
+    ).strip().upper()
+    startup_live_age_s = (
+        None
+        if startup_live_received_monotonic is None
+        else max(0.0, time.monotonic() - startup_live_received_monotonic)
+    )
+
+    same_firmware_campaign = bool(
+        active_campaign_name and firmware_campaign == active_campaign_name
+    )
+    firmware_started = firmware_campaign_state == "STARTED"
+
+    # Instrument survival is independent of campaign execution. REPORT_RECOVERY
+    # exposes the exact Alpha custody facts needed for that decision. Require the
+    # restore_alpha_required field to be explicitly present and false; absence is
+    # not permission to preserve Alpha.
+    alpha_owner = str(
+        lifecycle_status.get("instrument_statistics_owner") or ""
+    ).strip().upper()
+    alpha_preserved = _recovery_bool(
+        lifecycle_status.get("instrument_statistics_preserved")
+    )
+    restore_alpha_present = "restore_alpha_required" in lifecycle_status
+    restore_alpha_required = _recovery_bool(
+        lifecycle_status.get("restore_alpha_required")
+    )
+    recover_epoch_ready = _recovery_bool(
+        lifecycle_status.get("recover_epoch_ready")
+    )
+    alpha_lineage = _alpha_survival_lineage_court(
+        clocks,
+        startup_live_clocks,
+        live_age_s=startup_live_age_s,
+    )
+    alpha_lineage_proved = bool(alpha_lineage.get("proved"))
+
+    report_alpha_survived = bool(
+        lifecycle_status
+        and alpha_owner == "ALPHA"
+        and alpha_preserved
+        and restore_alpha_present
+        and not restore_alpha_required
+        and recover_epoch_ready
+        and not firmware_recovery_active
+        and alpha_lineage_proved
+    )
+
+    report_decline_reasons: List[str] = []
+    if not lifecycle_status:
+        report_decline_reasons.append("report_recovery_unavailable_or_empty")
+    if alpha_owner != "ALPHA":
+        report_decline_reasons.append("instrument_statistics_owner_not_alpha")
+    if not alpha_preserved:
+        report_decline_reasons.append("instrument_statistics_not_preserved")
+    if not restore_alpha_present:
+        report_decline_reasons.append("restore_alpha_required_missing")
+    elif restore_alpha_required:
+        report_decline_reasons.append("restore_alpha_required")
+    if not recover_epoch_ready:
+        report_decline_reasons.append("recover_epoch_not_ready")
+    if firmware_recovery_active:
+        report_decline_reasons.append("firmware_recovery_lifecycle_active")
+    if not alpha_lineage_proved:
+        report_decline_reasons.extend(
+            f"alpha_lineage:{reason}" for reason in alpha_lineage.get("reasons", [])
+        )
+
+    logging.info(
+        "🧭 [holistic restore/live probe] REPORT_RECOVERY court: %s",
+        json.dumps(
+            {
+                "pi_active_campaign": active_campaign_name or None,
+                "firmware_campaign": firmware_campaign or None,
+                "firmware_campaign_state": firmware_campaign_state or None,
+                "recover_lifecycle_active": _recovery_bool(
+                    lifecycle_status.get("recover_lifecycle_active")
+                ),
+                "recover_mode": str(
+                    lifecycle_status.get("recover_mode") or ""
+                ).strip().upper() or None,
+                "recover_cold_bootstrap_active": _recovery_bool(
+                    lifecycle_status.get("recover_cold_bootstrap_active")
+                ),
+                "recover_reattach_active": _recovery_bool(
+                    lifecycle_status.get("recover_reattach_active")
+                ),
+                "same_campaign": same_firmware_campaign,
+                "campaign_started": firmware_started,
+                "instrument_statistics_owner": alpha_owner or None,
+                "instrument_statistics_preserved": alpha_preserved,
+                "restore_alpha_required_present": restore_alpha_present,
+                "restore_alpha_required": restore_alpha_required,
+                "recover_epoch_ready": recover_epoch_ready,
+                "alpha_lineage": alpha_lineage,
+                "surviving_alpha_eligible": report_alpha_survived,
+                "decline_reasons": report_decline_reasons,
+                "canonical_live": {
+                    "sequence": _as_int(startup_live_clocks.get("sequence")),
+                    "received_at_utc": startup_live_received_utc,
+                    "age_s": (
+                        None
+                        if startup_live_age_s is None
+                        else round(float(startup_live_age_s), 3)
+                    ),
+                    "campaign": startup_live_campaign_name or None,
+                    "campaign_state": startup_live_campaign_state or None,
+                    "campaign_public_count": _as_int(
+                        startup_live_campaign.get("public_count")
+                        if isinstance(startup_live_campaign, dict)
+                        else None
+                    ),
+                },
+                "raw_report_recovery": copy.deepcopy(lifecycle_status),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ),
+    )
+
+    if report_alpha_survived:
+        logging.info(
+            "♻️ [holistic restore] REPORT_RECOVERY proves surviving Alpha custody: "
+            "owner=%s preserved=%s restore_alpha_required=%s recover_epoch_ready=%s "
+            "lineage_reset=%s update=%s->%s; firmware campaign=%s/%s Pi campaign=%s. "
+            "Restoring Pi-owned state only.",
+            alpha_owner,
+            alpha_preserved,
+            restore_alpha_required,
+            recover_epoch_ready,
+            alpha_lineage.get("live_reset_count"),
+            alpha_lineage.get("durable_update_count"),
+            alpha_lineage.get("live_update_count"),
+            firmware_campaign or "NONE",
+            firmware_campaign_state or "NONE",
+            active_campaign_name or "NONE",
+        )
+        return complete_surviving_alpha_reattach(
+            lifecycle_status,
+            basis="TEENSY_REPORT_RECOVERY_SURVIVING_ALPHA_CUSTODY",
+        )
+
+    # A live-campaign identity was not proved above.  Arm durable N+1 proof custody
+    # before asking RESTORE_MONITOR whether Alpha needs actual resurrection.
+    # The ordinary writer remains closed, so fresh-boot rows are still withheld;
+    # only the exact restored N+1 row can open this narrow path into PostgreSQL.
     _arm_holistic_restore_persistence_proof(detail)
 
-    # First use RESTORE_MONITOR as a lifecycle probe. A Pi-only restart while a
-    # live campaign still owns the Teensy must not touch Alpha's healthy rolling
-    # history. An idle rebooted Teensy explicitly answers that Better-Buckets
-    # state is required, and only then does the Pi replay PostgreSQL history.
+    # RESTORE_MONITOR remains the authoritative cold/full-restore court.  It can
+    # independently rediscover live campaign custody, or explicitly demand the
+    # literal Better-Buckets checkpoint before Alpha is touched.
     requested_monotonic = time.monotonic()
     teensy_response = _request_teensy_holistic_restore(
         clocks,
@@ -5776,56 +6358,84 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
     payload = payload if isinstance(payload, dict) else {}
     status = str(payload.get("status") or "")
     campaign_state = str(payload.get("campaign_state") or "").strip().upper()
-    if status == "monitor_restore_rejected_busy" and campaign_state == "STARTED":
-        pi_control = _dac_restore_control_from_clocks(clocks, realize=True)
-        startup_custody = _release_startup_clocks_custody_live()
-        return {
-            "success": True,
-            "mode": "LIVE_CAMPAIGN_CUSTODY",
-            "teensy": payload,
-            "pi_control": pi_control,
-            "startup_custody": startup_custody,
-            "proof": {"proved": True, "basis": "TEENSY_LIVE_CAMPAIGN_CUSTODY"},
-        }
+    monitor_live_eligible = bool(
+        status == "monitor_restore_rejected_busy"
+        and campaign_state == "STARTED"
+        and alpha_lineage_proved
+    )
+    logging.info(
+        "🧭 [holistic restore/live probe] RESTORE_MONITOR court: %s",
+        json.dumps(
+            {
+                "status": status or None,
+                "campaign": str(payload.get("campaign") or "").strip() or None,
+                "campaign_state": campaign_state or None,
+                "alpha_lineage_proved": alpha_lineage_proved,
+                "alpha_lineage_reasons": alpha_lineage.get("reasons", []),
+                "live_campaign_eligible": monitor_live_eligible,
+                "decision": (
+                    "LIVE_CAMPAIGN_CUSTODY"
+                    if monitor_live_eligible
+                    else "INSTRUMENT_RESTORE_PATH"
+                ),
+                "raw_restore_monitor": copy.deepcopy(payload),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ),
+    )
+    if monitor_live_eligible:
+        return complete_surviving_alpha_reattach(
+            payload,
+            basis="TEENSY_RESTORE_MONITOR_LIVE_CAMPAIGN_CUSTODY",
+        )
 
-    # The Teensy does not own a live campaign epoch.  Startup rows observed before
-    # this verdict belong to the fresh/superseded instrument and must not be
-    # persisted across the restore boundary.
+    # Neither explicit Alpha-survival testimony nor the legacy live-campaign
+    # RESTORE_MONITOR verdict proved that the instrument can remain untouched.
+    # Emit the final classification before retiring evidence so the log preserves
+    # the exact reason we entered resurrection.
+    logging.info(
+        "🧭 [holistic restore/live probe] surviving Alpha custody not proved; "
+        "entering instrument restore path: REPORT_RECOVERY_reasons=%s "
+        "RESTORE_MONITOR_status=%s campaign_state=%s canonical_live_campaign=%s/%s",
+        report_decline_reasons,
+        status or "missing",
+        campaign_state or "missing",
+        startup_live_campaign_name or "missing",
+        startup_live_campaign_state or "missing",
+    )
     _retire_startup_clocks_custody("instrument_restore_required")
     pi_control = _dac_restore_control_from_clocks(clocks, realize=True)
 
     ppb_stage: Dict[str, Any]
+    stats_update_count = _as_int(_path_get(clocks, "stats.update_count")) or 0
+    saved_ppb_checkpoint: Optional[Dict[str, Any]] = None
+    if stats_update_count > 0:
+        saved_ppb_checkpoint = _require_recoverable_ppb_checkpoint(clocks)
+
     if status == "monitor_restore_requires_ppb_state":
-        # The durable row remains the UI seed while the one-time cursor replay
-        # and bounded chunk transfer reconstruct Alpha's volatile rings.
+        if saved_ppb_checkpoint is None:
+            raise RuntimeError(
+                "Teensy requires Better-Buckets state but canonical CLOCKS has no "
+                "recoverable Pi checkpoint"
+            )
+        # Keep Pi's process-local custodian on the same exact image being returned
+        # to Alpha. Startup/fresh-boot fragments observed before this verdict may
+        # belong to a superseded firmware lifetime and must not contaminate it.
+        _restore_ppb_checkpoint_runtime(
+            saved_ppb_checkpoint,
+            source_db_detail_id=_as_int(detail.get("_db_detail_id")),
+        )
         _seed_clocks_from_detail(detail)
-        ppb_replay = _reconstruct_better_buckets_from_db(detail)
-        ppb_stage = _stage_teensy_better_buckets(ppb_replay)
+        ppb_stage = _stage_teensy_better_buckets_checkpoint(saved_ppb_checkpoint)
         logging.info(
-            "♻️ [holistic restore] Better-Buckets replay: rows=%d/%d admitted=%d "
-            "second=%d minute=%d lineage_start=%d/%d lineage_scan=%d "
-            "lineage_s=%.3f replay_s=%.3f rebases=%d gaps=%d effective_lower=%d "
-            "available=%ds checks=%d truncated_checks=%d stage_s=%s",
-            int(ppb_replay.get("rows_scanned") or 0),
-            int(ppb_replay.get("rows_scanned_total") or 0),
-            int(ppb_replay.get("admitted_rows") or 0),
-            len(ppb_replay.get("second_history") or []),
-            len(ppb_replay.get("minute_history") or []),
-            int(ppb_replay.get("source_lineage_start_db_detail_id") or 0),
-            int(ppb_replay.get("source_lineage_start_update_count") or 0),
-            int(ppb_replay.get("lineage_scan_rows") or 0),
-            float(ppb_replay.get("lineage_scan_s") or 0.0),
-            float(ppb_replay.get("replay_scan_s") or 0.0),
-            int(ppb_replay.get("lineage_physical_rebase_count") or 0),
-            int(ppb_replay.get("chronology_gap_count") or 0),
-            int(ppb_replay.get("effective_lower_sequence") or 0),
-            int(ppb_replay.get("available_population_seconds") or 0),
-            int((ppb_replay.get("verification") or {}).get("checked") or 0),
-            int(
-                (ppb_replay.get("verification") or {}).get(
-                    "truncated_comparisons"
-                ) or 0
-            ),
+            "♻️ [holistic restore] Better-Buckets checkpoint staged directly: "
+            "second=%d minute=%d source_update=%d gap_count=%d stage_s=%s",
+            len(saved_ppb_checkpoint.get("second_history") or []),
+            len(saved_ppb_checkpoint.get("minute_history") or []),
+            int(saved_ppb_checkpoint.get("update_count") or 0),
+            int(saved_ppb_checkpoint.get("gap_count") or 0),
             ppb_stage.get("waited_s"),
         )
 
@@ -5844,10 +6454,14 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
         status = str(payload.get("status") or "")
     else:
         # update_count==0 needs no rolling history. An immediately accepted restore
-        # restore with a mature population can also mean a prior interrupted Pi
-        # attempt already committed the exact Alpha stage; do not replay it twice.
+        # with a mature population can also mean a prior interrupted Pi attempt
+        # already committed this exact checkpoint to Alpha.
         _seed_clocks_from_detail(detail)
-        stats_update_count = _as_int(_path_get(clocks, "stats.update_count")) or 0
+        if saved_ppb_checkpoint is not None:
+            _restore_ppb_checkpoint_runtime(
+                saved_ppb_checkpoint,
+                source_db_detail_id=_as_int(detail.get("_db_detail_id")),
+            )
         ppb_stage = {
             "staged": bool(stats_update_count > 0),
             "reason": (
@@ -5855,7 +6469,12 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
                 if stats_update_count > 0
                 else "empty_statistics_epoch"
             ),
-            "rolling_sequence": int(stats_update_count),
+            "rolling_sequence": int(
+                saved_ppb_checkpoint.get("rolling_sequence")
+                if saved_ppb_checkpoint is not None
+                else 0
+            ),
+            "checkpoint_schema": PPB_PI_CHECKPOINT_SCHEMA,
         }
 
     if status not in _TEENSY_MONITOR_RESTORE_ACCEPTED_STATUSES:
@@ -8780,6 +9399,11 @@ def _validate_clocks_fragment_v4(
         raise ValueError(
             "CLOCKS_FRAGMENT_V4 admitted Better-Buckets endpoint does not own update_count"
         )
+
+    # The producer's compact checkpoint testimony is part of the V4 scientific
+    # contract now. Verify every published rolling bucket from the same row before
+    # allowing that testimony to mutate Pi checkpoint custody.
+    _validate_firmware_ppb_checkpoint_delta(stats)
     return int(sequence), teensy_clocks
 
 
@@ -8819,6 +9443,12 @@ def _build_canonical_clocks_state(
             auxiliary = {}
             stats["auxiliary_welford"] = auxiliary
         auxiliary.update(_dac_welford_snapshots())
+
+        # Pi owns persistence/recovery orchestration, so it packages the verified
+        # producer append testimony into a literal bounded resurrection image.
+        # This is intentionally large and explicit; no statistical quantity is
+        # recomputed or inferred from database history.
+        clocks["ppb_restore_checkpoint"] = _ppb_checkpoint_ingest(stats)
 
     clocks["gnss_raw"] = copy.deepcopy(pi_clocks.get("gnss_raw") or {})
     clocks["system_time_utc"] = published_at_utc
@@ -8949,8 +9579,12 @@ def _cache_clocks_state(state: Dict[str, Any]) -> None:
 
 def _queue_clocks_state(fragment: Dict[str, Any]) -> None:
     global _clocks_state_enqueued, _clocks_state_dropped
+    item = {
+        "fragment": copy.deepcopy(fragment),
+        "ppb_restore_transaction_ingress": _ppb_restore_transaction_active.is_set(),
+    }
     try:
-        _clocks_state_queue.put_nowait(copy.deepcopy(fragment))
+        _clocks_state_queue.put_nowait(item)
         _clocks_state_enqueued += 1
     except queue.Full:
         _clocks_state_dropped += 1
@@ -9094,6 +9728,33 @@ def _startup_clocks_custody_unresolved() -> bool:
         return bool(_startup_custody_active)
 
 
+def _ppb_restore_transition_row_expected(
+    clocks_fragment: Dict[str, Any],
+    *,
+    ingress_during_restore: bool,
+) -> bool:
+    """True only for the known incoherent PPB snapshot window we ourselves opened.
+
+    PPB_RESTORE_BEGIN/CHUNK/COMMIT mutates Alpha's bounded rings transactionally.
+    During staging firmware publishes the correct checkpoint schema with valid=false
+    because no coherent whole-ring testimony exists yet. Such a row is expected
+    only when it was received while Pi owned that restore transaction (or while the
+    transaction is still active at consumption time). Every other valid=false row
+    must continue through the strict validator and fail loudly.
+    """
+    if not (ingress_during_restore or _ppb_restore_transaction_active.is_set()):
+        return False
+    stats = _path_get(clocks_fragment, "clocks.stats")
+    if not isinstance(stats, dict):
+        return False
+    checkpoint = stats.get("rolling_ppb_checkpoint")
+    return bool(
+        isinstance(checkpoint, dict)
+        and checkpoint.get("schema") == PPB_FIRMWARE_DELTA_SCHEMA
+        and checkpoint.get("valid") is False
+    )
+
+
 def _clocks_state_loop() -> None:
     """Build and publish CLOCKS_V4 without storage latency stalling the live feed."""
     global _clocks_state_published, _clocks_state_dropped
@@ -9103,7 +9764,17 @@ def _clocks_state_loop() -> None:
     _clocks_state_worker_started.set()
     logging.info("🚀 [clocks] canonical CLOCKS_V4 state worker started")
     while True:
-        clocks_fragment = _clocks_state_queue.get()
+        queue_item = _clocks_state_queue.get()
+        clocks_fragment = queue_item.get("fragment") if isinstance(queue_item, dict) else None
+        ingress_during_ppb_restore = bool(
+            queue_item.get("ppb_restore_transaction_ingress")
+            if isinstance(queue_item, dict)
+            else False
+        )
+        if not isinstance(clocks_fragment, dict):
+            _clocks_state_dropped += 1
+            logging.error("💥 [clocks] malformed private CLOCKS state queue envelope; dropping")
+            continue
         if _hard_failure_active() and not _hard_failure_stats_repair_active():
             _clocks_state_dropped += 1
             _diag["hard_failure_state_dropped"] = (
@@ -9135,6 +9806,27 @@ def _clocks_state_loop() -> None:
             continue
 
         sequence = _clocks_fragment_count(clocks_fragment)
+        if _ppb_restore_transition_row_expected(
+            clocks_fragment,
+            ingress_during_restore=ingress_during_ppb_restore,
+        ):
+            _clocks_state_dropped += 1
+            _diag["ppb_restore_transition_rows_discarded"] = (
+                _diag.get("ppb_restore_transition_rows_discarded", 0) + 1
+            )
+            _diag["last_ppb_restore_transition_row"] = {
+                "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "sequence": sequence,
+                "ingress_during_restore": bool(ingress_during_ppb_restore),
+                "transaction_active_at_consume": _ppb_restore_transaction_active.is_set(),
+                "reason": "firmware_checkpoint_temporarily_invalid_during_pi_owned_ppb_restore",
+            }
+            logging.info(
+                "♻️ [holistic restore] retiring transitional CLOCKS_FRAGMENT sequence=%s "
+                "while Pi-owned Better-Buckets restore is in flight",
+                sequence,
+            )
+            continue
         try:
             sequence, _ = _validate_clocks_fragment_v4(clocks_fragment)
             _advance_gnss_raw_instrument(sequence, system_context)
@@ -11500,7 +12192,7 @@ def _restore_active_campaign_state(
         and reported_campaign_state != "STARTED"
     )
     cold_restore_custody = bool(physical_reboot_custody or lifecycle_lost_custody)
-    # Pi/PostgreSQL is the durable ancestry authority.  Firmware may discover that
+    # Durable canonical CLOCKS is the ancestry authority. Firmware may discover that
     # it needs a cold bootstrap locally, but it may not override this requirement
     # when Pi has already proved that the live Alpha lineage was surrendered.
     teensy_recover_args["restore_alpha_required"] = bool(cold_restore_custody)
@@ -11534,8 +12226,18 @@ def _restore_active_campaign_state(
                 reported_campaign_state or "UNKNOWN",
                 physical_reboot_custody,
             )
-        cold_ppb_replay = _reconstruct_better_buckets_from_db(last_tb)
-        cold_ppb_stage = _stage_teensy_better_buckets(cold_ppb_replay)
+        cold_ppb_checkpoint = _require_alpha_resurrection_checkpoint(
+            canonical_recovery_clocks,
+            campaign=campaign_name,
+            recovery_source_db_id=recovery_source_db_id,
+        )
+        _restore_ppb_checkpoint_runtime(
+            cold_ppb_checkpoint,
+            source_db_detail_id=_as_int(last_tb.get("_db_detail_id")),
+        )
+        cold_ppb_stage = _stage_teensy_better_buckets_checkpoint(
+            cold_ppb_checkpoint
+        )
         teensy_recover_args.update(
             _canonical_restore_args(canonical_recovery_clocks, include_control=False)
         )
@@ -11543,11 +12245,11 @@ def _restore_active_campaign_state(
         _diag["last_recovery"]["restore_schema_version"] = 4
         _diag["last_recovery"]["better_buckets_restore"] = cold_ppb_stage
         logging.info(
-            "📊 [recovery] cold Alpha epoch detected; staged Better Buckets "
-            "rows=%d second=%d minute=%d before structured RECOVER",
-            int(cold_ppb_replay.get("rows_scanned") or 0),
-            len(cold_ppb_replay.get("second_history") or []),
-            len(cold_ppb_replay.get("minute_history") or []),
+            "📊 [recovery] cold Alpha epoch detected; staged literal Better-Buckets "
+            "checkpoint second=%d minute=%d source_update=%d before structured RECOVER",
+            len(cold_ppb_checkpoint.get("second_history") or []),
+            len(cold_ppb_checkpoint.get("minute_history") or []),
+            int(cold_ppb_checkpoint.get("update_count") or 0),
         )
 
     try:
@@ -13077,13 +13779,11 @@ def run() -> None:
     _dac_start_control_thread()
     _dac_initialize_hardware()
 
-    logging.info(
-        "🕐 [clocks] CLOCKS owns CLOCKS_FRAGMENT ingestion, SYSTEM.REPORT context pull, "
-        "canonical CLOCKS publication, Pi-owned DAC/servo/dither actuation, campaign_detail "
-        "persistence, TEMPEST adjudication, and holistic subsystem restore. "
-        "Campaign execution is restored as CLOCKS state."
-    )
-
+    # Register CLOCKS with PUBSUB before any potentially slow durable-state read.
+    # server_setup(blocking=False) exposes commands/subscriptions immediately, but
+    # the state worker below has not started yet, so arriving CLOCKS_FRAGMENT rows
+    # can only queue; they cannot mutate Better-Buckets checkpoint custody before
+    # the one-row durable seed has been installed.
     server_setup(
         subsystem="CLOCKS",
         commands=COMMANDS,
@@ -13093,6 +13793,19 @@ def run() -> None:
             CLOCKS_RECOVERY_STALLED_TOPIC: on_recovery_stalled,
         },
         blocking=False,
+    )
+
+    # Resume the Pi-owned literal Better-Buckets checkpoint from exactly one
+    # durable CLOCKS row before queued live ingestion is consumed. This is
+    # checkpoint loading, not historical reconstruction; absence simply starts
+    # a truthful warm-up.
+    _seed_ppb_checkpoint_runtime_from_latest_durable()
+
+    logging.info(
+        "🕐 [clocks] CLOCKS owns CLOCKS_FRAGMENT ingestion, SYSTEM.REPORT context pull, "
+        "canonical CLOCKS publication, Pi-owned DAC/servo/dither actuation, campaign_detail "
+        "persistence, TEMPEST adjudication, and holistic subsystem restore. "
+        "Campaign execution is restored as CLOCKS state."
     )
 
     # Start the live data plane immediately. Ordinary persistence remains closed,

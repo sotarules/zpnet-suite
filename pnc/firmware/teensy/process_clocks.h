@@ -382,6 +382,46 @@ struct clocks_fragment_ppb_buckets_snapshot_t {
   clocks_fragment_ppb_value_snapshot_t total{};
 };
 
+// Compact Alpha-authored Better-Buckets sufficient state carried at 1 Hz.
+// SYSTEM serializes these values verbatim; Pi CLOCKS may use the append testimony
+// to maintain a larger synthetic recovery checkpoint but may not re-author them.
+struct clocks_fragment_ppb_endpoint_snapshot_t {
+  uint64_t reference_ns = 0ULL;
+  double dwt_error_cycles = 0.0;
+  int64_t ocxo1_error_ns = 0LL;
+  int64_t ocxo2_error_ns = 0LL;
+  uint32_t rolling_sequence = 0U;
+  uint32_t interval_count = 0U;
+};
+
+struct clocks_fragment_ppb_window_proof_snapshot_t {
+  bool valid = false;
+  uint32_t sample_count = 0U;
+  clocks_fragment_ppb_endpoint_snapshot_t anchor{};
+};
+
+struct clocks_fragment_ppb_checkpoint_delta_snapshot_t {
+  bool valid = false;
+  uint32_t rolling_sequence = 0U;
+  uint32_t second_count = 0U;
+  uint32_t minute_count = 0U;
+  uint32_t last_minute_key = 0U;
+
+  bool origin_valid = false;
+  clocks_fragment_ppb_endpoint_snapshot_t current{};
+  clocks_fragment_ppb_endpoint_snapshot_t origin{};
+
+  clocks_fragment_ppb_window_proof_snapshot_t minute_10{};
+  clocks_fragment_ppb_window_proof_snapshot_t minute_60{};
+  clocks_fragment_ppb_window_proof_snapshot_t hour_8{};
+  clocks_fragment_ppb_window_proof_snapshot_t hour_24{};
+
+  bool second_append_valid = false;
+  clocks_fragment_ppb_endpoint_snapshot_t second_append{};
+  bool minute_append_valid = false;
+  clocks_fragment_ppb_endpoint_snapshot_t minute_append{};
+};
+
 struct clocks_fragment_stats_clock_snapshot_t {
   clocks_fragment_welford_snapshot_t welford{};
   bool frequency_present = false;
@@ -405,6 +445,9 @@ struct clocks_fragment_stats_snapshot_t {
   uint32_t rolling_ppb_current_sequence = 0;
   bool rolling_ppb_endpoint_admitted = false;
   bool rolling_ppb_interval_advanced = false;
+
+  // Self-contained current-window proof plus exact ring append testimony.
+  clocks_fragment_ppb_checkpoint_delta_snapshot_t rolling_ppb_checkpoint{};
 
   bool completed_row_coherent = false;
 

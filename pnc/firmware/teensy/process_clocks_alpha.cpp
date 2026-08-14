@@ -1892,9 +1892,10 @@ static alpha_ppb_cumulative_endpoint_t g_alpha_ppb_origin{};
 static bool g_alpha_ppb_origin_valid = false;
 static bool g_alpha_ppb_last_endpoint_admitted = false;
 static bool g_alpha_ppb_last_interval_advanced = false;
+static bool g_alpha_ppb_last_minute_appended = false;
 
-// SQL replay stages reconstructed rolling history directly into Alpha's bounded
-// rings.  While staging is active, live rows may continue updating other
+// Recovery stages an exact bounded Better-Buckets checkpoint directly into
+// Alpha's rings.  While staging is active, live rows may continue updating other
 // instrument statistics but must not mutate Better Buckets. RESTORE_MONITOR
 // later consumes the committed stage atomically with restored statistics.
 static volatile bool g_alpha_ppb_restore_staging = false;
@@ -1921,6 +1922,7 @@ static void alpha_ppb_windows_reset_history(void) {
   g_alpha_ppb_origin_valid = false;
   g_alpha_ppb_last_endpoint_admitted = false;
   g_alpha_ppb_last_interval_advanced = false;
+  g_alpha_ppb_last_minute_appended = false;
 }
 
 static void alpha_ppb_windows_reset(void) {
@@ -2082,6 +2084,7 @@ bool clocks_alpha_ppb_restore_commit(uint32_t rolling_sequence) {
     g_alpha_ppb_previous_raw = alpha_ppb_raw_endpoint_t{};
     g_alpha_ppb_last_endpoint_admitted = false;
     g_alpha_ppb_last_interval_advanced = false;
+    g_alpha_ppb_last_minute_appended = false;
     g_alpha_ppb_restore_ready_state = true;
   }
 
@@ -2138,6 +2141,7 @@ static void alpha_ppb_windows_note_endpoint(uint32_t rolling_sequence,
                                             bool admitted) {
   g_alpha_ppb_last_endpoint_admitted = admitted && rolling_sequence != 0U;
   g_alpha_ppb_last_interval_advanced = false;
+  g_alpha_ppb_last_minute_appended = false;
   if (!admitted || rolling_sequence == 0U) {
     // A rejected endpoint cannot bookend the following interval.  The next
     // admitted row seeds fresh adjacency instead of spanning the excluded gap.
@@ -2202,6 +2206,7 @@ static void alpha_ppb_windows_note_endpoint(uint32_t rolling_sequence,
                           g_alpha_ppb_minute_count,
                           next);
     g_alpha_ppb_last_minute_key = minute_key;
+    g_alpha_ppb_last_minute_appended = true;
   }
 
   g_alpha_ppb_previous_raw = raw;
@@ -2263,6 +2268,74 @@ static bool alpha_ppb_window_anchor(
                                target,
                                g_alpha_ppb_current.rolling_sequence,
                                out);
+}
+
+static clocks_alpha_ppb_cumulative_endpoint_snapshot_t
+alpha_ppb_endpoint_snapshot(const alpha_ppb_cumulative_endpoint_t& endpoint) {
+  clocks_alpha_ppb_cumulative_endpoint_snapshot_t out{};
+  out.reference_ns = endpoint.reference_ns;
+  out.dwt_error_cycles = endpoint.dwt_error_cycles;
+  out.ocxo1_error_ns = endpoint.ocxo1_error_ns;
+  out.ocxo2_error_ns = endpoint.ocxo2_error_ns;
+  out.rolling_sequence = endpoint.rolling_sequence;
+  out.interval_count = endpoint.interval_count;
+  return out;
+}
+
+static clocks_alpha_ppb_window_proof_snapshot_t alpha_ppb_window_proof(
+    uint32_t window_seconds,
+    bool exact_second_history) {
+  clocks_alpha_ppb_window_proof_snapshot_t out{};
+  alpha_ppb_cumulative_endpoint_t anchor{};
+  if (!alpha_ppb_window_anchor(window_seconds, exact_second_history, anchor)) {
+    return out;
+  }
+
+  const uint32_t interval_count =
+      g_alpha_ppb_current.interval_count - anchor.interval_count;
+  const uint64_t reference_ns =
+      g_alpha_ppb_current.reference_ns - anchor.reference_ns;
+  if (interval_count == 0U || reference_ns == 0ULL) return out;
+
+  out.valid = true;
+  out.sample_count = interval_count;
+  out.anchor = alpha_ppb_endpoint_snapshot(anchor);
+  return out;
+}
+
+static void alpha_ppb_checkpoint_delta_snapshot(
+    clocks_alpha_ppb_checkpoint_delta_snapshot_t& out) {
+  out = clocks_alpha_ppb_checkpoint_delta_snapshot_t{};
+  if (g_alpha_ppb_restore_staging) return;
+
+  out.valid = true;
+  out.rolling_sequence = g_alpha_ppb_current.rolling_sequence;
+  out.second_count = (uint32_t)g_alpha_ppb_second_count;
+  out.minute_count = (uint32_t)g_alpha_ppb_minute_count;
+  out.last_minute_key = g_alpha_ppb_last_minute_key;
+  out.origin_valid = g_alpha_ppb_origin_valid;
+  out.current = alpha_ppb_endpoint_snapshot(g_alpha_ppb_current);
+  if (g_alpha_ppb_origin_valid) {
+    out.origin = alpha_ppb_endpoint_snapshot(g_alpha_ppb_origin);
+  }
+
+  out.minute_10 = alpha_ppb_window_proof(
+      ALPHA_PPB_MINUTE_10_SECONDS, true);
+  out.minute_60 = alpha_ppb_window_proof(
+      ALPHA_PPB_MINUTE_60_SECONDS, false);
+  out.hour_8 = alpha_ppb_window_proof(
+      ALPHA_PPB_HOUR_8_SECONDS, false);
+  out.hour_24 = alpha_ppb_window_proof(
+      ALPHA_PPB_HOUR_24_SECONDS, false);
+
+  out.second_append_valid = g_alpha_ppb_last_endpoint_admitted;
+  if (out.second_append_valid) {
+    out.second_append = out.current;
+  }
+  out.minute_append_valid = g_alpha_ppb_last_minute_appended;
+  if (out.minute_append_valid) {
+    out.minute_append = out.current;
+  }
 }
 
 static clocks_instrument_ppb_value_snapshot_t alpha_ppb_window_value(
@@ -2502,7 +2575,7 @@ static void alpha_instrument_stats_note_completed_row(
     alpha_ppb_windows_note_endpoint(rolling_sequence,
                                     rolling_endpoint_admitted);
   } else {
-    // A staged SQL replay owns Better Buckets until RESTORE_MONITOR consumes it.
+    // A staged durable checkpoint owns Better Buckets until RESTORE_MONITOR consumes it.
     g_alpha_ppb_last_endpoint_admitted = false;
     g_alpha_ppb_last_interval_advanced = false;
   }
@@ -2553,6 +2626,8 @@ FLASHMEM bool clocks_alpha_instrument_stats_snapshot(
         g_alpha_ppb_last_endpoint_admitted;
     local.rolling_ppb_interval_advanced =
         g_alpha_ppb_last_interval_advanced;
+    alpha_ppb_checkpoint_delta_snapshot(
+        local.rolling_ppb_checkpoint);
     local.completed_row_coherent =
         g_instrument_stats_completed_row_coherent;
     local.gnss_ns = g_instrument_stats_gnss_ns;
@@ -2662,9 +2737,9 @@ bool clocks_alpha_instrument_stats_restore(
   (void)clocks_alpha_ocxo_tau_restore(
       time_clock_id_t::OCXO2, &state->ocxo2_tau_state);
 
-  // Rolling history is staged from PostgreSQL before structured restore. Do not
-  // reset it here: consuming that stage is what makes 10m/60m/8h/24h continue
-  // across reboot without carrying the rings in every CLOCKS row.
+  // Rolling history is staged from Pi's durable Better-Buckets checkpoint before
+  // structured restore. Do not reset it here: consuming that exact stage is what
+  // makes 10m/60m/8h/24h continue across reboot without re-authoring history.
   if (state->update_count == 0U) {
     alpha_ppb_windows_reset();
   }

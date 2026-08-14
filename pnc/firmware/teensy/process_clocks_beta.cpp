@@ -687,9 +687,9 @@ static uint32_t g_campaign_restore_count = 0U;
 static uint32_t g_campaign_restore_failure_count = 0U;
 static uint32_t g_campaign_restore_ignored_live_count = 0U;
 
-// Better-Buckets replay is a recovery-only staging transaction. Pi CLOCKS
-// reconstructs Alpha's bounded histories from durable CLOCKS rows and sends
-// them in small idempotent chunks before structured restore may consume them.
+// Better-Buckets restore is a recovery-only staging transaction. Pi CLOCKS
+// supplies Alpha-authored endpoints from its durable synthetic checkpoint in
+// small idempotent chunks before structured restore may consume them.
 static bool g_ppb_restore_protocol_active = false;
 static bool g_ppb_restore_protocol_committed = false;
 static uint32_t g_ppb_restore_protocol_sequence = 0U;
@@ -3486,6 +3486,15 @@ static const char* recover_lifecycle_mode_name(
   }
 }
 
+// g_recover_last_restore_alpha_required is flight-recorder testimony about
+// what the most recent RECOVER request required. Do not expose that historical
+// fact as a present-tense obligation after cold bootstrap has already committed.
+// REPORT_RECOVERY must answer whether Alpha must be resurrected *now*.
+static bool recover_alpha_restore_required_now(void) {
+  return g_recover_last_restore_alpha_required &&
+         (request_recover || clocks_campaign_recovery_lifecycle_active());
+}
+
 static bool recover_lifecycle_prepare_cold_bootstrap(void) {
   g_recover_lifecycle_mode = recover_lifecycle_mode_t::COLD_BOOTSTRAP;
   g_recover_lifecycle_cold_bootstrap_epoch_ready = false;
@@ -5001,6 +5010,62 @@ clocks_fragment_tau_recovery_snapshot(
   return out;
 }
 
+static void clocks_fragment_ppb_endpoint_from_alpha(
+    clocks_fragment_ppb_endpoint_snapshot_t& out,
+    const clocks_alpha_ppb_cumulative_endpoint_snapshot_t& source) {
+  out = clocks_fragment_ppb_endpoint_snapshot_t{};
+  out.reference_ns = source.reference_ns;
+  out.dwt_error_cycles = source.dwt_error_cycles;
+  out.ocxo1_error_ns = source.ocxo1_error_ns;
+  out.ocxo2_error_ns = source.ocxo2_error_ns;
+  out.rolling_sequence = source.rolling_sequence;
+  out.interval_count = source.interval_count;
+}
+
+static void clocks_fragment_ppb_window_proof_from_alpha(
+    clocks_fragment_ppb_window_proof_snapshot_t& out,
+    const clocks_alpha_ppb_window_proof_snapshot_t& source) {
+  out = clocks_fragment_ppb_window_proof_snapshot_t{};
+  out.valid = source.valid;
+  out.sample_count = source.sample_count;
+  if (source.valid) {
+    clocks_fragment_ppb_endpoint_from_alpha(out.anchor, source.anchor);
+  }
+}
+
+static void clocks_fragment_ppb_checkpoint_from_alpha(
+    clocks_fragment_ppb_checkpoint_delta_snapshot_t& out,
+    const clocks_alpha_ppb_checkpoint_delta_snapshot_t& source) {
+  out = clocks_fragment_ppb_checkpoint_delta_snapshot_t{};
+  out.valid = source.valid;
+  out.rolling_sequence = source.rolling_sequence;
+  out.second_count = source.second_count;
+  out.minute_count = source.minute_count;
+  out.last_minute_key = source.last_minute_key;
+  out.origin_valid = source.origin_valid;
+
+  clocks_fragment_ppb_endpoint_from_alpha(out.current, source.current);
+  if (source.origin_valid) {
+    clocks_fragment_ppb_endpoint_from_alpha(out.origin, source.origin);
+  }
+
+  clocks_fragment_ppb_window_proof_from_alpha(out.minute_10, source.minute_10);
+  clocks_fragment_ppb_window_proof_from_alpha(out.minute_60, source.minute_60);
+  clocks_fragment_ppb_window_proof_from_alpha(out.hour_8, source.hour_8);
+  clocks_fragment_ppb_window_proof_from_alpha(out.hour_24, source.hour_24);
+
+  out.second_append_valid = source.second_append_valid;
+  if (source.second_append_valid) {
+    clocks_fragment_ppb_endpoint_from_alpha(
+        out.second_append, source.second_append);
+  }
+  out.minute_append_valid = source.minute_append_valid;
+  if (source.minute_append_valid) {
+    clocks_fragment_ppb_endpoint_from_alpha(
+        out.minute_append, source.minute_append);
+  }
+}
+
 static FLASHMEM void clocks_fragment_stats_snapshot_from_instrument(
     clocks_fragment_stats_snapshot_t& out,
     const clocks_instrument_stats_snapshot_t& instrument) {
@@ -5015,6 +5080,8 @@ static FLASHMEM void clocks_fragment_stats_snapshot_from_instrument(
       instrument.rolling_ppb_endpoint_admitted;
   out.rolling_ppb_interval_advanced =
       instrument.rolling_ppb_interval_advanced;
+  clocks_fragment_ppb_checkpoint_from_alpha(
+      out.rolling_ppb_checkpoint, instrument.rolling_ppb_checkpoint);
   out.completed_row_coherent = instrument.completed_row_coherent;
 
   out.gnss = clocks_fragment_stats_clock(instrument.gnss_welford, true, 0.0);
@@ -8463,7 +8530,8 @@ static FLASHMEM Payload cmd_report_recovery(const Payload&) {
   p.add("recover_lifecycle_active", clocks_campaign_recovery_lifecycle_active());
   p.add("recover_lifecycle_reason", g_recover_lifecycle_reason);
   p.add("recover_mode", recover_lifecycle_mode_name(g_recover_lifecycle_mode));
-  p.add("restore_alpha_required", g_recover_last_restore_alpha_required);
+  p.add("restore_alpha_required", recover_alpha_restore_required_now());
+  p.add("alpha_restore_was_required", g_recover_last_restore_alpha_required);
   p.add("recover_cold_bootstrap_active",
         g_recover_lifecycle_mode == recover_lifecycle_mode_t::COLD_BOOTSTRAP &&
         clocks_campaign_recovery_lifecycle_active());

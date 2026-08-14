@@ -3413,8 +3413,11 @@ static FLASHMEM Payload cmd_payload_info(const Payload& /*args*/) {
 //
 // SYSTEM owns only serialization and publication custody. CLOCKS supplies one
 // always-on instrument snapshot plus, when available, one campaign-relative
-// TEMPEST delta.  The wire format deliberately contains no restore mirror and no
-// periodic transport/process/Payload flight recorder.  raw_cycles is retained as
+// TEMPEST delta.  The wire format deliberately contains no full Better-Buckets
+// ring mirror and no periodic transport/process/Payload flight recorder.
+// Compact Alpha-authored checkpoint/proof testimony is carried at 1 Hz so Pi
+// may maintain a literal synthetic recovery checkpoint without re-authoring
+// the instrument math.  raw_cycles is retained as
 // the compact four-rail sanity-check surface; deeper forensics remain on focused
 // reports.
 
@@ -3455,6 +3458,82 @@ static void system_clocks_fragment_add_ppb_buckets(
   system_clocks_fragment_add_ppb_bucket(values, "24_hour", buckets.hour_24);
   system_clocks_fragment_add_ppb_bucket(values, "total", buckets.total);
   clock.add_object("ppb_buckets", values);
+}
+
+static void system_clocks_fragment_add_ppb_endpoint(
+    Payload& parent,
+    const char* key,
+    const clocks_fragment_ppb_endpoint_snapshot_t& endpoint) {
+  Payload value;
+  value.add("reference_ns", endpoint.reference_ns);
+  value.add("dwt_error_cycles", toFixedDecimal(endpoint.dwt_error_cycles, 12));
+  value.add("ocxo1_error_ns", endpoint.ocxo1_error_ns);
+  value.add("ocxo2_error_ns", endpoint.ocxo2_error_ns);
+  value.add("rolling_sequence", endpoint.rolling_sequence);
+  value.add("interval_count", endpoint.interval_count);
+  parent.add_object(key, value);
+}
+
+static void system_clocks_fragment_add_ppb_window_proof(
+    Payload& parent,
+    const char* key,
+    const clocks_fragment_ppb_window_proof_snapshot_t& proof) {
+  Payload value;
+  value.add("valid", proof.valid);
+  value.add("sample_count", proof.sample_count);
+  if (proof.valid) {
+    system_clocks_fragment_add_ppb_endpoint(value, "anchor", proof.anchor);
+  }
+  parent.add_object(key, value);
+}
+
+static void system_clocks_fragment_add_ppb_checkpoint(
+    Payload& parent,
+    const clocks_fragment_ppb_checkpoint_delta_snapshot_t& checkpoint) {
+  Payload value;
+  value.add("schema", "CLOCKS_PPB_CHECKPOINT_DELTA_V1");
+  value.add("valid", checkpoint.valid);
+  value.add("rolling_sequence", checkpoint.rolling_sequence);
+  value.add("second_count", checkpoint.second_count);
+  value.add("minute_count", checkpoint.minute_count);
+  value.add("last_minute_key", checkpoint.last_minute_key);
+  value.add("origin_valid", checkpoint.origin_valid);
+
+  if (checkpoint.valid) {
+    system_clocks_fragment_add_ppb_endpoint(
+        value, "current", checkpoint.current);
+  }
+  if (checkpoint.origin_valid) {
+    system_clocks_fragment_add_ppb_endpoint(
+        value, "origin", checkpoint.origin);
+  }
+
+  system_clocks_fragment_add_ppb_window_proof(
+      value, "10_min", checkpoint.minute_10);
+  system_clocks_fragment_add_ppb_window_proof(
+      value, "60_min", checkpoint.minute_60);
+  system_clocks_fragment_add_ppb_window_proof(
+      value, "8_hour", checkpoint.hour_8);
+  system_clocks_fragment_add_ppb_window_proof(
+      value, "24_hour", checkpoint.hour_24);
+
+  Payload second_append;
+  second_append.add("valid", checkpoint.second_append_valid);
+  if (checkpoint.second_append_valid) {
+    system_clocks_fragment_add_ppb_endpoint(
+        second_append, "endpoint", checkpoint.second_append);
+  }
+  value.add_object("second_append", second_append);
+
+  Payload minute_append;
+  minute_append.add("valid", checkpoint.minute_append_valid);
+  if (checkpoint.minute_append_valid) {
+    system_clocks_fragment_add_ppb_endpoint(
+        minute_append, "endpoint", checkpoint.minute_append);
+  }
+  value.add_object("minute_append", minute_append);
+
+  parent.add_object("rolling_ppb_checkpoint", value);
 }
 
 static void system_clocks_fragment_add_stats_clock(
@@ -3517,6 +3596,8 @@ static void system_clocks_fragment_add_stats(
             snapshot.rolling_ppb_endpoint_admitted);
   stats.add("rolling_ppb_interval_advanced",
             snapshot.rolling_ppb_interval_advanced);
+  system_clocks_fragment_add_ppb_checkpoint(
+      stats, snapshot.rolling_ppb_checkpoint);
   stats.add("completed_row_coherent", snapshot.completed_row_coherent);
 
   system_clocks_fragment_add_stats_clock(stats, "gnss", snapshot.gnss);

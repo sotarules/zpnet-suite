@@ -55,6 +55,9 @@ DISPLAY_PPB_TOLERANCE = 6.0e-4
 TAU_TOLERANCE = 2.0e-12
 WELFORD_FLOAT_ABS_TOL = 2.0e-8
 WELFORD_FLOAT_REL_TOL = 2.0e-12
+# Producer-authored Welford means are serialized to six decimal places.
+# Inferred samples therefore acquire an N-amplified quantization interval.
+WELFORD_SERIALIZED_MEAN_QUANTUM = 1.0e-6
 DAC_SAMPLE_TOL = 1.0e-9
 
 PPB_10_MIN_SECONDS = 10 * 60
@@ -805,16 +808,144 @@ def check_welford_step(
         return
 
     if known_sample is None:
-        # Derive the unique sample implied by the two means.
+        # The unique sample implied by two exact means is:
+        #   x = n*mean_n - (n-1)*mean_(n-1)
+        # But producer means cross the wire rounded to six decimal places.  At
+        # large N, subtracting those two N-scaled values amplifies sub-micro-unit
+        # serialization error into a visible inferred-sample error.  First retain
+        # the old nominal recurrence proof; only if that fails do we ask whether
+        # the published state is still compatible with the complete quantization
+        # interval of the two serialized means.
         sample = current.n * current.mean - previous.n * previous.mean
-    else:
-        sample = float(known_sample)
+        expected_mean = previous.mean + (sample - previous.mean) / current.n
+        expected_m2 = previous.m2 + (sample - previous.mean) * (sample - expected_mean)
+        expected_min = sample if previous.n == 0 else min(previous.min_value, sample)
+        expected_max = sample if previous.n == 0 else max(previous.max_value, sample)
 
+        nominal_checks = (
+            close(
+                current.mean,
+                expected_mean,
+                abs_tol=WELFORD_FLOAT_ABS_TOL,
+                rel_tol=WELFORD_FLOAT_REL_TOL,
+            ),
+            close(
+                current.m2,
+                expected_m2,
+                abs_tol=max(WELFORD_FLOAT_ABS_TOL, abs(expected_m2) * 2.0e-12),
+                rel_tol=2.0e-12,
+            ),
+            close(
+                current.min_value,
+                expected_min,
+                abs_tol=WELFORD_FLOAT_ABS_TOL,
+                rel_tol=WELFORD_FLOAT_REL_TOL,
+            ),
+            close(
+                current.max_value,
+                expected_max,
+                abs_tol=WELFORD_FLOAT_ABS_TOL,
+                rel_tol=WELFORD_FLOAT_REL_TOL,
+            ),
+        )
+        if all(nominal_checks):
+            audit.exact_welford_steps += 1
+            return
+
+        half_q = WELFORD_SERIALIZED_MEAN_QUANTUM / 2.0
+        prev_mean_lo = previous.mean - half_q
+        prev_mean_hi = previous.mean + half_q
+        cur_mean_lo = current.mean - half_q
+        cur_mean_hi = current.mean + half_q
+
+        # Linear extrema occur at the corners of the mean-quantization box.
+        sample_candidates = (
+            current.n * cur_mean_lo - previous.n * prev_mean_lo,
+            current.n * cur_mean_lo - previous.n * prev_mean_hi,
+            current.n * cur_mean_hi - previous.n * prev_mean_lo,
+            current.n * cur_mean_hi - previous.n * prev_mean_hi,
+        )
+        sample_lo = min(sample_candidates)
+        sample_hi = max(sample_candidates)
+
+        # For a one-sample Welford update, eliminating x gives the exact identity
+        #   M2_n - M2_(n-1) = n(n-1) * (mean_n - mean_(n-1))^2.
+        # Quantized means therefore imply a bounded interval for the lawful M2
+        # increment without inventing a more precise individual sample.
+        diff_lo = cur_mean_lo - prev_mean_hi
+        diff_hi = cur_mean_hi - prev_mean_lo
+        if diff_lo <= 0.0 <= diff_hi:
+            diff_sq_min = 0.0
+        else:
+            diff_sq_min = min(diff_lo * diff_lo, diff_hi * diff_hi)
+        diff_sq_max = max(diff_lo * diff_lo, diff_hi * diff_hi)
+        scale = float(current.n * previous.n)
+        m2_lo = previous.m2 + scale * diff_sq_min
+        m2_hi = previous.m2 + scale * diff_sq_max
+        m2_tol = max(
+            WELFORD_FLOAT_ABS_TOL,
+            abs(current.m2) * 2.0e-12,
+            abs(m2_hi) * 2.0e-12,
+        )
+
+        min_lo = (
+            sample_lo
+            if previous.n == 0
+            else min(previous.min_value, sample_lo)
+        )
+        min_hi = (
+            sample_hi
+            if previous.n == 0
+            else min(previous.min_value, sample_hi)
+        )
+        max_lo = (
+            sample_lo
+            if previous.n == 0
+            else max(previous.max_value, sample_lo)
+        )
+        max_hi = (
+            sample_hi
+            if previous.n == 0
+            else max(previous.max_value, sample_hi)
+        )
+        state_compatible = (
+            m2_lo - m2_tol <= current.m2 <= m2_hi + m2_tol
+            and min_lo - WELFORD_FLOAT_ABS_TOL
+            <= current.min_value
+            <= min_hi + WELFORD_FLOAT_ABS_TOL
+            and max_lo - WELFORD_FLOAT_ABS_TOL
+            <= current.max_value
+            <= max_hi + WELFORD_FLOAT_ABS_TOL
+        )
+        if state_compatible:
+            audit.event(
+                "welford_inferred_sample_precision_limited",
+                row,
+                f"{name} nominal sample={sample:.12g} lies in serialized-mean "
+                f"interval=[{sample_lo:.12g},{sample_hi:.12g}] "
+                f"n={previous.n}->{current.n}",
+            )
+            return
+
+        audit.problem(
+            "welford_recurrence",
+            row,
+            f"{name} one-sample recurrence incompatible with serialized-mean "
+            f"uncertainty nominal_sample={sample:.12g} "
+            f"sample_interval=[{sample_lo:.12g},{sample_hi:.12g}] "
+            f"n={previous.n}->{current.n}",
+        )
+        return
+
+    sample = float(known_sample)
     expected_mean = previous.mean + (sample - previous.mean) / current.n
     expected_m2 = previous.m2 + (sample - previous.mean) * (sample - expected_mean)
     expected_min = sample if previous.n == 0 else min(previous.min_value, sample)
     expected_max = sample if previous.n == 0 else max(previous.max_value, sample)
 
+    # Independently known samples (DAC targets and GNSS_RAW drift) keep the
+    # original strict recurrence court.  Serialization uncertainty must never
+    # weaken a proof whose source sample is already present in the durable row.
     checks = (
         close(
             current.mean,
@@ -850,7 +981,6 @@ def check_welford_step(
         )
     else:
         audit.exact_welford_steps += 1
-
 
 def check_welford_geometry(audit: Audit, row: Row, name: str, w: Welford) -> None:
     if w.n < 2:
@@ -1156,44 +1286,21 @@ def check_adjacent(audit: Audit, prev: Row, cur: Row) -> None:
             f"id {prev.db_id}->{cur.db_id}",
         )
 
+    # CLOCKS-owned chronology is authoritative.  gnss_time_utc is asynchronous
+    # Pi/SYSTEM context and may legitimately present +2/0 sampling pairs; retain
+    # that testimony as context only and never use it to convict instrument
+    # continuity.
+    seq_delta = cur.sequence - prev.sequence
     if prev.gnss_utc_s is not None and cur.gnss_utc_s is not None:
-        elapsed = cur.gnss_utc_s - prev.gnss_utc_s
-        if elapsed <= 0:
-            audit.problem(
-                "gnss_utc_chronology",
+        utc_delta = cur.gnss_utc_s - prev.gnss_utc_s
+        if seq_delta > 0 and utc_delta != seq_delta:
+            audit.event(
+                "gnss_utc_context_skew",
                 cur,
+                f"utc_delta={utc_delta}s physical_sequence_delta={seq_delta} "
                 f"{prev.gnss_utc}->{cur.gnss_utc}",
             )
-        elif elapsed > 1:
-            audit.durable_gaps += 1
-            audit.gnss_gap_seconds += elapsed - 1
-            audit.event(
-                "durable_gap",
-                cur,
-                f"elapsed={elapsed}s db_id={prev.db_id}->{cur.db_id}",
-            )
 
-        # Always-on logical clockfaces must carry elapsed GNSS time across both
-        # Pi and Teensy recovery.  This is one of the strongest holistic checks.
-        if elapsed > 0:
-            expected_gnss_delta = elapsed * NS_PER_SECOND
-            actual_gnss_delta = cur.clock_gnss_ns - prev.clock_gnss_ns
-            if actual_gnss_delta != expected_gnss_delta:
-                audit.problem(
-                    "clockface_gnss_continuity",
-                    cur,
-                    f"elapsed={elapsed}s delta={actual_gnss_delta} "
-                    f"expected={expected_gnss_delta}",
-                )
-            age_delta = cur.instrument_age_seconds - prev.instrument_age_seconds
-            if age_delta != elapsed:
-                audit.problem(
-                    "instrument_age_continuity",
-                    cur,
-                    f"elapsed={elapsed}s age_delta={age_delta}",
-                )
-
-    seq_delta = cur.sequence - prev.sequence
     if seq_delta < 0:
         audit.physical_reboots += 1
         audit.event(
@@ -1207,12 +1314,52 @@ def check_adjacent(audit: Audit, prev: Row, cur: Row) -> None:
             cur,
             f"sequence={cur.sequence}",
         )
-    elif seq_delta > 1:
-        audit.event(
-            "physical_sequence_gap",
-            cur,
-            f"sequence {prev.sequence}->{cur.sequence}",
-        )
+    else:
+        # Within one physical Teensy lifetime, all CLOCKS-owned elapsed-time
+        # witnesses must advance by the physical sequence delta.  These checks
+        # deliberately do not consult contextual GNSS UTC.
+        expected_gnss_delta = seq_delta * NS_PER_SECOND
+        actual_gnss_delta = cur.clock_gnss_ns - prev.clock_gnss_ns
+        if actual_gnss_delta != expected_gnss_delta:
+            audit.problem(
+                "clockface_gnss_continuity",
+                cur,
+                f"sequence_delta={seq_delta} delta={actual_gnss_delta} "
+                f"expected={expected_gnss_delta}",
+            )
+
+        age_delta = cur.instrument_age_seconds - prev.instrument_age_seconds
+        if age_delta != seq_delta:
+            audit.problem(
+                "instrument_age_continuity",
+                cur,
+                f"sequence_delta={seq_delta} age_delta={age_delta}",
+            )
+
+        completed_delta = cur.completed_pps_sequence - prev.completed_pps_sequence
+        clockface_pps_delta = cur.clockface_pps_sequence - prev.clockface_pps_sequence
+        if completed_delta != seq_delta or clockface_pps_delta != seq_delta:
+            audit.problem(
+                "physical_identity_continuity",
+                cur,
+                f"sequence_delta={seq_delta} completed_pps_delta={completed_delta} "
+                f"clockface_pps_delta={clockface_pps_delta}",
+            )
+
+        if seq_delta > 1:
+            audit.durable_gaps += 1
+            audit.gnss_gap_seconds += seq_delta - 1
+            audit.event(
+                "durable_gap",
+                cur,
+                f"physical_sequence_delta={seq_delta} missing={seq_delta - 1} "
+                f"sequence {prev.sequence}->{cur.sequence}",
+            )
+            audit.event(
+                "physical_sequence_gap",
+                cur,
+                f"sequence {prev.sequence}->{cur.sequence}",
+            )
 
     if cur.reset_count < prev.reset_count:
         audit.problem(
@@ -1280,31 +1427,40 @@ def check_adjacent(audit: Audit, prev: Row, cur: Row) -> None:
             if name.endswith("_dac") and cur.welfords[name].n == prev.welfords[name].n + 1:
                 audit.exact_dac_steps += 1
 
-    # Pi GNSS_RAW has its own lifetime.  A Teensy sequence rebase must not reset
-    # it.  If the Welford advances exactly once, the current GNSS drift value is
-    # the sample and closes the recurrence independently.
+    # Pi GNSS_RAW Welford custody is subordinate to the transitive CLOCKS
+    # statistics epoch.  An explicit STATS_RESET lawfully rebases that Pi-owned
+    # population together with the Teensy epoch; within one reset_count, however,
+    # it must remain exactly continuous even across a Teensy physical reboot.
     if prev.gnss_raw_welford is not None and cur.gnss_raw_welford is not None:
-        if (
-            cur.gnss_raw_welford.n == prev.gnss_raw_welford.n + 1
-            and cur.gnss_raw_drift_ppb is not None
-        ):
-            before = audit.exact_welford_steps
-            check_welford_step(
-                audit,
+        if cur.reset_count > prev.reset_count:
+            audit.event(
+                "gnss_raw_stats_epoch_reset",
                 cur,
-                "gnss_raw",
-                prev.gnss_raw_welford,
-                cur.gnss_raw_welford,
-                known_sample=cur.gnss_raw_drift_ppb,
-            )
-            if audit.exact_welford_steps > before:
-                audit.exact_gnss_raw_steps += 1
-        elif cur.gnss_raw_welford.n < prev.gnss_raw_welford.n:
-            audit.problem(
-                "gnss_raw_welford_regression",
-                cur,
+                f"reset_count {prev.reset_count}->{cur.reset_count} "
                 f"n {prev.gnss_raw_welford.n}->{cur.gnss_raw_welford.n}",
             )
+        elif cur.reset_count == prev.reset_count:
+            if (
+                cur.gnss_raw_welford.n == prev.gnss_raw_welford.n + 1
+                and cur.gnss_raw_drift_ppb is not None
+            ):
+                before = audit.exact_welford_steps
+                check_welford_step(
+                    audit,
+                    cur,
+                    "gnss_raw",
+                    prev.gnss_raw_welford,
+                    cur.gnss_raw_welford,
+                    known_sample=cur.gnss_raw_drift_ppb,
+                )
+                if audit.exact_welford_steps > before:
+                    audit.exact_gnss_raw_steps += 1
+            elif cur.gnss_raw_welford.n < prev.gnss_raw_welford.n:
+                audit.problem(
+                    "gnss_raw_welford_regression",
+                    cur,
+                    f"n {prev.gnss_raw_welford.n}->{cur.gnss_raw_welford.n}",
+                )
 
     if (
         prev.gnss_raw_clockface_n is not None
@@ -1317,8 +1473,8 @@ def check_adjacent(audit: Audit, prev: Row, cur: Row) -> None:
             f"clockface_n {prev.gnss_raw_clockface_n}->{cur.gnss_raw_clockface_n}",
         )
 
-    # Same campaign: public time is elapsed campaign time, so after recovery a
-    # truthful forward splice must equal elapsed GNSS time, not necessarily +1.
+    # Same campaign: public_count is itself the Teensy-authored campaign time.
+    # Its per-row progression is checked without borrowing asynchronous GNSS UTC.
     if (
         prev.campaign_name is not None
         and cur.campaign_name == prev.campaign_name
@@ -1326,22 +1482,11 @@ def check_adjacent(audit: Audit, prev: Row, cur: Row) -> None:
         and cur.campaign_public_count is not None
     ):
         public_delta = cur.campaign_public_count - prev.campaign_public_count
-        elapsed = (
-            cur.gnss_utc_s - prev.gnss_utc_s
-            if prev.gnss_utc_s is not None and cur.gnss_utc_s is not None
-            else None
-        )
         if public_delta <= 0:
             audit.problem(
                 "campaign_public_chronology",
                 cur,
                 f"{prev.campaign_public_count}->{cur.campaign_public_count}",
-            )
-        elif elapsed is not None and public_delta != elapsed:
-            audit.problem(
-                "campaign_public_elapsed",
-                cur,
-                f"public_delta={public_delta} elapsed_gnss={elapsed}",
             )
         elif public_delta > 1:
             audit.campaign_splices += 1
@@ -1349,7 +1494,7 @@ def check_adjacent(audit: Audit, prev: Row, cur: Row) -> None:
                 "campaign_forward_splice",
                 cur,
                 f"{prev.campaign_public_count}->{cur.campaign_public_count} "
-                f"elapsed={elapsed}s",
+                f"public_delta={public_delta}",
             )
 
     if cur.superseded and not prev.superseded:

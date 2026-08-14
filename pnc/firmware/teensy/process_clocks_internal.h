@@ -1594,6 +1594,53 @@ struct clocks_instrument_ppb_buckets_snapshot_t {
   clocks_instrument_ppb_value_snapshot_t total{};
 };
 
+// One Alpha-authored cumulative Better-Buckets endpoint.  The same six fields
+// cross three boundaries unchanged: 1 Hz proof testimony, Pi synthetic checkpoint
+// custody, and the existing PPB_RESTORE command path.  Keeping one mathematical
+// species prevents the stenographer from re-authoring rolling state.
+struct clocks_alpha_ppb_cumulative_endpoint_snapshot_t {
+  uint64_t reference_ns = 0ULL;
+  double   dwt_error_cycles = 0.0;
+  int64_t  ocxo1_error_ns = 0LL;
+  int64_t  ocxo2_error_ns = 0LL;
+  uint32_t rolling_sequence = 0;
+  uint32_t interval_count = 0U;
+};
+
+struct clocks_alpha_ppb_window_proof_snapshot_t {
+  bool valid = false;
+  uint32_t sample_count = 0U;
+  clocks_alpha_ppb_cumulative_endpoint_snapshot_t anchor{};
+};
+
+// Compact 1 Hz Better-Buckets testimony.  This is deliberately not the full
+// 601-second / 24-hour minute rings.  It gives Pi enough authoritative state to
+// advance a literal synthetic checkpoint during contiguous ingestion and enough
+// same-row evidence to prove every published rolling value without replaying SQL.
+// A discontinuous Pi observer must not invent skipped appends; recovery code may
+// re-establish checkpoint custody separately before admitting a new durable row.
+struct clocks_alpha_ppb_checkpoint_delta_snapshot_t {
+  bool valid = false;
+  uint32_t rolling_sequence = 0U;
+  uint32_t second_count = 0U;
+  uint32_t minute_count = 0U;
+  uint32_t last_minute_key = 0U;
+
+  bool origin_valid = false;
+  clocks_alpha_ppb_cumulative_endpoint_snapshot_t current{};
+  clocks_alpha_ppb_cumulative_endpoint_snapshot_t origin{};
+
+  clocks_alpha_ppb_window_proof_snapshot_t minute_10{};
+  clocks_alpha_ppb_window_proof_snapshot_t minute_60{};
+  clocks_alpha_ppb_window_proof_snapshot_t hour_8{};
+  clocks_alpha_ppb_window_proof_snapshot_t hour_24{};
+
+  bool second_append_valid = false;
+  clocks_alpha_ppb_cumulative_endpoint_snapshot_t second_append{};
+  bool minute_append_valid = false;
+  clocks_alpha_ppb_cumulative_endpoint_snapshot_t minute_append{};
+};
+
 struct clocks_instrument_frequency_snapshot_t {
   bool     valid = false;
   uint64_t sample_count = 0;
@@ -1614,10 +1661,14 @@ struct clocks_instrument_stats_snapshot_t {
   // Better Buckets uses update_count as its reboot-stable logical chronology.
   // current_sequence is the most recent admitted endpoint currently driving the
   // rolling windows; endpoint_admitted is Alpha's exact same-row admission
-  // verdict.  Together they bound SQL replay without carrying the rings at 1 Hz.
+  // verdict.  Together they identify the 1 Hz checkpoint mutation boundary.
   uint32_t rolling_ppb_current_sequence = 0;
   bool     rolling_ppb_endpoint_admitted = false;
   bool     rolling_ppb_interval_advanced = false;
+
+  // Same-row Better-Buckets sufficient state.  Alpha authors this under the
+  // instrument-statistics seqlock; Beta/System only transcribe it.
+  clocks_alpha_ppb_checkpoint_delta_snapshot_t rolling_ppb_checkpoint{};
 
   // All clock values below are captured atomically from the same completed
   // Alpha row.  They never mix the next PPS with prior OCXO completions.
@@ -1662,19 +1713,8 @@ struct clocks_instrument_stats_snapshot_t {
   welford_t pps_witness_welford{};
 };
 
-// Compact Better-Buckets state reconstructed by Pi CLOCKS from durable rows.
-// These are recovery/control-plane types only; ordinary CLOCKS_FRAGMENT does not
-// carry the rings. Endpoint rolling_sequence values are stats.update_count
-// identities from their source rows.
-struct clocks_alpha_ppb_cumulative_endpoint_snapshot_t {
-  uint64_t reference_ns = 0ULL;
-  double   dwt_error_cycles = 0.0;
-  int64_t  ocxo1_error_ns = 0LL;
-  int64_t  ocxo2_error_ns = 0LL;
-  uint32_t rolling_sequence = 0;
-  uint32_t interval_count = 0U;
-};
-
+// Full bounded-ring restore metadata.  Pi may persist a large synthetic checkpoint,
+// but every endpoint inside it remains an unmodified Alpha-authored endpoint.
 struct clocks_alpha_ppb_restore_snapshot_t {
   // Must equal the canonical stats.update_count being restored.
   uint32_t rolling_sequence = 0U;
