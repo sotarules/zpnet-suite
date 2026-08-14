@@ -1,14 +1,31 @@
-"""ZPNet campaign_analyzer — conservative one-pass streaming audit.
+"""ZPNet campaign_analyzer — holistic CLOCKS lineage and recovery audit.
 
-This replacement is intentionally modest. It reads TEMPEST-enriched CLOCKS_V4
-``campaign_detail`` rows through a named PostgreSQL cursor, orders them by the
-campaign-public identity in ``payload.campaign.public_count``, decodes one large
-unified state payload at a time, folds it into compact online state, and discards
-it immediately.
+Despite the historical filename, this is no longer campaign-scoped at its core.
 
-It does not retain a full campaign of expanded JSON dictionaries.  Memory use is
-bounded by the current payload, the previous compact row, online accumulators,
-and a small bounded set of anomaly examples.
+The analyzer streams canonical CLOCKS_V4 rows in durable PostgreSQL insertion
+order and treats the always-on CLOCKS instrument lineage as the primary object
+of study.  Optional TEMPEST campaign state is audited as a dependent view.
+
+The purpose is deliberately strict: restart/recovery is correct only when every
+recoverable sufficient state either continues exactly or changes for an explicit
+and lawful reason.  The analyzer therefore cross-checks independent witnesses:
+
+* durable row order versus boot-local physical sequence;
+* CLOCKS clockfaces and completed PPS identity;
+* statistical reset/update chronology;
+* every firmware Welford sufficient state;
+* OCXO TAU sufficient state and TOTAL PPB;
+* Better-Buckets cumulative endpoint reconstruction;
+* Pi-owned DAC Welfords against both DAC samples and OCXO ancestry;
+* Pi-owned GNSS_RAW Welford continuation;
+* campaign public-time/clockface/statistical closure;
+* recovery quarantine/supersession testimony.
+
+It never repairs, fills, smooths, or substitutes missing state.  Unknown or
+unprovable continuity is reported as such.
+
+Memory use is bounded by the current/previous compact row, Better-Buckets ring
+geometry, online counters, and bounded examples.
 """
 
 from __future__ import annotations
@@ -17,73 +34,99 @@ import json
 import math
 import sys
 import time
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterator, Optional, Sequence, Tuple
+from datetime import datetime, timezone
+from typing import Any, Deque, Dict, Iterator, Optional, Sequence, Tuple
 
 from zpnet.shared.db import open_db
 
+
 NS_PER_SECOND = 1_000_000_000
 DWT_EXPECTED_PER_PPS = 1_008_000_000
-DEFAULT_BATCH_SIZE = 8
-DEFAULT_PAUSE_MS = 50
-MAX_EXAMPLES = 12
-OCXO_SCIENCE_OUTLIER_NS = 50
-OCXO_SECOND_WARN_NS = 500
-OCXO_SECOND_ALARM_NS = 10_000
-PPB_ABSOLUTE_ALARM = 10_000.0
-PPB_STEP_ALARM = 100.0
-SNAPSHOT_LANES = ("pps", "vclock", "ocxo1", "ocxo2")
+DEFAULT_BATCH_SIZE = 32
+DEFAULT_PAUSE_MS = 0
+MAX_EXAMPLES = 16
 CAMPAIGN_TYPE = "TEMPEST"
-PPS_COUNT_SQL = """
-NULLIF(
-    payload #>> '{campaign,public_count}',
-    ''
-)::bigint
-"""
-DETAIL_PPS_COUNT_SQL = """
-NULLIF(
-    d.payload #>> '{campaign,public_count}',
-    ''
-)::bigint
-"""
+CLOCKS_SCHEMA = "CLOCKS_V4"
+
+PPB_TOLERANCE = 2.0e-6
+DISPLAY_PPB_TOLERANCE = 6.0e-4
+TAU_TOLERANCE = 2.0e-12
+WELFORD_FLOAT_ABS_TOL = 2.0e-8
+WELFORD_FLOAT_REL_TOL = 2.0e-12
+DAC_SAMPLE_TOL = 1.0e-9
+
+PPB_10_MIN_SECONDS = 10 * 60
+PPB_60_MIN_SECONDS = 60 * 60
+PPB_8_HOUR_SECONDS = 8 * 60 * 60
+PPB_24_HOUR_SECONDS = 24 * 60 * 60
+PPB_SECOND_CAPACITY = PPB_10_MIN_SECONDS + 1
+PPB_MINUTE_CAPACITY = 24 * 60 + 2
+
+STAT_LANES = ("gnss", "dwt", "vclock", "ocxo1", "ocxo2")
+WELFORD_LANES = (
+    "gnss",
+    "dwt",
+    "vclock",
+    "ocxo1",
+    "ocxo2",
+    "pps_witness",
+    "ocxo1_dac",
+    "ocxo2_dac",
+)
+PPB_LANES = ("dwt", "vclock", "ocxo1", "ocxo2")
 
 
-def d(v: Any) -> Dict[str, Any]:
-    return v if isinstance(v, dict) else {}
+def d(value: Any) -> Dict[str, Any]:
+    return value if isinstance(value, dict) else {}
 
 
-def i(v: Any) -> Optional[int]:
-    if v is None or isinstance(v, bool):
+def req_dict(value: Any, where: str) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{where} must be an object")
+    return value
+
+
+def req_int(value: Any, where: str, *, minimum: Optional[int] = None) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{where} must be an integer; got {value!r}")
+    out = int(value)
+    if minimum is not None and out < minimum:
+        raise ValueError(f"{where} must be >= {minimum}; got {out}")
+    return out
+
+
+def opt_int(value: Any) -> Optional[int]:
+    if value is None or isinstance(value, bool):
         return None
     try:
-        return int(v)
+        return int(value)
     except (TypeError, ValueError, OverflowError):
         return None
 
 
-def f(v: Any) -> Optional[float]:
-    if v is None:
+def req_float(value: Any, where: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{where} must be numeric; got {value!r}")
+    out = float(value)
+    if not math.isfinite(out):
+        raise ValueError(f"{where} must be finite; got {value!r}")
+    return out
+
+
+def opt_float(value: Any) -> Optional[float]:
+    if value is None or isinstance(value, bool):
         return None
     try:
-        out = float(v)
+        out = float(value)
     except (TypeError, ValueError, OverflowError):
         return None
     return out if math.isfinite(out) else None
 
 
-def b(v: Any) -> Optional[bool]:
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, int):
-        return bool(v)
-    if isinstance(v, str):
-        s = v.strip().lower()
-        if s in {"1", "true", "yes", "on", "nominal", "ready"}:
-            return True
-        if s in {"0", "false", "no", "off", "hold", "anomaly"}:
-            return False
-    return None
+def opt_bool(value: Any) -> Optional[bool]:
+    return value if isinstance(value, bool) else None
 
 
 def path(obj: Dict[str, Any], dotted: str) -> Any:
@@ -95,1252 +138,1591 @@ def path(obj: Dict[str, Any], dotted: str) -> Any:
     return cur
 
 
-def first_int(*values: Any) -> Optional[int]:
-    for value in values:
-        out = i(value)
-        if out is not None:
-            return out
-    return None
+def close(a: float, b: float, *, abs_tol: float, rel_tol: float = 0.0) -> bool:
+    return math.isclose(a, b, abs_tol=abs_tol, rel_tol=rel_tol)
 
 
-def first_float(*values: Any) -> Optional[float]:
-    for value in values:
-        out = f(value)
-        if out is not None:
-            return out
-    return None
+def utc_seconds(text: str) -> Optional[int]:
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return None
+    return int(dt.astimezone(timezone.utc).timestamp())
 
 
-def first_bool(*values: Any) -> Optional[bool]:
-    for value in values:
-        out = b(value)
-        if out is not None:
-            return out
-    return None
+@dataclass(frozen=True)
+class Welford:
+    n: int
+    mean: float
+    m2: float
+    min_value: float
+    max_value: float
+    stddev: Optional[float]
+    stderr: Optional[float]
+
+    @classmethod
+    def parse(cls, obj: Any, where: str) -> "Welford":
+        src = req_dict(obj, where)
+        n = req_int(src.get("n"), f"{where}.n", minimum=0)
+        mean = req_float(src.get("mean"), f"{where}.mean")
+        m2 = req_float(src.get("m2"), f"{where}.m2")
+        min_value = req_float(src.get("min"), f"{where}.min")
+        max_value = req_float(src.get("max"), f"{where}.max")
+        stddev = opt_float(src.get("stddev"))
+        stderr = opt_float(src.get("stderr"))
+        if n == 0:
+            if any(v != 0.0 for v in (mean, m2, min_value, max_value)):
+                raise ValueError(f"{where}: empty Welford publishes non-zero sufficient state")
+        else:
+            if m2 < -WELFORD_FLOAT_ABS_TOL:
+                raise ValueError(f"{where}: negative m2={m2}")
+            if min_value > max_value:
+                raise ValueError(f"{where}: min={min_value} > max={max_value}")
+            if mean < min_value - WELFORD_FLOAT_ABS_TOL or mean > max_value + WELFORD_FLOAT_ABS_TOL:
+                raise ValueError(
+                    f"{where}: mean={mean} outside [{min_value}, {max_value}]"
+                )
+        return cls(n, mean, m2, min_value, max_value, stddev, stderr)
 
 
-def root(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Return one persisted CLOCKS_V4 state detail."""
-    if not isinstance(payload, dict):
-        return {}
-    if payload.get("schema") == "CLOCKS_V4":
-        return payload
-    inner = d(payload.get("payload"))
-    return inner if inner.get("schema") == "CLOCKS_V4" else payload
+@dataclass(frozen=True)
+class TauState:
+    valid: bool
+    sample_count: int
+    interval_count: int
+    cumulative_reference_ns: int
+    cumulative_clock_ns: int
+    cumulative_clock_ns_exact: float
+    tau: Optional[float]
+    ppb: Optional[float]
+    first_refined_ns: Optional[int]
+    last_refined_ns: Optional[int]
+    last_pps_sequence: Optional[int]
+    last_interval_pps_sequence: Optional[int]
+    gap_reset_count: Optional[int]
+    reset_count: Optional[int]
+    reject_count: Optional[int]
 
-
-def campaign_view(payload: Dict[str, Any]) -> Dict[str, Any]:
-    campaign = d(root(payload).get("campaign"))
-    return campaign if campaign.get("schema") == "TEMPEST_FRAGMENT_V1" else {}
-
-
-def clocks_view(payload: Dict[str, Any]) -> Dict[str, Any]:
-    return d(root(payload).get("clocks"))
-
-
-def adjudication_view(payload: Dict[str, Any]) -> Dict[str, Any]:
-    return d(campaign_view(payload).get("adjudication"))
-
-
-def science_disposition(payload: Dict[str, Any], campaign: Dict[str, Any]) -> tuple[bool, bool, str]:
-    """Resolve completed TEMPEST science custody from the V4 campaign delta."""
-    adjudication = adjudication_view(payload)
-    court = d(adjudication.get("final_court"))
-    disposition = d(campaign.get("disposition"))
-
-    excluded = first_bool(
-        adjudication.get("science_excluded"),
-        court.get("science_excluded"),
-    )
-    eligible = first_bool(
-        adjudication.get("science_eligible"),
-        court.get("science_eligible"),
-        disposition.get("science_eligible"),
-    )
-    candidate_use = str(
-        adjudication.get("candidate_use")
-        or court.get("candidate_use")
-        or disposition.get("use")
-        or ""
-    ).strip().upper()
-    status = str(disposition.get("status") or "").strip().upper()
-
-    explicit_exclusion = bool(
-        excluded is True
-        or eligible is False
-        or candidate_use in {"AUDIT_ONLY", "SCIENCE_EXCLUDE", "EXCLUDE"}
-        or status in {"SCIENCE_EXCLUDE", "REJECT"}
-    )
-    if explicit_exclusion:
-        reason = str(
-            court.get("rationale")
-            or court.get("primary_rule")
-            or disposition.get("reason_name")
-            or candidate_use
-            or status
-            or "science excluded"
-        )
-        return False, True, reason
-
-    return True, False, "science admitted"
-
-
-@dataclass
-class RunningStats:
-    n: int = 0
-    mean: float = 0.0
-    m2: float = 0.0
-    min_value: float = math.inf
-    max_value: float = -math.inf
-
-    min_pps: Optional[int] = None
-    max_pps: Optional[int] = None
-
-    def update(self, value: float, pps: Optional[int] = None) -> None:
-        self.n += 1
-        delta = value - self.mean
-        self.mean += delta / self.n
-        self.m2 += delta * (value - self.mean)
-        if value < self.min_value:
-            self.min_value = value
-            self.min_pps = pps
-        if value > self.max_value:
-            self.max_value = value
-            self.max_pps = pps
-
-    @property
-    def stddev(self) -> float:
-        return math.sqrt(self.m2 / (self.n - 1)) if self.n >= 2 else 0.0
-
-    def text(self, digits: int = 3) -> str:
-        if self.n == 0:
-            return "no data"
-        return (
-            f"n={self.n:,} mean={self.mean:+.{digits}f} "
-            f"sd={self.stddev:.{digits}f} "
-            f"min={self.min_value:+.{digits}f}@{self.min_pps} "
-            f"max={self.max_value:+.{digits}f}@{self.max_pps}"
+    @classmethod
+    def parse(cls, obj: Any, where: str) -> "TauState":
+        src = req_dict(obj, where)
+        return cls(
+            valid=bool(src.get("valid") is True),
+            sample_count=req_int(src.get("sample_count"), f"{where}.sample_count", minimum=0),
+            interval_count=req_int(src.get("interval_count"), f"{where}.interval_count", minimum=0),
+            cumulative_reference_ns=req_int(
+                src.get("cumulative_reference_ns"),
+                f"{where}.cumulative_reference_ns",
+                minimum=0,
+            ),
+            cumulative_clock_ns=req_int(
+                src.get("cumulative_clock_ns"),
+                f"{where}.cumulative_clock_ns",
+                minimum=0,
+            ),
+            cumulative_clock_ns_exact=req_float(
+                src.get("cumulative_clock_ns_exact"),
+                f"{where}.cumulative_clock_ns_exact",
+            ),
+            tau=opt_float(src.get("tau")),
+            ppb=opt_float(src.get("ppb")),
+            first_refined_ns=opt_int(src.get("first_refined_ns")),
+            last_refined_ns=opt_int(src.get("last_refined_ns")),
+            last_pps_sequence=opt_int(src.get("last_pps_sequence")),
+            last_interval_pps_sequence=opt_int(src.get("last_interval_pps_sequence")),
+            gap_reset_count=opt_int(src.get("gap_reset_count")),
+            reset_count=opt_int(src.get("reset_count")),
+            reject_count=opt_int(src.get("reject_count")),
         )
 
 
+@dataclass(frozen=True)
+class BetterEndpoint:
+    rolling_sequence: int
+    reference_ns: int
+    dwt_error_cycles: float
+    ocxo1_error_ns: int
+    ocxo2_error_ns: int
+    interval_count: int
+
+
 @dataclass
-class CompactRow:
+class BetterBuckets:
+    epoch: Optional[int] = None
+    complete_from_origin: bool = False
+    current: BetterEndpoint = field(
+        default_factory=lambda: BetterEndpoint(0, 0, 0.0, 0, 0, 0)
+    )
+    origin: Optional[BetterEndpoint] = None
+    seconds: Deque[BetterEndpoint] = field(
+        default_factory=lambda: deque(maxlen=PPB_SECOND_CAPACITY)
+    )
+    minutes: Deque[BetterEndpoint] = field(
+        default_factory=lambda: deque(maxlen=PPB_MINUTE_CAPACITY)
+    )
+    last_minute_key: Optional[int] = None
+    previous_raw: Optional[Tuple[int, int, int, int, int]] = None
+
+    def reset(self, epoch: int, first_rolling_sequence: int) -> None:
+        self.epoch = epoch
+        self.complete_from_origin = first_rolling_sequence in (0, 1)
+        self.current = BetterEndpoint(0, 0, 0.0, 0, 0, 0)
+        self.origin = None
+        self.seconds.clear()
+        self.minutes.clear()
+        self.last_minute_key = None
+        self.previous_raw = None
+
+    @staticmethod
+    def minute_key(rolling_sequence: int) -> int:
+        return ((rolling_sequence - 1) // 60) + 1
+
+    def consume(self, row: "Row") -> None:
+        if self.epoch != row.reset_count:
+            self.reset(row.reset_count, row.rolling_sequence)
+
+        if not row.rolling_endpoint_admitted or row.rolling_sequence <= 0:
+            self.previous_raw = None
+            return
+
+        raw = (
+            row.rolling_sequence,
+            row.clock_gnss_ns,
+            row.clock_dwt_cycles,
+            row.clock_ocxo1_ns,
+            row.clock_ocxo2_ns,
+        )
+
+        cur = self.current
+        next_ep = BetterEndpoint(
+            rolling_sequence=row.rolling_sequence,
+            reference_ns=cur.reference_ns,
+            dwt_error_cycles=cur.dwt_error_cycles,
+            ocxo1_error_ns=cur.ocxo1_error_ns,
+            ocxo2_error_ns=cur.ocxo2_error_ns,
+            interval_count=cur.interval_count,
+        )
+
+        advanced_by_reconstruction: Optional[bool] = None
+        if self.previous_raw is not None:
+            pseq, pgnss, pdwt, po1, po2 = self.previous_raw
+            advanced_by_reconstruction = False
+            adjacent = (
+                row.rolling_sequence == pseq + 1
+                and row.clock_gnss_ns > pgnss
+                and row.clock_dwt_cycles > pdwt
+                and row.clock_ocxo1_ns > po1
+                and row.clock_ocxo2_ns > po2
+            )
+            if adjacent:
+                reference_delta = row.clock_gnss_ns - pgnss
+                dwt_delta = row.clock_dwt_cycles - pdwt
+                ocxo1_delta = row.clock_ocxo1_ns - po1
+                ocxo2_delta = row.clock_ocxo2_ns - po2
+                expected_dwt_delta = (
+                    float(reference_delta) * float(DWT_EXPECTED_PER_PPS)
+                    / float(NS_PER_SECOND)
+                )
+                next_ep = BetterEndpoint(
+                    rolling_sequence=row.rolling_sequence,
+                    reference_ns=cur.reference_ns + reference_delta,
+                    dwt_error_cycles=cur.dwt_error_cycles + float(dwt_delta) - expected_dwt_delta,
+                    ocxo1_error_ns=cur.ocxo1_error_ns + (ocxo1_delta - reference_delta),
+                    ocxo2_error_ns=cur.ocxo2_error_ns + (ocxo2_delta - reference_delta),
+                    interval_count=cur.interval_count + 1,
+                )
+                advanced_by_reconstruction = True
+
+        # Firmware testimony is authoritative.  A disagreement here means our
+        # durable rows cannot reproduce the producer's Better-Buckets ancestry.
+        if (
+            advanced_by_reconstruction is not None
+            and row.rolling_interval_advanced != advanced_by_reconstruction
+        ):
+            row.audit.problem(
+                "better_interval_advance",
+                row,
+                f"published={row.rolling_interval_advanced} "
+                f"reconstructed={advanced_by_reconstruction}",
+            )
+
+        self.current = next_ep
+        if self.origin is None:
+            self.origin = next_ep
+
+        self.seconds.append(next_ep)
+        minute_key = self.minute_key(row.rolling_sequence)
+        if minute_key != self.last_minute_key:
+            self.minutes.append(next_ep)
+            self.last_minute_key = minute_key
+
+        self.previous_raw = raw
+
+    @staticmethod
+    def find_anchor(
+        ring: Deque[BetterEndpoint],
+        target: int,
+        current_sequence: int,
+    ) -> Optional[BetterEndpoint]:
+        for endpoint in ring:
+            if target <= endpoint.rolling_sequence < current_sequence:
+                return endpoint
+        return None
+
+    def anchor(
+        self,
+        window_seconds: int,
+        *,
+        exact_second_history: bool,
+    ) -> Optional[BetterEndpoint]:
+        if (
+            self.origin is None
+            or self.current.rolling_sequence <= 0
+            or self.origin.rolling_sequence >= self.current.rolling_sequence
+        ):
+            return None
+        if self.current.rolling_sequence <= window_seconds:
+            return self.origin
+        target = self.current.rolling_sequence - window_seconds
+        ring = self.seconds if exact_second_history else self.minutes
+        return self.find_anchor(ring, target, self.current.rolling_sequence)
+
+    def expected_ppb(
+        self,
+        lane: str,
+        window_seconds: int,
+        *,
+        exact_second_history: bool,
+    ) -> Optional[float]:
+        if not self.complete_from_origin:
+            return None
+        anchor = self.anchor(window_seconds, exact_second_history=exact_second_history)
+        if anchor is None:
+            return None
+        interval_count = self.current.interval_count - anchor.interval_count
+        reference_ns = self.current.reference_ns - anchor.reference_ns
+        if interval_count <= 0 or reference_ns <= 0:
+            return None
+        if lane == "dwt":
+            expected_cycles = (
+                float(reference_ns) * float(DWT_EXPECTED_PER_PPS)
+                / float(NS_PER_SECOND)
+            )
+            error = self.current.dwt_error_cycles - anchor.dwt_error_cycles
+            return error * 1.0e9 / expected_cycles
+        if lane == "vclock":
+            return 0.0
+        if lane == "ocxo1":
+            error = self.current.ocxo1_error_ns - anchor.ocxo1_error_ns
+            return float(error) * 1.0e9 / float(reference_ns)
+        if lane == "ocxo2":
+            error = self.current.ocxo2_error_ns - anchor.ocxo2_error_ns
+            return float(error) * 1.0e9 / float(reference_ns)
+        raise ValueError(f"unknown Better-Buckets lane {lane!r}")
+
+
+@dataclass
+class Row:
+    audit: "Audit"
     db_id: int
-    pps: int
     ts: str
-    campaign: str
-    gnss_ns: Optional[int]
-    vclock_ns: Optional[int]
-    dwt_cycles: Optional[int]
-    ocxo1_ns: Optional[int]
-    ocxo2_ns: Optional[int]
-    ocxo1_interval_ns: Optional[int]
-    ocxo2_interval_ns: Optional[int]
-    ocxo1_residual_ns: Optional[int]
-    ocxo2_residual_ns: Optional[int]
-    ocxo1_valid: Optional[bool]
-    ocxo2_valid: Optional[bool]
-    dwt_ppb: Optional[float]
-    vclock_ppb: Optional[float]
-    ocxo1_ppb: Optional[float]
-    ocxo2_ppb: Optional[float]
-    science_eligible: bool
-    science_excluded: bool
-    science_reason: str
-    recovery_evidence: bool
-    recovery_hold: bool
-    timeline_ready: Optional[bool]
-    clockface_ready: Optional[bool]
-    science_ready: Optional[bool]
-    welford_n: Dict[str, Optional[int]]
-    welford_sd: Dict[str, Optional[float]]
-    snapshot_contract_present: bool
-    snapshot_contract_missing: Tuple[str, ...]
-    stats_snapshot_ok: Optional[bool]
-    stats_valid: Optional[bool]
-    stats_completed_row_coherent: Optional[bool]
-    raw_snapshot_ok: Dict[str, Optional[bool]]
-    raw_valid: Dict[str, Optional[bool]]
-    forensics_snapshot_ok: Dict[str, Optional[bool]]
-    delay_detail_present: Dict[str, Optional[bool]]
-    delay_status: Dict[str, str]
+    payload: Dict[str, Any]
+
+    sequence: int
+    completed_pps_sequence: int
+    gnss_utc: str
+    gnss_utc_s: Optional[int]
+    instrument_age_seconds: int
+
+    clock_gnss_ns: int
+    clock_dwt_cycles: int
+    clock_ocxo1_ns: int
+    clock_ocxo2_ns: int
+    clockface_pps_sequence: int
+
+    reset_count: int
+    update_count: int
+    stats_last_pps_sequence: int
+    rolling_sequence: int
+    rolling_endpoint_admitted: bool
+    rolling_interval_advanced: bool
+
+    welfords: Dict[str, Welford]
+    tau: Dict[str, TauState]
+    ppb: Dict[str, float]
+    frequency_tau: Dict[str, Optional[float]]
+    buckets: Dict[str, Dict[str, float]]
+
+    dac_hw: Dict[str, int]
+    dac_readback: Dict[str, Optional[int]]
+    dac_target: Dict[str, float]
+    dither_enabled: bool
     servo_mode: str
-    location: str
-    environment: Dict[str, Any]
-    final_forensics: Dict[str, Any]
+
+    gnss_raw_drift_ppb: Optional[float]
+    gnss_raw_welford: Optional[Welford]
+    gnss_raw_clockface_n: Optional[int]
+    gnss_raw_ns: Optional[int]
+    gnss_raw_ref_ns: Optional[int]
+
+    campaign_name: Optional[str]
+    campaign_public_count: Optional[int]
+    campaign_clockfaces: Dict[str, int]
+    campaign_ppb: Dict[str, float]
+    campaign_science_eligible: Optional[bool]
+
+    recovery_classification: Optional[str]
+    superseded: bool
+
+    @classmethod
+    def parse(
+        cls,
+        audit: "Audit",
+        db_id: int,
+        ts: str,
+        payload: Dict[str, Any],
+    ) -> "Row":
+        root = payload
+        if root.get("schema") != CLOCKS_SCHEMA:
+            inner = d(root.get("payload"))
+            if inner.get("schema") == CLOCKS_SCHEMA:
+                root = inner
+        if root.get("schema") != CLOCKS_SCHEMA:
+            raise ValueError(f"db_id={db_id}: payload is not {CLOCKS_SCHEMA}")
+
+        clocks = req_dict(root.get("clocks"), f"db_id={db_id}.clocks")
+        if clocks.get("schema") != "CLOCKS_INSTRUMENT_STATE_V1":
+            raise ValueError(
+                f"db_id={db_id}: clocks schema={clocks.get('schema')!r}"
+            )
+        stats = req_dict(clocks.get("stats"), f"db_id={db_id}.clocks.stats")
+        clockfaces = req_dict(
+            clocks.get("clockfaces"),
+            f"db_id={db_id}.clocks.clockfaces",
+        )
+        control = req_dict(clocks.get("control"), f"db_id={db_id}.clocks.control")
+
+        welfords: Dict[str, Welford] = {}
+        for lane in STAT_LANES:
+            welfords[lane] = Welford.parse(
+                path(stats, f"{lane}.welford"),
+                f"db_id={db_id}.stats.{lane}.welford",
+            )
+        aux = req_dict(
+            stats.get("auxiliary_welford"),
+            f"db_id={db_id}.stats.auxiliary_welford",
+        )
+        welfords["pps_witness"] = Welford.parse(
+            aux.get("pps_witness"),
+            f"db_id={db_id}.stats.auxiliary_welford.pps_witness",
+        )
+        welfords["ocxo1_dac"] = Welford.parse(
+            aux.get("ocxo1_dac"),
+            f"db_id={db_id}.stats.auxiliary_welford.ocxo1_dac",
+        )
+        welfords["ocxo2_dac"] = Welford.parse(
+            aux.get("ocxo2_dac"),
+            f"db_id={db_id}.stats.auxiliary_welford.ocxo2_dac",
+        )
+
+        tau = {
+            "ocxo1": TauState.parse(
+                stats.get("ocxo1_tau_state"),
+                f"db_id={db_id}.stats.ocxo1_tau_state",
+            ),
+            "ocxo2": TauState.parse(
+                stats.get("ocxo2_tau_state"),
+                f"db_id={db_id}.stats.ocxo2_tau_state",
+            ),
+        }
+
+        ppb: Dict[str, float] = {}
+        frequency_tau: Dict[str, Optional[float]] = {}
+        buckets: Dict[str, Dict[str, float]] = {}
+        for lane in PPB_LANES:
+            lane_obj = req_dict(stats.get(lane), f"db_id={db_id}.stats.{lane}")
+            ppb[lane] = req_float(lane_obj.get("ppb"), f"db_id={db_id}.stats.{lane}.ppb")
+            frequency_tau[lane] = opt_float(lane_obj.get("tau"))
+            bucket_obj = req_dict(
+                lane_obj.get("ppb_buckets"),
+                f"db_id={db_id}.stats.{lane}.ppb_buckets",
+            )
+            buckets[lane] = {}
+            for key in ("10_min", "60_min", "8_hour", "24_hour", "total"):
+                value = opt_float(bucket_obj.get(key))
+                if value is not None:
+                    buckets[lane][key] = value
+
+        dac_hw: Dict[str, int] = {}
+        dac_readback: Dict[str, Optional[int]] = {}
+        dac_target: Dict[str, float] = {}
+        for lane in ("ocxo1", "ocxo2"):
+            lane_obj = req_dict(control.get(lane), f"db_id={db_id}.control.{lane}")
+            dac_hw[lane] = req_int(
+                lane_obj.get("hw_code"),
+                f"db_id={db_id}.control.{lane}.hw_code",
+                minimum=0,
+            )
+            dac_readback[lane] = opt_int(lane_obj.get("readback_code"))
+            dac_target[lane] = req_float(
+                lane_obj.get("target_code"),
+                f"db_id={db_id}.control.{lane}.target_code",
+            )
+
+        gnss_raw = d(clocks.get("gnss_raw"))
+        gnss_raw_welford: Optional[Welford] = None
+        if gnss_raw:
+            gnss_raw_welford = Welford.parse(
+                gnss_raw.get("welford"),
+                f"db_id={db_id}.clocks.gnss_raw.welford",
+            )
+        gnss_raw_instr = d(gnss_raw.get("instrument"))
+
+        campaign_obj = d(root.get("campaign"))
+        campaign_name: Optional[str] = None
+        campaign_public_count: Optional[int] = None
+        campaign_clockfaces: Dict[str, int] = {}
+        campaign_ppb: Dict[str, float] = {}
+        campaign_science_eligible: Optional[bool] = None
+        if campaign_obj.get("schema") == "TEMPEST_FRAGMENT_V1":
+            campaign_name = str(campaign_obj.get("name") or "") or None
+            campaign_public_count = opt_int(campaign_obj.get("public_count"))
+            cfaces = d(campaign_obj.get("clockfaces"))
+            for key in ("gnss_ns", "dwt_cycles", "ocxo1_ns", "ocxo2_ns"):
+                value = opt_int(cfaces.get(key))
+                if value is not None:
+                    campaign_clockfaces[key] = value
+            cppb = d(d(campaign_obj.get("stats")).get("ppb"))
+            for lane in PPB_LANES:
+                value = opt_float(cppb.get(lane))
+                if value is not None:
+                    campaign_ppb[lane] = value
+            campaign_science_eligible = opt_bool(
+                d(campaign_obj.get("disposition")).get("science_eligible")
+            )
+
+        recovery = d(root.get("recovery_custody"))
+        classification = str(recovery.get("classification") or "").strip() or None
+
+        return cls(
+            audit=audit,
+            db_id=db_id,
+            ts=ts,
+            payload=root,
+            sequence=req_int(root.get("sequence"), f"db_id={db_id}.sequence", minimum=1),
+            completed_pps_sequence=req_int(
+                clocks.get("completed_pps_sequence"),
+                f"db_id={db_id}.clocks.completed_pps_sequence",
+                minimum=1,
+            ),
+            gnss_utc=str(clocks.get("gnss_time_utc") or ""),
+            gnss_utc_s=utc_seconds(str(clocks.get("gnss_time_utc") or "")),
+            instrument_age_seconds=req_int(
+                clocks.get("instrument_age_seconds"),
+                f"db_id={db_id}.clocks.instrument_age_seconds",
+                minimum=0,
+            ),
+            clock_gnss_ns=req_int(
+                clockfaces.get("gnss_ns"),
+                f"db_id={db_id}.clocks.clockfaces.gnss_ns",
+                minimum=0,
+            ),
+            clock_dwt_cycles=req_int(
+                clockfaces.get("dwt_cycles"),
+                f"db_id={db_id}.clocks.clockfaces.dwt_cycles",
+                minimum=0,
+            ),
+            clock_ocxo1_ns=req_int(
+                clockfaces.get("ocxo1_ns"),
+                f"db_id={db_id}.clocks.clockfaces.ocxo1_ns",
+                minimum=0,
+            ),
+            clock_ocxo2_ns=req_int(
+                clockfaces.get("ocxo2_ns"),
+                f"db_id={db_id}.clocks.clockfaces.ocxo2_ns",
+                minimum=0,
+            ),
+            clockface_pps_sequence=req_int(
+                clockfaces.get("pps_sequence"),
+                f"db_id={db_id}.clocks.clockfaces.pps_sequence",
+                minimum=1,
+            ),
+            reset_count=req_int(
+                stats.get("reset_count"),
+                f"db_id={db_id}.stats.reset_count",
+                minimum=0,
+            ),
+            update_count=req_int(
+                stats.get("update_count"),
+                f"db_id={db_id}.stats.update_count",
+                minimum=1,
+            ),
+            stats_last_pps_sequence=req_int(
+                stats.get("last_pps_sequence"),
+                f"db_id={db_id}.stats.last_pps_sequence",
+                minimum=1,
+            ),
+            rolling_sequence=req_int(
+                stats.get("rolling_ppb_current_sequence"),
+                f"db_id={db_id}.stats.rolling_ppb_current_sequence",
+                minimum=0,
+            ),
+            rolling_endpoint_admitted=bool(
+                stats.get("rolling_ppb_endpoint_admitted") is True
+            ),
+            rolling_interval_advanced=bool(
+                stats.get("rolling_ppb_interval_advanced") is True
+            ),
+            welfords=welfords,
+            tau=tau,
+            ppb=ppb,
+            frequency_tau=frequency_tau,
+            buckets=buckets,
+            dac_hw=dac_hw,
+            dac_readback=dac_readback,
+            dac_target=dac_target,
+            dither_enabled=bool(control.get("dither_operator_enabled") is True),
+            servo_mode=str(control.get("servo_mode") or ""),
+            gnss_raw_drift_ppb=opt_float(gnss_raw.get("drift_ppb")),
+            gnss_raw_welford=gnss_raw_welford,
+            gnss_raw_clockface_n=opt_int(gnss_raw_instr.get("clockface_n")),
+            gnss_raw_ns=opt_int(gnss_raw_instr.get("ns")),
+            gnss_raw_ref_ns=opt_int(gnss_raw_instr.get("ref_ns")),
+            campaign_name=campaign_name,
+            campaign_public_count=campaign_public_count,
+            campaign_clockfaces=campaign_clockfaces,
+            campaign_ppb=campaign_ppb,
+            campaign_science_eligible=campaign_science_eligible,
+            recovery_classification=classification,
+            superseded=bool(root.get("holistic_restore_superseded") is True),
+        )
 
 
 @dataclass
 class Audit:
-    campaign: str
-    first_pps: Optional[int] = None
-    last_pps: Optional[int] = None
+    scope: str
+    rows: int = 0
+    first_db_id: Optional[int] = None
+    last_db_id: Optional[int] = None
     first_ts: str = ""
     last_ts: str = ""
-    rows: int = 0
-    science_rows: int = 0
-    science_excluded_rows: int = 0
-    expected_rows: int = 0
-    gaps: int = 0
-    recovery_gaps: int = 0
-    unclassified_gaps: int = 0
-    repeats: int = 0
-    regressions: int = 0
-    payload_identity_mismatches: int = 0
-    timeline_errors: int = 0
-    gnss_identity_errors: int = 0
-    gnss_adjacent_errors: int = 0
-    gnss_identity_offsets_ns: Counter[int] = field(default_factory=Counter)
-    dwt_nonmonotonic: int = 0
-    ocxo1_interval_alarms: int = 0
-    ocxo2_interval_alarms: int = 0
-    ocxo1_science_outliers: int = 0
-    ocxo2_science_outliers: int = 0
-    divergence_science_outliers: int = 0
-    ocxo1_ledger_errors: int = 0
-    ocxo2_ledger_errors: int = 0
-    ppb_alarms: int = 0
-    ppb_steps: int = 0
-    welford_regressions: int = 0
-    snapshot_contract_rows: int = 0
-    snapshot_clean_rows: int = 0
-    snapshot_legacy_rows: int = 0
-    first_snapshot_contract_pps: Optional[int] = None
-    last_snapshot_contract_pps: Optional[int] = None
-    snapshot_missing_after_activation: int = 0
-    snapshot_contract_omissions: Counter[str] = field(default_factory=Counter)
-    snapshot_contract_violations: int = 0
-    snapshot_contract_violation_rows: int = 0
-    snapshot_failure_rows: int = 0
-    snapshot_failure_science_rows: int = 0
-    stats_snapshot_failures: int = 0
-    prediction_snapshot_failures: Counter[str] = field(default_factory=Counter)
-    forensics_snapshot_failures: Counter[str] = field(default_factory=Counter)
-    coherent_immature_snapshots: Counter[str] = field(default_factory=Counter)
-    coherent_immature_rows: int = 0
-    last_coherent_immature_pps: Optional[int] = None
-    science_event_rows: int = 0
-    last_science_event_pps: Optional[int] = None
+    first_gnss: str = ""
+    last_gnss: str = ""
+
+    problems: Counter[str] = field(default_factory=Counter)
+    events: Counter[str] = field(default_factory=Counter)
     examples: Dict[str, list[str]] = field(default_factory=dict)
-    missing_identities: int = 0
-    recovery_missing_identities: int = 0
-    unclassified_missing_identities: int = 0
-    stats: Dict[str, RunningStats] = field(default_factory=lambda: {
-        "dwt_delta": RunningStats(),
-        "ocxo1_interval": RunningStats(),
-        "ocxo2_interval": RunningStats(),
-        "ocxo1_residual": RunningStats(),
-        "ocxo2_residual": RunningStats(),
-        "ocxo_divergence": RunningStats(),
-        "dwt_ppb": RunningStats(),
-        "vclock_ppb": RunningStats(),
-        "ocxo1_ppb": RunningStats(),
-        "ocxo2_ppb": RunningStats(),
-    })
-    final_row: Optional[CompactRow] = None
 
-    def note(self, kind: str, message: str) -> None:
-        bucket = self.examples.setdefault(kind, [])
-        if len(bucket) < MAX_EXAMPLES:
-            bucket.append(message)
+    epochs: Counter[int] = field(default_factory=Counter)
+    campaigns: Counter[str] = field(default_factory=Counter)
+    recovery_classes: Counter[str] = field(default_factory=Counter)
 
-    def note_science_event(self, pps: int) -> None:
-        """Count one anomalous PPS once even when several courts fire."""
-        if self.last_science_event_pps != pps:
-            self.science_event_rows += 1
-            self.last_science_event_pps = pps
+    better: BetterBuckets = field(default_factory=BetterBuckets)
+    exact_welford_steps: int = 0
+    exact_dac_steps: int = 0
+    exact_gnss_raw_steps: int = 0
+    bucket_checks: int = 0
+    total_ppb_checks: int = 0
+    tau_checks: int = 0
+
+    physical_reboots: int = 0
+    durable_gaps: int = 0
+    gnss_gap_seconds: int = 0
+    stats_resets: int = 0
+    campaign_splices: int = 0
+
+    def note(self, bucket: str, message: str) -> None:
+        examples = self.examples.setdefault(bucket, [])
+        if len(examples) < MAX_EXAMPLES:
+            examples.append(message)
+
+    def problem(self, kind: str, row: Row, detail: str) -> None:
+        self.problems[kind] += 1
+        self.note(kind, f"db_id={row.db_id} gnss={row.gnss_utc or '?'} {detail}")
+
+    def event(self, kind: str, row: Row, detail: str) -> None:
+        self.events[kind] += 1
+        self.note(f"event:{kind}", f"db_id={row.db_id} gnss={row.gnss_utc or '?'} {detail}")
 
 
-def _assert_campaign_indexed(cur: Any, campaign: str) -> None:
-    cur.execute(
-        f"""
-        SELECT count(*) AS missing_count
-        FROM campaign_detail
-        WHERE campaign_type = %s
-          AND campaign = %s
-          AND payload #>> '{{campaign,schema}}' = 'TEMPEST_FRAGMENT_V1'
-          AND {PPS_COUNT_SQL} IS NULL
-        """,
-        (CAMPAIGN_TYPE, campaign),
+def welford_state_same(a: Welford, b: Welford) -> bool:
+    return (
+        a.n == b.n
+        and close(a.mean, b.mean, abs_tol=WELFORD_FLOAT_ABS_TOL, rel_tol=WELFORD_FLOAT_REL_TOL)
+        and close(a.m2, b.m2, abs_tol=WELFORD_FLOAT_ABS_TOL, rel_tol=WELFORD_FLOAT_REL_TOL)
+        and close(
+            a.min_value,
+            b.min_value,
+            abs_tol=WELFORD_FLOAT_ABS_TOL,
+            rel_tol=WELFORD_FLOAT_REL_TOL,
+        )
+        and close(
+            a.max_value,
+            b.max_value,
+            abs_tol=WELFORD_FLOAT_ABS_TOL,
+            rel_tol=WELFORD_FLOAT_REL_TOL,
+        )
     )
-    row = cur.fetchone()
-    missing = int(row["missing_count"] if row else 0)
-    if missing:
-        raise RuntimeError(
-            f"TEMPEST campaign {campaign!r} has {missing:,} decorated rows without "
-            "campaign.public_count"
+
+
+def check_welford_step(
+    audit: Audit,
+    row: Row,
+    name: str,
+    previous: Welford,
+    current: Welford,
+    *,
+    known_sample: Optional[float] = None,
+) -> None:
+    if current.n < previous.n:
+        audit.problem(
+            "welford_regression",
+            row,
+            f"{name}.n {previous.n}->{current.n} within reset_count={row.reset_count}",
+        )
+        return
+
+    if current.n == previous.n:
+        if not welford_state_same(previous, current):
+            audit.problem(
+                "welford_mutated_without_population",
+                row,
+                f"{name} n={current.n} but sufficient state changed",
+            )
+        return
+
+    if current.n != previous.n + 1:
+        audit.event(
+            "welford_unobserved_advancement",
+            row,
+            f"{name}.n {previous.n}->{current.n}; cannot single-step prove hidden samples",
+        )
+        return
+
+    if known_sample is None:
+        # Derive the unique sample implied by the two means.
+        sample = current.n * current.mean - previous.n * previous.mean
+    else:
+        sample = float(known_sample)
+
+    expected_mean = previous.mean + (sample - previous.mean) / current.n
+    expected_m2 = previous.m2 + (sample - previous.mean) * (sample - expected_mean)
+    expected_min = sample if previous.n == 0 else min(previous.min_value, sample)
+    expected_max = sample if previous.n == 0 else max(previous.max_value, sample)
+
+    checks = (
+        close(
+            current.mean,
+            expected_mean,
+            abs_tol=WELFORD_FLOAT_ABS_TOL,
+            rel_tol=WELFORD_FLOAT_REL_TOL,
+        ),
+        close(
+            current.m2,
+            expected_m2,
+            abs_tol=max(WELFORD_FLOAT_ABS_TOL, abs(expected_m2) * 2.0e-12),
+            rel_tol=2.0e-12,
+        ),
+        close(
+            current.min_value,
+            expected_min,
+            abs_tol=WELFORD_FLOAT_ABS_TOL,
+            rel_tol=WELFORD_FLOAT_REL_TOL,
+        ),
+        close(
+            current.max_value,
+            expected_max,
+            abs_tol=WELFORD_FLOAT_ABS_TOL,
+            rel_tol=WELFORD_FLOAT_REL_TOL,
+        ),
+    )
+    if not all(checks):
+        audit.problem(
+            "welford_recurrence",
+            row,
+            f"{name} one-sample recurrence failed sample={sample:.12g} "
+            f"n={previous.n}->{current.n}",
+        )
+    else:
+        audit.exact_welford_steps += 1
+
+
+def check_welford_geometry(audit: Audit, row: Row, name: str, w: Welford) -> None:
+    if w.n < 2:
+        expected_sd = 0.0
+    else:
+        expected_sd = math.sqrt(max(0.0, w.m2) / float(w.n - 1))
+    expected_se = expected_sd / math.sqrt(float(w.n)) if w.n else 0.0
+
+    if w.stddev is not None and not close(
+        w.stddev,
+        expected_sd,
+        abs_tol=2.0e-6,
+        rel_tol=2.0e-9,
+    ):
+        audit.problem(
+            "welford_stddev",
+            row,
+            f"{name} published={w.stddev:.12g} expected={expected_sd:.12g}",
+        )
+    if w.stderr is not None and not close(
+        w.stderr,
+        expected_se,
+        abs_tol=2.0e-6,
+        rel_tol=2.0e-9,
+    ):
+        audit.problem(
+            "welford_stderr",
+            row,
+            f"{name} published={w.stderr:.12g} expected={expected_se:.12g}",
         )
 
 
+def check_tau(audit: Audit, row: Row, lane: str) -> None:
+    tau = row.tau[lane]
+    w = row.welfords[lane]
+
+    if tau.sample_count != tau.interval_count:
+        audit.problem(
+            "tau_population",
+            row,
+            f"{lane} sample_count={tau.sample_count} interval_count={tau.interval_count}",
+        )
+    if tau.sample_count != w.n:
+        audit.problem(
+            "tau_welford_population",
+            row,
+            f"{lane} tau.n={tau.sample_count} welford.n={w.n}",
+        )
+    if tau.cumulative_reference_ns != tau.sample_count * NS_PER_SECOND:
+        audit.problem(
+            "tau_reference_total",
+            row,
+            f"{lane} reference={tau.cumulative_reference_ns} "
+            f"expected={tau.sample_count * NS_PER_SECOND}",
+        )
+
+    if tau.valid:
+        if tau.cumulative_clock_ns_exact <= 0.0 or tau.cumulative_reference_ns <= 0:
+            audit.problem("tau_valid_without_population", row, lane)
+            return
+        expected_tau = (
+            float(tau.cumulative_reference_ns) / tau.cumulative_clock_ns_exact
+        )
+        expected_ppb = (expected_tau - 1.0) * 1.0e9
+        published_tau = row.frequency_tau.get(lane)
+        if published_tau is not None and not close(
+            published_tau,
+            expected_tau,
+            abs_tol=TAU_TOLERANCE,
+            rel_tol=TAU_TOLERANCE,
+        ):
+            audit.problem(
+                "tau_ratio",
+                row,
+                f"{lane} published={published_tau} expected={expected_tau:.15f}",
+            )
+        if not close(
+            row.ppb[lane],
+            expected_ppb,
+            abs_tol=DISPLAY_PPB_TOLERANCE,
+            rel_tol=2.0e-12,
+        ):
+            audit.problem(
+                "total_ppb_tau",
+                row,
+                f"{lane} stats.ppb={row.ppb[lane]:.9f} tau={expected_ppb:.9f}",
+            )
+        total = row.buckets[lane].get("total")
+        if total is not None:
+            audit.total_ppb_checks += 1
+            if not close(total, expected_ppb, abs_tol=PPB_TOLERANCE, rel_tol=2.0e-12):
+                audit.problem(
+                    "bucket_total_tau",
+                    row,
+                    f"{lane} total={total:.9f} tau={expected_ppb:.9f}",
+                )
+        audit.tau_checks += 1
+
+
+def check_dwt_vclock_total(audit: Audit, row: Row, lane: str) -> None:
+    w = row.welfords[lane]
+    if not close(
+        row.ppb[lane],
+        w.mean,
+        abs_tol=DISPLAY_PPB_TOLERANCE,
+        rel_tol=2.0e-12,
+    ):
+        audit.problem(
+            "total_ppb_welford",
+            row,
+            f"{lane} stats.ppb={row.ppb[lane]:.9f} mean={w.mean:.9f}",
+        )
+    total = row.buckets[lane].get("total")
+    if total is not None:
+        audit.total_ppb_checks += 1
+        if not close(total, w.mean, abs_tol=PPB_TOLERANCE, rel_tol=2.0e-12):
+            audit.problem(
+                "bucket_total_welford",
+                row,
+                f"{lane} total={total:.9f} mean={w.mean:.9f}",
+            )
+
+
+def check_buckets(audit: Audit, row: Row) -> None:
+    audit.better.consume(row)
+    windows = (
+        ("10_min", PPB_10_MIN_SECONDS, True),
+        ("60_min", PPB_60_MIN_SECONDS, False),
+        ("8_hour", PPB_8_HOUR_SECONDS, False),
+        ("24_hour", PPB_24_HOUR_SECONDS, False),
+    )
+    for lane in PPB_LANES:
+        for key, seconds, exact in windows:
+            published = row.buckets[lane].get(key)
+            expected = audit.better.expected_ppb(
+                lane,
+                seconds,
+                exact_second_history=exact,
+            )
+            if published is None or expected is None:
+                continue
+            audit.bucket_checks += 1
+            if not close(
+                published,
+                expected,
+                abs_tol=PPB_TOLERANCE,
+                rel_tol=2.0e-12,
+            ):
+                audit.problem(
+                    "better_bucket_value",
+                    row,
+                    f"{lane}.{key} published={published:.9f} "
+                    f"reconstructed={expected:.9f}",
+                )
+
+
+def check_row_internal(audit: Audit, row: Row) -> None:
+    for name, value in (
+        ("completed_pps_sequence", row.completed_pps_sequence),
+        ("clockfaces.pps_sequence", row.clockface_pps_sequence),
+        ("stats.last_pps_sequence", row.stats_last_pps_sequence),
+    ):
+        if value != row.sequence:
+            audit.problem(
+                "physical_identity",
+                row,
+                f"sequence={row.sequence} {name}={value}",
+            )
+
+    if row.update_count <= 0:
+        audit.problem("stats_update_count", row, f"update_count={row.update_count}")
+
+    expected_clock_gnss = row.instrument_age_seconds * NS_PER_SECOND
+    if row.clock_gnss_ns != expected_clock_gnss:
+        audit.problem(
+            "instrument_gnss_age_identity",
+            row,
+            f"gnss_ns={row.clock_gnss_ns} instrument_age={row.instrument_age_seconds} "
+            f"expected={expected_clock_gnss}",
+        )
+
+    # CLOCKS Alpha updates exactly one row per stats update.  The rolling
+    # sequence can legitimately lag on an excluded endpoint, but never lead.
+    if row.rolling_sequence > row.update_count:
+        audit.problem(
+            "rolling_sequence_leads_stats",
+            row,
+            f"rolling={row.rolling_sequence} update={row.update_count}",
+        )
+
+    for name, w in row.welfords.items():
+        check_welford_geometry(audit, row, name, w)
+
+    # Restore-authority ancestry invariant that exposed the historical poison.
+    for lane in ("ocxo1", "ocxo2"):
+        dac = row.welfords[f"{lane}_dac"]
+        ocxo = row.welfords[lane]
+        if dac.n > ocxo.n:
+            audit.problem(
+                "dac_ocxo_ancestry",
+                row,
+                f"{lane} dac.n={dac.n} > ocxo.n={ocxo.n}",
+            )
+
+    for lane in ("ocxo1", "ocxo2"):
+        readback = row.dac_readback[lane]
+        if readback is not None and readback != row.dac_hw[lane]:
+            audit.problem(
+                "dac_readback",
+                row,
+                f"{lane} hw={row.dac_hw[lane]} readback={readback}",
+            )
+        if not row.dither_enabled:
+            rounded = int(math.floor(row.dac_target[lane] + 0.5))
+            if row.dac_hw[lane] != rounded:
+                audit.problem(
+                    "dac_static_target",
+                    row,
+                    f"{lane} target={row.dac_target[lane]} "
+                    f"hw={row.dac_hw[lane]} rounded={rounded}",
+                )
+        else:
+            lo = int(math.floor(row.dac_target[lane]))
+            hi = int(math.ceil(row.dac_target[lane]))
+            if row.dac_hw[lane] not in {lo, hi}:
+                audit.problem(
+                    "dac_dither_target",
+                    row,
+                    f"{lane} target={row.dac_target[lane]} hw={row.dac_hw[lane]} "
+                    f"expected one of {lo}/{hi}",
+                )
+
+    check_dwt_vclock_total(audit, row, "dwt")
+    check_dwt_vclock_total(audit, row, "vclock")
+    check_tau(audit, row, "ocxo1")
+    check_tau(audit, row, "ocxo2")
+
+    if row.gnss_raw_clockface_n is not None and row.gnss_raw_ref_ns is not None:
+        expected_ref = row.gnss_raw_clockface_n * NS_PER_SECOND
+        if row.gnss_raw_ref_ns != expected_ref:
+            audit.problem(
+                "gnss_raw_reference",
+                row,
+                f"clockface_n={row.gnss_raw_clockface_n} "
+                f"ref_ns={row.gnss_raw_ref_ns} expected={expected_ref}",
+            )
+
+    if row.campaign_name is not None:
+        if row.campaign_public_count is None:
+            audit.problem("campaign_identity", row, "campaign has no public_count")
+        else:
+            cgnss = row.campaign_clockfaces.get("gnss_ns")
+            expected = row.campaign_public_count * NS_PER_SECOND
+            if cgnss is None or cgnss != expected:
+                audit.problem(
+                    "campaign_gnss_clockface",
+                    row,
+                    f"public_count={row.campaign_public_count} gnss_ns={cgnss} "
+                    f"expected={expected}",
+                )
+
+        cfaces = row.campaign_clockfaces
+        cgnss = cfaces.get("gnss_ns")
+        if cgnss and cgnss > 0:
+            expected_values: Dict[str, float] = {}
+            dwt = cfaces.get("dwt_cycles")
+            o1 = cfaces.get("ocxo1_ns")
+            o2 = cfaces.get("ocxo2_ns")
+            if dwt is not None:
+                expected_values["dwt"] = (
+                    float(dwt) / (float(cgnss) * 1.008) - 1.0
+                ) * 1.0e9
+            expected_values["vclock"] = 0.0
+            if o1 is not None:
+                expected_values["ocxo1"] = (
+                    float(o1) / float(cgnss) - 1.0
+                ) * 1.0e9
+            if o2 is not None:
+                expected_values["ocxo2"] = (
+                    float(o2) / float(cgnss) - 1.0
+                ) * 1.0e9
+            for lane, expected_ppb in expected_values.items():
+                published = row.campaign_ppb.get(lane)
+                if published is not None and not close(
+                    published,
+                    expected_ppb,
+                    abs_tol=PPB_TOLERANCE,
+                    rel_tol=2.0e-12,
+                ):
+                    audit.problem(
+                        "campaign_ppb",
+                        row,
+                        f"{lane} published={published:.9f} "
+                        f"clockface={expected_ppb:.9f}",
+                    )
+
+
+def check_adjacent(audit: Audit, prev: Row, cur: Row) -> None:
+    if cur.db_id <= prev.db_id:
+        audit.problem(
+            "db_chronology",
+            cur,
+            f"id {prev.db_id}->{cur.db_id}",
+        )
+
+    if prev.gnss_utc_s is not None and cur.gnss_utc_s is not None:
+        elapsed = cur.gnss_utc_s - prev.gnss_utc_s
+        if elapsed <= 0:
+            audit.problem(
+                "gnss_utc_chronology",
+                cur,
+                f"{prev.gnss_utc}->{cur.gnss_utc}",
+            )
+        elif elapsed > 1:
+            audit.durable_gaps += 1
+            audit.gnss_gap_seconds += elapsed - 1
+            audit.event(
+                "durable_gap",
+                cur,
+                f"elapsed={elapsed}s db_id={prev.db_id}->{cur.db_id}",
+            )
+
+        # Always-on logical clockfaces must carry elapsed GNSS time across both
+        # Pi and Teensy recovery.  This is one of the strongest holistic checks.
+        if elapsed > 0:
+            expected_gnss_delta = elapsed * NS_PER_SECOND
+            actual_gnss_delta = cur.clock_gnss_ns - prev.clock_gnss_ns
+            if actual_gnss_delta != expected_gnss_delta:
+                audit.problem(
+                    "clockface_gnss_continuity",
+                    cur,
+                    f"elapsed={elapsed}s delta={actual_gnss_delta} "
+                    f"expected={expected_gnss_delta}",
+                )
+            age_delta = cur.instrument_age_seconds - prev.instrument_age_seconds
+            if age_delta != elapsed:
+                audit.problem(
+                    "instrument_age_continuity",
+                    cur,
+                    f"elapsed={elapsed}s age_delta={age_delta}",
+                )
+
+    seq_delta = cur.sequence - prev.sequence
+    if seq_delta < 0:
+        audit.physical_reboots += 1
+        audit.event(
+            "physical_sequence_rebase",
+            cur,
+            f"sequence {prev.sequence}->{cur.sequence}",
+        )
+    elif seq_delta == 0:
+        audit.problem(
+            "physical_sequence_repeat",
+            cur,
+            f"sequence={cur.sequence}",
+        )
+    elif seq_delta > 1:
+        audit.event(
+            "physical_sequence_gap",
+            cur,
+            f"sequence {prev.sequence}->{cur.sequence}",
+        )
+
+    if cur.reset_count < prev.reset_count:
+        audit.problem(
+            "stats_reset_regression",
+            cur,
+            f"reset_count {prev.reset_count}->{cur.reset_count}",
+        )
+    elif cur.reset_count > prev.reset_count:
+        audit.stats_resets += 1
+        audit.event(
+            "stats_epoch",
+            cur,
+            f"reset_count {prev.reset_count}->{cur.reset_count} "
+            f"update_count={cur.update_count}",
+        )
+        if cur.update_count != 1:
+            audit.problem(
+                "stats_epoch_birth",
+                cur,
+                f"new reset_count={cur.reset_count} begins update_count={cur.update_count}, expected 1",
+            )
+        if cur.rolling_sequence not in (0, 1):
+            audit.problem(
+                "rolling_epoch_birth",
+                cur,
+                f"new reset_count={cur.reset_count} rolling_sequence={cur.rolling_sequence}",
+            )
+    else:
+        update_delta = cur.update_count - prev.update_count
+        if update_delta <= 0:
+            audit.problem(
+                "stats_update_chronology",
+                cur,
+                f"reset_count={cur.reset_count} update_count "
+                f"{prev.update_count}->{cur.update_count}",
+            )
+        elif seq_delta > 0 and update_delta != seq_delta:
+            audit.problem(
+                "stats_physical_chronology",
+                cur,
+                f"same Teensy lifetime sequence_delta={seq_delta} "
+                f"update_delta={update_delta}",
+            )
+        elif seq_delta < 0 and update_delta > 1:
+            audit.event(
+                "stats_post_reboot_advancement",
+                cur,
+                f"physical sequence rebased while update_count advanced "
+                f"{prev.update_count}->{cur.update_count}",
+            )
+        for name in WELFORD_LANES:
+            known_sample: Optional[float] = None
+            if name == "ocxo1_dac":
+                known_sample = float(cur.dac_target["ocxo1"])
+            elif name == "ocxo2_dac":
+                known_sample = float(cur.dac_target["ocxo2"])
+            check_welford_step(
+                audit,
+                cur,
+                name,
+                prev.welfords[name],
+                cur.welfords[name],
+                known_sample=known_sample,
+            )
+            if name.endswith("_dac") and cur.welfords[name].n == prev.welfords[name].n + 1:
+                audit.exact_dac_steps += 1
+
+    # Pi GNSS_RAW has its own lifetime.  A Teensy sequence rebase must not reset
+    # it.  If the Welford advances exactly once, the current GNSS drift value is
+    # the sample and closes the recurrence independently.
+    if prev.gnss_raw_welford is not None and cur.gnss_raw_welford is not None:
+        if (
+            cur.gnss_raw_welford.n == prev.gnss_raw_welford.n + 1
+            and cur.gnss_raw_drift_ppb is not None
+        ):
+            before = audit.exact_welford_steps
+            check_welford_step(
+                audit,
+                cur,
+                "gnss_raw",
+                prev.gnss_raw_welford,
+                cur.gnss_raw_welford,
+                known_sample=cur.gnss_raw_drift_ppb,
+            )
+            if audit.exact_welford_steps > before:
+                audit.exact_gnss_raw_steps += 1
+        elif cur.gnss_raw_welford.n < prev.gnss_raw_welford.n:
+            audit.problem(
+                "gnss_raw_welford_regression",
+                cur,
+                f"n {prev.gnss_raw_welford.n}->{cur.gnss_raw_welford.n}",
+            )
+
+    if (
+        prev.gnss_raw_clockface_n is not None
+        and cur.gnss_raw_clockface_n is not None
+        and cur.gnss_raw_clockface_n != prev.gnss_raw_clockface_n + 1
+    ):
+        audit.problem(
+            "gnss_raw_clockface_chronology",
+            cur,
+            f"clockface_n {prev.gnss_raw_clockface_n}->{cur.gnss_raw_clockface_n}",
+        )
+
+    # Same campaign: public time is elapsed campaign time, so after recovery a
+    # truthful forward splice must equal elapsed GNSS time, not necessarily +1.
+    if (
+        prev.campaign_name is not None
+        and cur.campaign_name == prev.campaign_name
+        and prev.campaign_public_count is not None
+        and cur.campaign_public_count is not None
+    ):
+        public_delta = cur.campaign_public_count - prev.campaign_public_count
+        elapsed = (
+            cur.gnss_utc_s - prev.gnss_utc_s
+            if prev.gnss_utc_s is not None and cur.gnss_utc_s is not None
+            else None
+        )
+        if public_delta <= 0:
+            audit.problem(
+                "campaign_public_chronology",
+                cur,
+                f"{prev.campaign_public_count}->{cur.campaign_public_count}",
+            )
+        elif elapsed is not None and public_delta != elapsed:
+            audit.problem(
+                "campaign_public_elapsed",
+                cur,
+                f"public_delta={public_delta} elapsed_gnss={elapsed}",
+            )
+        elif public_delta > 1:
+            audit.campaign_splices += 1
+            audit.event(
+                "campaign_forward_splice",
+                cur,
+                f"{prev.campaign_public_count}->{cur.campaign_public_count} "
+                f"elapsed={elapsed}s",
+            )
+
+    if cur.superseded and not prev.superseded:
+        audit.event("superseded_region", cur, "row marked holistic_restore_superseded")
+
+
+def process_row(audit: Audit, prev: Optional[Row], row: Row) -> None:
+    audit.rows += 1
+    audit.first_db_id = row.db_id if audit.first_db_id is None else audit.first_db_id
+    audit.last_db_id = row.db_id
+    audit.first_ts = row.ts if not audit.first_ts else audit.first_ts
+    audit.last_ts = row.ts
+    audit.first_gnss = row.gnss_utc if not audit.first_gnss else audit.first_gnss
+    audit.last_gnss = row.gnss_utc
+    audit.epochs[row.reset_count] += 1
+    if row.campaign_name:
+        audit.campaigns[row.campaign_name] += 1
+    if row.recovery_classification:
+        audit.recovery_classes[row.recovery_classification] += 1
+
+    check_row_internal(audit, row)
+    if prev is not None:
+        check_adjacent(audit, prev, row)
+    check_buckets(audit, row)
+
+
 def iter_rows(
-    campaign: str,
     *,
+    campaign: Optional[str],
+    from_id: int,
+    to_id: int,
     batch_size: int,
     pause_ms: int,
     limit: int,
-) -> Iterator[Tuple[int, int, str, Dict[str, Any]]]:
+) -> Iterator[Tuple[int, str, Dict[str, Any]]]:
+    where = [
+        "campaign_type = %s",
+        "payload #>> '{schema}' = %s",
+    ]
+    params: list[Any] = [CAMPAIGN_TYPE, CLOCKS_SCHEMA]
+
+    if campaign is not None:
+        where.append("campaign = %s")
+        params.append(campaign)
+    if from_id > 0:
+        where.append("id >= %s")
+        params.append(from_id)
+    if to_id > 0:
+        where.append("id <= %s")
+        params.append(to_id)
+
+    sql = f"""
+        SELECT id, ts, payload
+        FROM campaign_detail
+        WHERE {' AND '.join(where)}
+        ORDER BY id ASC
+    """
+    if limit > 0:
+        sql += " LIMIT %s"
+        params.append(limit)
+
     with open_db(row_dict=True) as conn:
         conn.execute("SET TRANSACTION READ ONLY")
-        check = conn.cursor()
-        _assert_campaign_indexed(check, campaign)
-        check.close()
-
-        sql = f"""
-            SELECT id, ts, {PPS_COUNT_SQL} AS pps_count, payload
-            FROM campaign_detail
-            WHERE campaign_type = %s
-              AND campaign = %s
-              AND payload #>> '{{campaign,schema}}' = 'TEMPEST_FRAGMENT_V1'
-              AND {PPS_COUNT_SQL} IS NOT NULL
-            ORDER BY {PPS_COUNT_SQL} ASC, id ASC
-        """
-        params: list[Any] = [CAMPAIGN_TYPE, campaign]
-        if limit > 0:
-            sql += " LIMIT %s"
-            params.append(limit)
-
-        cur = conn.cursor(name="campaign_analyzer_stream")
+        cur = conn.cursor(name="campaign_analyzer_clocks_lineage")
         cur.itersize = max(1, batch_size)
         cur.execute(sql, tuple(params))
 
         in_batch = 0
-        for row in cur:
-            payload = row["payload"]
+        for dbrow in cur:
+            payload = dbrow["payload"]
             if isinstance(payload, str):
                 payload = json.loads(payload)
             if not isinstance(payload, dict):
-                continue
-            yield int(row["id"]), int(row["pps_count"]), str(row["ts"]), payload
+                raise RuntimeError(f"campaign_detail id={dbrow['id']} payload is not an object")
+            yield int(dbrow["id"]), str(dbrow["ts"]), payload
             in_batch += 1
             if in_batch >= max(1, batch_size):
                 in_batch = 0
-                if pause_ms > 0:
+                if pause_ms:
                     time.sleep(pause_ms / 1000.0)
 
 
-def compact(db_id: int, db_pps: int, ts: str, payload: Dict[str, Any]) -> CompactRow:
-    payload_root = root(payload)
-    campaign = campaign_view(payload)
-    clocks = clocks_view(payload)
-    adjudication = adjudication_view(payload)
-    final_court = d(adjudication.get("final_court"))
-    clockfaces = d(campaign.get("clockfaces"))
-    campaign_status = d(campaign.get("status"))
-    recovery = d(campaign.get("recovery"))
+def scope_report() -> None:
+    with open_db(row_dict=True) as conn:
+        conn.execute("SET TRANSACTION READ ONLY")
+        cur = conn.cursor()
 
-    payload_pps = first_int(campaign.get("public_count"))
-    if payload_pps is None:
-        raise ValueError(f"campaign_detail TEMPEST row id={db_id} missing campaign.public_count")
-    if payload_pps != db_pps:
-        raise ValueError(
-            f"campaign_detail campaign PPS mismatch id={db_id} db={db_pps} payload={payload_pps}"
+        cur.execute(
+            """
+            SELECT
+                count(*) AS rows,
+                min(id) AS min_id,
+                max(id) AS max_id,
+                min(ts) AS first_ts,
+                max(ts) AS last_ts,
+                count(*) FILTER (WHERE campaign IS NULL) AS ambient_rows,
+                count(*) FILTER (WHERE campaign IS NOT NULL) AS campaign_rows,
+                count(*) FILTER (
+                    WHERE COALESCE((payload #>> '{holistic_restore_superseded}')::boolean, false)
+                ) AS superseded_rows
+            FROM campaign_detail
+            WHERE campaign_type = %s
+              AND payload #>> '{schema}' = %s
+            """,
+            (CAMPAIGN_TYPE, CLOCKS_SCHEMA),
         )
+        totals = cur.fetchone() or {}
 
-    def ocxo(prefix: str) -> tuple[Optional[int], Optional[int], Optional[int], Optional[bool]]:
-        lane = d(campaign.get(prefix))
-        science = d(lane.get("science"))
-        ns = first_int(clockfaces.get(f"{prefix}_ns"))
-        interval = first_int(science.get("clock_interval_ns"))
-        fast = first_int(science.get("fast_residual_ns"))
-        valid = b(science.get("valid"))
-        return ns, interval, fast, valid
+        cur.execute(
+            """
+            SELECT
+                (payload #>> '{clocks,stats,reset_count}')::bigint AS reset_count,
+                min(id) AS min_id,
+                max(id) AS max_id,
+                count(*) AS rows,
+                min(ts) AS first_ts,
+                max(ts) AS last_ts
+            FROM campaign_detail
+            WHERE campaign_type = %s
+              AND payload #>> '{schema}' = %s
+              AND payload #>> '{clocks,stats,reset_count}' IS NOT NULL
+            GROUP BY 1
+            ORDER BY 1
+            """,
+            (CAMPAIGN_TYPE, CLOCKS_SCHEMA),
+        )
+        epochs = cur.fetchall()
 
-    o1_ns, o1_int, o1_res, o1_valid = ocxo("ocxo1")
-    o2_ns, o2_int, o2_res, o2_valid = ocxo("ocxo2")
-    row_science_eligible, row_science_excluded, row_science_reason = (
-        science_disposition(payload_root, campaign)
+        cur.execute(
+            """
+            SELECT campaign, count(*) AS rows, min(id) AS min_id, max(id) AS max_id,
+                   max(ts) AS last_ts
+            FROM campaign_detail
+            WHERE campaign_type = %s
+              AND payload #>> '{schema}' = %s
+              AND campaign IS NOT NULL
+            GROUP BY campaign
+            ORDER BY max(ts) DESC
+            LIMIT 20
+            """,
+            (CAMPAIGN_TYPE, CLOCKS_SCHEMA),
+        )
+        campaigns = cur.fetchall()
+
+    print("=" * 88)
+    print("CLOCKS_V4 AUDIT SCOPE")
+    print("=" * 88)
+    print(
+        f"Rows: {int(totals.get('rows') or 0):,}   "
+        f"DB id: {totals.get('min_id')}..{totals.get('max_id')}   "
+        f"ambient={int(totals.get('ambient_rows') or 0):,}   "
+        f"campaign={int(totals.get('campaign_rows') or 0):,}   "
+        f"superseded={int(totals.get('superseded_rows') or 0):,}"
     )
+    print(f"Time: {totals.get('first_ts')} -> {totals.get('last_ts')}")
 
-    stats_obj = d(clocks.get("stats"))
-    raw_cycles = d(clocks.get("raw_cycles"))
-    raw_lanes = {lane: d(raw_cycles.get(lane)) for lane in SNAPSHOT_LANES}
-
-    stats_snapshot_ok = b(stats_obj.get("snapshot_ok"))
-    stats_valid = b(stats_obj.get("valid"))
-    stats_completed_row_coherent = b(stats_obj.get("completed_row_coherent"))
-    raw_snapshot_ok = {
-        lane: b(raw_lanes[lane].get("snapshot_ok")) for lane in SNAPSHOT_LANES
-    }
-    raw_valid = {
-        lane: b(raw_lanes[lane].get("valid")) for lane in SNAPSHOT_LANES
-    }
-    forensics_snapshot_ok = {
-        lane: b(raw_lanes[lane].get("forensics_snapshot_ok"))
-        for lane in SNAPSHOT_LANES
-    }
-    delay_detail_present = {
-        lane: b(raw_lanes[lane].get("delay_detail_present"))
-        for lane in SNAPSHOT_LANES
-    }
-    delay_status = {
-        lane: str(raw_lanes[lane].get("delay_status") or "").strip().upper()
-        for lane in SNAPSHOT_LANES
-    }
-
-    snapshot_contract_present = bool(
-        "snapshot_ok" in stats_obj
-        or any(
-            "snapshot_ok" in raw_lanes[lane]
-            or "forensics_snapshot_ok" in raw_lanes[lane]
-            or "delay_detail_present" in raw_lanes[lane]
-            for lane in SNAPSHOT_LANES
-        )
-    )
-    snapshot_contract_missing: list[str] = []
-    if snapshot_contract_present:
-        for name, value in (
-            ("stats.snapshot_ok", stats_snapshot_ok),
-            ("stats.valid", stats_valid),
-            ("stats.completed_row_coherent", stats_completed_row_coherent),
-        ):
-            if value is None:
-                snapshot_contract_missing.append(name)
-        for lane in SNAPSHOT_LANES:
-            for name, value in (
-                (f"raw_cycles.{lane}.snapshot_ok", raw_snapshot_ok[lane]),
-                (f"raw_cycles.{lane}.valid", raw_valid[lane]),
-                (f"raw_cycles.{lane}.forensics_snapshot_ok", forensics_snapshot_ok[lane]),
-                (f"raw_cycles.{lane}.delay_detail_present", delay_detail_present[lane]),
-            ):
-                if value is None:
-                    snapshot_contract_missing.append(name)
-            if not delay_status[lane]:
-                snapshot_contract_missing.append(f"raw_cycles.{lane}.delay_status")
-
-    stats_usable = (
-        stats_snapshot_ok is True
-        and stats_valid is True
-        and stats_completed_row_coherent is True
-    )
-
-    recovery_evidence = bool(recovery) and bool(
-        b(recovery.get("transition_active")) is True
-        or b(recovery.get("degraded_active")) is True
-        or b(recovery.get("science_quarantine_active")) is True
-        or b(recovery.get("reattach_stalled")) is True
-    )
-    recovery_hold = bool(
-        b(recovery.get("science_quarantine_active")) is True
-        or (
-            b(recovery.get("degraded_active")) is True
-            and b(recovery.get("science_ready")) is not True
-        )
-    )
-
-    welford_n: Dict[str, Optional[int]] = {}
-    welford_sd: Dict[str, Optional[float]] = {}
-    for lane in ("dwt", "vclock", "ocxo1", "ocxo2"):
-        welford_n[lane] = (
-            first_int(path(stats_obj, f"{lane}.welford.n")) if stats_usable else None
-        )
-        welford_sd[lane] = (
-            first_float(path(stats_obj, f"{lane}.welford.stddev")) if stats_usable else None
+    print("\nSTATISTICAL EPOCHS")
+    if not epochs:
+        print("  none")
+    for row in epochs:
+        print(
+            f"  reset={int(row['reset_count']):>4d} "
+            f"rows={int(row['rows']):>9,d} "
+            f"id={row['min_id']}..{row['max_id']} "
+            f"{row['first_ts']} -> {row['last_ts']}"
         )
 
-    campaign_ppb = d(d(campaign.get("stats")).get("ppb"))
-    control = d(clocks.get("control"))
-
-    return CompactRow(
-        db_id=db_id,
-        pps=db_pps,
-        ts=ts,
-        campaign=str(campaign.get("name") or ""),
-        gnss_ns=first_int(clockfaces.get("gnss_ns")),
-        vclock_ns=first_int(clockfaces.get("gnss_ns")),
-        dwt_cycles=first_int(clockfaces.get("dwt_cycles")),
-        ocxo1_ns=o1_ns,
-        ocxo2_ns=o2_ns,
-        ocxo1_interval_ns=o1_int,
-        ocxo2_interval_ns=o2_int,
-        ocxo1_residual_ns=o1_res,
-        ocxo2_residual_ns=o2_res,
-        ocxo1_valid=o1_valid,
-        ocxo2_valid=o2_valid,
-        dwt_ppb=first_float(campaign_ppb.get("dwt")),
-        vclock_ppb=first_float(campaign_ppb.get("vclock")),
-        ocxo1_ppb=first_float(campaign_ppb.get("ocxo1")),
-        ocxo2_ppb=first_float(campaign_ppb.get("ocxo2")),
-        science_eligible=row_science_eligible,
-        science_excluded=row_science_excluded,
-        science_reason=row_science_reason,
-        recovery_evidence=recovery_evidence,
-        recovery_hold=recovery_hold,
-        timeline_ready=b(recovery.get("timeline_ready")),
-        clockface_ready=b(recovery.get("clockface_ready")),
-        science_ready=b(recovery.get("science_ready")),
-        welford_n=welford_n,
-        welford_sd=welford_sd,
-        snapshot_contract_present=snapshot_contract_present,
-        snapshot_contract_missing=tuple(snapshot_contract_missing),
-        stats_snapshot_ok=stats_snapshot_ok,
-        stats_valid=stats_valid,
-        stats_completed_row_coherent=stats_completed_row_coherent,
-        raw_snapshot_ok=raw_snapshot_ok,
-        raw_valid=raw_valid,
-        forensics_snapshot_ok=forensics_snapshot_ok,
-        delay_detail_present=delay_detail_present,
-        delay_status=delay_status,
-        servo_mode=str(control.get("servo_mode") or "?"),
-        location=str(adjudication.get("location") or "?"),
-        environment=d(payload_root.get("environment")),
-        final_forensics=final_court,
-    )
-
-
-def update_snapshot_contract(audit: Audit, cur: CompactRow) -> None:
-    """Audit explicit snapshot acquisition separately from scientific validity."""
-    if not cur.snapshot_contract_present:
-        if audit.first_snapshot_contract_pps is None:
-            audit.snapshot_legacy_rows += 1
-        else:
-            audit.snapshot_missing_after_activation += 1
-            audit.note(
-                "Snapshot contract missing",
-                f"pps={cur.pps} contract absent after "
-                f"first_pps={audit.first_snapshot_contract_pps}",
-            )
-        return
-
-    audit.snapshot_contract_rows += 1
-    if audit.first_snapshot_contract_pps is None:
-        audit.first_snapshot_contract_pps = cur.pps
-    audit.last_snapshot_contract_pps = cur.pps
-
-    row_has_omission = bool(cur.snapshot_contract_missing)
-    for field_name in cur.snapshot_contract_missing:
-        audit.snapshot_contract_omissions[field_name] += 1
-        audit.note(
-            "Snapshot field missing/invalid",
-            f"pps={cur.pps} field={field_name}",
+    print("\nRECENT CAMPAIGNS")
+    if not campaigns:
+        print("  none")
+    for row in campaigns:
+        print(
+            f"  {str(row['campaign']):<24s} rows={int(row['rows']):>9,d} "
+            f"id={row['min_id']}..{row['max_id']} last={row['last_ts']}"
         )
 
-    row_failed = False
-    row_immature = False
-    if cur.stats_snapshot_ok is False:
-        audit.stats_snapshot_failures += 1
-        row_failed = True
-        audit.note("Statistics snapshot unavailable", f"pps={cur.pps}")
-    elif cur.stats_snapshot_ok is True and (
-        cur.stats_valid is False or cur.stats_completed_row_coherent is False
-    ):
-        audit.coherent_immature_snapshots["stats"] += 1
-        row_immature = True
-        audit.note(
-            "Coherent but immature snapshot",
-            f"pps={cur.pps} scope=stats valid={cur.stats_valid} "
-            f"completed_row_coherent={cur.stats_completed_row_coherent}",
-        )
-
-    contradictions: list[str] = []
-    if cur.stats_snapshot_ok is False and cur.stats_valid is True:
-        contradictions.append("stats snapshot_ok=false but valid=true")
-    if (
-        cur.stats_snapshot_ok is False
-        and cur.stats_completed_row_coherent is True
-    ):
-        contradictions.append(
-            "stats snapshot_ok=false but completed_row_coherent=true"
-        )
-
-    for lane in SNAPSHOT_LANES:
-        if cur.raw_snapshot_ok[lane] is False:
-            audit.prediction_snapshot_failures[lane] += 1
-            row_failed = True
-            audit.note(
-                "Prediction snapshot unavailable",
-                f"pps={cur.pps} lane={lane}",
-            )
-        elif cur.raw_snapshot_ok[lane] is True and cur.raw_valid[lane] is False:
-            audit.coherent_immature_snapshots[lane] += 1
-            row_immature = True
-            audit.note(
-                "Coherent but immature snapshot",
-                f"pps={cur.pps} scope=prediction lane={lane} valid=false",
-            )
-
-        if cur.forensics_snapshot_ok[lane] is False:
-            audit.forensics_snapshot_failures[lane] += 1
-            row_failed = True
-            audit.note(
-                "Forensics snapshot unavailable",
-                f"pps={cur.pps} lane={lane}",
-            )
-
-        if cur.raw_snapshot_ok[lane] is False and cur.raw_valid[lane] is True:
-            contradictions.append(
-                f"{lane} snapshot_ok=false but valid=true"
-            )
-        if (
-            cur.forensics_snapshot_ok[lane] is False
-            and cur.delay_detail_present[lane] is True
-        ):
-            contradictions.append(
-                f"{lane} forensics_snapshot_ok=false but delay_detail_present=true"
-            )
-        if (
-            cur.forensics_snapshot_ok[lane] is False
-            and cur.delay_status[lane]
-            and cur.delay_status[lane] != "SNAPSHOT_UNAVAILABLE"
-        ):
-            contradictions.append(
-                f"{lane} forensics_snapshot_ok=false but delay_status={cur.delay_status[lane]}"
-            )
-
-    if contradictions:
-        audit.snapshot_contract_violation_rows += 1
-    for detail in contradictions:
-        audit.snapshot_contract_violations += 1
-        audit.note("Snapshot contract violation", f"pps={cur.pps} {detail}")
-
-    if row_immature and audit.last_coherent_immature_pps != cur.pps:
-        audit.coherent_immature_rows += 1
-        audit.last_coherent_immature_pps = cur.pps
-
-    if not row_failed and not row_has_omission and not contradictions:
-        audit.snapshot_clean_rows += 1
-
-    if row_failed:
-        audit.snapshot_failure_rows += 1
-        if cur.science_eligible:
-            audit.snapshot_failure_science_rows += 1
+    print("\nUsage:")
+    print("  campaign_analyzer.py --all")
+    print("  campaign_analyzer.py CAMPAIGN")
+    print("  campaign_analyzer.py --all --from-id N --to-id N")
+    print("  Optional: --batch-size N --pause-ms N --limit N")
 
 
-def update(audit: Audit, prev: Optional[CompactRow], cur: CompactRow) -> None:
-    audit.rows += 1
-    if cur.science_eligible:
-        audit.science_rows += 1
-    else:
-        audit.science_excluded_rows += 1
-        audit.note("Science excluded", f"pps={cur.pps} reason={cur.science_reason}")
-    audit.first_pps = cur.pps if audit.first_pps is None else audit.first_pps
-    audit.last_pps = cur.pps
-    audit.first_ts = cur.ts if not audit.first_ts else audit.first_ts
-    audit.last_ts = cur.ts
-    audit.final_row = cur
-    update_snapshot_contract(audit, cur)
-
-    if cur.gnss_ns is not None:
-        identity_offset = cur.gnss_ns - cur.pps * NS_PER_SECOND
-        audit.gnss_identity_offsets_ns[identity_offset] += 1
-        if identity_offset != 0:
-            audit.gnss_identity_errors += 1
-            audit.note(
-                "GNSS identity",
-                f"pps={cur.pps} gnss={cur.gnss_ns} offset_ns={identity_offset:+d}",
-            )
-
-    for key, value in (
-        ("dwt_ppb", cur.dwt_ppb),
-        ("vclock_ppb", cur.vclock_ppb),
-        ("ocxo1_ppb", cur.ocxo1_ppb),
-        ("ocxo2_ppb", cur.ocxo2_ppb),
-    ):
-        if value is not None and cur.science_eligible:
-            audit.stats[key].update(value, cur.pps)
-            if abs(value) > PPB_ABSOLUTE_ALARM:
-                audit.ppb_alarms += 1
-                audit.note_science_event(cur.pps)
-                audit.note("PPB absolute", f"pps={cur.pps} {key}={value:+.3f}")
-
-    for lane, interval, residual, valid in (
-        ("ocxo1", cur.ocxo1_interval_ns, cur.ocxo1_residual_ns, cur.ocxo1_valid),
-        ("ocxo2", cur.ocxo2_interval_ns, cur.ocxo2_residual_ns, cur.ocxo2_valid),
-    ):
-        if interval is not None and valid is True and cur.science_eligible:
-            audit.stats[f"{lane}_interval"].update(float(interval), cur.pps)
-            deviation = interval - NS_PER_SECOND
-            if abs(deviation) > OCXO_SECOND_ALARM_NS:
-                setattr(audit, f"{lane}_interval_alarms",
-                        getattr(audit, f"{lane}_interval_alarms") + 1)
-                audit.note_science_event(cur.pps)
-                audit.note(
-                    f"{lane.upper()} interval",
-                    f"pps={cur.pps} interval={interval} deviation={deviation:+d} valid={valid}",
-                )
-        if residual is not None and valid is True and cur.science_eligible:
-            audit.stats[f"{lane}_residual"].update(float(residual), cur.pps)
-
-        if interval is not None and valid is True and cur.science_eligible:
-            deviation = interval - NS_PER_SECOND
-            if abs(deviation) > OCXO_SCIENCE_OUTLIER_NS:
-                attr = f"{lane}_science_outliers"
-                setattr(audit, attr, getattr(audit, attr) + 1)
-                audit.note_science_event(cur.pps)
-                previous_context = (
-                    "none"
-                    if prev is None
-                    else (
-                        f"pps={prev.pps} eligible={prev.science_eligible} "
-                        f"excluded={prev.science_excluded} valid={getattr(prev, f'{lane}_valid')}"
-                    )
-                )
-                audit.note(
-                    f"Admitted {lane.upper()} interval outlier",
-                    f"pps={cur.pps} interval={interval} deviation={deviation:+d} "
-                    f"residual={residual} previous=[{previous_context}]",
-                )
-
-    if (
-        cur.ocxo1_residual_ns is not None
-        and cur.ocxo2_residual_ns is not None
-        and cur.ocxo1_valid is True
-        and cur.ocxo2_valid is True
-        and cur.science_eligible
-    ):
-        divergence = cur.ocxo1_residual_ns - cur.ocxo2_residual_ns
-        audit.stats["ocxo_divergence"].update(float(divergence), cur.pps)
-        if abs(divergence) > OCXO_SCIENCE_OUTLIER_NS:
-            audit.divergence_science_outliers += 1
-            audit.note_science_event(cur.pps)
-            audit.note(
-                "Admitted OCXO divergence outlier",
-                f"pps={cur.pps} divergence={divergence:+d} "
-                f"ocxo1_residual={cur.ocxo1_residual_ns:+d} "
-                f"ocxo2_residual={cur.ocxo2_residual_ns:+d}",
-            )
-
-    if prev is None:
-        return
-
-    delta_pps = cur.pps - prev.pps
-    if delta_pps == 0:
-        audit.repeats += 1
-        audit.note("PPS repeat", f"pps={cur.pps}")
-    elif delta_pps < 0:
-        audit.regressions += 1
-        audit.note("PPS regression", f"{prev.pps}->{cur.pps}")
-    elif delta_pps > 1:
-        missing = delta_pps - 1
-        audit.gaps += 1
-        audit.missing_identities += missing
-        if cur.recovery_evidence:
-            audit.recovery_gaps += 1
-            audit.recovery_missing_identities += missing
-            audit.note(
-                "Recovery gap",
-                f"{prev.pps}->{cur.pps} missing={missing} "
-                f"timeline_ready={cur.timeline_ready} clockface_ready={cur.clockface_ready} "
-                f"science_ready={cur.science_ready}",
-            )
-        else:
-            audit.unclassified_gaps += 1
-            audit.unclassified_missing_identities += missing
-            audit.note("Unclassified gap", f"{prev.pps}->{cur.pps} missing={missing}")
-
-    if delta_pps != 1:
-        return
-
-    if prev.gnss_ns is not None and cur.gnss_ns is not None:
-        if cur.gnss_ns - prev.gnss_ns != NS_PER_SECOND:
-            audit.gnss_adjacent_errors += 1
-            audit.note(
-                "GNSS adjacent",
-                f"pps={cur.pps} delta={cur.gnss_ns - prev.gnss_ns}",
-            )
-
-    if prev.dwt_cycles is not None and cur.dwt_cycles is not None:
-        dwt_delta = cur.dwt_cycles - prev.dwt_cycles
-        if prev.science_eligible and cur.science_eligible:
-            audit.stats["dwt_delta"].update(float(dwt_delta), cur.pps)
-        if dwt_delta <= 0:
-            audit.dwt_nonmonotonic += 1
-            audit.note_science_event(cur.pps)
-            audit.note("DWT nonmonotonic", f"pps={cur.pps} delta={dwt_delta}")
-
-    for lane in ("ocxo1", "ocxo2"):
-        prev_ns = getattr(prev, f"{lane}_ns")
-        cur_ns = getattr(cur, f"{lane}_ns")
-        interval = getattr(cur, f"{lane}_interval_ns")
-        if prev_ns is not None and cur_ns is not None and interval is not None:
-            error = (cur_ns - prev_ns) - interval
-            if (
-                abs(error) > OCXO_SECOND_WARN_NS
-                and prev.science_eligible
-                and cur.science_eligible
-                and getattr(prev, f"{lane}_valid") is True
-                and getattr(cur, f"{lane}_valid") is True
-            ):
-                setattr(audit, f"{lane}_ledger_errors",
-                        getattr(audit, f"{lane}_ledger_errors") + 1)
-                audit.note_science_event(cur.pps)
-                audit.note(
-                    f"{lane.upper()} ledger",
-                    f"pps={cur.pps} ledger_delta={cur_ns - prev_ns} interval={interval} error={error:+d}",
-                )
-
-    for lane in ("dwt", "vclock", "ocxo1", "ocxo2"):
-        pn = prev.welford_n.get(lane)
-        cn = cur.welford_n.get(lane)
-        if pn is None or cn is None:
-            continue
-        if cn < pn:
-            audit.welford_regressions += 1
-            audit.note_science_event(cur.pps)
-            audit.note("Welford regression", f"pps={cur.pps} {lane} {pn}->{cn}")
-
-    for lane in ("dwt", "vclock", "ocxo1", "ocxo2"):
-        pv = getattr(prev, f"{lane}_ppb")
-        cv = getattr(cur, f"{lane}_ppb")
-        if (
-            prev.science_eligible
-            and cur.science_eligible
-            and pv is not None
-            and cv is not None
-            and abs(cv - pv) > PPB_STEP_ALARM
-        ):
-            audit.ppb_steps += 1
-            audit.note_science_event(cur.pps)
-            audit.note("PPB step", f"pps={cur.pps} {lane} {pv:+.3f}->{cv:+.3f}")
-
-
-def print_report(audit: Audit, batch_size: int, pause_ms: int) -> None:
+def print_report(audit: Audit) -> None:
+    print("=" * 88)
+    print(f"HOLISTIC CLOCKS AUDIT: {audit.scope}")
+    print("=" * 88)
     if audit.rows == 0:
-        print(f"No TEMPEST campaign_detail rows found for campaign {audit.campaign!r}")
+        print("No matching CLOCKS_V4 rows.")
         return
 
-    assert audit.first_pps is not None and audit.last_pps is not None
-    audit.expected_rows = audit.last_pps - audit.first_pps + 1
-    final = audit.final_row
-    assert final is not None
+    print(f"Rows:              {audit.rows:,}")
+    print(f"DB id:             {audit.first_db_id} -> {audit.last_db_id}")
+    print(f"Database time:     {audit.first_ts} -> {audit.last_ts}")
+    print(f"GNSS time:         {audit.first_gnss} -> {audit.last_gnss}")
+    print(f"Physical rebases:  {audit.physical_reboots:,}")
+    print(f"Durable gaps:      {audit.durable_gaps:,} ({audit.gnss_gap_seconds:,} missing second(s))")
+    print(f"Stats epoch births:{audit.stats_resets:>10,d}")
+    print(f"Campaign splices:  {audit.campaign_splices:,}")
 
-    print("=" * 78)
-    print(f"CAMPAIGN ANALYSIS: {audit.campaign}")
-    print("=" * 78)
-    print(f"  Streaming policy:  named cursor, batch={batch_size}, pause={pause_ms} ms")
-    print("  Database ordering: campaign.public_count, id")
-    print(f"  Time range:        {audit.first_ts} -> {audit.last_ts}")
-    print(f"  PPS range:         {audit.first_pps} -> {audit.last_pps}")
-    print(f"  Actual rows:       {audit.rows:,}")
-    print(f"  Science rows:      {audit.science_rows:,}")
-    print(f"  Science excluded:  {audit.science_excluded_rows:,}")
-    print(f"  Expected rows:     {audit.expected_rows:,}")
-    computed_missing = audit.expected_rows - audit.rows
-    print(f"  Missing identities:{computed_missing:>10,d}")
-    print(f"    Recovery-classified:   {audit.recovery_missing_identities:>10,d}")
-    print(f"    Unclassified:          {audit.unclassified_missing_identities:>10,d}")
-    print(f"  Recovery gap ranges:     {audit.recovery_gaps:,}")
-    print(f"  Unclassified gap ranges: {audit.unclassified_gaps:,}")
-    print(f"  Repeats/regress:   {audit.repeats:,}/{audit.regressions:,}")
-    print(f"  Final servo mode:  {final.servo_mode}")
-    print(f"  Location:          {final.location}")
-
-    print("\nONLINE STATISTICS (SCIENCE-ELIGIBLE ROWS)")
-    for key in (
-        "dwt_delta",
-        "ocxo1_interval",
-        "ocxo2_interval",
-        "ocxo1_residual",
-        "ocxo2_residual",
-        "ocxo_divergence",
-        "dwt_ppb",
-        "vclock_ppb",
-        "ocxo1_ppb",
-        "ocxo2_ppb",
-    ):
-        print(f"  {key:<18s} {audit.stats[key].text(6 if 'ppb' in key else 3)}")
-
-    print("\nSNAPSHOT CONTRACT")
-    print(f"  Contract-bearing rows:        {audit.snapshot_contract_rows:,}")
-    print(f"  Clean contract rows:          {audit.snapshot_clean_rows:,}")
-    print(f"  Legacy rows before contract:  {audit.snapshot_legacy_rows:,}")
-    first_contract = (
-        str(audit.first_snapshot_contract_pps)
-        if audit.first_snapshot_contract_pps is not None
-        else "not observed"
-    )
-    last_contract = (
-        str(audit.last_snapshot_contract_pps)
-        if audit.last_snapshot_contract_pps is not None
-        else "not observed"
-    )
-    print(f"  First contract PPS:           {first_contract}")
-    print(f"  Last contract PPS:            {last_contract}")
-    if audit.first_snapshot_contract_pps is not None:
-        contract_expected = audit.last_pps - audit.first_snapshot_contract_pps + 1
-        contract_coverage = (
-            100.0 * audit.snapshot_clean_rows / contract_expected
-            if contract_expected > 0
-            else 0.0
-        )
-        print(f"  Expected identity span:       {contract_expected:,}")
-        print(f"  Clean identity coverage:      {contract_coverage:.3f}%")
+    print("\nCOVERAGE")
+    print(f"  Exact Welford one-sample proofs: {audit.exact_welford_steps:,}")
+    print(f"  Exact DAC one-sample proofs:     {audit.exact_dac_steps:,}")
+    print(f"  Exact GNSS_RAW proofs:           {audit.exact_gnss_raw_steps:,}")
+    print(f"  OCXO TAU closure checks:         {audit.tau_checks:,}")
+    print(f"  TOTAL PPB closure checks:        {audit.total_ppb_checks:,}")
+    print(f"  Better-Buckets value checks:     {audit.bucket_checks:,}")
     print(
-        f"  Missing after activation:     {audit.snapshot_missing_after_activation:,}"
+        "  Better-Buckets origin coverage: "
+        + ("COMPLETE" if audit.better.complete_from_origin else "PARTIAL/UNKNOWN")
     )
 
-    omission_count = sum(audit.snapshot_contract_omissions.values())
-    print("  Acquisition failures:")
-    print(f"    Statistics                   {audit.stats_snapshot_failures:,}")
-    print("    Prediction:")
-    for lane in SNAPSHOT_LANES:
-        print(f"      {lane.upper():<8s} {audit.prediction_snapshot_failures[lane]:,}")
-    print("    Forensics:")
-    for lane in SNAPSHOT_LANES:
-        print(f"      {lane.upper():<8s} {audit.forensics_snapshot_failures[lane]:,}")
-    print(f"    Failure-bearing PPS          {audit.snapshot_failure_rows:,}")
-    print(
-        f"    Science-admitted failure PPS: {audit.snapshot_failure_science_rows:>8,d}"
-    )
+    print("\nSTATISTICAL EPOCHS")
+    for epoch, count in sorted(audit.epochs.items()):
+        print(f"  reset_count={epoch:<6d} rows={count:,}")
 
-    immature_count = sum(audit.coherent_immature_snapshots.values())
-    print("  Coherent acquisition; scientific state immature:")
-    print(f"    Unique PPS events            {audit.coherent_immature_rows:,}")
-    print(f"    Scope/lane observations      {immature_count:,}")
-
-    print("  Contract integrity:")
-    print(f"    Missing/invalid fields       {omission_count:,}")
-    print(f"    Violation-bearing PPS        {audit.snapshot_contract_violation_rows:,}")
-    print(f"    Contract violations          {audit.snapshot_contract_violations:,}")
-
-    print("\nCOURTS")
-    print("  Science courts use only science-eligible rows; timeline courts use all rows.")
-    courts = [
-        ("GNSS identity errors", audit.gnss_identity_errors),
-        ("GNSS adjacent errors", audit.gnss_adjacent_errors),
-        ("DWT non-monotonic", audit.dwt_nonmonotonic),
-        ("OCXO1 interval alarms", audit.ocxo1_interval_alarms),
-        ("OCXO2 interval alarms", audit.ocxo2_interval_alarms),
-        ("OCXO1 admitted outliers", audit.ocxo1_science_outliers),
-        ("OCXO2 admitted outliers", audit.ocxo2_science_outliers),
-        ("OCXO divergence outliers", audit.divergence_science_outliers),
-        ("OCXO1 ledger errors", audit.ocxo1_ledger_errors),
-        ("OCXO2 ledger errors", audit.ocxo2_ledger_errors),
-        ("PPB absolute alarms", audit.ppb_alarms),
-        ("PPB steps", audit.ppb_steps),
-        ("Welford regressions", audit.welford_regressions),
-    ]
-    total = 0
-    for label, count in courts:
-        total += count
-        print(f"  {label:<28s} {count:,}")
-    print(f"  {'Unique science-event PPS':<28s} {audit.science_event_rows:,}")
-
-    print("\nGNSS IDENTITY DIAGNOSIS")
-    if audit.gnss_identity_offsets_ns:
-        ranked_offsets = audit.gnss_identity_offsets_ns.most_common(5)
-        for offset_ns, count in ranked_offsets:
-            seconds = offset_ns / NS_PER_SECOND
-            print(
-                f"  offset={offset_ns:+d} ns ({seconds:+.9f} s) rows={count:,}"
-            )
-        nonzero = [(offset, count) for offset, count in ranked_offsets if offset != 0]
-        if audit.gnss_identity_errors and len(nonzero) == 1:
-            offset, count = nonzero[0]
-            if count == audit.gnss_identity_errors:
-                print(
-                    "  Classification: systematic fixed identity offset; "
-                    "GNSS adjacency may remain lawful even though the PPS/GNSS contract disagrees."
-                )
-        elif audit.gnss_identity_errors:
-            print("  Classification: mixed identity offsets; inspect bounded examples.")
-        else:
-            print("  Classification: identity contract clean.")
+    print("\nCAMPAIGNS OBSERVED")
+    if audit.campaigns:
+        for name, count in audit.campaigns.most_common():
+            print(f"  {name:<24s} {count:,}")
     else:
-        print("  No GNSS identity data")
+        print("  none (ambient CLOCKS only)")
+
+    print("\nRECOVERY / CUSTODY EVENTS")
+    if audit.events:
+        for name, count in sorted(audit.events.items()):
+            print(f"  {name:<34s} {count:,}")
+    else:
+        print("  none")
+    if audit.recovery_classes:
+        print("  recovery classifications:")
+        for name, count in audit.recovery_classes.most_common():
+            print(f"    {name:<30s} {count:,}")
+
+    print("\nSTRICT FINDINGS")
+    total = sum(audit.problems.values())
+    if not audit.problems:
+        print("  NONE")
+    else:
+        for name, count in sorted(audit.problems.items()):
+            print(f"  {name:<38s} {count:,}")
+    print(f"  {'TOTAL':<38s} {total:,}")
 
     if audit.examples:
-        print("\nBOUNDED EXAMPLES")
+        print("\nBOUNDED EVIDENCE")
         for kind, examples in audit.examples.items():
             print(f"  [{kind}]")
             for example in examples:
                 print(f"    {example}")
 
-    science_confidence = (
-        100.0 * max(0, audit.science_rows - audit.science_event_rows) / audit.science_rows
-        if audit.science_rows > 0
-        else 0.0
-    )
-    continuity_confidence = (
-        100.0
-        * max(0, audit.expected_rows - audit.unclassified_missing_identities)
-        / audit.expected_rows
-        if audit.expected_rows > 0
-        else 0.0
-    )
-    snapshot_confidence: Optional[float] = None
-    if audit.first_snapshot_contract_pps is not None:
-        contract_expected = audit.last_pps - audit.first_snapshot_contract_pps + 1
-        snapshot_confidence = (
-            100.0 * audit.snapshot_clean_rows / contract_expected
-            if contract_expected > 0
-            else 0.0
-        )
-
-    contract_integrity = (
-        audit.snapshot_missing_after_activation == 0
-        and not audit.snapshot_contract_omissions
-        and audit.snapshot_contract_violations == 0
-    )
-    statistics_integrity = (
-        audit.welford_regressions == 0
-    )
-    quarantine_integrity = (
-        audit.snapshot_failure_science_rows == 0
-    )
-    confidence_components = [science_confidence, continuity_confidence]
-    if snapshot_confidence is not None:
-        confidence_components.append(snapshot_confidence)
-    campaign_confidence = min(confidence_components) if confidence_components else 0.0
-    if not contract_integrity or not statistics_integrity or not quarantine_integrity:
-        campaign_confidence = 0.0
-
-    print("\nCAMPAIGN CONFIDENCE (DETERMINISTIC FLOOR)")
-    print(f"  Science custody:             {science_confidence:8.3f}%")
-    if snapshot_confidence is None:
-        print("  Snapshot custody:                 N/A (legacy)")
-    else:
-        print(f"  Snapshot custody:            {snapshot_confidence:8.3f}%")
-    print(f"  Timeline continuity:         {continuity_confidence:8.3f}%")
-    print(
-        f"  Contract integrity:          {'PASS' if contract_integrity else 'FAIL'}"
-    )
-    print(
-        f"  Statistics integrity:        {'PASS' if statistics_integrity else 'FAIL'}"
-    )
-    print(
-        f"  Quarantine integrity:        {'PASS' if quarantine_integrity else 'FAIL'}"
-    )
-    print(f"  Campaign confidence:         {campaign_confidence:8.3f}%")
-    print("  Rule: lowest measurable custody percentage; integrity failure forces 0%")
-
-    print("\nFINAL CONTEXT")
-    if final.environment:
-        print(f"  Environment keys: {', '.join(sorted(final.environment.keys()))}")
-    else:
-        print("  Environment: no data")
-    if final.final_forensics:
+    print("\nVERDICT")
+    if total:
         print(
-            "  Final court: "
-            f"schema={final.final_forensics.get('schema') or final.final_forensics.get('micro_schema') or '?'}"
+            f"  INVESTIGATE — {total:,} strict continuity/closure finding(s). "
+            "Recovery is not accepted as exact."
+        )
+    elif not audit.better.complete_from_origin:
+        print(
+            "  STRUCTURALLY CLEAN, BUT BETTER-BUCKETS ORIGIN NOT IN SCOPE — "
+            "rerun from the beginning of the statistical epoch before declaring "
+            "holistic restore exact."
         )
     else:
-        print("  Final court: no data")
-
-    print("\nVERDICTS")
-    science_anomalies = sum((
-        audit.dwt_nonmonotonic,
-        audit.ocxo1_interval_alarms,
-        audit.ocxo2_interval_alarms,
-        audit.ocxo1_science_outliers,
-        audit.ocxo2_science_outliers,
-        audit.divergence_science_outliers,
-        audit.ocxo1_ledger_errors,
-        audit.ocxo2_ledger_errors,
-        audit.ppb_alarms,
-        audit.ppb_steps,
-        audit.welford_regressions,
-    ))
-    timeline_anomalies = sum((
-        audit.gnss_identity_errors,
-        audit.gnss_adjacent_errors,
-        audit.repeats,
-        audit.regressions,
-        audit.unclassified_gaps,
-    ))
-    snapshot_acquisition_failures = (
-        audit.stats_snapshot_failures
-        + sum(audit.prediction_snapshot_failures.values())
-        + sum(audit.forensics_snapshot_failures.values())
-    )
-    snapshot_contract_errors = (
-        audit.snapshot_missing_after_activation
-        + sum(audit.snapshot_contract_omissions.values())
-        + audit.snapshot_contract_violations
-    )
-
-    if audit.snapshot_contract_rows == 0:
-        print("  SNAPSHOTS:  LEGACY CAMPAIGN; EXPLICIT CONTRACT NOT OBSERVED")
-    elif snapshot_contract_errors:
         print(
-            "  SNAPSHOTS:  CONTRACT VIOLATION "
-            f"({snapshot_contract_errors:,} finding(s))"
-        )
-    elif snapshot_acquisition_failures:
-        print(
-            "  SNAPSHOTS:  ACQUISITION FAILURES OBSERVED "
-            f"({snapshot_acquisition_failures:,} failure(s) across "
-            f"{audit.snapshot_failure_rows:,} row(s)); unavailable values withheld"
-        )
-    else:
-        print("  SNAPSHOTS:  CLEAN")
-
-    if science_anomalies:
-        print(
-            "  SCIENCE:    ANOMALIES IN ADMITTED SCIENCE "
-            f"({audit.science_event_rows:,} unique PPS event(s), "
-            f"{science_anomalies:,} court finding(s))"
-        )
-    else:
-        print("  SCIENCE:    CLEAN")
-
-    if timeline_anomalies:
-        fixed_nonzero = [
-            (offset, count)
-            for offset, count in audit.gnss_identity_offsets_ns.items()
-            if offset != 0
-        ]
-        systematic_identity = (
-            audit.gnss_identity_errors > 0
-            and len(fixed_nonzero) == 1
-            and fixed_nonzero[0][1] == audit.gnss_identity_errors
-            and audit.gnss_adjacent_errors == 0
-            and audit.repeats == 0
-            and audit.regressions == 0
-            and audit.unclassified_gaps == 0
-        )
-        if systematic_identity:
-            offset, _ = fixed_nonzero[0]
-            print(
-                "  TIMELINE:   SYSTEMATIC GNSS IDENTITY CONTRACT OFFSET "
-                f"({offset:+d} ns); adjacency and ordering remain clean"
-            )
-        else:
-            print(f"  TIMELINE:   ANOMALIES ({timeline_anomalies:,} court finding(s))")
-    else:
-        print("  TIMELINE:   CLEAN")
-
-    if audit.unclassified_missing_identities:
-        print(
-            "  CONTINUITY: UNEXPLAINED LOSS "
-            f"({audit.unclassified_missing_identities:,} missing identity/identities)"
-        )
-    elif audit.recovery_missing_identities:
-        print(
-            "  CONTINUITY: ALL MISSING IDENTITIES CLASSIFIED AS RECOVERY DOWNTIME "
-            f"({audit.recovery_missing_identities:,} across {audit.recovery_gaps} range(s))"
-        )
-    else:
-        print("  CONTINUITY: COMPLETE")
-
-    if audit.science_excluded_rows:
-        print(
-            "  QUARANTINE: ACTIVE AND EFFECTIVE "
-            f"({audit.science_excluded_rows:,} row(s) retained for audit and excluded)"
-        )
-    else:
-        print("  QUARANTINE: NO EXCLUSIONS")
-
-    if snapshot_contract_errors:
-        print("  OVERALL:    SNAPSHOT CONTRACT INVESTIGATION REQUIRED")
-    elif science_anomalies:
-        print("  OVERALL:    SCIENCE INVESTIGATION REQUIRED")
-    elif timeline_anomalies:
-        print("  OVERALL:    SCIENCE CLEAN; TIMELINE CONTRACT REQUIRES RECONCILIATION")
-    elif (
-        snapshot_acquisition_failures
-        or audit.recovery_missing_identities
-        or audit.science_excluded_rows
-    ):
-        print(
-            "  OVERALL:    SCIENCE CLEAN WITH TRUTHFUL "
-            "SNAPSHOT/RECOVERY/QUARANTINE EVENTS"
-        )
-    else:
-        print("  OVERALL:    CLEAN")
-
-
-def list_campaigns() -> None:
-    with open_db(row_dict=True) as conn:
-        cur = conn.cursor()
-        cur.execute(
-            f"""
-            SELECT d.campaign,
-                   bool_or(m.active) AS active,
-                   count(*) AS detail_count,
-                   min({DETAIL_PPS_COUNT_SQL}) AS pps_min,
-                   max({DETAIL_PPS_COUNT_SQL}) AS pps_max,
-                   count(*) FILTER (WHERE {DETAIL_PPS_COUNT_SQL} IS NULL) AS pps_missing,
-                   max(d.ts) AS last_ts
-            FROM campaign_detail d
-            LEFT JOIN campaign_master m
-              ON m.campaign_type = d.campaign_type
-             AND m.campaign = d.campaign
-            WHERE d.campaign_type = %s
-              AND d.campaign IS NOT NULL
-              AND d.payload #>> '{{campaign,schema}}' = 'TEMPEST_FRAGMENT_V1'
-            GROUP BY d.campaign
-            ORDER BY max(d.ts) DESC
-            LIMIT 20
-            """,
-            (CAMPAIGN_TYPE,),
-        )
-        rows = cur.fetchall()
-
-    print("Available campaigns:")
-    print(f"  {'CAMPAIGN':<20s} {'ACTIVE':>7s} {'RECORDS':>9s} {'PPS RANGE':>22s}")
-    for row in rows:
-        missing = int(row.get("pps_missing") or 0)
-        range_text = (
-            f"UNINDEXED:{missing}"
-            if missing
-            else f"{row.get('pps_min')}-{row.get('pps_max')}"
-        )
-        print(
-            f"  {row['campaign']:<20s} "
-            f"{('>' if row['active'] else ''):>7s} "
-            f"{int(row['detail_count']):>9,d} {range_text:>22s}"
+            "  CLEAN — all continuity and sufficient-state courts that are "
+            "provable from the selected durable CLOCKS_V4 scope closed exactly."
         )
 
 
-def parse(argv: Sequence[str]) -> tuple[str, int, int, int]:
-    if len(argv) < 2:
-        list_campaigns()
-        raise SystemExit(1)
+@dataclass(frozen=True)
+class Args:
+    campaign: Optional[str]
+    all_rows: bool
+    from_id: int
+    to_id: int
+    batch_size: int
+    pause_ms: int
+    limit: int
 
-    campaign = argv[1]
+
+def parse(argv: Sequence[str]) -> Args:
+    campaign: Optional[str] = None
+    all_rows = False
+    from_id = 0
+    to_id = 0
     batch_size = DEFAULT_BATCH_SIZE
     pause_ms = DEFAULT_PAUSE_MS
     limit = 0
 
-    idx = 2
+    idx = 1
     while idx < len(argv):
         arg = argv[idx]
-        if arg in {"--batch-size", "--pause-ms", "--limit"}:
+        if arg == "--all":
+            all_rows = True
+            idx += 1
+            continue
+        if arg in {"--from-id", "--to-id", "--batch-size", "--pause-ms", "--limit"}:
             if idx + 1 >= len(argv):
                 raise SystemExit(f"{arg} requires a value")
             value = int(argv[idx + 1])
             idx += 2
-            if arg == "--batch-size":
+            if arg == "--from-id":
+                from_id = value
+            elif arg == "--to-id":
+                to_id = value
+            elif arg == "--batch-size":
                 batch_size = value
             elif arg == "--pause-ms":
                 pause_ms = value
             else:
                 limit = value
-        elif "=" in arg:
-            key, value = arg.split("=", 1)
-            if key == "--batch-size":
-                batch_size = int(value)
+            continue
+        if arg.startswith("--") and "=" in arg:
+            key, raw = arg.split("=", 1)
+            value = int(raw)
+            if key == "--from-id":
+                from_id = value
+            elif key == "--to-id":
+                to_id = value
+            elif key == "--batch-size":
+                batch_size = value
             elif key == "--pause-ms":
-                pause_ms = int(value)
+                pause_ms = value
             elif key == "--limit":
-                limit = int(value)
+                limit = value
             else:
-                raise SystemExit(f"unknown option: {key}")
+                raise SystemExit(f"unknown option {key}")
             idx += 1
-        else:
-            raise SystemExit(f"unknown argument: {arg}")
+            continue
+        if arg.startswith("--"):
+            raise SystemExit(f"unknown option {arg}")
+        if campaign is not None:
+            raise SystemExit("only one campaign may be specified")
+        campaign = arg
+        idx += 1
 
-    if batch_size <= 0 or pause_ms < 0 or limit < 0:
-        raise SystemExit("batch-size must be positive; pause-ms and limit nonnegative")
-    return campaign, batch_size, pause_ms, limit
+    if campaign is not None and all_rows:
+        raise SystemExit("choose either a campaign or --all")
+    if batch_size <= 0 or pause_ms < 0 or limit < 0 or from_id < 0 or to_id < 0:
+        raise SystemExit("invalid negative/zero option")
+    if from_id and to_id and from_id > to_id:
+        raise SystemExit("--from-id may not exceed --to-id")
+
+    return Args(campaign, all_rows, from_id, to_id, batch_size, pause_ms, limit)
 
 
 def main(argv: Sequence[str]) -> None:
-    campaign, batch_size, pause_ms, limit = parse(argv)
-    audit = Audit(campaign=campaign)
-    previous: Optional[CompactRow] = None
+    args = parse(argv)
+    if args.campaign is None and not args.all_rows:
+        scope_report()
+        return
 
-    for db_id, db_pps, ts, payload in iter_rows(
-        campaign,
-        batch_size=batch_size,
-        pause_ms=pause_ms,
-        limit=limit,
+    scope = args.campaign if args.campaign is not None else "ALL CLOCKS_V4"
+    audit = Audit(scope=scope)
+    previous: Optional[Row] = None
+
+    for db_id, ts, payload in iter_rows(
+        campaign=args.campaign,
+        from_id=args.from_id,
+        to_id=args.to_id,
+        batch_size=args.batch_size,
+        pause_ms=args.pause_ms,
+        limit=args.limit,
     ):
-        row = compact(db_id, db_pps, ts, payload)
-        update(audit, previous, row)
+        try:
+            row = Row.parse(audit, db_id, ts, payload)
+        except Exception as exc:
+            # The analyzer itself must fail loud on malformed canonical testimony.
+            raise RuntimeError(f"cannot decode canonical CLOCKS_V4 db_id={db_id}: {exc}") from exc
+        process_row(audit, previous, row)
         previous = row
 
-    print_report(audit, batch_size, pause_ms)
+    print_report(audit)
 
 
 if __name__ == "__main__":

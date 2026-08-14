@@ -12546,7 +12546,7 @@ def cmd_delete(args: Optional[dict]) -> Dict[str, Any]:
 
 
 def cmd_truncate(args: Optional[dict]) -> Dict[str, Any]:
-    """Delete stopped TEMPEST campaign history while retaining ambient state."""
+    """Destructively truncate all campaign history, regardless of subsystem type."""
     del args
 
     global _campaign_active, _accepted_pps_vclock_count
@@ -12588,24 +12588,7 @@ def cmd_truncate(args: Optional[dict]) -> Dict[str, Any]:
             with open_db() as conn:
                 cur = conn.cursor()
                 cur.execute(
-                    "SELECT COUNT(*) FROM campaign_detail "
-                    "WHERE campaign_type = %s AND campaign IS NOT NULL",
-                    (CAMPAIGN_TYPE_TEMPEST,),
-                )
-                detail_count = int(cur.fetchone()[0])
-                cur.execute(
-                    "SELECT COUNT(*) FROM campaign_master WHERE campaign_type = %s",
-                    (CAMPAIGN_TYPE_TEMPEST,),
-                )
-                master_count = int(cur.fetchone()[0])
-                cur.execute(
-                    "DELETE FROM campaign_detail "
-                    "WHERE campaign_type = %s AND campaign IS NOT NULL",
-                    (CAMPAIGN_TYPE_TEMPEST,),
-                )
-                cur.execute(
-                    "DELETE FROM campaign_master WHERE campaign_type = %s",
-                    (CAMPAIGN_TYPE_TEMPEST,),
+                    "TRUNCATE TABLE campaign_detail, campaign_master RESTART IDENTITY"
                 )
     except Exception as e:
         logging.exception("❌ [clocks] TRUNCATE failed")
@@ -12615,17 +12598,16 @@ def cmd_truncate(args: Optional[dict]) -> Dict[str, Any]:
             _clocks_persistence_enabled.set()
 
     logging.warning(
-        "🧨 [clocks] TRUNCATE: dropped %d TEMPEST masters and %d campaign-associated "
-        "details; ambient state retained; drained candidates=%d pending_states=%d",
-        master_count, detail_count, candidate_drained, state_drained,
+        "🧨 [clocks] TRUNCATE: campaign_detail and campaign_master completely truncated; "
+        "identity sequences restarted; drained candidates=%d pending_states=%d",
+        candidate_drained, state_drained,
     )
 
     server_args = {
         "source": "CLOCKS.TRUNCATE",
-        "campaign_type": CAMPAIGN_TYPE_TEMPEST,
-        "postgres_campaign_master_deleted": master_count,
-        "postgres_campaign_details_deleted": detail_count,
-        "ambient_campaign_details_retained": True,
+        "postgres_tables_truncated": ["campaign_detail", "campaign_master"],
+        "postgres_identity_restarted": True,
+        "ambient_campaign_details_retained": False,
     }
     try:
         server_resp = send_command(
@@ -12642,10 +12624,9 @@ def cmd_truncate(args: Optional[dict]) -> Dict[str, Any]:
         "success": True,
         "message": "OK",
         "payload": {
-            "campaign_type": CAMPAIGN_TYPE_TEMPEST,
-            "campaign_master_deleted": master_count,
-            "campaign_details_deleted": detail_count,
-            "ambient_campaign_details_retained": True,
+            "tables_truncated": ["campaign_detail", "campaign_master"],
+            "identity_restarted": True,
+            "ambient_campaign_details_retained": False,
             "candidate_ingress_drained": candidate_drained,
             "pending_state_rows_drained": state_drained,
             "server_truncate_success": (

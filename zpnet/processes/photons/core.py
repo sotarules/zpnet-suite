@@ -90,6 +90,7 @@ PHOTONS_RECOVERY_REPLAY_MAX_ROWS = PHOTONS_RECOVERY_24_HOUR_SECONDS + 120
 PHOTONS_RECOVERY_CURSOR_ITERSIZE = 256
 PHOTONS_RECOVERY_PROOF_TIMEOUT_S = 180.0
 PHOTONS_RECOVERY_VERIFY_TOLERANCE = 1.0e-6
+PHOTONS_STATS_RESET_PROOF_TIMEOUT_S = 30.0
 
 TEENSY_CAMPAIGN_START_ACCEPTED_STATUSES = {"start_requested", "flash_cut_requested"}
 TEENSY_CAMPAIGN_STOP_ACCEPTED_STATUSES = {"stop_requested"}
@@ -3876,7 +3877,7 @@ def cmd_delete(args: Optional[dict]) -> Dict[str, Any]:
 
 
 def cmd_truncate(_: Optional[dict]) -> Dict[str, Any]:
-    """Delete stopped LANTERN campaign history while retaining ambient PHOTONS rows."""
+    """Destructively truncate all campaign history, regardless of subsystem type."""
     global _truncate_count
     global _last_maintenance
 
@@ -3885,33 +3886,13 @@ def cmd_truncate(_: Optional[dict]) -> Dict[str, Any]:
         return busy
 
     with _maintenance_lock:
-        pending_campaigns = _pending_persist_campaign_names()
-        if pending_campaigns:
-            return {
-                "success": False,
-                "message": "TRUNCATE has campaign persistence pending; retry shortly: "
-                + ", ".join(sorted(pending_campaigns)),
-            }
+        ingress_drained = _drain_queue(_fragment_queue)
+        persist_drained = _drain_queue(_persist_queue)
         try:
             with open_db() as conn:
                 cur = conn.cursor()
                 cur.execute(
-                    "SELECT COUNT(*) FROM campaign_detail WHERE campaign_type = %s AND campaign IS NOT NULL",
-                    (CAMPAIGN_TYPE_LANTERN,),
-                )
-                detail_count = int(cur.fetchone()[0])
-                cur.execute(
-                    "SELECT COUNT(*) FROM campaign_master WHERE campaign_type = %s",
-                    (CAMPAIGN_TYPE_LANTERN,),
-                )
-                master_count = int(cur.fetchone()[0])
-                cur.execute(
-                    "DELETE FROM campaign_detail WHERE campaign_type = %s AND campaign IS NOT NULL",
-                    (CAMPAIGN_TYPE_LANTERN,),
-                )
-                cur.execute(
-                    "DELETE FROM campaign_master WHERE campaign_type = %s",
-                    (CAMPAIGN_TYPE_LANTERN,),
+                    "TRUNCATE TABLE campaign_detail, campaign_master RESTART IDENTITY"
                 )
         except Exception as exc:
             logging.exception("❌ [photons] TRUNCATE failed")
@@ -3919,10 +3900,9 @@ def cmd_truncate(_: Optional[dict]) -> Dict[str, Any]:
 
     server_args = {
         "source": "PHOTONS.TRUNCATE",
-        "campaign_type": CAMPAIGN_TYPE_LANTERN,
-        "postgres_campaign_master_deleted": master_count,
-        "postgres_campaign_details_deleted": detail_count,
-        "ambient_campaign_details_retained": True,
+        "postgres_tables_truncated": ["campaign_detail", "campaign_master"],
+        "postgres_identity_restarted": True,
+        "ambient_campaign_details_retained": False,
     }
     try:
         server_resp = send_command(
@@ -3935,11 +3915,11 @@ def cmd_truncate(_: Optional[dict]) -> Dict[str, Any]:
     result = {
         "action": "TRUNCATE",
         "at_utc": _utc_now_z(),
-        "campaign_type": CAMPAIGN_TYPE_LANTERN,
-        "campaign_master_deleted": master_count,
-        "campaign_details_deleted": detail_count,
-        "ambient_campaign_details_retained": True,
-        "legacy_photons_rows_retained": True,
+        "tables_truncated": ["campaign_detail", "campaign_master"],
+        "identity_restarted": True,
+        "ambient_campaign_details_retained": False,
+        "fragment_ingress_drained": ingress_drained,
+        "pending_persistence_drained": persist_drained,
         "server_truncate_success": bool(server_resp.get("success")) if isinstance(server_resp, dict) else False,
         "server_truncate_message": server_resp.get("message") if isinstance(server_resp, dict) else None,
     }
@@ -4165,18 +4145,402 @@ def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
 
 
 
-def _latest_stats_epoch() -> Dict[str, int]:
+def _stats_reset_campaign_identity(state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    campaign = state.get("campaign")
+    if campaign is None:
+        return None
+    campaign = _require_dict(campaign, "PHOTONS.campaign")
+    return {
+        "campaign": str(campaign.get("campaign") or ""),
+        "campaign_id": _require_int(
+            campaign.get("campaign_id"), "PHOTONS.campaign.campaign_id", minimum=1
+        ),
+        "start_after_sequence": _require_int(
+            campaign.get("start_after_sequence"),
+            "PHOTONS.campaign.start_after_sequence",
+            minimum=1,
+        ),
+    }
+
+
+def _stats_epoch_snapshot_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    state = _require_dict(state, "PHOTONS")
+    if state.get("schema") != PHOTONS_SCHEMA:
+        raise ValueError(f"unsupported PHOTONS schema {state.get('schema')!r}")
+
+    instrument = _require_dict(state.get("photons"), "PHOTONS.photons")
+    stats = _require_dict(instrument.get("stats"), "PHOTONS.photons.stats")
+    return {
+        "sequence": _require_int(state.get("sequence"), "PHOTONS.sequence", minimum=1),
+        "publish_count": _require_int(
+            state.get("publish_count"), "PHOTONS.publish_count", minimum=1
+        ),
+        "reset_count": _require_int(
+            stats.get("reset_count"), "PHOTONS.photons.stats.reset_count"
+        ),
+        "update_count": _require_int(
+            stats.get("update_count"),
+            "PHOTONS.photons.stats.update_count",
+            minimum=1,
+        ),
+        "standard_lap_ps": _require_int(
+            stats.get("standard_lap_ps"),
+            "PHOTONS.photons.stats.standard_lap_ps",
+            minimum=1,
+        ),
+        "lap_count": _require_int(
+            stats.get("lap_count"), "PHOTONS.photons.stats.lap_count"
+        ),
+        "total_lap_gnss_ns": _require_int(
+            stats.get("total_lap_gnss_ns"),
+            "PHOTONS.photons.stats.total_lap_gnss_ns",
+        ),
+        "custody_lap_count": _require_int(
+            stats.get("custody_lap_count"),
+            "PHOTONS.photons.stats.custody_lap_count",
+        ),
+        "custody_total_lap_gnss_ns": _require_int(
+            stats.get("custody_total_lap_gnss_ns"),
+            "PHOTONS.photons.stats.custody_total_lap_gnss_ns",
+        ),
+        "campaign": _stats_reset_campaign_identity(state),
+    }
+
+
+def _latest_stats_epoch() -> Dict[str, Any]:
     with _state_lock:
         latest = copy.deepcopy(_latest_photons)
     if not isinstance(latest, dict):
         raise RuntimeError("PHOTONS canonical heartbeat is unavailable")
-    instrument = _require_dict(latest.get("photons"), "PHOTONS.photons")
+    return _stats_epoch_snapshot_from_state(latest)
+
+
+def _stats_reset_birth_court(
+    state: Dict[str, Any],
+    *,
+    before: Dict[str, Any],
+    expected_reset_count: int,
+) -> Dict[str, Any]:
+    """Prove that one canonical PHOTONS row is row 1 of the requested stats epoch."""
+    state = copy.deepcopy(_require_dict(state, "PHOTONS stats-reset birth row"))
+    snapshot = _stats_epoch_snapshot_from_state(state)
+    if snapshot["reset_count"] != expected_reset_count:
+        raise ValueError(
+            "PHOTONS STATS_RESET birth row has wrong reset_count: "
+            f"expected={expected_reset_count} observed={snapshot['reset_count']}"
+        )
+    if snapshot["update_count"] != 1:
+        raise ValueError(
+            "PHOTONS STATS_RESET birth row is not update_count=1: "
+            f"observed={snapshot['update_count']}"
+        )
+    if snapshot["sequence"] <= int(before["sequence"]):
+        raise ValueError(
+            "PHOTONS physical publication chronology did not advance across STATS_RESET"
+        )
+    if snapshot["standard_lap_ps"] != int(before["standard_lap_ps"]):
+        raise ValueError("PHOTONS STATS_RESET changed immutable STANDARD_LAP_NS")
+    if snapshot["custody_lap_count"] < int(before["custody_lap_count"]):
+        raise ValueError("PHOTONS STATS_RESET regressed monotonic accepted-lap custody")
+    if snapshot["custody_total_lap_gnss_ns"] < int(
+        before["custody_total_lap_gnss_ns"]
+    ):
+        raise ValueError("PHOTONS STATS_RESET regressed monotonic lap-time custody")
+    if snapshot["campaign"] != before.get("campaign"):
+        raise ValueError(
+            "PHOTONS STATS_RESET changed LANTERN identity/origin: "
+            f"before={before.get('campaign')!r} after={snapshot['campaign']!r}"
+        )
+
+    instrument = _require_dict(state.get("photons"), "PHOTONS.photons")
+    if _require_bool(instrument.get("snapshot_ok"), "PHOTONS.photons.snapshot_ok") is not True:
+        raise ValueError("PHOTONS STATS_RESET birth row is not a coherent snapshot")
+    if _require_bool(instrument.get("valid"), "PHOTONS.photons.valid") is not True:
+        raise ValueError("PHOTONS STATS_RESET birth row is not instrument-valid")
+
     stats = _require_dict(instrument.get("stats"), "PHOTONS.photons.stats")
-    return {
-        "sequence": _require_int(latest.get("sequence"), "PHOTONS.sequence", minimum=1),
-        "reset_count": _require_int(stats.get("reset_count"), "PHOTONS.photons.stats.reset_count"),
-        "update_count": _require_int(stats.get("update_count"), "PHOTONS.photons.stats.update_count", minimum=1),
+    science = _require_dict(instrument.get("science"), "PHOTONS.photons.science")
+    projection = _require_dict(
+        instrument.get("projection"), "PHOTONS.photons.projection"
+    )
+    raw_cycles = _require_dict(
+        instrument.get("raw_cycles"), "PHOTONS.photons.raw_cycles"
+    )
+    accepted = _require_dict(science.get("accepted"), "PHOTONS.science.accepted")
+    excluded = _require_dict(science.get("excluded"), "PHOTONS.science.excluded")
+    reasons = _require_dict(
+        science.get("exclusion_reasons"), "PHOTONS.science.exclusion_reasons"
+    )
+
+    lap_welford = _validate_recovery_welford(
+        stats.get("lap_time"), "PHOTONS.stats.lap_time"
+    )
+    accepted_raw = _validate_recovery_welford(
+        accepted.get("raw_cycles"), "PHOTONS.science.accepted.raw_cycles"
+    )
+    accepted_projected = _validate_recovery_welford(
+        accepted.get("projected_lap_ns"),
+        "PHOTONS.science.accepted.projected_lap_ns",
+    )
+    excluded_raw = _validate_recovery_welford(
+        excluded.get("raw_cycles"), "PHOTONS.science.excluded.raw_cycles"
+    )
+    excluded_projected = _validate_recovery_welford(
+        excluded.get("projected_lap_ns"),
+        "PHOTONS.science.excluded.projected_lap_ns",
+    )
+
+    lap_count = int(snapshot["lap_count"])
+    total_ns = int(snapshot["total_lap_gnss_ns"])
+    accepted_count = _require_int(
+        accepted.get("count"), "PHOTONS.science.accepted.count"
+    )
+    excluded_count = _require_int(
+        excluded.get("count"), "PHOTONS.science.excluded.count"
+    )
+    pending_count = 1 if _require_bool(
+        science.get("seed_pending"), "PHOTONS.science.seed_pending"
+    ) else 0
+    candidate_count = _require_int(
+        science.get("candidate_count"), "PHOTONS.science.candidate_count"
+    )
+
+    accepted_populations = {
+        lap_count,
+        lap_welford["n"],
+        accepted_count,
+        accepted_raw["n"],
+        accepted_projected["n"],
     }
+    if len(accepted_populations) != 1:
+        raise ValueError(
+            "PHOTONS STATS_RESET birth accepted populations disagree: "
+            f"{sorted(accepted_populations)!r}"
+        )
+    if not _welford_equivalent(lap_welford, accepted_projected):
+        raise ValueError(
+            "PHOTONS STATS_RESET birth lap/accepted-projected Welfords differ"
+        )
+    if excluded_raw["n"] != excluded_count:
+        raise ValueError(
+            "PHOTONS STATS_RESET birth excluded raw Welford population disagrees"
+        )
+    if excluded_projected["n"] > excluded_count:
+        raise ValueError(
+            "PHOTONS STATS_RESET birth excluded projected population exceeds exclusions"
+        )
+    if candidate_count != accepted_count + excluded_count + pending_count:
+        raise ValueError("PHOTONS STATS_RESET birth candidate accounting does not close")
+
+    completed_laps = _require_int(
+        raw_cycles.get("completed_lap_count"),
+        "PHOTONS.raw_cycles.completed_lap_count",
+    )
+    attempts = _require_int(
+        projection.get("attempt_count"), "PHOTONS.projection.attempt_count"
+    )
+    successes = _require_int(
+        projection.get("success_count"), "PHOTONS.projection.success_count"
+    )
+    rejects = _require_int(
+        projection.get("reject_count"), "PHOTONS.projection.reject_count"
+    )
+    if completed_laps != candidate_count or attempts != candidate_count:
+        raise ValueError(
+            "PHOTONS STATS_RESET birth raw/projection populations do not start at epoch origin"
+        )
+    if attempts != successes + rejects:
+        raise ValueError("PHOTONS STATS_RESET birth projection accounting does not close")
+
+    reason_counts = {
+        name: _require_int(value, f"PHOTONS.science.exclusion_reasons.{name}")
+        for name, value in reasons.items()
+        if not name.endswith("_this_fragment")
+    }
+    if sum(reason_counts.values()) != excluded_count:
+        raise ValueError(
+            "PHOTONS STATS_RESET birth exclusion-reason population does not close"
+        )
+    if rejects != reason_counts.get("projection_invalid", 0):
+        raise ValueError(
+            "PHOTONS STATS_RESET birth projection rejects disagree with reason custody"
+        )
+
+    if lap_count == 0:
+        if total_ns != 0:
+            raise ValueError("PHOTONS STATS_RESET birth has zero N with nonzero total")
+    else:
+        if total_ns == 0:
+            raise ValueError("PHOTONS STATS_RESET birth has nonzero N with zero total")
+        ratio_mean = float(total_ns) / float(lap_count)
+        if abs(float(lap_welford["mean"]) - ratio_mean) > PHOTONS_RECOVERY_VERIFY_TOLERANCE:
+            raise ValueError("PHOTONS STATS_RESET birth Welford mean does not close with N/T")
+
+    current_sequence = _require_int(
+        stats.get("rolling_ppb_current_sequence"),
+        "PHOTONS.stats.rolling_ppb_current_sequence",
+        minimum=1,
+    )
+    admitted = _require_bool(
+        stats.get("rolling_ppb_endpoint_admitted"),
+        "PHOTONS.stats.rolling_ppb_endpoint_admitted",
+    )
+    if current_sequence != 1 or not admitted:
+        raise ValueError(
+            "PHOTONS STATS_RESET birth did not establish Better-Buckets endpoint 1"
+        )
+
+    buckets = _require_dict(stats.get("ppb_buckets"), "PHOTONS.stats.ppb_buckets")
+    if lap_count == 0:
+        if any(isinstance(buckets.get(name), dict) for name in PPB_BUCKET_NAMES):
+            raise ValueError("PHOTONS STATS_RESET empty birth published nonempty PPB bucket")
+        bucket_proof: Dict[str, Any] = {}
+    else:
+        bucket_proof = {}
+        reference_ppb: Optional[float] = None
+        for name in PPB_BUCKET_NAMES:
+            bucket = _require_dict(
+                buckets.get(name), f"PHOTONS.stats.ppb_buckets.{name}"
+            )
+            bucket_n = _require_int(
+                bucket.get("sample_count"),
+                f"PHOTONS.stats.ppb_buckets.{name}.sample_count",
+                minimum=1,
+            )
+            bucket_ppb = _require_float(
+                bucket.get("ppb"), f"PHOTONS.stats.ppb_buckets.{name}.ppb"
+            )
+            if bucket_n != lap_count:
+                raise ValueError(
+                    f"PHOTONS STATS_RESET birth {name} N={bucket_n} != lap_count={lap_count}"
+                )
+            if reference_ppb is None:
+                reference_ppb = bucket_ppb
+            elif abs(bucket_ppb - reference_ppb) > PHOTONS_RECOVERY_VERIFY_TOLERANCE:
+                raise ValueError(
+                    "PHOTONS STATS_RESET birth Better-Buckets do not share epoch origin"
+                )
+            bucket_proof[name] = {"sample_count": bucket_n, "ppb": bucket_ppb}
+
+    return {
+        **snapshot,
+        "candidate_count": candidate_count,
+        "accepted_count": accepted_count,
+        "excluded_count": excluded_count,
+        "pending_seed_count": pending_count,
+        "projection_attempt_count": attempts,
+        "projection_reject_count": rejects,
+        "reason_counts": reason_counts,
+        "ppb_buckets": bucket_proof,
+        "custody_lap_delta_from_before": (
+            int(snapshot["custody_lap_count"]) - int(before["custody_lap_count"])
+        ),
+        "custody_total_delta_from_before": (
+            int(snapshot["custody_total_lap_gnss_ns"])
+            - int(before["custody_total_lap_gnss_ns"])
+        ),
+    }
+
+
+PPB_BUCKET_NAMES = ("10_min", "60_min", "8_hour", "24_hour", "total")
+
+
+def _find_durable_stats_reset_birth(
+    *,
+    expected_reset_count: int,
+) -> Optional[Dict[str, Any]]:
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, payload
+            FROM campaign_detail
+            WHERE campaign_type = %s
+              AND payload #>> '{schema}' = %s
+              AND payload #>> '{photons,stats,reset_count}' = %s
+              AND payload #>> '{photons,stats,update_count}' = '1'
+            ORDER BY id DESC
+            LIMIT 2
+            """,
+            (
+                CAMPAIGN_TYPE_LANTERN,
+                PHOTONS_SCHEMA,
+                str(expected_reset_count),
+            ),
+        )
+        rows = cur.fetchall()
+    if len(rows) > 1:
+        raise RuntimeError(
+            "PHOTONS STATS_RESET has multiple durable update_count=1 rows "
+            f"for reset_count={expected_reset_count}"
+        )
+    if not rows:
+        return None
+
+    row = rows[0]
+    payload = row["payload"]
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    payload = copy.deepcopy(_require_dict(payload, "PHOTONS durable stats-reset birth"))
+    return {"detail_id": int(row["id"]), "canonical": payload}
+
+
+def _fetch_teensy_stats_reset_report() -> Dict[str, Any]:
+    """Return the authoritative firmware STATS_RESET chronology surface."""
+    response = send_command(
+        machine="TEENSY",
+        subsystem=SUBSYSTEM,
+        command="REPORT_STATS",
+        retries=1,
+        retry_delay_s=0.0,
+    )
+    payload = response.get("payload") if isinstance(response, dict) else None
+    if not isinstance(response, dict) or not response.get("success") or not isinstance(payload, dict):
+        raise RuntimeError(f"Teensy PHOTONS.REPORT_STATS failed: {response!r}")
+    return copy.deepcopy(payload)
+
+
+def _fetch_teensy_stats_reset_postcondition(
+    *,
+    expected_reset_count: int,
+    request_count: int,
+    prior_commit_count: int,
+) -> Dict[str, Any]:
+    payload = _fetch_teensy_stats_reset_report()
+
+    reset_count = _require_int(payload.get("reset_count"), "REPORT_STATS.reset_count")
+    update_count = _require_int(
+        payload.get("update_count"), "REPORT_STATS.update_count", minimum=1
+    )
+    reset_request_count = _require_int(
+        payload.get("reset_request_count"), "REPORT_STATS.reset_request_count"
+    )
+    reset_commit_count = _require_int(
+        payload.get("reset_commit_count"), "REPORT_STATS.reset_commit_count"
+    )
+    reset_pending = _require_bool(
+        payload.get("reset_pending"), "REPORT_STATS.reset_pending"
+    )
+    if reset_count != expected_reset_count:
+        raise RuntimeError(
+            "Teensy PHOTONS STATS_RESET postcondition has wrong reset_count: "
+            f"expected={expected_reset_count} observed={reset_count}"
+        )
+    if update_count < 1 or reset_pending:
+        raise RuntimeError(
+            "Teensy PHOTONS STATS_RESET postcondition is not a committed live epoch"
+        )
+    if reset_request_count != request_count:
+        raise RuntimeError(
+            "Teensy PHOTONS STATS_RESET request-count ancestry changed unexpectedly: "
+            f"requested={request_count} reported={reset_request_count}"
+        )
+    if reset_commit_count != prior_commit_count + 1:
+        raise RuntimeError(
+            "Teensy PHOTONS STATS_RESET commit count did not advance exactly once: "
+            f"before={prior_commit_count} after={reset_commit_count}"
+        )
+    return copy.deepcopy(payload)
 
 
 def _recovery_report_surface() -> Dict[str, Any]:
@@ -4278,7 +4642,7 @@ def cmd_report_stats(_: Optional[dict]) -> Dict[str, Any]:
 
 
 def cmd_stats_reset(_: Optional[dict]) -> Dict[str, Any]:
-    """Reset the always-on PHOTONS statistical epoch without changing LANTERN."""
+    """Reset PHOTONS statistics and prove exact canonical + durable epoch birth."""
     global _stats_reset_requests
     global _stats_reset_success
     global _stats_reset_failures
@@ -4302,9 +4666,36 @@ def cmd_stats_reset(_: Optional[dict]) -> Dict[str, Any]:
     except Exception as exc:
         return {"success": False, "message": str(exc)}
 
+    try:
+        teensy_before = _fetch_teensy_stats_reset_report()
+        firmware_before_reset_count = _require_int(
+            teensy_before.get("reset_count"), "REPORT_STATS.reset_count"
+        )
+        request_count_before = _require_int(
+            teensy_before.get("reset_request_count"), "REPORT_STATS.reset_request_count"
+        )
+        commit_count_before = _require_int(
+            teensy_before.get("reset_commit_count"), "REPORT_STATS.reset_commit_count"
+        )
+        reset_pending_before = _require_bool(
+            teensy_before.get("reset_pending"), "REPORT_STATS.reset_pending"
+        )
+        if firmware_before_reset_count != int(before["reset_count"]):
+            raise RuntimeError(
+                "Pi/Teensy PHOTONS statistics epoch disagrees before STATS_RESET: "
+                f"pi={before['reset_count']} teensy={firmware_before_reset_count}"
+            )
+        if reset_pending_before:
+            raise RuntimeError("Teensy PHOTONS already has a STATS_RESET boundary pending")
+    except Exception as exc:
+        return {"success": False, "message": str(exc)}
+
+    expected_reset_count = int(before["reset_count"]) + 1
+    expected_request_count = request_count_before + 1
     with _state_lock:
         _stats_reset_requests += 1
     requested_at = _utc_now_z()
+
     try:
         teensy_response = send_command(
             machine="TEENSY",
@@ -4316,58 +4707,213 @@ def cmd_stats_reset(_: Optional[dict]) -> Dict[str, Any]:
             _stats_reset_failures += 1
         return {"success": False, "message": f"Teensy PHOTONS.STATS_RESET failed: {exc}"}
 
-    teensy_payload = teensy_response.get("payload") if isinstance(teensy_response, dict) else None
-    if not isinstance(teensy_response, dict) or not teensy_response.get("success") or not isinstance(teensy_payload, dict):
-        with _state_lock:
-            _stats_reset_failures += 1
-        return {"success": False, "message": "Teensy PHOTONS.STATS_RESET rejected", "payload": {"teensy": teensy_response}}
-
-    deadline = time.monotonic() + 10.0
-    after: Optional[Dict[str, int]] = None
-    while time.monotonic() < deadline:
-        try:
-            candidate = _latest_stats_epoch()
-        except Exception:
-            candidate = None
-        if candidate is not None and candidate["reset_count"] > before["reset_count"]:
-            after = candidate
-            break
-        time.sleep(0.05)
-
-    if after is None:
+    teensy_payload = (
+        teensy_response.get("payload") if isinstance(teensy_response, dict) else None
+    )
+    try:
+        if (
+            not isinstance(teensy_response, dict)
+            or not teensy_response.get("success")
+            or not isinstance(teensy_payload, dict)
+        ):
+            raise RuntimeError(f"Teensy PHOTONS.STATS_RESET rejected: {teensy_response!r}")
+        if str(teensy_payload.get("status") or "") != "instrument_statistics_reset_requested":
+            raise RuntimeError(
+                f"Teensy PHOTONS.STATS_RESET returned unexpected status: {teensy_payload!r}"
+            )
+        if _require_bool(teensy_payload.get("reset"), "STATS_RESET.reset") is not True:
+            raise RuntimeError(
+                "Teensy PHOTONS.STATS_RESET did not acquire a fresh reset boundary"
+            )
+        if _require_bool(
+            teensy_payload.get("reset_pending"), "STATS_RESET.reset_pending"
+        ) is not True:
+            raise RuntimeError("Teensy PHOTONS.STATS_RESET did not arm reset_pending")
+        # The immediate command reply proves only that firmware armed a new
+        # publication-boundary reset.  Epoch ancestry comes from REPORT_STATS
+        # before the command and from the first published/durable row afterward;
+        # do not duplicate that authority with optional echo fields here.
+        if str(teensy_payload.get("boundary") or "") != (
+            "AFTER_NEXT_SUCCESSFULLY_PUBLISHED_FRAGMENT"
+        ):
+            raise RuntimeError(
+                f"Teensy PHOTONS.STATS_RESET returned unexpected boundary: {teensy_payload!r}"
+            )
+    except Exception as exc:
         failure = {
             "action": "STATS_RESET",
             "requested_at_utc": requested_at,
             "success": False,
-            "stage": "WAIT_FOR_NEW_EPOCH",
+            "stage": "ARM_RESET_BOUNDARY",
             "before": before,
-            "teensy": copy.deepcopy(teensy_payload),
+            "teensy_before": copy.deepcopy(teensy_before),
+            "expected_reset_count": expected_reset_count,
+            "teensy": copy.deepcopy(teensy_response),
+            "error": str(exc),
         }
         with _state_lock:
             _stats_reset_failures += 1
             _last_maintenance = copy.deepcopy(failure)
+        logging.exception("💥 [photons] STATS_RESET boundary contract failed")
+        return {"success": False, "message": str(exc), "payload": failure}
+
+    deadline = time.monotonic() + PHOTONS_STATS_RESET_PROOF_TIMEOUT_S
+    live_birth: Optional[Dict[str, Any]] = None
+    durable_birth: Optional[Dict[str, Any]] = None
+    last_live: Optional[Dict[str, Any]] = None
+    proof_error: Optional[str] = None
+
+    while time.monotonic() < deadline:
+        try:
+            with _state_lock:
+                latest = copy.deepcopy(_latest_photons)
+            if isinstance(latest, dict):
+                latest_epoch = _stats_epoch_snapshot_from_state(latest)
+                last_live = latest_epoch
+                if latest_epoch["reset_count"] > expected_reset_count:
+                    raise RuntimeError(
+                        "PHOTONS statistics skipped past requested reset epoch: "
+                        f"expected={expected_reset_count} observed={latest_epoch['reset_count']}"
+                    )
+                if (
+                    latest_epoch["reset_count"] == expected_reset_count
+                    and latest_epoch["update_count"] == 1
+                    and live_birth is None
+                ):
+                    live_birth = _stats_reset_birth_court(
+                        latest,
+                        before=before,
+                        expected_reset_count=expected_reset_count,
+                    )
+
+            durable = _find_durable_stats_reset_birth(
+                expected_reset_count=expected_reset_count
+            )
+            if durable is not None:
+                durable_proof = _stats_reset_birth_court(
+                    durable["canonical"],
+                    before=before,
+                    expected_reset_count=expected_reset_count,
+                )
+                durable_birth = {
+                    "detail_id": int(durable["detail_id"]),
+                    **durable_proof,
+                }
+                if live_birth is not None and int(live_birth["sequence"]) != int(
+                    durable_birth["sequence"]
+                ):
+                    raise RuntimeError(
+                        "PHOTONS live/durable STATS_RESET row-1 identity mismatch: "
+                        f"live_sequence={live_birth['sequence']} "
+                        f"durable_sequence={durable_birth['sequence']}"
+                    )
+                break
+        except Exception as exc:
+            proof_error = str(exc)
+            break
+        time.sleep(0.05)
+
+    if durable_birth is None:
+        failure = {
+            "action": "STATS_RESET",
+            "requested_at_utc": requested_at,
+            "completed_at_utc": _utc_now_z(),
+            "success": False,
+            "stage": "PROVE_DURABLE_EPOCH_BIRTH",
+            "before": before,
+            "expected_reset_count": expected_reset_count,
+            "live_birth": live_birth,
+            "last_live": last_live,
+            "teensy": copy.deepcopy(teensy_payload),
+            "error": proof_error,
+            "timeout_s": PHOTONS_STATS_RESET_PROOF_TIMEOUT_S,
+        }
+        with _state_lock:
+            _stats_reset_failures += 1
+            _last_maintenance = copy.deepcopy(failure)
+        logging.error("💥 [photons] STATS_RESET epoch-birth proof failed: %s", failure)
         return {
             "success": False,
-            "message": "PHOTONS.STATS_RESET was accepted but no new canonical stats epoch arrived within 10s",
+            "message": (
+                proof_error
+                or "PHOTONS.STATS_RESET did not produce one proven durable update_count=1 row"
+            ),
             "payload": failure,
         }
+
+    try:
+        teensy_after = _fetch_teensy_stats_reset_postcondition(
+            expected_reset_count=expected_reset_count,
+            request_count=expected_request_count,
+            prior_commit_count=commit_count_before,
+        )
+        after = _latest_stats_epoch()
+        if after["reset_count"] != expected_reset_count or after["update_count"] < 1:
+            raise RuntimeError(
+                "latest PHOTONS state is not descended from the proven STATS_RESET birth row"
+            )
+        if after["sequence"] < durable_birth["sequence"]:
+            raise RuntimeError("latest PHOTONS physical sequence regressed behind durable row 1")
+        if after["standard_lap_ps"] != before["standard_lap_ps"]:
+            raise RuntimeError("latest PHOTONS STANDARD_LAP_NS changed across STATS_RESET")
+        if after["campaign"] != before.get("campaign"):
+            raise RuntimeError("latest PHOTONS LANTERN identity/origin changed across STATS_RESET")
+        if after["custody_lap_count"] < durable_birth["custody_lap_count"]:
+            raise RuntimeError("latest PHOTONS custody regressed behind durable row 1")
+        if (
+            after["custody_total_lap_gnss_ns"]
+            < durable_birth["custody_total_lap_gnss_ns"]
+        ):
+            raise RuntimeError("latest PHOTONS custody total regressed behind durable row 1")
+    except Exception as exc:
+        failure = {
+            "action": "STATS_RESET",
+            "requested_at_utc": requested_at,
+            "completed_at_utc": _utc_now_z(),
+            "success": False,
+            "stage": "VERIFY_POSTCONDITION",
+            "before": before,
+            "durable_birth": durable_birth,
+            "last_live": last_live,
+            "teensy": copy.deepcopy(teensy_payload),
+            "error": str(exc),
+        }
+        with _state_lock:
+            _stats_reset_failures += 1
+            _last_maintenance = copy.deepcopy(failure)
+        logging.exception("💥 [photons] STATS_RESET postcondition failed")
+        return {"success": False, "message": str(exc), "payload": failure}
 
     result = {
         "action": "STATS_RESET",
         "requested_at_utc": requested_at,
         "completed_at_utc": _utc_now_z(),
         "success": True,
+        "scope": "SYSTEMWIDE_PHOTONS_STATISTICS",
         "before": before,
+        "epoch_birth": durable_birth,
         "after": after,
-        "teensy": copy.deepcopy(teensy_payload),
+        "teensy_before": copy.deepcopy(teensy_before),
+        "teensy_request": copy.deepcopy(teensy_payload),
+        "teensy_after": teensy_after,
         "campaign_unchanged": True,
         "physical_measurement_unchanged": True,
+        "physical_sequence_preserved": True,
+        "monotonic_custody_preserved": True,
         "standard_lap_preserved": True,
+        "first_durable_update_count": 1,
     }
     with _state_lock:
         _stats_reset_success += 1
         _last_maintenance = copy.deepcopy(result)
-    logging.warning("📊 [photons] STATS_RESET complete: %s", result)
+    logging.warning(
+        "📊 [photons] STATS_RESET proved new durable epoch reset_count=%d "
+        "detail_id=%d sequence=%d N=%d",
+        expected_reset_count,
+        int(durable_birth["detail_id"]),
+        int(durable_birth["sequence"]),
+        int(durable_birth["lap_count"]),
+    )
     return {"success": True, "message": "OK", "payload": result}
 
 

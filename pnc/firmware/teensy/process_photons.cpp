@@ -4028,6 +4028,8 @@ static FLASHMEM Payload cmd_stats_reset(const Payload& /*args*/) {
   if (g_photons_stats_reset_pending) {
     p.add("status", "instrument_statistics_reset_requested");
     p.add("reset_pending", true);
+    p.add("current_reset_count", g_photons_stats_reset_count);
+    p.add("expected_reset_count", g_photons_stats_reset_count + 1U);
     p.add("request_count", g_photons_stats_reset_request_count);
     p.add("commit_count", g_photons_stats_reset_commit_count);
     return p;
@@ -4038,14 +4040,17 @@ static FLASHMEM Payload cmd_stats_reset(const Payload& /*args*/) {
   p.add("status", "instrument_statistics_reset_requested");
   p.add("reset", true);
   p.add("reset_pending", true);
+  p.add("current_reset_count", g_photons_stats_reset_count);
+  p.add("expected_reset_count", g_photons_stats_reset_count + 1U);
+  p.add("request_count", g_photons_stats_reset_request_count);
+  p.add("commit_count", g_photons_stats_reset_commit_count);
   p.add("boundary", "AFTER_NEXT_SUCCESSFULLY_PUBLISHED_FRAGMENT");
   p.add("campaign_changed", false);
   p.add("custody_preserved", true);
   p.add("standard_lap_preserved", true);
-  p.add("next_report", "REPORT_PHOTONS");
+  p.add("next_report", "REPORT_STATS");
   return p;
 }
-
 
 static FLASHMEM Payload cmd_inject_problem(const Payload& args) {
   if (!g_photons_recovery.publication_started ||
