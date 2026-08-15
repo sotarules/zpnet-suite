@@ -81,12 +81,14 @@ TRANSPORT_RETRY_INTERVAL_S = 0.25   # poll every 250 ms — aggressive but not a
 # ZPNET_TRANSPORT_RAW_LOG environment variable to 1 to enable it temporarily.
 TRANSPORT_RAW_LOG_ENABLED = os.environ.get("ZPNET_TRANSPORT_RAW_LOG") == "1"
 
-# Formal Pi fan-out is synchronous today, so one subscriber that stops
-# consuming can otherwise hold the router indefinitely and starve every target
-# visited later in the fan-out loop.  Bound each local Unix-socket delivery and
-# narrate both slow and failed deliveries in the consolidated system log.
+# Formal Pi delivery is custody queued per target.  One unavailable subscriber
+# must neither drop its publication nor block unrelated targets.  Each target's
+# worker retries the FIFO head until Unix-socket delivery succeeds; the router
+# itself only performs an unbounded in-memory enqueue.
 PI_FANOUT_SOCKET_TIMEOUT_S = 2.0
 PI_FANOUT_SLOW_WARN_S = 0.100
+PI_DELIVERY_RETRY_INTERVAL_S = 0.25
+PI_DELIVERY_RETRY_LOG_INTERVAL_S = 30.0
 
 # Subsystems that PUBSUB should never query during ALLSUBSCRIPTIONS.
 # These are test/utility programs that may leave stale sockets behind.
@@ -123,12 +125,11 @@ ADHOC_RECV_TIMEOUT_S = 1.0
 # the Pi-side union remains valid.  Reapply the cached union when that happens.
 TEENSY_ROUTE_MONITOR_INTERVAL_S = 30.0
 
-# CLOCKS_FRAGMENT is continuous instrument evidence.  During PUBSUB startup the
-# transport may receive valid frames before CLOCKS has registered its formal
-# route.  Retain those frames until PI:CLOCKS is routable; do not let control-
-# plane convergence manufacture a hole in durable instrument chronology.
-STARTUP_CUSTODY_TOPIC = "CLOCKS_FRAGMENT"
-STARTUP_CUSTODY_SUBSYSTEM = "CLOCKS"
+# Teensy can publish valid data immediately when the serial transport attaches,
+# before PUBSUB has committed its first canonical route table.  Retain that
+# complete startup publication prefix until the first successful REFRESH, then
+# replay it through the ordinary router in original arrival order.  This is a
+# bus custody boundary, not a CLOCKS-specific exception.
 
 # ---------------------------------------------------------------------
 # Global state
@@ -249,18 +250,52 @@ applied_union: Dict[str, Any] = {}
 state_lock = threading.Lock()
 debug_log_fh: Optional[TextIO] = None
 
-# Startup-only CLOCKS_FRAGMENT custody.  This lock serializes the final backlog
-# flush against the transport RX callback so no live frame can overtake retained
-# attach-time evidence.  The list is intentionally unbounded: at 1 Hz, failure
-# to establish the CLOCKS route must remain visible as retained evidence rather
-# than becoming another silent drop policy.
+# Startup route-convergence custody for every Teensy-origin publication.  The
+# lock serializes final backlog release against the transport RX callback, so a
+# live frame cannot overtake any retained predecessor.  The backlog is
+# intentionally unbounded: evidence is never evicted merely because control
+# plane convergence is delayed.
 startup_custody_lock = threading.Lock()
 startup_custody_active = True
 startup_custody_backlog: List[Dict[str, Any]] = []
 startup_custody_retained = 0
 startup_custody_released = 0
 startup_custody_release_failures = 0
+startup_custody_unrouted_released = 0
+startup_custody_first_topic: Optional[str] = None
+startup_custody_first_sequence: Optional[int] = None
+startup_custody_last_topic: Optional[str] = None
 startup_custody_last_sequence: Optional[int] = None
+
+
+class _PiDeliveryTarget:
+    """One formal Pi subscriber's ordered, lossless in-memory custody queue."""
+
+    def __init__(self, subsystem: str) -> None:
+        self.subsystem = subsystem
+        self.queue: Queue = Queue()  # intentionally unbounded; formal evidence is never evicted
+        self.worker_started = False
+        self.enqueued = 0
+        self.delivered = 0
+        self.retry_count = 0
+        self.max_backlog = 0
+        self.current_topic: Optional[str] = None
+        self.current_sequence: Optional[int] = None
+        self.current_enqueued_monotonic: Optional[float] = None
+        self.blocked_since_monotonic: Optional[float] = None
+        self.last_enqueued_topic: Optional[str] = None
+        self.last_enqueued_sequence: Optional[int] = None
+        self.last_delivered_topic: Optional[str] = None
+        self.last_delivered_sequence: Optional[int] = None
+        self.last_delivery_monotonic: Optional[float] = None
+
+
+# Per-target isolation is essential: PI:PHOTONS being down must never stall
+# PI:CLOCKS, PI:GNSS, or another formal subscriber.  The lock covers target
+# creation, enqueue order, and diagnostics counters only; socket I/O occurs in
+# the independent worker for each target.
+pi_delivery_lock = threading.Lock()
+pi_delivery_targets: Dict[str, _PiDeliveryTarget] = {}
 
 # ---------------------------------------------------------------------
 # SERVER connection state
@@ -440,7 +475,7 @@ def on_receive_request_response(payload: Dict[str, Any]) -> None:
     _remember_reply_state(req_id, entry, "DELIVERED")
     entry["queue"].put(payload)
 
-def _startup_custody_sequence(msg: Dict[str, Any]) -> Optional[int]:
+def _publication_sequence(msg: Dict[str, Any]) -> Optional[int]:
     payload = msg.get("payload")
     if not isinstance(payload, dict):
         return None
@@ -451,25 +486,31 @@ def _startup_custody_sequence(msg: Dict[str, Any]) -> Optional[int]:
         return None
 
 
-def _retain_startup_clocks_fragment(msg: Dict[str, Any]) -> bool:
-    """Retain CLOCKS_FRAGMENT until the formal PI:CLOCKS route exists."""
-    global startup_custody_retained, startup_custody_last_sequence
-
-    if msg.get("topic") != STARTUP_CUSTODY_TOPIC:
-        return False
+def _retain_startup_publication(msg: Dict[str, Any]) -> bool:
+    """Retain every Teensy publication until PUBSUB commits its first routes."""
+    global startup_custody_retained
+    global startup_custody_first_topic, startup_custody_first_sequence
+    global startup_custody_last_topic, startup_custody_last_sequence
 
     with startup_custody_lock:
         if not startup_custody_active:
             return False
+
+        topic = str(msg.get("topic") or "")
+        sequence = _publication_sequence(msg)
         startup_custody_backlog.append(msg)
         startup_custody_retained += 1
-        startup_custody_last_sequence = _startup_custody_sequence(msg)
+        if startup_custody_first_topic is None:
+            startup_custody_first_topic = topic
+            startup_custody_first_sequence = sequence
+        startup_custody_last_topic = topic
+        startup_custody_last_sequence = sequence
         return True
 
 
 def on_receive_publish_subscribe(payload: Dict[str, Any]) -> None:
     # Message originated from Teensy. Never forward back to Teensy.
-    if _retain_startup_clocks_fragment(payload):
+    if _retain_startup_publication(payload):
         return
     route_publish(payload, forward_to_teensy=False)
 
@@ -870,15 +911,14 @@ def adhoc_tap_server() -> None:
 # Formal Pi fan-out instrumentation
 # ---------------------------------------------------------------------
 
-def _fanout_to_pi(topic: str, subsystem: str, raw: bytes) -> bool:
-    """
-    Deliver one publication to a formal Pi subscriber with bounded timing.
-
-    The router remains sequential, but a stopped/slow subscriber can no longer
-    hold the entire fan-out path forever.  Slow successes and all failures are
-    emitted through normal logging so they appear in the consolidated system
-    journal with the exact topic, target, byte count, and phase timings.
-    """
+def _fanout_to_pi(
+    topic: str,
+    subsystem: str,
+    raw: bytes,
+    *,
+    log_failure: bool = True,
+) -> bool:
+    """Perform one bounded Unix-socket delivery attempt for a formal Pi target."""
     sock_path = f"{SOCKET_DIR}/zpnet-{subsystem.lower()}-pubsub.sock"
     started = time.monotonic()
     connected: Optional[float] = None
@@ -922,67 +962,197 @@ def _fanout_to_pi(topic: str, subsystem: str, raw: bytes) -> bool:
             else (failed - connected) * 1000.0
         )
 
-        logging.exception(
-            "💥 [pubsub] Pi fan-out failed topic=%s target=PI:%s "
-            "socket=%s bytes=%d phase=%s connect_ms=%s send_ms=%s "
-            "total_ms=%.3f timeout_s=%.3f error=%r",
-            topic,
-            subsystem,
-            sock_path,
-            len(raw),
-            "CONNECT" if connected is None else "SEND",
-            "unavailable" if connect_ms is None else f"{connect_ms:.3f}",
-            "unavailable" if send_ms is None else f"{send_ms:.3f}",
-            (failed - started) * 1000.0,
-            PI_FANOUT_SOCKET_TIMEOUT_S,
-            exc,
-        )
+        if log_failure:
+            logging.exception(
+                "💥 [pubsub] Pi fan-out failed topic=%s target=PI:%s "
+                "socket=%s bytes=%d phase=%s connect_ms=%s send_ms=%s "
+                "total_ms=%.3f timeout_s=%.3f error=%r",
+                topic,
+                subsystem,
+                sock_path,
+                len(raw),
+                "CONNECT" if connected is None else "SEND",
+                "unavailable" if connect_ms is None else f"{connect_ms:.3f}",
+                "unavailable" if send_ms is None else f"{send_ms:.3f}",
+                (failed - started) * 1000.0,
+                PI_FANOUT_SOCKET_TIMEOUT_S,
+                exc,
+            )
         return False
 
 
-def _release_startup_clocks_custody_if_routed() -> bool:
-    """Flush retained CLOCKS_FRAGMENT directly to CLOCKS in original order."""
+def _pi_delivery_worker(target: _PiDeliveryTarget) -> None:
+    """Deliver one target's FIFO head until success before advancing custody."""
+    while True:
+        item = target.queue.get()
+        topic = str(item["topic"])
+        raw = item["raw"]
+        sequence = item.get("sequence")
+        enqueued_monotonic = float(item["enqueued_monotonic"])
+
+        with pi_delivery_lock:
+            target.current_topic = topic
+            target.current_sequence = sequence
+            target.current_enqueued_monotonic = enqueued_monotonic
+
+        attempts = 0
+        last_failure_log = 0.0
+        while True:
+            now = time.monotonic()
+            log_failure = attempts == 0 or (
+                now - last_failure_log >= PI_DELIVERY_RETRY_LOG_INTERVAL_S
+            )
+            if _fanout_to_pi(
+                topic, target.subsystem, raw, log_failure=log_failure
+            ):
+                delivered_at = time.monotonic()
+                with pi_delivery_lock:
+                    was_blocked = target.blocked_since_monotonic is not None
+                    blocked_since = target.blocked_since_monotonic
+                    target.delivered += 1
+                    target.last_delivered_topic = topic
+                    target.last_delivered_sequence = sequence
+                    target.last_delivery_monotonic = delivered_at
+                    target.current_topic = None
+                    target.current_sequence = None
+                    target.current_enqueued_monotonic = None
+                    target.blocked_since_monotonic = None
+                target.queue.task_done()
+                if was_blocked:
+                    blocked_ms = (
+                        (delivered_at - blocked_since) * 1000.0
+                        if blocked_since is not None
+                        else 0.0
+                    )
+                    logging.info(
+                        "✅ [pubsub] Pi delivery custody resumed target=PI:%s "
+                        "topic=%s sequence=%s retries=%d blocked_ms=%.1f backlog=%d",
+                        target.subsystem,
+                        topic,
+                        sequence,
+                        attempts,
+                        blocked_ms,
+                        target.queue.qsize(),
+                    )
+                break
+
+            attempts += 1
+            with pi_delivery_lock:
+                target.retry_count += 1
+                if target.blocked_since_monotonic is None:
+                    target.blocked_since_monotonic = time.monotonic()
+            if log_failure:
+                last_failure_log = now
+                logging.warning(
+                    "📥 [pubsub] retaining undelivered formal Pi publication "
+                    "target=PI:%s topic=%s sequence=%s retries=%d backlog=%d",
+                    target.subsystem,
+                    topic,
+                    sequence,
+                    attempts,
+                    target.queue.qsize() + 1,
+                )
+            time.sleep(PI_DELIVERY_RETRY_INTERVAL_S)
+
+
+def _enqueue_pi_delivery(
+    msg: Dict[str, Any], topic: str, subsystem: str, raw: bytes
+) -> None:
+    """Transfer one routed publication into a formal Pi target's FIFO custody."""
+    start_worker = False
+    sequence = _publication_sequence(msg)
+    item = {
+        "topic": topic,
+        "raw": raw,
+        "sequence": sequence,
+        "enqueued_monotonic": time.monotonic(),
+    }
+
+    with pi_delivery_lock:
+        target = pi_delivery_targets.get(subsystem)
+        if target is None:
+            target = _PiDeliveryTarget(subsystem)
+            pi_delivery_targets[subsystem] = target
+        target.queue.put_nowait(item)
+        target.enqueued += 1
+        target.last_enqueued_topic = topic
+        target.last_enqueued_sequence = sequence
+        backlog = target.queue.qsize()
+        if backlog > target.max_backlog:
+            target.max_backlog = backlog
+        if not target.worker_started:
+            target.worker_started = True
+            start_worker = True
+
+    if start_worker:
+        threading.Thread(
+            target=_pi_delivery_worker,
+            args=(target,),
+            daemon=True,
+            name=f"pubsub-pi-delivery-{subsystem.lower()}",
+        ).start()
+
+
+def _release_startup_custody_after_route_commit() -> bool:
+    """Replay the retained Teensy startup prefix through committed routes."""
     global startup_custody_active, startup_custody_released
-    global startup_custody_release_failures
+    global startup_custody_release_failures, startup_custody_unrouted_released
 
-    with state_lock:
-        targets = set(routes_by_topic.get(STARTUP_CUSTODY_TOPIC, set()))
-    if ("PI", STARTUP_CUSTODY_SUBSYSTEM) not in targets:
-        return False
-
-    # Hold the custody lock through the complete flush.  The transport RX callback
-    # blocks here, so a newly arriving live CLOCKS_FRAGMENT cannot overtake the
-    # retained prefix.
+    # Hold the custody lock through the complete transfer.  The transport RX
+    # callback blocks here, so newly arriving live publications cannot overtake
+    # the retained prefix.  route_publish() hands formal Pi deliveries to their
+    # per-target FIFO queues; a dead subscriber therefore cannot stall this
+    # global release or any unrelated target.
     with startup_custody_lock:
         if not startup_custody_active:
             return True
 
         released_now = 0
+        unrouted_now = 0
         while startup_custody_backlog:
             msg = startup_custody_backlog[0]
-            raw = payload_to_json_bytes(msg)
-            if not _fanout_to_pi(STARTUP_CUSTODY_TOPIC, STARTUP_CUSTODY_SUBSYSTEM, raw):
+            topic = str(msg.get("topic") or "")
+            sequence = _publication_sequence(msg)
+            with state_lock:
+                targets = set(routes_by_topic.get(topic, set()))
+            deliverable_targets = {
+                (machine, subsystem)
+                for machine, subsystem in targets
+                if machine != "TEENSY"
+            }
+            if not deliverable_targets:
+                unrouted_now += 1
+
+            try:
+                # Message originated from Teensy, so it must never be reflected
+                # back to Teensy during replay.
+                route_publish(msg, forward_to_teensy=False)
+            except Exception:
                 startup_custody_release_failures += 1
-                logging.error(
-                    "💥 [pubsub] startup CLOCKS_FRAGMENT custody release blocked: "
-                    "retained=%d released_now=%d next_sequence=%s",
+                logging.exception(
+                    "💥 [pubsub] startup publication custody release blocked: "
+                    "retained=%d released_now=%d next_topic=%s next_sequence=%s",
                     len(startup_custody_backlog),
                     released_now,
-                    _startup_custody_sequence(msg),
+                    topic,
+                    sequence,
                 )
                 return False
 
-            log_pubsub(msg)
-            _route_publish_to_adhoc(STARTUP_CUSTODY_TOPIC, msg)
             startup_custody_backlog.pop(0)
             startup_custody_released += 1
+            startup_custody_unrouted_released += 1 if not deliverable_targets else 0
             released_now += 1
 
         startup_custody_active = False
         logging.info(
-            "✅ [pubsub] startup CLOCKS_FRAGMENT custody released in order: "
-            "count=%d last_sequence=%s",
+            "✅ [pubsub] startup publication custody released in order: "
+            "count=%d unrouted=%d first=%s/%s last=%s/%s",
             released_now,
+            unrouted_now,
+            startup_custody_first_topic,
+            startup_custody_first_sequence,
+            startup_custody_last_topic,
             startup_custody_last_sequence,
         )
         return True
@@ -997,14 +1167,14 @@ def route_publish(msg: Dict[str, Any], *, forward_to_teensy: bool) -> None:
     Route a single published message to all interested targets.
 
     Semantics:
-      • Fan-out to PI targets via per-subsystem pubsub sockets
+      • Transfer PI-target publications into per-subsystem FIFO custody queues
       • Forward to TEENSY at most once (transport layer) if:
           - forward_to_teensy is True, and
           - at least one TEENSY target exists for the topic
       • Forward to SERVER via persistent TCP connection if:
           - at least one SERVER target exists for the topic
           - SERVER is connected
-      • Best-effort, silence on per-target failure
+      • A PI subscriber outage retains evidence for ordered retry without blocking peers
     """
     topic = msg.get("topic")
     if not topic:
@@ -1037,8 +1207,9 @@ def route_publish(msg: Dict[str, Any], *, forward_to_teensy: bool) -> None:
             server_needed = True
             continue
 
-        # PI target: bounded, instrumented Unix-socket delivery.
-        _fanout_to_pi(topic, subsystem, raw)
+        # PI target: transfer custody immediately; an independent target worker
+        # retries the FIFO head until the subscriber accepts it.
+        _enqueue_pi_delivery(msg, topic, subsystem, raw)
 
     if forward_to_teensy and teensy_needed:
         transport_send(TRAFFIC_PUBLISH_SUBSCRIBE, msg)
@@ -1420,8 +1591,9 @@ def _server_handle_publish(msg: Dict[str, Any]) -> None:
             # Do NOT echo back to the originator
             continue
 
-        # PI target: bounded, instrumented Unix-socket delivery.
-        _fanout_to_pi(topic, subsystem, raw)
+        # PI target: transfer custody immediately; an independent target worker
+        # retries the FIFO head until the subscriber accepts it.
+        _enqueue_pi_delivery(pub_msg, topic, subsystem, raw)
 
     if teensy_needed:
         transport_send(TRAFFIC_PUBLISH_SUBSCRIBE, pub_msg)
@@ -1678,13 +1850,16 @@ def cmd_diagnostics(_: Optional[dict]) -> Dict[str, Any]:
             for client in adhoc_clients.values()
         ]
         startup_custody = {
-            "topic": STARTUP_CUSTODY_TOPIC,
-            "target": f"PI:{STARTUP_CUSTODY_SUBSYSTEM}",
+            "scope": "ALL_TEENSY_PUBLICATIONS_UNTIL_FIRST_ROUTE_COMMIT",
             "active": startup_custody_active,
             "backlog_depth": len(startup_custody_backlog),
             "retained": startup_custody_retained,
             "released": startup_custody_released,
             "release_failures": startup_custody_release_failures,
+            "unrouted_released": startup_custody_unrouted_released,
+            "first_topic": startup_custody_first_topic,
+            "first_sequence": startup_custody_first_sequence,
+            "last_topic": startup_custody_last_topic,
             "last_sequence": startup_custody_last_sequence,
         }
         route_monitor = {
@@ -1703,6 +1878,40 @@ def cmd_diagnostics(_: Optional[dict]) -> Dict[str, Any]:
             "last_reapply_subscription_count": teensy_route_monitor_last_reapply_subscription_count,
             "last_status": teensy_route_monitor_last_status,
         }
+
+    with pi_delivery_lock:
+        now = time.monotonic()
+        pi_delivery_custody = [
+            {
+                "target": f"PI:{target.subsystem}",
+                "worker_started": target.worker_started,
+                "backlog_depth": target.queue.qsize(),
+                "in_flight": target.current_topic is not None,
+                "enqueued": target.enqueued,
+                "delivered": target.delivered,
+                "retry_count": target.retry_count,
+                "max_backlog": target.max_backlog,
+                "current_topic": target.current_topic,
+                "current_sequence": target.current_sequence,
+                "current_age_ms": (
+                    int((now - target.current_enqueued_monotonic) * 1000)
+                    if target.current_enqueued_monotonic is not None
+                    else None
+                ),
+                "blocked_ms": (
+                    int((now - target.blocked_since_monotonic) * 1000)
+                    if target.blocked_since_monotonic is not None
+                    else 0
+                ),
+                "last_enqueued_topic": target.last_enqueued_topic,
+                "last_enqueued_sequence": target.last_enqueued_sequence,
+                "last_delivered_topic": target.last_delivered_topic,
+                "last_delivered_sequence": target.last_delivered_sequence,
+            }
+            for target in sorted(
+                pi_delivery_targets.values(), key=lambda value: value.subsystem
+            )
+        ]
 
     with server_conn_lock:
         server_connected = server_conn is not None
@@ -1732,7 +1941,8 @@ def cmd_diagnostics(_: Optional[dict]) -> Dict[str, Any]:
             "adhoc_publish_drop_count": adhoc_publish_drop_count,
             "adhoc_routes": adhoc_routes,
             "teensy_route_monitor": route_monitor,
-            "startup_clocks_fragment_custody": startup_custody,
+            "startup_publication_custody": startup_custody,
+            "pi_delivery_custody": pi_delivery_custody,
         },
     }
 
@@ -1953,7 +2163,7 @@ def cmd_refresh(_: Optional[dict]) -> Dict[str, Any]:
 
         logging.info("🚀 [pubsub] routes updated (%d topics)", len(routes_by_topic))
 
-    _release_startup_clocks_custody_if_routed()
+    _release_startup_custody_after_route_commit()
 
     # 5) Return committed truth
     return {
