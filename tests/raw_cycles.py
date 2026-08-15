@@ -7,14 +7,15 @@ of campaign length.
 
 The SQL explicitly selects ``campaign_type='TEMPEST'`` and derives the campaign
 PPS identity from ``payload.campaign``. That identity must agree with the
-immutable identity carried inside the merged campaign view.
+immutable identity carried inside the merged campaign view.  The query projects
+only campaign testimony and ``clocks.raw_cycles``; the much larger recovery
+ledger remains durable in PostgreSQL and is not transferred for this audit.
 """
 
 from __future__ import annotations
 
 import json
 import sys
-import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, Optional, Sequence, Tuple
 
@@ -27,7 +28,6 @@ EXPLANATION_GATE_CYCLES = 16
 PLAUSIBLE_MIN = 900_000_000
 PLAUSIBLE_MAX = 1_100_000_000
 DEFAULT_BATCH_SIZE = 16
-DEFAULT_PAUSE_MS = 25
 CAMPAIGN_TYPE = "TEMPEST"
 PPS_COUNT_SQL = """
 NULLIF(
@@ -127,23 +127,32 @@ def _payload_pps_count(payload: Dict[str, Any], campaign: Dict[str, Any]) -> Opt
 
 
 def _assert_campaign_indexed(cur: Any, campaign: str) -> None:
+    """Fail if any decorated campaign row lacks its public PPS identity.
+
+    This is deliberately an existence probe rather than ``count(*)``.  The old
+    full-campaign count made every interactive report pay for a complete JSONB
+    audit before the named cursor could return its first row.  With the matching
+    partial index installed, the healthy case is an empty index lookup and the
+    unhealthy case stops on the first offending row.
+    """
     cur.execute(
         f"""
-        SELECT count(*) AS missing_count
+        SELECT id
         FROM campaign_detail
         WHERE campaign_type = %s
           AND campaign = %s
           AND payload #>> '{{campaign,schema}}' = 'TEMPEST_FRAGMENT_V1'
           AND {PPS_COUNT_SQL} IS NULL
+        ORDER BY id ASC
+        LIMIT 1
         """,
         (CAMPAIGN_TYPE, campaign),
     )
     row = cur.fetchone()
-    missing = int(row["missing_count"] if row else 0)
-    if missing:
+    if row:
         raise RuntimeError(
-            f"TEMPEST campaign {campaign!r} has {missing:,} decorated rows without "
-            "campaign.public_count"
+            f"TEMPEST campaign {campaign!r} has decorated row id={int(row['id'])} "
+            "without campaign.public_count"
         )
 
 
@@ -153,7 +162,6 @@ def iter_payloads(
     skip: int,
     limit: int,
     batch_size: int,
-    pause_ms: int,
 ) -> Iterator[Tuple[int, int, Dict[str, Any]]]:
     """Yield ``(db_id, campaign_pps_count, payload)`` using a server-side cursor."""
     with open_db(row_dict=True) as conn:
@@ -163,7 +171,11 @@ def iter_payloads(
         check.close()
 
         sql = f"""
-            SELECT id, {PPS_COUNT_SQL} AS pps_count, payload
+            SELECT
+                id,
+                {PPS_COUNT_SQL} AS pps_count,
+                payload -> 'campaign' AS campaign_payload,
+                payload #> '{{clocks,raw_cycles}}' AS raw_cycles_payload
             FROM campaign_detail
             WHERE campaign_type = %s
               AND campaign = %s
@@ -183,30 +195,40 @@ def iter_payloads(
         cur.itersize = max(1, batch_size)
         cur.execute(sql, tuple(params))
 
-        fetched_in_batch = 0
         for row in cur:
-            payload = row["payload"]
-            if isinstance(payload, str):
-                payload = json.loads(payload)
-            if not isinstance(payload, dict):
-                continue
+            campaign = row["campaign_payload"]
+            if isinstance(campaign, str):
+                campaign = json.loads(campaign)
+            if not isinstance(campaign, dict):
+                raise ValueError(
+                    f"campaign_detail id={row['id']} missing TEMPEST campaign payload"
+                )
+
+            raw_cycles = row["raw_cycles_payload"]
+            if isinstance(raw_cycles, str):
+                raw_cycles = json.loads(raw_cycles)
+            if not isinstance(raw_cycles, dict):
+                raise ValueError(
+                    f"campaign_detail id={row['id']} missing clocks.raw_cycles payload"
+                )
 
             db_count = int(row["pps_count"])
-            campaign = campaign_view(payload)
-            payload_count = _payload_pps_count(payload, campaign)
-            if payload_count is not None and payload_count != db_count:
+            payload_count = _payload_pps_count({}, campaign)
+            if payload_count != db_count:
                 raise ValueError(
                     "campaign_detail relational/payload campaign PPS mismatch: "
                     f"id={row['id']} db={db_count} payload={payload_count}"
                 )
 
+            # Build only the tiny canonical view consumed by build_row().  The
+            # durable CLOCKS_V4 recovery ledger remains in PostgreSQL and is not
+            # transferred or decoded by this raw-cycle audit.
+            payload = {
+                "schema": "CLOCKS_V4",
+                "campaign": campaign,
+                "clocks": {"raw_cycles": raw_cycles},
+            }
             yield int(row["id"]), db_count, payload
-
-            fetched_in_batch += 1
-            if fetched_in_batch >= max(1, batch_size):
-                fetched_in_batch = 0
-                if pause_ms > 0:
-                    time.sleep(pause_ms / 1000.0)
 
 
 def explicit_recovery_row(campaign: Dict[str, Any]) -> bool:
@@ -367,12 +389,12 @@ def fmt(value: Optional[int], width: int, signed: bool = False) -> str:
     return f"{text:>{width}}"
 
 
-def parse(argv: Sequence[str]) -> tuple[str, int, int, Optional[str], bool, int, int, int]:
+def parse(argv: Sequence[str]) -> tuple[str, int, int, Optional[str], bool, int, int]:
     if len(argv) < 2:
         raise SystemExit(
             "Usage: raw_cycles CAMPAIGN [limit] [clock] [--skip N] "
             "[--pathology-only] [--pathology-gate N] "
-            "[--batch-size N] [--pause-ms N]"
+            "[--batch-size N]"
         )
     campaign = argv[1]
     limit = 0
@@ -381,7 +403,6 @@ def parse(argv: Sequence[str]) -> tuple[str, int, int, Optional[str], bool, int,
     pathology_only = False
     gate = DEFAULT_GATE_CYCLES
     batch_size = DEFAULT_BATCH_SIZE
-    pause_ms = DEFAULT_PAUSE_MS
     positional: list[str] = []
 
     idx = 2
@@ -391,7 +412,7 @@ def parse(argv: Sequence[str]) -> tuple[str, int, int, Optional[str], bool, int,
             pathology_only = True
             idx += 1
         elif arg in {"--skip", "--pathology-gate", "--clock", "--limit",
-                     "--batch-size", "--pause-ms"}:
+                     "--batch-size"}:
             if idx + 1 >= len(argv):
                 raise SystemExit(f"{arg} requires a value")
             value = argv[idx + 1]
@@ -406,8 +427,6 @@ def parse(argv: Sequence[str]) -> tuple[str, int, int, Optional[str], bool, int,
                 limit = int(value)
             elif arg == "--batch-size":
                 batch_size = int(value)
-            else:
-                pause_ms = int(value)
         elif "=" in arg and arg.startswith("--"):
             key, value = arg.split("=", 1)
             if key == "--skip":
@@ -420,8 +439,6 @@ def parse(argv: Sequence[str]) -> tuple[str, int, int, Optional[str], bool, int,
                 limit = int(value)
             elif key == "--batch-size":
                 batch_size = int(value)
-            elif key == "--pause-ms":
-                pause_ms = int(value)
             idx += 1
         elif arg in {"--align-ocxo", "--delay-pps-vclock", "--slip"}:
             idx += 1
@@ -435,20 +452,20 @@ def parse(argv: Sequence[str]) -> tuple[str, int, int, Optional[str], bool, int,
         else:
             limit = int(arg)
 
-    if min(skip, limit, pause_ms) < 0 or batch_size <= 0:
-        raise SystemExit("skip/limit/pause must be nonnegative; batch-size must be positive")
+    if min(skip, limit) < 0 or batch_size <= 0:
+        raise SystemExit("skip/limit must be nonnegative; batch-size must be positive")
     if clock is not None and clock not in RAILS:
         raise SystemExit("clock must be PPS, VCLOCK, OCXO1, or OCXO2")
-    return campaign, limit, skip, clock, pathology_only, gate, batch_size, pause_ms
+    return campaign, limit, skip, clock, pathology_only, gate, batch_size
 
 
 def main(argv: Sequence[str]) -> None:
-    campaign, limit, skip, clock, pathology_only, gate, batch_size, pause_ms = parse(argv)
+    campaign, limit, skip, clock, pathology_only, gate, batch_size = parse(argv)
     selected = (clock,) if clock else RAILS
 
     print(
         f"Campaign: {campaign}  view={clock or 'ALL'}  "
-        f"server_batch={batch_size} pause_ms={pause_ms}"
+        f"server_batch={batch_size}"
     )
     header = [f"{'pps':>7}"]
     for name in selected:
@@ -468,7 +485,6 @@ def main(argv: Sequence[str]) -> None:
         skip=skip,
         limit=limit,
         batch_size=batch_size,
-        pause_ms=pause_ms,
     ):
         row = build_row(payload, db_count, previous_count, previous_observed)
         previous_count = db_count

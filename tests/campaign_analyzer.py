@@ -12,9 +12,10 @@ is explicit:
 The post-recovery CLOCKS format is intentionally self-proving.  Every durable row
 carries producer-authored Better-Buckets checkpoint/proof testimony, while Pi may
 also carry a literal bounded Better-Buckets resurrection image.  The analyzer
-therefore validates those witnesses directly.  Database replay is used only as an
-independent adjacent-row cross-check when the required raw observations are
-actually present; gaps remain gaps.
+therefore validates those witnesses directly.  Relational columns and partial
+indexes are navigation aids only; payload testimony remains authoritative.
+Database replay is used only as an independent adjacent-row cross-check when the
+required raw observations are actually present; gaps remain gaps.
 
 The final verdict is a proof ledger rather than a single continuity heuristic.
 Physical lifetime, Alpha statistics, Better-Buckets science, resurrection custody,
@@ -2009,28 +2010,47 @@ class Args:
 
 
 def campaign_bounds(campaign: str) -> Tuple[int, int]:
+    """Return the first/last durable CLOCKS_V4 IDs for one TEMPEST campaign.
+
+    Do not aggregate the whole campaign merely to discover its endpoints.
+    The matching partial index is ordered by ``id``, so two one-row probes
+    establish the exact bounds without a JSON-filtered campaign scan.
+    """
     with open_db(row_dict=True) as conn:
         conn.execute("SET TRANSACTION READ ONLY")
         cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT min(id) AS min_id, max(id) AS max_id
-            FROM campaign_detail
-            WHERE campaign_type = %s
-              AND payload #>> '{schema}' = %s
-              AND campaign = %s
-            """,
-            (CAMPAIGN_TYPE, CLOCKS_SCHEMA, campaign),
-        )
-        row = cur.fetchone() or {}
-    lo = opt_int(row.get("min_id"))
-    hi = opt_int(row.get("max_id"))
+
+        def endpoint(order: str) -> Optional[int]:
+            cur.execute(
+                f"""
+                SELECT id
+                FROM campaign_detail
+                WHERE campaign_type = %s
+                  AND campaign = %s
+                  AND payload #>> '{{schema}}' = %s
+                ORDER BY id {order}
+                LIMIT 1
+                """,
+                (CAMPAIGN_TYPE, campaign, CLOCKS_SCHEMA),
+            )
+            row = cur.fetchone()
+            return opt_int(row.get("id")) if row else None
+
+        lo = endpoint("ASC")
+        hi = endpoint("DESC")
+
     if lo is None or hi is None:
         raise SystemExit(f"no CLOCKS_V4 rows found for campaign {campaign!r}")
     return lo, hi
 
 
 def iter_rows(args: Args) -> Iterator[Tuple[int, str, Dict[str, Any]]]:
+    """Stream the proof ledger using a minimal canonical payload projection.
+
+    The analyzer still retrieves every producer/Pi witness it adjudicates.
+    Fields outside that proof surface are left in PostgreSQL so the enlarged
+    always-on recovery ledger does not force unrelated row transfer/decoding.
+    """
     from_id = args.from_id
     to_id = args.to_id
     if args.campaign is not None:
@@ -2048,7 +2068,24 @@ def iter_rows(args: Args) -> Iterator[Tuple[int, str, Dict[str, Any]]]:
         params.append(to_id)
 
     sql = f"""
-        SELECT id, ts, payload
+        SELECT
+            id,
+            ts,
+            payload -> 'sequence' AS sequence_payload,
+            payload -> 'campaign' AS campaign_payload,
+            payload -> 'recovery_custody' AS recovery_custody_payload,
+            payload -> 'holistic_restore_superseded' AS superseded_payload,
+            payload #> '{{clocks,schema}}' AS clocks_schema_payload,
+            payload #> '{{clocks,completed_pps_sequence}}' AS completed_pps_sequence_payload,
+            payload #> '{{clocks,completed_row_coherent}}' AS completed_row_coherent_payload,
+            payload #> '{{clocks,snapshot_ok}}' AS snapshot_ok_payload,
+            payload #> '{{clocks,instrument_age_seconds}}' AS instrument_age_seconds_payload,
+            payload #> '{{clocks,gnss_time_utc}}' AS gnss_time_utc_payload,
+            payload #> '{{clocks,clockfaces}}' AS clockfaces_payload,
+            payload #> '{{clocks,stats}}' AS stats_payload,
+            payload #> '{{clocks,control}}' AS control_payload,
+            payload #> '{{clocks,gnss_raw}}' AS gnss_raw_payload,
+            payload #> '{{clocks,ppb_restore_checkpoint}}' AS ppb_restore_checkpoint_payload
         FROM campaign_detail
         WHERE {' AND '.join(where)}
         ORDER BY id ASC
@@ -2063,13 +2100,57 @@ def iter_rows(args: Args) -> Iterator[Tuple[int, str, Dict[str, Any]]]:
         cur.itersize = max(1, args.batch_size)
         cur.execute(sql, tuple(params))
         in_batch = 0
+
+        def json_value(value: Any) -> Any:
+            # PostgreSQL JSONB scalar strings are already returned by the DB
+            # adapter as ordinary Python strings (for example
+            # CLOCKS_INSTRUMENT_STATE_V1 or an ISO UTC timestamp).  Only decode
+            # a string when it is visibly a serialized JSON container left by a
+            # different adapter configuration.
+            if isinstance(value, str):
+                stripped = value.lstrip()
+                if stripped.startswith("{") or stripped.startswith("["):
+                    return json.loads(value)
+            return value
+
         for dbrow in cur:
-            payload = dbrow["payload"]
-            if isinstance(payload, str):
-                payload = json.loads(payload)
-            if not isinstance(payload, dict):
-                raise RuntimeError(f"campaign_detail id={dbrow['id']} payload is not an object")
+            # Reconstitute only the canonical testimony actually consumed by
+            # Row.parse().  In particular, stats and ppb_restore_checkpoint
+            # remain complete because they are direct subjects of the proof
+            # ledger; unrelated SYSTEM/environment decoration stays in SQL.
+            clocks: Dict[str, Any] = {
+                "schema": json_value(dbrow["clocks_schema_payload"]),
+                "completed_pps_sequence": json_value(dbrow["completed_pps_sequence_payload"]),
+                "completed_row_coherent": json_value(dbrow["completed_row_coherent_payload"]),
+                "snapshot_ok": json_value(dbrow["snapshot_ok_payload"]),
+                "instrument_age_seconds": json_value(dbrow["instrument_age_seconds_payload"]),
+                "gnss_time_utc": json_value(dbrow["gnss_time_utc_payload"]),
+                "clockfaces": json_value(dbrow["clockfaces_payload"]),
+                "stats": json_value(dbrow["stats_payload"]),
+                "control": json_value(dbrow["control_payload"]),
+                "gnss_raw": json_value(dbrow["gnss_raw_payload"]),
+                "ppb_restore_checkpoint": json_value(dbrow["ppb_restore_checkpoint_payload"]),
+            }
+            payload: Dict[str, Any] = {
+                "schema": CLOCKS_SCHEMA,
+                "sequence": json_value(dbrow["sequence_payload"]),
+                "clocks": clocks,
+            }
+
+            campaign = json_value(dbrow["campaign_payload"])
+            if campaign is not None:
+                payload["campaign"] = campaign
+
+            recovery_custody = json_value(dbrow["recovery_custody_payload"])
+            if recovery_custody is not None:
+                payload["recovery_custody"] = recovery_custody
+
+            superseded = json_value(dbrow["superseded_payload"])
+            if superseded is not None:
+                payload["holistic_restore_superseded"] = superseded
+
             yield int(dbrow["id"]), str(dbrow["ts"]), payload
+
             in_batch += 1
             if in_batch >= max(1, args.batch_size):
                 in_batch = 0
