@@ -701,6 +701,17 @@ def _servo_state(r: dict) -> str:
         return "IDLE"
     return mode
 
+
+def _recoverable_status(r: dict) -> str:
+    """Return the operator-facing Alpha resurrection checkpoint state."""
+    checkpoint = r.get("ppb_restore_checkpoint")
+    if not isinstance(checkpoint, dict):
+        return "UNAVAILABLE"
+    if _to_bool(checkpoint.get("recoverable")) is True:
+        return "TRUE"
+    status = str(checkpoint.get("status") or "").strip().upper()
+    return status or "FALSE"
+
 # ---------------------------------------------------------------------
 # DAC presentation helpers
 # ---------------------------------------------------------------------
@@ -1491,12 +1502,18 @@ def clocks_combined_readout() -> list[str]:
 
     servo_str = servo_state
     baseline_str = f"BASELINE: {baseline_campaign}" if baseline_campaign else "BASELINE: NONE"
+    recoverable_str = _recoverable_status(r)
 
     if state == "STARTED" or r.get("campaign_present"):
         identity = f"CAMPAIGN: {campaign}  ELAPSED: {elapsed}  n={n}"
     else:
         identity = f"CAMPAIGN: STOPPED  INSTRUMENT: {instrument_elapsed}  n={n}"
-    lines.append(identity + f"    SERVO: {servo_str}" + f"    {baseline_str}")
+    lines.append(
+        identity
+        + f"    SERVO: {servo_str}"
+        + f"    {baseline_str}"
+        + f"    RECOVERABLE: {recoverable_str}"
+    )
     lines.append("")
 
     # ── Column widths ──

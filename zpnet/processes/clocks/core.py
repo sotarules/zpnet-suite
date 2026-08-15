@@ -649,6 +649,15 @@ _diag: Dict[str, Any] = {
     "last_timebase_activity": {},
     "last_timebase_silence": {},
 
+    # Ambient instrument recovery. A physical Teensy lifetime replacement is
+    # an Alpha custody event even when TEMPEST is stopped. These counters prove
+    # that the instrument-only resurrection path ran without inventing a campaign.
+    "ambient_instrument_recovery_started": 0,
+    "ambient_instrument_recovery_completed": 0,
+    "ambient_instrument_recovery_failures": 0,
+    "ambient_instrument_recovery_rows_retired": 0,
+    "last_ambient_instrument_recovery": {},
+
     # Live recovery persistence custody. Rows observed after continuity surrender
     # remain durable evidence, but are quarantined from restore authority until
     # the recovery transaction classifies the instrument lineage.
@@ -2414,6 +2423,12 @@ _hard_failure_stats_repair_lock = threading.Lock()
 _HARD_FAILURE_STATS_REPAIR_REASONS = {
     "dac_restore_population_ancestry_impossible",
     "dac_recovery_boundary_population_ancestry_impossible",
+    # Once physical Alpha custody has been proved lost, an incomplete/malformed
+    # literal Better-Buckets image is information-theoretically terminal for that
+    # statistics lineage.  The only lawful operator repair is an explicit new
+    # systemwide statistics epoch; raw PostgreSQL replay remains prohibited.
+    "alpha_resurrection_impossible_checkpoint_incomplete",
+    "alpha_resurrection_impossible_checkpoint_invalid",
 }
 
 _campaign_active: bool = False
@@ -2477,6 +2492,21 @@ _ppb_checkpoint_runtime: Optional[Dict[str, Any]] = None
 # remains an ordinary validation failure.
 _ppb_restore_transaction_active = threading.Event()
 
+# Ambient/no-campaign Alpha resurrection. ``active`` owns the recovery lifecycle;
+# ``hold`` is the narrow state-worker gate that retires newborn-Alpha rows until
+# the exact durable N+1 proof candidate appears. Pi-owned GNSS_RAW/control stay
+# live; only Teensy-owned instrument/statistical custody is resurrected.
+_ambient_instrument_recovery_active = threading.Event()
+_ambient_instrument_recovery_hold = threading.Event()
+
+# Cold/full startup Alpha resurrection has the same pre-mutation requirement as
+# ambient resurrection: once newborn Alpha has been disproved, no row may touch
+# Pi GNSS_RAW/DAC/Better-Buckets custody until the exact restored N+1 row arrives.
+# The gate lock closes the race between the state worker's hold check and its
+# subsequent mutations while the startup thread arms this hold.
+_startup_instrument_restore_hold = threading.Event()
+_clocks_state_mutation_gate_lock = threading.Lock()
+
 # Startup persistence custody.  Valid CLOCKS rows may arrive while holistic
 # restore deliberately keeps the ordinary writer closed.  Retain those exact
 # canonical rows until the Teensy lifecycle probe tells us whether they belong
@@ -2516,10 +2546,10 @@ _last_pps_vclock_count_seen: Optional[int] = None
 # This is observational only; it is never used to reject a fragment.
 _accepted_pps_vclock_count: Optional[int] = None
 
-# CLOCKS_FRAGMENT silence monitor.  This is intentionally process-local: if a
-# campaign is active and the Teensy stops publishing CLOCKS_FRAGMENT campaign deltas, CLOCKS
-# treats the silence as a recoverable Teensy lifecycle event once communication
-# returns.
+# CLOCKS_FRAGMENT silence monitor. During an active campaign it remains the early
+# transport-loss trigger. Independently, the state worker treats any proved physical
+# sequence rebase with no active campaign as an instrument-only Alpha resurrection
+# boundary, so always-on CLOCKS custody does not depend on TEMPEST lifecycle.
 _timebase_last_activity_monotonic: Optional[float] = None
 _timebase_last_activity_utc: Optional[str] = None
 _timebase_last_activity_topic: Optional[str] = None
@@ -3206,6 +3236,17 @@ def _wait_for_clocks_persistence_barrier_locked() -> None:
         )
 
 
+def _wait_for_clocks_persistence_barrier() -> None:
+    """Prove every already-routed CLOCKS row is durable before choosing restore authority."""
+    completion = threading.Event()
+    _clocks_persist_queue.put({"recovery_custody_barrier": completion})
+    if not completion.wait(timeout=HOLISTIC_RESTORE_TIMEOUT_S):
+        raise RuntimeError(
+            "CLOCKS persistence did not reach ambient instrument-recovery barrier "
+            f"within {HOLISTIC_RESTORE_TIMEOUT_S:.1f}s"
+        )
+
+
 def _finalize_recovery_clocks_custody(
     *,
     last_tb: Dict[str, Any],
@@ -3571,6 +3612,225 @@ def _teensy_clocks_health_ok() -> bool:
 
     _diag["teensy_health_probe_failures"] += 1
     return False
+
+
+def _ambient_instrument_restore_proof_candidate(clocks_fragment: Dict[str, Any]) -> bool:
+    """True only for the exact durable N+1 Alpha row armed by ambient recovery."""
+    if not _clocks_holistic_restore_proof_pending.is_set():
+        return False
+    stats = _path_get(clocks_fragment, "clocks.stats")
+    if not isinstance(stats, dict):
+        return False
+    reset_count = _as_int(stats.get("reset_count"))
+    update_count = _as_int(stats.get("update_count"))
+    return bool(
+        reset_count == _clocks_holistic_restore_proof_reset_count
+        and update_count == _clocks_holistic_restore_proof_update_count
+    )
+
+
+def _ambient_instrument_recovery(regression: Dict[str, Any]) -> None:
+    """Resurrect Alpha after a physical reboot while no TEMPEST campaign is active.
+
+    The Pi process survived, so Pi-owned GNSS_RAW and DAC/control state are not
+    rewound. The persistence barrier makes the newest pre-reboot canonical row
+    the exact durable Alpha authority; its literal Better-Buckets checkpoint is
+    staged back into firmware and the first admitted row must be exact N+1.
+    """
+    source_detail_id: Optional[int] = None
+    try:
+        _set_operational_state(
+            OPERATIONAL_STATE_RECOVERING,
+            reason="ambient_physical_sequence_rebase",
+            source="CLOCKS_PHYSICAL_LIFETIME_COURT",
+            details=copy.deepcopy(regression),
+        )
+
+        # The triggering newborn row was never built. Flush every older row that
+        # was already routed so PostgreSQL, Pi checkpoint custody, and DAC
+        # chronology all name the same pre-reboot boundary.
+        _wait_for_clocks_persistence_barrier()
+        detail, skipped = _read_latest_recoverable_clocks_state()
+        if detail is None:
+            raise RuntimeError(
+                "physical Teensy lifetime was replaced but no durable canonical "
+                "CLOCKS restore authority exists"
+            )
+
+        source_detail_id = _as_int(detail.get("_db_detail_id"))
+        clocks = _clocks_payload(detail)
+        checkpoint = _require_alpha_resurrection_checkpoint(
+            clocks,
+            campaign="AMBIENT",
+            recovery_source_db_id=source_detail_id,
+        )
+
+        source_stats = clocks.get("stats") if isinstance(clocks, dict) else None
+        source_reset = _as_int(source_stats.get("reset_count")) if isinstance(source_stats, dict) else None
+        source_update = _as_int(source_stats.get("update_count")) if isinstance(source_stats, dict) else None
+        if source_reset is None or source_update is None:
+            raise RuntimeError("ambient Alpha restore source lacks statistics chronology")
+
+        # Reinstall the exact durable Pi checkpoint image before any restored row
+        # can mutate it. No SQL history is replayed.
+        _restore_ppb_checkpoint_runtime(
+            checkpoint,
+            source_db_detail_id=source_detail_id,
+        )
+        _arm_holistic_restore_persistence_proof(
+            detail,
+            preserve_live_pi_control=True,
+        )
+
+        requested_monotonic = time.monotonic()
+        response = _request_teensy_holistic_restore(
+            clocks,
+            allow_ppb_stage_required=True,
+        )
+        payload = response.get("payload") if isinstance(response, dict) else None
+        payload = payload if isinstance(payload, dict) else {}
+        status = str(payload.get("status") or "")
+
+        ppb_stage: Dict[str, Any] = {
+            "staged": False,
+            "reason": "already_committed_on_teensy",
+            "rolling_sequence": int(checkpoint.get("rolling_sequence") or 0),
+        }
+        if status == "monitor_restore_requires_ppb_state":
+            ppb_stage = _stage_teensy_better_buckets_checkpoint(checkpoint)
+            logging.info(
+                "♻️ [ambient restore] Better-Buckets checkpoint staged directly: "
+                "second=%d minute=%d source_update=%d gap_count=%d stage_s=%s",
+                len(checkpoint.get("second_history") or []),
+                len(checkpoint.get("minute_history") or []),
+                int(checkpoint.get("update_count") or 0),
+                int(checkpoint.get("gap_count") or 0),
+                ppb_stage.get("waited_s"),
+            )
+            requested_monotonic = time.monotonic()
+            response = _request_teensy_holistic_restore(clocks)
+            payload = response.get("payload") if isinstance(response, dict) else None
+            payload = payload if isinstance(payload, dict) else {}
+            status = str(payload.get("status") or "")
+
+        if status not in _TEENSY_MONITOR_RESTORE_ACCEPTED_STATUSES:
+            raise RuntimeError(
+                "ambient Teensy CLOCKS restore did not reach requested state: "
+                f"status={status or 'missing_handler_status'} payload={payload!r}"
+            )
+
+        proof = _wait_for_holistic_restore(
+            detail,
+            requested_monotonic=requested_monotonic,
+            preserve_live_pi_control=True,
+        )
+        result = {
+            "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "mode": "AMBIENT_ALPHA_RESURRECTION",
+            "source_detail_id": source_detail_id,
+            "skipped_unrecoverable_details": int(skipped),
+            "source_reset_count": int(source_reset),
+            "source_update_count": int(source_update),
+            "expected_first_update_count": int(source_update) + 1,
+            "ppb_stage": copy.deepcopy(ppb_stage),
+            "proof": copy.deepcopy(proof),
+            "campaign_restored": False,
+            "pi_gnss_raw_rewound": False,
+            "pi_control_rewound": False,
+            "physical_regression": copy.deepcopy(regression),
+        }
+        _diag["ambient_instrument_recovery_completed"] = (
+            _diag.get("ambient_instrument_recovery_completed", 0) + 1
+        )
+        _diag["last_ambient_instrument_recovery"] = copy.deepcopy(result)
+        _clocks_persistence_enabled.set()
+        _set_operational_state(
+            OPERATIONAL_STATE_RUNNING,
+            reason="ambient_alpha_resurrection_complete",
+            source="CLOCKS_PHYSICAL_LIFETIME_COURT",
+            details=result,
+        )
+        logging.info(
+            "✅ [ambient restore] Alpha resurrection proved from durable detail_id=%s: "
+            "reset_count=%d update_count=%d->%d; no campaign lifecycle invoked",
+            source_detail_id,
+            int(source_reset),
+            int(source_update),
+            int(source_update) + 1,
+        )
+    except HardFailureRequired:
+        return
+    except Exception as exc:
+        _diag["ambient_instrument_recovery_failures"] = (
+            _diag.get("ambient_instrument_recovery_failures", 0) + 1
+        )
+        details = {
+            "error": str(exc),
+            "source_detail_id": source_detail_id,
+            "physical_regression": copy.deepcopy(regression),
+        }
+        _diag["last_ambient_instrument_recovery"] = {
+            "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "mode": "AMBIENT_ALPHA_RESURRECTION",
+            "success": False,
+            **copy.deepcopy(details),
+        }
+        logging.exception(
+            "💥 [ambient restore] Alpha resurrection failed — entering HARD_FAILURE"
+        )
+        _enter_hard_failure(
+            "ambient_alpha_resurrection_failed",
+            details,
+            source="CLOCKS_PHYSICAL_LIFETIME_COURT",
+        )
+    finally:
+        _ambient_instrument_recovery_hold.clear()
+        _ambient_instrument_recovery_active.clear()
+        _clocks_holistic_restore_proof_pending.clear()
+
+
+def _begin_ambient_instrument_recovery(
+    previous_sequence: int,
+    observed_sequence: int,
+) -> bool:
+    """Open instrument-only recovery on a proved ambient physical lifetime change."""
+    if _hard_failure_active() or _ambient_instrument_recovery_active.is_set():
+        return False
+    if not _startup_control_ready.is_set() or _campaign_active:
+        return False
+
+    regression = {
+        "observed_sequence": int(observed_sequence),
+        "previous_sequence": int(previous_sequence),
+        "observed_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "campaign_active": False,
+    }
+    _ambient_instrument_recovery_active.set()
+    _ambient_instrument_recovery_hold.set()
+    _clocks_persistence_enabled.clear()
+    _diag["ambient_instrument_recovery_started"] = (
+        _diag.get("ambient_instrument_recovery_started", 0) + 1
+    )
+    _diag["last_ambient_instrument_recovery"] = {
+        "ts_utc": regression["observed_at_utc"],
+        "mode": "AMBIENT_ALPHA_RESURRECTION",
+        "state": "STARTED",
+        "physical_regression": copy.deepcopy(regression),
+    }
+    logging.error(
+        "🧭 [ambient restore] physical CLOCKS sequence rebased %d -> %d with no "
+        "active campaign; suspending canonical authorship and resurrecting Alpha "
+        "from durable instrument custody",
+        int(previous_sequence),
+        int(observed_sequence),
+    )
+    threading.Thread(
+        target=_ambient_instrument_recovery,
+        args=(regression,),
+        name="clocks-ambient-instrument-recover",
+        daemon=True,
+    ).start()
+    return True
 
 
 def _timebase_silence_recovery(reason: str, details: Dict[str, Any]) -> None:
@@ -4664,11 +4924,60 @@ def _ppb_checkpoint_ingest(stats: Dict[str, Any]) -> Dict[str, Any]:
             return snapshot
 
         if previous_update is not None and update_count > int(previous_update) + 1:
+            # A Pi observation gap always destroys exact second-ring custody: one or
+            # more producer-authored second endpoints may have been appended while
+            # CLOCKS was absent. Minute custody is narrower. Before the producer
+            # minute ring reaches capacity, minute_count is an exact append counter;
+            # therefore, if its only increase is the explicitly testified append on
+            # this observed row, no minute endpoint was hidden inside the gap. Keep
+            # the already-durable minute history in that proved case instead of
+            # forcing it to age out over the full 24-hour ring. Once the producer
+            # ring is full, count alone cannot distinguish append+evict, so fail
+            # closed unless last_minute_key proves there was no append at all.
+            previous_expected_minute = int(runtime.get("expected_minute_count") or 0)
+            previous_last_minute_key = int(runtime.get("last_minute_key") or 0)
+            previous_minute_history = [
+                copy.deepcopy(endpoint) for endpoint in runtime["minute_history"]
+            ]
+            observed_minute_count = int(delta["minute_count"])
+            observed_last_minute_key = int(delta["last_minute_key"])
+            current_minute_append = bool(delta.get("minute_append_valid"))
+
+            minute_history_preserved = False
+            minute_preservation_reason = "UNSEEN_MINUTE_APPEND_NOT_EXCLUDED"
+            if previous_expected_minute < PPB_MINUTE_CAPACITY:
+                expected_visible_append_count = 1 if current_minute_append else 0
+                observed_append_count = observed_minute_count - previous_expected_minute
+                minute_history_preserved = bool(
+                    observed_append_count == expected_visible_append_count
+                    and observed_append_count >= 0
+                    and len(previous_minute_history) <= previous_expected_minute
+                )
+                minute_preservation_reason = (
+                    "MINUTE_COUNT_PROVES_NO_HIDDEN_APPEND"
+                    if minute_history_preserved
+                    else "MINUTE_COUNT_PROVES_OR_ALLOWS_HIDDEN_APPEND"
+                )
+            elif (
+                not current_minute_append
+                and observed_minute_count == previous_expected_minute
+                and observed_last_minute_key == previous_last_minute_key
+            ):
+                minute_history_preserved = True
+                minute_preservation_reason = "FULL_RING_KEY_PROVES_NO_APPEND"
+
             gap = {
                 "reason": "PI_OBSERVATION_GAP",
                 "expected_update_count": int(previous_update) + 1,
                 "observed_update_count": update_count,
                 "missing_rows": update_count - int(previous_update) - 1,
+                "previous_expected_minute_count": previous_expected_minute,
+                "observed_minute_count": observed_minute_count,
+                "previous_last_minute_key": previous_last_minute_key,
+                "observed_last_minute_key": observed_last_minute_key,
+                "current_minute_append": current_minute_append,
+                "minute_history_preserved": minute_history_preserved,
+                "minute_preservation_reason": minute_preservation_reason,
             }
             prior_gap_count = int(runtime.get("gap_count") or 0) + 1
             _ppb_checkpoint_runtime = _ppb_checkpoint_new_runtime(
@@ -4677,6 +4986,8 @@ def _ppb_checkpoint_ingest(stats: Dict[str, Any]) -> Dict[str, Any]:
                 last_gap=gap,
             )
             runtime = _ppb_checkpoint_runtime
+            if minute_history_preserved:
+                runtime["minute_history"].extend(previous_minute_history)
             _diag["ppb_checkpoint_gap_count"] = (
                 _diag.get("ppb_checkpoint_gap_count", 0) + 1
             )
@@ -5918,7 +6229,27 @@ def _holistic_restore_pending_categories(
     return pending or ["FRESH_CLOCKS_PROOF"]
 
 
-def _arm_holistic_restore_persistence_proof(detail: Dict[str, Any]) -> None:
+def _holistic_restore_expected_probe(
+    detail: Dict[str, Any],
+    *,
+    preserve_live_pi_control: bool = False,
+) -> Dict[str, Any]:
+    """Return restore expectations, optionally preserving surviving Pi control custody."""
+    expected = _holistic_restore_probe(detail)
+    if preserve_live_pi_control:
+        control = _dac_control_snapshot()
+        expected["servo_mode"] = str(control.get("servo_mode") or "OFF").upper()
+        expected["dither_operator_enabled"] = bool(control.get("dither_operator_enabled"))
+        expected["ocxo1_dac"] = _first_float(_path_get(control, "ocxo1.target_code"))
+        expected["ocxo2_dac"] = _first_float(_path_get(control, "ocxo2.target_code"))
+    return expected
+
+
+def _arm_holistic_restore_persistence_proof(
+    detail: Dict[str, Any],
+    *,
+    preserve_live_pi_control: bool = False,
+) -> None:
     """Require the first post-restore Alpha row to become durable evidence."""
     global _clocks_holistic_restore_proof_expected
     global _clocks_holistic_restore_proof_reset_count
@@ -5931,7 +6262,10 @@ def _arm_holistic_restore_persistence_proof(detail: Dict[str, Any]) -> None:
     if reset_count is None or reset_count < 0 or update_count is None or update_count < 0:
         raise RuntimeError("holistic restore source lacks usable statistics chronology")
 
-    _clocks_holistic_restore_proof_expected = _holistic_restore_probe(detail)
+    _clocks_holistic_restore_proof_expected = _holistic_restore_expected_probe(
+        detail,
+        preserve_live_pi_control=preserve_live_pi_control,
+    )
     _clocks_holistic_restore_proof_reset_count = int(reset_count)
     _clocks_holistic_restore_proof_update_count = int(update_count) + 1
     _clocks_holistic_restore_proof_sequence = None
@@ -5944,8 +6278,12 @@ def _wait_for_holistic_restore(
     *,
     requested_monotonic: float,
     timeout_s: float = HOLISTIC_RESTORE_TIMEOUT_S,
+    preserve_live_pi_control: bool = False,
 ) -> Dict[str, Any]:
-    expected = _holistic_restore_probe(detail)
+    expected = _holistic_restore_expected_probe(
+        detail,
+        preserve_live_pi_control=preserve_live_pi_control,
+    )
     deadline = time.monotonic() + float(timeout_s)
     next_progress_log = requested_monotonic + 10.0
     last_observed: Dict[str, Any] = {}
@@ -6405,14 +6743,30 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
         startup_live_campaign_name or "missing",
         startup_live_campaign_state or "missing",
     )
-    _retire_startup_clocks_custody("instrument_restore_required")
-    pi_control = _dac_restore_control_from_clocks(clocks, realize=True)
+    # Newborn Alpha has now been disproved. Atomically arm a pre-mutation hold
+    # before retiring startup custody and reinstalling durable Pi DAC ancestry.
+    # This closes the race that previously allowed one newborn row to reset the
+    # restored DAC Welfords before the exact Alpha N+1 successor arrived.
+    with _clocks_state_mutation_gate_lock:
+        _startup_instrument_restore_hold.set()
+        _retire_startup_clocks_custody("instrument_restore_required")
+        pi_control = _dac_restore_control_from_clocks(clocks, realize=True)
 
     ppb_stage: Dict[str, Any]
     stats_update_count = _as_int(_path_get(clocks, "stats.update_count")) or 0
     saved_ppb_checkpoint: Optional[Dict[str, Any]] = None
     if stats_update_count > 0:
-        saved_ppb_checkpoint = _require_recoverable_ppb_checkpoint(clocks)
+        # Newborn Alpha has already been disproved above.  At this point an
+        # incomplete durable checkpoint is not a transient startup condition:
+        # the missing producer endpoints died with the prior Teensy lifetime.
+        # Use the terminal Alpha-resurrection court so HARD_FAILURE records the
+        # exact information-loss species and can offer only the explicit
+        # new-statistics-epoch repair path.
+        saved_ppb_checkpoint = _require_alpha_resurrection_checkpoint(
+            clocks,
+            campaign=active_campaign_name or "AMBIENT_STARTUP",
+            recovery_source_db_id=_as_int(detail.get("_db_detail_id")),
+        )
 
     if status == "monitor_restore_requires_ppb_state":
         if saved_ppb_checkpoint is None:
@@ -9806,39 +10160,75 @@ def _clocks_state_loop() -> None:
             continue
 
         sequence = _clocks_fragment_count(clocks_fragment)
-        if _ppb_restore_transition_row_expected(
-            clocks_fragment,
-            ingress_during_restore=ingress_during_ppb_restore,
-        ):
-            _clocks_state_dropped += 1
-            _diag["ppb_restore_transition_rows_discarded"] = (
-                _diag.get("ppb_restore_transition_rows_discarded", 0) + 1
-            )
-            _diag["last_ppb_restore_transition_row"] = {
-                "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                "sequence": sequence,
-                "ingress_during_restore": bool(ingress_during_ppb_restore),
-                "transaction_active_at_consume": _ppb_restore_transaction_active.is_set(),
-                "reason": "firmware_checkpoint_temporarily_invalid_during_pi_owned_ppb_restore",
-            }
-            logging.info(
-                "♻️ [holistic restore] retiring transitional CLOCKS_FRAGMENT sequence=%s "
-                "while Pi-owned Better-Buckets restore is in flight",
-                sequence,
-            )
-            continue
-        try:
-            sequence, _ = _validate_clocks_fragment_v4(clocks_fragment)
-            _advance_gnss_raw_instrument(sequence, system_context)
-            state = _build_canonical_clocks_state(clocks_fragment, system_context)
-        except Exception:
-            _clocks_state_dropped += 1
-            logging.exception(
-                "💥 [clocks] rejecting malformed/incoherent CLOCKS_FRAGMENT_V4 "
-                "sequence=%s without terminating the state worker",
-                sequence,
-            )
-            continue
+        # Serialize the final pre-mutation admission check with startup's decision
+        # to replace newborn Alpha. Once startup arms its hold under this lock, no
+        # already-running worker iteration can slip through and reset Pi custody.
+        with _clocks_state_mutation_gate_lock:
+            if _ppb_restore_transition_row_expected(
+                clocks_fragment,
+                ingress_during_restore=ingress_during_ppb_restore,
+            ):
+                _clocks_state_dropped += 1
+                _diag["ppb_restore_transition_rows_discarded"] = (
+                    _diag.get("ppb_restore_transition_rows_discarded", 0) + 1
+                )
+                _diag["last_ppb_restore_transition_row"] = {
+                    "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "sequence": sequence,
+                    "ingress_during_restore": bool(ingress_during_ppb_restore),
+                    "transaction_active_at_consume": _ppb_restore_transaction_active.is_set(),
+                    "reason": "firmware_checkpoint_temporarily_invalid_during_pi_owned_ppb_restore",
+                }
+                logging.info(
+                    "♻️ [holistic restore] retiring transitional CLOCKS_FRAGMENT sequence=%s "
+                    "while Pi-owned Better-Buckets restore is in flight",
+                    sequence,
+                )
+                continue
+
+            # During Alpha resurrection, newborn-epoch rows are evidence of the lost
+            # physical lifetime but are not canonical successors. Retire them before
+            # they can advance GNSS_RAW, reset Pi DAC chronology, or replace the
+            # literal PPB image. The sole exception is the exact durable N+1 proof.
+            if (
+                _ambient_instrument_recovery_hold.is_set()
+                or _startup_instrument_restore_hold.is_set()
+            ):
+                if not _ambient_instrument_restore_proof_candidate(clocks_fragment):
+                    _clocks_state_dropped += 1
+                    if _ambient_instrument_recovery_hold.is_set():
+                        _diag["ambient_instrument_recovery_rows_retired"] = (
+                            _diag.get("ambient_instrument_recovery_rows_retired", 0) + 1
+                        )
+                    continue
+
+            try:
+                sequence, _ = _validate_clocks_fragment_v4(clocks_fragment)
+                previous_sequence = _last_clocks_state_sequence
+                if (
+                    previous_sequence is not None
+                    and int(sequence) < int(previous_sequence)
+                    and _begin_ambient_instrument_recovery(
+                        int(previous_sequence), int(sequence)
+                    )
+                ):
+                    # The triggering newborn row is intentionally not consumed. The
+                    # recovery thread will admit only the restored durable N+1 row.
+                    _clocks_state_dropped += 1
+                    _diag["ambient_instrument_recovery_rows_retired"] = (
+                        _diag.get("ambient_instrument_recovery_rows_retired", 0) + 1
+                    )
+                    continue
+                _advance_gnss_raw_instrument(sequence, system_context)
+                state = _build_canonical_clocks_state(clocks_fragment, system_context)
+            except Exception:
+                _clocks_state_dropped += 1
+                logging.exception(
+                    "💥 [clocks] rejecting malformed/incoherent CLOCKS_FRAGMENT_V4 "
+                    "sequence=%s without terminating the state worker",
+                    sequence,
+                )
+                continue
 
         _cache_clocks_state(state)
         if not _hard_failure_active():
@@ -9901,6 +10291,20 @@ def _clocks_state_loop() -> None:
                             update_count,
                             state.get("sequence"),
                         )
+                        if _ambient_instrument_recovery_active.is_set():
+                            _ambient_instrument_recovery_hold.clear()
+                            logging.info(
+                                "✅ [ambient restore] exact N+1 proof row admitted; "
+                                "releasing newborn-row hold at sequence=%s",
+                                state.get("sequence"),
+                            )
+                        if _startup_instrument_restore_hold.is_set():
+                            _startup_instrument_restore_hold.clear()
+                            logging.info(
+                                "✅ [holistic restore] exact startup N+1 proof row admitted; "
+                                "releasing newborn-row mutation hold at sequence=%s",
+                                state.get("sequence"),
+                            )
                 else:
                     restore_proof_custody = bool(
                         reset_count == _clocks_holistic_restore_proof_reset_count
@@ -11354,12 +11758,15 @@ def cmd_stats_reset(_: Optional[dict]) -> Dict[str, Any]:
 
 
 def cmd_repair_stats_epoch(args: Optional[dict]) -> Dict[str, Any]:
-    """Repair only the proved historical DAC/OCXO population-ancestry failure.
+    """Start a new statistics epoch for one narrowly proved terminal lineage loss.
 
-    This is deliberately not a generic HARD_FAILURE escape hatch.  The operator
-    must explicitly confirm destruction of the current statistical epoch.  CLOCKS
-    then performs the ordinary transitive STATS_RESET and temporarily reopens only
-    the epoch-birth persistence lane until update_count=1 is durably proved.
+    This is deliberately not a generic HARD_FAILURE escape hatch.  It is allowed
+    only when a court has proved either impossible DAC/OCXO population ancestry or
+    impossible Alpha resurrection from the literal durable Better-Buckets image.
+    The operator must explicitly confirm destruction of the current statistical
+    epoch.  CLOCKS then performs the ordinary transitive STATS_RESET and temporarily
+    reopens only the epoch-birth persistence lane until update_count=1 is durably
+    proved.
 
     HARD_FAILURE remains latched after success.  The clean row becomes future
     holistic-restore authority, and the operator restarts CLOCKS normally.
@@ -11377,7 +11784,7 @@ def cmd_repair_stats_epoch(args: Optional[dict]) -> Dict[str, Any]:
             "success": False,
             "message": (
                 "REPAIR_STATS_EPOCH refuses this HARD_FAILURE reason; "
-                "only proved DAC/OCXO population-ancestry corruption is repairable"
+                "only proved terminal statistics-lineage loss is repairable"
             ),
             "payload": {
                 "hard_failure_reason": failure_reason,
@@ -11432,14 +11839,21 @@ def cmd_repair_stats_epoch(args: Optional[dict]) -> Dict[str, Any]:
         # Keep it as historical DB evidence where it already exists, but never
         # let the in-memory startup prefix cross the destructive reset boundary.
         retired = _retire_startup_clocks_custody(
-            "hard_failure_dac_ancestry_stats_repair"
+            "hard_failure_statistics_lineage_repair"
         )
         repair_record["startup_custody_retired"] = retired
 
-        # No stale holistic proof may share the one-row repair lane.
-        _clocks_holistic_restore_proof_pending.clear()
-        _clocks_holistic_restore_proof_committed.clear()
-        _hard_failure_stats_repair_event.set()
+        # No stale holistic resurrection proof may share the one-row repair lane.
+        # A failed cold-start resurrection can also leave the pre-mutation newborn
+        # hold armed.  The explicit RESET_CLOCK_STATISTICS confirmation is the
+        # authority to abandon that dead lineage, so release the hold atomically
+        # before opening the exceptional repair data plane.  HARD_FAILURE itself
+        # remains latched, therefore no ordinary authorship is opened here.
+        with _clocks_state_mutation_gate_lock:
+            _clocks_holistic_restore_proof_pending.clear()
+            _clocks_holistic_restore_proof_committed.clear()
+            _startup_instrument_restore_hold.clear()
+            _hard_failure_stats_repair_event.set()
 
         try:
             epoch = _establish_fresh_durable_stats_epoch(
@@ -13774,6 +14188,8 @@ def run() -> None:
     _clocks_epoch_birth_committed.clear()
     _clocks_holistic_restore_proof_pending.clear()
     _clocks_holistic_restore_proof_committed.clear()
+    _startup_instrument_restore_hold.clear()
+    _ambient_instrument_recovery_hold.clear()
     _diag["startup_control_ready"] = False
 
     _dac_start_control_thread()
@@ -13867,19 +14283,29 @@ def run() -> None:
         )
     except Exception as exc:
         unresolved_custody = _startup_clocks_custody_unresolved()
+        failure_details = {
+            "error": str(exc),
+            "startup_custody_unresolved": unresolved_custody,
+            "startup_instrument_restore_hold": _startup_instrument_restore_hold.is_set(),
+            "holistic_restore_proof_pending": _clocks_holistic_restore_proof_pending.is_set(),
+            "holistic_restore_proof_committed": _clocks_holistic_restore_proof_committed.is_set(),
+        }
         logging.exception(
-            "💥 [holistic restore] failed; startup CLOCKS custody %s",
+            "💥 [holistic restore] failed; startup CLOCKS custody %s — latching HARD_FAILURE",
             "remains fail-closed" if unresolved_custody else "has been classified",
         )
-        if not unresolved_custody:
-            _clocks_persistence_enabled.set()
         try:
             _cleanup_after_recovery_failure(
                 "holistic_restore_failed",
-                {"error": str(exc), "startup_custody_unresolved": unresolved_custody},
+                failure_details,
             )
         except Exception:
             logging.exception("⚠️ [holistic restore] cleanup also failed")
+        _enter_hard_failure(
+            "startup_holistic_restore_unproved",
+            failure_details,
+            source="RUN_HOLISTIC_RESTORE",
+        )
     finally:
         if _hard_failure_active():
             _startup_control_ready.clear()
