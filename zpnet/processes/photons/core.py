@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import copy
 import json
+from collections import deque
 import logging
 import math
 import queue
@@ -90,7 +91,21 @@ PHOTONS_RECOVERY_REPLAY_MAX_ROWS = PHOTONS_RECOVERY_24_HOUR_SECONDS + 120
 PHOTONS_RECOVERY_CURSOR_ITERSIZE = 256
 PHOTONS_RECOVERY_PROOF_TIMEOUT_S = 180.0
 PHOTONS_RECOVERY_VERIFY_TOLERANCE = 1.0e-6
+# Cross-representation corroboration only.  Integer N/T and an incrementally
+# accumulated Welford mean are mathematically equivalent but do not share the
+# same floating-point path.  A large divergence is worth surfacing to the
+# operator, but it must never silently choose an older durable ancestor.
+PHOTONS_WELFORD_GRAND_RATIO_DIAGNOSTIC_PPB = 0.1
 PHOTONS_STATS_RESET_PROOF_TIMEOUT_S = 30.0
+
+# CLOCKS-parity checkpoint testimony. Firmware publishes one compact delta/proof
+# per second; Pi PHOTONS maintains and persists the complete bounded recovery image.
+# Phase 3 promotes that literal image to held-restore authority. PostgreSQL replay
+# remains only an independent shadow/audit witness and never reconstructs firmware
+# recovery state.
+PHOTONS_PPB_FIRMWARE_DELTA_SCHEMA = "PHOTONS_PPB_CHECKPOINT_DELTA_V1"
+PHOTONS_PPB_PI_CHECKPOINT_SCHEMA = "PI_PHOTONS_PPB_RESTORE_CHECKPOINT_V1"
+PHOTONS_PPB_SHADOW_SCHEMA = "PHOTONS_PPB_SQL_REPLAY_SHADOW_V1"
 
 TEENSY_CAMPAIGN_START_ACCEPTED_STATUSES = {"start_requested", "flash_cut_requested"}
 TEENSY_CAMPAIGN_STOP_ACCEPTED_STATUSES = {"stop_requested"}
@@ -187,6 +202,20 @@ _recovery_restore_count = 0
 _recovery_live_reattach_count = 0
 _recovery_cold_start_count = 0
 _recovery_failure_count = 0
+
+_ppb_checkpoint_lock = threading.RLock()
+_ppb_checkpoint_runtime: Optional[Dict[str, Any]] = None
+_ppb_checkpoint_last_shadow: Optional[Dict[str, Any]] = None
+_ppb_checkpoint_rows_verified = 0
+_ppb_checkpoint_recoverable_rows = 0
+_ppb_checkpoint_warming_rows = 0
+_ppb_checkpoint_gap_count = 0
+_ppb_checkpoint_shadow_match_count = 0
+_ppb_checkpoint_shadow_suffix_match_count = 0
+_ppb_checkpoint_shadow_mismatch_count = 0
+_ppb_checkpoint_shadow_unavailable_count = 0
+_ppb_checkpoint_ingest_failure_count = 0
+_ppb_checkpoint_last_ingest_failure: Optional[Dict[str, Any]] = None
 
 OPERATIONAL_STATE_SCHEMA = "PI_SUBSYSTEM_OPERATIONAL_STATE_V1"
 OPERATIONAL_STATE_STARTING = "STARTING"
@@ -393,6 +422,32 @@ def _welford_equivalent(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
         abs(float(a[key]) - float(b[key])) <= PHOTONS_RECOVERY_VERIFY_TOLERANCE
         for key in ("mean", "m2", "min", "max")
     )
+
+
+def _welford_grand_ratio_diagnostic(
+    *,
+    welford_mean_ns: float,
+    ratio_mean_ns: float,
+    standard_lap_ps: int,
+) -> Dict[str, Any]:
+    """Quantify Welford-vs-N/T drift without granting it custody authority."""
+    standard_lap_ns = float(standard_lap_ps) / 1000.0
+    if standard_lap_ns <= 0.0:
+        raise ValueError("PHOTONS Welford/grand-ratio diagnostic has nonpositive standard lap")
+    delta_ns = float(welford_mean_ns) - float(ratio_mean_ns)
+    delta_ppb = (delta_ns / standard_lap_ns) * 1.0e9
+    return {
+        "schema": "PHOTONS_WELFORD_GRAND_RATIO_DIAGNOSTIC_V1",
+        "welford_mean_ns": float(welford_mean_ns),
+        "grand_ratio_mean_ns": float(ratio_mean_ns),
+        "delta_ns": float(delta_ns),
+        "abs_delta_ns": abs(float(delta_ns)),
+        "delta_ppb": float(delta_ppb),
+        "abs_delta_ppb": abs(float(delta_ppb)),
+        "diagnostic_limit_ppb": float(PHOTONS_WELFORD_GRAND_RATIO_DIAGNOSTIC_PPB),
+        "notable": abs(float(delta_ppb)) > PHOTONS_WELFORD_GRAND_RATIO_DIAGNOSTIC_PPB,
+        "recovery_authority_effect": "NONE_DIAGNOSTIC_ONLY",
+    }
 
 
 def _load_standard_lap_ns() -> Tuple[str, int]:
@@ -941,9 +996,20 @@ def _validate_photons_fragment(fragment: Payload) -> Tuple[int, int, Optional[in
                     "PHOTONS cross-epoch recovery accepted/custody delta mismatch"
                 )
 
-        expected_advanced = custody_delta > 0
+        # proof_advanced is recovery-chronology testimony, not a claim that this
+        # particular one-second row happened to accept a lap.  A lawful N+1 row
+        # may contain zero accepted laps.  Once the proof is committed it remains
+        # true across later STATS_RESET epochs as durable recovery provenance.
+        expected_advanced = bool(
+            recovery_committed
+            or (
+                stats_reset_count == source_reset
+                and sequence > source_sequence
+                and stats_update_count > source_update
+            )
+        )
         if recovery_advanced != expected_advanced:
-            raise ValueError("PHOTONS recovery proof_advanced verdict is inconsistent")
+            raise ValueError("PHOTONS recovery proof_advanced chronology verdict is inconsistent")
 
     pps_count_raw = projection.get("last_pps_sequence")
     pps_count = _require_int(
@@ -952,8 +1018,1366 @@ def _validate_photons_fragment(fragment: Payload) -> Tuple[int, int, Optional[in
     return sequence, publish_count, (pps_count if pps_count > 0 else None), instrument
 
 
+# ---------------------------------------------------------------------
+# Literal Pi Better-Buckets checkpoint + SQL-replay shadow court
+# ---------------------------------------------------------------------
+
+def _ppb_zero_endpoint() -> Dict[str, Any]:
+    return {
+        "sequence": 0,
+        "lap_count": 0,
+        "total_lap_gnss_ns": 0,
+    }
+
+
+def _ppb_minute_key(sequence: int) -> int:
+    return ((int(sequence) - 1) // 60) + 1 if sequence > 0 else 0
+
+
+def _ppb_endpoint_from_payload(value: Any, *, path: str) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{path} must be an endpoint object")
+    endpoint = {
+        "sequence": _require_int(value.get("sequence"), f"{path}.sequence"),
+        "lap_count": _require_int(value.get("lap_count"), f"{path}.lap_count"),
+        "total_lap_gnss_ns": _require_int(
+            value.get("total_lap_gnss_ns"), f"{path}.total_lap_gnss_ns"
+        ),
+    }
+    if (endpoint["lap_count"] == 0) != (endpoint["total_lap_gnss_ns"] == 0):
+        raise ValueError(f"{path} has inconsistent zero N/T")
+    return endpoint
+
+
+def _ppb_endpoints_equal(a: Any, b: Any) -> bool:
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return False
+    try:
+        return bool(
+            int(a["sequence"]) == int(b["sequence"])
+            and int(a["lap_count"]) == int(b["lap_count"])
+            and int(a["total_lap_gnss_ns"]) == int(b["total_lap_gnss_ns"])
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _ppb_value_from_endpoints(
+    current: Dict[str, Any], anchor: Dict[str, Any], standard_lap_ps: int
+) -> Dict[str, Any]:
+    lap_count = int(current["lap_count"]) - int(anchor["lap_count"])
+    total_ns = int(current["total_lap_gnss_ns"]) - int(
+        anchor["total_lap_gnss_ns"]
+    )
+    if lap_count <= 0 or total_ns <= 0 or standard_lap_ps <= 0:
+        raise ValueError(
+            "Better-Buckets proof has nonpositive endpoint population: "
+            f"lap_count={lap_count} total_ns={total_ns} standard_lap_ps={standard_lap_ps}"
+        )
+    mean_ps = (float(total_ns) * 1000.0) / float(lap_count)
+    return {
+        "sample_count": lap_count,
+        "ppb": (mean_ps / float(standard_lap_ps) - 1.0) * 1.0e9,
+    }
+
+
+def _validate_firmware_ppb_checkpoint_delta(stats: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate one row-local PHOTONS checkpoint proof without mutating Pi state."""
+    stats = _require_dict(stats, "photons.stats")
+    raw = _require_dict(
+        stats.get("rolling_ppb_checkpoint"),
+        "photons.stats.rolling_ppb_checkpoint",
+    )
+    if raw.get("schema") != PHOTONS_PPB_FIRMWARE_DELTA_SCHEMA:
+        raise ValueError(
+            "unsupported PHOTONS Better-Buckets checkpoint schema "
+            f"{raw.get('schema')!r}"
+        )
+
+    reset_count = _require_int(stats.get("reset_count"), "photons.stats.reset_count")
+    update_count = _require_int(
+        stats.get("update_count"), "photons.stats.update_count", minimum=1
+    )
+    current_sequence = _require_int(
+        stats.get("rolling_ppb_current_sequence"),
+        "photons.stats.rolling_ppb_current_sequence",
+    )
+    endpoint_admitted = _require_bool(
+        stats.get("rolling_ppb_endpoint_admitted"),
+        "photons.stats.rolling_ppb_endpoint_admitted",
+    )
+    interval_advanced = _require_bool(
+        stats.get("rolling_ppb_interval_advanced"),
+        "photons.stats.rolling_ppb_interval_advanced",
+    )
+    standard_lap_ps = _require_int(
+        stats.get("standard_lap_ps"), "photons.stats.standard_lap_ps", minimum=1
+    )
+    stats_lap_count = _require_int(
+        stats.get("lap_count"), "photons.stats.lap_count"
+    )
+    stats_total_ns = _require_int(
+        stats.get("total_lap_gnss_ns"), "photons.stats.total_lap_gnss_ns"
+    )
+
+    valid = _require_bool(raw.get("valid"), "rolling_ppb_checkpoint.valid")
+    if valid != endpoint_admitted:
+        raise ValueError(
+            "PHOTONS checkpoint validity disagrees with endpoint admission: "
+            f"checkpoint={valid} admitted={endpoint_admitted}"
+        )
+    if interval_advanced and not endpoint_admitted:
+        raise ValueError("PHOTONS rolling interval advanced on an excluded endpoint")
+
+    rolling_sequence = _require_int(
+        raw.get("rolling_sequence"), "rolling_ppb_checkpoint.rolling_sequence"
+    )
+    second_count = _require_int(
+        raw.get("second_count"), "rolling_ppb_checkpoint.second_count"
+    )
+    minute_count = _require_int(
+        raw.get("minute_count"), "rolling_ppb_checkpoint.minute_count"
+    )
+    last_minute_key = _require_int(
+        raw.get("last_minute_key"), "rolling_ppb_checkpoint.last_minute_key"
+    )
+    if second_count > PHOTONS_RECOVERY_SECOND_CAPACITY:
+        raise ValueError(f"PHOTONS checkpoint second_count out of range: {second_count}")
+    if minute_count > PHOTONS_RECOVERY_MINUTE_CAPACITY:
+        raise ValueError(f"PHOTONS checkpoint minute_count out of range: {minute_count}")
+
+    origin_valid = _require_bool(
+        raw.get("origin_valid"), "rolling_ppb_checkpoint.origin_valid"
+    )
+    second_append_valid = _require_bool(
+        raw.get("second_append_valid"),
+        "rolling_ppb_checkpoint.second_append_valid",
+    )
+    minute_append_valid = _require_bool(
+        raw.get("minute_append_valid"),
+        "rolling_ppb_checkpoint.minute_append_valid",
+    )
+
+    proof: Dict[str, Any] = {}
+    proof_checks = 0
+    buckets = _require_dict(stats.get("ppb_buckets"), "photons.stats.ppb_buckets")
+    windows = (
+        ("10_min", PHOTONS_RECOVERY_10_MIN_SECONDS),
+        ("60_min", PHOTONS_RECOVERY_60_MIN_SECONDS),
+        ("8_hour", PHOTONS_RECOVERY_8_HOUR_SECONDS),
+        ("24_hour", PHOTONS_RECOVERY_24_HOUR_SECONDS),
+    )
+
+    if not valid:
+        if (
+            rolling_sequence != 0
+            or current_sequence != 0
+            or second_count != 0
+            or minute_count != 0
+            or last_minute_key != 0
+            or origin_valid
+            or second_append_valid
+            or minute_append_valid
+        ):
+            raise ValueError("invalid PHOTONS checkpoint publishes nonempty custody")
+        for key, _seconds in windows:
+            node = _require_dict(raw.get(key), f"rolling_ppb_checkpoint.{key}")
+            if _require_bool(node.get("valid"), f"rolling_ppb_checkpoint.{key}.valid"):
+                raise ValueError(f"invalid PHOTONS checkpoint publishes {key} proof")
+            sample_count = _require_int(
+                node.get("sample_count"),
+                f"rolling_ppb_checkpoint.{key}.sample_count",
+            )
+            if sample_count != 0 or buckets.get(key) is not None:
+                raise ValueError(f"invalid PHOTONS checkpoint publishes {key} population")
+            proof[key] = {"valid": False, "sample_count": 0, "anchor": None}
+        return {
+            "schema": PHOTONS_PPB_FIRMWARE_DELTA_SCHEMA,
+            "valid": False,
+            "reset_count": reset_count,
+            "update_count": update_count,
+            "rolling_sequence": 0,
+            "second_count": 0,
+            "minute_count": 0,
+            "last_minute_key": 0,
+            "origin_valid": False,
+            "origin": _ppb_zero_endpoint(),
+            "current": _ppb_zero_endpoint(),
+            "second_append_valid": False,
+            "second_append": None,
+            "minute_append_valid": False,
+            "minute_append": None,
+            "interval_advanced": False,
+            "proof": proof,
+            "proof_checks": 0,
+        }
+
+    if rolling_sequence != update_count or current_sequence != update_count:
+        raise ValueError(
+            "PHOTONS checkpoint chronology mismatch: "
+            f"update={update_count} stats_current={current_sequence} "
+            f"checkpoint={rolling_sequence}"
+        )
+    if second_count <= 0 or minute_count <= 0 or not origin_valid:
+        raise ValueError("valid PHOTONS checkpoint lacks ring/origin custody")
+    if last_minute_key != _ppb_minute_key(rolling_sequence):
+        raise ValueError(
+            "PHOTONS checkpoint minute-key mismatch: "
+            f"sequence={rolling_sequence} key={last_minute_key}"
+        )
+
+    current = _ppb_endpoint_from_payload(
+        raw.get("current"), path="rolling_ppb_checkpoint.current"
+    )
+    origin = _ppb_endpoint_from_payload(
+        raw.get("origin"), path="rolling_ppb_checkpoint.origin"
+    )
+    if current["sequence"] != rolling_sequence:
+        raise ValueError("PHOTONS checkpoint current endpoint identity mismatch")
+    if (
+        current["lap_count"] != stats_lap_count
+        or current["total_lap_gnss_ns"] != stats_total_ns
+    ):
+        raise ValueError("PHOTONS checkpoint current endpoint disagrees with stats N/T")
+    if origin != _ppb_zero_endpoint():
+        raise ValueError("PHOTONS checkpoint statistical origin is not exact zero")
+
+    if not second_append_valid:
+        raise ValueError("valid PHOTONS checkpoint lacks second append testimony")
+    second_append = _ppb_endpoint_from_payload(
+        raw.get("second_append"), path="rolling_ppb_checkpoint.second_append"
+    )
+    if not _ppb_endpoints_equal(second_append, current):
+        raise ValueError("PHOTONS second append is not the current endpoint")
+
+    minute_append = None
+    if minute_append_valid:
+        minute_append = _ppb_endpoint_from_payload(
+            raw.get("minute_append"), path="rolling_ppb_checkpoint.minute_append"
+        )
+        if not _ppb_endpoints_equal(minute_append, current):
+            raise ValueError("PHOTONS minute append is not the current endpoint")
+
+    for key, _seconds in windows:
+        node = _require_dict(raw.get(key), f"rolling_ppb_checkpoint.{key}")
+        node_valid = _require_bool(
+            node.get("valid"), f"rolling_ppb_checkpoint.{key}.valid"
+        )
+        sample_count = _require_int(
+            node.get("sample_count"),
+            f"rolling_ppb_checkpoint.{key}.sample_count",
+        )
+        recorded = buckets.get(key)
+        if not node_valid:
+            if sample_count != 0 or recorded is not None:
+                raise ValueError(
+                    f"PHOTONS {key} availability disagrees with checkpoint proof"
+                )
+            proof[key] = {"valid": False, "sample_count": 0, "anchor": None}
+            continue
+
+        if sample_count <= 0:
+            raise ValueError(f"PHOTONS {key} checkpoint proof has zero population")
+        anchor = _ppb_endpoint_from_payload(
+            node.get("anchor"), path=f"rolling_ppb_checkpoint.{key}.anchor"
+        )
+        computed = _ppb_value_from_endpoints(current, anchor, standard_lap_ps)
+        if computed["sample_count"] != sample_count:
+            raise ValueError(
+                f"PHOTONS {key} proof N mismatch: "
+                f"published={sample_count} endpoint={computed['sample_count']}"
+            )
+        recorded = _require_dict(recorded, f"photons.stats.ppb_buckets.{key}")
+        recorded_n = _require_int(
+            recorded.get("sample_count"),
+            f"photons.stats.ppb_buckets.{key}.sample_count",
+            minimum=1,
+        )
+        recorded_ppb = _require_float(
+            recorded.get("ppb"), f"photons.stats.ppb_buckets.{key}.ppb"
+        )
+        if recorded_n != sample_count:
+            raise ValueError(
+                f"PHOTONS {key} bucket/proof N mismatch: "
+                f"bucket={recorded_n} proof={sample_count}"
+            )
+        delta_ppb = float(computed["ppb"]) - recorded_ppb
+        if abs(delta_ppb) > PHOTONS_RECOVERY_VERIFY_TOLERANCE:
+            raise ValueError(
+                "PHOTONS Better-Buckets row-local proof mismatch: "
+                f"window={key} computed={computed['ppb']:.9f} "
+                f"recorded={recorded_ppb:.9f} delta={delta_ppb:.9f}"
+            )
+        proof[key] = {
+            "valid": True,
+            "sample_count": sample_count,
+            "anchor": anchor,
+            "computed_ppb": round(float(computed["ppb"]), 9),
+            "recorded_ppb": round(recorded_ppb, 9),
+            "delta_ppb": round(delta_ppb, 9),
+        }
+        proof_checks += 1
+
+    return {
+        "schema": PHOTONS_PPB_FIRMWARE_DELTA_SCHEMA,
+        "valid": True,
+        "reset_count": reset_count,
+        "update_count": update_count,
+        "rolling_sequence": rolling_sequence,
+        "second_count": second_count,
+        "minute_count": minute_count,
+        "last_minute_key": last_minute_key,
+        "origin_valid": True,
+        "origin": origin,
+        "current": current,
+        "second_append_valid": True,
+        "second_append": second_append,
+        "minute_append_valid": minute_append_valid,
+        "minute_append": minute_append,
+        "interval_advanced": interval_advanced,
+        "proof": proof,
+        "proof_checks": proof_checks,
+    }
+
+
+def _ppb_checkpoint_delta_signature(delta: Dict[str, Any]) -> str:
+    stable = {
+        key: delta.get(key)
+        for key in (
+            "schema",
+            "valid",
+            "reset_count",
+            "update_count",
+            "rolling_sequence",
+            "second_count",
+            "minute_count",
+            "last_minute_key",
+            "origin_valid",
+            "origin",
+            "current",
+            "second_append_valid",
+            "second_append",
+            "minute_append_valid",
+            "minute_append",
+            "interval_advanced",
+            "proof",
+        )
+    }
+    return json.dumps(stable, sort_keys=True, separators=(",", ":"))
+
+
+def _ppb_checkpoint_new_runtime(
+    *,
+    reason: str,
+    seed_source: str = "FIRMWARE_APPENDS",
+    gap_count: int = 0,
+    last_gap: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return {
+        "reset_count": None,
+        "last_update_count": None,
+        "last_delta_signature": None,
+        "rolling_sequence": 0,
+        "current_sequence": 0,
+        "expected_second_count": 0,
+        "expected_minute_count": 0,
+        "last_minute_key": 0,
+        "origin_valid": False,
+        "origin": _ppb_zero_endpoint(),
+        "current": _ppb_zero_endpoint(),
+        "second_history": deque(maxlen=PHOTONS_RECOVERY_SECOND_CAPACITY),
+        "minute_history": deque(maxlen=PHOTONS_RECOVERY_MINUTE_CAPACITY),
+        "contiguous_from_update_count": None,
+        "gap_count": int(gap_count),
+        "last_gap": copy.deepcopy(last_gap),
+        "status_reason": str(reason),
+        "seed_source": str(seed_source),
+        "seed_source_db_detail_id": None,
+        "proof_checks": 0,
+        "rolling_custody_lost": False,
+    }
+
+
+def _ppb_checkpoint_runtime_ensure_locked() -> Dict[str, Any]:
+    global _ppb_checkpoint_runtime
+    if _ppb_checkpoint_runtime is None:
+        _ppb_checkpoint_runtime = _ppb_checkpoint_new_runtime(
+            reason="NO_CHECKPOINT_SEED"
+        )
+    return _ppb_checkpoint_runtime
+
+
+def _ppb_checkpoint_snapshot_locked(runtime: Dict[str, Any]) -> Dict[str, Any]:
+    second_history = [copy.deepcopy(value) for value in runtime["second_history"]]
+    minute_history = [copy.deepcopy(value) for value in runtime["minute_history"]]
+    expected_second = int(runtime.get("expected_second_count") or 0)
+    expected_minute = int(runtime.get("expected_minute_count") or 0)
+    rolling_sequence = int(runtime.get("rolling_sequence") or 0)
+    current_sequence = int(runtime.get("current_sequence") or 0)
+    current = copy.deepcopy(runtime.get("current") or _ppb_zero_endpoint())
+
+    complete = bool(
+        not runtime.get("rolling_custody_lost")
+        and current_sequence > 0
+        and int(current.get("lap_count") or 0) > 0
+        and int(current.get("total_lap_gnss_ns") or 0) > 0
+        and runtime.get("origin_valid")
+        and len(second_history) == expected_second
+        and len(minute_history) == expected_minute
+        and bool(second_history)
+        and _ppb_endpoints_equal(second_history[-1], current)
+        and int(runtime.get("last_minute_key") or 0)
+        == _ppb_minute_key(current_sequence)
+        and bool(minute_history)
+        and _ppb_minute_key(int(minute_history[-1]["sequence"]))
+        == int(runtime.get("last_minute_key") or 0)
+    )
+
+    if complete:
+        status = "RECOVERABLE"
+    elif runtime.get("rolling_custody_lost"):
+        status = "ROLLING_CUSTODY_LOST"
+    elif runtime.get("last_gap"):
+        status = "WARMING_AFTER_OBSERVATION_GAP"
+    else:
+        status = "WARMING_FOR_COMPLETE_FIRMWARE_HISTORY"
+
+    return {
+        "schema": PHOTONS_PPB_PI_CHECKPOINT_SCHEMA,
+        "source_schema": PHOTONS_PPB_FIRMWARE_DELTA_SCHEMA,
+        "valid": True,
+        "recoverable": complete,
+        "status": status,
+        "status_reason": runtime.get("status_reason"),
+        "reset_count": runtime.get("reset_count"),
+        "update_count": runtime.get("last_update_count"),
+        "rolling_sequence": rolling_sequence,
+        "current_sequence": current_sequence,
+        "last_minute_key": int(runtime.get("last_minute_key") or 0),
+        "origin_valid": bool(runtime.get("origin_valid")),
+        "origin": copy.deepcopy(runtime.get("origin") or _ppb_zero_endpoint()),
+        "current": current,
+        "expected_second_count": expected_second,
+        "expected_minute_count": expected_minute,
+        "second_count": len(second_history),
+        "minute_count": len(minute_history),
+        "second_history": second_history,
+        "minute_history": minute_history,
+        "contiguous_from_update_count": runtime.get(
+            "contiguous_from_update_count"
+        ),
+        "gap_count": int(runtime.get("gap_count") or 0),
+        "last_gap": copy.deepcopy(runtime.get("last_gap")),
+        "seed_source": runtime.get("seed_source"),
+        "seed_source_db_detail_id": runtime.get("seed_source_db_detail_id"),
+        "last_delta_signature": runtime.get("last_delta_signature"),
+        "proof_checks": int(runtime.get("proof_checks") or 0),
+        "shadow_comparison": copy.deepcopy(_ppb_checkpoint_last_shadow),
+    }
+
+
+def _ppb_checkpoint_history_anchor_locked(
+    runtime: Dict[str, Any], window_seconds: int, *, exact_second_history: bool
+) -> Optional[Dict[str, Any]]:
+    """Return the same bounded-ring anchor the firmware Better-Buckets court used."""
+    current = runtime.get("current")
+    if not isinstance(current, dict):
+        return None
+    current_sequence = int(current.get("sequence") or 0)
+    if current_sequence <= 0:
+        return None
+
+    # The statistical epoch origin is separate testimony.  It is a lawful rolling
+    # anchor only when it is literally present in the bounded producer ring.  This
+    # matters after recovery of a truthful suffix: origin may remain sequence 0
+    # while the oldest retained 24-hour minute endpoint is much newer.
+    target = max(0, current_sequence - int(window_seconds))
+    history = (
+        runtime["second_history"]
+        if exact_second_history
+        else runtime["minute_history"]
+    )
+    for endpoint in history:
+        sequence = int(endpoint.get("sequence") or 0)
+        if target <= sequence < current_sequence:
+            return endpoint
+    return None
+
+
+def _ppb_checkpoint_assert_history_matches_proof_locked(
+    runtime: Dict[str, Any], delta: Dict[str, Any]
+) -> None:
+    for key, seconds, exact in (
+        ("10_min", PHOTONS_RECOVERY_10_MIN_SECONDS, True),
+        ("60_min", PHOTONS_RECOVERY_60_MIN_SECONDS, False),
+        ("8_hour", PHOTONS_RECOVERY_8_HOUR_SECONDS, False),
+        ("24_hour", PHOTONS_RECOVERY_24_HOUR_SECONDS, False),
+    ):
+        proof = (delta.get("proof") or {}).get(key)
+        if not isinstance(proof, dict) or not proof.get("valid"):
+            continue
+        actual_anchor = _ppb_checkpoint_history_anchor_locked(
+            runtime, seconds, exact_second_history=exact
+        )
+        if not _ppb_endpoints_equal(proof.get("anchor"), actual_anchor):
+            raise RuntimeError(
+                "Pi PHOTONS checkpoint ring disagrees with producer proof: "
+                f"window={key} expected={proof.get('anchor')!r} "
+                f"actual={actual_anchor!r}"
+            )
+
+
+def _ppb_checkpoint_ingest(stats: Dict[str, Any]) -> Dict[str, Any]:
+    """Fold one verified producer delta into the literal Pi recovery ledger."""
+    global _ppb_checkpoint_runtime
+    global _ppb_checkpoint_rows_verified
+    global _ppb_checkpoint_recoverable_rows
+    global _ppb_checkpoint_warming_rows
+    global _ppb_checkpoint_gap_count
+
+    delta = _validate_firmware_ppb_checkpoint_delta(stats)
+    signature = _ppb_checkpoint_delta_signature(delta)
+    reset_count = int(delta["reset_count"])
+    update_count = int(delta["update_count"])
+
+    with _ppb_checkpoint_lock:
+        runtime = _ppb_checkpoint_runtime_ensure_locked()
+        previous_reset = runtime.get("reset_count")
+        previous_update = runtime.get("last_update_count")
+
+        if previous_reset is not None and int(previous_reset) != reset_count:
+            gap = {
+                "reason": "STATISTICS_EPOCH_REPLACED",
+                "previous_reset_count": int(previous_reset),
+                "previous_update_count": int(previous_update or 0),
+                "observed_reset_count": reset_count,
+                "observed_update_count": update_count,
+            }
+            _ppb_checkpoint_runtime = _ppb_checkpoint_new_runtime(
+                reason="STATISTICS_EPOCH_REPLACED",
+                gap_count=int(runtime.get("gap_count") or 0),
+                last_gap=gap,
+            )
+            runtime = _ppb_checkpoint_runtime
+            previous_update = None
+
+        if previous_update is not None and update_count == int(previous_update):
+            if runtime.get("last_delta_signature") not in (None, signature):
+                raise RuntimeError(
+                    "duplicate PHOTONS checkpoint identity changed producer testimony: "
+                    f"reset={reset_count} update={update_count}"
+                )
+            runtime["last_delta_signature"] = signature
+            runtime["proof_checks"] = int(delta.get("proof_checks") or 0)
+            _ppb_checkpoint_rows_verified += 1
+            return _ppb_checkpoint_snapshot_locked(runtime)
+
+        if (
+            previous_update is not None
+            and update_count == int(previous_update) + 1
+            and delta["valid"]
+            and int(runtime.get("current_sequence") or 0) > 0
+        ):
+            previous_current = _require_dict(
+                runtime.get("current"), "Pi checkpoint previous current"
+            )
+            current = delta["current"]
+            if int(current["sequence"]) != int(previous_current["sequence"]) + 1:
+                raise RuntimeError(
+                    "adjacent PHOTONS checkpoint update has nonadjacent endpoint identity"
+                )
+            delta_laps = int(current["lap_count"]) - int(
+                previous_current["lap_count"]
+            )
+            delta_ns = int(current["total_lap_gnss_ns"]) - int(
+                previous_current["total_lap_gnss_ns"]
+            )
+            if delta_laps < 0 or delta_ns < 0:
+                raise RuntimeError("adjacent PHOTONS checkpoint cumulative state regressed")
+            if (delta_laps == 0) != (delta_ns == 0):
+                raise RuntimeError("adjacent PHOTONS checkpoint delta N/T does not close")
+            if bool(delta["interval_advanced"]) != bool(delta_laps > 0):
+                raise RuntimeError(
+                    "PHOTONS interval_advanced disagrees with cumulative endpoint delta"
+                )
+
+        if previous_update is not None and update_count != int(previous_update) + 1:
+            gap = {
+                "reason": "PI_OBSERVATION_GAP",
+                "expected_update_count": int(previous_update) + 1,
+                "observed_update_count": update_count,
+                "missing_rows": max(0, update_count - int(previous_update) - 1),
+            }
+            _ppb_checkpoint_runtime = _ppb_checkpoint_new_runtime(
+                reason="PI_OBSERVATION_GAP",
+                gap_count=int(runtime.get("gap_count") or 0) + 1,
+                last_gap=gap,
+            )
+            runtime = _ppb_checkpoint_runtime
+            _ppb_checkpoint_gap_count += 1
+
+        if not delta["valid"]:
+            gap = {
+                "reason": "ROLLING_CUSTODY_LOST",
+                "reset_count": reset_count,
+                "update_count": update_count,
+            }
+            _ppb_checkpoint_runtime = _ppb_checkpoint_new_runtime(
+                reason="ROLLING_CUSTODY_LOST",
+                gap_count=int(runtime.get("gap_count") or 0) + 1,
+                last_gap=gap,
+            )
+            runtime = _ppb_checkpoint_runtime
+            runtime["reset_count"] = reset_count
+            runtime["last_update_count"] = update_count
+            runtime["last_delta_signature"] = signature
+            runtime["rolling_sequence"] = update_count
+            runtime["rolling_custody_lost"] = True
+            _ppb_checkpoint_rows_verified += 1
+            _ppb_checkpoint_warming_rows += 1
+            _ppb_checkpoint_gap_count += 1
+            return _ppb_checkpoint_snapshot_locked(runtime)
+
+        if (
+            int(delta["second_count"]) < len(runtime["second_history"])
+            or int(delta["minute_count"]) < len(runtime["minute_history"])
+        ):
+            replacement = {
+                "reason": "PRODUCER_RING_REPLACED",
+                "previous_second_count": len(runtime["second_history"]),
+                "previous_minute_count": len(runtime["minute_history"]),
+                "observed_second_count": int(delta["second_count"]),
+                "observed_minute_count": int(delta["minute_count"]),
+                "observed_update_count": update_count,
+            }
+            _ppb_checkpoint_runtime = _ppb_checkpoint_new_runtime(
+                reason="PRODUCER_RING_REPLACED",
+                gap_count=int(runtime.get("gap_count") or 0),
+                last_gap=replacement,
+            )
+            runtime = _ppb_checkpoint_runtime
+
+        if runtime.get("contiguous_from_update_count") is None:
+            runtime["contiguous_from_update_count"] = update_count
+
+        # A fresh statistical epoch includes exact zero in both producer rings.
+        if (
+            not runtime["second_history"]
+            and update_count == 1
+            and int(delta["second_count"]) == 2
+        ):
+            runtime["second_history"].append(copy.deepcopy(delta["origin"]))
+        if (
+            not runtime["minute_history"]
+            and update_count == 1
+            and int(delta["minute_count"]) == 2
+        ):
+            runtime["minute_history"].append(copy.deepcopy(delta["origin"]))
+
+        second_endpoint = copy.deepcopy(delta["second_append"])
+        if runtime["second_history"] and int(second_endpoint["sequence"]) <= int(
+            runtime["second_history"][-1]["sequence"]
+        ):
+            raise RuntimeError("PHOTONS second append is not newer than Pi ledger tail")
+        runtime["second_history"].append(second_endpoint)
+
+        if delta["minute_append_valid"]:
+            minute_endpoint = copy.deepcopy(delta["minute_append"])
+            if runtime["minute_history"] and int(minute_endpoint["sequence"]) <= int(
+                runtime["minute_history"][-1]["sequence"]
+            ):
+                raise RuntimeError(
+                    "PHOTONS minute append is not newer than Pi ledger tail"
+                )
+            runtime["minute_history"].append(minute_endpoint)
+
+        runtime["reset_count"] = reset_count
+        runtime["last_update_count"] = update_count
+        runtime["last_delta_signature"] = signature
+        runtime["rolling_sequence"] = update_count
+        runtime["current_sequence"] = int(delta["rolling_sequence"])
+        runtime["expected_second_count"] = int(delta["second_count"])
+        runtime["expected_minute_count"] = int(delta["minute_count"])
+        runtime["last_minute_key"] = int(delta["last_minute_key"])
+        runtime["origin_valid"] = bool(delta["origin_valid"])
+        runtime["origin"] = copy.deepcopy(delta["origin"])
+        runtime["current"] = copy.deepcopy(delta["current"])
+        runtime["proof_checks"] = int(delta.get("proof_checks") or 0)
+        runtime["rolling_custody_lost"] = False
+
+        if len(runtime["second_history"]) > int(delta["second_count"]):
+            raise RuntimeError("Pi PHOTONS second history exceeds producer ring count")
+        if len(runtime["minute_history"]) > int(delta["minute_count"]):
+            raise RuntimeError("Pi PHOTONS minute history exceeds producer ring count")
+
+        snapshot = _ppb_checkpoint_snapshot_locked(runtime)
+        if snapshot["recoverable"]:
+            _ppb_checkpoint_assert_history_matches_proof_locked(runtime, delta)
+            runtime["status_reason"] = "COMPLETE_PRODUCER_RING_CUSTODY"
+            _ppb_checkpoint_recoverable_rows += 1
+        else:
+            runtime["status_reason"] = "WAITING_FOR_UNSEEN_PRODUCER_HISTORY"
+            _ppb_checkpoint_warming_rows += 1
+        _ppb_checkpoint_rows_verified += 1
+        return _ppb_checkpoint_snapshot_locked(runtime)
+
+
+def _normalize_saved_ppb_checkpoint(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict) or value.get("schema") != PHOTONS_PPB_PI_CHECKPOINT_SCHEMA:
+        raise ValueError("canonical PHOTONS row lacks the Pi Better-Buckets checkpoint")
+    if not _require_bool(value.get("valid"), "ppb_restore_checkpoint.valid"):
+        raise ValueError("saved Pi PHOTONS checkpoint is not valid")
+
+    reset_count = _require_int(
+        value.get("reset_count"), "ppb_restore_checkpoint.reset_count"
+    )
+    update_count = _require_int(
+        value.get("update_count"), "ppb_restore_checkpoint.update_count", minimum=1
+    )
+    rolling_sequence = _require_int(
+        value.get("rolling_sequence"), "ppb_restore_checkpoint.rolling_sequence"
+    )
+    current_sequence = _require_int(
+        value.get("current_sequence"), "ppb_restore_checkpoint.current_sequence"
+    )
+    expected_second = _require_int(
+        value.get("expected_second_count"),
+        "ppb_restore_checkpoint.expected_second_count",
+    )
+    expected_minute = _require_int(
+        value.get("expected_minute_count"),
+        "ppb_restore_checkpoint.expected_minute_count",
+    )
+    last_minute_key = _require_int(
+        value.get("last_minute_key"), "ppb_restore_checkpoint.last_minute_key"
+    )
+    if rolling_sequence != update_count or current_sequence > rolling_sequence:
+        raise ValueError("saved Pi PHOTONS checkpoint chronology is invalid")
+    if expected_second > PHOTONS_RECOVERY_SECOND_CAPACITY:
+        raise ValueError("saved Pi PHOTONS second ring count is invalid")
+    if expected_minute > PHOTONS_RECOVERY_MINUTE_CAPACITY:
+        raise ValueError("saved Pi PHOTONS minute ring count is invalid")
+
+    origin_valid = _require_bool(
+        value.get("origin_valid"), "ppb_restore_checkpoint.origin_valid"
+    )
+    origin = _ppb_endpoint_from_payload(
+        value.get("origin"), path="ppb_restore_checkpoint.origin"
+    )
+    current = _ppb_endpoint_from_payload(
+        value.get("current"), path="ppb_restore_checkpoint.current"
+    )
+    if current["sequence"] != current_sequence:
+        raise ValueError("saved Pi PHOTONS current endpoint identity is invalid")
+    if origin_valid and origin != _ppb_zero_endpoint():
+        raise ValueError("saved Pi PHOTONS origin is not exact zero")
+
+    def history(name: str, capacity: int) -> List[Dict[str, Any]]:
+        raw = value.get(name)
+        if not isinstance(raw, list) or len(raw) > capacity:
+            raise ValueError(f"saved Pi PHOTONS {name} is invalid")
+        out: List[Dict[str, Any]] = []
+        previous: Optional[Dict[str, Any]] = None
+        for index, node in enumerate(raw):
+            endpoint = _ppb_endpoint_from_payload(
+                node, path=f"ppb_restore_checkpoint.{name}[{index}]"
+            )
+            if previous is not None and (
+                endpoint["sequence"] <= previous["sequence"]
+                or endpoint["lap_count"] < previous["lap_count"]
+                or endpoint["total_lap_gnss_ns"]
+                < previous["total_lap_gnss_ns"]
+            ):
+                raise ValueError(f"saved Pi PHOTONS {name} chronology regresses")
+            if endpoint["sequence"] > current_sequence:
+                raise ValueError(f"saved Pi PHOTONS {name} extends beyond current")
+            out.append(endpoint)
+            previous = endpoint
+        return out
+
+    second_history = history("second_history", PHOTONS_RECOVERY_SECOND_CAPACITY)
+    minute_history = history("minute_history", PHOTONS_RECOVERY_MINUTE_CAPACITY)
+    published_second_count = _require_int(
+        value.get("second_count"), "ppb_restore_checkpoint.second_count"
+    )
+    published_minute_count = _require_int(
+        value.get("minute_count"), "ppb_restore_checkpoint.minute_count"
+    )
+    if published_second_count != len(second_history):
+        raise ValueError("saved Pi PHOTONS second_count disagrees with literal history")
+    if published_minute_count != len(minute_history):
+        raise ValueError("saved Pi PHOTONS minute_count disagrees with literal history")
+    if len(second_history) > expected_second or len(minute_history) > expected_minute:
+        raise ValueError("saved Pi PHOTONS histories exceed producer counts")
+
+    runtime = _ppb_checkpoint_new_runtime(
+        reason=str(value.get("status_reason") or "SAVED_CHECKPOINT"),
+        seed_source=str(value.get("seed_source") or "DURABLE_CHECKPOINT"),
+        gap_count=_require_int(value.get("gap_count"), "ppb_restore_checkpoint.gap_count"),
+        last_gap=(
+            copy.deepcopy(value.get("last_gap"))
+            if isinstance(value.get("last_gap"), dict)
+            else None
+        ),
+    )
+    runtime["reset_count"] = reset_count
+    runtime["last_update_count"] = update_count
+    runtime["last_delta_signature"] = value.get("last_delta_signature")
+    runtime["rolling_sequence"] = rolling_sequence
+    runtime["current_sequence"] = current_sequence
+    runtime["expected_second_count"] = expected_second
+    runtime["expected_minute_count"] = expected_minute
+    runtime["last_minute_key"] = last_minute_key
+    runtime["origin_valid"] = origin_valid
+    runtime["origin"] = origin
+    runtime["current"] = current
+    runtime["second_history"].extend(copy.deepcopy(second_history))
+    runtime["minute_history"].extend(copy.deepcopy(minute_history))
+    runtime["contiguous_from_update_count"] = value.get(
+        "contiguous_from_update_count"
+    )
+    runtime["seed_source_db_detail_id"] = value.get("seed_source_db_detail_id")
+    runtime["proof_checks"] = _require_int(
+        value.get("proof_checks"), "ppb_restore_checkpoint.proof_checks"
+    )
+    runtime["rolling_custody_lost"] = str(value.get("status") or "") == "ROLLING_CUSTODY_LOST"
+    normalized = _ppb_checkpoint_snapshot_locked(runtime)
+    if _require_bool(value.get("recoverable"), "ppb_restore_checkpoint.recoverable") != bool(
+        normalized["recoverable"]
+    ):
+        raise ValueError("saved Pi PHOTONS recoverable flag disagrees with history")
+    return normalized
+
+
+def _literal_recovery_history_from_source(source: Dict[str, Any]) -> Dict[str, Any]:
+    """Return one self-contained durable PHOTONS resurrection image.
+
+    This is the held-restore authority after producer loss.  SQL history is not
+    consulted to reconstruct missing endpoints: the selected canonical row must
+    itself carry a complete recoverable Better-Buckets checkpoint whose current
+    endpoint closes exactly against the same row's aggregate N/T and chronology.
+    """
+    canonical = _require_dict(source.get("canonical"), "recovery source canonical")
+    raw = canonical.get("ppb_restore_checkpoint")
+    saved = _normalize_saved_ppb_checkpoint(raw)
+    if not saved.get("recoverable"):
+        raise RuntimeError(
+            "selected durable PHOTONS source is not resurrection-capable: "
+            f"detail_id={source.get('db_detail_id')} status={saved.get('status')!r} "
+            f"second={saved.get('second_count')}/{saved.get('expected_second_count')} "
+            f"minute={saved.get('minute_count')}/{saved.get('expected_minute_count')}"
+        )
+
+    current = _require_dict(saved.get("current"), "saved PHOTONS checkpoint current")
+    expected = {
+        "reset_count": int(source["reset_count"]),
+        "update_count": int(source["update_count"]),
+        "sequence": int(source["update_count"]),
+        "lap_count": int(source["lap_count"]),
+        "total_lap_gnss_ns": int(source["total_lap_gnss_ns"]),
+    }
+    observed = {
+        "reset_count": int(saved["reset_count"]),
+        "update_count": int(saved["update_count"]),
+        "sequence": int(current.get("sequence") or 0),
+        "lap_count": int(current.get("lap_count") or 0),
+        "total_lap_gnss_ns": int(current.get("total_lap_gnss_ns") or 0),
+    }
+    if observed != expected:
+        raise RuntimeError(
+            "durable PHOTONS literal checkpoint does not close against its source row: "
+            f"expected={expected!r} observed={observed!r}"
+        )
+
+    second_history = copy.deepcopy(list(saved.get("second_history") or []))
+    minute_history = copy.deepcopy(list(saved.get("minute_history") or []))
+    if not second_history or not minute_history:
+        raise RuntimeError("recoverable PHOTONS literal checkpoint has empty history")
+    if not _ppb_endpoints_equal(second_history[-1], current):
+        raise RuntimeError("PHOTONS literal second-history tail is not the source endpoint")
+
+    return {
+        "schema": "PHOTONS_LITERAL_PPB_RESTORE_V1",
+        "authority": "DURABLE_LITERAL_CHECKPOINT",
+        "source_db_detail_id": int(source["db_detail_id"]),
+        "source_reset_count": int(source["reset_count"]),
+        "source_update_count": int(source["update_count"]),
+        "checkpoint_status": str(saved.get("status") or ""),
+        "checkpoint_seed_source": saved.get("seed_source"),
+        "gap_count": int(saved.get("gap_count") or 0),
+        "second_history": second_history,
+        "minute_history": minute_history,
+    }
+
+
+def _restore_ppb_checkpoint_runtime(
+    checkpoint: Dict[str, Any], *, source_db_detail_id: Optional[int]
+) -> Dict[str, Any]:
+    global _ppb_checkpoint_runtime
+    saved = _normalize_saved_ppb_checkpoint(checkpoint)
+    with _ppb_checkpoint_lock:
+        runtime = _ppb_checkpoint_new_runtime(
+            reason="RESTORED_FROM_DURABLE_PHOTONS",
+            seed_source="DURABLE_PI_CHECKPOINT",
+            gap_count=int(saved.get("gap_count") or 0),
+            last_gap=(
+                saved.get("last_gap")
+                if isinstance(saved.get("last_gap"), dict)
+                else None
+            ),
+        )
+        runtime["reset_count"] = int(saved["reset_count"])
+        runtime["last_update_count"] = int(saved["update_count"])
+        runtime["last_delta_signature"] = saved.get("last_delta_signature")
+        runtime["rolling_sequence"] = int(saved["rolling_sequence"])
+        runtime["current_sequence"] = int(saved["current_sequence"])
+        runtime["expected_second_count"] = int(saved["expected_second_count"])
+        runtime["expected_minute_count"] = int(saved["expected_minute_count"])
+        runtime["last_minute_key"] = int(saved["last_minute_key"])
+        runtime["origin_valid"] = bool(saved["origin_valid"])
+        runtime["origin"] = copy.deepcopy(saved["origin"])
+        runtime["current"] = copy.deepcopy(saved["current"])
+        runtime["second_history"].extend(copy.deepcopy(saved["second_history"]))
+        runtime["minute_history"].extend(copy.deepcopy(saved["minute_history"]))
+        runtime["contiguous_from_update_count"] = saved.get(
+            "contiguous_from_update_count"
+        )
+        runtime["seed_source_db_detail_id"] = (
+            int(source_db_detail_id) if source_db_detail_id is not None else None
+        )
+        runtime["proof_checks"] = int(saved.get("proof_checks") or 0)
+        runtime["rolling_custody_lost"] = saved.get("status") == "ROLLING_CUSTODY_LOST"
+        _ppb_checkpoint_runtime = runtime
+        return _ppb_checkpoint_snapshot_locked(runtime)
+
+
+def _seed_ppb_checkpoint_runtime_from_sql_replay(
+    source: Dict[str, Any], replay: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Build the legacy SQL-replay image for audit comparison only."""
+    global _ppb_checkpoint_runtime
+    second_history = [
+        _ppb_endpoint_from_payload(value, path="SQL replay second endpoint")
+        for value in list(replay.get("second_history") or [])
+    ]
+    minute_history = [
+        _ppb_endpoint_from_payload(value, path="SQL replay minute endpoint")
+        for value in list(replay.get("minute_history") or [])
+    ]
+    if not second_history:
+        raise ValueError("SQL replay produced no PHOTONS second history")
+    current = second_history[-1]
+    if (
+        current["sequence"] != int(source["update_count"])
+        or current["lap_count"] != int(source["lap_count"])
+        or current["total_lap_gnss_ns"] != int(source["total_lap_gnss_ns"])
+    ):
+        raise ValueError("SQL replay tail does not match PHOTONS recovery source")
+
+    with _ppb_checkpoint_lock:
+        runtime = _ppb_checkpoint_new_runtime(
+            reason="TRANSITIONAL_SQL_REPLAY_BOOTSTRAP",
+            seed_source="SQL_REPLAY_TRANSITIONAL_BOOTSTRAP",
+        )
+        runtime["reset_count"] = int(source["reset_count"])
+        runtime["last_update_count"] = int(source["update_count"])
+        runtime["rolling_sequence"] = int(source["update_count"])
+        runtime["current_sequence"] = int(source["update_count"])
+        runtime["expected_second_count"] = len(second_history)
+        runtime["expected_minute_count"] = len(minute_history)
+        runtime["last_minute_key"] = _ppb_minute_key(int(source["update_count"]))
+        runtime["origin_valid"] = True
+        runtime["origin"] = _ppb_zero_endpoint()
+        runtime["current"] = copy.deepcopy(current)
+        runtime["second_history"].extend(copy.deepcopy(second_history))
+        runtime["minute_history"].extend(copy.deepcopy(minute_history))
+        nonzero = [item["sequence"] for item in second_history if item["sequence"] > 0]
+        runtime["contiguous_from_update_count"] = min(nonzero) if nonzero else None
+        runtime["seed_source_db_detail_id"] = int(source["db_detail_id"])
+        _ppb_checkpoint_runtime = runtime
+        return _ppb_checkpoint_snapshot_locked(runtime)
+
+
+def _ppb_history_is_exact_suffix(
+    saved_history: Any, replay_history: Any
+) -> bool:
+    if not isinstance(saved_history, list) or not isinstance(replay_history, list):
+        return False
+    if len(replay_history) > len(saved_history):
+        return False
+    if not replay_history:
+        return not saved_history
+    return saved_history[-len(replay_history):] == replay_history
+
+
+def _ppb_minute_history_suffix_comparison(
+    saved_history: Any,
+    replay_history: Any,
+    *,
+    replay_first_sequence: int,
+) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "match": False,
+        "first_partial_minute": False,
+        "saved_first": None,
+        "replay_first": None,
+    }
+    if not isinstance(saved_history, list) or not isinstance(replay_history, list):
+        result["reason"] = "HISTORY_NOT_LIST"
+        return result
+    if len(replay_history) > len(saved_history):
+        result["reason"] = "REPLAY_LONGER_THAN_LITERAL"
+        return result
+    if not replay_history:
+        result["match"] = not saved_history
+        result["reason"] = "BOTH_EMPTY" if result["match"] else "REPLAY_EMPTY_LITERAL_NONEMPTY"
+        return result
+
+    saved_suffix = saved_history[-len(replay_history):]
+    result["saved_first"] = copy.deepcopy(saved_suffix[0])
+    result["replay_first"] = copy.deepcopy(replay_history[0])
+
+    for index, (saved_endpoint, replay_endpoint) in enumerate(
+        zip(saved_suffix, replay_history)
+    ):
+        if _ppb_endpoints_equal(saved_endpoint, replay_endpoint):
+            continue
+
+        if index != 0:
+            result["reason"] = "NONFIRST_MINUTE_ENDPOINT_DIFFERS"
+            result["difference_index"] = index
+            return result
+
+        saved_sequence = int(saved_endpoint.get("sequence") or 0)
+        replay_sequence = int(replay_endpoint.get("sequence") or 0)
+        same_minute = (
+            _ppb_minute_key(saved_sequence) == _ppb_minute_key(replay_sequence)
+        )
+        replay_begins_here = replay_sequence == int(replay_first_sequence)
+        monotonic_within_minute = bool(
+            saved_sequence <= replay_sequence
+            and int(saved_endpoint.get("lap_count") or 0)
+            <= int(replay_endpoint.get("lap_count") or 0)
+            and int(saved_endpoint.get("total_lap_gnss_ns") or 0)
+            <= int(replay_endpoint.get("total_lap_gnss_ns") or 0)
+        )
+        if not (same_minute and replay_begins_here and monotonic_within_minute):
+            result["reason"] = "FIRST_MINUTE_DIFF_NOT_EXPLAINED_BY_SUFFIX_START"
+            return result
+
+        result["first_partial_minute"] = True
+
+    result["match"] = True
+    result["reason"] = (
+        "FIRST_REPLAY_MINUTE_IS_PARTIAL"
+        if result["first_partial_minute"]
+        else "EXACT_MINUTE_SUFFIX"
+    )
+    return result
+
+
+def _ppb_proved_prior_recovery_splice(
+    source: Dict[str, Any], replay: Dict[str, Any]
+) -> Dict[str, Any]:
+    result: Dict[str, Any] = {"proved": False}
+    try:
+        replay_first = _require_int(
+            replay.get("first_sequence"), "PPB replay first_sequence", minimum=1
+        )
+        boundary = _require_dict(replay.get("boundary"), "PPB replay boundary")
+        boundary_expected = _require_int(
+            boundary.get("expected_update_count"),
+            "PPB replay boundary expected_update_count",
+            minimum=1,
+        )
+        witness = _require_dict(
+            replay.get("prior_recovery_splice_witness"),
+            "PPB replay prior recovery splice witness",
+        )
+        restored = _require_bool(witness.get("restored"), "splice witness restored")
+        proof_committed = _require_bool(
+            witness.get("proof_committed"), "splice witness proof_committed"
+        )
+        fresh_ancestry = _require_bool(
+            witness.get("fresh_physical_ancestry"),
+            "splice witness fresh_physical_ancestry",
+        )
+        prior_reset = _require_int(
+            witness.get("source_reset_count"), "splice witness source_reset_count"
+        )
+        prior_update = _require_int(
+            witness.get("source_update_count"),
+            "splice witness source_update_count",
+            minimum=1,
+        )
+    except Exception as exc:
+        result["reason"] = "PRIOR_RECOVERY_TESTIMONY_UNAVAILABLE"
+        result["error"] = str(exc)
+        return result
+
+    result.update(
+        {
+            "restored": restored,
+            "proof_committed": proof_committed,
+            "fresh_physical_ancestry": fresh_ancestry,
+            "prior_source_reset_count": prior_reset,
+            "prior_source_update_count": prior_update,
+            "replay_first_sequence": replay_first,
+            "boundary": copy.deepcopy(boundary),
+            "witness": copy.deepcopy(witness),
+        }
+    )
+    proved = bool(
+        restored
+        and proof_committed
+        and fresh_ancestry
+        and prior_reset == int(source["reset_count"])
+        and replay_first == prior_update + 1
+        and str(boundary.get("reason") or "") == "DURABLE_UPDATE_GAP_OR_DUPLICATE"
+        and boundary_expected == prior_update
+    )
+    result["proved"] = proved
+    result["reason"] = (
+        "PROVED_PRIOR_RECOVERY_SPLICE" if proved else "BOUNDARY_NOT_PROVED_RECOVERY_SPLICE"
+    )
+    return result
+
+
+def _ppb_shadow_compare(
+    saved: Dict[str, Any],
+    replay_snapshot: Dict[str, Any],
+    *,
+    source: Dict[str, Any],
+    replay: Dict[str, Any],
+) -> Dict[str, Any]:
+    differences: List[str] = []
+    for field in ("reset_count", "update_count", "current"):
+        if saved.get(field) != replay_snapshot.get(field):
+            differences.append(field)
+
+    second_exact = saved.get("second_history") == replay_snapshot.get("second_history")
+    minute_exact = saved.get("minute_history") == replay_snapshot.get("minute_history")
+    if not second_exact:
+        differences.append("second_history")
+    if not minute_exact:
+        differences.append("minute_history")
+
+    exact_match = not differences
+    splice = _ppb_proved_prior_recovery_splice(source, replay)
+    second_suffix = _ppb_history_is_exact_suffix(
+        saved.get("second_history"), replay_snapshot.get("second_history")
+    )
+    minute_suffix = _ppb_minute_history_suffix_comparison(
+        saved.get("minute_history"),
+        replay_snapshot.get("minute_history"),
+        replay_first_sequence=int(replay.get("first_sequence") or 0),
+    )
+    core_match = not any(
+        field in differences for field in ("reset_count", "update_count", "current")
+    )
+    suffix_match = bool(
+        not exact_match
+        and core_match
+        and splice.get("proved")
+        and second_suffix
+        and minute_suffix.get("match")
+    )
+    match = bool(exact_match or suffix_match)
+    comparison = (
+        "EXACT_MATCH"
+        if exact_match
+        else "PROVED_PRIOR_RECOVERY_SUFFIX_MATCH"
+        if suffix_match
+        else "MISMATCH"
+    )
+
+    return {
+        "schema": PHOTONS_PPB_SHADOW_SCHEMA,
+        "available": True,
+        "match": match,
+        "exact_match": exact_match,
+        "comparison": comparison,
+        "source_detail_id": int(source["db_detail_id"]),
+        "differences": differences,
+        "saved_recoverable": bool(saved.get("recoverable")),
+        "replay_recoverable": bool(replay_snapshot.get("recoverable")),
+        "saved_second_count": int(saved.get("second_count") or 0),
+        "replay_second_count": int(replay_snapshot.get("second_count") or 0),
+        "saved_minute_count": int(saved.get("minute_count") or 0),
+        "replay_minute_count": int(replay_snapshot.get("minute_count") or 0),
+        "second_exact": second_exact,
+        "second_suffix_match": second_suffix,
+        "minute_exact": minute_exact,
+        "minute_suffix": minute_suffix,
+        "prior_recovery_splice": splice,
+        "sql_replay_authority_unchanged": True,
+    }
+
+
+def _prepare_ppb_checkpoint_shadow(
+    source: Optional[Dict[str, Any]], replay: Optional[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """Restore literal Pi custody and compare SQL replay only as an audit witness."""
+    global _ppb_checkpoint_runtime
+    global _ppb_checkpoint_last_shadow
+    global _ppb_checkpoint_shadow_match_count
+    global _ppb_checkpoint_shadow_suffix_match_count
+    global _ppb_checkpoint_shadow_mismatch_count
+    global _ppb_checkpoint_shadow_unavailable_count
+
+    try:
+        if source is None:
+            with _ppb_checkpoint_lock:
+                _ppb_checkpoint_runtime = _ppb_checkpoint_new_runtime(
+                    reason="NO_DURABLE_SHADOW_SOURCE"
+                )
+            result = {
+                "schema": PHOTONS_PPB_SHADOW_SCHEMA,
+                "available": False,
+                "match": None,
+                "reason": "NO_DURABLE_SOURCE",
+            }
+            _ppb_checkpoint_shadow_unavailable_count += 1
+        else:
+            canonical = _require_dict(source.get("canonical"), "recovery source canonical")
+            raw_saved = canonical.get("ppb_restore_checkpoint")
+            if not isinstance(raw_saved, dict):
+                with _ppb_checkpoint_lock:
+                    _ppb_checkpoint_runtime = _ppb_checkpoint_new_runtime(
+                        reason="DURABLE_SOURCE_HAS_NO_LITERAL_CHECKPOINT"
+                    )
+                result = {
+                    "schema": PHOTONS_PPB_SHADOW_SCHEMA,
+                    "available": False,
+                    "match": None,
+                    "reason": "DURABLE_SOURCE_HAS_NO_LITERAL_CHECKPOINT",
+                    "source_detail_id": int(source["db_detail_id"]),
+                }
+                _ppb_checkpoint_shadow_unavailable_count += 1
+            else:
+                try:
+                    saved = _normalize_saved_ppb_checkpoint(raw_saved)
+                except Exception as exc:
+                    with _ppb_checkpoint_lock:
+                        _ppb_checkpoint_runtime = _ppb_checkpoint_new_runtime(
+                            reason="SAVED_CHECKPOINT_INVALID"
+                        )
+                    result = {
+                        "schema": PHOTONS_PPB_SHADOW_SCHEMA,
+                        "available": False,
+                        "match": None,
+                        "reason": "SAVED_CHECKPOINT_INVALID",
+                        "source_detail_id": int(source["db_detail_id"]),
+                        "error": str(exc),
+                    }
+                    _ppb_checkpoint_shadow_unavailable_count += 1
+                    logging.exception(
+                        "💥 [photons/ppb-shadow] saved literal recovery authority is invalid"
+                    )
+                else:
+                    # Install literal authority before consulting the SQL witness.
+                    # Even an unavailable or contradictory audit may not silently
+                    # replace the self-contained durable resurrection image.
+                    _restore_ppb_checkpoint_runtime(
+                        raw_saved,
+                        source_db_detail_id=int(source["db_detail_id"]),
+                    )
+                    if replay is None:
+                        result = {
+                            "schema": PHOTONS_PPB_SHADOW_SCHEMA,
+                            "available": False,
+                            "match": None,
+                            "reason": "SQL_REPLAY_AUDIT_UNAVAILABLE",
+                            "source_detail_id": int(source["db_detail_id"]),
+                            "literal_recoverable": bool(saved.get("recoverable")),
+                            "literal_authority_retained": True,
+                        }
+                        _ppb_checkpoint_shadow_unavailable_count += 1
+                    else:
+                        # Build the SQL comparison snapshot through the legacy helper,
+                        # then immediately reinstall literal authority before judging it.
+                        replay_snapshot = _seed_ppb_checkpoint_runtime_from_sql_replay(
+                            source, replay
+                        )
+                        _restore_ppb_checkpoint_runtime(
+                            raw_saved,
+                            source_db_detail_id=int(source["db_detail_id"]),
+                        )
+                        result = _ppb_shadow_compare(
+                            saved,
+                            replay_snapshot,
+                            source=source,
+                            replay=replay,
+                        )
+                        if result["match"]:
+                            _ppb_checkpoint_shadow_match_count += 1
+                            if not result.get("exact_match"):
+                                _ppb_checkpoint_shadow_suffix_match_count += 1
+                                logging.info(
+                                    "🧬 [photons/ppb-shadow] saved literal checkpoint extends "
+                                    "a proved prior recovery splice; SQL replay is an exact "
+                                    "visible suffix (comparison=%s differences=%s minute=%s). "
+                                    "Literal checkpoint remains recovery authority",
+                                    result.get("comparison"),
+                                    result.get("differences"),
+                                    result.get("minute_suffix"),
+                                )
+                        else:
+                            _ppb_checkpoint_shadow_mismatch_count += 1
+                            logging.error(
+                                "💥 [photons/ppb-shadow] SQL audit disagrees with literal "
+                                "recovery authority; literal checkpoint retained: %s",
+                                result,
+                            )
+    except Exception as exc:
+        logging.exception("💥 [photons/ppb-shadow] checkpoint shadow preparation failed")
+        with _ppb_checkpoint_lock:
+            _ppb_checkpoint_runtime = _ppb_checkpoint_new_runtime(
+                reason="SHADOW_PREPARATION_FAILED"
+            )
+        result = {
+            "schema": PHOTONS_PPB_SHADOW_SCHEMA,
+            "available": False,
+            "match": None,
+            "reason": "SHADOW_PREPARATION_FAILED",
+            "error": str(exc),
+        }
+        _ppb_checkpoint_shadow_unavailable_count += 1
+
+    with _ppb_checkpoint_lock:
+        _ppb_checkpoint_last_shadow = copy.deepcopy(result)
+    return copy.deepcopy(result)
+
+
+def _ppb_checkpoint_report_surface() -> Dict[str, Any]:
+    with _ppb_checkpoint_lock:
+        if _ppb_checkpoint_runtime is None:
+            checkpoint = None
+        else:
+            checkpoint = _ppb_checkpoint_snapshot_locked(_ppb_checkpoint_runtime)
+        return {
+            "checkpoint": checkpoint,
+            "last_shadow": copy.deepcopy(_ppb_checkpoint_last_shadow),
+            "rows_verified": _ppb_checkpoint_rows_verified,
+            "recoverable_rows": _ppb_checkpoint_recoverable_rows,
+            "warming_rows": _ppb_checkpoint_warming_rows,
+            "gap_count": _ppb_checkpoint_gap_count,
+            "shadow_match_count": _ppb_checkpoint_shadow_match_count,
+            "shadow_suffix_match_count": _ppb_checkpoint_shadow_suffix_match_count,
+            "shadow_mismatch_count": _ppb_checkpoint_shadow_mismatch_count,
+            "shadow_unavailable_count": _ppb_checkpoint_shadow_unavailable_count,
+            "ingest_failure_count": _ppb_checkpoint_ingest_failure_count,
+            "last_ingest_failure": copy.deepcopy(_ppb_checkpoint_last_ingest_failure),
+        }
+
+
+
 def _make_photons(fragment: Payload, system_context: Dict[str, Any]) -> Payload:
     """Form canonical PHOTONS_V1 from firmware testimony + authoritative SYSTEM context."""
+    global _ppb_checkpoint_runtime
+    global _ppb_checkpoint_ingest_failure_count
+    global _ppb_checkpoint_last_ingest_failure
+
     sequence, publish_count, pps_count, instrument = _validate_photons_fragment(fragment)
     system_context = _require_dict(system_context, "SYSTEM.REPORT.payload")
 
@@ -976,6 +2400,47 @@ def _make_photons(fragment: Payload, system_context: Dict[str, Any]) -> Payload:
     # Preserve the exact Teensy-owned instrument subtree.  Context enrichment
     # never reaches inside or re-authors firmware optical science.
     state["photons"] = copy.deepcopy(instrument)
+    stats = _require_dict(instrument.get("stats"), "PHOTONS_FRAGMENT.photons.stats")
+
+    # Phase 1 is deliberately shadow-only.  The literal Pi ledger must prove it
+    # can follow firmware testimony, but an objection here may not suppress an
+    # otherwise-lawful canonical PHOTONS row or alter the established SQL-replay
+    # recovery path.  Hold the checkpoint lock across a transactional snapshot +
+    # ingest so a failing shadow mutation is invisible to report readers and is
+    # rolled back exactly.
+    with _ppb_checkpoint_lock:
+        checkpoint_before = copy.deepcopy(_ppb_checkpoint_runtime)
+        try:
+            checkpoint = _ppb_checkpoint_ingest(stats)
+        except Exception as exc:
+            _ppb_checkpoint_runtime = checkpoint_before
+            _ppb_checkpoint_ingest_failure_count += 1
+            failure = {
+                "schema": "PHOTONS_PPB_CHECKPOINT_SHADOW_ERROR_V1",
+                "at_utc": _utc_now_z(),
+                "sequence": sequence,
+                "reset_count": stats.get("reset_count"),
+                "update_count": stats.get("update_count"),
+                "error": str(exc),
+                "failure_count": _ppb_checkpoint_ingest_failure_count,
+                "canonical_row_rejected": False,
+                "sql_replay_authority_unchanged": True,
+            }
+            first_failure = _ppb_checkpoint_last_ingest_failure is None
+            prior_error = (
+                _ppb_checkpoint_last_ingest_failure.get("error")
+                if isinstance(_ppb_checkpoint_last_ingest_failure, dict)
+                else None
+            )
+            _ppb_checkpoint_last_ingest_failure = copy.deepcopy(failure)
+            state["ppb_restore_checkpoint_shadow_error"] = copy.deepcopy(failure)
+            if first_failure or prior_error != failure["error"]:
+                logging.exception(
+                    "💥 [photons/ppb-shadow] literal checkpoint ingest objected; "
+                    "canonical PHOTONS row remains admissible and shadow state was rolled back"
+                )
+        else:
+            state["ppb_restore_checkpoint"] = checkpoint
     return state
 
 
@@ -1109,8 +2574,13 @@ def _canonical_recovery_state_from_row(
         raise ValueError("canonical PHOTONS instrument schema mismatch")
     if _require_bool(instrument.get("snapshot_ok"), "PHOTONS.photons.snapshot_ok") is not True:
         raise ValueError("canonical PHOTONS snapshot is not coherent")
-    if _require_bool(instrument.get("valid"), "PHOTONS.photons.valid") is not True:
-        raise ValueError("canonical PHOTONS instrument is invalid")
+    # Top-level instrument.valid is live measurement-readiness testimony, not
+    # durable recovery authority.  In particular, the exact N+1 row after a
+    # hard restore may truthfully publish valid=false while the fresh projection
+    # anchor is still reacquiring.  Preserve/type-check that testimony here, but
+    # let the explicit stats, custody, Better-Buckets, chronology, and physical-
+    # ancestry courts below decide whether the row is resurrection-capable.
+    _require_bool(instrument.get("valid"), "PHOTONS.photons.valid")
 
     stats = _require_dict(instrument.get("stats"), "PHOTONS.photons.stats")
     science = _require_dict(instrument.get("science"), "PHOTONS.photons.science")
@@ -1219,8 +2689,16 @@ def _canonical_recovery_state_from_row(
         or excluded_projected["n"] > excluded_count
     ):
         raise ValueError("canonical PHOTONS Welford population accounting fails")
-    if abs(float(accepted_projected["mean"]) - ratio_mean) > PHOTONS_RECOVERY_VERIFY_TOLERANCE:
-        raise ValueError("accepted projected-lap Welford mean does not close with N/T")
+
+    # N/T is exact integer sufficient state followed by one division.  The Welford
+    # mean reaches the same mathematical quantity through millions of incremental
+    # floating-point updates.  Their tiny numerical drift is corroborating evidence,
+    # not a lawful reason to discard newer durable ancestry.
+    welford_grand_ratio = _welford_grand_ratio_diagnostic(
+        welford_mean_ns=float(accepted_projected["mean"]),
+        ratio_mean_ns=ratio_mean,
+        standard_lap_ps=standard_lap_ps,
+    )
 
     seed_pending = _require_bool(
         science.get("seed_pending"), "PHOTONS.science.seed_pending"
@@ -1406,6 +2884,7 @@ def _canonical_recovery_state_from_row(
         "total_lap_gnss_ns": total_ns,
         "custody_lap_count": custody_lap_count,
         "custody_total_lap_gnss_ns": custody_total_ns,
+        "welford_grand_ratio_diagnostic": welford_grand_ratio,
         "restore_args": restore_args,
         "campaign_restore": campaign_restore,
         "pending_seed_dropped": pending_count,
@@ -1417,11 +2896,14 @@ def _load_newest_recoverable_photons_state(
     active_master: Optional[Dict[str, Any]],
     require_active_campaign: bool,
 ) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]], int]:
-    skipped: List[Dict[str, Any]] = []
-    rows_seen = 0
+    """Return the newest durable PHOTONS row or fail on its contradiction.
+
+    Phase 3 forbids ancestry search-by-convenience.  Once durable PHOTONS history
+    exists, a newer row that fails the recovery court is evidence of a contradiction,
+    not permission to walk backward until an older row happens to pass.
+    """
     with open_db(row_dict=True) as conn:
-        cur = conn.cursor(name="photons_recovery_source_scan")
-        cur.itersize = PHOTONS_RECOVERY_CURSOR_ITERSIZE
+        cur = conn.cursor()
         if require_active_campaign:
             assert active_master is not None
             cur.execute(
@@ -1431,6 +2913,7 @@ def _load_newest_recoverable_photons_state(
                 WHERE campaign_type = %s
                   AND campaign = %s
                 ORDER BY id DESC
+                LIMIT 1
                 """,
                 (CAMPAIGN_TYPE_LANTERN, active_master["campaign"]),
             )
@@ -1441,23 +2924,43 @@ def _load_newest_recoverable_photons_state(
                 FROM campaign_detail
                 WHERE campaign_type = %s
                 ORDER BY id DESC
+                LIMIT 1
                 """,
                 (CAMPAIGN_TYPE_LANTERN,),
             )
-        for row in cur:
-            rows_seen += 1
-            try:
-                source = _canonical_recovery_state_from_row(
-                    row,
-                    active_master=active_master,
-                    require_active_campaign=require_active_campaign,
-                )
-            except Exception as exc:
-                if len(skipped) < 32:
-                    skipped.append({"id": int(row["id"]), "reason": str(exc)})
-                continue
-            return source, skipped, rows_seen
-    return None, skipped, rows_seen
+        row = cur.fetchone()
+
+    if row is None:
+        return None, [], 0
+
+    try:
+        source = _canonical_recovery_state_from_row(
+            row,
+            active_master=active_master,
+            require_active_campaign=require_active_campaign,
+        )
+    except Exception as exc:
+        rejection = {"id": int(row["id"]), "reason": str(exc)}
+        raise RuntimeError(
+            "newest durable PHOTONS row failed recovery authority; refusing "
+            "silent fallback to older scientific history: "
+            f"{rejection!r}"
+        ) from exc
+
+    diagnostic = source.get("welford_grand_ratio_diagnostic")
+    if isinstance(diagnostic, dict):
+        log = logging.warning if diagnostic.get("notable") else logging.info
+        log(
+            "%s [photons/recovery] selected newest durable source id=%d update=%d "
+            "Welford/grand-ratio drift=%.9f ppb limit=%.6f ppb; "
+            "diagnostic only, authority unchanged",
+            "⚠️" if diagnostic.get("notable") else "🧮",
+            int(source["db_detail_id"]),
+            int(source["update_count"]),
+            float(diagnostic.get("delta_ppb") or 0.0),
+            float(diagnostic.get("diagnostic_limit_ppb") or 0.0),
+        )
+    return source, [], 1
 
 
 def _recovery_replay_endpoint(payload: Any) -> Dict[str, Any]:
@@ -1468,6 +2971,32 @@ def _recovery_replay_endpoint(payload: Any) -> Dict[str, Any]:
         raise ValueError("PPB replay canonical schema mismatch")
     instrument = _require_dict(state.get("photons"), "PPB replay photons")
     stats = _require_dict(instrument.get("stats"), "PPB replay stats")
+
+    recovery_witness: Optional[Dict[str, Any]] = None
+    recovery = instrument.get("recovery")
+    if isinstance(recovery, dict):
+        try:
+            recovery_witness = {
+                "restored": _require_bool(recovery.get("restored"), "PPB recovery restored"),
+                "proof_committed": _require_bool(
+                    recovery.get("proof_committed"), "PPB recovery proof_committed"
+                ),
+                "fresh_physical_ancestry": _require_bool(
+                    recovery.get("fresh_physical_ancestry"),
+                    "PPB recovery fresh_physical_ancestry",
+                ),
+                "generation": _require_int(recovery.get("generation"), "PPB recovery generation"),
+                "source_reset_count": _require_int(
+                    recovery.get("source_reset_count"), "PPB recovery source_reset_count"
+                ),
+                "source_update_count": _require_int(
+                    recovery.get("source_update_count"),
+                    "PPB recovery source_update_count",
+                ),
+            }
+        except Exception:
+            recovery_witness = None
+
     return {
         "reset_count": _require_int(stats.get("reset_count"), "PPB reset_count"),
         "sequence": _require_int(stats.get("update_count"), "PPB update_count", minimum=1),
@@ -1483,6 +3012,7 @@ def _recovery_replay_endpoint(payload: Any) -> Dict[str, Any]:
         "total_lap_gnss_ns": _require_int(
             stats.get("total_lap_gnss_ns"), "PPB total_lap_gnss_ns", minimum=1
         ),
+        "recovery_witness": recovery_witness,
     }
 
 
@@ -1588,6 +3118,7 @@ def _reconstruct_photons_ppb_history(source: Dict[str, Any]) -> Dict[str, Any]:
     expected_update = source_update
     descending: List[Dict[str, Any]] = []
     boundary: Optional[Dict[str, Any]] = None
+    committed_splice_witnesses: Dict[int, Dict[str, Any]] = {}
     rows_scanned = 0
 
     with open_db(row_dict=True) as conn:
@@ -1637,6 +3168,21 @@ def _reconstruct_photons_ppb_history(source: Dict[str, Any]) -> Dict[str, Any]:
                 }
                 break
             descending.append(endpoint)
+            witness = endpoint.get("recovery_witness")
+            if (
+                isinstance(witness, dict)
+                and witness.get("restored") is True
+                and witness.get("proof_committed") is True
+                and witness.get("fresh_physical_ancestry") is True
+                and int(witness.get("source_reset_count") or -1) == source_reset
+            ):
+                witness_source_update = int(witness.get("source_update_count") or 0)
+                if 0 < witness_source_update < observed_update:
+                    committed_splice_witnesses[witness_source_update] = {
+                        **copy.deepcopy(witness),
+                        "witness_detail_id": int(row["id"]),
+                        "witness_update_count": observed_update,
+                    }
             if observed_update == 1 or len(descending) >= PHOTONS_RECOVERY_REPLAY_MAX_ROWS:
                 break
             expected_update -= 1
@@ -1644,6 +3190,7 @@ def _reconstruct_photons_ppb_history(source: Dict[str, Any]) -> Dict[str, Any]:
     if not descending or int(descending[0]["sequence"]) != source_update:
         raise RuntimeError("PPB replay did not begin at the selected recovery source")
     all_history = list(reversed(descending))
+    first_sequence = int(all_history[0]["sequence"])
     for previous, current in zip(all_history, all_history[1:]):
         if (
             int(current["sequence"]) != int(previous["sequence"]) + 1
@@ -1682,6 +3229,12 @@ def _reconstruct_photons_ppb_history(source: Dict[str, Any]) -> Dict[str, Any]:
         second_history=second_history,
         minute_history=minute_history,
     )
+    prior_recovery_splice_witness = None
+    if isinstance(boundary, dict) and boundary.get("reason") == "DURABLE_UPDATE_GAP_OR_DUPLICATE":
+        expected = int(boundary.get("expected_update_count") or 0)
+        prior_recovery_splice_witness = copy.deepcopy(
+            committed_splice_witnesses.get(expected)
+        )
     return {
         "schema": "PHOTONS_PPB_RESTORE_V1",
         "source_db_detail_id": source_id,
@@ -1689,7 +3242,9 @@ def _reconstruct_photons_ppb_history(source: Dict[str, Any]) -> Dict[str, Any]:
         "source_update_count": source_update,
         "rows_scanned": rows_scanned,
         "boundary": boundary,
-        "history_truncated": int(all_history[0]["sequence"]) != 0,
+        "first_sequence": first_sequence,
+        "prior_recovery_splice_witness": prior_recovery_splice_witness,
+        "history_truncated": first_sequence != 1,
         "second_history": copy.deepcopy(second_history),
         "minute_history": copy.deepcopy(minute_history),
         "verification": verification,
@@ -2048,6 +3603,7 @@ def _recovery_proof_matches(
             ):
                 return False
             for field in (
+                "source_reset_count",
                 "source_sequence",
                 "source_update_count",
                 "source_lap_count",
@@ -2068,12 +3624,13 @@ def _recovery_proof_matches(
         if exact_update is not None and update_count != int(exact_update):
             return False
         return (
-            sequence > int(expected["source_sequence"])
-            and update_count > int(expected["source_update_count"])
-            and lap_count > int(expected["source_lap_count"])
-            and total_ns > int(expected["source_total_lap_gnss_ns"])
-            and custody_laps > int(expected["source_custody_lap_count"])
-            and custody_total > int(expected["source_custody_total_lap_gnss_ns"])
+            reset_count == int(expected["source_reset_count"])
+            and sequence == int(expected["source_sequence"]) + 1
+            and update_count == int(expected["source_update_count"]) + 1
+            and lap_count >= int(expected["source_lap_count"])
+            and total_ns >= int(expected["source_total_lap_gnss_ns"])
+            and custody_laps >= int(expected["source_custody_lap_count"])
+            and custody_total >= int(expected["source_custody_total_lap_gnss_ns"])
         )
 
     if mode == "LIVE_REATTACH":
@@ -2218,10 +3775,10 @@ def _wait_for_recovery_proof(*, acknowledge_firmware: bool) -> Dict[str, Any]:
 
 
 def _stage_recovery_history(
-    *, generation: int, replay: Dict[str, Any]
+    *, generation: int, history: Dict[str, Any]
 ) -> Dict[str, Any]:
-    second_history = list(replay["second_history"])
-    minute_history = list(replay["minute_history"])
+    second_history = list(history["second_history"])
+    minute_history = list(history["minute_history"])
     _send_teensy_recovery_command(
         "RECOVERY_BEGIN",
         args={
@@ -2358,7 +3915,7 @@ def _startup_held_restore(
     *,
     active_master: Optional[Dict[str, Any]],
     source: Dict[str, Any],
-    replay: Dict[str, Any],
+    literal_history: Dict[str, Any],
     skipped: List[Dict[str, Any]],
     rows_scanned: int,
 ) -> Dict[str, Any]:
@@ -2380,6 +3937,7 @@ def _startup_held_restore(
         "mode": "HELD_RESTORE",
         "generation": generation,
         "source_sequence": int(source["sequence"]),
+        "source_reset_count": int(source["reset_count"]),
         "source_update_count": int(source["update_count"]),
         "source_lap_count": int(source["lap_count"]),
         "source_total_lap_gnss_ns": int(source["total_lap_gnss_ns"]),
@@ -2387,6 +3945,8 @@ def _startup_held_restore(
         "source_custody_total_lap_gnss_ns": int(
             source["custody_total_lap_gnss_ns"]
         ),
+        "exact_sequence": int(source["sequence"]) + 1,
+        "exact_update_count": int(source["update_count"]) + 1,
     }
     _arm_recovery_proof(expected)
     _recovery_status_set(
@@ -2399,15 +3959,24 @@ def _startup_held_restore(
         damaged_rows_skipped=copy.deepcopy(skipped),
         source_rows_scanned=rows_scanned,
         ingress_rows_drained=drained,
-        ppb_replay={
-            "rows_scanned": replay["rows_scanned"],
-            "boundary": copy.deepcopy(replay["boundary"]),
-            "history_truncated": replay["history_truncated"],
-            "verification": copy.deepcopy(replay["verification"]),
+        ppb_restore_authority={
+            "schema": literal_history.get("schema"),
+            "authority": literal_history.get("authority"),
+            "source_db_detail_id": literal_history.get("source_db_detail_id"),
+            "source_update_count": literal_history.get("source_update_count"),
+            "checkpoint_status": literal_history.get("checkpoint_status"),
+            "checkpoint_seed_source": literal_history.get("checkpoint_seed_source"),
+            "gap_count": literal_history.get("gap_count"),
+            "second_count": len(literal_history.get("second_history") or []),
+            "minute_count": len(literal_history.get("minute_history") or []),
+        },
+        exact_successor={
+            "sequence": int(source["sequence"]) + 1,
+            "update_count": int(source["update_count"]) + 1,
         },
     )
     try:
-        staged = _stage_recovery_history(generation=generation, replay=replay)
+        staged = _stage_recovery_history(generation=generation, history=literal_history)
         commit_args = dict(source["restore_args"])
         commit_args["generation"] = generation
         commit = _send_teensy_recovery_command(
@@ -2446,6 +4015,8 @@ def _startup_held_restore(
         "source_sequence": int(source["sequence"]),
         "source_update_count": int(source["update_count"]),
         "pending_seed_dropped": int(source["pending_seed_dropped"]),
+        "ppb_restore_authority": "DURABLE_LITERAL_CHECKPOINT",
+        "proof_contract": "EXACT_SOURCE_N_PLUS_1",
         "proof": proof,
         "campaign_rearm": rearm,
         "staged": staged,
@@ -2547,6 +4118,7 @@ def _startup_live_reattach(
             "mode": "FIRMWARE_PENDING_PROOF",
             "generation": generation,
             "source_sequence": int(recovery_report["source_sequence"]),
+            "source_reset_count": int(recovery_report["source_reset_count"]),
             "source_update_count": int(recovery_report["source_update_count"]),
             "source_lap_count": int(recovery_report["source_lap_count"]),
             "source_total_lap_gnss_ns": int(
@@ -2579,12 +4151,29 @@ def _startup_live_reattach(
             _note_recovery_proof_persisted(
                 durable["canonical"], int(durable["detail_id"])
             )
+        # A surviving Teensy may have advanced while Pi PHOTONS was down.  Every
+        # queued fragment is producer testimony needed to advance the literal
+        # checkpoint without inventing a bridge.  Never discard it merely to
+        # obtain a fresh live floor; the proof court will ignore pre-floor rows
+        # until an actual advancing descendant arrives.
+        drained = 0
+        preserved = _fragment_queue.qsize()
+        if preserved:
+            logging.info(
+                "📥 [photons/recovery] preserving %d queued PHOTONS_FRAGMENT rows "
+                "during live reattach for literal-checkpoint continuity",
+                preserved,
+            )
         _start_workers()
         proof = _wait_for_recovery_proof(acknowledge_firmware=True)
         mode = "LIVE_REATTACH_PENDING_PROOF"
-        drained = 0
     else:
-        drained = _drain_queue(_fragment_queue)
+        # Do not drain startup custody here.  The queue normally contains the
+        # exact durable-source+1...live-floor producer rows accumulated while
+        # this Pi process was classifying the surviving Teensy.  Dropping them
+        # creates a self-inflicted observation gap and can make an otherwise
+        # complete literal checkpoint non-recoverable on the next hard restart.
+        drained = 0
         recovery_report = _fetch_teensy_recovery_report()
         broad = _fetch_teensy_photons_report()
         floor = _validate_live_teensy_against_durable_source(recovery_report, source)
@@ -2596,6 +4185,13 @@ def _startup_live_reattach(
         )
         expected = {"mode": "LIVE_REATTACH", **floor}
         _arm_recovery_proof(expected)
+        preserved = _fragment_queue.qsize()
+        if preserved:
+            logging.info(
+                "📥 [photons/recovery] preserving %d queued PHOTONS_FRAGMENT rows "
+                "during live reattach for literal-checkpoint continuity",
+                preserved,
+            )
         _start_workers()
         proof = _wait_for_recovery_proof(acknowledge_firmware=False)
         mode = "LIVE_REATTACH"
@@ -2619,6 +4215,7 @@ def _startup_live_reattach(
         "source_rows_scanned": rows_scanned,
         "damaged_rows_skipped": copy.deepcopy(skipped),
         "ingress_rows_drained": drained,
+        "ingress_rows_preserved_at_worker_start": preserved,
         "live_floor": floor,
         "proof": proof,
         "campaign_rearm": rearm,
@@ -2660,14 +4257,39 @@ def _perform_phase5_recovery() -> Dict[str, Any]:
         if report["staging_active"]:
             raise RuntimeError("Teensy PHOTONS recovery staging remains active")
 
+        replay: Optional[Dict[str, Any]] = None
+        replay_shadow_error: Optional[str] = None
+        if source is not None:
+            try:
+                replay = _reconstruct_photons_ppb_history(source)
+            except Exception as exc:
+                # Phase 3 never reconstructs held-restore state from SQL. Replay is
+                # now an independent audit witness only, so its absence is visible
+                # but cannot erase a complete literal durable checkpoint.
+                replay_shadow_error = str(exc)
+                logging.exception(
+                    "⚠️ [photons/ppb-shadow] SQL replay audit unavailable; "
+                    "literal checkpoint authority is unchanged"
+                )
+
+        ppb_shadow = _prepare_ppb_checkpoint_shadow(source, replay)
+        if replay_shadow_error is not None:
+            ppb_shadow["sql_replay_error"] = replay_shadow_error
+
         classification = {
             "active_campaign": active_master["campaign"] if active_master else None,
             "active_campaign_detail_count": active_detail_count,
             "total_detail_count": total_detail_count,
             "source_detail_id": int(source["db_detail_id"]) if source else None,
+            "source_welford_grand_ratio_diagnostic": (
+                copy.deepcopy(source.get("welford_grand_ratio_diagnostic"))
+                if source is not None
+                else None
+            ),
             "damaged_rows_skipped": copy.deepcopy(skipped),
             "rows_scanned": rows_scanned,
             "teensy_publication_started": bool(report["publication_started"]),
+            "ppb_checkpoint_shadow": copy.deepcopy(ppb_shadow),
         }
         _recovery_status_set("CLASSIFIED", **classification)
 
@@ -2684,11 +4306,21 @@ def _perform_phase5_recovery() -> Dict[str, Any]:
                 active_master=active_master,
                 rows_seen=total_detail_count,
             )
-        replay = _reconstruct_photons_ppb_history(source)
+        literal_history = _literal_recovery_history_from_source(source)
+        # Re-seed the Pi runtime from the exact same durable image that is about
+        # to be staged into firmware, independent of SQL audit availability.
+        canonical = _require_dict(source.get("canonical"), "recovery source canonical")
+        raw_checkpoint = _require_dict(
+            canonical.get("ppb_restore_checkpoint"),
+            "recovery source ppb_restore_checkpoint",
+        )
+        _restore_ppb_checkpoint_runtime(
+            raw_checkpoint, source_db_detail_id=int(source["db_detail_id"])
+        )
         return _startup_held_restore(
             active_master=active_master,
             source=source,
-            replay=replay,
+            literal_history=literal_history,
             skipped=skipped,
             rows_scanned=rows_scanned,
         )
@@ -2909,7 +4541,7 @@ def _baseline_relation_for_active_campaign() -> Optional[Dict[str, Any]]:
     }
 
 
-def _persist_photons(photons: Payload) -> None:
+def _persist_photons(photons: Payload) -> int:
     """Persist one canonical PHOTONS row and advance the LANTERN read model.
 
     ``viable`` remains structural: individual firmware lap exclusions never make
@@ -3041,9 +4673,10 @@ def _persist_photons(photons: Payload) -> None:
                         "final LANTERN firmware row did not close exactly one campaign_master"
                     )
 
-    # The open_db context has committed successfully.  Only now may this row
-    # satisfy Phase-5 proof custody; an uncommitted INSERT is never a proof.
-    _note_recovery_proof_persisted(photons, detail_id)
+    # Crossing the open_db context is the irreversible durability boundary.
+    # Return the committed identity to the worker; post-commit recovery-proof
+    # adjudication must never cause this scientific row to be inserted again.
+    return detail_id
 
 
 # ---------------------------------------------------------------------
@@ -3217,10 +4850,9 @@ def _persistence_loop() -> None:
                 failure_logged = False
                 while True:
                     try:
-                        _persist_photons(photons)
+                        detail_id = _persist_photons(photons)
                         with _state_lock:
                             _rows_persisted += 1
-                        break
                     except Exception as exc:
                         if _hard_failure_active():
                             with _state_lock:
@@ -3242,6 +4874,26 @@ def _persistence_loop() -> None:
                             )
                             failure_logged = True
                         time.sleep(PHOTONS_PERSIST_RETRY_S)
+                        continue
+
+                    # The campaign_detail row is already committed.  Recovery-proof
+                    # adjudication is a separate custody stage: if its contract is
+                    # internally inconsistent, fail hard rather than retrying the
+                    # INSERT and manufacturing duplicate durable testimony.
+                    try:
+                        _note_recovery_proof_persisted(photons, detail_id)
+                    except Exception as exc:
+                        _enter_hard_failure(
+                            "post_commit_recovery_proof_adjudication_failed",
+                            {
+                                "detail_id": int(detail_id),
+                                "sequence": photons.get("sequence"),
+                                "pps_count": photons.get("pps_count"),
+                                "error": str(exc),
+                            },
+                            source="PHOTONS_PERSISTENCE_PROOF",
+                        )
+                    break
 
 
         if photons is None:
@@ -4366,6 +6018,7 @@ def _stats_reset_birth_court(
             "PHOTONS STATS_RESET birth projection rejects disagree with reason custody"
         )
 
+    welford_grand_ratio: Optional[Dict[str, Any]] = None
     if lap_count == 0:
         if total_ns != 0:
             raise ValueError("PHOTONS STATS_RESET birth has zero N with nonzero total")
@@ -4373,8 +6026,11 @@ def _stats_reset_birth_court(
         if total_ns == 0:
             raise ValueError("PHOTONS STATS_RESET birth has nonzero N with zero total")
         ratio_mean = float(total_ns) / float(lap_count)
-        if abs(float(lap_welford["mean"]) - ratio_mean) > PHOTONS_RECOVERY_VERIFY_TOLERANCE:
-            raise ValueError("PHOTONS STATS_RESET birth Welford mean does not close with N/T")
+        welford_grand_ratio = _welford_grand_ratio_diagnostic(
+            welford_mean_ns=float(lap_welford["mean"]),
+            ratio_mean_ns=ratio_mean,
+            standard_lap_ps=int(snapshot["standard_lap_ps"]),
+        )
 
     current_sequence = _require_int(
         stats.get("rolling_ppb_current_sequence"),
@@ -4431,6 +6087,7 @@ def _stats_reset_birth_court(
         "projection_attempt_count": attempts,
         "projection_reject_count": rejects,
         "reason_counts": reason_counts,
+        "welford_grand_ratio_diagnostic": copy.deepcopy(welford_grand_ratio),
         "ppb_buckets": bucket_proof,
         "custody_lap_delta_from_before": (
             int(snapshot["custody_lap_count"]) - int(before["custody_lap_count"])
@@ -4593,6 +6250,7 @@ def _pi_report_surface() -> Dict[str, Any]:
             "closing_campaigns": copy.deepcopy(_closing_campaigns),
         }
     state["recovery"] = _recovery_report_surface()
+    state["ppb_checkpoint"] = _ppb_checkpoint_report_surface()
     return state
 
 
@@ -5148,7 +6806,7 @@ def run() -> None:
     _recovery_proof_durable.clear()
 
     logging.info(
-        "[photons] starting canonical PHOTONS_V1 with Phase-5 durable recovery, "
+        "[photons] starting canonical PHOTONS_V1 with Phase-3 literal durable recovery, "
         "authoritative SYSTEM context, ordered state/persistence workers, and "
         "Pi-owned LANTERN provenance subscription=%s publication=%s campaign_type=%s",
         PHOTONS_FRAGMENT_TOPIC,

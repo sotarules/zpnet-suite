@@ -703,7 +703,7 @@ def _servo_state(r: dict) -> str:
 
 
 def _recoverable_status(r: dict) -> str:
-    """Return the operator-facing Alpha resurrection checkpoint state."""
+    """Return the operator-facing instrument resurrection checkpoint state."""
     checkpoint = r.get("ppb_restore_checkpoint")
     if not isinstance(checkpoint, dict):
         return "UNAVAILABLE"
@@ -2118,6 +2118,7 @@ def photons_detail_readout() -> list[str]:
         campaign_error = None
 
     campaign = live.get("campaign") if isinstance(live.get("campaign"), dict) else {}
+    recoverable_str = _recoverable_status(live)
     campaign_id = _to_int(campaign.get("campaign_id"))
     summary_by_id = {s.get("id"): s for s in summaries}
     active_summary = summary_by_id.get(campaign_id)
@@ -2137,9 +2138,13 @@ def photons_detail_readout() -> list[str]:
         identity = (
             f"PHOTONS  CAMPAIGN: {campaign_name}  ELAPSED: {_seconds_to_hms(elapsed_s)}"
             f"  BASELINE: {baseline_name or 'NONE'}"
+            f"  RECOVERABLE: {recoverable_str}"
         )
     else:
-        identity = "PHOTONS  CAMPAIGN: STOPPED  INSTRUMENT: ALWAYS ON  BASELINE: NONE"
+        identity = (
+            "PHOTONS  CAMPAIGN: STOPPED  INSTRUMENT: ALWAYS ON  BASELINE: NONE"
+            f"  RECOVERABLE: {recoverable_str}"
+        )
 
     lines = [identity]
     if campaign_error:

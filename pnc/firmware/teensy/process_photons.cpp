@@ -465,9 +465,13 @@ static uint32_t g_photons_ppb_last_minute_key = 0U;
 static bool g_photons_ppb_previous_endpoint_valid = false;
 static photons_ppb_endpoint_t g_photons_ppb_previous_endpoint{};
 static uint32_t g_photons_stats_update_count = 0U;
+// Physical publication chronology pairs with statistical update chronology in
+// the exact recovery-successor court below.
+static uint32_t g_fragment_sequence = 0U;
 static uint32_t g_photons_ppb_current_sequence = 0U;
 static bool g_photons_ppb_endpoint_admitted = false;
 static bool g_photons_ppb_interval_advanced = false;
+static bool g_photons_ppb_last_minute_appended = false;
 
 static bool g_previous_fragment_mean_cycles_valid = false;
 static double g_previous_fragment_mean_cycles = 0.0;
@@ -576,6 +580,7 @@ static void photons_ppb_windows_clear_history(void) {
   g_photons_ppb_current_sequence = 0U;
   g_photons_ppb_endpoint_admitted = false;
   g_photons_ppb_interval_advanced = false;
+  g_photons_ppb_last_minute_appended = false;
 }
 
 
@@ -714,12 +719,121 @@ static photons_fragment_ppb_value_snapshot_t photons_ppb_bucket_between(
 }
 
 
+static photons_fragment_ppb_endpoint_snapshot_t photons_ppb_endpoint_snapshot(
+    const photons_ppb_endpoint_t& endpoint) {
+  photons_fragment_ppb_endpoint_snapshot_t out{};
+  out.sequence = endpoint.sequence;
+  out.lap_count = endpoint.lap_count;
+  out.total_lap_gnss_ns = endpoint.total_lap_gnss_ns;
+  return out;
+}
+
+
+template <size_t N>
+static photons_fragment_ppb_window_proof_snapshot_t photons_ppb_window_proof(
+    const photons_ppb_endpoint_t (&ring)[N],
+    uint32_t head,
+    uint32_t count,
+    uint32_t window_seconds,
+    const photons_ppb_endpoint_t& current) {
+  photons_fragment_ppb_window_proof_snapshot_t out{};
+  const uint32_t target_sequence =
+      current.sequence > window_seconds
+          ? current.sequence - window_seconds
+          : 0U;
+
+  photons_ppb_endpoint_t anchor{};
+  if (!photons_ppb_ring_find_anchor(
+          ring, head, count, target_sequence, current.sequence, anchor)) {
+    return out;
+  }
+
+  const photons_fragment_ppb_value_snapshot_t value =
+      photons_ppb_bucket_between(anchor, current);
+  if (value.sample_count == 0ULL) return out;
+
+  out.valid = true;
+  out.sample_count = value.sample_count;
+  out.anchor = photons_ppb_endpoint_snapshot(anchor);
+  return out;
+}
+
+
+static photons_fragment_ppb_checkpoint_delta_snapshot_t
+photons_ppb_checkpoint_delta_snapshot(void) {
+  photons_fragment_ppb_checkpoint_delta_snapshot_t out{};
+  if (!g_photons_ppb_endpoint_admitted ||
+      !g_photons_ppb_previous_endpoint_valid) {
+    return out;
+  }
+
+  const photons_ppb_endpoint_t current = g_photons_ppb_previous_endpoint;
+  if (current.sequence == 0U ||
+      current.sequence != g_photons_stats_update_count ||
+      current.sequence != g_photons_ppb_current_sequence ||
+      current.lap_count != g_lap_time_welford.n ||
+      current.total_lap_gnss_ns != g_total_lap_gnss_ns ||
+      g_photons_ppb_seconds_count == 0U ||
+      g_photons_ppb_minutes_count == 0U) {
+    __builtin_trap();
+  }
+
+  out.valid = true;
+  out.rolling_sequence = current.sequence;
+  out.second_count = g_photons_ppb_seconds_count;
+  out.minute_count = g_photons_ppb_minutes_count;
+  out.last_minute_key = g_photons_ppb_last_minute_key;
+  out.current = photons_ppb_endpoint_snapshot(current);
+
+  // The resettable PHOTONS statistical epoch always begins at exact zero N/T.
+  // This producer-authored origin remains truthful even after the bounded rings
+  // have aged it out; it is not reconstructed from PostgreSQL history.
+  const photons_ppb_endpoint_t origin{};
+  out.origin_valid = true;
+  out.origin = photons_ppb_endpoint_snapshot(origin);
+
+  out.minute_10 = photons_ppb_window_proof(
+      g_photons_ppb_seconds,
+      g_photons_ppb_seconds_head,
+      g_photons_ppb_seconds_count,
+      PHOTONS_PPB_MINUTE_10_SECONDS,
+      current);
+  out.minute_60 = photons_ppb_window_proof(
+      g_photons_ppb_minutes,
+      g_photons_ppb_minutes_head,
+      g_photons_ppb_minutes_count,
+      PHOTONS_PPB_MINUTE_60_SECONDS,
+      current);
+  out.hour_8 = photons_ppb_window_proof(
+      g_photons_ppb_minutes,
+      g_photons_ppb_minutes_head,
+      g_photons_ppb_minutes_count,
+      PHOTONS_PPB_HOUR_8_SECONDS,
+      current);
+  out.hour_24 = photons_ppb_window_proof(
+      g_photons_ppb_minutes,
+      g_photons_ppb_minutes_head,
+      g_photons_ppb_minutes_count,
+      PHOTONS_PPB_HOUR_24_SECONDS,
+      current);
+
+  out.second_append_valid = true;
+  out.second_append = out.current;
+  out.minute_append_valid = g_photons_ppb_last_minute_appended;
+  if (out.minute_append_valid) {
+    out.minute_append = out.current;
+  }
+  return out;
+}
+
+
 static void photons_ppb_windows_note_endpoint(uint32_t sequence,
                                               bool admitted,
                                               uint64_t lap_count,
                                               uint64_t total_lap_gnss_ns) {
   g_photons_ppb_endpoint_admitted = admitted;
   g_photons_ppb_interval_advanced = false;
+  g_photons_ppb_last_minute_appended = false;
 
   if (!admitted) {
     // Loss of instrument custody is a hard rolling-history boundary.  Do not
@@ -767,6 +881,7 @@ static void photons_ppb_windows_note_endpoint(uint32_t sequence,
         g_photons_ppb_minutes_count,
         endpoint);
     g_photons_ppb_last_minute_key = minute_key;
+    g_photons_ppb_last_minute_appended = true;
   }
 
   g_photons_ppb_previous_endpoint = endpoint;
@@ -1073,8 +1188,27 @@ static photons_fragment_recovery_snapshot_t photons_recovery_snapshot(void) {
     out.accepted_lap_delta = out.custody_lap_delta;
   }
 
+  // Recovery proof is chronology testimony, not a requirement that this exact
+  // one-second row happened to accept a lap.  While the restored statistics epoch
+  // remains current, physical publication and logical update chronology must move
+  // together.  A lawful source+1 row with zero accepted laps is still the exact
+  // successor.  Once published, retain the verdict across later STATS_RESET epochs
+  // as durable recovery provenance.
+  bool chronology_advanced_now = false;
+  if (source_stats_epoch_current) {
+    if (g_fragment_sequence < out.source_sequence ||
+        g_photons_stats_update_count < out.source_update_count) {
+      __builtin_trap();
+    }
+    const uint32_t sequence_delta =
+        g_fragment_sequence - out.source_sequence;
+    const uint32_t update_delta =
+        g_photons_stats_update_count - out.source_update_count;
+    if (sequence_delta != update_delta) __builtin_trap();
+    chronology_advanced_now = sequence_delta != 0U;
+  }
   out.proof_advanced =
-      out.accepted_lap_delta != 0ULL && out.custody_lap_delta != 0ULL;
+      g_photons_recovery.proof_advanced_published || chronology_advanced_now;
   return out;
 }
 
@@ -2004,7 +2138,6 @@ static photons_live_state_t g_photons_live{};
 
 static photons_toy_fragment_t g_last_fragment{};
 static photons_fragment_snapshot_t g_last_photons_fragment{};
-static uint32_t g_fragment_sequence = 0;
 static uint32_t g_publish_count = 0;
 static uint32_t g_publish_reject_count = 0;
 static uint32_t g_last_published_edge_count = 0;
@@ -2217,6 +2350,9 @@ static Payload g_photons_fragment_stats DMAMEM;
 static Payload g_photons_fragment_welford DMAMEM;
 static Payload g_photons_fragment_ppb_buckets DMAMEM;
 static Payload g_photons_fragment_ppb_value DMAMEM;
+static Payload g_photons_fragment_ppb_checkpoint DMAMEM;
+static Payload g_photons_fragment_ppb_endpoint DMAMEM;
+static Payload g_photons_fragment_ppb_window_proof DMAMEM;
 static Payload g_photons_fragment_campaign DMAMEM;
 static Payload g_photons_fragment_campaign_stats DMAMEM;
 static Payload g_photons_fragment_baseline DMAMEM;
@@ -2257,6 +2393,36 @@ static void photons_payload_add_ppb_value(
 }
 
 
+static void photons_payload_add_ppb_endpoint(
+    Payload& parent,
+    const char* name,
+    const photons_fragment_ppb_endpoint_snapshot_t& endpoint) {
+  Payload& obj = g_photons_fragment_ppb_endpoint;
+  obj.clear();
+  obj.add("sequence", endpoint.sequence);
+  obj.add("lap_count", endpoint.lap_count);
+  obj.add("total_lap_gnss_ns", endpoint.total_lap_gnss_ns);
+  parent.add_object(name, obj);
+  obj.clear();
+}
+
+
+static void photons_payload_add_ppb_window_proof(
+    Payload& parent,
+    const char* name,
+    const photons_fragment_ppb_window_proof_snapshot_t& proof) {
+  Payload& obj = g_photons_fragment_ppb_window_proof;
+  obj.clear();
+  obj.add("valid", proof.valid);
+  obj.add("sample_count", proof.sample_count);
+  if (proof.valid) {
+    photons_payload_add_ppb_endpoint(obj, "anchor", proof.anchor);
+  }
+  parent.add_object(name, obj);
+  obj.clear();
+}
+
+
 static Payload& photons_fragment_payload(
     const photons_fragment_snapshot_t& f) {
   Payload& root = g_photons_fragment_root;
@@ -2269,6 +2435,7 @@ static Payload& photons_fragment_payload(
   Payload& reasons = g_photons_fragment_science_reasons;
   Payload& stats = g_photons_fragment_stats;
   Payload& ppb_buckets = g_photons_fragment_ppb_buckets;
+  Payload& ppb_checkpoint = g_photons_fragment_ppb_checkpoint;
   Payload& campaign = g_photons_fragment_campaign;
   Payload& campaign_stats = g_photons_fragment_campaign_stats;
   Payload& baseline = g_photons_fragment_baseline;
@@ -2285,6 +2452,7 @@ static Payload& photons_fragment_payload(
   reasons.clear();
   stats.clear();
   ppb_buckets.clear();
+  ppb_checkpoint.clear();
   campaign.clear();
   campaign_stats.clear();
   baseline.clear();
@@ -2485,6 +2653,44 @@ static Payload& photons_fragment_payload(
   stats.add("rolling_ppb_interval_advanced",
             f.stats.rolling_ppb_interval_advanced);
 
+  const photons_fragment_ppb_checkpoint_delta_snapshot_t& checkpoint =
+      f.stats.rolling_ppb_checkpoint;
+  ppb_checkpoint.add("schema", "PHOTONS_PPB_CHECKPOINT_DELTA_V1");
+  ppb_checkpoint.add("valid", checkpoint.valid);
+  ppb_checkpoint.add("rolling_sequence", checkpoint.rolling_sequence);
+  ppb_checkpoint.add("second_count", checkpoint.second_count);
+  ppb_checkpoint.add("minute_count", checkpoint.minute_count);
+  ppb_checkpoint.add("last_minute_key", checkpoint.last_minute_key);
+  ppb_checkpoint.add("origin_valid", checkpoint.origin_valid);
+  if (checkpoint.valid) {
+    photons_payload_add_ppb_endpoint(
+        ppb_checkpoint, "current", checkpoint.current);
+  }
+  if (checkpoint.origin_valid) {
+    photons_payload_add_ppb_endpoint(
+        ppb_checkpoint, "origin", checkpoint.origin);
+  }
+  photons_payload_add_ppb_window_proof(
+      ppb_checkpoint, "10_min", checkpoint.minute_10);
+  photons_payload_add_ppb_window_proof(
+      ppb_checkpoint, "60_min", checkpoint.minute_60);
+  photons_payload_add_ppb_window_proof(
+      ppb_checkpoint, "8_hour", checkpoint.hour_8);
+  photons_payload_add_ppb_window_proof(
+      ppb_checkpoint, "24_hour", checkpoint.hour_24);
+  ppb_checkpoint.add("second_append_valid", checkpoint.second_append_valid);
+  if (checkpoint.second_append_valid) {
+    photons_payload_add_ppb_endpoint(
+        ppb_checkpoint, "second_append", checkpoint.second_append);
+  }
+  ppb_checkpoint.add("minute_append_valid", checkpoint.minute_append_valid);
+  if (checkpoint.minute_append_valid) {
+    photons_payload_add_ppb_endpoint(
+        ppb_checkpoint, "minute_append", checkpoint.minute_append);
+  }
+  stats.add_object("rolling_ppb_checkpoint", ppb_checkpoint);
+  ppb_checkpoint.clear();
+
   instrument.add_object("stats", stats);
   stats.clear();
 
@@ -2669,6 +2875,8 @@ static void photons_fragment_tick(
       g_photons_ppb_endpoint_admitted;
   fragment.stats.rolling_ppb_interval_advanced =
       g_photons_ppb_interval_advanced;
+  fragment.stats.rolling_ppb_checkpoint =
+      photons_ppb_checkpoint_delta_snapshot();
 
   // Optional LANTERN campaign testimony is firmware-authored from the same
   // cumulative accepted-lap authority as TOTAL.  START/STOP never reset the
@@ -3404,12 +3612,13 @@ static FLASHMEM Payload cmd_recovery_commit(const Payload& args) {
         "aggregate population accounting does not close");
   }
 
-  const double ratio_mean = (double)stats_total_ns / (double)stats_lap_count;
-  if (fabs(ratio_mean - accepted_projected.mean) > 0.000001) {
-    return photons_recovery_reject(
-        "recovery_commit_rejected_mean",
-        "accepted projected Welford does not close with N/T");
-  }
+  // N/T and the accepted projected-lap Welford describe the same population,
+  // but they reach the mean through different numerical paths: N/T performs one
+  // division over exact integer sufficient state, while Welford accumulates
+  // millions of floating-point updates.  Their tiny rounding drift is therefore
+  // corroborative testimony, not a custody identity.  Exact recovery integrity
+  // is proved by the population/accounting court above and by the staged endpoint
+  // N/T target below; do not reject truthful ancestry on cross-algorithm drift.
 
   const photons_ppb_endpoint_t& current = protocol.previous_second;
   if (current.sequence != source_update_count ||
@@ -3625,18 +3834,18 @@ static FLASHMEM Payload cmd_recovery_proof_ack(const Payload& args) {
       g_photons_recovery.proof_pending &&
       g_photons_recovery.proof_advanced_published &&
       generation == g_photons_recovery.generation &&
-      sequence >= g_photons_recovery.proof_sequence &&
-      update_count >= g_photons_recovery.proof_update_count &&
-      sequence > g_photons_recovery.source_sequence &&
-      update_count > g_photons_recovery.source_update_count &&
+      g_photons_recovery.proof_sequence ==
+          g_photons_recovery.source_sequence + 1U &&
+      g_photons_recovery.proof_update_count ==
+          g_photons_recovery.source_update_count + 1U &&
+      sequence == g_photons_recovery.proof_sequence &&
+      update_count == g_photons_recovery.proof_update_count &&
       sequence <= g_fragment_sequence &&
-      update_count <= g_photons_stats_update_count &&
-      sequence - g_photons_recovery.source_sequence ==
-          update_count - g_photons_recovery.source_update_count;
+      update_count <= g_photons_stats_update_count;
   if (!same_lineage) {
     return photons_recovery_reject(
         "recovery_proof_ack_rejected",
-        "durable proof is not on or beyond the first advancing recovery row");
+        "durable proof is not the exact first recovery successor row");
   }
 
   g_photons_recovery.proof_pending = false;

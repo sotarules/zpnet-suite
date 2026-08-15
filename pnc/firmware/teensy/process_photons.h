@@ -287,6 +287,46 @@ struct photons_fragment_ppb_buckets_snapshot_t {
 };
 
 
+// Compact PHOTONS-authored Better-Buckets sufficient state carried at 1 Hz.
+// Pi PHOTONS may use the append testimony to maintain a literal bounded recovery
+// checkpoint, but it may not reconstruct or re-author producer endpoint state.
+struct photons_fragment_ppb_endpoint_snapshot_t {
+  uint32_t sequence = 0;
+  uint64_t lap_count = 0;
+  uint64_t total_lap_gnss_ns = 0;
+};
+
+
+struct photons_fragment_ppb_window_proof_snapshot_t {
+  bool valid = false;
+  uint64_t sample_count = 0;
+  photons_fragment_ppb_endpoint_snapshot_t anchor{};
+};
+
+
+struct photons_fragment_ppb_checkpoint_delta_snapshot_t {
+  bool valid = false;
+  uint32_t rolling_sequence = 0;
+  uint32_t second_count = 0;
+  uint32_t minute_count = 0;
+  uint32_t last_minute_key = 0;
+
+  bool origin_valid = false;
+  photons_fragment_ppb_endpoint_snapshot_t current{};
+  photons_fragment_ppb_endpoint_snapshot_t origin{};
+
+  photons_fragment_ppb_window_proof_snapshot_t minute_10{};
+  photons_fragment_ppb_window_proof_snapshot_t minute_60{};
+  photons_fragment_ppb_window_proof_snapshot_t hour_8{};
+  photons_fragment_ppb_window_proof_snapshot_t hour_24{};
+
+  bool second_append_valid = false;
+  photons_fragment_ppb_endpoint_snapshot_t second_append{};
+  bool minute_append_valid = false;
+  photons_fragment_ppb_endpoint_snapshot_t minute_append{};
+};
+
+
 // Always-on optical statistics.  lap_count + total_lap_gnss_ns is the
 // authoritative grand ratio for mean lap time.  Welford independently carries
 // variance and doubles as a consistency witness for that ratio.  reset_count
@@ -308,6 +348,9 @@ struct photons_fragment_stats_snapshot_t {
   uint32_t rolling_ppb_current_sequence = 0;
   bool rolling_ppb_endpoint_admitted = false;
   bool rolling_ppb_interval_advanced = false;
+
+  // Self-contained current-window proof plus exact ring append testimony.
+  photons_fragment_ppb_checkpoint_delta_snapshot_t rolling_ppb_checkpoint{};
 };
 
 
