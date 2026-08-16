@@ -7462,7 +7462,7 @@ bool clocks_alpha_recover_rearm_interrupt_service(void) {
 }
 
 void clocks_alpha_recover_reprime_ocxo_state(void) {
-  // RECOVER is not a new SmartZero epoch.  Keep the installed epoch, visible
+  // LIVE_REATTACH RECOVER is not a new SmartZero epoch.  Keep the installed epoch, visible
   // origin, public-origin offsets, DWT/GNSS calibration, and long logical tick
   // ledgers alive.  What must not survive is OCXO previous/pending edge state
   // that would let the first post-recovery measurement form an interval across

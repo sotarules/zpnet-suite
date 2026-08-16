@@ -34,7 +34,10 @@ Core contract:
     RECOVER uses the last durable unified state detail with TEMPEST decoration as the public base. Exact
     Alpha resurrection consumes the literal Pi Better-Buckets checkpoint already
     embedded in that one CLOCKS row; PostgreSQL history is never replayed to
-    reconstruct firmware statistics. The Pi sends RECOVER, waits for the first
+    reconstruct firmware statistics.  If holistic startup has already resurrected
+    and proved Alpha while volatile Beta campaign state died, Pi carries that
+    custody fact into RECOVER and requests CAMPAIGN_BOOTSTRAP so firmware preserves
+    current Alpha and recreates only the campaign lifecycle. The Pi sends RECOVER, waits for the first
     accepted public row, and restores Pi-owned GNSS_RAW/Welford state immediately
     before that row is persisted. Timeline rows may be admitted while OCXO science is explicitly
     degraded/quarantined, but the final court still rejects malformed or
@@ -6488,6 +6491,7 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "success": True,
             "mode": "SURVIVING_ALPHA_CUSTODY",
+            "alpha_resurrected_this_startup": False,
             "teensy": copy.deepcopy(teensy_payload),
             "pi_control": pi_control,
             "gnss_raw": gnss_raw_result,
@@ -6521,6 +6525,7 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
     firmware_recovery_active = bool(
         _recovery_bool(lifecycle_status.get("recover_lifecycle_active"))
         or _recovery_bool(lifecycle_status.get("recover_cold_bootstrap_active"))
+        or _recovery_bool(lifecycle_status.get("recover_campaign_bootstrap_active"))
         or _recovery_bool(lifecycle_status.get("recover_reattach_active"))
     )
 
@@ -6624,6 +6629,9 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
                 ).strip().upper() or None,
                 "recover_cold_bootstrap_active": _recovery_bool(
                     lifecycle_status.get("recover_cold_bootstrap_active")
+                ),
+                "recover_campaign_bootstrap_active": _recovery_bool(
+                    lifecycle_status.get("recover_campaign_bootstrap_active")
                 ),
                 "recover_reattach_active": _recovery_bool(
                     lifecycle_status.get("recover_reattach_active")
@@ -6854,6 +6862,7 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "success": True,
         "mode": "HOLISTIC_INSTRUMENT",
+        "alpha_resurrected_this_startup": True,
         "teensy": payload,
         "pi_control": pi_control,
         "gnss_raw": gnss_raw_result,
@@ -6928,8 +6937,16 @@ def _holistic_restore(
         _clocks_holistic_restore_proof_pending.clear()
 
     if active_campaign is not None:
+        instrument_result = result.get("instrument")
+        alpha_resurrected_this_startup = bool(
+            isinstance(instrument_result, dict)
+            and instrument_result.get("alpha_resurrected_this_startup") is True
+            and isinstance(instrument_result.get("proof"), dict)
+            and instrument_result["proof"].get("proved") is True
+        )
         result["campaign"] = _restore_active_campaign_state(
             preverified_location=preverified_location,
+            alpha_resurrected_this_startup=alpha_resurrected_this_startup,
         )
 
     result["completed_at_utc"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -7856,6 +7873,12 @@ def _recovery_inflight_status_compact(status: Dict[str, Any]) -> Dict[str, Any]:
         "recover_mode": str(status.get("recover_mode") or "NONE").upper(),
         "recover_cold_bootstrap_active": _recovery_bool(
             status.get("recover_cold_bootstrap_active")
+        ),
+        "recover_campaign_bootstrap_active": _recovery_bool(
+            status.get("recover_campaign_bootstrap_active")
+        ),
+        "campaign_bootstrap_required": _recovery_bool(
+            status.get("campaign_bootstrap_required")
         ),
         "recover_cold_bootstrap_epoch_ready": _recovery_bool(
             status.get("recover_cold_bootstrap_epoch_ready")
@@ -12319,9 +12342,14 @@ def cmd_resume(args: Optional[dict]) -> dict:
 def _restore_active_campaign_state(
     *,
     preverified_location: Optional[Dict[str, Any]] = None,
+    alpha_resurrected_this_startup: bool = False,
 ) -> Dict[str, Any]:
-    """
-    RECOVER — v7 exact-first-row architecture.
+    """RECOVER — exact-first-row architecture with explicit startup topology.
+
+    ``alpha_resurrected_this_startup`` is custody testimony, not a health flag.
+    When true, Alpha has already been restored and durably proved during this
+    process startup while Beta campaign state was lost.  Campaign recovery must
+    therefore preserve current Alpha and bootstrap only the recording lifecycle.
     """
     global _campaign_active, _accepted_pps_vclock_count
     global _last_pps_vclock_count_seen
@@ -12716,10 +12744,39 @@ def _restore_active_campaign_state(
         and reported_campaign_state != "STARTED"
     )
     cold_restore_custody = bool(physical_reboot_custody or lifecycle_lost_custody)
-    # Durable canonical CLOCKS is the ancestry authority. Firmware may discover that
-    # it needs a cold bootstrap locally, but it may not override this requirement
-    # when Pi has already proved that the live Alpha lineage was surrendered.
+    campaign_bootstrap_required = bool(alpha_resurrected_this_startup)
+    if campaign_bootstrap_required and cold_restore_custody:
+        raise RecoveryRetryableFailure(
+            "startup_recovery_topology_conflict",
+            {
+                "campaign": campaign_name,
+                "alpha_resurrected_this_startup": True,
+                "physical_reboot_custody": bool(physical_reboot_custody),
+                "lifecycle_lost_custody": bool(lifecycle_lost_custody),
+                "teensy_campaign_state_before_recover": reported_campaign_state or None,
+                "custody": _recovery_custody_snapshot(),
+            },
+        )
+    if campaign_bootstrap_required and not epoch_ready_before_recover:
+        raise RecoveryRetryableFailure(
+            "campaign_bootstrap_alpha_not_ready",
+            {
+                "campaign": campaign_name,
+                "alpha_resurrected_this_startup": True,
+                "teensy_campaign_state_before_recover": reported_campaign_state or None,
+                "recovery_status_before": recovery_status_before,
+            },
+        )
+
+    # Durable canonical CLOCKS is the ancestry authority. Firmware may discover
+    # that it needs a cold bootstrap locally, but it may not override an explicit
+    # Alpha-restore verdict.  Conversely, after holistic startup has already
+    # resurrected Alpha, carry that historical custody fact forward explicitly:
+    # current epoch_ready alone cannot distinguish survival from resurrection.
     teensy_recover_args["restore_alpha_required"] = bool(cold_restore_custody)
+    teensy_recover_args["campaign_bootstrap_required"] = bool(
+        campaign_bootstrap_required
+    )
     _diag["last_recovery"]["teensy_epoch_ready_before_recover"] = bool(
         epoch_ready_before_recover
     )
@@ -12733,8 +12790,21 @@ def _restore_active_campaign_state(
         lifecycle_lost_custody
     )
     _diag["last_recovery"]["restore_alpha_required"] = bool(cold_restore_custody)
+    _diag["last_recovery"]["alpha_resurrected_this_startup"] = bool(
+        alpha_resurrected_this_startup
+    )
+    _diag["last_recovery"]["campaign_bootstrap_required"] = bool(
+        campaign_bootstrap_required
+    )
     cold_ppb_stage: Optional[Dict[str, Any]] = None
-    if epoch_ready_before_recover and not cold_restore_custody:
+    if campaign_bootstrap_required:
+        _diag["last_recovery"]["canonical_restore_present"] = False
+        _diag["last_recovery"]["restore_schema_version"] = None
+        logging.info(
+            "📊 [recovery] Alpha was resurrected and proved earlier in this startup; "
+            "preserving current Alpha and requesting campaign-only bootstrap"
+        )
+    elif epoch_ready_before_recover and not cold_restore_custody:
         _diag["last_recovery"]["canonical_restore_present"] = False
         _diag["last_recovery"]["restore_schema_version"] = None
         logging.info(
@@ -12809,10 +12879,54 @@ def _restore_active_campaign_state(
             },
         )
 
+    teensy_campaign_bootstrap_required = teensy_recover_payload.get(
+        "campaign_bootstrap_required"
+    )
+    if (
+        not isinstance(teensy_campaign_bootstrap_required, bool)
+        or teensy_campaign_bootstrap_required != bool(campaign_bootstrap_required)
+    ):
+        raise RecoveryRetryableFailure(
+            "recovery_campaign_bootstrap_policy_echo_mismatch",
+            {
+                "campaign": campaign_name,
+                "requested_campaign_bootstrap_required": bool(
+                    campaign_bootstrap_required
+                ),
+                "teensy_campaign_bootstrap_required":
+                    teensy_campaign_bootstrap_required,
+                "teensy_recover_payload": teensy_recover_payload,
+            },
+        )
+
     recover_mode = str(
         teensy_recover_payload.get("recover_mode") or "LIVE_REATTACH"
     ).strip().upper()
     cold_bootstrap = recover_mode == "COLD_BOOTSTRAP"
+    campaign_bootstrap = recover_mode == "CAMPAIGN_BOOTSTRAP"
+    if campaign_bootstrap_required and not campaign_bootstrap:
+        raise RecoveryRetryableFailure(
+            "recovery_mode_conflicts_with_campaign_bootstrap_custody",
+            {
+                "campaign": campaign_name,
+                "recover_mode": recover_mode,
+                "alpha_resurrected_this_startup": bool(
+                    alpha_resurrected_this_startup
+                ),
+                "teensy_campaign_state_before_recover":
+                    reported_campaign_state or None,
+                "teensy_recover_payload": teensy_recover_payload,
+            },
+        )
+    if not campaign_bootstrap_required and campaign_bootstrap:
+        raise RecoveryRetryableFailure(
+            "unexpected_campaign_bootstrap_mode",
+            {
+                "campaign": campaign_name,
+                "recover_mode": recover_mode,
+                "teensy_recover_payload": teensy_recover_payload,
+            },
+        )
     if cold_restore_custody and not cold_bootstrap:
         raise RecoveryRetryableFailure(
             "recovery_mode_conflicts_with_live_recovery_custody",
@@ -12835,8 +12949,13 @@ def _restore_active_campaign_state(
     _diag["last_recovery"].update({
         "recover_mode": recover_mode,
         "cold_bootstrap": bool(cold_bootstrap),
+        "campaign_bootstrap": bool(campaign_bootstrap),
         "restore_alpha_required": bool(cold_restore_custody),
         "teensy_restore_alpha_required": bool(teensy_restore_alpha_required),
+        "campaign_bootstrap_required": bool(campaign_bootstrap_required),
+        "teensy_campaign_bootstrap_required": bool(
+            teensy_campaign_bootstrap_required
+        ),
         "interrupt_service_preserved": not cold_bootstrap,
         "recover_cold_bootstrap_active": bool(
             teensy_recover_payload.get("recover_cold_bootstrap_active")
@@ -12853,6 +12972,12 @@ def _restore_active_campaign_state(
             "base=%d while startup SmartZero installs a fresh local epoch",
             recover_base_pps_vclock_count,
         )
+    elif campaign_bootstrap:
+        logging.info(
+            "🧭 [recovery] Teensy selected CAMPAIGN_BOOTSTRAP: preserving the "
+            "already-restored Alpha epoch and recreating Beta at campaign base=%d",
+            recover_base_pps_vclock_count,
+        )
     else:
         logging.info(
             "🧭 [recovery] Teensy selected LIVE_REATTACH for campaign base=%d",
@@ -12867,8 +12992,13 @@ def _restore_active_campaign_state(
         "recover_status": teensy_recover_payload.get("status"),
         "recover_mode": recover_mode,
         "cold_bootstrap": bool(cold_bootstrap),
+        "campaign_bootstrap": bool(campaign_bootstrap),
         "restore_alpha_required": bool(cold_restore_custody),
         "teensy_restore_alpha_required": bool(teensy_restore_alpha_required),
+        "campaign_bootstrap_required": bool(campaign_bootstrap_required),
+        "teensy_campaign_bootstrap_required": bool(
+            teensy_campaign_bootstrap_required
+        ),
         "recover_cold_bootstrap_active": bool(
             teensy_recover_payload.get("recover_cold_bootstrap_active")
         ),
@@ -12893,6 +13023,7 @@ def _restore_active_campaign_state(
                 "expected_first_public_pps_vclock_count": int(expected_first_public_pps_vclock_count),
                 "recover_mode": recover_mode,
                 "cold_bootstrap": bool(cold_bootstrap),
+                "campaign_bootstrap": bool(campaign_bootstrap),
                 "first_row_timeout_s": float(first_row_timeout_s),
                 "discarded_transitional_rows": int(discarded_transitional_rows),
                 "last_admission_verdict": recovery_admission_verdict,
@@ -12921,6 +13052,7 @@ def _restore_active_campaign_state(
                 "expected_first_public_pps_vclock_count": int(expected_first_public_pps_vclock_count),
                 "recover_mode": recover_mode,
                 "cold_bootstrap": bool(cold_bootstrap),
+                "campaign_bootstrap": bool(campaign_bootstrap),
                 "first_row_timeout_s": float(first_row_timeout_s),
                 "discarded_transitional_rows": int(discarded_transitional_rows),
                 "last_admission_verdict": recovery_admission_verdict,
@@ -13070,6 +13202,7 @@ def _restore_active_campaign_state(
         "recovery_fully_clean_at_admission": bool(recovery_admission_verdict.get("fully_clean")),
         "discarded_transitional_rows": int(discarded_transitional_rows),
         "gnss_raw_restored": bool(gnss_raw_restored),
+        "campaign_bootstrap": bool(campaign_bootstrap),
     })
 
     fully_clean_at_admission = bool(recovery_admission_verdict.get("fully_clean"))
@@ -13108,6 +13241,8 @@ def _restore_active_campaign_state(
     return {
         "restored": True,
         "mode": "warm_recover",
+        "firmware_recover_mode": recover_mode,
+        "campaign_bootstrap": bool(campaign_bootstrap),
         "campaign": campaign_name,
         "first_public_pps_vclock_count": int(teensy_pps_vclock_count),
         "science_clean": bool(recovery_admission_verdict.get("fully_clean")),

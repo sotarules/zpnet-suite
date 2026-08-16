@@ -1196,10 +1196,12 @@ bool clocks_alpha_ocxo_public_origin_ready(void);
 // Alpha RECOVER re-prime
 // ============================================================================
 //
-// RECOVER preserves the installed SmartZero/service epoch, public-origin
-// offsets, and long logical tick ledgers, but it creates a deliberate
-// discontinuity in OCXO measurement custody.  Previous/pending OCXO edge state
-// must not bridge the outage into the first post-recovery residual.
+// LIVE_REATTACH RECOVER preserves the installed SmartZero/service epoch,
+// public-origin offsets, and long logical tick ledgers, but deliberately cuts
+// OCXO measurement custody so previous/pending edge state cannot bridge an
+// observation outage.  CAMPAIGN_BOOTSTRAP does not call this path: Alpha has
+// already been resurrected and proved, so its fresh physical ancestry remains
+// continuous while only Beta campaign state is recreated.
 //
 // A live warm recovery may arrive after a Pi-side publication blackout while
 // the Teensy itself never rebooted.  This call begins the same asynchronous
@@ -1801,8 +1803,10 @@ void clocks_watchdog_anomaly_payload(const char* reason,
 // wrapper during migration.
 //
 // Physical-grid rephase is a separate asynchronous installation fact.  START,
-// ZERO, and RECOVER share the same TimePop-staged OCXO1-then-OCXO2 transaction;
-// the owner determines whether logical epoch state is replaced or preserved.
+// ZERO, and Alpha-affecting RECOVER paths share the same TimePop-staged
+// OCXO1-then-OCXO2 transaction; the owner determines whether logical epoch state
+// is replaced or preserved.  CAMPAIGN_BOOTSTRAP intentionally bypasses rephase
+// because it preserves already-proved Alpha and changes only Beta lifecycle.
 // Priority-0 preemption may enlarge either 50 ms gap; it must never compress it.
 enum class clocks_alpha_ocxo_grid_rephase_owner_t : uint8_t {
   NONE            = 0,
