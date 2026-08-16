@@ -282,7 +282,12 @@ class _PiDeliveryTarget:
         self.current_topic: Optional[str] = None
         self.current_sequence: Optional[int] = None
         self.current_enqueued_monotonic: Optional[float] = None
+        # One delivery outage episode spans queue heads until the target catches
+        # fully back up.  This prevents a temporarily saturated/unavailable
+        # subscriber from generating a fresh traceback for every retained row.
         self.blocked_since_monotonic: Optional[float] = None
+        self.blocked_last_log_monotonic: Optional[float] = None
+        self.blocked_retry_count = 0
         self.last_enqueued_topic: Optional[str] = None
         self.last_enqueued_sequence: Optional[int] = None
         self.last_delivered_topic: Optional[str] = None
@@ -915,9 +920,7 @@ def _fanout_to_pi(
     topic: str,
     subsystem: str,
     raw: bytes,
-    *,
-    log_failure: bool = True,
-) -> bool:
+) -> Tuple[bool, Optional[Dict[str, Any]]]:
     """Perform one bounded Unix-socket delivery attempt for a formal Pi target."""
     sock_path = f"{SOCKET_DIR}/zpnet-{subsystem.lower()}-pubsub.sock"
     started = time.monotonic()
@@ -947,7 +950,7 @@ def _fanout_to_pi(
                 total_s * 1000.0,
                 PI_FANOUT_SOCKET_TIMEOUT_S,
             )
-        return True
+        return True, None
 
     except Exception as exc:
         failed = time.monotonic()
@@ -961,24 +964,16 @@ def _fanout_to_pi(
             if connected is None
             else (failed - connected) * 1000.0
         )
-
-        if log_failure:
-            logging.exception(
-                "💥 [pubsub] Pi fan-out failed topic=%s target=PI:%s "
-                "socket=%s bytes=%d phase=%s connect_ms=%s send_ms=%s "
-                "total_ms=%.3f timeout_s=%.3f error=%r",
-                topic,
-                subsystem,
-                sock_path,
-                len(raw),
-                "CONNECT" if connected is None else "SEND",
-                "unavailable" if connect_ms is None else f"{connect_ms:.3f}",
-                "unavailable" if send_ms is None else f"{send_ms:.3f}",
-                (failed - started) * 1000.0,
-                PI_FANOUT_SOCKET_TIMEOUT_S,
-                exc,
-            )
-        return False
+        return False, {
+            "socket": sock_path,
+            "phase": "CONNECT" if connected is None else "SEND",
+            "connect_ms": connect_ms,
+            "send_ms": send_ms,
+            "total_ms": (failed - started) * 1000.0,
+            "timeout_s": PI_FANOUT_SOCKET_TIMEOUT_S,
+            "error_type": type(exc).__name__,
+            "error": repr(exc),
+        }
 
 
 def _pi_delivery_worker(target: _PiDeliveryTarget) -> None:
@@ -995,20 +990,25 @@ def _pi_delivery_worker(target: _PiDeliveryTarget) -> None:
             target.current_sequence = sequence
             target.current_enqueued_monotonic = enqueued_monotonic
 
-        attempts = 0
-        last_failure_log = 0.0
         while True:
             now = time.monotonic()
-            log_failure = attempts == 0 or (
-                now - last_failure_log >= PI_DELIVERY_RETRY_LOG_INTERVAL_S
+            with pi_delivery_lock:
+                blocked_since = target.blocked_since_monotonic
+                last_log = target.blocked_last_log_monotonic
+            log_failure = (
+                blocked_since is None
+                or last_log is None
+                or now - last_log >= PI_DELIVERY_RETRY_LOG_INTERVAL_S
             )
-            if _fanout_to_pi(
-                topic, target.subsystem, raw, log_failure=log_failure
-            ):
+
+            delivered, failure = _fanout_to_pi(topic, target.subsystem, raw)
+            if delivered:
                 delivered_at = time.monotonic()
+                backlog = target.queue.qsize()
                 with pi_delivery_lock:
                     was_blocked = target.blocked_since_monotonic is not None
                     blocked_since = target.blocked_since_monotonic
+                    episode_retries = target.blocked_retry_count
                     target.delivered += 1
                     target.last_delivered_topic = topic
                     target.last_delivered_sequence = sequence
@@ -1016,41 +1016,64 @@ def _pi_delivery_worker(target: _PiDeliveryTarget) -> None:
                     target.current_topic = None
                     target.current_sequence = None
                     target.current_enqueued_monotonic = None
-                    target.blocked_since_monotonic = None
+
+                    # A successful row while backlog remains is progress, not
+                    # recovery.  Keep the outage episode open until ordered
+                    # custody has actually caught up to the live head.
+                    caught_up = was_blocked and backlog == 0
+                    if caught_up:
+                        target.blocked_since_monotonic = None
+                        target.blocked_last_log_monotonic = None
+                        target.blocked_retry_count = 0
+
                 target.queue.task_done()
-                if was_blocked:
+                if caught_up:
                     blocked_ms = (
                         (delivered_at - blocked_since) * 1000.0
                         if blocked_since is not None
                         else 0.0
                     )
                     logging.info(
-                        "✅ [pubsub] Pi delivery custody resumed target=PI:%s "
-                        "topic=%s sequence=%s retries=%d blocked_ms=%.1f backlog=%d",
+                        "✅ [pubsub] Pi delivery custody caught up target=PI:%s "
+                        "topic=%s sequence=%s outage_ms=%.1f retries=%d backlog=0",
                         target.subsystem,
                         topic,
                         sequence,
-                        attempts,
                         blocked_ms,
-                        target.queue.qsize(),
+                        episode_retries,
                     )
                 break
 
-            attempts += 1
+            failure = failure or {}
             with pi_delivery_lock:
+                first_block = target.blocked_since_monotonic is None
+                if first_block:
+                    target.blocked_since_monotonic = now
+                    target.blocked_retry_count = 0
                 target.retry_count += 1
-                if target.blocked_since_monotonic is None:
-                    target.blocked_since_monotonic = time.monotonic()
+                target.blocked_retry_count += 1
+                blocked_since = target.blocked_since_monotonic
+                episode_retries = target.blocked_retry_count
+                total_retries = target.retry_count
+                if log_failure:
+                    target.blocked_last_log_monotonic = now
+
             if log_failure:
-                last_failure_log = now
+                blocked_s = max(0.0, now - float(blocked_since or now))
                 logging.warning(
-                    "📥 [pubsub] retaining undelivered formal Pi publication "
-                    "target=PI:%s topic=%s sequence=%s retries=%d backlog=%d",
+                    "%s [pubsub] Pi subscriber unavailable; retaining ordered custody "
+                    "target=PI:%s topic=%s sequence=%s backlog=%d blocked_s=%.1f "
+                    "episode_retries=%d total_retries=%d phase=%s error=%s",
+                    "📥" if first_block else "⏳",
                     target.subsystem,
                     topic,
                     sequence,
-                    attempts,
                     target.queue.qsize() + 1,
+                    blocked_s,
+                    episode_retries,
+                    total_retries,
+                    failure.get("phase"),
+                    failure.get("error"),
                 )
             time.sleep(PI_DELIVERY_RETRY_INTERVAL_S)
 
@@ -1902,6 +1925,12 @@ def cmd_diagnostics(_: Optional[dict]) -> Dict[str, Any]:
                     int((now - target.blocked_since_monotonic) * 1000)
                     if target.blocked_since_monotonic is not None
                     else 0
+                ),
+                "blocked_episode_retry_count": target.blocked_retry_count,
+                "last_failure_log_age_ms": (
+                    int((now - target.blocked_last_log_monotonic) * 1000)
+                    if target.blocked_last_log_monotonic is not None
+                    else None
                 ),
                 "last_enqueued_topic": target.last_enqueued_topic,
                 "last_enqueued_sequence": target.last_enqueued_sequence,
