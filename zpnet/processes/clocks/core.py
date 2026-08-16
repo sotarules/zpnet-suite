@@ -633,9 +633,11 @@ _diag: Dict[str, Any] = {
     "startup_custody_depth": 0,
     "startup_custody_retained": 0,
     "startup_custody_released": 0,
+    "startup_custody_quarantined": 0,
     "startup_custody_retired": 0,
     "startup_custody_last_sequence": None,
     "last_startup_custody_release": {},
+    "last_startup_custody_quarantine": {},
     "last_startup_custody_retire": {},
 
     # CLOCKS_FRAGMENT silence / Teensy restart detection
@@ -2509,8 +2511,10 @@ _clocks_state_mutation_gate_lock = threading.Lock()
 
 # Startup persistence custody.  Valid CLOCKS rows may arrive while holistic
 # restore deliberately keeps the ordinary writer closed.  Retain those exact
-# canonical rows until the Teensy lifecycle probe tells us whether they belong
-# to a still-live instrument epoch or to a superseded cold/full-restore epoch.
+# canonical rows until the Teensy lifecycle probe classifies their relationship
+# to Alpha.  A proved live continuation may release them normally; surviving-Alpha
+# rows observed before Pi-owned state restoration are durably quarantined rather
+# than discarded; cold/full-restore boundaries may still retire superseded epochs.
 _startup_custody_lock = threading.Lock()
 _startup_custody_active = True
 _startup_custody_backlog = deque()
@@ -6478,7 +6482,7 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
         # live row can be mistaken for an N+1 resurrection proof.
         _clocks_holistic_restore_proof_pending.clear()
         _clocks_holistic_restore_proof_committed.clear()
-        startup_custody = _retire_startup_clocks_custody(
+        startup_custody = _quarantine_startup_clocks_custody_surviving_alpha(
             "surviving_alpha_pi_state_not_yet_restored"
         )
         return {
@@ -6491,8 +6495,10 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
             "proof": {
                 "proved": True,
                 "basis": basis,
-                "startup_prefix_retired": True,
-                "canonical_gap_intentional": True,
+                "startup_prefix_preserved": True,
+                "startup_prefix_classification": "SURVIVING_ALPHA_PRE_PI_RESTORE",
+                "startup_prefix_restore_authority": False,
+                "canonical_gap_intentional": False,
             },
         }
 
@@ -9957,9 +9963,11 @@ def _reset_startup_clocks_custody() -> None:
         _diag["startup_custody_depth"] = 0
         _diag["startup_custody_retained"] = 0
         _diag["startup_custody_released"] = 0
+        _diag["startup_custody_quarantined"] = 0
         _diag["startup_custody_retired"] = 0
         _diag["startup_custody_last_sequence"] = None
         _diag["last_startup_custody_release"] = {}
+        _diag["last_startup_custody_quarantine"] = {}
         _diag["last_startup_custody_retire"] = {}
 
 
@@ -10036,6 +10044,108 @@ def _release_startup_clocks_custody_live() -> Dict[str, Any]:
         "✅ [holistic restore] startup CLOCKS custody committed before campaign recovery: "
         "rows=%d first_sequence=%s last_sequence=%s",
         count, first_sequence, last_sequence,
+    )
+    return result
+
+
+def _quarantine_startup_clocks_custody_surviving_alpha(
+    reason: str,
+) -> Dict[str, Any]:
+    """Durably preserve startup rows that predate Pi-state restoration.
+
+    Alpha has been proved continuous, so the producer observations belong to the
+    surviving physical/statistical lifetime and must not disappear.  Their Pi-owned
+    GNSS_RAW/DAC/checkpoint decorations were formed before durable Pi custody was
+    restored, however, so those decorations are historical evidence only.  Persist
+    the exact retained canonical rows in FIFO order, mark them ineligible as future
+    holistic-restore authority, and never replay their embedded TEMPEST candidates.
+    """
+    global _startup_custody_active
+
+    completion: Optional[threading.Event] = None
+    classified_at_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    with _startup_custody_lock:
+        if not _startup_custody_active:
+            return {"quarantined": 0, "already_resolved": True}
+
+        count = len(_startup_custody_backlog)
+        first_sequence = (
+            _startup_custody_backlog[0]["state"].get("sequence")
+            if count
+            else None
+        )
+        last_sequence = (
+            _startup_custody_backlog[-1]["state"].get("sequence")
+            if count
+            else None
+        )
+
+        for index, retained in enumerate(_startup_custody_backlog):
+            item = copy.deepcopy(retained)
+            state = item.get("state")
+            if not isinstance(state, dict):
+                raise RuntimeError("startup CLOCKS custody item lacks canonical state")
+
+            state["holistic_restore_superseded"] = True
+            state["startup_custody"] = {
+                "schema": "PI_CLOCKS_STARTUP_CUSTODY_V1",
+                "classification": "SURVIVING_ALPHA_PRE_PI_RESTORE",
+                "classified_at_utc": classified_at_utc,
+                "reason": str(reason),
+                "producer_observation_preserved": True,
+                "pi_state_authority": False,
+                "restore_authority": False,
+                "campaign_candidate_replayed": False,
+            }
+            item["state"] = state
+
+            # The physical producer observation is preserved, but campaign
+            # adjudication depended on a live Pi context that did not yet own
+            # restored custody.  Do not manufacture that historical decision now.
+            item["release_campaign_candidate"] = False
+            if index == count - 1:
+                completion = threading.Event()
+                item["persistence_completion"] = completion
+            _clocks_persist_queue.put(item)
+
+        _startup_custody_backlog.clear()
+        _startup_custody_active = False
+        _diag["startup_custody_active"] = False
+        _diag["startup_custody_depth"] = 0
+
+        # Establish FIFO order before opening ordinary persistence.  Every future
+        # live row therefore follows this preserved pre-restore prefix durably.
+        _clocks_persistence_enabled.set()
+
+    if completion is not None and not completion.wait(timeout=HOLISTIC_RESTORE_TIMEOUT_S):
+        raise RuntimeError(
+            "quarantined startup CLOCKS custody did not become durable "
+            f"within {HOLISTIC_RESTORE_TIMEOUT_S:.1f}s "
+            f"(count={count} first_sequence={first_sequence} last_sequence={last_sequence})"
+        )
+
+    result = {
+        "quarantined": count,
+        "first_sequence": first_sequence,
+        "last_sequence": last_sequence,
+        "classification": "SURVIVING_ALPHA_PRE_PI_RESTORE",
+        "reason": str(reason),
+        "producer_observation_preserved": True,
+        "pi_state_authority": False,
+        "restore_authority": False,
+        "campaign_candidate_replayed": False,
+    }
+    _diag["startup_custody_quarantined"] = (
+        _diag.get("startup_custody_quarantined", 0) + count
+    )
+    _diag["last_startup_custody_quarantine"] = copy.deepcopy(result)
+    logging.info(
+        "🧾 [holistic restore] startup CLOCKS evidence preserved under surviving Alpha: "
+        "rows=%d first_sequence=%s last_sequence=%s classification=%s",
+        count,
+        first_sequence,
+        last_sequence,
+        result["classification"],
     )
     return result
 
