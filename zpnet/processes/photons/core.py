@@ -25,8 +25,12 @@ persistence.  Firmware owns the exact START/STOP measurement boundary.
 
 Baselines remain campaign-to-campaign relationships stored by campaign_master ID.
 No baseline statistics are copied into firmware and ``photons.baseline`` remains
-untouched.  Durable recovery restores only aggregate sufficient state and bounded
-PPB endpoint history; physical edge ancestry is always reacquired after restart.
+untouched.  Durable recovery restores aggregate sufficient state plus only the
+bounded PPB endpoint history the Pi literally possesses.  If an observation gap
+left a bounded ring incomplete, held restore may deliberately install that exact
+literal suffix and surrender the unseen rolling ancestry instead of inventing it
+or discarding otherwise-proven aggregate state.  Physical edge ancestry is always
+reacquired after restart.
 """
 
 from __future__ import annotations
@@ -97,9 +101,10 @@ PHOTONS_WELFORD_GRAND_RATIO_DIAGNOSTIC_PPB = 0.1
 PHOTONS_STATS_RESET_PROOF_TIMEOUT_S = 30.0
 
 # CLOCKS-parity checkpoint testimony. Firmware publishes one compact delta/proof
-# per second; Pi PHOTONS maintains and persists the complete bounded recovery image.
-# The literal image embedded in each canonical durable row is the sole Better-Buckets
-# held-restore authority; PostgreSQL history is not a recovery source.
+# per second; Pi PHOTONS persists the literal bounded recovery custody it actually
+# observed.  A gap may leave that image temporarily incomplete.  Held restore may
+# stage the exact retained suffix (plus exact epoch-origin testimony when useful),
+# but PostgreSQL history is never replayed and unseen endpoints are never invented.
 PHOTONS_PPB_FIRMWARE_DELTA_SCHEMA = "PHOTONS_PPB_CHECKPOINT_DELTA_V1"
 PHOTONS_PPB_PI_CHECKPOINT_SCHEMA = "PI_PHOTONS_PPB_RESTORE_CHECKPOINT_V1"
 
@@ -195,6 +200,7 @@ _recovery_status: Dict[str, Any] = {
 }
 _recovery_attempt_count = 0
 _recovery_restore_count = 0
+_recovery_partial_history_restore_count = 0
 _recovery_live_reattach_count = 0
 _recovery_cold_start_count = 0
 _recovery_failure_count = 0
@@ -1840,23 +1846,21 @@ def _normalize_saved_ppb_checkpoint(value: Any) -> Dict[str, Any]:
 
 
 def _literal_recovery_history_from_source(source: Dict[str, Any]) -> Dict[str, Any]:
-    """Return one self-contained durable PHOTONS resurrection image.
+    """Return the exact durable PHOTONS history that may lawfully be staged.
 
-    This is the held-restore authority after producer loss.  SQL history is not
-    consulted to reconstruct missing endpoints: the selected canonical row must
-    itself carry a complete recoverable Better-Buckets checkpoint whose current
-    endpoint closes exactly against the same row's aggregate N/T and chronology.
+    Aggregate N/T, Welfords, exclusions, chronology, and monotonic custody come
+    from the selected canonical row.  Better-Buckets history is different: only
+    endpoints literally retained in that row may cross a producer-loss boundary.
+
+    A complete checkpoint restores the complete bounded producer rings.  A
+    structurally valid checkpoint that is merely warming after an observation
+    gap may instead restore its exact retained suffix.  The missing older ring
+    ancestry is explicitly surrendered; SQL is never consulted and no endpoint
+    is synthesized.  A lost/empty/contradictory rolling lineage still fails.
     """
     canonical = _require_dict(source.get("canonical"), "recovery source canonical")
     raw = canonical.get("ppb_restore_checkpoint")
     saved = _normalize_saved_ppb_checkpoint(raw)
-    if not saved.get("recoverable"):
-        raise RuntimeError(
-            "selected durable PHOTONS source is not resurrection-capable: "
-            f"detail_id={source.get('db_detail_id')} status={saved.get('status')!r} "
-            f"second={saved.get('second_count')}/{saved.get('expected_second_count')} "
-            f"minute={saved.get('minute_count')}/{saved.get('expected_minute_count')}"
-        )
 
     current = _require_dict(saved.get("current"), "saved PHOTONS checkpoint current")
     expected = {
@@ -1879,22 +1883,92 @@ def _literal_recovery_history_from_source(source: Dict[str, Any]) -> Dict[str, A
             f"expected={expected!r} observed={observed!r}"
         )
 
+    checkpoint_status = str(saved.get("status") or "")
+    complete = bool(saved.get("recoverable"))
+    if not complete and checkpoint_status not in {
+        "WARMING_AFTER_OBSERVATION_GAP",
+        "WARMING_FOR_COMPLETE_FIRMWARE_HISTORY",
+    }:
+        raise RuntimeError(
+            "selected durable PHOTONS checkpoint cannot support literal-suffix restore: "
+            f"detail_id={source.get('db_detail_id')} status={checkpoint_status!r} "
+            f"second={saved.get('second_count')}/{saved.get('expected_second_count')} "
+            f"minute={saved.get('minute_count')}/{saved.get('expected_minute_count')}"
+        )
+
     second_history = copy.deepcopy(list(saved.get("second_history") or []))
     minute_history = copy.deepcopy(list(saved.get("minute_history") or []))
+    expected_second = int(saved.get("expected_second_count") or 0)
+    expected_minute = int(saved.get("expected_minute_count") or 0)
+    source_update_count = int(source["update_count"])
+    origin = copy.deepcopy(saved.get("origin") or _ppb_zero_endpoint())
+    second_origin_promoted = False
+    minute_origin_promoted = False
+
+    # The exact epoch origin is producer-authored testimony carried separately
+    # from the bounded rings.  When the statistical epoch is younger than a
+    # window, target_sequence is zero and the origin is the only truthful anchor.
+    # Promote that already-durable fact into a partial restore image when useful;
+    # this is not reconstruction of any unseen intermediate endpoint.
+    if not complete:
+        if (
+            source_update_count <= PHOTONS_RECOVERY_10_MIN_SECONDS
+            and (not second_history or int(second_history[0]["sequence"]) != 0)
+            and len(second_history) < expected_second
+        ):
+            second_history.insert(0, copy.deepcopy(origin))
+            second_origin_promoted = True
+        if (
+            source_update_count <= PHOTONS_RECOVERY_24_HOUR_SECONDS
+            and (not minute_history or int(minute_history[0]["sequence"]) != 0)
+            and len(minute_history) < expected_minute
+        ):
+            minute_history.insert(0, copy.deepcopy(origin))
+            minute_origin_promoted = True
+
     if not second_history or not minute_history:
-        raise RuntimeError("recoverable PHOTONS literal checkpoint has empty history")
+        raise RuntimeError(
+            "durable PHOTONS checkpoint has no literal Better-Buckets history to stage"
+        )
     if not _ppb_endpoints_equal(second_history[-1], current):
         raise RuntimeError("PHOTONS literal second-history tail is not the source endpoint")
+
+    if len(second_history) > expected_second or len(minute_history) > expected_minute:
+        raise RuntimeError(
+            "PHOTONS literal restore image exceeds the source producer ring counts"
+        )
+    missing_second = max(0, expected_second - len(second_history))
+    missing_minute = max(0, expected_minute - len(minute_history))
+    history_truncated = not complete
+    if complete and (missing_second or missing_minute):
+        raise RuntimeError("recoverable PHOTONS checkpoint unexpectedly lacks literal ring entries")
+
+    if complete:
+        history_scope = "COMPLETE_PRODUCER_RING"
+    elif second_origin_promoted or minute_origin_promoted:
+        history_scope = "LITERAL_SUFFIX_WITH_EXACT_EPOCH_ORIGIN"
+    else:
+        history_scope = "LITERAL_SUFFIX_ONLY"
 
     return {
         "schema": "PHOTONS_LITERAL_PPB_RESTORE_V1",
         "authority": "DURABLE_LITERAL_CHECKPOINT",
+        "history_scope": history_scope,
+        "history_truncated": history_truncated,
         "source_db_detail_id": int(source["db_detail_id"]),
         "source_reset_count": int(source["reset_count"]),
         "source_update_count": int(source["update_count"]),
-        "checkpoint_status": str(saved.get("status") or ""),
+        "checkpoint_status": checkpoint_status,
         "checkpoint_seed_source": saved.get("seed_source"),
         "gap_count": int(saved.get("gap_count") or 0),
+        "source_expected_second_count": expected_second,
+        "source_expected_minute_count": expected_minute,
+        "staged_second_count": len(second_history),
+        "staged_minute_count": len(minute_history),
+        "surrendered_second_endpoints": missing_second,
+        "surrendered_minute_endpoints": missing_minute,
+        "second_origin_promoted": second_origin_promoted,
+        "minute_origin_promoted": minute_origin_promoted,
         "second_history": second_history,
         "minute_history": minute_history,
     }
@@ -1937,6 +2011,106 @@ def _restore_ppb_checkpoint_runtime(
         )
         runtime["proof_checks"] = int(saved.get("proof_checks") or 0)
         runtime["rolling_custody_lost"] = saved.get("status") == "ROLLING_CUSTODY_LOST"
+        _ppb_checkpoint_runtime = runtime
+        return _ppb_checkpoint_snapshot_locked(runtime)
+
+
+def _adopt_held_restore_checkpoint_runtime(
+    *,
+    source: Dict[str, Any],
+    literal_history: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Mirror the exact Better-Buckets rings just committed into a newborn producer.
+
+    Before RECOVERY_COMMIT, Pi runtime describes the durable source producer,
+    including that producer's advertised ring counts.  A literal-suffix held
+    restore intentionally creates a new producer whose bounded rings contain only
+    the endpoints actually staged.  After firmware accepts the commit, rebase the
+    Pi's expected ring sizes to that exact installed image before workers consume
+    the first N+1 row.
+
+    This does not heal the historical observation gap.  ``last_gap`` and the
+    retained suffix remain evidence; only the new producer's ring geometry is
+    updated to the state we just proved and installed.
+    """
+    global _ppb_checkpoint_runtime
+
+    second_history = copy.deepcopy(list(literal_history.get("second_history") or []))
+    minute_history = copy.deepcopy(list(literal_history.get("minute_history") or []))
+    if not second_history or not minute_history:
+        raise RuntimeError("held PHOTONS restore committed without literal ring history")
+
+    with _ppb_checkpoint_lock:
+        runtime = _ppb_checkpoint_runtime_ensure_locked()
+        current = _require_dict(runtime.get("current"), "held restore Pi checkpoint current")
+        expected_identity = {
+            "reset_count": int(source["reset_count"]),
+            "update_count": int(source["update_count"]),
+            "sequence": int(source["update_count"]),
+            "lap_count": int(source["lap_count"]),
+            "total_lap_gnss_ns": int(source["total_lap_gnss_ns"]),
+        }
+        observed_identity = {
+            "reset_count": int(runtime.get("reset_count") or 0),
+            "update_count": int(runtime.get("last_update_count") or 0),
+            "sequence": int(current.get("sequence") or 0),
+            "lap_count": int(current.get("lap_count") or 0),
+            "total_lap_gnss_ns": int(current.get("total_lap_gnss_ns") or 0),
+        }
+        if observed_identity != expected_identity:
+            raise RuntimeError(
+                "Pi PHOTONS checkpoint changed while held restore was staged: "
+                f"expected={expected_identity!r} observed={observed_identity!r}"
+            )
+        source_second_history = list(runtime["second_history"])
+        source_minute_history = list(runtime["minute_history"])
+        expected_origin = copy.deepcopy(runtime.get("origin") or _ppb_zero_endpoint())
+
+        def staged_history_matches_source(
+            staged_values: List[Dict[str, Any]],
+            source_values: List[Dict[str, Any]],
+            *,
+            origin_promoted: bool,
+        ) -> bool:
+            if not origin_promoted:
+                return staged_values == source_values
+            return bool(
+                staged_values
+                and _ppb_endpoints_equal(staged_values[0], expected_origin)
+                and staged_values[1:] == source_values
+            )
+
+        if not staged_history_matches_source(
+            second_history,
+            source_second_history,
+            origin_promoted=bool(literal_history.get("second_origin_promoted")),
+        ):
+            raise RuntimeError("Pi PHOTONS second history changed while held restore was staged")
+        if not staged_history_matches_source(
+            minute_history,
+            source_minute_history,
+            origin_promoted=bool(literal_history.get("minute_origin_promoted")),
+        ):
+            raise RuntimeError("Pi PHOTONS minute history changed while held restore was staged")
+
+        runtime["second_history"].clear()
+        runtime["second_history"].extend(copy.deepcopy(second_history))
+        runtime["minute_history"].clear()
+        runtime["minute_history"].extend(copy.deepcopy(minute_history))
+        runtime["expected_second_count"] = len(second_history)
+        runtime["expected_minute_count"] = len(minute_history)
+        runtime["seed_source"] = (
+            "DURABLE_LITERAL_SUFFIX_HELD_RESTORE"
+            if literal_history.get("history_truncated")
+            else "DURABLE_COMPLETE_HELD_RESTORE"
+        )
+        runtime["status_reason"] = (
+            "HELD_RESTORE_LITERAL_SUFFIX_INSTALLED"
+            if literal_history.get("history_truncated")
+            else "HELD_RESTORE_COMPLETE_RING_INSTALLED"
+        )
+        runtime["seed_source_db_detail_id"] = int(source["db_detail_id"])
+        runtime["rolling_custody_lost"] = False
         _ppb_checkpoint_runtime = runtime
         return _ppb_checkpoint_snapshot_locked(runtime)
 
@@ -3205,7 +3379,9 @@ def _startup_held_restore(
     rows_scanned: int,
 ) -> Dict[str, Any]:
     global _recovery_restore_count
+    global _recovery_partial_history_restore_count
     generation = _new_recovery_generation()
+    history_truncated = bool(literal_history.get("history_truncated"))
     # HELD_RESTORE replaces physical ancestry rather than pretending the Pi saw
     # every firmware publication during restart/reacquisition.  The first
     # post-restore campaign row may therefore be a lawful forward splice from
@@ -3247,13 +3423,29 @@ def _startup_held_restore(
         ppb_restore_authority={
             "schema": literal_history.get("schema"),
             "authority": literal_history.get("authority"),
+            "history_scope": literal_history.get("history_scope"),
+            "history_truncated": history_truncated,
             "source_db_detail_id": literal_history.get("source_db_detail_id"),
             "source_update_count": literal_history.get("source_update_count"),
             "checkpoint_status": literal_history.get("checkpoint_status"),
             "checkpoint_seed_source": literal_history.get("checkpoint_seed_source"),
             "gap_count": literal_history.get("gap_count"),
-            "second_count": len(literal_history.get("second_history") or []),
-            "minute_count": len(literal_history.get("minute_history") or []),
+            "source_expected_second_count": literal_history.get(
+                "source_expected_second_count"
+            ),
+            "source_expected_minute_count": literal_history.get(
+                "source_expected_minute_count"
+            ),
+            "staged_second_count": len(literal_history.get("second_history") or []),
+            "staged_minute_count": len(literal_history.get("minute_history") or []),
+            "surrendered_second_endpoints": literal_history.get(
+                "surrendered_second_endpoints"
+            ),
+            "surrendered_minute_endpoints": literal_history.get(
+                "surrendered_minute_endpoints"
+            ),
+            "second_origin_promoted": literal_history.get("second_origin_promoted"),
+            "minute_origin_promoted": literal_history.get("minute_origin_promoted"),
         },
         exact_successor={
             "sequence": int(source["sequence"]) + 1,
@@ -3273,6 +3465,32 @@ def _startup_held_restore(
         _best_effort_recovery_abort()
         raise
 
+    # RECOVERY_COMMIT is the producer-side cutover.  If the durable source held
+    # only a literal suffix, firmware now owns exactly that shorter bounded ring.
+    # Mirror the installed geometry before releasing queued N+1 testimony to the
+    # workers; otherwise Pi would still expect unseen entries from the dead
+    # producer and would manufacture another observation-gap diagnosis.
+    checkpoint_after_commit = _adopt_held_restore_checkpoint_runtime(
+        source=source,
+        literal_history=literal_history,
+    )
+    if history_truncated:
+        logging.warning(
+            "🧾 [photons/recovery] held restore preserved exact aggregate ancestry "
+            "while surrendering unseen Better-Buckets history: source_detail=%d "
+            "staged_second=%d/%d staged_minute=%d/%d surrendered_second=%d "
+            "surrendered_minute=%d exact_origin_promoted(second=%s minute=%s)",
+            int(source["db_detail_id"]),
+            int(literal_history.get("staged_second_count") or 0),
+            int(literal_history.get("source_expected_second_count") or 0),
+            int(literal_history.get("staged_minute_count") or 0),
+            int(literal_history.get("source_expected_minute_count") or 0),
+            int(literal_history.get("surrendered_second_endpoints") or 0),
+            int(literal_history.get("surrendered_minute_endpoints") or 0),
+            bool(literal_history.get("second_origin_promoted")),
+            bool(literal_history.get("minute_origin_promoted")),
+        )
+
     _start_workers()
     _recovery_status_set(
         "WAITING_FOR_DURABLE_PROOF",
@@ -3281,6 +3499,9 @@ def _startup_held_restore(
         source_detail_id=int(source["db_detail_id"]),
         staged=staged,
         firmware_commit=commit,
+        ppb_history_scope=literal_history.get("history_scope"),
+        ppb_history_truncated=history_truncated,
+        ppb_checkpoint_after_commit=checkpoint_after_commit,
     )
     proof = _wait_for_recovery_proof(acknowledge_firmware=True)
     _mark_active_campaign_recovered(
@@ -3293,6 +3514,8 @@ def _startup_held_restore(
     rearm = _arm_existing_active_campaign_after_instrument_recovery(active_master)
     with _state_lock:
         _recovery_restore_count += 1
+        if history_truncated:
+            _recovery_partial_history_restore_count += 1
     result = {
         "mode": "HELD_RESTORE",
         "generation": generation,
@@ -3301,6 +3524,14 @@ def _startup_held_restore(
         "source_update_count": int(source["update_count"]),
         "pending_seed_dropped": int(source["pending_seed_dropped"]),
         "ppb_restore_authority": "DURABLE_LITERAL_CHECKPOINT",
+        "ppb_history_scope": literal_history.get("history_scope"),
+        "ppb_history_truncated": history_truncated,
+        "surrendered_second_endpoints": int(
+            literal_history.get("surrendered_second_endpoints") or 0
+        ),
+        "surrendered_minute_endpoints": int(
+            literal_history.get("surrendered_minute_endpoints") or 0
+        ),
         "proof_contract": "EXACT_SOURCE_N_PLUS_1",
         "proof": proof,
         "campaign_rearm": rearm,
@@ -5479,6 +5710,7 @@ def _recovery_report_surface() -> Dict[str, Any]:
             {
                 "attempt_count": _recovery_attempt_count,
                 "restore_count": _recovery_restore_count,
+                "partial_history_restore_count": _recovery_partial_history_restore_count,
                 "live_reattach_count": _recovery_live_reattach_count,
                 "cold_start_count": _recovery_cold_start_count,
                 "failure_count": _recovery_failure_count,
@@ -6089,7 +6321,8 @@ def run() -> None:
 
     # Configuration is necessary but no longer sufficient to begin publication.
     # Firmware remains held until the Pi delivers one explicit recovery verdict:
-    # aggregate restore, live reattachment, or scientifically empty cold start.
+    # aggregate restore (with complete rings or an exact literal suffix), live
+    # reattachment, or scientifically empty cold start.
     _set_operational_state(
         OPERATIONAL_STATE_RECOVERING,
         reason="phase5_startup_recovery",

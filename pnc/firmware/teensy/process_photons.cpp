@@ -63,7 +63,10 @@ static constexpr uint32_t PHOTONS_SCIENCE_GATE_MIN_CYCLES = 64U;
 // CLOCKS-shaped Better-Buckets geometry.  Keep exact one-second endpoints for
 // the trailing ten minutes and first-admitted-per-minute endpoints for the
 // longer windows.  Every bucket still evaluates against the live current-second
-// endpoint, so only the historical edge is minute-granular.
+// endpoint, so only the historical edge is minute-granular.  A recovery-installed
+// literal suffix may contain an explicit chronology gap; window publication must
+// prove that its requested old edge lies inside the newest contiguous suffix
+// rather than silently relabeling a shorter available baseline.
 static constexpr uint32_t PHOTONS_PPB_MINUTE_10_SECONDS = 10U * 60U;
 static constexpr uint32_t PHOTONS_PPB_MINUTE_60_SECONDS = 60U * 60U;
 static constexpr uint32_t PHOTONS_PPB_HOUR_8_SECONDS = 8U * 60U * 60U;
@@ -541,6 +544,11 @@ static void photons_ppb_ring_append(photons_ppb_endpoint_t (&ring)[N],
 }
 
 
+static uint32_t photons_ppb_minute_key(uint32_t sequence) {
+  return sequence == 0U ? 0U : ((sequence - 1U) / 60U) + 1U;
+}
+
+
 template <size_t N>
 static bool photons_ppb_ring_find_anchor(
     const photons_ppb_endpoint_t (&ring)[N],
@@ -548,10 +556,68 @@ static bool photons_ppb_ring_find_anchor(
     uint32_t count,
     uint32_t target_sequence,
     uint32_t current_sequence,
+    bool minute_history,
     photons_ppb_endpoint_t& out) {
   if (count > (uint32_t)N) __builtin_trap();
+  if (count == 0U || current_sequence == 0U) return false;
+
+  // A young statistical epoch may lawfully use exact zero as the old edge of a
+  // window that reaches before epoch birth.  The zero endpoint is authoritative
+  // aggregate testimony, so it remains usable even if a later observation gap
+  // split the bounded history.
+  if (target_sequence == 0U) {
+    for (uint32_t offset = 0U; offset < count; offset++) {
+      const photons_ppb_endpoint_t& candidate =
+          ring[(head + offset) % (uint32_t)N];
+      if (candidate.sequence == 0U) {
+        out = candidate;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Recovery may intentionally install an exact literal suffix after Pi missed
+  // older producer appends.  A ring is therefore not automatically continuous
+  // merely because its endpoints are monotonic.  Find the newest suffix whose
+  // second identities (or minute keys) are adjacent all the way to the tail.
+  // Windows whose target lies before that suffix are unavailable rather than
+  // silently relabeled with a shorter baseline.
+  uint32_t suffix_offset = 0U;
+  bool previous_valid = false;
+  uint32_t previous_sequence = 0U;
 
   for (uint32_t offset = 0U; offset < count; offset++) {
+    const photons_ppb_endpoint_t& candidate =
+        ring[(head + offset) % (uint32_t)N];
+
+    bool follows = false;
+    if (previous_valid) {
+      if (minute_history) {
+        follows =
+            photons_ppb_minute_key(candidate.sequence) ==
+            photons_ppb_minute_key(previous_sequence) + 1U;
+      } else {
+        follows = candidate.sequence == previous_sequence + 1U;
+      }
+    }
+
+    if (!previous_valid || !follows) {
+      suffix_offset = offset;
+    }
+    previous_valid = true;
+    previous_sequence = candidate.sequence;
+  }
+
+  const photons_ppb_endpoint_t& coverage_start =
+      ring[(head + suffix_offset) % (uint32_t)N];
+  const bool target_covered = minute_history
+      ? photons_ppb_minute_key(target_sequence) >=
+            photons_ppb_minute_key(coverage_start.sequence)
+      : target_sequence >= coverage_start.sequence;
+  if (!target_covered) return false;
+
+  for (uint32_t offset = suffix_offset; offset < count; offset++) {
     const photons_ppb_endpoint_t& candidate =
         ring[(head + offset) % (uint32_t)N];
     if (candidate.sequence >= target_sequence &&
@@ -561,11 +627,6 @@ static bool photons_ppb_ring_find_anchor(
     }
   }
   return false;
-}
-
-
-static uint32_t photons_ppb_minute_key(uint32_t sequence) {
-  return sequence == 0U ? 0U : ((sequence - 1U) / 60U) + 1U;
 }
 
 
@@ -735,6 +796,7 @@ static photons_fragment_ppb_window_proof_snapshot_t photons_ppb_window_proof(
     uint32_t head,
     uint32_t count,
     uint32_t window_seconds,
+    bool minute_history,
     const photons_ppb_endpoint_t& current) {
   photons_fragment_ppb_window_proof_snapshot_t out{};
   const uint32_t target_sequence =
@@ -744,7 +806,8 @@ static photons_fragment_ppb_window_proof_snapshot_t photons_ppb_window_proof(
 
   photons_ppb_endpoint_t anchor{};
   if (!photons_ppb_ring_find_anchor(
-          ring, head, count, target_sequence, current.sequence, anchor)) {
+          ring, head, count, target_sequence, current.sequence,
+          minute_history, anchor)) {
     return out;
   }
 
@@ -797,24 +860,28 @@ photons_ppb_checkpoint_delta_snapshot(void) {
       g_photons_ppb_seconds_head,
       g_photons_ppb_seconds_count,
       PHOTONS_PPB_MINUTE_10_SECONDS,
+      false,
       current);
   out.minute_60 = photons_ppb_window_proof(
       g_photons_ppb_minutes,
       g_photons_ppb_minutes_head,
       g_photons_ppb_minutes_count,
       PHOTONS_PPB_MINUTE_60_SECONDS,
+      true,
       current);
   out.hour_8 = photons_ppb_window_proof(
       g_photons_ppb_minutes,
       g_photons_ppb_minutes_head,
       g_photons_ppb_minutes_count,
       PHOTONS_PPB_HOUR_8_SECONDS,
+      true,
       current);
   out.hour_24 = photons_ppb_window_proof(
       g_photons_ppb_minutes,
       g_photons_ppb_minutes_head,
       g_photons_ppb_minutes_count,
       PHOTONS_PPB_HOUR_24_SECONDS,
+      true,
       current);
 
   out.second_append_valid = true;
@@ -896,6 +963,7 @@ static photons_fragment_ppb_value_snapshot_t photons_ppb_window_snapshot(
     uint32_t head,
     uint32_t count,
     uint32_t window_seconds,
+    bool minute_history,
     const photons_ppb_endpoint_t& current) {
   const uint32_t target_sequence =
       current.sequence > window_seconds
@@ -903,7 +971,8 @@ static photons_fragment_ppb_value_snapshot_t photons_ppb_window_snapshot(
           : 0U;
   photons_ppb_endpoint_t anchor{};
   if (!photons_ppb_ring_find_anchor(
-          ring, head, count, target_sequence, current.sequence, anchor)) {
+          ring, head, count, target_sequence, current.sequence,
+          minute_history, anchor)) {
     return photons_fragment_ppb_value_snapshot_t{};
   }
   return photons_ppb_bucket_between(anchor, current);
@@ -929,24 +998,28 @@ static photons_fragment_ppb_buckets_snapshot_t photons_ppb_buckets_snapshot(void
       g_photons_ppb_seconds_head,
       g_photons_ppb_seconds_count,
       PHOTONS_PPB_MINUTE_10_SECONDS,
+      false,
       current);
   out.minute_60 = photons_ppb_window_snapshot(
       g_photons_ppb_minutes,
       g_photons_ppb_minutes_head,
       g_photons_ppb_minutes_count,
       PHOTONS_PPB_MINUTE_60_SECONDS,
+      true,
       current);
   out.hour_8 = photons_ppb_window_snapshot(
       g_photons_ppb_minutes,
       g_photons_ppb_minutes_head,
       g_photons_ppb_minutes_count,
       PHOTONS_PPB_HOUR_8_SECONDS,
+      true,
       current);
   out.hour_24 = photons_ppb_window_snapshot(
       g_photons_ppb_minutes,
       g_photons_ppb_minutes_head,
       g_photons_ppb_minutes_count,
       PHOTONS_PPB_HOUR_24_SECONDS,
+      true,
       current);
 
   if (current.lap_count != 0ULL) {
