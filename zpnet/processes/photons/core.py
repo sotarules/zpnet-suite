@@ -87,8 +87,6 @@ PHOTONS_RECOVERY_8_HOUR_SECONDS = 8 * 60 * 60
 PHOTONS_RECOVERY_24_HOUR_SECONDS = 24 * 60 * 60
 PHOTONS_RECOVERY_SECOND_CAPACITY = PHOTONS_RECOVERY_10_MIN_SECONDS + 1
 PHOTONS_RECOVERY_MINUTE_CAPACITY = 24 * 60 + 2
-PHOTONS_RECOVERY_REPLAY_MAX_ROWS = PHOTONS_RECOVERY_24_HOUR_SECONDS + 120
-PHOTONS_RECOVERY_CURSOR_ITERSIZE = 256
 PHOTONS_RECOVERY_PROOF_TIMEOUT_S = 180.0
 PHOTONS_RECOVERY_VERIFY_TOLERANCE = 1.0e-6
 # Cross-representation corroboration only.  Integer N/T and an incrementally
@@ -100,12 +98,10 @@ PHOTONS_STATS_RESET_PROOF_TIMEOUT_S = 30.0
 
 # CLOCKS-parity checkpoint testimony. Firmware publishes one compact delta/proof
 # per second; Pi PHOTONS maintains and persists the complete bounded recovery image.
-# Phase 3 promotes that literal image to held-restore authority. PostgreSQL replay
-# remains only an independent shadow/audit witness and never reconstructs firmware
-# recovery state.
+# The literal image embedded in each canonical durable row is the sole Better-Buckets
+# held-restore authority; PostgreSQL history is not a recovery source.
 PHOTONS_PPB_FIRMWARE_DELTA_SCHEMA = "PHOTONS_PPB_CHECKPOINT_DELTA_V1"
 PHOTONS_PPB_PI_CHECKPOINT_SCHEMA = "PI_PHOTONS_PPB_RESTORE_CHECKPOINT_V1"
-PHOTONS_PPB_SHADOW_SCHEMA = "PHOTONS_PPB_SQL_REPLAY_SHADOW_V1"
 
 TEENSY_CAMPAIGN_START_ACCEPTED_STATUSES = {"start_requested", "flash_cut_requested"}
 TEENSY_CAMPAIGN_STOP_ACCEPTED_STATUSES = {"stop_requested"}
@@ -205,15 +201,10 @@ _recovery_failure_count = 0
 
 _ppb_checkpoint_lock = threading.RLock()
 _ppb_checkpoint_runtime: Optional[Dict[str, Any]] = None
-_ppb_checkpoint_last_shadow: Optional[Dict[str, Any]] = None
 _ppb_checkpoint_rows_verified = 0
 _ppb_checkpoint_recoverable_rows = 0
 _ppb_checkpoint_warming_rows = 0
 _ppb_checkpoint_gap_count = 0
-_ppb_checkpoint_shadow_match_count = 0
-_ppb_checkpoint_shadow_suffix_match_count = 0
-_ppb_checkpoint_shadow_mismatch_count = 0
-_ppb_checkpoint_shadow_unavailable_count = 0
 _ppb_checkpoint_ingest_failure_count = 0
 _ppb_checkpoint_last_ingest_failure: Optional[Dict[str, Any]] = None
 
@@ -1019,7 +1010,7 @@ def _validate_photons_fragment(fragment: Payload) -> Tuple[int, int, Optional[in
 
 
 # ---------------------------------------------------------------------
-# Literal Pi Better-Buckets checkpoint + SQL-replay shadow court
+# Literal Pi Better-Buckets recovery checkpoint
 # ---------------------------------------------------------------------
 
 def _ppb_zero_endpoint() -> Dict[str, Any]:
@@ -1472,7 +1463,6 @@ def _ppb_checkpoint_snapshot_locked(runtime: Dict[str, Any]) -> Dict[str, Any]:
         "seed_source_db_detail_id": runtime.get("seed_source_db_detail_id"),
         "last_delta_signature": runtime.get("last_delta_signature"),
         "proof_checks": int(runtime.get("proof_checks") or 0),
-        "shadow_comparison": copy.deepcopy(_ppb_checkpoint_last_shadow),
     }
 
 
@@ -1951,404 +1941,6 @@ def _restore_ppb_checkpoint_runtime(
         return _ppb_checkpoint_snapshot_locked(runtime)
 
 
-def _seed_ppb_checkpoint_runtime_from_sql_replay(
-    source: Dict[str, Any], replay: Dict[str, Any]
-) -> Dict[str, Any]:
-    """Build the legacy SQL-replay image for audit comparison only."""
-    global _ppb_checkpoint_runtime
-    second_history = [
-        _ppb_endpoint_from_payload(value, path="SQL replay second endpoint")
-        for value in list(replay.get("second_history") or [])
-    ]
-    minute_history = [
-        _ppb_endpoint_from_payload(value, path="SQL replay minute endpoint")
-        for value in list(replay.get("minute_history") or [])
-    ]
-    if not second_history:
-        raise ValueError("SQL replay produced no PHOTONS second history")
-    current = second_history[-1]
-    if (
-        current["sequence"] != int(source["update_count"])
-        or current["lap_count"] != int(source["lap_count"])
-        or current["total_lap_gnss_ns"] != int(source["total_lap_gnss_ns"])
-    ):
-        raise ValueError("SQL replay tail does not match PHOTONS recovery source")
-
-    with _ppb_checkpoint_lock:
-        runtime = _ppb_checkpoint_new_runtime(
-            reason="TRANSITIONAL_SQL_REPLAY_BOOTSTRAP",
-            seed_source="SQL_REPLAY_TRANSITIONAL_BOOTSTRAP",
-        )
-        runtime["reset_count"] = int(source["reset_count"])
-        runtime["last_update_count"] = int(source["update_count"])
-        runtime["rolling_sequence"] = int(source["update_count"])
-        runtime["current_sequence"] = int(source["update_count"])
-        runtime["expected_second_count"] = len(second_history)
-        runtime["expected_minute_count"] = len(minute_history)
-        runtime["last_minute_key"] = _ppb_minute_key(int(source["update_count"]))
-        runtime["origin_valid"] = True
-        runtime["origin"] = _ppb_zero_endpoint()
-        runtime["current"] = copy.deepcopy(current)
-        runtime["second_history"].extend(copy.deepcopy(second_history))
-        runtime["minute_history"].extend(copy.deepcopy(minute_history))
-        nonzero = [item["sequence"] for item in second_history if item["sequence"] > 0]
-        runtime["contiguous_from_update_count"] = min(nonzero) if nonzero else None
-        runtime["seed_source_db_detail_id"] = int(source["db_detail_id"])
-        _ppb_checkpoint_runtime = runtime
-        return _ppb_checkpoint_snapshot_locked(runtime)
-
-
-def _ppb_history_is_exact_suffix(
-    saved_history: Any, replay_history: Any
-) -> bool:
-    if not isinstance(saved_history, list) or not isinstance(replay_history, list):
-        return False
-    if len(replay_history) > len(saved_history):
-        return False
-    if not replay_history:
-        return not saved_history
-    return saved_history[-len(replay_history):] == replay_history
-
-
-def _ppb_minute_history_suffix_comparison(
-    saved_history: Any,
-    replay_history: Any,
-    *,
-    replay_first_sequence: int,
-) -> Dict[str, Any]:
-    result: Dict[str, Any] = {
-        "match": False,
-        "first_partial_minute": False,
-        "saved_first": None,
-        "replay_first": None,
-    }
-    if not isinstance(saved_history, list) or not isinstance(replay_history, list):
-        result["reason"] = "HISTORY_NOT_LIST"
-        return result
-    if len(replay_history) > len(saved_history):
-        result["reason"] = "REPLAY_LONGER_THAN_LITERAL"
-        return result
-    if not replay_history:
-        result["match"] = not saved_history
-        result["reason"] = "BOTH_EMPTY" if result["match"] else "REPLAY_EMPTY_LITERAL_NONEMPTY"
-        return result
-
-    saved_suffix = saved_history[-len(replay_history):]
-    result["saved_first"] = copy.deepcopy(saved_suffix[0])
-    result["replay_first"] = copy.deepcopy(replay_history[0])
-
-    for index, (saved_endpoint, replay_endpoint) in enumerate(
-        zip(saved_suffix, replay_history)
-    ):
-        if _ppb_endpoints_equal(saved_endpoint, replay_endpoint):
-            continue
-
-        if index != 0:
-            result["reason"] = "NONFIRST_MINUTE_ENDPOINT_DIFFERS"
-            result["difference_index"] = index
-            return result
-
-        saved_sequence = int(saved_endpoint.get("sequence") or 0)
-        replay_sequence = int(replay_endpoint.get("sequence") or 0)
-        same_minute = (
-            _ppb_minute_key(saved_sequence) == _ppb_minute_key(replay_sequence)
-        )
-        replay_begins_here = replay_sequence == int(replay_first_sequence)
-        monotonic_within_minute = bool(
-            saved_sequence <= replay_sequence
-            and int(saved_endpoint.get("lap_count") or 0)
-            <= int(replay_endpoint.get("lap_count") or 0)
-            and int(saved_endpoint.get("total_lap_gnss_ns") or 0)
-            <= int(replay_endpoint.get("total_lap_gnss_ns") or 0)
-        )
-        if not (same_minute and replay_begins_here and monotonic_within_minute):
-            result["reason"] = "FIRST_MINUTE_DIFF_NOT_EXPLAINED_BY_SUFFIX_START"
-            return result
-
-        result["first_partial_minute"] = True
-
-    result["match"] = True
-    result["reason"] = (
-        "FIRST_REPLAY_MINUTE_IS_PARTIAL"
-        if result["first_partial_minute"]
-        else "EXACT_MINUTE_SUFFIX"
-    )
-    return result
-
-
-def _ppb_proved_prior_recovery_splice(
-    source: Dict[str, Any], replay: Dict[str, Any]
-) -> Dict[str, Any]:
-    result: Dict[str, Any] = {"proved": False}
-    try:
-        replay_first = _require_int(
-            replay.get("first_sequence"), "PPB replay first_sequence", minimum=1
-        )
-        boundary = _require_dict(replay.get("boundary"), "PPB replay boundary")
-        boundary_expected = _require_int(
-            boundary.get("expected_update_count"),
-            "PPB replay boundary expected_update_count",
-            minimum=1,
-        )
-        witness = _require_dict(
-            replay.get("prior_recovery_splice_witness"),
-            "PPB replay prior recovery splice witness",
-        )
-        restored = _require_bool(witness.get("restored"), "splice witness restored")
-        proof_committed = _require_bool(
-            witness.get("proof_committed"), "splice witness proof_committed"
-        )
-        fresh_ancestry = _require_bool(
-            witness.get("fresh_physical_ancestry"),
-            "splice witness fresh_physical_ancestry",
-        )
-        prior_reset = _require_int(
-            witness.get("source_reset_count"), "splice witness source_reset_count"
-        )
-        prior_update = _require_int(
-            witness.get("source_update_count"),
-            "splice witness source_update_count",
-            minimum=1,
-        )
-    except Exception as exc:
-        result["reason"] = "PRIOR_RECOVERY_TESTIMONY_UNAVAILABLE"
-        result["error"] = str(exc)
-        return result
-
-    result.update(
-        {
-            "restored": restored,
-            "proof_committed": proof_committed,
-            "fresh_physical_ancestry": fresh_ancestry,
-            "prior_source_reset_count": prior_reset,
-            "prior_source_update_count": prior_update,
-            "replay_first_sequence": replay_first,
-            "boundary": copy.deepcopy(boundary),
-            "witness": copy.deepcopy(witness),
-        }
-    )
-    proved = bool(
-        restored
-        and proof_committed
-        and fresh_ancestry
-        and prior_reset == int(source["reset_count"])
-        and replay_first == prior_update + 1
-        and str(boundary.get("reason") or "") == "DURABLE_UPDATE_GAP_OR_DUPLICATE"
-        and boundary_expected == prior_update
-    )
-    result["proved"] = proved
-    result["reason"] = (
-        "PROVED_PRIOR_RECOVERY_SPLICE" if proved else "BOUNDARY_NOT_PROVED_RECOVERY_SPLICE"
-    )
-    return result
-
-
-def _ppb_shadow_compare(
-    saved: Dict[str, Any],
-    replay_snapshot: Dict[str, Any],
-    *,
-    source: Dict[str, Any],
-    replay: Dict[str, Any],
-) -> Dict[str, Any]:
-    differences: List[str] = []
-    for field in ("reset_count", "update_count", "current"):
-        if saved.get(field) != replay_snapshot.get(field):
-            differences.append(field)
-
-    second_exact = saved.get("second_history") == replay_snapshot.get("second_history")
-    minute_exact = saved.get("minute_history") == replay_snapshot.get("minute_history")
-    if not second_exact:
-        differences.append("second_history")
-    if not minute_exact:
-        differences.append("minute_history")
-
-    exact_match = not differences
-    splice = _ppb_proved_prior_recovery_splice(source, replay)
-    second_suffix = _ppb_history_is_exact_suffix(
-        saved.get("second_history"), replay_snapshot.get("second_history")
-    )
-    minute_suffix = _ppb_minute_history_suffix_comparison(
-        saved.get("minute_history"),
-        replay_snapshot.get("minute_history"),
-        replay_first_sequence=int(replay.get("first_sequence") or 0),
-    )
-    core_match = not any(
-        field in differences for field in ("reset_count", "update_count", "current")
-    )
-    suffix_match = bool(
-        not exact_match
-        and core_match
-        and splice.get("proved")
-        and second_suffix
-        and minute_suffix.get("match")
-    )
-    match = bool(exact_match or suffix_match)
-    comparison = (
-        "EXACT_MATCH"
-        if exact_match
-        else "PROVED_PRIOR_RECOVERY_SUFFIX_MATCH"
-        if suffix_match
-        else "MISMATCH"
-    )
-
-    return {
-        "schema": PHOTONS_PPB_SHADOW_SCHEMA,
-        "available": True,
-        "match": match,
-        "exact_match": exact_match,
-        "comparison": comparison,
-        "source_detail_id": int(source["db_detail_id"]),
-        "differences": differences,
-        "saved_recoverable": bool(saved.get("recoverable")),
-        "replay_recoverable": bool(replay_snapshot.get("recoverable")),
-        "saved_second_count": int(saved.get("second_count") or 0),
-        "replay_second_count": int(replay_snapshot.get("second_count") or 0),
-        "saved_minute_count": int(saved.get("minute_count") or 0),
-        "replay_minute_count": int(replay_snapshot.get("minute_count") or 0),
-        "second_exact": second_exact,
-        "second_suffix_match": second_suffix,
-        "minute_exact": minute_exact,
-        "minute_suffix": minute_suffix,
-        "prior_recovery_splice": splice,
-        "sql_replay_authority_unchanged": True,
-    }
-
-
-def _prepare_ppb_checkpoint_shadow(
-    source: Optional[Dict[str, Any]], replay: Optional[Dict[str, Any]]
-) -> Dict[str, Any]:
-    """Restore literal Pi custody and compare SQL replay only as an audit witness."""
-    global _ppb_checkpoint_runtime
-    global _ppb_checkpoint_last_shadow
-    global _ppb_checkpoint_shadow_match_count
-    global _ppb_checkpoint_shadow_suffix_match_count
-    global _ppb_checkpoint_shadow_mismatch_count
-    global _ppb_checkpoint_shadow_unavailable_count
-
-    try:
-        if source is None:
-            with _ppb_checkpoint_lock:
-                _ppb_checkpoint_runtime = _ppb_checkpoint_new_runtime(
-                    reason="NO_DURABLE_SHADOW_SOURCE"
-                )
-            result = {
-                "schema": PHOTONS_PPB_SHADOW_SCHEMA,
-                "available": False,
-                "match": None,
-                "reason": "NO_DURABLE_SOURCE",
-            }
-            _ppb_checkpoint_shadow_unavailable_count += 1
-        else:
-            canonical = _require_dict(source.get("canonical"), "recovery source canonical")
-            raw_saved = canonical.get("ppb_restore_checkpoint")
-            if not isinstance(raw_saved, dict):
-                with _ppb_checkpoint_lock:
-                    _ppb_checkpoint_runtime = _ppb_checkpoint_new_runtime(
-                        reason="DURABLE_SOURCE_HAS_NO_LITERAL_CHECKPOINT"
-                    )
-                result = {
-                    "schema": PHOTONS_PPB_SHADOW_SCHEMA,
-                    "available": False,
-                    "match": None,
-                    "reason": "DURABLE_SOURCE_HAS_NO_LITERAL_CHECKPOINT",
-                    "source_detail_id": int(source["db_detail_id"]),
-                }
-                _ppb_checkpoint_shadow_unavailable_count += 1
-            else:
-                try:
-                    saved = _normalize_saved_ppb_checkpoint(raw_saved)
-                except Exception as exc:
-                    with _ppb_checkpoint_lock:
-                        _ppb_checkpoint_runtime = _ppb_checkpoint_new_runtime(
-                            reason="SAVED_CHECKPOINT_INVALID"
-                        )
-                    result = {
-                        "schema": PHOTONS_PPB_SHADOW_SCHEMA,
-                        "available": False,
-                        "match": None,
-                        "reason": "SAVED_CHECKPOINT_INVALID",
-                        "source_detail_id": int(source["db_detail_id"]),
-                        "error": str(exc),
-                    }
-                    _ppb_checkpoint_shadow_unavailable_count += 1
-                    logging.exception(
-                        "💥 [photons/ppb-shadow] saved literal recovery authority is invalid"
-                    )
-                else:
-                    # Install literal authority before consulting the SQL witness.
-                    # Even an unavailable or contradictory audit may not silently
-                    # replace the self-contained durable resurrection image.
-                    _restore_ppb_checkpoint_runtime(
-                        raw_saved,
-                        source_db_detail_id=int(source["db_detail_id"]),
-                    )
-                    if replay is None:
-                        result = {
-                            "schema": PHOTONS_PPB_SHADOW_SCHEMA,
-                            "available": False,
-                            "match": None,
-                            "reason": "SQL_REPLAY_AUDIT_UNAVAILABLE",
-                            "source_detail_id": int(source["db_detail_id"]),
-                            "literal_recoverable": bool(saved.get("recoverable")),
-                            "literal_authority_retained": True,
-                        }
-                        _ppb_checkpoint_shadow_unavailable_count += 1
-                    else:
-                        # Build the SQL comparison snapshot through the legacy helper,
-                        # then immediately reinstall literal authority before judging it.
-                        replay_snapshot = _seed_ppb_checkpoint_runtime_from_sql_replay(
-                            source, replay
-                        )
-                        _restore_ppb_checkpoint_runtime(
-                            raw_saved,
-                            source_db_detail_id=int(source["db_detail_id"]),
-                        )
-                        result = _ppb_shadow_compare(
-                            saved,
-                            replay_snapshot,
-                            source=source,
-                            replay=replay,
-                        )
-                        if result["match"]:
-                            _ppb_checkpoint_shadow_match_count += 1
-                            if not result.get("exact_match"):
-                                _ppb_checkpoint_shadow_suffix_match_count += 1
-                                logging.info(
-                                    "🧬 [photons/ppb-shadow] saved literal checkpoint extends "
-                                    "a proved prior recovery splice; SQL replay is an exact "
-                                    "visible suffix (comparison=%s differences=%s minute=%s). "
-                                    "Literal checkpoint remains recovery authority",
-                                    result.get("comparison"),
-                                    result.get("differences"),
-                                    result.get("minute_suffix"),
-                                )
-                        else:
-                            _ppb_checkpoint_shadow_mismatch_count += 1
-                            logging.error(
-                                "💥 [photons/ppb-shadow] SQL audit disagrees with literal "
-                                "recovery authority; literal checkpoint retained: %s",
-                                result,
-                            )
-    except Exception as exc:
-        logging.exception("💥 [photons/ppb-shadow] checkpoint shadow preparation failed")
-        with _ppb_checkpoint_lock:
-            _ppb_checkpoint_runtime = _ppb_checkpoint_new_runtime(
-                reason="SHADOW_PREPARATION_FAILED"
-            )
-        result = {
-            "schema": PHOTONS_PPB_SHADOW_SCHEMA,
-            "available": False,
-            "match": None,
-            "reason": "SHADOW_PREPARATION_FAILED",
-            "error": str(exc),
-        }
-        _ppb_checkpoint_shadow_unavailable_count += 1
-
-    with _ppb_checkpoint_lock:
-        _ppb_checkpoint_last_shadow = copy.deepcopy(result)
-    return copy.deepcopy(result)
-
-
 def _ppb_checkpoint_report_surface() -> Dict[str, Any]:
     with _ppb_checkpoint_lock:
         if _ppb_checkpoint_runtime is None:
@@ -2357,19 +1949,13 @@ def _ppb_checkpoint_report_surface() -> Dict[str, Any]:
             checkpoint = _ppb_checkpoint_snapshot_locked(_ppb_checkpoint_runtime)
         return {
             "checkpoint": checkpoint,
-            "last_shadow": copy.deepcopy(_ppb_checkpoint_last_shadow),
             "rows_verified": _ppb_checkpoint_rows_verified,
             "recoverable_rows": _ppb_checkpoint_recoverable_rows,
             "warming_rows": _ppb_checkpoint_warming_rows,
             "gap_count": _ppb_checkpoint_gap_count,
-            "shadow_match_count": _ppb_checkpoint_shadow_match_count,
-            "shadow_suffix_match_count": _ppb_checkpoint_shadow_suffix_match_count,
-            "shadow_mismatch_count": _ppb_checkpoint_shadow_mismatch_count,
-            "shadow_unavailable_count": _ppb_checkpoint_shadow_unavailable_count,
             "ingest_failure_count": _ppb_checkpoint_ingest_failure_count,
             "last_ingest_failure": copy.deepcopy(_ppb_checkpoint_last_ingest_failure),
         }
-
 
 
 def _make_photons(fragment: Payload, system_context: Dict[str, Any]) -> Payload:
@@ -2402,12 +1988,10 @@ def _make_photons(fragment: Payload, system_context: Dict[str, Any]) -> Payload:
     state["photons"] = copy.deepcopy(instrument)
     stats = _require_dict(instrument.get("stats"), "PHOTONS_FRAGMENT.photons.stats")
 
-    # Phase 1 is deliberately shadow-only.  The literal Pi ledger must prove it
-    # can follow firmware testimony, but an objection here may not suppress an
-    # otherwise-lawful canonical PHOTONS row or alter the established SQL-replay
-    # recovery path.  Hold the checkpoint lock across a transactional snapshot +
-    # ingest so a failing shadow mutation is invisible to report readers and is
-    # rolled back exactly.
+    # The literal Pi Better-Buckets ledger is part of the canonical recovery
+    # contract.  Fold this producer-authored delta before publication; if the
+    # ledger court cannot prove the update, roll back its mutation and reject the
+    # canonical row rather than persisting testimony that cannot carry recovery.
     with _ppb_checkpoint_lock:
         checkpoint_before = copy.deepcopy(_ppb_checkpoint_runtime)
         try:
@@ -2416,37 +2000,27 @@ def _make_photons(fragment: Payload, system_context: Dict[str, Any]) -> Payload:
             _ppb_checkpoint_runtime = checkpoint_before
             _ppb_checkpoint_ingest_failure_count += 1
             failure = {
-                "schema": "PHOTONS_PPB_CHECKPOINT_SHADOW_ERROR_V1",
+                "schema": "PHOTONS_PPB_CHECKPOINT_INGEST_ERROR_V1",
                 "at_utc": _utc_now_z(),
                 "sequence": sequence,
                 "reset_count": stats.get("reset_count"),
                 "update_count": stats.get("update_count"),
                 "error": str(exc),
                 "failure_count": _ppb_checkpoint_ingest_failure_count,
-                "canonical_row_rejected": False,
-                "sql_replay_authority_unchanged": True,
+                "canonical_row_rejected": True,
             }
-            first_failure = _ppb_checkpoint_last_ingest_failure is None
-            prior_error = (
-                _ppb_checkpoint_last_ingest_failure.get("error")
-                if isinstance(_ppb_checkpoint_last_ingest_failure, dict)
-                else None
-            )
             _ppb_checkpoint_last_ingest_failure = copy.deepcopy(failure)
-            state["ppb_restore_checkpoint_shadow_error"] = copy.deepcopy(failure)
-            if first_failure or prior_error != failure["error"]:
-                logging.exception(
-                    "💥 [photons/ppb-shadow] literal checkpoint ingest objected; "
-                    "canonical PHOTONS row remains admissible and shadow state was rolled back"
-                )
-        else:
-            state["ppb_restore_checkpoint"] = checkpoint
+            logging.exception(
+                "💥 [photons/ppb-checkpoint] literal checkpoint ingest failed; "
+                "rejecting canonical PHOTONS row"
+            )
+            raise
+        state["ppb_restore_checkpoint"] = checkpoint
     return state
 
 
-
 # ---------------------------------------------------------------------
-# Phase 5 durable recovery court + Better-Buckets replay
+# Phase 5 durable recovery court
 # ---------------------------------------------------------------------
 
 def _recovery_status_set(state: str, **details: Any) -> None:
@@ -2961,295 +2535,6 @@ def _load_newest_recoverable_photons_state(
             float(diagnostic.get("diagnostic_limit_ppb") or 0.0),
         )
     return source, [], 1
-
-
-def _recovery_replay_endpoint(payload: Any) -> Dict[str, Any]:
-    if isinstance(payload, str):
-        payload = json.loads(payload)
-    state = _require_dict(payload, "PPB replay payload")
-    if state.get("schema") != PHOTONS_SCHEMA:
-        raise ValueError("PPB replay canonical schema mismatch")
-    instrument = _require_dict(state.get("photons"), "PPB replay photons")
-    stats = _require_dict(instrument.get("stats"), "PPB replay stats")
-
-    recovery_witness: Optional[Dict[str, Any]] = None
-    recovery = instrument.get("recovery")
-    if isinstance(recovery, dict):
-        try:
-            recovery_witness = {
-                "restored": _require_bool(recovery.get("restored"), "PPB recovery restored"),
-                "proof_committed": _require_bool(
-                    recovery.get("proof_committed"), "PPB recovery proof_committed"
-                ),
-                "fresh_physical_ancestry": _require_bool(
-                    recovery.get("fresh_physical_ancestry"),
-                    "PPB recovery fresh_physical_ancestry",
-                ),
-                "generation": _require_int(recovery.get("generation"), "PPB recovery generation"),
-                "source_reset_count": _require_int(
-                    recovery.get("source_reset_count"), "PPB recovery source_reset_count"
-                ),
-                "source_update_count": _require_int(
-                    recovery.get("source_update_count"),
-                    "PPB recovery source_update_count",
-                ),
-            }
-        except Exception:
-            recovery_witness = None
-
-    return {
-        "reset_count": _require_int(stats.get("reset_count"), "PPB reset_count"),
-        "sequence": _require_int(stats.get("update_count"), "PPB update_count", minimum=1),
-        "current_sequence": _require_int(
-            stats.get("rolling_ppb_current_sequence"),
-            "PPB current_sequence",
-            minimum=1,
-        ),
-        "admitted": _require_bool(
-            stats.get("rolling_ppb_endpoint_admitted"), "PPB endpoint_admitted"
-        ),
-        "lap_count": _require_int(stats.get("lap_count"), "PPB lap_count", minimum=1),
-        "total_lap_gnss_ns": _require_int(
-            stats.get("total_lap_gnss_ns"), "PPB total_lap_gnss_ns", minimum=1
-        ),
-        "recovery_witness": recovery_witness,
-    }
-
-
-def _photon_ppb_from_endpoints(
-    anchor: Dict[str, Any], current: Dict[str, Any]
-) -> Optional[Dict[str, Any]]:
-    laps = int(current["lap_count"]) - int(anchor["lap_count"])
-    total_ns = int(current["total_lap_gnss_ns"]) - int(anchor["total_lap_gnss_ns"])
-    if laps == 0:
-        if total_ns != 0:
-            raise ValueError("PPB endpoint has zero laps and nonzero duration")
-        return None
-    if laps < 0 or total_ns <= 0 or _standard_lap_ps is None:
-        raise ValueError("PPB endpoint subtraction is invalid")
-    mean_ps = (float(total_ns) * 1000.0) / float(laps)
-    return {
-        "sample_count": laps,
-        "ppb": (mean_ps / float(_standard_lap_ps) - 1.0) * 1.0e9,
-    }
-
-
-def _recovery_bucket_from_history(
-    history: List[Dict[str, Any]],
-    current: Dict[str, Any],
-    window_seconds: int,
-) -> Optional[Dict[str, Any]]:
-    current_sequence = int(current["sequence"])
-    target = max(0, current_sequence - int(window_seconds))
-    for endpoint in history:
-        sequence = int(endpoint["sequence"])
-        if sequence >= target and sequence < current_sequence:
-            return _photon_ppb_from_endpoints(endpoint, current)
-    return None
-
-
-def _verify_photons_ppb_replay(
-    source: Dict[str, Any],
-    *,
-    all_history: List[Dict[str, Any]],
-    second_history: List[Dict[str, Any]],
-    minute_history: List[Dict[str, Any]],
-) -> Dict[str, Any]:
-    current = all_history[-1]
-    stats = _require_dict(
-        _require_dict(source["canonical"].get("photons"), "source photons").get("stats"),
-        "source stats",
-    )
-    recorded_buckets = _require_dict(stats.get("ppb_buckets"), "source ppb_buckets")
-    first_sequence = int(all_history[0]["sequence"])
-    comparisons: Dict[str, Any] = {}
-    checked = 0
-    truncated = 0
-    for name, seconds, history in (
-        ("10_min", PHOTONS_RECOVERY_10_MIN_SECONDS, second_history),
-        ("60_min", PHOTONS_RECOVERY_60_MIN_SECONDS, minute_history),
-        ("8_hour", PHOTONS_RECOVERY_8_HOUR_SECONDS, minute_history),
-        ("24_hour", PHOTONS_RECOVERY_24_HOUR_SECONDS, minute_history),
-    ):
-        current_sequence = int(current["sequence"])
-        target = max(0, current_sequence - seconds)
-        full_ancestry = first_sequence == 0 if target == 0 else first_sequence <= target
-        computed = _recovery_bucket_from_history(history, current, seconds)
-        recorded = recorded_buckets.get(name)
-        if not full_ancestry:
-            comparisons[name] = {
-                "comparison": "SKIPPED_TRUNCATED_CONTIGUOUS_SUFFIX",
-                "computed": copy.deepcopy(computed),
-                "recorded": copy.deepcopy(recorded),
-            }
-            truncated += 1
-            continue
-        if computed is None and recorded is None:
-            comparisons[name] = None
-            continue
-        if computed is None or not isinstance(recorded, dict):
-            raise ValueError(f"PPB replay availability mismatch for {name}")
-        recorded_n = _require_int(recorded.get("sample_count"), f"source {name}.sample_count")
-        recorded_ppb = _require_float(recorded.get("ppb"), f"source {name}.ppb")
-        if (
-            recorded_n != int(computed["sample_count"])
-            or abs(recorded_ppb - float(computed["ppb"])) > PHOTONS_RECOVERY_VERIFY_TOLERANCE
-        ):
-            raise ValueError(
-                f"PPB replay mismatch for {name}: computed={computed!r} recorded={recorded!r}"
-            )
-        comparisons[name] = {
-            "comparison": "VERIFIED",
-            "sample_count": recorded_n,
-            "delta_ppb": float(computed["ppb"]) - recorded_ppb,
-        }
-        checked += 1
-    return {
-        "checked": checked,
-        "truncated_comparisons": truncated,
-        "comparisons": comparisons,
-    }
-
-
-def _reconstruct_photons_ppb_history(source: Dict[str, Any]) -> Dict[str, Any]:
-    source_id = int(source["db_detail_id"])
-    source_reset = int(source["reset_count"])
-    source_update = int(source["update_count"])
-    expected_update = source_update
-    descending: List[Dict[str, Any]] = []
-    boundary: Optional[Dict[str, Any]] = None
-    committed_splice_witnesses: Dict[int, Dict[str, Any]] = {}
-    rows_scanned = 0
-
-    with open_db(row_dict=True) as conn:
-        cur = conn.cursor(name="photons_ppb_recovery_scan")
-        cur.itersize = PHOTONS_RECOVERY_CURSOR_ITERSIZE
-        cur.execute(
-            """
-            SELECT id, payload
-            FROM campaign_detail
-            WHERE campaign_type = %s
-              AND id <= %s
-            ORDER BY id DESC
-            """,
-            (CAMPAIGN_TYPE_LANTERN, source_id),
-        )
-        for row in cur:
-            rows_scanned += 1
-            try:
-                endpoint = _recovery_replay_endpoint(row["payload"])
-            except Exception as exc:
-                boundary = {
-                    "reason": "UNRECOVERABLE_DURABLE_ROW",
-                    "id": int(row["id"]),
-                    "error": str(exc),
-                }
-                break
-            if int(endpoint["reset_count"]) != source_reset:
-                boundary = {
-                    "reason": "STATISTICS_EPOCH_BOUNDARY",
-                    "id": int(row["id"]),
-                }
-                break
-            observed_update = int(endpoint["sequence"])
-            if observed_update != expected_update:
-                boundary = {
-                    "reason": "DURABLE_UPDATE_GAP_OR_DUPLICATE",
-                    "id": int(row["id"]),
-                    "expected_update_count": expected_update,
-                    "observed_update_count": observed_update,
-                }
-                break
-            if not endpoint["admitted"] or int(endpoint["current_sequence"]) != observed_update:
-                boundary = {
-                    "reason": "ROLLING_ANCESTRY_BOUNDARY",
-                    "id": int(row["id"]),
-                    "update_count": observed_update,
-                }
-                break
-            descending.append(endpoint)
-            witness = endpoint.get("recovery_witness")
-            if (
-                isinstance(witness, dict)
-                and witness.get("restored") is True
-                and witness.get("proof_committed") is True
-                and witness.get("fresh_physical_ancestry") is True
-                and int(witness.get("source_reset_count") or -1) == source_reset
-            ):
-                witness_source_update = int(witness.get("source_update_count") or 0)
-                if 0 < witness_source_update < observed_update:
-                    committed_splice_witnesses[witness_source_update] = {
-                        **copy.deepcopy(witness),
-                        "witness_detail_id": int(row["id"]),
-                        "witness_update_count": observed_update,
-                    }
-            if observed_update == 1 or len(descending) >= PHOTONS_RECOVERY_REPLAY_MAX_ROWS:
-                break
-            expected_update -= 1
-
-    if not descending or int(descending[0]["sequence"]) != source_update:
-        raise RuntimeError("PPB replay did not begin at the selected recovery source")
-    all_history = list(reversed(descending))
-    first_sequence = int(all_history[0]["sequence"])
-    for previous, current in zip(all_history, all_history[1:]):
-        if (
-            int(current["sequence"]) != int(previous["sequence"]) + 1
-            or int(current["lap_count"]) < int(previous["lap_count"])
-            or int(current["total_lap_gnss_ns"]) < int(previous["total_lap_gnss_ns"])
-        ):
-            raise RuntimeError("PPB replay forward chronology is invalid")
-
-    if int(all_history[0]["sequence"]) == 1:
-        all_history.insert(
-            0,
-            {"sequence": 0, "lap_count": 0, "total_lap_gnss_ns": 0},
-        )
-
-    current = all_history[-1]
-    if (
-        int(current["sequence"]) != source_update
-        or int(current["lap_count"]) != int(source["lap_count"])
-        or int(current["total_lap_gnss_ns"]) != int(source["total_lap_gnss_ns"])
-    ):
-        raise RuntimeError("PPB replay current endpoint does not match recovery source")
-
-    second_history = all_history[-PHOTONS_RECOVERY_SECOND_CAPACITY:]
-    minute_history_all: List[Dict[str, Any]] = []
-    last_key: Optional[int] = None
-    for endpoint in all_history:
-        sequence = int(endpoint["sequence"])
-        minute_key = 0 if sequence == 0 else ((sequence - 1) // 60) + 1
-        if minute_key != last_key:
-            minute_history_all.append(endpoint)
-            last_key = minute_key
-    minute_history = minute_history_all[-PHOTONS_RECOVERY_MINUTE_CAPACITY:]
-    verification = _verify_photons_ppb_replay(
-        source,
-        all_history=all_history,
-        second_history=second_history,
-        minute_history=minute_history,
-    )
-    prior_recovery_splice_witness = None
-    if isinstance(boundary, dict) and boundary.get("reason") == "DURABLE_UPDATE_GAP_OR_DUPLICATE":
-        expected = int(boundary.get("expected_update_count") or 0)
-        prior_recovery_splice_witness = copy.deepcopy(
-            committed_splice_witnesses.get(expected)
-        )
-    return {
-        "schema": "PHOTONS_PPB_RESTORE_V1",
-        "source_db_detail_id": source_id,
-        "source_reset_count": source_reset,
-        "source_update_count": source_update,
-        "rows_scanned": rows_scanned,
-        "boundary": boundary,
-        "first_sequence": first_sequence,
-        "prior_recovery_splice_witness": prior_recovery_splice_witness,
-        "history_truncated": first_sequence != 1,
-        "second_history": copy.deepcopy(second_history),
-        "minute_history": copy.deepcopy(minute_history),
-        "verification": verification,
-    }
-
 
 
 # ---------------------------------------------------------------------
@@ -4257,24 +3542,18 @@ def _perform_phase5_recovery() -> Dict[str, Any]:
         if report["staging_active"]:
             raise RuntimeError("Teensy PHOTONS recovery staging remains active")
 
-        replay: Optional[Dict[str, Any]] = None
-        replay_shadow_error: Optional[str] = None
         if source is not None:
-            try:
-                replay = _reconstruct_photons_ppb_history(source)
-            except Exception as exc:
-                # Phase 3 never reconstructs held-restore state from SQL. Replay is
-                # now an independent audit witness only, so its absence is visible
-                # but cannot erase a complete literal durable checkpoint.
-                replay_shadow_error = str(exc)
-                logging.exception(
-                    "⚠️ [photons/ppb-shadow] SQL replay audit unavailable; "
-                    "literal checkpoint authority is unchanged"
-                )
-
-        ppb_shadow = _prepare_ppb_checkpoint_shadow(source, replay)
-        if replay_shadow_error is not None:
-            ppb_shadow["sql_replay_error"] = replay_shadow_error
+            # Seed live Pi recovery custody from the exact literal image carried by
+            # the newest durable canonical row.  Historical SQL rows have no role
+            # in Better-Buckets resurrection or startup reconstruction.
+            canonical = _require_dict(source.get("canonical"), "recovery source canonical")
+            raw_checkpoint = _require_dict(
+                canonical.get("ppb_restore_checkpoint"),
+                "recovery source ppb_restore_checkpoint",
+            )
+            _restore_ppb_checkpoint_runtime(
+                raw_checkpoint, source_db_detail_id=int(source["db_detail_id"])
+            )
 
         classification = {
             "active_campaign": active_master["campaign"] if active_master else None,
@@ -4289,7 +3568,6 @@ def _perform_phase5_recovery() -> Dict[str, Any]:
             "damaged_rows_skipped": copy.deepcopy(skipped),
             "rows_scanned": rows_scanned,
             "teensy_publication_started": bool(report["publication_started"]),
-            "ppb_checkpoint_shadow": copy.deepcopy(ppb_shadow),
         }
         _recovery_status_set("CLASSIFIED", **classification)
 
@@ -4307,16 +3585,6 @@ def _perform_phase5_recovery() -> Dict[str, Any]:
                 rows_seen=total_detail_count,
             )
         literal_history = _literal_recovery_history_from_source(source)
-        # Re-seed the Pi runtime from the exact same durable image that is about
-        # to be staged into firmware, independent of SQL audit availability.
-        canonical = _require_dict(source.get("canonical"), "recovery source canonical")
-        raw_checkpoint = _require_dict(
-            canonical.get("ppb_restore_checkpoint"),
-            "recovery source ppb_restore_checkpoint",
-        )
-        _restore_ppb_checkpoint_runtime(
-            raw_checkpoint, source_db_detail_id=int(source["db_detail_id"])
-        )
         return _startup_held_restore(
             active_master=active_master,
             source=source,
@@ -5349,7 +4617,6 @@ def cmd_stop(_: Optional[dict]) -> dict:
     }
 
 
-
 def _pending_persist_campaign_names() -> set[str]:
     """Return campaign names already canonicalized but not yet persisted."""
     names: set[str] = set()
@@ -5794,7 +5061,6 @@ def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
             "campaigns": campaigns,
         },
     }
-
 
 
 def _stats_reset_campaign_identity(state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
