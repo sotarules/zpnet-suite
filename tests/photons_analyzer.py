@@ -177,7 +177,7 @@ class Row:
     ts: str
     sequence: int
     publish_count: int
-    pps_count: int
+    pps_count: Optional[int]
 
     reset_count: int
     update_count: int
@@ -208,7 +208,7 @@ class Row:
     fw_second_count: int
     fw_minute_count: int
     fw_last_minute_key: int
-    buckets: Dict[str, Tuple[float, int]]
+    buckets: Dict[str, Optional[Tuple[float, int]]]
     fw_proofs: Dict[str, Tuple[Endpoint, int, bool]]
 
     pi_recoverable: Optional[bool]
@@ -263,15 +263,6 @@ class Row:
                 return None
             return Endpoint.parse(fw.get(name), f"db_id={db_id}.fw.{name}")
 
-        buckets_obj = req_dict(stats.get("ppb_buckets"), f"db_id={db_id}.ppb_buckets")
-        buckets: Dict[str, Tuple[float, int]] = {}
-        for name in (*PPB_WINDOWS, "total"):
-            node = req_dict(buckets_obj.get(name), f"db_id={db_id}.ppb_buckets.{name}")
-            buckets[name] = (
-                req_float(node.get("ppb"), f"db_id={db_id}.ppb_buckets.{name}.ppb"),
-                req_int(node.get("sample_count"), f"db_id={db_id}.ppb_buckets.{name}.sample_count", 0),
-            )
-
         fw_proofs: Dict[str, Tuple[Endpoint, int, bool]] = {}
         for name in PPB_WINDOWS:
             node = req_dict(fw.get(name), f"db_id={db_id}.fw.{name}")
@@ -279,6 +270,34 @@ class Row:
             sample_count = req_int(node.get("sample_count"), f"db_id={db_id}.fw.{name}.sample_count", 0)
             anchor = Endpoint.parse(node.get("anchor"), f"db_id={db_id}.fw.{name}.anchor") if valid else Endpoint(0, 0, 0)
             fw_proofs[name] = (anchor, sample_count, valid)
+
+        buckets_obj = req_dict(stats.get("ppb_buckets"), f"db_id={db_id}.ppb_buckets")
+        buckets: Dict[str, Optional[Tuple[float, int]]] = {}
+        for name in PPB_WINDOWS:
+            node = buckets_obj.get(name)
+            proof_valid = fw_proofs[name][2]
+            if node is None:
+                if proof_valid:
+                    raise ValueError(
+                        f"db_id={db_id}.ppb_buckets.{name} absent while firmware proof is valid"
+                    )
+                buckets[name] = None
+                continue
+            node = req_dict(node, f"db_id={db_id}.ppb_buckets.{name}")
+            buckets[name] = (
+                req_float(node.get("ppb"), f"db_id={db_id}.ppb_buckets.{name}.ppb"),
+                req_int(node.get("sample_count"), f"db_id={db_id}.ppb_buckets.{name}.sample_count", 0),
+            )
+            if not proof_valid:
+                raise ValueError(
+                    f"db_id={db_id}.ppb_buckets.{name} published while firmware proof is invalid"
+                )
+
+        total_node = req_dict(buckets_obj.get("total"), f"db_id={db_id}.ppb_buckets.total")
+        buckets["total"] = (
+            req_float(total_node.get("ppb"), f"db_id={db_id}.ppb_buckets.total.ppb"),
+            req_int(total_node.get("sample_count"), f"db_id={db_id}.ppb_buckets.total.sample_count", 0),
+        )
 
         pi = root.get("ppb_restore_checkpoint")
         pi_recoverable: Optional[bool] = None
@@ -330,7 +349,7 @@ class Row:
             ts=ts,
             sequence=req_int(root.get("sequence"), f"db_id={db_id}.sequence", 1),
             publish_count=req_int(root.get("publish_count"), f"db_id={db_id}.publish_count", 0),
-            pps_count=req_int(root.get("pps_count"), f"db_id={db_id}.pps_count", 0),
+            pps_count=opt_int(root.get("pps_count")),
             reset_count=req_int(stats.get("reset_count"), f"db_id={db_id}.reset_count", 0),
             update_count=req_int(stats.get("update_count"), f"db_id={db_id}.update_count", 0),
             rolling_sequence=req_int(stats.get("rolling_ppb_current_sequence"), f"db_id={db_id}.rolling_sequence", 0),
@@ -416,6 +435,8 @@ class Audit:
 
     last_row: Optional[Row] = None
     last_campaign: Dict[str, Row] = field(default_factory=dict)
+    last_recovery_generation: Optional[int] = None
+    pending_recovery_generation: Optional[int] = None
 
     def proof(self, name: str, status: str) -> None:
         self.proofs.setdefault(name, Proof()).mark(status)
@@ -465,7 +486,9 @@ def check_row(audit: Audit, row: Row) -> None:
             audit.problem("mean_lap_total", row, f"mean={row.mean_lap_ns:.9f} expected={expected_mean:.9f}")
             failed = True
         total_ppb = (expected_mean / STANDARD_LAP_NS - 1.0) * 1.0e9
-        published_total, total_samples = row.buckets["total"]
+        total_bucket = row.buckets["total"]
+        assert total_bucket is not None
+        published_total, total_samples = total_bucket
         if total_samples != row.lap_count or not close(published_total, total_ppb, PPB_TOL):
             audit.problem("total_ppb", row, f"published={published_total:.9f}/{total_samples} expected={total_ppb:.9f}/{row.lap_count}")
             failed = True
@@ -479,10 +502,19 @@ def check_row(audit: Audit, row: Row) -> None:
 
     for name in PPB_WINDOWS:
         anchor, sample_count, valid = row.fw_proofs[name]
-        published, published_samples = row.buckets[name]
+        bucket = row.buckets[name]
         if not valid:
-            audit.proof("ppb_windows", "unavailable")
+            if bucket is not None:
+                audit.problem("ppb_value_without_valid_proof", row, f"{name} published while producer proof is invalid")
+                audit.proof("ppb_windows", "failed")
+            else:
+                audit.proof("ppb_windows", "unavailable")
             continue
+        if bucket is None:
+            audit.problem("ppb_value_missing_with_valid_proof", row, f"{name} producer proof is valid but bucket is absent")
+            audit.proof("ppb_windows", "failed")
+            continue
+        published, published_samples = bucket
         expected_samples = row.fw_current.lap_count - anchor.lap_count
         if sample_count != expected_samples or published_samples != sample_count:
             audit.problem("ppb_sample_count", row, f"{name} fw={sample_count} published={published_samples} endpoint={expected_samples}")
@@ -550,6 +582,115 @@ def check_row(audit: Audit, row: Row) -> None:
 
     audit.proof("row_internal", "failed" if failed else "passed")
 
+
+
+def check_recovery_testimony(audit: Audit, row: Row) -> None:
+    r = row.recovery
+    if not r or r.get("restored") is not True:
+        return
+
+    generation = opt_int(r.get("generation"))
+    if generation is None:
+        audit.problem("recovery_generation_missing", row, "restored=true without generation")
+        audit.proof("recovery_lineage", "failed")
+        return
+
+    source_sequence = opt_int(r.get("source_sequence"))
+    source_update = opt_int(r.get("source_update_count"))
+    source_reset = opt_int(r.get("source_reset_count"))
+    source_laps = opt_int(r.get("source_lap_count"))
+    source_total = opt_int(r.get("source_total_lap_gnss_ns"))
+
+    exact_n_plus_1 = (
+        source_sequence is not None
+        and source_update is not None
+        and source_reset is not None
+        and source_laps is not None
+        and source_total is not None
+        and row.sequence == source_sequence + 1
+        and row.update_count == source_update + 1
+        and row.reset_count == source_reset
+        and row.lap_count >= source_laps
+        and row.total_lap_gnss_ns >= source_total
+        and r.get("fresh_physical_ancestry") is True
+    )
+
+    committed = r.get("proof_committed") is True and r.get("proof_pending") is not True
+    pending = r.get("proof_pending") is True and r.get("proof_committed") is not True
+
+    # Recovery testimony persists on every later row. The first generation seen
+    # in a campaign is historical context unless this row is itself source N+1.
+    if audit.last_recovery_generation is None and not exact_n_plus_1:
+        audit.last_recovery_generation = generation
+        audit.event(
+            "recovery_context_preexisting",
+            row,
+            f"generation={generation} source_sequence={source_sequence} current_sequence={row.sequence}",
+        )
+        return
+
+    # A newly restored source N+1 row may be published before the recovery proof
+    # transaction commits. Follow the same generation until that proof commits.
+    if generation == audit.last_recovery_generation:
+        if audit.pending_recovery_generation != generation:
+            return
+        if committed:
+            audit.event(
+                "recovery_proof_committed",
+                row,
+                f"generation={generation} source_sequence={source_sequence} current_sequence={row.sequence}",
+            )
+            audit.proof("recovery_lineage", "passed")
+            audit.pending_recovery_generation = None
+        elif not pending:
+            audit.problem(
+                "recovery_proof_state",
+                row,
+                f"generation={generation} pending episode became contradictory: "
+                f"proof_pending={r.get('proof_pending')} proof_committed={r.get('proof_committed')}",
+            )
+            audit.proof("recovery_lineage", "failed")
+            audit.pending_recovery_generation = None
+        return
+
+    audit.last_recovery_generation = generation
+
+    if exact_n_plus_1:
+        if committed:
+            audit.event(
+                "recovery_exact_n_plus_1",
+                row,
+                f"generation={generation} source_sequence={source_sequence}->{row.sequence} "
+                f"source_update={source_update}->{row.update_count} proof=committed",
+            )
+            audit.proof("recovery_lineage", "passed")
+            return
+        if pending:
+            audit.event(
+                "recovery_exact_n_plus_1",
+                row,
+                f"generation={generation} source_sequence={source_sequence}->{row.sequence} "
+                f"source_update={source_update}->{row.update_count} proof=pending",
+            )
+            audit.proof("recovery_lineage", "bounded")
+            audit.pending_recovery_generation = generation
+            return
+        audit.problem(
+            "recovery_proof_state",
+            row,
+            f"generation={generation} exact N+1 ancestry but proof_pending={r.get('proof_pending')} "
+            f"proof_committed={r.get('proof_committed')}",
+        )
+        audit.proof("recovery_lineage", "failed")
+        return
+
+    audit.problem(
+        "recovery_ancestry",
+        row,
+        f"new generation={generation} source seq/update/reset={source_sequence}/{source_update}/{source_reset} "
+        f"current={row.sequence}/{row.update_count}/{row.reset_count}",
+    )
+    audit.proof("recovery_lineage", "failed")
 
 def classify(prev: Row, cur: Row) -> str:
     if cur.reset_count > prev.reset_count:
@@ -632,8 +773,9 @@ def check_adjacent(audit: Audit, prev: Row, cur: Row) -> str:
         if source_total is None or cur.total_lap_gnss_ns < source_total:
             audit.problem("recovery_total", cur, f"source={source_total} current={cur.total_lap_gnss_ns}")
             failed = True
-        audit.event("proved_recovery", cur, f"generation={r.get('generation')} source_update={source_update} current_update={cur.update_count}")
-        audit.proof("recovery_lineage", "failed" if failed else "passed")
+        audit.event("proved_recovery_boundary", cur, f"generation={r.get('generation')} source_update={source_update} current_update={cur.update_count}")
+        if failed:
+            audit.proof("recovery_lineage", "failed")
 
     elif boundary == "PHYSICAL_REBOOT_NEW_EPOCH":
         audit.event("physical_reboot_new_epoch", cur, f"update_count={cur.update_count}")
@@ -682,6 +824,7 @@ def process(audit: Audit, row: Row) -> None:
         audit.campaigns[row.campaign] += 1
 
     check_row(audit, row)
+    check_recovery_testimony(audit, row)
     boundary = None
     if audit.last_row is not None:
         boundary = check_adjacent(audit, audit.last_row, row)
