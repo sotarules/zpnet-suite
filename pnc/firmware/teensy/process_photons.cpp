@@ -1071,7 +1071,14 @@ static photons_fragment_campaign_snapshot_t photons_campaign_snapshot(
   safeCopy(out.campaign, sizeof(out.campaign), g_photons_campaign_name);
   out.start_after_sequence = g_photons_campaign_start_after_sequence;
   out.stop_after_sequence = out.final ? fragment_sequence : 0U;
-  out.public_count = g_photons_campaign_public_count + 1U;
+
+  // Campaign identity belongs to the physical PHOTONS row, not to transport
+  // success.  A PUBSUB rejection must therefore leave a visible hole in public
+  // campaign identity instead of compressing the next successful row backward.
+  // START commits start_after_sequence only after a successfully published
+  // private boundary, so every later physical row has one exact ordinal.
+  out.public_count =
+      fragment_sequence - g_photons_campaign_start_after_sequence;
   out.lap_count =
       g_photons_custody_lap_count - g_photons_campaign_origin_lap_count;
   out.total_lap_gnss_ns =
@@ -1105,12 +1112,19 @@ static void photons_campaign_commit_after_publish(
         g_photons_campaign_state != photons_campaign_state_t::FLASH_CUT_PENDING) {
       __builtin_trap();
     }
-    if (fragment.campaign.public_count !=
-        g_photons_campaign_public_count + 1U ||
+    const uint32_t expected_public_count =
+        fragment.sequence - g_photons_campaign_start_after_sequence;
+    if (fragment.campaign.start_after_sequence !=
+            g_photons_campaign_start_after_sequence ||
+        fragment.campaign.public_count != expected_public_count ||
+        fragment.campaign.public_count <= g_photons_campaign_public_count ||
         strcmp(fragment.campaign.campaign, g_photons_campaign_name) != 0) {
       __builtin_trap();
     }
 
+    // This stores the last successfully transported campaign identity.  It may
+    // jump by more than one after a rejected publication; that jump is custody
+    // evidence and must never be renumbered away.
     g_photons_campaign_public_count = fragment.campaign.public_count;
 
     if (fragment.campaign.final) {
@@ -3727,6 +3741,8 @@ static FLASHMEM Payload cmd_recovery_commit(const Payload& args) {
         !photons_recovery_get_u32(
             args, "campaign_public_count", campaign_public_count) ||
         campaign_public_count == 0U ||
+        campaign_public_count !=
+            source_sequence - campaign_start_after_sequence ||
         !photons_recovery_get_u64(
             args, "campaign_lap_count", campaign_lap_count) ||
         !photons_recovery_get_u64(

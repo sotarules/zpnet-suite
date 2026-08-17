@@ -3877,6 +3877,9 @@ def _campaign_public_decoration(window: Dict[str, Any]) -> Dict[str, Any]:
     restart_gap = window.get("restart_public_count_gap")
     if restart_gap is not None:
         out["restart_public_count_gap"] = int(restart_gap)
+    observation_gap = window.get("public_count_observation_gap")
+    if observation_gap is not None:
+        out["public_count_observation_gap"] = int(observation_gap)
     return out
 
 
@@ -3916,15 +3919,24 @@ def _campaign_decoration_from_firmware(
 
         previous_public_count = int(window.get("firmware_public_count") or 0)
         splice_pending = bool(window.get("restart_public_count_splice_pending"))
-        if public_count != previous_public_count + 1:
-            if not splice_pending or public_count <= previous_public_count:
-                raise ValueError(
-                    "PHOTONS campaign public-count discontinuity: "
-                    f"previous={previous_public_count} current={public_count} campaign={name!r}"
-                )
-            window["restart_public_count_gap"] = (
-                public_count - previous_public_count - 1
+        if public_count <= previous_public_count:
+            raise ValueError(
+                "PHOTONS campaign public-count failed to advance: "
+                f"previous={previous_public_count} current={public_count} campaign={name!r}"
             )
+
+        public_gap = public_count - previous_public_count - 1
+        window.pop("public_count_observation_gap", None)
+        if public_gap > 0:
+            if splice_pending:
+                window["restart_public_count_gap"] = public_gap
+            else:
+                # The firmware boundary court already proved public_count ==
+                # sequence-start_after_sequence.  A forward jump therefore means
+                # Pi did not receive one or more physical campaign rows; preserve
+                # that missing testimony as an explicit observation gap instead of
+                # rejecting every descendant forever.
+                window["public_count_observation_gap"] = public_gap
         if splice_pending:
             window.pop("restart_public_count_splice_pending", None)
         window["firmware_public_count"] = public_count
@@ -3939,6 +3951,7 @@ def _campaign_decoration_from_firmware(
         out["public_count"] = public_count
         out["final"] = final
         out["stats"] = copy.deepcopy(firmware_campaign.get("stats") or {})
+        window.pop("public_count_observation_gap", None)
 
         if final:
             closing_id = int(window["campaign_id"])
