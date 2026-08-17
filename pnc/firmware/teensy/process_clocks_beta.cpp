@@ -938,6 +938,8 @@ static bool clocks_recovery_state_from_args(
 }
 
 
+static FLASHMEM Payload clocks_report_busy_response(const char* report);
+
 struct clocks_report_build_guard_t {
   uint32_t prior_basepri = 0U;
   uint32_t begin_dwt = 0U;
@@ -3507,6 +3509,23 @@ static bool recover_alpha_restore_required_now(void) {
 static bool recover_campaign_bootstrap_required_now(void) {
   return g_recover_last_campaign_bootstrap_required &&
          (request_recover || clocks_campaign_recovery_lifecycle_active());
+}
+
+static bool recover_restore_court_ready_now(void) {
+  // RESTORE_MONITOR may be accepted before startup SmartZero completes.  Its
+  // command handler already preserves an in-flight SmartZero acquisition and
+  // commits the structured restore only on the next completed PPS after the
+  // Alpha epoch becomes ready.  Report that control-plane admission fact
+  // separately from recover_epoch_ready, which continues to mean that an
+  // installed SmartZero-backed Alpha epoch exists right now.
+  return campaign_state == clocks_campaign_state_t::STOPPED &&
+         !request_start &&
+         !request_stop &&
+         !request_recover &&
+         !request_zero &&
+         !request_flash_cut &&
+         !g_clocks_restore_requested &&
+         !clocks_campaign_recovery_lifecycle_active();
 }
 
 static bool recover_lifecycle_prepare_cold_bootstrap(void) {
@@ -7856,6 +7875,120 @@ static bool clocks_ppb_restore_parse_endpoint(
   return true;
 }
 
+static void clocks_ppb_export_add_endpoint(
+    Payload& p,
+    const char* prefix,
+    const clocks_alpha_ppb_cumulative_endpoint_snapshot_t& endpoint) {
+  char key[80];
+  snprintf(key, sizeof(key), "%s_reference_ns", prefix);
+  p.add(key, endpoint.reference_ns);
+  snprintf(key, sizeof(key), "%s_dwt_error_cycles", prefix);
+  p.add(key, toFixedDecimal(endpoint.dwt_error_cycles, 9));
+  snprintf(key, sizeof(key), "%s_ocxo1_error_ns", prefix);
+  p.add(key, endpoint.ocxo1_error_ns);
+  snprintf(key, sizeof(key), "%s_ocxo2_error_ns", prefix);
+  p.add(key, endpoint.ocxo2_error_ns);
+  snprintf(key, sizeof(key), "%s_rolling_sequence", prefix);
+  p.add(key, endpoint.rolling_sequence);
+  snprintf(key, sizeof(key), "%s_interval_count", prefix);
+  p.add(key, endpoint.interval_count);
+}
+
+static FLASHMEM Payload cmd_ppb_export_meta(const Payload&) {
+  clocks_report_build_guard_t guard;
+  if (!guard.acquired) return clocks_report_busy_response("CLOCKS_PPB_EXPORT_META");
+
+  clocks_alpha_ppb_export_snapshot_t snapshot{};
+  if (!clocks_alpha_ppb_export_snapshot(&snapshot) || !snapshot.snapshot_ok) {
+    Payload err;
+    err.add("error", "Alpha Better-Buckets export snapshot unavailable");
+    err.add("status", "ppb_export_snapshot_unavailable");
+    return err;
+  }
+
+  Payload p;
+  p.add("status", "ppb_export_ready");
+  p.add("schema", "CLOCKS_PPB_FULL_RING_EXPORT_V1");
+  p.add("read_only", true);
+  p.add("reset_count", snapshot.reset_count);
+  p.add("update_count", snapshot.update_count);
+  p.add("current_sequence", snapshot.current_sequence);
+  p.add("second_count", snapshot.second_count);
+  p.add("minute_count", snapshot.minute_count);
+  p.add("second_oldest_sequence", snapshot.second_oldest_sequence);
+  p.add("second_newest_sequence", snapshot.second_newest_sequence);
+  p.add("minute_oldest_sequence", snapshot.minute_oldest_sequence);
+  p.add("minute_newest_sequence", snapshot.minute_newest_sequence);
+  p.add("last_minute_key", snapshot.last_minute_key);
+  p.add("origin_valid", snapshot.origin_valid);
+  p.add("chunk_max_endpoints", CLOCKS_PPB_RESTORE_CHUNK_MAX_ENDPOINTS);
+  clocks_ppb_export_add_endpoint(p, "current", snapshot.current);
+  if (snapshot.origin_valid) {
+    clocks_ppb_export_add_endpoint(p, "origin", snapshot.origin);
+  }
+  return p;
+}
+
+static FLASHMEM Payload cmd_ppb_export_chunk(const Payload& args) {
+  clocks_report_build_guard_t guard;
+  if (!guard.acquired) return clocks_report_busy_response("CLOCKS_PPB_EXPORT_CHUNK");
+
+  const char* history = args.getString("history");
+  uint32_t reset_count = 0U;
+  uint32_t before_sequence = 0U;
+  uint32_t count = 0U;
+  if (!history || !*history ||
+      !restore_get_u32(args, "reset_count", reset_count) ||
+      !restore_get_u32(args, "before_sequence", before_sequence) ||
+      !restore_get_u32(args, "count", count) ||
+      count == 0U || count > CLOCKS_PPB_RESTORE_CHUNK_MAX_ENDPOINTS) {
+    Payload err;
+    err.add("error", "invalid Better-Buckets export chunk header");
+    err.add("status", "ppb_export_chunk_rejected_header");
+    return err;
+  }
+
+  const bool seconds = strcmp(history, "SECOND") == 0;
+  const bool minutes = strcmp(history, "MINUTE") == 0;
+  if (!seconds && !minutes) {
+    Payload err;
+    err.add("error", "history must be SECOND or MINUTE");
+    err.add("status", "ppb_export_chunk_rejected_history");
+    return err;
+  }
+
+  clocks_alpha_ppb_export_snapshot_t meta{};
+  if (!clocks_alpha_ppb_export_snapshot(&meta) || !meta.snapshot_ok ||
+      meta.reset_count != reset_count) {
+    Payload err;
+    err.add("error", "Alpha Better-Buckets export reset identity changed");
+    err.add("status", "ppb_export_chunk_rejected_reset");
+    err.add("requested_reset_count", reset_count);
+    err.add("observed_reset_count", meta.reset_count);
+    return err;
+  }
+
+  clocks_alpha_ppb_cumulative_endpoint_snapshot_t endpoints[
+      CLOCKS_PPB_RESTORE_CHUNK_MAX_ENDPOINTS]{};
+  const uint32_t returned = clocks_alpha_ppb_export_chunk(
+      seconds, reset_count, before_sequence, endpoints, count);
+
+  // An empty page is a lawful end-of-history response. No endpoint is invented.
+  Payload p;
+  p.add("status", "ppb_export_chunk");
+  p.add("schema", "CLOCKS_PPB_FULL_RING_EXPORT_V1");
+  p.add("history", history);
+  p.add("reset_count", reset_count);
+  p.add("before_sequence", before_sequence);
+  p.add("count", returned);
+  for (uint32_t i = 0U; i < returned; ++i) {
+    char prefix[16];
+    snprintf(prefix, sizeof(prefix), "e%lu", (unsigned long)i);
+    clocks_ppb_export_add_endpoint(p, prefix, endpoints[i]);
+  }
+  return p;
+}
+
 static FLASHMEM Payload cmd_ppb_restore_begin(const Payload& args) {
   if (!clocks_ppb_restore_lifecycle_idle()) {
     Payload err;
@@ -8478,6 +8611,7 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
   p.add("recover_smartzero_complete", interrupt_smartzero_complete());
   p.add("recover_epoch_ready",
         clocks_alpha_installed_smartzero_backing_epoch());
+  p.add("restore_court_ready", recover_restore_court_ready_now());
   p.add("recover_command_custody_reset_count",
         g_recover_lifecycle_command_custody_reset_count);
   p.add("recover_interrupt_service_rearm_count",
@@ -8677,6 +8811,7 @@ static FLASHMEM Payload cmd_report_recovery(const Payload&) {
   p.add("recover_smartzero_running", interrupt_smartzero_running());
   p.add("recover_smartzero_complete", interrupt_smartzero_complete());
   p.add("recover_epoch_ready", clocks_alpha_installed_smartzero_backing_epoch());
+  p.add("restore_court_ready", recover_restore_court_ready_now());
   p.add("recover_interrupt_service_rearm_ok",
         g_recover_lifecycle_last_interrupt_service_rearm_ok);
   p.add("recover_interrupt_service_rearm_count",
@@ -8941,6 +9076,8 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "STOP",                cmd_stop                },
   { "ZERO",                cmd_zero                },
   { "RECOVER",             cmd_recover             },
+  { "PPB_EXPORT_META",     cmd_ppb_export_meta     },
+  { "PPB_EXPORT_CHUNK",    cmd_ppb_export_chunk    },
   { "PPB_RESTORE_BEGIN",   cmd_ppb_restore_begin   },
   { "PPB_RESTORE_CHUNK",   cmd_ppb_restore_chunk   },
   { "PPB_RESTORE_COMMIT",  cmd_ppb_restore_commit  },

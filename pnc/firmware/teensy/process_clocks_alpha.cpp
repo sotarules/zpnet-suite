@@ -2282,6 +2282,111 @@ alpha_ppb_endpoint_snapshot(const alpha_ppb_cumulative_endpoint_t& endpoint) {
   return out;
 }
 
+static uint32_t alpha_ppb_ring_oldest_sequence(
+    const alpha_ppb_cumulative_endpoint_t* ring,
+    size_t capacity,
+    size_t head,
+    size_t count) {
+  if (!ring || count == 0U) return 0U;
+  const size_t oldest = (head + capacity - count) % capacity;
+  return ring[oldest].rolling_sequence;
+}
+
+static uint32_t alpha_ppb_ring_newest_sequence(
+    const alpha_ppb_cumulative_endpoint_t* ring,
+    size_t capacity,
+    size_t head,
+    size_t count) {
+  if (!ring || count == 0U) return 0U;
+  const size_t newest = (head + capacity - 1U) % capacity;
+  return ring[newest].rolling_sequence;
+}
+
+bool clocks_alpha_ppb_export_snapshot(
+    clocks_alpha_ppb_export_snapshot_t* out) {
+  if (!out) return false;
+  *out = clocks_alpha_ppb_export_snapshot_t{};
+
+  for (int attempt = 0; attempt < 4; ++attempt) {
+    const uint32_t seq1 = g_instrument_stats_seq;
+    clocks_alpha_dmb();
+    if ((seq1 & 1U) != 0U || g_alpha_ppb_restore_staging) continue;
+
+    clocks_alpha_ppb_export_snapshot_t local{};
+    local.reset_count = g_instrument_stats_reset_count;
+    local.update_count = g_instrument_stats_update_count;
+    local.current_sequence = g_alpha_ppb_current.rolling_sequence;
+    local.second_count = (uint32_t)g_alpha_ppb_second_count;
+    local.minute_count = (uint32_t)g_alpha_ppb_minute_count;
+    local.second_oldest_sequence = alpha_ppb_ring_oldest_sequence(
+        g_alpha_ppb_seconds, ALPHA_PPB_SECOND_CAPACITY,
+        g_alpha_ppb_second_head, g_alpha_ppb_second_count);
+    local.second_newest_sequence = alpha_ppb_ring_newest_sequence(
+        g_alpha_ppb_seconds, ALPHA_PPB_SECOND_CAPACITY,
+        g_alpha_ppb_second_head, g_alpha_ppb_second_count);
+    local.minute_oldest_sequence = alpha_ppb_ring_oldest_sequence(
+        g_alpha_ppb_minutes, ALPHA_PPB_MINUTE_CAPACITY,
+        g_alpha_ppb_minute_head, g_alpha_ppb_minute_count);
+    local.minute_newest_sequence = alpha_ppb_ring_newest_sequence(
+        g_alpha_ppb_minutes, ALPHA_PPB_MINUTE_CAPACITY,
+        g_alpha_ppb_minute_head, g_alpha_ppb_minute_count);
+    local.last_minute_key = g_alpha_ppb_last_minute_key;
+    local.origin_valid = g_alpha_ppb_origin_valid;
+    local.current = alpha_ppb_endpoint_snapshot(g_alpha_ppb_current);
+    if (g_alpha_ppb_origin_valid) {
+      local.origin = alpha_ppb_endpoint_snapshot(g_alpha_ppb_origin);
+    }
+
+    clocks_alpha_dmb();
+    const uint32_t seq2 = g_instrument_stats_seq;
+    if (seq1 == seq2 && (seq2 & 1U) == 0U) {
+      local.snapshot_ok = true;
+      *out = local;
+      return true;
+    }
+  }
+  return false;
+}
+
+uint32_t clocks_alpha_ppb_export_chunk(
+    bool second_history,
+    uint32_t reset_count,
+    uint32_t before_sequence,
+    clocks_alpha_ppb_cumulative_endpoint_snapshot_t* out,
+    uint32_t capacity) {
+  if (!out || capacity == 0U) return 0U;
+
+  const uint32_t prior_basepri = alpha_ppb_restore_irq_save();
+  uint32_t written = 0U;
+  if (!g_alpha_ppb_restore_staging &&
+      reset_count == g_instrument_stats_reset_count) {
+    const alpha_ppb_cumulative_endpoint_t* ring =
+        second_history ? g_alpha_ppb_seconds : g_alpha_ppb_minutes;
+    const size_t ring_capacity =
+        second_history ? ALPHA_PPB_SECOND_CAPACITY : ALPHA_PPB_MINUTE_CAPACITY;
+    const size_t head =
+        second_history ? g_alpha_ppb_second_head : g_alpha_ppb_minute_head;
+    const size_t count =
+        second_history ? g_alpha_ppb_second_count : g_alpha_ppb_minute_count;
+
+    // Walk newest -> oldest.  before_sequence is an immutable cursor: rows
+    // appended after the caller's prior page are simply newer than the cursor
+    // and cannot perturb the page being requested.
+    for (size_t age = 0U; age < count && written < capacity; ++age) {
+      const size_t index =
+          (head + ring_capacity - 1U - age) % ring_capacity;
+      const alpha_ppb_cumulative_endpoint_t& endpoint = ring[index];
+      if (before_sequence != 0U &&
+          endpoint.rolling_sequence >= before_sequence) {
+        continue;
+      }
+      out[written++] = alpha_ppb_endpoint_snapshot(endpoint);
+    }
+  }
+  alpha_ppb_restore_irq_restore(prior_basepri);
+  return written;
+}
+
 static clocks_alpha_ppb_window_proof_snapshot_t alpha_ppb_window_proof(
     uint32_t window_seconds,
     bool exact_second_history) {

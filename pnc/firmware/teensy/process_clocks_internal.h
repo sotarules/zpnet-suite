@@ -1728,6 +1728,28 @@ struct clocks_alpha_ppb_restore_snapshot_t {
   clocks_alpha_ppb_cumulative_endpoint_snapshot_t origin{};
 };
 
+// Read-only full-ring custody export.  Unlike the 1 Hz checkpoint delta, this
+// surface lets a restarted Pi reacquire producer-authored endpoints that still
+// exist in surviving Alpha RAM.  Export never freezes or mutates Alpha.
+// Cursors are rolling-sequence identities, so concurrent newer appends cannot
+// turn an old endpoint into a different fact.
+struct clocks_alpha_ppb_export_snapshot_t {
+  bool snapshot_ok = false;
+  uint32_t reset_count = 0U;
+  uint32_t update_count = 0U;
+  uint32_t current_sequence = 0U;
+  uint32_t second_count = 0U;
+  uint32_t minute_count = 0U;
+  uint32_t second_oldest_sequence = 0U;
+  uint32_t second_newest_sequence = 0U;
+  uint32_t minute_oldest_sequence = 0U;
+  uint32_t minute_newest_sequence = 0U;
+  uint32_t last_minute_key = 0U;
+  bool origin_valid = false;
+  clocks_alpha_ppb_cumulative_endpoint_snapshot_t current{};
+  clocks_alpha_ppb_cumulative_endpoint_snapshot_t origin{};
+};
+
 uint32_t clocks_alpha_ppb_second_capacity(void);
 uint32_t clocks_alpha_ppb_minute_capacity(void);
 bool clocks_alpha_ppb_restore_begin(
@@ -1739,6 +1761,15 @@ bool clocks_alpha_ppb_restore_append_minute(
 bool clocks_alpha_ppb_restore_commit(uint32_t rolling_sequence);
 void clocks_alpha_ppb_restore_abort(void);
 bool clocks_alpha_ppb_restore_ready(uint32_t rolling_sequence);
+
+bool clocks_alpha_ppb_export_snapshot(
+    clocks_alpha_ppb_export_snapshot_t* out);
+uint32_t clocks_alpha_ppb_export_chunk(
+    bool second_history,
+    uint32_t reset_count,
+    uint32_t before_sequence,
+    clocks_alpha_ppb_cumulative_endpoint_snapshot_t* out,
+    uint32_t capacity);
 
 bool clocks_alpha_instrument_stats_snapshot(
     clocks_instrument_stats_snapshot_t* out);

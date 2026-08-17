@@ -537,6 +537,10 @@ _diag: Dict[str, Any] = {
     "ppb_checkpoint_epoch_rebases": 0,
     "ppb_checkpoint_seed_loaded": 0,
     "ppb_checkpoint_seed_missing": 0,
+    "ppb_checkpoint_live_refresh_attempts": 0,
+    "ppb_checkpoint_live_refresh_success": 0,
+    "ppb_checkpoint_live_refresh_failures": 0,
+    "last_ppb_checkpoint_live_refresh": {},
     "ppb_restore_transition_rows_discarded": 0,
     "last_ppb_restore_transition_row": {},
     "last_ppb_checkpoint": {},
@@ -5673,6 +5677,405 @@ def _stage_teensy_better_buckets_checkpoint(checkpoint: Dict[str, Any]) -> Dict[
         _ppb_restore_transaction_active.clear()
 
 
+def _ppb_export_endpoint_from_payload(payload: Dict[str, Any], prefix: str) -> Dict[str, Any]:
+    """Parse one producer-authored endpoint from the read-only Alpha export."""
+    required = (
+        "reference_ns",
+        "dwt_error_cycles",
+        "ocxo1_error_ns",
+        "ocxo2_error_ns",
+        "rolling_sequence",
+        "interval_count",
+    )
+    endpoint: Dict[str, Any] = {}
+    for field in required:
+        key = f"{prefix}_{field}"
+        if key not in payload:
+            raise RuntimeError(f"Better-Buckets export endpoint missing {key}")
+        value = payload[key]
+        try:
+            endpoint[field] = (
+                float(value) if field == "dwt_error_cycles" else int(value)
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Better-Buckets export endpoint has invalid {key}={value!r}"
+            ) from exc
+    return _ppb_endpoint_from_payload(
+        endpoint, path=f"ppb_export.{prefix}"
+    )
+
+
+def _fetch_teensy_ppb_export_meta() -> Dict[str, Any]:
+    response = send_command(
+        machine="TEENSY",
+        subsystem="CLOCKS",
+        command="PPB_EXPORT_META",
+        args={},
+    )
+    payload = response.get("payload") if isinstance(response, dict) else None
+    payload = payload if isinstance(payload, dict) else {}
+    if (
+        not isinstance(response, dict)
+        or not response.get("success")
+        or payload.get("status") != "ppb_export_ready"
+    ):
+        raise RuntimeError(f"Teensy Better-Buckets export META failed: {response!r}")
+
+    required_ints = (
+        "reset_count", "update_count", "current_sequence",
+        "second_count", "minute_count",
+        "second_oldest_sequence", "second_newest_sequence",
+        "minute_oldest_sequence", "minute_newest_sequence",
+        "last_minute_key",
+    )
+    meta = dict(payload)
+    for key in required_ints:
+        value = _as_int(payload.get(key))
+        if value is None or value < 0:
+            raise RuntimeError(
+                f"Teensy Better-Buckets export META has invalid {key}={payload.get(key)!r}"
+            )
+        meta[key] = int(value)
+    if meta["second_count"] > PPB_SECOND_CAPACITY:
+        raise RuntimeError("Teensy Better-Buckets export second_count exceeds Pi capacity")
+    if meta["minute_count"] > PPB_MINUTE_CAPACITY:
+        raise RuntimeError("Teensy Better-Buckets export minute_count exceeds Pi capacity")
+
+    meta["origin_valid"] = _recovery_bool(payload.get("origin_valid"))
+    meta["current"] = _ppb_export_endpoint_from_payload(payload, "current")
+    meta["origin"] = (
+        _ppb_export_endpoint_from_payload(payload, "origin")
+        if meta["origin_valid"]
+        else _ppb_zero_endpoint()
+    )
+    meta["chunk_max_endpoints"] = max(
+        1, min(
+            PPB_RESTORE_CHUNK_ENDPOINTS,
+            _as_int(payload.get("chunk_max_endpoints")) or 1,
+        )
+    )
+    if int(meta["current"]["rolling_sequence"]) != meta["current_sequence"]:
+        raise RuntimeError("Teensy Better-Buckets export current identity mismatch")
+    return meta
+
+
+def _fetch_teensy_ppb_export_page(
+    *,
+    history: str,
+    reset_count: int,
+    before_sequence: int,
+    count: int,
+) -> List[Dict[str, Any]]:
+    response = send_command(
+        machine="TEENSY",
+        subsystem="CLOCKS",
+        command="PPB_EXPORT_CHUNK",
+        args={
+            "history": history,
+            "reset_count": int(reset_count),
+            "before_sequence": int(before_sequence),
+            "count": int(count),
+        },
+    )
+    payload = response.get("payload") if isinstance(response, dict) else None
+    payload = payload if isinstance(payload, dict) else {}
+    if (
+        not isinstance(response, dict)
+        or not response.get("success")
+        or payload.get("status") != "ppb_export_chunk"
+    ):
+        raise RuntimeError(
+            f"Teensy Better-Buckets export {history} chunk failed: {response!r}"
+        )
+    returned = _as_int(payload.get("count"))
+    if returned is None or returned < 0 or returned > int(count):
+        raise RuntimeError("Teensy Better-Buckets export returned invalid chunk count")
+
+    out: List[Dict[str, Any]] = []
+    previous = int(before_sequence) if int(before_sequence) > 0 else None
+    for index in range(int(returned)):
+        endpoint = _ppb_export_endpoint_from_payload(payload, f"e{index}")
+        sequence = int(endpoint["rolling_sequence"])
+        if previous is not None and sequence >= previous:
+            raise RuntimeError(
+                "Teensy Better-Buckets export chunk is not strictly newest-to-oldest"
+            )
+        previous = sequence
+        out.append(endpoint)
+    return out
+
+
+def _ppb_export_collect_history(
+    *,
+    meta: Dict[str, Any],
+    history: str,
+    existing: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Return the exact producer ring named by one META snapshot.
+
+    Existing Pi endpoints seed the set, so a small observation gap normally
+    downloads only the missing historical suffix/prefix rather than all 601
+    seconds. Firmware pages by immutable rolling-sequence cursor; concurrent
+    newer appends cannot rewrite an endpoint already returned.
+    """
+    if history == "SECOND":
+        expected = int(meta["second_count"])
+        oldest = int(meta["second_oldest_sequence"])
+        newest = int(meta["second_newest_sequence"])
+    elif history == "MINUTE":
+        expected = int(meta["minute_count"])
+        oldest = int(meta["minute_oldest_sequence"])
+        newest = int(meta["minute_newest_sequence"])
+    else:
+        raise ValueError(f"unsupported Better-Buckets export history {history!r}")
+
+    if expected == 0:
+        if oldest != 0 or newest != 0:
+            raise RuntimeError(f"{history} export has empty count with nonempty bounds")
+        return []
+    if oldest <= 0 or newest < oldest:
+        raise RuntimeError(f"{history} export has invalid sequence bounds")
+
+    collected: Dict[int, Dict[str, Any]] = {}
+    for endpoint in existing:
+        sequence = _as_int(endpoint.get("rolling_sequence"))
+        if sequence is None or not (oldest <= sequence <= newest):
+            continue
+        prior = collected.get(sequence)
+        if prior is not None and not _ppb_endpoints_equal(prior, endpoint):
+            raise RuntimeError(f"{history} existing endpoint identity changed at {sequence}")
+        collected[sequence] = copy.deepcopy(endpoint)
+
+    before_sequence = 0
+    chunk_size = int(meta["chunk_max_endpoints"])
+    while len(collected) < expected:
+        page = _fetch_teensy_ppb_export_page(
+            history=history,
+            reset_count=int(meta["reset_count"]),
+            before_sequence=before_sequence,
+            count=chunk_size,
+        )
+        if not page:
+            break
+        for endpoint in page:
+            sequence = int(endpoint["rolling_sequence"])
+            if sequence < oldest:
+                continue
+            if sequence > newest:
+                raise RuntimeError(
+                    f"{history} export crossed snapshot newest boundary: {sequence}>{newest}"
+                )
+            prior = collected.get(sequence)
+            if prior is not None and not _ppb_endpoints_equal(prior, endpoint):
+                raise RuntimeError(
+                    f"{history} producer endpoint changed at rolling_sequence={sequence}"
+                )
+            collected[sequence] = copy.deepcopy(endpoint)
+        before_sequence = int(page[-1]["rolling_sequence"])
+        if before_sequence <= oldest:
+            break
+
+    ordered = [collected[key] for key in sorted(collected)]
+    if (
+        len(ordered) != expected
+        or int(ordered[0]["rolling_sequence"]) != oldest
+        or int(ordered[-1]["rolling_sequence"]) != newest
+    ):
+        raise RuntimeError(
+            f"{history} full-ring export incomplete for reset={meta['reset_count']} "
+            f"update={meta['update_count']}: got={len(ordered)} expected={expected} "
+            f"bounds={oldest}..{newest}"
+        )
+    return ordered
+
+
+def _refresh_ppb_checkpoint_from_surviving_alpha() -> Dict[str, Any]:
+    """Reacquire exact Better-Buckets rings from a proved surviving Alpha.
+
+    This is a read-only custody transfer.  It is invoked only after the existing
+    Alpha lineage court has independently proved survival.  The final install
+    occurs only when Pi's processed update_count exactly equals the firmware META
+    snapshot, so queued live rows continue naturally at N+1 after the lock opens.
+    """
+    _diag["ppb_checkpoint_live_refresh_attempts"] = (
+        _diag.get("ppb_checkpoint_live_refresh_attempts", 0) + 1
+    )
+    started = time.monotonic()
+    attempts = 0
+    learned_second_history: List[Dict[str, Any]] = []
+    learned_minute_history: List[Dict[str, Any]] = []
+    try:
+        while True:
+            attempts += 1
+            meta = _fetch_teensy_ppb_export_meta()
+
+            with _ppb_checkpoint_lock:
+                runtime = _ppb_checkpoint_runtime_ensure_locked()
+                runtime_snapshot = _ppb_checkpoint_snapshot_locked(runtime)
+
+            if runtime_snapshot.get("reset_count") not in (None, meta["reset_count"]):
+                raise RuntimeError(
+                    "surviving Alpha export reset_count disagrees with Pi checkpoint: "
+                    f"pi={runtime_snapshot.get('reset_count')} teensy={meta['reset_count']}"
+                )
+
+            second_history = _ppb_export_collect_history(
+                meta=meta,
+                history="SECOND",
+                existing=(
+                    list(runtime_snapshot.get("second_history") or [])
+                    + learned_second_history
+                ),
+            )
+            minute_history = _ppb_export_collect_history(
+                meta=meta,
+                history="MINUTE",
+                existing=(
+                    list(runtime_snapshot.get("minute_history") or [])
+                    + learned_minute_history
+                ),
+            )
+            learned_second_history = copy.deepcopy(second_history)
+            learned_minute_history = copy.deepcopy(minute_history)
+
+            # Export may span one or more live seconds. Re-read META and rendezvous
+            # only if the exact statistical identity is still the one we collected.
+            final_meta = _fetch_teensy_ppb_export_meta()
+            stable_meta = all(
+                final_meta.get(key) == meta.get(key)
+                for key in (
+                    "reset_count", "update_count", "current_sequence",
+                    "second_count", "minute_count",
+                    "second_oldest_sequence", "second_newest_sequence",
+                    "minute_oldest_sequence", "minute_newest_sequence",
+                    "last_minute_key", "origin_valid",
+                )
+            ) and _ppb_endpoints_equal(final_meta.get("current"), meta.get("current"))
+            if not stable_meta:
+                # Keep the endpoints already learned in Pi runtime as ordinary
+                # live custody and try the newer immutable window.
+                if attempts >= 12:
+                    raise RuntimeError(
+                        "surviving Alpha Better-Buckets export could not reach a stable META rendezvous"
+                    )
+                time.sleep(0.05)
+                continue
+
+            with _ppb_checkpoint_lock:
+                runtime = _ppb_checkpoint_runtime_ensure_locked()
+                live_snapshot = _ppb_checkpoint_snapshot_locked(runtime)
+                live_reset = live_snapshot.get("reset_count")
+                live_update = live_snapshot.get("update_count")
+
+                if live_reset != meta["reset_count"] or live_update != meta["update_count"]:
+                    if attempts >= 12:
+                        raise RuntimeError(
+                            "Pi Better-Buckets consumer did not rendezvous with Alpha export "
+                            f"(pi={live_reset}/{live_update} teensy="
+                            f"{meta['reset_count']}/{meta['update_count']})"
+                        )
+                    time.sleep(0.05)
+                    continue
+
+                # Current cumulative state must agree before historical custody is
+                # allowed to replace the incomplete Pi rings.
+                if (
+                    int(live_snapshot.get("current_sequence") or 0) !=
+                        int(meta["current_sequence"])
+                    or not _ppb_endpoints_equal(
+                        live_snapshot.get("current"), meta["current"]
+                    )
+                ):
+                    raise RuntimeError(
+                        "surviving Alpha export current endpoint disagrees with Pi live testimony"
+                    )
+
+                candidate = {
+                    "schema": PPB_PI_CHECKPOINT_SCHEMA,
+                    "source_schema": PPB_FIRMWARE_DELTA_SCHEMA,
+                    "valid": True,
+                    "recoverable": True,
+                    "status": "RECOVERABLE",
+                    "status_reason": "FULL_RING_REACQUIRED_FROM_SURVIVING_ALPHA",
+                    "reset_count": int(meta["reset_count"]),
+                    "update_count": int(meta["update_count"]),
+                    "rolling_sequence": int(meta["update_count"]),
+                    "current_sequence": int(meta["current_sequence"]),
+                    "last_minute_key": int(meta["last_minute_key"]),
+                    "origin_valid": bool(meta["origin_valid"]),
+                    "origin": copy.deepcopy(meta["origin"]),
+                    "current": copy.deepcopy(meta["current"]),
+                    "expected_second_count": int(meta["second_count"]),
+                    "expected_minute_count": int(meta["minute_count"]),
+                    "second_count": len(second_history),
+                    "minute_count": len(minute_history),
+                    "second_history": copy.deepcopy(second_history),
+                    "minute_history": copy.deepcopy(minute_history),
+                    "contiguous_from_update_count": int(meta["update_count"]),
+                    "gap_count": int(live_snapshot.get("gap_count") or 0),
+                    "last_gap": copy.deepcopy(live_snapshot.get("last_gap")),
+                    "seeded_from_durable": False,
+                    "seed_source_db_detail_id": None,
+                    "last_delta_signature": None,
+                    "proof_checks": 0,
+                }
+                normalized = _normalize_saved_ppb_checkpoint(candidate)
+                if not normalized.get("recoverable"):
+                    raise RuntimeError(
+                        "surviving Alpha full-ring export did not form a recoverable checkpoint"
+                    )
+
+                refreshed = _restore_ppb_checkpoint_runtime(
+                    normalized,
+                    source_db_detail_id=None,
+                )
+
+            result = {
+                "refreshed": True,
+                "basis": "TEENSY_ALPHA_FULL_RING_EXPORT",
+                "reset_count": int(meta["reset_count"]),
+                "update_count": int(meta["update_count"]),
+                "current_sequence": int(meta["current_sequence"]),
+                "second_count": len(second_history),
+                "minute_count": len(minute_history),
+                "attempts": int(attempts),
+                "waited_s": round(time.monotonic() - started, 3),
+                "prior_recoverable": bool(runtime_snapshot.get("recoverable")),
+                "prior_second_count": int(runtime_snapshot.get("second_count") or 0),
+                "prior_minute_count": int(runtime_snapshot.get("minute_count") or 0),
+                "gap_count": int(refreshed.get("gap_count") or 0),
+            }
+            _diag["ppb_checkpoint_live_refresh_success"] = (
+                _diag.get("ppb_checkpoint_live_refresh_success", 0) + 1
+            )
+            _diag["last_ppb_checkpoint_live_refresh"] = copy.deepcopy(result)
+            logging.info(
+                "📦 [clocks/ppb] surviving Alpha full-ring custody reacquired: "
+                "reset=%d update=%d second=%d/%d minute=%d/%d attempts=%d in %.3fs",
+                int(meta["reset_count"]),
+                int(meta["update_count"]),
+                len(second_history),
+                int(meta["second_count"]),
+                len(minute_history),
+                int(meta["minute_count"]),
+                int(attempts),
+                float(result["waited_s"]),
+            )
+            return result
+    except Exception as exc:
+        _diag["ppb_checkpoint_live_refresh_failures"] = (
+            _diag.get("ppb_checkpoint_live_refresh_failures", 0) + 1
+        )
+        _diag["last_ppb_checkpoint_live_refresh"] = {
+            "refreshed": False,
+            "error": str(exc),
+            "attempts": int(attempts),
+            "waited_s": round(time.monotonic() - started, 3),
+        }
+        raise
+
+
 def _probe_teensy_recovery_epoch() -> Tuple[bool, Dict[str, Any]]:
     """Return explicit Teensy epoch readiness together with its lifecycle testimony."""
     last_status: Dict[str, Any] = {}
@@ -6484,6 +6887,7 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
         basis: str,
     ) -> Dict[str, Any]:
         """Restore only Pi-owned custody when firmware proves Alpha survived."""
+        ppb_refresh = _refresh_ppb_checkpoint_from_surviving_alpha()
         pi_control = _dac_restore_control_from_clocks(clocks, realize=True)
         gnss_raw_result = _restore_gnss_raw_payload(gnss_raw)
         if not gnss_raw_result.get("restored"):
@@ -6504,6 +6908,7 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
             "teensy": copy.deepcopy(teensy_payload),
             "pi_control": pi_control,
             "gnss_raw": gnss_raw_result,
+            "better_buckets_live_refresh": ppb_refresh,
             "startup_custody": startup_custody,
             "proof": {
                 "proved": True,
@@ -6582,14 +6987,53 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
     restore_alpha_required = _recovery_bool(
         lifecycle_status.get("restore_alpha_required")
     )
+    recover_epoch_ready_present = "recover_epoch_ready" in lifecycle_status
     recover_epoch_ready = _recovery_bool(
         lifecycle_status.get("recover_epoch_ready")
     )
+    restore_court_ready_present = "restore_court_ready" in lifecycle_status
+    restore_court_ready = _recovery_bool(
+        lifecycle_status.get("restore_court_ready")
+    )
+
     alpha_lineage = _alpha_survival_lineage_court(
         clocks,
         startup_live_clocks,
         live_age_s=startup_live_age_s,
     )
+
+    # Receipt freshness is not producer-lifetime freshness. PUBSUB may lawfully
+    # deliver retained pre-flash CLOCKS rows immediately after a new Teensy comes
+    # online. If current firmware explicitly says its restore court is open but
+    # its Alpha epoch is not installed yet, a mature canonical row cannot prove
+    # current-lifetime Alpha survival regardless of how recently Pi received it.
+    #
+    # Keep the row as historical testimony; only withdraw its authority from this
+    # survival court. Once firmware reports recover_epoch_ready=true, ordinary
+    # canonical lineage proof resumes unchanged.
+    current_lifetime_pre_epoch = bool(
+        lifecycle_status
+        and restore_court_ready_present
+        and restore_court_ready
+        and recover_epoch_ready_present
+        and not recover_epoch_ready
+    )
+    if current_lifetime_pre_epoch:
+        reasons = list(alpha_lineage.get("reasons") or [])
+        reason = "canonical_live_not_current_lifetime_proven_pre_epoch"
+        if reason not in reasons:
+            reasons.append(reason)
+        alpha_lineage["reasons"] = reasons
+        alpha_lineage["proved"] = False
+        alpha_lineage["current_lifetime_eligible"] = False
+        alpha_lineage["current_lifetime_barrier"] = {
+            "restore_court_ready": True,
+            "recover_epoch_ready": False,
+            "basis": "TEENSY_REPORT_RECOVERY_CURRENT_LIFETIME_PRE_EPOCH",
+        }
+    else:
+        alpha_lineage["current_lifetime_eligible"] = True
+
     alpha_lineage_proved = bool(alpha_lineage.get("proved"))
 
     report_alpha_survived = bool(
@@ -6651,7 +7095,9 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
                 "instrument_statistics_preserved": alpha_preserved,
                 "restore_alpha_required_present": restore_alpha_present,
                 "restore_alpha_required": restore_alpha_required,
+                "restore_court_ready": restore_court_ready,
                 "recover_epoch_ready": recover_epoch_ready,
+                "current_lifetime_pre_epoch": current_lifetime_pre_epoch,
                 "alpha_lineage": alpha_lineage,
                 "surviving_alpha_eligible": report_alpha_survived,
                 "decline_reasons": report_decline_reasons,
@@ -11987,19 +12433,136 @@ def cmd_stats_reset(_: Optional[dict]) -> Dict[str, Any]:
 
 
 
+def _hard_failure_stats_repair_worker(
+    *,
+    state: Dict[str, Any],
+    confirmation: str,
+    repair_record: Dict[str, Any],
+) -> None:
+    """Execute the destructive repair after the operator command has returned."""
+    try:
+        # Everything already retained belongs to the poisoned/pre-repair epoch.
+        # Keep it as historical DB evidence where it already exists, but never
+        # let the in-memory startup prefix cross the destructive reset boundary.
+        retired = _retire_startup_clocks_custody(
+            "hard_failure_statistics_lineage_repair"
+        )
+        repair_record["startup_custody_retired"] = retired
+        repair_record["phase"] = "RESETTING_STATISTICS"
+        _diag["last_hard_failure_stats_repair"] = copy.deepcopy(repair_record)
+
+        # No stale holistic resurrection proof may share the one-row repair lane.
+        # The explicit RESET_CLOCK_STATISTICS confirmation is the authority to
+        # abandon that dead lineage. HARD_FAILURE itself remains latched.
+        with _clocks_state_mutation_gate_lock:
+            _clocks_holistic_restore_proof_pending.clear()
+            _clocks_holistic_restore_proof_committed.clear()
+            _startup_instrument_restore_hold.clear()
+
+        epoch = _establish_fresh_durable_stats_epoch(
+            source="CLOCKS.REPAIR_STATS_EPOCH",
+        )
+        new_reset_count = int(epoch["reset_count"])
+        repair_record["phase"] = "PROVING_DURABLE_ROW_1"
+        repair_record["new_reset_count"] = new_reset_count
+        repair_record["first_durable_update_count"] = 1
+        _diag["last_hard_failure_stats_repair"] = copy.deepcopy(repair_record)
+
+        # The epoch-birth event is set only after PostgreSQL commits row 1.
+        # Re-read that exact durable witness and make the population court prove
+        # that the repair created lawful restore ancestry.
+        with open_db(row_dict=True) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT id, payload
+                FROM campaign_detail
+                WHERE campaign_type = %s
+                  AND payload #>> '{schema}' = 'CLOCKS_V4'
+                  AND (payload #>> '{clocks,stats,reset_count}')::bigint = %s
+                  AND (payload #>> '{clocks,stats,update_count}')::bigint = 1
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (CAMPAIGN_TYPE_TEMPEST, new_reset_count),
+            )
+            row = cur.fetchone()
+
+        if row is None:
+            raise RuntimeError(
+                "fresh statistics epoch reported durable row 1 but PostgreSQL witness is missing"
+            )
+        durable = row["payload"]
+        if isinstance(durable, str):
+            durable = json.loads(durable)
+        if not isinstance(durable, dict):
+            raise RuntimeError("fresh statistics epoch row 1 payload is not an object")
+
+        durable_clocks = _clocks_payload(durable)
+        ancestry = _dac_restore_population_ancestry_court(durable_clocks)
+        if not ancestry.get("available") or not ancestry.get("valid"):
+            raise RuntimeError(
+                "fresh statistics epoch row 1 failed DAC/OCXO population ancestry court: "
+                f"{ancestry!r}"
+            )
+
+        repair_record.update({
+            "phase": "SUCCEEDED",
+            "completed_at_utc": datetime.now(timezone.utc)
+                .isoformat().replace("+00:00", "Z"),
+            "success": True,
+            "new_reset_count": new_reset_count,
+            "first_durable_update_count": 1,
+            "first_durable_detail_id": int(row["id"]),
+            "population_ancestry": copy.deepcopy(ancestry),
+            "stats_reset": copy.deepcopy(epoch.get("stats_reset") or {}),
+            "next_action": (
+                "Restart zpnet-clocks.service. HARD_FAILURE intentionally remains latched "
+                "in this process; the new row 1 is the clean future restore authority."
+            ),
+        })
+        _diag["hard_failure_stats_repair_success"] = (
+            _diag.get("hard_failure_stats_repair_success", 0) + 1
+        )
+        _diag["last_hard_failure_stats_repair"] = copy.deepcopy(repair_record)
+        logging.critical(
+            "🧯 [clocks] HARD_FAILURE statistics repair proved a clean durable epoch: "
+            "reset_count=%d detail_id=%d ancestry=%s. HARD_FAILURE remains latched; "
+            "restart CLOCKS to resume normal operation.",
+            new_reset_count,
+            int(row["id"]),
+            ancestry,
+        )
+    except Exception as exc:
+        repair_record.update({
+            "phase": "FAILED",
+            "completed_at_utc": datetime.now(timezone.utc)
+                .isoformat().replace("+00:00", "Z"),
+            "success": False,
+            "error": str(exc),
+        })
+        _diag["hard_failure_stats_repair_failures"] = (
+            _diag.get("hard_failure_stats_repair_failures", 0) + 1
+        )
+        _diag["last_hard_failure_stats_repair"] = copy.deepcopy(repair_record)
+        logging.exception(
+            "🛑 [clocks] HARD_FAILURE statistics repair failed; hold remains latched"
+        )
+    finally:
+        # Repair never turns this process back into an author. Close the
+        # exceptional data lane regardless of outcome and leave HARD_FAILURE
+        # latched until a normal operator restart re-enters the full courts.
+        _hard_failure_stats_repair_event.clear()
+        _clocks_persistence_enabled.clear()
+        _clocks_epoch_birth_pending.clear()
+
+
 def cmd_repair_stats_epoch(args: Optional[dict]) -> Dict[str, Any]:
-    """Start a new statistics epoch for one narrowly proved terminal lineage loss.
+    """Accept one explicit terminal-lineage repair and execute it asynchronously.
 
-    This is deliberately not a generic HARD_FAILURE escape hatch.  It is allowed
-    only when a court has proved either impossible DAC/OCXO population ancestry or
-    impossible Alpha resurrection from the literal durable Better-Buckets image.
-    The operator must explicitly confirm destruction of the current statistical
-    epoch.  CLOCKS then performs the ordinary transitive STATS_RESET and temporarily
-    reopens only the epoch-birth persistence lane until update_count=1 is durably
-    proved.
-
-    HARD_FAILURE remains latched after success.  The clean row becomes future
-    holistic-restore authority, and the operator restarts CLOCKS normally.
+    The command returns as soon as the narrowly scoped repair worker owns the
+    HARD_FAILURE repair lane. CLOCKS.REPORT exposes the authoritative progress
+    and terminal result under ``stats_epoch_repair``.
     """
     if not _hard_failure_active():
         return {
@@ -12039,9 +12602,13 @@ def cmd_repair_stats_epoch(args: Optional[dict]) -> Dict[str, Any]:
 
     with _hard_failure_stats_repair_lock:
         if _hard_failure_stats_repair_active():
+            current = copy.deepcopy(
+                _diag.get("last_hard_failure_stats_repair") or {}
+            )
             return {
-                "success": False,
+                "success": True,
                 "message": "REPAIR_STATS_EPOCH is already in progress",
+                "payload": current,
             }
         if _auto_recovery_in_progress or _timebase_silence_recovery_active:
             return {
@@ -12054,134 +12621,61 @@ def cmd_repair_stats_epoch(args: Optional[dict]) -> Dict[str, Any]:
             _diag.get("hard_failure_stats_repair_requests", 0) + 1
         )
         repair_record: Dict[str, Any] = {
-            "schema": "PI_CLOCKS_HARD_FAILURE_STATS_REPAIR_V1",
+            "schema": "PI_CLOCKS_HARD_FAILURE_STATS_REPAIR_V2",
             "requested_at_utc": requested_at,
             "hard_failure_reason": failure_reason,
             "hard_failure_entered_at_utc": state.get("entered_at_utc"),
             "confirmation": confirmation,
-            "success": False,
+            "phase": "IN_PROGRESS",
+            "success": None,
             "hard_failure_remains_latched": True,
             "restart_required": True,
+            "next_action": (
+                "Wait for stats_epoch_repair.phase=SUCCEEDED in CLOCKS.REPORT, "
+                "then restart zpnet-clocks.service."
+            ),
         }
         _diag["last_hard_failure_stats_repair"] = copy.deepcopy(repair_record)
 
-        # Everything already retained belongs to the poisoned/pre-repair epoch.
-        # Keep it as historical DB evidence where it already exists, but never
-        # let the in-memory startup prefix cross the destructive reset boundary.
-        retired = _retire_startup_clocks_custody(
-            "hard_failure_statistics_lineage_repair"
-        )
-        repair_record["startup_custody_retired"] = retired
-
-        # No stale holistic resurrection proof may share the one-row repair lane.
-        # A failed cold-start resurrection can also leave the pre-mutation newborn
-        # hold armed.  The explicit RESET_CLOCK_STATISTICS confirmation is the
-        # authority to abandon that dead lineage, so release the hold atomically
-        # before opening the exceptional repair data plane.  HARD_FAILURE itself
-        # remains latched, therefore no ordinary authorship is opened here.
-        with _clocks_state_mutation_gate_lock:
-            _clocks_holistic_restore_proof_pending.clear()
-            _clocks_holistic_restore_proof_committed.clear()
-            _startup_instrument_restore_hold.clear()
-            _hard_failure_stats_repair_event.set()
-
+        # Set ownership before starting the worker so a second command cannot race
+        # between thread creation and the first worker instruction.
+        _hard_failure_stats_repair_event.set()
         try:
-            epoch = _establish_fresh_durable_stats_epoch(
-                source="CLOCKS.REPAIR_STATS_EPOCH",
-            )
-            new_reset_count = int(epoch["reset_count"])
-
-            # The epoch-birth event is set only after PostgreSQL commits row 1.
-            # Re-read that exact durable witness and make the population court
-            # prove that the repair created lawful restore ancestry.
-            with open_db(row_dict=True) as conn:
-                cur = conn.cursor()
-                cur.execute(
-                    """
-                    SELECT id, payload
-                    FROM campaign_detail
-                    WHERE campaign_type = %s
-                      AND payload #>> '{schema}' = 'CLOCKS_V4'
-                      AND (payload #>> '{clocks,stats,reset_count}')::bigint = %s
-                      AND (payload #>> '{clocks,stats,update_count}')::bigint = 1
-                    ORDER BY id DESC
-                    LIMIT 1
-                    """,
-                    (CAMPAIGN_TYPE_TEMPEST, new_reset_count),
-                )
-                row = cur.fetchone()
-
-            if row is None:
-                raise RuntimeError(
-                    "fresh statistics epoch reported durable row 1 but PostgreSQL witness is missing"
-                )
-            durable = row["payload"]
-            if isinstance(durable, str):
-                durable = json.loads(durable)
-            if not isinstance(durable, dict):
-                raise RuntimeError("fresh statistics epoch row 1 payload is not an object")
-
-            durable_clocks = _clocks_payload(durable)
-            ancestry = _dac_restore_population_ancestry_court(durable_clocks)
-            if not ancestry.get("available") or not ancestry.get("valid"):
-                raise RuntimeError(
-                    "fresh statistics epoch row 1 failed DAC/OCXO population ancestry court: "
-                    f"{ancestry!r}"
-                )
-
-            repair_record.update({
-                "completed_at_utc": datetime.now(timezone.utc)
-                    .isoformat().replace("+00:00", "Z"),
-                "success": True,
-                "new_reset_count": new_reset_count,
-                "first_durable_update_count": 1,
-                "first_durable_detail_id": int(row["id"]),
-                "population_ancestry": copy.deepcopy(ancestry),
-                "stats_reset": copy.deepcopy(epoch.get("stats_reset") or {}),
-                "next_action": (
-                    "Restart zpnet-clocks.service. HARD_FAILURE intentionally remains latched "
-                    "in this process; the new row 1 is the clean future restore authority."
-                ),
-            })
-            _diag["hard_failure_stats_repair_success"] = (
-                _diag.get("hard_failure_stats_repair_success", 0) + 1
-            )
-            _diag["last_hard_failure_stats_repair"] = copy.deepcopy(repair_record)
-            logging.critical(
-                "🧯 [clocks] HARD_FAILURE statistics repair proved a clean durable epoch: "
-                "reset_count=%d detail_id=%d ancestry=%s. HARD_FAILURE remains latched; "
-                "restart CLOCKS to resume normal operation.",
-                new_reset_count,
-                int(row["id"]),
-                ancestry,
-            )
-            return {"success": True, "message": "OK", "payload": repair_record}
+            threading.Thread(
+                target=_hard_failure_stats_repair_worker,
+                kwargs={
+                    "state": copy.deepcopy(state),
+                    "confirmation": confirmation,
+                    "repair_record": repair_record,
+                },
+                daemon=True,
+                name="clocks-hard-failure-stats-repair",
+            ).start()
         except Exception as exc:
+            _hard_failure_stats_repair_event.clear()
             repair_record.update({
+                "phase": "FAILED_TO_START",
+                "success": False,
                 "completed_at_utc": datetime.now(timezone.utc)
                     .isoformat().replace("+00:00", "Z"),
-                "success": False,
                 "error": str(exc),
             })
             _diag["hard_failure_stats_repair_failures"] = (
                 _diag.get("hard_failure_stats_repair_failures", 0) + 1
             )
             _diag["last_hard_failure_stats_repair"] = copy.deepcopy(repair_record)
-            logging.exception(
-                "🛑 [clocks] HARD_FAILURE statistics repair failed; hold remains latched"
-            )
             return {
                 "success": False,
-                "message": f"REPAIR_STATS_EPOCH failed: {exc}",
+                "message": f"REPAIR_STATS_EPOCH could not start repair worker: {exc}",
                 "payload": repair_record,
             }
-        finally:
-            # Repair never turns this process back into an author.  Close the
-            # exceptional data lane regardless of success and leave HARD_FAILURE
-            # latched until a normal operator restart re-enters the full courts.
-            _hard_failure_stats_repair_event.clear()
-            _clocks_persistence_enabled.clear()
-            _clocks_epoch_birth_pending.clear()
+
+    return {
+        "success": True,
+        "message": "REPAIR_STATS_EPOCH accepted; repair is running",
+        "payload": copy.deepcopy(repair_record),
+    }
+
 
 
 def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
@@ -12203,6 +12697,9 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
                 "integrity_contract": contract,
                 "startup": _start_status_payload(),
                 "operational_state": _operational_state_snapshot(),
+                "stats_epoch_repair": copy.deepcopy(
+                    _diag.get("last_hard_failure_stats_repair") or {}
+                ),
             },
         }
 
@@ -12212,6 +12709,9 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
     payload["integrity_contract"] = contract
     payload["startup"] = _start_status_payload()
     payload["operational_state"] = _operational_state_snapshot()
+    payload["stats_epoch_repair"] = copy.deepcopy(
+        _diag.get("last_hard_failure_stats_repair") or {}
+    )
     return {"success": True, "message": "OK", "payload": payload}
 
 
@@ -13663,6 +14163,67 @@ def _check_feature_preflight(context: str) -> tuple[bool, list[str]]:
     return True, []
 
 
+def _startup_restore_court_ready() -> Optional[Dict[str, Any]]:
+    """Return explicit firmware testimony allowing startup to enter restore early.
+
+    A Pi-only restart must still wait for a fresh canonical CLOCKS row so Alpha
+    survival can be proved independently. A post-flash Teensy can explicitly
+    prove the opposite condition before its first public CLOCKS row: PostgreSQL
+    still owns an active campaign while REPORT_RECOVERY says firmware has no live
+    campaign and the restore court may accept RESTORE_MONITOR. That is sufficient
+    to enter the existing holistic restore court immediately; it bypasses no
+    restore proof and does not require SmartZero/Alpha epoch completion first.
+    """
+    active_campaign = _get_active_campaign()
+    if active_campaign is None:
+        return None
+
+    status = _fetch_teensy_recovery_status()
+    if not status:
+        return None
+
+    firmware_campaign = str(status.get("campaign") or "").strip()
+    firmware_state = str(status.get("campaign_state") or "").strip().upper()
+    restore_court_ready = _recovery_bool(status.get("restore_court_ready"))
+    recovery_active = bool(
+        _recovery_bool(status.get("recover_lifecycle_active"))
+        or _recovery_bool(status.get("recover_cold_bootstrap_active"))
+        or _recovery_bool(status.get("recover_campaign_bootstrap_active"))
+        or _recovery_bool(status.get("recover_reattach_active"))
+    )
+
+    if (
+        not firmware_campaign
+        and firmware_state in {"", "STOPPED", "IDLE", "NONE"}
+        and restore_court_ready
+        and not recovery_active
+    ):
+        return {
+            "basis": "TEENSY_REPORT_RECOVERY_RESTORE_COURT_READY",
+            "pi_active_campaign": str(active_campaign.get("campaign") or ""),
+            "firmware_campaign": None,
+            "firmware_campaign_state": firmware_state or None,
+            "restore_court_ready": True,
+            "recover_epoch_ready": _recovery_bool(
+                status.get("recover_epoch_ready")
+            ),
+        }
+    return None
+
+
+def _preflight_wait_is_expected_clocks_absence(pending: list[str]) -> bool:
+    """True when startup is waiting only for the Teensy CLOCKS producer to exist."""
+    if not pending:
+        return False
+    prefixes = (
+        f"{FEATURE_PREFLIGHT_PROFILE}: CLOCKS feature tree unavailable "
+        "(CLOCKS heartbeat not yet received",
+        f"{FEATURE_PREFLIGHT_PROFILE}: CLOCKS feature tree unavailable "
+        "(CLOCKS heartbeat stale",
+    )
+    return all(any(item.startswith(prefix) for prefix in prefixes) for item in pending)
+
+
 def _preflight_wait_items(reasons: list[str]) -> list[str]:
     """Return a compact, stable list of pending CLOCKS prerequisites."""
     items: list[str] = []
@@ -13722,64 +14283,81 @@ def _check_preflight(
     if not feature_ready:
         reasons.extend(feature_reasons)
 
+    # If the canonical CLOCKS heartbeat itself is unavailable or stale, its
+    # SYSTEM/GNSS decoration is not current testimony. Do not reinterpret absent
+    # decoration as physical GF-8802 weakness; the feature-tree reason above is
+    # the complete blocker until a fresh producer row exists.
+    canonical_clocks_available = not any(
+        reason.startswith(
+            f"{FEATURE_PREFLIGHT_PROFILE}: CLOCKS feature tree unavailable"
+        )
+        for reason in feature_reasons
+    )
+
     # -----------------------------------------------------------------
     # 1. GNSS state carried by the canonical CLOCKS snapshot
     # -----------------------------------------------------------------
-    try:
-        with _clocks_lock:
-            latest = copy.deepcopy(_latest_clocks)
-        gnss = latest.get("gnss") if isinstance(latest.get("gnss"), dict) else {}
-        if not gnss:
-            reasons.append(
-                "canonical CLOCKS live GNSS telemetry not yet populated from SYSTEM.REPORT"
-            )
-        else:
-            if not gnss.get("time_valid"):
-                reasons.append("GNSS time not valid (no satellite time/date)")
-            lock_quality = str(gnss.get("lock_quality") or "WEAK").upper()
-            if lock_quality == "WEAK":
+    if canonical_clocks_available:
+        try:
+            with _clocks_lock:
+                latest = copy.deepcopy(_latest_clocks)
+            gnss = latest.get("gnss") if isinstance(latest.get("gnss"), dict) else {}
+            if not gnss:
                 reasons.append(
-                    f"GNSS lock quality is WEAK "
-                    f"(satellites={gnss.get('satellites', '?')}, "
-                    f"hdop={gnss.get('hdop', '?')})"
+                    "canonical CLOCKS live GNSS telemetry not yet populated from SYSTEM.REPORT"
                 )
-            if not gnss.get("pps_valid"):
-                reasons.append("GNSS PPS not valid (discipline loop not active)")
             else:
-                discipline = gnss.get("discipline", {})
-                freq_mode = (
-                    _as_int(discipline.get("freq_mode"))
-                    if isinstance(discipline, dict)
-                    else None
-                )
-                freq_mode_name = (
-                    str(discipline.get("freq_mode_name") or "UNKNOWN")
-                    if isinstance(discipline, dict)
-                    else "UNKNOWN"
-                )
-                if required_gnss_freq_mode is None:
-                    if freq_mode is None or freq_mode < 2:
+                if not gnss.get("time_valid"):
+                    reasons.append("GNSS time not valid (no satellite time/date)")
+                lock_quality = str(gnss.get("lock_quality") or "WEAK").upper()
+                if lock_quality == "WEAK":
+                    reasons.append(
+                        f"GNSS lock quality is WEAK "
+                        f"(satellites={gnss.get('satellites', '?')}, "
+                        f"hdop={gnss.get('hdop', '?')})"
+                    )
+                if not gnss.get("pps_valid"):
+                    reasons.append("GNSS PPS not valid (discipline loop not active)")
+                else:
+                    discipline = gnss.get("discipline", {})
+                    freq_mode = (
+                        _as_int(discipline.get("freq_mode"))
+                        if isinstance(discipline, dict)
+                        else None
+                    )
+                    freq_mode_name = (
+                        str(discipline.get("freq_mode_name") or "UNKNOWN")
+                        if isinstance(discipline, dict)
+                        else "UNKNOWN"
+                    )
+                    if required_gnss_freq_mode is None:
+                        if freq_mode is None or freq_mode < 2:
+                            reasons.append(
+                                f"GNSS discipline not locked "
+                                f"(freq_mode={freq_mode} '{freq_mode_name}', need at least COARSE_LOCK)"
+                            )
+                    elif freq_mode != int(required_gnss_freq_mode):
+                        required_name = required_gnss_freq_mode_name or str(required_gnss_freq_mode)
                         reasons.append(
-                            f"GNSS discipline not locked "
-                            f"(freq_mode={freq_mode} '{freq_mode_name}', need at least COARSE_LOCK)"
+                            f"GNSS discipline not ready for {context} "
+                            f"(freq_mode={freq_mode} '{freq_mode_name}', need {required_name})"
                         )
-                elif freq_mode != int(required_gnss_freq_mode):
-                    required_name = required_gnss_freq_mode_name or str(required_gnss_freq_mode)
-                    reasons.append(
-                        f"GNSS discipline not ready for {context} "
-                        f"(freq_mode={freq_mode} '{freq_mode_name}', need {required_name})"
-                    )
 
-            if required_receiver_mode is not None:
-                location = latest.get("location") if isinstance(latest.get("location"), dict) else {}
-                receiver_mode = str(location.get("receiver_mode") or "UNKNOWN").upper()
-                expected_mode = str(required_receiver_mode).upper()
-                if receiver_mode != expected_mode:
-                    reasons.append(
-                        f"GF-8802 receiver mode is {receiver_mode}; need {expected_mode} for {context}"
+                if required_receiver_mode is not None:
+                    location = (
+                        latest.get("location")
+                        if isinstance(latest.get("location"), dict)
+                        else {}
                     )
-    except Exception as e:
-        reasons.append(f"SYSTEM.REPORT GNSS preflight failed: {e}")
+                    receiver_mode = str(location.get("receiver_mode") or "UNKNOWN").upper()
+                    expected_mode = str(required_receiver_mode).upper()
+                    if receiver_mode != expected_mode:
+                        reasons.append(
+                            f"GF-8802 receiver mode is {receiver_mode}; "
+                            f"need {expected_mode} for {context}"
+                        )
+        except Exception as e:
+            reasons.append(f"SYSTEM.REPORT GNSS preflight failed: {e}")
 
     # -----------------------------------------------------------------
     # 4. Chrony PPS selected
@@ -13818,21 +14396,21 @@ def _check_preflight(
     ready = len(reasons) == 0
     return ready, reasons
 
-
 def _wait_for_preflight(
     context: str = "recovery",
     *,
     required_gnss_freq_mode: Optional[int] = None,
     required_gnss_freq_mode_name: Optional[str] = None,
     required_receiver_mode: Optional[str] = None,
+    allow_restore_court_entry: bool = False,
 ) -> None:
     """Wait quietly until the unified CLOCKS readiness profile is open.
 
-    Readiness is polled frequently so startup proceeds promptly.  The log is
+    Readiness is polled frequently so startup proceeds promptly. The log is
     intentionally sparse: no success line when the gate is immediately open.
-    After a logged wait, emit one admission summary; while blocked, emit only
-    one compact pending summary after the grace period, when the pending set
-    changes, or once per status interval.
+    A post-flash startup may enter the existing holistic restore court earlier
+    when firmware explicitly proves that the durable active campaign no longer
+    exists on Teensy and the recovery epoch is ready.
     """
     attempt = 0
     t0 = time.monotonic()
@@ -13841,6 +14419,19 @@ def _wait_for_preflight(
     logged_wait = False
 
     while True:
+        if allow_restore_court_entry:
+            restore_entry = _startup_restore_court_ready()
+            if restore_entry is not None:
+                _diag["last_preflight_wait"] = {
+                    "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "context": context,
+                    "status": "RESTORE_COURT",
+                    "checks": int(attempt),
+                    "waited_s": round(float(time.monotonic() - t0), 3),
+                    "restore_entry": copy.deepcopy(restore_entry),
+                }
+                return
+
         ready, reasons = _check_preflight(
             context,
             required_gnss_freq_mode=required_gnss_freq_mode,
@@ -13873,10 +14464,15 @@ def _wait_for_preflight(
         attempt += 1
         pending = _preflight_wait_items(reasons)
         signature = tuple(pending)
-        should_log = elapsed >= PREFLIGHT_QUIET_GRACE_S and (
-            not logged_wait
-            or signature != last_signature
-            or now - last_log_at >= PREFLIGHT_STATUS_LOG_INTERVAL_S
+        expected_clocks_absence = _preflight_wait_is_expected_clocks_absence(pending)
+        should_log = (
+            not expected_clocks_absence
+            and elapsed >= PREFLIGHT_QUIET_GRACE_S
+            and (
+                not logged_wait
+                or signature != last_signature
+                or now - last_log_at >= PREFLIGHT_STATUS_LOG_INTERVAL_S
+            )
         )
 
         _diag["last_preflight_wait"] = {
@@ -13886,6 +14482,7 @@ def _wait_for_preflight(
             "checks": int(attempt),
             "waited_s": round(float(elapsed), 3),
             "pending": pending,
+            "expected_clocks_absence": bool(expected_clocks_absence),
         }
 
         if should_log:
@@ -13904,9 +14501,6 @@ def _wait_for_preflight(
             last_signature = signature
 
         time.sleep(PREFLIGHT_POLL_INTERVAL_S)
-
-
-
 
 def cmd_delete(args: Optional[dict]) -> Dict[str, Any]:
     """Delete one stopped TEMPEST campaign and every associated detail."""
@@ -14599,6 +15193,7 @@ def run() -> None:
         required_gnss_freq_mode=STARTUP_REQUIRED_GNSS_FREQ_MODE,
         required_gnss_freq_mode_name="FINE_LOCK",
         required_receiver_mode=required_receiver_mode,
+        allow_restore_court_entry=True,
     )
 
     _set_operational_state(
