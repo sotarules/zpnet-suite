@@ -71,7 +71,7 @@ FIRMWARE_WELFORD_LANES = ("gnss", "dwt", "vclock", "ocxo1", "ocxo2", "pps_witnes
 PI_WELFORD_LANES = ("ocxo1_dac", "ocxo2_dac")
 ALL_WELFORD_LANES = FIRMWARE_WELFORD_LANES + PI_WELFORD_LANES
 
-DEFAULT_BATCH_SIZE = 32
+DEFAULT_BATCH_SIZE = 512
 DEFAULT_PAUSE_MS = 0
 MAX_EXAMPLES = 18
 
@@ -529,6 +529,8 @@ class PiCheckpoint:
     expected_minute_count: int
     second_history: Tuple[BetterEndpoint, ...]
     minute_history: Tuple[BetterEndpoint, ...]
+    second_history_count: int
+    minute_history_count: int
     contiguous_from_update_count: Optional[int]
     gap_count: int
     last_gap: Dict[str, Any]
@@ -577,31 +579,78 @@ class PiCheckpoint:
             arr = req_list(raw.get(name), f"{where}.{name}")
             if len(arr) > capacity:
                 raise ValueError(f"{where}.{name} exceeds capacity")
-            out: List[BetterEndpoint] = []
-            prev: Optional[BetterEndpoint] = None
+            if not arr:
+                return ()
+
+            # Full literal ring custody is already producer/Pi testimony carried
+            # in this row.  The analyzer only consumes history length and tail
+            # downstream, so validate chronology/monotonicity directly from raw
+            # scalars and instantiate only the final endpoint.  This preserves
+            # the same court while avoiding thousands of BetterEndpoint objects
+            # per mature CLOCKS row.
+            prev_sequence: Optional[int] = None
+            prev_reference_ns: Optional[int] = None
+            prev_interval_count: Optional[int] = None
             for idx, item in enumerate(arr):
-                ep = BetterEndpoint.parse(item, f"{where}.{name}[{idx}]")
-                if prev is not None:
-                    if ep.rolling_sequence <= prev.rolling_sequence:
+                node = req_dict(item, f"{where}.{name}[{idx}]")
+                rolling = req_int(
+                    node.get("rolling_sequence"),
+                    f"{where}.{name}[{idx}].rolling_sequence",
+                    minimum=0,
+                )
+                reference_ns = req_int(
+                    node.get("reference_ns"),
+                    f"{where}.{name}[{idx}].reference_ns",
+                    minimum=0,
+                )
+                interval_count = req_int(
+                    node.get("interval_count"),
+                    f"{where}.{name}[{idx}].interval_count",
+                    minimum=0,
+                )
+                # Validate the remaining scalar fields even though only the tail
+                # is materialized as a BetterEndpoint object.
+                req_float(
+                    node.get("dwt_error_cycles"),
+                    f"{where}.{name}[{idx}].dwt_error_cycles",
+                )
+                req_int(
+                    node.get("ocxo1_error_ns"),
+                    f"{where}.{name}[{idx}].ocxo1_error_ns",
+                )
+                req_int(
+                    node.get("ocxo2_error_ns"),
+                    f"{where}.{name}[{idx}].ocxo2_error_ns",
+                )
+
+                if prev_sequence is not None:
+                    if rolling <= prev_sequence:
                         raise ValueError(f"{where}.{name} is not chronological")
-                    if not ep.monotonic_after(prev):
+                    if reference_ns < prev_reference_ns or interval_count < prev_interval_count:
                         raise ValueError(f"{where}.{name} cumulative state regresses")
-                if ep.rolling_sequence > current_sequence:
+                if rolling > current_sequence:
                     raise ValueError(f"{where}.{name} extends past current")
-                out.append(ep)
-                prev = ep
-            return tuple(out)
+
+                prev_sequence = rolling
+                prev_reference_ns = reference_ns
+                prev_interval_count = interval_count
+
+            return (
+                BetterEndpoint.parse(arr[-1], f"{where}.{name}[{len(arr) - 1}]"),
+            )
 
         seconds = parse_history("second_history", PPB_SECOND_CAPACITY)
         minutes = parse_history("minute_history", PPB_MINUTE_CAPACITY)
-        if len(seconds) > expected_second or len(minutes) > expected_minute:
+        second_history_count = len(req_list(raw.get("second_history"), f"{where}.second_history"))
+        minute_history_count = len(req_list(raw.get("minute_history"), f"{where}.minute_history"))
+        if second_history_count > expected_second or minute_history_count > expected_minute:
             raise ValueError(f"{where}: literal history exceeds producer ring counts")
         if current_sequence > 0 and seconds and not seconds[-1].equal(current):
             raise ValueError(f"{where}: second history tail is not current")
 
         computed_recoverable = bool(
-            len(seconds) == expected_second
-            and len(minutes) == expected_minute
+            second_history_count == expected_second
+            and minute_history_count == expected_minute
             and (
                 (
                     current_sequence == 0
@@ -640,6 +689,8 @@ class PiCheckpoint:
             expected_minute_count=expected_minute,
             second_history=seconds,
             minute_history=minutes,
+            second_history_count=second_history_count,
+            minute_history_count=minute_history_count,
             contiguous_from_update_count=opt_int(raw.get("contiguous_from_update_count")),
             gap_count=req_int(raw.get("gap_count") or 0, f"{where}.gap_count", minimum=0),
             last_gap=d(raw.get("last_gap")),
@@ -962,6 +1013,14 @@ class RecoveryEpisode:
     lineage_status: str = "UNASSESSED"
 
 
+@dataclass(frozen=True)
+class GnssRawAuthority:
+    db_id: int
+    welford: Welford
+    clockface_n: int
+    ref_ns: int
+
+
 @dataclass
 class Audit:
     scope: str
@@ -1006,6 +1065,11 @@ class Audit:
 
     last_authoritative: Optional[Row] = None
     last_campaign_authoritative: Dict[str, Row] = field(default_factory=dict)
+    # Compact lookup for proving Pi-owned GNSS_RAW reinstatement.  A restart may
+    # temporarily expose a fresh process-local population before CLOCKS restores
+    # the durable Pi lineage.  Keep only the sufficient predecessor witness,
+    # never the full canonical Row/checkpoint payload.
+    gnss_raw_authoritative_by_n: Dict[int, "GnssRawAuthority"] = field(default_factory=dict)
 
     def note(self, bucket: str, message: str) -> None:
         examples = self.examples.setdefault(bucket, [])
@@ -1217,8 +1281,8 @@ def check_pi_checkpoint(audit: Audit, row: Row) -> None:
         audit.event(
             "pi_checkpoint_warming",
             row,
-            f"status={pi.status or '?'} second={len(pi.second_history)}/{pi.expected_second_count} "
-            f"minute={len(pi.minute_history)}/{pi.expected_minute_count} gaps={pi.gap_count}",
+            f"status={pi.status or '?'} second={pi.second_history_count}/{pi.expected_second_count} "
+            f"minute={pi.minute_history_count}/{pi.expected_minute_count} gaps={pi.gap_count}",
         )
 
 
@@ -1470,6 +1534,8 @@ def classify_boundary(prev: Row, cur: Row) -> str:
             return "PHYSICAL_REBOOT_ALPHA_N_PLUS_1"
         if cur.update_count > prev.update_count:
             return "PHYSICAL_REBOOT_ALPHA_CONTINUED"
+        if cur.update_count == 1 and cur.rolling_sequence in (0, 1):
+            return "PHYSICAL_REBOOT_NEWBORN_ALPHA"
         return "PHYSICAL_REBOOT_UNPROVED"
     if seq_delta == 0:
         return "PHYSICAL_SEQUENCE_REPEAT"
@@ -1614,6 +1680,24 @@ def check_adjacent_authoritative(audit: Audit, prev: Row, cur: Row) -> str:
         check_pi_owned_gap(audit, prev, cur)
         return boundary
 
+    if boundary == "PHYSICAL_REBOOT_NEWBORN_ALPHA":
+        audit.physical_rebases += 1
+        audit.event(
+            "physical_sequence_rebase",
+            cur,
+            f"sequence {prev.sequence}->{cur.sequence} stats {prev.reset_count}/{prev.update_count} "
+            f"->{cur.reset_count}/{cur.update_count}",
+        )
+        audit.event(
+            "alpha_lineage_newborn_after_reboot",
+            cur,
+            f"new physical lifetime began at update_count={cur.update_count} "
+            f"rolling_sequence={cur.rolling_sequence}; prior Alpha lineage ended rather than resurrected",
+        )
+        audit.proof("physical_lifetime", "passed")
+        audit.proof("alpha_statistics_lineage", "bounded")
+        return boundary
+
     if boundary in {"PHYSICAL_REBOOT_ALPHA_N_PLUS_1", "PHYSICAL_REBOOT_ALPHA_CONTINUED", "PHYSICAL_REBOOT_UNPROVED"}:
         audit.physical_rebases += 1
         audit.event(
@@ -1662,6 +1746,55 @@ def check_exact_one_row_statistics(audit: Audit, prev: Row, cur: Row) -> None:
         else:
             audit.problem("welford_population_jump", cur, f"{name} n {p.n}->{c.n} on adjacent physical row")
             audit.proof("firmware_welford_lineage", "failed")
+
+
+def welford_known_sample_matches(previous: Welford, current: Welford, sample: float) -> bool:
+    """Pure exact one-sample Welford recurrence test."""
+    if current.n != previous.n + 1:
+        return False
+    sample = float(sample)
+    expected_mean = previous.mean + (sample - previous.mean) / current.n
+    expected_m2 = previous.m2 + (sample - previous.mean) * (sample - expected_mean)
+    expected_min = sample if previous.n == 0 else min(previous.min_value, sample)
+    expected_max = sample if previous.n == 0 else max(previous.max_value, sample)
+    return bool(
+        close(current.mean, expected_mean, abs_tol=WELFORD_FLOAT_ABS_TOL, rel_tol=WELFORD_FLOAT_REL_TOL)
+        and close(
+            current.m2,
+            expected_m2,
+            abs_tol=max(WELFORD_FLOAT_ABS_TOL, abs(expected_m2) * 2.0e-12),
+            rel_tol=2.0e-12,
+        )
+        and close(current.min_value, expected_min, abs_tol=WELFORD_FLOAT_ABS_TOL, rel_tol=WELFORD_FLOAT_REL_TOL)
+        and close(current.max_value, expected_max, abs_tol=WELFORD_FLOAT_ABS_TOL, rel_tol=WELFORD_FLOAT_REL_TOL)
+    )
+
+
+def prove_gnss_raw_reinstatement(audit: Audit, cur: Row) -> Optional[GnssRawAuthority]:
+    """Return the earlier authoritative Pi witness proving an exact GNSS_RAW restore."""
+    if (
+        cur.gnss_raw_welford is None
+        or cur.gnss_raw_drift_ppb is None
+        or cur.gnss_raw_clockface_n is None
+        or cur.gnss_raw_ref_ns is None
+    ):
+        return None
+
+    source = audit.gnss_raw_authoritative_by_n.get(cur.gnss_raw_welford.n - 1)
+    if source is None:
+        return None
+
+    if cur.gnss_raw_clockface_n != source.clockface_n + 1:
+        return None
+    if cur.gnss_raw_ref_ns != source.ref_ns + NS_PER_SECOND:
+        return None
+    if not welford_known_sample_matches(
+        source.welford,
+        cur.gnss_raw_welford,
+        cur.gnss_raw_drift_ppb,
+    ):
+        return None
+    return source
 
 
 def check_pi_owned_one_row(audit: Audit, prev: Row, cur: Row) -> None:
@@ -1716,17 +1849,31 @@ def check_pi_owned_one_row(audit: Audit, prev: Row, cur: Row) -> None:
             else:
                 audit.proof("pi_gnss_raw_lineage", "failed")
         else:
-            audit.problem("gnss_raw_population_jump", cur, f"n {p.n}->{c.n} on adjacent physical row")
-            audit.proof("pi_gnss_raw_lineage", "failed")
+            reinstated_from = prove_gnss_raw_reinstatement(audit, cur)
+            if reinstated_from is not None:
+                audit.event(
+                    "gnss_raw_durable_reinstatement",
+                    cur,
+                    f"adjacent local n {p.n}->{c.n}; exact durable N+1 from "
+                    f"db_id={reinstated_from.db_id} n={reinstated_from.welford.n}->{c.n} "
+                    f"clockface_n={reinstated_from.clockface_n}->{cur.gnss_raw_clockface_n}",
+                )
+                audit.exact_gnss_raw_steps += 1
+                audit.proof("pi_gnss_raw_lineage", "passed")
+            else:
+                audit.problem("gnss_raw_population_jump", cur, f"n {p.n}->{c.n} on adjacent physical row")
+                audit.proof("pi_gnss_raw_lineage", "failed")
 
         if prev.gnss_raw_clockface_n is not None and cur.gnss_raw_clockface_n is not None:
             if cur.gnss_raw_clockface_n != prev.gnss_raw_clockface_n + 1:
-                audit.problem(
-                    "gnss_raw_clockface_chronology",
-                    cur,
-                    f"clockface_n {prev.gnss_raw_clockface_n}->{cur.gnss_raw_clockface_n}",
-                )
-                audit.proof("pi_gnss_raw_lineage", "failed")
+                reinstated_from = prove_gnss_raw_reinstatement(audit, cur)
+                if reinstated_from is None:
+                    audit.problem(
+                        "gnss_raw_clockface_chronology",
+                        cur,
+                        f"clockface_n {prev.gnss_raw_clockface_n}->{cur.gnss_raw_clockface_n}",
+                    )
+                    audit.proof("pi_gnss_raw_lineage", "failed")
 
 
 def check_pi_owned_gap(audit: Audit, prev: Row, cur: Row) -> None:
@@ -1786,8 +1933,8 @@ def check_resurrection_boundary(audit: Audit, source: Row, boundary: Row, kind: 
         audit.problem(
             "resurrection_checkpoint_unrecoverable",
             boundary,
-            f"status={boundary.pi_checkpoint.status} second={len(boundary.pi_checkpoint.second_history)}/"
-            f"{boundary.pi_checkpoint.expected_second_count} minute={len(boundary.pi_checkpoint.minute_history)}/"
+            f"status={boundary.pi_checkpoint.status} second={boundary.pi_checkpoint.second_history_count}/"
+            f"{boundary.pi_checkpoint.expected_second_count} minute={boundary.pi_checkpoint.minute_history_count}/"
             f"{boundary.pi_checkpoint.expected_minute_count}",
         )
         failed = True
@@ -1991,6 +2138,17 @@ def process_row(audit: Audit, row: Row) -> None:
         boundary = check_adjacent_authoritative(audit, prev, row)
     check_campaign_chronology(audit, row, boundary)
     audit.last_authoritative = row
+    if (
+        row.gnss_raw_welford is not None
+        and row.gnss_raw_clockface_n is not None
+        and row.gnss_raw_ref_ns is not None
+    ):
+        audit.gnss_raw_authoritative_by_n[row.gnss_raw_welford.n] = GnssRawAuthority(
+            db_id=row.db_id,
+            welford=row.gnss_raw_welford,
+            clockface_n=row.gnss_raw_clockface_n,
+            ref_ns=row.gnss_raw_ref_ns,
+        )
 
 
 # -----------------------------------------------------------------------------
