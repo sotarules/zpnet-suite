@@ -66,7 +66,6 @@ from zpnet.shared.util import (
 # ------------------------------------------------------------------
 
 POLL_INTERVAL_SEC = 30
-STARTUP_TEENSY_QUIET_DELAY_S = 10.0
 GNSS_ANNOUNCEMENT_TOPIC = "GNSS_ANNOUNCEMENT"
 GNSS_MONITOR_FRESHNESS_MAX_AGE_S = 2.5
 GNSS_ANNOUNCEMENT_HISTORY_MAX = 8
@@ -2026,20 +2025,6 @@ COMMANDS = {
 }
 
 # ---------------------------------------------------------------------
-# Startup quiet barrier
-# ---------------------------------------------------------------------
-
-def startup_teensy_quiet_delay() -> None:
-    """Let PubSub and GNSS routing settle before the first platform poll."""
-    logging.info(
-        "⏳ [system] waiting %.1fs for pubsub routing before active polling",
-        STARTUP_TEENSY_QUIET_DELAY_S,
-    )
-    time.sleep(STARTUP_TEENSY_QUIET_DELAY_S)
-    logging.info("✅ [system] startup quiet delay complete — active polling may begin")
-
-
-# ---------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------
 
@@ -2055,8 +2040,9 @@ def run() -> None:
             blocking=False,
         )
 
-        startup_teensy_quiet_delay()
-
+        # Formal PUBSUB topology already exists independently of SYSTEM process
+        # lifetime. Start platform observation immediately; CLOCKS readiness
+        # gates consume the resulting facts rather than waiting on a fixed timer.
         threading.Thread(
             target=system_poller,
             daemon=True,

@@ -2385,23 +2385,6 @@ COMMANDS = {
     "DIAGNOSTICS": cmd_diagnostics,
 }
 
-def _delayed_refresh(delay_s: float = 10.0) -> None:
-    """
-    Invoke REFRESH after a fixed delay to allow full system bring-up.
-    """
-    import time
-
-    time.sleep(delay_s)
-    try:
-        if not transport_wait_ready(timeout_s=REPLY_TIMEOUT_S):
-            logging.warning("⚠️ [pubsub] auto REFRESH skipped — Teensy transport not ready")
-            return
-        logging.info("🔄 [pubsub] auto REFRESH starting")
-        cmd_refresh(None)
-        logging.info("✅ [pubsub] auto REFRESH complete")
-    except Exception:
-        logging.exception("❌ [pubsub] auto REFRESH failed")
-
 # ---------------------------------------------------------------------
 # Transport init with aggressive retry
 # ---------------------------------------------------------------------

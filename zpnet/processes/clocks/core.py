@@ -306,7 +306,6 @@ PREFLIGHT_POLL_INTERVAL_S = 2.0
 PREFLIGHT_QUIET_GRACE_S = 15.0
 PREFLIGHT_STATUS_LOG_INTERVAL_S = 30.0
 PREFLIGHT_LOG_PREFIX = "🛡️ [preflight]"
-STARTUP_TEENSY_QUIET_DELAY_S = 20.0
 STARTUP_LOCATION_RETRY_S = 5.0
 STARTUP_LOCATION_STATUS_LOG_INTERVAL_S = 30.0
 STARTUP_REQUIRED_GNSS_FREQ_MODE = 3       # GF-8802 TPS4 FINE_LOCK
@@ -14419,17 +14418,6 @@ def on_publication(topic: str, payload: Dict[str, Any]) -> None:
 # Entrypoint
 # ---------------------------------------------------------------------
 
-def startup_teensy_quiet_delay() -> None:
-    """Give routing a short head start; readiness is proved afterward from live evidence."""
-    logging.info(
-        "⏳ [clocks] waiting %.1fs for initial routing/context startup before readiness admission",
-        STARTUP_TEENSY_QUIET_DELAY_S,
-    )
-    time.sleep(STARTUP_TEENSY_QUIET_DELAY_S)
-    logging.info("✅ [clocks] startup quiet delay complete — proving cold-start readiness")
-
-
-
 def run() -> None:
     setup_logging()
     _setup_invalid_timebase_logger()
@@ -14498,8 +14486,6 @@ def run() -> None:
         daemon=True,
         name="clocks-tempest",
     ).start()
-
-    startup_teensy_quiet_delay()
 
     # Cold power-up is physical, not a timer contract.  First make the durable
     # SYSTEM location real on the GF-8802, then wait without a deadline until

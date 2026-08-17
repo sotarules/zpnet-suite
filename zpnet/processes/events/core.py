@@ -70,7 +70,6 @@ DESPOOL_BACKOFF_S = 60.0         # polling interval when server is unreachable
 # interval so the server receives the settled snapshot rather than its transient
 # pre-decoration form.
 CAMPAIGN_DETAIL_SETTLE_S = 10.0
-STARTUP_TEENSY_QUIET_DELAY_S = 10.0
 
 
 # ---------------------------------------------------------------------
@@ -373,21 +372,6 @@ def campaign_detail_despooler_loop() -> None:
 
 
 # ---------------------------------------------------------------------
-# Startup quiet barrier
-# ---------------------------------------------------------------------
-
-def startup_teensy_quiet_delay() -> None:
-    """Allow Teensy initialization and any retained static-route delivery to settle."""
-    logging.info(
-        "⏳ [events] waiting %.1fs for pubsub routing and Teensy initialization "
-        "before active work",
-        STARTUP_TEENSY_QUIET_DELAY_S,
-    )
-    time.sleep(STARTUP_TEENSY_QUIET_DELAY_S)
-    logging.info("✅ [events] startup quiet delay complete — active work may begin")
-
-
-# ---------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------
 
@@ -412,8 +396,6 @@ def run() -> None:
             publication_handler=on_publication,
             blocking=False,
         )
-
-        startup_teensy_quiet_delay()
 
         # --------------------------------------------------------------
         # Start events despooler thread (independent fault barrier)

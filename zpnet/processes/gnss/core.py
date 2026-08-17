@@ -72,7 +72,6 @@ GNSS_DEVICE = os.environ.get("ZPNET_GNSS_PORT", "/dev/zpnet-gnss-serial")
 GNSS_BAUD   = int(os.environ.get("ZPNET_GNSS_BAUD", "38400"))
 
 STREAM_SOCKET_PATH = "/tmp/zpnet-gnss-stream.sock"
-STARTUP_TEENSY_QUIET_DELAY_S = 10.0
 GNSS_ANNOUNCEMENT_TOPIC = "GNSS_ANNOUNCEMENT"
 
 
@@ -1533,21 +1532,6 @@ COMMANDS = {
 }
 
 # ------------------------------------------------------------------
-# Startup quiet barrier
-# ------------------------------------------------------------------
-
-def startup_teensy_quiet_delay() -> None:
-    """Let PubSub/Teensy routing settle while GF-8802 acquisition is already live."""
-    logging.info(
-        "⏳ [gnss] observing GF-8802 during %.1fs startup quiet window for "
-        "pubsub routing and Teensy initialization",
-        STARTUP_TEENSY_QUIET_DELAY_S,
-    )
-    time.sleep(STARTUP_TEENSY_QUIET_DELAY_S)
-    logging.info("✅ [gnss] startup quiet delay complete — active work may begin")
-
-
-# ------------------------------------------------------------------
 # Entrypoint
 # ------------------------------------------------------------------
 
@@ -1569,8 +1553,6 @@ def run() -> None:
             daemon=True,
             name="gnss-stream",
         ).start()
-
-        startup_teensy_quiet_delay()
 
         logging.info("🏁 [gnss] entering main loop")
         while True:
