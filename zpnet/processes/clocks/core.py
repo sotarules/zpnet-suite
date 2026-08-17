@@ -638,6 +638,9 @@ _diag: Dict[str, Any] = {
     "startup_custody_quarantined": 0,
     "startup_custody_retired": 0,
     "startup_custody_last_sequence": None,
+    "startup_physical_lifetime_boundaries": 0,
+    "startup_preclassification_rows_non_authoritative": 0,
+    "last_startup_physical_lifetime_boundary": {},
     "last_startup_custody_release": {},
     "last_startup_custody_quarantine": {},
     "last_startup_custody_retire": {},
@@ -2510,6 +2513,13 @@ _ambient_instrument_recovery_hold = threading.Event()
 # subsequent mutations while the startup thread arms this hold.
 _startup_instrument_restore_hold = threading.Event()
 _clocks_state_mutation_gate_lock = threading.Lock()
+
+# A physical CLOCKS_FRAGMENT sequence regression during unresolved startup proves
+# that PUBSUB custody has crossed a Teensy boot boundary before holistic startup
+# has classified the producer.  Keep the newborn stream visible to preflight and
+# the lifecycle court, but do not let it mutate Alpha-derived Pi custody
+# (DAC statistics / Better-Buckets) until that court resolves the lifetime.
+_startup_physical_lifetime_unclassified = threading.Event()
 
 # Startup persistence custody.  Valid CLOCKS rows may arrive while holistic
 # restore deliberately keeps the ordinary writer closed.  Retain those exact
@@ -6762,6 +6772,7 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
     # restored DAC Welfords before the exact Alpha N+1 successor arrived.
     with _clocks_state_mutation_gate_lock:
         _startup_instrument_restore_hold.set()
+        _startup_physical_lifetime_unclassified.clear()
         _retire_startup_clocks_custody("instrument_restore_required")
         pi_control = _dac_restore_control_from_clocks(clocks, realize=True)
 
@@ -9792,20 +9803,32 @@ def _validate_clocks_fragment_v4(
 def _build_canonical_clocks_state(
     clocks_fragment: Dict[str, Any],
     system_context: Dict[str, Any],
+    *,
+    mutate_alpha_custody: bool = True,
 ) -> Dict[str, Any]:
-    """Build canonical CLOCKS_V4 from one exact CLOCKS_FRAGMENT_V4 observation."""
+    """Build canonical CLOCKS_V4 from one exact CLOCKS_FRAGMENT_V4 observation.
+
+    During unresolved startup a proved physical-sequence regression means the
+    fragment belongs to a newborn Teensy lifetime whose relationship to durable
+    Alpha has not yet been classified.  Such rows remain live evidence, but they
+    must not reset/advance Pi custody that is statistically descended from Alpha.
+    """
     published_at = datetime.now(timezone.utc)
     published_at_utc = published_at.isoformat().replace("+00:00", "Z")
     sequence, teensy_clocks = _validate_clocks_fragment_v4(clocks_fragment)
 
     gnss = _system_gnss_info(system_context)
 
-    # Consume this lawful completed measurement before decorating canonical CLOCKS.
-    _dac_process_completed_row(
-        teensy_clocks,
-        clocks_fragment.get("campaign"),
-        sequence,
-    )
+    # Consume Alpha-derived Pi custody only after producer lifetime is classified.
+    # A pre-classification newborn row is still a lawful physical observation, but
+    # allowing it to reset DAC chronology or replace the literal Better-Buckets
+    # image would let an unclassified lifetime rewrite resurrection authority.
+    if mutate_alpha_custody:
+        _dac_process_completed_row(
+            teensy_clocks,
+            clocks_fragment.get("campaign"),
+            sequence,
+        )
     pi_clocks = _pi_clocks_state_snapshot()
 
     # One canonical clocks object.  Teensy owns the real clocks; Pi adds only
@@ -9829,8 +9852,15 @@ def _build_canonical_clocks_state(
         # Pi owns persistence/recovery orchestration, so it packages the verified
         # producer append testimony into a literal bounded resurrection image.
         # This is intentionally large and explicit; no statistical quantity is
-        # recomputed or inferred from database history.
-        clocks["ppb_restore_checkpoint"] = _ppb_checkpoint_ingest(stats)
+        # recomputed or inferred from database history.  Before startup lifetime
+        # classification, expose the currently held image without folding newborn
+        # producer testimony into it.
+        if mutate_alpha_custody:
+            clocks["ppb_restore_checkpoint"] = _ppb_checkpoint_ingest(stats)
+        else:
+            with _ppb_checkpoint_lock:
+                runtime = _ppb_checkpoint_runtime_ensure_locked()
+                clocks["ppb_restore_checkpoint"] = _ppb_checkpoint_snapshot_locked(runtime)
 
     clocks["gnss_raw"] = copy.deepcopy(pi_clocks.get("gnss_raw") or {})
     clocks["system_time_utc"] = published_at_utc
@@ -9988,9 +10018,13 @@ def _reset_startup_clocks_custody() -> None:
         _diag["startup_custody_quarantined"] = 0
         _diag["startup_custody_retired"] = 0
         _diag["startup_custody_last_sequence"] = None
+        _diag["startup_physical_lifetime_boundaries"] = 0
+        _diag["startup_preclassification_rows_non_authoritative"] = 0
+        _diag["last_startup_physical_lifetime_boundary"] = {}
         _diag["last_startup_custody_release"] = {}
         _diag["last_startup_custody_quarantine"] = {}
         _diag["last_startup_custody_retire"] = {}
+    _startup_physical_lifetime_unclassified.clear()
 
 
 def _retain_startup_clocks_item(item: Dict[str, Any]) -> bool:
@@ -10008,6 +10042,12 @@ def _retain_startup_clocks_item(item: Dict[str, Any]) -> bool:
 def _release_startup_clocks_custody_live() -> Dict[str, Any]:
     """Durably flush retained live-Teensy rows before campaign reconciliation."""
     global _startup_custody_active
+
+    if _startup_physical_lifetime_unclassified.is_set():
+        raise RuntimeError(
+            "cannot release startup CLOCKS custody as live after a proved physical "
+            "sequence regression"
+        )
 
     completion: Optional[threading.Event] = None
     with _startup_custody_lock:
@@ -10083,6 +10123,12 @@ def _quarantine_startup_clocks_custody_surviving_alpha(
     holistic-restore authority, and never replay their embedded TEMPEST candidates.
     """
     global _startup_custody_active
+
+    if _startup_physical_lifetime_unclassified.is_set():
+        raise RuntimeError(
+            "cannot classify startup CLOCKS custody as surviving Alpha after a proved "
+            "physical sequence regression"
+        )
 
     completion: Optional[threading.Event] = None
     classified_at_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -10192,6 +10238,7 @@ def _retire_startup_clocks_custody(reason: str) -> Dict[str, Any]:
         _startup_custody_active = False
         _diag["startup_custody_active"] = False
         _diag["startup_custody_depth"] = 0
+        _startup_physical_lifetime_unclassified.clear()
 
     result = {
         "retired": count,
@@ -10337,9 +10384,36 @@ def _clocks_state_loop() -> None:
             try:
                 sequence, _ = _validate_clocks_fragment_v4(clocks_fragment)
                 previous_sequence = _last_clocks_state_sequence
+                startup_unresolved = _startup_clocks_custody_unresolved()
+                startup_regression = bool(
+                    startup_unresolved
+                    and previous_sequence is not None
+                    and int(sequence) < int(previous_sequence)
+                )
+                if startup_regression and not _startup_physical_lifetime_unclassified.is_set():
+                    _startup_physical_lifetime_unclassified.set()
+                    boundary = {
+                        "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                        "previous_sequence": int(previous_sequence),
+                        "observed_sequence": int(sequence),
+                        "startup_custody_depth": int(len(_startup_custody_backlog)),
+                    }
+                    _diag["startup_physical_lifetime_boundaries"] = (
+                        _diag.get("startup_physical_lifetime_boundaries", 0) + 1
+                    )
+                    _diag["last_startup_physical_lifetime_boundary"] = copy.deepcopy(boundary)
+                    logging.warning(
+                        "🧭 [clocks/startup] physical CLOCKS sequence rebased %d -> %d "
+                        "before lifecycle classification; newborn rows remain visible evidence "
+                        "but cannot mutate Alpha-derived Pi custody",
+                        int(previous_sequence),
+                        int(sequence),
+                    )
+
                 if (
                     previous_sequence is not None
                     and int(sequence) < int(previous_sequence)
+                    and not startup_unresolved
                     and _begin_ambient_instrument_recovery(
                         int(previous_sequence), int(sequence)
                     )
@@ -10351,8 +10425,25 @@ def _clocks_state_loop() -> None:
                         _diag.get("ambient_instrument_recovery_rows_retired", 0) + 1
                     )
                     continue
+
+                # GNSS_RAW is an independent Pi-owned witness, not Alpha statistical
+                # custody. Continue its exactly-once observation across the boot
+                # boundary while holding only Alpha-derived mutation.
                 _advance_gnss_raw_instrument(sequence, system_context)
-                state = _build_canonical_clocks_state(clocks_fragment, system_context)
+                preclassification_newborn = bool(
+                    _startup_physical_lifetime_unclassified.is_set()
+                    and _startup_clocks_custody_unresolved()
+                )
+                state = _build_canonical_clocks_state(
+                    clocks_fragment,
+                    system_context,
+                    mutate_alpha_custody=not preclassification_newborn,
+                )
+                if preclassification_newborn:
+                    _diag["startup_preclassification_rows_non_authoritative"] = (
+                        _diag.get("startup_preclassification_rows_non_authoritative", 0) + 1
+                    )
+                    state["startup_lifetime_unclassified"] = True
             except Exception:
                 _clocks_state_dropped += 1
                 logging.exception(
@@ -14437,6 +14528,7 @@ def run() -> None:
     _clocks_holistic_restore_proof_pending.clear()
     _clocks_holistic_restore_proof_committed.clear()
     _startup_instrument_restore_hold.clear()
+    _startup_physical_lifetime_unclassified.clear()
     _ambient_instrument_recovery_hold.clear()
     _diag["startup_control_ready"] = False
 

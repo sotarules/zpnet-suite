@@ -6754,10 +6754,24 @@ FLASHMEM bool clocks_fragment_snapshot_take(
   *out = clocks_fragment_snapshot_t{};
   clocks_fragment_live_snapshot_fill(out->live);
 
-  // Publication-custody metadata only. This preserves the old rule that, once
-  // public campaign time is already advancing, SYSTEM must wait for the exact
-  // matching campaign delta before releasing this physical second.
+  // Publication-custody metadata only. During ordinary campaign operation, once
+  // public campaign time is advancing, SYSTEM must wait for the exact matching
+  // campaign delta before releasing this physical second.
+  //
+  // CAMPAIGN_BOOTSTRAP has one deliberately narrower boundary. Alpha has already
+  // been resurrected and proved, so a physical row that was open before RECOVER
+  // was armed may complete after Beta enters RECOVERING. Alpha commits that row
+  // before calling Beta; Beta has no truthful campaign interpretation for it.
+  // Preserve the completed live observation without manufacturing a campaign row.
+  // As soon as the recovery PPS gate returns to STARTED, exact campaign coupling
+  // resumes on the next public campaign row.
+  const bool campaign_bootstrap_live_only_boundary =
+      g_recover_lifecycle_mode ==
+          recover_lifecycle_mode_t::CAMPAIGN_BOOTSTRAP &&
+      (request_recover ||
+       campaign_state == clocks_campaign_state_t::RECOVERING);
   out->campaign_row_expected =
+      !campaign_bootstrap_live_only_boundary &&
       campaign_state != clocks_campaign_state_t::STOPPED &&
       campaign_name[0] != '\0' &&
       campaign_seconds > 0ULL;
