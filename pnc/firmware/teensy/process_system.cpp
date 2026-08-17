@@ -4510,9 +4510,8 @@ static const process_command_entry_t SYSTEM_COMMANDS[] = {
 };
 
 static const process_vtable_t SYSTEM_PROCESS = {
-  .process_id    = "SYSTEM",
-  .commands      = SYSTEM_COMMANDS,
-  .subscriptions = nullptr,
+  .process_id = "SYSTEM",
+  .commands   = SYSTEM_COMMANDS,
 };
 
 void process_system_register(void) {

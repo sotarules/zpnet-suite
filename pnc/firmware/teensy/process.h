@@ -7,21 +7,15 @@
 #include "payload.h"
 
 // ============================================================================
-// ZPNet Process Framework — Declarative Contract
+// ZPNet Process Framework — Command Contract
 // ============================================================================
 //
-// A process is a named semantic participant that may:
+// A process is a named semantic participant that declares the COMMANDS it
+// serves.  Formal pub/sub topology is not part of this contract: process_pubsub
+// owns the complete static routing graph as code truth.
 //
-//   • Accept COMMANDS (request/response)
-//   • Receive SUBSCRIPTIONS (pub/sub delivery)
-//
-// Commands and subscriptions are symmetric:
-//   • Each name maps to exactly one handler
-//   • No shared multiplexers
-//   • No implicit routing
-//
-// The framework owns sizing, iteration, and dispatch.
-// Process authors declare intent only.
+// The framework owns command sizing, iteration, and dispatch.  Process authors
+// declare command intent only.
 //
 // ============================================================================
 
@@ -90,17 +84,6 @@ using process_command_fn =
 
 
 // --------------------------------------------------
-// Subscription Handler Contract
-// --------------------------------------------------
-//
-// Invoked synchronously on topic delivery.
-// No return value. Side effects only.
-//
-using process_subscription_fn =
-  void (*)(const Payload& payload);
-
-
-// --------------------------------------------------
 // Command Declaration
 // --------------------------------------------------
 
@@ -111,32 +94,19 @@ typedef struct {
 
 
 // --------------------------------------------------
-// Subscription Declaration
-// --------------------------------------------------
-
-typedef struct {
-  const char*              topic;
-  process_subscription_fn  handler;
-} process_subscription_entry_t;
-
-
-// --------------------------------------------------
-// Process VTable (Declarative)
+// Process VTable (commands only)
 // --------------------------------------------------
 //
 // NOTE:
 //   • No counts
 //   • No query surface
-//   • No shared message handler
+//   • No pub/sub declaration surface
 //
 // Array termination is determined by the framework.
 //
 typedef struct {
   const char* process_id;
-
-  const process_command_entry_t*      commands;
-  const process_subscription_entry_t* subscriptions;
-
+  const process_command_entry_t* commands;
 } process_vtable_t;
 
 

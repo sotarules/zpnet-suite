@@ -5865,9 +5865,8 @@ static const process_command_entry_t TIMEPOP_COMMANDS[] = {
 };
 
 static const process_vtable_t TIMEPOP_PROCESS = {
-  .process_id    = "TIMEPOP",
-  .commands      = TIMEPOP_COMMANDS,
-  .subscriptions = nullptr,
+  .process_id = "TIMEPOP",
+  .commands   = TIMEPOP_COMMANDS,
 };
 
 void process_timepop_register(void) {

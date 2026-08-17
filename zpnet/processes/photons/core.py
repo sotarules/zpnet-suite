@@ -4414,9 +4414,11 @@ def _start_workers() -> None:
         ).start()
 
 
-SUBSCRIPTIONS = {
-    PHOTONS_FRAGMENT_TOPIC: on_photons_fragment,
-}
+def on_publication(topic: str, payload: Payload) -> None:
+    """Execute one publication that PUBSUB already routed to PI:PHOTONS."""
+    if topic != PHOTONS_FRAGMENT_TOPIC:
+        raise RuntimeError(f"PI:PHOTONS received unexpected static route topic {topic!r}")
+    on_photons_fragment(payload)
 
 
 # ---------------------------------------------------------------------
@@ -6306,7 +6308,7 @@ def run() -> None:
     logging.info(
         "[photons] starting canonical PHOTONS_V1 with Phase-3 literal durable recovery, "
         "authoritative SYSTEM context, ordered state/persistence workers, and "
-        "Pi-owned LANTERN provenance subscription=%s publication=%s campaign_type=%s",
+        "Pi-owned LANTERN provenance ingress=%s publication=%s campaign_type=%s",
         PHOTONS_FRAGMENT_TOPIC,
         PHOTONS_TOPIC,
         CAMPAIGN_TYPE_LANTERN,
@@ -6315,7 +6317,7 @@ def run() -> None:
     server_setup(
         subsystem=SUBSYSTEM,
         commands=COMMANDS,
-        subscriptions=SUBSCRIPTIONS,
+        publication_handler=on_publication,
         blocking=False,
     )
 

@@ -173,9 +173,8 @@ static const process_command_entry_t PERFORMANCE_COMMANDS[] = {
 };
 
 static const process_vtable_t PERFORMANCE_PROCESS = {
-  .process_id    = "PERFORMANCE",
-  .commands      = PERFORMANCE_COMMANDS,
-  .subscriptions = nullptr
+  .process_id = "PERFORMANCE",
+  .commands   = PERFORMANCE_COMMANDS,
 };
 
 void process_performance_register(void) {

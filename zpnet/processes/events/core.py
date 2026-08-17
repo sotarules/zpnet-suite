@@ -99,9 +99,11 @@ def on_events(payload: Payload) -> None:
         create_event(item["event_type"], item.get("payload"))
 
 
-SUBSCRIPTIONS = {
-    "EVENTS": on_events,
-}
+def on_publication(topic: str, payload: Payload) -> None:
+    """Execute one publication that PUBSUB already routed to PI:EVENTS."""
+    if topic != "EVENTS":
+        raise RuntimeError(f"PI:EVENTS received unexpected static route topic {topic!r}")
+    on_events(payload)
 
 
 # ---------------------------------------------------------------------
@@ -375,9 +377,7 @@ def campaign_detail_despooler_loop() -> None:
 # ---------------------------------------------------------------------
 
 def startup_teensy_quiet_delay() -> None:
-    """
-    Let pubsub discover this process' subscription surface before active work.
-    """
+    """Allow Teensy initialization and any retained static-route delivery to settle."""
     logging.info(
         "⏳ [events] waiting %.1fs for pubsub routing and Teensy initialization "
         "before active work",
@@ -404,15 +404,12 @@ def run() -> None:
 
     try:
         # --------------------------------------------------------------
-        # Advertise command/subscription surface first.
-        #
-        # Pubsub needs these sockets alive so it can query SUBSCRIPTIONS and
-        # build routing, but active service work is intentionally delayed so
-        # cluster restart does not create a post-flash command storm.
+        # Expose the static-route target socket before active service work.  The
+        # route itself already exists independently of this process lifetime.
         # --------------------------------------------------------------
         server_setup(
             subsystem="EVENTS",
-            subscriptions=SUBSCRIPTIONS,
+            publication_handler=on_publication,
             blocking=False,
         )
 

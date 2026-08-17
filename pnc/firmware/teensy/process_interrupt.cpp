@@ -7475,8 +7475,7 @@ static const process_command_entry_t INTERRUPT_COMMANDS[] = {
 
 static const process_vtable_t INTERRUPT_PROCESS = {
   .process_id = "INTERRUPT",
-  .commands = INTERRUPT_COMMANDS,
-  .subscriptions = nullptr,
+  .commands   = INTERRUPT_COMMANDS,
 };
 
 FLASHMEM void process_interrupt_register(void) {

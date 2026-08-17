@@ -14400,6 +14400,21 @@ COMMANDS = {
     for name, handler in COMMANDS.items()
 }
 
+
+def on_publication(topic: str, payload: Dict[str, Any]) -> None:
+    """Execute one publication that PUBSUB already routed to PI:CLOCKS."""
+    if topic == CLOCKS_FRAGMENT_TOPIC:
+        on_clocks_fragment(payload)
+        return
+    if topic == "WATCHDOG_ANOMALY":
+        on_watchdog_anomaly(payload)
+        return
+    if topic == CLOCKS_RECOVERY_STALLED_TOPIC:
+        on_recovery_stalled(payload)
+        return
+    raise RuntimeError(f"PI:CLOCKS received unexpected static route topic {topic!r}")
+
+
 # ---------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------
@@ -14440,19 +14455,14 @@ def run() -> None:
     _dac_start_control_thread()
     _dac_initialize_hardware()
 
-    # Register CLOCKS with PUBSUB before any potentially slow durable-state read.
-    # server_setup(blocking=False) exposes commands/subscriptions immediately, but
-    # the state worker below has not started yet, so arriving CLOCKS_FRAGMENT rows
-    # can only queue; they cannot mutate Better-Buckets checkpoint custody before
-    # the one-row durable seed has been installed.
+    # Expose CLOCKS command/publication ingress before any potentially slow
+    # durable-state read.  PUBSUB topology is already static code truth; the
+    # state worker below has not started yet, so arriving CLOCKS_FRAGMENT rows
+    # can only queue and cannot mutate checkpoint custody before the durable seed.
     server_setup(
         subsystem="CLOCKS",
         commands=COMMANDS,
-        subscriptions={
-            CLOCKS_FRAGMENT_TOPIC: on_clocks_fragment,
-            "WATCHDOG_ANOMALY": on_watchdog_anomaly,
-            CLOCKS_RECOVERY_STALLED_TOPIC: on_recovery_stalled,
-        },
+        publication_handler=on_publication,
         blocking=False,
     )
 

@@ -4909,8 +4909,7 @@ static const process_command_entry_t PHOTONS_COMMANDS[] = {
 
 static const process_vtable_t PHOTONS_PROCESS = {
   .process_id = "PHOTONS",
-  .commands = PHOTONS_COMMANDS,
-  .subscriptions = nullptr,
+  .commands   = PHOTONS_COMMANDS,
 };
 
 FLASHMEM void process_photons_register(void) {

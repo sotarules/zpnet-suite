@@ -2,13 +2,9 @@
 // process.cpp — ZPNet Process Framework
 // ============================================================================
 //
-// Subscriptions:
-//   • NO persistence
-//   • NO local storage
-//   • Subscription truth is owned by PUBSUB (volatile, RAM-only)
-//
-// Handlers:
-//   • Handler functions live in process vtables (code truth)
+// Process registry:
+//   • command handlers only
+//   • formal pub/sub topology is owned statically by process_pubsub
 //
 // Instrumentation:
 //   • RPC command pipeline is fully counted

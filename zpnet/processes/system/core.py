@@ -1548,6 +1548,13 @@ def on_gnss_announcement(payload: Optional[dict]) -> None:
     _GNSS_ANNOUNCEMENT_RECEIVED += 1
 
 
+def on_publication(topic: str, payload: Optional[dict]) -> None:
+    """Execute one publication that PUBSUB already routed to PI:SYSTEM."""
+    if topic != GNSS_ANNOUNCEMENT_TOPIC:
+        raise RuntimeError(f"PI:SYSTEM received unexpected static route topic {topic!r}")
+    on_gnss_announcement(payload)
+
+
 # ------------------------------------------------------------------
 # Location ownership / GNSS realization
 # ------------------------------------------------------------------
@@ -2044,9 +2051,7 @@ def run() -> None:
         server_setup(
             subsystem="SYSTEM",
             commands=COMMANDS,
-            subscriptions={
-                GNSS_ANNOUNCEMENT_TOPIC: on_gnss_announcement,
-            },
+            publication_handler=on_publication,
             blocking=False,
         )
 

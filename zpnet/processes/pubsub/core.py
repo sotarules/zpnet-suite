@@ -15,7 +15,7 @@ SERVER integration:
   • Pubsub listens on a TCP port (localhost only)
   • SERVER connects through the SSH reverse tunnel
   • Wire protocol: newline-delimited JSON, bidirectional
-  • SERVER is a first-class machine with subscriptions and commands
+  • SERVER is a first-class machine with static formal routes and commands
   • One persistent connection at a time; graceful reconnect
 
 SERVER command relay:
@@ -90,8 +90,23 @@ PI_FANOUT_SLOW_WARN_S = 0.100
 PI_DELIVERY_RETRY_INTERVAL_S = 0.25
 PI_DELIVERY_RETRY_LOG_INTERVAL_S = 30.0
 
-# Subsystems that PUBSUB should never query during ALLSUBSCRIPTIONS.
-# These are test/utility programs that may leave stale sockets behind.
+# Canonical formal routing graph.  Process lifetime never authors these edges.
+# Keep this list byte-for-byte equivalent to the Teensy STATIC_ROUTES table.
+#
+# The current formal union contains no SERVER recipient.  SERVER remains a
+# command/publish peer, but any future SERVER subscription is added here as code
+# truth rather than declared over the live TCP connection.
+STATIC_ROUTE_EDGES: Tuple[Tuple[str, str, str], ...] = (
+    ("PI", "CLOCKS", "CLOCKS_FRAGMENT"),
+    ("PI", "CLOCKS", "CLOCKS_RECOVERY_STALLED"),
+    ("PI", "CLOCKS", "WATCHDOG_ANOMALY"),
+    ("PI", "EVENTS", "EVENTS"),
+    ("PI", "PHOTONS", "PHOTONS_FRAGMENT"),
+    ("PI", "SYSTEM", "GNSS_ANNOUNCEMENT"),
+)
+
+# Retained only so retired private discovery helpers below remain harmless if
+# called during a mixed-version diagnostic session.  They are not command API.
 SUBSYSTEM_SKIP = {"TIMEBASE_WATCH"}
 
 # SERVER TCP configuration
@@ -125,11 +140,11 @@ ADHOC_RECV_TIMEOUT_S = 1.0
 # the Pi-side union remains valid.  Reapply the cached union when that happens.
 TEENSY_ROUTE_MONITOR_INTERVAL_S = 30.0
 
-# Teensy can publish valid data immediately when the serial transport attaches,
-# before PUBSUB has committed its first canonical route table.  Retain that
-# complete startup publication prefix until the first successful REFRESH, then
-# replay it through the ordinary router in original arrival order.  This is a
-# bus custody boundary, not a CLOCKS-specific exception.
+# Teensy can publish valid data immediately when the serial transport attaches.
+# Retain that complete startup publication prefix until the static route table
+# has been installed, then replay through the ordinary router in original order.
+# In normal startup the static table is installed before transport opens, so the
+# backlog is empty and per-target delivery custody begins immediately.
 
 # ---------------------------------------------------------------------
 # Global state
@@ -310,8 +325,8 @@ pi_delivery_targets: Dict[str, _PiDeliveryTarget] = {}
 #
 # server_conn is the live socket (or None if SERVER is not connected).
 # server_conn_lock serializes writes and connection lifecycle.
-# server_subscriptions holds the most recent subscription declaration
-# from SERVER, in the same canonical shape as PI/TEENSY declarations.
+# Formal SERVER routing, like PI and TEENSY routing, is code-owned by the static
+# route graph above.  Legacy SERVER subscribe frames are ignored and counted.
 #
 # server_pending_commands holds pending command relay requests:
 #   req_id → Queue(maxsize=1)
@@ -328,8 +343,11 @@ pi_delivery_targets: Dict[str, _PiDeliveryTarget] = {}
 
 server_conn: Optional[socket.socket] = None
 server_conn_lock = threading.Lock()
+# Legacy compatibility container for retired discovery helpers below.  It is
+# intentionally never populated and is not topology authority.
 server_subscriptions: List[Dict[str, Any]] = []
 server_pending_commands: Dict[int, Queue] = {}
+server_subscription_declarations_ignored = 0
 
 # ---------------------------------------------------------------------
 # Teensy route-table custody monitor state
@@ -347,7 +365,7 @@ teensy_route_monitor_last_empty_ts: Optional[float] = None
 teensy_route_monitor_last_reapply_ts: Optional[float] = None
 teensy_route_monitor_last_reapply_topic_count = 0
 teensy_route_monitor_last_reapply_subscription_count = 0
-teensy_route_monitor_last_status = "INIT"
+teensy_route_monitor_last_status = "DISABLED_STATIC_TOPOLOGY"
 
 # ---------------------------------------------------------------------
 # Ad-hoc diagnostic tap state
@@ -1181,6 +1199,46 @@ def _release_startup_custody_after_route_commit() -> bool:
         return True
 
 
+def _install_static_routes() -> None:
+    """Install the compile-time route graph before transport can deliver data."""
+    new_routes: Dict[str, Set[Tuple[str, str]]] = {}
+    for machine, subsystem, topic in STATIC_ROUTE_EDGES:
+        new_routes.setdefault(topic, set()).add((machine, subsystem))
+
+    route_count = sum(len(targets) for targets in new_routes.values())
+    if route_count != len(STATIC_ROUTE_EDGES):
+        raise RuntimeError("PUBSUB static route graph contains duplicate edges")
+
+    with state_lock:
+        routes_by_topic.clear()
+        routes_by_topic.update(new_routes)
+
+        # Keep the legacy diagnostic cache truthful, but it is no longer an
+        # authority and is never reconstructed from process declarations.
+        applied_union.clear()
+        grouped: Dict[Tuple[str, str], List[str]] = {}
+        for machine, subsystem, topic in STATIC_ROUTE_EDGES:
+            grouped.setdefault((machine, subsystem), []).append(topic)
+        applied_union["subscriptions"] = [
+            {
+                "machine": machine,
+                "subsystem": subsystem,
+                "subscriptions": [
+                    {"name": topic} for topic in sorted(topics)
+                ],
+            }
+            for (machine, subsystem), topics in sorted(grouped.items())
+        ]
+
+    logging.info(
+        "🚀 [pubsub] static formal routing installed (%d routes, %d topics)",
+        route_count,
+        len(new_routes),
+    )
+    if not _release_startup_custody_after_route_commit():
+        raise RuntimeError("PUBSUB static route install could not release startup custody")
+
+
 # ---------------------------------------------------------------------
 # Pub/Sub routing core
 # ---------------------------------------------------------------------
@@ -1319,8 +1377,8 @@ def _server_disconnect(reason: str) -> None:
     """
     Cleanly tear down the SERVER connection.
 
-    Clears the socket, subscription state, and any pending command relays.
-    Pending command relays receive an error response so callers don't hang.
+    Clears the socket and any pending command relays.  Formal routing is static
+    code truth and therefore does not change when SERVER disconnects.
     """
     global server_conn
 
@@ -1336,8 +1394,6 @@ def _server_disconnect(reason: str) -> None:
         logging.info("🌐 [pubsub] SERVER disconnected (%s)", reason)
 
     with state_lock:
-        server_subscriptions.clear()
-
         # Unblock any Pi-side callers waiting for SERVER command responses
         for req_id, q in server_pending_commands.items():
             q.put({
@@ -1353,7 +1409,7 @@ def _server_reader(conn: socket.socket) -> None:
     Read newline-delimited JSON messages from SERVER.
 
     Each message has a "type" field:
-      • "subscribe"  — SERVER declares its subscriptions
+      • "subscribe"  — legacy declaration frame; ignored (topology is static)
       • "command"    — SERVER sends a command to PI or TEENSY
       • "publish"    — SERVER publishes to the bus
       • "response"   — SERVER returns a response to a relayed command
@@ -1396,41 +1452,19 @@ def _server_reader(conn: socket.socket) -> None:
 
 
 def _server_handle_subscribe(msg: Dict[str, Any]) -> None:
-    """
-    Process a subscription declaration from SERVER.
+    """Reject SERVER topology authorship while preserving wire compatibility."""
+    global server_subscription_declarations_ignored
 
-    Expected shape:
-        {
-            "type": "subscribe",
-            "subscriptions": [
-                {
-                    "machine": "SERVER",
-                    "subsystem": "SYSTEM",
-                    "subscriptions": [
-                        {"name": "EVENTS"},
-                        {"name": "TIMEBASE"}
-                    ]
-                }
-            ]
-        }
-
-    This replaces the entire SERVER subscription set.
-    A REFRESH is triggered automatically to rebuild routes.
-    """
+    declared = msg.get("subscriptions")
+    declared_count = len(declared) if isinstance(declared, list) else 0
     with state_lock:
-        server_subscriptions.clear()
-        server_subscriptions.extend(msg.get("subscriptions", []))
+        server_subscription_declarations_ignored += 1
 
-    logging.info(
-        "🌐 [pubsub] SERVER subscriptions updated (%d entries)",
-        len(server_subscriptions),
+    logging.warning(
+        "🌐 [pubsub] ignored SERVER subscription declaration (%d entries); "
+        "formal topology is static code truth",
+        declared_count,
     )
-
-    # Auto-refresh routes to include SERVER subscriptions
-    try:
-        cmd_refresh(None)
-    except Exception:
-        logging.exception("⚠️ [pubsub] auto REFRESH after SERVER subscribe failed")
 
 
 def _server_handle_command(msg: Dict[str, Any], conn: socket.socket) -> None:
@@ -1863,6 +1897,11 @@ def cmd_diagnostics(_: Optional[dict]) -> Dict[str, Any]:
         adhoc_topic_count = len(adhoc_by_topic)
         applied_subscription_count = len(applied_union.get("subscriptions", []))
         applied_topic_count = len(routes_by_topic)
+        static_route_count = sum(len(targets) for targets in routes_by_topic.values())
+        static_server_route_count = sum(
+            1 for machine, _, _ in STATIC_ROUTE_EDGES if machine == "SERVER"
+        )
+        ignored_server_subscriptions = server_subscription_declarations_ignored
         adhoc_routes = [
             {
                 "client_id": client.client_id,
@@ -1955,11 +1994,13 @@ def cmd_diagnostics(_: Optional[dict]) -> Dict[str, Any]:
             "recent_reply_detail": recent_detail,
             "req_id_last_issued": req_id_last_issued,
             "routes_topic_count": len(routes_by_topic),
+            "static_route_count": static_route_count,
+            "static_server_route_count": static_server_route_count,
             "applied_topic_count": applied_topic_count,
             "applied_subscription_count": applied_subscription_count,
             "active_threads": threading.active_count(),
             "server_connected": server_connected,
-            "server_subscription_count": len(server_subscriptions),
+            "server_subscription_declarations_ignored": ignored_server_subscriptions,
             "server_cmd_pending": server_cmd_pending,
             "adhoc_socket_path": ADHOC_TAP_SOCKET_PATH,
             "adhoc_client_count": adhoc_client_count,
@@ -2341,9 +2382,6 @@ def teensy_route_monitor_loop() -> None:
 
 COMMANDS = {
     "REPORT": cmd_report,
-    "ALLSUBSCRIPTIONS": cmd_allsubscriptions,
-    "UNIONSUBSCRIPTIONS": cmd_unionsubscriptions,
-    "REFRESH": cmd_refresh,
     "DIAGNOSTICS": cmd_diagnostics,
 }
 
@@ -2415,6 +2453,11 @@ def run() -> None:
         "ENABLED" if TRANSPORT_RAW_LOG_ENABLED else "disabled",
     )
 
+    # Install formal routing before the transport can observe even one Teensy
+    # publication.  Process sockets may still be absent; per-target delivery
+    # custody queues retain those routed publications until each owner appears.
+    _install_static_routes()
+
     # Register receive handlers before starting the serial RX supervisor.
     # The Teensy emits DEBUG/PUBSUB frames immediately during boot; the
     # transport must not observe a live serial stream before PUBSUB has
@@ -2452,27 +2495,13 @@ def run() -> None:
         name="server-cmd-relay",
     ).start()
 
-    # Automatic control-plane convergence
-    threading.Thread(
-        target=_delayed_refresh,
-        daemon=True,
-        name="pubsub-auto-refresh",
-    ).start()
-
-    # Teensy route-table custody monitor.  If Teensy reboots and loses its
-    # in-firmware PUBSUB routes, reapply the cached Pi-side union without
-    # repolling every service.
-    threading.Thread(
-        target=teensy_route_monitor_loop,
-        daemon=True,
-        name="teensy-route-monitor",
-    ).start()
+    # No subscription discovery, delayed REFRESH, or route-repair thread exists
+    # in the active topology path.  Teensy and Pi each boot with the same graph.
 
     # Process lifetime (never returns)
     server_setup(
         subsystem="PUBSUB",
         commands=COMMANDS,
-        subscriptions={},
     )
 
 def bootstrap() -> None:

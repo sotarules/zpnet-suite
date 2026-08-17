@@ -6,8 +6,11 @@ Provides a unified, declarative runtime for Pi-side processes.
 A process declares:
   • its subsystem name
   • the commands it serves
-  • the topics it subscribes to (topic → handler)
-  • no routing logic whatsoever
+  • optionally, one publication-ingress callback
+
+Formal pub/sub topology is not declared by processes.  PUBSUB owns that graph
+as static code truth; this module only exposes the target socket and dispatches
+an already-routed publication to the owning process.
 
 All transport, sockets, threads, and routing are owned here.
 
@@ -518,7 +521,11 @@ def _serve_commands(
 # Pub/Sub server (internal)
 # =============================================================================
 
-def _serve_pubsub(*, subsystem: str, subscriptions: Dict[str, Callable[[dict], None]]) -> None:
+def _serve_pubsub(
+    *,
+    subsystem: str,
+    publication_handler: Callable[[str, Any], None],
+) -> None:
     sock_path = pubsub_socket_path(subsystem)
     srv = _bind_unix_socket(sock_path)
 
@@ -567,16 +574,14 @@ def _serve_pubsub(*, subsystem: str, subscriptions: Dict[str, Callable[[dict], N
                 len(chunks),
             )
 
-            handler = subscriptions.get(topic)
-            if handler is None:
-                # IMPORTANT: do NOT kill the server thread
-                logging.warning("[pubsub] %s ignoring unknown topic=%r", subsystem, topic)
+            if not isinstance(topic, str) or not topic:
+                logging.warning("[pubsub] %s ignoring malformed topic=%r", subsystem, topic)
                 continue
 
             try:
-                handler(payload)
+                publication_handler(topic, payload)
             except Exception:
-                logging.exception("[pubsub] handler failed (%s:%s)", subsystem, topic)
+                logging.exception("[pubsub] publication handler failed (%s:%s)", subsystem, topic)
 
 # =============================================================================
 # Public declarative API
@@ -586,7 +591,7 @@ def server_setup(
     *,
     subsystem: str,
     commands: Dict[str, Callable[[Optional[dict]], dict]] | None = None,
-    subscriptions: Dict[str, Callable[[dict], None]] | None = None,
+    publication_handler: Callable[[str, Any], None] | None = None,
     blocking: bool = True,
 ) -> None:
     """
@@ -595,9 +600,10 @@ def server_setup(
     The caller declares:
       • subsystem name
       • command handlers
-      • pub/sub topic → handler mapping
+      • optionally, one publication-ingress callback
 
-    All sockets, threads, and routing are handled internally.
+    PUBSUB owns formal topic routing.  This runtime owns only the target socket
+    and invokes the callback for publications already routed to this subsystem.
 
     If blocking=True (default), this function never returns.
     If blocking=False, this function returns after launching server
@@ -607,30 +613,9 @@ def server_setup(
 
     logging.info("🚀 [process] starting subsystem: %s", subsystem)
 
-    commands = commands or {}
-    subscriptions = subscriptions or {}
-
-    # -----------------------------------------------------------------
-    # Inject implicit SUBSCRIPTIONS command
-    # -----------------------------------------------------------------
-
-    def _cmd_subscriptions(_: Optional[dict]) -> dict:
-        return {
-            "success": True,
-            "message": "OK",
-            "payload": {
-                "machine": "PI",
-                "subsystem": subsystem,
-                "subscriptions": [
-                    { "name": topic }
-                    for topic in sorted(subscriptions.keys())
-                ],
-            },
-        }
-
-    # Do not mutate caller's command table
-    effective_commands = dict(commands)
-    effective_commands["SUBSCRIPTIONS"] = _cmd_subscriptions
+    # Do not mutate the caller's command table.  There is deliberately no
+    # implicit SUBSCRIPTIONS command: process lifetime does not author topology.
+    commands = dict(commands or {})
 
     # -----------------------------------------------------------------
     # Command plane
@@ -640,7 +625,7 @@ def server_setup(
         target=_serve_commands,
         kwargs={
             "subsystem": subsystem,
-            "commands": effective_commands,
+            "commands": commands,
         },
         daemon=True,
         name=f"{subsystem}-commands",
@@ -650,15 +635,16 @@ def server_setup(
     # Pub/Sub plane
     # -----------------------------------------------------------------
 
-    threading.Thread(
-        target=_serve_pubsub,
-        kwargs={
-            "subsystem": subsystem,
-            "subscriptions": subscriptions,
-        },
-        daemon=True,
-        name=f"{subsystem}-pubsub",
-    ).start()
+    if publication_handler is not None:
+        threading.Thread(
+            target=_serve_pubsub,
+            kwargs={
+                "subsystem": subsystem,
+                "publication_handler": publication_handler,
+            },
+            daemon=True,
+            name=f"{subsystem}-pubsub",
+        ).start()
 
     # -----------------------------------------------------------------
     # Process lifetime

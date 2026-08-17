@@ -110,36 +110,44 @@ static void publish_events(timepop_ctx_t*, timepop_diag_t*, void*) {
     return;
   }
 
-  // Hard gate: do nothing until routing truth exists
   if (!pubsub_routes_ready()) {
     return;
   }
 
+  // Static topology is available from boot, so route readiness is no longer a
+  // proxy for Pi transport custody.  Build a non-destructive snapshot and only
+  // retire those events after publish() accepts the complete wire image.
+  const size_t publish_count = evt_count;
+  size_t cursor = evt_tail;
+
   Payload out;
   PayloadArray events;
 
-  while (evt_count > 0) {
-
-    const EventItem& e = evtq[evt_tail];
+  for (size_t i = 0; i < publish_count; i++) {
+    const EventItem& e = evtq[cursor];
 
     Payload item;
     item.add("event_type", e.type);
 
     if (e.payload[0] != '\0') {
-      // Adopt trusted JSON object as a real sub-node
       item.add_raw_object("payload", e.payload);
     }
 
     events.add(item);
-
-    evt_tail = (evt_tail + 1) % EVT_MAX;
-    evt_count--;
+    cursor = (cursor + 1) % EVT_MAX;
   }
 
   out.add_array("events", events);
 
   debug_log("publish_events", (unsigned)events.size());
-  publish("EVENTS", out);
+  if (!publish("EVENTS", out)) {
+    debug_log("publish_events_transport_custody_rejected",
+              (unsigned)publish_count);
+    return;
+  }
+
+  evt_tail = cursor;
+  evt_count -= publish_count;
 }
 
 // --------------------------------------------------------------
@@ -191,9 +199,8 @@ static const process_command_entry_t EVENTS_COMMANDS[] = {
 };
 
 static const process_vtable_t EVENTS_PROCESS = {
-  .process_id    = "EVENTS",
-  .commands      = EVENTS_COMMANDS,
-  .subscriptions = nullptr,
+  .process_id = "EVENTS",
+  .commands   = EVENTS_COMMANDS,
 };
 
 void process_events_register(void) {

@@ -8947,7 +8947,6 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
 static const process_vtable_t CLOCKS_PROCESS = {
   .process_id    = "CLOCKS",
   .commands      = CLOCKS_COMMANDS,
-  .subscriptions = nullptr
 };
 
 void process_clocks_register(void) {
