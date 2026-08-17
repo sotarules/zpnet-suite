@@ -302,9 +302,9 @@ GNSS_RAW_RECOVERY_REBUILD_GATE_PPB = 1000.0
 # Preflight is polled quickly so START follows readiness promptly, but the log
 # remains quiet.  Pending prerequisites are summarized only after a short grace
 # period, when the pending set changes, or at the periodic status interval.
-PREFLIGHT_POLL_INTERVAL_S = 2.0
-PREFLIGHT_QUIET_GRACE_S = 15.0
-PREFLIGHT_STATUS_LOG_INTERVAL_S = 30.0
+PREFLIGHT_POLL_INTERVAL_S = 1.0
+PREFLIGHT_QUIET_GRACE_S = 30.0
+PREFLIGHT_STATUS_LOG_INTERVAL_S = 60.0
 PREFLIGHT_LOG_PREFIX = "🛡️ [preflight]"
 STARTUP_LOCATION_RETRY_S = 5.0
 STARTUP_LOCATION_STATUS_LOG_INTERVAL_S = 30.0
@@ -10326,10 +10326,17 @@ def _clocks_state_loop() -> None:
             try:
                 system_context = _fetch_system_report()
                 break
-            except Exception:
-                if not failure_logged:
+            except Exception as exc:
+                # A sibling Pi process may simply not have opened its command
+                # socket yet during startup/restart. That is an ordinary wait
+                # state, not an anomaly: retry quietly without imposing timing
+                # semantics on process startup. Preserve one loud diagnostic for
+                # non-transport failures such as a malformed SYSTEM.REPORT reply.
+                transport_unavailable = isinstance(exc.__cause__, OSError)
+                if not transport_unavailable and not failure_logged:
                     logging.exception(
-                        "⚠️ [clocks] SYSTEM.REPORT unavailable for CLOCKS sequence=%s; retrying",
+                        "⚠️ [clocks] SYSTEM.REPORT failed semantically for CLOCKS "
+                        "sequence=%s; retrying",
                         _clocks_fragment_count(clocks_fragment),
                     )
                     failure_logged = True

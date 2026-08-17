@@ -1708,19 +1708,18 @@ def cmd_report(_: Optional[dict]) -> Dict:
     with _SYSTEM_LOCK:
         snapshot = copy.deepcopy(SYSTEM)
 
+    # GNSS is a fast, announcement-backed readiness surface. Refresh its
+    # SYSTEM-owned feature leaf from the same current observation returned by
+    # this REPORT instead of waiting for the slow platform polling cadence.
     gnss_payload = build_gnss_status()
+    set_pi_feature(
+        "GNSS",
+        "REPORT",
+        _health_to_feature_status(gnss_payload.get("health_state")),
+    )
     snapshot["gnss"] = gnss_payload
     snapshot["location"] = _location_context(gnss_payload)
-
-    features = snapshot.get("features")
-    if isinstance(features, dict):
-        pi_features = features.setdefault("PI", {})
-        if isinstance(pi_features, dict):
-            gnss_features = pi_features.setdefault("GNSS", {})
-            if isinstance(gnss_features, dict):
-                gnss_features["REPORT"] = _health_to_feature_status(
-                    gnss_payload.get("health_state")
-                )
+    snapshot["features"] = _feature_tree_snapshot()
 
     return {
         "success": True,
