@@ -2379,9 +2379,9 @@ def scope_report() -> None:
             f"id={row['min_id']}..{row['max_id']} last={row['last_ts']}"
         )
     print("\nUsage:")
-    print("  campaign_analyzer.py --all")
-    print("  campaign_analyzer.py CAMPAIGN")
-    print("  campaign_analyzer.py --all --from-id N --to-id N")
+    print("  clocks_analyzer.py --all")
+    print("  clocks_analyzer.py CAMPAIGN")
+    print("  clocks_analyzer.py --all --from-id N --to-id N")
     print("  Optional: --batch-size N --pause-ms N --limit N")
     print("\nNamed campaign scope includes every CLOCKS_V4 row between that campaign's first and last durable IDs,")
     print("so ambient/recovery testimony inside the campaign interval is not accidentally hidden.")
