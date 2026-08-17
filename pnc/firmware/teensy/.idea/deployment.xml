@@ -7,11 +7,14 @@
       <paths name="ZPNet Tunnel (mule)">
         <serverdata>
           <mappings>
-            <mapping deploy="/home/mule/zpnet/pnc/firmware/teensy" local="$PROJECT_DIR$" web="/" />
+            <mapping deploy="/zpnet" local="$PROJECT_DIR$/../../.." web="/" />
           </mappings>
           <excludedPaths>
             <excludedPath local="true" path="$PROJECT_DIR$/cmake-build-debug-remote-host" />
-            <excludedPath local="true" path="$PROJECT_DIR$/cmake-build-debug-remote-host" />
+            <excludedPath local="true" path="$PROJECT_DIR$/../../../.venv" />
+            <excludedPath local="true" path="$PROJECT_DIR$/../../../.idea" />
+            <excludedPath local="true" path="$PROJECT_DIR$/../../../.git" />
+            <excludedPath local="true" path="$PROJECT_DIR$/cmake-build-debug" />
           </excludedPaths>
         </serverdata>
       </paths>

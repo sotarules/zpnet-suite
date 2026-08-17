@@ -3744,6 +3744,14 @@ def _ambient_instrument_recovery(regression: Dict[str, Any]) -> None:
             requested_monotonic=requested_monotonic,
             preserve_live_pi_control=True,
         )
+
+        # The N+1 court proves the resurrected Alpha lifetime, but Pi may have
+        # intentionally retired transitional rows while that proof was forming.
+        # Reacquire Alpha's exact current bounded rings before ordinary delta
+        # custody resumes so those deliberate omissions are never misclassified
+        # as an uncontrolled PI_OBSERVATION_GAP.
+        ppb_refresh = _refresh_ppb_checkpoint_from_proved_alpha()
+
         result = {
             "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "mode": "AMBIENT_ALPHA_RESURRECTION",
@@ -3753,6 +3761,7 @@ def _ambient_instrument_recovery(regression: Dict[str, Any]) -> None:
             "source_update_count": int(source_update),
             "expected_first_update_count": int(source_update) + 1,
             "ppb_stage": copy.deepcopy(ppb_stage),
+            "ppb_post_resurrection_refresh": copy.deepcopy(ppb_refresh),
             "proof": copy.deepcopy(proof),
             "campaign_restored": False,
             "pi_gnss_raw_rewound": False,
@@ -5811,13 +5820,17 @@ def _ppb_export_collect_history(
     meta: Dict[str, Any],
     history: str,
     existing: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    """Return the exact producer ring named by one META snapshot.
+) -> Tuple[List[Dict[str, Any]], bool]:
+    """Collect producer endpoints for one META snapshot, retaining partial custody.
 
     Existing Pi endpoints seed the set, so a small observation gap normally
     downloads only the missing historical suffix/prefix rather than all 601
     seconds. Firmware pages by immutable rolling-sequence cursor; concurrent
     newer appends cannot rewrite an endpoint already returned.
+
+    Alpha is intentionally not frozen. If the bounded producer ring advances
+    while paging, return every exact endpoint learned together with complete=False.
+    The caller carries those immutable endpoints into the next META window.
     """
     if history == "SECOND":
         expected = int(meta["second_count"])
@@ -5833,7 +5846,7 @@ def _ppb_export_collect_history(
     if expected == 0:
         if oldest != 0 or newest != 0:
             raise RuntimeError(f"{history} export has empty count with nonempty bounds")
-        return []
+        return [], True
     if oldest <= 0 or newest < oldest:
         raise RuntimeError(f"{history} export has invalid sequence bounds")
 
@@ -5877,26 +5890,22 @@ def _ppb_export_collect_history(
             break
 
     ordered = [collected[key] for key in sorted(collected)]
-    if (
-        len(ordered) != expected
-        or int(ordered[0]["rolling_sequence"]) != oldest
-        or int(ordered[-1]["rolling_sequence"]) != newest
-    ):
-        raise RuntimeError(
-            f"{history} full-ring export incomplete for reset={meta['reset_count']} "
-            f"update={meta['update_count']}: got={len(ordered)} expected={expected} "
-            f"bounds={oldest}..{newest}"
-        )
-    return ordered
+    complete = bool(
+        len(ordered) == expected
+        and int(ordered[0]["rolling_sequence"]) == oldest
+        and int(ordered[-1]["rolling_sequence"]) == newest
+    )
+    return ordered, complete
 
 
-def _refresh_ppb_checkpoint_from_surviving_alpha() -> Dict[str, Any]:
-    """Reacquire exact Better-Buckets rings from a proved surviving Alpha.
+def _refresh_ppb_checkpoint_from_proved_alpha() -> Dict[str, Any]:
+    """Reacquire exact Better-Buckets rings from a proved live Alpha.
 
-    This is a read-only custody transfer.  It is invoked only after the existing
-    Alpha lineage court has independently proved survival.  The final install
-    occurs only when Pi's processed update_count exactly equals the firmware META
-    snapshot, so queued live rows continue naturally at N+1 after the lock opens.
+    This is a read-only custody transfer. It is invoked only after either the
+    independent surviving-Alpha lineage court or the exact durable resurrection
+    N+1 court has proved the current Alpha lifetime. The final install occurs only
+    when Pi's processed update_count exactly equals the firmware META snapshot, so
+    queued live rows continue naturally at N+1 after the lock opens.
     """
     _diag["ppb_checkpoint_live_refresh_attempts"] = (
         _diag.get("ppb_checkpoint_live_refresh_attempts", 0) + 1
@@ -5916,11 +5925,11 @@ def _refresh_ppb_checkpoint_from_surviving_alpha() -> Dict[str, Any]:
 
             if runtime_snapshot.get("reset_count") not in (None, meta["reset_count"]):
                 raise RuntimeError(
-                    "surviving Alpha export reset_count disagrees with Pi checkpoint: "
+                    "proved Alpha export reset_count disagrees with Pi checkpoint: "
                     f"pi={runtime_snapshot.get('reset_count')} teensy={meta['reset_count']}"
                 )
 
-            second_history = _ppb_export_collect_history(
+            second_history, second_complete = _ppb_export_collect_history(
                 meta=meta,
                 history="SECOND",
                 existing=(
@@ -5928,7 +5937,27 @@ def _refresh_ppb_checkpoint_from_surviving_alpha() -> Dict[str, Any]:
                     + learned_second_history
                 ),
             )
-            minute_history = _ppb_export_collect_history(
+            learned_second_history = copy.deepcopy(second_history)
+            if not second_complete:
+                if attempts >= 12:
+                    raise RuntimeError(
+                        "proved Alpha SECOND export could not converge after cumulative "
+                        f"moving-window custody: got={len(second_history)} "
+                        f"expected={meta['second_count']} "
+                        f"bounds={meta['second_oldest_sequence']}.."
+                        f"{meta['second_newest_sequence']}"
+                    )
+                logging.info(
+                    "⏳ [clocks/ppb] proved Alpha SECOND window moved during paging; "
+                    "retaining %d exact endpoints and retrying current META "
+                    "(attempt=%d/12)",
+                    len(second_history),
+                    attempts,
+                )
+                time.sleep(0.05)
+                continue
+
+            minute_history, minute_complete = _ppb_export_collect_history(
                 meta=meta,
                 history="MINUTE",
                 existing=(
@@ -5936,8 +5965,25 @@ def _refresh_ppb_checkpoint_from_surviving_alpha() -> Dict[str, Any]:
                     + learned_minute_history
                 ),
             )
-            learned_second_history = copy.deepcopy(second_history)
             learned_minute_history = copy.deepcopy(minute_history)
+            if not minute_complete:
+                if attempts >= 12:
+                    raise RuntimeError(
+                        "proved Alpha MINUTE export could not converge after cumulative "
+                        f"moving-window custody: got={len(minute_history)} "
+                        f"expected={meta['minute_count']} "
+                        f"bounds={meta['minute_oldest_sequence']}.."
+                        f"{meta['minute_newest_sequence']}"
+                    )
+                logging.info(
+                    "⏳ [clocks/ppb] proved Alpha MINUTE window moved during paging; "
+                    "retaining %d exact endpoints and retrying current META "
+                    "(attempt=%d/12)",
+                    len(minute_history),
+                    attempts,
+                )
+                time.sleep(0.05)
+                continue
 
             # Export may span one or more live seconds. Re-read META and rendezvous
             # only if the exact statistical identity is still the one we collected.
@@ -5957,7 +6003,7 @@ def _refresh_ppb_checkpoint_from_surviving_alpha() -> Dict[str, Any]:
                 # live custody and try the newer immutable window.
                 if attempts >= 12:
                     raise RuntimeError(
-                        "surviving Alpha Better-Buckets export could not reach a stable META rendezvous"
+                        "proved Alpha Better-Buckets export could not reach a stable META rendezvous"
                     )
                 time.sleep(0.05)
                 continue
@@ -5988,7 +6034,7 @@ def _refresh_ppb_checkpoint_from_surviving_alpha() -> Dict[str, Any]:
                     )
                 ):
                     raise RuntimeError(
-                        "surviving Alpha export current endpoint disagrees with Pi live testimony"
+                        "proved Alpha export current endpoint disagrees with Pi live testimony"
                     )
 
                 candidate = {
@@ -6023,7 +6069,7 @@ def _refresh_ppb_checkpoint_from_surviving_alpha() -> Dict[str, Any]:
                 normalized = _normalize_saved_ppb_checkpoint(candidate)
                 if not normalized.get("recoverable"):
                     raise RuntimeError(
-                        "surviving Alpha full-ring export did not form a recoverable checkpoint"
+                        "proved Alpha full-ring export did not form a recoverable checkpoint"
                     )
 
                 refreshed = _restore_ppb_checkpoint_runtime(
@@ -6051,7 +6097,7 @@ def _refresh_ppb_checkpoint_from_surviving_alpha() -> Dict[str, Any]:
             )
             _diag["last_ppb_checkpoint_live_refresh"] = copy.deepcopy(result)
             logging.info(
-                "📦 [clocks/ppb] surviving Alpha full-ring custody reacquired: "
+                "📦 [clocks/ppb] proved Alpha full-ring custody reacquired: "
                 "reset=%d update=%d second=%d/%d minute=%d/%d attempts=%d in %.3fs",
                 int(meta["reset_count"]),
                 int(meta["update_count"]),
@@ -6887,7 +6933,7 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
         basis: str,
     ) -> Dict[str, Any]:
         """Restore only Pi-owned custody when firmware proves Alpha survived."""
-        ppb_refresh = _refresh_ppb_checkpoint_from_surviving_alpha()
+        ppb_refresh = _refresh_ppb_checkpoint_from_proved_alpha()
         pi_control = _dac_restore_control_from_clocks(clocks, realize=True)
         gnss_raw_result = _restore_gnss_raw_payload(gnss_raw)
         if not gnss_raw_result.get("restored"):
@@ -7315,6 +7361,13 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
         detail,
         requested_monotonic=requested_monotonic,
     )
+
+    # Exact durable N+1 proves this resurrected Alpha is now the authoritative
+    # live owner. Rows intentionally retired during PPB_RESTORE/SmartZero proof
+    # formation must not leave Pi's bounded-ring custodian artificially warming.
+    # Reacquire the exact current Alpha rings before campaign recovery proceeds.
+    ppb_refresh = _refresh_ppb_checkpoint_from_proved_alpha()
+
     return {
         "success": True,
         "mode": "HOLISTIC_INSTRUMENT",
@@ -7323,6 +7376,7 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
         "pi_control": pi_control,
         "gnss_raw": gnss_raw_result,
         "better_buckets": ppb_stage,
+        "better_buckets_post_resurrection_refresh": ppb_refresh,
         "proof": proof,
     }
 
@@ -12680,6 +12734,10 @@ def cmd_repair_stats_epoch(args: Optional[dict]) -> Dict[str, Any]:
 
 def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
     row = _get_active_campaign()
+    with _ppb_checkpoint_lock:
+        ppb_checkpoint = _ppb_checkpoint_snapshot_locked(
+            _ppb_checkpoint_runtime_ensure_locked()
+        )
     contract = {
         "mode_free": True,
         "coherent_rows_persist": True,
@@ -12700,6 +12758,7 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
                 "stats_epoch_repair": copy.deepcopy(
                     _diag.get("last_hard_failure_stats_repair") or {}
                 ),
+                "ppb_restore_checkpoint": copy.deepcopy(ppb_checkpoint),
             },
         }
 
@@ -12712,6 +12771,7 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
     payload["stats_epoch_repair"] = copy.deepcopy(
         _diag.get("last_hard_failure_stats_repair") or {}
     )
+    payload["ppb_restore_checkpoint"] = copy.deepcopy(ppb_checkpoint)
     return {"success": True, "message": "OK", "payload": payload}
 
 
@@ -13813,6 +13873,22 @@ def _restore_active_campaign_state(
         else None
     )
 
+    ppb_post_campaign_bootstrap_refresh: Optional[Dict[str, Any]] = None
+    if campaign_bootstrap and alpha_resurrected_this_startup:
+        # CAMPAIGN_BOOTSTRAP explicitly preserves the Alpha epoch proved earlier in
+        # this startup, but its private Beta handoff may consume one or more Alpha
+        # statistical updates without publishing an ordinary Pi-observed CLOCKS row.
+        # That deliberate recovery-owned omission must not reach the generic
+        # PI_OBSERVATION_GAP court. The first admitted campaign row proves the
+        # bootstrap boundary; reacquire Alpha's exact live rings once more before
+        # ordinary campaign processing resumes.
+        ppb_post_campaign_bootstrap_refresh = (
+            _refresh_ppb_checkpoint_from_proved_alpha()
+        )
+        _diag["last_recovery"]["better_buckets_post_campaign_bootstrap_refresh"] = (
+            copy.deepcopy(ppb_post_campaign_bootstrap_refresh)
+        )
+
     _campaign_active = True
     _arm_timebase_silence_watch("RECOVERY_RESUME")
     _sync_resume_event.set()
@@ -13843,6 +13919,9 @@ def _restore_active_campaign_state(
         "campaign": campaign_name,
         "first_public_pps_vclock_count": int(teensy_pps_vclock_count),
         "science_clean": bool(recovery_admission_verdict.get("fully_clean")),
+        "better_buckets_post_campaign_bootstrap_refresh": copy.deepcopy(
+            ppb_post_campaign_bootstrap_refresh
+        ),
     }
 
 
