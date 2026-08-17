@@ -182,13 +182,6 @@ _PHOTONS_LIVE_TAP = _RollingPubSubTap(
 # Mission-control readiness board. The feature payload remains scalar-only;
 # this table is just the operator-facing projection of CLOCKS.features.
 FEATURE_STATUS_GRID = (
-    ("NET", "PI.SYSTEM.NETWORK"),
-    ("BATTERY", "PI.SYSTEM.BATTERY"),
-    ("GNSS", "PI.GNSS.REPORT"),
-    ("PI_HOST", "PI.SYSTEM.HOST"),
-    ("POWER", "PI.SYSTEM.POWER"),
-    ("ENV", "PI.SYSTEM.ENVIRONMENT"),
-    ("SENSORS", "PI.SYSTEM.SENSORS"),
     ("OBS_EDGE", "TEENSY.INTERRUPT.OBSERVED_EDGE_AUTHORITY"),
     ("QTIMER_CNT", "TEENSY.INTERRUPT.QTIMER_COUNTER_CUSTODY"),
     ("CTR32_LINE", "TEENSY.INTERRUPT.COUNTER32_LINEAGE"),
@@ -295,38 +288,34 @@ def _merge_missing(dst: dict, src: dict | None) -> dict:
 
 
 def _derive_gnss_lock_quality(g: dict) -> str:
-    explicit = g.get("lock_quality")
-    if explicit:
-        return str(explicit).upper()
+    """Return binary GNSS/PPS readiness from zpnet-gnss receiver testimony.
 
+    The title bar is a readiness annunciator, not a signal-strength meter.
+    Satellite count and HDOP remain useful operator telemetry but must not make
+    the title oscillate while GF-8802 discipline/PPS state remains locked.
+    """
     freq_mode = str(g.get("freq_mode_name") or "").upper()
     time_status = str(g.get("time_status") or "").upper()
+    pps_sync = str(g.get("pps_sync") or "").upper()
     traim = str(g.get("traim") or "").upper()
     pps_valid = _to_bool(g.get("pps_valid"))
     pps_active = _to_bool(g.get("pps_active"))
 
-    acc = _to_float(g.get("estimated_accuracy_ns"))
-    timing_err = _to_float(g.get("pps_timing_error_ns"))
-    hdop = _to_float(g.get("hdop"))
-    sats = _to_int(g.get("satellites"))
-
     fine_lock = freq_mode == "FINE_LOCK"
-    time_locked = time_status in ("LS_FIX", "UTC", "LOCKED", "FIX")
-    traim_ok = traim in ("OK", "", "NONE")
-    pps_ok = (pps_valid is not False) and (pps_active is not False)
-    acc_ok = acc is None or acc <= 50.0
-    timing_ok = timing_err is None or abs(timing_err) <= 100.0
-    hdop_ok = hdop is None or hdop <= 1.5
-    sats_ok = sats is None or sats >= 8
+    time_locked = time_status == "LS_FIX"
+    pps_synced = pps_sync in ("GPS", "UTC_USNO", "UTC_SU", "UTC_EU", "UTC_NICT")
+    traim_ok = traim == "OK"
 
-    if fine_lock and time_locked and traim_ok and pps_ok and acc_ok and timing_ok and hdop_ok and sats_ok:
-        return "STRONG"
-    if fine_lock and time_locked:
-        return "STRONG"
-    if fine_lock or time_locked or pps_ok:
-        return "MEDIUM"
-    return "WEAK"
-
+    if (
+        fine_lock
+        and time_locked
+        and pps_synced
+        and traim_ok
+        and pps_valid is True
+        and pps_active is True
+    ):
+        return "NOMINAL"
+    return "INITIALIZING"
 
 def _gnss_from_timebase(r: dict) -> dict:
     return {

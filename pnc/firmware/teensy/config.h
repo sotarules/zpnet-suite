@@ -119,12 +119,8 @@ static const int PHOTODIODE_MON_PIN  = 38;  // Teensy 4.1 A14
 //   10 MHz VCLOCK square wave from GF-8802 (pin 10)
 //   Counted and compared by QTimer1 CH0 (single-edge, 100 ns per tick)
 //
-// GNSS_LOCK_PIN:
-//   GNSS lock status (true/false)
-//
 static const int GNSS_PPS_PIN  = 1;
 static const int GNSS_VCLK_PIN = 10;
-static const int GNSS_LOCK_PIN = 4;
 
 static const int GNSS_PPS_RELAY = 32;
 
