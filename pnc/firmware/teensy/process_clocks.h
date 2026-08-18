@@ -17,10 +17,11 @@
 //   • Local CLOCKS-owned autonomous startup and explicit ZERO epoch install
 //   • Campaign Flash Cut: hot campaign boundary without Alpha epoch rebase
 //   • PPS/VCLOCK-selected truth capture
-//   • Deferred 1 Hz completed-row handoff after both post-PPS OCXO edges complete
+//   • Deferred 1 Hz canonical publication after both post-PPS OCXO edges complete
 //   • Serialized command reporting: Priority 0 capture remains live while the
 //     Priority 16 TimePop/handoff tier is excluded from re-entering command
-//     report construction; SYSTEM independently owns CLOCKS_FRAGMENT formatting
+//     report construction; CLOCKS independently owns CLOCKS_FRAGMENT formatting,
+//     exact-sequence retry custody, and publication
 //   • Continuous DWT-to-GNSS calibration (campaign-independent)
 //   • Static PPS/GPIO-based one-second prediction audit for VCLOCK and OCXO lanes
 //   • VCLOCK heartbeat and OCXO one-second compare consumption as observed
@@ -309,11 +310,12 @@ bool clocks_alpha_tau_snapshot(time_clock_id_t clock,
 
 
 // -----------------------------------------------------------------------------
-// Typed CLOCKS -> SYSTEM CLOCKS_FRAGMENT handoff
+// Typed CLOCKS_FRAGMENT publication snapshot
 // -----------------------------------------------------------------------------
 //
-// CLOCKS owns measurement, campaign lifecycle, and scientific verdicts. SYSTEM
-// owns the CLOCKS_FRAGMENT wire schema.  This handoff is deliberately normalized:
+// CLOCKS owns measurement, campaign lifecycle, scientific verdicts, the
+// CLOCKS_FRAGMENT wire schema, and canonical publication. The snapshot is
+// deliberately normalized:
 // one fact has one typed home before serialization.
 //
 //   live     = always-on instrument truth for one completed physical second
@@ -387,7 +389,7 @@ struct clocks_fragment_ppb_buckets_snapshot_t {
 };
 
 // Compact Alpha-authored Better-Buckets sufficient state carried at 1 Hz.
-// SYSTEM serializes these values verbatim; Pi CLOCKS may use the append testimony
+// CLOCKS serializes these values verbatim; Pi CLOCKS may use the append testimony
 // to maintain a larger synthetic recovery checkpoint but may not re-author them.
 struct clocks_fragment_ppb_endpoint_snapshot_t {
   uint64_t reference_ns = 0ULL;
@@ -640,12 +642,22 @@ struct clocks_fragment_snapshot_t {
   clocks_fragment_live_snapshot_t live{};
   clocks_fragment_campaign_snapshot_t campaign{};
 
-  // Publication-custody metadata only; SYSTEM does not serialize this field.
+  // Publication-custody metadata only; CLOCKS does not serialize this field.
   // Once public campaign time already exists, the matching campaign delta must
-  // accompany this sequence before SYSTEM releases it.  Keeping the bit here
+  // accompany this sequence before CLOCKS releases it. Keeping the bit here
   // avoids polluting the canonical live instrument state with campaign mirrors.
   bool campaign_row_expected = false;
 };
 
 bool clocks_fragment_snapshot_take(uint32_t completed_second_sequence,
                                    clocks_fragment_snapshot_t* out);
+
+// -----------------------------------------------------------------------------
+// CLOCKS-owned canonical publication readiness
+// -----------------------------------------------------------------------------
+// process_interrupt calls the first entry point from foreground after taking the
+// immutable PPS/VCLOCK sequence fact. Beta calls the completed-row and optional
+// campaign-row entry points only after the exact typed state is frozen.
+void clocks_fragment_pps_tick_from_interrupt(uint32_t pps_sequence);
+void clocks_fragment_completed_row_ready(uint32_t completed_second_sequence);
+void clocks_fragment_campaign_row_ready(uint32_t completed_second_sequence);

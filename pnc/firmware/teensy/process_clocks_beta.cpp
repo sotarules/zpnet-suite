@@ -109,7 +109,7 @@ uint64_t recover_ocxo2_ns = 0;
 
 // Beta owns campaign/science adjudication and freezes at most one typed completed
 // observation for SYSTEM. It does not construct a transport payload or know the
-// CLOCKS_FRAGMENT wire schema. SYSTEM consumes this handoff and owns serialization.
+// CLOCKS_FRAGMENT wire schema. The CLOCKS publisher consumes this handoff and owns serialization.
 
 // Alpha-authored physical PPS witness DWT audit surface. These facts enter the
 // typed handoff so SYSTEM can expose physical PPS-to-PPS DWT intervals beside the
@@ -543,9 +543,9 @@ static clocks_alpha_ocxo_counterledger_snapshot_t
 static clocks_alpha_ocxo_counterledger_snapshot_t
     g_beta_ocxo2_counterledger_row DMAMEM = {};
 
-// One immutable completed campaign record may await SYSTEM.  The typed snapshot
+// One immutable completed campaign record may await the CLOCKS publisher.  The typed snapshot
 // lives in RAM2 so the completed-row path never places the handoff object on the
-// scarce DTCM stack.  SYSTEM consumes it only when the requested PPS sequence
+// scarce DTCM stack. The CLOCKS publisher consumes it only when the requested PPS sequence
 // matches exactly; an unconsumed record is never overwritten.
 static clocks_fragment_campaign_snapshot_t
     g_clocks_fragment_campaign_record DMAMEM = {};
@@ -555,7 +555,931 @@ static uint32_t g_clocks_fragment_campaign_record_stage_count = 0U;
 static uint32_t g_clocks_fragment_campaign_record_take_count = 0U;
 static uint32_t g_clocks_fragment_campaign_record_backlog_count = 0U;
 
-// SYSTEM publication is normally armed by the first readiness notification.
+// ============================================================================
+// CLOCKS_FRAGMENT publication ownership
+// ============================================================================
+//
+// CLOCKS owns its canonical publication symmetrically with PHOTONS. Alpha and
+// Beta author the immutable instrument/campaign facts; this foreground publisher
+// owns exact-sequence serialization, transport retry custody, and final publish().
+// SYSTEM remains only the feature-status registry queried while building the
+// curated readiness tree.
+
+static constexpr uint64_t CLOCKS_FRAGMENT_RETRY_DELAY_NS = 25000000ULL;  // 25 ms
+static bool g_clocks_fragment_publication_initialized = false;
+
+// --------------------------------------------------------------
+// PPS-aligned CLOCKS_FRAGMENT publication custody
+// --------------------------------------------------------------
+// process_interrupt contributes only the completed PPS/VCLOCK sequence. CLOCKS
+// later takes one typed CLOCKS snapshot in foreground ALAP service and authors the
+// complete CLOCKS_FRAGMENT, including optional campaign facts. The former campaign
+// readiness notification remains a same-owner wake after Alpha freezes the exact row.
+static volatile uint32_t g_clocks_fragment_publication_pending_sequence = 0U;
+static volatile bool g_clocks_fragment_publication_pending = false;
+static volatile bool g_clocks_fragment_publication_service_armed = false;
+static timepop_handle_t g_clocks_fragment_publication_service_handle =
+    TIMEPOP_INVALID_HANDLE;
+static uint32_t g_clocks_fragment_publication_service_generation = 0U;
+static uint32_t g_clocks_fragment_publication_service_armed_generation = 0U;
+static uint32_t g_clocks_fragment_publication_service_forced_rearm_count = 0U;
+static uint32_t g_clocks_fragment_publication_service_cancel_count = 0U;
+static uint32_t g_clocks_fragment_publication_service_cancel_failure_count = 0U;
+static uint32_t g_clocks_fragment_publication_service_stale_callback_count = 0U;
+static bool g_clocks_fragment_publication_campaign_ready_last_valid = false;
+static uint32_t g_clocks_fragment_publication_campaign_ready_last_sequence = 0U;
+static uint32_t g_clocks_fragment_publication_campaign_ready_signal_count = 0U;
+static uint32_t g_clocks_fragment_publication_campaign_ready_repeat_count = 0U;
+static uint32_t g_clocks_fragment_publication_publish_count = 0U;
+static uint32_t g_clocks_fragment_publication_publish_reject_count = 0U;
+static uint32_t g_clocks_fragment_publication_coalesce_count = 0U;
+static uint32_t g_clocks_fragment_publication_service_arm_failures = 0U;
+static uint32_t g_clocks_fragment_publication_campaign_rows_embedded = 0U;
+static uint32_t g_clocks_fragment_publication_campaign_ready_enrichment_retry_count = 0U;
+static uint32_t g_clocks_fragment_publication_campaign_retry_count = 0U;
+static uint32_t g_clocks_fragment_publication_campaign_row_embed_fail_count = 0U;
+static bool g_clocks_fragment_publication_retry_snapshot_valid = false;
+static bool g_clocks_fragment_publication_retry_pi_only = false;
+static uint32_t g_clocks_fragment_publication_retry_sequence = 0U;
+static uint32_t g_clocks_fragment_publication_retry_attempt_count = 0U;
+static uint32_t g_clocks_fragment_publication_retry_tick_hold_count = 0U;
+static uint32_t g_clocks_fragment_publication_retry_schedule_count = 0U;
+static uint32_t g_clocks_fragment_publication_retry_success_count = 0U;
+static bool g_clocks_fragment_publication_last_tick_valid = false;
+static uint32_t g_clocks_fragment_publication_last_tick_sequence = 0U;
+
+// The CLOCKS handoff is intentionally large and must never become a foreground
+// stack local. CLOCKS owns this RAM2 snapshot and all serialization derived from it.
+static clocks_fragment_snapshot_t g_clocks_fragment_publication_clocks_snapshot DMAMEM = {};
+
+static void clocks_fragment_schedule_publish(void);
+
+static inline uint32_t clocks_fragment_current_ipsr(void) {
+#if defined(__arm__)
+  uint32_t value = 0U;
+  __asm__ volatile("mrs %0, ipsr" : "=r"(value) :: "memory");
+  return value;
+#else
+  return 0U;
+#endif
+}
+
+static FLASHMEM Payload clocks_fragment_features_payload(void) {
+  Payload clocks;
+  bool clocks_present = false;
+#define CLOCKS_ADD_FEATURE(name) \
+  do { \
+    if (system_feature_has("CLOCKS", name)) { \
+      clocks.add(name, system_feature_get_status("CLOCKS", name)); \
+      clocks_present = true; \
+    } \
+  } while (0)
+  CLOCKS_ADD_FEATURE("ALPHA_EPOCH");
+  CLOCKS_ADD_FEATURE("DWT_CALIBRATION");
+  CLOCKS_ADD_FEATURE("OCXO_PUBLIC_ORIGIN");
+  CLOCKS_ADD_FEATURE("STATIC_PREDICTION");
+#undef CLOCKS_ADD_FEATURE
+
+  Payload interrupt;
+  bool interrupt_present = false;
+#define CLOCKS_ADD_INTERRUPT_FEATURE(name) \
+  do { \
+    if (system_feature_has("INTERRUPT", name)) { \
+      interrupt.add(name, system_feature_get_status("INTERRUPT", name)); \
+      interrupt_present = true; \
+    } \
+  } while (0)
+  CLOCKS_ADD_INTERRUPT_FEATURE("COUNTER32_LINEAGE");
+  CLOCKS_ADD_INTERRUPT_FEATURE("OBSERVED_EDGE_AUTHORITY");
+  CLOCKS_ADD_INTERRUPT_FEATURE("PPS_VCLOCK_AUTHORITY");
+  CLOCKS_ADD_INTERRUPT_FEATURE("QTIMER_COUNTER_CUSTODY");
+#undef CLOCKS_ADD_INTERRUPT_FEATURE
+
+  Payload teensy;
+  if (clocks_present) teensy.add_object("CLOCKS", clocks);
+  if (interrupt_present) teensy.add_object("INTERRUPT", interrupt);
+
+  Payload root;
+  root.add_object("TEENSY", teensy);
+  return root;
+}
+
+static void clocks_fragment_publication_ensure_initialized(void) {
+  if (g_clocks_fragment_publication_initialized) return;
+
+  g_clocks_fragment_publication_clocks_snapshot = clocks_fragment_snapshot_t{};
+  g_clocks_fragment_publication_retry_snapshot_valid = false;
+  g_clocks_fragment_publication_retry_pi_only = false;
+  g_clocks_fragment_publication_retry_sequence = 0U;
+  g_clocks_fragment_publication_retry_attempt_count = 0U;
+  g_clocks_fragment_publication_retry_tick_hold_count = 0U;
+  g_clocks_fragment_publication_retry_schedule_count = 0U;
+  g_clocks_fragment_publication_retry_success_count = 0U;
+  g_clocks_fragment_publication_initialized = true;
+}
+
+// ============================================================================
+// CLOCKS_FRAGMENT — normalized canonical Teensy observation
+// ============================================================================
+//
+// CLOCKS owns serialization and publication custody for its own canonical feed.
+// Alpha supplies one always-on instrument snapshot plus, when available, Beta supplies one campaign-relative
+// TEMPEST delta.  The wire format deliberately contains no full Better-Buckets
+// ring mirror and no periodic transport/process/Payload flight recorder.
+// Compact Alpha-authored checkpoint/proof testimony is carried at 1 Hz so Pi
+// may maintain a literal synthetic recovery checkpoint without re-authoring
+// the instrument math.  raw_cycles is retained as
+// the compact four-rail sanity-check surface; deeper forensics remain on focused
+// reports.
+
+// ============================================================================
+// CLOCKS-owned canonical serialization
+// ============================================================================
+
+static void clocks_fragment_add_welford(
+    Payload& parent,
+    const char* key,
+    const clocks_fragment_welford_snapshot_t& sample) {
+  Payload value;
+  value.add("n", sample.n);
+  value.add("mean", toFixedDecimal(sample.mean, 12));
+  value.add("m2", toFixedDecimal(sample.m2, 12));
+  value.add("stddev", toFixedDecimal(sample.stddev, 6));
+  value.add("stderr", toFixedDecimal(sample.stderr_value, 6));
+  value.add("min", toFixedDecimal(sample.min, 12));
+  value.add("max", toFixedDecimal(sample.max, 12));
+  parent.add_object(key, value);
+}
+
+static void clocks_fragment_add_ppb_bucket(
+    Payload& buckets,
+    const char* key,
+    const clocks_fragment_ppb_value_snapshot_t& sample) {
+  if (sample.sample_count == 0ULL) return;
+  buckets.add(key, toFixedDecimal(sample.ppb, 6));
+}
+
+static void clocks_fragment_add_ppb_buckets(
+    Payload& clock,
+    const clocks_fragment_ppb_buckets_snapshot_t& buckets) {
+  Payload values;
+  clocks_fragment_add_ppb_bucket(values, "10_min", buckets.minute_10);
+  clocks_fragment_add_ppb_bucket(values, "60_min", buckets.minute_60);
+  clocks_fragment_add_ppb_bucket(values, "8_hour", buckets.hour_8);
+  clocks_fragment_add_ppb_bucket(values, "24_hour", buckets.hour_24);
+  clocks_fragment_add_ppb_bucket(values, "total", buckets.total);
+  clock.add_object("ppb_buckets", values);
+}
+
+static void clocks_fragment_add_ppb_endpoint(
+    Payload& parent,
+    const char* key,
+    const clocks_fragment_ppb_endpoint_snapshot_t& endpoint) {
+  Payload value;
+  value.add("reference_ns", endpoint.reference_ns);
+  value.add("dwt_error_cycles", toFixedDecimal(endpoint.dwt_error_cycles, 12));
+  value.add("ocxo1_error_ns", endpoint.ocxo1_error_ns);
+  value.add("ocxo2_error_ns", endpoint.ocxo2_error_ns);
+  value.add("rolling_sequence", endpoint.rolling_sequence);
+  value.add("interval_count", endpoint.interval_count);
+  parent.add_object(key, value);
+}
+
+static void clocks_fragment_add_ppb_window_proof(
+    Payload& parent,
+    const char* key,
+    const clocks_fragment_ppb_window_proof_snapshot_t& proof) {
+  Payload value;
+  value.add("valid", proof.valid);
+  value.add("sample_count", proof.sample_count);
+  if (proof.valid) {
+    clocks_fragment_add_ppb_endpoint(value, "anchor", proof.anchor);
+  }
+  parent.add_object(key, value);
+}
+
+static void clocks_fragment_add_ppb_checkpoint(
+    Payload& parent,
+    const clocks_fragment_ppb_checkpoint_delta_snapshot_t& checkpoint) {
+  Payload value;
+  value.add("schema", "CLOCKS_PPB_CHECKPOINT_DELTA_V1");
+  value.add("valid", checkpoint.valid);
+  value.add("rolling_sequence", checkpoint.rolling_sequence);
+  value.add("second_count", checkpoint.second_count);
+  value.add("minute_count", checkpoint.minute_count);
+  value.add("last_minute_key", checkpoint.last_minute_key);
+  value.add("origin_valid", checkpoint.origin_valid);
+
+  if (checkpoint.valid) {
+    clocks_fragment_add_ppb_endpoint(
+        value, "current", checkpoint.current);
+  }
+  if (checkpoint.origin_valid) {
+    clocks_fragment_add_ppb_endpoint(
+        value, "origin", checkpoint.origin);
+  }
+
+  clocks_fragment_add_ppb_window_proof(
+      value, "10_min", checkpoint.minute_10);
+  clocks_fragment_add_ppb_window_proof(
+      value, "60_min", checkpoint.minute_60);
+  clocks_fragment_add_ppb_window_proof(
+      value, "8_hour", checkpoint.hour_8);
+  clocks_fragment_add_ppb_window_proof(
+      value, "24_hour", checkpoint.hour_24);
+
+  Payload second_append;
+  second_append.add("valid", checkpoint.second_append_valid);
+  if (checkpoint.second_append_valid) {
+    clocks_fragment_add_ppb_endpoint(
+        second_append, "endpoint", checkpoint.second_append);
+  }
+  value.add_object("second_append", second_append);
+
+  Payload minute_append;
+  minute_append.add("valid", checkpoint.minute_append_valid);
+  if (checkpoint.minute_append_valid) {
+    clocks_fragment_add_ppb_endpoint(
+        minute_append, "endpoint", checkpoint.minute_append);
+  }
+  value.add_object("minute_append", minute_append);
+
+  parent.add_object("rolling_ppb_checkpoint", value);
+}
+
+static void clocks_fragment_add_stats_clock(
+    Payload& parent,
+    const char* key,
+    const clocks_fragment_stats_clock_snapshot_t& clock) {
+  Payload value;
+  clocks_fragment_add_welford(value, "welford", clock.welford);
+  if (clock.frequency_present) {
+    value.add("tau", toFixedDecimal(clock.tau, 12));
+    value.add("ppb", toFixedDecimal(clock.ppb, 3));
+  }
+  clocks_fragment_add_ppb_buckets(value, clock.ppb_buckets);
+  parent.add_object(key, value);
+}
+
+static void clocks_fragment_add_tau_state(
+    Payload& parent,
+    const char* key,
+    const clocks_fragment_tau_recovery_snapshot_t& state) {
+  Payload value;
+  value.add("valid", state.valid);
+  value.add("reset_count", state.reset_count);
+  value.add("sample_count", state.sample_count);
+  value.add("interval_count", state.interval_count);
+  value.add("reject_count", state.reject_count);
+  value.add("gap_reset_count", state.gap_reset_count);
+  value.add("last_pps_sequence", state.last_pps_sequence);
+  value.add("last_interval_pps_sequence", state.last_interval_pps_sequence);
+  value.add("first_refined_ns", state.first_refined_ns);
+  value.add("last_refined_ns", state.last_refined_ns);
+  value.add("last_fast_residual_ns", state.last_fast_residual_ns);
+  value.add("cumulative_reference_ns", state.cumulative_reference_ns);
+  value.add("cumulative_clock_ns", state.cumulative_clock_ns);
+  value.add("cumulative_clock_ns_exact",
+            toFixedDecimal(state.cumulative_clock_ns_exact, 12));
+  value.add("mean_x", toFixedDecimal(state.mean_x, 12));
+  value.add("mean_y", toFixedDecimal(state.mean_y, 12));
+  value.add("sxx", toFixedDecimal(state.sxx, 12));
+  value.add("sxy", toFixedDecimal(state.sxy, 12));
+  value.add("syy", toFixedDecimal(state.syy, 12));
+  value.add("interval_mean_ppb", toFixedDecimal(state.interval_mean_ppb, 12));
+  value.add("interval_m2_ppb", toFixedDecimal(state.interval_m2_ppb, 12));
+  parent.add_object(key, value);
+}
+
+static void clocks_fragment_add_stats(
+    Payload& parent,
+    const clocks_fragment_stats_snapshot_t& snapshot) {
+  Payload stats;
+  stats.add("schema", "CLOCKS_INSTRUMENT_STATS_V4");
+  stats.add("snapshot_ok", snapshot.snapshot_ok);
+  stats.add("valid", snapshot.valid);
+  stats.add("reset_count", snapshot.reset_count);
+  stats.add("update_count", snapshot.update_count);
+  stats.add("last_pps_sequence", snapshot.last_pps_sequence);
+  stats.add("rolling_ppb_current_sequence",
+            snapshot.rolling_ppb_current_sequence);
+  stats.add("rolling_ppb_endpoint_admitted",
+            snapshot.rolling_ppb_endpoint_admitted);
+  stats.add("rolling_ppb_interval_advanced",
+            snapshot.rolling_ppb_interval_advanced);
+  clocks_fragment_add_ppb_checkpoint(
+      stats, snapshot.rolling_ppb_checkpoint);
+  stats.add("completed_row_coherent", snapshot.completed_row_coherent);
+
+  clocks_fragment_add_stats_clock(stats, "gnss", snapshot.gnss);
+  clocks_fragment_add_stats_clock(stats, "dwt", snapshot.dwt);
+  clocks_fragment_add_stats_clock(stats, "vclock", snapshot.vclock);
+  clocks_fragment_add_stats_clock(stats, "ocxo1", snapshot.ocxo1);
+  clocks_fragment_add_stats_clock(stats, "ocxo2", snapshot.ocxo2);
+
+  // These sufficient-state objects are retained because Holistic Restore must
+  // continue the exact Alpha populations rather than manufacture new ones.
+  clocks_fragment_add_tau_state(
+      stats, "ocxo1_tau_state", snapshot.ocxo1_tau_state);
+  clocks_fragment_add_tau_state(
+      stats, "ocxo2_tau_state", snapshot.ocxo2_tau_state);
+
+  Payload auxiliary_welford;
+  clocks_fragment_add_welford(
+      auxiliary_welford, "pps_witness", snapshot.pps_witness.welford);
+  stats.add_object("auxiliary_welford", auxiliary_welford);
+
+  parent.add_object("stats", stats);
+}
+
+static void clocks_fragment_add_raw_cycles_lane(
+    Payload& parent,
+    const char* key,
+    const clocks_fragment_raw_cycles_lane_t& sample) {
+  Payload lane;
+  lane.add("snapshot_ok", sample.snapshot_ok);
+  lane.add("forensics_snapshot_ok", sample.forensics_snapshot_ok);
+  lane.add("valid", sample.valid);
+  lane.add("completed_interval_count", sample.completed_interval_count);
+  lane.add("observed_cycles", sample.observed_cycles);
+  lane.add("previous_observed_cycles", sample.previous_observed_cycles);
+  lane.add("residual_cycles", sample.residual_cycles);
+  lane.add("delay_status", sample.delay_status);
+  lane.add("delay_detail_present", sample.delay_detail_present);
+  lane.add("delay_by", sample.delay_by);
+  lane.add("residual_delay_valid", sample.residual_delay_valid);
+  lane.add("residual_delay_cycles", sample.residual_delay_cycles);
+  lane.add("residual_delay_by", sample.residual_delay_by);
+  lane.add("delay_explains_residual", sample.delay_explains_residual);
+  parent.add_object(key, lane);
+}
+
+static void clocks_fragment_add_raw_cycles(
+    Payload& parent,
+    const clocks_fragment_raw_cycles_snapshot_t& snapshot) {
+  Payload raw;
+  clocks_fragment_add_raw_cycles_lane(raw, "pps", snapshot.pps);
+  clocks_fragment_add_raw_cycles_lane(raw, "vclock", snapshot.vclock);
+  clocks_fragment_add_raw_cycles_lane(raw, "ocxo1", snapshot.ocxo1);
+  clocks_fragment_add_raw_cycles_lane(raw, "ocxo2", snapshot.ocxo2);
+  parent.add_object("raw_cycles", raw);
+}
+
+static void clocks_fragment_add_science(
+    Payload& parent,
+    const clocks_fragment_science_snapshot_t& science) {
+  Payload value;
+  value.add("valid", science.valid);
+  value.add("science_worthy", science.science_worthy);
+  value.add("antecedents_complete", science.antecedents_complete);
+  value.add("gnss_interval_ns", science.gnss_interval_ns);
+  value.add("clock_interval_ns", science.clock_interval_ns);
+  value.add("fast_residual_ns", science.fast_residual_ns);
+  value.add("fast_residual_ns_exact",
+            toFixedDecimal(science.fast_residual_ns_exact, 6));
+  value.add("delta_raw_valid", science.delta_raw_valid);
+  value.add("delta_raw_reference_interval_cycles",
+            science.delta_raw_reference_interval_cycles);
+  value.add("delta_raw_clock_interval_cycles",
+            science.delta_raw_clock_interval_cycles);
+  value.add("delta_raw_fast_residual_cycles",
+            science.delta_raw_fast_residual_cycles);
+  parent.add_object("science", value);
+}
+
+static Payload clocks_fragment_clocks_payload(
+    const clocks_fragment_live_snapshot_t& snapshot) {
+  Payload clocks;
+  clocks.add("schema", "CLOCKS_INSTRUMENT_V1");
+  clocks.add("snapshot_ok", snapshot.snapshot_ok);
+  clocks.add("valid", snapshot.valid);
+  clocks.add("completed_row_coherent", snapshot.completed_row_coherent);
+  clocks.add("completed_pps_sequence", snapshot.completed_pps_sequence);
+  clocks.add("instrument_age_seconds", snapshot.instrument_age_seconds);
+
+  Payload clockfaces;
+  clockfaces.add("gnss_ns", snapshot.instrument_gnss_ns);
+  clockfaces.add("dwt_cycles", snapshot.instrument_dwt_cycles);
+  clockfaces.add("ocxo1_ns", snapshot.instrument_ocxo1_ns);
+  clockfaces.add("ocxo2_ns", snapshot.instrument_ocxo2_ns);
+  clockfaces.add("pps_sequence", snapshot.instrument_pps_sequence);
+  clocks.add_object("clockfaces", clockfaces);
+
+  Payload anchor;
+  anchor.add("dwt_cycles_per_second", snapshot.dwt_cycles_per_second);
+  anchor.add("dwt_at_pps_vclock", snapshot.dwt_at_pps_vclock);
+  anchor.add("counter32_at_pps_vclock", snapshot.counter32_at_pps_vclock);
+  clocks.add_object("anchor", anchor);
+
+  clocks_fragment_add_raw_cycles(clocks, snapshot.raw_cycles);
+  clocks_fragment_add_stats(clocks, snapshot.stats);
+  return clocks;
+}
+
+static const char* clocks_fragment_clock_candidate_status_name(
+    clocks_fragment_clock_candidate_status_t status) {
+  switch (status) {
+    case clocks_fragment_clock_candidate_status_t::SEEDED:
+      return "SEEDED";
+    case clocks_fragment_clock_candidate_status_t::ADVANCED:
+      return "ADVANCED";
+    case clocks_fragment_clock_candidate_status_t::DELTA_INVALID:
+      return "DELTA_INVALID";
+    case clocks_fragment_clock_candidate_status_t::PUBLIC_COUNT_GAP:
+      return "PUBLIC_COUNT_GAP";
+    case clocks_fragment_clock_candidate_status_t::ARITHMETIC_FAILURE:
+      return "ARITHMETIC_FAILURE";
+    case clocks_fragment_clock_candidate_status_t::UNAVAILABLE:
+    default:
+      return "UNAVAILABLE";
+  }
+}
+
+static void clocks_fragment_add_clock_candidate(
+    Payload& parent,
+    const char* key,
+    const clocks_fragment_clock_candidate_t& candidate) {
+  Payload out;
+  out.add("available", candidate.available);
+  out.add("continuity_valid", candidate.continuity_valid);
+  out.add("status_id", (uint32_t)candidate.status);
+  out.add("status",
+          clocks_fragment_clock_candidate_status_name(candidate.status));
+  out.add("start_public_count", candidate.start_public_count);
+  out.add("last_public_count", candidate.last_public_count);
+  out.add("interval_count", candidate.interval_count);
+  out.add("ns", candidate.ns);
+  out.add("fractional_ns", toFixedDecimal(candidate.fractional_ns, 12));
+  out.add("residual_available", candidate.residual_available);
+  out.add("residual_ns", candidate.residual_ns);
+  out.add("residual_ns_exact",
+          toFixedDecimal(candidate.residual_ns_exact, 12));
+  parent.add_object(key, out);
+}
+
+static void clocks_fragment_add_clock_candidates(
+    Payload& parent,
+    const clocks_fragment_clock_candidates_snapshot_t& snapshot) {
+  Payload candidates;
+  candidates.add("schema", "OCXO_CLOCK_CANDIDATES_V1");
+  candidates.add("published_source", snapshot.published_source);
+  clocks_fragment_add_clock_candidate(
+      candidates, "phaseledger", snapshot.phaseledger);
+  clocks_fragment_add_clock_candidate(
+      candidates, "delta_cycles", snapshot.delta_cycles);
+  candidates.add("comparable", snapshot.comparable);
+  candidates.add("delta_cycles_minus_phaseledger_ns",
+                 snapshot.delta_cycles_minus_phaseledger_ns);
+  candidates.add("residuals_comparable", snapshot.residuals_comparable);
+  candidates.add(
+      "delta_cycles_minus_phaseledger_residual_ns_exact",
+      toFixedDecimal(
+          snapshot.delta_cycles_minus_phaseledger_residual_ns_exact, 12));
+  parent.add_object("clock_candidates", candidates);
+}
+
+static void clocks_fragment_add_campaign_ocxo(
+    Payload& parent,
+    const char* key,
+    const clocks_fragment_clock_candidates_snapshot_t& clock_candidates,
+    const clocks_fragment_science_snapshot_t& science) {
+  Payload lane;
+  clocks_fragment_add_clock_candidates(lane, clock_candidates);
+  clocks_fragment_add_science(lane, science);
+  parent.add_object(key, lane);
+}
+
+static void clocks_fragment_add_campaign_ppb(
+    Payload& ppb,
+    const char* key,
+    const clocks_fragment_ppb_value_snapshot_t& sample) {
+  if (sample.sample_count == 0ULL) return;
+  ppb.add(key, toFixedDecimal(sample.ppb, 6));
+}
+
+static void clocks_fragment_add_campaign_stats(
+    Payload& parent,
+    const clocks_fragment_campaign_stats_snapshot_t& snapshot) {
+  Payload stats;
+  Payload ppb;
+  clocks_fragment_add_campaign_ppb(ppb, "gnss", snapshot.gnss);
+  clocks_fragment_add_campaign_ppb(ppb, "dwt", snapshot.dwt);
+  clocks_fragment_add_campaign_ppb(ppb, "vclock", snapshot.vclock);
+  clocks_fragment_add_campaign_ppb(ppb, "ocxo1", snapshot.ocxo1);
+  clocks_fragment_add_campaign_ppb(ppb, "ocxo2", snapshot.ocxo2);
+  stats.add_object("ppb", ppb);
+  parent.add_object("stats", stats);
+}
+
+static Payload clocks_fragment_campaign_payload(
+    const clocks_fragment_campaign_snapshot_t& snapshot) {
+  Payload campaign;
+  campaign.add("schema", "TEMPEST_FRAGMENT_V1");
+  campaign.add("name", snapshot.campaign);
+  campaign.add("state", snapshot.campaign_state);
+  campaign.add("public_count", snapshot.public_count);
+
+  Payload clockfaces;
+  clockfaces.add("gnss_ns", snapshot.gnss_ns);
+  clockfaces.add("dwt_cycles", snapshot.dwt_cycles);
+  clockfaces.add("ocxo1_ns", snapshot.ocxo1_ns);
+  clockfaces.add("ocxo2_ns", snapshot.ocxo2_ns);
+  campaign.add_object("clockfaces", clockfaces);
+
+  Payload status;
+  status.add("timeline_valid", snapshot.timeline_valid);
+  status.add("ocxo_clockface_valid", snapshot.ocxo_clockface_valid);
+  status.add("ocxo_science_valid", snapshot.ocxo_science_valid);
+  campaign.add_object("status", status);
+
+  Payload disposition;
+  disposition.add("status", snapshot.disposition);
+  disposition.add("use", snapshot.science_eligible && snapshot.control_eligible
+      ? "SCIENCE_AND_CONTROL"
+      : "AUDIT_ONLY");
+  disposition.add("science_eligible", snapshot.science_eligible);
+  disposition.add("control_eligible", snapshot.control_eligible);
+  if (snapshot.rejection.present) {
+    disposition.add("reason_code", snapshot.rejection.reason_code);
+    disposition.add("reason_name", snapshot.rejection.reason_name);
+    disposition.add("source", snapshot.rejection.source);
+    disposition.add("lane_mask", snapshot.rejection.lane_mask);
+  }
+  campaign.add_object("disposition", disposition);
+
+  if (snapshot.recovery.present) {
+    Payload recovery;
+    recovery.add("generation", snapshot.recovery.generation);
+    recovery.add("transition_active", snapshot.recovery.transition_active);
+    recovery.add("timeline_ready", snapshot.recovery.timeline_ready);
+    recovery.add("clockface_ready", snapshot.recovery.clockface_ready);
+    recovery.add("science_ready", snapshot.recovery.science_ready);
+    recovery.add("degraded_active", snapshot.recovery.degraded_active);
+    recovery.add("science_quarantine_active",
+                 snapshot.recovery.science_quarantine_active);
+    recovery.add("science_quarantine_remaining",
+                 snapshot.recovery.science_quarantine_remaining);
+    recovery.add("reattach_stalled", snapshot.recovery.reattach_stalled);
+    campaign.add_object("recovery", recovery);
+  }
+
+  clocks_fragment_add_campaign_ocxo(
+      campaign, "ocxo1", snapshot.ocxo1_clock_candidates, snapshot.ocxo1_science);
+  clocks_fragment_add_campaign_ocxo(
+      campaign, "ocxo2", snapshot.ocxo2_clock_candidates, snapshot.ocxo2_science);
+  clocks_fragment_add_campaign_stats(campaign, snapshot.stats);
+  return campaign;
+}
+
+static void clocks_fragment_publish_service(timepop_ctx_t*,
+                                                   timepop_diag_t*,
+                                                   void* user_data) {
+  const uint32_t callback_generation = (uint32_t)(uintptr_t)user_data;
+  if (!g_clocks_fragment_publication_service_armed ||
+      callback_generation == 0U ||
+      callback_generation != g_clocks_fragment_publication_service_armed_generation) {
+    g_clocks_fragment_publication_service_stale_callback_count++;
+    return;
+  }
+
+  g_clocks_fragment_publication_service_armed = false;
+  g_clocks_fragment_publication_service_handle = TIMEPOP_INVALID_HANDLE;
+
+  const bool retrying_snapshot = g_clocks_fragment_publication_retry_snapshot_valid;
+  if (!retrying_snapshot && !g_clocks_fragment_publication_pending) return;
+
+  clocks_fragment_publication_ensure_initialized();
+
+  uint32_t sequence = 0U;
+  bool clocks_snapshot_ok = false;
+  if (retrying_snapshot) {
+    sequence = g_clocks_fragment_publication_retry_sequence;
+    clocks_snapshot_ok = true;
+  } else {
+    sequence = g_clocks_fragment_publication_pending_sequence;
+    g_clocks_fragment_publication_pending = false;
+    g_clocks_fragment_publication_clocks_snapshot = clocks_fragment_snapshot_t{};
+    clocks_snapshot_ok = clocks_fragment_snapshot_take(
+        sequence, &g_clocks_fragment_publication_clocks_snapshot);
+  }
+
+  const bool instrument_row_exact = clocks_snapshot_ok &&
+      g_clocks_fragment_publication_clocks_snapshot.live.snapshot_ok &&
+      g_clocks_fragment_publication_clocks_snapshot.live.completed_row_coherent &&
+      g_clocks_fragment_publication_clocks_snapshot.live.completed_pps_sequence == sequence;
+
+  if (!instrument_row_exact) {
+    // The interrupt-side PPS notification arrives before both post-PPS OCXO edges
+    // have necessarily completed Alpha's immutable row. Never label the latest
+    // completed instrument state with the newer trigger identity. Hold this exact
+    // requested sequence until Beta's completed-row notification rearms service.
+    if (retrying_snapshot) {
+      g_clocks_fragment_publication_publish_reject_count++;
+      g_clocks_fragment_publication_retry_snapshot_valid = false;
+      g_clocks_fragment_publication_retry_pi_only = false;
+      g_clocks_fragment_publication_retry_sequence = 0U;
+      g_clocks_fragment_publication_retry_attempt_count = 0U;
+    }
+    g_clocks_fragment_publication_pending_sequence = sequence;
+    g_clocks_fragment_publication_pending = true;
+    g_clocks_fragment_publication_clocks_snapshot = clocks_fragment_snapshot_t{};
+    return;
+  }
+
+  const bool campaign_available = clocks_snapshot_ok &&
+      g_clocks_fragment_publication_clocks_snapshot.campaign.present &&
+      g_clocks_fragment_publication_clocks_snapshot.campaign.completed_second_sequence ==
+          sequence;
+
+  if (clocks_snapshot_ok &&
+      g_clocks_fragment_publication_clocks_snapshot.campaign_row_expected &&
+      !campaign_available) {
+    // Public campaign time is already advancing, so this exact physical second
+    // must wait for Beta's matching campaign delta.  This custody bit is never
+    // serialized and does not contaminate the canonical instrument model.
+    if (retrying_snapshot) {
+      g_clocks_fragment_publication_publish_reject_count++;
+      g_clocks_fragment_publication_retry_snapshot_valid = false;
+      g_clocks_fragment_publication_retry_pi_only = false;
+      g_clocks_fragment_publication_retry_sequence = 0U;
+      g_clocks_fragment_publication_retry_attempt_count = 0U;
+    }
+    g_clocks_fragment_publication_pending_sequence = sequence;
+    g_clocks_fragment_publication_pending = true;
+    g_clocks_fragment_publication_clocks_snapshot = clocks_fragment_snapshot_t{};
+    return;
+  }
+
+  Payload fragment;
+  fragment.add("schema", "CLOCKS_FRAGMENT_V4");
+  fragment.add("sequence",
+               g_clocks_fragment_publication_clocks_snapshot.live.completed_pps_sequence);
+
+  // Campaign is optional enrichment. If Beta has not frozen it yet, publish the
+  // instrument row now; campaign_row_ready() will schedule a same-sequence
+  // strengthening copy. This avoids carrying campaign lifecycle mirrors inside
+  // the always-on instrument snapshot merely to coordinate serialization.
+  bool campaign_embedded = false;
+  if (campaign_available) {
+    Payload campaign = clocks_fragment_campaign_payload(
+        g_clocks_fragment_publication_clocks_snapshot.campaign);
+    campaign_embedded = fragment.add_object("campaign", campaign);
+    if (!campaign_embedded) {
+      g_clocks_fragment_publication_publish_reject_count++;
+      g_clocks_fragment_publication_campaign_row_embed_fail_count++;
+      if (!retrying_snapshot) {
+        g_clocks_fragment_publication_retry_snapshot_valid = true;
+        g_clocks_fragment_publication_retry_pi_only = false;
+        g_clocks_fragment_publication_retry_sequence = sequence;
+        g_clocks_fragment_publication_retry_attempt_count = 1U;
+        g_clocks_fragment_publication_campaign_retry_count++;
+      } else {
+        g_clocks_fragment_publication_retry_attempt_count++;
+      }
+      g_clocks_fragment_publication_retry_schedule_count++;
+      clocks_fragment_schedule_publish();
+      return;
+    }
+  }
+
+  if (!clocks_snapshot_ok ||
+      !fragment.add_object(
+          "clocks",
+          clocks_fragment_clocks_payload(
+              g_clocks_fragment_publication_clocks_snapshot.live)) ||
+      !fragment.add_object("features", clocks_fragment_features_payload())) {
+    g_clocks_fragment_publication_publish_reject_count++;
+    if (!retrying_snapshot) {
+      g_clocks_fragment_publication_retry_snapshot_valid = true;
+      g_clocks_fragment_publication_retry_pi_only = false;
+      g_clocks_fragment_publication_retry_sequence = sequence;
+      g_clocks_fragment_publication_retry_attempt_count = 1U;
+    } else {
+      g_clocks_fragment_publication_retry_attempt_count++;
+    }
+    g_clocks_fragment_publication_retry_schedule_count++;
+    clocks_fragment_schedule_publish();
+    return;
+  }
+
+  const uint32_t next_publish_count = g_clocks_fragment_publication_publish_count + 1U;
+  const uint32_t next_campaign_rows_embedded =
+      g_clocks_fragment_publication_campaign_rows_embedded +
+      (campaign_embedded ? 1U : 0U);
+
+  const bool publication_enqueued =
+      retrying_snapshot && g_clocks_fragment_publication_retry_pi_only
+          ? publish_to_pi("CLOCKS_FRAGMENT", fragment)
+          : publish("CLOCKS_FRAGMENT", fragment);
+  fragment.clear();
+
+  if (!publication_enqueued) {
+    g_clocks_fragment_publication_publish_reject_count++;
+    if (!retrying_snapshot) {
+      g_clocks_fragment_publication_retry_snapshot_valid = true;
+      g_clocks_fragment_publication_retry_sequence = sequence;
+      g_clocks_fragment_publication_retry_attempt_count = 1U;
+      if (campaign_embedded) {
+        g_clocks_fragment_publication_campaign_retry_count++;
+      }
+    } else {
+      g_clocks_fragment_publication_retry_attempt_count++;
+    }
+    g_clocks_fragment_publication_retry_pi_only = true;
+    g_clocks_fragment_publication_retry_schedule_count++;
+    clocks_fragment_schedule_publish();
+    return;
+  }
+
+  g_clocks_fragment_publication_publish_count = next_publish_count;
+  g_clocks_fragment_publication_campaign_rows_embedded = next_campaign_rows_embedded;
+  if (retrying_snapshot) {
+    g_clocks_fragment_publication_retry_success_count++;
+  }
+  g_clocks_fragment_publication_retry_snapshot_valid = false;
+  g_clocks_fragment_publication_retry_pi_only = false;
+  g_clocks_fragment_publication_retry_sequence = 0U;
+  g_clocks_fragment_publication_retry_attempt_count = 0U;
+
+  g_clocks_fragment_publication_clocks_snapshot = clocks_fragment_snapshot_t{};
+  if (g_clocks_fragment_publication_pending) clocks_fragment_schedule_publish();
+}
+
+static void clocks_fragment_schedule_publish(void) {
+  if ((!g_clocks_fragment_publication_pending &&
+       !g_clocks_fragment_publication_retry_snapshot_valid) ||
+      g_clocks_fragment_publication_service_armed) {
+    return;
+  }
+
+  uint32_t generation = g_clocks_fragment_publication_service_generation + 1U;
+  if (generation == 0U) generation = 1U;
+
+  const bool delayed_retry =
+      g_clocks_fragment_publication_retry_snapshot_valid &&
+      g_clocks_fragment_publication_retry_attempt_count > 0U;
+  const timepop_handle_t handle = delayed_retry
+      ? timepop_arm(CLOCKS_FRAGMENT_RETRY_DELAY_NS,
+                    false,
+                    clocks_fragment_publish_service,
+                    (void*)(uintptr_t)generation,
+                    "CLOCKS_FRAGMENT_RETRY")
+      : timepop_arm_alap(clocks_fragment_publish_service,
+                         (void*)(uintptr_t)generation,
+                         "CLOCKS_FRAGMENT_PUBLISH");
+  if (handle == TIMEPOP_INVALID_HANDLE) {
+    g_clocks_fragment_publication_service_arm_failures++;
+    return;
+  }
+
+  g_clocks_fragment_publication_service_handle = handle;
+  g_clocks_fragment_publication_service_generation = generation;
+  g_clocks_fragment_publication_service_armed_generation = generation;
+  g_clocks_fragment_publication_service_armed = true;
+}
+
+static void clocks_fragment_force_rearm(void) {
+  if (!g_clocks_fragment_publication_service_armed) {
+    clocks_fragment_schedule_publish();
+    return;
+  }
+
+  bool cancelled = false;
+  if (g_clocks_fragment_publication_service_handle != TIMEPOP_INVALID_HANDLE) {
+    cancelled = timepop_cancel(g_clocks_fragment_publication_service_handle);
+  }
+  if (cancelled) {
+    g_clocks_fragment_publication_service_cancel_count++;
+  } else {
+    g_clocks_fragment_publication_service_cancel_failure_count++;
+  }
+
+  // Generation-tagged callbacks make this safe even if the old handle was
+  // already selected for dispatch and could not be cancelled. The replacement
+  // arm advances the generation; any superseded callback becomes a no-op.
+  g_clocks_fragment_publication_service_handle = TIMEPOP_INVALID_HANDLE;
+  g_clocks_fragment_publication_service_armed = false;
+  g_clocks_fragment_publication_service_forced_rearm_count++;
+  clocks_fragment_schedule_publish();
+}
+
+static void clocks_fragment_accept_tick(uint32_t requested_sequence) {
+  if (g_clocks_fragment_publication_last_tick_valid &&
+      requested_sequence == g_clocks_fragment_publication_last_tick_sequence) {
+    return;
+  }
+  g_clocks_fragment_publication_last_tick_sequence = requested_sequence;
+  g_clocks_fragment_publication_last_tick_valid = true;
+
+  // A retained campaign retry already owns g_clocks_fragment_publication_clocks_snapshot.
+  // While that exact row remains in transport custody, a newer physical tick
+  // must not replace the pending sequence selected by Beta's next immutable
+  // campaign row. Doing so creates a permanent head-of-line mismatch: Beta
+  // keeps the older row while the CLOCKS publisher repeatedly asks for the newest tick.
+  //
+  // The physical tick still drives retry progress. Once the retained row is
+  // accepted, any campaign_row_ready() received during the retry remains in
+  // g_clocks_fragment_publication_pending_sequence and is published next.
+  if (g_clocks_fragment_publication_retry_snapshot_valid) {
+    g_clocks_fragment_publication_retry_tick_hold_count++;
+    if (!g_clocks_fragment_publication_pending) {
+      g_clocks_fragment_publication_pending_sequence = requested_sequence;
+      g_clocks_fragment_publication_pending = true;
+    } else if (g_clocks_fragment_publication_pending_sequence != requested_sequence) {
+      // One exact snapshot is in retry custody and one following identity is
+      // reserved. A further arrival is visible as coalescing rather than
+      // silently replacing the reserved successor. Under normal USB budget
+      // pressure the 25 ms retry must clear long before this boundary.
+      g_clocks_fragment_publication_coalesce_count++;
+    }
+    clocks_fragment_schedule_publish();
+    return;
+  }
+
+  if (g_clocks_fragment_publication_pending) g_clocks_fragment_publication_coalesce_count++;
+  g_clocks_fragment_publication_pending_sequence = requested_sequence;
+  g_clocks_fragment_publication_pending = true;
+  clocks_fragment_schedule_publish();
+}
+
+void clocks_fragment_pps_tick_from_interrupt(
+    uint32_t pps_sequence) {
+  if (clocks_fragment_current_ipsr() != 0U) return;
+  clocks_fragment_accept_tick(pps_sequence);
+}
+
+void clocks_fragment_completed_row_ready(uint32_t completed_second_sequence) {
+  if (clocks_fragment_current_ipsr() != 0U || completed_second_sequence == 0U) return;
+
+  // Beta calls this only after Alpha has frozen the exact completed row. If the
+  // interrupt-side notification already reserved this identity, wake/rearm the
+  // held serializer now that the row is actually available.
+  if (g_clocks_fragment_publication_pending &&
+      g_clocks_fragment_publication_pending_sequence == completed_second_sequence) {
+    if (g_clocks_fragment_publication_service_armed) {
+      clocks_fragment_force_rearm();
+    } else {
+      clocks_fragment_schedule_publish();
+    }
+    return;
+  }
+
+  clocks_fragment_accept_tick(completed_second_sequence);
+}
+
+void clocks_fragment_campaign_row_ready(uint32_t completed_second_sequence) {
+  if (clocks_fragment_current_ipsr() != 0U || completed_second_sequence == 0U) {
+    return;
+  }
+
+  g_clocks_fragment_publication_campaign_ready_signal_count++;
+  const bool repeated_signal =
+      g_clocks_fragment_publication_campaign_ready_last_valid &&
+      g_clocks_fragment_publication_campaign_ready_last_sequence ==
+          completed_second_sequence;
+  const bool service_was_armed = g_clocks_fragment_publication_service_armed;
+  if (repeated_signal) {
+    g_clocks_fragment_publication_campaign_ready_repeat_count++;
+  }
+  g_clocks_fragment_publication_campaign_ready_last_valid = true;
+  g_clocks_fragment_publication_campaign_ready_last_sequence = completed_second_sequence;
+
+  // If the canonical interrupt tick is still pending, keep one publication and
+  // let the completed campaign observation ride along. If that sequence already
+  // published, arm a deliberate same-sequence enrichment copy rather than losing
+  // durable truth.
+  if (g_clocks_fragment_publication_pending &&
+      g_clocks_fragment_publication_pending_sequence == completed_second_sequence) {
+    if (repeated_signal && service_was_armed) {
+      clocks_fragment_force_rearm();
+    } else {
+      clocks_fragment_schedule_publish();
+    }
+    return;
+  }
+
+  if (g_clocks_fragment_publication_last_tick_valid &&
+      g_clocks_fragment_publication_last_tick_sequence == completed_second_sequence) {
+    g_clocks_fragment_publication_campaign_ready_enrichment_retry_count++;
+    g_clocks_fragment_publication_pending_sequence = completed_second_sequence;
+    g_clocks_fragment_publication_pending = true;
+    if (repeated_signal && service_was_armed) {
+      clocks_fragment_force_rearm();
+    } else {
+      clocks_fragment_schedule_publish();
+    }
+    return;
+  }
+
+  clocks_fragment_accept_tick(completed_second_sequence);
+  if (repeated_signal && service_was_armed) {
+    clocks_fragment_force_rearm();
+  }
+}
+
+
+
+// CLOCKS publication is normally armed by the first readiness notification.
 // Keep one bounded second-chance notification inside the same public second so
 // an orphaned/stale ALAP arm cannot strand Beta's immutable row until the next
 // candidate reaches the structural backlog court.
@@ -587,7 +1511,7 @@ static void clocks_fragment_campaign_record_ready_retry_callback(
   }
 
   g_clocks_fragment_campaign_record_ready_retry_fire_count++;
-  system_clocks_fragment_campaign_row_ready(g_clocks_fragment_campaign_record_sequence);
+  clocks_fragment_campaign_row_ready(g_clocks_fragment_campaign_record_sequence);
 }
 
 static void clocks_fragment_campaign_record_ready_retry_arm(void) {
@@ -6822,11 +7746,11 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   campaign_record_stage(CAMPAIGN_RECORD_STAGE_ENTRY);
 
   // Alpha enters Beta only after both post-PPS OCXO lanes have frozen this exact
-  // completed row. Wake SYSTEM's PPS-triggered serializer now that the requested
+  // completed row. Wake CLOCKS' PPS-triggered serializer now that the requested
   // identity is genuinely available. Campaign rows may still hold publication
   // below until their matching enrichment is frozen.
   if (completed_pps_sequence != 0U) {
-    system_clocks_fragment_pps_tick(completed_pps_sequence);
+    clocks_fragment_completed_row_ready(completed_pps_sequence);
   }
 
   if (request_stop) {
@@ -7567,14 +8491,14 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   g_clocks_fragment_campaign_record_stage_count++;
   campaign_record_stage(CAMPAIGN_RECORD_STAGE_HANDOFF_READY);
 
-  // The interrupt-owned tick normally already has this sequence pending. This
+  // The CLOCKS-owned physical tick normally already has this sequence pending. This
   // call coalesces the completed record into that publication, or schedules a
   // same-sequence copy if the observation-only fragment already escaped.
-  system_clocks_fragment_campaign_row_ready(completed_pps_sequence);
+  clocks_fragment_campaign_row_ready(completed_pps_sequence);
 
-  // A second notification 100 ms later is idempotent when SYSTEM consumed the
-  // row normally. If SYSTEM's first ALAP arm was orphaned, the repeated signal
-  // lets SYSTEM replace that stale arm before the next campaign candidate exists.
+  // A second notification 100 ms later is idempotent when CLOCKS consumed the
+  // row normally. If CLOCKS' first ALAP arm was orphaned, the repeated signal
+  // lets CLOCKS replace that stale arm before the next campaign candidate exists.
   clocks_fragment_campaign_record_ready_retry_arm();
 
   clocks_watchdog_arm_campaign_publication();

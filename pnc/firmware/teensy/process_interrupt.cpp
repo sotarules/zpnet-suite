@@ -2692,9 +2692,9 @@ static timepop_foreground_diag_t g_timepop_foreground_diag{};
 static volatile bool g_timepop_foreground_rearm_requested = false;
 static bool g_interrupt_foreground_service_running = false;
 
-// Always-on CLOCKS_FRAGMENT tick custody.  Priority 32 observes the canonical
+// Always-on CLOCKS_FRAGMENT tick custody. Priority 32 observes the canonical
 // one-second PPS/VCLOCK identity; foreground transfers only that immutable
-// sequence to SYSTEM for serialization.  Latest-value coalescing is deliberate.
+// sequence to CLOCKS for serialization. Latest-value coalescing is deliberate.
 struct interrupt_clocks_fragment_tick_mailbox_t {
   volatile uint32_t sequence = 0U;
   volatile bool pending = false;
@@ -4259,8 +4259,8 @@ static void publish_observed_pps_vclock(uint32_t sequence,
   g_pps_gpio_heartbeat.last_dwt = dwt_at_edge;
   g_pps_gpio_heartbeat.last_gnss_ns = -1;
 
-  // This one-second identity exists independently of campaign state.  Hand only
-  // the immutable sequence to foreground; SYSTEM serializes CLOCKS_FRAGMENT.
+  // This one-second identity exists independently of campaign state. Hand only
+  // the immutable sequence to foreground; CLOCKS serializes CLOCKS_FRAGMENT.
   interrupt_clocks_fragment_tick_publish(sequence);
 }
 
@@ -5949,11 +5949,11 @@ void process_interrupt_foreground_service(void) {
 
   phase_start = ARM_DWT_CYCCNT;
   // Transfer the canonical CLOCKS_FRAGMENT tick before application subscribers
-  // run.  process_interrupt owns only the immutable sequence fact; SYSTEM owns
+  // run. process_interrupt owns only the immutable sequence fact; CLOCKS owns
   // foreground serialization and publication timing.
   uint32_t clocks_sequence = 0U;
   if (interrupt_clocks_fragment_tick_take(clocks_sequence)) {
-    system_clocks_fragment_pps_tick_from_interrupt(clocks_sequence);
+    clocks_fragment_pps_tick_from_interrupt(clocks_sequence);
   }
   interrupt_dispatch_foreground_service();
   g_interrupt_foreground_forensic_live.subscriber_cycles =

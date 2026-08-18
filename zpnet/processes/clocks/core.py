@@ -9632,17 +9632,19 @@ def _tempest_detail_from_state_snapshot(state: Dict[str, Any]) -> Dict[str, Any]
     }
 
 
-def _count_tempest_state_details(campaign_name: str) -> int:
-    """Return unified CLOCKS rows carrying a fully adjudicated TEMPEST delta."""
+def _has_tempest_state_details(campaign_name: str) -> bool:
+    """Return whether one adjudicated TEMPEST state exists without counting history."""
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT COUNT(*) AS cnt
+            SELECT 1 AS present
             FROM campaign_detail
             WHERE campaign_type = %s
               AND campaign = %s
               AND payload #> '{campaign,adjudication}' IS NOT NULL
+            ORDER BY id DESC
+            LIMIT 1
             """,
             (
                 CAMPAIGN_TYPE_TEMPEST,
@@ -9650,7 +9652,7 @@ def _count_tempest_state_details(campaign_name: str) -> int:
             ),
         )
         row = cur.fetchone()
-    return int(row["cnt"] if row else 0)
+    return row is not None
 
 
 def _load_last_recoverable_tempest_detail(
@@ -12895,10 +12897,8 @@ def cmd_resume(args: Optional[dict]) -> dict:
     if row["active"]:
         return {"success": False, "message": f"Campaign '{campaign_name}' is already active"}
 
-    # Verify it has unified state rows with TEMPEST decoration.
-    tb_count = _count_tempest_state_details(campaign_name)
-
-    if tb_count == 0:
+    # Verify it has at least one unified state row with TEMPEST decoration.
+    if not _has_tempest_state_details(campaign_name):
         return {
             "success": False,
             "message": f"Campaign '{campaign_name}' has no TEMPEST campaign details — use START instead",
@@ -13058,7 +13058,7 @@ def _restore_active_campaign_state(
     # ------------------------------------------------------------------
     # Step 1: Establish whether unified TEMPEST state exists
     # ------------------------------------------------------------------
-    if _count_tempest_state_details(campaign_name) == 0:
+    if not _has_tempest_state_details(campaign_name):
         _diag["recovery_missing_timebase"] += 1
         if _reattach_pending_flash_cut_without_recovery(
             campaign_name=campaign_name,
