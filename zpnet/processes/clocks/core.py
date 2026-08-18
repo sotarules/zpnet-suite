@@ -309,6 +309,12 @@ PREFLIGHT_LOG_PREFIX = "🛡️ [preflight]"
 STARTUP_LOCATION_RETRY_S = 5.0
 STARTUP_LOCATION_STATUS_LOG_INTERVAL_S = 30.0
 STARTUP_REQUIRED_GNSS_FREQ_MODE = 3       # GF-8802 TPS4 FINE_LOCK
+# Newborn Alpha acquisition is a physical startup phase, not part of the
+# restored-row proof deadline.  Poll REPORT_RECOVERY until firmware says the
+# current lifetime has an installed SmartZero-backed Alpha epoch.
+STARTUP_ALPHA_EPOCH_POLL_S = 1.0
+STARTUP_ALPHA_EPOCH_QUIET_GRACE_S = 30.0
+STARTUP_ALPHA_EPOCH_STATUS_LOG_INTERVAL_S = 30.0
 HOLISTIC_RESTORE_TIMEOUT_S = 60.0
 HOLISTIC_RESTORE_COMMAND_RETRY_S = 10.0
 
@@ -554,6 +560,9 @@ _diag: Dict[str, Any] = {
     "recovery_degraded_rows_admitted": 0,
     "recovery_science_clean_rows_admitted": 0,
     "last_recovery_admission": {},
+    "recovery_campaign_bootstrap_clockface_proofs": 0,
+    "recovery_campaign_bootstrap_clockface_failures": 0,
+    "last_recovery_campaign_bootstrap_clockface_proof": {},
     "recovery_inflight_health_polls": 0,
     "recovery_inflight_health_empty": 0,
     "recovery_inflight_command_lost": 0,
@@ -635,6 +644,7 @@ _diag: Dict[str, Any] = {
     "startup_location_waits": 0,
     "startup_location_wait_seconds_last": 0.0,
     "last_startup_location_wait": {},
+    "last_startup_alpha_epoch_wait": {},
     "startup_custody_active": True,
     "startup_custody_depth": 0,
     "startup_custody_retained": 0,
@@ -8947,6 +8957,77 @@ def _fragment_ns(fragment: Dict[str, Any], *keys: str, default: int = 0) -> int:
     return _fragment_int(fragment, *keys, default=default)
 
 
+def _recovery_project_ocxo_from_base(
+    *,
+    public_gnss_ns: int,
+    recovered_gnss_ns: int,
+    recovered_ocxo_ns: int,
+) -> int:
+    """Mirror Beta's one-time RECOVER OCXO presentation projection exactly."""
+    public_gnss_ns = int(public_gnss_ns)
+    recovered_gnss_ns = int(recovered_gnss_ns)
+    recovered_ocxo_ns = int(recovered_ocxo_ns)
+    if public_gnss_ns <= 0 or recovered_gnss_ns <= 0 or recovered_ocxo_ns <= 0:
+        raise ValueError("recovery OCXO projection requires positive clockfaces")
+
+    recovered_offset_ns = recovered_ocxo_ns - recovered_gnss_ns
+    scale = float(public_gnss_ns) / float(recovered_gnss_ns)
+    scaled_offset_ns = float(recovered_offset_ns) * scale
+    projected_offset_ns = (
+        int(scaled_offset_ns + 0.5)
+        if scaled_offset_ns >= 0.0
+        else int(scaled_offset_ns - 0.5)
+    )
+    projected = public_gnss_ns + projected_offset_ns
+    if projected <= 0:
+        raise ValueError("recovery OCXO projection produced a non-positive clockface")
+    return int(projected)
+
+
+def _campaign_bootstrap_first_public_clockface_proof(
+    fragment: Dict[str, Any],
+    *,
+    expected_public_count: int,
+    expected_gnss_ns: int,
+    expected_ocxo1_ns: int,
+    expected_ocxo2_ns: int,
+) -> Dict[str, Any]:
+    """Prove the exact Beta presentation splice on CAMPAIGN_BOOTSTRAP row N+1."""
+    actual_public_count = _as_int(fragment.get("public_count"))
+    actual_gnss_ns = _fragment_ns(fragment, "gnss_ns", default=0)
+    actual_ocxo1_ns = _fragment_ns(fragment, "ocxo1_ns", default=0)
+    actual_ocxo2_ns = _fragment_ns(fragment, "ocxo2_ns", default=0)
+
+    expected = {
+        "public_count": int(expected_public_count),
+        "gnss_ns": int(expected_gnss_ns),
+        "ocxo1_ns": int(expected_ocxo1_ns),
+        "ocxo2_ns": int(expected_ocxo2_ns),
+    }
+    actual = {
+        "public_count": actual_public_count,
+        "gnss_ns": int(actual_gnss_ns),
+        "ocxo1_ns": int(actual_ocxo1_ns),
+        "ocxo2_ns": int(actual_ocxo2_ns),
+    }
+    matches = {
+        key: actual.get(key) == value
+        for key, value in expected.items()
+    }
+    return {
+        "schema": "CAMPAIGN_BOOTSTRAP_FIRST_PUBLIC_CLOCKFACE_PROOF_V1",
+        "valid": all(matches.values()),
+        "expected": expected,
+        "actual": actual,
+        "matches": matches,
+        "delta_ns": {
+            "gnss": int(actual_gnss_ns) - int(expected_gnss_ns),
+            "ocxo1": int(actual_ocxo1_ns) - int(expected_ocxo1_ns),
+            "ocxo2": int(actual_ocxo2_ns) - int(expected_ocxo2_ns),
+        },
+    }
+
+
 # ---------------------------------------------------------------------
 # Final TIMEBASE courtroom — last-mile persistence gate
 # ---------------------------------------------------------------------
@@ -13311,6 +13392,16 @@ def _restore_active_campaign_state(
     )
     projected_ocxo1_ns = projected_gnss_ns * last_ocxo1_ns // last_gnss_ns if (last_gnss_ns > 0 and last_ocxo1_ns > 0) else 0
     projected_ocxo2_ns = projected_gnss_ns * last_ocxo2_ns // last_gnss_ns if (last_gnss_ns > 0 and last_ocxo2_ns > 0) else 0
+    expected_first_public_ocxo1_ns = _recovery_project_ocxo_from_base(
+        public_gnss_ns=expected_first_public_gnss_ns,
+        recovered_gnss_ns=projected_gnss_ns,
+        recovered_ocxo_ns=projected_ocxo1_ns,
+    )
+    expected_first_public_ocxo2_ns = _recovery_project_ocxo_from_base(
+        public_gnss_ns=expected_first_public_gnss_ns,
+        recovered_gnss_ns=projected_gnss_ns,
+        recovered_ocxo_ns=projected_ocxo2_ns,
+    )
 
     # GNSS_RAW is Pi-owned and has its own reference ledger.  Do not project it
     # as last_gnss_raw_ns / last_gnss_ns; that preserves any poisoned
@@ -13353,6 +13444,8 @@ def _restore_active_campaign_state(
         "recover_base_pps_vclock_count": int(recover_base_pps_vclock_count),
         "expected_first_public_pps_vclock_count": int(expected_first_public_pps_vclock_count),
         "expected_first_public_gnss_ns": int(expected_first_public_gnss_ns),
+        "expected_first_public_ocxo1_ns": int(expected_first_public_ocxo1_ns),
+        "expected_first_public_ocxo2_ns": int(expected_first_public_ocxo2_ns),
         # Legacy diagnostic alias: expected first public row, not the RECOVER seed.
         "next_pps_vclock_count": int(expected_first_public_pps_vclock_count),
         "projected_gnss_ns": int(projected_gnss_ns),
@@ -13732,6 +13825,46 @@ def _restore_active_campaign_state(
                 {"fragment": frag},
             )
         first_public_offset = teensy_pps_vclock_count - expected_first_public_pps_vclock_count
+
+        if campaign_bootstrap and discarded_transitional_rows == 0:
+            clockface_proof = _campaign_bootstrap_first_public_clockface_proof(
+                frag,
+                expected_public_count=expected_first_public_pps_vclock_count,
+                expected_gnss_ns=expected_first_public_gnss_ns,
+                expected_ocxo1_ns=expected_first_public_ocxo1_ns,
+                expected_ocxo2_ns=expected_first_public_ocxo2_ns,
+            )
+            _diag["recovery_campaign_bootstrap_clockface_proofs"] += 1
+            _diag["last_recovery_campaign_bootstrap_clockface_proof"] = (
+                copy.deepcopy(clockface_proof)
+            )
+            _diag["last_recovery"]["campaign_bootstrap_first_public_clockface_proof"] = (
+                copy.deepcopy(clockface_proof)
+            )
+            if not clockface_proof.get("valid"):
+                _diag["recovery_campaign_bootstrap_clockface_failures"] += 1
+                reason = "campaign_bootstrap_first_public_clockface_mismatch"
+                details = {
+                    "campaign": campaign_name,
+                    "recover_mode": recover_mode,
+                    "recover_base_pps_vclock_count": int(recover_base_pps_vclock_count),
+                    "expected_first_public_pps_vclock_count": int(
+                        expected_first_public_pps_vclock_count
+                    ),
+                    "first_public_offset": int(first_public_offset),
+                    "clockface_proof": clockface_proof,
+                }
+                _cleanup_after_recovery_failure(reason, details)
+                raise RecoveryRetryableFailure(reason, details, cleanup_sent=True)
+            logging.info(
+                "✅ [recovery] CAMPAIGN_BOOTSTRAP first-public clockface proof exact: "
+                "count=%d gnss=%d ocxo1=%d ocxo2=%d",
+                teensy_pps_vclock_count,
+                _fragment_ns(frag, "gnss_ns", default=0),
+                _fragment_ns(frag, "ocxo1_ns", default=0),
+                _fragment_ns(frag, "ocxo2_ns", default=0),
+            )
+
         recovery_status = _fetch_teensy_recovery_status()
         admissible, recovery_admission_verdict = _recovery_admission_verdict(
             fragment=frag,
@@ -14242,6 +14375,100 @@ def _check_feature_preflight(context: str) -> tuple[bool, list[str]]:
     return True, []
 
 
+def _wait_for_startup_alpha_epoch() -> Dict[str, Any]:
+    """Wait for the current Teensy lifetime to earn its first Alpha epoch.
+
+    Cold power-up may spend substantial time in SmartZero while GNSS, OCXOs,
+    and their one-second repeatability evidence mature.  During that interval
+    Alpha intentionally cannot author a canonical completed CLOCKS row.  Do not
+    spend HOLISTIC_RESTORE_TIMEOUT_S against a proof that firmware is not yet
+    physically capable of producing.
+
+    REPORT_RECOVERY is the non-mutating lifecycle authority for this boundary.
+    There is deliberately no fixed elapsed-time failure here: startup remains
+    visibly INITIALIZING while physics progresses.  Once recover_epoch_ready is
+    true, the ordinary CLOCKS preflight must still prove a fresh canonical row,
+    FINE_LOCK, receiver mode, and chrony PPS before holistic restore begins.
+    """
+    t0 = time.monotonic()
+    last_log_at = t0
+    last_signature: Optional[Tuple[Any, ...]] = None
+    logged_wait = False
+    checks = 0
+
+    while True:
+        checks += 1
+        status = _fetch_teensy_recovery_status()
+        now = time.monotonic()
+        elapsed = now - t0
+
+        recover_epoch_ready = _recovery_bool(status.get("recover_epoch_ready"))
+        smartzero_running = _recovery_bool(status.get("recover_smartzero_running"))
+        smartzero_complete = _recovery_bool(status.get("recover_smartzero_complete"))
+        restore_court_ready = _recovery_bool(status.get("restore_court_ready"))
+        firmware_campaign_state = str(
+            status.get("campaign_state") or ""
+        ).strip().upper()
+
+        diag = {
+            "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "status": "NOMINAL" if recover_epoch_ready else "WAITING",
+            "checks": int(checks),
+            "waited_s": round(float(elapsed), 3),
+            "report_available": bool(status),
+            "recover_epoch_ready": bool(recover_epoch_ready),
+            "recover_smartzero_running": bool(smartzero_running),
+            "recover_smartzero_complete": bool(smartzero_complete),
+            "restore_court_ready": bool(restore_court_ready),
+            "firmware_campaign_state": firmware_campaign_state or None,
+        }
+        _diag["last_startup_alpha_epoch_wait"] = diag
+
+        if recover_epoch_ready:
+            if logged_wait:
+                logging.info(
+                    "✅ [clocks/startup] newborn Alpha epoch ready after %.1fs; "
+                    "entering full CLOCKS/GNSS/chrony preflight",
+                    elapsed,
+                )
+            return copy.deepcopy(diag)
+
+        signature = (
+            bool(status),
+            bool(smartzero_running),
+            bool(smartzero_complete),
+            bool(restore_court_ready),
+            firmware_campaign_state,
+        )
+        should_log = (
+            elapsed >= STARTUP_ALPHA_EPOCH_QUIET_GRACE_S
+            and (
+                not logged_wait
+                or signature != last_signature
+                or now - last_log_at >= STARTUP_ALPHA_EPOCH_STATUS_LOG_INTERVAL_S
+            )
+        )
+        if should_log:
+            if not status:
+                detail = "REPORT_RECOVERY unavailable"
+            elif smartzero_running:
+                detail = "SmartZero acquiring current-lifetime epoch"
+            elif smartzero_complete:
+                detail = "SmartZero complete; Alpha epoch install pending"
+            else:
+                detail = "Alpha epoch not ready"
+            logging.info(
+                "⏳ [clocks/startup] waiting for newborn Alpha epoch (%.0fs): %s",
+                elapsed,
+                detail,
+            )
+            logged_wait = True
+            last_log_at = now
+            last_signature = signature
+
+        time.sleep(STARTUP_ALPHA_EPOCH_POLL_S)
+
+
 def _startup_restore_court_ready() -> Optional[Dict[str, Any]]:
     """Return explicit firmware testimony allowing startup to enter restore early.
 
@@ -14249,9 +14476,9 @@ def _startup_restore_court_ready() -> Optional[Dict[str, Any]]:
     survival can be proved independently. A post-flash Teensy can explicitly
     prove the opposite condition before its first public CLOCKS row: PostgreSQL
     still owns an active campaign while REPORT_RECOVERY says firmware has no live
-    campaign and the restore court may accept RESTORE_MONITOR. That is sufficient
-    to enter the existing holistic restore court immediately; it bypasses no
-    restore proof and does not require SmartZero/Alpha epoch completion first.
+    campaign and the restore court may accept RESTORE_MONITOR. Even this legacy
+    escape hatch now requires recover_epoch_ready: no caller may spend a restored-
+    row proof deadline before the current lifetime has an installed Alpha epoch.
     """
     active_campaign = _get_active_campaign()
     if active_campaign is None:
@@ -14264,6 +14491,7 @@ def _startup_restore_court_ready() -> Optional[Dict[str, Any]]:
     firmware_campaign = str(status.get("campaign") or "").strip()
     firmware_state = str(status.get("campaign_state") or "").strip().upper()
     restore_court_ready = _recovery_bool(status.get("restore_court_ready"))
+    recover_epoch_ready = _recovery_bool(status.get("recover_epoch_ready"))
     recovery_active = bool(
         _recovery_bool(status.get("recover_lifecycle_active"))
         or _recovery_bool(status.get("recover_cold_bootstrap_active"))
@@ -14275,6 +14503,7 @@ def _startup_restore_court_ready() -> Optional[Dict[str, Any]]:
         not firmware_campaign
         and firmware_state in {"", "STOPPED", "IDLE", "NONE"}
         and restore_court_ready
+        and recover_epoch_ready
         and not recovery_active
     ):
         return {
@@ -14283,9 +14512,7 @@ def _startup_restore_court_ready() -> Optional[Dict[str, Any]]:
             "firmware_campaign": None,
             "firmware_campaign_state": firmware_state or None,
             "restore_court_ready": True,
-            "recover_epoch_ready": _recovery_bool(
-                status.get("recover_epoch_ready")
-            ),
+            "recover_epoch_ready": True,
         }
     return None
 
@@ -15260,10 +15487,14 @@ def run() -> None:
     ).start()
 
     # Cold power-up is physical, not a timer contract.  First make the durable
-    # SYSTEM location real on the GF-8802, then wait without a deadline until
-    # the existing CLOCKS preflight proves a fresh canonical heartbeat, chrony
-    # PPS selection, and exact TPS4 FINE_LOCK.
+    # SYSTEM location real on the GF-8802.  Then let the newborn Teensy lifetime
+    # earn its SmartZero-backed Alpha epoch before any restored-row proof clock
+    # starts.  Only after that physical boundary exists do we require the normal
+    # full preflight: fresh CLOCKS heartbeat, exact TPS4 FINE_LOCK, receiver mode,
+    # and chrony PPS selection.  The 60-second holistic proof deadline begins
+    # later, inside restore, when firmware is actually capable of producing it.
     startup_location = _wait_for_startup_location()
+    _wait_for_startup_alpha_epoch()
     required_receiver_mode = str(
         startup_location.get("verified_pos_mode_name") or ""
     ).upper()
@@ -15272,7 +15503,6 @@ def run() -> None:
         required_gnss_freq_mode=STARTUP_REQUIRED_GNSS_FREQ_MODE,
         required_gnss_freq_mode_name="FINE_LOCK",
         required_receiver_mode=required_receiver_mode,
-        allow_restore_court_entry=True,
     )
 
     _set_operational_state(

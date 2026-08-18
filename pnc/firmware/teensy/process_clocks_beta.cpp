@@ -1411,20 +1411,40 @@ void clocks_fragment_pps_tick_from_interrupt(
 void clocks_fragment_completed_row_ready(uint32_t completed_second_sequence) {
   if (clocks_fragment_current_ipsr() != 0U || completed_second_sequence == 0U) return;
 
-  // Beta calls this only after Alpha has frozen the exact completed row. If the
-  // interrupt-side notification already reserved this identity, wake/rearm the
-  // held serializer now that the row is actually available.
-  if (g_clocks_fragment_publication_pending &&
-      g_clocks_fragment_publication_pending_sequence == completed_second_sequence) {
-    if (g_clocks_fragment_publication_service_armed) {
-      clocks_fragment_force_rearm();
-    } else {
-      clocks_fragment_schedule_publish();
+  clocks_fragment_publication_ensure_initialized();
+
+  // Alpha's completed-row notification is stronger than the earlier physical
+  // PPS wake: at this point the exact immutable instrument row exists.  Reassert
+  // that identity directly instead of routing through accept_tick(), whose
+  // duplicate-tick suppression may legitimately remember the earlier PPS wake.
+  // A transport-retry snapshot keeps its existing custody; the completed row is
+  // then reserved as the immediate successor exactly as accept_tick() does.
+  if (g_clocks_fragment_publication_retry_snapshot_valid) {
+    if (!g_clocks_fragment_publication_pending) {
+      g_clocks_fragment_publication_pending_sequence = completed_second_sequence;
+      g_clocks_fragment_publication_pending = true;
+    } else if (g_clocks_fragment_publication_pending_sequence !=
+               completed_second_sequence) {
+      g_clocks_fragment_publication_coalesce_count++;
     }
+    clocks_fragment_schedule_publish();
     return;
   }
 
-  clocks_fragment_accept_tick(completed_second_sequence);
+  if (g_clocks_fragment_publication_pending &&
+      g_clocks_fragment_publication_pending_sequence != completed_second_sequence) {
+    g_clocks_fragment_publication_coalesce_count++;
+  }
+  g_clocks_fragment_publication_last_tick_sequence = completed_second_sequence;
+  g_clocks_fragment_publication_last_tick_valid = true;
+  g_clocks_fragment_publication_pending_sequence = completed_second_sequence;
+  g_clocks_fragment_publication_pending = true;
+
+  if (g_clocks_fragment_publication_service_armed) {
+    clocks_fragment_force_rearm();
+  } else {
+    clocks_fragment_schedule_publish();
+  }
 }
 
 void clocks_fragment_campaign_row_ready(uint32_t completed_second_sequence) {
@@ -1924,6 +1944,10 @@ static bool g_clocks_beta_dmamem_initialized = false;
 
 void clocks_beta_features_init(void) {
   clocks_beta_cold_diagnostics_init();
+  // Publication custody is CLOCKS state too.  Initialize it synchronously with
+  // the rest of Beta so the first completed Alpha row never depends on a lazy
+  // callback-side initialization transaction.
+  clocks_fragment_publication_ensure_initialized();
   g_clocks_fragment_campaign_record = clocks_fragment_campaign_snapshot_t{};
   g_clocks_fragment_campaign_record_pending = false;
   g_clocks_fragment_campaign_record_sequence = 0U;
@@ -3150,6 +3174,11 @@ static char              g_recover_lifecycle_abort_reason[64] = "none";
 // One-second science and Welfords remain independently
 // gated until fresh post-recovery interval custody is complete.
 static volatile bool g_recover_continuity_align_pending = false;
+// Presentation alignment normally participates in the recovery science hold.
+// CAMPAIGN_BOOTSTRAP is the exception: Alpha has already been resurrected and
+// proved, so its first post-splice row must stay scientifically eligible while
+// Beta repairs only the campaign-visible OCXO intercept.
+static bool g_recover_continuity_align_science_hold = false;
 static uint32_t g_recover_continuity_align_count = 0;
 static uint32_t g_recover_continuity_align_failure_count = 0;
 static uint32_t g_recover_continuity_align_last_public_count = 0;
@@ -3175,7 +3204,10 @@ static uint32_t clocks_row_lifecycle_science_hold_flags(void) {
   if (g_recover_reattach_active) flags |= 1U << 0;
   if (g_recover_reattach_degraded_active) flags |= 1U << 1;
   if (g_science_residual_quarantine_remaining != 0U) flags |= 1U << 2;
-  if (g_recover_continuity_align_pending) flags |= 1U << 3;
+  if (g_recover_continuity_align_pending &&
+      g_recover_continuity_align_science_hold) {
+    flags |= 1U << 3;
+  }
   return flags;
 }
 
@@ -3403,15 +3435,19 @@ static void recover_continuity_set_reason(const char* reason) {
            reason ? reason : "recover_continuity");
 }
 
-static void recover_continuity_align_arm(void) {
+static void recover_continuity_align_arm(bool science_hold = true) {
   g_recover_continuity_align_pending = true;
+  g_recover_continuity_align_science_hold = science_hold;
   g_recover_continuity_align_requested_public_count =
       (uint32_t)(campaign_seconds + 1ULL);
-  recover_continuity_set_reason("armed_for_first_recovered_public_row");
+  recover_continuity_set_reason(science_hold
+      ? "armed_for_first_recovered_public_row"
+      : "armed_campaign_bootstrap_public_row");
 }
 
 static void recover_continuity_align_reset(const char* reason) {
   g_recover_continuity_align_pending = false;
+  g_recover_continuity_align_science_hold = false;
   g_recover_continuity_align_requested_public_count = 0;
   recover_continuity_set_reason(reason ? reason : "reset");
 }
@@ -3441,6 +3477,7 @@ static void recover_continuity_align_if_pending(uint32_t public_count,
 
   if (target_o1 == 0ULL || target_o2 == 0ULL) {
     g_recover_continuity_align_pending = false;
+    g_recover_continuity_align_science_hold = false;
     g_recover_continuity_align_failure_count++;
     g_recover_continuity_ocxo1_target_ns = target_o1;
     g_recover_continuity_ocxo2_target_ns = target_o2;
@@ -3492,6 +3529,7 @@ static void recover_continuity_align_if_pending(uint32_t public_count,
   }
 
   g_recover_continuity_align_pending = false;
+  g_recover_continuity_align_science_hold = false;
   g_recover_continuity_align_count++;
   g_recover_continuity_align_last_public_count = public_count;
   g_recover_continuity_ocxo1_target_ns = target_o1;
@@ -7911,9 +7949,12 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
     recover_lifecycle_complete_at_pps();
     if (campaign_bootstrap_commit) {
       // Do not enter the OCXO reattachment court: no Alpha custody boundary was
-      // created by this RECOVER.  The next already-complete physical row becomes
-      // base+1 immediately under the recovered campaign presentation transform.
+      // created by this RECOVER.  Alpha science remains live, but Beta must align
+      // the campaign OCXO presentation on the exact first public base+1 row.
+      // Seeding an offset at the RECOVER gate is not enough because the live
+      // CounterLedger may already carry the next physical PPS identity.
       recover_reattach_reset("campaign_bootstrap_preserves_alpha");
+      recover_continuity_align_arm(false);
     } else {
       campaign_warmup_begin(campaign_warmup_mode_t::RECOVER);
     }
