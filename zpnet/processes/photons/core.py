@@ -4298,6 +4298,57 @@ def _state_loop() -> None:
 
                 try:
                     photons = _make_photons(fragment, system_context)
+
+                    # Producer-declared rolling custody loss is not an ordinary
+                    # science exclusion.  The current row cannot carry durable
+                    # resurrection authority, and an active LANTERN campaign has
+                    # also missed physical optical observations.  Stop before
+                    # publishing or persisting this row so the newest durable
+                    # campaign_detail remains the last trustworthy predecessor.
+                    checkpoint = photons.get("ppb_restore_checkpoint")
+                    if (
+                        isinstance(checkpoint, dict)
+                        and checkpoint.get("status") == "ROLLING_CUSTODY_LOST"
+                    ):
+                        instrument = _require_dict(
+                            photons.get("photons"), "PHOTONS.photons"
+                        )
+                        stats = _require_dict(
+                            instrument.get("stats"), "PHOTONS.photons.stats"
+                        )
+                        projection = _require_dict(
+                            instrument.get("projection"),
+                            "PHOTONS.photons.projection",
+                        )
+                        interrupt = _require_dict(
+                            instrument.get("interrupt"),
+                            "PHOTONS.photons.interrupt",
+                        )
+                        _enter_hard_failure(
+                            "producer_rolling_custody_lost",
+                            {
+                                "sequence": photons.get("sequence"),
+                                "reset_count": stats.get("reset_count"),
+                                "update_count": stats.get("update_count"),
+                                "lap_count": stats.get("lap_count"),
+                                "raw_lap_ring_overflow_count": projection.get(
+                                    "queue_overflow_count"
+                                ),
+                                "interrupt_callback_missing_count": interrupt.get(
+                                    "callback_missing_count"
+                                ),
+                                "interrupt_inactive_edge_count": interrupt.get(
+                                    "inactive_edge_count"
+                                ),
+                                "checkpoint_status": checkpoint.get("status"),
+                                "checkpoint_last_gap": copy.deepcopy(
+                                    checkpoint.get("last_gap")
+                                ),
+                            },
+                            source="PHOTONS_FRAGMENT_CUSTODY",
+                        )
+                        continue
+
                     firmware_campaign = _validate_firmware_campaign(
                         fragment, int(photons["sequence"])
                     )

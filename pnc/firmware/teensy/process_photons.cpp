@@ -39,11 +39,13 @@
 static constexpr uint64_t PHOTONS_FRAGMENT_PERIOD_NS = 1000000000ULL;
 static constexpr uint64_t PHOTONS_NS_PER_SECOND = 1000000000ULL;
 
-// Bring-up raw-lap handoff.  At the current 10 ms emulator cadence this holds
-// several seconds of completed laps.  A future high-rate PD200T engine may
-// replace this ring with a batch sufficient-statistics path; overflow is
-// explicit science data loss and therefore invalidates the lifetime stats.
-static constexpr uint32_t PHOTONS_LAP_RING_CAPACITY = 256U;
+// Bring-up raw-lap handoff.  The temporary emulator produces about 60 measured
+// laps/s, so 2048 entries provide roughly thirty seconds of foreground-latency
+// headroom instead of the ~4 s afforded by the original 256-entry ring.  A
+// future high-rate PD200T engine must replace this ring with a batch sufficient-
+// statistics path; overflow is explicit science data loss and remains fatal to
+// the current statistical/campaign custody.
+static constexpr uint32_t PHOTONS_LAP_RING_CAPACITY = 2048U;
 static constexpr uint32_t PHOTONS_LAP_RING_MASK =
     PHOTONS_LAP_RING_CAPACITY - 1U;
 static_assert((PHOTONS_LAP_RING_CAPACITY &
@@ -299,6 +301,11 @@ struct photons_raw_lap_record_t {
   uint32_t anchor_dwt_cycles_per_second = 0U;
   uint32_t anchor_pps_count = 0U;
 };
+
+static_assert(
+    sizeof(photons_raw_lap_record_t) * PHOTONS_LAP_RING_CAPACITY <=
+        64U * 1024U,
+    "PHOTONS raw-lap bring-up ring exceeds 64 KiB RAM2 budget");
 
 
 struct photons_welford_state_t {
@@ -672,6 +679,17 @@ static void photons_recovery_protocol_clear(bool clear_histories) {
 }
 
 
+// Better-Buckets endpoints are cumulative chronology, not per-second samples.
+// A lawful endpoint may therefore advance sequence while N/T remains exactly
+// unchanged (including zero/zero before the first accepted lap).  The producer
+// enforces the same invariant through delta_laps/delta_ns.
+static bool photons_ppb_endpoint_population_consistent(
+    const photons_ppb_endpoint_t& endpoint) {
+  return (endpoint.lap_count == 0ULL) ==
+         (endpoint.total_lap_gnss_ns == 0ULL);
+}
+
+
 static bool photons_recovery_stage_endpoint(bool minute_history,
                                             const photons_ppb_endpoint_t& endpoint) {
   photons_recovery_protocol_t& protocol = g_photons_recovery_protocol;
@@ -692,13 +710,9 @@ static bool photons_recovery_stage_endpoint(bool minute_history,
       ? protocol.previous_minute
       : protocol.previous_second;
 
-  if (endpoint.sequence == 0U) {
-    if (accepted != 0U || endpoint.lap_count != 0ULL ||
-        endpoint.total_lap_gnss_ns != 0ULL) {
-      return false;
-    }
-  } else if (endpoint.lap_count == 0ULL ||
-             endpoint.total_lap_gnss_ns == 0ULL) {
+  if (!photons_ppb_endpoint_population_consistent(endpoint)) return false;
+  if (endpoint.sequence == 0U &&
+      (accepted != 0U || endpoint.lap_count != 0ULL)) {
     return false;
   }
 
@@ -3415,12 +3429,9 @@ static bool photons_recovery_endpoint_follows(
     bool previous_valid,
     uint32_t accepted_count,
     const photons_ppb_endpoint_t& endpoint) {
+  if (!photons_ppb_endpoint_population_consistent(endpoint)) return false;
   if (endpoint.sequence == 0U) {
-    return accepted_count == 0U && endpoint.lap_count == 0ULL &&
-           endpoint.total_lap_gnss_ns == 0ULL;
-  }
-  if (endpoint.lap_count == 0ULL || endpoint.total_lap_gnss_ns == 0ULL) {
-    return false;
+    return accepted_count == 0U && endpoint.lap_count == 0ULL;
   }
   if (!previous_valid) return true;
   if (endpoint.sequence <= previous.sequence ||
@@ -3504,9 +3515,25 @@ static FLASHMEM Payload cmd_recovery_chunk(const Payload& args) {
             previous_valid,
             accepted_before + i,
             endpoints[i])) {
-      return photons_recovery_reject(
+      Payload rejected = photons_recovery_reject(
           "recovery_chunk_rejected_chronology",
           "endpoint chronology or cumulative population is invalid");
+      rejected.add("history", minute_history ? "MINUTE" : "SECOND");
+      rejected.add("staging_generation", protocol.generation);
+      rejected.add("chunk_index", i);
+      rejected.add("accepted_before", accepted_before);
+      rejected.add("endpoint_sequence", endpoints[i].sequence);
+      rejected.add("endpoint_lap_count", endpoints[i].lap_count);
+      rejected.add("endpoint_total_lap_gnss_ns",
+                   endpoints[i].total_lap_gnss_ns);
+      rejected.add("previous_valid", previous_valid);
+      if (previous_valid) {
+        rejected.add("previous_sequence", previous.sequence);
+        rejected.add("previous_lap_count", previous.lap_count);
+        rejected.add("previous_total_lap_gnss_ns",
+                     previous.total_lap_gnss_ns);
+      }
+      return rejected;
     }
     previous = endpoints[i];
     previous_valid = true;
@@ -4253,6 +4280,11 @@ static FLASHMEM Payload cmd_report_stats(const Payload& /*args*/) {
         g_photons_recovery.proof_update_count);
   p.add("snapshot_ok", canonical.snapshot_ok);
   p.add("valid", canonical.stats.valid);
+  p.add("raw_lap_ring_capacity", PHOTONS_LAP_RING_CAPACITY);
+  p.add("raw_lap_ring_overflow_count",
+        (uint32_t)g_raw_lap_ring_overflow_count);
+  p.add("raw_lap_ring_data_loss",
+        (bool)g_raw_lap_ring_data_loss);
   p.add("reset_count", canonical.stats.reset_count);
   p.add("update_count", canonical.stats.update_count);
   p.add("reset_pending", g_photons_stats_reset_pending);
