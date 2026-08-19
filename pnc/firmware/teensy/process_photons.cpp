@@ -804,6 +804,57 @@ static photons_fragment_ppb_endpoint_snapshot_t photons_ppb_endpoint_snapshot(
 }
 
 
+// Read-only full-ring custody export for a surviving producer.  A restarted Pi
+// may reacquire the exact endpoint rings that remain authoritative in PHOTONS
+// RAM without freezing or mutating the instrument.  Cursor identities are the
+// producer's rolling sequences, so a newer append cannot rewrite an endpoint
+// already learned by the Pi.
+template <size_t N>
+static uint32_t photons_ppb_ring_oldest_sequence(
+    const photons_ppb_endpoint_t (&ring)[N],
+    uint32_t head,
+    uint32_t count) {
+  if (count == 0U || count > (uint32_t)N) return 0U;
+  return ring[head].sequence;
+}
+
+
+template <size_t N>
+static uint32_t photons_ppb_ring_newest_sequence(
+    const photons_ppb_endpoint_t (&ring)[N],
+    uint32_t head,
+    uint32_t count) {
+  if (count == 0U || count > (uint32_t)N) return 0U;
+  const uint32_t newest =
+      (head + count - 1U) % (uint32_t)N;
+  return ring[newest].sequence;
+}
+
+
+template <size_t N>
+static uint32_t photons_ppb_ring_export_chunk(
+    const photons_ppb_endpoint_t (&ring)[N],
+    uint32_t head,
+    uint32_t ring_count,
+    uint32_t before_sequence,
+    photons_ppb_endpoint_t* out,
+    uint32_t capacity) {
+  if (!out || capacity == 0U || ring_count > (uint32_t)N) return 0U;
+
+  uint32_t written = 0U;
+  for (uint32_t age = 0U; age < ring_count && written < capacity; ++age) {
+    const uint32_t index =
+        (head + ring_count - 1U - age) % (uint32_t)N;
+    const photons_ppb_endpoint_t& endpoint = ring[index];
+    if (before_sequence != 0U && endpoint.sequence >= before_sequence) {
+      continue;
+    }
+    out[written++] = endpoint;
+  }
+  return written;
+}
+
+
 template <size_t N>
 static photons_fragment_ppb_window_proof_snapshot_t photons_ppb_window_proof(
     const photons_ppb_endpoint_t (&ring)[N],
@@ -3294,6 +3345,137 @@ static bool photons_recovery_get_u64(const Payload& args,
 }
 
 
+static void photons_ppb_export_add_endpoint(
+    Payload& p,
+    const char* prefix,
+    const photons_ppb_endpoint_t& endpoint) {
+  char key[80];
+  snprintf(key, sizeof(key), "%s_sequence", prefix);
+  p.add(key, endpoint.sequence);
+  snprintf(key, sizeof(key), "%s_lap_count", prefix);
+  p.add(key, endpoint.lap_count);
+  snprintf(key, sizeof(key), "%s_total_lap_gnss_ns", prefix);
+  p.add(key, endpoint.total_lap_gnss_ns);
+}
+
+
+static bool photons_ppb_export_live_ready(void) {
+  return g_photons_recovery.publication_started &&
+         !g_photons_recovery_protocol.active &&
+         g_photons_ppb_endpoint_admitted &&
+         g_photons_ppb_previous_endpoint_valid &&
+         g_photons_ppb_current_sequence != 0U &&
+         g_photons_ppb_current_sequence == g_photons_stats_update_count &&
+         g_photons_ppb_previous_endpoint.sequence ==
+             g_photons_ppb_current_sequence &&
+         g_photons_ppb_seconds_count != 0U &&
+         g_photons_ppb_minutes_count != 0U;
+}
+
+
+static FLASHMEM Payload cmd_ppb_export_meta(const Payload& /*args*/) {
+  if (!photons_ppb_export_live_ready()) {
+    Payload err;
+    err.add("status", "ppb_export_snapshot_unavailable");
+    err.add("error", "live PHOTONS Better-Buckets custody is unavailable");
+    err.add("publication_started", g_photons_recovery.publication_started);
+    err.add("staging_active", g_photons_recovery_protocol.active);
+    err.add("endpoint_admitted", g_photons_ppb_endpoint_admitted);
+    return err;
+  }
+
+  const photons_ppb_endpoint_t current = g_photons_ppb_previous_endpoint;
+  const photons_ppb_endpoint_t origin{};
+  Payload p;
+  p.add("status", "ppb_export_ready");
+  p.add("schema", "PHOTONS_PPB_FULL_RING_EXPORT_V1");
+  p.add("read_only", true);
+  p.add("reset_count", g_photons_stats_reset_count);
+  p.add("update_count", g_photons_stats_update_count);
+  p.add("current_sequence", g_photons_ppb_current_sequence);
+  p.add("second_count", g_photons_ppb_seconds_count);
+  p.add("minute_count", g_photons_ppb_minutes_count);
+  p.add("second_oldest_sequence", photons_ppb_ring_oldest_sequence(
+      g_photons_ppb_seconds, g_photons_ppb_seconds_head,
+      g_photons_ppb_seconds_count));
+  p.add("second_newest_sequence", photons_ppb_ring_newest_sequence(
+      g_photons_ppb_seconds, g_photons_ppb_seconds_head,
+      g_photons_ppb_seconds_count));
+  p.add("minute_oldest_sequence", photons_ppb_ring_oldest_sequence(
+      g_photons_ppb_minutes, g_photons_ppb_minutes_head,
+      g_photons_ppb_minutes_count));
+  p.add("minute_newest_sequence", photons_ppb_ring_newest_sequence(
+      g_photons_ppb_minutes, g_photons_ppb_minutes_head,
+      g_photons_ppb_minutes_count));
+  p.add("last_minute_key", g_photons_ppb_last_minute_key);
+  p.add("origin_valid", true);
+  p.add("standard_lap_ps", g_standard_lap_ps);
+  p.add("chunk_max_endpoints", PHOTONS_RECOVERY_CHUNK_MAX_ENDPOINTS);
+  photons_ppb_export_add_endpoint(p, "current", current);
+  photons_ppb_export_add_endpoint(p, "origin", origin);
+  return p;
+}
+
+
+static FLASHMEM Payload cmd_ppb_export_chunk(const Payload& args) {
+  uint32_t reset_count = 0U;
+  uint32_t before_sequence = 0U;
+  uint32_t count = 0U;
+  const char* history = args.getString("history");
+  const bool seconds = history && !strcmp(history, "SECOND");
+  const bool minutes = history && !strcmp(history, "MINUTE");
+
+  if ((!seconds && !minutes) ||
+      !photons_recovery_get_u32(args, "reset_count", reset_count) ||
+      !photons_recovery_get_u32(args, "before_sequence", before_sequence) ||
+      !photons_recovery_get_u32(args, "count", count) ||
+      count == 0U || count > PHOTONS_RECOVERY_CHUNK_MAX_ENDPOINTS) {
+    Payload err;
+    err.add("status", "ppb_export_chunk_rejected_contract");
+    err.add("error", "invalid PHOTONS Better-Buckets export request");
+    return err;
+  }
+
+  if (!photons_ppb_export_live_ready()) {
+    Payload err;
+    err.add("status", "ppb_export_chunk_rejected_unavailable");
+    err.add("error", "live PHOTONS Better-Buckets custody is unavailable");
+    return err;
+  }
+  if (reset_count != g_photons_stats_reset_count) {
+    Payload err;
+    err.add("status", "ppb_export_chunk_rejected_reset");
+    err.add("error", "PHOTONS Better-Buckets reset identity changed");
+    err.add("requested_reset_count", reset_count);
+    err.add("observed_reset_count", g_photons_stats_reset_count);
+    return err;
+  }
+
+  photons_ppb_endpoint_t endpoints[PHOTONS_RECOVERY_CHUNK_MAX_ENDPOINTS]{};
+  const uint32_t returned = seconds
+      ? photons_ppb_ring_export_chunk(
+            g_photons_ppb_seconds, g_photons_ppb_seconds_head,
+            g_photons_ppb_seconds_count, before_sequence, endpoints, count)
+      : photons_ppb_ring_export_chunk(
+            g_photons_ppb_minutes, g_photons_ppb_minutes_head,
+            g_photons_ppb_minutes_count, before_sequence, endpoints, count);
+
+  Payload p;
+  p.add("status", "ppb_export_chunk");
+  p.add("schema", "PHOTONS_PPB_FULL_RING_EXPORT_V1");
+  p.add("history", history);
+  p.add("reset_count", reset_count);
+  p.add("before_sequence", before_sequence);
+  p.add("count", returned);
+  for (uint32_t i = 0U; i < returned; ++i) {
+    char prefix[16];
+    snprintf(prefix, sizeof(prefix), "e%lu", (unsigned long)i);
+    photons_ppb_export_add_endpoint(p, prefix, endpoints[i]);
+  }
+  return p;
+}
+
+
 static bool photons_recovery_get_bool(const Payload& args,
                                       const char* key,
                                       bool& out) {
@@ -4942,6 +5124,8 @@ static const process_command_entry_t PHOTONS_COMMANDS[] = {
   { "REPORT_PHOTONS",      cmd_report_photons      },
   { "REPORT_STATS",        cmd_report_stats        },
   { "STATS_RESET",         cmd_stats_reset         },
+  { "PPB_EXPORT_META",     cmd_ppb_export_meta     },
+  { "PPB_EXPORT_CHUNK",    cmd_ppb_export_chunk    },
   { "RECOVERY_BEGIN",      cmd_recovery_begin      },
   { "RECOVERY_CHUNK",      cmd_recovery_chunk      },
   { "RECOVERY_COMMIT",     cmd_recovery_commit     },

@@ -27,10 +27,11 @@ Baselines remain campaign-to-campaign relationships stored by campaign_master ID
 No baseline statistics are copied into firmware and ``photons.baseline`` remains
 untouched.  Durable recovery restores aggregate sufficient state plus only the
 bounded PPB endpoint history the Pi literally possesses.  If an observation gap
-left a bounded ring incomplete, held restore may deliberately install that exact
-literal suffix and surrender the unseen rolling ancestry instead of inventing it
-or discarding otherwise-proven aggregate state.  Physical edge ancestry is always
-reacquired after restart.
+left a bounded ring incomplete while the producer survived, Pi may reacquire the
+producer's exact current rings through the read-only export court.  If the producer
+was lost, held restore may deliberately install only the literal suffix Pi already
+possesses and surrender unseen rolling ancestry instead of inventing it.  Physical
+edge ancestry is always reacquired after restart.
 """
 
 from __future__ import annotations
@@ -1975,14 +1976,18 @@ def _literal_recovery_history_from_source(source: Dict[str, Any]) -> Dict[str, A
 
 
 def _restore_ppb_checkpoint_runtime(
-    checkpoint: Dict[str, Any], *, source_db_detail_id: Optional[int]
+    checkpoint: Dict[str, Any],
+    *,
+    source_db_detail_id: Optional[int],
+    reason: str = "RESTORED_FROM_DURABLE_PHOTONS",
+    seed_source: str = "DURABLE_PI_CHECKPOINT",
 ) -> Dict[str, Any]:
     global _ppb_checkpoint_runtime
     saved = _normalize_saved_ppb_checkpoint(checkpoint)
     with _ppb_checkpoint_lock:
         runtime = _ppb_checkpoint_new_runtime(
-            reason="RESTORED_FROM_DURABLE_PHOTONS",
-            seed_source="DURABLE_PI_CHECKPOINT",
+            reason=str(reason),
+            seed_source=str(seed_source),
             gap_count=int(saved.get("gap_count") or 0),
             last_gap=(
                 saved.get("last_gap")
@@ -2873,6 +2878,438 @@ def _fetch_teensy_photons_report() -> Dict[str, Any]:
     return copy.deepcopy(payload)
 
 
+def _ppb_export_endpoint_from_payload(
+    payload: Dict[str, Any], prefix: str
+) -> Dict[str, Any]:
+    endpoint = {
+        "sequence": _require_int(
+            payload.get(f"{prefix}_sequence"),
+            f"PHOTONS.PPB_EXPORT.{prefix}_sequence",
+        ),
+        "lap_count": _require_int(
+            payload.get(f"{prefix}_lap_count"),
+            f"PHOTONS.PPB_EXPORT.{prefix}_lap_count",
+        ),
+        "total_lap_gnss_ns": _require_int(
+            payload.get(f"{prefix}_total_lap_gnss_ns"),
+            f"PHOTONS.PPB_EXPORT.{prefix}_total_lap_gnss_ns",
+        ),
+    }
+    if (endpoint["lap_count"] == 0) != (endpoint["total_lap_gnss_ns"] == 0):
+        raise RuntimeError(
+            f"PHOTONS Better-Buckets export {prefix} has inconsistent zero N/T"
+        )
+    return endpoint
+
+
+def _fetch_teensy_ppb_export_meta() -> Dict[str, Any]:
+    response = send_command(
+        machine="TEENSY",
+        subsystem=SUBSYSTEM,
+        command="PPB_EXPORT_META",
+    )
+    payload = response.get("payload") if isinstance(response, dict) else None
+    payload = payload if isinstance(payload, dict) else {}
+    if (
+        not isinstance(response, dict)
+        or not response.get("success")
+        or payload.get("status") != "ppb_export_ready"
+        or payload.get("schema") != "PHOTONS_PPB_FULL_RING_EXPORT_V1"
+        or payload.get("read_only") is not True
+    ):
+        raise RuntimeError(f"Teensy PHOTONS Better-Buckets export META failed: {response!r}")
+
+    meta: Dict[str, Any] = dict(payload)
+    for key in (
+        "reset_count",
+        "update_count",
+        "current_sequence",
+        "second_count",
+        "minute_count",
+        "second_oldest_sequence",
+        "second_newest_sequence",
+        "minute_oldest_sequence",
+        "minute_newest_sequence",
+        "last_minute_key",
+        "chunk_max_endpoints",
+    ):
+        meta[key] = _require_int(
+            payload.get(key), f"PHOTONS.PPB_EXPORT_META.{key}"
+        )
+
+    standard_lap_ps = _require_int(
+        payload.get("standard_lap_ps"),
+        "PHOTONS.PPB_EXPORT_META.standard_lap_ps",
+        minimum=1,
+    )
+    if _standard_lap_ps is None or standard_lap_ps != int(_standard_lap_ps):
+        raise RuntimeError(
+            "PHOTONS Better-Buckets export standard disagrees with config: "
+            f"teensy={standard_lap_ps} config={_standard_lap_ps}"
+        )
+    if meta["update_count"] <= 0 or meta["current_sequence"] != meta["update_count"]:
+        raise RuntimeError("PHOTONS Better-Buckets export current chronology is invalid")
+    if not (0 < meta["second_count"] <= PHOTONS_RECOVERY_SECOND_CAPACITY):
+        raise RuntimeError("PHOTONS Better-Buckets export second_count is invalid")
+    if not (0 < meta["minute_count"] <= PHOTONS_RECOVERY_MINUTE_CAPACITY):
+        raise RuntimeError("PHOTONS Better-Buckets export minute_count is invalid")
+    if meta["second_newest_sequence"] < meta["second_oldest_sequence"]:
+        raise RuntimeError("PHOTONS SECOND export bounds are invalid")
+    if meta["minute_newest_sequence"] < meta["minute_oldest_sequence"]:
+        raise RuntimeError("PHOTONS MINUTE export bounds are invalid")
+    if meta["second_newest_sequence"] != meta["current_sequence"]:
+        raise RuntimeError("PHOTONS SECOND export tail is not the current endpoint")
+    if _ppb_minute_key(meta["minute_newest_sequence"]) != meta["last_minute_key"]:
+        raise RuntimeError("PHOTONS MINUTE export tail does not close its minute key")
+
+    meta["origin_valid"] = _require_bool(
+        payload.get("origin_valid"), "PHOTONS.PPB_EXPORT_META.origin_valid"
+    )
+    if not meta["origin_valid"]:
+        raise RuntimeError("PHOTONS Better-Buckets export lacks the statistical origin")
+    meta["current"] = _ppb_export_endpoint_from_payload(payload, "current")
+    meta["origin"] = _ppb_export_endpoint_from_payload(payload, "origin")
+    if int(meta["current"]["sequence"]) != meta["current_sequence"]:
+        raise RuntimeError("PHOTONS Better-Buckets export current identity mismatch")
+    if meta["origin"] != _ppb_zero_endpoint():
+        raise RuntimeError("PHOTONS Better-Buckets export origin is not exact zero")
+    meta["chunk_max_endpoints"] = max(
+        1,
+        min(PHOTONS_RECOVERY_CHUNK_MAX_ENDPOINTS, int(meta["chunk_max_endpoints"])),
+    )
+    return meta
+
+
+def _fetch_teensy_ppb_export_page(
+    *,
+    history: str,
+    reset_count: int,
+    before_sequence: int,
+    count: int,
+) -> List[Dict[str, Any]]:
+    response = send_command(
+        machine="TEENSY",
+        subsystem=SUBSYSTEM,
+        command="PPB_EXPORT_CHUNK",
+        args={
+            "history": history,
+            "reset_count": int(reset_count),
+            "before_sequence": int(before_sequence),
+            "count": int(count),
+        },
+    )
+    payload = response.get("payload") if isinstance(response, dict) else None
+    payload = payload if isinstance(payload, dict) else {}
+    if (
+        not isinstance(response, dict)
+        or not response.get("success")
+        or payload.get("status") != "ppb_export_chunk"
+        or payload.get("schema") != "PHOTONS_PPB_FULL_RING_EXPORT_V1"
+        or str(payload.get("history") or "") != history
+    ):
+        raise RuntimeError(
+            f"Teensy PHOTONS Better-Buckets export {history} chunk failed: {response!r}"
+        )
+    if _require_int(
+        payload.get("reset_count"), "PHOTONS.PPB_EXPORT_CHUNK.reset_count"
+    ) != int(reset_count):
+        raise RuntimeError("PHOTONS Better-Buckets export chunk reset identity changed")
+    if _require_int(
+        payload.get("before_sequence"),
+        "PHOTONS.PPB_EXPORT_CHUNK.before_sequence",
+    ) != int(before_sequence):
+        raise RuntimeError("PHOTONS Better-Buckets export chunk cursor echo changed")
+    returned = _require_int(
+        payload.get("count"), "PHOTONS.PPB_EXPORT_CHUNK.count"
+    )
+    if returned > int(count):
+        raise RuntimeError("PHOTONS Better-Buckets export returned an oversized chunk")
+
+    out: List[Dict[str, Any]] = []
+    previous = int(before_sequence) if int(before_sequence) > 0 else None
+    for index in range(returned):
+        endpoint = _ppb_export_endpoint_from_payload(payload, f"e{index}")
+        sequence = int(endpoint["sequence"])
+        if previous is not None and sequence >= previous:
+            raise RuntimeError(
+                "PHOTONS Better-Buckets export chunk is not strictly newest-to-oldest"
+            )
+        previous = sequence
+        out.append(endpoint)
+    return out
+
+
+def _ppb_export_collect_history(
+    *,
+    meta: Dict[str, Any],
+    history: str,
+    existing: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], bool]:
+    """Collect one live producer ring without freezing PHOTONS.
+
+    Exact endpoints learned during a moving-window miss remain lawful facts and
+    seed the next META attempt.  A Pi observation gap is therefore repaired by
+    reacquiring producer custody, never by inventing the publications it missed.
+    """
+    if history == "SECOND":
+        expected = int(meta["second_count"])
+        oldest = int(meta["second_oldest_sequence"])
+        newest = int(meta["second_newest_sequence"])
+    elif history == "MINUTE":
+        expected = int(meta["minute_count"])
+        oldest = int(meta["minute_oldest_sequence"])
+        newest = int(meta["minute_newest_sequence"])
+    else:
+        raise ValueError(f"unsupported PHOTONS Better-Buckets history {history!r}")
+
+    if expected <= 0 or newest < oldest:
+        raise RuntimeError(f"PHOTONS {history} export has invalid ring geometry")
+
+    collected: Dict[int, Dict[str, Any]] = {}
+    for endpoint in existing:
+        if not isinstance(endpoint, dict):
+            continue
+        sequence = endpoint.get("sequence")
+        if isinstance(sequence, bool) or not isinstance(sequence, int):
+            continue
+        if not (oldest <= int(sequence) <= newest):
+            continue
+        prior = collected.get(int(sequence))
+        if prior is not None and not _ppb_endpoints_equal(prior, endpoint):
+            raise RuntimeError(
+                f"PHOTONS {history} existing endpoint identity changed at {sequence}"
+            )
+        collected[int(sequence)] = copy.deepcopy(endpoint)
+
+    before_sequence = 0
+    chunk_size = int(meta["chunk_max_endpoints"])
+    while len(collected) < expected:
+        page = _fetch_teensy_ppb_export_page(
+            history=history,
+            reset_count=int(meta["reset_count"]),
+            before_sequence=before_sequence,
+            count=chunk_size,
+        )
+        if not page:
+            break
+        for endpoint in page:
+            sequence = int(endpoint["sequence"])
+            if sequence < oldest:
+                continue
+            if sequence > newest:
+                # PHOTONS remains live while Pi pages.  A newer endpoint than
+                # this META window is expected transport-time motion, not a
+                # contradiction; leave it for the next META rendezvous.
+                continue
+            prior = collected.get(sequence)
+            if prior is not None and not _ppb_endpoints_equal(prior, endpoint):
+                raise RuntimeError(
+                    f"PHOTONS {history} producer endpoint changed at sequence={sequence}"
+                )
+            collected[sequence] = copy.deepcopy(endpoint)
+        before_sequence = int(page[-1]["sequence"])
+        if before_sequence == oldest:
+            break
+
+    ordered = [collected[key] for key in sorted(collected)]
+    complete = bool(
+        len(ordered) == expected
+        and int(ordered[0]["sequence"]) == oldest
+        and int(ordered[-1]["sequence"]) == newest
+    )
+    return ordered, complete
+
+
+def _refresh_ppb_checkpoint_from_live_photons() -> Dict[str, Any]:
+    """Reacquire exact Better-Buckets rings from a proved surviving PHOTONS producer."""
+    started = time.monotonic()
+    attempts = 0
+    learned_second_history: List[Dict[str, Any]] = []
+    learned_minute_history: List[Dict[str, Any]] = []
+
+    while attempts < 12:
+        attempts += 1
+        meta = _fetch_teensy_ppb_export_meta()
+        with _ppb_checkpoint_lock:
+            runtime = _ppb_checkpoint_runtime_ensure_locked()
+            runtime_snapshot = _ppb_checkpoint_snapshot_locked(runtime)
+
+        if runtime_snapshot.get("reset_count") not in (None, meta["reset_count"]):
+            raise RuntimeError(
+                "proved PHOTONS export reset_count disagrees with Pi checkpoint: "
+                f"pi={runtime_snapshot.get('reset_count')} teensy={meta['reset_count']}"
+            )
+
+        second_history, second_complete = _ppb_export_collect_history(
+            meta=meta,
+            history="SECOND",
+            existing=(
+                list(runtime_snapshot.get("second_history") or [])
+                + learned_second_history
+            ),
+        )
+        learned_second_history = copy.deepcopy(second_history)
+        if not second_complete:
+            logging.info(
+                "⏳ [photons/ppb] live SECOND window moved during paging; "
+                "retaining %d exact endpoints and retrying META (attempt=%d/12)",
+                len(second_history),
+                attempts,
+            )
+            time.sleep(0.05)
+            continue
+
+        minute_history, minute_complete = _ppb_export_collect_history(
+            meta=meta,
+            history="MINUTE",
+            existing=(
+                list(runtime_snapshot.get("minute_history") or [])
+                + learned_minute_history
+            ),
+        )
+        learned_minute_history = copy.deepcopy(minute_history)
+        if not minute_complete:
+            logging.info(
+                "⏳ [photons/ppb] live MINUTE window moved during paging; "
+                "retaining %d exact endpoints and retrying META (attempt=%d/12)",
+                len(minute_history),
+                attempts,
+            )
+            time.sleep(0.05)
+            continue
+
+        final_meta = _fetch_teensy_ppb_export_meta()
+        stable_meta = all(
+            final_meta.get(key) == meta.get(key)
+            for key in (
+                "reset_count",
+                "update_count",
+                "current_sequence",
+                "second_count",
+                "minute_count",
+                "second_oldest_sequence",
+                "second_newest_sequence",
+                "minute_oldest_sequence",
+                "minute_newest_sequence",
+                "last_minute_key",
+                "origin_valid",
+            )
+        ) and _ppb_endpoints_equal(final_meta.get("current"), meta.get("current"))
+        if not stable_meta:
+            time.sleep(0.05)
+            continue
+
+        retry_rendezvous = False
+        with _ppb_checkpoint_lock:
+            runtime = _ppb_checkpoint_runtime_ensure_locked()
+            live_snapshot = _ppb_checkpoint_snapshot_locked(runtime)
+            if (
+                live_snapshot.get("reset_count") != meta["reset_count"]
+                or live_snapshot.get("update_count") != meta["update_count"]
+            ):
+                retry_rendezvous = True
+            else:
+                if (
+                    int(live_snapshot.get("current_sequence") or 0)
+                    != int(meta["current_sequence"])
+                    or not _ppb_endpoints_equal(
+                        live_snapshot.get("current"), meta["current"]
+                    )
+                ):
+                    raise RuntimeError(
+                        "proved PHOTONS export current endpoint disagrees with Pi live testimony"
+                    )
+                if (
+                    int(live_snapshot.get("expected_second_count") or 0)
+                    != int(meta["second_count"])
+                    or int(live_snapshot.get("expected_minute_count") or 0)
+                    != int(meta["minute_count"])
+                    or int(live_snapshot.get("last_minute_key") or 0)
+                    != int(meta["last_minute_key"])
+                ):
+                    raise RuntimeError(
+                        "proved PHOTONS export ring geometry disagrees with Pi live testimony"
+                    )
+
+                candidate = {
+                    "schema": PHOTONS_PPB_PI_CHECKPOINT_SCHEMA,
+                    "source_schema": PHOTONS_PPB_FIRMWARE_DELTA_SCHEMA,
+                    "valid": True,
+                    "recoverable": True,
+                    "status": "RECOVERABLE",
+                    "status_reason": "FULL_RING_REACQUIRED_FROM_LIVE_PHOTONS",
+                    "reset_count": int(meta["reset_count"]),
+                    "update_count": int(meta["update_count"]),
+                    "rolling_sequence": int(meta["update_count"]),
+                    "current_sequence": int(meta["current_sequence"]),
+                    "last_minute_key": int(meta["last_minute_key"]),
+                    "origin_valid": bool(meta["origin_valid"]),
+                    "origin": copy.deepcopy(meta["origin"]),
+                    "current": copy.deepcopy(meta["current"]),
+                    "expected_second_count": int(meta["second_count"]),
+                    "expected_minute_count": int(meta["minute_count"]),
+                    "second_count": len(second_history),
+                    "minute_count": len(minute_history),
+                    "second_history": copy.deepcopy(second_history),
+                    "minute_history": copy.deepcopy(minute_history),
+                    "contiguous_from_update_count": int(second_history[0]["sequence"]),
+                    "gap_count": int(live_snapshot.get("gap_count") or 0),
+                    "last_gap": copy.deepcopy(live_snapshot.get("last_gap")),
+                    "seed_source": "TEENSY_PHOTONS_FULL_RING_EXPORT",
+                    "seed_source_db_detail_id": None,
+                    "last_delta_signature": None,
+                    "proof_checks": 0,
+                }
+                normalized = _normalize_saved_ppb_checkpoint(candidate)
+                if not normalized.get("recoverable"):
+                    raise RuntimeError(
+                        "proved PHOTONS full-ring export did not form a recoverable checkpoint"
+                    )
+                refreshed = _restore_ppb_checkpoint_runtime(
+                    normalized,
+                    source_db_detail_id=None,
+                    reason="FULL_RING_REACQUIRED_FROM_LIVE_PHOTONS",
+                    seed_source="TEENSY_PHOTONS_FULL_RING_EXPORT",
+                )
+
+        if retry_rendezvous:
+            time.sleep(0.05)
+            continue
+
+        result = {
+            "refreshed": True,
+            "basis": "TEENSY_PHOTONS_FULL_RING_EXPORT",
+            "reset_count": int(meta["reset_count"]),
+            "update_count": int(meta["update_count"]),
+            "current_sequence": int(meta["current_sequence"]),
+            "second_count": len(second_history),
+            "minute_count": len(minute_history),
+            "attempts": attempts,
+            "waited_s": round(time.monotonic() - started, 3),
+            "prior_recoverable": bool(runtime_snapshot.get("recoverable")),
+            "prior_status": runtime_snapshot.get("status"),
+            "gap_count": int(refreshed.get("gap_count") or 0),
+        }
+        logging.info(
+            "📦 [photons/ppb] surviving producer full-ring custody reacquired: "
+            "reset=%d update=%d second=%d/%d minute=%d/%d attempts=%d in %.3fs",
+            int(meta["reset_count"]),
+            int(meta["update_count"]),
+            len(second_history),
+            int(meta["second_count"]),
+            len(minute_history),
+            int(meta["minute_count"]),
+            attempts,
+            float(result["waited_s"]),
+        )
+        return result
+
+    raise RuntimeError(
+        "proved PHOTONS Better-Buckets export could not reach an exact live rendezvous "
+        "after 12 attempts"
+    )
+
+
 def _rehydrate_pi_campaign(
     active_master: Optional[Dict[str, Any]],
     *,
@@ -3712,6 +4149,11 @@ def _startup_live_reattach(
         proof = _wait_for_recovery_proof(acknowledge_firmware=False)
         mode = "LIVE_REATTACH"
 
+    # LIVE_REATTACH proves the Teensy producer survived.  The Pi may therefore
+    # reacquire the producer's complete current bounded rings directly instead
+    # of waiting for a transport observation gap to age out organically.
+    ppb_live_refresh = _refresh_ppb_checkpoint_from_live_photons()
+
     _mark_active_campaign_recovered(
         active_master,
         mode=mode,
@@ -3734,6 +4176,7 @@ def _startup_live_reattach(
         "ingress_rows_preserved_at_worker_start": preserved,
         "live_floor": floor,
         "proof": proof,
+        "ppb_live_refresh": ppb_live_refresh,
         "campaign_rearm": rearm,
     }
     _recovery_status_set("COMPLETE", **result)

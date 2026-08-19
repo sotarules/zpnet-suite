@@ -61,6 +61,8 @@
 //   • REPORT_PHOTONS      — compact always-on instrument + current CAMP report
 //   • REPORT_STATS        — detailed statistical/court/Better-Buckets report
 //   • STATS_RESET         — reset the always-on statistical epoch without changing CAMP custody
+//   • PPB_EXPORT_META     — read-only live Better-Buckets ring identity for Pi custody reacquisition
+//   • PPB_EXPORT_CHUNK    — page immutable live SECOND/MINUTE endpoints without freezing PHOTONS
 //   • RECOVERY_BEGIN      — stage bounded Better-Buckets history while publication remains held
 //   • RECOVERY_CHUNK      — append one bounded SECOND or MINUTE endpoint chunk
 //   • RECOVERY_COMMIT     — atomically install durable aggregate/campaign state and start fresh ancestry
