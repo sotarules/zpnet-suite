@@ -566,6 +566,11 @@ static uint32_t g_clocks_fragment_campaign_record_backlog_count = 0U;
 // curated readiness tree.
 
 static constexpr uint64_t CLOCKS_FRAGMENT_RETRY_DELAY_NS = 25000000ULL;  // 25 ms
+// While a campaign is active, exact publication custody remains strict until
+// the next campaign row can explicitly surrender continuity.  Once Beta is
+// STOPPED, however, a missing Pi must not turn one observation-only fragment
+// into a 40 Hz permanent retry loop that starves the command/control plane.
+static constexpr uint32_t CLOCKS_FRAGMENT_IDLE_RETRY_MAX_ATTEMPTS = 4U;
 static bool g_clocks_fragment_publication_initialized = false;
 
 // --------------------------------------------------------------
@@ -607,6 +612,17 @@ static uint32_t g_clocks_fragment_publication_retry_schedule_count = 0U;
 static uint32_t g_clocks_fragment_publication_retry_success_count = 0U;
 static bool g_clocks_fragment_publication_last_tick_valid = false;
 static uint32_t g_clocks_fragment_publication_last_tick_sequence = 0U;
+static uint32_t g_clocks_fragment_publication_recovery_reset_count = 0U;
+static uint32_t g_clocks_fragment_publication_recovery_retired_retry_sequence = 0U;
+static uint32_t g_clocks_fragment_publication_recovery_retired_pending_sequence = 0U;
+static uint32_t g_clocks_fragment_publication_recovery_retired_campaign_sequence = 0U;
+static uint32_t g_clocks_fragment_publication_watchdog_reset_count = 0U;
+static uint32_t g_clocks_fragment_publication_watchdog_retired_retry_sequence = 0U;
+static uint32_t g_clocks_fragment_publication_watchdog_retired_pending_sequence = 0U;
+static uint32_t g_clocks_fragment_publication_watchdog_retired_campaign_sequence = 0U;
+static uint32_t g_clocks_fragment_publication_idle_retry_abandon_count = 0U;
+static uint32_t g_clocks_fragment_publication_idle_retry_last_sequence = 0U;
+static uint32_t g_clocks_fragment_publication_idle_retry_last_attempt_count = 0U;
 
 // The CLOCKS handoff is intentionally large and must never become a foreground
 // stack local. CLOCKS owns this RAM2 snapshot and all serialization derived from it.
@@ -1286,6 +1302,30 @@ static void clocks_fragment_publish_service(timepop_ctx_t*,
       g_clocks_fragment_publication_retry_attempt_count++;
     }
     g_clocks_fragment_publication_retry_pi_only = true;
+
+    if (campaign_state == clocks_campaign_state_t::STOPPED &&
+        g_clocks_fragment_publication_retry_attempt_count >=
+            CLOCKS_FRAGMENT_IDLE_RETRY_MAX_ATTEMPTS) {
+      // No campaign identity is at risk here.  Retire this unreachable
+      // observation exactly and let the next physical second try again.
+      // This turns a Pi-lifetime outage into missing testimony instead of
+      // a foreground retry storm that can starve command responses.
+      g_clocks_fragment_publication_idle_retry_abandon_count++;
+      g_clocks_fragment_publication_idle_retry_last_sequence = sequence;
+      g_clocks_fragment_publication_idle_retry_last_attempt_count =
+          g_clocks_fragment_publication_retry_attempt_count;
+      g_clocks_fragment_publication_retry_snapshot_valid = false;
+      g_clocks_fragment_publication_retry_pi_only = false;
+      g_clocks_fragment_publication_retry_sequence = 0U;
+      g_clocks_fragment_publication_retry_attempt_count = 0U;
+      g_clocks_fragment_publication_clocks_snapshot =
+          clocks_fragment_snapshot_t{};
+      if (g_clocks_fragment_publication_pending) {
+        clocks_fragment_schedule_publish();
+      }
+      return;
+    }
+
     g_clocks_fragment_publication_retry_schedule_count++;
     clocks_fragment_schedule_publish();
     return;
@@ -1548,6 +1588,83 @@ static void clocks_fragment_campaign_record_ready_retry_arm(void) {
     return;
   }
   g_clocks_fragment_campaign_record_ready_retry_arm_count++;
+}
+
+// RECOVER is a new CLOCKS_FRAGMENT transport-custody epoch. A Pi/PUBSUB
+// outage can strand one exact retry snapshot plus one Beta campaign handoff;
+// once continuity has already been surrendered those pre-recovery obligations
+// must not hold the newly proved recovery boundary hostage. Retire them
+// explicitly while preserving Alpha's physical/statistical state.
+static void clocks_fragment_recover_reset_publication_custody(bool count_recovery = true) {
+  clocks_fragment_publication_ensure_initialized();
+
+  g_clocks_fragment_publication_recovery_retired_retry_sequence =
+      g_clocks_fragment_publication_retry_snapshot_valid
+          ? g_clocks_fragment_publication_retry_sequence
+          : 0U;
+  g_clocks_fragment_publication_recovery_retired_pending_sequence =
+      g_clocks_fragment_publication_pending
+          ? g_clocks_fragment_publication_pending_sequence
+          : 0U;
+  g_clocks_fragment_publication_recovery_retired_campaign_sequence =
+      g_clocks_fragment_campaign_record_pending
+          ? g_clocks_fragment_campaign_record_sequence
+          : 0U;
+
+  if (g_clocks_fragment_publication_service_handle != TIMEPOP_INVALID_HANDLE) {
+    const bool cancelled =
+        timepop_cancel(g_clocks_fragment_publication_service_handle);
+    if (cancelled) {
+      g_clocks_fragment_publication_service_cancel_count++;
+    } else {
+      g_clocks_fragment_publication_service_cancel_failure_count++;
+    }
+  }
+  g_clocks_fragment_publication_service_handle = TIMEPOP_INVALID_HANDLE;
+  g_clocks_fragment_publication_service_armed = false;
+  g_clocks_fragment_publication_service_armed_generation = 0U;
+
+  g_clocks_fragment_publication_pending_sequence = 0U;
+  g_clocks_fragment_publication_pending = false;
+  g_clocks_fragment_publication_retry_snapshot_valid = false;
+  g_clocks_fragment_publication_retry_pi_only = false;
+  g_clocks_fragment_publication_retry_sequence = 0U;
+  g_clocks_fragment_publication_retry_attempt_count = 0U;
+  g_clocks_fragment_publication_last_tick_valid = false;
+  g_clocks_fragment_publication_last_tick_sequence = 0U;
+  g_clocks_fragment_publication_campaign_ready_last_valid = false;
+  g_clocks_fragment_publication_campaign_ready_last_sequence = 0U;
+  g_clocks_fragment_publication_clocks_snapshot = clocks_fragment_snapshot_t{};
+
+  clocks_fragment_campaign_record_ready_retry_cancel();
+  g_clocks_fragment_campaign_record = clocks_fragment_campaign_snapshot_t{};
+  g_clocks_fragment_campaign_record_pending = false;
+  g_clocks_fragment_campaign_record_sequence = 0U;
+  if (count_recovery) {
+    g_clocks_fragment_publication_recovery_reset_count++;
+  }
+}
+
+// A watchdog surrender must cut stale CLOCKS_FRAGMENT transport custody at
+// the surrender boundary itself.  Waiting for Pi RECOVER is too late: a Pi
+// reboot can leave the retained 25 ms retry loop hot enough that REPORT/RECOVER
+// commands never get a turn.  Preserve separate testimony because the later
+// RECOVER reset is intentionally idempotent and may find nothing left to retire.
+static void clocks_fragment_watchdog_reset_publication_custody(void) {
+  g_clocks_fragment_publication_watchdog_retired_retry_sequence =
+      g_clocks_fragment_publication_retry_snapshot_valid
+          ? g_clocks_fragment_publication_retry_sequence
+          : 0U;
+  g_clocks_fragment_publication_watchdog_retired_pending_sequence =
+      g_clocks_fragment_publication_pending
+          ? g_clocks_fragment_publication_pending_sequence
+          : 0U;
+  g_clocks_fragment_publication_watchdog_retired_campaign_sequence =
+      g_clocks_fragment_campaign_record_pending
+          ? g_clocks_fragment_campaign_record_sequence
+          : 0U;
+  clocks_fragment_recover_reset_publication_custody(false);
+  g_clocks_fragment_publication_watchdog_reset_count++;
 }
 
 // Command-report construction is a serialized foreground service. Priority-0
@@ -4528,12 +4645,13 @@ static bool recover_lifecycle_enter_from_command(
   recover_lifecycle_set_reason(reason ? reason : "recover_command_armed");
   recover_lifecycle_set_abort_reason("none");
 
-  // A watchdog may have stopped the campaign and left process_interrupt's
-  // publication court in a surrendered state. Clear that custody immediately
-  // at command acceptance so the next PPS/VCLOCK can reach Beta and consume
-  // request_recover. The PPS gate repeats the reset as an idempotent boundary
-  // proof before publication resumes.
+  // A watchdog may have stopped the campaign while Pi/PUBSUB was absent.
+  // Reset both publication layers at command acceptance: process_interrupt's
+  // physical release court and CLOCKS' own retained transport transaction.
+  // The latter may contain a pre-outage retry snapshot/campaign handoff that
+  // cannot lawfully precede the newly projected RECOVER boundary.
   interrupt_recover_reset_publication_custody();
+  clocks_fragment_recover_reset_publication_custody();
   g_recover_lifecycle_command_custody_reset_count++;
 
   // Pi owns durable ancestry and also owns the distinction between current
@@ -4632,6 +4750,10 @@ static void recover_lifecycle_abort(const char* reason) {
   request_zero = false;
   flash_cut_clear_pending();
   clocks_watchdog_clear_surrender_for_new_lifecycle();
+  // RECOVER_ABORT is also a publication boundary. If the failed attempt
+  // accumulated a new undeliverable retry, retire it so always-on Alpha rows
+  // can resume publication instead of inheriting the failed transaction.
+  clocks_fragment_recover_reset_publication_custody();
   campaign_state = clocks_campaign_state_t::STOPPED;
   campaign_warmup_reset();
 }
@@ -7542,6 +7664,10 @@ static bool clocks_watchdog_surrender_now(const char* reason,
   watchdog_anomaly_active = true;
   watchdog_anomaly_publish_pending = publish_pending && first;
 
+  if (first) {
+    clocks_fragment_watchdog_reset_publication_custody();
+  }
+
   // The publication/watchdog gate holds further campaign science until the
   // lifecycle is recovered.
   return first;
@@ -9814,6 +9940,28 @@ static FLASHMEM Payload cmd_report_recovery(const Payload&) {
         g_clocks_fragment_campaign_record_ready_retry_fire_count);
   p.add("campaign_record_ready_retry_cancel_count",
         g_clocks_fragment_campaign_record_ready_retry_cancel_count);
+  p.add("fragment_publication_recovery_reset_count",
+        g_clocks_fragment_publication_recovery_reset_count);
+  p.add("fragment_publication_retired_retry_sequence",
+        g_clocks_fragment_publication_recovery_retired_retry_sequence);
+  p.add("fragment_publication_retired_pending_sequence",
+        g_clocks_fragment_publication_recovery_retired_pending_sequence);
+  p.add("fragment_publication_retired_campaign_sequence",
+        g_clocks_fragment_publication_recovery_retired_campaign_sequence);
+  p.add("fragment_publication_watchdog_reset_count",
+        g_clocks_fragment_publication_watchdog_reset_count);
+  p.add("fragment_publication_watchdog_retired_retry_sequence",
+        g_clocks_fragment_publication_watchdog_retired_retry_sequence);
+  p.add("fragment_publication_watchdog_retired_pending_sequence",
+        g_clocks_fragment_publication_watchdog_retired_pending_sequence);
+  p.add("fragment_publication_watchdog_retired_campaign_sequence",
+        g_clocks_fragment_publication_watchdog_retired_campaign_sequence);
+  p.add("fragment_publication_idle_retry_abandon_count",
+        g_clocks_fragment_publication_idle_retry_abandon_count);
+  p.add("fragment_publication_idle_retry_last_sequence",
+        g_clocks_fragment_publication_idle_retry_last_sequence);
+  p.add("fragment_publication_idle_retry_last_attempt_count",
+        g_clocks_fragment_publication_idle_retry_last_attempt_count);
 
   p.add("recover_reattach_active", (bool)g_recover_reattach_active);
   p.add("recover_reattach_degraded_active",

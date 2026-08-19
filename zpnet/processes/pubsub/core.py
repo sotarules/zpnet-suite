@@ -75,7 +75,9 @@ DEBUG_LOG_PATH = "/home/mule/zpnet/logs/zpnet-debug.log"
 SOCKET_DIR = "/tmp"
 
 # Transport retry configuration
-TRANSPORT_RETRY_INTERVAL_S = 0.25   # poll every 250 ms — aggressive but not a spinlock
+TRANSPORT_RETRY_INTERVAL_S = 0.25   # retry transport subsystem initialization indefinitely
+TRANSPORT_STATE_POLL_S = 0.10       # observe ready/lost generations without busy-spinning
+RPC_REPLY_POLL_S = 0.10             # wake promptly when a transport generation disappears
 
 # Raw byte-for-byte transport logging is normally disabled.  Set the
 # ZPNET_TRANSPORT_RAW_LOG environment variable to 1 to enable it temporarily.
@@ -89,6 +91,7 @@ PI_FANOUT_SOCKET_TIMEOUT_S = 2.0
 PI_FANOUT_SLOW_WARN_S = 0.100
 PI_DELIVERY_RETRY_INTERVAL_S = 0.25
 PI_DELIVERY_RETRY_LOG_INTERVAL_S = 30.0
+PI_DELIVERY_INITIAL_WARN_GRACE_S = 2.0  # ordinary process-start races stay silent
 
 # Canonical formal routing graph.  Process lifetime never authors these edges.
 # Keep this list byte-for-byte equivalent to the Teensy STATIC_ROUTES table.
@@ -162,6 +165,26 @@ req_id_counter = itertools.count(1)
 req_id_last_issued = 0
 req_id_lock = threading.Lock()
 
+# PUBSUB process availability is independent of the serial device lifetime.
+# Local sockets come up immediately; this state machine tracks successive
+# Teensy transport generations underneath them.  A disappearing generation
+# wakes every RPC bound to that generation immediately so a known USB outage
+# never burns a 30-second semantic reply timeout.
+transport_state_lock = threading.Lock()
+transport_ready_event = threading.Event()
+transport_state_ready = False
+transport_generation = 0
+transport_ready_transition_count = 0
+transport_loss_transition_count = 0
+transport_pending_retired_on_loss = 0
+transport_last_transition_monotonic: Optional[float] = None
+transport_last_transition = "PROCESS_START"
+
+rpc_peer_disconnect_count = 0
+rpc_unknown_response_count = 0
+rpc_retired_response_count = 0
+rpc_req_ts_mismatch_count = 0
+
 
 def _next_req_id() -> int:
     global req_id_last_issued
@@ -201,6 +224,7 @@ def _register_pending_reply(
     attempt: int,
     source: str,
     req_ts_ms: int,
+    transport_generation_id: int,
 ) -> Dict[str, Any]:
     entry = {
         "queue": queue,
@@ -209,6 +233,7 @@ def _register_pending_reply(
         "attempt": attempt,
         "source": source,
         "req_ts_ms": req_ts_ms,
+        "transport_generation": int(transport_generation_id),
         "sent_monotonic": time.monotonic(),
     }
     with state_lock:
@@ -223,6 +248,221 @@ def _retire_pending_reply(req_id: int, outcome: str) -> Optional[Dict[str, Any]]
     if entry is not None:
         _remember_reply_state(req_id, entry, outcome)
     return entry
+
+
+def _transport_state_snapshot() -> Tuple[bool, int]:
+    with transport_state_lock:
+        return bool(transport_state_ready), int(transport_generation)
+
+
+def _wait_for_transport_generation() -> int:
+    """Wait indefinitely for one live serial generation; startup absence is normal."""
+    while True:
+        transport_ready_event.wait()
+        ready, generation = _transport_state_snapshot()
+        if ready and generation > 0:
+            return generation
+
+
+def _retire_transport_generation_pending(generation: int) -> int:
+    """Wake every RPC whose serial generation is known to have disappeared."""
+    retired_items: List[Tuple[int, Dict[str, Any]]] = []
+    with state_lock:
+        for req_id, entry in list(pending_replies.items()):
+            if int(entry.get("transport_generation") or 0) != int(generation):
+                continue
+            retired_items.append((req_id, pending_replies.pop(req_id)))
+
+    for req_id, entry in retired_items:
+        _remember_reply_state(req_id, entry, "TRANSPORT_GENERATION_LOST")
+        try:
+            entry["queue"].put_nowait({
+                "_pubsub_internal": "TRANSPORT_GENERATION_LOST",
+                "transport_generation": int(generation),
+            })
+        except Full:
+            # A real response won the race and already filled the private queue.
+            pass
+    return len(retired_items)
+
+
+def _transport_state_monitor_loop() -> None:
+    """Convert serial ready/lost transitions into explicit PUBSUB generations."""
+    global transport_state_ready, transport_generation
+    global transport_ready_transition_count, transport_loss_transition_count
+    global transport_pending_retired_on_loss
+    global transport_last_transition_monotonic, transport_last_transition
+
+    while True:
+        try:
+            ready_now = bool(transport_wait_ready(timeout_s=TRANSPORT_STATE_POLL_S))
+        except Exception:
+            # The transport supervisor owns device errors.  PUBSUB treats this as
+            # temporarily unavailable and keeps waiting.
+            ready_now = False
+
+        lost_generation: Optional[int] = None
+        became_ready_generation: Optional[int] = None
+        with transport_state_lock:
+            if ready_now and not transport_state_ready:
+                transport_generation += 1
+                transport_state_ready = True
+                transport_ready_transition_count += 1
+                transport_last_transition_monotonic = time.monotonic()
+                transport_last_transition = "READY"
+                became_ready_generation = int(transport_generation)
+                transport_ready_event.set()
+            elif not ready_now and transport_state_ready:
+                lost_generation = int(transport_generation)
+                transport_state_ready = False
+                transport_loss_transition_count += 1
+                transport_last_transition_monotonic = time.monotonic()
+                transport_last_transition = "LOST"
+                transport_ready_event.clear()
+
+        if lost_generation is not None:
+            retired = _retire_transport_generation_pending(lost_generation)
+            transport_pending_retired_on_loss += retired
+            logging.info(
+                "⏳ [transport] serial generation=%d unavailable; "
+                "retired_inflight_rpc=%d; waiting indefinitely for reattach",
+                lost_generation, retired,
+            )
+
+        if became_ready_generation is not None:
+            if became_ready_generation > 1:
+                logging.info(
+                    "✅ [transport] serial reattached as generation=%d",
+                    became_ready_generation,
+                )
+            else:
+                logging.debug(
+                    "[transport] initial serial generation=%d ready",
+                    became_ready_generation,
+                )
+
+        if ready_now:
+            time.sleep(TRANSPORT_STATE_POLL_S)
+
+
+def _transport_supervisor_loop() -> None:
+    """Start transport independently of every PUBSUB-facing socket and never give up."""
+    announced = False
+    while True:
+        try:
+            transport_init()
+            break
+        except Exception as exc:
+            if not announced:
+                logging.info(
+                    "⏳ [transport] supervisor initialization unavailable; retrying silently: %r",
+                    exc,
+                )
+                announced = True
+            time.sleep(TRANSPORT_RETRY_INTERVAL_S)
+
+    _transport_state_monitor_loop()
+
+
+def _teensy_rpc_exchange(
+    req: Dict[str, Any],
+    *,
+    subsystem: str,
+    command: str,
+    source: str,
+) -> Dict[str, Any]:
+    """Perform one semantic RPC across any number of ephemeral transport lifetimes."""
+    stable_timeouts = 0
+
+    while stable_timeouts < MAX_TEENSY_RETRIES:
+        generation = _wait_for_transport_generation()
+        ready, current_generation = _transport_state_snapshot()
+        if not ready or current_generation != generation:
+            continue
+
+        req_id = _next_req_id()
+        req_ts_ms = int(time.monotonic() * 1000)
+        req["req_id"] = req_id
+        req["req_ts_ms"] = req_ts_ms
+
+        q = Queue(maxsize=1)
+        _register_pending_reply(
+            req_id=req_id,
+            queue=q,
+            subsystem=subsystem,
+            command=command,
+            attempt=stable_timeouts + 1,
+            source=source,
+            req_ts_ms=req_ts_ms,
+            transport_generation_id=generation,
+        )
+
+        try:
+            transport_send(TRAFFIC_REQUEST_RESPONSE, req)
+        except RuntimeError as exc:
+            if str(exc) != "SERIAL transport is not ready":
+                _retire_pending_reply(req_id, "SEND_FAILURE")
+                raise
+            _retire_pending_reply(req_id, "SEND_TRANSPORT_NOT_READY")
+            continue
+        except Exception:
+            _retire_pending_reply(req_id, "SEND_FAILURE")
+            raise
+
+        deadline = time.monotonic() + REPLY_TIMEOUT_S
+        transport_lost = False
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                break
+            try:
+                reply = q.get(timeout=min(RPC_REPLY_POLL_S, remaining))
+            except Empty:
+                ready, observed_generation = _transport_state_snapshot()
+                if not ready or observed_generation != generation:
+                    _retire_pending_reply(req_id, "TRANSPORT_GENERATION_LOST")
+                    transport_lost = True
+                    break
+                continue
+
+            if reply.get("_pubsub_internal") == "TRANSPORT_GENERATION_LOST":
+                transport_lost = True
+                break
+            return reply
+
+        if transport_lost:
+            # A known physical transport break is not a failed semantic command.
+            # Wait for the next generation and retry without consuming the
+            # bounded no-response budget.
+            continue
+
+        timed_out = _retire_pending_reply(req_id, "TIMEOUT")
+        stable_timeouts += 1
+        if timed_out is not None:
+            logging.warning(
+                "⏱️ [rpc] Teensy timeout req_id=%d source=%s target=%s.%s "
+                "attempt=%d/%d generation=%d timeout_s=%.1f",
+                req_id, source, subsystem, command, stable_timeouts,
+                MAX_TEENSY_RETRIES, generation, REPLY_TIMEOUT_S,
+            )
+
+    return {
+        "success": False,
+        "message": "TEENSY did not respond on a stable transport",
+        "payload": {},
+    }
+
+
+def _send_client_bytes_best_effort(conn: socket.socket, raw: bytes, *, context: str) -> bool:
+    """A caller disappearing before its reply arrives is ordinary IPC churn."""
+    global rpc_peer_disconnect_count
+    try:
+        conn.sendall(raw)
+        return True
+    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError) as exc:
+        rpc_peer_disconnect_count += 1
+        logging.debug("[pubsub] %s peer disappeared before reply: %r", context, exc)
+        return False
 
 # ---------------------------------------------------------------------
 # Routing table (cartesian subscription edges)
@@ -433,6 +673,9 @@ def on_receive_debug(payload: Dict[str, Any]) -> None:
         debug_log_fh.write(payload_to_json_str(payload) + "\n")
 
 def on_receive_request_response(payload: Dict[str, Any]) -> None:
+    global rpc_unknown_response_count, rpc_retired_response_count
+    global rpc_req_ts_mismatch_count
+
     req_id = payload.get("req_id")
     if req_id is None:
         logging.error(
@@ -445,58 +688,71 @@ def on_receive_request_response(payload: Dict[str, Any]) -> None:
         return
 
     with state_lock:
-        entry = pending_replies.pop(req_id, None)
+        entry = pending_replies.get(req_id)
         retired = recent_replies.get(req_id)
 
     if entry is None:
         if retired is None:
-            logging.error(
-                "❌ [rpc] response for UNKNOWN req_id=%r — discarded; "
-                "req_ts_ms=%r success=%r message=%r",
-                req_id,
-                payload.get("req_ts_ms"),
-                payload.get("success"),
-                payload.get("message"),
+            rpc_unknown_response_count += 1
+            logging.debug(
+                "[rpc] late/unknown response req_id=%r req_ts_ms=%r discarded",
+                req_id, payload.get("req_ts_ms"),
             )
         else:
-            age_ms = int(
-                (time.monotonic() - retired["sent_monotonic"]) * 1000
-            )
-            logging.warning(
-                "⚠️ [rpc] response for RETIRED req_id=%r classification=%s "
-                "source=%s target=%s.%s attempt=%d age_ms=%d "
-                "req_ts_ms=%r success=%r message=%r — discarded",
-                req_id,
-                retired.get("outcome"),
-                retired.get("source"),
-                retired.get("subsystem"),
-                retired.get("command"),
-                retired.get("attempt"),
-                age_ms,
-                payload.get("req_ts_ms"),
-                payload.get("success"),
-                payload.get("message"),
+            rpc_retired_response_count += 1
+            logging.debug(
+                "[rpc] late response for retired req_id=%r classification=%s discarded",
+                req_id, retired.get("outcome"),
             )
         return
 
     sent_ms = payload.get("req_ts_ms")
     if sent_ms is None:
-        _remember_reply_state(req_id, entry, "RESPONSE_MISSING_REQ_TS")
         logging.error(
             "❌ [rpc] response missing req_ts_ms req_id=%r source=%s "
-            "target=%s.%s attempt=%d — discarded",
-            req_id,
-            entry["source"],
-            entry["subsystem"],
-            entry["command"],
-            entry["attempt"],
+            "target=%s.%s attempt=%d — discarded without stealing pending custody",
+            req_id, entry["source"], entry["subsystem"],
+            entry["command"], entry["attempt"],
         )
         return
 
-    latency = int(time.monotonic() * 1000) - sent_ms
+    try:
+        response_ts_ms = int(sent_ms)
+    except (TypeError, ValueError):
+        logging.error(
+            "❌ [rpc] response has invalid req_ts_ms req_id=%r value=%r — discarded",
+            req_id, sent_ms,
+        )
+        return
+
+    if response_ts_ms != int(entry["req_ts_ms"]):
+        # PUBSUB request IDs restart with the process.  A delayed response from a
+        # previous PUBSUB lifetime can therefore reuse the same numeric req_id.
+        # req_ts_ms is the second half of the wire identity: never let stale
+        # testimony steal the current pending request.
+        rpc_req_ts_mismatch_count += 1
+        logging.debug(
+            "[rpc] stale response identity req_id=%r response_ts=%r current_ts=%r discarded",
+            req_id, response_ts_ms, entry["req_ts_ms"],
+        )
+        return
+
+    with state_lock:
+        current = pending_replies.get(req_id)
+        if current is not entry:
+            return
+        pending_replies.pop(req_id, None)
+
+    latency = int(time.monotonic() * 1000) - response_ts_ms
     payload["latency"] = latency
     _remember_reply_state(req_id, entry, "DELIVERED")
-    entry["queue"].put(payload)
+    try:
+        entry["queue"].put_nowait(payload)
+    except Full:
+        logging.error(
+            "❌ [rpc] private reply queue unexpectedly full req_id=%r target=%s.%s",
+            req_id, entry["subsystem"], entry["command"],
+        )
 
 def _publication_sequence(msg: Dict[str, Any]) -> Optional[int]:
     payload = msg.get("payload")
@@ -548,75 +804,28 @@ def handle_client(conn: socket.socket) -> None:
         except RuntimeError:
             return
 
-        req_id = None
-
-        for attempt in range(MAX_TEENSY_RETRIES):
-            req_id = _next_req_id()
-            req_ts_ms = int(time.monotonic() * 1000)
-            req["req_id"] = req_id
-            req["req_ts_ms"] = req_ts_ms
-
-            q = Queue(maxsize=1)
-            _register_pending_reply(
-                req_id=req_id,
-                queue=q,
-                subsystem=str(req.get("subsystem") or ""),
-                command=str(req.get("command") or ""),
-                attempt=attempt + 1,
-                source="PI_RPC",
-                req_ts_ms=req_ts_ms,
-            )
-
-            try:
-                transport_send(TRAFFIC_REQUEST_RESPONSE, req)
-
-                reply = q.get(timeout=REPLY_TIMEOUT_S)
-                conn.sendall(
-                    json.dumps(reply, separators=(",", ":")).encode()
-                )
-                return
-
-            except RuntimeError as exc:
-                if str(exc) != "SERIAL transport is not ready":
-                    raise
-                _retire_pending_reply(req_id, "SEND_TRANSPORT_NOT_READY")
-                if transport_wait_ready(timeout_s=REPLY_TIMEOUT_S):
-                    continue
-                conn.sendall(
-                    json.dumps({
-                        "req_id": req_id,
-                        "success": False,
-                        "message": "TEENSY transport did not become ready",
-                    }, separators=(",", ":")).encode()
-                )
-                return
-
-            except Empty:
-                timed_out = _retire_pending_reply(req_id, "TIMEOUT")
-                if timed_out is not None:
-                    logging.warning(
-                        "⏱️ [rpc] Teensy timeout req_id=%d source=%s "
-                        "target=%s.%s attempt=%d timeout_s=%.1f",
-                        req_id,
-                        timed_out["source"],
-                        timed_out["subsystem"],
-                        timed_out["command"],
-                        timed_out["attempt"],
-                        REPLY_TIMEOUT_S,
-                    )
-                continue
-
-        # All retries exhausted
-        conn.sendall(
-            json.dumps({
-                "req_id": req_id,
-                "success": False,
-                "message": "TEENSY did not respond",
-            }).encode()
+        subsystem = str(req.get("subsystem") or "")
+        command = str(req.get("command") or "")
+        reply = _teensy_rpc_exchange(
+            req,
+            subsystem=subsystem,
+            command=command,
+            source="PI_RPC",
         )
-
+        _send_client_bytes_best_effort(
+            conn,
+            json.dumps(reply, separators=(",", ":")).encode(),
+            context=f"PI_RPC {subsystem}.{command}",
+        )
+    except Exception:
+        # Programming/protocol defects remain loud.  Peer disappearance and
+        # transport churn are handled below this boundary and never traceback.
+        logging.exception("💥 [rpc] unexpected local RPC broker failure")
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------
@@ -1009,16 +1218,6 @@ def _pi_delivery_worker(target: _PiDeliveryTarget) -> None:
             target.current_enqueued_monotonic = enqueued_monotonic
 
         while True:
-            now = time.monotonic()
-            with pi_delivery_lock:
-                blocked_since = target.blocked_since_monotonic
-                last_log = target.blocked_last_log_monotonic
-            log_failure = (
-                blocked_since is None
-                or last_log is None
-                or now - last_log >= PI_DELIVERY_RETRY_LOG_INTERVAL_S
-            )
-
             delivered, failure = _fanout_to_pi(topic, target.subsystem, raw)
             if delivered:
                 delivered_at = time.monotonic()
@@ -1027,6 +1226,7 @@ def _pi_delivery_worker(target: _PiDeliveryTarget) -> None:
                     was_blocked = target.blocked_since_monotonic is not None
                     blocked_since = target.blocked_since_monotonic
                     episode_retries = target.blocked_retry_count
+                    episode_was_logged = target.blocked_last_log_monotonic is not None
                     target.delivered += 1
                     target.last_delivered_topic = topic
                     target.last_delivered_sequence = sequence
@@ -1035,9 +1235,6 @@ def _pi_delivery_worker(target: _PiDeliveryTarget) -> None:
                     target.current_sequence = None
                     target.current_enqueued_monotonic = None
 
-                    # A successful row while backlog remains is progress, not
-                    # recovery.  Keep the outage episode open until ordered
-                    # custody has actually caught up to the live head.
                     caught_up = was_blocked and backlog == 0
                     if caught_up:
                         target.blocked_since_monotonic = None
@@ -1045,24 +1242,22 @@ def _pi_delivery_worker(target: _PiDeliveryTarget) -> None:
                         target.blocked_retry_count = 0
 
                 target.queue.task_done()
-                if caught_up:
+                # A sub-second process-start race is invisible.  Only close an
+                # outage episode in INFO if we previously had reason to announce it.
+                if caught_up and episode_was_logged:
                     blocked_ms = (
                         (delivered_at - blocked_since) * 1000.0
-                        if blocked_since is not None
-                        else 0.0
+                        if blocked_since is not None else 0.0
                     )
                     logging.info(
                         "✅ [pubsub] Pi delivery custody caught up target=PI:%s "
                         "topic=%s sequence=%s outage_ms=%.1f retries=%d backlog=0",
-                        target.subsystem,
-                        topic,
-                        sequence,
-                        blocked_ms,
-                        episode_retries,
+                        target.subsystem, topic, sequence, blocked_ms, episode_retries,
                     )
                 break
 
             failure = failure or {}
+            now = time.monotonic()
             with pi_delivery_lock:
                 first_block = target.blocked_since_monotonic is None
                 if first_block:
@@ -1070,28 +1265,29 @@ def _pi_delivery_worker(target: _PiDeliveryTarget) -> None:
                     target.blocked_retry_count = 0
                 target.retry_count += 1
                 target.blocked_retry_count += 1
-                blocked_since = target.blocked_since_monotonic
+                blocked_since = target.blocked_since_monotonic or now
                 episode_retries = target.blocked_retry_count
                 total_retries = target.retry_count
+                last_log = target.blocked_last_log_monotonic
+                blocked_s = max(0.0, now - blocked_since)
+                log_failure = (
+                    blocked_s >= PI_DELIVERY_INITIAL_WARN_GRACE_S
+                    and (
+                        last_log is None
+                        or now - last_log >= PI_DELIVERY_RETRY_LOG_INTERVAL_S
+                    )
+                )
                 if log_failure:
                     target.blocked_last_log_monotonic = now
 
             if log_failure:
-                blocked_s = max(0.0, now - float(blocked_since or now))
                 logging.warning(
-                    "%s [pubsub] Pi subscriber unavailable; retaining ordered custody "
+                    "⏳ [pubsub] Pi subscriber unavailable; retaining ordered custody "
                     "target=PI:%s topic=%s sequence=%s backlog=%d blocked_s=%.1f "
                     "episode_retries=%d total_retries=%d phase=%s error=%s",
-                    "📥" if first_block else "⏳",
-                    target.subsystem,
-                    topic,
-                    sequence,
-                    target.queue.qsize() + 1,
-                    blocked_s,
-                    episode_retries,
-                    total_retries,
-                    failure.get("phase"),
-                    failure.get("error"),
+                    target.subsystem, topic, sequence, target.queue.qsize() + 1,
+                    blocked_s, episode_retries, total_retries,
+                    failure.get("phase"), failure.get("error"),
                 )
             time.sleep(PI_DELIVERY_RETRY_INTERVAL_S)
 
@@ -1331,8 +1527,8 @@ def _server_send(wire_msg: Dict[str, Any]) -> None:
         try:
             line = json.dumps(wire_msg, separators=(",", ":")) + "\n"
             conn.sendall(line.encode("utf-8"))
-        except Exception:
-            logging.warning("⚠️ [pubsub] SERVER send failed (disconnected?)")
+        except Exception as exc:
+            logging.debug("[pubsub] SERVER send skipped after disconnect: %r", exc)
 
 
 # ---------------------------------------------------------------------
@@ -1445,8 +1641,10 @@ def _server_reader(conn: socket.socket) -> None:
                 else:
                     logging.warning("⚠️ [pubsub] SERVER sent unknown message type: %r", msg_type)
 
+    except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError, OSError) as exc:
+        logging.debug("[pubsub] SERVER reader connection ended: %r", exc)
     except Exception:
-        logging.exception("💥 [pubsub] SERVER reader exception")
+        logging.exception("💥 [pubsub] SERVER reader protocol failure")
     finally:
         _server_disconnect("reader exited")
 
@@ -1460,8 +1658,8 @@ def _server_handle_subscribe(msg: Dict[str, Any]) -> None:
     with state_lock:
         server_subscription_declarations_ignored += 1
 
-    logging.warning(
-        "🌐 [pubsub] ignored SERVER subscription declaration (%d entries); "
+    logging.debug(
+        "[pubsub] ignored legacy SERVER subscription declaration (%d entries); "
         "formal topology is static code truth",
         declared_count,
     )
@@ -1537,12 +1735,7 @@ def _server_command_to_teensy(
     *,
     source: str = "SERVER_RPC",
 ) -> Dict[str, Any]:
-    """
-    Route a SERVER-originated command to TEENSY via the RPC path.
-
-    Uses the same req_id / pending_replies / transport_send mechanism
-    as handle_client, but without the Unix socket wrapper.
-    """
+    """Route a SERVER-originated command through the same resilient Teensy RPC court."""
     req: Dict[str, Any] = {
         "machine": "TEENSY",
         "subsystem": subsystem,
@@ -1550,61 +1743,9 @@ def _server_command_to_teensy(
     }
     if args is not None:
         req["args"] = args
-
-    for attempt in range(MAX_TEENSY_RETRIES):
-        req_id = _next_req_id()
-        req_ts_ms = int(time.monotonic() * 1000)
-        req["req_id"] = req_id
-        req["req_ts_ms"] = req_ts_ms
-
-        q = Queue(maxsize=1)
-        _register_pending_reply(
-            req_id=req_id,
-            queue=q,
-            subsystem=subsystem,
-            command=command,
-            attempt=attempt + 1,
-            source=source,
-            req_ts_ms=req_ts_ms,
-        )
-
-        try:
-            transport_send(TRAFFIC_REQUEST_RESPONSE, req)
-            reply = q.get(timeout=REPLY_TIMEOUT_S)
-            return reply
-
-        except RuntimeError as exc:
-            if str(exc) != "SERIAL transport is not ready":
-                raise
-            _retire_pending_reply(req_id, "SEND_TRANSPORT_NOT_READY")
-            if transport_wait_ready(timeout_s=REPLY_TIMEOUT_S):
-                continue
-            return {
-                "success": False,
-                "message": "TEENSY transport did not become ready",
-                "payload": {},
-            }
-
-        except Empty:
-            timed_out = _retire_pending_reply(req_id, "TIMEOUT")
-            if timed_out is not None:
-                logging.warning(
-                    "⏱️ [rpc] Teensy timeout req_id=%d source=%s "
-                    "target=%s.%s attempt=%d timeout_s=%.1f",
-                    req_id,
-                    timed_out["source"],
-                    timed_out["subsystem"],
-                    timed_out["command"],
-                    timed_out["attempt"],
-                    REPLY_TIMEOUT_S,
-                )
-            continue
-
-    return {
-        "success": False,
-        "message": "TEENSY did not respond",
-        "payload": {},
-    }
+    return _teensy_rpc_exchange(
+        req, subsystem=subsystem, command=command, source=source
+    )
 
 
 def _server_handle_publish(msg: Dict[str, Any]) -> None:
@@ -1762,7 +1903,7 @@ def _handle_server_cmd_client(conn: socket.socket) -> None:
                 return
 
         # Assign a relay req_id (internal to pubsub, not the caller's)
-        req_id = next(req_id_counter)
+        req_id = _next_req_id()
 
         q = Queue(maxsize=1)
         with state_lock:
@@ -1802,8 +1943,10 @@ def _handle_server_cmd_client(conn: socket.socket) -> None:
                 "payload": {},
             }
 
-        conn.sendall(
-            json.dumps(relay_resp, separators=(",", ":")).encode("utf-8")
+        _send_client_bytes_best_effort(
+            conn,
+            json.dumps(relay_resp, separators=(",", ":")).encode("utf-8"),
+            context="SERVER_CMD_RELAY",
         )
 
     finally:
@@ -1838,11 +1981,10 @@ def pubsub_server() -> None:
             except (UnicodeDecodeError, json.JSONDecodeError):
                 # One malformed or abandoned publisher must never terminate
                 # the long-lived authoritative pub/sub routing thread.
-                logging.exception(
+                logging.warning(
                     "⚠️ [pubsub] malformed PI publication ignored "
                     "(bytes=%d preview=%r)",
-                    len(raw),
-                    raw[:256],
+                    len(raw), raw[:256],
                 )
                 continue
 
@@ -1875,6 +2017,7 @@ def cmd_diagnostics(_: Optional[dict]) -> Dict[str, Any]:
                 "subsystem": entry["subsystem"],
                 "command": entry["command"],
                 "attempt": entry["attempt"],
+                "transport_generation": entry.get("transport_generation"),
                 "age_ms": int(
                     (time.monotonic() - entry["sent_monotonic"]) * 1000
                 ),
@@ -1889,6 +2032,7 @@ def cmd_diagnostics(_: Optional[dict]) -> Dict[str, Any]:
                 "subsystem": entry.get("subsystem"),
                 "command": entry.get("command"),
                 "attempt": entry.get("attempt"),
+                "transport_generation": entry.get("transport_generation"),
             }
             for req_id, entry in list(recent_replies.items())[-16:]
         ]
@@ -1984,11 +2128,29 @@ def cmd_diagnostics(_: Optional[dict]) -> Dict[str, Any]:
     with server_conn_lock:
         server_connected = server_conn is not None
 
+    transport_ready, transport_generation_now = _transport_state_snapshot()
+
     return {
         "success": True,
         "message": "OK",
         "payload": {
             "pending_reply_count": pending_count,
+            "transport": {
+                "ready": transport_ready,
+                "generation": transport_generation_now,
+                "ready_transition_count": transport_ready_transition_count,
+                "loss_transition_count": transport_loss_transition_count,
+                "pending_retired_on_loss": transport_pending_retired_on_loss,
+                "last_transition": transport_last_transition,
+                "last_transition_age_ms": (
+                    int((time.monotonic() - transport_last_transition_monotonic) * 1000)
+                    if transport_last_transition_monotonic is not None else None
+                ),
+            },
+            "rpc_peer_disconnect_count": rpc_peer_disconnect_count,
+            "rpc_unknown_response_count": rpc_unknown_response_count,
+            "rpc_retired_response_count": rpc_retired_response_count,
+            "rpc_req_ts_mismatch_count": rpc_req_ts_mismatch_count,
             "pending_req_ids": pending_ids[:50],  # cap for sanity
             "pending_reply_detail": pending_detail[:50],
             "recent_reply_detail": recent_detail,
@@ -2389,37 +2551,9 @@ COMMANDS = {
 # Transport init with aggressive retry
 # ---------------------------------------------------------------------
 
-def _transport_init_with_retry() -> None:
-    """
-    Start the serial transport supervisor, retrying if the transport
-    subsystem itself is not ready yet.  Device availability after startup is
-    owned by the serial transport supervisor, which survives flash/reboot and
-    late udev enumeration.
-
-    Behaviour:
-      • First failure logs a single INFO line so we know we're waiting
-      • All subsequent failures are swallowed silently
-      • Polls every TRANSPORT_RETRY_INTERVAL_S (250 ms)
-      • Runs indefinitely until transport_init succeeds
-      • On success logs once and returns
-    """
-    announced = False
-
-    transport_init()
-
-    while True:
-        if transport_wait_ready(timeout_s=5.0):
-            if announced:
-                logging.info("✅ [transport] device available — transport initialized")
-            else:
-                logging.info("✅ [transport] device available — transport initialized")
-            return
-
-        if not announced:
-            logging.info("⏳ [transport] waiting for serial readiness every %.0f ms",
-                         TRANSPORT_RETRY_INTERVAL_S * 1000)
-            announced = True
-        time.sleep(TRANSPORT_RETRY_INTERVAL_S)
+# Transport startup is intentionally asynchronous.  _transport_supervisor_loop()
+# above owns indefinite serial initialization and generation tracking; PUBSUB's
+# local sockets never wait for a device to exist.
 
 # ---------------------------------------------------------------------
 # Entrypoint
@@ -2436,56 +2570,44 @@ def run() -> None:
         "ENABLED" if TRANSPORT_RAW_LOG_ENABLED else "disabled",
     )
 
-    # Install formal routing before the transport can observe even one Teensy
-    # publication.  Process sockets may still be absent; per-target delivery
-    # custody queues retain those routed publications until each owner appears.
+    # Routing and receive callbacks are code truth and exist before either side
+    # of the transport.  This closes the only ordering requirement PUBSUB owns.
     _install_static_routes()
-
-    # Register receive handlers before starting the serial RX supervisor.
-    # The Teensy emits DEBUG/PUBSUB frames immediately during boot; the
-    # transport must not observe a live serial stream before PUBSUB has
-    # installed its traffic callbacks.
     transport_register_receive_callback(TRAFFIC_DEBUG, on_receive_debug)
     transport_register_receive_callback(TRAFFIC_REQUEST_RESPONSE, on_receive_request_response)
     transport_register_receive_callback(TRAFFIC_PUBLISH_SUBSCRIBE, on_receive_publish_subscribe)
 
-    # Start the serial transport supervisor.  The supervisor handles flash,
-    # reboot, late enumeration, and transient device disappearance after this.
-    _transport_init_with_retry()
-
-    threading.Thread(target=rpc_server, daemon=True).start()
-    threading.Thread(target=pubsub_server, daemon=True).start()
-
-    # Ad-hoc observer tap for metrics panels and debugging tools.
-    # This is intentionally outside the formal subscription union.
+    # Expose every Pi-facing endpoint immediately.  A missing Teensy is now a
+    # transport state underneath PUBSUB, not a reason for PUBSUB itself to be
+    # unavailable to independently-starting services.
+    threading.Thread(target=rpc_server, daemon=True, name="pubsub-teensy-rpc").start()
+    threading.Thread(target=pubsub_server, daemon=True, name="pubsub-local-publish").start()
     threading.Thread(
-        target=adhoc_tap_server,
-        daemon=True,
-        name="pubsub-adhoc-tap",
+        target=adhoc_tap_server, daemon=True, name="pubsub-adhoc-tap"
+    ).start()
+    threading.Thread(
+        target=server_tcp_listener, daemon=True, name="server-tcp-listener"
+    ).start()
+    threading.Thread(
+        target=server_cmd_relay_server, daemon=True, name="server-cmd-relay"
     ).start()
 
-    # SERVER TCP listener — accepts connections from the Meteor server
+    # Serial availability is fully asynchronous and self-healing.  This thread
+    # retries initialization forever, tracks attach generations, and wakes any
+    # in-flight RPC immediately when its generation disappears.
     threading.Thread(
-        target=server_tcp_listener,
+        target=_transport_supervisor_loop,
         daemon=True,
-        name="server-tcp-listener",
+        name="pubsub-transport-supervisor",
     ).start()
 
-    # SERVER command relay — accepts Pi→SERVER command requests
-    threading.Thread(
-        target=server_cmd_relay_server,
-        daemon=True,
-        name="server-cmd-relay",
-    ).start()
-
-    # No subscription discovery, delayed REFRESH, or route-repair thread exists
-    # in the active topology path.  Teensy and Pi each boot with the same graph.
-
-    # Process lifetime (never returns)
+    # PUBSUB's own command surface is also independent of serial readiness.
+    # server_setup owns process lifetime and never returns in normal operation.
     server_setup(
         subsystem="PUBSUB",
         commands=COMMANDS,
     )
+
 
 def bootstrap() -> None:
     run()

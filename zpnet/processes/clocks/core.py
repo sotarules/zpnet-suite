@@ -624,7 +624,10 @@ _diag: Dict[str, Any] = {
     "watchdog_anomalies_received": 0,
     "watchdog_anomaly_recovery_started": 0,
     "watchdog_anomaly_event_enqueue_failures": 0,
+    "watchdog_anomaly_startup_deferred": 0,
+    "watchdog_anomaly_startup_reconciled": 0,
     "last_watchdog_anomaly": {},
+    "last_startup_deferred_watchdog": {},
 
     # Dedicated recovery-liveness anomaly.  This is observational and never
     # initiates RECOVER; restarting would destroy the evidence being awaited.
@@ -2560,8 +2563,12 @@ _recovery_custody_physical_sequence_regression = False
 _recovery_custody_regression_witness: Dict[str, Any] = {}
 
 # The command server is exposed early so PUBSUB can discover subscriptions, but
-# START/RESUME must not race holistic startup reconciliation.
+# START/RESUME must not race holistic startup reconciliation. A retained
+# WATCHDOG_ANOMALY may also arrive as soon as PUBSUB reconnects; startup owns
+# that evidence until holistic reconciliation has classified the Teensy.
 _startup_control_ready = threading.Event()
+_startup_watchdog_lock = threading.Lock()
+_startup_watchdog_deferred = deque()
 
 # Latest unified operational heartbeat.  CLOCKS consumes CLOCKS.features for
 # campaign preflight; it never polls or subscribes to a feature-only side feed.
@@ -10032,6 +10039,61 @@ def _clear_start_wait_state() -> None:
 # ---------------------------------------------------------------------
 
 
+def _defer_startup_watchdog(anomaly: Dict[str, Any]) -> None:
+    """Hold continuity-surrender testimony until startup owns recovery."""
+    envelope = {
+        "received_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "received_monotonic": time.monotonic(),
+        "payload": copy.deepcopy(anomaly),
+    }
+    with _startup_watchdog_lock:
+        _startup_watchdog_deferred.append(envelope)
+        depth = len(_startup_watchdog_deferred)
+    _diag["watchdog_anomaly_startup_deferred"] += 1
+    _diag["last_startup_deferred_watchdog"] = {
+        **copy.deepcopy(envelope),
+        "depth": int(depth),
+        "state": "DEFERRED_TO_STARTUP_RECONCILIATION",
+    }
+    logging.warning(
+        "🧭 [clocks/startup] WATCHDOG_ANOMALY retained during startup; "
+        "holistic reconciliation owns recovery (reason=%s campaign=%s depth=%d)",
+        anomaly.get("reason"),
+        anomaly.get("campaign"),
+        depth,
+    )
+
+
+def _reconcile_deferred_startup_watchdogs() -> Dict[str, Any]:
+    """Retire startup watchdog triggers after holistic state reconciliation."""
+    with _startup_watchdog_lock:
+        deferred = list(_startup_watchdog_deferred)
+        _startup_watchdog_deferred.clear()
+
+    if not deferred:
+        return {"count": 0, "reconciled": False}
+
+    _diag["watchdog_anomaly_startup_reconciled"] += len(deferred)
+    latest = copy.deepcopy(deferred[-1])
+    result = {
+        "count": len(deferred),
+        "reconciled": True,
+        "latest": latest,
+        "authority": "STARTUP_HOLISTIC_RECONCILIATION",
+    }
+    _diag["last_startup_deferred_watchdog"] = {
+        **latest,
+        "depth": 0,
+        "state": "RECONCILED_BY_STARTUP",
+        "reconciled_count": len(deferred),
+    }
+    logging.info(
+        "✅ [clocks/startup] reconciled %d deferred WATCHDOG_ANOMALY "
+        "trigger(s) inside the holistic startup transaction; no competing "
+        "auto-recovery thread was launched",
+        len(deferred),
+    )
+    return result
 
 
 def on_watchdog_anomaly(payload: Payload) -> None:
@@ -10039,8 +10101,9 @@ def on_watchdog_anomaly(payload: Payload) -> None:
     PUBSUB handler for WATCHDOG_ANOMALY from Teensy CLOCKS.
 
     This is an explicit semantic surrender by the Teensy: campaign continuity
-    is no longer being asserted. We enqueue a durable event and then initiate
-    Pi-side recovery using the existing battle-tested protocol.
+    is no longer being asserted. We enqueue a durable event immediately. Once
+    startup reconciliation is complete it initiates ordinary auto-recovery;
+    before that boundary the anomaly is retained as startup-owned evidence.
     """
     _diag["watchdog_anomalies_received"] += 1
 
@@ -10063,6 +10126,10 @@ def on_watchdog_anomaly(payload: Payload) -> None:
     except Exception:
         _diag["watchdog_anomaly_event_enqueue_failures"] += 1
         logging.exception("⚠️ [clocks] failed to enqueue WATCHDOG_ANOMALY event")
+
+    if not _startup_control_ready.is_set():
+        _defer_startup_watchdog(anomaly)
+        return
 
     started = _begin_auto_recovery(
         "watchdog_anomaly",
@@ -15428,6 +15495,8 @@ def run() -> None:
     )
 
     _startup_control_ready.clear()
+    with _startup_watchdog_lock:
+        _startup_watchdog_deferred.clear()
     _clocks_persistence_enabled.clear()
     _reset_startup_clocks_custody()
     _clocks_epoch_birth_pending.clear()
@@ -15512,6 +15581,9 @@ def run() -> None:
     )
     try:
         result = _holistic_restore(preverified_location=startup_location)
+        result["startup_watchdog_reconciliation"] = (
+            _reconcile_deferred_startup_watchdogs()
+        )
         logging.info("✅ [holistic restore] complete: %s", result)
     except HardFailureRequired:
         # The restore court has already latched HARD_FAILURE with exact evidence.
