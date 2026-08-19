@@ -406,6 +406,12 @@ FLASHMEM bool clocks_alpha_pps_vclock_edge_forensics(
 // pps_selector_callback.
 static volatile uint32_t g_vclock_event_count = 0;
 
+// Tiny current-selector witness used by the SmartZero install transaction
+// and by the read-only Alpha row-court diagnostic. pps_selector_callback
+// authors it before any START/ZERO control path runs.
+static volatile uint32_t g_alpha_latest_selector_reference_sequence = 0;
+static volatile uint32_t g_alpha_latest_selector_reference_dwt = 0;
+
 // ============================================================================
 // Alpha-owned DWT64 logical clock
 // ============================================================================
@@ -5976,6 +5982,58 @@ static uint32_t alpha_completed_row_missing_mask(uint32_t pps_sequence) {
   return missing;
 }
 
+FLASHMEM bool clocks_alpha_row_court_snapshot(
+    clocks_alpha_row_court_snapshot_t* out) {
+  if (!out) return false;
+
+  clocks_alpha_row_court_snapshot_t local{};
+  local.epoch_ready = epoch_ready();
+  local.selector_sequence = g_alpha_latest_selector_reference_sequence;
+  local.selector_dwt = g_alpha_latest_selector_reference_dwt;
+  local.vclock_event_counter32 = g_last_vclock_event_counter32_at_event;
+  local.vclock_event_dwt = g_prev_dwt_at_vclock_event;
+  local.selector_vclock_counter_match =
+      local.selector_sequence != 0U &&
+      local.vclock_event_counter32 == g_counter32_at_pps_vclock;
+  local.selector_vclock_dwt_match =
+      local.selector_dwt != 0U &&
+      local.vclock_event_dwt == local.selector_dwt;
+  local.selector_vclock_match =
+      local.selector_vclock_counter_match && local.selector_vclock_dwt_match;
+
+  local.row_open = g_alpha_pending_completed_row.open;
+  local.row_sequence = g_alpha_pending_completed_row.pps_sequence;
+  local.row_ocxo1_complete = g_alpha_pending_completed_row.ocxo1_complete;
+  local.row_ocxo2_complete = g_alpha_pending_completed_row.ocxo2_complete;
+
+  const uint32_t court_sequence =
+      local.row_open ? local.row_sequence : local.selector_sequence;
+  local.row_missing_mask =
+      court_sequence != 0U ? alpha_completed_row_missing_mask(court_sequence) : 0U;
+
+  local.pps_witness_sequence = g_pps_witness_diag.pps_edge_sequence;
+  local.anchor_dwt = g_dwt_at_pps_vclock;
+  local.anchor_counter32 = g_counter32_at_pps_vclock;
+  local.anchor_gnss_ns = g_gnss_ns_at_pps_vclock;
+
+  local.last_ocxo1_pps_sequence = g_alpha_last_ocxo1_pps_sequence;
+  local.last_ocxo2_pps_sequence = g_alpha_last_ocxo2_pps_sequence;
+  local.ocxo1_lane_ready = court_sequence != 0U &&
+      alpha_completed_row_lane_ready(time_clock_id_t::OCXO1, court_sequence);
+  local.ocxo2_lane_ready = court_sequence != 0U &&
+      alpha_completed_row_lane_ready(time_clock_id_t::OCXO2, court_sequence);
+  local.ocxo1_waiting_for_phase = court_sequence != 0U &&
+      alpha_completed_row_lane_waiting_for_phase(
+          g_ocxo1_pps_counterledger, court_sequence);
+  local.ocxo2_waiting_for_phase = court_sequence != 0U &&
+      alpha_completed_row_lane_waiting_for_phase(
+          g_ocxo2_pps_counterledger, court_sequence);
+
+  local.snapshot_ok = true;
+  *out = local;
+  return true;
+}
+
 static bool alpha_completed_row_install_refined_clockfaces(
     uint32_t pps_sequence) {
   if (g_alpha_last_installed_completed_row_pps_sequence == pps_sequence) {
@@ -6995,11 +7053,6 @@ static constexpr const char* ALPHA_OCXO_GRID_REPHASE_OCXO2_TIMER =
 static void alpha_smartzero_install_fail(uint32_t stage,
                                          uint32_t failure_code);
 static bool alpha_smartzero_finish_epoch_commit(void);
-
-// Tiny current-selector witness used by the SmartZero install transaction.
-// pps_selector_callback authors it before any START/ZERO control path runs.
-static volatile uint32_t g_alpha_latest_selector_reference_sequence = 0;
-static volatile uint32_t g_alpha_latest_selector_reference_dwt = 0;
 
 static volatile uint32_t g_alpha_recover_reprime_count = 0;
 

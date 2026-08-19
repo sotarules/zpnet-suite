@@ -574,6 +574,48 @@ bool clocks_alpha_ocxo_counterledger_snapshot(
     clocks_alpha_ocxo_counterledger_snapshot_t* out);
 bool clocks_alpha_ocxo_counterledger_ready(void);
 
+// ============================================================================
+// Alpha completed-row courtroom snapshot
+// ============================================================================
+//
+// Read-only diagnostic testimony for the exact court that must open and close
+// one canonical Alpha row before CLOCKS_FRAGMENT can exist.  This surface does
+// not repair, advance, or reinterpret state; it only exposes the current
+// selector/VCLOCK identity, row custody, and per-lane readiness verdicts.
+struct clocks_alpha_row_court_snapshot_t {
+  bool     snapshot_ok = false;
+  bool     epoch_ready = false;
+
+  uint32_t selector_sequence = 0U;
+  uint32_t selector_dwt = 0U;
+  uint32_t vclock_event_counter32 = 0U;
+  uint32_t vclock_event_dwt = 0U;
+  bool     selector_vclock_counter_match = false;
+  bool     selector_vclock_dwt_match = false;
+  bool     selector_vclock_match = false;
+
+  bool     row_open = false;
+  uint32_t row_sequence = 0U;
+  bool     row_ocxo1_complete = false;
+  bool     row_ocxo2_complete = false;
+  uint32_t row_missing_mask = 0U;
+
+  uint32_t pps_witness_sequence = 0U;
+  uint32_t anchor_dwt = 0U;
+  uint32_t anchor_counter32 = 0U;
+  uint64_t anchor_gnss_ns = 0ULL;
+
+  uint32_t last_ocxo1_pps_sequence = 0U;
+  uint32_t last_ocxo2_pps_sequence = 0U;
+  bool     ocxo1_lane_ready = false;
+  bool     ocxo2_lane_ready = false;
+  bool     ocxo1_waiting_for_phase = false;
+  bool     ocxo2_waiting_for_phase = false;
+};
+
+bool clocks_alpha_row_court_snapshot(
+    clocks_alpha_row_court_snapshot_t* out);
+
 
 // ============================================================================
 // Alpha always-on OCXO TAU estimator

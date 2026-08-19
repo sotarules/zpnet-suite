@@ -6755,6 +6755,46 @@ def _arm_holistic_restore_persistence_proof(
     _clocks_holistic_restore_proof_pending.set()
 
 
+def _log_holistic_restore_row_court(waited_s: float, *, phase: str) -> None:
+    """Log Teensy Alpha's read-only row court while no fresh CLOCKS row exists."""
+    try:
+        response = send_command(
+            machine="TEENSY",
+            subsystem="CLOCKS",
+            command="REPORT_ROW_COURT",
+            retries=1,
+            retry_delay_s=0.0,
+        )
+    except Exception as exc:
+        logging.warning(
+            "⚠️ [holistic restore] no fresh CLOCKS_FRAGMENT after %.1fs; "
+            "REPORT_ROW_COURT failed during %s: %s",
+            float(waited_s),
+            phase,
+            exc,
+        )
+        return
+
+    payload = response.get("payload") if isinstance(response, dict) else None
+    if not isinstance(response, dict) or not response.get("success") or not isinstance(payload, dict):
+        logging.warning(
+            "⚠️ [holistic restore] no fresh CLOCKS_FRAGMENT after %.1fs; "
+            "REPORT_ROW_COURT unavailable during %s: %r",
+            float(waited_s),
+            phase,
+            response,
+        )
+        return
+
+    logging.info(
+        "⚖️ [holistic restore] no fresh CLOCKS_FRAGMENT after %.1fs; "
+        "Alpha row court (%s): %s",
+        float(waited_s),
+        phase,
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str),
+    )
+
+
 def _wait_for_holistic_restore(
     detail: Dict[str, Any],
     *,
@@ -6790,13 +6830,22 @@ def _wait_for_holistic_restore(
                 }
         now = time.monotonic()
         if now >= next_progress_log:
-            logging.info(
-                "⏳ [holistic restore] converging after %.1fs; waiting for %s",
-                now - requested_monotonic,
-                ", ".join(_holistic_restore_pending_categories(expected, last_observed)),
-            )
+            waited_s = now - requested_monotonic
+            if not last_observed:
+                _log_holistic_restore_row_court(waited_s, phase="progress")
+            else:
+                logging.info(
+                    "⏳ [holistic restore] converging after %.1fs; waiting for %s",
+                    waited_s,
+                    ", ".join(_holistic_restore_pending_categories(expected, last_observed)),
+                )
             next_progress_log = now + 10.0
         time.sleep(0.1)
+    if not last_observed:
+        _log_holistic_restore_row_court(
+            time.monotonic() - requested_monotonic,
+            phase="timeout",
+        )
     raise TimeoutError(
         "timed out waiting for holistic CLOCKS restore proof "
         f"after {timeout_s:.1f}s; expected={expected!r} observed={last_observed!r}"

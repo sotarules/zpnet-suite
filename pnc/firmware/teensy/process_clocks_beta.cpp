@@ -10063,6 +10063,155 @@ static FLASHMEM void report_add_common_metadata(
   p.add("report_max_duration_cycles", g_clocks_report_max_duration_cycles);
 }
 
+static FLASHMEM void report_add_row_court_lane(
+    Payload& parent,
+    const char* key,
+    time_clock_id_t clock,
+    uint32_t court_sequence) {
+  g_beta_counterledger_raw_scratch =
+      clocks_alpha_ocxo_counterledger_snapshot_t{};
+  const bool snapshot_ok = clocks_alpha_ocxo_counterledger_snapshot(
+      clock, &g_beta_counterledger_raw_scratch);
+  const clocks_alpha_ocxo_counterledger_snapshot_t& lane =
+      g_beta_counterledger_raw_scratch;
+
+  Payload detail;
+  detail.add("snapshot_ok", snapshot_ok);
+  detail.add("valid", lane.valid);
+  detail.add("initialized", lane.initialized);
+  detail.add("interval_valid", lane.interval_valid);
+  detail.add("pps_sequence", lane.pps_sequence);
+  detail.add("court_sequence_match",
+             court_sequence != 0U && lane.pps_sequence == court_sequence);
+  detail.add("sample_count", lane.sample_count);
+  detail.add("last_counter32", lane.last_counter32);
+
+  detail.add("phase_valid", lane.phase_valid);
+  detail.add("phase_pending", lane.phase_pending);
+  detail.add("phase_pps_sequence", lane.phase_pps_sequence);
+  detail.add("phase_sequence_match",
+             court_sequence != 0U &&
+                 lane.phase_pps_sequence == court_sequence);
+  detail.add("phase_lag_pps", lane.phase_lag_pps);
+  detail.add("phase_implied_counter32_at_pps",
+             lane.phase_implied_counter32_at_pps);
+  detail.add("counter_identity_match",
+             lane.phase_valid &&
+                 lane.phase_implied_counter32_at_pps == lane.last_counter32);
+  detail.add("phase_pending_depth", lane.phase_pending_depth);
+  detail.add("phase_pending_oldest_pps_sequence",
+             lane.phase_pending_oldest_pps_sequence);
+  detail.add("phase_pending_newest_pps_sequence",
+             lane.phase_pending_newest_pps_sequence);
+  detail.add("phase_last_resolved_pps_sequence",
+             lane.phase_pending_last_resolved_pps_sequence);
+  detail.add("phase_last_resolve_reason_id",
+             lane.last_phase_resolve_reason_id);
+  detail.add("phase_last_resolve_reason",
+             clocks_phaseledger_resolve_reason_name(
+                 lane.last_phase_resolve_reason_id));
+  detail.add("phase_last_resolve_source_id",
+             lane.phase_last_resolve_source_id);
+  detail.add("phase_last_resolve_source",
+             clocks_phaseledger_resolve_source_name(
+                 lane.phase_last_resolve_source_id));
+
+  detail.add("refined_valid", lane.refined_valid);
+  detail.add("refined_interval_valid", lane.refined_interval_valid);
+  detail.add("refined_ns", lane.refined_ns);
+  detail.add("refined_interval_ns", lane.refined_interval_ns);
+  detail.add("last_sample_decision_id", lane.last_sample_decision_id);
+  detail.add("last_sample_decision",
+             clocks_counterledger_sample_decision_name(
+                 lane.last_sample_decision_id));
+  detail.add("last_sample_pps_sequence", lane.last_sample_pps_sequence);
+  detail.add("last_sample_delta_ticks", lane.last_sample_delta_ticks);
+
+  parent.add_object(key, detail);
+}
+
+static FLASHMEM Payload cmd_report_row_court(const Payload&) {
+  clocks_report_build_guard_t guard;
+  if (!guard.acquired) return clocks_report_busy_response("CLOCKS_ROW_COURT");
+
+  clocks_alpha_row_court_snapshot_t court{};
+  const bool snapshot_ok = clocks_alpha_row_court_snapshot(&court);
+  const uint32_t court_sequence =
+      court.row_open ? court.row_sequence : court.selector_sequence;
+
+  Payload p;
+  p.add("report", "CLOCKS_ROW_COURT");
+  p.add("schema", "CLOCKS_ALPHA_ROW_COURT_V1");
+  p.add("read_only", true);
+  p.add("snapshot_ok", snapshot_ok && court.snapshot_ok);
+  p.add("court_sequence", court_sequence);
+  p.add("epoch_ready", court.epoch_ready);
+
+  Payload selector;
+  selector.add("sequence", court.selector_sequence);
+  selector.add("dwt", court.selector_dwt);
+  selector.add("vclock_event_counter32", court.vclock_event_counter32);
+  selector.add("vclock_event_dwt", court.vclock_event_dwt);
+  selector.add("anchor_counter32", court.anchor_counter32);
+  selector.add("counter_match", court.selector_vclock_counter_match);
+  selector.add("dwt_match", court.selector_vclock_dwt_match);
+  selector.add("match", court.selector_vclock_match);
+  p.add_object("selector_vclock_court", selector);
+
+  Payload row;
+  row.add("open", court.row_open);
+  row.add("sequence", court.row_sequence);
+  row.add("ocxo1_complete", court.row_ocxo1_complete);
+  row.add("ocxo2_complete", court.row_ocxo2_complete);
+  row.add("missing_mask", court.row_missing_mask);
+  row.add("missing_epoch_ready",
+          (court.row_missing_mask & (1U << 0)) != 0U);
+  row.add("missing_sequence",
+          (court.row_missing_mask & (1U << 1)) != 0U);
+  row.add("missing_ocxo1_previous_edge",
+          (court.row_missing_mask & (1U << 2)) != 0U);
+  row.add("missing_ocxo2_previous_edge",
+          (court.row_missing_mask & (1U << 3)) != 0U);
+  row.add("missing_pps_witness_sequence",
+          (court.row_missing_mask & (1U << 4)) != 0U);
+  row.add("missing_anchor_dwt",
+          (court.row_missing_mask & (1U << 5)) != 0U);
+  row.add("missing_anchor_gnss",
+          (court.row_missing_mask & (1U << 6)) != 0U);
+  row.add("missing_ocxo1_lane",
+          (court.row_missing_mask & (1U << 7)) != 0U);
+  row.add("missing_ocxo2_lane",
+          (court.row_missing_mask & (1U << 8)) != 0U);
+  p.add_object("row", row);
+
+  Payload anchor_state;
+  anchor_state.add("pps_witness_sequence", court.pps_witness_sequence);
+  anchor_state.add("dwt", court.anchor_dwt);
+  anchor_state.add("counter32", court.anchor_counter32);
+  anchor_state.add("gnss_ns", court.anchor_gnss_ns);
+  p.add_object("anchor", anchor_state);
+
+  Payload lanes;
+  lanes.add("last_ocxo1_pps_sequence", court.last_ocxo1_pps_sequence);
+  lanes.add("last_ocxo2_pps_sequence", court.last_ocxo2_pps_sequence);
+  lanes.add("ocxo1_ready", court.ocxo1_lane_ready);
+  lanes.add("ocxo2_ready", court.ocxo2_lane_ready);
+  lanes.add("ocxo1_waiting_for_phase", court.ocxo1_waiting_for_phase);
+  lanes.add("ocxo2_waiting_for_phase", court.ocxo2_waiting_for_phase);
+  report_add_row_court_lane(
+      lanes, "ocxo1", time_clock_id_t::OCXO1, court_sequence);
+  report_add_row_court_lane(
+      lanes, "ocxo2", time_clock_id_t::OCXO2, court_sequence);
+  p.add_object("lanes", lanes);
+
+  p.add("campaign_state", clocks_campaign_state_name(campaign_state));
+  p.add("campaign", campaign_name);
+  p.add("campaign_seconds", campaign_seconds);
+  p.add("report_priority0_capture_live", true);
+  p.add("report_priority16_excluded", true);
+  return p;
+}
+
 static FLASHMEM Payload cmd_report_smartzero(const Payload&) {
   clocks_report_build_guard_t guard;
   if (!guard.acquired) return clocks_report_busy_response("CLOCKS_SMARTZERO");
@@ -10200,6 +10349,7 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "REPORT_CLOCKS",       cmd_report_clocks       },
   { "REPORT_STATS",        cmd_report_stats        },
   { "REPORT_SMARTZERO",    cmd_report_smartzero    },
+  { "REPORT_ROW_COURT",    cmd_report_row_court    },
   { "STATS_RESET",         cmd_stats_reset         },
   { "REPORT_RECOVERY",     cmd_report_recovery     },
   { "STACK_WITNESS_RESET", cmd_stack_witness_reset },
