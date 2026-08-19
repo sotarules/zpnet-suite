@@ -25,6 +25,8 @@
 //   • The pump advances only by bytes actually accepted by Serial.
 //   • Each job owns its heap allocation — freed on completion.
 //   • Memory is bounded via soft budget cap (TX_BUDGET_MAX).
+//   • D1 command/response retains reserved byte + job custody; D0/D2 cannot
+//     exhaust the complete TX queue during startup or publication bursts.
 //   • TimePop is the sole physical RX/TX service path.
 //
 // Serial-only doctrine:

@@ -13153,8 +13153,9 @@ def _restore_active_campaign_state(
 
     ``alpha_resurrected_this_startup`` is custody testimony, not a health flag.
     When true, Alpha has already been restored and durably proved during this
-    process startup while Beta campaign state was lost.  Campaign recovery must
-    therefore preserve current Alpha and bootstrap only the recording lifecycle.
+    process startup while Beta campaign state was lost.  Independently, a proved
+    surviving Alpha with the durable active campaign absent from firmware is the
+    same topology: preserve Alpha and bootstrap only the recording lifecycle.
     """
     global _campaign_active, _accepted_pps_vclock_count
     global _last_pps_vclock_count_seen
@@ -13553,15 +13554,60 @@ def _restore_active_campaign_state(
 
     epoch_ready_before_recover, recovery_status_before = _probe_teensy_recovery_epoch()
     physical_reboot_custody = _recovery_custody_requires_cold_restore()
+    reported_campaign_name = str(
+        recovery_status_before.get("campaign") or ""
+    ).strip()
     reported_campaign_state = str(
         recovery_status_before.get("campaign_state") or ""
     ).strip().upper()
+    firmware_campaign_started = reported_campaign_state == "STARTED"
+    firmware_campaign_idle = reported_campaign_state in {"", "STOPPED", "IDLE", "NONE"}
+    if firmware_campaign_started and reported_campaign_name != campaign_name:
+        raise RecoveryRetryableFailure(
+            "firmware_campaign_identity_conflict",
+            {
+                "campaign": campaign_name,
+                "teensy_campaign": reported_campaign_name or None,
+                "teensy_campaign_state": reported_campaign_state,
+                "recovery_status_before": recovery_status_before,
+            },
+        )
+    if not firmware_campaign_started and not firmware_campaign_idle:
+        raise RecoveryRetryableFailure(
+            "firmware_campaign_state_unrecognized",
+            {
+                "campaign": campaign_name,
+                "teensy_campaign": reported_campaign_name or None,
+                "teensy_campaign_state": reported_campaign_state or None,
+                "recovery_status_before": recovery_status_before,
+            },
+        )
+    firmware_campaign_matches_durable = bool(
+        firmware_campaign_started and reported_campaign_name == campaign_name
+    )
     lifecycle_lost_custody = bool(
         _recovery_custody_snapshot().get("active")
-        and reported_campaign_state != "STARTED"
+        and not firmware_campaign_matches_durable
     )
     cold_restore_custody = bool(physical_reboot_custody or lifecycle_lost_custody)
-    campaign_bootstrap_required = bool(alpha_resurrected_this_startup)
+
+    # Alpha and Beta have independent lifetimes.  The original campaign-bootstrap
+    # trigger covered only the case where Alpha was resurrected earlier in this
+    # same Pi startup.  A service restart after an explicit statistics repair (or
+    # any equivalent topology) can instead prove that Alpha survived while Beta is
+    # STOPPED/absent on the Teensy.  LIVE_REATTACH is impossible in that state:
+    # there is no live campaign lifecycle to reattach.  Ask firmware to recreate
+    # Beta while preserving the already-proved Alpha instrument state.
+    campaign_bootstrap_basis: Optional[str] = None
+    if alpha_resurrected_this_startup:
+        campaign_bootstrap_basis = "ALPHA_RESURRECTED_THIS_STARTUP"
+    elif (
+        epoch_ready_before_recover
+        and not cold_restore_custody
+        and not firmware_campaign_matches_durable
+    ):
+        campaign_bootstrap_basis = "SURVIVING_ALPHA_BETA_ABSENT"
+    campaign_bootstrap_required = campaign_bootstrap_basis is not None
     if campaign_bootstrap_required and cold_restore_custody:
         raise RecoveryRetryableFailure(
             "startup_recovery_topology_conflict",
@@ -13597,8 +13643,14 @@ def _restore_active_campaign_state(
     _diag["last_recovery"]["teensy_epoch_ready_before_recover"] = bool(
         epoch_ready_before_recover
     )
+    _diag["last_recovery"]["teensy_campaign_before_recover"] = (
+        reported_campaign_name or None
+    )
     _diag["last_recovery"]["teensy_campaign_state_before_recover"] = (
         reported_campaign_state or None
+    )
+    _diag["last_recovery"]["teensy_campaign_matches_durable"] = bool(
+        firmware_campaign_matches_durable
     )
     _diag["last_recovery"]["physical_reboot_custody"] = bool(
         physical_reboot_custody
@@ -13613,13 +13665,18 @@ def _restore_active_campaign_state(
     _diag["last_recovery"]["campaign_bootstrap_required"] = bool(
         campaign_bootstrap_required
     )
+    _diag["last_recovery"]["campaign_bootstrap_basis"] = campaign_bootstrap_basis
     cold_ppb_stage: Optional[Dict[str, Any]] = None
     if campaign_bootstrap_required:
         _diag["last_recovery"]["canonical_restore_present"] = False
         _diag["last_recovery"]["restore_schema_version"] = None
         logging.info(
-            "📊 [recovery] Alpha was resurrected and proved earlier in this startup; "
-            "preserving current Alpha and requesting campaign-only bootstrap"
+            "📊 [recovery] Alpha custody proved while durable campaign is not live on "
+            "Teensy; preserving current Alpha and requesting campaign-only bootstrap "
+            "(basis=%s firmware=%s/%s)",
+            campaign_bootstrap_basis,
+            reported_campaign_name or "NONE",
+            reported_campaign_state or "NONE",
         )
     elif epoch_ready_before_recover and not cold_restore_custody:
         _diag["last_recovery"]["canonical_restore_present"] = False
@@ -13730,6 +13787,8 @@ def _restore_active_campaign_state(
                 "alpha_resurrected_this_startup": bool(
                     alpha_resurrected_this_startup
                 ),
+                "campaign_bootstrap_basis": campaign_bootstrap_basis,
+                "teensy_campaign_before_recover": reported_campaign_name or None,
                 "teensy_campaign_state_before_recover":
                     reported_campaign_state or None,
                 "teensy_recover_payload": teensy_recover_payload,
@@ -14539,17 +14598,14 @@ def _wait_for_startup_alpha_epoch() -> Dict[str, Any]:
 def _startup_restore_court_ready() -> Optional[Dict[str, Any]]:
     """Return explicit firmware testimony allowing startup to enter restore early.
 
-    A Pi-only restart must still wait for a fresh canonical CLOCKS row so Alpha
-    survival can be proved independently. A post-flash Teensy can explicitly
-    prove the opposite condition before its first public CLOCKS row: PostgreSQL
-    still owns an active campaign while REPORT_RECOVERY says firmware has no live
-    campaign and the restore court may accept RESTORE_MONITOR. Even this legacy
-    escape hatch now requires recover_epoch_ready: no caller may spend a restored-
-    row proof deadline before the current lifetime has an installed Alpha epoch.
+    This is an instrument-lifecycle court, not a TEMPEST-only court. A newborn
+    Teensy may require canonical CLOCKS resurrection even when no campaign is
+    active. Admission still requires the current lifetime to have earned its own
+    Alpha epoch and for firmware to say RESTORE_MONITOR may lawfully adjudicate
+    the stopped instrument. The caller remains responsible for external GNSS/chrony
+    readiness before using this court to bypass an absent canonical CLOCKS row.
     """
     active_campaign = _get_active_campaign()
-    if active_campaign is None:
-        return None
 
     status = _fetch_teensy_recovery_status()
     if not status:
@@ -14575,7 +14631,11 @@ def _startup_restore_court_ready() -> Optional[Dict[str, Any]]:
     ):
         return {
             "basis": "TEENSY_REPORT_RECOVERY_RESTORE_COURT_READY",
-            "pi_active_campaign": str(active_campaign.get("campaign") or ""),
+            "pi_active_campaign": (
+                str(active_campaign.get("campaign") or "")
+                if isinstance(active_campaign, dict)
+                else None
+            ),
             "firmware_campaign": None,
             "firmware_campaign_state": firmware_state or None,
             "restore_court_ready": True,
@@ -14584,17 +14644,22 @@ def _startup_restore_court_ready() -> Optional[Dict[str, Any]]:
     return None
 
 
-def _preflight_wait_is_expected_clocks_absence(pending: list[str]) -> bool:
-    """True when startup is waiting only for the Teensy CLOCKS producer to exist."""
-    if not pending:
-        return False
+def _preflight_reason_is_expected_clocks_absence(reason: str) -> bool:
+    """True only for absence/staleness of the canonical CLOCKS heartbeat."""
     prefixes = (
         f"{FEATURE_PREFLIGHT_PROFILE}: CLOCKS feature tree unavailable "
         "(CLOCKS heartbeat not yet received",
         f"{FEATURE_PREFLIGHT_PROFILE}: CLOCKS feature tree unavailable "
         "(CLOCKS heartbeat stale",
     )
-    return all(any(item.startswith(prefix) for prefix in prefixes) for item in pending)
+    return any(str(reason).startswith(prefix) for prefix in prefixes)
+
+
+def _preflight_wait_is_expected_clocks_absence(pending: list[str]) -> bool:
+    """True when startup is waiting only for the Teensy CLOCKS producer to exist."""
+    return bool(pending) and all(
+        _preflight_reason_is_expected_clocks_absence(item) for item in pending
+    )
 
 
 def _preflight_wait_items(reasons: list[str]) -> list[str]:
@@ -14628,6 +14693,84 @@ def _preflight_wait_items(reasons: list[str]) -> list[str]:
 
     # Preserve order while removing duplicates.
     return list(dict.fromkeys(items))
+
+
+def _startup_restore_court_direct_gnss_reasons(
+    context: str,
+    *,
+    required_gnss_freq_mode: Optional[int],
+    required_gnss_freq_mode_name: Optional[str],
+    required_receiver_mode: Optional[str],
+) -> list[str]:
+    """Re-prove GNSS readiness directly when canonical CLOCKS cannot yet exist.
+
+    The ordinary preflight deliberately trusts GNSS decoration carried by canonical
+    CLOCKS. During a newborn-instrument restore circularity that row may be exactly
+    what cannot exist yet. REPORT_RECOVERY may open the restore court, but it does
+    not replace external receiver testimony. Re-read SYSTEM.REPORT here and apply
+    the same GNSS/receiver requirements before allowing the CLOCKS-heartbeat-only
+    escape hatch. Chrony remains checked by _check_preflight().
+    """
+    reasons: list[str] = []
+    try:
+        system_context = _fetch_system_report()
+        gnss = _system_gnss_info(system_context)
+        location = (
+            system_context.get("location")
+            if isinstance(system_context.get("location"), dict)
+            else {}
+        )
+        if not gnss:
+            return ["restore-court SYSTEM.REPORT GNSS context unavailable"]
+
+        if not gnss.get("time_valid"):
+            reasons.append("restore-court GNSS time not valid (no satellite time/date)")
+
+        lock_quality = str(gnss.get("lock_quality") or "WEAK").upper()
+        if lock_quality == "WEAK":
+            reasons.append(
+                "restore-court GNSS lock quality is WEAK "
+                f"(satellites={gnss.get('satellites', '?')}, hdop={gnss.get('hdop', '?')})"
+            )
+
+        if not gnss.get("pps_valid"):
+            reasons.append("restore-court GNSS PPS not valid (discipline loop not active)")
+        else:
+            discipline = gnss.get("discipline", {})
+            freq_mode = (
+                _as_int(discipline.get("freq_mode"))
+                if isinstance(discipline, dict)
+                else None
+            )
+            freq_mode_name = (
+                str(discipline.get("freq_mode_name") or "UNKNOWN")
+                if isinstance(discipline, dict)
+                else "UNKNOWN"
+            )
+            if required_gnss_freq_mode is None:
+                if freq_mode is None or freq_mode < 2:
+                    reasons.append(
+                        "restore-court GNSS discipline not locked "
+                        f"(freq_mode={freq_mode} '{freq_mode_name}', need at least COARSE_LOCK)"
+                    )
+            elif freq_mode != int(required_gnss_freq_mode):
+                required_name = required_gnss_freq_mode_name or str(required_gnss_freq_mode)
+                reasons.append(
+                    f"restore-court GNSS discipline not ready for {context} "
+                    f"(freq_mode={freq_mode} '{freq_mode_name}', need {required_name})"
+                )
+
+        if required_receiver_mode is not None:
+            receiver_mode = str(location.get("receiver_mode") or "UNKNOWN").upper()
+            expected_mode = str(required_receiver_mode).upper()
+            if receiver_mode != expected_mode:
+                reasons.append(
+                    f"restore-court GF-8802 receiver mode is {receiver_mode}; "
+                    f"need {expected_mode} for {context}"
+                )
+    except Exception as exc:
+        reasons.append(f"restore-court SYSTEM.REPORT GNSS preflight failed: {exc}")
+    return reasons
 
 
 # ---------------------------------------------------------------------
@@ -14792,19 +14935,9 @@ def _wait_for_preflight(
     logged_wait = False
 
     while True:
-        if allow_restore_court_entry:
-            restore_entry = _startup_restore_court_ready()
-            if restore_entry is not None:
-                _diag["last_preflight_wait"] = {
-                    "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                    "context": context,
-                    "status": "RESTORE_COURT",
-                    "checks": int(attempt),
-                    "waited_s": round(float(time.monotonic() - t0), 3),
-                    "restore_entry": copy.deepcopy(restore_entry),
-                }
-                return
-
+        restore_entry = (
+            _startup_restore_court_ready() if allow_restore_court_entry else None
+        )
         ready, reasons = _check_preflight(
             context,
             required_gnss_freq_mode=required_gnss_freq_mode,
@@ -14833,6 +14966,47 @@ def _wait_for_preflight(
                     FEATURE_PREFLIGHT_PROFILE,
                 )
             return
+
+        if restore_entry is not None:
+            # The restore court may replace only the missing canonical CLOCKS
+            # heartbeat/profile witness. Every independently checkable prerequisite
+            # must still be nominal. In particular, _check_preflight() continues to
+            # enforce chrony PPS, while this direct SYSTEM.REPORT pass re-proves the
+            # GNSS facts that _check_preflight() intentionally cannot infer when
+            # canonical CLOCKS is absent/stale.
+            non_clocks_reasons = [
+                reason
+                for reason in reasons
+                if not _preflight_reason_is_expected_clocks_absence(reason)
+            ]
+            direct_gnss_reasons = _startup_restore_court_direct_gnss_reasons(
+                context,
+                required_gnss_freq_mode=required_gnss_freq_mode,
+                required_gnss_freq_mode_name=required_gnss_freq_mode_name,
+                required_receiver_mode=required_receiver_mode,
+            )
+            if not non_clocks_reasons and not direct_gnss_reasons:
+                _diag["last_preflight_wait"] = {
+                    "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "context": context,
+                    "status": "RESTORE_COURT",
+                    "checks": int(attempt),
+                    "waited_s": round(float(elapsed), 3),
+                    "restore_entry": copy.deepcopy(restore_entry),
+                    "bypassed_only": "CANONICAL_CLOCKS_HEARTBEAT_PROFILE",
+                    "direct_system_gnss_ready": True,
+                    "chrony_pps_ready": True,
+                }
+                logging.info(
+                    "%s %s admitted to holistic restore court after %.1fs: "
+                    "firmware epoch/court ready; direct SYSTEM GNSS and chrony PPS "
+                    "nominal; canonical CLOCKS heartbeat is the only missing witness",
+                    PREFLIGHT_LOG_PREFIX,
+                    context,
+                    elapsed,
+                )
+                return
+            reasons = list(reasons) + direct_gnss_reasons
 
         attempt += 1
         pending = _preflight_wait_items(reasons)
@@ -15572,6 +15746,7 @@ def run() -> None:
         required_gnss_freq_mode=STARTUP_REQUIRED_GNSS_FREQ_MODE,
         required_gnss_freq_mode_name="FINE_LOCK",
         required_receiver_mode=required_receiver_mode,
+        allow_restore_court_entry=True,
     )
 
     _set_operational_state(

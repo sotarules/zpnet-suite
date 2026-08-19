@@ -74,12 +74,15 @@ static_assert((RX_BUF_MAX % RX_CACHE_LINE_BYTES) == 0U,
 
 static constexpr size_t TX_JOB_MAX = 64;
 static constexpr size_t TX_CONTROL_RESERVE = 16 * 1024;
+static constexpr size_t TX_CONTROL_RESERVE_JOBS = 8;
 static constexpr size_t TX_BUDGET_MAX = 64 * 1024;
 
 static_assert(TX_BUDGET_MAX >=
                   TRANSPORT_MAX_MESSAGE + FRAME_SLACK +
                       TX_CONTROL_RESERVE,
               "TX budget must hold one maximum message plus control reserve");
+static_assert(TX_CONTROL_RESERVE_JOBS < TX_JOB_MAX,
+              "TX control reserve must leave data-plane queue capacity");
 
 static constexpr char   STX_SEQ[] = "<STX=";
 static constexpr size_t STX_LEN   = 5;
@@ -88,7 +91,7 @@ static constexpr char   ETX_SEQ[] = "<ETX>";
 static constexpr size_t ETX_LEN   = 5;
 
 static const char* BUILD_FINGERPRINT =
-    "__FP__ZPNET_SERIAL_CANONICAL_WIRE_RX_DMAMEM_GUARDED__";
+    "__FP__ZPNET_SERIAL_CANONICAL_WIRE_RX_DMAMEM_GUARDED_D1_RESERVE__";
 static const char* TRANSPORT_LIFELINE_FINGERPRINT = "__FP__ZPNET_TRANSPORT_TIMEPOP_RX_ALAP__";
 
 // =============================================================
@@ -231,6 +234,10 @@ static void tx_copy_topic(char* dst, size_t capacity, const char* topic) {
 
 static bool tx_topic_is_timebase(const char* topic) {
   return topic && strcmp(topic, "TIMEBASE_FRAGMENT") == 0;
+}
+
+static bool tx_traffic_is_control(uint8_t traffic) {
+  return traffic == TRAFFIC_REQUEST_RESPONSE;
 }
 
 const char* transport_tx_outcome_name(uint32_t outcome_id) {
@@ -712,7 +719,23 @@ static bool tx_allocate_wire(uint32_t sequence,
     }
   }
 
-  if (tx_budget_used + wire_len > TX_BUDGET_MAX) {
+  // D1 request/response is the command/control plane.  D0/D2 traffic must
+  // never consume the entire outstanding-byte budget or every queue slot:
+  // during cold startup the always-on publishers can otherwise fill TX before
+  // the Pi reaches REPORT_RECOVERY / SET_STANDARD_LAP_NS, causing the command
+  // handler to produce a response that transport has no custody available to
+  // accept.  Preserve explicit byte and job reserves for D1.  D1 itself may
+  // use the full hard limits; only a true control-plane saturation can reject
+  // another D1 response.
+  const bool control = tx_traffic_is_control(traffic);
+  const size_t budget_limit = control
+      ? TX_BUDGET_MAX
+      : (TX_BUDGET_MAX - TX_CONTROL_RESERVE);
+  const size_t job_limit = control
+      ? TX_JOB_MAX
+      : (TX_JOB_MAX - TX_CONTROL_RESERVE_JOBS);
+
+  if (tx_budget_used + wire_len > budget_limit) {
     tx_budget_fail++;
     tx_outstanding_budget_fail_count++;
     tx_note_reject(sequence, traffic, topic, json_len, wire_len,
@@ -723,7 +746,7 @@ static bool tx_allocate_wire(uint32_t sequence,
     return false;
   }
 
-  if (tx_job_count >= TX_JOB_MAX) {
+  if (tx_job_count >= job_limit) {
     tx_queue_full++;
     tx_note_reject(sequence, traffic, topic, json_len, wire_len,
                    TX_REASON_QUEUE_FULL, timebase);
