@@ -1238,25 +1238,21 @@ bool clocks_alpha_ocxo_public_origin_ready(void);
 // Alpha RECOVER re-prime
 // ============================================================================
 //
-// LIVE_REATTACH RECOVER preserves the installed SmartZero/service epoch,
-// public-origin offsets, and long logical tick ledgers, but deliberately cuts
-// OCXO measurement custody so previous/pending edge state cannot bridge an
-// observation outage.  CAMPAIGN_BOOTSTRAP does not call this path: Alpha has
-// already been resurrected and proved, so its fresh physical ancestry remains
-// continuous while only Beta campaign state is recreated.
+// A Pi-side publication/process outage is not an Alpha observation outage.
+// LIVE_REATTACH therefore preserves the installed SmartZero/service epoch,
+// physical OCXO grids, CounterLedger/PhaseLedger state, public-origin offsets,
+// measured-edge ancestry, and long logical tick ledgers exactly.  Beta may
+// rebase only its campaign presentation namespace.
 //
-// A live warm recovery may arrive after a Pi-side publication blackout while
-// the Teensy itself never rebooted.  This call begins the same asynchronous
-// 50 ms + 50 ms physical-grid rephase used by START, but selects PRESERVE
-// logical-epoch semantics.  It does not replace the Alpha epoch, re-subscribe
-// callbacks, reset SmartZero/public-origin state, or disturb VCLOCK anchors.
-// A true return means the transaction was accepted or already completed; Beta
-// must consult clocks_alpha_ocxo_grid_rephase_status(RECOVER) before consuming
-// the PPS recovery gate.
+// The helpers below are retained as explicit Alpha-discontinuity utilities for
+// a topology that has independently proved Alpha service ancestry must be cut.
+// Normal LIVE_REATTACH and CAMPAIGN_BOOTSTRAP must not call them.  In particular,
+// Pi process restart is never sufficient authority to rephase or reprime Alpha.
 bool clocks_alpha_recover_rearm_interrupt_service(void);
 
-// Beta calls this from the RECOVER gate after the recovery request is observed
-// on a PPS/VCLOCK row and before recovered campaign publication resumes.
+// Explicit Alpha-discontinuity recovery may invoke this only after a separate
+// custody court has proved that surviving OCXO interval/phase ancestry is not
+// authoritative.  LIVE_REATTACH does not call it.
 void clocks_alpha_recover_reprime_ocxo_state(void);
 uint32_t clocks_alpha_recover_reprime_count(void);
 

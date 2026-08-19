@@ -7596,9 +7596,11 @@ bool clocks_alpha_recover_rearm_interrupt_service(void) {
     return false;
   }
 
-  // VCLOCK remains sovereign and continuous.  Both OCXO lanes then enter the
-  // same staged physical-grid transaction used by START, but their installed
-  // logical zeros and long Alpha ledgers remain untouched.
+  // Explicit Alpha-discontinuity repair only.  Normal LIVE_REATTACH never calls
+  // this function: a Pi process/publication outage does not authorize physical
+  // OCXO grid replacement.  If a separate custody court has surrendered Alpha
+  // service ancestry, VCLOCK remains sovereign while the OCXO grids are rebuilt
+  // without replacing their logical zeros or long tick ledgers.
   if (!interrupt_ensure_service(interrupt_subscriber_kind_t::VCLOCK)) {
     return false;
   }
@@ -7620,22 +7622,20 @@ bool clocks_alpha_recover_rearm_interrupt_service(void) {
 }
 
 void clocks_alpha_recover_reprime_ocxo_state(void) {
-  // LIVE_REATTACH RECOVER is not a new SmartZero epoch.  Keep the installed epoch, visible
-  // origin, public-origin offsets, DWT/GNSS calibration, and long logical tick
-  // ledgers alive.  What must not survive is OCXO previous/pending edge state
-  // that would let the first post-recovery measurement form an interval across
-  // the downtime gap.
+  // Explicit Alpha-discontinuity repair only.  This is not the normal
+  // LIVE_REATTACH path.  Preserve the installed epoch, visible/public origins,
+  // DWT/GNSS calibration, and long logical tick ledgers while cutting only the
+  // OCXO interval/phase ancestry that an independent custody court has already
+  // declared unusable.
   //
-  // The public campaign clocks are recovered by Beta through signed offsets.
-  // This re-prime only cuts local OCXO measurement custody so the first
-  // post-recovery OCXO edges seed a new interval chain instead of bridging
-  // through pre-recovery state.
+  // Beta owns campaign presentation recovery through signed offsets.  A Pi-only
+  // restart must preserve this Alpha ancestry and therefore must not call here.
   g_alpha_recover_reprime_count++;
 
-  // The physical grids were rephased before this PPS gate.  Any Alpha OCXO
-  // endpoint still visible here belongs to the old grid and must not seed the
-  // replacement chain.  The first post-recovery edge becomes the new left
-  // bookend; the following adjacent edge forms the first lawful interval.
+  // The explicit discontinuity caller rephases physical grids before this cut.
+  // Any Alpha OCXO endpoint still visible here therefore belongs to the old grid
+  // and must not seed the replacement chain.  The first new edge becomes the
+  // left bookend; the following adjacent edge forms the first lawful interval.
 
   alpha_completed_row_reset_all();         // no pre-recovery PPS row may survive
   alpha_measured_ns_reset_all();          // bridge anchors + pending OCXO edges

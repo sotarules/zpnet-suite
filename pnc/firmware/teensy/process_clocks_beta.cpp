@@ -3163,10 +3163,12 @@ static bool g_recover_proof_warning_published = false;
 // Alpha-owned instrument statistics continue across RECOVER.  Beta gates the
 // current row until proof is complete; raw interval testimony remains visible.
 
-// RECOVER OCXO reattachment gate.  Alpha deliberately cuts OCXO measurement
-// custody during warm recovery.  Beta initially treats recovered candidates as
-// private elapsed seconds while waiting for both OCXO lanes to prove fresh
-// reattachment evidence.  This gate must be finite: after timeout, campaign
+// RECOVER OCXO reattachment gate for a recovery topology that actually replaces
+// Alpha physical ancestry.  A true LIVE_REATTACH is explicitly excluded: the
+// Teensy/Alpha producer survived the Pi outage, so its physical grids,
+// CounterLedger, PhaseLedger, and measured-edge ancestry remain authoritative.
+// COLD_BOOTSTRAP may still use this gate while its fresh Alpha epoch proves the
+// first complete OCXO rows.  The gate remains finite: after timeout, campaign
 // publication resumes in degraded mode and OCXO science remains quarantined/
 // invalid until PhaseLedger/reattach evidence catches up.
 static constexpr uint32_t CLOCKS_RECOVER_REATTACH_TIMEOUT_CANDIDATES = 32U;
@@ -4048,18 +4050,17 @@ static void campaign_warmup_begin(campaign_warmup_mode_t mode) {
   g_campaign_warmup_suppressed_total = 0;
 
   if (mode == campaign_warmup_mode_t::RECOVER) {
-    // RECOVER no longer buries fixed rows, but it must prove OCXO
-    // reattachment before public campaign record resumes.  Install recovered offsets
-    // now; the reattach gate advances hidden candidate identity while waiting
-    // for fresh OCXO evidence.
+    // Alpha-affecting RECOVER no longer buries fixed rows, but a fresh physical
+    // ancestry (currently COLD_BOOTSTRAP) must prove OCXO reattachment before
+    // unrestricted campaign science resumes.  LIVE_REATTACH never enters this
+    // warmup because surviving Alpha is preserved wholesale.
     interrupt_dwt_publication_launch_acquisition_end();
     g_campaign_warmup_mode = campaign_warmup_mode_t::NONE;
     g_campaign_warmup_remaining = 0;
     campaign_start_prologue_reset("recover_no_prologue");
-    // RECOVER offsets are installed in the RECOVER gate before Alpha re-primes
-    // OCXO/CounterLedger custody.  Do not recompute them here after the raw
-    // CounterLedger lanes have intentionally been converted back into seed
-    // state.
+    // RECOVER offsets are installed in the RECOVER gate before this fresh-Alpha
+    // proof court begins.  Do not recompute them here from a partially matured
+    // post-bootstrap presentation.
     recover_reattach_begin();
     return;
   }
@@ -4398,17 +4399,10 @@ static bool recover_proof_lane_current_row_ready(
     return true;
   }
 
-  // LIVE_REATTACH preserves the long logical epoch but explicitly re-primes the
-  // interval/phase chain.  These RECOVER counters are reset to zero by that cut,
-  // so nonzero values prove seed -> adjacent interval -> PhaseLedger resolve ->
-  // refined interval all occurred after the recovery boundary.
-  return lane.reprime_count != 0U &&
-         lane.counterledger_recover_reprime_count == lane.reprime_count &&
-         lane.counterledger_recover_capture_ready_count != 0U &&
-         lane.counterledger_recover_sample_seed_count != 0U &&
-         lane.counterledger_recover_sample_interval_accept_count != 0U &&
-         lane.counterledger_recover_phase_resolve_success_count != 0U &&
-         lane.counterledger_recover_refined_interval_accept_count != 0U;
+  // LIVE_REATTACH no longer cuts Alpha.  If a non-cold recovery gate is ever
+  // active, exact current-row identity is itself the proof: requiring RECOVER
+  // reprime counters would demand evidence from a mutation that must not occur.
+  return true;
 }
 
 static FLASHMEM bool recover_proof_driven_release_try(uint32_t pps_sequence) {
@@ -4704,12 +4698,18 @@ static bool recover_lifecycle_enter_from_command(
   g_recover_lifecycle_mode = recover_lifecycle_mode_t::LIVE_REATTACH;
   g_recover_lifecycle_cold_bootstrap_epoch_ready = true;
 
-  // Live recovery preserves the installed service epoch.  Verify sovereign
-  // VCLOCK service, then launch the shared TimePop-staged OCXO physical-grid
-  // rephase before the reattachment timeout starts.
+  // LIVE_REATTACH means the producer survived.  Verify the existing services
+  // are available, but do not rephase the physical OCXO grids and do not cut
+  // Alpha measurement ancestry merely because the Pi process restarted.
   g_recover_lifecycle_interrupt_service_rearm_count++;
+  const bool vclock_service_ok =
+      interrupt_ensure_service(interrupt_subscriber_kind_t::VCLOCK);
+  const bool ocxo1_service_ok =
+      interrupt_ensure_service(interrupt_subscriber_kind_t::OCXO1);
+  const bool ocxo2_service_ok =
+      interrupt_ensure_service(interrupt_subscriber_kind_t::OCXO2);
   g_recover_lifecycle_last_interrupt_service_rearm_ok =
-      clocks_alpha_recover_rearm_interrupt_service();
+      vclock_service_ok && ocxo1_service_ok && ocxo2_service_ok;
   if (!g_recover_lifecycle_last_interrupt_service_rearm_ok) {
     g_recover_lifecycle_interrupt_service_rearm_failure_count++;
     recover_lifecycle_set_reason("recover_interrupt_service_rearm_failed");
@@ -4719,6 +4719,7 @@ static bool recover_lifecycle_enter_from_command(
   clocks_watchdog_clear_surrender_for_new_lifecycle();
   clocks_watchdog_disarm_campaign_publication();
   campaign_state = clocks_campaign_state_t::RECOVERING;
+  recover_lifecycle_set_reason("recover_live_reattach_preserve_alpha");
   return true;
 }
 
@@ -7978,6 +7979,9 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
     const bool campaign_bootstrap_commit =
         g_recover_lifecycle_mode ==
             recover_lifecycle_mode_t::CAMPAIGN_BOOTSTRAP;
+    const bool live_reattach_commit =
+        g_recover_lifecycle_mode ==
+            recover_lifecycle_mode_t::LIVE_REATTACH;
 
     if (cold_bootstrap_commit) {
       // SmartZero has already created and physically staggered the fresh OCXO
@@ -7997,28 +8001,17 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
       g_recover_lifecycle_last_interrupt_service_rearm_ok = true;
       recover_lifecycle_set_reason("recover_campaign_bootstrap_commit_ready");
     } else {
-      clocks_alpha_ocxo_grid_rephase_status_t rephase_status =
-          clocks_alpha_ocxo_grid_rephase_status(
-              clocks_alpha_ocxo_grid_rephase_owner_t::RECOVER);
-      if (rephase_status == clocks_alpha_ocxo_grid_rephase_status_t::IDLE) {
-        g_recover_lifecycle_interrupt_service_rearm_count++;
-        g_recover_lifecycle_last_interrupt_service_rearm_ok =
-            clocks_alpha_recover_rearm_interrupt_service();
-        rephase_status = clocks_alpha_ocxo_grid_rephase_status(
-            clocks_alpha_ocxo_grid_rephase_owner_t::RECOVER);
-      }
-      if (rephase_status == clocks_alpha_ocxo_grid_rephase_status_t::PENDING) {
-        recover_lifecycle_set_reason("recover_ocxo_grid_rephase_pending");
-        return;
-      }
-      if (rephase_status != clocks_alpha_ocxo_grid_rephase_status_t::COMPLETE) {
-        g_recover_lifecycle_last_interrupt_service_rearm_ok = false;
+      // LIVE_REATTACH is a Beta presentation splice over a producer that never
+      // stopped.  Command acceptance already verified the surviving VCLOCK/OCXO
+      // services.  Rephasing here would create a new Alpha physical boundary and
+      // destroy the very custody this mode claims to preserve.
+      if (!live_reattach_commit ||
+          !g_recover_lifecycle_last_interrupt_service_rearm_ok) {
         g_recover_lifecycle_interrupt_service_rearm_failure_count++;
-        clocks_alpha_ocxo_grid_rephase_acknowledge(
-            clocks_alpha_ocxo_grid_rephase_owner_t::RECOVER);
-        recover_lifecycle_abort("recover_ocxo_grid_rephase_failed");
+        recover_lifecycle_abort("recover_live_reattach_service_not_ready");
         return;
       }
+      recover_lifecycle_set_reason("recover_live_reattach_commit_ready");
     }
 
     if (cold_bootstrap_commit && g_campaign_restore_state.valid) {
@@ -8040,21 +8033,10 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
 
     campaign_seconds = recover_gnss_ns / 1000000000ull;
 
-    // Capture recovered public offsets before Alpha cuts OCXO/CounterLedger
-    // measurement custody.  After re-prime, the first PPS-sampled OCXO
-    // CounterLedger rows are deliberately bookend seeds rather than valid
-    // intervals, so offset recovery must use the last pre-cut raw clock
-    // coordinate.
+    // Rebase only Beta's campaign presentation.  COLD_BOOTSTRAP supplies a
+    // genuinely new Alpha epoch; CAMPAIGN_BOOTSTRAP and LIVE_REATTACH both
+    // preserve already-authoritative Alpha clockfaces and edge ancestry.
     campaign_public_offsets_reset_for_recover();
-
-    // LIVE_REATTACH must cut pre-recovery edge history so no interval bridges
-    // the outage.  COLD_BOOTSTRAP is already a fresh SmartZero epoch.
-    // CAMPAIGN_BOOTSTRAP is different again: Alpha was resurrected earlier in
-    // this startup and has already accumulated fresh physical ancestry, so
-    // cutting it here would destroy exactly the evidence the topology preserves.
-    if (!cold_bootstrap_commit && !campaign_bootstrap_commit) {
-      clocks_alpha_recover_reprime_ocxo_state();
-    }
     interrupt_recover_reset_publication_custody();
     g_recover_lifecycle_gate_custody_reset_count++;
     // Cut Beta's interval totals at the same custody boundary.  No fixed row
@@ -8068,18 +8050,16 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
     flash_cut_clear_pending();
     if (cold_bootstrap_commit) {
       g_recover_lifecycle_cold_bootstrap_commit_count++;
-    } else if (!campaign_bootstrap_commit) {
-      clocks_alpha_ocxo_grid_rephase_acknowledge(
-          clocks_alpha_ocxo_grid_rephase_owner_t::RECOVER);
     }
     recover_lifecycle_complete_at_pps();
-    if (campaign_bootstrap_commit) {
-      // Do not enter the OCXO reattachment court: no Alpha custody boundary was
-      // created by this RECOVER.  Alpha science remains live, but Beta must align
-      // the campaign OCXO presentation on the exact first public base+1 row.
-      // Seeding an offset at the RECOVER gate is not enough because the live
-      // CounterLedger may already carry the next physical PPS identity.
-      recover_reattach_reset("campaign_bootstrap_preserves_alpha");
+    if (campaign_bootstrap_commit || live_reattach_commit) {
+      // Neither topology creates an Alpha custody boundary.  Align only the
+      // campaign-visible OCXO intercept on the exact first public base+1 row;
+      // do not demand post-cut PhaseLedger evidence when no cut occurred.
+      recover_reattach_reset(
+          campaign_bootstrap_commit
+              ? "campaign_bootstrap_preserves_alpha"
+              : "live_reattach_preserves_alpha");
       recover_continuity_align_arm(false);
     } else {
       campaign_warmup_begin(campaign_warmup_mode_t::RECOVER);
@@ -9531,8 +9511,8 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
   }
 
   // A transport retry may arrive after the exact recovery already completed.
-  // Re-running the same identity would cut OCXO custody a second time, so
-  // acknowledge it without touching Alpha/Beta state.
+  // Re-running the same identity would repeat the campaign splice and retire
+  // publication custody a second time, so acknowledge it without touching state.
   if (same_identity &&
       campaign_state == clocks_campaign_state_t::STARTED &&
       g_campaign_record_last_public_count >=

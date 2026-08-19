@@ -31,17 +31,24 @@ Core contract:
 
   RECOVER behavior:
 
-    RECOVER uses the last durable unified state detail with TEMPEST decoration as the public base. Exact
-    Alpha resurrection consumes the literal Pi Better-Buckets checkpoint already
-    embedded in that one CLOCKS row; PostgreSQL history is never replayed to
-    reconstruct firmware statistics.  If holistic startup has already resurrected
-    and proved Alpha while volatile Beta campaign state died, Pi carries that
-    custody fact into RECOVER and requests CAMPAIGN_BOOTSTRAP so firmware preserves
-    current Alpha and recreates only the campaign lifecycle. The Pi sends RECOVER, waits for the first
-    accepted public row, and restores Pi-owned GNSS_RAW/Welford state immediately
-    before that row is persisted. Timeline rows may be admitted while OCXO science is explicitly
-    degraded/quarantined, but the final court still rejects malformed or
-    incoherent candidates.
+    Recovery first classifies Alpha and Beta independently.  If the current Teensy
+    still proves both the same Alpha lifetime and the same STARTED durable campaign,
+    a Pi-only restart restores Pi-owned custody and rejoins the naturally continuing
+    CLOCKS_FRAGMENT stream without sending CLOCKS.RECOVER.  Missing Pi observations
+    remain missing; they are never replayed or reconstructed.
+
+    When firmware campaign state is absent, RECOVER uses the last durable unified
+    state detail with TEMPEST decoration as the public base. Exact Alpha resurrection
+    consumes the literal Pi Better-Buckets checkpoint already embedded in that one
+    CLOCKS row; PostgreSQL history is never replayed to reconstruct firmware
+    statistics.  If holistic startup has already resurrected and proved Alpha while
+    volatile Beta campaign state died, Pi carries that custody fact into RECOVER and
+    requests CAMPAIGN_BOOTSTRAP so firmware preserves current Alpha and recreates only
+    the campaign lifecycle. The Pi sends RECOVER, waits for the first accepted public
+    row, and restores Pi-owned GNSS_RAW/Welford state immediately before that row is
+    persisted. Timeline rows may be admitted while OCXO science is explicitly
+    degraded/quarantined, but the final court still rejects malformed or incoherent
+    candidates.
 
 Responsibilities:
   * Receive optional TEMPEST campaign enrichment from the unified CLOCKS_FRAGMENT stream.
@@ -6997,6 +7004,7 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
         teensy_payload: Dict[str, Any],
         *,
         basis: str,
+        surviving_campaign: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Restore only Pi-owned custody when firmware proves Alpha survived."""
         ppb_refresh = _refresh_ppb_checkpoint_from_proved_alpha()
@@ -7022,6 +7030,7 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
             "gnss_raw": gnss_raw_result,
             "better_buckets_live_refresh": ppb_refresh,
             "startup_custody": startup_custody,
+            "surviving_campaign": copy.deepcopy(surviving_campaign),
             "proof": {
                 "proved": True,
                 "basis": basis,
@@ -7159,6 +7168,39 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
         and alpha_lineage_proved
     )
 
+    startup_live_public_count = _as_int(
+        startup_live_campaign.get("public_count")
+        if isinstance(startup_live_campaign, dict)
+        else None
+    )
+    surviving_campaign_proved = bool(
+        report_alpha_survived
+        and active_campaign_name
+        and same_firmware_campaign
+        and firmware_started
+        and startup_live_campaign_name == active_campaign_name
+        and startup_live_campaign_state == "STARTED"
+        and startup_live_public_count is not None
+        and startup_live_public_count > 0
+        and startup_live_age_s is not None
+        and startup_live_age_s <= CLOCKS_PREFLIGHT_MAX_AGE_S
+    )
+    surviving_campaign = {
+        "proved": surviving_campaign_proved,
+        "campaign": active_campaign_name or None,
+        "firmware_campaign": firmware_campaign or None,
+        "firmware_campaign_state": firmware_campaign_state or None,
+        "canonical_campaign": startup_live_campaign_name or None,
+        "canonical_campaign_state": startup_live_campaign_state or None,
+        "canonical_public_count": startup_live_public_count,
+        "canonical_age_s": (
+            None
+            if startup_live_age_s is None
+            else round(float(startup_live_age_s), 3)
+        ),
+        "basis": "TEENSY_REPORT_RECOVERY_PLUS_FRESH_CANONICAL_CAMPAIGN",
+    }
+
     report_decline_reasons: List[str] = []
     if not lifecycle_status:
         report_decline_reasons.append("report_recovery_unavailable_or_empty")
@@ -7212,6 +7254,8 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
                 "current_lifetime_pre_epoch": current_lifetime_pre_epoch,
                 "alpha_lineage": alpha_lineage,
                 "surviving_alpha_eligible": report_alpha_survived,
+                "surviving_campaign_eligible": surviving_campaign_proved,
+                "surviving_campaign": surviving_campaign,
                 "decline_reasons": report_decline_reasons,
                 "canonical_live": {
                     "sequence": _as_int(startup_live_clocks.get("sequence")),
@@ -7257,6 +7301,9 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
         return complete_surviving_alpha_reattach(
             lifecycle_status,
             basis="TEENSY_REPORT_RECOVERY_SURVIVING_ALPHA_CUSTODY",
+            surviving_campaign=(
+                surviving_campaign if surviving_campaign_proved else None
+            ),
         )
 
     # A live-campaign identity was not proved above.  Arm durable N+1 proof custody
@@ -7308,6 +7355,9 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
         return complete_surviving_alpha_reattach(
             payload,
             basis="TEENSY_RESTORE_MONITOR_LIVE_CAMPAIGN_CUSTODY",
+            surviving_campaign=(
+                surviving_campaign if surviving_campaign_proved else None
+            ),
         )
 
     # Neither explicit Alpha-survival testimony nor the legacy live-campaign
@@ -7447,6 +7497,194 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _reattach_surviving_campaign_without_recover(
+    *,
+    active_campaign: Dict[str, Any],
+    instrument_result: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Rejoin a surviving Alpha+Beta campaign without mutating Teensy state.
+
+    The Pi process lifetime is not a producer lifetime.  When REPORT_RECOVERY,
+    fresh canonical CLOCKS, and the durable campaign master all prove that the
+    same firmware campaign is already STARTED, recovery consists only of
+    restoring Pi-owned custody and choosing a new observation baseline.  The
+    next naturally occurring accepted campaign row becomes the exact handoff;
+    no CLOCKS.RECOVER command is sent.
+    """
+    global _campaign_active, _accepted_pps_vclock_count
+    global _last_pps_vclock_count_seen
+    global _post_recovery_science_confirmation_pending
+    global _post_recovery_science_confirmation_campaign
+    global _post_recovery_first_public_pps_vclock_count
+
+    campaign_name = str(active_campaign.get("campaign") or "").strip()
+    proof = instrument_result.get("surviving_campaign")
+    if not campaign_name or not isinstance(proof, dict) or proof.get("proved") is not True:
+        raise RuntimeError("surviving campaign reattach lacks an explicit proved custody verdict")
+    if str(proof.get("campaign") or "").strip() != campaign_name:
+        raise RuntimeError(
+            "surviving campaign reattach identity changed between instrument and campaign courts"
+        )
+
+    # Re-probe immediately before arming the local handoff.  A producer that
+    # changed lifecycle state after the earlier startup court is not permission
+    # to infer continuity from stale testimony.
+    lifecycle_status = _fetch_teensy_recovery_status()
+    firmware_campaign = str(lifecycle_status.get("campaign") or "").strip()
+    firmware_state = str(lifecycle_status.get("campaign_state") or "").strip().upper()
+    firmware_recovery_active = bool(
+        _recovery_bool(lifecycle_status.get("recover_lifecycle_active"))
+        or _recovery_bool(lifecycle_status.get("recover_cold_bootstrap_active"))
+        or _recovery_bool(lifecycle_status.get("recover_campaign_bootstrap_active"))
+        or _recovery_bool(lifecycle_status.get("recover_reattach_active"))
+    )
+    if (
+        firmware_campaign != campaign_name
+        or firmware_state != "STARTED"
+        or firmware_recovery_active
+        or not _recovery_bool(lifecycle_status.get("recover_epoch_ready"))
+        or _recovery_bool(lifecycle_status.get("restore_alpha_required"))
+    ):
+        raise RuntimeError(
+            "surviving campaign changed before Pi reattach: "
+            f"firmware={firmware_campaign or 'NONE'}/{firmware_state or 'NONE'} "
+            f"recovery_active={firmware_recovery_active} "
+            f"recover_epoch_ready={lifecycle_status.get('recover_epoch_ready')} "
+            f"restore_alpha_required={lifecycle_status.get('restore_alpha_required')}"
+        )
+
+    with _clocks_lock:
+        live_state = copy.deepcopy(_latest_clocks)
+        live_received_monotonic = _latest_clocks_received_monotonic
+        live_received_utc = _latest_clocks_received_utc
+    live_campaign = _state_campaign(live_state)
+    live_name = (
+        _tempest_campaign_name(live_campaign)
+        if isinstance(live_campaign, dict) and live_campaign
+        else ""
+    )
+    live_state_name = str(
+        live_campaign.get("state") if isinstance(live_campaign, dict) else ""
+    ).strip().upper()
+    live_public_count = _as_int(
+        live_campaign.get("public_count") if isinstance(live_campaign, dict) else None
+    )
+    live_age_s = (
+        None
+        if live_received_monotonic is None
+        else max(0.0, time.monotonic() - live_received_monotonic)
+    )
+    if (
+        live_name != campaign_name
+        or live_state_name != "STARTED"
+        or live_public_count is None
+        or live_public_count <= 0
+        or live_age_s is None
+        or live_age_s > CLOCKS_PREFLIGHT_MAX_AGE_S
+    ):
+        raise RuntimeError(
+            "fresh canonical campaign proof disappeared before Pi reattach: "
+            f"canonical={live_name or 'NONE'}/{live_state_name or 'NONE'} "
+            f"public_count={live_public_count} age_s={live_age_s}"
+        )
+
+    # Do not guess which row wins the small race between this foreground court
+    # and the 1 Hz producer.  Arm the existing exact sync latch for the next
+    # naturally occurring accepted row.  The processor pauses on that exact row
+    # while campaign_active is false; Pi then seeds itself to N-1 and releases N.
+    expected_next = int(live_public_count) + 1
+    _begin_sync_wait(expected_pps=expected_next)
+    try:
+        frag, waited_s = _end_sync_wait(timeout_s=SYNC_RECOVER_TIMEOUT_S)
+        first_public_count = _as_int(frag.get("public_count"))
+        if first_public_count is None or first_public_count < expected_next:
+            raise RuntimeError(
+                "surviving campaign handoff returned an invalid first public count: "
+                f"expected>={expected_next} observed={first_public_count}"
+            )
+
+        seed_pps_vclock_count = int(first_public_count) - 1
+        last_tb, recovery_snapshot, skipped_unrecoverable_rows = (
+            _load_last_recoverable_tempest_detail(campaign_name)
+        )
+        if not recovery_snapshot.get("recoverable"):
+            raise RuntimeError(
+                "surviving campaign lacks a recoverable durable GNSS_RAW baseline"
+            )
+        last_durable_count = int(recovery_snapshot["last_pps_vclock_count"])
+        if seed_pps_vclock_count < last_durable_count:
+            raise RuntimeError(
+                "surviving campaign baseline regressed behind durable campaign state: "
+                f"seed={seed_pps_vclock_count} durable={last_durable_count}"
+            )
+
+        gnss_raw_projection = _gnss_raw_recovery_project_seed(
+            last_tb=last_tb,
+            last_pps_vclock_count=last_durable_count,
+            seed_pps_vclock_count=seed_pps_vclock_count,
+        )
+        seed_gnss_ns = seed_pps_vclock_count * NS_PER_SECOND
+        gnss_raw_restored = _restore_gnss_raw_from_last_timebase(
+            last_tb=last_tb,
+            projected_gnss_ns=int(seed_gnss_ns),
+            projected_gnss_raw_ns=int(gnss_raw_projection.get("seed_raw_ns") or 0),
+            projected_gnss_raw_ref_ns=int(
+                gnss_raw_projection.get("seed_ref_ns") or seed_gnss_ns
+            ),
+            projection_details=gnss_raw_projection,
+        )
+        if not gnss_raw_restored:
+            raise RuntimeError("surviving campaign GNSS_RAW baseline restore failed")
+
+        _accepted_pps_vclock_count = seed_pps_vclock_count
+        _last_pps_vclock_count_seen = seed_pps_vclock_count
+        _diag["accepted_pps_count"] = seed_pps_vclock_count
+        _diag["accepted_pps_vclock_count"] = seed_pps_vclock_count
+        _gnss_canary_reset()
+        _clear_start_wait_state()
+        _post_recovery_science_confirmation_pending = False
+        _post_recovery_science_confirmation_campaign = None
+        _post_recovery_first_public_pps_vclock_count = None
+
+        _campaign_active = True
+        _arm_timebase_silence_watch("SURVIVING_CAMPAIGN_REATTACH")
+        _sync_resume_event.set()
+
+        result = {
+            "restored": True,
+            "mode": "live_campaign_reattach",
+            "campaign": campaign_name,
+            "firmware_recover_sent": False,
+            "firmware_campaign_state": firmware_state,
+            "baseline_pps_vclock_count": seed_pps_vclock_count,
+            "first_public_pps_vclock_count": int(first_public_count),
+            "waited_s": round(float(waited_s), 3),
+            "canonical_probe_sequence": _as_int(live_state.get("sequence")),
+            "canonical_probe_public_count": int(live_public_count),
+            "canonical_probe_received_at_utc": live_received_utc,
+            "canonical_probe_age_s": round(float(live_age_s), 3),
+            "skipped_unrecoverable_rows": int(skipped_unrecoverable_rows),
+            "gnss_raw_projection": gnss_raw_projection,
+        }
+        _diag["last_recovery"] = {
+            "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            **copy.deepcopy(result),
+        }
+        logging.info(
+            "✅ [holistic restore] surviving Alpha+Beta campaign reattached without "
+            "Teensy RECOVER: campaign='%s' baseline=%d first_public=%d waited=%.3fs",
+            campaign_name,
+            seed_pps_vclock_count,
+            int(first_public_count),
+            float(waited_s),
+        )
+        return result
+    except Exception:
+        _campaign_active = False
+        _clear_sync_wait()
+        raise
+
+
 def _holistic_restore(
     *,
     preverified_location: Optional[Dict[str, Any]] = None,
@@ -7520,10 +7758,21 @@ def _holistic_restore(
             and isinstance(instrument_result.get("proof"), dict)
             and instrument_result["proof"].get("proved") is True
         )
-        result["campaign"] = _restore_active_campaign_state(
-            preverified_location=preverified_location,
-            alpha_resurrected_this_startup=alpha_resurrected_this_startup,
+        surviving_campaign = (
+            instrument_result.get("surviving_campaign")
+            if isinstance(instrument_result, dict)
+            else None
         )
+        if isinstance(surviving_campaign, dict) and surviving_campaign.get("proved") is True:
+            result["campaign"] = _reattach_surviving_campaign_without_recover(
+                active_campaign=active_campaign,
+                instrument_result=instrument_result,
+            )
+        else:
+            result["campaign"] = _restore_active_campaign_state(
+                preverified_location=preverified_location,
+                alpha_resurrected_this_startup=alpha_resurrected_this_startup,
+            )
 
     result["completed_at_utc"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     return result
