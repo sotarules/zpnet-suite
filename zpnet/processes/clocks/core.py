@@ -13883,11 +13883,54 @@ def _restore_active_campaign_state(
     firmware_campaign_matches_durable = bool(
         firmware_campaign_started and reported_campaign_name == campaign_name
     )
+    recovery_custody = _recovery_custody_snapshot()
     lifecycle_lost_custody = bool(
-        _recovery_custody_snapshot().get("active")
+        recovery_custody.get("active")
         and not firmware_campaign_matches_durable
     )
-    cold_restore_custody = bool(physical_reboot_custody or lifecycle_lost_custody)
+
+    # Beta continuity surrender is not Alpha continuity surrender.  A watchdog
+    # deliberately leaves the always-on instrument alive while forcing the campaign
+    # lifecycle to STOPPED, so campaign absence alone is never authority to rewind
+    # Alpha to the last durable checkpoint.  When no physical sequence regression
+    # has proved a new Teensy lifetime, require the same independent canonical
+    # lineage court used at startup before preserving the live Alpha.
+    recovery_alpha_lineage: Optional[Dict[str, Any]] = None
+    recovery_alpha_survived = False
+    if lifecycle_lost_custody and not physical_reboot_custody:
+        with _clocks_lock:
+            recovery_live_state = copy.deepcopy(_latest_clocks)
+            recovery_live_received_monotonic = _latest_clocks_received_monotonic
+        recovery_live_age_s = (
+            None
+            if recovery_live_received_monotonic is None
+            else max(0.0, time.monotonic() - recovery_live_received_monotonic)
+        )
+        recovery_alpha_lineage = _alpha_survival_lineage_court(
+            canonical_recovery_clocks,
+            recovery_live_state,
+            live_age_s=recovery_live_age_s,
+        )
+        recovery_alpha_survived = bool(
+            epoch_ready_before_recover
+            and recovery_alpha_lineage.get("proved") is True
+        )
+        logging.info(
+            "🧭 [recovery] Beta custody absent; Alpha survival court: "
+            "proved=%s epoch_ready=%s durable_update=%s live_update=%s "
+            "live_age_s=%s reasons=%s",
+            recovery_alpha_survived,
+            epoch_ready_before_recover,
+            recovery_alpha_lineage.get("durable_update_count"),
+            recovery_alpha_lineage.get("live_update_count"),
+            recovery_alpha_lineage.get("live_age_s"),
+            recovery_alpha_lineage.get("reasons"),
+        )
+
+    cold_restore_custody = bool(
+        physical_reboot_custody
+        or (lifecycle_lost_custody and not recovery_alpha_survived)
+    )
 
     # Alpha and Beta have independent lifetimes.  The original campaign-bootstrap
     # trigger covered only the case where Alpha was resurrected earlier in this
@@ -13955,6 +13998,12 @@ def _restore_active_campaign_state(
     )
     _diag["last_recovery"]["lifecycle_lost_custody"] = bool(
         lifecycle_lost_custody
+    )
+    _diag["last_recovery"]["recovery_alpha_survived"] = bool(
+        recovery_alpha_survived
+    )
+    _diag["last_recovery"]["recovery_alpha_lineage"] = copy.deepcopy(
+        recovery_alpha_lineage
     )
     _diag["last_recovery"]["restore_alpha_required"] = bool(cold_restore_custody)
     _diag["last_recovery"]["alpha_resurrected_this_startup"] = bool(
