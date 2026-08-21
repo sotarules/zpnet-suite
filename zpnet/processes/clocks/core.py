@@ -3316,12 +3316,18 @@ def _finalize_recovery_clocks_custody(
     if first_public_count <= 0:
         raise ValueError("recovery custody finalization requires positive public_count")
 
+    finalize_started = time.monotonic()
     with _recovery_custody_lock:
         if not _recovery_custody_active:
             return {"active": False, "classified": False, "reason": "no_live_custody"}
         generation = _recovery_custody_generation
         if not generation:
             raise RuntimeError("active recovery custody has no generation identity")
+        source_detail_id = _as_int(last_tb.get("_db_detail_id"))
+        if source_detail_id is None or source_detail_id <= 0:
+            raise RuntimeError(
+                "active recovery custody source lacks durable campaign_detail identity"
+            )
         physical_regression = bool(_recovery_custody_physical_sequence_regression)
         entered_at_utc = _recovery_custody_entered_at_utc
         initial_reason = _recovery_custody_reason
@@ -3330,7 +3336,9 @@ def _finalize_recovery_clocks_custody(
         # State routing takes this same lock through its persistence-queue put.
         # Holding it while waiting for the FIFO barrier therefore proves that no
         # row in this generation can appear after the classification transaction.
+        barrier_started = time.monotonic()
         _wait_for_clocks_persistence_barrier_locked()
+        barrier_wait_s = time.monotonic() - barrier_started
 
         source_stats = _clocks_payload(last_tb).get("stats")
         if not isinstance(source_stats, dict):
@@ -3340,15 +3348,18 @@ def _finalize_recovery_clocks_custody(
         if source_reset is None or source_update is None:
             raise RuntimeError("recovery custody source lacks statistics chronology")
 
+        transaction_started = time.monotonic()
         with _clocks_persistence_lock:
             with open_db(row_dict=True) as conn:
                 cur = conn.cursor()
+                boundary_select_started = time.monotonic()
                 cur.execute(
                     """
                     SELECT id, payload
                     FROM campaign_detail
                     WHERE campaign_type = %s
                       AND campaign = %s
+                      AND id > %s
                       AND payload #>> '{recovery_custody,generation}' = %s
                       AND payload #>> '{campaign,public_count}' = %s
                     ORDER BY id DESC
@@ -3357,11 +3368,13 @@ def _finalize_recovery_clocks_custody(
                     (
                         CAMPAIGN_TYPE_TEMPEST,
                         campaign_name,
+                        int(source_detail_id),
                         generation,
                         str(first_public_count),
                     ),
                 )
                 row = cur.fetchone()
+                boundary_select_s = time.monotonic() - boundary_select_started
                 if row is None:
                     raise RuntimeError(
                         "first admitted recovery row is not durably present in recovery custody"
@@ -3485,6 +3498,7 @@ def _finalize_recovery_clocks_custody(
                 classified_at = datetime.now(timezone.utc).isoformat().replace(
                     "+00:00", "Z"
                 )
+                classification_update_started = time.monotonic()
                 if cold_or_rebased:
                     cur.execute(
                         """
@@ -3501,15 +3515,17 @@ def _finalize_recovery_clocks_custody(
                             true
                         )
                         WHERE campaign_type = %s
-                          AND payload #>> '{recovery_custody,generation}' = %s
+                          AND id > %s
                           AND id < %s
+                          AND payload #>> '{recovery_custody,generation}' = %s
                         """,
                         (
                             "SUPERSEDED_PRE_RECOVERY",
                             classified_at,
                             CAMPAIGN_TYPE_TEMPEST,
-                            generation,
+                            int(source_detail_id),
                             boundary_id,
+                            generation,
                         ),
                     )
                     superseded = int(cur.rowcount or 0)
@@ -3534,15 +3550,15 @@ def _finalize_recovery_clocks_custody(
                             true
                         )
                         WHERE campaign_type = %s
-                          AND payload #>> '{recovery_custody,generation}' = %s
                           AND id >= %s
+                          AND payload #>> '{recovery_custody,generation}' = %s
                         """,
                         (
                             promoted_classification,
                             classified_at,
                             CAMPAIGN_TYPE_TEMPEST,
-                            generation,
                             boundary_id,
+                            generation,
                         ),
                     )
                     promoted = int(cur.rowcount or 0)
@@ -3569,16 +3585,22 @@ def _finalize_recovery_clocks_custody(
                             true
                         )
                         WHERE campaign_type = %s
+                          AND id > %s
                           AND payload #>> '{recovery_custody,generation}' = %s
                         """,
                         (
                             promoted_classification,
                             classified_at,
                             CAMPAIGN_TYPE_TEMPEST,
+                            int(source_detail_id),
                             generation,
                         ),
                     )
                     promoted = int(cur.rowcount or 0)
+                classification_update_s = (
+                    time.monotonic() - classification_update_started
+                )
+        transaction_s = time.monotonic() - transaction_started
 
         result = {
             "active": False,
@@ -3591,6 +3613,7 @@ def _finalize_recovery_clocks_custody(
             "physical_sequence_regression": physical_regression,
             "regression_witness": regression_witness,
             "first_public_count": first_public_count,
+            "source_detail_id": int(source_detail_id),
             "boundary_detail_id": boundary_id,
             "source_reset_count": int(source_reset),
             "source_update_count": int(source_update),
@@ -3605,6 +3628,15 @@ def _finalize_recovery_clocks_custody(
             "promoted_classification": promoted_classification,
             "rows_promoted": promoted,
             "rows_superseded": superseded,
+            "timing": {
+                "barrier_wait_s": round(float(barrier_wait_s), 6),
+                "boundary_select_s": round(float(boundary_select_s), 6),
+                "classification_update_s": round(
+                    float(classification_update_s), 6
+                ),
+                "transaction_s": round(float(transaction_s), 6),
+                "total_s": round(float(time.monotonic() - finalize_started), 6),
+            },
         }
 
         _recovery_custody_active = False
@@ -3625,13 +3657,16 @@ def _finalize_recovery_clocks_custody(
     _diag["last_recovery_custody"] = copy.deepcopy(result)
     logging.info(
         "✅ [recovery/custody] classified generation=%s mode=%s promoted=%d "
-        "superseded=%d boundary_id=%d lineage_proved=%s",
+        "superseded=%d source_id=%d boundary_id=%d lineage_proved=%s "
+        "timing=%s",
         generation,
         str(recover_mode).upper(),
         promoted,
         superseded,
+        int(source_detail_id),
         boundary_id,
         lineage_proved,
+        result.get("timing"),
     )
     return result
 
@@ -6988,6 +7023,149 @@ def _alpha_survival_lineage_court(
         "live_restore_ready": bool(live_restore_ready),
         "clockfaces": clockfaces,
     }
+
+
+@dataclass(frozen=True)
+class _RecoveryTopologyPlan:
+    """One custody verdict for the active-campaign RECOVER transaction.
+
+    Phase 1 keeps the existing recovery executors unchanged.  This object merely
+    makes the already-existing Alpha/Beta decision explicit so later phases can
+    pass one proved topology forward instead of rediscovering it.
+    """
+
+    alpha_action: str
+    campaign_action: str
+    observed_campaign_name: str
+    observed_campaign_state: str
+    firmware_campaign_matches_durable: bool
+    physical_reboot_custody: bool
+    lifecycle_lost_custody: bool
+    alpha_survived: bool
+    alpha_lineage: Optional[Dict[str, Any]]
+    restore_alpha_required: bool
+    campaign_bootstrap_required: bool
+    campaign_bootstrap_basis: Optional[str]
+
+
+def _plan_active_campaign_recovery_topology(
+    *,
+    campaign_name: str,
+    canonical_recovery_clocks: Dict[str, Any],
+    alpha_resurrected_this_startup: bool,
+    epoch_ready_before_recover: bool,
+    firmware_campaign_matches_durable: bool,
+    physical_reboot_custody: bool,
+    recovery_custody: Dict[str, Any],
+    reported_campaign_name: str,
+    reported_campaign_state: str,
+    recovery_status_before: Dict[str, Any],
+) -> _RecoveryTopologyPlan:
+    """Classify Alpha and Beta once before the RECOVER executor mutates either."""
+    lifecycle_lost_custody = bool(
+        recovery_custody.get("active")
+        and not firmware_campaign_matches_durable
+    )
+
+    # Beta continuity surrender is not Alpha continuity surrender.  A watchdog
+    # deliberately leaves the always-on instrument alive while forcing the campaign
+    # lifecycle to STOPPED, so campaign absence alone is never authority to rewind
+    # Alpha to the last durable checkpoint.  When no physical sequence regression
+    # has proved a new Teensy lifetime, require the same independent canonical
+    # lineage court used at startup before preserving the live Alpha.
+    recovery_alpha_lineage: Optional[Dict[str, Any]] = None
+    recovery_alpha_survived = False
+    if lifecycle_lost_custody and not physical_reboot_custody:
+        with _clocks_lock:
+            recovery_live_state = copy.deepcopy(_latest_clocks)
+            recovery_live_received_monotonic = _latest_clocks_received_monotonic
+        recovery_live_age_s = (
+            None
+            if recovery_live_received_monotonic is None
+            else max(0.0, time.monotonic() - recovery_live_received_monotonic)
+        )
+        recovery_alpha_lineage = _alpha_survival_lineage_court(
+            canonical_recovery_clocks,
+            recovery_live_state,
+            live_age_s=recovery_live_age_s,
+        )
+        recovery_alpha_survived = bool(
+            epoch_ready_before_recover
+            and recovery_alpha_lineage.get("proved") is True
+        )
+        logging.info(
+            "🧭 [recovery] Beta custody absent; Alpha survival court: "
+            "proved=%s epoch_ready=%s durable_update=%s live_update=%s "
+            "live_age_s=%s reasons=%s",
+            recovery_alpha_survived,
+            epoch_ready_before_recover,
+            recovery_alpha_lineage.get("durable_update_count"),
+            recovery_alpha_lineage.get("live_update_count"),
+            recovery_alpha_lineage.get("live_age_s"),
+            recovery_alpha_lineage.get("reasons"),
+        )
+
+    cold_restore_custody = bool(
+        physical_reboot_custody
+        or (lifecycle_lost_custody and not recovery_alpha_survived)
+    )
+
+    # Alpha and Beta have independent lifetimes.  Alpha may already have been
+    # resurrected and proved earlier in this startup, or it may have survived
+    # while Beta alone was surrendered.  Both topologies preserve the current
+    # Alpha and recreate only the recording lifecycle.
+    campaign_bootstrap_basis: Optional[str] = None
+    if alpha_resurrected_this_startup:
+        campaign_bootstrap_basis = "ALPHA_RESURRECTED_THIS_STARTUP"
+    elif (
+        epoch_ready_before_recover
+        and not cold_restore_custody
+        and not firmware_campaign_matches_durable
+    ):
+        campaign_bootstrap_basis = "SURVIVING_ALPHA_BETA_ABSENT"
+    campaign_bootstrap_required = campaign_bootstrap_basis is not None
+
+    if campaign_bootstrap_required and cold_restore_custody:
+        raise RecoveryRetryableFailure(
+            "startup_recovery_topology_conflict",
+            {
+                "campaign": campaign_name,
+                "alpha_resurrected_this_startup": True,
+                "physical_reboot_custody": bool(physical_reboot_custody),
+                "lifecycle_lost_custody": bool(lifecycle_lost_custody),
+                "teensy_campaign_state_before_recover": reported_campaign_state or None,
+                "custody": _recovery_custody_snapshot(),
+            },
+        )
+    if campaign_bootstrap_required and not epoch_ready_before_recover:
+        raise RecoveryRetryableFailure(
+            "campaign_bootstrap_alpha_not_ready",
+            {
+                "campaign": campaign_name,
+                "alpha_resurrected_this_startup": True,
+                "teensy_campaign_state_before_recover": reported_campaign_state or None,
+                "recovery_status_before": recovery_status_before,
+            },
+        )
+
+    return _RecoveryTopologyPlan(
+        alpha_action="RESTORE" if cold_restore_custody else "PRESERVE",
+        campaign_action=(
+            "CAMPAIGN_BOOTSTRAP"
+            if campaign_bootstrap_required
+            else "LIVE_REATTACH"
+        ),
+        observed_campaign_name=reported_campaign_name,
+        observed_campaign_state=reported_campaign_state,
+        firmware_campaign_matches_durable=bool(firmware_campaign_matches_durable),
+        physical_reboot_custody=bool(physical_reboot_custody),
+        lifecycle_lost_custody=bool(lifecycle_lost_custody),
+        alpha_survived=bool(recovery_alpha_survived),
+        alpha_lineage=copy.deepcopy(recovery_alpha_lineage),
+        restore_alpha_required=bool(cold_restore_custody),
+        campaign_bootstrap_required=bool(campaign_bootstrap_required),
+        campaign_bootstrap_basis=campaign_bootstrap_basis,
+    )
 
 
 def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
@@ -13884,93 +14062,28 @@ def _restore_active_campaign_state(
         firmware_campaign_started and reported_campaign_name == campaign_name
     )
     recovery_custody = _recovery_custody_snapshot()
-    lifecycle_lost_custody = bool(
-        recovery_custody.get("active")
-        and not firmware_campaign_matches_durable
+    recovery_plan = _plan_active_campaign_recovery_topology(
+        campaign_name=campaign_name,
+        canonical_recovery_clocks=canonical_recovery_clocks,
+        alpha_resurrected_this_startup=alpha_resurrected_this_startup,
+        epoch_ready_before_recover=epoch_ready_before_recover,
+        firmware_campaign_matches_durable=firmware_campaign_matches_durable,
+        physical_reboot_custody=physical_reboot_custody,
+        recovery_custody=recovery_custody,
+        reported_campaign_name=reported_campaign_name,
+        reported_campaign_state=reported_campaign_state,
+        recovery_status_before=recovery_status_before,
     )
 
-    # Beta continuity surrender is not Alpha continuity surrender.  A watchdog
-    # deliberately leaves the always-on instrument alive while forcing the campaign
-    # lifecycle to STOPPED, so campaign absence alone is never authority to rewind
-    # Alpha to the last durable checkpoint.  When no physical sequence regression
-    # has proved a new Teensy lifetime, require the same independent canonical
-    # lineage court used at startup before preserving the live Alpha.
-    recovery_alpha_lineage: Optional[Dict[str, Any]] = None
-    recovery_alpha_survived = False
-    if lifecycle_lost_custody and not physical_reboot_custody:
-        with _clocks_lock:
-            recovery_live_state = copy.deepcopy(_latest_clocks)
-            recovery_live_received_monotonic = _latest_clocks_received_monotonic
-        recovery_live_age_s = (
-            None
-            if recovery_live_received_monotonic is None
-            else max(0.0, time.monotonic() - recovery_live_received_monotonic)
-        )
-        recovery_alpha_lineage = _alpha_survival_lineage_court(
-            canonical_recovery_clocks,
-            recovery_live_state,
-            live_age_s=recovery_live_age_s,
-        )
-        recovery_alpha_survived = bool(
-            epoch_ready_before_recover
-            and recovery_alpha_lineage.get("proved") is True
-        )
-        logging.info(
-            "🧭 [recovery] Beta custody absent; Alpha survival court: "
-            "proved=%s epoch_ready=%s durable_update=%s live_update=%s "
-            "live_age_s=%s reasons=%s",
-            recovery_alpha_survived,
-            epoch_ready_before_recover,
-            recovery_alpha_lineage.get("durable_update_count"),
-            recovery_alpha_lineage.get("live_update_count"),
-            recovery_alpha_lineage.get("live_age_s"),
-            recovery_alpha_lineage.get("reasons"),
-        )
-
-    cold_restore_custody = bool(
-        physical_reboot_custody
-        or (lifecycle_lost_custody and not recovery_alpha_survived)
-    )
-
-    # Alpha and Beta have independent lifetimes.  The original campaign-bootstrap
-    # trigger covered only the case where Alpha was resurrected earlier in this
-    # same Pi startup.  A service restart after an explicit statistics repair (or
-    # any equivalent topology) can instead prove that Alpha survived while Beta is
-    # STOPPED/absent on the Teensy.  LIVE_REATTACH is impossible in that state:
-    # there is no live campaign lifecycle to reattach.  Ask firmware to recreate
-    # Beta while preserving the already-proved Alpha instrument state.
-    campaign_bootstrap_basis: Optional[str] = None
-    if alpha_resurrected_this_startup:
-        campaign_bootstrap_basis = "ALPHA_RESURRECTED_THIS_STARTUP"
-    elif (
-        epoch_ready_before_recover
-        and not cold_restore_custody
-        and not firmware_campaign_matches_durable
-    ):
-        campaign_bootstrap_basis = "SURVIVING_ALPHA_BETA_ABSENT"
-    campaign_bootstrap_required = campaign_bootstrap_basis is not None
-    if campaign_bootstrap_required and cold_restore_custody:
-        raise RecoveryRetryableFailure(
-            "startup_recovery_topology_conflict",
-            {
-                "campaign": campaign_name,
-                "alpha_resurrected_this_startup": True,
-                "physical_reboot_custody": bool(physical_reboot_custody),
-                "lifecycle_lost_custody": bool(lifecycle_lost_custody),
-                "teensy_campaign_state_before_recover": reported_campaign_state or None,
-                "custody": _recovery_custody_snapshot(),
-            },
-        )
-    if campaign_bootstrap_required and not epoch_ready_before_recover:
-        raise RecoveryRetryableFailure(
-            "campaign_bootstrap_alpha_not_ready",
-            {
-                "campaign": campaign_name,
-                "alpha_resurrected_this_startup": True,
-                "teensy_campaign_state_before_recover": reported_campaign_state or None,
-                "recovery_status_before": recovery_status_before,
-            },
-        )
+    # Phase 1 deliberately leaves the proven RECOVER executor unchanged.  These
+    # local aliases preserve its current inputs while the decision itself now
+    # has one explicit, inspectable topology verdict.
+    lifecycle_lost_custody = recovery_plan.lifecycle_lost_custody
+    recovery_alpha_lineage = recovery_plan.alpha_lineage
+    recovery_alpha_survived = recovery_plan.alpha_survived
+    cold_restore_custody = recovery_plan.restore_alpha_required
+    campaign_bootstrap_required = recovery_plan.campaign_bootstrap_required
+    campaign_bootstrap_basis = recovery_plan.campaign_bootstrap_basis
 
     # Durable canonical CLOCKS is the ancestry authority. Firmware may discover
     # that it needs a cold bootstrap locally, but it may not override an explicit
