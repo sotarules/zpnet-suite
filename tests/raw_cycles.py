@@ -8,13 +8,26 @@ of campaign length.
 The SQL explicitly selects ``campaign_type='TEMPEST'`` and derives the campaign
 PPS identity from ``payload.campaign``. That identity must agree with the
 immutable identity carried inside the merged campaign view.  The query projects
-only campaign testimony and ``clocks.raw_cycles``; the much larger recovery
-ledger remains durable in PostgreSQL and is not transferred for this audit.
+only campaign testimony, ``clocks.raw_cycles``, and the receiver's compact GNSS
+discipline testimony; the much larger recovery ledger remains durable in
+PostgreSQL and is not transferred for this audit.
+
+GNSS columns intentionally preserve the receiver's own distinct surfaces rather
+than collapsing them into one invented "correction":
+
+* g_drift — TPS1 receiver-clock drift estimate, ppb.
+* dg      — adjacent-row change in g_drift, ppb.
+* g_freq  — TPS4 VCLK frequency error, ppb.
+* p_err   — TPS4 PPS timing error from the synchronization target, ns.
+* dp      — adjacent-row change in p_err, ns.
+
+The adjacent-row deltas surrender across a durable campaign gap.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import sys
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, Optional, Sequence, Tuple
@@ -57,6 +70,20 @@ class Rail:
 
 
 @dataclass
+class GnssWitness:
+    clock_drift_ppb: float
+    drift_delta_ppb: Optional[float]
+    freq_error_ppb: float
+    freq_error_delta_ppb: Optional[float]
+    pps_timing_error_ns: float
+    pps_timing_error_delta_ns: Optional[float]
+    freq_mode_name: str
+    phase_skip: int
+    alarm: int
+    status: int
+
+
+@dataclass
 class AuditRow:
     count: int
     previous_count: Optional[int]
@@ -65,6 +92,8 @@ class AuditRow:
     recovery_boundary: bool
     disposition: str
     timeline_valid: Optional[bool]
+    gnss: Optional[GnssWitness]
+    gnss_status: str
     rails: Dict[str, Rail]
 
 
@@ -95,6 +124,33 @@ def b(v: Any) -> Optional[bool]:
     return None
 
 
+def req_dict(v: Any, where: str) -> Dict[str, Any]:
+    if not isinstance(v, dict):
+        raise ValueError(f"{where} must be an object; got {v!r}")
+    return v
+
+
+def req_float(v: Any, where: str) -> float:
+    if v is None or isinstance(v, bool):
+        raise ValueError(f"{where} must be numeric; got {v!r}")
+    try:
+        out = float(v)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{where} must be numeric; got {v!r}") from exc
+    if not math.isfinite(out):
+        raise ValueError(f"{where} must be finite; got {v!r}")
+    return out
+
+
+def req_int(v: Any, where: str) -> int:
+    if isinstance(v, bool) or not isinstance(v, (int, str)):
+        raise ValueError(f"{where} must be an integer; got {v!r}")
+    try:
+        return int(v)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{where} must be an integer; got {v!r}") from exc
+
+
 def first_int(*values: Any) -> Optional[int]:
     for value in values:
         parsed = i(value)
@@ -120,6 +176,77 @@ def campaign_view(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def clocks_view(payload: Dict[str, Any]) -> Dict[str, Any]:
     return d(root(payload).get("clocks"))
+
+
+def gnss_view(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return d(root(payload).get("gnss"))
+
+
+def parse_gnss_witness(
+    payload: Dict[str, Any],
+    previous: Optional[GnssWitness],
+    *,
+    adjacent: bool,
+) -> Tuple[Optional[GnssWitness], str]:
+    gnss = gnss_view(payload)
+    if not gnss:
+        return None, "MISSING"
+
+    clock_obj = gnss.get("clock")
+    discipline_obj = gnss.get("discipline")
+    if clock_obj is None or discipline_obj is None:
+        missing = []
+        if clock_obj is None:
+            missing.append("CLOCK")
+        if discipline_obj is None:
+            missing.append("DISCIPLINE")
+        return None, "+".join(missing) + "_MISSING"
+
+    clock = req_dict(clock_obj, "gnss.clock")
+    discipline = req_dict(discipline_obj, "gnss.discipline")
+
+    drift = req_float(clock.get("drift_ppb"), "gnss.clock.drift_ppb")
+    # CLOCKS currently carries a compatibility alias.  If it is present, make
+    # disagreement loud rather than silently choosing one testimony surface.
+    if "clock_drift_ppb" in gnss:
+        alias = req_float(gnss.get("clock_drift_ppb"), "gnss.clock_drift_ppb")
+        if abs(alias - drift) > 1.0e-9:
+            raise ValueError(
+                "GNSS drift alias disagreement: "
+                f"gnss.clock.drift_ppb={drift} gnss.clock_drift_ppb={alias}"
+            )
+
+    freq_error = req_float(
+        discipline.get("freq_error_ppb"), "gnss.discipline.freq_error_ppb"
+    )
+    pps_error = req_float(
+        discipline.get("pps_timing_error_ns"),
+        "gnss.discipline.pps_timing_error_ns",
+    )
+    freq_mode_name = str(discipline.get("freq_mode_name") or "").upper()
+    if not freq_mode_name:
+        raise ValueError("gnss.discipline.freq_mode_name is missing")
+
+    drift_delta = None
+    freq_delta = None
+    pps_delta = None
+    if adjacent and previous is not None:
+        drift_delta = drift - previous.clock_drift_ppb
+        freq_delta = freq_error - previous.freq_error_ppb
+        pps_delta = pps_error - previous.pps_timing_error_ns
+
+    return GnssWitness(
+        clock_drift_ppb=drift,
+        drift_delta_ppb=drift_delta,
+        freq_error_ppb=freq_error,
+        freq_error_delta_ppb=freq_delta,
+        pps_timing_error_ns=pps_error,
+        pps_timing_error_delta_ns=pps_delta,
+        freq_mode_name=freq_mode_name,
+        phase_skip=req_int(discipline.get("phase_skip"), "gnss.discipline.phase_skip"),
+        alarm=req_int(discipline.get("alarm"), "gnss.discipline.alarm"),
+        status=req_int(discipline.get("status"), "gnss.discipline.status"),
+    ), "OK"
 
 
 def _payload_pps_count(payload: Dict[str, Any], campaign: Dict[str, Any]) -> Optional[int]:
@@ -175,7 +302,8 @@ def iter_payloads(
                 id,
                 {PPS_COUNT_SQL} AS pps_count,
                 payload -> 'campaign' AS campaign_payload,
-                payload #> '{{clocks,raw_cycles}}' AS raw_cycles_payload
+                payload #> '{{clocks,raw_cycles}}' AS raw_cycles_payload,
+                payload -> 'gnss' AS gnss_payload
             FROM campaign_detail
             WHERE campaign_type = %s
               AND campaign = %s
@@ -212,6 +340,16 @@ def iter_payloads(
                     f"campaign_detail id={row['id']} missing clocks.raw_cycles payload"
                 )
 
+            gnss = row["gnss_payload"]
+            if isinstance(gnss, str):
+                gnss = json.loads(gnss)
+            if gnss is None:
+                gnss = {}
+            elif not isinstance(gnss, dict):
+                raise ValueError(
+                    f"campaign_detail id={row['id']} gnss payload must be an object or null"
+                )
+
             db_count = int(row["pps_count"])
             payload_count = _payload_pps_count({}, campaign)
             if payload_count != db_count:
@@ -227,6 +365,7 @@ def iter_payloads(
                 "schema": "CLOCKS_V4",
                 "campaign": campaign,
                 "clocks": {"raw_cycles": raw_cycles},
+                "gnss": gnss,
             }
             yield int(row["id"]), db_count, payload
 
@@ -248,6 +387,7 @@ def build_row(
     db_count: int,
     previous_count: Optional[int],
     previous_observed: Dict[str, Optional[int]],
+    previous_gnss: Optional[GnssWitness],
 ) -> AuditRow:
     campaign = campaign_view(payload)
     clocks = clocks_view(payload)
@@ -258,6 +398,9 @@ def build_row(
     delta = None if previous_count is None else db_count - previous_count
     gap = delta is not None and delta != 1
     recovery = bool(gap and delta is not None and delta > 1 and explicit_recovery_row(campaign))
+    gnss, gnss_status = parse_gnss_witness(
+        payload, previous_gnss, adjacent=not gap
+    )
 
     rails: Dict[str, Rail] = {}
 
@@ -324,6 +467,8 @@ def build_row(
         recovery_boundary=recovery,
         disposition=str(disposition.get("status") or "ACCEPT").upper(),
         timeline_valid=b(status.get("timeline_valid")),
+        gnss=gnss,
+        gnss_status=gnss_status,
         rails=rails,
     )
 
@@ -340,6 +485,15 @@ def row_note(row: AuditRow, selected: Sequence[str], gate: int) -> str:
         notes.append(row.disposition)
     if row.timeline_valid is False:
         notes.append("TIMELINE_INVALID")
+    if row.gnss is None:
+        notes.append(f"GNSS_{row.gnss_status}")
+    else:
+        if row.gnss.freq_mode_name != "FINE_LOCK":
+            notes.append(f"GNSS_MODE={row.gnss.freq_mode_name}")
+        if row.gnss.phase_skip != 0:
+            notes.append(f"GNSS_PHASE_SKIP={row.gnss.phase_skip}")
+        if row.gnss.alarm != 0:
+            notes.append(f"GNSS_ALARM=0x{row.gnss.alarm:X}")
 
     for name in selected:
         rail = row.rails[name]
@@ -387,6 +541,12 @@ def fmt(value: Optional[int], width: int, signed: bool = False) -> str:
     else:
         text = f"{value:+,d}" if signed else f"{value:,d}"
     return f"{text:>{width}}"
+
+
+def fmt_float(value: Optional[float], width: int, decimals: int = 3) -> str:
+    if value is None:
+        return f"{'---':>{width}}"
+    return f"{value:+{width}.{decimals}f}"
 
 
 def parse(argv: Sequence[str]) -> tuple[str, int, int, Optional[str], bool, int, int]:
@@ -467,7 +627,14 @@ def main(argv: Sequence[str]) -> None:
         f"Campaign: {campaign}  view={clock or 'ALL'}  "
         f"server_batch={batch_size}"
     )
-    header = [f"{'pps':>7}"]
+    header = [
+        f"{'pps':>7}",
+        f"{'g_drift':>9}",
+        f"{'dg':>8}",
+        f"{'g_freq':>8}",
+        f"{'p_err':>7}",
+        f"{'dp':>7}",
+    ]
     for name in selected:
         prefix = {"PPS": "p", "VCLOCK": "v", "OCXO1": "o1", "OCXO2": "o2"}[name]
         header += [f"{prefix + '_cyc':>13}", f"{prefix + '_raw':>9}"]
@@ -477,6 +644,7 @@ def main(argv: Sequence[str]) -> None:
 
     previous_count: Optional[int] = None
     previous_observed: Dict[str, Optional[int]] = {name: None for name in RAILS}
+    previous_gnss: Optional[GnssWitness] = None
     processed = 0
     displayed = 0
 
@@ -486,8 +654,15 @@ def main(argv: Sequence[str]) -> None:
         limit=limit,
         batch_size=batch_size,
     ):
-        row = build_row(payload, db_count, previous_count, previous_observed)
+        row = build_row(
+            payload,
+            db_count,
+            previous_count,
+            previous_observed,
+            previous_gnss,
+        )
         previous_count = db_count
+        previous_gnss = row.gnss
         processed += 1
 
         note = row_note(row, selected, gate)
@@ -495,7 +670,15 @@ def main(argv: Sequence[str]) -> None:
         if pathology_only and not pathological:
             continue
 
-        fields = [fmt(row.count, 7)]
+        gnss = row.gnss
+        fields = [
+            fmt(row.count, 7),
+            fmt_float(None if gnss is None else gnss.clock_drift_ppb, 9),
+            fmt_float(None if gnss is None else gnss.drift_delta_ppb, 8),
+            fmt_float(None if gnss is None else gnss.freq_error_ppb, 8),
+            fmt_float(None if gnss is None else gnss.pps_timing_error_ns, 7, 1),
+            fmt_float(None if gnss is None else gnss.pps_timing_error_delta_ns, 7, 1),
+        ]
         for name in selected:
             rail = row.rails[name]
             fields += [
