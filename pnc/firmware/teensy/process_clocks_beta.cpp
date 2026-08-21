@@ -152,6 +152,7 @@ static constexpr uint32_t CAMPAIGN_RECORD_INVALID_OCXO2_CUSTODY =
 
 // Defined with the watchdog/recovery state later in this translation unit.
 bool clocks_watchdog_campaign_armed(void);
+static void recover_lifecycle_abort(const char* reason);
 static uint32_t clocks_row_lifecycle_science_hold_flags(void);
 static FLASHMEM bool recover_proof_driven_release_try(uint32_t pps_sequence);
 
@@ -566,11 +567,25 @@ static uint32_t g_clocks_fragment_campaign_record_backlog_count = 0U;
 // curated readiness tree.
 
 static constexpr uint64_t CLOCKS_FRAGMENT_RETRY_DELAY_NS = 25000000ULL;  // 25 ms
-// While a campaign is active, exact publication custody remains strict until
-// the next campaign row can explicitly surrender continuity.  Once Beta is
-// STOPPED, however, a missing Pi must not turn one observation-only fragment
-// into a 40 Hz permanent retry loop that starves the command/control plane.
+// Exact publication retry is deliberately bounded in every stable lifecycle.
+// D1 request/response transport capacity is reserved below the D0/D2 ceiling;
+// a CLOCKS_FRAGMENT can therefore be rejected while the command plane still has
+// lawful transport custody.  Never let that ordinary backpressure turn into a
+// permanent 40 Hz foreground retry loop that prevents D1 from getting a turn.
+//
+// A public STARTED campaign gets a substantially wider court than ambient
+// publication, but the court still closes well before the next one-second row.
+// Exhaustion is not a dropped campaign observation: it is explicit Beta
+// continuity surrender through WATCHDOG_ANOMALY.  RECOVERING similarly aborts
+// the failed recovery transaction so Pi may adjudicate/retry while Alpha lives.
 static constexpr uint32_t CLOCKS_FRAGMENT_IDLE_RETRY_MAX_ATTEMPTS = 4U;
+static constexpr uint32_t CLOCKS_FRAGMENT_ACTIVE_RETRY_MAX_ATTEMPTS = 16U;
+
+static constexpr uint32_t CLOCKS_FRAGMENT_RETRY_REASON_NONE = 0U;
+static constexpr uint32_t CLOCKS_FRAGMENT_RETRY_REASON_CAMPAIGN_EMBED = 1U;
+static constexpr uint32_t CLOCKS_FRAGMENT_RETRY_REASON_CLOCKS_PAYLOAD = 2U;
+static constexpr uint32_t CLOCKS_FRAGMENT_RETRY_REASON_TRANSPORT_ENQUEUE = 3U;
+
 static bool g_clocks_fragment_publication_initialized = false;
 
 // --------------------------------------------------------------
@@ -607,9 +622,18 @@ static bool g_clocks_fragment_publication_retry_snapshot_valid = false;
 static bool g_clocks_fragment_publication_retry_pi_only = false;
 static uint32_t g_clocks_fragment_publication_retry_sequence = 0U;
 static uint32_t g_clocks_fragment_publication_retry_attempt_count = 0U;
+static uint32_t g_clocks_fragment_publication_retry_reason_id =
+    CLOCKS_FRAGMENT_RETRY_REASON_NONE;
 static uint32_t g_clocks_fragment_publication_retry_tick_hold_count = 0U;
 static uint32_t g_clocks_fragment_publication_retry_schedule_count = 0U;
 static uint32_t g_clocks_fragment_publication_retry_success_count = 0U;
+static uint32_t g_clocks_fragment_publication_active_retry_exhaustion_count = 0U;
+static uint32_t g_clocks_fragment_publication_recovery_retry_abort_count = 0U;
+static uint32_t g_clocks_fragment_publication_last_exhausted_sequence = 0U;
+static uint32_t g_clocks_fragment_publication_last_exhausted_attempt_count = 0U;
+static uint32_t g_clocks_fragment_publication_last_exhausted_reason_id =
+    CLOCKS_FRAGMENT_RETRY_REASON_NONE;
+static uint32_t g_clocks_fragment_publication_last_exhausted_pending_sequence = 0U;
 static bool g_clocks_fragment_publication_last_tick_valid = false;
 static uint32_t g_clocks_fragment_publication_last_tick_sequence = 0U;
 static uint32_t g_clocks_fragment_publication_recovery_reset_count = 0U;
@@ -688,6 +712,8 @@ static void clocks_fragment_publication_ensure_initialized(void) {
   g_clocks_fragment_publication_retry_pi_only = false;
   g_clocks_fragment_publication_retry_sequence = 0U;
   g_clocks_fragment_publication_retry_attempt_count = 0U;
+  g_clocks_fragment_publication_retry_reason_id =
+      CLOCKS_FRAGMENT_RETRY_REASON_NONE;
   g_clocks_fragment_publication_retry_tick_hold_count = 0U;
   g_clocks_fragment_publication_retry_schedule_count = 0U;
   g_clocks_fragment_publication_retry_success_count = 0U;
@@ -1147,6 +1173,111 @@ static Payload clocks_fragment_campaign_payload(
   return campaign;
 }
 
+static FLASHMEM const char* clocks_fragment_retry_reason_name(uint32_t reason_id) {
+  switch (reason_id) {
+    case CLOCKS_FRAGMENT_RETRY_REASON_CAMPAIGN_EMBED:
+      return "CAMPAIGN_EMBED";
+    case CLOCKS_FRAGMENT_RETRY_REASON_CLOCKS_PAYLOAD:
+      return "CLOCKS_PAYLOAD";
+    case CLOCKS_FRAGMENT_RETRY_REASON_TRANSPORT_ENQUEUE:
+      return "TRANSPORT_ENQUEUE";
+    default:
+      return "NONE";
+  }
+}
+
+static void clocks_fragment_retry_note_failure(uint32_t sequence,
+                                               uint32_t reason_id,
+                                               bool retrying_snapshot,
+                                               bool pi_only) {
+  if (!retrying_snapshot) {
+    g_clocks_fragment_publication_retry_snapshot_valid = true;
+    g_clocks_fragment_publication_retry_sequence = sequence;
+    g_clocks_fragment_publication_retry_attempt_count = 1U;
+    g_clocks_fragment_publication_retry_reason_id = reason_id;
+    g_clocks_fragment_publication_retry_pi_only = pi_only;
+  } else {
+    g_clocks_fragment_publication_retry_attempt_count++;
+    // Once transport rejects a broadcast publication, retain the existing
+    // direct-to-Pi retry policy across any later Payload-build failure.
+    if (pi_only) g_clocks_fragment_publication_retry_pi_only = true;
+  }
+}
+
+static void clocks_fragment_retry_note_exhaustion(uint32_t sequence) {
+  g_clocks_fragment_publication_last_exhausted_sequence = sequence;
+  g_clocks_fragment_publication_last_exhausted_attempt_count =
+      g_clocks_fragment_publication_retry_attempt_count;
+  g_clocks_fragment_publication_last_exhausted_reason_id =
+      g_clocks_fragment_publication_retry_reason_id;
+  g_clocks_fragment_publication_last_exhausted_pending_sequence =
+      g_clocks_fragment_publication_pending
+          ? g_clocks_fragment_publication_pending_sequence
+          : 0U;
+}
+
+static void clocks_fragment_retry_retire_observation(uint32_t sequence) {
+  g_clocks_fragment_publication_idle_retry_abandon_count++;
+  g_clocks_fragment_publication_idle_retry_last_sequence = sequence;
+  g_clocks_fragment_publication_idle_retry_last_attempt_count =
+      g_clocks_fragment_publication_retry_attempt_count;
+  g_clocks_fragment_publication_retry_snapshot_valid = false;
+  g_clocks_fragment_publication_retry_pi_only = false;
+  g_clocks_fragment_publication_retry_sequence = 0U;
+  g_clocks_fragment_publication_retry_attempt_count = 0U;
+  g_clocks_fragment_publication_retry_reason_id =
+      CLOCKS_FRAGMENT_RETRY_REASON_NONE;
+  g_clocks_fragment_publication_clocks_snapshot =
+      clocks_fragment_snapshot_t{};
+  if (g_clocks_fragment_publication_pending) {
+    clocks_fragment_schedule_publish();
+  }
+}
+
+// Return true when the current failed publication has crossed a lifecycle
+// boundary and the caller must stop retrying it.  No path here fabricates
+// delivery: ambient testimony is explicitly retired, public campaign custody
+// is explicitly surrendered, and an in-flight recovery is explicitly aborted.
+static bool clocks_fragment_retry_finish_if_exhausted(uint32_t sequence) {
+  const uint32_t attempts = g_clocks_fragment_publication_retry_attempt_count;
+
+  if (campaign_state == clocks_campaign_state_t::STOPPED &&
+      attempts >= CLOCKS_FRAGMENT_IDLE_RETRY_MAX_ATTEMPTS) {
+    clocks_fragment_retry_note_exhaustion(sequence);
+    clocks_fragment_retry_retire_observation(sequence);
+    return true;
+  }
+
+  if (attempts < CLOCKS_FRAGMENT_ACTIVE_RETRY_MAX_ATTEMPTS) {
+    return false;
+  }
+
+  if (campaign_state == clocks_campaign_state_t::RECOVERING) {
+    clocks_fragment_retry_note_exhaustion(sequence);
+    g_clocks_fragment_publication_recovery_retry_abort_count++;
+    recover_lifecycle_abort("recover_publication_retry_exhausted");
+    return true;
+  }
+
+  if (clocks_watchdog_campaign_armed()) {
+    clocks_fragment_retry_note_exhaustion(sequence);
+    g_clocks_fragment_publication_active_retry_exhaustion_count++;
+    clocks_watchdog_anomaly(
+        "clocks_fragment_publication_retry_exhausted",
+        sequence,
+        attempts,
+        g_clocks_fragment_publication_retry_reason_id,
+        g_clocks_fragment_publication_last_exhausted_pending_sequence);
+    return true;
+  }
+
+  // START/STOP/FLASH_CUT command boundaries temporarily disarm the public
+  // watchdog.  Those transactions are already finite; retain exact custody
+  // until their existing lifecycle court resolves, then this same retry court
+  // will either become STOPPED or armed STARTED on a subsequent attempt.
+  return false;
+}
+
 static void clocks_fragment_publish_service(timepop_ctx_t*,
                                                    timepop_diag_t*,
                                                    void* user_data) {
@@ -1243,15 +1374,15 @@ static void clocks_fragment_publish_service(timepop_ctx_t*,
     if (!campaign_embedded) {
       g_clocks_fragment_publication_publish_reject_count++;
       g_clocks_fragment_publication_campaign_row_embed_fail_count++;
+      clocks_fragment_retry_note_failure(
+          sequence,
+          CLOCKS_FRAGMENT_RETRY_REASON_CAMPAIGN_EMBED,
+          retrying_snapshot,
+          false);
       if (!retrying_snapshot) {
-        g_clocks_fragment_publication_retry_snapshot_valid = true;
-        g_clocks_fragment_publication_retry_pi_only = false;
-        g_clocks_fragment_publication_retry_sequence = sequence;
-        g_clocks_fragment_publication_retry_attempt_count = 1U;
         g_clocks_fragment_publication_campaign_retry_count++;
-      } else {
-        g_clocks_fragment_publication_retry_attempt_count++;
       }
+      if (clocks_fragment_retry_finish_if_exhausted(sequence)) return;
       g_clocks_fragment_publication_retry_schedule_count++;
       clocks_fragment_schedule_publish();
       return;
@@ -1265,14 +1396,12 @@ static void clocks_fragment_publish_service(timepop_ctx_t*,
               g_clocks_fragment_publication_clocks_snapshot.live)) ||
       !fragment.add_object("features", clocks_fragment_features_payload())) {
     g_clocks_fragment_publication_publish_reject_count++;
-    if (!retrying_snapshot) {
-      g_clocks_fragment_publication_retry_snapshot_valid = true;
-      g_clocks_fragment_publication_retry_pi_only = false;
-      g_clocks_fragment_publication_retry_sequence = sequence;
-      g_clocks_fragment_publication_retry_attempt_count = 1U;
-    } else {
-      g_clocks_fragment_publication_retry_attempt_count++;
-    }
+    clocks_fragment_retry_note_failure(
+        sequence,
+        CLOCKS_FRAGMENT_RETRY_REASON_CLOCKS_PAYLOAD,
+        retrying_snapshot,
+        false);
+    if (clocks_fragment_retry_finish_if_exhausted(sequence)) return;
     g_clocks_fragment_publication_retry_schedule_count++;
     clocks_fragment_schedule_publish();
     return;
@@ -1291,40 +1420,15 @@ static void clocks_fragment_publish_service(timepop_ctx_t*,
 
   if (!publication_enqueued) {
     g_clocks_fragment_publication_publish_reject_count++;
-    if (!retrying_snapshot) {
-      g_clocks_fragment_publication_retry_snapshot_valid = true;
-      g_clocks_fragment_publication_retry_sequence = sequence;
-      g_clocks_fragment_publication_retry_attempt_count = 1U;
-      if (campaign_embedded) {
-        g_clocks_fragment_publication_campaign_retry_count++;
-      }
-    } else {
-      g_clocks_fragment_publication_retry_attempt_count++;
+    clocks_fragment_retry_note_failure(
+        sequence,
+        CLOCKS_FRAGMENT_RETRY_REASON_TRANSPORT_ENQUEUE,
+        retrying_snapshot,
+        true);
+    if (!retrying_snapshot && campaign_embedded) {
+      g_clocks_fragment_publication_campaign_retry_count++;
     }
-    g_clocks_fragment_publication_retry_pi_only = true;
-
-    if (campaign_state == clocks_campaign_state_t::STOPPED &&
-        g_clocks_fragment_publication_retry_attempt_count >=
-            CLOCKS_FRAGMENT_IDLE_RETRY_MAX_ATTEMPTS) {
-      // No campaign identity is at risk here.  Retire this unreachable
-      // observation exactly and let the next physical second try again.
-      // This turns a Pi-lifetime outage into missing testimony instead of
-      // a foreground retry storm that can starve command responses.
-      g_clocks_fragment_publication_idle_retry_abandon_count++;
-      g_clocks_fragment_publication_idle_retry_last_sequence = sequence;
-      g_clocks_fragment_publication_idle_retry_last_attempt_count =
-          g_clocks_fragment_publication_retry_attempt_count;
-      g_clocks_fragment_publication_retry_snapshot_valid = false;
-      g_clocks_fragment_publication_retry_pi_only = false;
-      g_clocks_fragment_publication_retry_sequence = 0U;
-      g_clocks_fragment_publication_retry_attempt_count = 0U;
-      g_clocks_fragment_publication_clocks_snapshot =
-          clocks_fragment_snapshot_t{};
-      if (g_clocks_fragment_publication_pending) {
-        clocks_fragment_schedule_publish();
-      }
-      return;
-    }
+    if (clocks_fragment_retry_finish_if_exhausted(sequence)) return;
 
     g_clocks_fragment_publication_retry_schedule_count++;
     clocks_fragment_schedule_publish();
@@ -1340,6 +1444,8 @@ static void clocks_fragment_publish_service(timepop_ctx_t*,
   g_clocks_fragment_publication_retry_pi_only = false;
   g_clocks_fragment_publication_retry_sequence = 0U;
   g_clocks_fragment_publication_retry_attempt_count = 0U;
+  g_clocks_fragment_publication_retry_reason_id =
+      CLOCKS_FRAGMENT_RETRY_REASON_NONE;
 
   g_clocks_fragment_publication_clocks_snapshot = clocks_fragment_snapshot_t{};
   if (g_clocks_fragment_publication_pending) clocks_fragment_schedule_publish();
@@ -1630,6 +1736,8 @@ static void clocks_fragment_recover_reset_publication_custody(bool count_recover
   g_clocks_fragment_publication_retry_pi_only = false;
   g_clocks_fragment_publication_retry_sequence = 0U;
   g_clocks_fragment_publication_retry_attempt_count = 0U;
+  g_clocks_fragment_publication_retry_reason_id =
+      CLOCKS_FRAGMENT_RETRY_REASON_NONE;
   g_clocks_fragment_publication_last_tick_valid = false;
   g_clocks_fragment_publication_last_tick_sequence = 0U;
   g_clocks_fragment_publication_campaign_ready_last_valid = false;
@@ -9920,6 +10028,50 @@ static FLASHMEM Payload cmd_report_recovery(const Payload&) {
         g_clocks_fragment_campaign_record_ready_retry_fire_count);
   p.add("campaign_record_ready_retry_cancel_count",
         g_clocks_fragment_campaign_record_ready_retry_cancel_count);
+  p.add("fragment_publication_publish_reject_count",
+        g_clocks_fragment_publication_publish_reject_count);
+  p.add("fragment_publication_retry_active",
+        g_clocks_fragment_publication_retry_snapshot_valid);
+  p.add("fragment_publication_retry_sequence",
+        g_clocks_fragment_publication_retry_sequence);
+  p.add("fragment_publication_retry_attempt_count",
+        g_clocks_fragment_publication_retry_attempt_count);
+  p.add("fragment_publication_retry_reason_id",
+        g_clocks_fragment_publication_retry_snapshot_valid
+            ? g_clocks_fragment_publication_retry_reason_id
+            : CLOCKS_FRAGMENT_RETRY_REASON_NONE);
+  p.add("fragment_publication_retry_reason",
+        clocks_fragment_retry_reason_name(
+            g_clocks_fragment_publication_retry_snapshot_valid
+                ? g_clocks_fragment_publication_retry_reason_id
+                : CLOCKS_FRAGMENT_RETRY_REASON_NONE));
+  p.add("fragment_publication_retry_pi_only",
+        g_clocks_fragment_publication_retry_pi_only);
+  p.add("fragment_publication_retry_schedule_count",
+        g_clocks_fragment_publication_retry_schedule_count);
+  p.add("fragment_publication_retry_success_count",
+        g_clocks_fragment_publication_retry_success_count);
+  p.add("fragment_publication_campaign_row_embed_fail_count",
+        g_clocks_fragment_publication_campaign_row_embed_fail_count);
+  p.add("fragment_publication_service_arm_failures",
+        g_clocks_fragment_publication_service_arm_failures);
+  p.add("fragment_publication_active_retry_max_attempts",
+        (uint32_t)CLOCKS_FRAGMENT_ACTIVE_RETRY_MAX_ATTEMPTS);
+  p.add("fragment_publication_active_retry_exhaustion_count",
+        g_clocks_fragment_publication_active_retry_exhaustion_count);
+  p.add("fragment_publication_recovery_retry_abort_count",
+        g_clocks_fragment_publication_recovery_retry_abort_count);
+  p.add("fragment_publication_last_exhausted_sequence",
+        g_clocks_fragment_publication_last_exhausted_sequence);
+  p.add("fragment_publication_last_exhausted_attempt_count",
+        g_clocks_fragment_publication_last_exhausted_attempt_count);
+  p.add("fragment_publication_last_exhausted_reason_id",
+        g_clocks_fragment_publication_last_exhausted_reason_id);
+  p.add("fragment_publication_last_exhausted_reason",
+        clocks_fragment_retry_reason_name(
+            g_clocks_fragment_publication_last_exhausted_reason_id));
+  p.add("fragment_publication_last_exhausted_pending_sequence",
+        g_clocks_fragment_publication_last_exhausted_pending_sequence);
   p.add("fragment_publication_recovery_reset_count",
         g_clocks_fragment_publication_recovery_reset_count);
   p.add("fragment_publication_retired_retry_sequence",
