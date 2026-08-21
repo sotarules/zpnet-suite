@@ -7026,12 +7026,28 @@ def _alpha_survival_lineage_court(
 
 
 @dataclass(frozen=True)
+class _HolisticInstrumentVerdict:
+    """Proved Alpha/Beta testimony carried from instrument reconciliation.
+
+    This is process-local recovery context, not persisted state.  It prevents the
+    campaign phase from reducing a proved Alpha disposition to a boolean and then
+    independently rediscovering the same producer lifetime.
+    """
+
+    alpha_disposition: str
+    alpha_basis: str
+    alpha_proof: Dict[str, Any]
+    observed_campaign_name: str
+    observed_campaign_state: str
+    surviving_campaign: Optional[Dict[str, Any]]
+
+
+@dataclass(frozen=True)
 class _RecoveryTopologyPlan:
     """One custody verdict for the active-campaign RECOVER transaction.
 
-    Phase 1 keeps the existing recovery executors unchanged.  This object merely
-    makes the already-existing Alpha/Beta decision explicit so later phases can
-    pass one proved topology forward instead of rediscovering it.
+    The executor consumes this verdict after fresh firmware testimony has been
+    reconciled with any proved holistic-startup Alpha custody carried forward.
     """
 
     alpha_action: str
@@ -7052,7 +7068,7 @@ def _plan_active_campaign_recovery_topology(
     *,
     campaign_name: str,
     canonical_recovery_clocks: Dict[str, Any],
-    alpha_resurrected_this_startup: bool,
+    startup_instrument_verdict: Optional[_HolisticInstrumentVerdict],
     epoch_ready_before_recover: bool,
     firmware_campaign_matches_durable: bool,
     physical_reboot_custody: bool,
@@ -7062,6 +7078,31 @@ def _plan_active_campaign_recovery_topology(
     recovery_status_before: Dict[str, Any],
 ) -> _RecoveryTopologyPlan:
     """Classify Alpha and Beta once before the RECOVER executor mutates either."""
+    startup_alpha_disposition = ""
+    startup_alpha_proved = False
+    startup_alpha_proof: Optional[Dict[str, Any]] = None
+    if startup_instrument_verdict is not None:
+        startup_alpha_disposition = str(
+            startup_instrument_verdict.alpha_disposition or ""
+        ).strip().upper()
+        if startup_alpha_disposition not in {"SURVIVED", "RESURRECTED"}:
+            raise RuntimeError(
+                "holistic instrument verdict has invalid Alpha disposition "
+                f"{startup_alpha_disposition!r}"
+            )
+        startup_alpha_proof = copy.deepcopy(startup_instrument_verdict.alpha_proof)
+        startup_alpha_proved = bool(
+            isinstance(startup_alpha_proof, dict)
+            and startup_alpha_proof.get("proved") is True
+        )
+        if not startup_alpha_proved:
+            raise RuntimeError(
+                "holistic instrument verdict lacks proved Alpha custody testimony"
+            )
+
+    startup_alpha_resurrected = startup_alpha_disposition == "RESURRECTED"
+    startup_alpha_survived = startup_alpha_disposition == "SURVIVED"
+
     lifecycle_lost_custody = bool(
         recovery_custody.get("active")
         and not firmware_campaign_matches_durable
@@ -7073,37 +7114,53 @@ def _plan_active_campaign_recovery_topology(
     # Alpha to the last durable checkpoint.  When no physical sequence regression
     # has proved a new Teensy lifetime, require the same independent canonical
     # lineage court used at startup before preserving the live Alpha.
-    recovery_alpha_lineage: Optional[Dict[str, Any]] = None
-    recovery_alpha_survived = False
+    recovery_alpha_lineage: Optional[Dict[str, Any]] = (
+        copy.deepcopy(startup_alpha_proof) if startup_alpha_survived else None
+    )
+    recovery_alpha_survived = bool(startup_alpha_survived)
     if lifecycle_lost_custody and not physical_reboot_custody:
-        with _clocks_lock:
-            recovery_live_state = copy.deepcopy(_latest_clocks)
-            recovery_live_received_monotonic = _latest_clocks_received_monotonic
-        recovery_live_age_s = (
-            None
-            if recovery_live_received_monotonic is None
-            else max(0.0, time.monotonic() - recovery_live_received_monotonic)
-        )
-        recovery_alpha_lineage = _alpha_survival_lineage_court(
-            canonical_recovery_clocks,
-            recovery_live_state,
-            live_age_s=recovery_live_age_s,
-        )
-        recovery_alpha_survived = bool(
-            epoch_ready_before_recover
-            and recovery_alpha_lineage.get("proved") is True
-        )
-        logging.info(
-            "🧭 [recovery] Beta custody absent; Alpha survival court: "
-            "proved=%s epoch_ready=%s durable_update=%s live_update=%s "
-            "live_age_s=%s reasons=%s",
-            recovery_alpha_survived,
-            epoch_ready_before_recover,
-            recovery_alpha_lineage.get("durable_update_count"),
-            recovery_alpha_lineage.get("live_update_count"),
-            recovery_alpha_lineage.get("live_age_s"),
-            recovery_alpha_lineage.get("reasons"),
-        )
+        if startup_alpha_proved:
+            recovery_alpha_lineage = copy.deepcopy(startup_alpha_proof)
+            recovery_alpha_survived = bool(
+                epoch_ready_before_recover
+                and startup_alpha_disposition in {"SURVIVED", "RESURRECTED"}
+            )
+            logging.info(
+                "🧭 [recovery] Beta custody absent; carrying proved holistic Alpha "
+                "verdict forward: disposition=%s basis=%s epoch_ready=%s",
+                startup_alpha_disposition,
+                startup_instrument_verdict.alpha_basis,
+                epoch_ready_before_recover,
+            )
+        else:
+            with _clocks_lock:
+                recovery_live_state = copy.deepcopy(_latest_clocks)
+                recovery_live_received_monotonic = _latest_clocks_received_monotonic
+            recovery_live_age_s = (
+                None
+                if recovery_live_received_monotonic is None
+                else max(0.0, time.monotonic() - recovery_live_received_monotonic)
+            )
+            recovery_alpha_lineage = _alpha_survival_lineage_court(
+                canonical_recovery_clocks,
+                recovery_live_state,
+                live_age_s=recovery_live_age_s,
+            )
+            recovery_alpha_survived = bool(
+                epoch_ready_before_recover
+                and recovery_alpha_lineage.get("proved") is True
+            )
+            logging.info(
+                "🧭 [recovery] Beta custody absent; Alpha survival court: "
+                "proved=%s epoch_ready=%s durable_update=%s live_update=%s "
+                "live_age_s=%s reasons=%s",
+                recovery_alpha_survived,
+                epoch_ready_before_recover,
+                recovery_alpha_lineage.get("durable_update_count"),
+                recovery_alpha_lineage.get("live_update_count"),
+                recovery_alpha_lineage.get("live_age_s"),
+                recovery_alpha_lineage.get("reasons"),
+            )
 
     cold_restore_custody = bool(
         physical_reboot_custody
@@ -7115,7 +7172,7 @@ def _plan_active_campaign_recovery_topology(
     # while Beta alone was surrendered.  Both topologies preserve the current
     # Alpha and recreate only the recording lifecycle.
     campaign_bootstrap_basis: Optional[str] = None
-    if alpha_resurrected_this_startup:
+    if startup_alpha_resurrected:
         campaign_bootstrap_basis = "ALPHA_RESURRECTED_THIS_STARTUP"
     elif (
         epoch_ready_before_recover
@@ -7130,7 +7187,7 @@ def _plan_active_campaign_recovery_topology(
             "startup_recovery_topology_conflict",
             {
                 "campaign": campaign_name,
-                "alpha_resurrected_this_startup": True,
+                "alpha_resurrected_this_startup": bool(startup_alpha_resurrected),
                 "physical_reboot_custody": bool(physical_reboot_custody),
                 "lifecycle_lost_custody": bool(lifecycle_lost_custody),
                 "teensy_campaign_state_before_recover": reported_campaign_state or None,
@@ -7142,7 +7199,7 @@ def _plan_active_campaign_recovery_topology(
             "campaign_bootstrap_alpha_not_ready",
             {
                 "campaign": campaign_name,
-                "alpha_resurrected_this_startup": True,
+                "alpha_resurrected_this_startup": bool(startup_alpha_resurrected),
                 "teensy_campaign_state_before_recover": reported_campaign_state or None,
                 "recovery_status_before": recovery_status_before,
             },
@@ -7168,7 +7225,9 @@ def _plan_active_campaign_recovery_topology(
     )
 
 
-def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
+def _restore_instrument_from_clocks(
+    detail: Dict[str, Any],
+) -> Tuple[Dict[str, Any], _HolisticInstrumentVerdict]:
     clocks = _clocks_payload(detail)
     gnss_raw = _clocks_gnss_raw_payload(detail)
     if not _canonical_instrument_restore_ready(
@@ -7182,8 +7241,11 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
         teensy_payload: Dict[str, Any],
         *,
         basis: str,
+        alpha_proof: Dict[str, Any],
+        observed_campaign_name: str,
+        observed_campaign_state: str,
         surviving_campaign: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+    ) -> Tuple[Dict[str, Any], _HolisticInstrumentVerdict]:
         """Restore only Pi-owned custody when firmware proves Alpha survived."""
         ppb_refresh = _refresh_ppb_checkpoint_from_proved_alpha()
         pi_control = _dac_restore_control_from_clocks(clocks, realize=True)
@@ -7199,7 +7261,7 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
         startup_custody = _quarantine_startup_clocks_custody_surviving_alpha(
             "surviving_alpha_pi_state_not_yet_restored"
         )
-        return {
+        result = {
             "success": True,
             "mode": "SURVIVING_ALPHA_CUSTODY",
             "alpha_resurrected_this_startup": False,
@@ -7218,6 +7280,15 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
                 "canonical_gap_intentional": False,
             },
         }
+        verdict = _HolisticInstrumentVerdict(
+            alpha_disposition="SURVIVED",
+            alpha_basis=basis,
+            alpha_proof=copy.deepcopy(alpha_proof),
+            observed_campaign_name=str(observed_campaign_name or "").strip(),
+            observed_campaign_state=str(observed_campaign_state or "").strip().upper(),
+            surviving_campaign=copy.deepcopy(surviving_campaign),
+        )
+        return result, verdict
 
     # First ask the dedicated, non-mutating firmware lifecycle surface whether
     # the same campaign is already alive.  This is the strongest Pi-only restart
@@ -7479,6 +7550,9 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
         return complete_surviving_alpha_reattach(
             lifecycle_status,
             basis="TEENSY_REPORT_RECOVERY_SURVIVING_ALPHA_CUSTODY",
+            alpha_proof=alpha_lineage,
+            observed_campaign_name=firmware_campaign,
+            observed_campaign_state=firmware_campaign_state,
             surviving_campaign=(
                 surviving_campaign if surviving_campaign_proved else None
             ),
@@ -7533,6 +7607,9 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
         return complete_surviving_alpha_reattach(
             payload,
             basis="TEENSY_RESTORE_MONITOR_LIVE_CAMPAIGN_CUSTODY",
+            alpha_proof=alpha_lineage,
+            observed_campaign_name=str(payload.get("campaign") or "").strip(),
+            observed_campaign_state=campaign_state,
             surviving_campaign=(
                 surviving_campaign if surviving_campaign_proved else None
             ),
@@ -7662,7 +7739,7 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
     # Reacquire the exact current Alpha rings before campaign recovery proceeds.
     ppb_refresh = _refresh_ppb_checkpoint_from_proved_alpha()
 
-    return {
+    result = {
         "success": True,
         "mode": "HOLISTIC_INSTRUMENT",
         "alpha_resurrected_this_startup": True,
@@ -7673,12 +7750,21 @@ def _restore_instrument_from_clocks(detail: Dict[str, Any]) -> Dict[str, Any]:
         "better_buckets_post_resurrection_refresh": ppb_refresh,
         "proof": proof,
     }
+    verdict = _HolisticInstrumentVerdict(
+        alpha_disposition="RESURRECTED",
+        alpha_basis="HOLISTIC_ALPHA_N_PLUS_ONE_PROOF",
+        alpha_proof=copy.deepcopy(proof),
+        observed_campaign_name=str(payload.get("campaign") or "").strip(),
+        observed_campaign_state=str(payload.get("campaign_state") or "").strip().upper(),
+        surviving_campaign=None,
+    )
+    return result, verdict
 
 
 def _reattach_surviving_campaign_without_recover(
     *,
     active_campaign: Dict[str, Any],
-    instrument_result: Dict[str, Any],
+    instrument_verdict: _HolisticInstrumentVerdict,
 ) -> Dict[str, Any]:
     """Rejoin a surviving Alpha+Beta campaign without mutating Teensy state.
 
@@ -7696,7 +7782,11 @@ def _reattach_surviving_campaign_without_recover(
     global _post_recovery_first_public_pps_vclock_count
 
     campaign_name = str(active_campaign.get("campaign") or "").strip()
-    proof = instrument_result.get("surviving_campaign")
+    if str(instrument_verdict.alpha_disposition).strip().upper() != "SURVIVED":
+        raise RuntimeError(
+            "surviving campaign reattach requires a carried surviving-Alpha verdict"
+        )
+    proof = instrument_verdict.surviving_campaign
     if not campaign_name or not isinstance(proof, dict) or proof.get("proved") is not True:
         raise RuntimeError("surviving campaign reattach lacks an explicit proved custody verdict")
     if str(proof.get("campaign") or "").strip() != campaign_name:
@@ -7904,6 +7994,7 @@ def _holistic_restore(
             active_campaign.get("campaign"),
         )
 
+    instrument_verdict: Optional[_HolisticInstrumentVerdict] = None
     try:
         if detail is not None:
             logging.info(
@@ -7911,7 +8002,8 @@ def _holistic_restore(
                 "(skipped_unrecoverable=%d)",
                 detail.get("sequence"), skipped,
             )
-            result["instrument"] = _restore_instrument_from_clocks(detail)
+            instrument_result, instrument_verdict = _restore_instrument_from_clocks(detail)
+            result["instrument"] = instrument_result
         else:
             logging.info(
                 "ℹ️ [holistic restore] no structured-recoverable CLOCKS detail; "
@@ -7929,27 +8021,24 @@ def _holistic_restore(
         _clocks_holistic_restore_proof_pending.clear()
 
     if active_campaign is not None:
-        instrument_result = result.get("instrument")
-        alpha_resurrected_this_startup = bool(
-            isinstance(instrument_result, dict)
-            and instrument_result.get("alpha_resurrected_this_startup") is True
-            and isinstance(instrument_result.get("proof"), dict)
-            and instrument_result["proof"].get("proved") is True
-        )
         surviving_campaign = (
-            instrument_result.get("surviving_campaign")
-            if isinstance(instrument_result, dict)
+            instrument_verdict.surviving_campaign
+            if instrument_verdict is not None
             else None
         )
         if isinstance(surviving_campaign, dict) and surviving_campaign.get("proved") is True:
+            if instrument_verdict is None:
+                raise RuntimeError(
+                    "surviving campaign proof exists without holistic instrument verdict"
+                )
             result["campaign"] = _reattach_surviving_campaign_without_recover(
                 active_campaign=active_campaign,
-                instrument_result=instrument_result,
+                instrument_verdict=instrument_verdict,
             )
         else:
             result["campaign"] = _restore_active_campaign_state(
                 preverified_location=preverified_location,
-                alpha_resurrected_this_startup=alpha_resurrected_this_startup,
+                startup_instrument_verdict=instrument_verdict,
             )
 
     result["completed_at_utc"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -13623,15 +13712,15 @@ def cmd_resume(args: Optional[dict]) -> dict:
 def _restore_active_campaign_state(
     *,
     preverified_location: Optional[Dict[str, Any]] = None,
-    alpha_resurrected_this_startup: bool = False,
+    startup_instrument_verdict: Optional[_HolisticInstrumentVerdict] = None,
 ) -> Dict[str, Any]:
-    """RECOVER — exact-first-row architecture with explicit startup topology.
+    """RECOVER — exact-first-row execution from one proved topology context.
 
-    ``alpha_resurrected_this_startup`` is custody testimony, not a health flag.
-    When true, Alpha has already been restored and durably proved during this
-    process startup while Beta campaign state was lost.  Independently, a proved
-    surviving Alpha with the durable active campaign absent from firmware is the
-    same topology: preserve Alpha and bootstrap only the recording lifecycle.
+    Holistic startup carries its proved Alpha disposition into this executor.
+    Live recovery entry points have no prior verdict and still run the ordinary
+    Alpha/Beta court locally.  Fresh REPORT_RECOVERY remains a mutation-time
+    witness, but startup Alpha custody is no longer reduced to a boolean and
+    independently rediscovered here.
     """
     global _campaign_active, _accepted_pps_vclock_count
     global _last_pps_vclock_count_seen
@@ -14065,7 +14154,7 @@ def _restore_active_campaign_state(
     recovery_plan = _plan_active_campaign_recovery_topology(
         campaign_name=campaign_name,
         canonical_recovery_clocks=canonical_recovery_clocks,
-        alpha_resurrected_this_startup=alpha_resurrected_this_startup,
+        startup_instrument_verdict=startup_instrument_verdict,
         epoch_ready_before_recover=epoch_ready_before_recover,
         firmware_campaign_matches_durable=firmware_campaign_matches_durable,
         physical_reboot_custody=physical_reboot_custody,
@@ -14075,9 +14164,8 @@ def _restore_active_campaign_state(
         recovery_status_before=recovery_status_before,
     )
 
-    # Phase 1 deliberately leaves the proven RECOVER executor unchanged.  These
-    # local aliases preserve its current inputs while the decision itself now
-    # has one explicit, inspectable topology verdict.
+    # The proven RECOVER executor remains unchanged.  These local aliases retain
+    # its existing inputs while all topology authority now comes from one plan.
     lifecycle_lost_custody = recovery_plan.lifecycle_lost_custody
     recovery_alpha_lineage = recovery_plan.alpha_lineage
     recovery_alpha_survived = recovery_plan.alpha_survived
@@ -14120,7 +14208,19 @@ def _restore_active_campaign_state(
     )
     _diag["last_recovery"]["restore_alpha_required"] = bool(cold_restore_custody)
     _diag["last_recovery"]["alpha_resurrected_this_startup"] = bool(
-        alpha_resurrected_this_startup
+        startup_instrument_verdict is not None
+        and str(startup_instrument_verdict.alpha_disposition).strip().upper()
+            == "RESURRECTED"
+    )
+    _diag["last_recovery"]["startup_instrument_verdict"] = (
+        {
+            "alpha_disposition": startup_instrument_verdict.alpha_disposition,
+            "alpha_basis": startup_instrument_verdict.alpha_basis,
+            "observed_campaign_name": startup_instrument_verdict.observed_campaign_name or None,
+            "observed_campaign_state": startup_instrument_verdict.observed_campaign_state or None,
+        }
+        if startup_instrument_verdict is not None
+        else None
     )
     _diag["last_recovery"]["campaign_bootstrap_required"] = bool(
         campaign_bootstrap_required
@@ -14245,7 +14345,9 @@ def _restore_active_campaign_state(
                 "campaign": campaign_name,
                 "recover_mode": recover_mode,
                 "alpha_resurrected_this_startup": bool(
-                    alpha_resurrected_this_startup
+                    startup_instrument_verdict is not None
+                    and str(startup_instrument_verdict.alpha_disposition).strip().upper()
+                        == "RESURRECTED"
                 ),
                 "campaign_bootstrap_basis": campaign_bootstrap_basis,
                 "teensy_campaign_before_recover": reported_campaign_name or None,
@@ -14593,7 +14695,10 @@ def _restore_active_campaign_state(
     )
 
     ppb_post_campaign_bootstrap_refresh: Optional[Dict[str, Any]] = None
-    if campaign_bootstrap and alpha_resurrected_this_startup:
+    if (
+        campaign_bootstrap
+        and campaign_bootstrap_basis == "ALPHA_RESURRECTED_THIS_STARTUP"
+    ):
         # CAMPAIGN_BOOTSTRAP explicitly preserves the Alpha epoch proved earlier in
         # this startup, but its private Beta handoff may consume one or more Alpha
         # statistical updates without publishing an ordinary Pi-observed CLOCKS row.

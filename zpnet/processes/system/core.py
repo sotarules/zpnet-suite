@@ -70,6 +70,16 @@ GNSS_ANNOUNCEMENT_TOPIC = "GNSS_ANNOUNCEMENT"
 GNSS_MONITOR_FRESHNESS_MAX_AGE_S = 2.5
 GNSS_ANNOUNCEMENT_HISTORY_MAX = 8
 
+# Application-level readiness.  systemd starts processes; SYSTEM decides when
+# platform services are actually usable.  PostgreSQL is proved by a real query,
+# while externally-authored dynamic feature leaves (for example PUBSUB's
+# TEENSY_RPC) must be refreshed before their TTL expires.
+POSTGRES_PROBE_INTERVAL_S = 1.0
+POSTGRES_STATUS_LOG_INTERVAL_S = 30.0
+EXTERNAL_FEATURE_EXPIRY_POLL_S = 1.0
+EXTERNAL_FEATURE_TTL_MIN_S = 1.0
+EXTERNAL_FEATURE_TTL_MAX_S = 300.0
+
 # ------------------------------------------------------------------
 # Raspberry Pi status configuration
 # ------------------------------------------------------------------
@@ -243,6 +253,14 @@ _SYSTEM_LOCK = threading.Lock()
 # startup and updated only by SYSTEM.SET_LOCATION.
 _CURRENT_LOCATION_LOCK = threading.Lock()
 _CURRENT_LOCATION: Optional[str] = None
+_CURRENT_LOCATION_LOADED = threading.Event()
+
+# PostgreSQL readiness is a live application fact, not a process-ordering
+# assumption.  Other Pi subsystems may eventually consume PI.SYSTEM.POSTGRES
+# from SYSTEM.features; SYSTEM itself uses this event only to avoid DB work while
+# the service is unavailable.
+_POSTGRES_READY = threading.Event()
+_POSTGRES_EVER_READY = False
 
 # GNSS publishes predictive TPS1 announcements.  Retain a short history so
 # CLOCKS can select the announcement naming its completed UTC second rather
@@ -267,6 +285,11 @@ FEATURE_STATUSES = {"INITIALIZING", "NOMINAL", "HOLD", "ANOMALY"}
 _FEATURE_LOCK = threading.Lock()
 _PI_FEATURES: Dict[str, Dict[str, Dict[str, str]]] = {"PI": {}}
 
+# Canonical feature output remains scalar-only.  Freshness metadata lives beside
+# it so a dynamic owner can refresh a leaf without changing CLOCKS.features JSON.
+# If the owner disappears, SYSTEM expires the scalar leaf to HOLD.
+_EXTERNAL_FEATURE_META: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
 
 def _health_to_feature_status(health_state: Any) -> str:
     return normalize_feature_status(health_state, default="INITIALIZING")
@@ -277,7 +300,7 @@ def set_pi_feature(subsystem: str,
                    status: Any,
                    detail: str = "",
                    **extra: Any) -> str:
-    """Set one Pi-authored feature status in the local SYSTEM registry."""
+    """Set one locally-owned Pi feature and clear any external freshness lease."""
     subsystem_key = str(subsystem or "").strip().upper()
     feature_key = str(feature or "").strip().upper()
     if not subsystem_key or not feature_key:
@@ -286,14 +309,88 @@ def set_pi_feature(subsystem: str,
     value = normalize_feature_status(status)
     with _FEATURE_LOCK:
         subsystem_map = _PI_FEATURES.setdefault("PI", {}).setdefault(subsystem_key, {})
-        if subsystem_map.get(feature_key) == value:
-            return value
         subsystem_map[feature_key] = value
+        _EXTERNAL_FEATURE_META.pop((subsystem_key, feature_key), None)
 
-    # detail/extra are accepted for compatibility with earlier callers, but
-    # the feature-state substrate is deliberately scalar-only.
+    # detail/extra are accepted for compatibility with earlier callers; canonical
+    # feature state remains deliberately scalar-only.
     _ = detail, extra
     return value
+
+
+def _set_external_pi_feature(
+    subsystem: str,
+    feature: str,
+    status: Any,
+    *,
+    ttl_s: float,
+    generation: Any = None,
+) -> str:
+    """Set one externally refreshed Pi feature with an expiring freshness lease."""
+    subsystem_key = str(subsystem or "").strip().upper()
+    feature_key = str(feature or "").strip().upper()
+    if not subsystem_key or not feature_key:
+        raise ValueError("subsystem and feature are required")
+    ttl = float(ttl_s)
+    if not (EXTERNAL_FEATURE_TTL_MIN_S <= ttl <= EXTERNAL_FEATURE_TTL_MAX_S):
+        raise ValueError(
+            f"ttl_s must be between {EXTERNAL_FEATURE_TTL_MIN_S:.1f} and "
+            f"{EXTERNAL_FEATURE_TTL_MAX_S:.1f} seconds"
+        )
+
+    value = normalize_feature_status(status)
+    observed = time.monotonic()
+    with _FEATURE_LOCK:
+        subsystem_map = _PI_FEATURES.setdefault("PI", {}).setdefault(subsystem_key, {})
+        subsystem_map[feature_key] = value
+        _EXTERNAL_FEATURE_META[(subsystem_key, feature_key)] = {
+            "observed_monotonic": observed,
+            "ttl_s": ttl,
+            "generation": copy.deepcopy(generation),
+            "expired": False,
+        }
+    return value
+
+
+def _external_feature_metadata(subsystem: str, feature: str) -> Dict[str, Any]:
+    key = (str(subsystem).strip().upper(), str(feature).strip().upper())
+    with _FEATURE_LOCK:
+        meta = copy.deepcopy(_EXTERNAL_FEATURE_META.get(key) or {})
+    if not meta:
+        return {}
+    observed = meta.pop("observed_monotonic", None)
+    if observed is not None:
+        meta["age_s"] = round(max(0.0, time.monotonic() - float(observed)), 3)
+    return meta
+
+
+def _expire_external_pi_features() -> list[str]:
+    """Move stale externally-refreshed feature leaves to HOLD exactly once."""
+    now = time.monotonic()
+    expired: list[str] = []
+    with _FEATURE_LOCK:
+        for (subsystem, feature), meta in _EXTERNAL_FEATURE_META.items():
+            if bool(meta.get("expired")):
+                continue
+            observed = float(meta["observed_monotonic"])
+            ttl_s = float(meta["ttl_s"])
+            if now - observed <= ttl_s:
+                continue
+            subsystem_map = _PI_FEATURES.setdefault("PI", {}).setdefault(subsystem, {})
+            subsystem_map[feature] = "HOLD"
+            meta["expired"] = True
+            expired.append(f"PI.{subsystem}.{feature}")
+    return expired
+
+
+def _external_feature_expiry_loop() -> None:
+    while True:
+        for name in _expire_external_pi_features():
+            logging.warning(
+                "⏳ [system/readiness] external feature freshness expired: %s -> HOLD",
+                name,
+            )
+        time.sleep(EXTERNAL_FEATURE_EXPIRY_POLL_S)
 
 
 def _copy_feature_tree(tree: Any) -> Dict[str, Dict[str, Dict[str, str]]]:
@@ -1464,6 +1561,93 @@ def build_battery_status() -> dict:
 
 
 # ------------------------------------------------------------------
+# Application-level infrastructure readiness
+# ------------------------------------------------------------------
+
+
+def _postgres_probe_once() -> None:
+    """Prove PostgreSQL usability with an actual round trip."""
+    with open_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        row = cur.fetchone()
+    if row is None:
+        raise RuntimeError("PostgreSQL SELECT 1 returned no row")
+
+
+def _postgres_mark_unavailable(error: BaseException, *, initial: bool = False) -> None:
+    global _POSTGRES_EVER_READY
+    was_ready = _POSTGRES_READY.is_set()
+    _POSTGRES_READY.clear()
+    status = "INITIALIZING" if initial and not _POSTGRES_EVER_READY else "HOLD"
+    set_pi_feature("SYSTEM", "POSTGRES", status)
+    if was_ready:
+        logging.warning(
+            "⏳ [system/readiness] PostgreSQL availability lost: %s",
+            error,
+        )
+
+
+def _postgres_monitor_loop() -> None:
+    """Continuously author PI.SYSTEM.POSTGRES from real DB transactions."""
+    global _POSTGRES_EVER_READY
+    last_log = 0.0
+    last_error = "not yet probed"
+
+    while True:
+        try:
+            _postgres_probe_once()
+            became_ready = not _POSTGRES_READY.is_set()
+            _POSTGRES_READY.set()
+            _POSTGRES_EVER_READY = True
+            set_pi_feature("SYSTEM", "POSTGRES", "NOMINAL")
+            if became_ready:
+                logging.info("✅ [system/readiness] PostgreSQL transaction plane NOMINAL")
+
+            if not _CURRENT_LOCATION_LOADED.is_set():
+                try:
+                    _load_current_location_from_config()
+                except Exception as exc:
+                    now = time.monotonic()
+                    if now - last_log >= POSTGRES_STATUS_LOG_INTERVAL_S:
+                        logging.exception(
+                            "💥 [system/readiness] PostgreSQL is NOMINAL but durable "
+                            "config.SYSTEM could not be loaded"
+                        )
+                        last_log = now
+                    last_error = str(exc)
+                else:
+                    last_error = ""
+        except Exception as exc:
+            last_error = str(exc)
+            initial = not _POSTGRES_EVER_READY
+            _postgres_mark_unavailable(exc, initial=initial)
+            now = time.monotonic()
+            if now - last_log >= POSTGRES_STATUS_LOG_INTERVAL_S:
+                logging.info(
+                    "⏳ [system/readiness] waiting for PostgreSQL transaction plane: %s",
+                    last_error,
+                )
+                last_log = now
+
+        time.sleep(POSTGRES_PROBE_INTERVAL_S)
+
+
+def _battery_postgres_hold_payload(reason: str) -> Dict[str, Any]:
+    return {
+        "remaining_pct": None,
+        "tte_minutes": None,
+        "wh_used_since_recharge": None,
+        "wh_remaining_estimate": None,
+        "samples_used": 0,
+        "sample_step": POWER_SAMPLE_STEP,
+        "battery_capacity_wh": BATTERY_CAPACITY_WH,
+        "health_state": "HOLD",
+        "readiness_reason": str(reason),
+    }
+
+
+# ------------------------------------------------------------------
 # Pi context publication surface
 # ------------------------------------------------------------------
 
@@ -1478,46 +1662,67 @@ def _update_pi_context(snapshot: Dict[str, Any]) -> None:
 
 
 def system_poller() -> None:
-    """Refresh the complete Pi-owned platform context for SYSTEM.REPORT."""
-    try:
-        while True:
-            pi_payload = build_pi_status()
-            network_payload = build_network_status()
-            sensor_payload = build_sensor_scan_status()
-            environment_payload = build_environment_status()
-            gnss_payload = build_gnss_status()
-            power_payload = build_power_status()
-            battery_payload = build_battery_status()
+    """Refresh platform context without treating PostgreSQL outage as process failure."""
+    while True:
+        pi_payload = build_pi_status()
+        network_payload = build_network_status()
+        sensor_payload = build_sensor_scan_status()
+        environment_payload = build_environment_status()
+        gnss_payload = build_gnss_status()
+        power_payload = build_power_status()
 
-            _update_builtin_pi_features(
-                pi_payload=pi_payload,
-                network_payload=network_payload,
-                sensor_payload=sensor_payload,
-                environment_payload=environment_payload,
-                gnss_payload=gnss_payload,
-                power_payload=power_payload,
-                battery_payload=battery_payload,
+        if _POSTGRES_READY.is_set():
+            try:
+                battery_payload = build_battery_status()
+            except Exception as exc:
+                _postgres_mark_unavailable(exc)
+                logging.warning(
+                    "⏳ [system/readiness] battery history unavailable with PostgreSQL; "
+                    "publishing HOLD context: %s",
+                    exc,
+                )
+                battery_payload = _battery_postgres_hold_payload(str(exc))
+        else:
+            battery_payload = _battery_postgres_hold_payload(
+                "PI.SYSTEM.POSTGRES is not NOMINAL"
             )
 
-            pi_context = {
-                "pi": dict(pi_payload),
-                "network": dict(network_payload),
-                "sensors": dict(sensor_payload),
-                "environment": dict(environment_payload),
-                "gnss": dict(gnss_payload),
-                "power": dict(power_payload),
-                "battery": dict(battery_payload),
-            }
-            _update_pi_context(pi_context)
+        _update_builtin_pi_features(
+            pi_payload=pi_payload,
+            network_payload=network_payload,
+            sensor_payload=sensor_payload,
+            environment_payload=environment_payload,
+            gnss_payload=gnss_payload,
+            power_payload=power_payload,
+            battery_payload=battery_payload,
+        )
 
-            # Persist only the slow Pi context.  The 1 Hz CLOCKS publication,
-            # its Teensy fragment, and live CLOCKS block are intentionally
-            # ephemeral latest-state telemetry.
-            create_event("SYSTEM_STATUS", pi_context)
-            time.sleep(POLL_INTERVAL_SEC)
+        pi_context = {
+            "pi": dict(pi_payload),
+            "network": dict(network_payload),
+            "sensors": dict(sensor_payload),
+            "environment": dict(environment_payload),
+            "gnss": dict(gnss_payload),
+            "power": dict(power_payload),
+            "battery": dict(battery_payload),
+        }
+        _update_pi_context(pi_context)
 
-    except Exception:
-        logging.exception("[system_poller] unhandled exception - poller thread terminating")
+        # Persist slow context only while PostgreSQL has current transaction proof.
+        # A race where the DB disappears after the probe is classified back to HOLD
+        # and retried on the next ordinary poll; no process restart is required.
+        if _POSTGRES_READY.is_set():
+            try:
+                create_event("SYSTEM_STATUS", pi_context)
+            except Exception as exc:
+                _postgres_mark_unavailable(exc)
+                logging.warning(
+                    "⏳ [system/readiness] SYSTEM_STATUS persistence deferred because "
+                    "PostgreSQL became unavailable: %s",
+                    exc,
+                )
+
+        time.sleep(POLL_INTERVAL_SEC)
 
 
 # ------------------------------------------------------------------
@@ -1577,6 +1782,7 @@ def _load_current_location_from_config() -> Optional[str]:
 
     with _CURRENT_LOCATION_LOCK:
         _CURRENT_LOCATION = selected
+    _CURRENT_LOCATION_LOADED.set()
 
     logging.info(
         "📍 [system] restored current_location=%s from config.SYSTEM",
@@ -1623,7 +1829,11 @@ def _set_current_location_cache(location: Optional[str]) -> None:
 
 
 def _apply_current_location_to_gnss(*, context: str) -> Dict[str, Any]:
-    """Make receiver mode agree with SYSTEM.current_location and return testimony."""
+    """Make receiver mode agree with the loaded durable SYSTEM location selection."""
+    if not _CURRENT_LOCATION_LOADED.is_set():
+        raise RuntimeError(
+            "durable SYSTEM current_location is not loaded; waiting for PI.SYSTEM.POSTGRES"
+        )
     location = _current_location()
     args = (
         {"mode": "TO", "location": location}
@@ -1688,6 +1898,7 @@ def _location_context(gnss_payload: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "current_location": selected,
         "selection": selected or "NONE",
+        "durable_selection_loaded": _CURRENT_LOCATION_LOADED.is_set(),
         "requested_mode": "TO" if selected is not None else "NORMAL",
         "receiver_mode": (
             survey.get("receiver_mode")
@@ -1753,6 +1964,11 @@ def _refresh_feature_payload_from_registry() -> dict:
 
 def cmd_set_location(args: Optional[dict]) -> Dict:
     """Select a named fixed location, or NONE for ordinary GF-8802 navigation."""
+    if not _CURRENT_LOCATION_LOADED.is_set():
+        return {
+            "success": False,
+            "message": "durable SYSTEM config is not loaded; PI.SYSTEM.POSTGRES is not ready",
+        }
     if not args or "location" not in args:
         return {"success": False, "message": "SET_LOCATION requires 'location'"}
 
@@ -1824,6 +2040,11 @@ def cmd_set_location(args: Optional[dict]) -> Dict:
 
 def cmd_capture_location(args: Optional[dict]) -> Dict:
     """Capture a named GF-8802 location while SYSTEM explicitly owns NONE."""
+    if not _CURRENT_LOCATION_LOADED.is_set():
+        return {
+            "success": False,
+            "message": "durable SYSTEM config is not loaded; PI.SYSTEM.POSTGRES is not ready",
+        }
     if not args or "location" not in args:
         return {"success": False, "message": "CAPTURE_LOCATION requires 'location'"}
 
@@ -1960,6 +2181,12 @@ def cmd_get_feature(args: Optional[dict]) -> Dict:
     except ValueError as e:
         return {"success": False, "message": str(e)}
 
+    parts = name.split(".")
+    metadata = (
+        _external_feature_metadata(parts[1], parts[2])
+        if len(parts) == 3 and parts[0] == "PI"
+        else {}
+    )
     return {
         "success": True,
         "message": "OK",
@@ -1967,6 +2194,7 @@ def cmd_get_feature(args: Optional[dict]) -> Dict:
             "name": name,
             "known": entry is not None,
             "status": status,
+            **metadata,
         },
     }
 
@@ -1986,12 +2214,24 @@ def cmd_set_feature(args: Optional[dict]) -> Dict:
 
     subsystem = str(args.get("subsystem") or "")
     feature = str(args.get("feature") or "")
+    ttl_raw = args.get("ttl_s")
+    generation = args.get("generation")
     try:
-        status = set_pi_feature(subsystem, feature, raw_status)
-    except ValueError as e:
+        if ttl_raw is None:
+            status = set_pi_feature(subsystem, feature, raw_status)
+        else:
+            status = _set_external_pi_feature(
+                subsystem,
+                feature,
+                raw_status,
+                ttl_s=float(ttl_raw),
+                generation=generation,
+            )
+    except (TypeError, ValueError) as e:
         return {"success": False, "message": str(e)}
 
     _refresh_feature_payload_from_registry()
+    metadata = _external_feature_metadata(subsystem, feature)
     return {
         "success": True,
         "message": "OK",
@@ -1999,11 +2239,24 @@ def cmd_set_feature(args: Optional[dict]) -> Dict:
             "subsystem": subsystem.strip().upper(),
             "feature": feature.strip().upper(),
             "status": status,
+            **metadata,
         },
     }
 
 def cmd_swap_battery(_: Optional[dict]) -> Dict:
-    create_event("SWAP_BATTERY", None)
+    if not _POSTGRES_READY.is_set():
+        return {
+            "success": False,
+            "message": "SWAP_BATTERY requires PI.SYSTEM.POSTGRES=NOMINAL",
+        }
+    try:
+        create_event("SWAP_BATTERY", None)
+    except Exception as exc:
+        _postgres_mark_unavailable(exc)
+        return {
+            "success": False,
+            "message": f"SWAP_BATTERY persistence failed: {exc}",
+        }
     return {
         "success": True,
         "message": "OK",
@@ -2029,34 +2282,48 @@ COMMANDS = {
 
 def run() -> None:
     setup_logging()
-    try:
-        _load_current_location_from_config()
 
-        server_setup(
-            subsystem="SYSTEM",
-            commands=COMMANDS,
-            publication_handler=on_publication,
-            blocking=False,
-        )
+    # Readiness leaves exist before their owners have proved anything.  This lets
+    # independently starting processes query SYSTEM immediately after its command
+    # socket appears without confusing process existence with service readiness.
+    set_pi_feature("SYSTEM", "POSTGRES", "INITIALIZING")
+    set_pi_feature("PUBSUB", "TEENSY_RPC", "INITIALIZING")
 
-        # Formal PUBSUB topology already exists independently of SYSTEM process
-        # lifetime. Start platform observation immediately; CLOCKS readiness
-        # gates consume the resulting facts rather than waiting on a fixed timer.
-        threading.Thread(
-            target=system_poller,
-            daemon=True,
-            name="system-poller",
-        ).start()
+    # Expose SYSTEM before touching PostgreSQL.  Database startup/restart is a
+    # normal infrastructure state underneath this long-lived application process.
+    server_setup(
+        subsystem="SYSTEM",
+        commands=COMMANDS,
+        publication_handler=on_publication,
+        blocking=False,
+    )
 
-        logging.info(
-            "🏁 [system] entering context-only main loop; CLOCKS owns its stream, "
-            "persistence, and holistic restore"
-        )
-        while True:
-            time.sleep(3600)
+    threading.Thread(
+        target=_postgres_monitor_loop,
+        daemon=True,
+        name="system-postgres-readiness",
+    ).start()
+    threading.Thread(
+        target=_external_feature_expiry_loop,
+        daemon=True,
+        name="system-feature-expiry",
+    ).start()
 
-    except Exception:
-        logging.exception("💥 [system] unhandled exception in main thread")
+    # Formal PUBSUB topology already exists independently of SYSTEM process
+    # lifetime. Start platform observation immediately; DB-dependent observations
+    # remain HOLD until PI.SYSTEM.POSTGRES is proved NOMINAL.
+    threading.Thread(
+        target=system_poller,
+        daemon=True,
+        name="system-poller",
+    ).start()
+
+    logging.info(
+        "🏁 [system] entering context/readiness main loop; CLOCKS owns its stream, "
+        "persistence, and holistic restore"
+    )
+    while True:
+        time.sleep(3600)
 
 
 if __name__ == "__main__":

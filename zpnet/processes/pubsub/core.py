@@ -79,6 +79,14 @@ TRANSPORT_RETRY_INTERVAL_S = 0.25   # retry transport subsystem initialization i
 TRANSPORT_STATE_POLL_S = 0.10       # observe ready/lost generations without busy-spinning
 RPC_REPLY_POLL_S = 0.10             # wake promptly when a transport generation disappears
 
+# A serial generation is necessary but not sufficient for command readiness.
+# Prove the Pi->Teensy->Pi request/response plane with a short non-mutating
+# PUBSUB.REPORT round trip and refresh that generation-bound fact into SYSTEM.
+TEENSY_RPC_PROBE_INTERVAL_S = 3.0
+TEENSY_RPC_PROBE_TIMEOUT_S = 2.0
+TEENSY_RPC_FEATURE_TTL_S = 10.0
+TEENSY_RPC_STATUS_LOG_INTERVAL_S = 30.0
+
 # Raw byte-for-byte transport logging is normally disabled.  Set the
 # ZPNET_TRANSPORT_RAW_LOG environment variable to 1 to enable it temporarily.
 TRANSPORT_RAW_LOG_ENABLED = os.environ.get("ZPNET_TRANSPORT_RAW_LOG") == "1"
@@ -185,6 +193,23 @@ rpc_unknown_response_count = 0
 rpc_retired_response_count = 0
 rpc_req_ts_mismatch_count = 0
 
+# Application-level command-plane readiness.  This is intentionally separate
+# from transport_state_ready: publications can flow while semantic RPC is not yet
+# answering.  The proof is bound to one transport generation.
+teensy_rpc_readiness_lock = threading.Lock()
+teensy_rpc_readiness_wakeup = threading.Event()
+teensy_rpc_readiness_status = "INITIALIZING"
+teensy_rpc_readiness_generation = 0
+teensy_rpc_readiness_reason = "PROCESS_START"
+teensy_rpc_readiness_last_probe_monotonic: Optional[float] = None
+teensy_rpc_readiness_last_success_monotonic: Optional[float] = None
+teensy_rpc_readiness_probe_count = 0
+teensy_rpc_readiness_success_count = 0
+teensy_rpc_readiness_failure_count = 0
+teensy_rpc_readiness_ever_ready = False
+teensy_rpc_feature_publish_count = 0
+teensy_rpc_feature_publish_fail_count = 0
+
 
 def _next_req_id() -> int:
     global req_id_last_issued
@@ -248,6 +273,47 @@ def _retire_pending_reply(req_id: int, outcome: str) -> Optional[Dict[str, Any]]
     if entry is not None:
         _remember_reply_state(req_id, entry, outcome)
     return entry
+
+
+def _teensy_rpc_readiness_snapshot() -> Dict[str, Any]:
+    with teensy_rpc_readiness_lock:
+        last_probe = teensy_rpc_readiness_last_probe_monotonic
+        last_success = teensy_rpc_readiness_last_success_monotonic
+        return {
+            "status": teensy_rpc_readiness_status,
+            "generation": int(teensy_rpc_readiness_generation),
+            "reason": teensy_rpc_readiness_reason,
+            "probe_count": int(teensy_rpc_readiness_probe_count),
+            "success_count": int(teensy_rpc_readiness_success_count),
+            "failure_count": int(teensy_rpc_readiness_failure_count),
+            "ever_ready": bool(teensy_rpc_readiness_ever_ready),
+            "last_probe_age_s": (
+                None if last_probe is None
+                else round(max(0.0, time.monotonic() - last_probe), 3)
+            ),
+            "last_success_age_s": (
+                None if last_success is None
+                else round(max(0.0, time.monotonic() - last_success), 3)
+            ),
+            "feature_publish_count": int(teensy_rpc_feature_publish_count),
+            "feature_publish_fail_count": int(teensy_rpc_feature_publish_fail_count),
+            "probe_interval_s": float(TEENSY_RPC_PROBE_INTERVAL_S),
+            "probe_timeout_s": float(TEENSY_RPC_PROBE_TIMEOUT_S),
+            "feature_ttl_s": float(TEENSY_RPC_FEATURE_TTL_S),
+        }
+
+
+def _set_teensy_rpc_readiness(status: str, generation: int, reason: str) -> None:
+    """Update local generation-bound readiness testimony."""
+    global teensy_rpc_readiness_status, teensy_rpc_readiness_generation
+    global teensy_rpc_readiness_reason
+    normalized = str(status or "").strip().upper()
+    if normalized not in {"INITIALIZING", "NOMINAL", "HOLD"}:
+        raise ValueError(f"unsupported TEENSY_RPC readiness status {status!r}")
+    with teensy_rpc_readiness_lock:
+        teensy_rpc_readiness_status = normalized
+        teensy_rpc_readiness_generation = int(generation)
+        teensy_rpc_readiness_reason = str(reason)
 
 
 def _transport_state_snapshot() -> Tuple[bool, int]:
@@ -323,6 +389,14 @@ def _transport_state_monitor_loop() -> None:
         if lost_generation is not None:
             retired = _retire_transport_generation_pending(lost_generation)
             transport_pending_retired_on_loss += retired
+            with teensy_rpc_readiness_lock:
+                prior_rpc_ready = bool(teensy_rpc_readiness_ever_ready)
+            _set_teensy_rpc_readiness(
+                "HOLD" if prior_rpc_ready else "INITIALIZING",
+                lost_generation,
+                "TRANSPORT_GENERATION_LOST",
+            )
+            teensy_rpc_readiness_wakeup.set()
             logging.info(
                 "⏳ [transport] serial generation=%d unavailable; "
                 "retired_inflight_rpc=%d; waiting indefinitely for reattach",
@@ -330,6 +404,14 @@ def _transport_state_monitor_loop() -> None:
             )
 
         if became_ready_generation is not None:
+            with teensy_rpc_readiness_lock:
+                prior_rpc_ready = bool(teensy_rpc_readiness_ever_ready)
+            _set_teensy_rpc_readiness(
+                "HOLD" if prior_rpc_ready else "INITIALIZING",
+                became_ready_generation,
+                "TRANSPORT_READY_AWAITING_RPC_PROOF",
+            )
+            teensy_rpc_readiness_wakeup.set()
             if became_ready_generation > 1:
                 logging.info(
                     "✅ [transport] serial reattached as generation=%d",
@@ -370,11 +452,24 @@ def _teensy_rpc_exchange(
     subsystem: str,
     command: str,
     source: str,
+    reply_timeout_s: float = REPLY_TIMEOUT_S,
+    max_stable_timeouts: int = MAX_TEENSY_RETRIES,
+    log_timeouts: bool = True,
+    retry_across_generations: bool = True,
 ) -> Dict[str, Any]:
-    """Perform one semantic RPC across any number of ephemeral transport lifetimes."""
+    """Perform one semantic RPC across ephemeral transport lifetimes.
+
+    Ordinary callers retain the established 3 x 30-second semantics.  The
+    readiness monitor uses one quiet short probe bound to the current generation
+    so probing readiness cannot itself become a 90-second startup prerequisite.
+    """
+    timeout_s = float(reply_timeout_s)
+    timeout_limit = int(max_stable_timeouts)
+    if timeout_s <= 0.0 or timeout_limit <= 0:
+        raise ValueError("RPC timeout and stable-timeout limit must be positive")
     stable_timeouts = 0
 
-    while stable_timeouts < MAX_TEENSY_RETRIES:
+    while stable_timeouts < timeout_limit:
         generation = _wait_for_transport_generation()
         ready, current_generation = _transport_state_snapshot()
         if not ready or current_generation != generation:
@@ -409,7 +504,7 @@ def _teensy_rpc_exchange(
             _retire_pending_reply(req_id, "SEND_FAILURE")
             raise
 
-        deadline = time.monotonic() + REPLY_TIMEOUT_S
+        deadline = time.monotonic() + timeout_s
         transport_lost = False
         while True:
             remaining = deadline - time.monotonic()
@@ -432,18 +527,24 @@ def _teensy_rpc_exchange(
 
         if transport_lost:
             # A known physical transport break is not a failed semantic command.
-            # Wait for the next generation and retry without consuming the
-            # bounded no-response budget.
-            continue
+            # Ordinary callers wait for the next generation without consuming the
+            # bounded no-response budget.  A readiness probe is generation-bound.
+            if retry_across_generations:
+                continue
+            return {
+                "success": False,
+                "message": "TEENSY transport generation changed during RPC probe",
+                "payload": {},
+            }
 
         timed_out = _retire_pending_reply(req_id, "TIMEOUT")
         stable_timeouts += 1
-        if timed_out is not None:
+        if timed_out is not None and log_timeouts:
             logging.warning(
                 "⏱️ [rpc] Teensy timeout req_id=%d source=%s target=%s.%s "
                 "attempt=%d/%d generation=%d timeout_s=%.1f",
                 req_id, source, subsystem, command, stable_timeouts,
-                MAX_TEENSY_RETRIES, generation, REPLY_TIMEOUT_S,
+                timeout_limit, generation, timeout_s,
             )
 
     return {
@@ -451,6 +552,135 @@ def _teensy_rpc_exchange(
         "message": "TEENSY did not respond on a stable transport",
         "payload": {},
     }
+
+
+def _publish_teensy_rpc_feature() -> None:
+    """Refresh PI.PUBSUB.TEENSY_RPC into SYSTEM with an expiring lease."""
+    global teensy_rpc_feature_publish_count, teensy_rpc_feature_publish_fail_count
+    snapshot = _teensy_rpc_readiness_snapshot()
+    try:
+        response = send_command(
+            machine="PI",
+            subsystem="SYSTEM",
+            command="SET_FEATURE",
+            args={
+                "machine": "PI",
+                "subsystem": "PUBSUB",
+                "feature": "TEENSY_RPC",
+                "status": snapshot["status"],
+                "ttl_s": TEENSY_RPC_FEATURE_TTL_S,
+                "generation": snapshot["generation"],
+            },
+        )
+    except Exception:
+        teensy_rpc_feature_publish_fail_count += 1
+        return
+    if not isinstance(response, dict) or not response.get("success"):
+        teensy_rpc_feature_publish_fail_count += 1
+        return
+    teensy_rpc_feature_publish_count += 1
+
+
+def _teensy_rpc_readiness_loop() -> None:
+    """Continuously prove semantic RPC on the current serial generation."""
+    global teensy_rpc_readiness_last_probe_monotonic
+    global teensy_rpc_readiness_last_success_monotonic
+    global teensy_rpc_readiness_probe_count, teensy_rpc_readiness_success_count
+    global teensy_rpc_readiness_failure_count, teensy_rpc_readiness_ever_ready
+
+    last_failure_log = 0.0
+    while True:
+        ready, generation = _transport_state_snapshot()
+        if not ready or generation <= 0:
+            with teensy_rpc_readiness_lock:
+                prior_ready = bool(teensy_rpc_readiness_ever_ready)
+            _set_teensy_rpc_readiness(
+                "HOLD" if prior_ready else "INITIALIZING",
+                generation,
+                "TRANSPORT_UNAVAILABLE",
+            )
+            _publish_teensy_rpc_feature()
+            teensy_rpc_readiness_wakeup.wait(timeout=TEENSY_RPC_PROBE_INTERVAL_S)
+            teensy_rpc_readiness_wakeup.clear()
+            continue
+
+        before_probe = _teensy_rpc_readiness_snapshot()
+        prior_ready = bool(before_probe.get("ever_ready"))
+        already_nominal = bool(
+            before_probe.get("status") == "NOMINAL"
+            and int(before_probe.get("generation") or 0) == int(generation)
+        )
+        if not already_nominal:
+            _set_teensy_rpc_readiness(
+                "HOLD" if prior_ready else "INITIALIZING",
+                generation,
+                "AWAITING_RPC_ROUND_TRIP",
+            )
+            _publish_teensy_rpc_feature()
+
+        request = {
+            "machine": "TEENSY",
+            "subsystem": "PUBSUB",
+            "command": "REPORT",
+        }
+        with teensy_rpc_readiness_lock:
+            teensy_rpc_readiness_probe_count += 1
+            teensy_rpc_readiness_last_probe_monotonic = time.monotonic()
+
+        response = _teensy_rpc_exchange(
+            request,
+            subsystem="PUBSUB",
+            command="REPORT",
+            source="READINESS_PROBE",
+            reply_timeout_s=TEENSY_RPC_PROBE_TIMEOUT_S,
+            max_stable_timeouts=1,
+            log_timeouts=False,
+            retry_across_generations=False,
+        )
+
+        still_ready, observed_generation = _transport_state_snapshot()
+        if not still_ready or observed_generation != generation:
+            # The transport monitor owns the generation transition; never promote
+            # testimony obtained across a different physical transport lifetime.
+            continue
+
+        if isinstance(response, dict) and response.get("success"):
+            with teensy_rpc_readiness_lock:
+                teensy_rpc_readiness_success_count += 1
+                teensy_rpc_readiness_ever_ready = True
+                teensy_rpc_readiness_last_success_monotonic = time.monotonic()
+            _set_teensy_rpc_readiness(
+                "NOMINAL", generation, "PUBSUB_REPORT_ROUND_TRIP_PROVED"
+            )
+            if not already_nominal:
+                logging.info(
+                    "✅ [pubsub/readiness] Teensy RPC round trip proved on transport generation=%d",
+                    generation,
+                )
+        else:
+            with teensy_rpc_readiness_lock:
+                teensy_rpc_readiness_failure_count += 1
+                prior_ready = bool(teensy_rpc_readiness_ever_ready)
+            reason = str(
+                response.get("message") if isinstance(response, dict) else "malformed response"
+            )
+            _set_teensy_rpc_readiness(
+                "HOLD" if prior_ready else "INITIALIZING",
+                generation,
+                f"RPC_PROBE_FAILED:{reason}",
+            )
+            now = time.monotonic()
+            if now - last_failure_log >= TEENSY_RPC_STATUS_LOG_INTERVAL_S:
+                logging.info(
+                    "⏳ [pubsub/readiness] transport generation=%d is attached but "
+                    "Teensy RPC is not yet proved: %s",
+                    generation, reason,
+                )
+                last_failure_log = now
+
+        _publish_teensy_rpc_feature()
+        teensy_rpc_readiness_wakeup.wait(timeout=TEENSY_RPC_PROBE_INTERVAL_S)
+        teensy_rpc_readiness_wakeup.clear()
 
 
 def _send_client_bytes_best_effort(conn: socket.socket, raw: bytes, *, context: str) -> bool:
@@ -2129,6 +2359,7 @@ def cmd_diagnostics(_: Optional[dict]) -> Dict[str, Any]:
         server_connected = server_conn is not None
 
     transport_ready, transport_generation_now = _transport_state_snapshot()
+    teensy_rpc_readiness = _teensy_rpc_readiness_snapshot()
 
     return {
         "success": True,
@@ -2151,6 +2382,7 @@ def cmd_diagnostics(_: Optional[dict]) -> Dict[str, Any]:
             "rpc_unknown_response_count": rpc_unknown_response_count,
             "rpc_retired_response_count": rpc_retired_response_count,
             "rpc_req_ts_mismatch_count": rpc_req_ts_mismatch_count,
+            "teensy_rpc_readiness": teensy_rpc_readiness,
             "pending_req_ids": pending_ids[:50],  # cap for sanity
             "pending_reply_detail": pending_detail[:50],
             "recent_reply_detail": recent_detail,
@@ -2599,6 +2831,11 @@ def run() -> None:
         target=_transport_supervisor_loop,
         daemon=True,
         name="pubsub-transport-supervisor",
+    ).start()
+    threading.Thread(
+        target=_teensy_rpc_readiness_loop,
+        daemon=True,
+        name="pubsub-teensy-rpc-readiness",
     ).start()
 
     # PUBSUB's own command surface is also independent of serial readiness.
