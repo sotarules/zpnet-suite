@@ -229,6 +229,13 @@ _ppb_checkpoint_warming_rows = 0
 _ppb_checkpoint_gap_count = 0
 _ppb_checkpoint_ingest_failure_count = 0
 _ppb_checkpoint_last_ingest_failure: Optional[Dict[str, Any]] = None
+_ppb_checkpoint_reacquire_requested = threading.Event()
+_ppb_checkpoint_reacquire_worker_started = threading.Event()
+_ppb_checkpoint_reacquire_request_count = 0
+_ppb_checkpoint_reacquire_success_count = 0
+_ppb_checkpoint_reacquire_failure_count = 0
+_ppb_checkpoint_reacquire_last_result: Optional[Dict[str, Any]] = None
+_ppb_checkpoint_reacquire_last_failure: Optional[Dict[str, Any]] = None
 
 OPERATIONAL_STATE_SCHEMA = "PI_SUBSYSTEM_OPERATIONAL_STATE_V1"
 OPERATIONAL_STATE_STARTING = "STARTING"
@@ -1706,6 +1713,7 @@ def _ppb_checkpoint_ingest(stats: Dict[str, Any]) -> Dict[str, Any]:
     global _ppb_checkpoint_recoverable_rows
     global _ppb_checkpoint_warming_rows
     global _ppb_checkpoint_gap_count
+    global _ppb_checkpoint_reacquire_request_count
 
     delta = _validate_firmware_ppb_checkpoint_delta(stats)
     signature = _ppb_checkpoint_delta_signature(delta)
@@ -1787,6 +1795,17 @@ def _ppb_checkpoint_ingest(stats: Dict[str, Any]) -> Dict[str, Any]:
             )
             runtime = _ppb_checkpoint_runtime
             _ppb_checkpoint_gap_count += 1
+
+            # A Pi observation gap destroys Pi-owned literal ring custody, but it
+            # does not destroy the surviving Teensy producer's Better-Buckets
+            # ancestry.  Startup LIVE_REATTACH already performs an explicit full-ring
+            # export before campaign control opens.  During ordinary RUNNING state,
+            # request the same read-only producer-authority reacquisition asynchronously
+            # so the state worker can continue ingesting rows and meet the export court
+            # at one exact live endpoint.  Never reconstruct the missing rows locally.
+            if _campaign_control_ready.is_set():
+                _ppb_checkpoint_reacquire_request_count += 1
+                _ppb_checkpoint_reacquire_requested.set()
 
         if not delta["valid"]:
             gap = {
@@ -2454,6 +2473,17 @@ def _ppb_checkpoint_report_surface() -> Dict[str, Any]:
             "gap_count": _ppb_checkpoint_gap_count,
             "ingest_failure_count": _ppb_checkpoint_ingest_failure_count,
             "last_ingest_failure": copy.deepcopy(_ppb_checkpoint_last_ingest_failure),
+            "live_reacquire_requested": _ppb_checkpoint_reacquire_requested.is_set(),
+            "live_reacquire_worker_started": _ppb_checkpoint_reacquire_worker_started.is_set(),
+            "live_reacquire_request_count": _ppb_checkpoint_reacquire_request_count,
+            "live_reacquire_success_count": _ppb_checkpoint_reacquire_success_count,
+            "live_reacquire_failure_count": _ppb_checkpoint_reacquire_failure_count,
+            "live_reacquire_last_result": copy.deepcopy(
+                _ppb_checkpoint_reacquire_last_result
+            ),
+            "live_reacquire_last_failure": copy.deepcopy(
+                _ppb_checkpoint_reacquire_last_failure
+            ),
         }
 
 
@@ -3631,6 +3661,94 @@ def _refresh_ppb_checkpoint_from_live_photons() -> Dict[str, Any]:
         "proved PHOTONS Better-Buckets export could not reach an exact live rendezvous "
         "after 12 attempts"
     )
+
+
+def _ppb_checkpoint_reacquire_loop() -> None:
+    """Repair Pi Better-Buckets custody from the surviving producer after a live gap."""
+    global _ppb_checkpoint_reacquire_success_count
+    global _ppb_checkpoint_reacquire_failure_count
+    global _ppb_checkpoint_reacquire_last_result
+    global _ppb_checkpoint_reacquire_last_failure
+
+    _ppb_checkpoint_reacquire_worker_started.set()
+    logging.info("🚀 [photons/ppb] live Better-Buckets reacquisition worker started")
+
+    while True:
+        _ppb_checkpoint_reacquire_requested.wait()
+
+        # Clear before beginning, not after success.  If another observation gap
+        # occurs while this export is in flight, that newer request remains set
+        # and forces another exact producer rendezvous on the next loop.
+        _ppb_checkpoint_reacquire_requested.clear()
+        if _hard_failure_active():
+            continue
+
+        try:
+            result = _refresh_ppb_checkpoint_from_live_photons()
+        except Exception as exc:
+            failure = {
+                "failed_at_utc": _utc_now_z(),
+                "error": str(exc),
+            }
+            with _ppb_checkpoint_lock:
+                _ppb_checkpoint_reacquire_failure_count += 1
+                _ppb_checkpoint_reacquire_last_failure = copy.deepcopy(failure)
+            logging.exception(
+                "⚠️ [photons/ppb] live Better-Buckets reacquisition failed; retrying"
+            )
+            if not _hard_failure_active():
+                _ppb_checkpoint_reacquire_requested.set()
+                time.sleep(PHOTONS_STATE_RETRY_S)
+            continue
+
+        # The in-memory ring is repaired first.  Do not call that repair durable
+        # until the ordinary ordered persistence worker has crossed a canonical row
+        # carrying a recoverable checkpoint from this repaired ancestry.  This keeps
+        # config.PHOTONS_RECOVERY paired to campaign_detail through the existing
+        # transaction and prevents an older queued partial snapshot from overwriting
+        # a separately-written repair.
+        repaired_reset = int(result["reset_count"])
+        repaired_update = int(result["update_count"])
+        durable_checkpoint: Optional[Dict[str, Any]] = None
+        superseded = False
+        while not _hard_failure_active():
+            if _ppb_checkpoint_reacquire_requested.is_set():
+                superseded = True
+                break
+            durable = _read_photons_recovery_config()
+            if durable is not None:
+                durable_reset = int(durable["reset_count"])
+                durable_update = int(durable["update_count"])
+                if durable_reset > repaired_reset:
+                    # A newer statistical epoch superseded this repair.  Its own
+                    # checkpoint ancestry is authoritative; never write backward.
+                    superseded = True
+                    break
+                if durable_reset < repaired_reset:
+                    # Ordered persistence has not crossed this statistical epoch yet.
+                    time.sleep(PHOTONS_PERSIST_RETRY_S)
+                    continue
+                if durable_update >= repaired_update and durable.get("recoverable"):
+                    durable_checkpoint = durable
+                    break
+            time.sleep(PHOTONS_PERSIST_RETRY_S)
+
+        if superseded or durable_checkpoint is None:
+            continue
+
+        result = {
+            **result,
+            "durable_update_count": int(durable_checkpoint["update_count"]),
+            "durable_status": str(durable_checkpoint.get("status") or ""),
+        }
+        with _ppb_checkpoint_lock:
+            _ppb_checkpoint_reacquire_success_count += 1
+            _ppb_checkpoint_reacquire_last_result = copy.deepcopy(result)
+            _ppb_checkpoint_reacquire_last_failure = None
+        logging.info(
+            "✅ [photons/ppb] live Better-Buckets custody repaired and durable after Pi observation gap: %s",
+            result,
+        )
 
 
 def _rehydrate_pi_campaign(
@@ -5260,6 +5378,12 @@ def _start_workers() -> None:
             target=_persistence_loop,
             daemon=True,
             name="photons-persistence",
+        ).start()
+    if not _ppb_checkpoint_reacquire_worker_started.is_set():
+        threading.Thread(
+            target=_ppb_checkpoint_reacquire_loop,
+            daemon=True,
+            name="photons-ppb-reacquire",
         ).start()
 
 
@@ -7188,6 +7312,7 @@ def run() -> None:
     )
     _campaign_control_ready.clear()
     _recovery_proof_durable.clear()
+    _ppb_checkpoint_reacquire_requested.clear()
 
     logging.info(
         "[photons] starting canonical PHOTONS_V1 with Phase-3 literal durable recovery, "
