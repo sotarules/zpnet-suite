@@ -316,6 +316,18 @@ PREFLIGHT_LOG_PREFIX = "🛡️ [preflight]"
 STARTUP_LOCATION_RETRY_S = 5.0
 STARTUP_LOCATION_STATUS_LOG_INTERVAL_S = 30.0
 STARTUP_REQUIRED_GNSS_FREQ_MODE = 3       # GF-8802 TPS4 FINE_LOCK
+
+# Application-level startup infrastructure admission.  SYSTEM owns these facts;
+# CLOCKS consumes them before the first durable read or Teensy command.  Ingress
+# remains open while the gate is closed so a surviving Alpha can continue sending
+# exact CLOCKS_FRAGMENT testimony into startup custody.
+STARTUP_INFRASTRUCTURE_REQUIRED = (
+    "PI.SYSTEM.POSTGRES",
+    "PI.PUBSUB.TEENSY_RPC",
+)
+STARTUP_INFRASTRUCTURE_POLL_S = 0.5
+STARTUP_INFRASTRUCTURE_QUIET_GRACE_S = 5.0
+STARTUP_INFRASTRUCTURE_STATUS_LOG_INTERVAL_S = 30.0
 # Newborn Alpha acquisition is a physical startup phase, not part of the
 # restored-row proof deadline.  Poll REPORT_RECOVERY until firmware says the
 # current lifetime has an installed SmartZero-backed Alpha epoch.
@@ -327,10 +339,10 @@ HOLISTIC_RESTORE_COMMAND_RETRY_S = 10.0
 
 # Better-Buckets recovery custody. Firmware publishes one compact, authoritative
 # CLOCKS_PPB_CHECKPOINT_DELTA_V1 proof/delta on every CLOCKS_FRAGMENT. Pi CLOCKS
-# validates that testimony, maintains the literal bounded endpoint rings, and
-# embeds a complete synthetic recovery image in every canonical CLOCKS row.
-# Recovery consumes that one saved image directly; raw PostgreSQL history is
-# never replayed to reconstruct Alpha state.
+# validates that testimony and maintains the literal bounded endpoint rings. The
+# complete recovery image is private durable continuation state in the singleton
+# config.CLOCKS_RECOVERY row; canonical CLOCKS observations never carry the ring.
+# Raw PostgreSQL history is never replayed to reconstruct Alpha state.
 PPB_10_MIN_SECONDS = 10 * 60
 PPB_60_MIN_SECONDS = 60 * 60
 PPB_8_HOUR_SECONDS = 8 * 60 * 60
@@ -341,6 +353,7 @@ PPB_RESTORE_CHUNK_ENDPOINTS = 4
 PPB_PROOF_VERIFY_TOLERANCE_PPB = 0.00001
 PPB_FIRMWARE_DELTA_SCHEMA = "CLOCKS_PPB_CHECKPOINT_DELTA_V1"
 PPB_PI_CHECKPOINT_SCHEMA = "PI_CLOCKS_PPB_RESTORE_CHECKPOINT_V1"
+CLOCKS_RECOVERY_CONFIG_KEY = "CLOCKS_RECOVERY"
 TIMEBASE_SILENCE_TIMEOUT_S = 30.0
 TIMEBASE_SILENCE_MONITOR_POLL_S = 1.0
 TEENSY_HEALTH_RETRY_S = 60.0
@@ -651,6 +664,9 @@ _diag: Dict[str, Any] = {
     "startup_control_ready": False,
     "startup_control_busy_rejections": 0,
     "last_startup_control_rejection": {},
+    "startup_infrastructure_waits": 0,
+    "startup_infrastructure_wait_seconds_last": 0.0,
+    "last_startup_infrastructure_wait": {},
     "startup_location_waits": 0,
     "startup_location_wait_seconds_last": 0.0,
     "last_startup_location_wait": {},
@@ -2568,6 +2584,11 @@ _recovery_custody_entered_at_utc: Optional[str] = None
 _recovery_custody_reason: Optional[str] = None
 _recovery_custody_physical_sequence_regression = False
 _recovery_custody_regression_witness: Dict[str, Any] = {}
+# Exact private Better-Buckets image belonging to the newest CLOCKS row that has
+# actually crossed the recovery-custody routing boundary. Finalization uses this
+# rather than the mutable live runtime, which may already contain one later row
+# blocked behind _recovery_custody_lock.
+_recovery_custody_last_checkpoint: Optional[Dict[str, Any]] = None
 
 # The command server is exposed early so PUBSUB can discover subscriptions, but
 # START/RESUME must not race holistic startup reconciliation. A retained
@@ -2581,6 +2602,10 @@ _startup_watchdog_deferred = deque()
 # campaign preflight; it never polls or subscribes to a feature-only side feed.
 _clocks_lock = threading.Lock()
 _latest_clocks: Dict[str, Any] = {}
+# Private recovery custody paired with _latest_clocks.  Canonical CLOCKS no longer
+# transports the literal Better-Buckets restore image, but restore/proof courts
+# still need the exact checkpoint authored for that same observation.
+_latest_clocks_ppb_restore_checkpoint: Optional[Dict[str, Any]] = None
 _latest_clocks_received_monotonic: Optional[float] = None
 _latest_clocks_received_utc: Optional[str] = None
 
@@ -3174,6 +3199,7 @@ def _begin_recovery_clocks_custody(
     global _recovery_custody_entered_at_utc, _recovery_custody_reason
     global _recovery_custody_physical_sequence_regression
     global _recovery_custody_regression_witness
+    global _recovery_custody_last_checkpoint
 
     # Boot reconciliation already owns a stricter in-memory custody boundary.
     # Do not create a second lifecycle while startup is still classifying Teensy.
@@ -3194,6 +3220,7 @@ def _begin_recovery_clocks_custody(
             _recovery_custody_reason = str(reason)
             _recovery_custody_physical_sequence_regression = False
             _recovery_custody_regression_witness = {}
+            _recovery_custody_last_checkpoint = None
 
         newly_proved_physical_regression = False
         if physical_sequence_regression:
@@ -3243,12 +3270,20 @@ def _recovery_custody_requires_cold_restore() -> bool:
         )
 
 
-def _decorate_recovery_custody_state_locked(state: Dict[str, Any]) -> bool:
-    """Persist one recovery-custody row as evidence but never as restore authority."""
+def _decorate_recovery_custody_state_locked(
+    state: Dict[str, Any], checkpoint: Dict[str, Any]
+) -> bool:
+    """Persist one recovery-custody row and retain its exact private checkpoint."""
+    global _recovery_custody_last_checkpoint
     if not _recovery_custody_active:
         return False
     if not _recovery_custody_generation:
         raise RuntimeError("active recovery custody has no generation identity")
+    normalized_checkpoint = _normalize_saved_ppb_checkpoint(checkpoint)
+    if not _checkpoint_matches_clocks_state(normalized_checkpoint, state):
+        raise RuntimeError(
+            "recovery-custody CLOCKS row and private Better-Buckets checkpoint disagree"
+        )
 
     state["holistic_restore_superseded"] = True
     state["recovery_custody"] = {
@@ -3263,6 +3298,7 @@ def _decorate_recovery_custody_state_locked(state: Dict[str, Any]) -> bool:
         ),
         "regression_witness": copy.deepcopy(_recovery_custody_regression_witness),
     }
+    _recovery_custody_last_checkpoint = copy.deepcopy(normalized_checkpoint)
     _diag["recovery_custody_rows_quarantined"] = (
         _diag.get("recovery_custody_rows_quarantined", 0) + 1
     )
@@ -3311,6 +3347,7 @@ def _finalize_recovery_clocks_custody(
     global _recovery_custody_entered_at_utc, _recovery_custody_reason
     global _recovery_custody_physical_sequence_regression
     global _recovery_custody_regression_witness
+    global _recovery_custody_last_checkpoint
 
     first_public_count = int(first_public_count)
     if first_public_count <= 0:
@@ -3332,6 +3369,16 @@ def _finalize_recovery_clocks_custody(
         entered_at_utc = _recovery_custody_entered_at_utc
         initial_reason = _recovery_custody_reason
         regression_witness = copy.deepcopy(_recovery_custody_regression_witness)
+
+        # Captured only when its canonical row crossed this same custody lock into
+        # the persistence FIFO. It therefore cannot name a later state-worker
+        # mutation that is still blocked behind this lock.
+        routed_checkpoint = copy.deepcopy(_recovery_custody_last_checkpoint)
+        if not isinstance(routed_checkpoint, dict):
+            raise RuntimeError(
+                "active recovery custody has no routed Better-Buckets checkpoint"
+            )
+        routed_checkpoint = _normalize_saved_ppb_checkpoint(routed_checkpoint)
 
         # State routing takes this same lock through its persistence-queue put.
         # Holding it while waiting for the FIFO barrier therefore proves that no
@@ -3420,9 +3467,7 @@ def _finalize_recovery_clocks_custody(
                 boundary_ppb_checkpoint: Optional[Dict[str, Any]] = None
                 if cold_or_rebased:
                     try:
-                        boundary_ppb_checkpoint = _normalize_saved_ppb_checkpoint(
-                            _ppb_restore_checkpoint_from_clocks(boundary_clocks)
-                        )
+                        boundary_ppb_checkpoint = copy.deepcopy(routed_checkpoint)
                     except (TypeError, ValueError) as exc:
                         raise RecoveryRetryableFailure(
                             "recovery_boundary_ppb_checkpoint_invalid",
@@ -3434,7 +3479,15 @@ def _finalize_recovery_clocks_custody(
                                 "error": str(exc),
                             },
                         ) from exc
-                    if not boundary_ppb_checkpoint.get("recoverable"):
+                    checkpoint_reset = _as_int(boundary_ppb_checkpoint.get("reset_count"))
+                    checkpoint_update = _as_int(boundary_ppb_checkpoint.get("update_count"))
+                    if (
+                        not boundary_ppb_checkpoint.get("recoverable")
+                        or checkpoint_reset != boundary_reset
+                        or checkpoint_update is None
+                        or boundary_update is None
+                        or checkpoint_update < boundary_update
+                    ):
                         raise RecoveryRetryableFailure(
                             "recovery_boundary_ppb_checkpoint_not_recoverable",
                             {
@@ -3442,6 +3495,10 @@ def _finalize_recovery_clocks_custody(
                                 "generation": generation,
                                 "recover_mode": str(recover_mode).upper(),
                                 "boundary_detail_id": boundary_id,
+                                "boundary_reset_count": boundary_reset,
+                                "boundary_update_count": boundary_update,
+                                "checkpoint_reset_count": checkpoint_reset,
+                                "checkpoint_update_count": checkpoint_update,
                                 "checkpoint_status": boundary_ppb_checkpoint.get("status"),
                                 "second_count": boundary_ppb_checkpoint.get("second_count"),
                                 "expected_second_count": boundary_ppb_checkpoint.get(
@@ -3457,7 +3514,9 @@ def _finalize_recovery_clocks_custody(
                 lineage_proved = True
                 if cold_or_rebased:
                     source_probe = _holistic_restore_probe(last_tb)
-                    boundary_probe = _holistic_restore_probe(boundary_state)
+                    boundary_probe = _holistic_restore_probe(
+                        boundary_state, boundary_ppb_checkpoint
+                    )
                     # Recovery lineage is Teensy instrument/statistics custody.
                     # Pi DAC targets may lawfully move while RECOVER is active, so
                     # remove control equality from this proof without weakening the
@@ -3600,6 +3659,60 @@ def _finalize_recovery_clocks_custody(
                 classification_update_s = (
                     time.monotonic() - classification_update_started
                 )
+
+                routed_reset = _as_int(routed_checkpoint.get("reset_count"))
+                routed_update = _as_int(routed_checkpoint.get("update_count"))
+                if routed_reset is None or routed_update is None:
+                    raise RuntimeError(
+                        "routed recovery checkpoint lacks statistics identity"
+                    )
+                cur.execute(
+                    """
+                    SELECT id, payload
+                    FROM campaign_detail
+                    WHERE campaign_type = %s
+                      AND id > %s
+                      AND payload #>> '{recovery_custody,generation}' = %s
+                      AND payload #>> '{recovery_custody,restore_authority}' = 'true'
+                      AND payload #>> '{clocks,stats,reset_count}' = %s
+                      AND payload #>> '{clocks,stats,update_count}' = %s
+                      AND NOT (payload @> '{"holistic_restore_superseded":true}'::jsonb)
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (
+                        CAMPAIGN_TYPE_TEMPEST,
+                        int(source_detail_id),
+                        generation,
+                        str(int(routed_reset)),
+                        str(int(routed_update)),
+                    ),
+                )
+                routed_row = cur.fetchone()
+                if routed_row is None:
+                    raise RuntimeError(
+                        "classified recovery custody lacks the durable row owning the "
+                        "last routed Better-Buckets checkpoint"
+                    )
+                routed_state = routed_row["payload"]
+                if isinstance(routed_state, str):
+                    routed_state = json.loads(routed_state)
+                if not isinstance(routed_state, dict):
+                    raise RuntimeError(
+                        "classified recovery checkpoint owner payload is not an object"
+                    )
+                if not _clocks_state_owns_recovery_config(
+                    routed_state, routed_checkpoint
+                ):
+                    raise RuntimeError(
+                        "classified recovery checkpoint owner is not CLOCKS restore authority"
+                    )
+                recovery_config_detail_id = int(routed_row["id"])
+                _write_clocks_recovery_config(
+                    cur,
+                    routed_checkpoint,
+                    source_detail_id=recovery_config_detail_id,
+                )
         transaction_s = time.monotonic() - transaction_started
 
         result = {
@@ -3628,6 +3741,8 @@ def _finalize_recovery_clocks_custody(
             "promoted_classification": promoted_classification,
             "rows_promoted": promoted,
             "rows_superseded": superseded,
+            "recovery_config_detail_id": recovery_config_detail_id,
+            "recovery_config_update_count": _as_int(routed_checkpoint.get("update_count")),
             "timing": {
                 "barrier_wait_s": round(float(barrier_wait_s), 6),
                 "boundary_select_s": round(float(boundary_select_s), 6),
@@ -3645,6 +3760,7 @@ def _finalize_recovery_clocks_custody(
         _recovery_custody_reason = None
         _recovery_custody_physical_sequence_regression = False
         _recovery_custody_regression_witness = {}
+        _recovery_custody_last_checkpoint = None
 
     _diag["recovery_custody_active"] = False
     _diag["recovery_custody_generation"] = None
@@ -4389,6 +4505,159 @@ def _get_active_campaign() -> Optional[Dict[str, Any]]:
     }
 
 
+
+
+def _read_startup_system_feature(name: str) -> Dict[str, Any]:
+    """Read one SYSTEM readiness leaf without converting malformed testimony to WAIT."""
+    try:
+        response = send_command(
+            machine="PI",
+            subsystem="SYSTEM",
+            command="GET_FEATURE",
+            args={"name": name},
+            retries=1,
+            retry_delay_s=0.0,
+        )
+    except Exception as exc:
+        return {
+            "name": name,
+            "known": False,
+            "status": "UNAVAILABLE",
+            "detail": f"SYSTEM.GET_FEATURE unavailable: {exc}",
+        }
+
+    if not isinstance(response, dict):
+        raise RuntimeError(
+            f"SYSTEM.GET_FEATURE {name} returned malformed response: {response!r}"
+        )
+    if not response.get("success"):
+        return {
+            "name": name,
+            "known": False,
+            "status": "UNAVAILABLE",
+            "detail": str(response.get("message") or "SYSTEM.GET_FEATURE unavailable"),
+        }
+
+    payload = response.get("payload")
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            f"SYSTEM.GET_FEATURE {name} returned no payload: {response!r}"
+        )
+    observed_name = str(payload.get("name") or "").strip().upper()
+    if observed_name != name:
+        raise RuntimeError(
+            f"SYSTEM.GET_FEATURE identity mismatch: requested={name} observed={observed_name!r}"
+        )
+    known = payload.get("known")
+    if not isinstance(known, bool):
+        raise RuntimeError(
+            f"SYSTEM.GET_FEATURE {name} payload.known must be boolean: {payload!r}"
+        )
+    status = str(payload.get("status") or "").strip().upper()
+    if not status:
+        raise RuntimeError(
+            f"SYSTEM.GET_FEATURE {name} omitted status: {payload!r}"
+        )
+
+    result: Dict[str, Any] = {
+        "name": name,
+        "known": known,
+        "status": status,
+    }
+    for key in ("age_s", "ttl_s", "expired", "generation"):
+        if key in payload:
+            result[key] = copy.deepcopy(payload.get(key))
+
+    if name == "PI.PUBSUB.TEENSY_RPC" and known and status == "NOMINAL":
+        if payload.get("expired") is not False:
+            raise RuntimeError(
+                "PI.PUBSUB.TEENSY_RPC is NOMINAL without an unexpired lease: "
+                f"{payload!r}"
+            )
+        generation = payload.get("generation")
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation <= 0:
+            raise RuntimeError(
+                "PI.PUBSUB.TEENSY_RPC is NOMINAL without a positive transport generation: "
+                f"{payload!r}"
+            )
+
+    return result
+
+
+def _wait_for_startup_infrastructure() -> Dict[str, Any]:
+    """Wait for real PostgreSQL and Teensy RPC readiness before startup custody work."""
+    started = time.monotonic()
+    last_log_at = started
+    last_signature: Optional[Tuple[Tuple[str, str, bool], ...]] = None
+    logged_wait = False
+    checks = 0
+    _diag["startup_infrastructure_waits"] += 1
+
+    while True:
+        checks += 1
+        observed = [
+            _read_startup_system_feature(name)
+            for name in STARTUP_INFRASTRUCTURE_REQUIRED
+        ]
+        blockers = [
+            item for item in observed
+            if not item.get("known") or item.get("status") != "NOMINAL"
+        ]
+        now = time.monotonic()
+        waited = now - started
+        snapshot = {
+            "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "status": "NOMINAL" if not blockers else "WAITING",
+            "checks": int(checks),
+            "waited_s": round(float(waited), 3),
+            "required": copy.deepcopy(observed),
+            "blockers": copy.deepcopy(blockers),
+        }
+        _diag["last_startup_infrastructure_wait"] = snapshot
+
+        if not blockers:
+            _diag["startup_infrastructure_wait_seconds_last"] = float(waited)
+            if logged_wait:
+                logging.info(
+                    "✅ [clocks/startup] infrastructure admitted after %.1fs: "
+                    "PI.SYSTEM.POSTGRES=NOMINAL PI.PUBSUB.TEENSY_RPC=NOMINAL",
+                    waited,
+                )
+            return copy.deepcopy(snapshot)
+
+        signature = tuple(
+            (
+                str(item.get("name") or "?"),
+                str(item.get("status") or "UNAVAILABLE"),
+                bool(item.get("known")),
+            )
+            for item in blockers
+        )
+        should_log = bool(
+            waited >= STARTUP_INFRASTRUCTURE_QUIET_GRACE_S
+            and (
+                not logged_wait
+                or signature != last_signature
+                or now - last_log_at >= STARTUP_INFRASTRUCTURE_STATUS_LOG_INTERVAL_S
+            )
+        )
+        if should_log:
+            detail = ", ".join(
+                f"{item.get('name')}={item.get('status')}"
+                + ("" if item.get("known") else "(unknown)")
+                for item in blockers
+            )
+            logging.info(
+                "⏳ [clocks/startup] waiting for application infrastructure "
+                "(%.1fs): %s",
+                waited,
+                detail,
+            )
+            logged_wait = True
+            last_log_at = now
+            last_signature = signature
+
+        time.sleep(STARTUP_INFRASTRUCTURE_POLL_S)
 
 
 def _ensure_system_location(*, context: str) -> Dict[str, Any]:
@@ -5282,6 +5551,12 @@ def _normalize_saved_ppb_checkpoint(value: Any) -> Dict[str, Any]:
             "persisted Pi Better-Buckets recoverable flag disagrees with literal history"
         )
 
+    durable_source_detail_id = _as_int(value.get("durable_source_detail_id"))
+    if durable_source_detail_id is not None and durable_source_detail_id <= 0:
+        raise ValueError(
+            "persisted Pi Better-Buckets durable_source_detail_id must be positive"
+        )
+
     return {
         "schema": PPB_PI_CHECKPOINT_SCHEMA,
         "source_schema": PPB_FIRMWARE_DELTA_SCHEMA,
@@ -5308,6 +5583,7 @@ def _normalize_saved_ppb_checkpoint(value: Any) -> Dict[str, Any]:
         "last_gap": copy.deepcopy(value.get("last_gap")),
         "seeded_from_durable": bool(value.get("seeded_from_durable")),
         "seed_source_db_detail_id": _as_int(value.get("seed_source_db_detail_id")),
+        "durable_source_detail_id": durable_source_detail_id,
         "last_delta_signature": value.get("last_delta_signature"),
         "proof_checks": int(_as_int(value.get("proof_checks")) or 0),
     }
@@ -5350,27 +5626,213 @@ def _restore_ppb_checkpoint_runtime(
         return _ppb_checkpoint_snapshot_locked(runtime)
 
 
-def _seed_ppb_checkpoint_runtime_from_latest_durable() -> Dict[str, Any]:
-    """Resume Pi checkpoint custody from one saved CLOCKS row; never replay history."""
-    global _ppb_checkpoint_runtime
+def _write_clocks_recovery_config(
+    cur: Any, checkpoint: Dict[str, Any], *, source_detail_id: int
+) -> None:
+    """Persist the literal CLOCKS recovery image and its exact durable owner."""
+    detail_id = int(source_detail_id)
+    if detail_id <= 0:
+        raise ValueError("CLOCKS recovery source_detail_id must be positive")
+    normalized = _normalize_saved_ppb_checkpoint(checkpoint)
+    normalized["durable_source_detail_id"] = detail_id
+    encoded = json.dumps(normalized, separators=(",", ":"), ensure_ascii=False)
+    cur.execute(
+        "UPDATE config SET payload = %s::jsonb WHERE config_key = %s",
+        (encoded, CLOCKS_RECOVERY_CONFIG_KEY),
+    )
+    if cur.rowcount > 1:
+        raise RuntimeError(
+            f"config.{CLOCKS_RECOVERY_CONFIG_KEY} is not a singleton: rows={cur.rowcount}"
+        )
+    if cur.rowcount == 0:
+        cur.execute(
+            "INSERT INTO config (config_key, payload) VALUES (%s, %s::jsonb)",
+            (CLOCKS_RECOVERY_CONFIG_KEY, encoded),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError(
+                f"config.{CLOCKS_RECOVERY_CONFIG_KEY} insert did not create exactly one row"
+            )
+
+
+def _read_clocks_recovery_config() -> Optional[Dict[str, Any]]:
+    """Read the singleton CLOCKS recovery image, or None before first custody."""
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT payload FROM config WHERE config_key = %s",
+            (CLOCKS_RECOVERY_CONFIG_KEY,),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    payload = row["payload"]
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    return _normalize_saved_ppb_checkpoint(payload)
+
+
+def _legacy_clocks_recovery_checkpoint() -> Optional[Dict[str, Any]]:
+    """One-time migration bridge from pre-singleton CLOCKS rows."""
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT id, payload
+            SELECT id, campaign, payload
             FROM campaign_detail
             WHERE campaign_type = %s
               AND NOT (payload @> '{"holistic_restore_superseded":true}'::jsonb)
               AND payload #>> '{schema}' = 'CLOCKS_V4'
               AND payload #> '{clocks,ppb_restore_checkpoint}' IS NOT NULL
             ORDER BY id DESC
-            LIMIT 1
+            LIMIT 64
             """,
             (CAMPAIGN_TYPE_TEMPEST,),
         )
-        row = cur.fetchone()
+        rows = cur.fetchall()
 
+    for row in rows:
+        state = row["payload"]
+        if isinstance(state, str):
+            state = json.loads(state)
+        if not isinstance(state, dict):
+            continue
+        clocks = _clocks_payload(state)
+        checkpoint = clocks.get("ppb_restore_checkpoint")
+        if not isinstance(checkpoint, dict):
+            continue
+        if not _canonical_instrument_restore_ready(
+            clocks, include_control=True, detail_id=int(row["id"])
+        ):
+            continue
+        if _clocks_gnss_raw_payload(state) is None:
+            continue
+        normalized = _normalize_saved_ppb_checkpoint(checkpoint)
+        source_detail_id = int(row["id"])
+        with open_db() as conn:
+            _write_clocks_recovery_config(
+                conn.cursor(), normalized, source_detail_id=source_detail_id
+            )
+        normalized["durable_source_detail_id"] = source_detail_id
+        logging.warning(
+            "📦 [clocks/ppb] migrated legacy embedded Better-Buckets checkpoint "
+            "from detail_id=%d to config.%s",
+            int(row["id"]),
+            CLOCKS_RECOVERY_CONFIG_KEY,
+        )
+        return normalized
+    return None
+
+
+def _load_or_migrate_clocks_recovery_checkpoint() -> Optional[Dict[str, Any]]:
+    checkpoint = _read_clocks_recovery_config()
+    if checkpoint is None:
+        return _legacy_clocks_recovery_checkpoint()
+    if _as_int(checkpoint.get("durable_source_detail_id")) is not None:
+        return checkpoint
+
+    # Transitional repair for the first singleton implementation, which wrote the
+    # complete recovery block but did not preserve the exact campaign_detail owner.
+    # Reuse the already-bounded legacy embedded-row migration once; never search
+    # historical JSONB statistics to rediscover an identity the writer already knew.
+    logging.warning(
+        "📦 [clocks/ppb] config.%s lacks durable_source_detail_id; "
+        "upgrading from the newest legacy embedded checkpoint",
+        CLOCKS_RECOVERY_CONFIG_KEY,
+    )
+    migrated = _legacy_clocks_recovery_checkpoint()
+    if migrated is None:
+        raise RuntimeError(
+            f"config.{CLOCKS_RECOVERY_CONFIG_KEY} lacks durable_source_detail_id and "
+            "no legacy embedded CLOCKS checkpoint remains to repair it"
+        )
+    return migrated
+
+
+def _clocks_recovery_source_row(checkpoint: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return the exact durable CLOCKS row named by the recovery singleton."""
+    saved = _normalize_saved_ppb_checkpoint(checkpoint)
+    source_detail_id = _as_int(saved.get("durable_source_detail_id"))
+    if source_detail_id is None or source_detail_id <= 0:
+        raise RuntimeError(
+            f"config.{CLOCKS_RECOVERY_CONFIG_KEY} lacks durable_source_detail_id"
+        )
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, campaign, payload
+            FROM campaign_detail
+            WHERE id = %s
+              AND campaign_type = %s
+            """,
+            (int(source_detail_id), CAMPAIGN_TYPE_TEMPEST),
+        )
+        row = cur.fetchone()
     if row is None:
+        return None
+    state = row["payload"]
+    if isinstance(state, str):
+        state = json.loads(state)
+    if not isinstance(state, dict) or state.get("schema") != "CLOCKS_V4":
+        raise RuntimeError(
+            f"config.{CLOCKS_RECOVERY_CONFIG_KEY} source detail_id={source_detail_id} "
+            "is not a CLOCKS_V4 payload"
+        )
+    if state.get("holistic_restore_superseded") is True:
+        raise RuntimeError(
+            f"config.{CLOCKS_RECOVERY_CONFIG_KEY} source detail_id={source_detail_id} "
+            "is superseded"
+        )
+    if not _checkpoint_matches_clocks_state(saved, state):
+        raise RuntimeError(
+            f"config.{CLOCKS_RECOVERY_CONFIG_KEY} source detail_id={source_detail_id} "
+            "does not own the checkpoint statistics identity"
+        )
+    return copy.deepcopy(row)
+
+
+def _checkpoint_matches_clocks_state(
+    checkpoint: Dict[str, Any], state: Dict[str, Any]
+) -> bool:
+    stats = _clocks_payload(state).get("stats")
+    if not isinstance(checkpoint, dict) or not isinstance(stats, dict):
+        return False
+    return bool(
+        _as_int(stats.get("reset_count")) == _as_int(checkpoint.get("reset_count"))
+        and _as_int(stats.get("update_count")) == _as_int(checkpoint.get("update_count"))
+        and _as_int(stats.get("rolling_ppb_current_sequence"))
+        == _as_int(checkpoint.get("current_sequence"))
+    )
+
+
+def _clocks_state_owns_recovery_config(
+    state: Dict[str, Any], checkpoint: Dict[str, Any]
+) -> bool:
+    """True only when this durable observation is lawful singleton authority."""
+    if state.get("holistic_restore_superseded") is True:
+        return False
+    if not _checkpoint_matches_clocks_state(checkpoint, state):
+        raise RuntimeError(
+            "CLOCKS recovery checkpoint identity does not match canonical observation"
+        )
+    clocks = _clocks_payload(state)
+    if not _canonical_instrument_restore_ready(clocks, include_control=False):
+        return False
+    ancestry = _dac_restore_population_ancestry_court(clocks)
+    if not ancestry.get("available") or not ancestry.get("valid"):
+        return False
+    control = clocks.get("control")
+    if not isinstance(control, dict) or control.get("schema") != "CLOCKS_CONTROL_V1":
+        return False
+    return _clocks_gnss_raw_payload(state) is not None
+
+
+def _seed_ppb_checkpoint_runtime_from_latest_durable() -> Dict[str, Any]:
+    """Resume Pi checkpoint custody from config.CLOCKS_RECOVERY; never replay history."""
+    global _ppb_checkpoint_runtime
+    checkpoint = _load_or_migrate_clocks_recovery_checkpoint()
+    if checkpoint is None:
         with _ppb_checkpoint_lock:
             _ppb_checkpoint_runtime = _ppb_checkpoint_new_runtime(
                 reason="NO_DURABLE_CHECKPOINT_SEED"
@@ -5380,29 +5842,30 @@ def _seed_ppb_checkpoint_runtime_from_latest_durable() -> Dict[str, Any]:
             _diag.get("ppb_checkpoint_seed_missing", 0) + 1
         )
         logging.warning(
-            "📦 [clocks/ppb] no durable synthetic Better-Buckets checkpoint exists yet; "
-            "Pi will warm from producer-authored endpoint appends without SQL replay"
+            "📦 [clocks/ppb] config.%s does not exist yet; Pi will warm from "
+            "producer-authored endpoint appends without SQL replay",
+            CLOCKS_RECOVERY_CONFIG_KEY,
         )
         return snapshot
 
-    state = row["payload"]
-    if isinstance(state, str):
-        state = json.loads(state)
-    if not isinstance(state, dict):
-        raise RuntimeError("latest durable Better-Buckets checkpoint row is malformed")
-    clocks = _clocks_payload(state)
-    checkpoint = clocks.get("ppb_restore_checkpoint") if isinstance(clocks, dict) else None
+    row = _clocks_recovery_source_row(checkpoint)
+    if row is None:
+        raise RuntimeError(
+            f"config.{CLOCKS_RECOVERY_CONFIG_KEY} has no matching durable CLOCKS row"
+        )
+    source_detail_id = int(row["id"])
     snapshot = _restore_ppb_checkpoint_runtime(
-        checkpoint,
-        source_db_detail_id=int(row["id"]),
+        checkpoint, source_db_detail_id=source_detail_id
     )
     _diag["ppb_checkpoint_seed_loaded"] = (
         _diag.get("ppb_checkpoint_seed_loaded", 0) + 1
     )
     logging.info(
-        "📦 [clocks/ppb] restored Pi Better-Buckets checkpoint custody from detail_id=%d "
-        "update_count=%s recoverable=%s second=%d/%d minute=%d/%d",
-        int(row["id"]),
+        "📦 [clocks/ppb] restored Pi Better-Buckets checkpoint custody from "
+        "config.%s aligned to detail_id=%d update_count=%s recoverable=%s "
+        "second=%d/%d minute=%d/%d",
+        CLOCKS_RECOVERY_CONFIG_KEY,
+        source_detail_id,
         snapshot.get("update_count"),
         snapshot.get("recoverable"),
         int(snapshot.get("second_count") or 0),
@@ -6504,54 +6967,52 @@ def _read_latest_recoverable_clocks_state(
     *,
     scan_limit: int = 64,
 ) -> Tuple[Optional[Dict[str, Any]], int]:
-    """Return the newest durable CLOCKS_V4 state with canonical restore authority."""
-    with open_db(row_dict=True) as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT id, payload
-            FROM campaign_detail
-            WHERE campaign_type = %s
-              AND NOT (payload @> '{"holistic_restore_superseded":true}'::jsonb)
-            ORDER BY id DESC
-            LIMIT %s
-            """,
-            (CAMPAIGN_TYPE_TEMPEST, int(scan_limit)),
+    """Return the durable CLOCKS_V4 state paired to config.CLOCKS_RECOVERY."""
+    del scan_limit
+    checkpoint = _load_or_migrate_clocks_recovery_checkpoint()
+    if checkpoint is None:
+        return None, 0
+    row = _clocks_recovery_source_row(checkpoint)
+    if row is None:
+        raise RuntimeError(
+            f"config.{CLOCKS_RECOVERY_CONFIG_KEY} has no matching durable CLOCKS restore row"
         )
-        rows = cur.fetchall()
-
-    for skipped, row in enumerate(rows):
-        state = row.get("payload") if isinstance(row, dict) else row[1]
-        if isinstance(state, str):
-            try:
-                state = json.loads(state)
-            except Exception:
-                continue
-        if not isinstance(state, dict):
-            continue
-        clocks = _clocks_payload(state)
-        row_id = int(row.get("id") if isinstance(row, dict) else row[0])
-        if not _canonical_instrument_restore_ready(
-            clocks,
-            include_control=True,
-            detail_id=row_id,
-        ):
-            continue
-        if _clocks_gnss_raw_payload(state) is None:
-            continue
-        restored = copy.deepcopy(state)
-        restored["_db_detail_id"] = int(row.get("id") if isinstance(row, dict) else row[0])
-        return restored, int(skipped)
-    return None, len(rows)
+    state = row["payload"]
+    if isinstance(state, str):
+        state = json.loads(state)
+    if not isinstance(state, dict):
+        raise RuntimeError("CLOCKS recovery source payload is not an object")
+    row_id = int(row["id"])
+    clocks = _clocks_payload(state)
+    if not _checkpoint_matches_clocks_state(checkpoint, state):
+        raise RuntimeError(
+            f"config.{CLOCKS_RECOVERY_CONFIG_KEY} identity disagrees with detail_id={row_id}"
+        )
+    if not _canonical_instrument_restore_ready(
+        clocks, include_control=True, detail_id=row_id
+    ):
+        raise RuntimeError(
+            f"config.{CLOCKS_RECOVERY_CONFIG_KEY} points to non-restorable detail_id={row_id}"
+        )
+    if _clocks_gnss_raw_payload(state) is None:
+        raise RuntimeError(
+            f"config.{CLOCKS_RECOVERY_CONFIG_KEY} source detail_id={row_id} lacks GNSS_RAW"
+        )
+    restored = copy.deepcopy(state)
+    _clocks_payload(restored)["ppb_restore_checkpoint"] = copy.deepcopy(checkpoint)
+    restored["_db_detail_id"] = row_id
+    return restored, 0
 
 def _seed_clocks_from_detail(detail: Dict[str, Any]) -> None:
-    """Publish and cache the last durable CLOCKS state without persisting it again."""
+    """Publish/cache a compact durable CLOCKS seed without its private recovery ring."""
     seeded = copy.deepcopy(detail)
+    checkpoint = _ppb_restore_checkpoint_from_clocks(_clocks_payload(seeded))
+    _clocks_payload(seeded).pop("ppb_restore_checkpoint", None)
     seeded["restored_display_seed"] = True
     seeded["restored_display_seed_at_utc"] = (
         datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     )
-    _cache_clocks_state(seeded)
+    _cache_clocks_state(seeded, checkpoint)
     publish(CLOCKS_TOPIC, seeded)
 
 
@@ -6601,8 +7062,18 @@ def _request_teensy_holistic_restore(
             f"status={status or 'missing_handler_status'} response={last_response!r}"
         )
 
-def _holistic_restore_probe(state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """Project the canonical V4 sufficient state used to prove restore convergence."""
+def _holistic_restore_probe(
+    state: Optional[Dict[str, Any]],
+    ppb_restore_checkpoint: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Project sufficient state used to prove restore convergence.
+
+    The canonical CLOCKS observation is intentionally compact.  Better-Buckets
+    resurrection custody travels beside it as a private Pi persistence/proof
+    sidecar, so callers evaluating a live compact row must supply that checkpoint.
+    Rehydrated durable recovery sources may still carry the checkpoint inside
+    ``clocks`` process-locally.
+    """
     clocks = _clocks_payload(state)
     instrument = clocks.get("clockfaces")
     stats = clocks.get("stats")
@@ -6644,7 +7115,11 @@ def _holistic_restore_probe(state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     ppb_checkpoint_recoverable = False
     ppb_checkpoint_update_count = 0
     ppb_checkpoint_current_sequence = 0
-    checkpoint = _ppb_restore_checkpoint_from_clocks(clocks)
+    checkpoint = (
+        copy.deepcopy(ppb_restore_checkpoint)
+        if isinstance(ppb_restore_checkpoint, dict)
+        else _ppb_restore_checkpoint_from_clocks(clocks)
+    )
     if checkpoint is not None:
         try:
             normalized_checkpoint = _normalize_saved_ppb_checkpoint(checkpoint)
@@ -6854,9 +7329,14 @@ def _wait_for_holistic_restore(
     while time.monotonic() < deadline:
         with _clocks_lock:
             current = copy.deepcopy(_latest_clocks)
+            current_ppb_checkpoint = copy.deepcopy(
+                _latest_clocks_ppb_restore_checkpoint
+            )
             received = _latest_clocks_received_monotonic
         if received is not None and received > requested_monotonic and current:
-            last_observed = _holistic_restore_probe(current)
+            last_observed = _holistic_restore_probe(
+                current, current_ppb_checkpoint
+            )
             if (
                 _holistic_restore_probe_satisfied(expected, last_observed)
                 and _clocks_holistic_restore_proof_committed.is_set()
@@ -11020,7 +11500,7 @@ def _build_canonical_clocks_state(
     system_context: Dict[str, Any],
     *,
     mutate_alpha_custody: bool = True,
-) -> Dict[str, Any]:
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Build canonical CLOCKS_V4 from one exact CLOCKS_FRAGMENT_V4 observation.
 
     During unresolved startup a proved physical-sequence regression means the
@@ -11056,6 +11536,7 @@ def _build_canonical_clocks_state(
     # DAC/control is Pi-authored.  Keep the established canonical JSON shape so
     # front-end consumers do not care that CLOCKS_FRAGMENT stopped carrying it.
     clocks["control"] = _dac_control_snapshot()
+    ppb_restore_checkpoint: Optional[Dict[str, Any]] = None
     stats = clocks.get("stats")
     if isinstance(stats, dict):
         auxiliary = stats.get("auxiliary_welford")
@@ -11064,18 +11545,15 @@ def _build_canonical_clocks_state(
             stats["auxiliary_welford"] = auxiliary
         auxiliary.update(_dac_welford_snapshots())
 
-        # Pi owns persistence/recovery orchestration, so it packages the verified
-        # producer append testimony into a literal bounded resurrection image.
-        # This is intentionally large and explicit; no statistical quantity is
-        # recomputed or inferred from database history.  Before startup lifetime
-        # classification, expose the currently held image without folding newborn
-        # producer testimony into it.
+        # Pi owns persistence/recovery orchestration. Keep the literal bounded
+        # resurrection image private: it is committed to config.CLOCKS_RECOVERY
+        # beside the durable observation, never transported inside CLOCKS itself.
         if mutate_alpha_custody:
-            clocks["ppb_restore_checkpoint"] = _ppb_checkpoint_ingest(stats)
+            ppb_restore_checkpoint = _ppb_checkpoint_ingest(stats)
         else:
             with _ppb_checkpoint_lock:
                 runtime = _ppb_checkpoint_runtime_ensure_locked()
-                clocks["ppb_restore_checkpoint"] = _ppb_checkpoint_snapshot_locked(runtime)
+                ppb_restore_checkpoint = _ppb_checkpoint_snapshot_locked(runtime)
 
     clocks["gnss_raw"] = copy.deepcopy(pi_clocks.get("gnss_raw") or {})
     clocks["system_time_utc"] = published_at_utc
@@ -11126,7 +11604,9 @@ def _build_canonical_clocks_state(
         # The raw firmware delta is persisted exactly once at top level.
         state["campaign"] = copy.deepcopy(campaign)
 
-    return state
+    if ppb_restore_checkpoint is None:
+        raise RuntimeError("canonical CLOCKS row did not produce recovery custody")
+    return state, ppb_restore_checkpoint
 
 
 def _clocks_detail_campaign(state: Dict[str, Any]) -> Optional[str]:
@@ -11147,12 +11627,15 @@ def _clocks_detail_viable(state: Dict[str, Any]) -> bool:
     return bool(disposition.get("science_eligible"))
 
 
-def _persist_clocks_state(state: Dict[str, Any]) -> str:
+def _persist_clocks_state(
+    state: Dict[str, Any], checkpoint: Dict[str, Any]
+) -> str:
     encoded = json.dumps(state, separators=(",", ":"), ensure_ascii=False)
     sequence = state.get("sequence")
     pps_count = sequence
     campaign = _clocks_detail_campaign(state)
     viable = _clocks_detail_viable(state)
+    persist_recovery = _clocks_state_owns_recovery_config(state, checkpoint)
     with open_db() as conn:
         cur = conn.cursor()
         cur.execute(
@@ -11180,25 +11663,53 @@ def _persist_clocks_state(state: Dict[str, Any]) -> str:
                 CAMPAIGN_TYPE_TEMPEST, sequence, pps_count,
             ),
         )
-        if cur.fetchone() is not None:
+        merged_row = cur.fetchone()
+        if merged_row is not None:
+            detail_id = int(
+                merged_row["id"] if isinstance(merged_row, dict) else merged_row[0]
+            )
+            if persist_recovery:
+                _write_clocks_recovery_config(
+                    cur, checkpoint, source_detail_id=detail_id
+                )
             return "merged"
         cur.execute(
             """
             INSERT INTO campaign_detail
                 (campaign_type, campaign, viable, payload, sequence, pps_count)
             VALUES (%s, %s, %s, %s::jsonb, %s, %s)
+            RETURNING id
             """,
             (
                 CAMPAIGN_TYPE_TEMPEST, campaign, viable, encoded, sequence, pps_count,
             ),
         )
+        inserted_row = cur.fetchone()
+        if inserted_row is None:
+            raise RuntimeError("CLOCKS insert returned no durable detail identity")
+        detail_id = int(
+            inserted_row["id"] if isinstance(inserted_row, dict) else inserted_row[0]
+        )
+        if persist_recovery:
+            _write_clocks_recovery_config(
+                cur, checkpoint, source_detail_id=detail_id
+            )
     return "inserted"
 
 
-def _cache_clocks_state(state: Dict[str, Any]) -> None:
-    global _latest_clocks, _latest_clocks_received_monotonic, _latest_clocks_received_utc
+def _cache_clocks_state(
+    state: Dict[str, Any],
+    ppb_restore_checkpoint: Optional[Dict[str, Any]] = None,
+) -> None:
+    global _latest_clocks, _latest_clocks_ppb_restore_checkpoint
+    global _latest_clocks_received_monotonic, _latest_clocks_received_utc
     with _clocks_lock:
         _latest_clocks = copy.deepcopy(state)
+        _latest_clocks_ppb_restore_checkpoint = (
+            copy.deepcopy(ppb_restore_checkpoint)
+            if isinstance(ppb_restore_checkpoint, dict)
+            else None
+        )
         _latest_clocks_received_monotonic = time.monotonic()
         _latest_clocks_received_utc = str(state.get("published_at_utc") or system_time_z())
     _diag["preflight_clocks_updates"] += 1
@@ -11656,7 +12167,7 @@ def _clocks_state_loop() -> None:
                     _startup_physical_lifetime_unclassified.is_set()
                     and _startup_clocks_custody_unresolved()
                 )
-                state = _build_canonical_clocks_state(
+                state, ppb_restore_checkpoint = _build_canonical_clocks_state(
                     clocks_fragment,
                     system_context,
                     mutate_alpha_custody=not preclassification_newborn,
@@ -11675,7 +12186,7 @@ def _clocks_state_loop() -> None:
                 )
                 continue
 
-        _cache_clocks_state(state)
+        _cache_clocks_state(state, ppb_restore_checkpoint)
         if not _hard_failure_active():
             publish(CLOCKS_TOPIC, state)
             _clocks_state_published += 1
@@ -11684,13 +12195,16 @@ def _clocks_state_loop() -> None:
             "state": state,
             "system_context": system_context,
             "clocks_fragment": clocks_fragment,
+            "ppb_restore_checkpoint": ppb_restore_checkpoint,
         }
 
         # Recovery custody and ordinary routing share one lock through the final
         # persistence-queue put. A continuity-surrender thread therefore cannot
         # open custody between our routing decision and durable enqueue.
         with _recovery_custody_lock:
-            if _decorate_recovery_custody_state_locked(state):
+            if _decorate_recovery_custody_state_locked(
+                state, ppb_restore_checkpoint
+            ):
                 item["state"] = state
                 _clocks_persist_queue.put(item)
                 continue
@@ -11719,7 +12233,9 @@ def _clocks_state_loop() -> None:
                 )
 
                 if _clocks_holistic_restore_proof_sequence is None:
-                    observed = _holistic_restore_probe(state)
+                    observed = _holistic_restore_probe(
+                        state, ppb_restore_checkpoint
+                    )
                     if (
                         reset_count == _clocks_holistic_restore_proof_reset_count
                         and update_count == _clocks_holistic_restore_proof_update_count
@@ -11816,6 +12332,7 @@ def _clocks_persistence_loop() -> None:
         state = copy.deepcopy(item["state"])
         system_context = item["system_context"]
         clocks_fragment = item["clocks_fragment"]
+        ppb_restore_checkpoint = item["ppb_restore_checkpoint"]
         release_campaign_candidate = bool(item.get("release_campaign_candidate", True))
         persistence_completion = item.get("persistence_completion")
         state_clocks = state.get("clocks")
@@ -11827,7 +12344,9 @@ def _clocks_persistence_loop() -> None:
         while True:
             try:
                 with _clocks_persistence_lock:
-                    disposition = _persist_clocks_state(state)
+                    disposition = _persist_clocks_state(
+                        state, ppb_restore_checkpoint
+                    )
                 _clocks_state_persisted += 1
                 if disposition == "merged":
                     _clocks_state_merged += 1
@@ -13519,6 +14038,10 @@ def cmd_clear(_: Optional[dict]) -> dict:
                     (CAMPAIGN_TYPE_TEMPEST,),
                 )
                 master_count = cur.rowcount
+                cur.execute(
+                    "DELETE FROM config WHERE config_key = %s",
+                    (CLOCKS_RECOVERY_CONFIG_KEY,),
+                )
     except Exception as e:
         logging.exception("❌ [clocks] CLEAR failed")
         return {"success": False, "message": str(e)}
@@ -15628,6 +16151,26 @@ def cmd_delete(args: Optional[dict]) -> Dict[str, Any]:
             "message": f"Campaign '{campaign_name}' is active — STOP it first",
         }
 
+    recovery_checkpoint = _read_clocks_recovery_config()
+    if recovery_checkpoint is not None:
+        recovery_source = _clocks_recovery_source_row(recovery_checkpoint)
+        if recovery_source is None:
+            return {
+                "success": False,
+                "message": (
+                    f"config.{CLOCKS_RECOVERY_CONFIG_KEY} has no matching durable "
+                    "CLOCKS source; refusing campaign deletion"
+                ),
+            }
+        if str(recovery_source.get("campaign") or "") == campaign_name:
+            return {
+                "success": False,
+                "message": (
+                    f"Campaign '{campaign_name}' still owns current CLOCKS recovery "
+                    "custody — retry after the next ambient CLOCKS row"
+                ),
+            }
+
     try:
         with open_db(row_dict=True) as conn:
             cur = conn.cursor()
@@ -15753,6 +16296,10 @@ def cmd_truncate(args: Optional[dict]) -> Dict[str, Any]:
                 cur = conn.cursor()
                 cur.execute(
                     "TRUNCATE TABLE campaign_detail, campaign_master RESTART IDENTITY"
+                )
+                cur.execute(
+                    "DELETE FROM config WHERE config_key IN (%s, %s)",
+                    (CLOCKS_RECOVERY_CONFIG_KEY, "PHOTONS_RECOVERY"),
                 )
     except Exception as e:
         logging.exception("❌ [clocks] TRUNCATE failed")
@@ -16261,10 +16808,15 @@ def run() -> None:
         blocking=False,
     )
 
-    # Resume the Pi-owned literal Better-Buckets checkpoint from exactly one
-    # durable CLOCKS row before queued live ingestion is consumed. This is
-    # checkpoint loading, not historical reconstruction; absence simply starts
-    # a truthful warm-up.
+    # SYSTEM/PUBSUB readiness is application truth, not systemd ordering.  Keep
+    # CLOCKS_FRAGMENT ingress open while waiting, but do not touch PostgreSQL or
+    # issue Teensy RPC until those exact planes have been proved usable.
+    _wait_for_startup_infrastructure()
+
+    # Resume the Pi-owned literal Better-Buckets checkpoint from the singleton
+    # config.CLOCKS_RECOVERY image before queued live ingestion is consumed.
+    # The image is paired back to its exact durable CLOCKS statistics identity;
+    # legacy embedded checkpoints are migrated once without history replay.
     _seed_ppb_checkpoint_runtime_from_latest_durable()
 
     logging.info(

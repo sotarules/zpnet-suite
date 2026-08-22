@@ -108,6 +108,7 @@ PHOTONS_STATS_RESET_PROOF_TIMEOUT_S = 30.0
 # but PostgreSQL history is never replayed and unseen endpoints are never invented.
 PHOTONS_PPB_FIRMWARE_DELTA_SCHEMA = "PHOTONS_PPB_CHECKPOINT_DELTA_V1"
 PHOTONS_PPB_PI_CHECKPOINT_SCHEMA = "PI_PHOTONS_PPB_RESTORE_CHECKPOINT_V1"
+PHOTONS_RECOVERY_CONFIG_KEY = "PHOTONS_RECOVERY"
 
 TEENSY_CAMPAIGN_START_ACCEPTED_STATUSES = {"start_requested", "flash_cut_requested"}
 TEENSY_CAMPAIGN_STOP_ACCEPTED_STATUSES = {"stop_requested"}
@@ -119,6 +120,17 @@ PHOTONS_INGRESS_QUEUE_MAXSIZE = 0
 PHOTONS_PERSIST_QUEUE_MAXSIZE = 0
 PHOTONS_STATE_RETRY_S = 0.25
 PHOTONS_PERSIST_RETRY_S = 0.25
+
+# Application-level startup infrastructure admission.  Keep PHOTONS_FRAGMENT
+# ingress open while these facts mature, but do not perform durable recovery or
+# issue Teensy commands until SYSTEM has proved both planes usable.
+STARTUP_INFRASTRUCTURE_REQUIRED = (
+    "PI.SYSTEM.POSTGRES",
+    "PI.PUBSUB.TEENSY_RPC",
+)
+STARTUP_INFRASTRUCTURE_POLL_S = 0.5
+STARTUP_INFRASTRUCTURE_QUIET_GRACE_S = 5.0
+STARTUP_INFRASTRUCTURE_STATUS_LOG_INTERVAL_S = 30.0
 
 # SYSTEM owns these platform/context objects.  PHOTONS copies them transitively
 # and does not derive replacement values or reinterpret their scientific meaning.
@@ -147,7 +159,7 @@ _recovery_lock = threading.RLock()
 _maintenance_lock = threading.RLock()
 
 _fragment_queue: queue.Queue[Payload] = queue.Queue(maxsize=PHOTONS_INGRESS_QUEUE_MAXSIZE)
-_persist_queue: queue.Queue[Payload] = queue.Queue(maxsize=PHOTONS_PERSIST_QUEUE_MAXSIZE)
+_persist_queue: queue.Queue[Dict[str, Any]] = queue.Queue(maxsize=PHOTONS_PERSIST_QUEUE_MAXSIZE)
 _state_worker_started = threading.Event()
 _persistence_worker_started = threading.Event()
 _campaign_control_ready = threading.Event()
@@ -172,6 +184,9 @@ _ingress_queue_depth_max = 0
 _persist_queue_depth_max = 0
 _system_report_retry_count = 0
 _persistence_retry_count = 0
+_startup_infrastructure_wait_count = 0
+_startup_infrastructure_wait_seconds_last = 0.0
+_last_startup_infrastructure_wait: Optional[Dict[str, Any]] = None
 _campaign_start_count = 0
 _campaign_stop_count = 0
 _baseline_set_count = 0
@@ -702,6 +717,166 @@ def _fetch_system_report() -> Dict[str, Any]:
     if not isinstance(response, dict) or not response.get("success") or not isinstance(payload, dict):
         raise RuntimeError(f"SYSTEM.REPORT unavailable: {response!r}")
     return copy.deepcopy(payload)
+
+
+def _read_startup_system_feature(name: str) -> Dict[str, Any]:
+    """Read one SYSTEM readiness leaf without hiding malformed successful testimony."""
+    try:
+        response = send_command(
+            machine="PI",
+            subsystem="SYSTEM",
+            command="GET_FEATURE",
+            args={"name": name},
+            retries=1,
+            retry_delay_s=0.0,
+        )
+    except Exception as exc:
+        return {
+            "name": name,
+            "known": False,
+            "status": "UNAVAILABLE",
+            "detail": f"SYSTEM.GET_FEATURE unavailable: {exc}",
+        }
+
+    if not isinstance(response, dict):
+        raise RuntimeError(
+            f"SYSTEM.GET_FEATURE {name} returned malformed response: {response!r}"
+        )
+    if not response.get("success"):
+        return {
+            "name": name,
+            "known": False,
+            "status": "UNAVAILABLE",
+            "detail": str(response.get("message") or "SYSTEM.GET_FEATURE unavailable"),
+        }
+
+    payload = response.get("payload")
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            f"SYSTEM.GET_FEATURE {name} returned no payload: {response!r}"
+        )
+    observed_name = str(payload.get("name") or "").strip().upper()
+    if observed_name != name:
+        raise RuntimeError(
+            f"SYSTEM.GET_FEATURE identity mismatch: requested={name} observed={observed_name!r}"
+        )
+    known = payload.get("known")
+    if not isinstance(known, bool):
+        raise RuntimeError(
+            f"SYSTEM.GET_FEATURE {name} payload.known must be boolean: {payload!r}"
+        )
+    status = str(payload.get("status") or "").strip().upper()
+    if not status:
+        raise RuntimeError(
+            f"SYSTEM.GET_FEATURE {name} omitted status: {payload!r}"
+        )
+
+    result: Dict[str, Any] = {
+        "name": name,
+        "known": known,
+        "status": status,
+    }
+    for key in ("age_s", "ttl_s", "expired", "generation"):
+        if key in payload:
+            result[key] = copy.deepcopy(payload.get(key))
+
+    if name == "PI.PUBSUB.TEENSY_RPC" and known and status == "NOMINAL":
+        if payload.get("expired") is not False:
+            raise RuntimeError(
+                "PI.PUBSUB.TEENSY_RPC is NOMINAL without an unexpired lease: "
+                f"{payload!r}"
+            )
+        generation = payload.get("generation")
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation <= 0:
+            raise RuntimeError(
+                "PI.PUBSUB.TEENSY_RPC is NOMINAL without a positive transport generation: "
+                f"{payload!r}"
+            )
+
+    return result
+
+
+def _wait_for_startup_infrastructure() -> Dict[str, Any]:
+    """Wait for PostgreSQL and semantic Teensy RPC before Phase-5 recovery."""
+    global _startup_infrastructure_wait_count
+    global _startup_infrastructure_wait_seconds_last
+    global _last_startup_infrastructure_wait
+
+    started = time.monotonic()
+    last_log_at = started
+    last_signature: Optional[Tuple[Tuple[str, str, bool], ...]] = None
+    logged_wait = False
+    checks = 0
+    with _state_lock:
+        _startup_infrastructure_wait_count += 1
+
+    while True:
+        checks += 1
+        observed = [
+            _read_startup_system_feature(name)
+            for name in STARTUP_INFRASTRUCTURE_REQUIRED
+        ]
+        blockers = [
+            item for item in observed
+            if not item.get("known") or item.get("status") != "NOMINAL"
+        ]
+        now = time.monotonic()
+        waited = now - started
+        snapshot = {
+            "ts_utc": _utc_now_z(),
+            "status": "NOMINAL" if not blockers else "WAITING",
+            "checks": int(checks),
+            "waited_s": round(float(waited), 3),
+            "required": copy.deepcopy(observed),
+            "blockers": copy.deepcopy(blockers),
+        }
+        with _state_lock:
+            _last_startup_infrastructure_wait = copy.deepcopy(snapshot)
+
+        if not blockers:
+            with _state_lock:
+                _startup_infrastructure_wait_seconds_last = float(waited)
+            if logged_wait:
+                logging.info(
+                    "✅ [photons/startup] infrastructure admitted after %.1fs: "
+                    "PI.SYSTEM.POSTGRES=NOMINAL PI.PUBSUB.TEENSY_RPC=NOMINAL",
+                    waited,
+                )
+            return copy.deepcopy(snapshot)
+
+        signature = tuple(
+            (
+                str(item.get("name") or "?"),
+                str(item.get("status") or "UNAVAILABLE"),
+                bool(item.get("known")),
+            )
+            for item in blockers
+        )
+        should_log = bool(
+            waited >= STARTUP_INFRASTRUCTURE_QUIET_GRACE_S
+            and (
+                not logged_wait
+                or signature != last_signature
+                or now - last_log_at >= STARTUP_INFRASTRUCTURE_STATUS_LOG_INTERVAL_S
+            )
+        )
+        if should_log:
+            detail = ", ".join(
+                f"{item.get('name')}={item.get('status')}"
+                + ("" if item.get("known") else "(unknown)")
+                for item in blockers
+            )
+            logging.info(
+                "⏳ [photons/startup] waiting for application infrastructure "
+                "(%.1fs): %s",
+                waited,
+                detail,
+            )
+            logged_wait = True
+            last_log_at = now
+            last_signature = signature
+
+        time.sleep(STARTUP_INFRASTRUCTURE_POLL_S)
 
 
 def _validate_photons_fragment(fragment: Payload) -> Tuple[int, int, Optional[int], Dict[str, Any]]:
@@ -1846,12 +2021,158 @@ def _normalize_saved_ppb_checkpoint(value: Any) -> Dict[str, Any]:
     return normalized
 
 
+def _write_photons_recovery_config(cur: Any, checkpoint: Dict[str, Any]) -> None:
+    """Persist the literal PHOTONS recovery image as one singleton config row."""
+    normalized = _normalize_saved_ppb_checkpoint(checkpoint)
+    encoded = json.dumps(normalized, separators=(",", ":"))
+    cur.execute(
+        "UPDATE config SET payload = %s::jsonb WHERE config_key = %s",
+        (encoded, PHOTONS_RECOVERY_CONFIG_KEY),
+    )
+    if cur.rowcount > 1:
+        raise RuntimeError(
+            f"config.{PHOTONS_RECOVERY_CONFIG_KEY} is not a singleton: rows={cur.rowcount}"
+        )
+    if cur.rowcount == 0:
+        cur.execute(
+            "INSERT INTO config (config_key, payload) VALUES (%s, %s::jsonb)",
+            (PHOTONS_RECOVERY_CONFIG_KEY, encoded),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError(
+                f"config.{PHOTONS_RECOVERY_CONFIG_KEY} insert did not create exactly one row"
+            )
+
+
+def _read_photons_recovery_config() -> Optional[Dict[str, Any]]:
+    """Read config.PHOTONS_RECOVERY, or None before the first durable checkpoint."""
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT payload FROM config WHERE config_key = %s",
+            (PHOTONS_RECOVERY_CONFIG_KEY,),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    payload = row["payload"]
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    return _normalize_saved_ppb_checkpoint(payload)
+
+
+def _photons_recovery_source_row(
+    checkpoint: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Return the durable PHOTONS row whose statistics identity owns checkpoint."""
+    saved = _normalize_saved_ppb_checkpoint(checkpoint)
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, campaign
+            FROM campaign_detail
+            WHERE campaign_type = %s
+              AND payload #>> '{photons,stats,reset_count}' = %s
+              AND payload #>> '{photons,stats,update_count}' = %s
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (
+                CAMPAIGN_TYPE_LANTERN,
+                str(int(saved["reset_count"])),
+                str(int(saved["update_count"])),
+            ),
+        )
+        row = cur.fetchone()
+    return copy.deepcopy(row) if isinstance(row, dict) else None
+
+
+def _checkpoint_matches_photons_state(
+    checkpoint: Dict[str, Any], photons: Dict[str, Any]
+) -> bool:
+    instrument = photons.get("photons") if isinstance(photons, dict) else None
+    stats = instrument.get("stats") if isinstance(instrument, dict) else None
+    current = checkpoint.get("current") if isinstance(checkpoint, dict) else None
+    if not isinstance(stats, dict) or not isinstance(current, dict):
+        return False
+    return bool(
+        _require_int(stats.get("reset_count"), "PHOTONS.stats.reset_count")
+        == _require_int(checkpoint.get("reset_count"), "PHOTONS recovery reset_count")
+        and _require_int(stats.get("update_count"), "PHOTONS.stats.update_count", minimum=1)
+        == _require_int(checkpoint.get("update_count"), "PHOTONS recovery update_count", minimum=1)
+        and _require_int(stats.get("rolling_ppb_current_sequence"), "PHOTONS.stats.rolling_ppb_current_sequence", minimum=1)
+        == _require_int(checkpoint.get("current_sequence"), "PHOTONS recovery current_sequence", minimum=1)
+        and _require_int(stats.get("lap_count"), "PHOTONS.stats.lap_count")
+        == _require_int(current.get("lap_count"), "PHOTONS recovery current.lap_count")
+        and _require_int(stats.get("total_lap_gnss_ns"), "PHOTONS.stats.total_lap_gnss_ns")
+        == _require_int(current.get("total_lap_gnss_ns"), "PHOTONS recovery current.total_lap_gnss_ns")
+    )
+
+
+def _checkpoint_matches_photons_source(
+    checkpoint: Dict[str, Any], source: Dict[str, Any]
+) -> bool:
+    current = checkpoint.get("current") if isinstance(checkpoint, dict) else None
+    if not isinstance(current, dict):
+        return False
+    return bool(
+        _require_int(checkpoint.get("reset_count"), "PHOTONS recovery reset_count")
+        == int(source["reset_count"])
+        and _require_int(checkpoint.get("update_count"), "PHOTONS recovery update_count", minimum=1)
+        == int(source["update_count"])
+        and _require_int(current.get("sequence"), "PHOTONS recovery current.sequence", minimum=1)
+        == int(source["update_count"])
+        and _require_int(current.get("lap_count"), "PHOTONS recovery current.lap_count", minimum=1)
+        == int(source["lap_count"])
+        and _require_int(current.get("total_lap_gnss_ns"), "PHOTONS recovery current.total_lap_gnss_ns", minimum=1)
+        == int(source["total_lap_gnss_ns"])
+    )
+
+
+def _recovery_checkpoint_for_selected_row(
+    row: Dict[str, Any], source: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Load singleton recovery custody, migrating one legacy embedded row if needed."""
+    checkpoint = _read_photons_recovery_config()
+    if checkpoint is None:
+        payload = row.get("payload")
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        payload = _require_dict(payload, "legacy PHOTONS campaign_detail.payload")
+        legacy = payload.get("ppb_restore_checkpoint")
+        if not isinstance(legacy, dict):
+            raise RuntimeError(
+                f"config.{PHOTONS_RECOVERY_CONFIG_KEY} is missing and selected "
+                f"detail_id={int(row['id'])} has no legacy embedded checkpoint"
+            )
+        checkpoint = _normalize_saved_ppb_checkpoint(legacy)
+        if not _checkpoint_matches_photons_source(checkpoint, source):
+            raise RuntimeError(
+                "legacy PHOTONS checkpoint does not match selected durable source"
+            )
+        with open_db() as conn:
+            _write_photons_recovery_config(conn.cursor(), checkpoint)
+        logging.warning(
+            "📦 [photons/ppb] migrated legacy embedded Better-Buckets checkpoint "
+            "from detail_id=%d to config.%s",
+            int(row["id"]),
+            PHOTONS_RECOVERY_CONFIG_KEY,
+        )
+    if not _checkpoint_matches_photons_source(checkpoint, source):
+        raise RuntimeError(
+            f"config.{PHOTONS_RECOVERY_CONFIG_KEY} does not match selected "
+            f"detail_id={int(row['id'])}"
+        )
+    return checkpoint
+
+
 def _literal_recovery_history_from_source(source: Dict[str, Any]) -> Dict[str, Any]:
     """Return the exact durable PHOTONS history that may lawfully be staged.
 
     Aggregate N/T, Welfords, exclusions, chronology, and monotonic custody come
-    from the selected canonical row.  Better-Buckets history is different: only
-    endpoints literally retained in that row may cross a producer-loss boundary.
+    from the selected canonical row. Better-Buckets history comes from the exact
+    config.PHOTONS_RECOVERY singleton paired to that row's statistics identity.
 
     A complete checkpoint restores the complete bounded producer rings.  A
     structurally valid checkpoint that is merely warming after an observation
@@ -1859,8 +2180,7 @@ def _literal_recovery_history_from_source(source: Dict[str, Any]) -> Dict[str, A
     ancestry is explicitly surrendered; SQL is never consulted and no endpoint
     is synthesized.  A lost/empty/contradictory rolling lineage still fails.
     """
-    canonical = _require_dict(source.get("canonical"), "recovery source canonical")
-    raw = canonical.get("ppb_restore_checkpoint")
+    raw = source.get("ppb_restore_checkpoint")
     saved = _normalize_saved_ppb_checkpoint(raw)
 
     current = _require_dict(saved.get("current"), "saved PHOTONS checkpoint current")
@@ -2137,7 +2457,9 @@ def _ppb_checkpoint_report_surface() -> Dict[str, Any]:
         }
 
 
-def _make_photons(fragment: Payload, system_context: Dict[str, Any]) -> Payload:
+def _make_photons(
+    fragment: Payload, system_context: Dict[str, Any]
+) -> Tuple[Payload, Dict[str, Any]]:
     """Form canonical PHOTONS_V1 from firmware testimony + authoritative SYSTEM context."""
     global _ppb_checkpoint_runtime
     global _ppb_checkpoint_ingest_failure_count
@@ -2167,10 +2489,9 @@ def _make_photons(fragment: Payload, system_context: Dict[str, Any]) -> Payload:
     state["photons"] = copy.deepcopy(instrument)
     stats = _require_dict(instrument.get("stats"), "PHOTONS_FRAGMENT.photons.stats")
 
-    # The literal Pi Better-Buckets ledger is part of the canonical recovery
-    # contract.  Fold this producer-authored delta before publication; if the
-    # ledger court cannot prove the update, roll back its mutation and reject the
-    # canonical row rather than persisting testimony that cannot carry recovery.
+    # Fold the producer-authored Better-Buckets delta before publication. The
+    # complete literal recovery image is private continuation state committed to
+    # config.PHOTONS_RECOVERY; canonical PHOTONS never transports the bounded ring.
     with _ppb_checkpoint_lock:
         checkpoint_before = copy.deepcopy(_ppb_checkpoint_runtime)
         try:
@@ -2194,8 +2515,7 @@ def _make_photons(fragment: Payload, system_context: Dict[str, Any]) -> Payload:
                 "rejecting canonical PHOTONS row"
             )
             raise
-        state["ppb_restore_checkpoint"] = checkpoint
-    return state
+    return state, checkpoint
 
 
 # ---------------------------------------------------------------------
@@ -2691,6 +3011,9 @@ def _load_newest_recoverable_photons_state(
             row,
             active_master=active_master,
             require_active_campaign=require_active_campaign,
+        )
+        source["ppb_restore_checkpoint"] = _recovery_checkpoint_for_selected_row(
+            row, source
         )
     except Exception as exc:
         rejection = {"id": int(row["id"]), "reason": str(exc)}
@@ -4217,12 +4540,11 @@ def _perform_phase5_recovery() -> Dict[str, Any]:
             raise RuntimeError("Teensy PHOTONS recovery staging remains active")
 
         if source is not None:
-            # Seed live Pi recovery custody from the exact literal image carried by
-            # the newest durable canonical row.  Historical SQL rows have no role
+            # Seed live Pi recovery custody from the exact singleton image paired
+            # to the newest durable canonical row. Historical SQL rows have no role
             # in Better-Buckets resurrection or startup reconstruction.
-            canonical = _require_dict(source.get("canonical"), "recovery source canonical")
             raw_checkpoint = _require_dict(
-                canonical.get("ppb_restore_checkpoint"),
+                source.get("ppb_restore_checkpoint"),
                 "recovery source ppb_restore_checkpoint",
             )
             _restore_ppb_checkpoint_runtime(
@@ -4496,13 +4818,19 @@ def _baseline_relation_for_active_campaign() -> Optional[Dict[str, Any]]:
     }
 
 
-def _persist_photons(photons: Payload) -> int:
+def _persist_photons(
+    photons: Payload, checkpoint: Dict[str, Any]
+) -> int:
     """Persist one canonical PHOTONS row and advance the LANTERN read model.
 
     ``viable`` remains structural: individual firmware lap exclusions never make
     the one-second batch non-viable.  campaign_master is only a latest read model;
     campaign_detail remains the durable observation history.
     """
+    if not _checkpoint_matches_photons_state(checkpoint, photons):
+        raise RuntimeError(
+            "PHOTONS recovery checkpoint identity does not match canonical observation"
+        )
     sequence = photons["sequence"]
     pps_count = photons.get("pps_count")
     campaign = photons.get("campaign")
@@ -4628,6 +4956,8 @@ def _persist_photons(photons: Payload) -> int:
                         "final LANTERN firmware row did not close exactly one campaign_master"
                     )
 
+        _write_photons_recovery_config(cur, checkpoint)
+
     # Crossing the open_db context is the irreversible durability boundary.
     # Return the committed identity to the worker; post-commit recovery-proof
     # adjudication must never cause this scientific row to be inserted again.
@@ -4740,7 +5070,9 @@ def _state_loop() -> None:
                     continue
 
                 try:
-                    photons = _make_photons(fragment, system_context)
+                    photons, ppb_restore_checkpoint = _make_photons(
+                        fragment, system_context
+                    )
 
                     # Producer-declared rolling custody loss is not an ordinary
                     # science exclusion.  The current row cannot carry durable
@@ -4748,11 +5080,8 @@ def _state_loop() -> None:
                     # also missed physical optical observations.  Stop before
                     # publishing or persisting this row so the newest durable
                     # campaign_detail remains the last trustworthy predecessor.
-                    checkpoint = photons.get("ppb_restore_checkpoint")
-                    if (
-                        isinstance(checkpoint, dict)
-                        and checkpoint.get("status") == "ROLLING_CUSTODY_LOST"
-                    ):
+                    checkpoint = ppb_restore_checkpoint
+                    if checkpoint.get("status") == "ROLLING_CUSTODY_LOST":
                         instrument = _require_dict(
                             photons.get("photons"), "PHOTONS.photons"
                         )
@@ -4822,7 +5151,12 @@ def _state_loop() -> None:
                 with _state_lock:
                     _photons_published += 1
 
-                _persist_queue.put_nowait(copy.deepcopy(photons))
+                _persist_queue.put_nowait(
+                    {
+                        "photons": copy.deepcopy(photons),
+                        "ppb_restore_checkpoint": copy.deepcopy(ppb_restore_checkpoint),
+                    }
+                )
                 _note_persist_queue_depth()
 
 
@@ -4841,12 +5175,20 @@ def _persistence_loop() -> None:
     logging.info("🚀 [photons] ordered PHOTONS persistence worker started")
 
     while True:
+        persist_item = None
         photons = None
+        checkpoint = None
         with _maintenance_lock:
             try:
-                photons = _persist_queue.get_nowait()
+                persist_item = _persist_queue.get_nowait()
             except queue.Empty:
                 pass
+            if persist_item is not None:
+                photons = _require_dict(persist_item.get("photons"), "PHOTONS persistence item")
+                checkpoint = _require_dict(
+                    persist_item.get("ppb_restore_checkpoint"),
+                    "PHOTONS persistence recovery checkpoint",
+                )
             if photons is None:
                 pass
             elif _hard_failure_active():
@@ -4856,7 +5198,7 @@ def _persistence_loop() -> None:
                 failure_logged = False
                 while True:
                     try:
-                        detail_id = _persist_photons(photons)
+                        detail_id = _persist_photons(photons, checkpoint)
                         with _state_lock:
                             _rows_persisted += 1
                     except Exception as exc:
@@ -5362,8 +5704,9 @@ def _pending_persist_campaign_names() -> set[str]:
     names: set[str] = set()
     with _persist_queue.mutex:
         pending = list(_persist_queue.queue)
-    for payload in pending:
-        campaign = payload.get("campaign") if isinstance(payload, dict) else None
+    for item in pending:
+        photons = item.get("photons") if isinstance(item, dict) else None
+        campaign = photons.get("campaign") if isinstance(photons, dict) else None
         if isinstance(campaign, dict):
             name = str(campaign.get("campaign") or "").strip()
             if name:
@@ -5425,6 +5768,10 @@ def cmd_clear(_: Optional[dict]) -> Dict[str, Any]:
                     (CAMPAIGN_TYPE_LANTERN,),
                 )
                 master_count = int(cur.rowcount or 0)
+                cur.execute(
+                    "DELETE FROM config WHERE config_key = %s",
+                    (PHOTONS_RECOVERY_CONFIG_KEY,),
+                )
         except Exception as exc:
             logging.exception("❌ [photons] CLEAR failed")
             return {"success": False, "message": str(exc)}
@@ -5464,6 +5811,26 @@ def cmd_delete(args: Optional[dict]) -> Dict[str, Any]:
             return {"success": False, "message": f"Campaign '{campaign_name}' is active — STOP it first"}
         if any(item.get("campaign") == campaign_name for item in _closing_campaigns):
             return {"success": False, "message": f"Campaign '{campaign_name}' final firmware row is still pending"}
+
+    recovery_checkpoint = _read_photons_recovery_config()
+    if recovery_checkpoint is not None:
+        recovery_source = _photons_recovery_source_row(recovery_checkpoint)
+        if recovery_source is None:
+            return {
+                "success": False,
+                "message": (
+                    f"config.{PHOTONS_RECOVERY_CONFIG_KEY} has no matching durable "
+                    "PHOTONS source; refusing campaign deletion"
+                ),
+            }
+        if str(recovery_source.get("campaign") or "") == campaign_name:
+            return {
+                "success": False,
+                "message": (
+                    f"Campaign '{campaign_name}' still owns current PHOTONS recovery "
+                    "custody — retry after the next ambient PHOTONS row"
+                ),
+            }
 
     with _maintenance_lock:
         if campaign_name in _pending_persist_campaign_names():
@@ -5552,6 +5919,10 @@ def cmd_truncate(_: Optional[dict]) -> Dict[str, Any]:
                 cur = conn.cursor()
                 cur.execute(
                     "TRUNCATE TABLE campaign_detail, campaign_master RESTART IDENTITY"
+                )
+                cur.execute(
+                    "DELETE FROM config WHERE config_key IN (%s, %s)",
+                    ("CLOCKS_RECOVERY", PHOTONS_RECOVERY_CONFIG_KEY),
                 )
         except Exception as exc:
             logging.exception("❌ [photons] TRUNCATE failed")
@@ -6634,6 +7005,9 @@ def cmd_photons_info(_: Optional[dict]) -> Dict[str, Any]:
             "state_worker_started": _state_worker_started.is_set(),
             "persistence_worker_started": _persistence_worker_started.is_set(),
             "campaign_control_ready": _campaign_control_ready.is_set(),
+            "startup_infrastructure_wait_count": _startup_infrastructure_wait_count,
+            "startup_infrastructure_wait_seconds_last": _startup_infrastructure_wait_seconds_last,
+            "startup_infrastructure": copy.deepcopy(_last_startup_infrastructure_wait),
             "fragments_received": _fragments_received,
             "fragments_processed": _fragments_processed,
             "fragments_rejected": _fragments_rejected,
@@ -6688,6 +7062,9 @@ def cmd_report(_: Optional[dict]) -> dict:
             "persist_queue_depth_max": _persist_queue_depth_max,
             "system_report_retry_count": _system_report_retry_count,
             "persistence_retry_count": _persistence_retry_count,
+            "startup_infrastructure_wait_count": _startup_infrastructure_wait_count,
+            "startup_infrastructure_wait_seconds_last": _startup_infrastructure_wait_seconds_last,
+            "startup_infrastructure": copy.deepcopy(_last_startup_infrastructure_wait),
             "state_worker_started": _state_worker_started.is_set(),
             "persistence_worker_started": _persistence_worker_started.is_set(),
             "campaign_control_ready": _campaign_control_ready.is_set(),
@@ -6827,6 +7204,12 @@ def run() -> None:
         publication_handler=on_publication,
         blocking=False,
     )
+
+    # Preserve the complete surviving-producer prefix while infrastructure comes
+    # back after a Pi boot.  The command/publication surface is already open and
+    # PHOTONS_FRAGMENT ingress is unbounded, but durable reads and Teensy commands
+    # are forbidden until SYSTEM proves both application planes NOMINAL.
+    _wait_for_startup_infrastructure()
 
     # Configuration is necessary but no longer sufficient to begin publication.
     # Firmware remains held until the Pi delivers one explicit recovery verdict:
