@@ -84,6 +84,8 @@ PPB_VISIBLE_COLUMN_COUNT = len(PPB_BUCKET_KEYS) + 1  # + campaign
 
 CLOCKS_TOPIC = "CLOCKS"
 PHOTONS_TOPIC = "PHOTONS"
+CLOCKS_RECOVERY_CONFIG_KEY = "CLOCKS_RECOVERY"
+PHOTONS_RECOVERY_CONFIG_KEY = "PHOTONS_RECOVERY"
 CAMPAIGN_TYPE_LANTERN = "LANTERN"
 PHOTONS_ROLLING_ROWS = 25
 
@@ -691,15 +693,49 @@ def _servo_state(r: dict) -> str:
     return mode
 
 
-def _recoverable_status(r: dict) -> str:
-    """Return the operator-facing instrument resurrection checkpoint state."""
-    checkpoint = r.get("ppb_restore_checkpoint")
-    if not isinstance(checkpoint, dict):
+def _recoverable_status(config_key: str) -> str:
+    """Return durable instrument resurrection readiness."""
+    expected_schemas = {
+        CLOCKS_RECOVERY_CONFIG_KEY: "PI_CLOCKS_PPB_RESTORE_CHECKPOINT_V1",
+        PHOTONS_RECOVERY_CONFIG_KEY: "PI_PHOTONS_PPB_RESTORE_CHECKPOINT_V1",
+    }
+    if config_key not in expected_schemas:
+        raise ValueError(f"unsupported recovery config key {config_key!r}")
+
+    with open_db(row_dict=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT payload FROM config WHERE config_key = %s",
+                (config_key,),
+            )
+            rows = cur.fetchall()
+
+    if not rows:
         return "UNAVAILABLE"
-    if _to_bool(checkpoint.get("recoverable")) is True:
-        return "TRUE"
-    status = str(checkpoint.get("status") or "").strip().upper()
-    return status or "FALSE"
+    if len(rows) != 1:
+        raise RuntimeError(
+            f"config.{config_key} is not a singleton: rows={len(rows)}"
+        )
+
+    checkpoint = rows[0]["payload"]
+    if isinstance(checkpoint, str):
+        checkpoint = json.loads(checkpoint)
+    if not isinstance(checkpoint, dict):
+        raise RuntimeError(f"config.{config_key} payload is not an object")
+    if checkpoint.get("schema") != expected_schemas[config_key]:
+        raise RuntimeError(
+            f"config.{config_key} has unexpected schema "
+            f"{checkpoint.get('schema')!r}"
+        )
+    if _to_bool(checkpoint.get("valid")) is not True:
+        raise RuntimeError(f"config.{config_key} checkpoint is not valid")
+
+    recoverable = _to_bool(checkpoint.get("recoverable"))
+    if recoverable is None:
+        raise RuntimeError(
+            f"config.{config_key} lacks boolean recoverable testimony"
+        )
+    return "NOMINAL" if recoverable else "HOLD"
 
 # ---------------------------------------------------------------------
 # DAC presentation helpers
@@ -1491,7 +1527,7 @@ def clocks_combined_readout() -> list[str]:
 
     servo_str = servo_state
     baseline_str = f"BASELINE: {baseline_campaign}" if baseline_campaign else "BASELINE: NONE"
-    recoverable_str = _recoverable_status(r)
+    recoverable_str = _recoverable_status(CLOCKS_RECOVERY_CONFIG_KEY)
 
     if state == "STARTED" or r.get("campaign_present"):
         identity = f"CAMPAIGN: {campaign}  ELAPSED: {elapsed}  n={n}"
@@ -2107,7 +2143,7 @@ def photons_detail_readout() -> list[str]:
         campaign_error = None
 
     campaign = live.get("campaign") if isinstance(live.get("campaign"), dict) else {}
-    recoverable_str = _recoverable_status(live)
+    recoverable_str = _recoverable_status(PHOTONS_RECOVERY_CONFIG_KEY)
     campaign_id = _to_int(campaign.get("campaign_id"))
     summary_by_id = {s.get("id"): s for s in summaries}
     active_summary = summary_by_id.get(campaign_id)
