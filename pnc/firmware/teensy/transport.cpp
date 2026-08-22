@@ -364,9 +364,25 @@ static volatile uint32_t rx_len_overflow_count       = 0;
 static volatile uint32_t rx_overlap_count            = 0;
 static volatile uint32_t rx_expected_traffic_missing = 0;
 
+// Pi->Teensy frame custody is scoped to one USB CDC DTR session.  The Teensy
+// may outlive the Pi process or the entire Pi host lifetime, so the byte
+// assembler must not let an unfinished frame from one DTR author be completed
+// by bytes from a replacement author.
+static bool              rx_host_dtr_last = false;
+static volatile uint32_t rx_host_session_generation = 0;
+static volatile uint32_t rx_host_dtr_transition_count = 0;
+static volatile uint32_t rx_host_connect_count = 0;
+static volatile uint32_t rx_host_disconnect_count = 0;
+static volatile uint32_t rx_host_incomplete_frame_retired_count = 0;
+static volatile uint32_t rx_host_last_retired_traffic = 0;
+static volatile uint32_t rx_host_last_retired_len = 0;
+static volatile uint32_t rx_host_last_retired_dwt = 0;
+
 // One complete parsed frame may wait here between the bounded timed RX service
 // and ordinary ALAP semantic dispatch.  Payload move assignment transfers owned
-// storage; the mailbox never borrows from the reusable RX byte buffer.
+// storage; the mailbox never borrows from the reusable RX byte buffer.  While
+// pending is true, the USB CDC receive FIFO itself is the backpressure queue:
+// timed RX service must not consume another byte until ALAP releases custody.
 static bool    rx_dispatch_pending = false;
 static uint8_t rx_dispatch_traffic = 0;
 static Payload rx_dispatch_payload;
@@ -374,10 +390,10 @@ static volatile uint32_t rx_dispatch_alap_arm_fail = 0;
 static volatile uint32_t rx_dispatch_invalid_callback = 0;
 static volatile uint32_t rx_dispatch_stack_mismatch = 0;
 
-// A complete frame must not overwrite the one-slot semantic-dispatch mailbox
-// before ALAP has taken custody.  For now this is forensic only: record the
-// exact collision and leave behavior unchanged so the instrument can tell us
-// whether this boundary participates in the sparse RPC anomaly.
+// A complete frame must never overwrite an owned semantic-dispatch mailbox.
+// The normal path prevents this by refusing further serial reads while pending.
+// If the contradiction is nevertheless observed, retain exact collision evidence
+// and fail hard before either payload can be silently replaced.
 static volatile uint32_t rx_dispatch_pending_collision_count = 0;
 static volatile uint32_t rx_dispatch_pending_collision_dwt = 0;
 static volatile uint32_t rx_dispatch_pending_collision_pending_traffic = 0;
@@ -1018,6 +1034,49 @@ static void rx_reset_hard() {
   rx_traffic = 0;
 }
 
+static void rx_retire_incomplete_host_frame() {
+  if (!rx_have_traffic)
+    return;
+
+  rx_host_incomplete_frame_retired_count++;
+  rx_host_last_retired_traffic = rx_traffic;
+  rx_host_last_retired_len = (uint32_t)rx_len;
+  rx_host_last_retired_dwt = ARM_DWT_CYCCNT;
+
+  // This is a lawful custody retirement, not malformed framing.  Do not charge
+  // it to rx_reset_hard: the prior DTR author simply no longer exists.
+  rx_len = 0;
+  rx_have_traffic = false;
+  rx_traffic = 0;
+}
+
+static bool rx_host_session_tick() {
+  const bool dtr_now = ZPNET_SERIAL.dtr() != 0U;
+
+  if (dtr_now == rx_host_dtr_last)
+    return dtr_now;
+
+  rx_host_dtr_transition_count++;
+
+  // A frame may never cross its author's serial-session boundary.
+  rx_retire_incomplete_host_frame();
+
+  if (dtr_now) {
+    rx_host_connect_count++;
+    rx_host_session_generation++;
+  } else {
+    rx_host_disconnect_count++;
+
+    // Unread USB CDC bytes were authored by the session that just ended.
+    // Remove them while that ownership fact is known; the next session starts
+    // at a clean physical byte boundary.
+    ZPNET_SERIAL.clear();
+  }
+
+  rx_host_dtr_last = dtr_now;
+  return dtr_now;
+}
+
 static inline bool rx_stx_accepts(uint8_t b) {
   if (rx_len >= STX_LEN)
     return true;
@@ -1069,7 +1128,6 @@ static void rx_dispatch_alap(
   const transport_receive_cb_t callback = recv_cb[traffic];
   const uint32_t msp_before = transport_read_msp();
   g_rx_dispatch_min_msp = msp_before;
-  rx_dispatch_pending = false;
   rx_dispatch_breadcrumb_note(TRANSPORT_RX_DISPATCH_ENTER,
                               traffic, callback, msp_before, 0U);
 
@@ -1098,6 +1156,8 @@ static void rx_dispatch_alap(
   rx_dispatch_breadcrumb_note(TRANSPORT_RX_DISPATCH_COMPLETE,
                               traffic, callback, msp_before,
                               transport_read_msp());
+  rx_dispatch_traffic = 0;
+  rx_dispatch_pending = false;
 }
 
 static bool dispatch_if_complete() {
@@ -1215,6 +1275,11 @@ static bool dispatch_if_complete() {
         pending_req_id_valid ? 1U : 0U;
     rx_dispatch_pending_collision_incoming_req_id_valid =
         incoming_req_id_valid ? 1U : 0U;
+
+    // Mailbox ownership is a semantic invariant.  Continuing here would
+    // overwrite testimony already promised to an armed ALAP callback.
+    __asm__ volatile("udf #0");
+    return false;
   }
 
   rx_dispatch_traffic = rx_traffic;
@@ -1226,8 +1291,9 @@ static bool dispatch_if_complete() {
         rx_dispatch_alap,
         nullptr,
         "TRANSPORT_RX_DISPATCH") == TIMEPOP_INVALID_HANDLE) {
-    rx_dispatch_pending = false;
     rx_dispatch_payload.clear();
+    rx_dispatch_traffic = 0;
+    rx_dispatch_pending = false;
     rx_dispatch_alap_arm_fail++;
   }
 
@@ -1241,6 +1307,19 @@ static bool dispatch_if_complete() {
 static void rx_serial_tick() {
 
   transport_rx_entered();
+
+  // DTR is the physical Pi-author session boundary.  Observe it before any
+  // mailbox backpressure decision so a dead host can retire an incomplete
+  // byte-assembly frame even while a previously complete payload is pending
+  // semantic dispatch.
+  if (!rx_host_session_tick())
+    return;
+
+  // One-slot mailbox custody is backpressured at the physical boundary.
+  // Leave unread bytes in the USB CDC FIFO until the armed ALAP callback has
+  // consumed and released the current semantic frame.
+  if (rx_dispatch_pending)
+    return;
 
   bool appended = false;
 
@@ -1474,6 +1553,18 @@ FLASHMEM void transport_get_info(transport_info_t* out) {
   out->rx_frames_complete           = rx_frames_complete;
   out->rx_frames_dispatched         = rx_frames_dispatched;
   out->rx_reset_hard                = rx_reset_hard_count;
+
+  out->rx_host_dtr_now = rx_host_dtr_last ? 1U : 0U;
+  out->rx_host_session_generation = rx_host_session_generation;
+  out->rx_host_dtr_transition_count = rx_host_dtr_transition_count;
+  out->rx_host_connect_count = rx_host_connect_count;
+  out->rx_host_disconnect_count = rx_host_disconnect_count;
+  out->rx_host_incomplete_frame_retired_count =
+      rx_host_incomplete_frame_retired_count;
+  out->rx_host_last_retired_traffic = rx_host_last_retired_traffic;
+  out->rx_host_last_retired_len = rx_host_last_retired_len;
+  out->rx_host_last_retired_dwt = rx_host_last_retired_dwt;
+
   out->rx_bad_stx                   = rx_bad_stx_count;
   out->rx_bad_etx                   = rx_bad_etx_count;
   out->rx_len_overflow              = rx_len_overflow_count;
@@ -1530,6 +1621,17 @@ void transport_init(void) {
   ZPNET_SERIAL.begin(USB_SERIAL_BAUD);
   rx_init_ms = millis();
   rx_first_frame_seen = false;
+
+  rx_host_dtr_last = ZPNET_SERIAL.dtr() != 0U;
+  rx_host_session_generation = rx_host_dtr_last ? 1U : 0U;
+  rx_host_dtr_transition_count = 0U;
+  rx_host_connect_count = rx_host_dtr_last ? 1U : 0U;
+  rx_host_disconnect_count = 0U;
+  rx_host_incomplete_frame_retired_count = 0U;
+  rx_host_last_retired_traffic = 0U;
+  rx_host_last_retired_len = 0U;
+  rx_host_last_retired_dwt = 0U;
+
   rx_len = 0;
   rx_have_traffic = false;
   rx_traffic = 0;

@@ -288,6 +288,24 @@ typedef struct {
   uint32_t rx_reset_hard;         // Hard RX state resets
 
   // ===========================================================
+  // RX — Host serial-session custody
+  // ===========================================================
+  //
+  // DTR is the physical author-session boundary for Pi->Teensy serial input.
+  // An incomplete frame belongs only to the DTR session that authored it and
+  // is retired when that session ends or a replacement session begins.
+
+  uint32_t rx_host_dtr_now;
+  uint32_t rx_host_session_generation;
+  uint32_t rx_host_dtr_transition_count;
+  uint32_t rx_host_connect_count;
+  uint32_t rx_host_disconnect_count;
+  uint32_t rx_host_incomplete_frame_retired_count;
+  uint32_t rx_host_last_retired_traffic;
+  uint32_t rx_host_last_retired_len;
+  uint32_t rx_host_last_retired_dwt;
+
+  // ===========================================================
   // RX — Framing failures
   // ===========================================================
 
