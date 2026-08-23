@@ -38,15 +38,14 @@ Core contract:
     remain missing; they are never replayed or reconstructed.
 
     When firmware campaign state is absent, RECOVER uses the last durable unified
-    state detail with TEMPEST decoration as the public base. Exact Alpha resurrection
-    consumes the literal Pi Better-Buckets checkpoint already embedded in that one
-    CLOCKS row; PostgreSQL history is never replayed to reconstruct firmware
-    statistics.  If holistic startup has already resurrected and proved Alpha while
-    volatile Beta campaign state died, Pi carries that custody fact into RECOVER and
-    requests CAMPAIGN_BOOTSTRAP so firmware preserves current Alpha and recreates only
-    the campaign lifecycle. The Pi sends RECOVER, waits for the first accepted public
-    row, and restores Pi-owned GNSS_RAW/Welford state immediately before that row is
-    persisted. Timeline rows may be admitted while OCXO science is explicitly
+    state detail with TEMPEST decoration as the public base. If Alpha is also lost,
+    the same structured COLD_BOOTSTRAP transaction restores canonical Alpha state,
+    its literal Pi Better-Buckets checkpoint, and the projected TEMPEST state together;
+    PostgreSQL history is never replayed to reconstruct firmware statistics. A surviving
+    Alpha whose volatile Beta alone was lost may still take the narrower campaign-only
+    repair path without rewinding instrument custody. The Pi waits for the first accepted
+    public row and restores Pi-owned GNSS_RAW/Welford state immediately before that row
+    is persisted. Timeline rows may be admitted while OCXO science is explicitly
     degraded/quarantined, but the final court still rejects malformed or incoherent
     candidates.
 
@@ -7655,7 +7654,7 @@ def _plan_active_campaign_recovery_topology(
         startup_alpha_disposition = str(
             startup_instrument_verdict.alpha_disposition or ""
         ).strip().upper()
-        if startup_alpha_disposition not in {"SURVIVED", "RESURRECTED"}:
+        if startup_alpha_disposition not in {"SURVIVED", "RESURRECTED", "LOST"}:
             raise RuntimeError(
                 "holistic instrument verdict has invalid Alpha disposition "
                 f"{startup_alpha_disposition!r}"
@@ -7672,6 +7671,7 @@ def _plan_active_campaign_recovery_topology(
 
     startup_alpha_resurrected = startup_alpha_disposition == "RESURRECTED"
     startup_alpha_survived = startup_alpha_disposition == "SURVIVED"
+    startup_alpha_lost = startup_alpha_disposition == "LOST"
 
     lifecycle_lost_custody = bool(
         recovery_custody.get("active")
@@ -7733,21 +7733,29 @@ def _plan_active_campaign_recovery_topology(
             )
 
     cold_restore_custody = bool(
-        physical_reboot_custody
+        startup_alpha_lost
+        or physical_reboot_custody
         or (lifecycle_lost_custody and not recovery_alpha_survived)
     )
 
-    # Alpha and Beta have independent lifetimes.  Alpha may already have been
-    # resurrected and proved earlier in this startup, or it may have survived
-    # while Beta alone was surrendered.  Both topologies preserve the current
-    # Alpha and recreate only the recording lifecycle.
+    # A dead Alpha with durable campaign state is restored together with Beta by
+    # the one structured COLD_BOOTSTRAP transaction.  CAMPAIGN_BOOTSTRAP remains
+    # only the narrower surviving-Alpha / lost-Beta repair path; it is no longer
+    # a second phase of dead-producer startup recovery.
     campaign_bootstrap_basis: Optional[str] = None
-    if startup_alpha_resurrected:
-        campaign_bootstrap_basis = "ALPHA_RESURRECTED_THIS_STARTUP"
-    elif (
-        epoch_ready_before_recover
+    if (
+        startup_alpha_survived
+        and epoch_ready_before_recover
         and not cold_restore_custody
         and not firmware_campaign_matches_durable
+    ):
+        campaign_bootstrap_basis = "SURVIVING_ALPHA_BETA_ABSENT"
+    elif (
+        startup_instrument_verdict is None
+        and epoch_ready_before_recover
+        and not cold_restore_custody
+        and not firmware_campaign_matches_durable
+        and recovery_alpha_survived
     ):
         campaign_bootstrap_basis = "SURVIVING_ALPHA_BETA_ABSENT"
     campaign_bootstrap_required = campaign_bootstrap_basis is not None
@@ -8199,6 +8207,51 @@ def _restore_instrument_from_clocks(
         startup_live_campaign_name or "missing",
         startup_live_campaign_state or "missing",
     )
+
+    # When this exact durable CLOCKS observation also carries the active TEMPEST
+    # state, do not resurrect Alpha here and then run a second campaign bootstrap.
+    # The active-campaign RECOVER command already accepts both canonical Alpha
+    # restore state and projected Beta coordinates.  Return an explicit LOST
+    # verdict so one later COLD_BOOTSTRAP transaction can install both together.
+    durable_campaign = _state_campaign(detail)
+    durable_campaign_name = (
+        _tempest_campaign_name(durable_campaign)
+        if isinstance(durable_campaign, dict) and durable_campaign
+        else ""
+    )
+    if active_campaign_name and durable_campaign_name == active_campaign_name:
+        loss_proof = {
+            "proved": True,
+            "alpha_lost": True,
+            "basis": "DEAD_ALPHA_DEFERRED_TO_COMBINED_CAMPAIGN_RECOVER",
+            "restore_monitor_status": status or None,
+            "report_decline_reasons": copy.deepcopy(report_decline_reasons),
+            "survival_lineage": copy.deepcopy(alpha_lineage),
+            "source_detail_id": _as_int(detail.get("_db_detail_id")),
+            "campaign": active_campaign_name,
+        }
+        logging.info(
+            "🧭 [holistic restore] dead Alpha + durable campaign '%s' will converge "
+            "in one CLOCKS.RECOVER transaction; skipping standalone Alpha restore",
+            active_campaign_name,
+        )
+        return (
+            {
+                "success": True,
+                "mode": "DEFERRED_COMBINED_ALPHA_CAMPAIGN_RESTORE",
+                "alpha_resurrected_this_startup": False,
+                "teensy_probe": copy.deepcopy(payload),
+                "proof": copy.deepcopy(loss_proof),
+            },
+            _HolisticInstrumentVerdict(
+                alpha_disposition="LOST",
+                alpha_basis="DEAD_ALPHA_DEFERRED_TO_COMBINED_CAMPAIGN_RECOVER",
+                alpha_proof=copy.deepcopy(loss_proof),
+                observed_campaign_name=str(payload.get("campaign") or "").strip(),
+                observed_campaign_state=campaign_state,
+                surviving_campaign=None,
+            ),
+        )
     # Newborn Alpha has now been disproved. Atomically arm a pre-mutation hold
     # before retiring startup custody and reinstalling durable Pi DAC ancestry.
     # This closes the race that previously allowed one newborn row to reset the
@@ -8606,10 +8659,19 @@ def _holistic_restore(
                 instrument_verdict=instrument_verdict,
             )
         else:
-            result["campaign"] = _restore_active_campaign_state(
+            campaign_result = _restore_active_campaign_state(
                 preverified_location=preverified_location,
                 startup_instrument_verdict=instrument_verdict,
             )
+            result["campaign"] = campaign_result
+            if (
+                instrument_verdict is not None
+                and str(instrument_verdict.alpha_disposition).strip().upper() == "LOST"
+                and isinstance(campaign_result.get("combined_instrument_restore"), dict)
+            ):
+                result["instrument"] = copy.deepcopy(
+                    campaign_result["combined_instrument_restore"]
+                )
 
     result["completed_at_utc"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     return result
@@ -13283,6 +13345,11 @@ def _cleanup_after_recovery_failure(reason: str, details: Dict[str, Any]) -> Non
     drained = _drain_timebase_ingress()
     _request_teensy_recover_abort_best_effort(reason, details)
     _abort_teensy_ppb_restore_best_effort()
+    if bool((_diag.get("last_recovery") or {}).get("combined_dead_producer_restore")):
+        with _clocks_state_mutation_gate_lock:
+            _clocks_holistic_restore_proof_pending.clear()
+            _clocks_holistic_restore_proof_committed.clear()
+            _startup_instrument_restore_hold.clear()
     _diag["last_recovery_abort"] = {
         **(_diag.get("last_recovery_abort") or {}),
         "pi_cleanup_reason": reason,
@@ -14951,6 +15018,10 @@ def _restore_active_campaign_state(
     cold_restore_custody = recovery_plan.restore_alpha_required
     campaign_bootstrap_required = recovery_plan.campaign_bootstrap_required
     campaign_bootstrap_basis = recovery_plan.campaign_bootstrap_basis
+    startup_alpha_lost = bool(
+        startup_instrument_verdict is not None
+        and str(startup_instrument_verdict.alpha_disposition).strip().upper() == "LOST"
+    )
 
     # Durable canonical CLOCKS is the ancestry authority. Firmware may discover
     # that it needs a cold bootstrap locally, but it may not override an explicit
@@ -14991,6 +15062,9 @@ def _restore_active_campaign_state(
         and str(startup_instrument_verdict.alpha_disposition).strip().upper()
             == "RESURRECTED"
     )
+    _diag["last_recovery"]["alpha_lost_before_combined_restore"] = bool(
+        startup_alpha_lost
+    )
     _diag["last_recovery"]["startup_instrument_verdict"] = (
         {
             "alpha_disposition": startup_instrument_verdict.alpha_disposition,
@@ -15005,6 +15079,79 @@ def _restore_active_campaign_state(
         campaign_bootstrap_required
     )
     _diag["last_recovery"]["campaign_bootstrap_basis"] = campaign_bootstrap_basis
+
+    combined_startup_custody: Optional[Dict[str, Any]] = None
+    combined_pi_control: Optional[Dict[str, Any]] = None
+    combined_alpha_proof: Optional[Dict[str, Any]] = None
+    combined_recovery_detail: Optional[Dict[str, Any]] = None
+    combined_restore_requested_monotonic: Optional[float] = None
+    if startup_alpha_lost:
+        if not cold_restore_custody or campaign_bootstrap_required:
+            raise RecoveryRetryableFailure(
+                "combined_dead_producer_topology_not_cold",
+                {
+                    "campaign": campaign_name,
+                    "restore_alpha_required": bool(cold_restore_custody),
+                    "campaign_bootstrap_required": bool(campaign_bootstrap_required),
+                    "startup_instrument_verdict": copy.deepcopy(
+                        _diag["last_recovery"].get("startup_instrument_verdict")
+                    ),
+                },
+            )
+
+        # Step 1 deliberately moved the literal Better-Buckets image out of
+        # canonical CLOCKS and into config.CLOCKS_RECOVERY.  The campaign
+        # recovery view above is therefore compact observation state and must
+        # never be asked to manufacture the private Alpha checkpoint.  Rebind
+        # this exact durable detail to its formal recovery snapshot and require
+        # all three courts to name the same source identity before mutation.
+        combined_snapshot = _load_clocks_recovery_snapshot()
+        if combined_snapshot is None:
+            raise RuntimeError(
+                "combined dead-producer restore has no CLOCKS recovery snapshot"
+            )
+        combined_source_detail_id = int(combined_snapshot.source_detail_id)
+        loss_source_detail_id = _as_int(
+            (startup_instrument_verdict.alpha_proof or {}).get("source_detail_id")
+            if startup_instrument_verdict is not None
+            else None
+        )
+        if (
+            recovery_source_db_id is None
+            or loss_source_detail_id != int(recovery_source_db_id)
+            or combined_source_detail_id != int(recovery_source_db_id)
+        ):
+            raise RuntimeError(
+                "combined dead-producer recovery authority identity mismatch: "
+                f"campaign_source={recovery_source_db_id} "
+                f"loss_source={loss_source_detail_id} "
+                f"snapshot_source={combined_source_detail_id}"
+            )
+        combined_recovery_detail = combined_snapshot.restore_detail()
+        combined_recovery_clocks = _clocks_payload(combined_recovery_detail)
+
+        # This is the single dead-producer cutover boundary. Retire the newborn
+        # startup prefix, restore Pi-owned DAC/control custody from the exact
+        # snapshot authority, and arm the exact Alpha N+1 proof before firmware
+        # receives the one combined Alpha+Beta RECOVER transaction.
+        with _clocks_state_mutation_gate_lock:
+            _startup_instrument_restore_hold.set()
+            _startup_physical_lifetime_unclassified.clear()
+            combined_startup_custody = _retire_startup_clocks_custody(
+                "combined_dead_producer_restore"
+            )
+            combined_pi_control = _dac_restore_control_from_clocks(
+                combined_recovery_clocks, realize=True
+            )
+        _seed_clocks_from_detail(combined_recovery_detail)
+        _arm_holistic_restore_persistence_proof(combined_recovery_detail)
+        logging.info(
+            "♻️ [recovery] dead Alpha and TEMPEST '%s' prepared for one combined "
+            "COLD_BOOTSTRAP transaction from detail_id=%s",
+            campaign_name,
+            recovery_source_db_id,
+        )
+
     cold_ppb_stage: Optional[Dict[str, Any]] = None
     if campaign_bootstrap_required:
         _diag["last_recovery"]["canonical_restore_present"] = False
@@ -15033,8 +15180,15 @@ def _restore_active_campaign_state(
                 reported_campaign_state or "UNKNOWN",
                 physical_reboot_custody,
             )
+        alpha_restore_clocks = canonical_recovery_clocks
+        if startup_alpha_lost:
+            if combined_recovery_detail is None:
+                raise RuntimeError(
+                    "combined dead-producer restore lost its formal recovery snapshot"
+                )
+            alpha_restore_clocks = _clocks_payload(combined_recovery_detail)
         cold_ppb_checkpoint = _require_alpha_resurrection_checkpoint(
-            canonical_recovery_clocks,
+            alpha_restore_clocks,
             campaign=campaign_name,
             recovery_source_db_id=recovery_source_db_id,
         )
@@ -15046,7 +15200,7 @@ def _restore_active_campaign_state(
             cold_ppb_checkpoint
         )
         teensy_recover_args.update(
-            _canonical_restore_args(canonical_recovery_clocks, include_control=False)
+            _canonical_restore_args(alpha_restore_clocks, include_control=False)
         )
         _diag["last_recovery"]["canonical_restore_present"] = True
         _diag["last_recovery"]["restore_schema_version"] = 4
@@ -15060,6 +15214,8 @@ def _restore_active_campaign_state(
         )
 
     try:
+        if startup_alpha_lost:
+            combined_restore_requested_monotonic = time.monotonic()
         teensy_recover_resp = _request_teensy_recover(
             int(recover_base_pps_vclock_count),
             teensy_recover_args,
@@ -15163,6 +15319,37 @@ def _restore_active_campaign_state(
         else RECOVERY_FIRST_ROW_TIMEOUT_S
     )
 
+    if startup_alpha_lost:
+        if not cold_bootstrap:
+            raise RecoveryRetryableFailure(
+                "combined_dead_producer_restore_not_cold_bootstrap",
+                {
+                    "campaign": campaign_name,
+                    "recover_mode": recover_mode,
+                    "teensy_recover_payload": teensy_recover_payload,
+                },
+            )
+        if combined_restore_requested_monotonic is None:
+            raise RuntimeError("combined CLOCKS restore has no command timestamp")
+        if combined_recovery_detail is None:
+            raise RuntimeError(
+                "combined dead-producer restore lost its formal recovery snapshot"
+            )
+        combined_alpha_proof = _wait_for_holistic_restore(
+            combined_recovery_detail,
+            requested_monotonic=combined_restore_requested_monotonic,
+            timeout_s=float(first_row_timeout_s),
+        )
+        # Exact Alpha N+1 is now durable, but ordinary persistence intentionally
+        # remains closed.  The narrow holistic-proof lane can carry the subsequent
+        # rows from this same COLD_BOOTSTRAP while we wait for the projected TEMPEST
+        # first-public boundary.  The general writer opens only after both Alpha and
+        # Beta have converged, preserving one atomic dead-producer recovery boundary.
+        logging.info(
+            "✅ [recovery] combined dead-producer Alpha proof durable; the same "
+            "COLD_BOOTSTRAP transaction is now awaiting its TEMPEST first-public row"
+        )
+
     _diag["last_recovery"].update({
         "recover_mode": recover_mode,
         "cold_bootstrap": bool(cold_bootstrap),
@@ -15173,6 +15360,8 @@ def _restore_active_campaign_state(
         "teensy_campaign_bootstrap_required": bool(
             teensy_campaign_bootstrap_required
         ),
+        "combined_dead_producer_restore": bool(startup_alpha_lost),
+        "combined_alpha_proof": copy.deepcopy(combined_alpha_proof),
         "interrupt_service_preserved": not cold_bootstrap,
         "recover_cold_bootstrap_active": bool(
             teensy_recover_payload.get("recover_cold_bootstrap_active")
@@ -15476,10 +15665,9 @@ def _restore_active_campaign_state(
     ppb_post_campaign_bootstrap_refresh: Optional[Dict[str, Any]] = None
     if (
         campaign_bootstrap
-        and campaign_bootstrap_basis == "ALPHA_RESURRECTED_THIS_STARTUP"
+        and campaign_bootstrap_basis == "SURVIVING_ALPHA_BETA_ABSENT"
     ):
-        # CAMPAIGN_BOOTSTRAP explicitly preserves the Alpha epoch proved earlier in
-        # this startup, but its private Beta handoff may consume one or more Alpha
+        # The surviving-Alpha Beta-only handoff may consume one or more Alpha
         # statistical updates without publishing an ordinary Pi-observed CLOCKS row.
         # That deliberate recovery-owned omission must not reach the generic
         # PI_OBSERVATION_GAP court. The first admitted campaign row proves the
@@ -15514,14 +15702,34 @@ def _restore_active_campaign_state(
         teensy_pps_vclock_count,
         bool(recovery_admission_verdict.get("fully_clean")),
     )
+    combined_instrument_restore = None
+    if startup_alpha_lost:
+        combined_instrument_restore = {
+            "success": True,
+            "mode": "COMBINED_ALPHA_CAMPAIGN_RESTORE",
+            "alpha_resurrected_this_startup": True,
+            "firmware_recover_mode": recover_mode,
+            "pi_control": copy.deepcopy(combined_pi_control),
+            "startup_custody": copy.deepcopy(combined_startup_custody),
+            "better_buckets": copy.deepcopy(cold_ppb_stage),
+            "proof": copy.deepcopy(combined_alpha_proof),
+        }
+        # The combined transaction is complete only now: Alpha N+1 is durable,
+        # the projected TEMPEST first-public row has been admitted, and Pi custody
+        # has been reseeded.  Open ordinary persistence at this single boundary.
+        _clocks_persistence_enabled.set()
+        _clocks_holistic_restore_proof_pending.clear()
+
     return {
         "restored": True,
         "mode": "warm_recover",
         "firmware_recover_mode": recover_mode,
         "campaign_bootstrap": bool(campaign_bootstrap),
+        "combined_dead_producer_restore": bool(startup_alpha_lost),
         "campaign": campaign_name,
         "first_public_pps_vclock_count": int(teensy_pps_vclock_count),
         "science_clean": bool(recovery_admission_verdict.get("fully_clean")),
+        "combined_instrument_restore": combined_instrument_restore,
         "better_buckets_post_campaign_bootstrap_refresh": copy.deepcopy(
             ppb_post_campaign_bootstrap_refresh
         ),

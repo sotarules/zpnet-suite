@@ -4376,6 +4376,31 @@ def _startup_held_restore(
     global _recovery_partial_history_restore_count
     generation = _new_recovery_generation()
     history_truncated = bool(literal_history.get("history_truncated"))
+
+    # RECOVERY_COMMIT is the complete dead-producer desired-state cutover.  If a
+    # durable active LANTERN exists, its firmware state must already be inside the
+    # same producer restore image; a later recovery-specific START is forbidden.
+    campaign_restore = source.get("campaign_restore")
+    restore_args = source.get("restore_args")
+    if not isinstance(restore_args, dict):
+        raise RuntimeError("PHOTONS held restore source lacks producer restore_args")
+    if active_master is not None:
+        if not isinstance(campaign_restore, dict):
+            raise RuntimeError(
+                "active LANTERN is absent from PHOTONS RECOVERY_COMMIT desired state"
+            )
+        if restore_args.get("campaign_active") is not True:
+            raise RuntimeError(
+                "active LANTERN restore source does not set campaign_active=true"
+            )
+        if str(restore_args.get("campaign") or "") != str(active_master["campaign"]):
+            raise RuntimeError(
+                "PHOTONS RECOVERY_COMMIT campaign identity disagrees with active master"
+            )
+    elif campaign_restore is not None or restore_args.get("campaign_active") is not False:
+        raise RuntimeError(
+            "PHOTONS held restore carries campaign state without an active LANTERN master"
+        )
     # HELD_RESTORE replaces physical ancestry rather than pretending the Pi saw
     # every firmware publication during restart/reacquisition.  The first
     # post-restore campaign row may therefore be a lawful forward splice from
@@ -4448,7 +4473,7 @@ def _startup_held_restore(
     )
     try:
         staged = _stage_recovery_history(generation=generation, history=literal_history)
-        commit_args = dict(source["restore_args"])
+        commit_args = copy.deepcopy(restore_args)
         commit_args["generation"] = generation
         commit = _send_teensy_recovery_command(
             "RECOVERY_COMMIT",
@@ -4505,7 +4530,7 @@ def _startup_held_restore(
         source=source,
         proof=proof,
     )
-    rearm = _arm_existing_active_campaign_after_instrument_recovery(active_master)
+    campaign_restored_in_commit = bool(active_master is not None)
     with _state_lock:
         _recovery_restore_count += 1
         if history_truncated:
@@ -4528,7 +4553,8 @@ def _startup_held_restore(
         ),
         "proof_contract": "EXACT_SOURCE_N_PLUS_1",
         "proof": proof,
-        "campaign_rearm": rearm,
+        "campaign_restored_in_commit": campaign_restored_in_commit,
+        "campaign_rearm": None,
         "staged": staged,
     }
     _recovery_status_set("COMPLETE", **result)
