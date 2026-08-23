@@ -355,6 +355,7 @@ PPB_FIRMWARE_DELTA_SCHEMA = "CLOCKS_PPB_CHECKPOINT_DELTA_V1"
 PPB_PI_CHECKPOINT_SCHEMA = "PI_CLOCKS_PPB_RESTORE_CHECKPOINT_V1"
 CLOCKS_RECOVERY_CONFIG_KEY = "CLOCKS_RECOVERY"
 CLOCKS_RECOVERY_SNAPSHOT_SCHEMA = "PI_CLOCKS_RECOVERY_SNAPSHOT_V1"
+CLOCKS_RECOVERY_DESIRED_STATE_SCHEMA = "PI_CLOCKS_RECOVERY_DESIRED_STATE_V1"
 TIMEBASE_SILENCE_TIMEOUT_S = 30.0
 TIMEBASE_SILENCE_MONITOR_POLL_S = 1.0
 TEENSY_HEALTH_RETRY_S = 60.0
@@ -10794,6 +10795,157 @@ def _recovery_timebase_snapshot(tb: Dict[str, Any]) -> Dict[str, Any]:
 
 
 
+def _project_clocks_recovery_snapshot(
+    snapshot: Dict[str, Any],
+    now: datetime,
+) -> Dict[str, Any]:
+    """Purely translate one selected CLOCKS recovery snapshot to desired state.
+
+    ``snapshot`` is observation-only input from ``_recovery_timebase_snapshot``.
+    This function performs no database access, firmware I/O, topology inspection,
+    logging, or process-state mutation.  Its only non-identity work is the
+    unavoidable deterministic translation of a running TEMPEST timeline across
+    elapsed GNSS time.
+    """
+    if not isinstance(snapshot, dict):
+        raise TypeError("CLOCKS recovery projection requires a snapshot object")
+    if not snapshot.get("recoverable"):
+        raise ValueError("CLOCKS recovery projection requires a recoverable snapshot")
+    if not isinstance(now, datetime) or now.tzinfo is None:
+        raise ValueError("CLOCKS recovery projection requires timezone-aware now")
+
+    now_utc = now.astimezone(timezone.utc)
+    last_pps_vclock_count = int(snapshot["last_pps_vclock_count"])
+    last_gnss_ns = int(snapshot["last_gnss_ns"])
+    last_dwt_cycles = int(snapshot["last_dwt_cycles"])
+    last_dwt_ns = int(snapshot["last_dwt_ns"])
+    last_ocxo1_ns = int(snapshot["last_ocxo1_ns"])
+    last_ocxo2_ns = int(snapshot["last_ocxo2_ns"])
+    last_gnss_time_str = str(snapshot["last_gnss_time_str"])
+
+    # Preserve the legacy recovery rule exactly.  In a formally recoverable V4
+    # snapshot GNSS is positive, but retain the historical DWT fallback here so
+    # observation parsing and projection remain behaviorally equivalent.
+    projection_gnss_ns = last_gnss_ns if last_gnss_ns > 0 else last_dwt_ns
+
+    try:
+        last_gnss_utc = datetime.fromisoformat(
+            last_gnss_time_str.replace("Z", "+00:00")
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"CLOCKS recovery snapshot has invalid GNSS UTC {last_gnss_time_str!r}"
+        ) from exc
+    if last_gnss_utc.tzinfo is None:
+        raise ValueError("CLOCKS recovery snapshot GNSS UTC is timezone-naive")
+    last_gnss_utc = last_gnss_utc.astimezone(timezone.utc)
+
+    elapsed_seconds = int(round((now_utc - last_gnss_utc).total_seconds()))
+    if elapsed_seconds <= 0:
+        raise ValueError(
+            "CLOCKS recovery projection requires positive elapsed GNSS time: "
+            f"last={last_gnss_time_str} "
+            f"current={now_utc.isoformat().replace('+00:00', 'Z')} "
+            f"elapsed_seconds={elapsed_seconds}"
+        )
+
+    recover_base_pps_vclock_count = last_pps_vclock_count + elapsed_seconds
+    expected_first_public_pps_vclock_count = (
+        recover_base_pps_vclock_count + RECOVERY_FIRST_PUBLIC_OFFSET
+    )
+
+    projected_gnss_ns = recover_base_pps_vclock_count * NS_PER_SECOND
+    expected_first_public_gnss_ns = (
+        expected_first_public_pps_vclock_count * NS_PER_SECOND
+    )
+    projected_dwt_cycles = (
+        projected_gnss_ns * last_dwt_cycles // projection_gnss_ns
+        if projection_gnss_ns > 0 and last_dwt_cycles > 0
+        else 0
+    )
+    projected_dwt_ns = (
+        _dwt_cycles_to_recover_ns(projected_dwt_cycles)
+        if projected_dwt_cycles > 0
+        else (
+            projected_gnss_ns * last_dwt_ns // projection_gnss_ns
+            if projection_gnss_ns > 0
+            else projected_gnss_ns
+        )
+    )
+    projected_ocxo1_ns = (
+        projected_gnss_ns * last_ocxo1_ns // projection_gnss_ns
+        if projection_gnss_ns > 0 and last_ocxo1_ns > 0
+        else 0
+    )
+    projected_ocxo2_ns = (
+        projected_gnss_ns * last_ocxo2_ns // projection_gnss_ns
+        if projection_gnss_ns > 0 and last_ocxo2_ns > 0
+        else 0
+    )
+    expected_first_public_ocxo1_ns = _recovery_project_ocxo_from_base(
+        public_gnss_ns=expected_first_public_gnss_ns,
+        recovered_gnss_ns=projected_gnss_ns,
+        recovered_ocxo_ns=projected_ocxo1_ns,
+    )
+    expected_first_public_ocxo2_ns = _recovery_project_ocxo_from_base(
+        public_gnss_ns=expected_first_public_gnss_ns,
+        recovered_gnss_ns=projected_gnss_ns,
+        recovered_ocxo_ns=projected_ocxo2_ns,
+    )
+
+    tau_dwt = (
+        last_dwt_cycles
+        / ((projection_gnss_ns * DWT_EXPECTED_PER_PPS) / NS_PER_SECOND)
+        if projection_gnss_ns > 0 and last_dwt_cycles > 0
+        else 1.0
+    )
+    tau_ocxo1 = (
+        last_ocxo1_ns / projection_gnss_ns
+        if projection_gnss_ns > 0 and last_ocxo1_ns > 0
+        else 1.0
+    )
+    tau_ocxo2 = (
+        last_ocxo2_ns / projection_gnss_ns
+        if projection_gnss_ns > 0 and last_ocxo2_ns > 0
+        else 1.0
+    )
+
+    return {
+        "schema": CLOCKS_RECOVERY_DESIRED_STATE_SCHEMA,
+        "source": copy.deepcopy(snapshot),
+        "projected_at_gnss_utc": now_utc.isoformat().replace("+00:00", "Z"),
+        "elapsed_seconds": int(elapsed_seconds),
+        "recover_base_pps_vclock_count": int(recover_base_pps_vclock_count),
+        "expected_first_public_pps_vclock_count": int(
+            expected_first_public_pps_vclock_count
+        ),
+        "restore_clockfaces": {
+            "gnss_ns": int(projected_gnss_ns),
+            "dwt_cycles": int(projected_dwt_cycles),
+            "dwt_ns": int(projected_dwt_ns),
+            "ocxo1_ns": int(projected_ocxo1_ns),
+            "ocxo2_ns": int(projected_ocxo2_ns),
+        },
+        "expected_first_public_clockfaces": {
+            "gnss_ns": int(expected_first_public_gnss_ns),
+            "ocxo1_ns": int(expected_first_public_ocxo1_ns),
+            "ocxo2_ns": int(expected_first_public_ocxo2_ns),
+        },
+        "tau": {
+            "dwt": float(tau_dwt),
+            "ocxo1": float(tau_ocxo1),
+            "ocxo2": float(tau_ocxo2),
+        },
+        "teensy_recover_args": {
+            "dwt_ns": str(int(projected_dwt_ns)),
+            "gnss_ns": str(int(projected_gnss_ns)),
+            "ocxo1_ns": str(int(projected_ocxo1_ns)),
+            "ocxo2_ns": str(int(projected_ocxo2_ns)),
+        },
+    }
+
+
+
 def _state_campaign(state: Dict[str, Any]) -> Dict[str, Any]:
     """Return the canonical optional TEMPEST campaign delta from CLOCKS_V4."""
     campaign = state.get("campaign")
@@ -14636,23 +14788,43 @@ def _restore_active_campaign_state(
     time.sleep(sleep_to_boundary)
 
     # ------------------------------------------------------------------
-    # Step 3: Compute elapsed GNSS seconds
+    # Step 3-5: Pure snapshot -> desired-state projection
     # ------------------------------------------------------------------
     current_gnss_time_str = _wait_for_gnss_time()
     logging.info("📐 [recovery] current GNSS time: %s", current_gnss_time_str)
-
-    last_gnss_utc = datetime.fromisoformat(last_gnss_time_str.replace("Z", "+00:00"))
-    current_gnss_utc = datetime.fromisoformat(current_gnss_time_str.replace("Z", "+00:00"))
-
-    elapsed_td = current_gnss_utc - last_gnss_utc
-    elapsed_seconds = int(round(elapsed_td.total_seconds()))
-
-    if elapsed_seconds <= 0:
-        _diag["recovery_elapsed_seconds_nonpositive"] += 1
-        raise RuntimeError(
-            f"recovery failed: elapsed_seconds={elapsed_seconds} "
-            f"(last={last_gnss_time_str} current={current_gnss_time_str})"
+    current_gnss_utc = datetime.fromisoformat(
+        current_gnss_time_str.replace("Z", "+00:00")
+    )
+    try:
+        desired_state = _project_clocks_recovery_snapshot(
+            recovery_snapshot, current_gnss_utc
         )
+    except ValueError as exc:
+        if "positive elapsed GNSS time" in str(exc):
+            _diag["recovery_elapsed_seconds_nonpositive"] += 1
+        raise RuntimeError(f"recovery projection failed: {exc}") from exc
+
+    elapsed_seconds = int(desired_state["elapsed_seconds"])
+    recover_base_pps_vclock_count = int(
+        desired_state["recover_base_pps_vclock_count"]
+    )
+    expected_first_public_pps_vclock_count = int(
+        desired_state["expected_first_public_pps_vclock_count"]
+    )
+    restore_clockfaces = desired_state["restore_clockfaces"]
+    first_public_clockfaces = desired_state["expected_first_public_clockfaces"]
+    tau = desired_state["tau"]
+    projected_gnss_ns = int(restore_clockfaces["gnss_ns"])
+    projected_dwt_cycles = int(restore_clockfaces["dwt_cycles"])
+    projected_dwt_ns = int(restore_clockfaces["dwt_ns"])
+    projected_ocxo1_ns = int(restore_clockfaces["ocxo1_ns"])
+    projected_ocxo2_ns = int(restore_clockfaces["ocxo2_ns"])
+    expected_first_public_gnss_ns = int(first_public_clockfaces["gnss_ns"])
+    expected_first_public_ocxo1_ns = int(first_public_clockfaces["ocxo1_ns"])
+    expected_first_public_ocxo2_ns = int(first_public_clockfaces["ocxo2_ns"])
+    tau_dwt = float(tau["dwt"])
+    tau_ocxo1 = float(tau["ocxo1"])
+    tau_ocxo2 = float(tau["ocxo2"])
 
     logging.info(
         "📐 [recovery] GNSS ELAPSED:\r\n"
@@ -14661,64 +14833,9 @@ def _restore_active_campaign_state(
         "    elapsed_seconds   = %d",
         last_gnss_time_str, current_gnss_time_str, elapsed_seconds,
     )
-
-    # ------------------------------------------------------------------
-    # Step 4-5: Symmetric projection
-    # ------------------------------------------------------------------
-    # Seed RECOVER at the campaign base count for the current GNSS second.
-    # The first public row should then be the next PPS/VCLOCK identity. No
-    # fixed skipped-row policy is modeled Pi-side anymore.
-    recover_base_pps_vclock_count = last_pps_vclock_count + elapsed_seconds
-    expected_first_public_pps_vclock_count = (
-        recover_base_pps_vclock_count + RECOVERY_FIRST_PUBLIC_OFFSET
-    )
-
-    projected_gnss_ns = recover_base_pps_vclock_count * NS_PER_SECOND
-    expected_first_public_gnss_ns = (
-        expected_first_public_pps_vclock_count * NS_PER_SECOND
-    )
-    projected_dwt_cycles = (
-        projected_gnss_ns * last_dwt_cycles // last_gnss_ns
-        if (last_gnss_ns > 0 and last_dwt_cycles > 0)
-        else 0
-    )
-    projected_dwt_ns = (
-        _dwt_cycles_to_recover_ns(projected_dwt_cycles)
-        if projected_dwt_cycles > 0
-        else (projected_gnss_ns * last_dwt_ns // last_gnss_ns if last_gnss_ns > 0 else projected_gnss_ns)
-    )
-    projected_ocxo1_ns = projected_gnss_ns * last_ocxo1_ns // last_gnss_ns if (last_gnss_ns > 0 and last_ocxo1_ns > 0) else 0
-    projected_ocxo2_ns = projected_gnss_ns * last_ocxo2_ns // last_gnss_ns if (last_gnss_ns > 0 and last_ocxo2_ns > 0) else 0
-    expected_first_public_ocxo1_ns = _recovery_project_ocxo_from_base(
-        public_gnss_ns=expected_first_public_gnss_ns,
-        recovered_gnss_ns=projected_gnss_ns,
-        recovered_ocxo_ns=projected_ocxo1_ns,
-    )
-    expected_first_public_ocxo2_ns = _recovery_project_ocxo_from_base(
-        public_gnss_ns=expected_first_public_gnss_ns,
-        recovered_gnss_ns=projected_gnss_ns,
-        recovered_ocxo_ns=projected_ocxo2_ns,
-    )
-
-    # GNSS_RAW is Pi-owned and has its own reference ledger.  Do not project it
-    # as last_gnss_raw_ns / last_gnss_ns; that preserves any poisoned
-    # clockface/GNSS ratio across every recovery.  The actual seed immediately
-    # before the first accepted public row is computed below after the clean
-    # row is known.
-    projected_gnss_raw_ns = 0
-    projected_gnss_raw_ref_ns = 0
-
-    tau_dwt = (
-        last_dwt_cycles / ((last_gnss_ns * DWT_EXPECTED_PER_PPS) / NS_PER_SECOND)
-        if last_gnss_ns > 0 and last_dwt_cycles > 0
-        else 1.0
-    )
-    tau_ocxo1 = last_ocxo1_ns / last_gnss_ns if (last_gnss_ns > 0 and last_ocxo1_ns > 0) else 1.0
-    tau_ocxo2 = last_ocxo2_ns / last_gnss_ns if (last_gnss_ns > 0 and last_ocxo2_ns > 0) else 1.0
-
     logging.info(
-        "📐 [recovery] projection: last=%d elapsed=%d base=%d first_public=%d; "
-        "gnss_base=%d dwt_cycles=%d ocxo1=%d ocxo2=%d",
+        "📐 [recovery] declarative projection: last=%d elapsed=%d base=%d "
+        "first_public=%d; gnss_base=%d dwt_cycles=%d ocxo1=%d ocxo2=%d",
         last_pps_vclock_count,
         elapsed_seconds,
         recover_base_pps_vclock_count,
@@ -14734,6 +14851,7 @@ def _restore_active_campaign_state(
         "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "campaign": campaign_name,
         "recovery_source_db_id": recovery_source_db_id,
+        "desired_state_schema": desired_state.get("schema"),
         "last_pps_vclock_count": int(last_pps_vclock_count),
         "last_gnss_time": last_gnss_time_str,
         "current_gnss_time": current_gnss_time_str,
@@ -14775,10 +14893,7 @@ def _restore_active_campaign_state(
 
     teensy_recover_args: Dict[str, Any] = {
         "campaign": campaign_name,
-        "dwt_ns": str(int(projected_dwt_ns)),
-        "gnss_ns": str(int(projected_gnss_ns)),
-        "ocxo1_ns": str(int(projected_ocxo1_ns)),
-        "ocxo2_ns": str(int(projected_ocxo2_ns)),
+        **copy.deepcopy(desired_state["teensy_recover_args"]),
     }
 
     epoch_ready_before_recover, recovery_status_before = _probe_teensy_recovery_epoch()

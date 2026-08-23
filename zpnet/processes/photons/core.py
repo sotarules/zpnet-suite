@@ -110,6 +110,7 @@ PHOTONS_PPB_FIRMWARE_DELTA_SCHEMA = "PHOTONS_PPB_CHECKPOINT_DELTA_V1"
 PHOTONS_PPB_PI_CHECKPOINT_SCHEMA = "PI_PHOTONS_PPB_RESTORE_CHECKPOINT_V1"
 PHOTONS_RECOVERY_CONFIG_KEY = "PHOTONS_RECOVERY"
 PHOTONS_RECOVERY_SNAPSHOT_SCHEMA = "PI_PHOTONS_RECOVERY_SNAPSHOT_V1"
+PHOTONS_RECOVERY_DESIRED_STATE_SCHEMA = "PI_PHOTONS_RECOVERY_DESIRED_STATE_V1"
 
 TEENSY_CAMPAIGN_START_ACCEPTED_STATUSES = {"start_requested", "flash_cut_requested"}
 TEENSY_CAMPAIGN_STOP_ACCEPTED_STATUSES = {"stop_requested"}
@@ -3074,6 +3075,44 @@ def _photons_recovery_snapshot_from_row(
     )
 
 
+def _project_photons_recovery_snapshot(
+    snapshot: _PhotonsRecoverySnapshot,
+    now: datetime,
+) -> Dict[str, Any]:
+    """Purely translate one durable PHOTONS snapshot to desired state at ``now``.
+
+    PHOTONS has no lawful elapsed-time synthesis for unobserved optical laps.
+    Therefore the producer restoration image is intentionally identity-translated:
+    aggregate statistics, custody counters, Welfords, LANTERN coordinates, and the
+    literal Better-Buckets sidecar remain exactly as captured.  ``now`` names the
+    requested convergence instant but does not manufacture physical ancestry.
+    """
+    if not isinstance(snapshot, _PhotonsRecoverySnapshot):
+        raise TypeError("PHOTONS recovery projection requires _PhotonsRecoverySnapshot")
+    if not isinstance(now, datetime) or now.tzinfo is None:
+        raise ValueError("PHOTONS recovery projection requires timezone-aware now")
+
+    now_utc = now.astimezone(timezone.utc)
+    source = snapshot.restore_source()
+    restore_args = source.get("restore_args")
+    if not isinstance(restore_args, dict):
+        raise ValueError("PHOTONS recovery snapshot lacks producer restore_args")
+
+    return {
+        "schema": PHOTONS_RECOVERY_DESIRED_STATE_SCHEMA,
+        "source_snapshot_schema": snapshot.schema,
+        "source_detail_id": int(snapshot.source_detail_id),
+        "source_sequence": int(snapshot.source_sequence),
+        "source_campaign": snapshot.source_campaign,
+        "projected_at_utc": now_utc.isoformat().replace("+00:00", "Z"),
+        "time_translation": "IDENTITY_NO_UNOBSERVED_OPTICAL_ANCESTRY",
+        "restore_source": source,
+        "producer_restore_args": copy.deepcopy(restore_args),
+        "campaign": copy.deepcopy(snapshot.campaign),
+        "ppb_restore_checkpoint": copy.deepcopy(snapshot.ppb_restore_checkpoint),
+    }
+
+
 def _load_newest_recoverable_photons_state(
     *,
     active_master: Optional[Dict[str, Any]],
@@ -4721,7 +4760,18 @@ def _perform_phase5_recovery() -> Dict[str, Any]:
             active_master=active_master,
             require_active_campaign=require_active_campaign,
         )
-        source = snapshot.restore_source() if snapshot is not None else None
+        desired_state = (
+            _project_photons_recovery_snapshot(
+                snapshot, datetime.now(timezone.utc)
+            )
+            if snapshot is not None
+            else None
+        )
+        source = (
+            copy.deepcopy(desired_state["restore_source"])
+            if isinstance(desired_state, dict)
+            else None
+        )
         if snapshot is None and total_detail_count != 0:
             raise RuntimeError(
                 "durable PHOTONS history exists but no row satisfies the recovery court: "
@@ -4750,6 +4800,14 @@ def _perform_phase5_recovery() -> Dict[str, Any]:
             "total_detail_count": total_detail_count,
             "source_detail_id": (
                 int(snapshot.source_detail_id) if snapshot is not None else None
+            ),
+            "desired_state_schema": (
+                desired_state.get("schema") if isinstance(desired_state, dict) else None
+            ),
+            "time_translation": (
+                desired_state.get("time_translation")
+                if isinstance(desired_state, dict)
+                else None
             ),
             "source_welford_grand_ratio_diagnostic": (
                 copy.deepcopy(source.get("welford_grand_ratio_diagnostic"))
