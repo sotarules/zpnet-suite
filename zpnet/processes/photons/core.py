@@ -26,12 +26,13 @@ persistence.  Firmware owns the exact START/STOP measurement boundary.
 Baselines remain campaign-to-campaign relationships stored by campaign_master ID.
 No baseline statistics are copied into firmware and ``photons.baseline`` remains
 untouched.  Durable recovery restores aggregate sufficient state plus only the
-bounded PPB endpoint history the Pi literally possesses.  If an observation gap
-left a bounded ring incomplete while the producer survived, Pi may reacquire the
-producer's exact current rings through the read-only export court.  If the producer
-was lost, held restore may deliberately install only the literal suffix Pi already
-possesses and surrender unseen rolling ancestry instead of inventing it.  Physical
-edge ancestry is always reacquired after restart.
+bounded PPB endpoint history the Pi literally possesses.  A surviving producer is
+never repaired or replayed: Pi proves monotonic descent from the durable snapshot,
+reacquires the producer's exact current bounded rings through the read-only export
+court, restores Pi-owned custody, and adopts the producer's current LANTERN state.
+If the producer was lost, held restore may deliberately install only the literal
+suffix Pi already possesses and surrender unseen rolling ancestry instead of
+inventing it.  Physical edge ancestry is always reacquired after restart.
 """
 
 from __future__ import annotations
@@ -226,7 +227,7 @@ _recovery_status: Dict[str, Any] = {
 _recovery_attempt_count = 0
 _recovery_restore_count = 0
 _recovery_partial_history_restore_count = 0
-_recovery_live_reattach_count = 0
+_recovery_live_adopt_count = 0
 _recovery_cold_start_count = 0
 _recovery_failure_count = 0
 
@@ -1807,7 +1808,7 @@ def _ppb_checkpoint_ingest(stats: Dict[str, Any]) -> Dict[str, Any]:
 
             # A Pi observation gap destroys Pi-owned literal ring custody, but it
             # does not destroy the surviving Teensy producer's Better-Buckets
-            # ancestry.  Startup LIVE_REATTACH already performs an explicit full-ring
+            # ancestry.  Startup live adoption already performs an explicit full-ring
             # export before campaign control opens.  During ordinary RUNNING state,
             # request the same read-only producer-authority reacquisition asynchronously
             # so the state worker can continue ingesting rows and meet the export court
@@ -4086,7 +4087,7 @@ def _recovery_proof_matches(
             and custody_total >= int(expected["source_custody_total_lap_gnss_ns"])
         )
 
-    if mode == "LIVE_REATTACH":
+    if mode == "LIVE_PRODUCER_ADOPT":
         return (
             reset_count == int(expected["reset_count"])
             and sequence > int(expected["sequence"])
@@ -4202,7 +4203,8 @@ def _find_durable_firmware_proof(
     return None
 
 
-def _wait_for_recovery_proof(*, acknowledge_firmware: bool) -> Dict[str, Any]:
+def _wait_for_recovery_proof() -> Dict[str, Any]:
+    """Wait for durable proof only; this operation cannot mutate the producer."""
     if not _recovery_proof_durable.wait(timeout=PHOTONS_RECOVERY_PROOF_TIMEOUT_S):
         with _recovery_lock:
             expected = copy.deepcopy(_recovery_proof_expected)
@@ -4214,17 +4216,20 @@ def _wait_for_recovery_proof(*, acknowledge_firmware: bool) -> Dict[str, Any]:
         proof = copy.deepcopy(_recovery_proof_persisted)
     if not isinstance(proof, dict):
         raise RuntimeError("PHOTONS recovery proof event has no persisted identity")
-    if acknowledge_firmware:
-        _send_teensy_recovery_command(
-            "RECOVERY_PROOF_ACK",
-            args={
-                "generation": int(proof["generation"]),
-                "sequence": int(proof["sequence"]),
-                "update_count": int(proof["update_count"]),
-            },
-            accepted_statuses={"recovery_proof_committed"},
-        )
     return proof
+
+
+def _acknowledge_recovery_proof(proof: Dict[str, Any]) -> None:
+    """Commit a prior producer restore proof; never called by live reuse."""
+    _send_teensy_recovery_command(
+        "RECOVERY_PROOF_ACK",
+        args={
+            "generation": int(proof["generation"]),
+            "sequence": int(proof["sequence"]),
+            "update_count": int(proof["update_count"]),
+        },
+        accepted_statuses={"recovery_proof_committed"},
+    )
 
 
 def _stage_recovery_history(
@@ -4330,38 +4335,209 @@ def _mark_active_campaign_recovered(
             raise RuntimeError("active LANTERN recovery metadata did not update exactly once")
 
 
-def _arm_existing_active_campaign_after_instrument_recovery(
+
+
+def _adopt_live_lantern_state(
     active_master: Optional[Dict[str, Any]],
-) -> Optional[Dict[str, Any]]:
-    global _last_campaign_transition
+    *,
+    live_report: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Adopt the surviving producer's current LANTERN state without mutating it.
+
+    Producer campaign state is newer than the durable snapshot once producer
+    continuity has been proved.  This function mutates only Pi-owned custody:
+    process-local campaign state and, when the producer is already STOPPED, the
+    stale active campaign_master flag.  It never sends a Teensy command.
+    """
+    global _active_campaign
+    global _closing_campaigns
+
+    state = str(live_report.get("campaign_state") or "").strip().upper()
+    campaign = str(live_report.get("campaign") or "").strip()
+
     if active_master is None:
-        return None
+        if state != "STOPPED" or campaign:
+            raise RuntimeError(
+                "surviving PHOTONS producer owns a LANTERN campaign but PostgreSQL "
+                "has no active campaign master"
+            )
+        _rehydrate_pi_campaign(
+            None,
+            source=None,
+            live_report=live_report,
+            allow_first_public_count_splice=False,
+        )
+        return {
+            "state": "STOPPED",
+            "campaign": None,
+            "active_master": False,
+            "master_mutated": False,
+        }
+
+    durable_campaign = str(active_master["campaign"])
+    if state in {"ACTIVE", "START_PENDING"}:
+        if campaign != durable_campaign:
+            raise RuntimeError(
+                "surviving PHOTONS producer campaign identity disagrees with active "
+                f"master: producer={campaign!r} durable={durable_campaign!r}"
+            )
+        _rehydrate_pi_campaign(
+            active_master,
+            source=None,
+            live_report=live_report,
+            allow_first_public_count_splice=True,
+        )
+        return {
+            "state": state,
+            "campaign": campaign,
+            "active_master": True,
+            "master_mutated": False,
+        }
+
+    if state != "STOPPED":
+        raise RuntimeError(
+            f"surviving PHOTONS producer is in non-adoptable campaign state {state!r}"
+        )
+    if campaign and campaign != durable_campaign:
+        raise RuntimeError(
+            "stopped surviving PHOTONS producer retains a different campaign "
+            f"identity: producer={campaign!r} durable={durable_campaign!r}"
+        )
+
+    adopted_at = _utc_now_z()
+    with open_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE campaign_master
+            SET active = false,
+                payload = payload || jsonb_build_object(
+                    'stopped_at', to_jsonb(%s::text),
+                    'producer_state_adopted_at', to_jsonb(%s::text),
+                    'producer_state_adoption', to_jsonb(%s::text)
+                )
+            WHERE id = %s
+              AND campaign_type = %s
+              AND campaign = %s
+              AND active = true
+            """,
+            (
+                adopted_at,
+                adopted_at,
+                "SURVIVING_PRODUCER_STOPPED",
+                int(active_master["campaign_id"]),
+                CAMPAIGN_TYPE_LANTERN,
+                durable_campaign,
+            ),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError(
+                "surviving PHOTONS STOPPED adoption did not retire exactly one "
+                "active LANTERN campaign master"
+            )
+
     with _campaign_lock:
-        if _active_campaign is None:
-            raise RuntimeError("active LANTERN master was not rehydrated")
-        if _active_campaign.get("start_after_sequence") is not None:
-            return None
-        campaign_name = str(_active_campaign["campaign"])
-    response = _request_teensy_campaign_command(
-        "START",
-        campaign=campaign_name,
-        accepted_statuses=TEENSY_CAMPAIGN_START_ACCEPTED_STATUSES,
-    )
-    transition = {
-        "action": "RECOVERY_REARM_START",
-        "at_utc": _utc_now_z(),
-        "campaign": campaign_name,
-        "campaign_id": int(active_master["campaign_id"]),
-        "boundary_pending": True,
-        "teensy_status": (response.get("payload") or {}).get("status"),
+        _active_campaign = None
+        _closing_campaigns = []
+
+    return {
+        "state": "STOPPED",
+        "campaign": durable_campaign,
+        "active_master": False,
+        "master_mutated": True,
+        "adopted_at_utc": adopted_at,
     }
-    with _state_lock:
-        _last_campaign_transition = copy.deepcopy(transition)
-    logging.warning(
-        "▶️ [photons] re-armed zero-row active LANTERN campaign '%s' after instrument recovery",
-        campaign_name,
+
+
+def _startup_finish_pending_recovery_proof(
+    *,
+    active_master: Optional[Dict[str, Any]],
+    source: Optional[Dict[str, Any]],
+    recovery_report: Dict[str, Any],
+    skipped: List[Dict[str, Any]],
+    rows_scanned: int,
+) -> Dict[str, Any]:
+    """Finish a previously committed restore; this is not producer reuse."""
+
+    if not bool(recovery_report.get("proof_pending")):
+        raise RuntimeError("pending PHOTONS recovery-proof continuation is not pending")
+    if source is None:
+        raise RuntimeError("pending PHOTONS recovery proof has no durable source")
+
+    broad = _fetch_teensy_photons_report()
+    floor = _validate_live_teensy_against_durable_source(recovery_report, source)
+    generation = int(recovery_report["generation"])
+    expected = {
+        "mode": "FIRMWARE_PENDING_PROOF",
+        "generation": generation,
+        "source_sequence": int(recovery_report["source_sequence"]),
+        "source_reset_count": int(recovery_report["source_reset_count"]),
+        "source_update_count": int(recovery_report["source_update_count"]),
+        "source_lap_count": int(recovery_report["source_lap_count"]),
+        "source_total_lap_gnss_ns": int(
+            recovery_report["source_total_lap_gnss_ns"]
+        ),
+        "source_custody_lap_count": int(
+            recovery_report["source_custody_lap_count"]
+        ),
+        "source_custody_total_lap_gnss_ns": int(
+            recovery_report["source_custody_total_lap_gnss_ns"]
+        ),
+    }
+    _arm_recovery_proof(expected)
+
+    if bool(recovery_report.get("proof_advanced_published")):
+        durable = _find_durable_firmware_proof(
+            generation=generation,
+            sequence=int(recovery_report["proof_sequence"]),
+            update_count=int(recovery_report["proof_update_count"]),
+        )
+        if durable is not None:
+            _note_recovery_proof_persisted(
+                durable["canonical"], int(durable["detail_id"])
+            )
+
+    preserved = _fragment_queue.qsize()
+    if preserved:
+        logging.info(
+            "📥 [photons/recovery] preserving %d queued PHOTONS_FRAGMENT rows "
+            "while completing prior restore proof",
+            preserved,
+        )
+    campaign_adoption = _adopt_live_lantern_state(
+        active_master,
+        live_report=broad,
     )
-    return transition
+    _start_workers()
+    proof = _wait_for_recovery_proof()
+    _acknowledge_recovery_proof(proof)
+    ppb_live_refresh = _refresh_ppb_checkpoint_from_live_photons()
+
+    if campaign_adoption["active_master"]:
+        _mark_active_campaign_recovered(
+            active_master,
+            mode="PENDING_RESTORE_PROOF",
+            generation=generation,
+            source=source,
+            proof=proof,
+        )
+
+    result = {
+        "mode": "PENDING_RESTORE_PROOF",
+        "generation": generation,
+        "source_detail_id": int(source["db_detail_id"]),
+        "source_rows_scanned": rows_scanned,
+        "damaged_rows_skipped": copy.deepcopy(skipped),
+        "ingress_rows_preserved_at_worker_start": preserved,
+        "live_floor": floor,
+        "proof": proof,
+        "ppb_live_refresh": ppb_live_refresh,
+        "campaign_adoption": campaign_adoption,
+        "producer_reuse": False,
+        "producer_mutation": "RECOVERY_PROOF_ACK_ONLY",
+    }
+    _recovery_status_set("COMPLETE", **result)
+    return result
 
 
 def _startup_held_restore(
@@ -4522,7 +4698,8 @@ def _startup_held_restore(
         ppb_history_truncated=history_truncated,
         ppb_checkpoint_after_commit=checkpoint_after_commit,
     )
-    proof = _wait_for_recovery_proof(acknowledge_firmware=True)
+    proof = _wait_for_recovery_proof()
+    _acknowledge_recovery_proof(proof)
     _mark_active_campaign_recovered(
         active_master,
         mode="HELD_RESTORE",
@@ -4554,22 +4731,25 @@ def _startup_held_restore(
         "proof_contract": "EXACT_SOURCE_N_PLUS_1",
         "proof": proof,
         "campaign_restored_in_commit": campaign_restored_in_commit,
-        "campaign_rearm": None,
         "staged": staged,
     }
     _recovery_status_set("COMPLETE", **result)
     return result
 
 
+
 def _startup_cold_start(
     *, active_master: Optional[Dict[str, Any]], rows_seen: int
 ) -> Dict[str, Any]:
+    """Create a fresh producer epoch without replaying a zero-row campaign."""
     global _recovery_cold_start_count
+
     if rows_seen != 0:
         raise RuntimeError("cold PHOTONS start was requested despite durable LANTERN rows")
+
     generation = _new_recovery_generation()
     _rehydrate_pi_campaign(
-        active_master,
+        None,
         source=None,
         live_report=None,
         allow_first_public_count_splice=False,
@@ -4588,15 +4768,13 @@ def _startup_cold_start(
         accepted_statuses={"recovery_cold_start_committed"},
     )
     _start_workers()
-    proof = _wait_for_recovery_proof(acknowledge_firmware=False)
-    _mark_active_campaign_recovered(
+    proof = _wait_for_recovery_proof()
+    live = _fetch_teensy_photons_report()
+    campaign_adoption = _adopt_live_lantern_state(
         active_master,
-        mode="COLD_START",
-        generation=generation,
-        source=None,
-        proof=proof,
+        live_report=live,
     )
-    rearm = _arm_existing_active_campaign_after_instrument_recovery(active_master)
+
     with _state_lock:
         _recovery_cold_start_count += 1
     result = {
@@ -4604,13 +4782,14 @@ def _startup_cold_start(
         "generation": generation,
         "firmware": cold,
         "proof": proof,
-        "campaign_rearm": rearm,
+        "campaign_adoption": campaign_adoption,
     }
     _recovery_status_set("COMPLETE", **result)
     return result
 
 
-def _startup_live_reattach(
+
+def _startup_adopt_live_producer(
     *,
     active_master: Optional[Dict[str, Any]],
     source: Optional[Dict[str, Any]],
@@ -4618,149 +4797,68 @@ def _startup_live_reattach(
     skipped: List[Dict[str, Any]],
     rows_scanned: int,
 ) -> Dict[str, Any]:
-    global _recovery_live_reattach_count
+    """Prove and adopt a surviving PHOTONS producer without mutating it."""
+    global _recovery_live_adopt_count
+
+    if bool(recovery_report.get("proof_pending")):
+        raise RuntimeError(
+            "pending restored-producer proof is not eligible for zero-mutation reuse"
+        )
+
+    recovery_report = _fetch_teensy_recovery_report()
+    if bool(recovery_report.get("proof_pending")):
+        raise RuntimeError(
+            "PHOTONS producer entered pending recovery proof during live adoption"
+        )
     broad = _fetch_teensy_photons_report()
     floor = _validate_live_teensy_against_durable_source(recovery_report, source)
 
-    campaign_state = str(recovery_report.get("campaign_state") or "").upper()
-    live_campaign = str(recovery_report.get("campaign") or "")
-    if active_master is None:
-        if campaign_state != "STOPPED" or live_campaign:
-            raise RuntimeError(
-                "live Teensy owns a LANTERN campaign but PostgreSQL has no active master"
-            )
-    else:
-        if campaign_state in {"ACTIVE", "START_PENDING"}:
-            if live_campaign != active_master["campaign"]:
-                raise RuntimeError("live Teensy/DB active LANTERN campaign mismatch")
-        elif campaign_state == "STOPPED":
-            if _count_lantern_campaign_details(active_master["campaign"]) != 0:
-                raise RuntimeError(
-                    "active durable LANTERN campaign has history but live Teensy is stopped"
-                )
-        else:
-            raise RuntimeError(
-                f"live reattachment refuses transitional campaign state {campaign_state!r}"
-            )
+    campaign_adoption = _adopt_live_lantern_state(
+        active_master,
+        live_report=broad,
+    )
 
-    proof_pending = bool(recovery_report["proof_pending"])
-    proof_advanced = bool(recovery_report["proof_advanced_published"])
-    generation = int(recovery_report["generation"])
+    expected = {"mode": "LIVE_PRODUCER_ADOPT", **floor}
+    _arm_recovery_proof(expected)
 
-    if proof_pending:
-        if source is None:
-            raise RuntimeError("live pending firmware proof has no durable recovery source")
-        expected = {
-            "mode": "FIRMWARE_PENDING_PROOF",
-            "generation": generation,
-            "source_sequence": int(recovery_report["source_sequence"]),
-            "source_reset_count": int(recovery_report["source_reset_count"]),
-            "source_update_count": int(recovery_report["source_update_count"]),
-            "source_lap_count": int(recovery_report["source_lap_count"]),
-            "source_total_lap_gnss_ns": int(
-                recovery_report["source_total_lap_gnss_ns"]
-            ),
-            "source_custody_lap_count": int(
-                recovery_report["source_custody_lap_count"]
-            ),
-            "source_custody_total_lap_gnss_ns": int(
-                recovery_report["source_custody_total_lap_gnss_ns"]
-            ),
-        }
-        first_proof_sequence = int(recovery_report["proof_sequence"])
-        first_proof_update_count = int(recovery_report["proof_update_count"])
-        _rehydrate_pi_campaign(
-            active_master,
-            source=source,
-            live_report=broad,
-            allow_first_public_count_splice=True,
+    preserved = _fragment_queue.qsize()
+    if preserved:
+        logging.info(
+            "📥 [photons/recovery] preserving %d queued PHOTONS_FRAGMENT rows "
+            "during zero-mutation producer adoption",
+            preserved,
         )
-        _arm_recovery_proof(expected)
-        durable = None
-        if proof_advanced:
-            durable = _find_durable_firmware_proof(
-                generation=generation,
-                sequence=first_proof_sequence,
-                update_count=first_proof_update_count,
-            )
-        if durable is not None:
-            _note_recovery_proof_persisted(
-                durable["canonical"], int(durable["detail_id"])
-            )
-        # A surviving Teensy may have advanced while Pi PHOTONS was down.  Every
-        # queued fragment is producer testimony needed to advance the literal
-        # checkpoint without inventing a bridge.  Never discard it merely to
-        # obtain a fresh live floor; the proof court will ignore pre-floor rows
-        # until an actual advancing descendant arrives.
-        drained = 0
-        preserved = _fragment_queue.qsize()
-        if preserved:
-            logging.info(
-                "📥 [photons/recovery] preserving %d queued PHOTONS_FRAGMENT rows "
-                "during live reattach for literal-checkpoint continuity",
-                preserved,
-            )
-        _start_workers()
-        proof = _wait_for_recovery_proof(acknowledge_firmware=True)
-        mode = "LIVE_REATTACH_PENDING_PROOF"
-    else:
-        # Do not drain startup custody here.  The queue normally contains the
-        # exact durable-source+1...live-floor producer rows accumulated while
-        # this Pi process was classifying the surviving Teensy.  Dropping them
-        # creates a self-inflicted observation gap and can make an otherwise
-        # complete literal checkpoint non-recoverable on the next hard restart.
-        drained = 0
-        recovery_report = _fetch_teensy_recovery_report()
-        broad = _fetch_teensy_photons_report()
-        floor = _validate_live_teensy_against_durable_source(recovery_report, source)
-        _rehydrate_pi_campaign(
-            active_master,
-            source=source,
-            live_report=broad,
-            allow_first_public_count_splice=True,
-        )
-        expected = {"mode": "LIVE_REATTACH", **floor}
-        _arm_recovery_proof(expected)
-        preserved = _fragment_queue.qsize()
-        if preserved:
-            logging.info(
-                "📥 [photons/recovery] preserving %d queued PHOTONS_FRAGMENT rows "
-                "during live reattach for literal-checkpoint continuity",
-                preserved,
-            )
-        _start_workers()
-        proof = _wait_for_recovery_proof(acknowledge_firmware=False)
-        mode = "LIVE_REATTACH"
-
-    # LIVE_REATTACH proves the Teensy producer survived.  The Pi may therefore
-    # reacquire the producer's complete current bounded rings directly instead
-    # of waiting for a transport observation gap to age out organically.
+    _start_workers()
+    proof = _wait_for_recovery_proof()
     ppb_live_refresh = _refresh_ppb_checkpoint_from_live_photons()
 
-    _mark_active_campaign_recovered(
-        active_master,
-        mode=mode,
-        generation=generation,
-        source=source,
-        proof=proof,
-    )
-    rearm = None
-    if campaign_state == "STOPPED":
-        rearm = _arm_existing_active_campaign_after_instrument_recovery(active_master)
+    generation = int(recovery_report["generation"])
+    if campaign_adoption["active_master"]:
+        _mark_active_campaign_recovered(
+            active_master,
+            mode="LIVE_PRODUCER_ADOPT",
+            generation=generation,
+            source=source,
+            proof=proof,
+        )
+
     with _state_lock:
-        _recovery_live_reattach_count += 1
+        _recovery_live_adopt_count += 1
     result = {
-        "mode": mode,
+        "mode": "LIVE_PRODUCER_ADOPT",
         "generation": generation,
         "source_detail_id": int(source["db_detail_id"]) if source else None,
         "source_rows_scanned": rows_scanned,
         "damaged_rows_skipped": copy.deepcopy(skipped),
-        "ingress_rows_drained": drained,
+        "ingress_rows_drained": 0,
         "ingress_rows_preserved_at_worker_start": preserved,
         "live_floor": floor,
         "proof": proof,
         "ppb_live_refresh": ppb_live_refresh,
-        "campaign_rearm": rearm,
+        "campaign_adoption": campaign_adoption,
+        "producer_reuse": True,
+        "producer_mutated": False,
+        "producer_mutation_commands": [],
     }
     _recovery_status_set("COMPLETE", **result)
     return result
@@ -4846,8 +4944,16 @@ def _perform_phase5_recovery() -> Dict[str, Any]:
         }
         _recovery_status_set("CLASSIFIED", **classification)
 
+        if report["publication_started"] and report["proof_pending"]:
+            return _startup_finish_pending_recovery_proof(
+                active_master=active_master,
+                source=source,
+                recovery_report=report,
+                skipped=skipped,
+                rows_scanned=rows_scanned,
+            )
         if report["publication_started"]:
-            return _startup_live_reattach(
+            return _startup_adopt_live_producer(
                 active_master=active_master,
                 source=source,
                 recovery_report=report,
@@ -6798,7 +6904,7 @@ def _recovery_report_surface() -> Dict[str, Any]:
                 "attempt_count": _recovery_attempt_count,
                 "restore_count": _recovery_restore_count,
                 "partial_history_restore_count": _recovery_partial_history_restore_count,
-                "live_reattach_count": _recovery_live_reattach_count,
+                "live_adopt_count": _recovery_live_adopt_count,
                 "cold_start_count": _recovery_cold_start_count,
                 "failure_count": _recovery_failure_count,
             }
