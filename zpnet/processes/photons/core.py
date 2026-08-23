@@ -99,7 +99,6 @@ PHOTONS_RECOVERY_VERIFY_TOLERANCE = 1.0e-6
 # same floating-point path.  A large divergence is worth surfacing to the
 # operator, but it must never silently choose an older durable ancestor.
 PHOTONS_WELFORD_GRAND_RATIO_DIAGNOSTIC_PPB = 0.1
-PHOTONS_STATS_RESET_PROOF_TIMEOUT_S = 30.0
 
 # CLOCKS-parity checkpoint testimony. Firmware publishes one compact delta/proof
 # per second; Pi PHOTONS persists the literal bounded recovery custody it actually
@@ -194,6 +193,13 @@ _stale_campaign_retire_count = 0
 _stats_reset_requests = 0
 _stats_reset_success = 0
 _stats_reset_failures = 0
+# Operator STATS_RESET is control-plane asynchronous.  A short worker owns only
+# producer-side arming so the command RPC can return immediately.  Completion is
+# witnessed by the normal ordered persistence path when it commits canonical row 1
+# of the requested firmware statistics epoch.
+_stats_reset_control_lock = threading.Lock()
+_stats_reset_in_progress = threading.Event()
+_stats_reset_pending: Optional[Dict[str, Any]] = None
 _report_photons_requests = 0
 _report_stats_requests = 0
 _clear_count = 0
@@ -5359,6 +5365,11 @@ def _persistence_loop() -> None:
                             },
                             source="PHOTONS_PERSISTENCE_PROOF",
                         )
+
+                    # STATS_RESET completion belongs to this same custody path.  The
+                    # returned detail_id proves this exact canonical row is already
+                    # durable; do not race the writer with a side-channel DB poll.
+                    _note_stats_reset_persisted(photons, detail_id)
                     break
 
 
@@ -6603,46 +6614,6 @@ def _stats_reset_birth_court(
 PPB_BUCKET_NAMES = ("10_min", "60_min", "8_hour", "24_hour", "total")
 
 
-def _find_durable_stats_reset_birth(
-    *,
-    expected_reset_count: int,
-) -> Optional[Dict[str, Any]]:
-    with open_db(row_dict=True) as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT id, payload
-            FROM campaign_detail
-            WHERE campaign_type = %s
-              AND payload #>> '{schema}' = %s
-              AND payload #>> '{photons,stats,reset_count}' = %s
-              AND payload #>> '{photons,stats,update_count}' = '1'
-            ORDER BY id DESC
-            LIMIT 2
-            """,
-            (
-                CAMPAIGN_TYPE_LANTERN,
-                PHOTONS_SCHEMA,
-                str(expected_reset_count),
-            ),
-        )
-        rows = cur.fetchall()
-    if len(rows) > 1:
-        raise RuntimeError(
-            "PHOTONS STATS_RESET has multiple durable update_count=1 rows "
-            f"for reset_count={expected_reset_count}"
-        )
-    if not rows:
-        return None
-
-    row = rows[0]
-    payload = row["payload"]
-    if isinstance(payload, str):
-        payload = json.loads(payload)
-    payload = copy.deepcopy(_require_dict(payload, "PHOTONS durable stats-reset birth"))
-    return {"detail_id": int(row["id"]), "canonical": payload}
-
-
 def _fetch_teensy_stats_reset_report() -> Dict[str, Any]:
     """Return the authoritative firmware STATS_RESET chronology surface."""
     response = send_command(
@@ -6655,49 +6626,6 @@ def _fetch_teensy_stats_reset_report() -> Dict[str, Any]:
     payload = response.get("payload") if isinstance(response, dict) else None
     if not isinstance(response, dict) or not response.get("success") or not isinstance(payload, dict):
         raise RuntimeError(f"Teensy PHOTONS.REPORT_STATS failed: {response!r}")
-    return copy.deepcopy(payload)
-
-
-def _fetch_teensy_stats_reset_postcondition(
-    *,
-    expected_reset_count: int,
-    request_count: int,
-    prior_commit_count: int,
-) -> Dict[str, Any]:
-    payload = _fetch_teensy_stats_reset_report()
-
-    reset_count = _require_int(payload.get("reset_count"), "REPORT_STATS.reset_count")
-    update_count = _require_int(
-        payload.get("update_count"), "REPORT_STATS.update_count", minimum=1
-    )
-    reset_request_count = _require_int(
-        payload.get("reset_request_count"), "REPORT_STATS.reset_request_count"
-    )
-    reset_commit_count = _require_int(
-        payload.get("reset_commit_count"), "REPORT_STATS.reset_commit_count"
-    )
-    reset_pending = _require_bool(
-        payload.get("reset_pending"), "REPORT_STATS.reset_pending"
-    )
-    if reset_count != expected_reset_count:
-        raise RuntimeError(
-            "Teensy PHOTONS STATS_RESET postcondition has wrong reset_count: "
-            f"expected={expected_reset_count} observed={reset_count}"
-        )
-    if update_count < 1 or reset_pending:
-        raise RuntimeError(
-            "Teensy PHOTONS STATS_RESET postcondition is not a committed live epoch"
-        )
-    if reset_request_count != request_count:
-        raise RuntimeError(
-            "Teensy PHOTONS STATS_RESET request-count ancestry changed unexpectedly: "
-            f"requested={request_count} reported={reset_request_count}"
-        )
-    if reset_commit_count != prior_commit_count + 1:
-        raise RuntimeError(
-            "Teensy PHOTONS STATS_RESET commit count did not advance exactly once: "
-            f"before={prior_commit_count} after={reset_commit_count}"
-        )
     return copy.deepcopy(payload)
 
 
@@ -6801,11 +6729,309 @@ def cmd_report_stats(_: Optional[dict]) -> Dict[str, Any]:
     return _combined_teensy_report("REPORT_STATS", report_name="PHOTONS_SYSTEM_STATS")
 
 
-def cmd_stats_reset(_: Optional[dict]) -> Dict[str, Any]:
-    """Reset PHOTONS statistics and prove exact canonical + durable epoch birth."""
+def _stats_reset_terminal_failure(
+    *,
+    requested_at: str,
+    stage: str,
+    error: str,
+    details: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Close one asynchronous reset request as a proved terminal failure."""
+    global _stats_reset_pending
+    global _stats_reset_failures
+    global _last_maintenance
+
+    with _stats_reset_control_lock:
+        pending = copy.deepcopy(_stats_reset_pending)
+        if not isinstance(pending, dict) or pending.get("requested_at_utc") != requested_at:
+            return
+        failure = {
+            "action": "STATS_RESET",
+            "requested_at_utc": requested_at,
+            "completed_at_utc": _utc_now_z(),
+            "success": False,
+            "stage": str(stage),
+            "scope": "SYSTEMWIDE_PHOTONS_STATISTICS",
+            "before": copy.deepcopy(pending.get("before")),
+            "expected_reset_count": pending.get("expected_reset_count"),
+            "teensy_before": copy.deepcopy(pending.get("teensy_before")),
+            "teensy_request": copy.deepcopy(pending.get("teensy_request")),
+            "error": str(error),
+        }
+        if details:
+            failure.update(copy.deepcopy(details))
+        _stats_reset_pending = None
+        _stats_reset_in_progress.clear()
+
+    with _state_lock:
+        _stats_reset_failures += 1
+        _last_maintenance = copy.deepcopy(failure)
+    logging.error("💥 [photons] asynchronous STATS_RESET failed: %s", failure)
+
+
+def _stats_reset_arm_worker(requested_at: str, before: Dict[str, Any]) -> None:
+    """Arm one firmware reset; normal ordered persistence proves its completion."""
+    global _stats_reset_pending
     global _stats_reset_requests
+    global _last_maintenance
+
+    try:
+        teensy_before = _fetch_teensy_stats_reset_report()
+        firmware_before_reset_count = _require_int(
+            teensy_before.get("reset_count"), "REPORT_STATS.reset_count"
+        )
+        reset_pending_before = _require_bool(
+            teensy_before.get("reset_pending"), "REPORT_STATS.reset_pending"
+        )
+        if firmware_before_reset_count != int(before["reset_count"]):
+            raise RuntimeError(
+                "Pi/Teensy PHOTONS statistics epoch disagrees before STATS_RESET: "
+                f"pi={before['reset_count']} teensy={firmware_before_reset_count}"
+            )
+        if reset_pending_before:
+            raise RuntimeError("Teensy PHOTONS already has a STATS_RESET boundary pending")
+
+        expected_reset_count = int(before["reset_count"]) + 1
+        pending = {
+            "action": "STATS_RESET",
+            "requested_at_utc": requested_at,
+            "success": None,
+            "status": "statistics_reset_arming",
+            "asynchronous": True,
+            "scope": "SYSTEMWIDE_PHOTONS_STATISTICS",
+            "before": copy.deepcopy(before),
+            "expected_reset_count": expected_reset_count,
+            "teensy_before": copy.deepcopy(teensy_before),
+            "teensy_request": None,
+            "completion_authority": "ORDERED_CANONICAL_PERSISTENCE",
+            "completion_report": "PHOTONS_INFO.last_maintenance",
+        }
+
+        # Install the expected epoch before sending the producer command.  Hold this
+        # lock through the tiny RPC so an exceptionally fast row-1 persistence cannot
+        # adjudicate an incompletely armed transaction.
+        with _stats_reset_control_lock:
+            if not _stats_reset_in_progress.is_set():
+                raise RuntimeError("PHOTONS STATS_RESET lost command custody before producer arming")
+            _stats_reset_pending = copy.deepcopy(pending)
+            with _state_lock:
+                _stats_reset_requests += 1
+
+            teensy_response = send_command(
+                machine="TEENSY",
+                subsystem=SUBSYSTEM,
+                command="STATS_RESET",
+            )
+            teensy_payload = (
+                teensy_response.get("payload") if isinstance(teensy_response, dict) else None
+            )
+            if (
+                not isinstance(teensy_response, dict)
+                or not teensy_response.get("success")
+                or not isinstance(teensy_payload, dict)
+            ):
+                raise RuntimeError(f"Teensy PHOTONS.STATS_RESET rejected: {teensy_response!r}")
+            if str(teensy_payload.get("status") or "") != "instrument_statistics_reset_requested":
+                raise RuntimeError(
+                    f"Teensy PHOTONS.STATS_RESET returned unexpected status: {teensy_payload!r}"
+                )
+            if _require_bool(teensy_payload.get("reset"), "STATS_RESET.reset") is not True:
+                raise RuntimeError(
+                    "Teensy PHOTONS.STATS_RESET did not acquire a fresh reset boundary"
+                )
+            if _require_bool(
+                teensy_payload.get("reset_pending"), "STATS_RESET.reset_pending"
+            ) is not True:
+                raise RuntimeError("Teensy PHOTONS.STATS_RESET did not arm reset_pending")
+            if str(teensy_payload.get("boundary") or "") != (
+                "AFTER_NEXT_SUCCESSFULLY_PUBLISHED_FRAGMENT"
+            ):
+                raise RuntimeError(
+                    f"Teensy PHOTONS.STATS_RESET returned unexpected boundary: {teensy_payload!r}"
+                )
+
+            pending["status"] = "statistics_reset_armed"
+            pending["teensy_request"] = copy.deepcopy(teensy_payload)
+            _stats_reset_pending = copy.deepcopy(pending)
+
+        with _state_lock:
+            _last_maintenance = copy.deepcopy(pending)
+        logging.info(
+            "📊 [photons] STATS_RESET armed asynchronously; awaiting durable row 1 "
+            "for reset_count=%d",
+            expected_reset_count,
+        )
+    except Exception as exc:
+        # If failure occurred before the pending object was installed, install the
+        # minimum request identity so the common terminal court can close custody.
+        with _stats_reset_control_lock:
+            if _stats_reset_in_progress.is_set() and _stats_reset_pending is None:
+                _stats_reset_pending = {
+                    "action": "STATS_RESET",
+                    "requested_at_utc": requested_at,
+                    "before": copy.deepcopy(before),
+                    "expected_reset_count": int(before["reset_count"]) + 1,
+                }
+        _stats_reset_terminal_failure(
+            requested_at=requested_at,
+            stage="ARM_RESET_BOUNDARY",
+            error=str(exc),
+        )
+        logging.exception("💥 [photons] asynchronous STATS_RESET producer arming failed")
+
+
+def _note_stats_reset_persisted(photons: Dict[str, Any], detail_id: int) -> None:
+    """Close STATS_RESET only when ordered persistence commits the exact birth row."""
+    global _stats_reset_pending
     global _stats_reset_success
     global _stats_reset_failures
+    global _last_maintenance
+
+    if not _stats_reset_in_progress.is_set():
+        return
+
+    with _stats_reset_control_lock:
+        pending = copy.deepcopy(_stats_reset_pending)
+        if not isinstance(pending, dict):
+            return
+        if str(pending.get("status") or "") != "statistics_reset_armed":
+            return
+
+        requested_at = str(pending["requested_at_utc"])
+        before = _require_dict(pending.get("before"), "pending STATS_RESET.before")
+        expected_reset_count = _require_int(
+            pending.get("expected_reset_count"), "pending STATS_RESET.expected_reset_count"
+        )
+        snapshot = _stats_epoch_snapshot_from_state(photons)
+
+        # Rows already in flight before the firmware boundary remain valid old-epoch
+        # testimony.  They do not complete or fail this request.
+        if snapshot["reset_count"] < expected_reset_count:
+            return
+
+        if snapshot["reset_count"] > expected_reset_count:
+            failure_reason = (
+                "PHOTONS statistics skipped past requested reset epoch before durable birth: "
+                f"expected={expected_reset_count} observed={snapshot['reset_count']}"
+            )
+        elif snapshot["update_count"] != 1:
+            failure_reason = (
+                "PHOTONS ordered persistence entered the requested reset epoch without "
+                "durable update_count=1: "
+                f"reset_count={expected_reset_count} observed_update={snapshot['update_count']}"
+            )
+        else:
+            failure_reason = None
+
+        if failure_reason is not None:
+            failure = {
+                "action": "STATS_RESET",
+                "requested_at_utc": requested_at,
+                "completed_at_utc": _utc_now_z(),
+                "success": False,
+                "stage": "PROVE_DURABLE_EPOCH_BIRTH",
+                "scope": "SYSTEMWIDE_PHOTONS_STATISTICS",
+                "before": copy.deepcopy(before),
+                "expected_reset_count": expected_reset_count,
+                "observed_durable_detail_id": int(detail_id),
+                "observed_durable": copy.deepcopy(snapshot),
+                "teensy_before": copy.deepcopy(pending.get("teensy_before")),
+                "teensy_request": copy.deepcopy(pending.get("teensy_request")),
+                "error": failure_reason,
+            }
+            _stats_reset_pending = None
+            _stats_reset_in_progress.clear()
+            with _state_lock:
+                _stats_reset_failures += 1
+                _last_maintenance = copy.deepcopy(failure)
+            logging.error("💥 [photons] STATS_RESET durable birth proof failed: %s", failure)
+            return
+
+        try:
+            birth = _stats_reset_birth_court(
+                photons,
+                before=before,
+                expected_reset_count=expected_reset_count,
+            )
+            durable_birth = {"detail_id": int(detail_id), **birth}
+            after = _latest_stats_epoch()
+            if after["reset_count"] != expected_reset_count or after["update_count"] < 1:
+                raise RuntimeError(
+                    "latest PHOTONS state is not descended from the durable STATS_RESET birth row"
+                )
+            if after["sequence"] < durable_birth["sequence"]:
+                raise RuntimeError("latest PHOTONS physical sequence regressed behind durable row 1")
+            if after["standard_lap_ps"] != before["standard_lap_ps"]:
+                raise RuntimeError("latest PHOTONS STANDARD_LAP_NS changed across STATS_RESET")
+            if after["campaign"] != before.get("campaign"):
+                raise RuntimeError("latest PHOTONS LANTERN identity/origin changed across STATS_RESET")
+            if after["custody_lap_count"] < durable_birth["custody_lap_count"]:
+                raise RuntimeError("latest PHOTONS custody regressed behind durable row 1")
+            if (
+                after["custody_total_lap_gnss_ns"]
+                < durable_birth["custody_total_lap_gnss_ns"]
+            ):
+                raise RuntimeError("latest PHOTONS custody total regressed behind durable row 1")
+        except Exception as exc:
+            failure = {
+                "action": "STATS_RESET",
+                "requested_at_utc": requested_at,
+                "completed_at_utc": _utc_now_z(),
+                "success": False,
+                "stage": "VERIFY_DURABLE_EPOCH_BIRTH",
+                "scope": "SYSTEMWIDE_PHOTONS_STATISTICS",
+                "before": copy.deepcopy(before),
+                "expected_reset_count": expected_reset_count,
+                "durable_detail_id": int(detail_id),
+                "teensy_before": copy.deepcopy(pending.get("teensy_before")),
+                "teensy_request": copy.deepcopy(pending.get("teensy_request")),
+                "error": str(exc),
+            }
+            _stats_reset_pending = None
+            _stats_reset_in_progress.clear()
+            with _state_lock:
+                _stats_reset_failures += 1
+                _last_maintenance = copy.deepcopy(failure)
+            logging.exception("💥 [photons] STATS_RESET durable birth verification failed")
+            return
+
+        result = {
+            "action": "STATS_RESET",
+            "requested_at_utc": requested_at,
+            "completed_at_utc": _utc_now_z(),
+            "success": True,
+            "scope": "SYSTEMWIDE_PHOTONS_STATISTICS",
+            "completion_authority": "ORDERED_CANONICAL_PERSISTENCE",
+            "before": copy.deepcopy(before),
+            "epoch_birth": durable_birth,
+            "after": after,
+            "teensy_before": copy.deepcopy(pending.get("teensy_before")),
+            "teensy_request": copy.deepcopy(pending.get("teensy_request")),
+            "campaign_unchanged": True,
+            "physical_measurement_unchanged": True,
+            "physical_sequence_preserved": True,
+            "monotonic_custody_preserved": True,
+            "standard_lap_preserved": True,
+            "first_durable_update_count": 1,
+        }
+        _stats_reset_pending = None
+        _stats_reset_in_progress.clear()
+
+    with _state_lock:
+        _stats_reset_success += 1
+        _last_maintenance = copy.deepcopy(result)
+    logging.warning(
+        "📊 [photons] STATS_RESET proved by ordered persistence reset_count=%d "
+        "detail_id=%d sequence=%d N=%d",
+        expected_reset_count,
+        int(durable_birth["detail_id"]),
+        int(durable_birth["sequence"]),
+        int(durable_birth["lap_count"]),
+    )
+
+
+def cmd_stats_reset(_: Optional[dict]) -> Dict[str, Any]:
+    """Accept one PHOTONS statistics reset and return before proof completion."""
     global _last_maintenance
 
     busy = _campaign_control_gate("STATS_RESET")
@@ -6821,261 +7047,48 @@ def cmd_stats_reset(_: Optional[dict]) -> Dict[str, Any]:
                 "message": "STATS_RESET unavailable while a LANTERN boundary transition is pending",
             }
 
+    # This is local-only and cheap; reject a command that cannot even name the
+    # current canonical epoch before acquiring asynchronous reset custody.
     try:
         before = _latest_stats_epoch()
     except Exception as exc:
         return {"success": False, "message": str(exc)}
 
-    try:
-        teensy_before = _fetch_teensy_stats_reset_report()
-        firmware_before_reset_count = _require_int(
-            teensy_before.get("reset_count"), "REPORT_STATS.reset_count"
-        )
-        request_count_before = _require_int(
-            teensy_before.get("reset_request_count"), "REPORT_STATS.reset_request_count"
-        )
-        commit_count_before = _require_int(
-            teensy_before.get("reset_commit_count"), "REPORT_STATS.reset_commit_count"
-        )
-        reset_pending_before = _require_bool(
-            teensy_before.get("reset_pending"), "REPORT_STATS.reset_pending"
-        )
-        if firmware_before_reset_count != int(before["reset_count"]):
-            raise RuntimeError(
-                "Pi/Teensy PHOTONS statistics epoch disagrees before STATS_RESET: "
-                f"pi={before['reset_count']} teensy={firmware_before_reset_count}"
-            )
-        if reset_pending_before:
-            raise RuntimeError("Teensy PHOTONS already has a STATS_RESET boundary pending")
-    except Exception as exc:
-        return {"success": False, "message": str(exc)}
+    with _stats_reset_control_lock:
+        if _stats_reset_in_progress.is_set():
+            return {
+                "success": True,
+                "message": "PHOTONS STATS_RESET is already in progress",
+                "payload": {
+                    "status": "statistics_reset_in_progress",
+                    "asynchronous": True,
+                    "before": before,
+                },
+            }
 
-    expected_reset_count = int(before["reset_count"]) + 1
-    expected_request_count = request_count_before + 1
-    with _state_lock:
-        _stats_reset_requests += 1
-    requested_at = _utc_now_z()
-
-    try:
-        teensy_response = send_command(
-            machine="TEENSY",
-            subsystem=SUBSYSTEM,
-            command="STATS_RESET",
-        )
-    except Exception as exc:
-        with _state_lock:
-            _stats_reset_failures += 1
-        return {"success": False, "message": f"Teensy PHOTONS.STATS_RESET failed: {exc}"}
-
-    teensy_payload = (
-        teensy_response.get("payload") if isinstance(teensy_response, dict) else None
-    )
-    try:
-        if (
-            not isinstance(teensy_response, dict)
-            or not teensy_response.get("success")
-            or not isinstance(teensy_payload, dict)
-        ):
-            raise RuntimeError(f"Teensy PHOTONS.STATS_RESET rejected: {teensy_response!r}")
-        if str(teensy_payload.get("status") or "") != "instrument_statistics_reset_requested":
-            raise RuntimeError(
-                f"Teensy PHOTONS.STATS_RESET returned unexpected status: {teensy_payload!r}"
-            )
-        if _require_bool(teensy_payload.get("reset"), "STATS_RESET.reset") is not True:
-            raise RuntimeError(
-                "Teensy PHOTONS.STATS_RESET did not acquire a fresh reset boundary"
-            )
-        if _require_bool(
-            teensy_payload.get("reset_pending"), "STATS_RESET.reset_pending"
-        ) is not True:
-            raise RuntimeError("Teensy PHOTONS.STATS_RESET did not arm reset_pending")
-        # The immediate command reply proves only that firmware armed a new
-        # publication-boundary reset.  Epoch ancestry comes from REPORT_STATS
-        # before the command and from the first published/durable row afterward;
-        # do not duplicate that authority with optional echo fields here.
-        if str(teensy_payload.get("boundary") or "") != (
-            "AFTER_NEXT_SUCCESSFULLY_PUBLISHED_FRAGMENT"
-        ):
-            raise RuntimeError(
-                f"Teensy PHOTONS.STATS_RESET returned unexpected boundary: {teensy_payload!r}"
-            )
-    except Exception as exc:
-        failure = {
+        requested_at = _utc_now_z()
+        accepted = {
             "action": "STATS_RESET",
             "requested_at_utc": requested_at,
-            "success": False,
-            "stage": "ARM_RESET_BOUNDARY",
+            "success": None,
+            "status": "statistics_reset_requested",
+            "asynchronous": True,
+            "scope": "SYSTEMWIDE_PHOTONS_STATISTICS",
             "before": before,
-            "teensy_before": copy.deepcopy(teensy_before),
-            "expected_reset_count": expected_reset_count,
-            "teensy": copy.deepcopy(teensy_response),
-            "error": str(exc),
+            "completion_authority": "ORDERED_CANONICAL_PERSISTENCE",
+            "completion_report": "PHOTONS_INFO.last_maintenance",
         }
+        _stats_reset_in_progress.set()
         with _state_lock:
-            _stats_reset_failures += 1
-            _last_maintenance = copy.deepcopy(failure)
-        logging.exception("💥 [photons] STATS_RESET boundary contract failed")
-        return {"success": False, "message": str(exc), "payload": failure}
+            _last_maintenance = copy.deepcopy(accepted)
+        threading.Thread(
+            target=_stats_reset_arm_worker,
+            args=(requested_at, copy.deepcopy(before)),
+            daemon=True,
+            name="photons-stats-reset-arm",
+        ).start()
 
-    deadline = time.monotonic() + PHOTONS_STATS_RESET_PROOF_TIMEOUT_S
-    live_birth: Optional[Dict[str, Any]] = None
-    durable_birth: Optional[Dict[str, Any]] = None
-    last_live: Optional[Dict[str, Any]] = None
-    proof_error: Optional[str] = None
-
-    while time.monotonic() < deadline:
-        try:
-            with _state_lock:
-                latest = copy.deepcopy(_latest_photons)
-            if isinstance(latest, dict):
-                latest_epoch = _stats_epoch_snapshot_from_state(latest)
-                last_live = latest_epoch
-                if latest_epoch["reset_count"] > expected_reset_count:
-                    raise RuntimeError(
-                        "PHOTONS statistics skipped past requested reset epoch: "
-                        f"expected={expected_reset_count} observed={latest_epoch['reset_count']}"
-                    )
-                if (
-                    latest_epoch["reset_count"] == expected_reset_count
-                    and latest_epoch["update_count"] == 1
-                    and live_birth is None
-                ):
-                    live_birth = _stats_reset_birth_court(
-                        latest,
-                        before=before,
-                        expected_reset_count=expected_reset_count,
-                    )
-
-            durable = _find_durable_stats_reset_birth(
-                expected_reset_count=expected_reset_count
-            )
-            if durable is not None:
-                durable_proof = _stats_reset_birth_court(
-                    durable["canonical"],
-                    before=before,
-                    expected_reset_count=expected_reset_count,
-                )
-                durable_birth = {
-                    "detail_id": int(durable["detail_id"]),
-                    **durable_proof,
-                }
-                if live_birth is not None and int(live_birth["sequence"]) != int(
-                    durable_birth["sequence"]
-                ):
-                    raise RuntimeError(
-                        "PHOTONS live/durable STATS_RESET row-1 identity mismatch: "
-                        f"live_sequence={live_birth['sequence']} "
-                        f"durable_sequence={durable_birth['sequence']}"
-                    )
-                break
-        except Exception as exc:
-            proof_error = str(exc)
-            break
-        time.sleep(0.05)
-
-    if durable_birth is None:
-        failure = {
-            "action": "STATS_RESET",
-            "requested_at_utc": requested_at,
-            "completed_at_utc": _utc_now_z(),
-            "success": False,
-            "stage": "PROVE_DURABLE_EPOCH_BIRTH",
-            "before": before,
-            "expected_reset_count": expected_reset_count,
-            "live_birth": live_birth,
-            "last_live": last_live,
-            "teensy": copy.deepcopy(teensy_payload),
-            "error": proof_error,
-            "timeout_s": PHOTONS_STATS_RESET_PROOF_TIMEOUT_S,
-        }
-        with _state_lock:
-            _stats_reset_failures += 1
-            _last_maintenance = copy.deepcopy(failure)
-        logging.error("💥 [photons] STATS_RESET epoch-birth proof failed: %s", failure)
-        return {
-            "success": False,
-            "message": (
-                proof_error
-                or "PHOTONS.STATS_RESET did not produce one proven durable update_count=1 row"
-            ),
-            "payload": failure,
-        }
-
-    try:
-        teensy_after = _fetch_teensy_stats_reset_postcondition(
-            expected_reset_count=expected_reset_count,
-            request_count=expected_request_count,
-            prior_commit_count=commit_count_before,
-        )
-        after = _latest_stats_epoch()
-        if after["reset_count"] != expected_reset_count or after["update_count"] < 1:
-            raise RuntimeError(
-                "latest PHOTONS state is not descended from the proven STATS_RESET birth row"
-            )
-        if after["sequence"] < durable_birth["sequence"]:
-            raise RuntimeError("latest PHOTONS physical sequence regressed behind durable row 1")
-        if after["standard_lap_ps"] != before["standard_lap_ps"]:
-            raise RuntimeError("latest PHOTONS STANDARD_LAP_NS changed across STATS_RESET")
-        if after["campaign"] != before.get("campaign"):
-            raise RuntimeError("latest PHOTONS LANTERN identity/origin changed across STATS_RESET")
-        if after["custody_lap_count"] < durable_birth["custody_lap_count"]:
-            raise RuntimeError("latest PHOTONS custody regressed behind durable row 1")
-        if (
-            after["custody_total_lap_gnss_ns"]
-            < durable_birth["custody_total_lap_gnss_ns"]
-        ):
-            raise RuntimeError("latest PHOTONS custody total regressed behind durable row 1")
-    except Exception as exc:
-        failure = {
-            "action": "STATS_RESET",
-            "requested_at_utc": requested_at,
-            "completed_at_utc": _utc_now_z(),
-            "success": False,
-            "stage": "VERIFY_POSTCONDITION",
-            "before": before,
-            "durable_birth": durable_birth,
-            "last_live": last_live,
-            "teensy": copy.deepcopy(teensy_payload),
-            "error": str(exc),
-        }
-        with _state_lock:
-            _stats_reset_failures += 1
-            _last_maintenance = copy.deepcopy(failure)
-        logging.exception("💥 [photons] STATS_RESET postcondition failed")
-        return {"success": False, "message": str(exc), "payload": failure}
-
-    result = {
-        "action": "STATS_RESET",
-        "requested_at_utc": requested_at,
-        "completed_at_utc": _utc_now_z(),
-        "success": True,
-        "scope": "SYSTEMWIDE_PHOTONS_STATISTICS",
-        "before": before,
-        "epoch_birth": durable_birth,
-        "after": after,
-        "teensy_before": copy.deepcopy(teensy_before),
-        "teensy_request": copy.deepcopy(teensy_payload),
-        "teensy_after": teensy_after,
-        "campaign_unchanged": True,
-        "physical_measurement_unchanged": True,
-        "physical_sequence_preserved": True,
-        "monotonic_custody_preserved": True,
-        "standard_lap_preserved": True,
-        "first_durable_update_count": 1,
-    }
-    with _state_lock:
-        _stats_reset_success += 1
-        _last_maintenance = copy.deepcopy(result)
-    logging.warning(
-        "📊 [photons] STATS_RESET proved new durable epoch reset_count=%d "
-        "detail_id=%d sequence=%d N=%d",
-        expected_reset_count,
-        int(durable_birth["detail_id"]),
-        int(durable_birth["sequence"]),
-        int(durable_birth["lap_count"]),
-    )
-    return {"success": True, "message": "OK", "payload": result}
-
+    return {"success": True, "message": "OK", "payload": accepted}
 
 def cmd_inject_problem(args: Optional[dict]) -> Dict[str, Any]:
     """Pass one diagnostic science-court injection request to Teensy PHOTONS."""
@@ -7141,6 +7154,7 @@ def cmd_photons_info(_: Optional[dict]) -> Dict[str, Any]:
             "stats_reset_requests": _stats_reset_requests,
             "stats_reset_success": _stats_reset_success,
             "stats_reset_failures": _stats_reset_failures,
+            "stats_reset_in_progress": _stats_reset_in_progress.is_set(),
             "report_photons_requests": _report_photons_requests,
             "report_stats_requests": _report_stats_requests,
             "clear_count": _clear_count,
@@ -7276,6 +7290,31 @@ _HARD_FAILURE_READ_ONLY_COMMANDS = {
 }
 
 
+_STATS_RESET_ALLOWED_COMMANDS = _HARD_FAILURE_READ_ONLY_COMMANDS | {"STATS_RESET"}
+
+
+def _stats_reset_guard_command(
+    command: str,
+    handler,
+):
+    def guarded(args: Optional[dict]) -> Dict[str, Any]:
+        if _stats_reset_in_progress.is_set() and command not in _STATS_RESET_ALLOWED_COMMANDS:
+            return {
+                "success": False,
+                "message": (
+                    f"PHOTONS.{command} refused while asynchronous STATS_RESET owns "
+                    "the statistics epoch boundary"
+                ),
+                "payload": {
+                    "stats_reset_in_progress": True,
+                    "last_maintenance": copy.deepcopy(_last_maintenance or {}),
+                },
+            }
+        return handler(args)
+
+    return guarded
+
+
 def _hard_failure_guard_command(
     command: str,
     handler,
@@ -7293,7 +7332,9 @@ def _hard_failure_guard_command(
 
 
 COMMANDS = {
-    name: _hard_failure_guard_command(name, handler)
+    name: _hard_failure_guard_command(
+        name, _stats_reset_guard_command(name, handler)
+    )
     for name, handler in COMMANDS.items()
 }
 

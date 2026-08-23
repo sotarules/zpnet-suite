@@ -1140,6 +1140,10 @@ _dac_stats_reset_count: Optional[int] = None
 _dac_stats_update_count: Optional[int] = None
 _dac_stats_last_sequence: Optional[int] = None
 _dac_stats_reset_fence_count: Optional[int] = None
+# Operator STATS_RESET returns immediately; one background worker owns the
+# existing transitive Teensy/Pi reset transaction until it reaches a terminal result.
+_stats_reset_control_lock = threading.Lock()
+_stats_reset_in_progress = threading.Event()
 _dac_control_wakeup = threading.Event()
 _dac_control_thread_started = threading.Event()
 _dac_hardware_initialized = False
@@ -11435,6 +11439,7 @@ def _pi_clocks_state_snapshot() -> Dict[str, Any]:
         "stats_reset": {
             "requests": int(_diag.get("stats_reset_requests") or 0),
             "success": int(_diag.get("stats_reset_success") or 0),
+            "in_progress": _stats_reset_in_progress.is_set(),
             "last": _diag.get("last_stats_reset") or {},
         },
         "startup": _start_status_payload(),
@@ -13699,13 +13704,37 @@ def _establish_fresh_durable_stats_epoch(
     }
 
 
-def cmd_stats_reset(_: Optional[dict]) -> Dict[str, Any]:
-    """Reset all CLOCKS statistical populations as one operator command.
+def _stats_reset_worker(*, requested_at: str, pi_before: Dict[str, Any]) -> None:
+    """Complete one accepted operator STATS_RESET after the command has returned."""
+    try:
+        response = _perform_transitive_stats_reset(
+            requested_at=requested_at,
+            pi_before=pi_before,
+            source="CLOCKS.STATS_RESET",
+        )
+        if not isinstance(response, dict):
+            raise RuntimeError(f"CLOCKS STATS_RESET worker returned malformed result: {response!r}")
+        if not response.get("success"):
+            logging.error("💥 [clocks] asynchronous STATS_RESET failed: %s", response)
+    except Exception as exc:
+        failure = {
+            "requested_at_utc": requested_at,
+            "completed_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "success": False,
+            "stage": "ASYNC_WORKER_EXCEPTION",
+            "source": "CLOCKS.STATS_RESET",
+            "error": str(exc),
+            "pi_gnss_raw_before": copy.deepcopy(pi_before),
+            "pi_reset_applied": False,
+        }
+        _diag["last_stats_reset"] = failure
+        logging.exception("💥 [clocks] asynchronous STATS_RESET worker crashed")
+    finally:
+        _stats_reset_in_progress.clear()
 
-    Teensy owns the real-clock Welfords; Pi owns GNSS_RAW.  Require the
-    Teensy reset to succeed before resetting Pi state so a transport failure
-    cannot silently split the statistical epoch.
-    """
+
+def cmd_stats_reset(_: Optional[dict]) -> Dict[str, Any]:
+    """Accept one CLOCKS statistics reset and return before reset completion."""
     _diag["stats_reset_requests"] = _diag.get("stats_reset_requests", 0) + 1
     startup_busy = _startup_control_gate("STATS_RESET")
     if startup_busy is not None:
@@ -13713,13 +13742,40 @@ def cmd_stats_reset(_: Optional[dict]) -> Dict[str, Any]:
 
     requested_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     pi_before = _gnss_raw_welford_snapshot()
-    return _perform_transitive_stats_reset(
-        requested_at=requested_at,
-        pi_before=pi_before,
-        source="CLOCKS.STATS_RESET",
-    )
 
+    with _stats_reset_control_lock:
+        if _stats_reset_in_progress.is_set():
+            return {
+                "success": True,
+                "message": "CLOCKS STATS_RESET is already in progress",
+                "payload": {
+                    "status": "statistics_reset_in_progress",
+                    "asynchronous": True,
+                    "last": copy.deepcopy(_diag.get("last_stats_reset") or {}),
+                },
+            }
 
+        accepted = {
+            "requested_at_utc": requested_at,
+            "success": None,
+            "status": "statistics_reset_requested",
+            "source": "CLOCKS.STATS_RESET",
+            "scope": "SYSTEMWIDE_CLOCK_STATISTICS",
+            "asynchronous": True,
+            "campaign_unchanged": True,
+            "pi_gnss_raw_before": copy.deepcopy(pi_before),
+            "completion_report": "CLOCKS.REPORT_STATS.stats_reset.last",
+        }
+        _stats_reset_in_progress.set()
+        _diag["last_stats_reset"] = copy.deepcopy(accepted)
+        threading.Thread(
+            target=_stats_reset_worker,
+            kwargs={"requested_at": requested_at, "pi_before": copy.deepcopy(pi_before)},
+            daemon=True,
+            name="clocks-stats-reset",
+        ).start()
+
+    return {"success": True, "message": "OK", "payload": accepted}
 
 def _hard_failure_stats_repair_worker(
     *,
@@ -16725,6 +16781,31 @@ _HARD_FAILURE_OPERATOR_REPAIR_COMMANDS = {
 }
 
 
+_STATS_RESET_ALLOWED_COMMANDS = _HARD_FAILURE_READ_ONLY_COMMANDS | {"STATS_RESET"}
+
+
+def _stats_reset_guard_command(
+    command: str,
+    handler,
+):
+    def guarded(args: Optional[dict]) -> Dict[str, Any]:
+        if _stats_reset_in_progress.is_set() and command not in _STATS_RESET_ALLOWED_COMMANDS:
+            return {
+                "success": False,
+                "message": (
+                    f"CLOCKS.{command} refused while asynchronous STATS_RESET owns "
+                    "the statistics epoch boundary"
+                ),
+                "payload": {
+                    "stats_reset_in_progress": True,
+                    "last_stats_reset": copy.deepcopy(_diag.get("last_stats_reset") or {}),
+                },
+            }
+        return handler(args)
+
+    return guarded
+
+
 def _hard_failure_guard_command(
     command: str,
     handler,
@@ -16746,7 +16827,9 @@ def _hard_failure_guard_command(
 
 
 COMMANDS = {
-    name: _hard_failure_guard_command(name, handler)
+    name: _hard_failure_guard_command(
+        name, _stats_reset_guard_command(name, handler)
+    )
     for name, handler in COMMANDS.items()
 }
 
