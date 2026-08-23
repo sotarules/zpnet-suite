@@ -354,6 +354,7 @@ PPB_PROOF_VERIFY_TOLERANCE_PPB = 0.00001
 PPB_FIRMWARE_DELTA_SCHEMA = "CLOCKS_PPB_CHECKPOINT_DELTA_V1"
 PPB_PI_CHECKPOINT_SCHEMA = "PI_CLOCKS_PPB_RESTORE_CHECKPOINT_V1"
 CLOCKS_RECOVERY_CONFIG_KEY = "CLOCKS_RECOVERY"
+CLOCKS_RECOVERY_SNAPSHOT_SCHEMA = "PI_CLOCKS_RECOVERY_SNAPSHOT_V1"
 TIMEBASE_SILENCE_TIMEOUT_S = 30.0
 TIMEBASE_SILENCE_MONITOR_POLL_S = 1.0
 TEENSY_HEALTH_RETRY_S = 60.0
@@ -6967,28 +6968,70 @@ def _clocks_gnss_raw_payload(state: Optional[Dict[str, Any]]) -> Optional[Dict[s
     return copy.deepcopy(gnss_raw) if isinstance(gnss_raw, dict) else None
 
 
-def _read_latest_recoverable_clocks_state(
-    *,
-    scan_limit: int = 64,
-) -> Tuple[Optional[Dict[str, Any]], int]:
-    """Return the durable CLOCKS_V4 state paired to config.CLOCKS_RECOVERY."""
-    del scan_limit
-    checkpoint = _load_or_migrate_clocks_recovery_checkpoint()
-    if checkpoint is None:
-        return None, 0
-    row = _clocks_recovery_source_row(checkpoint)
-    if row is None:
-        raise RuntimeError(
-            f"config.{CLOCKS_RECOVERY_CONFIG_KEY} has no matching durable CLOCKS restore row"
+@dataclass(frozen=True)
+class _ClocksRecoverySnapshot:
+    """One explicit CLOCKS resurrection image at a durable one-second boundary.
+
+    This is an internal formalization only; it does not introduce a new durable
+    representation. ``canonical`` is the exact CLOCKS_V4 campaign_detail payload
+    and ``ppb_restore_checkpoint`` is the exact config.CLOCKS_RECOVERY sidecar
+    owned by that same row. Campaign state is carried as part of the snapshot, not
+    rediscovered as a separate recovery species.
+
+    The existing recovery executor still consumes the historical process-local
+    shape with the Better-Buckets checkpoint embedded under ``clocks``.
+    ``restore_detail()`` is the single compatibility boundary that forms that
+    legacy view from the explicit snapshot pair.
+    """
+
+    schema: str
+    source_detail_id: int
+    source_sequence: int
+    source_campaign: Optional[str]
+    canonical: Dict[str, Any]
+    ppb_restore_checkpoint: Dict[str, Any]
+    campaign: Optional[Dict[str, Any]]
+    gnss_raw: Dict[str, Any]
+
+    def restore_detail(self) -> Dict[str, Any]:
+        restored = copy.deepcopy(self.canonical)
+        _clocks_payload(restored)["ppb_restore_checkpoint"] = copy.deepcopy(
+            self.ppb_restore_checkpoint
         )
-    state = row["payload"]
+        restored["_db_detail_id"] = int(self.source_detail_id)
+        return restored
+
+
+def _clocks_recovery_snapshot_from_authority(
+    row: Dict[str, Any], checkpoint: Dict[str, Any]
+) -> _ClocksRecoverySnapshot:
+    """Bind one canonical CLOCKS row to its exact singleton recovery sidecar."""
+    saved = _normalize_saved_ppb_checkpoint(checkpoint)
+    row_id = _as_int(row.get("id"))
+    if row_id is None or row_id <= 0:
+        raise RuntimeError("CLOCKS recovery source has no positive durable detail identity")
+    owner_id = _as_int(saved.get("durable_source_detail_id"))
+    if owner_id != row_id:
+        raise RuntimeError(
+            f"config.{CLOCKS_RECOVERY_CONFIG_KEY} owner mismatch: "
+            f"checkpoint={owner_id} row={row_id}"
+        )
+
+    state = row.get("payload")
     if isinstance(state, str):
         state = json.loads(state)
     if not isinstance(state, dict):
         raise RuntimeError("CLOCKS recovery source payload is not an object")
-    row_id = int(row["id"])
+    state = copy.deepcopy(state)
+
+    sequence = _as_int(state.get("sequence"))
+    if sequence is None or sequence <= 0:
+        raise RuntimeError(
+            f"CLOCKS recovery source detail_id={row_id} lacks positive sequence identity"
+        )
+
     clocks = _clocks_payload(state)
-    if not _checkpoint_matches_clocks_state(checkpoint, state):
+    if not _checkpoint_matches_clocks_state(saved, state):
         raise RuntimeError(
             f"config.{CLOCKS_RECOVERY_CONFIG_KEY} identity disagrees with detail_id={row_id}"
         )
@@ -6998,14 +7041,56 @@ def _read_latest_recoverable_clocks_state(
         raise RuntimeError(
             f"config.{CLOCKS_RECOVERY_CONFIG_KEY} points to non-restorable detail_id={row_id}"
         )
-    if _clocks_gnss_raw_payload(state) is None:
+
+    gnss_raw = _clocks_gnss_raw_payload(state)
+    if gnss_raw is None:
         raise RuntimeError(
             f"config.{CLOCKS_RECOVERY_CONFIG_KEY} source detail_id={row_id} lacks GNSS_RAW"
         )
-    restored = copy.deepcopy(state)
-    _clocks_payload(restored)["ppb_restore_checkpoint"] = copy.deepcopy(checkpoint)
-    restored["_db_detail_id"] = row_id
-    return restored, 0
+
+    campaign_raw = state.get("campaign")
+    if campaign_raw is not None and not isinstance(campaign_raw, dict):
+        raise RuntimeError(
+            f"CLOCKS recovery source detail_id={row_id} has malformed campaign decoration"
+        )
+    source_campaign_raw = row.get("campaign")
+    source_campaign = (
+        str(source_campaign_raw) if source_campaign_raw is not None else None
+    )
+
+    return _ClocksRecoverySnapshot(
+        schema=CLOCKS_RECOVERY_SNAPSHOT_SCHEMA,
+        source_detail_id=int(row_id),
+        source_sequence=int(sequence),
+        source_campaign=source_campaign,
+        canonical=state,
+        ppb_restore_checkpoint=copy.deepcopy(saved),
+        campaign=copy.deepcopy(campaign_raw) if isinstance(campaign_raw, dict) else None,
+        gnss_raw=copy.deepcopy(gnss_raw),
+    )
+
+
+def _load_clocks_recovery_snapshot() -> Optional[_ClocksRecoverySnapshot]:
+    """Return the current declarative CLOCKS recovery snapshot, if one exists."""
+    checkpoint = _load_or_migrate_clocks_recovery_checkpoint()
+    if checkpoint is None:
+        return None
+    row = _clocks_recovery_source_row(checkpoint)
+    if row is None:
+        raise RuntimeError(
+            f"config.{CLOCKS_RECOVERY_CONFIG_KEY} has no matching durable CLOCKS restore row"
+        )
+    return _clocks_recovery_snapshot_from_authority(row, checkpoint)
+
+
+def _read_latest_recoverable_clocks_state(
+    *,
+    scan_limit: int = 64,
+) -> Tuple[Optional[Dict[str, Any]], int]:
+    """Compatibility view of the explicit CLOCKS recovery snapshot."""
+    del scan_limit
+    snapshot = _load_clocks_recovery_snapshot()
+    return (snapshot.restore_detail() if snapshot is not None else None), 0
 
 def _seed_clocks_from_detail(detail: Dict[str, Any]) -> None:
     """Publish/cache a compact durable CLOCKS seed without its private recovery ring."""

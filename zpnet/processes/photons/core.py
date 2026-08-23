@@ -39,6 +39,7 @@ from __future__ import annotations
 import copy
 import json
 from collections import deque
+from dataclasses import dataclass
 import logging
 import math
 import queue
@@ -108,6 +109,7 @@ PHOTONS_WELFORD_GRAND_RATIO_DIAGNOSTIC_PPB = 0.1
 PHOTONS_PPB_FIRMWARE_DELTA_SCHEMA = "PHOTONS_PPB_CHECKPOINT_DELTA_V1"
 PHOTONS_PPB_PI_CHECKPOINT_SCHEMA = "PI_PHOTONS_PPB_RESTORE_CHECKPOINT_V1"
 PHOTONS_RECOVERY_CONFIG_KEY = "PHOTONS_RECOVERY"
+PHOTONS_RECOVERY_SNAPSHOT_SCHEMA = "PI_PHOTONS_RECOVERY_SNAPSHOT_V1"
 
 TEENSY_CAMPAIGN_START_ACCEPTED_STATUSES = {"start_requested", "flash_cut_requested"}
 TEENSY_CAMPAIGN_STOP_ACCEPTED_STATUSES = {"stop_requested"}
@@ -3000,12 +3002,84 @@ def _canonical_recovery_state_from_row(
     }
 
 
+@dataclass(frozen=True)
+class _PhotonsRecoverySnapshot:
+    """One explicit PHOTONS resurrection image at a durable one-second boundary.
+
+    This object deliberately binds the canonical PHOTONS_V1 observation to the
+    exact config.PHOTONS_RECOVERY singleton that owns its bounded Better-Buckets
+    continuation state. ``prepared_restore`` is the existing validated projection
+    consumed by the current executor; keeping it inside this object makes the
+    canonical row + sidecar the one named recovery authority without changing the
+    durable representation or recovery behavior in this step.
+    """
+
+    schema: str
+    source_detail_id: int
+    source_sequence: int
+    source_campaign: Optional[str]
+    canonical: Dict[str, Any]
+    ppb_restore_checkpoint: Dict[str, Any]
+    campaign: Optional[Dict[str, Any]]
+    prepared_restore: Dict[str, Any]
+
+    def restore_source(self) -> Dict[str, Any]:
+        source = copy.deepcopy(self.prepared_restore)
+        source["ppb_restore_checkpoint"] = copy.deepcopy(
+            self.ppb_restore_checkpoint
+        )
+        return source
+
+
+def _photons_recovery_snapshot_from_row(
+    row: Dict[str, Any],
+    *,
+    active_master: Optional[Dict[str, Any]],
+    require_active_campaign: bool,
+) -> _PhotonsRecoverySnapshot:
+    """Bind one canonical PHOTONS row to its exact singleton recovery sidecar."""
+    source = _canonical_recovery_state_from_row(
+        row,
+        active_master=active_master,
+        require_active_campaign=require_active_campaign,
+    )
+    checkpoint = _recovery_checkpoint_for_selected_row(row, source)
+    if not _checkpoint_matches_photons_source(checkpoint, source):
+        raise RuntimeError(
+            f"config.{PHOTONS_RECOVERY_CONFIG_KEY} does not own selected "
+            f"detail_id={int(source['db_detail_id'])}"
+        )
+
+    canonical = _require_dict(source.get("canonical"), "PHOTONS recovery canonical")
+    campaign_raw = canonical.get("campaign")
+    if campaign_raw is not None and not isinstance(campaign_raw, dict):
+        raise RuntimeError(
+            f"PHOTONS recovery source detail_id={int(source['db_detail_id'])} "
+            "has malformed campaign decoration"
+        )
+    source_campaign_raw = row.get("campaign")
+    source_campaign = (
+        str(source_campaign_raw) if source_campaign_raw is not None else None
+    )
+
+    return _PhotonsRecoverySnapshot(
+        schema=PHOTONS_RECOVERY_SNAPSHOT_SCHEMA,
+        source_detail_id=int(source["db_detail_id"]),
+        source_sequence=int(source["sequence"]),
+        source_campaign=source_campaign,
+        canonical=copy.deepcopy(canonical),
+        ppb_restore_checkpoint=copy.deepcopy(checkpoint),
+        campaign=copy.deepcopy(campaign_raw) if isinstance(campaign_raw, dict) else None,
+        prepared_restore=copy.deepcopy(source),
+    )
+
+
 def _load_newest_recoverable_photons_state(
     *,
     active_master: Optional[Dict[str, Any]],
     require_active_campaign: bool,
-) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]], int]:
-    """Return the newest durable PHOTONS row or fail on its contradiction.
+) -> Tuple[Optional[_PhotonsRecoverySnapshot], List[Dict[str, Any]], int]:
+    """Return the newest declarative PHOTONS snapshot or fail on contradiction.
 
     Phase 3 forbids ancestry search-by-convenience.  Once durable PHOTONS history
     exists, a newer row that fails the recovery court is evidence of a contradiction,
@@ -3043,13 +3117,10 @@ def _load_newest_recoverable_photons_state(
         return None, [], 0
 
     try:
-        source = _canonical_recovery_state_from_row(
+        snapshot = _photons_recovery_snapshot_from_row(
             row,
             active_master=active_master,
             require_active_campaign=require_active_campaign,
-        )
-        source["ppb_restore_checkpoint"] = _recovery_checkpoint_for_selected_row(
-            row, source
         )
     except Exception as exc:
         rejection = {"id": int(row["id"]), "reason": str(exc)}
@@ -3059,7 +3130,7 @@ def _load_newest_recoverable_photons_state(
             f"{rejection!r}"
         ) from exc
 
-    diagnostic = source.get("welford_grand_ratio_diagnostic")
+    diagnostic = snapshot.prepared_restore.get("welford_grand_ratio_diagnostic")
     if isinstance(diagnostic, dict):
         log = logging.warning if diagnostic.get("notable") else logging.info
         log(
@@ -3067,12 +3138,12 @@ def _load_newest_recoverable_photons_state(
             "Welford/grand-ratio drift=%.9f ppb limit=%.6f ppb; "
             "diagnostic only, authority unchanged",
             "⚠️" if diagnostic.get("notable") else "🧮",
-            int(source["db_detail_id"]),
-            int(source["update_count"]),
+            int(snapshot.source_detail_id),
+            int(snapshot.prepared_restore["update_count"]),
             float(diagnostic.get("delta_ppb") or 0.0),
             float(diagnostic.get("diagnostic_limit_ppb") or 0.0),
         )
-    return source, [], 1
+    return snapshot, [], 1
 
 
 # ---------------------------------------------------------------------
@@ -4646,11 +4717,12 @@ def _perform_phase5_recovery() -> Dict[str, Any]:
         )
         total_detail_count = _count_current_lantern_details()
         require_active_campaign = active_master is not None and active_detail_count > 0
-        source, skipped, rows_scanned = _load_newest_recoverable_photons_state(
+        snapshot, skipped, rows_scanned = _load_newest_recoverable_photons_state(
             active_master=active_master,
             require_active_campaign=require_active_campaign,
         )
-        if source is None and total_detail_count != 0:
+        source = snapshot.restore_source() if snapshot is not None else None
+        if snapshot is None and total_detail_count != 0:
             raise RuntimeError(
                 "durable PHOTONS history exists but no row satisfies the recovery court: "
                 f"rows_scanned={rows_scanned} skipped={skipped!r}"
@@ -4663,23 +4735,22 @@ def _perform_phase5_recovery() -> Dict[str, Any]:
         if report["staging_active"]:
             raise RuntimeError("Teensy PHOTONS recovery staging remains active")
 
-        if source is not None:
-            # Seed live Pi recovery custody from the exact singleton image paired
-            # to the newest durable canonical row. Historical SQL rows have no role
-            # in Better-Buckets resurrection or startup reconstruction.
-            raw_checkpoint = _require_dict(
-                source.get("ppb_restore_checkpoint"),
-                "recovery source ppb_restore_checkpoint",
-            )
+        if snapshot is not None:
+            # Seed live Pi recovery custody from the exact sidecar carried by the
+            # explicit snapshot. Historical SQL rows have no role in Better-Buckets
+            # resurrection or startup reconstruction.
             _restore_ppb_checkpoint_runtime(
-                raw_checkpoint, source_db_detail_id=int(source["db_detail_id"])
+                snapshot.ppb_restore_checkpoint,
+                source_db_detail_id=int(snapshot.source_detail_id),
             )
 
         classification = {
             "active_campaign": active_master["campaign"] if active_master else None,
             "active_campaign_detail_count": active_detail_count,
             "total_detail_count": total_detail_count,
-            "source_detail_id": int(source["db_detail_id"]) if source else None,
+            "source_detail_id": (
+                int(snapshot.source_detail_id) if snapshot is not None else None
+            ),
             "source_welford_grand_ratio_diagnostic": (
                 copy.deepcopy(source.get("welford_grand_ratio_diagnostic"))
                 if source is not None
