@@ -104,6 +104,10 @@ static constexpr uint32_t HANDOFF_PPS_RING_SIZE = 4U;
 // the observed normal callback/idle scale while remaining tiny beside the
 // suspected 50 ms event.  CH2 event age retains a tighter 100 us trigger.
 static constexpr uint32_t INTERRUPT_FORENSIC_RING_SIZE = 16U;
+static constexpr uint32_t INTERRUPT_FORENSIC_REPORT_MAX_RECORDS = 8U;
+static_assert(INTERRUPT_FORENSIC_REPORT_MAX_RECORDS <=
+                  INTERRUPT_FORENSIC_RING_SIZE,
+              "forensic report limit must fit the retained ring");
 static constexpr uint32_t INTERRUPT_FORENSIC_SERVICE_THRESHOLD_CYCLES =
     (uint32_t)DWT_EXPECTED_PER_PPS / 500U;
 static constexpr uint32_t INTERRUPT_FORENSIC_GAP_THRESHOLD_CYCLES =
@@ -7166,6 +7170,8 @@ static FLASHMEM Payload cmd_report_forensics(const Payload&) {
   payload.add("report", "INTERRUPT_FORENSICS");
   payload.add("architecture", "FOREGROUND_BLACK_BOX");
   payload.add("record_order", "OLDEST_TO_NEWEST");
+  payload.add("record_selection", "NEWEST_SUFFIX");
+  payload.add("report_record_limit", INTERRUPT_FORENSIC_REPORT_MAX_RECORDS);
   payload.add("gap_measurement", "DWT_AND_QTIMER10MHZ");
   payload.add("timepop_pressure_marker_api_present", true);
   payload.add("ring_size", INTERRUPT_FORENSIC_RING_SIZE);
@@ -7263,10 +7269,16 @@ static FLASHMEM Payload cmd_report_forensics(const Payload&) {
   const uint32_t stored = total_recorded < INTERRUPT_FORENSIC_RING_SIZE
       ? total_recorded
       : INTERRUPT_FORENSIC_RING_SIZE;
+  const uint32_t reported = stored < INTERRUPT_FORENSIC_REPORT_MAX_RECORDS
+      ? stored
+      : INTERRUPT_FORENSIC_REPORT_MAX_RECORDS;
+  const uint32_t omitted = stored - reported;
   payload.add("snapshot_ok", snapshot_ok);
   payload.add("service_pass_count", service_pass_count);
   payload.add("total_recorded", total_recorded);
   payload.add("records_stored", stored);
+  payload.add("records_reported", reported);
+  payload.add("records_omitted", omitted);
   payload.add("overwrite_count", overwrite_count);
   payload.add("pressure_marker_count", pressure_marker_count);
   payload.add("timepop_pressure_marker_wiring_observed",
@@ -7289,13 +7301,16 @@ static FLASHMEM Payload cmd_report_forensics(const Payload&) {
 
   if (!snapshot_ok) return payload;
 
-  const uint32_t oldest = total_recorded >= INTERRUPT_FORENSIC_RING_SIZE
-      ? total_recorded % INTERRUPT_FORENSIC_RING_SIZE
-      : 0U;
-  for (uint32_t i = 0U; i < stored; ++i) {
+  const uint32_t oldest_stored =
+      total_recorded >= INTERRUPT_FORENSIC_RING_SIZE
+          ? total_recorded % INTERRUPT_FORENSIC_RING_SIZE
+          : 0U;
+  const uint32_t first_reported =
+      (oldest_stored + omitted) % INTERRUPT_FORENSIC_RING_SIZE;
+  for (uint32_t i = 0U; i < reported; ++i) {
     const interrupt_foreground_forensic_record_t record =
         g_interrupt_foreground_forensics.records[
-            (oldest + i) % INTERRUPT_FORENSIC_RING_SIZE];
+            (first_reported + i) % INTERRUPT_FORENSIC_RING_SIZE];
     add_forensic_record_field(payload, i, "sequence", record.sequence);
     add_forensic_record_field(payload, i, "trigger_flags",
                                record.trigger_flags);
