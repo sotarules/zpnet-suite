@@ -119,12 +119,11 @@ static bool copy_request_metadata_into_response(const Payload& request,
     }
 
     // Request identity is a protocol invariant. Never manufacture a fallback
-    // identity (especially req_id=0) from malformed input.
-    if (!response.add("req_id", req_id) ||
-        !response.add("req_ts_ms", req_ts_ms)) {
-        debug_log("process.rpc_metadata_response_add_failed", request);
-        return false;
-    }
+    // identity (especially req_id=0) from malformed input. Payload construction
+    // is itself infallible from the client point of view: if either add() cannot
+    // complete, Payload publishes its fatal WATCHDOG_ANOMALY and does not return.
+    response.add("req_id", req_id);
+    response.add("req_ts_ms", req_ts_ms);
 
     return true;
 }

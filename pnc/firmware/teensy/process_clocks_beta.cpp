@@ -574,10 +574,11 @@ static constexpr uint64_t CLOCKS_FRAGMENT_RETRY_DELAY_NS = 25000000ULL;  // 25 m
 // permanent 40 Hz foreground retry loop that prevents D1 from getting a turn.
 //
 // A public STARTED campaign gets a substantially wider court than ambient
-// publication. After the typed Alpha/Beta row passes the exact-row court, failure
-// to attach that immutable testimony to the outbound Payload or enqueue it is
-// observer-plane loss, not producer continuity surrender. Retire that undeliverable
-// Pi observation explicitly and let Beta continue authoring subsequent campaign
+// publication. After the typed Alpha/Beta row passes the exact-row court, Payload
+// construction is a hard invariant: a failed add/add_object never returns to this
+// client. The only recoverable publication failure here is transport refusing
+// custody of the completed wire observation. Retire that undeliverable Pi
+// observation explicitly and let Beta continue authoring subsequent campaign
 // seconds. Ambiguous/legacy retry state still fails through WATCHDOG_ANOMALY.
 // RECOVERING also remains transactional: retry exhaustion aborts that recovery so
 // Pi may adjudicate/retry while Alpha lives.
@@ -585,10 +586,10 @@ static constexpr uint32_t CLOCKS_FRAGMENT_IDLE_RETRY_MAX_ATTEMPTS = 4U;
 static constexpr uint32_t CLOCKS_FRAGMENT_ACTIVE_RETRY_MAX_ATTEMPTS = 16U;
 
 static constexpr uint32_t CLOCKS_FRAGMENT_RETRY_REASON_NONE = 0U;
+// Payload-build reason IDs remain only so existing report/log decoders retain
+// their historical vocabulary. Defenseless Payload clients can no longer author
+// these reasons: construction either returns complete or does not return at all.
 static constexpr uint32_t CLOCKS_FRAGMENT_RETRY_REASON_CAMPAIGN_EMBED = 1U;
-// Historical coarse reason retained for report/log interpretation only. New
-// publication attempts never author it because exact serializer species below
-// now distinguish the two former CLOCKS_PAYLOAD branches.
 static constexpr uint32_t CLOCKS_FRAGMENT_RETRY_REASON_CLOCKS_PAYLOAD = 2U;
 static constexpr uint32_t CLOCKS_FRAGMENT_RETRY_REASON_TRANSPORT_ENQUEUE = 3U;
 static constexpr uint32_t CLOCKS_FRAGMENT_RETRY_REASON_CLOCKS_OBJECT = 4U;
@@ -1199,18 +1200,11 @@ static FLASHMEM const char* clocks_fragment_retry_reason_name(uint32_t reason_id
 }
 
 static bool clocks_fragment_retry_reason_is_observer_plane(uint32_t reason_id) {
-  switch (reason_id) {
-    case CLOCKS_FRAGMENT_RETRY_REASON_CAMPAIGN_EMBED:
-    case CLOCKS_FRAGMENT_RETRY_REASON_TRANSPORT_ENQUEUE:
-    case CLOCKS_FRAGMENT_RETRY_REASON_CLOCKS_OBJECT:
-    case CLOCKS_FRAGMENT_RETRY_REASON_FEATURES_OBJECT:
-      return true;
-    default:
-      // NONE and the legacy coarse CLOCKS_PAYLOAD reason are not permission to
-      // preserve Beta. New code cannot author the legacy reason, so seeing it in
-      // an active retry would be ambiguous internal state and must fail loud.
-      return false;
-  }
+  // Payload construction failures are no longer retryable observer-plane events.
+  // The only current author of retry state is a completed observation that
+  // transport declined to enqueue. Any legacy Payload-build reason found active
+  // is therefore contradictory state and must fail loud.
+  return reason_id == CLOCKS_FRAGMENT_RETRY_REASON_TRANSPORT_ENQUEUE;
 }
 
 static void clocks_fragment_retry_note_failure(uint32_t sequence,
@@ -1411,63 +1405,23 @@ static void clocks_fragment_publish_service(timepop_ctx_t*,
   // instrument row now; campaign_row_ready() will schedule a same-sequence
   // strengthening copy. This avoids carrying campaign lifecycle mirrors inside
   // the always-on instrument snapshot merely to coordinate serialization.
-  bool campaign_embedded = false;
+  const bool campaign_embedded = campaign_available;
   if (campaign_available) {
     Payload campaign = clocks_fragment_campaign_payload(
         g_clocks_fragment_publication_clocks_snapshot.campaign);
-    campaign_embedded = fragment.add_object("campaign", campaign);
-    if (!campaign_embedded) {
-      g_clocks_fragment_publication_publish_reject_count++;
-      g_clocks_fragment_publication_campaign_row_embed_fail_count++;
-      clocks_fragment_retry_note_failure(
-          sequence,
-          CLOCKS_FRAGMENT_RETRY_REASON_CAMPAIGN_EMBED,
-          retrying_snapshot,
-          false);
-      if (!retrying_snapshot) {
-        g_clocks_fragment_publication_campaign_retry_count++;
-      }
-      if (clocks_fragment_retry_finish_if_exhausted(sequence)) return;
-      g_clocks_fragment_publication_retry_schedule_count++;
-      clocks_fragment_schedule_publish();
-      return;
-    }
+    fragment.add_object("campaign", campaign);
   }
 
   // instrument_row_exact above has already proved the typed Alpha snapshot and
-  // its completed-row identity. From this point onward a failure is serialization
-  // of already-authoritative testimony, not failure of the producer truth court.
-  const bool clocks_object_added = fragment.add_object(
+  // its completed-row identity. Payload construction is now a hard invariant:
+  // these attachments either return complete or Payload escalates through its
+  // retained fatal WATCHDOG court and does not return to CLOCKS.
+  fragment.add_object(
       "clocks",
       clocks_fragment_clocks_payload(
           g_clocks_fragment_publication_clocks_snapshot.live));
-  if (!clocks_object_added) {
-    g_clocks_fragment_publication_publish_reject_count++;
-    clocks_fragment_retry_note_failure(
-        sequence,
-        CLOCKS_FRAGMENT_RETRY_REASON_CLOCKS_OBJECT,
-        retrying_snapshot,
-        false);
-    if (clocks_fragment_retry_finish_if_exhausted(sequence)) return;
-    g_clocks_fragment_publication_retry_schedule_count++;
-    clocks_fragment_schedule_publish();
-    return;
-  }
 
-  const bool features_object_added =
-      fragment.add_object("features", clocks_fragment_features_payload());
-  if (!features_object_added) {
-    g_clocks_fragment_publication_publish_reject_count++;
-    clocks_fragment_retry_note_failure(
-        sequence,
-        CLOCKS_FRAGMENT_RETRY_REASON_FEATURES_OBJECT,
-        retrying_snapshot,
-        false);
-    if (clocks_fragment_retry_finish_if_exhausted(sequence)) return;
-    g_clocks_fragment_publication_retry_schedule_count++;
-    clocks_fragment_schedule_publish();
-    return;
-  }
+  fragment.add_object("features", clocks_fragment_features_payload());
 
   const uint32_t next_publish_count = g_clocks_fragment_publication_publish_count + 1U;
   const uint32_t next_campaign_rows_embedded =

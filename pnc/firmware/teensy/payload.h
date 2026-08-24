@@ -24,7 +24,10 @@
     • Every successfully verified mutation advances an object-local generation
       and structural fingerprint.  A later mismatch is classified as drift
       between mutation boundaries rather than silently accepted.
-    • Public mutators return bool; existing callers may ignore the result.
+    • Public construction mutators return void. Returning control proves the
+      requested mutation completed and passed its postcondition court; a failed
+      construction commits retained fatal evidence, emits WATCHDOG_ANOMALY via
+      the allocator-free emergency transport path, and deliberately faults.
     • Payload runtime code performs no float or double conversion. Scientific
       values cross the construction boundary as integer-only fixed_decimal_t
       objects; floating read accessors are intentionally retired.
@@ -191,6 +194,43 @@ bool payload_contract_event_peek(payload_contract_event_t* out);
 void payload_contract_event_begin(void);
 void payload_contract_event_end(bool emitted);
 void payload_contract_clear_retained(void);
+
+// ============================================================================
+// Payload fatal construction court (retained, scalar-only)
+// ============================================================================
+//
+// A construction mutator that cannot complete is a producer-integrity failure,
+// not a recoverable client choice. The record is committed and cache-flushed
+// before the allocator-free WATCHDOG_ANOMALY emergency path is attempted.
+
+#define PAYLOAD_FATAL_SCHEMA_VERSION 1U
+
+struct payload_fatal_record_t {
+  uint32_t magic;
+  uint32_t magic_inv;
+  uint32_t schema_version;
+  uint32_t sequence;
+  uint32_t sequence_inv;
+  uint32_t error_code;
+  uint32_t operation_id;
+  uint32_t last_error_code;
+  uint32_t last_error_operation_id;
+  uint32_t last_error_count;
+  uint32_t last_error_object_ptr;
+  uint32_t object_ptr;
+  uint32_t requested_bytes;
+  uint32_t capacity;
+  uint32_t count;
+  uint32_t data_used;
+  uint32_t ipsr;
+  uint32_t dwt_cyccnt;
+  uint32_t msp;
+  uint32_t watchdog_attempted;
+  uint32_t watchdog_sent;
+};
+
+bool payload_fatal_record_get(payload_fatal_record_t* out);
+void payload_fatal_record_clear(void);
 
 // ============================================================================
 // Payload Instrumentation Snapshot (Read-Only, Monotonic)
@@ -582,7 +622,7 @@ public:
     Payload& operator=(const Payload& other);
 
     // Lifecycle
-    bool clear();
+    void clear();
     bool empty() const;
     Payload clone() const;
 
@@ -595,48 +635,48 @@ public:
     String to_json() const;
 
     // Semantic construction
-    bool add(const char* key, int32_t value);
-    bool add(const char* key, uint32_t value);
-    bool add(const char* key, int64_t value);
-    bool add(const char* key, uint64_t value);
+    void add(const char* key, int32_t value);
+    void add(const char* key, uint32_t value);
+    void add(const char* key, int64_t value);
+    void add(const char* key, uint64_t value);
 
-    bool add(const char* key, const char* value);
-    bool add(const char* key, const String& value);
-    bool add(const char* key, bool value);
-    bool add(const char* key, const fixed_decimal_t& value);
+    void add(const char* key, const char* value);
+    void add(const char* key, const String& value);
+    void add(const char* key, bool value);
+    void add(const char* key, const fixed_decimal_t& value);
 
     // Construction is deliberately hostile to accidental FP reintroduction.
     // Call toFixedDecimal() in the owning/reporting module, then pass the
     // resulting integer-only object to the overload above.
-    bool add(const char* key, float value) = delete;
-    bool add(const char* key, double value) = delete;
-    bool add(const char* key, double value, int precision) = delete;
+    void add(const char* key, float value) = delete;
+    void add(const char* key, double value) = delete;
+    void add(const char* key, double value, int precision) = delete;
 
     template <typename T>
     typename std::enable_if<
         std::is_integral<T>::value &&
         std::is_signed<T>::value &&
-        !std::is_same<T, bool>::value, bool>::type
+        !std::is_same<T, bool>::value, void>::type
     add(const char* key, T value) {
-        return add(key, (int64_t)value);
+        add(key, (int64_t)value);
     }
 
     template <typename T>
     typename std::enable_if<
         std::is_integral<T>::value &&
         std::is_unsigned<T>::value &&
-        !std::is_same<T, bool>::value, bool>::type
+        !std::is_same<T, bool>::value, void>::type
     add(const char* key, T value) {
-        return add(key, (uint64_t)value);
+        add(key, (uint64_t)value);
     }
 
     // String-format convenience only. Floating conversion specifiers
     // (%a/%e/%f/%g and uppercase forms) are rejected before vsnprintf().
-    bool add_fmt(const char* key, const char* fmt, ...);
+    void add_fmt(const char* key, const char* fmt, ...);
 
-    bool add_object(const char* key, const Payload& obj);
-    bool add_array(const char* key, const PayloadArray& arr);
-    bool add_raw_object(const char* key, const char* raw_json_object);
+    void add_object(const char* key, const Payload& obj);
+    void add_array(const char* key, const PayloadArray& arr);
+    void add_raw_object(const char* key, const char* raw_json_object);
 
     // Parsing
     bool parseJSON(const uint8_t* data, size_t len);
@@ -749,6 +789,11 @@ private:
     void _release_storage();
     void _move_from(Payload& other);
     bool _copy_from(const Payload& other);
+    size_t _append_required_bytes(size_t key_len,
+                                  size_t value_len) const;
+    [[noreturn]] void _fatal(uint32_t fallback_error_code,
+                             uint32_t fallback_operation_id,
+                             size_t requested_bytes = 0U) const;
 
     bool _self_ok(uint32_t operation_id) const;
     bool _entry_ok(const Entry& e, size_t index, uint32_t operation_id) const;
@@ -818,11 +863,11 @@ public:
     PayloadArray(PayloadArray&& other) noexcept;
     PayloadArray& operator=(PayloadArray&& other) noexcept;
 
-    bool clear();
+    void clear();
     bool empty() const;
 
     String to_json() const;
-    bool add(const Payload& obj);
+    void add(const Payload& obj);
     bool parseJSON(const char* json);
 
     size_t  size() const;
@@ -879,6 +924,9 @@ private:
     void _release_storage();
     void _move_from(PayloadArray& other);
     bool _copy_from(const PayloadArray& other);
+    [[noreturn]] void _fatal(uint32_t fallback_error_code,
+                             uint32_t fallback_operation_id,
+                             size_t requested_bytes = 0U) const;
 
     size_t _json_size() const;
     size_t _write_json_unchecked(char* out) const;

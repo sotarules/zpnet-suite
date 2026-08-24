@@ -596,6 +596,176 @@ static inline size_t serial_write_some(const uint8_t* buf, size_t len) {
 }
 
 // =============================================================
+// Allocator-free fatal WATCHDOG_ANOMALY lifeboat
+// =============================================================
+//
+// Payload construction failure cannot use publish(): ordinary publication
+// allocates a queued wire image and constructs a topic Payload.  This path is
+// transport-owned, fixed-storage, and synchronous.  It is invoked only after
+// Payload has committed its retained scalar fatal record.
+
+static char g_payload_fatal_watchdog_json[768];
+static char g_payload_fatal_watchdog_header[24];
+
+struct transport_emergency_writer_t {
+  char* data;
+  size_t capacity;
+  size_t length;
+  bool ok;
+};
+
+static void transport_emergency_putc(transport_emergency_writer_t* w, char ch) {
+  if (!w || !w->ok || !w->data || w->length + 1U >= w->capacity) {
+    if (w) w->ok = false;
+    return;
+  }
+  w->data[w->length++] = ch;
+  w->data[w->length] = '\0';
+}
+
+static void transport_emergency_puts(transport_emergency_writer_t* w,
+                                     const char* text) {
+  if (!w || !text) {
+    if (w) w->ok = false;
+    return;
+  }
+  while (*text != '\0' && w->ok) {
+    transport_emergency_putc(w, *text++);
+  }
+}
+
+static void transport_emergency_put_u32(transport_emergency_writer_t* w,
+                                        uint32_t value) {
+  char reversed[10];
+  size_t digits = 0U;
+  do {
+    reversed[digits++] = (char)('0' + (value % 10U));
+    value /= 10U;
+  } while (value != 0U);
+  while (digits != 0U) {
+    transport_emergency_putc(w, reversed[--digits]);
+  }
+}
+
+static char transport_emergency_hex_digit(uint32_t value) {
+  value &= 0xFU;
+  return value < 10U ? (char)('0' + value)
+                     : (char)('A' + (value - 10U));
+}
+
+static void transport_emergency_put_hex32(transport_emergency_writer_t* w,
+                                          uint32_t value) {
+  transport_emergency_puts(w, "\"0x");
+  for (int shift = 28; shift >= 0; shift -= 4) {
+    transport_emergency_putc(
+        w, transport_emergency_hex_digit(value >> (uint32_t)shift));
+  }
+  transport_emergency_putc(w, '"');
+}
+
+static bool transport_emergency_write_all(const uint8_t* data, size_t length) {
+  if (!data && length != 0U) return false;
+  size_t sent = 0U;
+  const uint32_t started_ms = millis();
+  while (sent < length) {
+    const size_t n = serial_write_some(data + sent, length - sent);
+    if (n != 0U) {
+      sent += n;
+      continue;
+    }
+    if ((uint32_t)(millis() - started_ms) >= 25U) return false;
+    delayMicroseconds(50);
+  }
+  return true;
+}
+
+bool transport_send_watchdog_anomaly_emergency(
+    const payload_fatal_record_t& record) {
+  if (transport_read_ipsr() != 0U || ZPNET_SERIAL.dtr() == 0U) return false;
+
+  // If the ordinary pump already placed a prefix of its current frame onto
+  // USB, complete only that frame first so the emergency D2 frame begins at a
+  // lawful wire boundary.  Do not free, advance, or service any later jobs:
+  // the producer is about to fault and allocator participation is forbidden.
+  if (tx_job_count != 0U) {
+    const tx_job_t& current = tx_jobs[tx_job_tail];
+    if (current.sent > current.length ||
+        (current.sent != 0U && !current.data)) {
+      return false;
+    }
+    if (current.sent != 0U && current.sent < current.length &&
+        !transport_emergency_write_all(current.data + current.sent,
+                                       current.length - current.sent)) {
+      return false;
+    }
+  }
+
+  transport_emergency_writer_t json{
+      g_payload_fatal_watchdog_json,
+      sizeof(g_payload_fatal_watchdog_json),
+      0U,
+      true};
+  g_payload_fatal_watchdog_json[0] = '\0';
+
+  transport_emergency_puts(&json,
+      "{\"topic\":\"WATCHDOG_ANOMALY\",\"payload\":{");
+  transport_emergency_puts(&json,
+      "\"schema\":\"PAYLOAD_FATAL_V1\",\"source\":\"PAYLOAD\"");
+  transport_emergency_puts(&json, ",\"sequence\":");
+  transport_emergency_put_u32(&json, record.sequence);
+  transport_emergency_puts(&json, ",\"error_code\":");
+  transport_emergency_put_u32(&json, record.error_code);
+  transport_emergency_puts(&json, ",\"operation_id\":");
+  transport_emergency_put_u32(&json, record.operation_id);
+  transport_emergency_puts(&json, ",\"last_error_code\":");
+  transport_emergency_put_u32(&json, record.last_error_code);
+  transport_emergency_puts(&json, ",\"last_error_operation_id\":");
+  transport_emergency_put_u32(&json, record.last_error_operation_id);
+  transport_emergency_puts(&json, ",\"last_error_count\":");
+  transport_emergency_put_u32(&json, record.last_error_count);
+  transport_emergency_puts(&json, ",\"last_error_object\":");
+  transport_emergency_put_hex32(&json, record.last_error_object_ptr);
+  transport_emergency_puts(&json, ",\"object\":");
+  transport_emergency_put_hex32(&json, record.object_ptr);
+  transport_emergency_puts(&json, ",\"requested_bytes\":");
+  transport_emergency_put_u32(&json, record.requested_bytes);
+  transport_emergency_puts(&json, ",\"capacity\":");
+  transport_emergency_put_u32(&json, record.capacity);
+  transport_emergency_puts(&json, ",\"count\":");
+  transport_emergency_put_u32(&json, record.count);
+  transport_emergency_puts(&json, ",\"data_used\":");
+  transport_emergency_put_u32(&json, record.data_used);
+  transport_emergency_puts(&json, ",\"ipsr\":");
+  transport_emergency_put_u32(&json, record.ipsr);
+  transport_emergency_puts(&json, ",\"dwt\":");
+  transport_emergency_put_u32(&json, record.dwt_cyccnt);
+  transport_emergency_puts(&json, ",\"msp\":");
+  transport_emergency_put_hex32(&json, record.msp);
+  transport_emergency_puts(&json, "}}");
+  if (!json.ok || json.length == 0U) return false;
+
+  transport_emergency_writer_t header{
+      g_payload_fatal_watchdog_header,
+      sizeof(g_payload_fatal_watchdog_header),
+      0U,
+      true};
+  g_payload_fatal_watchdog_header[0] = '\0';
+  transport_emergency_puts(&header, "<STX=");
+  transport_emergency_put_u32(&header, (uint32_t)json.length);
+  transport_emergency_putc(&header, '>');
+  if (!header.ok) return false;
+
+  const uint8_t traffic = TRAFFIC_PUBLISH_SUBSCRIBE;
+  return transport_emergency_write_all(&traffic, 1U) &&
+         transport_emergency_write_all(
+             reinterpret_cast<const uint8_t*>(header.data), header.length) &&
+         transport_emergency_write_all(
+             reinterpret_cast<const uint8_t*>(json.data), json.length) &&
+         transport_emergency_write_all(
+             reinterpret_cast<const uint8_t*>(ETX_SEQ), ETX_LEN);
+}
+
+// =============================================================
 // TX Pump (TimePop scheduled, single writer)
 // =============================================================
 
@@ -921,15 +1091,11 @@ bool transport_send_publish(const char* topic, const Payload& payload) {
   }
 
   // Use a tiny Payload only for the topic field so string validation and JSON
-  // escaping remain identical to the canonical Payload serializer. The large
-  // publication payload is never copied into another Payload.
+  // escaping remain identical to the canonical Payload serializer. Payload
+  // construction is defenseless: returning from add() proves the field exists.
+  // The large publication payload is never copied into another Payload.
   Payload topic_field;
-  if (!topic_field.add("topic", topic)) {
-    tx_empty_serialization_count++;
-    tx_note_reject(sequence, traffic, topic, 0U, 0U,
-                   TX_REASON_EMPTY_SERIALIZATION, timebase);
-    return false;
-  }
+  topic_field.add("topic", topic);
 
   const size_t topic_json_len = topic_field.json_size();
   const size_t payload_json_len = payload.json_size();
