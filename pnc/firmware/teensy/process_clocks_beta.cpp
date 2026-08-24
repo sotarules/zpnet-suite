@@ -661,6 +661,13 @@ static uint32_t g_clocks_fragment_publication_idle_retry_last_attempt_count = 0U
 // stack local. CLOCKS owns this RAM2 snapshot and all serialization derived from it.
 static clocks_fragment_snapshot_t g_clocks_fragment_publication_clocks_snapshot DMAMEM = {};
 
+// The canonical statistics object is large and rebuilt every second. Keep one
+// CLOCKS-owned Payload scratch object in RAM2 so its admitted heap capacity is
+// reused across rows instead of returning an 8 KiB block to malloc each second.
+// Serialization is single-owner foreground work; add_object() copies the child
+// JSON image before this scratch is cleared for the next row.
+static Payload g_clocks_fragment_stats_payload DMAMEM;
+
 static void clocks_fragment_schedule_publish(void);
 
 static inline uint32_t clocks_fragment_current_ipsr(void) {
@@ -905,7 +912,17 @@ static void clocks_fragment_add_tau_state(
 static void clocks_fragment_add_stats(
     Payload& parent,
     const clocks_fragment_stats_snapshot_t& snapshot) {
-  Payload stats;
+  Payload& stats = g_clocks_fragment_stats_payload;
+  stats.clear();
+
+  // This canonical object is predictably larger than 4 KiB: five clock lanes,
+  // the rolling checkpoint, two full TAU recovery states, and auxiliary Welford
+  // testimony are present every second.  Admit its final storage class up front.
+  // The RAM2 scratch retains that capacity across clear(), so after the first
+  // row this path performs no allocator growth for the stats parent at all.
+  // Payload::reserve() remains contract-governed and fatal on failure.
+  stats.reserve(8192U);
+
   stats.add("schema", "CLOCKS_INSTRUMENT_STATS_V4");
   stats.add("snapshot_ok", snapshot.snapshot_ok);
   stats.add("valid", snapshot.valid);
@@ -941,6 +958,7 @@ static void clocks_fragment_add_stats(
   stats.add_object("auxiliary_welford", auxiliary_welford);
 
   parent.add_object("stats", stats);
+  stats.clear();
 }
 
 static void clocks_fragment_add_raw_cycles_lane(

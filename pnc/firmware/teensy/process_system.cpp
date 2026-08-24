@@ -1939,6 +1939,8 @@ static FLASHMEM Payload system_execution_trace_summary_payload(void) {
 static payload_flight_info_t g_system_payload_flight_scratch;
 static payload_append_trace_snapshot_t
     g_system_payload_append_trace_scratch DMAMEM;
+static payload_heap_resize_trace_snapshot_t
+    g_system_payload_heap_resize_trace_scratch DMAMEM;
 
 static char system_hex_digit(uint8_t value) {
   return value < 10U ? (char)('0' + value)
@@ -2192,6 +2194,143 @@ static FLASHMEM Payload system_payload_append_trace_summary_payload(void) {
     out.add_object(
         "newest",
         system_payload_append_trace_entry_payload(
+            retained.entries[retained.count - 1U]));
+  }
+  return out;
+}
+
+// ================================================================
+// Payload heap-resize transaction recorder — reporting surface
+// ================================================================
+
+static const char* payload_heap_resize_trace_stage_name(uint32_t stage) {
+  switch ((payload_heap_resize_trace_stage_t)stage) {
+    case payload_heap_resize_trace_stage_t::PRE_REALLOC:
+      return "PRE_REALLOC";
+    case payload_heap_resize_trace_stage_t::REALLOC_FAILED:
+      return "REALLOC_FAILED";
+    case payload_heap_resize_trace_stage_t::POST_REALLOC:
+      return "POST_REALLOC";
+    case payload_heap_resize_trace_stage_t::HEADER_WRITTEN:
+      return "HEADER_WRITTEN";
+    case payload_heap_resize_trace_stage_t::POST_DATA_MOVE:
+      return "POST_DATA_MOVE";
+    case payload_heap_resize_trace_stage_t::POST_OFFSET_REBASE:
+      return "POST_OFFSET_REBASE";
+    case payload_heap_resize_trace_stage_t::POST_CONTRACT:
+      return "POST_CONTRACT";
+    default:
+      return "NONE";
+  }
+}
+
+static FLASHMEM Payload system_payload_heap_resize_trace_entry_payload(
+    const payload_heap_resize_trace_entry_t& entry) {
+  Payload out;
+  out.add("sequence", entry.sequence);
+  out.add("stage_id", entry.stage);
+  out.add("stage", payload_heap_resize_trace_stage_name(entry.stage));
+  system_crash_add_hex32(out, "this", entry.this_ptr);
+  system_crash_add_hex32(out, "old_raw", entry.old_raw);
+  system_crash_add_hex32(out, "new_raw", entry.new_raw);
+  out.add("old_capacity", entry.old_capacity);
+  out.add("new_capacity", entry.new_capacity);
+  system_crash_add_hex32(out, "header0", entry.header0);
+  system_crash_add_hex32(out, "header1", entry.header1);
+  system_crash_add_hex32(out, "header2", entry.header2);
+  system_crash_add_hex32(out, "header3", entry.header3);
+  system_crash_add_hex32(out, "expected_owner_cookie",
+                         entry.expected_owner_cookie);
+  out.add("span_remaining", entry.span_remaining);
+  system_crash_add_hex32(out, "verdict_flags", entry.verdict_flags);
+  out.add("raw_present",
+          (entry.verdict_flags & PAYLOAD_HEAP_RESIZE_FLAG_RAW_PRESENT) != 0U);
+  out.add("aligned",
+          (entry.verdict_flags & PAYLOAD_HEAP_RESIZE_FLAG_ALIGNED) != 0U);
+  out.add("header_readable",
+          (entry.verdict_flags & PAYLOAD_HEAP_RESIZE_FLAG_HEADER_READABLE) != 0U);
+  out.add("capacity_complement_ok",
+          (entry.verdict_flags & PAYLOAD_HEAP_RESIZE_FLAG_CAP_COMPLEMENT) != 0U);
+  out.add("owner_complement_ok",
+          (entry.verdict_flags & PAYLOAD_HEAP_RESIZE_FLAG_OWNER_COMPLEMENT) != 0U);
+  out.add("owner_matches",
+          (entry.verdict_flags & PAYLOAD_HEAP_RESIZE_FLAG_OWNER_MATCH) != 0U);
+  out.add("capacity_expected",
+          (entry.verdict_flags & PAYLOAD_HEAP_RESIZE_FLAG_CAP_EXPECTED) != 0U);
+  out.add("storage_span_ok",
+          (entry.verdict_flags & PAYLOAD_HEAP_RESIZE_FLAG_STORAGE_SPAN) != 0U);
+  out.add("moved",
+          (entry.verdict_flags & PAYLOAD_HEAP_RESIZE_FLAG_MOVED) != 0U);
+  out.add("contract_ok",
+          (entry.verdict_flags & PAYLOAD_HEAP_RESIZE_FLAG_CONTRACT_OK) != 0U);
+  out.add("alloc_overlap_count", entry.alloc_overlap_count);
+  out.add("alloc_overlap_depth", entry.alloc_overlap_depth);
+  system_crash_add_hex32(out, "dwt", entry.dwt_cyccnt);
+  out.add("ipsr", entry.ipsr);
+  return out;
+}
+
+static FLASHMEM Payload system_payload_heap_resize_trace_payload(
+    const Payload& args) {
+  payload_get_heap_resize_trace(&g_system_payload_heap_resize_trace_scratch);
+
+  bool bank_valid = true;
+  const bool live_bank = system_trace_report_live_bank(args, &bank_valid);
+  if (!bank_valid) {
+    Payload error;
+    error.add("error", "bank must be live or retained");
+    return error;
+  }
+
+  const uint32_t requested = system_trace_report_count(args);
+  const uint32_t offset = system_trace_report_offset(args);
+  const payload_heap_resize_trace_bank_snapshot_t& bank = live_bank
+      ? g_system_payload_heap_resize_trace_scratch.live
+      : g_system_payload_heap_resize_trace_scratch.retained;
+  uint32_t begin = 0U;
+  uint32_t end = 0U;
+  system_trace_bounds(bank.count, requested, offset, &begin, &end);
+
+  Payload out;
+  out.add("schema", "ZPNET_PAYLOAD_HEAP_RESIZE_TRACE_V1");
+  out.add("bank", live_bank ? "live" : "retained");
+  out.add("valid", bank.valid != 0U);
+  out.add("capacity", PAYLOAD_HEAP_RESIZE_TRACE_ENTRIES);
+  out.add("available_count", bank.count);
+  out.add("newest_sequence", bank.newest_sequence);
+  out.add("requested_count", requested);
+  out.add("returned_count", end - begin);
+  out.add("offset_from_newest", offset);
+  out.add("has_older", begin != 0U);
+  out.add("has_newer", offset != 0U && bank.count != 0U);
+  out.add("first_sequence", begin < end ? bank.entries[begin].sequence : 0U);
+  out.add("last_sequence", begin < end ? bank.entries[end - 1U].sequence : 0U);
+
+  PayloadArray records;
+  for (uint32_t i = begin; i < end; ++i) {
+    Payload record =
+        system_payload_heap_resize_trace_entry_payload(bank.entries[i]);
+    record.add("bank_index", i);
+    records.add(record);
+  }
+  out.add_array("records", records);
+  return out;
+}
+
+static FLASHMEM Payload system_payload_heap_resize_trace_summary_payload(void) {
+  payload_get_heap_resize_trace(&g_system_payload_heap_resize_trace_scratch);
+  const payload_heap_resize_trace_bank_snapshot_t& retained =
+      g_system_payload_heap_resize_trace_scratch.retained;
+
+  Payload out;
+  out.add("schema", "ZPNET_PAYLOAD_HEAP_RESIZE_TRACE_SUMMARY_V1");
+  out.add("retained_valid", retained.valid != 0U);
+  out.add("retained_count", retained.count);
+  out.add("newest_sequence", retained.newest_sequence);
+  if (retained.valid != 0U && retained.count != 0U) {
+    out.add_object(
+        "newest",
+        system_payload_heap_resize_trace_entry_payload(
             retained.entries[retained.count - 1U]));
   }
   return out;
@@ -2559,33 +2698,69 @@ static FLASHMEM Payload system_dispatch_breadcrumb_payload(void) {
   return p;
 }
 
-static FLASHMEM Payload system_crash_report_payload(bool include_text) {
+static FLASHMEM Payload system_crash_report_payload(void) {
+  // CRASH_INFO is an index, not a black-box dump.  Keep it comfortably below
+  // the transport Payload ceiling regardless of how much retained evidence the
+  // focused recorders hold.
   Payload p;
+  p.reserve(4096U);
+  p.add("schema", "ZPNET_CRASH_INDEX_V1");
   p.add("core_fault_present_now", (bool)CrashReport);
+  p.add("captured", g_system_crash_report_captured);
+  p.add("captured_core_fault_present", g_system_crash_report_core_fault_present);
+  p.add("crash_report_bytes", g_system_crash_report_bytes);
+  p.add("crash_report_truncated", g_system_crash_report_truncated);
+
+  crash_forensics_status_t status{};
+  crash_forensics_get_status(&status);
+  Payload processor;
+  processor.add("core_present", status.core_present);
+  processor.add("core_header_valid", status.core_header_valid);
+  processor.add("core_crc_valid", status.core_crc_valid);
+  processor.add("extended_present", status.extended_present);
+  processor.add("extended_header_valid", status.header_valid);
+  processor.add("extended_crc_valid", status.crc_valid);
+  const crash_forensics_core_record_t* core = crash_forensics_core_record();
+  if (core) {
+    processor.add("capture_sequence", core->capture_sequence);
+    processor.add("exception_number", core->exception_number);
+    system_crash_add_hex32(processor, "exc_return", core->exc_return);
+    system_crash_add_hex32(processor, "pc", core->stacked_pc);
+    system_crash_add_hex32(processor, "lr", core->stacked_lr);
+    system_crash_add_hex32(processor, "cfsr", core->cfsr);
+    system_crash_add_hex32(processor, "hfsr", core->hfsr);
+  }
+  p.add_object("processor", processor);
+
+  p.add_object("payload_fatal", system_payload_fatal_payload());
+  p.add_object("payload_contract", system_payload_contract_summary_payload());
+  p.add_object("payload_append_trace",
+               system_payload_append_trace_summary_payload());
+  p.add_object("payload_heap_resize_trace",
+               system_payload_heap_resize_trace_summary_payload());
+
+  Payload detail;
+  detail.add("crash_report_text", "SYSTEM.CRASH_REPORT_TEXT");
+  detail.add("crash_policy", "SYSTEM.CRASH_POLICY");
+  detail.add("execution_trace", "SYSTEM.EXECUTION_TRACE");
+  detail.add("payload_flight", "SYSTEM.PAYLOAD_FLIGHT_INFO");
+  detail.add("payload_fatal", "SYSTEM.PAYLOAD_FATAL_INFO");
+  detail.add("payload_append_trace", "SYSTEM.PAYLOAD_APPEND_TRACE");
+  detail.add("payload_heap_resize_trace", "SYSTEM.PAYLOAD_HEAP_RESIZE_TRACE");
+  detail.add("payload_contract", "SYSTEM.PAYLOAD_CONTRACT_INFO");
+  p.add_object("detail_commands", detail);
+  return p;
+}
+
+static FLASHMEM Payload system_crash_report_text_payload(void) {
+  Payload p;
+  p.reserve(4096U);
+  p.add("schema", "ZPNET_CRASH_REPORT_TEXT_V1");
   p.add("captured", g_system_crash_report_captured);
   p.add("captured_core_fault_present", g_system_crash_report_core_fault_present);
   p.add("bytes", g_system_crash_report_bytes);
   p.add("truncated", g_system_crash_report_truncated);
-  if (include_text) {
-    p.add("text", g_system_crash_report_text);
-  }
-  p.add_object("extended", system_crash_forensics_payload());
-
-  // Runtime breadcrumbs, unified Execution Trace, and Payload forensics remain
-  // retained through reboot beside the processor exception evidence.
-  p.add_object("runtime_ledger", system_runtime_ledger_payload());
-  p.add_object("dispatch_breadcrumb",
-               system_dispatch_breadcrumb_payload());
-  p.add_object("execution_trace",
-               system_execution_trace_summary_payload());
-  p.add_object("payload_fatal", system_payload_fatal_payload());
-  p.add_object("payload_flight", system_payload_flight_payload(true));
-  p.add_object("payload_append_trace",
-               system_payload_append_trace_summary_payload());
-  p.add_object("payload_contract",
-               system_payload_contract_summary_payload());
-  p.add_object("stack_watch", system_stack_watch_payload());
-  p.add_object("stack_tripwire", system_stack_tripwire_payload());
+  p.add("text", g_system_crash_report_text);
   return p;
 }
 
@@ -3479,6 +3654,8 @@ static void system_dmamem_ensure_initialized(void) {
          sizeof(g_system_timepop_dispatch_trace_scratch));
   memset((void*)&g_system_payload_append_trace_scratch, 0,
          sizeof(g_system_payload_append_trace_scratch));
+  memset((void*)&g_system_payload_heap_resize_trace_scratch, 0,
+         sizeof(g_system_payload_heap_resize_trace_scratch));
   memset((void*)&g_system_payload_contract_info_scratch, 0,
          sizeof(g_system_payload_contract_info_scratch));
   memset((void*)&g_system_dispatch_breadcrumb_scratch, 0,
@@ -3646,6 +3823,13 @@ static FLASHMEM Payload cmd_payload_append_trace(const Payload& args) {
 }
 
 // ------------------------------------------------------------
+// PAYLOAD_HEAP_RESIZE_TRACE — retained/live allocator-growth transcript
+// ------------------------------------------------------------
+static FLASHMEM Payload cmd_payload_heap_resize_trace(const Payload& args) {
+  return system_payload_heap_resize_trace_payload(args);
+}
+
+// ------------------------------------------------------------
 // PAYLOAD_CONTRACT_INFO — contract counters and first/latest incidents
 // ------------------------------------------------------------
 static FLASHMEM Payload cmd_payload_contract_info(const Payload& /*args*/) {
@@ -3657,7 +3841,15 @@ static FLASHMEM Payload cmd_payload_contract_info(const Payload& /*args*/) {
 // ------------------------------------------------------------
 static FLASHMEM Payload cmd_crash_info(const Payload& /*args*/) {
   system_crash_report_capture_once();
-  return system_crash_report_payload(true);
+  return system_crash_report_payload();
+}
+
+// ------------------------------------------------------------
+// CRASH_REPORT_TEXT — focused cached Teensyduino CrashReport text
+// ------------------------------------------------------------
+static FLASHMEM Payload cmd_crash_report_text(const Payload& /*args*/) {
+  system_crash_report_capture_once();
+  return system_crash_report_text_payload();
 }
 
 // ------------------------------------------------------------
@@ -3684,6 +3876,7 @@ static FLASHMEM Payload cmd_crash_clear(const Payload& /*args*/) {
   timepop_dispatch_trace_clear_retained();
   payload_fatal_record_clear();
   payload_clear_retained_append_trace();
+  payload_clear_retained_heap_resize_trace();
   payload_contract_clear_retained();
   crash_stack_watch_clear_retained();
   crash_stack_tripwire_clear_retained();
@@ -3697,6 +3890,7 @@ static FLASHMEM Payload cmd_crash_clear(const Payload& /*args*/) {
   resp.add("timepop_dispatch_trace_cleared", true);
   resp.add("payload_fatal_cleared", true);
   resp.add("payload_append_trace_cleared", true);
+  resp.add("payload_heap_resize_trace_cleared", true);
   resp.add("stack_watch_retained_cleared", true);
   resp.add("stack_tripwire_retained_cleared", true);
   resp.add("payload_contract_cleared", true);
@@ -3754,6 +3948,7 @@ static const process_command_entry_t SYSTEM_COMMANDS[] = {
   { "SET_FEATURE",      cmd_set_feature      },
   { "GET_FEATURE",      cmd_get_feature      },
   { "CRASH_INFO",       cmd_crash_info       },
+  { "CRASH_REPORT_TEXT", cmd_crash_report_text },
   { "CRASH_POLICY",     cmd_crash_policy     },
   { "CRASH_CLEAR",      cmd_crash_clear      },
   { "EXECUTION_TRACE", cmd_execution_trace },
@@ -3761,6 +3956,7 @@ static const process_command_entry_t SYSTEM_COMMANDS[] = {
   { "PAYLOAD_FLIGHT_INFO", cmd_payload_flight_info },
   { "PAYLOAD_FATAL_INFO", cmd_payload_fatal_info },
   { "PAYLOAD_APPEND_TRACE", cmd_payload_append_trace },
+  { "PAYLOAD_HEAP_RESIZE_TRACE", cmd_payload_heap_resize_trace },
   { "PAYLOAD_CONTRACT_INFO", cmd_payload_contract_info },
   { "DEBUG",            cmd_debug            },
   { "STATUS",           cmd_status           },

@@ -501,6 +501,7 @@ enum payload_operation_id_t : uint32_t {
     PAYLOAD_OP_PARSEJSON_UNCLOSED = 0x8FED3DF7UL,
     PAYLOAD_OP_PARSEJSON_VALUE = 0x4CA3F351UL,
     PAYLOAD_OP_PARSEJSON_VALUE_DECODE = 0x956CAB1CUL,
+    PAYLOAD_OP_RESERVE = 0x27291B4BUL,
     PAYLOAD_OP_RELEASE_STORAGE = 0x6705E500UL,
     PAYLOAD_OP_RELEASE_STORAGE_GUARD = 0x59BE62E3UL,
     PAYLOAD_OP_TO_JSON_ALLOC = 0x81EEC028UL,
@@ -617,6 +618,7 @@ FLASHMEM const char* payload_operation_id_name(uint32_t operation_id) {
         case PAYLOAD_OP_PARSEJSON_UNCLOSED: return "parseJSON.unclosed";
         case PAYLOAD_OP_PARSEJSON_VALUE: return "parseJSON.value";
         case PAYLOAD_OP_PARSEJSON_VALUE_DECODE: return "parseJSON.value_decode";
+        case PAYLOAD_OP_RESERVE: return "reserve";
         case PAYLOAD_OP_RELEASE_STORAGE: return "release_storage";
         case PAYLOAD_OP_RELEASE_STORAGE_GUARD: return "release_storage.guard";
         case PAYLOAD_OP_TO_JSON_ALLOC: return "to_json.alloc";
@@ -2239,6 +2241,218 @@ static bool payload_heap_header_span_readable(const void* block) {
 #endif
 }
 
+// ---- Retained heap-resize transaction recorder -----------------------------
+
+static constexpr uint32_t PAYLOAD_HEAP_RESIZE_TRACE_MAGIC = 0x48525A31UL;  // 'HRZ1'
+static constexpr uint32_t PAYLOAD_HEAP_RESIZE_TRACE_SCHEMA_VERSION = 1U;
+
+struct payload_heap_resize_trace_bank_t {
+    uint32_t magic;
+    uint32_t magic_inv;
+    uint32_t schema_version;
+    uint32_t capacity;
+    payload_heap_resize_trace_entry_t entries[PAYLOAD_HEAP_RESIZE_TRACE_ENTRIES];
+};
+
+static payload_heap_resize_trace_bank_t
+    g_payload_heap_resize_trace_live PAYLOAD_RETAINED_MEM;
+static payload_heap_resize_trace_bank_t
+    g_payload_heap_resize_trace_retained PAYLOAD_RETAINED_MEM;
+static bool g_payload_heap_resize_trace_boot_latched = false;
+static volatile uint32_t g_payload_heap_resize_trace_next_sequence = 0U;
+
+static bool payload_heap_resize_trace_bank_valid(
+    const payload_heap_resize_trace_bank_t& bank) {
+    return bank.magic == PAYLOAD_HEAP_RESIZE_TRACE_MAGIC &&
+           (bank.magic ^ bank.magic_inv) == 0xFFFFFFFFUL &&
+           bank.schema_version == PAYLOAD_HEAP_RESIZE_TRACE_SCHEMA_VERSION &&
+           bank.capacity == PAYLOAD_HEAP_RESIZE_TRACE_ENTRIES;
+}
+
+static bool payload_heap_resize_trace_entry_valid(
+    const payload_heap_resize_trace_entry_t& entry) {
+    return entry.sequence != 0U &&
+           (entry.sequence ^ entry.sequence_inv) == 0xFFFFFFFFUL;
+}
+
+static void payload_heap_resize_trace_initialize_live() {
+    memset((void*)&g_payload_heap_resize_trace_live, 0,
+           sizeof(g_payload_heap_resize_trace_live));
+    g_payload_heap_resize_trace_live.schema_version =
+        PAYLOAD_HEAP_RESIZE_TRACE_SCHEMA_VERSION;
+    g_payload_heap_resize_trace_live.capacity =
+        PAYLOAD_HEAP_RESIZE_TRACE_ENTRIES;
+    g_payload_heap_resize_trace_live.magic_inv =
+        ~PAYLOAD_HEAP_RESIZE_TRACE_MAGIC;
+    g_payload_heap_resize_trace_live.magic = PAYLOAD_HEAP_RESIZE_TRACE_MAGIC;
+    g_payload_heap_resize_trace_next_sequence = 0U;
+    payload_retained_flush(&g_payload_heap_resize_trace_live,
+                           sizeof(g_payload_heap_resize_trace_live));
+}
+
+static void payload_heap_resize_trace_boot_latch() {
+    if (g_payload_heap_resize_trace_boot_latched) return;
+    g_payload_heap_resize_trace_boot_latched = true;
+
+    if (payload_heap_resize_trace_bank_valid(g_payload_heap_resize_trace_live)) {
+        g_payload_heap_resize_trace_retained = g_payload_heap_resize_trace_live;
+    } else {
+        memset((void*)&g_payload_heap_resize_trace_retained, 0,
+               sizeof(g_payload_heap_resize_trace_retained));
+    }
+    payload_retained_flush(&g_payload_heap_resize_trace_retained,
+                           sizeof(g_payload_heap_resize_trace_retained));
+    payload_heap_resize_trace_initialize_live();
+}
+
+static void payload_heap_resize_trace_record(
+    payload_heap_resize_trace_stage_t stage,
+    const void* owner,
+    const void* old_raw,
+    const void* new_raw,
+    size_t old_capacity,
+    size_t new_capacity,
+    size_t expected_header_capacity,
+    bool contract_ok = false) {
+    payload_heap_resize_trace_boot_latch();
+
+    uint32_t sequence = g_payload_heap_resize_trace_next_sequence + 1U;
+    if (sequence == 0U) sequence = 1U;
+    g_payload_heap_resize_trace_next_sequence = sequence;
+
+    payload_heap_resize_trace_entry_t& entry =
+        g_payload_heap_resize_trace_live.entries[
+            (sequence - 1U) % PAYLOAD_HEAP_RESIZE_TRACE_ENTRIES];
+
+    entry.sequence = 0U;
+    entry.sequence_inv = 0U;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    payload_retained_flush(&entry, 2U * sizeof(uint32_t));
+    memset(reinterpret_cast<uint8_t*>(&entry) + 2U * sizeof(uint32_t),
+           0,
+           sizeof(entry) - 2U * sizeof(uint32_t));
+    entry.stage = (uint32_t)stage;
+    entry.this_ptr = (uint32_t)(uintptr_t)owner;
+    entry.old_raw = (uint32_t)(uintptr_t)old_raw;
+    entry.new_raw = (uint32_t)(uintptr_t)new_raw;
+    entry.old_capacity = old_capacity > UINT32_MAX
+        ? UINT32_MAX : (uint32_t)old_capacity;
+    entry.new_capacity = new_capacity > UINT32_MAX
+        ? UINT32_MAX : (uint32_t)new_capacity;
+    entry.expected_owner_cookie = owner ? payload_heap_owner_cookie(owner) : 0U;
+    entry.alloc_overlap_count = g_payload_alloc_overlap_detected;
+    entry.alloc_overlap_depth = g_payload_alloc_depth;
+
+    const void* inspect_raw = new_raw ? new_raw : old_raw;
+    uint32_t flags = 0U;
+    if (inspect_raw) {
+        flags |= PAYLOAD_HEAP_RESIZE_FLAG_RAW_PRESENT;
+        const uintptr_t addr = (uintptr_t)inspect_raw;
+        if ((addr % PAYLOAD_HEAP_ALIGNMENT) == 0U) {
+            flags |= PAYLOAD_HEAP_RESIZE_FLAG_ALIGNED;
+        }
+        if (payload_heap_header_span_readable(inspect_raw)) {
+            flags |= PAYLOAD_HEAP_RESIZE_FLAG_HEADER_READABLE;
+            uint32_t header[4] = {0U, 0U, 0U, 0U};
+            memcpy(header, inspect_raw, sizeof(header));
+            entry.header0 = header[0];
+            entry.header1 = header[1];
+            entry.header2 = header[2];
+            entry.header3 = header[3];
+            if ((header[0] ^ header[1]) == 0xFFFFFFFFUL) {
+                flags |= PAYLOAD_HEAP_RESIZE_FLAG_CAP_COMPLEMENT;
+            }
+            if ((header[2] ^ header[3]) == 0xFFFFFFFFUL) {
+                flags |= PAYLOAD_HEAP_RESIZE_FLAG_OWNER_COMPLEMENT;
+            }
+            if (owner && header[2] == entry.expected_owner_cookie) {
+                flags |= PAYLOAD_HEAP_RESIZE_FLAG_OWNER_MATCH;
+            }
+            if ((size_t)header[0] == expected_header_capacity) {
+                flags |= PAYLOAD_HEAP_RESIZE_FLAG_CAP_EXPECTED;
+            }
+            size_t remaining = 0U;
+            uint32_t ignored_reason = 0U;
+            if (payload_pointer_remaining(payload_heap_bytes(inspect_raw),
+                                          &remaining,
+                                          &ignored_reason)) {
+                entry.span_remaining = remaining > UINT32_MAX
+                    ? UINT32_MAX : (uint32_t)remaining;
+                if ((size_t)header[0] <= remaining) {
+                    flags |= PAYLOAD_HEAP_RESIZE_FLAG_STORAGE_SPAN;
+                }
+            }
+        }
+    }
+    if (old_raw && new_raw && old_raw != new_raw) {
+        flags |= PAYLOAD_HEAP_RESIZE_FLAG_MOVED;
+    }
+    if (contract_ok) flags |= PAYLOAD_HEAP_RESIZE_FLAG_CONTRACT_OK;
+    entry.verdict_flags = flags;
+    entry.dwt_cyccnt = payload_read_dwt();
+    entry.ipsr = payload_read_ipsr();
+    entry.sequence_inv = ~sequence;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    entry.sequence = sequence;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    payload_retained_flush(&entry, sizeof(entry));
+}
+
+static void payload_heap_resize_trace_snapshot_bank(
+    const payload_heap_resize_trace_bank_t& bank,
+    payload_heap_resize_trace_bank_snapshot_t* out) {
+    memset(out, 0, sizeof(*out));
+    if (!payload_heap_resize_trace_bank_valid(bank)) return;
+    out->valid = 1U;
+    for (uint32_t i = 0U; i < PAYLOAD_HEAP_RESIZE_TRACE_ENTRIES; ++i) {
+        const volatile payload_heap_resize_trace_entry_t* source =
+            &bank.entries[i];
+        const uint32_t sequence_before = source->sequence;
+        const uint32_t sequence_inv_before = source->sequence_inv;
+        if (sequence_before == 0U ||
+            (sequence_before ^ sequence_inv_before) != 0xFFFFFFFFUL) {
+            continue;
+        }
+
+        const payload_heap_resize_trace_entry_t candidate = bank.entries[i];
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        if (source->sequence != sequence_before ||
+            source->sequence_inv != sequence_inv_before ||
+            !payload_heap_resize_trace_entry_valid(candidate)) {
+            continue;
+        }
+
+        uint32_t pos = out->count;
+        while (pos > 0U &&
+               out->entries[pos - 1U].sequence > candidate.sequence) {
+            out->entries[pos] = out->entries[pos - 1U];
+            --pos;
+        }
+        out->entries[pos] = candidate;
+        ++out->count;
+    }
+    if (out->count != 0U) {
+        out->newest_sequence = out->entries[out->count - 1U].sequence;
+    }
+}
+
+void payload_get_heap_resize_trace(payload_heap_resize_trace_snapshot_t* out) {
+    if (!out) return;
+    payload_heap_resize_trace_boot_latch();
+    memset(out, 0, sizeof(*out));
+    payload_heap_resize_trace_snapshot_bank(
+        g_payload_heap_resize_trace_live, &out->live);
+    payload_heap_resize_trace_snapshot_bank(
+        g_payload_heap_resize_trace_retained, &out->retained);
+}
+
+void payload_clear_retained_heap_resize_trace() {
+    memset((void*)&g_payload_heap_resize_trace_retained, 0,
+           sizeof(g_payload_heap_resize_trace_retained));
+    payload_retained_flush(&g_payload_heap_resize_trace_retained,
+                           sizeof(g_payload_heap_resize_trace_retained));
+}
+
 static bool payload_heap_read_capacity(const void* raw,
                                        const void* expected_owner,
                                        size_t minimum,
@@ -2315,6 +2529,10 @@ static void* payload_heap_resize(void* raw,
         return nullptr;
     }
 
+    payload_heap_resize_trace_record(
+        payload_heap_resize_trace_stage_t::PRE_REALLOC,
+        owner, raw, nullptr, old_capacity, new_capacity, old_capacity);
+
     // realloc() preserves the old block on failure and can extend a block in
     // place when the allocator has adjacent space.  Unlike the former explicit
     // malloc/copy/free sequence, Payload no longer requires a second complete
@@ -2327,8 +2545,17 @@ static void* payload_heap_resize(void* raw,
         raw, total, PAYLOAD_OP_HEAP_BLOCK, owner);
     if (!resized) {
         g_payload_arena_heap_realloc_fail_count++;
+        payload_heap_resize_trace_record(
+            payload_heap_resize_trace_stage_t::REALLOC_FAILED,
+            owner, raw, nullptr, old_capacity, new_capacity, old_capacity);
         return nullptr;
     }
+
+    payload_heap_resize_trace_record(
+        payload_heap_resize_trace_stage_t::POST_REALLOC,
+        owner, (const void*)old_address, resized,
+        old_capacity, new_capacity, old_capacity);
+
     if ((uintptr_t)resized == old_address) {
         g_payload_arena_heap_realloc_in_place_count++;
         g_payload_arena_heap_realloc_in_place_growth_bytes += growth_bytes;
@@ -2346,6 +2573,10 @@ static void* payload_heap_resize(void* raw,
         ~owner_cookie,
     };
     memcpy(resized, header, sizeof(header));
+    payload_heap_resize_trace_record(
+        payload_heap_resize_trace_stage_t::HEADER_WRITTEN,
+        owner, (const void*)old_address, resized,
+        old_capacity, new_capacity, new_capacity);
     return resized;
 }
 
@@ -4877,6 +5108,31 @@ Payload Payload::clone() const {
     return Payload(*this);
 }
 
+void Payload::reserve(size_t minimum_capacity) {
+    payload_contract_state_t before{};
+    if (!_contract_begin(PAYLOAD_OP_RESERVE, &before)) {
+        _fatal(PAYLOAD_ERR_INTEGRITY, PAYLOAD_OP_RESERVE, minimum_capacity);
+    }
+    if (minimum_capacity > STORAGE_MAX) {
+        payload_note_error(PAYLOAD_ERR_ARENA_LIMIT, PAYLOAD_OP_RESERVE, this);
+        _fatal(PAYLOAD_ERR_ARENA_LIMIT, PAYLOAD_OP_RESERVE, minimum_capacity);
+    }
+    if (minimum_capacity <= before.capacity) return;
+
+    const size_t occupied =
+        (size_t)before.count * sizeof(Entry) + (size_t)before.data_used;
+    if (occupied > minimum_capacity) {
+        _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, PAYLOAD_OP_RESERVE, minimum_capacity);
+    }
+    const size_t additional_data = minimum_capacity - occupied;
+    if (!_ensure_room(0U, additional_data, nullptr)) {
+        _fatal(PAYLOAD_ERR_ARENA_ALLOC_FAIL, PAYLOAD_OP_RESERVE, minimum_capacity);
+    }
+    if (_capacity() < minimum_capacity) {
+        _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, PAYLOAD_OP_RESERVE, minimum_capacity);
+    }
+}
+
 size_t Payload::count() const {
     return _self_ok(PAYLOAD_OP_COUNT) ? _count : 0;
 }
@@ -5137,6 +5393,10 @@ bool Payload::_ensure_room(size_t additional_entries,
     const int32_t shift =
         (int32_t)new_data_begin - (int32_t)old_data_begin;
 
+    const bool heap_resize = _heap_block != nullptr;
+    const void* old_heap_block = _heap_block;
+    void* resized_heap_block = nullptr;
+
     if (_heap_block) {
         // Heap-backed growth uses realloc so the allocator gets the opportunity
         // to extend this exact block in place.  Failure leaves _heap_block and
@@ -5150,6 +5410,7 @@ bool Payload::_ensure_room(size_t additional_entries,
                                this);
             return false;
         }
+        resized_heap_block = resized_block;
         _set_heap_block(resized_block);
         payload_flight_note(PAYLOAD_OP_ENSURE_ROOM_ALLOC, this, 0U);
 
@@ -5159,6 +5420,11 @@ bool Payload::_ensure_room(size_t additional_entries,
                     storage + old_data_begin,
                     data_used);
         }
+        payload_heap_resize_trace_record(
+            payload_heap_resize_trace_stage_t::POST_DATA_MOVE,
+            this, old_heap_block, resized_block,
+            old_capacity, new_capacity, new_capacity);
+
         Entry* entries = reinterpret_cast<Entry*>(storage);
         for (size_t i = 0U; i < _count; ++i) {
             entries[i].key_off =
@@ -5167,6 +5433,10 @@ bool Payload::_ensure_room(size_t additional_entries,
                 (uint16_t)((int32_t)entries[i].val_off + shift);
         }
         _set_data_begin(new_data_begin);
+        payload_heap_resize_trace_record(
+            payload_heap_resize_trace_stage_t::POST_OFFSET_REBASE,
+            this, old_heap_block, resized_block,
+            old_capacity, new_capacity, new_capacity);
         payload_note_heap_delta((int32_t)new_capacity -
                                 (int32_t)old_capacity);
     } else {
@@ -5215,9 +5485,15 @@ bool Payload::_ensure_room(size_t additional_entries,
     }
 
     if (data_shift) *data_shift = shift;
-    return _contract_finish_preserve(PAYLOAD_OP_ENSURE_ROOM,
-                                     before,
-                                     required);
+    const bool contract_ok = _contract_finish_preserve(
+        PAYLOAD_OP_ENSURE_ROOM, before, required);
+    if (heap_resize) {
+        payload_heap_resize_trace_record(
+            payload_heap_resize_trace_stage_t::POST_CONTRACT,
+            this, old_heap_block, resized_heap_block,
+            old_capacity, new_capacity, new_capacity, contract_ok);
+    }
+    return contract_ok;
 }
 
 

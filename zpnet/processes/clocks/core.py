@@ -5693,6 +5693,59 @@ def _read_clocks_recovery_config() -> Optional[Dict[str, Any]]:
     return _normalize_saved_ppb_checkpoint(payload)
 
 
+def _retire_orphaned_clocks_recovery_config_if_domain_empty() -> Dict[str, Any]:
+    """Retire stale singleton custody only when the durable TEMPEST domain is empty.
+
+    ``config.CLOCKS_RECOVERY`` is meaningful only while its owning canonical
+    CLOCKS row still exists.  An operator-level truncation can lawfully remove
+    every TEMPEST master/detail while leaving config rows intact.  Treat that
+    exact zero/zero topology as a new durable epoch, not as corrupted ancestry.
+
+    Any nonempty TEMPEST history remains fail-closed: this helper does not delete
+    or reinterpret recovery custody when even one master or detail survives.
+    """
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM campaign_master WHERE campaign_type = %s) AS master_count,
+                (SELECT COUNT(*) FROM campaign_detail WHERE campaign_type = %s) AS detail_count
+            """,
+            (CAMPAIGN_TYPE_TEMPEST, CAMPAIGN_TYPE_TEMPEST),
+        )
+        row = cur.fetchone()
+        if not isinstance(row, dict):
+            raise RuntimeError("CLOCKS empty-domain court returned no count row")
+
+        master_count = int(row.get("master_count") or 0)
+        detail_count = int(row.get("detail_count") or 0)
+        if master_count != 0 or detail_count != 0:
+            return {
+                "domain_empty": False,
+                "master_count": master_count,
+                "detail_count": detail_count,
+                "recovery_config_deleted": False,
+            }
+
+        cur.execute(
+            "DELETE FROM config WHERE config_key = %s",
+            (CLOCKS_RECOVERY_CONFIG_KEY,),
+        )
+        deleted = int(cur.rowcount or 0)
+        if deleted > 1:
+            raise RuntimeError(
+                f"config.{CLOCKS_RECOVERY_CONFIG_KEY} is not a singleton: rows={deleted}"
+            )
+
+    return {
+        "domain_empty": True,
+        "master_count": 0,
+        "detail_count": 0,
+        "recovery_config_deleted": bool(deleted),
+    }
+
+
 def _clocks_checkpoint_receipt_summary(checkpoint: Dict[str, Any]) -> Dict[str, Any]:
     """Fingerprint one exact private CLOCKS checkpoint without copying its rings."""
     saved = _normalize_saved_ppb_checkpoint(checkpoint)
@@ -6082,6 +6135,17 @@ def _legacy_clocks_recovery_checkpoint() -> Optional[Dict[str, Any]]:
 
 
 def _load_or_migrate_clocks_recovery_checkpoint() -> Optional[Dict[str, Any]]:
+    empty_domain = _retire_orphaned_clocks_recovery_config_if_domain_empty()
+    if empty_domain.get("domain_empty"):
+        logging.warning(
+            "🧹 [clocks/ppb] durable TEMPEST domain is empty "
+            "(campaign_master=0 campaign_detail=0); retired orphaned config.%s=%s "
+            "and starting a fresh CLOCKS durability epoch",
+            CLOCKS_RECOVERY_CONFIG_KEY,
+            bool(empty_domain.get("recovery_config_deleted")),
+        )
+        return None
+
     checkpoint = _read_clocks_recovery_config()
     if checkpoint is None:
         return _legacy_clocks_recovery_checkpoint()

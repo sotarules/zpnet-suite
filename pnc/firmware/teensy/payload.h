@@ -586,6 +586,77 @@ typedef struct {
 void payload_get_append_trace(payload_append_trace_snapshot_t* out);
 void payload_clear_retained_append_trace();
 
+// ============================================================================
+// Payload heap-resize transaction recorder (retained, read-only)
+// ============================================================================
+//
+// Captures one bounded allocator-growth transaction across realloc(), header
+// rewrite, semantic data relocation, offset rebasing, and the final preservation
+// court.  The recorder is scalar-only, allocator-free, and retained in RAM2.
+// It exists to distinguish allocator return/header/span failures from later
+// Payload mutation faults without weakening any contract.
+
+#define PAYLOAD_HEAP_RESIZE_TRACE_ENTRIES 8U
+
+#define PAYLOAD_HEAP_RESIZE_FLAG_RAW_PRESENT      (1UL << 0)
+#define PAYLOAD_HEAP_RESIZE_FLAG_ALIGNED          (1UL << 1)
+#define PAYLOAD_HEAP_RESIZE_FLAG_HEADER_READABLE  (1UL << 2)
+#define PAYLOAD_HEAP_RESIZE_FLAG_CAP_COMPLEMENT   (1UL << 3)
+#define PAYLOAD_HEAP_RESIZE_FLAG_OWNER_COMPLEMENT (1UL << 4)
+#define PAYLOAD_HEAP_RESIZE_FLAG_OWNER_MATCH      (1UL << 5)
+#define PAYLOAD_HEAP_RESIZE_FLAG_CAP_EXPECTED     (1UL << 6)
+#define PAYLOAD_HEAP_RESIZE_FLAG_STORAGE_SPAN     (1UL << 7)
+#define PAYLOAD_HEAP_RESIZE_FLAG_MOVED            (1UL << 8)
+#define PAYLOAD_HEAP_RESIZE_FLAG_CONTRACT_OK      (1UL << 9)
+
+enum class payload_heap_resize_trace_stage_t : uint32_t {
+  NONE               = 0,
+  PRE_REALLOC        = 1,
+  REALLOC_FAILED     = 2,
+  POST_REALLOC       = 3,
+  HEADER_WRITTEN     = 4,
+  POST_DATA_MOVE     = 5,
+  POST_OFFSET_REBASE = 6,
+  POST_CONTRACT      = 7,
+};
+
+typedef struct {
+  uint32_t sequence;
+  uint32_t sequence_inv;
+  uint32_t stage;
+  uint32_t this_ptr;
+  uint32_t old_raw;
+  uint32_t new_raw;
+  uint32_t old_capacity;
+  uint32_t new_capacity;
+  uint32_t header0;
+  uint32_t header1;
+  uint32_t header2;
+  uint32_t header3;
+  uint32_t expected_owner_cookie;
+  uint32_t span_remaining;
+  uint32_t verdict_flags;
+  uint32_t alloc_overlap_count;
+  uint32_t alloc_overlap_depth;
+  uint32_t dwt_cyccnt;
+  uint32_t ipsr;
+} payload_heap_resize_trace_entry_t;
+
+typedef struct {
+  uint32_t valid;
+  uint32_t count;
+  uint32_t newest_sequence;
+  payload_heap_resize_trace_entry_t entries[PAYLOAD_HEAP_RESIZE_TRACE_ENTRIES];
+} payload_heap_resize_trace_bank_snapshot_t;
+
+typedef struct {
+  payload_heap_resize_trace_bank_snapshot_t live;
+  payload_heap_resize_trace_bank_snapshot_t retained;
+} payload_heap_resize_trace_snapshot_t;
+
+void payload_get_heap_resize_trace(payload_heap_resize_trace_snapshot_t* out);
+void payload_clear_retained_heap_resize_trace();
+
 // fixed_decimal_t is defined by util.h.  A forward declaration keeps Payload's
 // header independent of the conversion implementation while allowing the
 // integer-only publication object to cross the API by const reference.
@@ -637,6 +708,11 @@ public:
     void clear();
     bool empty() const;
     Payload clone() const;
+
+    // Deterministic storage admission.  reserve() changes capacity only; it does
+    // not change the semantic document.  Returning proves the requested capacity
+    // exists and the preservation court passed.  Failure is fatal like add().
+    void reserve(size_t minimum_capacity);
 
     // Serialization
     // json_size() returns the exact JSON byte count excluding the trailing NUL.

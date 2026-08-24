@@ -2092,6 +2092,59 @@ def _read_photons_recovery_config() -> Optional[Dict[str, Any]]:
     return _normalize_saved_ppb_checkpoint(payload)
 
 
+def _retire_orphaned_photons_recovery_config_if_domain_empty() -> Dict[str, Any]:
+    """Retire stale singleton custody only when the durable LANTERN domain is empty.
+
+    The singleton is continuation state for canonical PHOTONS rows, not an
+    independent history source.  If every LANTERN master/detail has been removed,
+    a leftover config.PHOTONS_RECOVERY row has no durable owner and must not
+    influence the new database epoch.
+
+    Any surviving LANTERN master or detail keeps the ordinary fail-closed recovery
+    courts intact.
+    """
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM campaign_master WHERE campaign_type = %s) AS master_count,
+                (SELECT COUNT(*) FROM campaign_detail WHERE campaign_type = %s) AS detail_count
+            """,
+            (CAMPAIGN_TYPE_LANTERN, CAMPAIGN_TYPE_LANTERN),
+        )
+        row = cur.fetchone()
+        if not isinstance(row, dict):
+            raise RuntimeError("PHOTONS empty-domain court returned no count row")
+
+        master_count = int(row.get("master_count") or 0)
+        detail_count = int(row.get("detail_count") or 0)
+        if master_count != 0 or detail_count != 0:
+            return {
+                "domain_empty": False,
+                "master_count": master_count,
+                "detail_count": detail_count,
+                "recovery_config_deleted": False,
+            }
+
+        cur.execute(
+            "DELETE FROM config WHERE config_key = %s",
+            (PHOTONS_RECOVERY_CONFIG_KEY,),
+        )
+        deleted = int(cur.rowcount or 0)
+        if deleted > 1:
+            raise RuntimeError(
+                f"config.{PHOTONS_RECOVERY_CONFIG_KEY} is not a singleton: rows={deleted}"
+            )
+
+    return {
+        "domain_empty": True,
+        "master_count": 0,
+        "detail_count": 0,
+        "recovery_config_deleted": bool(deleted),
+    }
+
+
 def _photons_checkpoint_receipt_summary(
     checkpoint: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
@@ -4634,6 +4687,7 @@ def _adopt_live_lantern_state(
     active_master: Optional[Dict[str, Any]],
     *,
     live_report: Dict[str, Any],
+    durable_cursor_source: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Adopt the surviving producer's current LANTERN state without mutating it.
 
@@ -4674,9 +4728,62 @@ def _adopt_live_lantern_state(
                 "surviving PHOTONS producer campaign identity disagrees with active "
                 f"master: producer={campaign!r} durable={durable_campaign!r}"
             )
+        # The live report proves present producer ownership and the current physical
+        # floor.  It is not, however, the Pi observation cursor: PUBSUB may already
+        # hold an exact ordered prefix between the newest durable row and that live
+        # floor.  Seed campaign chronology from the durable predecessor when one is
+        # available so those queued producer-authored rows cross the ordinary strict
+        # monotonic court in order.  If some publications truly were not observed,
+        # the existing first-row splice records that forward gap explicitly.
+        cursor_source: Optional[Dict[str, Any]] = None
+        cursor_authority = "LIVE_PRODUCER_REPORT"
+        if state == "ACTIVE" and isinstance(durable_cursor_source, dict):
+            campaign_restore = durable_cursor_source.get("campaign_restore")
+            if isinstance(campaign_restore, dict):
+                source_campaign = str(campaign_restore.get("campaign") or "").strip()
+                if source_campaign != durable_campaign:
+                    raise RuntimeError(
+                        "durable PHOTONS campaign cursor disagrees with active master: "
+                        f"source={source_campaign!r} durable={durable_campaign!r}"
+                    )
+                source_start_after = _require_int(
+                    campaign_restore.get("start_after_sequence"),
+                    "durable PHOTONS campaign cursor start_after_sequence",
+                    minimum=1,
+                )
+                source_public_count = _require_int(
+                    campaign_restore.get("public_count"),
+                    "durable PHOTONS campaign cursor public_count",
+                    minimum=1,
+                )
+                live_start_after = _require_int(
+                    live_report.get("campaign_start_after_sequence"),
+                    "live PHOTONS campaign start_after_sequence",
+                    minimum=1,
+                )
+                live_public_count = _require_int(
+                    live_report.get("campaign_public_count"),
+                    "live PHOTONS campaign public_count",
+                    minimum=1,
+                )
+                if live_start_after != source_start_after:
+                    raise RuntimeError(
+                        "surviving PHOTONS campaign boundary disagrees with durable cursor: "
+                        f"live={live_start_after} durable={source_start_after} "
+                        f"campaign={durable_campaign!r}"
+                    )
+                if live_public_count < source_public_count:
+                    raise RuntimeError(
+                        "surviving PHOTONS campaign public-count regressed behind durable cursor: "
+                        f"live={live_public_count} durable={source_public_count} "
+                        f"campaign={durable_campaign!r}"
+                    )
+                cursor_source = durable_cursor_source
+                cursor_authority = "DURABLE_RECOVERY_SOURCE"
+
         _rehydrate_pi_campaign(
             active_master,
-            source=None,
+            source=cursor_source,
             live_report=live_report,
             allow_first_public_count_splice=True,
         )
@@ -4685,6 +4792,12 @@ def _adopt_live_lantern_state(
             "campaign": campaign,
             "active_master": True,
             "master_mutated": False,
+            "campaign_cursor_authority": cursor_authority,
+            "campaign_cursor_source_detail_id": (
+                int(durable_cursor_source["db_detail_id"])
+                if cursor_source is not None
+                else None
+            ),
         }
 
     if state != "STOPPED":
@@ -5130,6 +5243,7 @@ def _startup_adopt_live_producer(
     campaign_adoption = _adopt_live_lantern_state(
         active_master,
         live_report=broad,
+        durable_cursor_source=source,
     )
 
     expected = {"mode": "LIVE_PRODUCER_ADOPT", **floor}
@@ -5186,6 +5300,16 @@ def _perform_phase5_recovery() -> Dict[str, Any]:
         _recovery_attempt_count += 1
     _recovery_status_set("CLASSIFYING")
     try:
+        empty_domain = _retire_orphaned_photons_recovery_config_if_domain_empty()
+        if empty_domain.get("domain_empty"):
+            logging.warning(
+                "🧹 [photons/recovery] durable LANTERN domain is empty "
+                "(campaign_master=0 campaign_detail=0); retired orphaned config.%s=%s "
+                "and classifying startup as a fresh PHOTONS durability epoch",
+                PHOTONS_RECOVERY_CONFIG_KEY,
+                bool(empty_domain.get("recovery_config_deleted")),
+            )
+
         active_master = _load_active_lantern_master()
         active_detail_count = (
             _count_lantern_campaign_details(active_master["campaign"])

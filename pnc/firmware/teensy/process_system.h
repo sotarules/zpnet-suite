@@ -55,6 +55,9 @@
  *     bank=retained|live, count=1..8, offset=N; retained is the default.
  *   • TIMEPOP_DISPATCH_INFO — compatibility alias for EXECUTION_TRACE using
  *     the earlier TimePop report schema
+ *   • CRASH_INFO — return a bounded crash index and focused drill-down command
+ *     names; it never embeds the full retained black-box corpus
+ *   • CRASH_REPORT_TEXT — return only the cached Teensyduino CrashReport text
  *   • CRASH_POLICY — return live CPU/FPU exception policy plus a compact
  *     consistency analysis of retained core and extended exception frames
  *   • PAYLOAD_FATAL_INFO — return the retained fatal-construction record,
@@ -62,6 +65,8 @@
  *     internal Payload error breadcrumb
  *   • PAYLOAD_APPEND_TRACE — return the bounded retained/live append custody
  *     transcript, including stage-local source hashes and bounded key prefixes
+ *   • PAYLOAD_HEAP_RESIZE_TRACE — return the retained/live realloc growth
+ *     transcript with header words, owner/span verdicts, and contract outcome
  *   • PAYLOAD_CONTRACT_INFO — return design-by-contract counters plus the
  *     first/latest current-boot incident and latest retained incident
  *
