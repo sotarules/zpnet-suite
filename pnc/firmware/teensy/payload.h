@@ -232,6 +232,19 @@ typedef struct {
   uint32_t arena_high_water;
   uint32_t max_arena_capacity_seen;
 
+  // Heap-growth strategy telemetry.  These distinguish fresh storage
+  // allocation from true realloc(), and whether realloc could preserve the
+  // block address (in-place extension) or had to relocate it.
+  uint32_t arena_heap_alloc_count;
+  uint32_t arena_heap_resize_attempt_count;
+  uint32_t arena_heap_resize_reject_count;
+  uint32_t arena_heap_realloc_call_count;
+  uint32_t arena_heap_realloc_in_place_count;
+  uint32_t arena_heap_realloc_moved_count;
+  uint32_t arena_heap_realloc_fail_count;
+  uint64_t arena_heap_realloc_in_place_growth_bytes;
+  uint64_t arena_heap_realloc_moved_growth_bytes;
+
   // Serialization / parsing / integrity
   uint32_t serialize_overflow;
   uint32_t to_json_fail;

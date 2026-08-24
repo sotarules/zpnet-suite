@@ -3104,6 +3104,24 @@ static FLASHMEM Payload cmd_payload_info(const Payload& /*args*/) {
   p.add("payload_arena_heap_bytes_high_water", info.arena_heap_bytes_high_water);
   p.add("payload_arena_high_water",            info.arena_high_water);
   p.add("payload_max_arena_capacity_seen",     info.max_arena_capacity_seen);
+  p.add("payload_arena_heap_alloc_count",
+        info.arena_heap_alloc_count);
+  p.add("payload_arena_heap_resize_attempt_count",
+        info.arena_heap_resize_attempt_count);
+  p.add("payload_arena_heap_resize_reject_count",
+        info.arena_heap_resize_reject_count);
+  p.add("payload_arena_heap_realloc_call_count",
+        info.arena_heap_realloc_call_count);
+  p.add("payload_arena_heap_realloc_in_place_count",
+        info.arena_heap_realloc_in_place_count);
+  p.add("payload_arena_heap_realloc_moved_count",
+        info.arena_heap_realloc_moved_count);
+  p.add("payload_arena_heap_realloc_fail_count",
+        info.arena_heap_realloc_fail_count);
+  p.add("payload_arena_heap_realloc_in_place_growth_bytes",
+        info.arena_heap_realloc_in_place_growth_bytes);
+  p.add("payload_arena_heap_realloc_moved_growth_bytes",
+        info.arena_heap_realloc_moved_growth_bytes);
 
   // Combined heap custody for the Payload subsystem.
   p.add("payload_heap_bytes_alive",

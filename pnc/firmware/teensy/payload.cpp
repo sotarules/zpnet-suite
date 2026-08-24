@@ -37,6 +37,18 @@ static volatile uint32_t g_payload_arena_heap_bytes_high_water = 0;
 static volatile uint32_t g_payload_arena_high_water_global = 0;
 static volatile uint32_t g_payload_max_arena_capacity_seen = 0;
 
+// Storage-growth strategy telemetry.  Counts are allocator-boundary facts:
+// callers cannot infer or author whether realloc() extended in place.
+static volatile uint32_t g_payload_arena_heap_alloc_count = 0;
+static volatile uint32_t g_payload_arena_heap_resize_attempt_count = 0;
+static volatile uint32_t g_payload_arena_heap_resize_reject_count = 0;
+static volatile uint32_t g_payload_arena_heap_realloc_call_count = 0;
+static volatile uint32_t g_payload_arena_heap_realloc_in_place_count = 0;
+static volatile uint32_t g_payload_arena_heap_realloc_moved_count = 0;
+static volatile uint32_t g_payload_arena_heap_realloc_fail_count = 0;
+static volatile uint64_t g_payload_arena_heap_realloc_in_place_growth_bytes = 0;
+static volatile uint64_t g_payload_arena_heap_realloc_moved_growth_bytes = 0;
+
 static volatile uint32_t g_payload_serialize_overflow = 0;
 static volatile uint32_t g_payload_to_json_fail = 0;
 static volatile uint32_t g_payload_string_truncation = 0;
@@ -1096,6 +1108,18 @@ static void* payload_guarded_malloc(size_t total,
     return raw;
 }
 
+static void* payload_guarded_realloc(void* block,
+                                     size_t total,
+                                     uint32_t op_id,
+                                     const void* self) {
+    payload_note_handler_context(op_id, self, &g_payload_handler_ctx_alloc);
+    payload_note_alloc_overlap(op_id, self);
+    g_payload_alloc_depth++;
+    void* raw = realloc(block, total);
+    g_payload_alloc_depth--;
+    return raw;
+}
+
 static void payload_guarded_free(void* block,
                                  uint32_t op_id,
                                  const void* self) {
@@ -2115,7 +2139,64 @@ static void* payload_heap_allocate(size_t capacity, const void* owner) {
         ~owner_cookie,
     };
     memcpy(raw, header, sizeof(header));
+    g_payload_arena_heap_alloc_count++;
     return raw;
+}
+
+static void* payload_heap_resize(void* raw,
+                                 size_t old_capacity,
+                                 size_t new_capacity,
+                                 const void* owner) {
+    g_payload_arena_heap_resize_attempt_count++;
+    if (!raw || !owner || new_capacity <= old_capacity ||
+        new_capacity > UINT32_MAX - PAYLOAD_HEAP_HEADER_SIZE) {
+        g_payload_arena_heap_resize_reject_count++;
+        return nullptr;
+    }
+
+    uint32_t verified_capacity = 0U;
+    if (!payload_heap_read_capacity(raw,
+                                    owner,
+                                    old_capacity,
+                                    old_capacity,
+                                    &verified_capacity) ||
+        verified_capacity != old_capacity) {
+        g_payload_arena_heap_resize_reject_count++;
+        return nullptr;
+    }
+
+    // realloc() preserves the old block on failure and can extend a block in
+    // place when the allocator has adjacent space.  Unlike the former explicit
+    // malloc/copy/free sequence, Payload no longer requires a second complete
+    // application-owned block to exist before releasing the first one.
+    const uintptr_t old_address = (uintptr_t)raw;
+    const uint64_t growth_bytes = (uint64_t)(new_capacity - old_capacity);
+    const size_t total = PAYLOAD_HEAP_HEADER_SIZE + new_capacity;
+    g_payload_arena_heap_realloc_call_count++;
+    void* resized = payload_guarded_realloc(
+        raw, total, PAYLOAD_OP_HEAP_BLOCK, owner);
+    if (!resized) {
+        g_payload_arena_heap_realloc_fail_count++;
+        return nullptr;
+    }
+    if ((uintptr_t)resized == old_address) {
+        g_payload_arena_heap_realloc_in_place_count++;
+        g_payload_arena_heap_realloc_in_place_growth_bytes += growth_bytes;
+    } else {
+        g_payload_arena_heap_realloc_moved_count++;
+        g_payload_arena_heap_realloc_moved_growth_bytes += growth_bytes;
+    }
+
+    const uint32_t cap32 = (uint32_t)new_capacity;
+    const uint32_t owner_cookie = payload_heap_owner_cookie(owner);
+    const uint32_t header[4] = {
+        cap32,
+        ~cap32,
+        owner_cookie,
+        ~owner_cookie,
+    };
+    memcpy(resized, header, sizeof(header));
+    return resized;
 }
 
 static size_t payload_heap_capacity(const void* raw,
@@ -4859,49 +4940,82 @@ bool Payload::_ensure_room(size_t additional_entries,
         return false;
     }
 
-    void* new_block = payload_heap_allocate(new_capacity, this);
-    if (!new_block) {
-        g_payload_arena_alloc_fail++;
-        payload_note_error(PAYLOAD_ERR_ARENA_ALLOC_FAIL,
-                           PAYLOAD_OP_ENSURE_ROOM_ALLOC,
-                           this);
-        return false;
-    }
-    payload_flight_note(PAYLOAD_OP_ENSURE_ROOM_ALLOC, this, 0U);
-
-    uint8_t* new_storage = payload_heap_bytes(new_block);
-    memset(new_storage, 0, new_capacity);
-    const uint8_t* old_storage = _storage();
+    const uint16_t old_data_begin = _data_begin;
     const uint16_t new_data_begin =
         (uint16_t)(new_capacity - data_used);
     const int32_t shift =
-        (int32_t)new_data_begin - (int32_t)_data_begin;
+        (int32_t)new_data_begin - (int32_t)old_data_begin;
 
-    if (_count != 0U) {
-        memcpy(new_storage,
-               old_storage,
-               (size_t)_count * sizeof(Entry));
-        Entry* copied_entries = reinterpret_cast<Entry*>(new_storage);
-        for (size_t i = 0U; i < _count; ++i) {
-            copied_entries[i].key_off =
-                (uint16_t)((int32_t)copied_entries[i].key_off + shift);
-            copied_entries[i].val_off =
-                (uint16_t)((int32_t)copied_entries[i].val_off + shift);
+    if (_heap_block) {
+        // Heap-backed growth uses realloc so the allocator gets the opportunity
+        // to extend this exact block in place.  Failure leaves _heap_block and
+        // the entire semantic document untouched.
+        void* resized_block = payload_heap_resize(
+            _heap_block, old_capacity, new_capacity, this);
+        if (!resized_block) {
+            g_payload_arena_alloc_fail++;
+            payload_note_error(PAYLOAD_ERR_ARENA_ALLOC_FAIL,
+                               PAYLOAD_OP_ENSURE_ROOM_ALLOC,
+                               this);
+            return false;
         }
-    }
-    if (data_used != 0U) {
-        memcpy(new_storage + new_data_begin,
-               old_storage + _data_begin,
-               data_used);
+        _set_heap_block(resized_block);
+        payload_flight_note(PAYLOAD_OP_ENSURE_ROOM_ALLOC, this, 0U);
+
+        uint8_t* storage = payload_heap_bytes(resized_block);
+        if (data_used != 0U) {
+            memmove(storage + new_data_begin,
+                    storage + old_data_begin,
+                    data_used);
+        }
+        Entry* entries = reinterpret_cast<Entry*>(storage);
+        for (size_t i = 0U; i < _count; ++i) {
+            entries[i].key_off =
+                (uint16_t)((int32_t)entries[i].key_off + shift);
+            entries[i].val_off =
+                (uint16_t)((int32_t)entries[i].val_off + shift);
+        }
+        _set_data_begin(new_data_begin);
+        payload_note_heap_delta((int32_t)new_capacity -
+                                (int32_t)old_capacity);
+    } else {
+        // Inline -> heap remains a first allocation; inline bytes are not heap
+        // pressure and therefore do not create the old+new heap-block problem.
+        void* new_block = payload_heap_allocate(new_capacity, this);
+        if (!new_block) {
+            g_payload_arena_alloc_fail++;
+            payload_note_error(PAYLOAD_ERR_ARENA_ALLOC_FAIL,
+                               PAYLOAD_OP_ENSURE_ROOM_ALLOC,
+                               this);
+            return false;
+        }
+        payload_flight_note(PAYLOAD_OP_ENSURE_ROOM_ALLOC, this, 0U);
+
+        uint8_t* new_storage = payload_heap_bytes(new_block);
+        memset(new_storage, 0, new_capacity);
+        const uint8_t* old_storage = _inline_storage;
+        if (_count != 0U) {
+            memcpy(new_storage,
+                   old_storage,
+                   (size_t)_count * sizeof(Entry));
+            Entry* copied_entries = reinterpret_cast<Entry*>(new_storage);
+            for (size_t i = 0U; i < _count; ++i) {
+                copied_entries[i].key_off =
+                    (uint16_t)((int32_t)copied_entries[i].key_off + shift);
+                copied_entries[i].val_off =
+                    (uint16_t)((int32_t)copied_entries[i].val_off + shift);
+            }
+        }
+        if (data_used != 0U) {
+            memcpy(new_storage + new_data_begin,
+                   old_storage + old_data_begin,
+                   data_used);
+        }
+        _set_heap_block(new_block);
+        _set_data_begin(new_data_begin);
+        payload_note_heap_delta((int32_t)new_capacity);
     }
 
-    void* old_block = _heap_block;
-    const size_t old_heap_capacity = old_block ? old_capacity : 0U;
-    _set_heap_block(new_block);
-    _set_data_begin(new_data_begin);
-
-    payload_note_heap_delta((int32_t)new_capacity -
-                            (int32_t)old_heap_capacity);
     g_payload_arena_realloc_count++;
     const size_t data_capacity =
         new_capacity - new_count * sizeof(Entry);
@@ -4909,11 +5023,6 @@ bool Payload::_ensure_room(size_t additional_entries,
         g_payload_max_arena_capacity_seen = (uint32_t)data_capacity;
     }
 
-    if (old_block) {
-        payload_guarded_free(old_block,
-                             PAYLOAD_OP_ENSURE_ROOM_ALLOC,
-                             this);
-    }
     if (data_shift) *data_shift = shift;
     return _contract_finish_preserve(PAYLOAD_OP_ENSURE_ROOM,
                                      before,
@@ -7060,28 +7169,39 @@ bool PayloadArray::_ensure_capacity(size_t needed) {
                            this);
         return false;
     }
-    void* block = payload_heap_allocate(new_capacity, this);
-    if (!block) {
-        g_payload_arena_alloc_fail++;
-        payload_note_error(PAYLOAD_ERR_ARENA_ALLOC_FAIL,
-                           PAYLOAD_OP_ARRAY_ALLOC,
-                           this);
-        return false;
+
+    if (_heap_block) {
+        void* resized_block = payload_heap_resize(
+            _heap_block, old_capacity, new_capacity, this);
+        if (!resized_block) {
+            g_payload_arena_alloc_fail++;
+            payload_note_error(PAYLOAD_ERR_ARENA_ALLOC_FAIL,
+                               PAYLOAD_OP_ARRAY_ALLOC,
+                               this);
+            return false;
+        }
+        _set_heap_block(resized_block);
+        payload_note_heap_delta((int32_t)new_capacity -
+                                (int32_t)old_capacity);
+    } else {
+        void* block = payload_heap_allocate(new_capacity, this);
+        if (!block) {
+            g_payload_arena_alloc_fail++;
+            payload_note_error(PAYLOAD_ERR_ARENA_ALLOC_FAIL,
+                               PAYLOAD_OP_ARRAY_ALLOC,
+                               this);
+            return false;
+        }
+        memset(payload_heap_bytes(block), 0, new_capacity);
+        memcpy(payload_heap_bytes(block), _inline_storage,
+               (size_t)_length + 1U);
+        _set_heap_block(block);
+        payload_note_heap_delta((int32_t)new_capacity);
     }
 
-    memset(payload_heap_bytes(block), 0, new_capacity);
-    memcpy(payload_heap_bytes(block), _data(), (size_t)_length + 1U);
-    void* old_block = _heap_block;
-    const size_t old_heap_capacity = old_block ? old_capacity : 0U;
-    _set_heap_block(block);
-    payload_note_heap_delta((int32_t)new_capacity -
-                            (int32_t)old_heap_capacity);
     g_payload_arena_realloc_count++;
     if (new_capacity > g_payload_max_arena_capacity_seen) {
         g_payload_max_arena_capacity_seen = (uint32_t)new_capacity;
-    }
-    if (old_block) {
-        payload_guarded_free(old_block, PAYLOAD_OP_ARRAY_ALLOC, this);
     }
     return _contract_finish_preserve(PAYLOAD_OP_ARRAY_CAPACITY,
                                      before,
@@ -7486,6 +7606,23 @@ FLASHMEM void payload_get_info(payload_info_t* out) {
     out->arena_heap_bytes_high_water = g_payload_arena_heap_bytes_high_water;
     out->arena_high_water = g_payload_arena_high_water_global;
     out->max_arena_capacity_seen = g_payload_max_arena_capacity_seen;
+    out->arena_heap_alloc_count = g_payload_arena_heap_alloc_count;
+    out->arena_heap_resize_attempt_count =
+        g_payload_arena_heap_resize_attempt_count;
+    out->arena_heap_resize_reject_count =
+        g_payload_arena_heap_resize_reject_count;
+    out->arena_heap_realloc_call_count =
+        g_payload_arena_heap_realloc_call_count;
+    out->arena_heap_realloc_in_place_count =
+        g_payload_arena_heap_realloc_in_place_count;
+    out->arena_heap_realloc_moved_count =
+        g_payload_arena_heap_realloc_moved_count;
+    out->arena_heap_realloc_fail_count =
+        g_payload_arena_heap_realloc_fail_count;
+    out->arena_heap_realloc_in_place_growth_bytes =
+        g_payload_arena_heap_realloc_in_place_growth_bytes;
+    out->arena_heap_realloc_moved_growth_bytes =
+        g_payload_arena_heap_realloc_moved_growth_bytes;
 
     out->serialize_overflow = g_payload_serialize_overflow;
     out->to_json_fail = g_payload_to_json_fail;
