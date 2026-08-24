@@ -520,6 +520,7 @@ void payload_get_flight_info(payload_flight_info_t* out);
 // sequence/complement, and cache-flushed into RAM2.
 
 #define PAYLOAD_APPEND_TRACE_ENTRIES 16U
+#define PAYLOAD_APPEND_TRACE_KEY_PREFIX_BYTES 32U
 
 enum class payload_append_trace_stage_t : uint32_t {
   NONE             = 0,
@@ -555,6 +556,17 @@ typedef struct {
   int32_t  data_shift;
   uint32_t key_off;
   uint32_t val_off;
+
+  // Borrowed-source identity at this exact transaction stage.  Hashes use the
+  // same length-seeded FNV-1a definition as the Payload contract court.
+  // source_hash_valid is false for stages that intentionally precede pointer
+  // admission; no source pointer is dereferenced merely to improve forensics.
+  uint32_t source_hash_valid;
+  uint32_t key_hash;
+  uint32_t value_hash;
+  uint32_t key_prefix_len;
+  uint8_t  key_prefix[PAYLOAD_APPEND_TRACE_KEY_PREFIX_BYTES];
+
   uint32_t dwt_cyccnt;
   uint32_t ipsr;
 } payload_append_trace_entry_t;

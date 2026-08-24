@@ -8504,114 +8504,145 @@ def _finalize_live_recovery_custody_without_campaign(
         if source_detail_id is None or source_detail_id <= 0:
             raise RuntimeError("live producer adoption source lacks durable detail identity")
         routed_checkpoint = copy.deepcopy(_recovery_custody_last_checkpoint)
-        if not isinstance(routed_checkpoint, dict):
+        if routed_checkpoint is not None and not isinstance(routed_checkpoint, dict):
             raise RuntimeError(
-                "active live-producer custody has no routed Better-Buckets checkpoint"
+                "active live-producer custody has malformed routed Better-Buckets checkpoint"
             )
-        routed_checkpoint = _normalize_saved_ppb_checkpoint(routed_checkpoint)
+        if isinstance(routed_checkpoint, dict):
+            routed_checkpoint = _normalize_saved_ppb_checkpoint(routed_checkpoint)
 
         _wait_for_clocks_persistence_barrier_locked()
         classified_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         with _clocks_persistence_lock:
             with open_db(row_dict=True) as conn:
                 cur = conn.cursor()
-                cur.execute(
-                    """
-                    UPDATE campaign_detail
-                    SET payload = jsonb_set(
-                        jsonb_set(
+                if routed_checkpoint is None:
+                    cur.execute(
+                        """
+                        SELECT COUNT(*) AS row_count
+                        FROM campaign_detail
+                        WHERE campaign_type = %s
+                          AND id > %s
+                          AND payload #>> '{recovery_custody,generation}' = %s
+                        """,
+                        (
+                            CAMPAIGN_TYPE_TEMPEST,
+                            int(source_detail_id),
+                            generation,
+                        ),
+                    )
+                    row = cur.fetchone()
+                    routed_row_count = int(row["row_count"] if row is not None else -1)
+                    if routed_row_count != 0:
+                        raise RuntimeError(
+                            "live-producer custody has durable routed rows but no "
+                            "routed Better-Buckets checkpoint: "
+                            f"generation={generation} rows={routed_row_count}"
+                        )
+                    promoted = 0
+                    classification = "LIVE_PRODUCER_ADOPT_NO_ROUTED_ROWS"
+                    recovery_config_detail_id = None
+                    recovery_config_update_count = None
+                else:
+                    cur.execute(
+                        """
+                        UPDATE campaign_detail
+                        SET payload = jsonb_set(
                             jsonb_set(
-                                payload - 'holistic_restore_superseded',
-                                '{recovery_custody,classification}',
+                                jsonb_set(
+                                    payload - 'holistic_restore_superseded',
+                                    '{recovery_custody,classification}',
+                                    to_jsonb(%s::text),
+                                    true
+                                ),
+                                '{recovery_custody,classified_at_utc}',
                                 to_jsonb(%s::text),
                                 true
                             ),
-                            '{recovery_custody,classified_at_utc}',
-                            to_jsonb(%s::text),
+                            '{recovery_custody,restore_authority}',
+                            'true'::jsonb,
                             true
+                        )
+                        WHERE campaign_type = %s
+                          AND id > %s
+                          AND payload #>> '{recovery_custody,generation}' = %s
+                        """,
+                        (
+                            "LIVE_PRODUCER_ADOPT_CONTINUITY",
+                            classified_at,
+                            CAMPAIGN_TYPE_TEMPEST,
+                            int(source_detail_id),
+                            generation,
                         ),
-                        '{recovery_custody,restore_authority}',
-                        'true'::jsonb,
-                        true
                     )
-                    WHERE campaign_type = %s
-                      AND id > %s
-                      AND payload #>> '{recovery_custody,generation}' = %s
-                    """,
-                    (
-                        "LIVE_PRODUCER_ADOPT_CONTINUITY",
-                        classified_at,
-                        CAMPAIGN_TYPE_TEMPEST,
-                        int(source_detail_id),
-                        generation,
-                    ),
-                )
-                promoted = int(cur.rowcount or 0)
+                    promoted = int(cur.rowcount or 0)
 
-                routed_reset = _as_int(routed_checkpoint.get("reset_count"))
-                routed_update = _as_int(routed_checkpoint.get("update_count"))
-                if routed_reset is None or routed_update is None:
-                    raise RuntimeError(
-                        "routed live-producer checkpoint lacks statistics identity"
+                    routed_reset = _as_int(routed_checkpoint.get("reset_count"))
+                    routed_update = _as_int(routed_checkpoint.get("update_count"))
+                    if routed_reset is None or routed_update is None:
+                        raise RuntimeError(
+                            "routed live-producer checkpoint lacks statistics identity"
+                        )
+                    cur.execute(
+                        """
+                        SELECT id, payload
+                        FROM campaign_detail
+                        WHERE campaign_type = %s
+                          AND id > %s
+                          AND payload #>> '{recovery_custody,generation}' = %s
+                          AND payload #>> '{recovery_custody,restore_authority}' = 'true'
+                          AND payload #>> '{clocks,stats,reset_count}' = %s
+                          AND payload #>> '{clocks,stats,update_count}' = %s
+                          AND NOT (payload @> '{"holistic_restore_superseded":true}'::jsonb)
+                        ORDER BY id DESC
+                        LIMIT 1
+                        """,
+                        (
+                            CAMPAIGN_TYPE_TEMPEST,
+                            int(source_detail_id),
+                            generation,
+                            str(int(routed_reset)),
+                            str(int(routed_update)),
+                        ),
                     )
-                cur.execute(
-                    """
-                    SELECT id, payload
-                    FROM campaign_detail
-                    WHERE campaign_type = %s
-                      AND id > %s
-                      AND payload #>> '{recovery_custody,generation}' = %s
-                      AND payload #>> '{recovery_custody,restore_authority}' = 'true'
-                      AND payload #>> '{clocks,stats,reset_count}' = %s
-                      AND payload #>> '{clocks,stats,update_count}' = %s
-                      AND NOT (payload @> '{"holistic_restore_superseded":true}'::jsonb)
-                    ORDER BY id DESC
-                    LIMIT 1
-                    """,
-                    (
-                        CAMPAIGN_TYPE_TEMPEST,
-                        int(source_detail_id),
-                        generation,
-                        str(int(routed_reset)),
-                        str(int(routed_update)),
-                    ),
-                )
-                routed_row = cur.fetchone()
-                if routed_row is None:
-                    raise RuntimeError(
-                        "live-producer custody lacks the durable row owning its "
-                        "last routed Better-Buckets checkpoint"
+                    routed_row = cur.fetchone()
+                    if routed_row is None:
+                        raise RuntimeError(
+                            "live-producer custody lacks the durable row owning its "
+                            "last routed Better-Buckets checkpoint"
+                        )
+                    routed_state = routed_row["payload"]
+                    if isinstance(routed_state, str):
+                        routed_state = json.loads(routed_state)
+                    if not isinstance(routed_state, dict):
+                        raise RuntimeError(
+                            "live-producer checkpoint owner payload is not an object"
+                        )
+                    if not _clocks_state_owns_recovery_config(
+                        routed_state, routed_checkpoint
+                    ):
+                        raise RuntimeError(
+                            "live-producer checkpoint owner is not CLOCKS restore authority"
+                        )
+                    recovery_config_detail_id = int(routed_row["id"])
+                    recovery_config_update_count = int(routed_update)
+                    _write_clocks_recovery_config(
+                        cur,
+                        routed_checkpoint,
+                        source_detail_id=recovery_config_detail_id,
                     )
-                routed_state = routed_row["payload"]
-                if isinstance(routed_state, str):
-                    routed_state = json.loads(routed_state)
-                if not isinstance(routed_state, dict):
-                    raise RuntimeError(
-                        "live-producer checkpoint owner payload is not an object"
-                    )
-                if not _clocks_state_owns_recovery_config(
-                    routed_state, routed_checkpoint
-                ):
-                    raise RuntimeError(
-                        "live-producer checkpoint owner is not CLOCKS restore authority"
-                    )
-                recovery_config_detail_id = int(routed_row["id"])
-                _write_clocks_recovery_config(
-                    cur,
-                    routed_checkpoint,
-                    source_detail_id=recovery_config_detail_id,
-                )
+                    classification = "LIVE_PRODUCER_ADOPT_CONTINUITY"
 
         result = {
             "active": False,
             "classified": True,
             "generation": generation,
-            "classification": "LIVE_PRODUCER_ADOPT_CONTINUITY",
+            "classification": classification,
             "rows_promoted": promoted,
             "rows_superseded": 0,
             "source_detail_id": int(source_detail_id),
             "recovery_config_detail_id": recovery_config_detail_id,
-            "recovery_config_update_count": int(routed_update),
+            "recovery_config_update_count": recovery_config_update_count,
         }
 
         _recovery_custody_active = False
@@ -8849,6 +8880,15 @@ def _adopt_surviving_clocks_producer(
 
         adopted_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         master_mutated = False
+
+        # Close the recovery-custody court before retiring durable campaign intent.
+        # If custody finalization fails, the active campaign remains available to
+        # the retry path instead of being converted into a false "nothing to restore".
+        if _recovery_custody_snapshot().get("active"):
+            recovery_custody = _finalize_live_recovery_custody_without_campaign(
+                source_detail=snapshot_detail,
+            )
+
         if active_campaign is not None:
             with open_db() as conn:
                 cur = conn.cursor()
@@ -8889,11 +8929,6 @@ def _adopt_surviving_clocks_producer(
                         "one active TEMPEST campaign"
                     )
             master_mutated = True
-
-        if _recovery_custody_snapshot().get("active"):
-            recovery_custody = _finalize_live_recovery_custody_without_campaign(
-                source_detail=snapshot_detail,
-            )
 
         _campaign_active = False
         _accepted_pps_vclock_count = None

@@ -1940,6 +1940,40 @@ static payload_flight_info_t g_system_payload_flight_scratch;
 static payload_append_trace_snapshot_t
     g_system_payload_append_trace_scratch DMAMEM;
 
+static char system_hex_digit(uint8_t value) {
+  return value < 10U ? (char)('0' + value)
+                     : (char)('A' + (value - 10U));
+}
+
+static void system_bytes_hex(const uint8_t* bytes,
+                             size_t length,
+                             char* out,
+                             size_t out_capacity) {
+  if (!out || out_capacity == 0U) return;
+  out[0] = '\0';
+  if (!bytes || length > (out_capacity - 1U) / 2U) return;
+  for (size_t i = 0U; i < length; ++i) {
+    out[i * 2U] = system_hex_digit((uint8_t)(bytes[i] >> 4));
+    out[i * 2U + 1U] = system_hex_digit((uint8_t)(bytes[i] & 0x0FU));
+  }
+  out[length * 2U] = '\0';
+}
+
+static void system_bytes_printable(const uint8_t* bytes,
+                                   size_t length,
+                                   char* out,
+                                   size_t out_capacity) {
+  if (!out || out_capacity == 0U) return;
+  const size_t bounded = length < out_capacity - 1U
+      ? length
+      : out_capacity - 1U;
+  for (size_t i = 0U; i < bounded; ++i) {
+    const uint8_t byte = bytes ? bytes[i] : 0U;
+    out[i] = (byte >= 0x20U && byte <= 0x7EU) ? (char)byte : '.';
+  }
+  out[bounded] = '\0';
+}
+
 static FLASHMEM Payload system_payload_flight_bank_payload(
     uint32_t valid,
     uint32_t sequence,
@@ -1991,6 +2025,46 @@ static FLASHMEM Payload system_payload_flight_payload(bool retained_only) {
 
 
 // ================================================================
+// Payload fatal construction court — retained reporting surface
+// ================================================================
+
+static FLASHMEM Payload system_payload_fatal_payload(void) {
+  payload_fatal_record_t fatal{};
+  const bool valid = payload_fatal_record_get(&fatal);
+
+  Payload out;
+  out.add("schema", "ZPNET_PAYLOAD_FATAL_V1");
+  out.add("valid", valid);
+  if (!valid) return out;
+
+  out.add("schema_version", fatal.schema_version);
+  out.add("sequence", fatal.sequence);
+  out.add("error_code", fatal.error_code);
+  out.add("error", payload_error_code_name(fatal.error_code));
+  out.add("operation_id", fatal.operation_id);
+  out.add("operation", payload_operation_id_name(fatal.operation_id));
+  out.add("last_error_code", fatal.last_error_code);
+  out.add("last_error", payload_error_code_name(fatal.last_error_code));
+  out.add("last_error_operation_id", fatal.last_error_operation_id);
+  out.add("last_error_operation",
+          payload_operation_id_name(fatal.last_error_operation_id));
+  out.add("last_error_count", fatal.last_error_count);
+  system_crash_add_hex32(out, "last_error_object",
+                         fatal.last_error_object_ptr);
+  system_crash_add_hex32(out, "object", fatal.object_ptr);
+  out.add("requested_bytes", fatal.requested_bytes);
+  out.add("capacity", fatal.capacity);
+  out.add("count", fatal.count);
+  out.add("data_used", fatal.data_used);
+  out.add("ipsr", fatal.ipsr);
+  system_crash_add_hex32(out, "dwt", fatal.dwt_cyccnt);
+  system_crash_add_hex32(out, "msp", fatal.msp);
+  out.add("watchdog_attempted", fatal.watchdog_attempted != 0U);
+  out.add("watchdog_sent", fatal.watchdog_sent != 0U);
+  return out;
+}
+
+// ================================================================
 // Payload v4.1 append transaction recorder — reporting surface
 // ================================================================
 
@@ -2033,6 +2107,25 @@ static FLASHMEM Payload system_payload_append_trace_entry_payload(
   out.add("data_shift", entry.data_shift);
   out.add("key_off", entry.key_off);
   out.add("val_off", entry.val_off);
+  out.add("source_hash_valid", entry.source_hash_valid != 0U);
+  if (entry.source_hash_valid != 0U) {
+    system_crash_add_hex32(out, "key_hash", entry.key_hash);
+    system_crash_add_hex32(out, "value_hash", entry.value_hash);
+    out.add("key_prefix_len", entry.key_prefix_len);
+
+    char prefix_hex[PAYLOAD_APPEND_TRACE_KEY_PREFIX_BYTES * 2U + 1U];
+    char prefix_printable[PAYLOAD_APPEND_TRACE_KEY_PREFIX_BYTES + 1U];
+    const size_t prefix_len =
+        entry.key_prefix_len < PAYLOAD_APPEND_TRACE_KEY_PREFIX_BYTES
+            ? entry.key_prefix_len
+            : PAYLOAD_APPEND_TRACE_KEY_PREFIX_BYTES;
+    system_bytes_hex(entry.key_prefix, prefix_len,
+                     prefix_hex, sizeof(prefix_hex));
+    system_bytes_printable(entry.key_prefix, prefix_len,
+                           prefix_printable, sizeof(prefix_printable));
+    out.add("key_prefix_hex", prefix_hex);
+    out.add("key_prefix_printable", prefix_printable);
+  }
   system_crash_add_hex32(out, "dwt", entry.dwt_cyccnt);
   out.add("ipsr", entry.ipsr);
   return out;
@@ -2060,7 +2153,7 @@ static FLASHMEM Payload system_payload_append_trace_payload(
   system_trace_bounds(bank.count, requested, offset, &begin, &end);
 
   Payload out;
-  out.add("schema", "ZPNET_PAYLOAD_APPEND_TRACE_V1");
+  out.add("schema", "ZPNET_PAYLOAD_APPEND_TRACE_V2");
   out.add("bank", live_bank ? "live" : "retained");
   out.add("valid", bank.valid != 0U);
   out.add("capacity", PAYLOAD_APPEND_TRACE_ENTRIES);
@@ -2091,7 +2184,7 @@ static FLASHMEM Payload system_payload_append_trace_summary_payload(void) {
       g_system_payload_append_trace_scratch.retained;
 
   Payload out;
-  out.add("schema", "ZPNET_PAYLOAD_APPEND_TRACE_SUMMARY_V1");
+  out.add("schema", "ZPNET_PAYLOAD_APPEND_TRACE_SUMMARY_V2");
   out.add("retained_valid", retained.valid != 0U);
   out.add("retained_count", retained.count);
   out.add("newest_sequence", retained.newest_sequence);
@@ -2485,6 +2578,7 @@ static FLASHMEM Payload system_crash_report_payload(bool include_text) {
                system_dispatch_breadcrumb_payload());
   p.add_object("execution_trace",
                system_execution_trace_summary_payload());
+  p.add_object("payload_fatal", system_payload_fatal_payload());
   p.add_object("payload_flight", system_payload_flight_payload(true));
   p.add_object("payload_append_trace",
                system_payload_append_trace_summary_payload());
@@ -3538,6 +3632,13 @@ static FLASHMEM Payload cmd_payload_flight_info(const Payload& /*args*/) {
 
 
 // ------------------------------------------------------------
+// PAYLOAD_FATAL_INFO — retained fatal construction record
+// ------------------------------------------------------------
+static FLASHMEM Payload cmd_payload_fatal_info(const Payload& /*args*/) {
+  return system_payload_fatal_payload();
+}
+
+// ------------------------------------------------------------
 // PAYLOAD_APPEND_TRACE — bounded retained/live append transaction transcript
 // ------------------------------------------------------------
 static FLASHMEM Payload cmd_payload_append_trace(const Payload& args) {
@@ -3581,6 +3682,7 @@ static FLASHMEM Payload cmd_crash_clear(const Payload& /*args*/) {
          sizeof(g_runtime_ledger_retained));
 
   timepop_dispatch_trace_clear_retained();
+  payload_fatal_record_clear();
   payload_clear_retained_append_trace();
   payload_contract_clear_retained();
   crash_stack_watch_clear_retained();
@@ -3593,6 +3695,7 @@ static FLASHMEM Payload cmd_crash_clear(const Payload& /*args*/) {
   resp.add("runtime_ledger_cleared", true);
   resp.add("execution_trace_cleared", true);
   resp.add("timepop_dispatch_trace_cleared", true);
+  resp.add("payload_fatal_cleared", true);
   resp.add("payload_append_trace_cleared", true);
   resp.add("stack_watch_retained_cleared", true);
   resp.add("stack_tripwire_retained_cleared", true);
@@ -3656,6 +3759,7 @@ static const process_command_entry_t SYSTEM_COMMANDS[] = {
   { "EXECUTION_TRACE", cmd_execution_trace },
   { "TIMEPOP_DISPATCH_INFO", cmd_timepop_dispatch_info },
   { "PAYLOAD_FLIGHT_INFO", cmd_payload_flight_info },
+  { "PAYLOAD_FATAL_INFO", cmd_payload_fatal_info },
   { "PAYLOAD_APPEND_TRACE", cmd_payload_append_trace },
   { "PAYLOAD_CONTRACT_INFO", cmd_payload_contract_info },
   { "DEBUG",            cmd_debug            },

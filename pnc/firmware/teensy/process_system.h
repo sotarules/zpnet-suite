@@ -57,6 +57,11 @@
  *     the earlier TimePop report schema
  *   • CRASH_POLICY — return live CPU/FPU exception policy plus a compact
  *     consistency analysis of retained core and extended exception frames
+ *   • PAYLOAD_FATAL_INFO — return the retained fatal-construction record,
+ *     including the public operation that stopped the firmware and its last
+ *     internal Payload error breadcrumb
+ *   • PAYLOAD_APPEND_TRACE — return the bounded retained/live append custody
+ *     transcript, including stage-local source hashes and bounded key prefixes
  *   • PAYLOAD_CONTRACT_INFO — return design-by-contract counters plus the
  *     first/latest current-boot incident and latest retained incident
  *

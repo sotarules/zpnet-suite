@@ -1707,7 +1707,7 @@ static void payload_contract_note_integrity(uint32_t operation_id,
 // remapping, and final-copy failures.
 
 static constexpr uint32_t PAYLOAD_APPEND_TRACE_MAGIC = 0x50413431UL;  // 'PA41'
-static constexpr uint32_t PAYLOAD_APPEND_TRACE_SCHEMA_VERSION = 1U;
+static constexpr uint32_t PAYLOAD_APPEND_TRACE_SCHEMA_VERSION = 2U;
 
 struct payload_append_trace_bank_t {
     uint32_t magic;
@@ -1726,6 +1726,36 @@ static inline void payload_append_trace_dmb() {
 #if defined(__arm__)
     __asm__ volatile("dmb" ::: "memory");
 #endif
+}
+
+// Append forensics intentionally duplicate the contract court's length-seeded
+// FNV-1a definition.  The recorder is earlier in this translation unit than the
+// general contract hash helpers and must remain independent of mutation logic.
+static constexpr uint32_t PAYLOAD_APPEND_TRACE_HASH_SEED = 0x811C9DC5UL;
+static constexpr uint32_t PAYLOAD_APPEND_TRACE_HASH_PRIME = 0x01000193UL;
+
+static uint32_t payload_append_trace_hash_byte(uint32_t hash, uint8_t byte) {
+    hash ^= byte;
+    hash *= PAYLOAD_APPEND_TRACE_HASH_PRIME;
+    return hash;
+}
+
+static uint32_t payload_append_trace_hash_u32(uint32_t hash, uint32_t value) {
+    hash = payload_append_trace_hash_byte(hash, (uint8_t)(value & 0xFFU));
+    hash = payload_append_trace_hash_byte(hash, (uint8_t)((value >> 8) & 0xFFU));
+    hash = payload_append_trace_hash_byte(hash, (uint8_t)((value >> 16) & 0xFFU));
+    hash = payload_append_trace_hash_byte(hash, (uint8_t)((value >> 24) & 0xFFU));
+    return hash;
+}
+
+static uint32_t payload_append_trace_span_hash(const void* data, size_t length) {
+    uint32_t hash = payload_append_trace_hash_u32(
+        PAYLOAD_APPEND_TRACE_HASH_SEED, (uint32_t)length);
+    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(data);
+    for (size_t i = 0U; i < length; ++i) {
+        hash = payload_append_trace_hash_byte(hash, bytes[i]);
+    }
+    return hash;
 }
 
 static bool payload_append_trace_bank_valid(
@@ -1777,6 +1807,7 @@ static void payload_append_trace_record(
     size_t key_len,
     const char* value,
     size_t value_len,
+    bool capture_sources,
     uint32_t kind,
     const void* storage,
     size_t capacity,
@@ -1822,6 +1853,22 @@ static void payload_append_trace_record(
     entry.data_shift = data_shift;
     entry.key_off = (uint32_t)key_off;
     entry.val_off = (uint32_t)val_off;
+
+    entry.source_hash_valid = capture_sources ? 1U : 0U;
+    entry.key_hash = 0U;
+    entry.value_hash = 0U;
+    entry.key_prefix_len = 0U;
+    memset(entry.key_prefix, 0, sizeof(entry.key_prefix));
+    if (capture_sources) {
+        entry.key_hash = payload_append_trace_span_hash(key, key_len);
+        entry.value_hash = payload_append_trace_span_hash(value, value_len);
+        const size_t prefix_len = key_len < sizeof(entry.key_prefix)
+            ? key_len
+            : sizeof(entry.key_prefix);
+        if (prefix_len != 0U) memcpy(entry.key_prefix, key, prefix_len);
+        entry.key_prefix_len = (uint32_t)prefix_len;
+    }
+
     entry.dwt_cyccnt = payload_read_dwt();
     entry.ipsr = payload_read_ipsr();
 
@@ -5183,6 +5230,7 @@ bool Payload::_append_value(const char* key,
                                 this,
                                 key, key_len,
                                 value, value_len,
+                                false,
                                 (uint32_t)kind,
                                 nullptr, 0U, 0U, 0U,
                                 false, false, 0U, 0U, 0, 0U, 0U);
@@ -5323,6 +5371,7 @@ bool Payload::_append_value(const char* key,
                                 this,
                                 key, key_len,
                                 value, value_len,
+                                true,
                                 (uint32_t)kind,
                                 old_storage, old_capacity,
                                 old_data_begin, _count,
@@ -5334,6 +5383,7 @@ bool Payload::_append_value(const char* key,
                                     this,
                                     key, key_len,
                                     value, value_len,
+                                    true,
                                     (uint32_t)kind,
                                     _storage(), _capacity(),
                                     _data_begin, _count,
@@ -5362,6 +5412,7 @@ bool Payload::_append_value(const char* key,
                                 this,
                                 key, key_len,
                                 value, value_len,
+                                true,
                                 (uint32_t)kind,
                                 storage, _capacity(),
                                 _data_begin, _count,
@@ -5377,6 +5428,7 @@ bool Payload::_append_value(const char* key,
                                     this,
                                     key, key_len,
                                     value, value_len,
+                                    true,
                                     (uint32_t)kind,
                                     storage, _capacity(),
                                     _data_begin, _count,
@@ -5398,6 +5450,7 @@ bool Payload::_append_value(const char* key,
                                     this,
                                     key, key_len,
                                     value, value_len,
+                                    true,
                                     (uint32_t)kind,
                                     storage, _capacity(),
                                     _data_begin, _count,
@@ -5440,6 +5493,7 @@ bool Payload::_append_value(const char* key,
                                 this,
                                 key, key_len,
                                 value, value_len,
+                                true,
                                 (uint32_t)kind,
                                 storage, _capacity(),
                                 _data_begin, _count,
@@ -5454,6 +5508,7 @@ bool Payload::_append_value(const char* key,
                                 this,
                                 key, key_len,
                                 value, value_len,
+                                true,
                                 (uint32_t)kind,
                                 storage, _capacity(),
                                 _data_begin, _count,
@@ -5465,6 +5520,7 @@ bool Payload::_append_value(const char* key,
                                 this,
                                 key, key_len,
                                 value, value_len,
+                                true,
                                 (uint32_t)kind,
                                 storage, _capacity(),
                                 _data_begin, _count,
@@ -5479,6 +5535,7 @@ bool Payload::_append_value(const char* key,
                                 this,
                                 key, key_len,
                                 value, value_len,
+                                true,
                                 (uint32_t)kind,
                                 storage, _capacity(),
                                 _data_begin, _count,
@@ -5501,6 +5558,7 @@ bool Payload::_append_value(const char* key,
                                 this,
                                 key, key_len,
                                 value, value_len,
+                                true,
                                 (uint32_t)kind,
                                 storage, _capacity(),
                                 _data_begin, _count,
