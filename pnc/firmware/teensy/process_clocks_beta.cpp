@@ -1619,40 +1619,20 @@ void clocks_fragment_pps_tick_from_interrupt(
 void clocks_fragment_completed_row_ready(uint32_t completed_second_sequence) {
   if (clocks_fragment_current_ipsr() != 0U || completed_second_sequence == 0U) return;
 
-  clocks_fragment_publication_ensure_initialized();
-
-  // Alpha's completed-row notification is stronger than the earlier physical
-  // PPS wake: at this point the exact immutable instrument row exists.  Reassert
-  // that identity directly instead of routing through accept_tick(), whose
-  // duplicate-tick suppression may legitimately remember the earlier PPS wake.
-  // A transport-retry snapshot keeps its existing custody; the completed row is
-  // then reserved as the immediate successor exactly as accept_tick() does.
-  if (g_clocks_fragment_publication_retry_snapshot_valid) {
-    if (!g_clocks_fragment_publication_pending) {
-      g_clocks_fragment_publication_pending_sequence = completed_second_sequence;
-      g_clocks_fragment_publication_pending = true;
-    } else if (g_clocks_fragment_publication_pending_sequence !=
-               completed_second_sequence) {
-      g_clocks_fragment_publication_coalesce_count++;
+  // Beta calls this only after Alpha has frozen the exact completed row. If the
+  // interrupt-side notification already reserved this identity, wake/rearm the
+  // held serializer now that the row is actually available.
+  if (g_clocks_fragment_publication_pending &&
+      g_clocks_fragment_publication_pending_sequence == completed_second_sequence) {
+    if (g_clocks_fragment_publication_service_armed) {
+      clocks_fragment_force_rearm();
+    } else {
+      clocks_fragment_schedule_publish();
     }
-    clocks_fragment_schedule_publish();
     return;
   }
 
-  if (g_clocks_fragment_publication_pending &&
-      g_clocks_fragment_publication_pending_sequence != completed_second_sequence) {
-    g_clocks_fragment_publication_coalesce_count++;
-  }
-  g_clocks_fragment_publication_last_tick_sequence = completed_second_sequence;
-  g_clocks_fragment_publication_last_tick_valid = true;
-  g_clocks_fragment_publication_pending_sequence = completed_second_sequence;
-  g_clocks_fragment_publication_pending = true;
-
-  if (g_clocks_fragment_publication_service_armed) {
-    clocks_fragment_force_rearm();
-  } else {
-    clocks_fragment_schedule_publish();
-  }
+  clocks_fragment_accept_tick(completed_second_sequence);
 }
 
 void clocks_fragment_campaign_row_ready(uint32_t completed_second_sequence) {
