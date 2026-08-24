@@ -111,10 +111,10 @@
 // Constants — 10 MHz domain
 // ============================================================================
 
-static constexpr uint32_t MAX_SLOTS = 12;
-static constexpr uint32_t MAX_ASAP_SLOTS = 4;
+static constexpr uint32_t MAX_SLOTS = 16;
+static constexpr uint32_t MAX_ASAP_SLOTS = 8;
 static constexpr uint32_t MAX_ALAP_SLOTS = 4;
-static constexpr uint32_t MAX_DISPATCH_MUTATIONS = 8;
+static constexpr uint32_t MAX_DISPATCH_MUTATIONS = 24;
 static constexpr uint32_t MAX_TIMEPOP_NAME = 63;
 static constexpr bool     TIMEPOP_IDLE_DWT_WITNESS_ENABLED = true;
 static constexpr uint64_t NS_PER_TICK = 100ULL;

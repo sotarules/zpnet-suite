@@ -160,7 +160,7 @@ static uint32_t g_system_feature_handler_last_ipsr = 0;
 // compact scalar status for each MACHINE.SUBSYSTEM.FEATURE path. Focused
 // subsystem reports remain the place for detailed diagnostics.
 
-static constexpr size_t SYSTEM_FEATURE_MAX_FEATURES   = 16;
+static constexpr size_t SYSTEM_FEATURE_MAX_FEATURES   = 32;
 static constexpr size_t SYSTEM_FEATURE_SUBSYSTEM_MAX  = 24;
 static constexpr size_t SYSTEM_FEATURE_NAME_MAX       = 48;
 

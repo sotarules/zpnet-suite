@@ -72,7 +72,7 @@ static constexpr uint32_t RX_GUARD_AFTER_WORD  = 0x52584741UL;  // 'RXGA'
 static_assert((RX_BUF_MAX % RX_CACHE_LINE_BYTES) == 0U,
               "RX buffer must occupy complete cache lines");
 
-static constexpr size_t TX_JOB_MAX = 48;
+static constexpr size_t TX_JOB_MAX = 64;
 static constexpr size_t TX_CONTROL_RESERVE = 16 * 1024;
 static constexpr size_t TX_CONTROL_RESERVE_JOBS = 8;
 static constexpr size_t TX_BUDGET_MAX = 64 * 1024;
