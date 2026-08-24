@@ -222,7 +222,7 @@ enum payload_error_code_t : uint32_t {
     PAYLOAD_ERR_FLOAT_FORMAT_FORBIDDEN = 20,
 };
 
-const char* payload_error_code_name(uint32_t code) {
+FLASHMEM const char* payload_error_code_name(uint32_t code) {
     switch (code) {
         case PAYLOAD_ERR_NONE:               return "NONE";
         case PAYLOAD_ERR_ENTRY_OVERFLOW:     return "ENTRY_OVERFLOW";
@@ -260,7 +260,7 @@ enum payload_string_fault_reason_t : uint32_t {
     PAYLOAD_STRING_FAULT_TOO_LONG = 7,
 };
 
-const char* payload_string_fault_reason_name(uint32_t reason) {
+FLASHMEM const char* payload_string_fault_reason_name(uint32_t reason) {
     switch (reason) {
         case PAYLOAD_STRING_FAULT_NONE:              return "NONE";
         case PAYLOAD_STRING_FAULT_NULL:              return "NULL";
@@ -301,7 +301,7 @@ enum payload_self_ok_fail_reason_t : uint32_t {
     PAYLOAD_SELF_OK_ENTRY_KEY_UNTERMINATED = 23,
 };
 
-const char* payload_self_ok_fail_reason_name(uint32_t reason) {
+FLASHMEM const char* payload_self_ok_fail_reason_name(uint32_t reason) {
     switch (reason) {
         case PAYLOAD_SELF_OK_NONE:                        return "NONE";
         case PAYLOAD_SELF_OK_MAGIC_BAD:                   return "MAGIC_BAD_RETIRED_V4";
@@ -342,7 +342,7 @@ enum payload_numeric_reject_reason_t : uint32_t {
     PAYLOAD_NUMERIC_REJECT_OUT_OF_RANGE = 6,
 };
 
-const char* payload_numeric_reject_reason_name(uint32_t reason) {
+FLASHMEM const char* payload_numeric_reject_reason_name(uint32_t reason) {
     switch (reason) {
         case PAYLOAD_NUMERIC_REJECT_NONE: return "NONE";
         case PAYLOAD_NUMERIC_REJECT_NAN: return "NAN";
@@ -367,7 +367,7 @@ enum payload_semantic_fail_reason_t : uint32_t {
     PAYLOAD_SEMANTIC_FAIL_ARRAY_JSON = 8,
 };
 
-const char* payload_semantic_fail_reason_name(uint32_t reason) {
+FLASHMEM const char* payload_semantic_fail_reason_name(uint32_t reason) {
     switch (reason) {
         case PAYLOAD_SEMANTIC_FAIL_NONE: return "NONE";
         case PAYLOAD_SEMANTIC_FAIL_INVALID_KIND: return "INVALID_KIND";
@@ -506,7 +506,7 @@ enum payload_operation_id_t : uint32_t {
     PAYLOAD_OP_WRITE_JSON_SIZE = 0xA14EE86AUL,
 };
 
-const char* payload_operation_id_name(uint32_t operation_id) {
+FLASHMEM const char* payload_operation_id_name(uint32_t operation_id) {
     switch (operation_id) {
         case PAYLOAD_OP_NONE: return "NONE";
         case PAYLOAD_OP_ADD_KEY: return "add.key";
@@ -1345,7 +1345,7 @@ static void payload_contract_snapshot_bank(
     }
 }
 
-void payload_contract_get_snapshot(payload_contract_snapshot_t* out) {
+FLASHMEM void payload_contract_get_snapshot(payload_contract_snapshot_t* out) {
     if (!out) return;
     payload_contract_boot_latch();
     memset(out, 0, sizeof(*out));
@@ -1354,7 +1354,7 @@ void payload_contract_get_snapshot(payload_contract_snapshot_t* out) {
                                    &out->retained);
 }
 
-void payload_contract_get_info(payload_contract_info_t* out) {
+FLASHMEM void payload_contract_get_info(payload_contract_info_t* out) {
     if (!out) return;
     payload_contract_get_snapshot(&g_payload_contract_info_scratch);
     const payload_contract_snapshot_t& snapshot =
@@ -1435,7 +1435,7 @@ void payload_contract_clear_retained(void) {
                            sizeof(g_payload_contract_retained));
 }
 
-const char* payload_contract_phase_name(uint32_t phase) {
+FLASHMEM const char* payload_contract_phase_name(uint32_t phase) {
     switch ((payload_contract_phase_t)phase) {
         case payload_contract_phase_t::PRECONDITION: return "PRECONDITION";
         case payload_contract_phase_t::PRE_INVARIANT: return "PRE_INVARIANT";
@@ -1448,7 +1448,7 @@ const char* payload_contract_phase_name(uint32_t phase) {
     }
 }
 
-const char* payload_contract_reason_name(uint32_t reason) {
+FLASHMEM const char* payload_contract_reason_name(uint32_t reason) {
     switch ((payload_contract_reason_t)reason) {
         case payload_contract_reason_t::INPUT_POINTER: return "INPUT_POINTER";
         case payload_contract_reason_t::INPUT_LENGTH: return "INPUT_LENGTH";
@@ -1835,7 +1835,7 @@ static void payload_flight_note(uint32_t op_id,
                            3U * sizeof(uint32_t));
 }
 
-void payload_get_flight_info(payload_flight_info_t* out) {
+FLASHMEM void payload_get_flight_info(payload_flight_info_t* out) {
     if (!out) return;
     memset(out, 0, sizeof(*out));
 
@@ -7455,7 +7455,7 @@ Payload PayloadArray::get(size_t idx) const {
 // Instrumentation snapshot
 // ============================================================================
 
-void payload_get_info(payload_info_t* out) {
+FLASHMEM void payload_get_info(payload_info_t* out) {
     if (!out) return;
     memset(out, 0, sizeof(*out));
 

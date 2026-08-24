@@ -6210,7 +6210,7 @@ static bool interrupt_fpu_context_policy_install_once(void) {
 // Hardware and lifecycle initialization
 // ============================================================================
 
-static void qtimer_init_count_compare_channel(IMXRT_TMR_t& module,
+FLASHMEM static void qtimer_init_count_compare_channel(IMXRT_TMR_t& module,
                                                uint8_t channel,
                                                uint8_t pcs) {
   module.CH[channel].CTRL = 0;
@@ -6224,7 +6224,7 @@ static void qtimer_init_count_compare_channel(IMXRT_TMR_t& module,
   module.CH[channel].CTRL = TMR_CTRL_CM(1) | TMR_CTRL_PCS(pcs);
 }
 
-static void qtimer1_init_vclock_base(void) {
+FLASHMEM static void qtimer1_init_vclock_base(void) {
   CCM_CCGR6 |= CCM_CCGR6_QTIMER1(CCM_CCGR_ON);
   *(portConfigRegister(10)) = 1;
   IOMUXC_SW_PAD_CTL_PAD_GPIO_B0_00 =
@@ -6236,7 +6236,7 @@ static void qtimer1_init_vclock_base(void) {
   qtimer_disable_compare(IMXRT_TMR1, QTIMER1_VCLOCK_CH);
 }
 
-static void qtimer1_init_ch2_scheduler(void) {
+FLASHMEM static void qtimer1_init_ch2_scheduler(void) {
   qtimer_init_count_compare_channel(IMXRT_TMR1,
                                     QTIMER1_TIMEPOP_CH,
                                     QTIMER1_TIMEPOP_PCS);
@@ -6251,7 +6251,7 @@ static void qtimer1_init_ch2_scheduler(void) {
   IMXRT_TMR1.CH[QTIMER1_RETIRED_AUX_CH].CMPLD2 = 0;
 }
 
-void process_interrupt_init_hardware(void) {
+FLASHMEM void process_interrupt_init_hardware(void) {
   if (!interrupt_fpu_context_policy_install_once()) return;
   if (g_interrupt_hw_ready) return;
 
@@ -6322,7 +6322,7 @@ void process_interrupt_init_hardware(void) {
   g_interrupt_hw_ready = true;
 }
 
-static void runtime_init_subscribers(void) {
+FLASHMEM static void runtime_init_subscribers(void) {
   g_subscriber_count = 0U;
   for (interrupt_subscriber_runtime_t& rt : g_subscribers) {
     rt = interrupt_subscriber_runtime_t{};
@@ -6334,7 +6334,7 @@ static void runtime_init_subscribers(void) {
   g_subscriber_count = INTERRUPT_SUBSCRIBER_COUNT;
 }
 
-void process_interrupt_init(void) {
+FLASHMEM void process_interrupt_init(void) {
   if (g_interrupt_runtime_ready) return;
   runtime_init_subscribers();
   interrupt_delay_runtime_reset();

@@ -111,10 +111,10 @@
 // Constants — 10 MHz domain
 // ============================================================================
 
-static constexpr uint32_t MAX_SLOTS = 16;
-static constexpr uint32_t MAX_ASAP_SLOTS = 8;
+static constexpr uint32_t MAX_SLOTS = 12;
+static constexpr uint32_t MAX_ASAP_SLOTS = 4;
 static constexpr uint32_t MAX_ALAP_SLOTS = 4;
-static constexpr uint32_t MAX_DISPATCH_MUTATIONS = 24;
+static constexpr uint32_t MAX_DISPATCH_MUTATIONS = 8;
 static constexpr uint32_t MAX_TIMEPOP_NAME = 63;
 static constexpr bool     TIMEPOP_IDLE_DWT_WITNESS_ENABLED = true;
 static constexpr uint64_t NS_PER_TICK = 100ULL;
@@ -3722,7 +3722,7 @@ static timepop_handle_t arm_deferred(deferred_slot_t* slots_buf,
 // Initialization
 // ============================================================================
 
-void timepop_init(void) {
+FLASHMEM void timepop_init(void) {
   // Initialize the live Execution Trace surface without touching the retained
   // fault-time bank from the previous boot.
   timepop_dispatch_trace_boot_latch();

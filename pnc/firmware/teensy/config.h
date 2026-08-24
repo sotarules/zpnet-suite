@@ -218,7 +218,9 @@ static const float ADC_FS_COUNTS = 4095.0f;
 // Constants
 // ============================================================================
 
-static constexpr uint32_t MAX_INTERRUPT_SUBSCRIBERS = 8;
+// The interrupt clock architecture has exactly three subscriber lanes:
+// VCLOCK, OCXO1, and OCXO2.
+static constexpr uint32_t MAX_INTERRUPT_SUBSCRIBERS = 3;
 
 static constexpr uint32_t VCLOCK_INTERVAL_COUNTS = 10000U;  // 1 ms at 10 MHz
 

@@ -2229,7 +2229,7 @@ static char     g_flash_cut_last_status[48] = {0};
 static FLASHMEM void clocks_beta_cold_diagnostics_init(void);
 static bool g_clocks_beta_dmamem_initialized = false;
 
-void clocks_beta_features_init(void) {
+FLASHMEM void clocks_beta_features_init(void) {
   clocks_beta_cold_diagnostics_init();
   // Publication custody is CLOCKS state too.  Initialize it synchronously with
   // the rest of Beta so the first completed Alpha row never depends on a lazy
