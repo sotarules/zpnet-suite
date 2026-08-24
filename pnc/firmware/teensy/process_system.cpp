@@ -2906,23 +2906,6 @@ static FLASHMEM Payload cmd_transport_info(const Payload& /*args*/) {
   p.add("rx_reset_hard",        info.rx_reset_hard);
 
   // ==========================================================
-  // RX — Host serial-session custody
-  // ==========================================================
-
-  p.add("rx_host_dtr_now", info.rx_host_dtr_now != 0U);
-  p.add("rx_host_session_generation", info.rx_host_session_generation);
-  p.add("rx_host_dtr_transition_count", info.rx_host_dtr_transition_count);
-  p.add("rx_host_connect_count", info.rx_host_connect_count);
-  p.add("rx_host_disconnect_count", info.rx_host_disconnect_count);
-  p.add("rx_host_incomplete_frame_retired_count",
-        info.rx_host_incomplete_frame_retired_count);
-  p.add("rx_host_last_retired_traffic", info.rx_host_last_retired_traffic);
-  p.add_fmt("rx_host_last_retired_traffic_hex", "0x%02lX",
-            (unsigned long)info.rx_host_last_retired_traffic);
-  p.add("rx_host_last_retired_len", info.rx_host_last_retired_len);
-  p.add("rx_host_last_retired_dwt", info.rx_host_last_retired_dwt);
-
-  // ==========================================================
   // RX — Framing failures
   // ==========================================================
 
