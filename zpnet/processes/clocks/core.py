@@ -70,6 +70,7 @@ Semantics:
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 from collections import deque
 from dataclasses import dataclass, field
@@ -354,6 +355,7 @@ PPB_PI_CHECKPOINT_SCHEMA = "PI_CLOCKS_PPB_RESTORE_CHECKPOINT_V1"
 CLOCKS_RECOVERY_CONFIG_KEY = "CLOCKS_RECOVERY"
 CLOCKS_RECOVERY_SNAPSHOT_SCHEMA = "PI_CLOCKS_RECOVERY_SNAPSHOT_V1"
 CLOCKS_RECOVERY_DESIRED_STATE_SCHEMA = "PI_CLOCKS_RECOVERY_DESIRED_STATE_V1"
+CLOCKS_RECOVERY_RECEIPT_SCHEMA = "PI_CLOCKS_RECOVERY_RECEIPT_V1"
 TIMEBASE_SILENCE_TIMEOUT_S = 30.0
 TIMEBASE_SILENCE_MONITOR_POLL_S = 1.0
 TEENSY_HEALTH_RETRY_S = 60.0
@@ -3927,6 +3929,23 @@ def _ambient_instrument_recovery(regression: Dict[str, Any]) -> None:
         # custody resumes so those deliberate omissions are never misclassified
         # as an uncontrolled PI_OBSERVATION_GAP.
         ppb_refresh = _refresh_ppb_checkpoint_from_proved_alpha()
+        proof_sequence = _as_int(proof.get("durable_proof_sequence"))
+        if proof_sequence is None or proof_sequence <= 0:
+            raise RuntimeError("ambient Alpha resurrection proof lacks durable sequence identity")
+        boundary_detail_id = _find_clocks_exact_recovery_boundary_detail_id(
+            source_detail_id=int(source_detail_id),
+            source_reset_count=int(source_reset),
+            source_update_count=int(source_update),
+            proof_sequence=int(proof_sequence),
+        )
+        recovery_receipt = _record_clocks_recovery_receipt(
+            boundary_detail_id=boundary_detail_id,
+            source_detail=detail,
+            source_checkpoint=checkpoint,
+            recovery_mode="AMBIENT_ALPHA_RESURRECTION",
+            proof=proof,
+            alpha_proof_detail_id=boundary_detail_id,
+        )
 
         result = {
             "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -3939,6 +3958,7 @@ def _ambient_instrument_recovery(regression: Dict[str, Any]) -> None:
             "ppb_stage": copy.deepcopy(ppb_stage),
             "ppb_post_resurrection_refresh": copy.deepcopy(ppb_refresh),
             "proof": copy.deepcopy(proof),
+            "recovery_receipt": copy.deepcopy(recovery_receipt),
             "campaign_restored": False,
             "pi_gnss_raw_rewound": False,
             "pi_control_rewound": False,
@@ -5671,6 +5691,342 @@ def _read_clocks_recovery_config() -> Optional[Dict[str, Any]]:
     if isinstance(payload, str):
         payload = json.loads(payload)
     return _normalize_saved_ppb_checkpoint(payload)
+
+
+def _clocks_checkpoint_receipt_summary(checkpoint: Dict[str, Any]) -> Dict[str, Any]:
+    """Fingerprint one exact private CLOCKS checkpoint without copying its rings."""
+    saved = _normalize_saved_ppb_checkpoint(checkpoint)
+    encoded = json.dumps(
+        saved, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return {
+        "schema": saved.get("schema"),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "durable_source_detail_id": _as_int(saved.get("durable_source_detail_id")),
+        "reset_count": int(saved["reset_count"]),
+        "update_count": int(saved["update_count"]),
+        "current_sequence": int(saved["current_sequence"]),
+        "recoverable": bool(saved.get("recoverable")),
+        "status": str(saved.get("status") or ""),
+        "second_count": int(saved.get("second_count") or 0),
+        "expected_second_count": int(saved.get("expected_second_count") or 0),
+        "minute_count": int(saved.get("minute_count") or 0),
+        "expected_minute_count": int(saved.get("expected_minute_count") or 0),
+        "gap_count": int(saved.get("gap_count") or 0),
+    }
+
+
+def _find_clocks_exact_recovery_boundary_detail_id(
+    *,
+    source_detail_id: int,
+    source_reset_count: int,
+    source_update_count: int,
+    proof_sequence: int,
+) -> int:
+    """Find the one durable exact-N+1 CLOCKS row admitted after a restore."""
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id
+            FROM campaign_detail
+            WHERE campaign_type = %s
+              AND id > %s
+              AND payload #>> '{schema}' = 'CLOCKS_V4'
+              AND payload #>> '{sequence}' = %s
+              AND payload #>> '{clocks,stats,reset_count}' = %s
+              AND payload #>> '{clocks,stats,update_count}' = %s
+            ORDER BY id ASC
+            LIMIT 2
+            """,
+            (
+                CAMPAIGN_TYPE_TEMPEST,
+                int(source_detail_id),
+                str(int(proof_sequence)),
+                str(int(source_reset_count)),
+                str(int(source_update_count) + 1),
+            ),
+        )
+        rows = cur.fetchall()
+    if len(rows) != 1:
+        raise RuntimeError(
+            "exact CLOCKS recovery boundary is not unique: "
+            f"source_detail_id={source_detail_id} reset={source_reset_count} "
+            f"update={source_update_count}->{source_update_count + 1} "
+            f"sequence={proof_sequence} rows={len(rows)}"
+        )
+    return int(rows[0]["id"])
+
+
+def _record_clocks_recovery_receipt(
+    *,
+    boundary_detail_id: int,
+    source_detail: Dict[str, Any],
+    source_checkpoint: Dict[str, Any],
+    recovery_mode: str,
+    proof: Dict[str, Any],
+    alpha_proof_detail_id: Optional[int] = None,
+    campaign_name: Optional[str] = None,
+    campaign_boundary_detail_id: Optional[int] = None,
+    source_public_count: Optional[int] = None,
+    expected_first_public_count: Optional[int] = None,
+    elapsed_seconds: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Attach one immutable Pi recovery receipt to the authoritative CLOCKS boundary.
+
+    The receipt is deliberately compact.  It fingerprints the exact private
+    config.CLOCKS_RECOVERY image used for resurrection, but never copies the
+    bounded endpoint rings back into canonical CLOCKS.
+    """
+    source_id = _as_int(source_detail.get("_db_detail_id"))
+    if source_id is None or source_id <= 0:
+        raise RuntimeError("CLOCKS recovery receipt source lacks durable detail identity")
+    source_sequence = _as_int(source_detail.get("sequence"))
+    source_clocks = _clocks_payload(source_detail)
+    source_stats = source_clocks.get("stats") if isinstance(source_clocks, dict) else None
+    source_reset = _as_int(source_stats.get("reset_count")) if isinstance(source_stats, dict) else None
+    source_update = _as_int(source_stats.get("update_count")) if isinstance(source_stats, dict) else None
+    if source_sequence is None or source_reset is None or source_update is None:
+        raise RuntimeError("CLOCKS recovery receipt source lacks chronology")
+    if proof.get("proved") is not True or proof.get("durable") is not True:
+        raise RuntimeError("CLOCKS recovery receipt requires a proved durable Alpha successor")
+
+    checkpoint_summary = _clocks_checkpoint_receipt_summary(source_checkpoint)
+    if checkpoint_summary.get("durable_source_detail_id") not in (None, int(source_id)):
+        raise RuntimeError(
+            "CLOCKS recovery receipt checkpoint owner disagrees with source: "
+            f"checkpoint={checkpoint_summary.get('durable_source_detail_id')} source={source_id}"
+        )
+    if (
+        int(checkpoint_summary["reset_count"]) != int(source_reset)
+        or int(checkpoint_summary["update_count"]) != int(source_update)
+    ):
+        raise RuntimeError("CLOCKS recovery receipt checkpoint chronology disagrees with source")
+
+    boundary_id = int(boundary_detail_id)
+    if boundary_id <= source_id:
+        raise RuntimeError("CLOCKS recovery receipt boundary does not follow source")
+
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT payload FROM campaign_detail WHERE id = %s AND campaign_type = %s FOR UPDATE",
+            (boundary_id, CAMPAIGN_TYPE_TEMPEST),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise RuntimeError(
+                f"CLOCKS recovery receipt boundary detail_id={boundary_id} is missing"
+            )
+        boundary = row["payload"]
+        if isinstance(boundary, str):
+            boundary = json.loads(boundary)
+        if not isinstance(boundary, dict) or boundary.get("schema") != "CLOCKS_V4":
+            raise RuntimeError("CLOCKS recovery receipt boundary is not CLOCKS_V4")
+
+        boundary_clocks = _clocks_payload(boundary)
+        boundary_stats = boundary_clocks.get("stats") if isinstance(boundary_clocks, dict) else None
+        boundary_sequence = _as_int(boundary.get("sequence"))
+        boundary_reset = _as_int(boundary_stats.get("reset_count")) if isinstance(boundary_stats, dict) else None
+        boundary_update = _as_int(boundary_stats.get("update_count")) if isinstance(boundary_stats, dict) else None
+        if (
+            boundary_sequence is None
+            or boundary_reset != source_reset
+            or boundary_update is None
+            or boundary_update < source_update + 1
+            or boundary.get("holistic_restore_superseded") is True
+        ):
+            raise RuntimeError(
+                "CLOCKS recovery receipt resumed boundary is not authoritative descendant: "
+                f"source={source_reset}/{source_update} "
+                f"boundary={boundary_reset}/{boundary_update} sequence={boundary_sequence} "
+                f"superseded={boundary.get('holistic_restore_superseded')}"
+            )
+
+        durable_proof_sequence = _as_int(proof.get("durable_proof_sequence"))
+        if durable_proof_sequence is None or durable_proof_sequence <= 0:
+            raise RuntimeError("CLOCKS recovery receipt proof lacks durable Alpha sequence")
+        alpha_detail_id = (
+            int(alpha_proof_detail_id)
+            if alpha_proof_detail_id is not None
+            else boundary_id
+        )
+        if alpha_detail_id > boundary_id:
+            raise RuntimeError("CLOCKS Alpha proof row follows the resumed authority boundary")
+        if alpha_detail_id == boundary_id:
+            alpha_boundary = boundary
+        else:
+            cur.execute(
+                "SELECT payload FROM campaign_detail WHERE id = %s AND campaign_type = %s",
+                (alpha_detail_id, CAMPAIGN_TYPE_TEMPEST),
+            )
+            alpha_row = cur.fetchone()
+            if alpha_row is None:
+                raise RuntimeError(
+                    f"CLOCKS exact Alpha proof detail_id={alpha_detail_id} is missing"
+                )
+            alpha_boundary = alpha_row["payload"]
+            if isinstance(alpha_boundary, str):
+                alpha_boundary = json.loads(alpha_boundary)
+            if not isinstance(alpha_boundary, dict):
+                raise RuntimeError("CLOCKS exact Alpha proof payload is not an object")
+        alpha_clocks = _clocks_payload(alpha_boundary)
+        alpha_stats = alpha_clocks.get("stats") if isinstance(alpha_clocks, dict) else None
+        alpha_sequence = _as_int(alpha_boundary.get("sequence"))
+        alpha_reset = _as_int(alpha_stats.get("reset_count")) if isinstance(alpha_stats, dict) else None
+        alpha_update = _as_int(alpha_stats.get("update_count")) if isinstance(alpha_stats, dict) else None
+        if not (
+            alpha_sequence == durable_proof_sequence
+            and alpha_reset == source_reset
+            and alpha_update == source_update + 1
+        ):
+            raise RuntimeError(
+                "CLOCKS recovery receipt exact Alpha proof does not close source N+1: "
+                f"source={source_reset}/{source_update} "
+                f"alpha={alpha_reset}/{alpha_update} sequence={alpha_sequence} "
+                f"expected_sequence={durable_proof_sequence}"
+            )
+
+        campaign_receipt: Optional[Dict[str, Any]] = None
+        if campaign_name is not None:
+            campaign_boundary_id = (
+                int(campaign_boundary_detail_id)
+                if campaign_boundary_detail_id is not None
+                else boundary_id
+            )
+            if campaign_boundary_id < boundary_id:
+                raise RuntimeError(
+                    "CLOCKS recovery receipt campaign boundary precedes Alpha boundary"
+                )
+            if campaign_boundary_id == boundary_id:
+                campaign_boundary = boundary
+            else:
+                cur.execute(
+                    "SELECT payload FROM campaign_detail WHERE id = %s AND campaign_type = %s",
+                    (campaign_boundary_id, CAMPAIGN_TYPE_TEMPEST),
+                )
+                campaign_row = cur.fetchone()
+                if campaign_row is None:
+                    raise RuntimeError(
+                        "CLOCKS recovery receipt first-public detail is missing: "
+                        f"detail_id={campaign_boundary_id}"
+                    )
+                campaign_boundary = campaign_row["payload"]
+                if isinstance(campaign_boundary, str):
+                    campaign_boundary = json.loads(campaign_boundary)
+                if not isinstance(campaign_boundary, dict):
+                    raise RuntimeError("CLOCKS recovery first-public payload is not an object")
+
+            campaign = _state_campaign(campaign_boundary)
+            boundary_campaign = _tempest_campaign_name(campaign) if isinstance(campaign, dict) else ""
+            actual_public = (
+                _tempest_public_count(campaign)
+                if isinstance(campaign, dict) and boundary_campaign
+                else 0
+            )
+            if boundary_campaign != str(campaign_name):
+                raise RuntimeError(
+                    "CLOCKS recovery receipt boundary campaign mismatch: "
+                    f"expected={campaign_name!r} observed={boundary_campaign!r}"
+                )
+            if (
+                expected_first_public_count is not None
+                and actual_public != int(expected_first_public_count)
+            ):
+                raise RuntimeError(
+                    "CLOCKS recovery receipt first-public mismatch: "
+                    f"expected={expected_first_public_count} actual={actual_public}"
+                )
+            campaign_receipt = {
+                "campaign": str(campaign_name),
+                "first_public_detail_id": campaign_boundary_id,
+                "source_public_count": (
+                    int(source_public_count) if source_public_count is not None else None
+                ),
+                "expected_first_public_count": (
+                    int(expected_first_public_count)
+                    if expected_first_public_count is not None
+                    else None
+                ),
+                "actual_first_public_count": int(actual_public),
+                "elapsed_seconds": int(elapsed_seconds) if elapsed_seconds is not None else None,
+            }
+
+        receipt: Dict[str, Any] = {
+            "schema": CLOCKS_RECOVERY_RECEIPT_SCHEMA,
+            "subsystem": "CLOCKS",
+            "recorded_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "recovery_mode": str(recovery_mode).strip().upper(),
+            "producer_transition": "RESURRECTED",
+            "source": {
+                "detail_id": int(source_id),
+                "sequence": int(source_sequence),
+                "reset_count": int(source_reset),
+                "update_count": int(source_update),
+            },
+            "checkpoint": checkpoint_summary,
+            "boundary": {
+                "detail_id": boundary_id,
+                "sequence": int(boundary_sequence),
+                "reset_count": int(boundary_reset),
+                "update_count": int(boundary_update),
+            },
+            "proof": {
+                "contract": "EXACT_SOURCE_N_PLUS_1",
+                "durable": bool(proof.get("durable")),
+                "proved": bool(proof.get("proved")),
+                "alpha_detail_id": int(alpha_detail_id),
+                "alpha_sequence": int(alpha_sequence),
+                "alpha_reset_count": int(alpha_reset),
+                "alpha_update_count": int(alpha_update),
+            },
+        }
+        if campaign_receipt is not None:
+            receipt["campaign"] = campaign_receipt
+
+        existing = boundary.get("recovery_receipt")
+        if existing is not None:
+            if not isinstance(existing, dict):
+                raise RuntimeError("CLOCKS recovery boundary has malformed recovery_receipt")
+            same_identity = bool(
+                existing.get("schema") == CLOCKS_RECOVERY_RECEIPT_SCHEMA
+                and _as_int(_path_get(existing, "source.detail_id")) == source_id
+                and _as_int(_path_get(existing, "boundary.detail_id")) == boundary_id
+                and str(existing.get("recovery_mode") or "").strip().upper()
+                == str(recovery_mode).strip().upper()
+            )
+            if not same_identity:
+                raise RuntimeError(
+                    f"CLOCKS recovery boundary detail_id={boundary_id} already has a different receipt"
+                )
+            return copy.deepcopy(existing)
+
+        cur.execute(
+            """
+            UPDATE campaign_detail
+            SET payload = jsonb_set(payload, '{recovery_receipt}', %s::jsonb, true)
+            WHERE id = %s AND campaign_type = %s
+            """,
+            (
+                json.dumps(receipt, separators=(",", ":"), ensure_ascii=False),
+                boundary_id,
+                CAMPAIGN_TYPE_TEMPEST,
+            ),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError(
+                f"CLOCKS recovery receipt did not decorate exactly one boundary row: {boundary_id}"
+            )
+
+    logging.info(
+        "🧾 [recovery] durable CLOCKS recovery receipt recorded: mode=%s source_id=%d "
+        "boundary_id=%d checkpoint_sha256=%s",
+        str(recovery_mode).strip().upper(),
+        int(source_id),
+        boundary_id,
+        checkpoint_summary["sha256"],
+    )
+    return receipt
 
 
 def _legacy_clocks_recovery_checkpoint() -> Optional[Dict[str, Any]]:
@@ -8066,6 +8422,39 @@ def _restore_instrument_from_clocks(
     # Reacquire the exact current Alpha rings before campaign recovery proceeds.
     ppb_refresh = _refresh_ppb_checkpoint_from_proved_alpha()
 
+    recovery_receipt: Optional[Dict[str, Any]] = None
+    if saved_ppb_checkpoint is not None:
+        source_detail_id = _as_int(detail.get("_db_detail_id"))
+        source_stats = clocks.get("stats") if isinstance(clocks, dict) else None
+        source_reset = (
+            _as_int(source_stats.get("reset_count")) if isinstance(source_stats, dict) else None
+        )
+        source_update = (
+            _as_int(source_stats.get("update_count")) if isinstance(source_stats, dict) else None
+        )
+        proof_sequence = _as_int(proof.get("durable_proof_sequence"))
+        if (
+            source_detail_id is None
+            or source_reset is None
+            or source_update is None
+            or proof_sequence is None
+        ):
+            raise RuntimeError("startup Alpha resurrection receipt lacks exact proof identity")
+        boundary_detail_id = _find_clocks_exact_recovery_boundary_detail_id(
+            source_detail_id=int(source_detail_id),
+            source_reset_count=int(source_reset),
+            source_update_count=int(source_update),
+            proof_sequence=int(proof_sequence),
+        )
+        recovery_receipt = _record_clocks_recovery_receipt(
+            boundary_detail_id=boundary_detail_id,
+            source_detail=detail,
+            source_checkpoint=saved_ppb_checkpoint,
+            recovery_mode="STARTUP_ALPHA_RESURRECTION",
+            proof=proof,
+            alpha_proof_detail_id=boundary_detail_id,
+        )
+
     result = {
         "success": True,
         "mode": "HOLISTIC_INSTRUMENT",
@@ -8076,6 +8465,7 @@ def _restore_instrument_from_clocks(
         "better_buckets": ppb_stage,
         "better_buckets_post_resurrection_refresh": ppb_refresh,
         "proof": proof,
+        "recovery_receipt": copy.deepcopy(recovery_receipt),
     }
     verdict = _HolisticInstrumentVerdict(
         alpha_disposition="RESURRECTED",
@@ -15329,6 +15719,42 @@ def _restore_active_campaign_state(
         projection_details=gnss_raw_projection,
     )
 
+    if not isinstance(cold_bootstrap_supersede, dict):
+        raise RuntimeError("dead-producer CLOCKS recovery lacks durable first-public boundary")
+    alpha_proof_sequence = _as_int(combined_alpha_proof.get("durable_proof_sequence"))
+    source_stats = combined_recovery_clocks.get("stats")
+    source_reset_count = (
+        _as_int(source_stats.get("reset_count")) if isinstance(source_stats, dict) else None
+    )
+    source_update_count = (
+        _as_int(source_stats.get("update_count")) if isinstance(source_stats, dict) else None
+    )
+    if (
+        alpha_proof_sequence is None
+        or source_reset_count is None
+        or source_update_count is None
+    ):
+        raise RuntimeError("dead-producer CLOCKS receipt lacks exact Alpha proof chronology")
+    alpha_boundary_detail_id = _find_clocks_exact_recovery_boundary_detail_id(
+        source_detail_id=int(combined_source_detail_id),
+        source_reset_count=int(source_reset_count),
+        source_update_count=int(source_update_count),
+        proof_sequence=int(alpha_proof_sequence),
+    )
+    recovery_receipt = _record_clocks_recovery_receipt(
+        boundary_detail_id=int(cold_bootstrap_supersede["recovered_detail_id"]),
+        source_detail=combined_recovery_detail,
+        source_checkpoint=cold_ppb_checkpoint,
+        recovery_mode=recover_mode,
+        proof=combined_alpha_proof,
+        alpha_proof_detail_id=alpha_boundary_detail_id,
+        campaign_name=campaign_name,
+        source_public_count=int(last_pps_vclock_count),
+        expected_first_public_count=int(expected_first_public_pps_vclock_count),
+        elapsed_seconds=int(elapsed_seconds),
+    )
+    _diag["last_recovery"]["recovery_receipt"] = copy.deepcopy(recovery_receipt)
+
     _accepted_pps_vclock_count = seed_pps_vclock_count
     _last_pps_vclock_count_seen = seed_pps_vclock_count
     _diag["accepted_pps_count"] = _accepted_pps_vclock_count
@@ -15409,6 +15835,7 @@ def _restore_active_campaign_state(
         "first_public_pps_vclock_count": int(teensy_pps_vclock_count),
         "science_clean": bool(recovery_admission_verdict.get("fully_clean")),
         "combined_instrument_restore": combined_instrument_restore,
+        "recovery_receipt": copy.deepcopy(recovery_receipt),
     }
 
 

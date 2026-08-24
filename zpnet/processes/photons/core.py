@@ -38,6 +38,7 @@ inventing it.  Physical edge ancestry is always reacquired after restart.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 from collections import deque
 from dataclasses import dataclass
@@ -112,6 +113,7 @@ PHOTONS_PPB_PI_CHECKPOINT_SCHEMA = "PI_PHOTONS_PPB_RESTORE_CHECKPOINT_V1"
 PHOTONS_RECOVERY_CONFIG_KEY = "PHOTONS_RECOVERY"
 PHOTONS_RECOVERY_SNAPSHOT_SCHEMA = "PI_PHOTONS_RECOVERY_SNAPSHOT_V1"
 PHOTONS_RECOVERY_DESIRED_STATE_SCHEMA = "PI_PHOTONS_RECOVERY_DESIRED_STATE_V1"
+PHOTONS_RECOVERY_RECEIPT_SCHEMA = "PI_PHOTONS_RECOVERY_RECEIPT_V1"
 
 TEENSY_CAMPAIGN_START_ACCEPTED_STATUSES = {"start_requested", "flash_cut_requested"}
 TEENSY_CAMPAIGN_STOP_ACCEPTED_STATUSES = {"stop_requested"}
@@ -2088,6 +2090,297 @@ def _read_photons_recovery_config() -> Optional[Dict[str, Any]]:
     if isinstance(payload, str):
         payload = json.loads(payload)
     return _normalize_saved_ppb_checkpoint(payload)
+
+
+def _photons_checkpoint_receipt_summary(
+    checkpoint: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Fingerprint one exact private PHOTONS checkpoint without copying its rings."""
+    if checkpoint is None:
+        return {
+            "schema": PHOTONS_PPB_PI_CHECKPOINT_SCHEMA,
+            "sha256": None,
+            "digest_available": False,
+            "digest_reason": "SOURCE_CHECKPOINT_NOT_RETAINED_ACROSS_PRIOR_COMMIT",
+        }
+    saved = _normalize_saved_ppb_checkpoint(checkpoint)
+    encoded = json.dumps(saved, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return {
+        "schema": saved.get("schema"),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "digest_available": True,
+        "reset_count": int(saved["reset_count"]),
+        "update_count": int(saved["update_count"]),
+        "current_sequence": int(saved["current_sequence"]),
+        "recoverable": bool(saved.get("recoverable")),
+        "status": str(saved.get("status") or ""),
+        "second_count": int(saved.get("second_count") or 0),
+        "expected_second_count": int(saved.get("expected_second_count") or 0),
+        "minute_count": int(saved.get("minute_count") or 0),
+        "expected_minute_count": int(saved.get("expected_minute_count") or 0),
+        "gap_count": int(saved.get("gap_count") or 0),
+    }
+
+
+def _find_photons_recovery_source_detail_id(
+    *,
+    boundary_detail_id: int,
+    source_sequence: int,
+    source_reset_count: int,
+    source_update_count: int,
+) -> int:
+    """Resolve firmware source identity to exactly one earlier canonical PHOTONS row."""
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id
+            FROM campaign_detail
+            WHERE campaign_type = %s
+              AND id < %s
+              AND payload #>> '{schema}' = %s
+              AND payload #>> '{sequence}' = %s
+              AND payload #>> '{photons,stats,reset_count}' = %s
+              AND payload #>> '{photons,stats,update_count}' = %s
+            ORDER BY id DESC
+            LIMIT 2
+            """,
+            (
+                CAMPAIGN_TYPE_LANTERN,
+                int(boundary_detail_id),
+                PHOTONS_SCHEMA,
+                str(int(source_sequence)),
+                str(int(source_reset_count)),
+                str(int(source_update_count)),
+            ),
+        )
+        rows = cur.fetchall()
+    if len(rows) != 1:
+        raise RuntimeError(
+            "PHOTONS recovery source identity is not unique: "
+            f"boundary={boundary_detail_id} sequence={source_sequence} "
+            f"reset/update={source_reset_count}/{source_update_count} rows={len(rows)}"
+        )
+    return int(rows[0]["id"])
+
+
+def _record_photons_recovery_receipt(
+    *,
+    proof: Dict[str, Any],
+    recovery_mode: str,
+    generation: int,
+    source: Optional[Dict[str, Any]],
+    source_identity: Optional[Dict[str, Any]] = None,
+    source_checkpoint: Optional[Dict[str, Any]] = None,
+    history: Optional[Dict[str, Any]] = None,
+    producer_mutated: bool,
+) -> Dict[str, Any]:
+    """Attach one immutable Pi receipt to the durable PHOTONS recovery proof row."""
+    boundary_id = _require_int(proof.get("detail_id"), "PHOTONS receipt proof.detail_id", minimum=1)
+    boundary_sequence_expected = _require_int(
+        proof.get("sequence"), "PHOTONS receipt proof.sequence", minimum=1
+    )
+    boundary_reset_expected = _require_int(
+        proof.get("reset_count"), "PHOTONS receipt proof.reset_count"
+    )
+    boundary_update_expected = _require_int(
+        proof.get("update_count"), "PHOTONS receipt proof.update_count", minimum=1
+    )
+
+    if source is not None:
+        source_id = _require_int(source.get("db_detail_id"), "PHOTONS receipt source.detail_id", minimum=1)
+        source_sequence = _require_int(source.get("sequence"), "PHOTONS receipt source.sequence", minimum=1)
+        source_reset = _require_int(source.get("reset_count"), "PHOTONS receipt source.reset_count")
+        source_update = _require_int(source.get("update_count"), "PHOTONS receipt source.update_count", minimum=1)
+        if source_checkpoint is None:
+            candidate = source.get("ppb_restore_checkpoint")
+            source_checkpoint = candidate if isinstance(candidate, dict) else None
+    else:
+        identity = _require_dict(source_identity, "PHOTONS receipt source_identity")
+        source_sequence = _require_int(identity.get("source_sequence"), "PHOTONS receipt source_sequence", minimum=1)
+        source_reset = _require_int(identity.get("source_reset_count"), "PHOTONS receipt source_reset_count")
+        source_update = _require_int(identity.get("source_update_count"), "PHOTONS receipt source_update_count", minimum=1)
+        source_id = _find_photons_recovery_source_detail_id(
+            boundary_detail_id=boundary_id,
+            source_sequence=source_sequence,
+            source_reset_count=source_reset,
+            source_update_count=source_update,
+        )
+
+    mode = str(recovery_mode).strip().upper()
+    exact_n_plus_1 = mode in {"HELD_RESTORE", "PENDING_RESTORE_PROOF"}
+    checkpoint_summary = _photons_checkpoint_receipt_summary(source_checkpoint)
+    if source_checkpoint is not None and (
+        int(checkpoint_summary["reset_count"]) != source_reset
+        or int(checkpoint_summary["update_count"]) != source_update
+    ):
+        raise RuntimeError("PHOTONS recovery receipt checkpoint chronology disagrees with source")
+
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT payload FROM campaign_detail WHERE id = %s AND campaign_type = %s FOR UPDATE",
+            (boundary_id, CAMPAIGN_TYPE_LANTERN),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise RuntimeError(
+                f"PHOTONS recovery receipt boundary detail_id={boundary_id} is missing"
+            )
+        boundary = row["payload"]
+        if isinstance(boundary, str):
+            boundary = json.loads(boundary)
+        if not isinstance(boundary, dict) or boundary.get("schema") != PHOTONS_SCHEMA:
+            raise RuntimeError("PHOTONS recovery receipt boundary is not PHOTONS_V1")
+        instrument = _require_dict(boundary.get("photons"), "PHOTONS receipt boundary.photons")
+        stats = _require_dict(instrument.get("stats"), "PHOTONS receipt boundary.stats")
+        recovery = _require_dict(instrument.get("recovery"), "PHOTONS receipt boundary.recovery")
+        boundary_sequence = _require_int(boundary.get("sequence"), "PHOTONS receipt boundary.sequence", minimum=1)
+        boundary_reset = _require_int(stats.get("reset_count"), "PHOTONS receipt boundary.reset_count")
+        boundary_update = _require_int(stats.get("update_count"), "PHOTONS receipt boundary.update_count", minimum=1)
+        if (
+            boundary_sequence != boundary_sequence_expected
+            or boundary_reset != boundary_reset_expected
+            or boundary_update != boundary_update_expected
+        ):
+            raise RuntimeError("PHOTONS recovery receipt proof identity changed after durability")
+        if _require_int(recovery.get("generation"), "PHOTONS receipt generation") != int(generation):
+            raise RuntimeError("PHOTONS recovery receipt generation disagrees with proof row")
+        if _require_bool(recovery.get("fresh_physical_ancestry"), "PHOTONS receipt fresh ancestry") is not True:
+            raise RuntimeError("PHOTONS recovery receipt boundary lacks fresh physical ancestry")
+        if exact_n_plus_1 and not (
+            boundary_sequence == source_sequence + 1
+            and boundary_reset == source_reset
+            and boundary_update == source_update + 1
+        ):
+            raise RuntimeError(
+                "PHOTONS recovery receipt boundary is not exact source N+1: "
+                f"source={source_sequence}/{source_reset}/{source_update} "
+                f"boundary={boundary_sequence}/{boundary_reset}/{boundary_update}"
+            )
+        if not exact_n_plus_1 and not (
+            boundary_sequence > source_sequence
+            and boundary_reset == source_reset
+            and boundary_update > source_update
+        ):
+            raise RuntimeError("PHOTONS live-adopt receipt boundary is not a monotonic descendant")
+
+        history_receipt: Optional[Dict[str, Any]] = None
+        if isinstance(history, dict):
+            history_receipt = {
+                "scope": history.get("history_scope"),
+                "truncated": bool(history.get("history_truncated")),
+                "staged_second_count": int(history.get("staged_second_count") or 0),
+                "staged_minute_count": int(history.get("staged_minute_count") or 0),
+                "surrendered_second_endpoints": int(
+                    history.get("surrendered_second_endpoints") or 0
+                ),
+                "surrendered_minute_endpoints": int(
+                    history.get("surrendered_minute_endpoints") or 0
+                ),
+            }
+
+        campaign = boundary.get("campaign")
+        campaign_receipt = None
+        if isinstance(campaign, dict):
+            campaign_receipt = {
+                "campaign": str(campaign.get("campaign") or ""),
+                "public_count": _require_int(
+                    campaign.get("public_count"),
+                    "PHOTONS receipt campaign.public_count",
+                    minimum=1,
+                ),
+                "start_after_sequence": _require_int(
+                    campaign.get("start_after_sequence"),
+                    "PHOTONS receipt campaign.start_after_sequence",
+                    minimum=1,
+                ),
+            }
+
+        receipt: Dict[str, Any] = {
+            "schema": PHOTONS_RECOVERY_RECEIPT_SCHEMA,
+            "subsystem": "PHOTONS",
+            "recorded_at_utc": _utc_now_z(),
+            "recovery_mode": mode,
+            "generation": int(generation),
+            "producer_mutated": bool(producer_mutated),
+            "source": {
+                "detail_id": int(source_id),
+                "sequence": int(source_sequence),
+                "reset_count": int(source_reset),
+                "update_count": int(source_update),
+            },
+            "checkpoint": checkpoint_summary,
+            "boundary": {
+                "detail_id": int(boundary_id),
+                "sequence": int(boundary_sequence),
+                "reset_count": int(boundary_reset),
+                "update_count": int(boundary_update),
+            },
+            "proof": {
+                "contract": (
+                    "EXACT_SOURCE_N_PLUS_1" if exact_n_plus_1 else "MONOTONIC_LIVE_DESCENDANT"
+                ),
+                "durable": True,
+                "fresh_physical_ancestry": True,
+            },
+        }
+        if history_receipt is not None:
+            receipt["history"] = history_receipt
+        if campaign_receipt is not None:
+            receipt["campaign"] = campaign_receipt
+
+        existing = boundary.get("recovery_receipt")
+        if existing is not None:
+            if not isinstance(existing, dict):
+                raise RuntimeError("PHOTONS recovery boundary has malformed recovery_receipt")
+            existing_mode = str(existing.get("recovery_mode") or "").strip().upper()
+            mode_compatible = bool(
+                existing_mode == mode
+                or (mode == "PENDING_RESTORE_PROOF" and existing_mode == "HELD_RESTORE")
+            )
+            same_identity = bool(
+                existing.get("schema") == PHOTONS_RECOVERY_RECEIPT_SCHEMA
+                and _require_int(
+                    _require_dict(existing.get("source"), "existing PHOTONS receipt source").get("detail_id"),
+                    "existing PHOTONS receipt source.detail_id",
+                    minimum=1,
+                ) == source_id
+                and _require_int(
+                    _require_dict(existing.get("boundary"), "existing PHOTONS receipt boundary").get("detail_id"),
+                    "existing PHOTONS receipt boundary.detail_id",
+                    minimum=1,
+                ) == boundary_id
+                and mode_compatible
+            )
+            if not same_identity:
+                raise RuntimeError(
+                    f"PHOTONS recovery boundary detail_id={boundary_id} already has a different receipt"
+                )
+            return copy.deepcopy(existing)
+
+        cur.execute(
+            """
+            UPDATE campaign_detail
+            SET payload = jsonb_set(payload, '{recovery_receipt}', %s::jsonb, true)
+            WHERE id = %s AND campaign_type = %s
+            """,
+            (json.dumps(receipt, separators=(",", ":")), boundary_id, CAMPAIGN_TYPE_LANTERN),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError(
+                f"PHOTONS recovery receipt did not decorate exactly one boundary row: {boundary_id}"
+            )
+
+    logging.info(
+        "🧾 [photons/recovery] durable recovery receipt recorded: mode=%s source_id=%d "
+        "boundary_id=%d checkpoint_sha256=%s",
+        mode,
+        int(source_id),
+        int(boundary_id),
+        checkpoint_summary.get("sha256") or "UNAVAILABLE",
+    )
+    return receipt
 
 
 def _photons_recovery_source_row(
@@ -4510,6 +4803,16 @@ def _startup_finish_pending_recovery_proof(
     )
     _start_workers()
     proof = _wait_for_recovery_proof()
+    recovery_receipt = _record_photons_recovery_receipt(
+        proof=proof,
+        recovery_mode="PENDING_RESTORE_PROOF",
+        generation=generation,
+        source=None,
+        source_identity=recovery_report,
+        source_checkpoint=None,
+        history=None,
+        producer_mutated=True,
+    )
     _acknowledge_recovery_proof(proof)
     ppb_live_refresh = _refresh_ppb_checkpoint_from_live_photons()
 
@@ -4531,6 +4834,7 @@ def _startup_finish_pending_recovery_proof(
         "ingress_rows_preserved_at_worker_start": preserved,
         "live_floor": floor,
         "proof": proof,
+        "recovery_receipt": copy.deepcopy(recovery_receipt),
         "ppb_live_refresh": ppb_live_refresh,
         "campaign_adoption": campaign_adoption,
         "producer_reuse": False,
@@ -4699,6 +5003,15 @@ def _startup_held_restore(
         ppb_checkpoint_after_commit=checkpoint_after_commit,
     )
     proof = _wait_for_recovery_proof()
+    recovery_receipt = _record_photons_recovery_receipt(
+        proof=proof,
+        recovery_mode="HELD_RESTORE",
+        generation=generation,
+        source=source,
+        source_checkpoint=source.get("ppb_restore_checkpoint"),
+        history=literal_history,
+        producer_mutated=True,
+    )
     _acknowledge_recovery_proof(proof)
     _mark_active_campaign_recovered(
         active_master,
@@ -4730,6 +5043,7 @@ def _startup_held_restore(
         ),
         "proof_contract": "EXACT_SOURCE_N_PLUS_1",
         "proof": proof,
+        "recovery_receipt": copy.deepcopy(recovery_receipt),
         "campaign_restored_in_commit": campaign_restored_in_commit,
         "staged": staged,
     }

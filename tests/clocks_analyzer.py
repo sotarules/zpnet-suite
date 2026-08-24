@@ -9,11 +9,14 @@ is explicit:
   * PostgreSQL preserves testimony; it is never a substitute author of Alpha state.
   * TEMPEST is a campaign-relative view layered on the always-on CLOCKS instrument.
 
-The post-recovery CLOCKS format is intentionally self-proving.  Every durable row
-carries producer-authored Better-Buckets checkpoint/proof testimony, while Pi may
-also carry a literal bounded Better-Buckets resurrection image.  The analyzer
-therefore validates those witnesses directly.  Relational columns and partial
-indexes are navigation aids only; payload testimony remains authoritative.
+The post-recovery CLOCKS format is intentionally auditable.  Every durable row
+carries producer-authored Better-Buckets checkpoint/proof testimony.  Pi's literal
+bounded resurrection image is private continuation state in config.CLOCKS_RECOVERY;
+it is not copied into modern canonical rows.  A successful producer resurrection
+instead decorates the authoritative resumed row with a compact immutable
+``recovery_receipt`` binding the source row, private-checkpoint fingerprint, exact
+Alpha N+1 proof, and (for TEMPEST) projected first-public boundary.  Legacy embedded
+checkpoints remain readable as historical evidence.
 Database replay is used only as an independent adjacent-row cross-check when the
 required raw observations are actually present; gaps remain gaps.
 
@@ -49,6 +52,7 @@ CAMPAIGN_TYPE = "TEMPEST"
 FW_PPB_SCHEMA = "CLOCKS_PPB_CHECKPOINT_DELTA_V1"
 PI_PPB_SCHEMA = "PI_CLOCKS_PPB_RESTORE_CHECKPOINT_V1"
 RECOVERY_CUSTODY_SCHEMA = "PI_CLOCKS_RECOVERY_CUSTODY_V1"
+RECOVERY_RECEIPT_SCHEMA = "PI_CLOCKS_RECOVERY_RECEIPT_V1"
 
 NS_PER_SECOND = 1_000_000_000
 DWT_EXPECTED_PER_PPS = 1_008_000_000
@@ -537,6 +541,7 @@ class PiCheckpoint:
     seeded_from_durable: bool
     seed_source_db_detail_id: Optional[int]
     proof_checks: int
+    history_exhaustive: bool
 
     @classmethod
     def parse_optional(cls, obj: Any, where: str) -> Optional["PiCheckpoint"]:
@@ -575,19 +580,36 @@ class PiCheckpoint:
         if origin_valid and not current.monotonic_after(origin):
             raise ValueError(f"{where}: origin follows current")
 
-        def parse_history(name: str, capacity: int) -> Tuple[BetterEndpoint, ...]:
+        compact_history = bool(raw.get("__analyzer_compact_history") is True)
+
+        def parse_history(name: str, capacity: int) -> Tuple[Tuple[BetterEndpoint, ...], int]:
+            if compact_history:
+                count = req_int(
+                    raw.get(f"__analyzer_{name}_count"),
+                    f"{where}.__analyzer_{name}_count",
+                    minimum=0,
+                )
+                if count > capacity:
+                    raise ValueError(f"{where}.{name} exceeds capacity")
+                tail_obj = raw.get(f"__analyzer_{name}_tail")
+                if count == 0:
+                    if tail_obj is not None:
+                        raise ValueError(f"{where}.{name} has zero count but publishes a tail")
+                    return (), 0
+                tail = BetterEndpoint.parse(tail_obj, f"{where}.{name}[tail]")
+                if tail.rolling_sequence > current_sequence:
+                    raise ValueError(f"{where}.{name} tail extends past current")
+                return (tail,), count
+
             arr = req_list(raw.get(name), f"{where}.{name}")
             if len(arr) > capacity:
                 raise ValueError(f"{where}.{name} exceeds capacity")
             if not arr:
-                return ()
+                return (), 0
 
-            # Full literal ring custody is already producer/Pi testimony carried
-            # in this row.  The analyzer only consumes history length and tail
-            # downstream, so validate chronology/monotonicity directly from raw
-            # scalars and instantiate only the final endpoint.  This preserves
-            # the same court while avoiding thousands of BetterEndpoint objects
-            # per mature CLOCKS row.
+            # Deep mode validates every literal endpoint carried by the durable
+            # resurrection image.  Normal campaign auditing uses SQL-projected
+            # counts/tails instead so mature full rings do not dominate runtime.
             prev_sequence: Optional[int] = None
             prev_reference_ns: Optional[int] = None
             prev_interval_count: Optional[int] = None
@@ -608,8 +630,6 @@ class PiCheckpoint:
                     f"{where}.{name}[{idx}].interval_count",
                     minimum=0,
                 )
-                # Validate the remaining scalar fields even though only the tail
-                # is materialized as a BetterEndpoint object.
                 req_float(
                     node.get("dwt_error_cycles"),
                     f"{where}.{name}[{idx}].dwt_error_cycles",
@@ -637,12 +657,10 @@ class PiCheckpoint:
 
             return (
                 BetterEndpoint.parse(arr[-1], f"{where}.{name}[{len(arr) - 1}]"),
-            )
+            ), len(arr)
 
-        seconds = parse_history("second_history", PPB_SECOND_CAPACITY)
-        minutes = parse_history("minute_history", PPB_MINUTE_CAPACITY)
-        second_history_count = len(req_list(raw.get("second_history"), f"{where}.second_history"))
-        minute_history_count = len(req_list(raw.get("minute_history"), f"{where}.minute_history"))
+        seconds, second_history_count = parse_history("second_history", PPB_SECOND_CAPACITY)
+        minutes, minute_history_count = parse_history("minute_history", PPB_MINUTE_CAPACITY)
         if second_history_count > expected_second or minute_history_count > expected_minute:
             raise ValueError(f"{where}: literal history exceeds producer ring counts")
         if current_sequence > 0 and seconds and not seconds[-1].equal(current):
@@ -697,6 +715,7 @@ class PiCheckpoint:
             seeded_from_durable=bool(raw.get("seeded_from_durable") is True),
             seed_source_db_detail_id=opt_int(raw.get("seed_source_db_detail_id")),
             proof_checks=req_int(raw.get("proof_checks") or 0, f"{where}.proof_checks", minimum=0),
+            history_exhaustive=not compact_history,
         )
 
 
@@ -731,6 +750,77 @@ class RecoveryCustody:
             classified_at_utc=str(raw.get("classified_at_utc") or ""),
             regression_witness=d(raw.get("regression_witness")),
         )
+
+
+def parse_recovery_receipt_optional(obj: Any, where: str) -> Optional[Dict[str, Any]]:
+    """Parse the compact immutable Pi recovery attestation carried by one boundary row."""
+    if obj is None:
+        return None
+    raw = req_dict(obj, where)
+    if raw.get("schema") != RECOVERY_RECEIPT_SCHEMA:
+        raise ValueError(
+            f"{where} schema={raw.get('schema')!r}, expected {RECOVERY_RECEIPT_SCHEMA}"
+        )
+    if str(raw.get("subsystem") or "").strip().upper() != "CLOCKS":
+        raise ValueError(f"{where}.subsystem must be CLOCKS")
+    mode = str(raw.get("recovery_mode") or "").strip().upper()
+    if mode not in {"COLD_BOOTSTRAP", "STARTUP_ALPHA_RESURRECTION", "AMBIENT_ALPHA_RESURRECTION"}:
+        raise ValueError(f"{where}.recovery_mode={mode!r} is not a receipt-bearing restore mode")
+    if str(raw.get("producer_transition") or "").strip().upper() != "RESURRECTED":
+        raise ValueError(f"{where}.producer_transition must be RESURRECTED")
+
+    source = req_dict(raw.get("source"), f"{where}.source")
+    req_int(source.get("detail_id"), f"{where}.source.detail_id", minimum=1)
+    req_int(source.get("sequence"), f"{where}.source.sequence", minimum=1)
+    req_int(source.get("reset_count"), f"{where}.source.reset_count", minimum=0)
+    req_int(source.get("update_count"), f"{where}.source.update_count", minimum=0)
+
+    checkpoint = req_dict(raw.get("checkpoint"), f"{where}.checkpoint")
+    if checkpoint.get("schema") != PI_PPB_SCHEMA:
+        raise ValueError(f"{where}.checkpoint schema mismatch")
+    req_int(checkpoint.get("reset_count"), f"{where}.checkpoint.reset_count", minimum=0)
+    req_int(checkpoint.get("update_count"), f"{where}.checkpoint.update_count", minimum=0)
+    req_int(checkpoint.get("current_sequence"), f"{where}.checkpoint.current_sequence", minimum=0)
+    if not isinstance(checkpoint.get("recoverable"), bool):
+        raise ValueError(f"{where}.checkpoint.recoverable must be boolean")
+    for key in ("second_count", "expected_second_count", "minute_count", "expected_minute_count", "gap_count"):
+        req_int(checkpoint.get(key), f"{where}.checkpoint.{key}", minimum=0)
+    owner = checkpoint.get("durable_source_detail_id")
+    if owner is not None:
+        req_int(owner, f"{where}.checkpoint.durable_source_detail_id", minimum=1)
+
+    boundary = req_dict(raw.get("boundary"), f"{where}.boundary")
+    req_int(boundary.get("detail_id"), f"{where}.boundary.detail_id", minimum=1)
+    req_int(boundary.get("sequence"), f"{where}.boundary.sequence", minimum=1)
+    req_int(boundary.get("reset_count"), f"{where}.boundary.reset_count", minimum=0)
+    req_int(boundary.get("update_count"), f"{where}.boundary.update_count", minimum=0)
+
+    proof = req_dict(raw.get("proof"), f"{where}.proof")
+    if str(proof.get("contract") or "") != "EXACT_SOURCE_N_PLUS_1":
+        raise ValueError(f"{where}.proof.contract must be EXACT_SOURCE_N_PLUS_1")
+    if not isinstance(proof.get("durable"), bool) or not isinstance(proof.get("proved"), bool):
+        raise ValueError(f"{where}.proof durable/proved must be boolean")
+    req_int(proof.get("alpha_detail_id"), f"{where}.proof.alpha_detail_id", minimum=1)
+    req_int(proof.get("alpha_sequence"), f"{where}.proof.alpha_sequence", minimum=1)
+    req_int(proof.get("alpha_reset_count"), f"{where}.proof.alpha_reset_count", minimum=0)
+    req_int(proof.get("alpha_update_count"), f"{where}.proof.alpha_update_count", minimum=0)
+
+    campaign = raw.get("campaign")
+    if campaign is not None:
+        campaign = req_dict(campaign, f"{where}.campaign")
+        if not str(campaign.get("campaign") or "").strip():
+            raise ValueError(f"{where}.campaign.campaign missing")
+        req_int(campaign.get("first_public_detail_id"), f"{where}.campaign.first_public_detail_id", minimum=1)
+        req_int(campaign.get("source_public_count"), f"{where}.campaign.source_public_count", minimum=1)
+        req_int(campaign.get("expected_first_public_count"), f"{where}.campaign.expected_first_public_count", minimum=1)
+        req_int(campaign.get("actual_first_public_count"), f"{where}.campaign.actual_first_public_count", minimum=1)
+        req_int(campaign.get("elapsed_seconds"), f"{where}.campaign.elapsed_seconds", minimum=0)
+    return raw
+
+
+def valid_sha256(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    return len(text) == 64 and all(ch in "0123456789abcdef" for ch in text)
 
 
 # -----------------------------------------------------------------------------
@@ -795,6 +885,7 @@ class Row:
     campaign_status: str
 
     recovery: Optional[RecoveryCustody]
+    recovery_receipt: Optional[Dict[str, Any]]
     superseded: bool
 
     @classmethod
@@ -898,6 +989,9 @@ class Row:
             clocks.get("ppb_restore_checkpoint"), f"db_id={db_id}.clocks.ppb_restore_checkpoint"
         )
         recovery = RecoveryCustody.parse_optional(root.get("recovery_custody"), f"db_id={db_id}.recovery_custody")
+        recovery_receipt = parse_recovery_receipt_optional(
+            root.get("recovery_receipt"), f"db_id={db_id}.recovery_receipt"
+        )
 
         return cls(
             db_id=db_id,
@@ -958,6 +1052,7 @@ class Row:
             campaign_control_eligible=campaign_control_eligible,
             campaign_status=campaign_status,
             recovery=recovery,
+            recovery_receipt=recovery_receipt,
             superseded=bool(root.get("holistic_restore_superseded") is True),
         )
 
@@ -1021,9 +1116,17 @@ class GnssRawAuthority:
     ref_ns: int
 
 
+@dataclass(frozen=True)
+class PendingGnssRawReinstatement:
+    boundary_db_id: int
+    source: GnssRawAuthority
+    recovery_mode: str
+
+
 @dataclass
 class Audit:
     scope: str
+    deep_checkpoints: bool = False
     rows: int = 0
     authoritative_rows: int = 0
     superseded_rows: int = 0
@@ -1044,8 +1147,10 @@ class Audit:
     boundaries: Counter[str] = field(default_factory=Counter)
     recovery_classes: Counter[str] = field(default_factory=Counter)
     recovery_episodes: Dict[str, RecoveryEpisode] = field(default_factory=dict)
+    recovery_receipt_modes: Counter[str] = field(default_factory=Counter)
 
     physical_rebases: int = 0
+    recovery_receipts: int = 0
     durable_gaps: int = 0
     durable_missing_rows: int = 0
     stats_resets: int = 0
@@ -1070,6 +1175,14 @@ class Audit:
     # the durable Pi lineage.  Keep only the sufficient predecessor witness,
     # never the full canonical Row/checkpoint payload.
     gnss_raw_authoritative_by_n: Dict[int, "GnssRawAuthority"] = field(default_factory=dict)
+    # Keep only compact row identities so a receipt may independently point to a
+    # superseded exact-N+1 proof row without retaining tens of thousands of full payloads.
+    row_identity_by_db_id: Dict[int, Dict[str, Any]] = field(default_factory=dict)
+    receipt_status_by_db_id: Dict[int, str] = field(default_factory=dict)
+    pending_gnss_raw_reinstatement: Optional[PendingGnssRawReinstatement] = None
+    gnss_raw_reinstatement_pending_count: int = 0
+    gnss_raw_reinstatement_proved_count: int = 0
+    gnss_raw_reinstatement_bounded_count: int = 0
 
     def note(self, bucket: str, message: str) -> None:
         examples = self.examples.setdefault(bucket, [])
@@ -1226,7 +1339,9 @@ def check_pi_checkpoint(audit: Audit, row: Row) -> None:
     pi = row.pi_checkpoint
     fw = row.firmware_checkpoint
     if pi is None:
-        audit.proof("pi_resurrection_checkpoint", "unavailable")
+        # Modern CLOCKS keeps the literal Pi resurrection image private in
+        # config.CLOCKS_RECOVERY.  Its absence from a canonical row is intentional,
+        # not an unavailable proof.  Historical boundary proof is now the receipt.
         return
 
     failed = False
@@ -1274,10 +1389,13 @@ def check_pi_checkpoint(audit: Audit, row: Row) -> None:
 
     if pi.recoverable:
         audit.pi_checkpoint_recoverable_rows += 1
-        audit.proof("pi_resurrection_checkpoint", "failed" if failed else "passed")
+        audit.proof(
+            "legacy_embedded_pi_checkpoint",
+            "failed" if failed else "passed" if pi.history_exhaustive else "bounded",
+        )
     else:
         audit.pi_checkpoint_warming_rows += 1
-        audit.proof("pi_resurrection_checkpoint", "failed" if failed else "bounded")
+        audit.proof("legacy_embedded_pi_checkpoint", "failed" if failed else "bounded")
         audit.event(
             "pi_checkpoint_warming",
             row,
@@ -1523,6 +1641,13 @@ def check_welford_one_step(
 
 
 def classify_boundary(prev: Row, cur: Row) -> str:
+    # A durable receipt is stronger lifetime testimony than boot-local sequence
+    # arithmetic.  In particular, a newborn producer can numerically catch up to
+    # the prior sequence before its authoritative row is admitted.
+    if cur.recovery_receipt is not None:
+        source_id = opt_int(path(cur.recovery_receipt, "source.detail_id"))
+        if source_id == prev.db_id:
+            return "RECOVERY_RECEIPT_ALPHA_RESURRECTION"
     if cur.reset_count > prev.reset_count:
         return "STATS_RESET"
     if cur.reset_count < prev.reset_count:
@@ -1588,6 +1713,9 @@ def check_endpoint_append_delta(audit: Audit, prev: Row, cur: Row) -> None:
 def check_adjacent_authoritative(audit: Audit, prev: Row, cur: Row) -> str:
     boundary = classify_boundary(prev, cur)
     audit.boundaries[boundary] += 1
+    gnss_raw_already_adjudicated = adjudicate_pending_gnss_raw_reinstatement(
+        audit, prev, cur, boundary
+    )
 
     if cur.db_id <= prev.db_id:
         audit.problem("db_chronology", cur, f"id {prev.db_id}->{cur.db_id}")
@@ -1631,6 +1759,19 @@ def check_adjacent_authoritative(audit: Audit, prev: Row, cur: Row) -> str:
     if boundary == "PHYSICAL_SEQUENCE_REPEAT":
         audit.problem("physical_sequence_repeat", cur, f"sequence={cur.sequence}")
         audit.proof("physical_lifetime", "failed")
+        return boundary
+
+    if boundary == "RECOVERY_RECEIPT_ALPHA_RESURRECTION":
+        audit.physical_rebases += 1
+        audit.event(
+            "receipted_physical_lifetime_transition",
+            cur,
+            f"source_detail={prev.db_id} boundary_detail={cur.db_id} sequence={prev.sequence}->{cur.sequence} "
+            f"stats={prev.reset_count}/{prev.update_count}->{cur.reset_count}/{cur.update_count}",
+        )
+        receipt_status = audit.receipt_status_by_db_id.get(cur.db_id, "failed")
+        audit.proof("physical_lifetime", "failed" if receipt_status == "failed" else "passed")
+        check_resurrection_boundary(audit, prev, cur, boundary)
         return boundary
 
     if seq_delta > 0:
@@ -1677,7 +1818,9 @@ def check_adjacent_authoritative(audit: Audit, prev: Row, cur: Row) -> str:
                 cur,
                 f"update_count {prev.update_count}->{cur.update_count}; hidden rows are not replayed",
             )
-        check_pi_owned_gap(audit, prev, cur)
+        check_pi_owned_gap(
+            audit, prev, cur, gnss_raw_already_adjudicated=gnss_raw_already_adjudicated
+        )
         return boundary
 
     if boundary == "PHYSICAL_REBOOT_NEWBORN_ALPHA":
@@ -1721,7 +1864,9 @@ def check_adjacent_authoritative(audit: Audit, prev: Row, cur: Row) -> str:
         audit.proof("alpha_statistics_lineage", "passed")
         check_exact_one_row_statistics(audit, prev, cur)
         check_endpoint_append_delta(audit, prev, cur)
-        check_pi_owned_one_row(audit, prev, cur)
+        check_pi_owned_one_row(
+            audit, prev, cur, gnss_raw_already_adjudicated=gnss_raw_already_adjudicated
+        )
 
     return boundary
 
@@ -1797,7 +1942,125 @@ def prove_gnss_raw_reinstatement(audit: Audit, cur: Row) -> Optional[GnssRawAuth
     return source
 
 
-def check_pi_owned_one_row(audit: Audit, prev: Row, cur: Row) -> None:
+def gnss_raw_authority_from_row(row: Row) -> Optional[GnssRawAuthority]:
+    if (
+        row.gnss_raw_welford is None
+        or row.gnss_raw_clockface_n is None
+        or row.gnss_raw_ref_ns is None
+    ):
+        return None
+    return GnssRawAuthority(
+        db_id=row.db_id,
+        welford=row.gnss_raw_welford,
+        clockface_n=row.gnss_raw_clockface_n,
+        ref_ns=row.gnss_raw_ref_ns,
+    )
+
+
+def arm_receipted_gnss_raw_reinstatement(
+    audit: Audit, source: Row, boundary: Row
+) -> bool:
+    """Defer GNSS_RAW judgment across the COLD_BOOTSTRAP first-public handoff.
+
+    CLOCKS forms the canonical first-public row before the TEMPEST recovery thread
+    reinstalls Pi-owned GNSS_RAW.  Therefore that receipted row may still expose
+    newborn process-local GNSS_RAW.  The next authoritative row must independently
+    prove exact durable N+1 from the pre-reboot GNSS_RAW authority.
+    """
+    receipt = boundary.recovery_receipt
+    if receipt is None:
+        return False
+    if str(receipt.get("recovery_mode") or "").strip().upper() != "COLD_BOOTSTRAP":
+        return False
+    if audit.receipt_status_by_db_id.get(boundary.db_id) == "failed":
+        return False
+
+    source_authority = gnss_raw_authority_from_row(source)
+    if source_authority is None:
+        audit.event(
+            "gnss_raw_reinstatement_source_unavailable",
+            boundary,
+            f"source_db={source.db_id} lacks complete durable GNSS_RAW sufficient state",
+        )
+        audit.proof("pi_gnss_raw_lineage", "unavailable")
+        return True
+
+    if audit.pending_gnss_raw_reinstatement is not None:
+        previous = audit.pending_gnss_raw_reinstatement
+        audit.problem(
+            "gnss_raw_reinstatement_overlap",
+            boundary,
+            f"new boundary={boundary.db_id} arrived while boundary={previous.boundary_db_id} remained unresolved",
+        )
+        audit.proof("pi_gnss_raw_lineage", "failed")
+
+    audit.pending_gnss_raw_reinstatement = PendingGnssRawReinstatement(
+        boundary_db_id=boundary.db_id,
+        source=source_authority,
+        recovery_mode="COLD_BOOTSTRAP",
+    )
+    audit.gnss_raw_reinstatement_pending_count += 1
+    boundary_n = boundary.gnss_raw_welford.n if boundary.gnss_raw_welford is not None else None
+    audit.event(
+        "gnss_raw_reinstatement_pending",
+        boundary,
+        f"source_db={source.db_id} source_n={source_authority.welford.n} "
+        f"boundary_local_n={boundary_n}; next authoritative row must prove exact durable N+1",
+    )
+    return True
+
+
+def adjudicate_pending_gnss_raw_reinstatement(
+    audit: Audit, prev: Row, cur: Row, boundary_kind: str
+) -> bool:
+    """Close the one-row GNSS_RAW handoff obligation opened by COLD_BOOTSTRAP."""
+    pending = audit.pending_gnss_raw_reinstatement
+    if pending is None or prev.db_id != pending.boundary_db_id:
+        return False
+
+    exact = prove_gnss_raw_reinstatement(audit, cur)
+    if exact is not None and exact.db_id == pending.source.db_id:
+        audit.gnss_raw_reinstatement_proved_count += 1
+        audit.exact_gnss_raw_steps += 1
+        audit.event(
+            "gnss_raw_reinstatement_proved",
+            cur,
+            f"boundary_db={pending.boundary_db_id} source_db={exact.db_id} "
+            f"n={exact.welford.n}->{cur.gnss_raw_welford.n if cur.gnss_raw_welford else '?'} "
+            f"clockface_n={exact.clockface_n}->{cur.gnss_raw_clockface_n}",
+        )
+        audit.proof("pi_gnss_raw_lineage", "passed")
+        audit.pending_gnss_raw_reinstatement = None
+        return True
+
+    if boundary_kind == "DURABLE_OBSERVATION_GAP":
+        audit.gnss_raw_reinstatement_bounded_count += 1
+        audit.event(
+            "gnss_raw_reinstatement_obscured_by_gap",
+            cur,
+            f"boundary_db={pending.boundary_db_id} source_db={pending.source.db_id}; "
+            "the first post-recovery GNSS_RAW witness is absent from durable history",
+        )
+        audit.proof("pi_gnss_raw_lineage", "bounded")
+        audit.pending_gnss_raw_reinstatement = None
+        return True
+
+    observed_n = cur.gnss_raw_welford.n if cur.gnss_raw_welford is not None else None
+    audit.problem(
+        "gnss_raw_reinstatement_not_exact",
+        cur,
+        f"boundary_db={pending.boundary_db_id} source_db={pending.source.db_id} "
+        f"expected_n={pending.source.welford.n + 1} observed_n={observed_n} "
+        f"boundary_kind={boundary_kind}",
+    )
+    audit.proof("pi_gnss_raw_lineage", "failed")
+    audit.pending_gnss_raw_reinstatement = None
+    return True
+
+
+def check_pi_owned_one_row(
+    audit: Audit, prev: Row, cur: Row, *, gnss_raw_already_adjudicated: bool = False
+) -> None:
     for lane in ("ocxo1", "ocxo2"):
         name = f"{lane}_dac"
         p = prev.welfords[name]
@@ -1822,6 +2085,8 @@ def check_pi_owned_one_row(audit: Audit, prev: Row, cur: Row) -> None:
             audit.problem("dac_welford_population_jump", cur, f"{name} n {p.n}->{c.n}")
             audit.proof("pi_dac_lineage", "failed")
 
+    if gnss_raw_already_adjudicated:
+        return
     if prev.gnss_raw_welford is None or cur.gnss_raw_welford is None:
         audit.proof("pi_gnss_raw_lineage", "unavailable")
     else:
@@ -1876,7 +2141,9 @@ def check_pi_owned_one_row(audit: Audit, prev: Row, cur: Row) -> None:
                     audit.proof("pi_gnss_raw_lineage", "failed")
 
 
-def check_pi_owned_gap(audit: Audit, prev: Row, cur: Row) -> None:
+def check_pi_owned_gap(
+    audit: Audit, prev: Row, cur: Row, *, gnss_raw_already_adjudicated: bool = False
+) -> None:
     # Database gaps hide Pi observations.  The correct theorem is monotonicity,
     # not a fabricated sequence of one-sample recurrences.
     for lane in ("ocxo1_dac", "ocxo2_dac"):
@@ -1885,7 +2152,11 @@ def check_pi_owned_gap(audit: Audit, prev: Row, cur: Row) -> None:
             audit.proof("pi_dac_lineage", "failed")
         else:
             audit.proof("pi_dac_lineage", "bounded")
-    if prev.gnss_raw_welford is not None and cur.gnss_raw_welford is not None:
+    if (
+        not gnss_raw_already_adjudicated
+        and prev.gnss_raw_welford is not None
+        and cur.gnss_raw_welford is not None
+    ):
         if cur.gnss_raw_welford.n < prev.gnss_raw_welford.n:
             audit.problem(
                 "gnss_raw_welford_regression",
@@ -1895,6 +2166,242 @@ def check_pi_owned_gap(audit: Audit, prev: Row, cur: Row) -> None:
             audit.proof("pi_gnss_raw_lineage", "failed")
         else:
             audit.proof("pi_gnss_raw_lineage", "bounded")
+
+
+def check_recovery_receipt(audit: Audit, source: Optional[Row], boundary: Row) -> str:
+    """Adjudicate the immutable Pi receipt attached to an authoritative resumed row."""
+    receipt = boundary.recovery_receipt
+    if receipt is None:
+        return "absent"
+
+    audit.recovery_receipts += 1
+    mode = str(receipt.get("recovery_mode") or "").strip().upper() or "UNKNOWN"
+    audit.recovery_receipt_modes[mode] += 1
+    failed = False
+    bounded = False
+    if mode not in {"COLD_BOOTSTRAP", "STARTUP_ALPHA_RESURRECTION", "AMBIENT_ALPHA_RESURRECTION"}:
+        audit.problem("recovery_receipt_mode", boundary, f"mode={mode!r}")
+        failed = True
+    if str(receipt.get("producer_transition") or "").strip().upper() != "RESURRECTED":
+        audit.problem(
+            "recovery_receipt_transition",
+            boundary,
+            f"producer_transition={receipt.get('producer_transition')!r}",
+        )
+        failed = True
+
+    src = req_dict(receipt.get("source"), f"db_id={boundary.db_id}.receipt.source")
+    checkpoint = req_dict(
+        receipt.get("checkpoint"), f"db_id={boundary.db_id}.receipt.checkpoint"
+    )
+    resumed = req_dict(receipt.get("boundary"), f"db_id={boundary.db_id}.receipt.boundary")
+    proof = req_dict(receipt.get("proof"), f"db_id={boundary.db_id}.receipt.proof")
+
+    source_id = req_int(src.get("detail_id"), "receipt.source.detail_id", minimum=1)
+    source_sequence = req_int(src.get("sequence"), "receipt.source.sequence", minimum=1)
+    source_reset = req_int(src.get("reset_count"), "receipt.source.reset_count", minimum=0)
+    source_update = req_int(src.get("update_count"), "receipt.source.update_count", minimum=0)
+
+    source_identity = audit.row_identity_by_db_id.get(source_id)
+    if source is not None and source.db_id == source_id:
+        source_identity = {
+            "sequence": source.sequence,
+            "reset_count": source.reset_count,
+            "update_count": source.update_count,
+            "campaign": source.campaign_name,
+            "public_count": source.campaign_public_count,
+            "superseded": source.superseded,
+        }
+    if source_identity is None:
+        bounded = True
+        audit.event(
+            "recovery_receipt_source_out_of_scope",
+            boundary,
+            f"mode={mode} source_detail_id={source_id}",
+        )
+    else:
+        if (
+            int(source_identity["sequence"]) != source_sequence
+            or int(source_identity["reset_count"]) != source_reset
+            or int(source_identity["update_count"]) != source_update
+            or bool(source_identity.get("superseded"))
+        ):
+            audit.problem(
+                "recovery_receipt_source_identity",
+                boundary,
+                f"receipt={source_id}:{source_sequence}/{source_reset}/{source_update} "
+                f"durable={source_identity}",
+            )
+            failed = True
+
+    if (
+        req_int(resumed.get("detail_id"), "receipt.boundary.detail_id", minimum=1) != boundary.db_id
+        or req_int(resumed.get("sequence"), "receipt.boundary.sequence", minimum=1) != boundary.sequence
+        or req_int(resumed.get("reset_count"), "receipt.boundary.reset_count", minimum=0) != boundary.reset_count
+        or req_int(resumed.get("update_count"), "receipt.boundary.update_count", minimum=0) != boundary.update_count
+    ):
+        audit.problem("recovery_receipt_boundary_identity", boundary, f"boundary={resumed!r}")
+        failed = True
+
+    if str(checkpoint.get("schema") or "") != PI_PPB_SCHEMA:
+        audit.problem("recovery_receipt_checkpoint_schema", boundary, str(checkpoint.get("schema")))
+        failed = True
+    sha256 = checkpoint.get("sha256")
+    if not valid_sha256(sha256):
+        audit.problem("recovery_receipt_checkpoint_digest", boundary, f"sha256={sha256!r}")
+        failed = True
+    owner_id = opt_int(checkpoint.get("durable_source_detail_id"))
+    if owner_id not in (None, source_id):
+        audit.problem(
+            "recovery_receipt_checkpoint_owner", boundary, f"checkpoint={owner_id} source={source_id}"
+        )
+        failed = True
+    checkpoint_reset = req_int(checkpoint.get("reset_count"), "receipt.checkpoint.reset_count", minimum=0)
+    checkpoint_update = req_int(checkpoint.get("update_count"), "receipt.checkpoint.update_count", minimum=0)
+    checkpoint_current = req_int(
+        checkpoint.get("current_sequence"), "receipt.checkpoint.current_sequence", minimum=0
+    )
+    second_count = req_int(checkpoint.get("second_count"), "receipt.checkpoint.second_count", minimum=0)
+    expected_second = req_int(
+        checkpoint.get("expected_second_count"), "receipt.checkpoint.expected_second_count", minimum=0
+    )
+    minute_count = req_int(checkpoint.get("minute_count"), "receipt.checkpoint.minute_count", minimum=0)
+    expected_minute = req_int(
+        checkpoint.get("expected_minute_count"), "receipt.checkpoint.expected_minute_count", minimum=0
+    )
+    if (
+        checkpoint_reset != source_reset
+        or checkpoint_update != source_update
+        or checkpoint_current != source_update
+        or checkpoint.get("recoverable") is not True
+        or second_count != expected_second
+        or minute_count != expected_minute
+        or second_count > PPB_SECOND_CAPACITY
+        or expected_second > PPB_SECOND_CAPACITY
+        or minute_count > PPB_MINUTE_CAPACITY
+        or expected_minute > PPB_MINUTE_CAPACITY
+        or str(checkpoint.get("status") or "") != "RECOVERABLE"
+    ):
+        audit.problem(
+            "recovery_receipt_checkpoint_identity",
+            boundary,
+            f"source={source_reset}/{source_update} checkpoint={checkpoint_reset}/{checkpoint_update}/"
+            f"{checkpoint_current} second={second_count}/{expected_second} minute={minute_count}/{expected_minute} "
+            f"recoverable={checkpoint.get('recoverable')}",
+        )
+        failed = True
+
+    if (
+        str(proof.get("contract") or "") != "EXACT_SOURCE_N_PLUS_1"
+        or proof.get("durable") is not True
+        or proof.get("proved") is not True
+    ):
+        audit.problem("recovery_receipt_proof_contract", boundary, f"proof={proof!r}")
+        failed = True
+    alpha_detail_id = req_int(proof.get("alpha_detail_id"), "receipt.proof.alpha_detail_id", minimum=1)
+    alpha_sequence = req_int(proof.get("alpha_sequence"), "receipt.proof.alpha_sequence", minimum=1)
+    alpha_reset = req_int(proof.get("alpha_reset_count"), "receipt.proof.alpha_reset_count", minimum=0)
+    alpha_update = req_int(proof.get("alpha_update_count"), "receipt.proof.alpha_update_count", minimum=0)
+    if alpha_reset != source_reset or alpha_update != source_update + 1 or alpha_detail_id > boundary.db_id:
+        audit.problem(
+            "recovery_receipt_alpha_n_plus_1",
+            boundary,
+            f"source={source_reset}/{source_update} alpha={alpha_detail_id}:{alpha_sequence}/"
+            f"{alpha_reset}/{alpha_update}",
+        )
+        failed = True
+    alpha_identity = audit.row_identity_by_db_id.get(alpha_detail_id)
+    if alpha_detail_id == boundary.db_id:
+        alpha_identity = {
+            "sequence": boundary.sequence,
+            "reset_count": boundary.reset_count,
+            "update_count": boundary.update_count,
+            "superseded": boundary.superseded,
+        }
+    if alpha_identity is None:
+        bounded = True
+        audit.event(
+            "recovery_receipt_alpha_proof_out_of_scope",
+            boundary,
+            f"alpha_detail_id={alpha_detail_id}",
+        )
+    elif (
+        int(alpha_identity["sequence"]) != alpha_sequence
+        or int(alpha_identity["reset_count"]) != alpha_reset
+        or int(alpha_identity["update_count"]) != alpha_update
+    ):
+        audit.problem(
+            "recovery_receipt_alpha_identity",
+            boundary,
+            f"receipt={alpha_detail_id}:{alpha_sequence}/{alpha_reset}/{alpha_update} durable={alpha_identity}",
+        )
+        failed = True
+
+    campaign = receipt.get("campaign")
+    if mode == "COLD_BOOTSTRAP" and campaign is None:
+        audit.problem("recovery_receipt_campaign_missing", boundary, "COLD_BOOTSTRAP receipt lacks campaign")
+        failed = True
+    if mode != "COLD_BOOTSTRAP" and campaign is not None:
+        audit.problem(
+            "recovery_receipt_unexpected_campaign",
+            boundary,
+            f"mode={mode} campaign={campaign!r}",
+        )
+        failed = True
+    if campaign is not None:
+        c = req_dict(campaign, "receipt.campaign")
+        campaign_name = str(c.get("campaign") or "").strip()
+        first_public_id = req_int(
+            c.get("first_public_detail_id"), "receipt.campaign.first_public_detail_id", minimum=1
+        )
+        source_public = req_int(
+            c.get("source_public_count"), "receipt.campaign.source_public_count", minimum=1
+        )
+        expected_public = req_int(
+            c.get("expected_first_public_count"),
+            "receipt.campaign.expected_first_public_count",
+            minimum=1,
+        )
+        actual_public = req_int(
+            c.get("actual_first_public_count"), "receipt.campaign.actual_first_public_count", minimum=1
+        )
+        elapsed = req_int(c.get("elapsed_seconds"), "receipt.campaign.elapsed_seconds", minimum=0)
+        if (
+            campaign_name != (boundary.campaign_name or "")
+            or first_public_id != boundary.db_id
+            or actual_public != boundary.campaign_public_count
+            or expected_public != actual_public
+            or expected_public != source_public + elapsed + 1
+        ):
+            audit.problem(
+                "recovery_receipt_campaign_projection",
+                boundary,
+                f"receipt={campaign_name} source={source_public} elapsed={elapsed} "
+                f"expected/actual={expected_public}/{actual_public} boundary={boundary.campaign_name}/"
+                f"{boundary.campaign_public_count}",
+            )
+            failed = True
+        if source_identity is not None:
+            durable_campaign = source_identity.get("campaign")
+            durable_public = source_identity.get("public_count")
+            if durable_campaign not in (None, campaign_name) or durable_public not in (None, source_public):
+                audit.problem(
+                    "recovery_receipt_campaign_source",
+                    boundary,
+                    f"receipt={campaign_name}/{source_public} durable={durable_campaign}/{durable_public}",
+                )
+                failed = True
+
+    status = "failed" if failed else "bounded" if bounded else "passed"
+    audit.receipt_status_by_db_id[boundary.db_id] = status
+    audit.proof("recovery_receipt", status)
+    audit.event(
+        "recovery_receipt",
+        boundary,
+        f"mode={mode} source={source_id} alpha={alpha_detail_id} boundary={boundary.db_id} "
+        f"checkpoint_sha256={str(sha256)[:12]} status={status}",
+    )
+    return status
 
 
 def check_resurrection_boundary(audit: Audit, source: Row, boundary: Row, kind: str) -> None:
@@ -1926,18 +2433,21 @@ def check_resurrection_boundary(audit: Audit, source: Row, boundary: Row, kind: 
             audit.problem("resurrection_clockface", boundary, f"{label} {p}->{c} did not advance")
             failed = True
 
-    if boundary.pi_checkpoint is None:
-        audit.problem("resurrection_checkpoint_missing", boundary, "Pi resurrection checkpoint absent")
+    receipt_status = audit.receipt_status_by_db_id.get(boundary.db_id, "absent")
+    if receipt_status == "failed":
         failed = True
-    elif not boundary.pi_checkpoint.recoverable:
-        audit.problem(
-            "resurrection_checkpoint_unrecoverable",
-            boundary,
-            f"status={boundary.pi_checkpoint.status} second={boundary.pi_checkpoint.second_history_count}/"
-            f"{boundary.pi_checkpoint.expected_second_count} minute={boundary.pi_checkpoint.minute_history_count}/"
-            f"{boundary.pi_checkpoint.expected_minute_count}",
-        )
-        failed = True
+    elif receipt_status == "absent" and boundary.pi_checkpoint is not None:
+        # Historical embedded-checkpoint format: retain the old court when the
+        # evidence literally exists on the boundary row.
+        if not boundary.pi_checkpoint.recoverable:
+            audit.problem(
+                "resurrection_checkpoint_unrecoverable",
+                boundary,
+                f"status={boundary.pi_checkpoint.status} second={boundary.pi_checkpoint.second_history_count}/"
+                f"{boundary.pi_checkpoint.expected_second_count} minute={boundary.pi_checkpoint.minute_history_count}/"
+                f"{boundary.pi_checkpoint.expected_minute_count}",
+            )
+            failed = True
 
     # Statistical sufficient state must never regress.  Exact N+1 resurrection
     # allows each science population either to freeze (excluded row) or advance once.
@@ -1955,19 +2465,37 @@ def check_resurrection_boundary(audit: Audit, source: Row, boundary: Row, kind: 
         audit.proof("alpha_resurrection", "failed")
         return
 
-    if exact_n_plus_1:
+    if receipt_status == "passed":
         audit.event(
-            "alpha_resurrection_n_plus_1",
+            "alpha_resurrection_receipt_proved",
+            boundary,
+            f"source_detail={source.db_id} boundary_detail={boundary.db_id} "
+            f"stats={source.update_count}->{boundary.update_count}",
+        )
+        audit.proof("alpha_resurrection", "passed")
+    elif receipt_status == "bounded":
+        audit.event(
+            "alpha_resurrection_receipt_bounded",
+            boundary,
+            f"source_detail={source.db_id} boundary_detail={boundary.db_id}",
+        )
+        audit.proof("alpha_resurrection", "bounded")
+    elif exact_n_plus_1 and boundary.pi_checkpoint is not None and boundary.pi_checkpoint.recoverable:
+        audit.event(
+            "alpha_resurrection_n_plus_1_legacy_checkpoint",
             boundary,
             f"physical sequence {source.sequence}->{boundary.sequence}; stats update {source.update_count}->{boundary.update_count}",
         )
         audit.proof("alpha_resurrection", "passed")
     else:
-        # This can be a surviving/restored Alpha with unobserved post-source updates.
+        # Before recovery receipts existed, the canonical physical/statistical
+        # testimony may still prove a lawful forward resurrection, but the private
+        # Pi checkpoint used at that historical instant is no longer inspectable.
         audit.event(
-            "alpha_resurrection_with_unobserved_advancement",
+            "legacy_resurrection_without_receipt",
             boundary,
-            f"physical sequence {source.sequence}->{boundary.sequence}; stats update {source.update_count}->{boundary.update_count}",
+            f"physical sequence {source.sequence}->{boundary.sequence}; stats update "
+            f"{source.update_count}->{boundary.update_count}",
         )
         audit.proof("alpha_resurrection", "bounded")
 
@@ -1977,14 +2505,19 @@ def check_resurrection_boundary(audit: Audit, source: Row, boundary: Row, kind: 
         if boundary.welfords[name].n < source.welfords[name].n:
             audit.problem("pi_state_regression_at_resurrection", boundary, f"{name} n {source.welfords[name].n}->{boundary.welfords[name].n}")
             audit.proof("pi_dac_lineage", "failed")
-    if source.gnss_raw_welford is not None and boundary.gnss_raw_welford is not None:
-        if boundary.gnss_raw_welford.n < source.gnss_raw_welford.n:
-            audit.problem(
-                "pi_state_regression_at_resurrection",
-                boundary,
-                f"gnss_raw n {source.gnss_raw_welford.n}->{boundary.gnss_raw_welford.n}",
-            )
-            audit.proof("pi_gnss_raw_lineage", "failed")
+    gnss_raw_deferred = arm_receipted_gnss_raw_reinstatement(audit, source, boundary)
+    if (
+        not gnss_raw_deferred
+        and source.gnss_raw_welford is not None
+        and boundary.gnss_raw_welford is not None
+        and boundary.gnss_raw_welford.n < source.gnss_raw_welford.n
+    ):
+        audit.problem(
+            "pi_state_regression_at_resurrection",
+            boundary,
+            f"gnss_raw n {source.gnss_raw_welford.n}->{boundary.gnss_raw_welford.n}",
+        )
+        audit.proof("pi_gnss_raw_lineage", "failed")
 
 
 # -----------------------------------------------------------------------------
@@ -2011,7 +2544,12 @@ def observe_recovery_custody(audit: Audit, row: Row) -> None:
         ep.boundary_db_id = row.db_id
         ep.boundary_reset = row.reset_count
         ep.boundary_update = row.update_count
-        ep.ppb_recoverable = bool(row.pi_checkpoint and row.pi_checkpoint.recoverable)
+        receipt_checkpoint = d(row.recovery_receipt.get("checkpoint")) if row.recovery_receipt else {}
+        ep.ppb_recoverable = (
+            bool(receipt_checkpoint.get("recoverable") is True)
+            if receipt_checkpoint
+            else bool(row.pi_checkpoint and row.pi_checkpoint.recoverable)
+        )
         if source is not None:
             ep.source_db_id = source.db_id
             ep.source_reset = source.reset_count
@@ -2023,8 +2561,6 @@ def observe_recovery_custody(audit: Audit, row: Row) -> None:
                 and row.clock_dwt_cycles > source.clock_dwt_cycles
                 and row.clock_ocxo1_ns > source.clock_ocxo1_ns
                 and row.clock_ocxo2_ns > source.clock_ocxo2_ns
-                and row.pi_checkpoint is not None
-                and row.pi_checkpoint.recoverable
             )
             if recovery.classification == "RESTORED_RECOVERY_LINEAGE":
                 ep.lineage_status = "PROVED" if lineage_ok else "FAILED"
@@ -2035,7 +2571,7 @@ def observe_recovery_custody(audit: Audit, row: Row) -> None:
                         row,
                         f"generation={recovery.generation} source_db={source.db_id} boundary_db={row.db_id}",
                     )
-            elif recovery.classification == "LIVE_REATTACH_CONTINUITY":
+            elif recovery.classification in {"LIVE_REATTACH_CONTINUITY", "LIVE_PRODUCER_ADOPT_CONTINUITY"}:
                 # Live Alpha can advance while Pi is absent, so >source is enough.
                 ep.lineage_status = "PROVED" if lineage_ok else "FAILED"
                 audit.proof("recovery_custody", "passed" if lineage_ok else "failed")
@@ -2066,11 +2602,18 @@ def check_campaign_chronology(audit: Audit, row: Row, boundary: Optional[str]) -
                     "DURABLE_OBSERVATION_GAP",
                     "PHYSICAL_REBOOT_ALPHA_N_PLUS_1",
                     "PHYSICAL_REBOOT_ALPHA_CONTINUED",
+                    "RECOVERY_RECEIPT_ALPHA_RESURRECTION",
                 }
                 or (row.recovery is not None and row.recovery.restore_authority)
+                or row.recovery_receipt is not None
+            )
+            event_name = (
+                "campaign_elapsed_time_projection"
+                if row.recovery_receipt is not None and row.recovery_receipt.get("campaign") is not None
+                else "campaign_forward_splice"
             )
             audit.event(
-                "campaign_forward_splice",
+                event_name,
                 row,
                 f"{row.campaign_name} {prev.campaign_public_count}->{row.campaign_public_count} delta={delta} "
                 f"lawful_context={lawful}",
@@ -2105,6 +2648,14 @@ def process_row(audit: Audit, row: Row) -> None:
         audit.campaigns[row.campaign_name] += 1
 
     check_row_internal(audit, row)
+    audit.row_identity_by_db_id[row.db_id] = {
+        "sequence": row.sequence,
+        "reset_count": row.reset_count,
+        "update_count": row.update_count,
+        "campaign": row.campaign_name,
+        "public_count": row.campaign_public_count,
+        "superseded": row.superseded,
+    }
     observe_recovery_custody(audit, row)
 
     if row.superseded:
@@ -2133,6 +2684,8 @@ def process_row(audit: Audit, row: Row) -> None:
     audit.proof("restore_authority", "passed")
 
     prev = audit.last_authoritative
+    if row.recovery_receipt is not None:
+        check_recovery_receipt(audit, prev, row)
     boundary: Optional[str] = None
     if prev is not None:
         boundary = check_adjacent_authoritative(audit, prev, row)
@@ -2165,6 +2718,7 @@ class Args:
     batch_size: int
     pause_ms: int
     limit: int
+    deep_checkpoints: bool
 
 
 def campaign_bounds(campaign: str) -> Tuple[int, int]:
@@ -2225,6 +2779,28 @@ def iter_rows(args: Args) -> Iterator[Tuple[int, str, Dict[str, Any]]]:
         where.append("id <= %s")
         params.append(to_id)
 
+    if args.deep_checkpoints:
+        checkpoint_projection = """
+            payload #> '{clocks,ppb_restore_checkpoint}' AS ppb_restore_checkpoint_payload,
+            NULL::bigint AS ppb_second_history_count,
+            NULL::bigint AS ppb_minute_history_count,
+            NULL::jsonb AS ppb_second_history_tail,
+            NULL::jsonb AS ppb_minute_history_tail
+        """
+    else:
+        checkpoint_projection = """
+            (payload #> '{clocks,ppb_restore_checkpoint}') - 'second_history' - 'minute_history'
+                AS ppb_restore_checkpoint_payload,
+            jsonb_array_length(payload #> '{clocks,ppb_restore_checkpoint,second_history}')
+                AS ppb_second_history_count,
+            jsonb_array_length(payload #> '{clocks,ppb_restore_checkpoint,minute_history}')
+                AS ppb_minute_history_count,
+            (payload #> '{clocks,ppb_restore_checkpoint,second_history}') -> -1
+                AS ppb_second_history_tail,
+            (payload #> '{clocks,ppb_restore_checkpoint,minute_history}') -> -1
+                AS ppb_minute_history_tail
+        """
+
     sql = f"""
         SELECT
             id,
@@ -2232,6 +2808,7 @@ def iter_rows(args: Args) -> Iterator[Tuple[int, str, Dict[str, Any]]]:
             payload -> 'sequence' AS sequence_payload,
             payload -> 'campaign' AS campaign_payload,
             payload -> 'recovery_custody' AS recovery_custody_payload,
+            payload -> 'recovery_receipt' AS recovery_receipt_payload,
             payload -> 'holistic_restore_superseded' AS superseded_payload,
             payload #> '{{clocks,schema}}' AS clocks_schema_payload,
             payload #> '{{clocks,completed_pps_sequence}}' AS completed_pps_sequence_payload,
@@ -2243,7 +2820,7 @@ def iter_rows(args: Args) -> Iterator[Tuple[int, str, Dict[str, Any]]]:
             payload #> '{{clocks,stats}}' AS stats_payload,
             payload #> '{{clocks,control}}' AS control_payload,
             payload #> '{{clocks,gnss_raw}}' AS gnss_raw_payload,
-            payload #> '{{clocks,ppb_restore_checkpoint}}' AS ppb_restore_checkpoint_payload
+            {checkpoint_projection}
         FROM campaign_detail
         WHERE {' AND '.join(where)}
         ORDER BY id ASC
@@ -2272,10 +2849,19 @@ def iter_rows(args: Args) -> Iterator[Tuple[int, str, Dict[str, Any]]]:
             return value
 
         for dbrow in cur:
-            # Reconstitute only the canonical testimony actually consumed by
-            # Row.parse().  In particular, stats and ppb_restore_checkpoint
-            # remain complete because they are direct subjects of the proof
-            # ledger; unrelated SYSTEM/environment decoration stays in SQL.
+            # Reconstitute only canonical testimony consumed by Row.parse().
+            # Firmware stats remain complete.  The Pi checkpoint is either the
+            # literal full object (--deep-checkpoints) or an analyzer-only
+            # envelope containing every scalar plus SQL-derived ring counts/tails.
+            checkpoint = json_value(dbrow["ppb_restore_checkpoint_payload"])
+            if checkpoint is not None and not args.deep_checkpoints:
+                checkpoint = req_dict(checkpoint, "SQL-projected clocks.ppb_restore_checkpoint")
+                checkpoint["__analyzer_compact_history"] = True
+                checkpoint["__analyzer_second_history_count"] = dbrow["ppb_second_history_count"]
+                checkpoint["__analyzer_minute_history_count"] = dbrow["ppb_minute_history_count"]
+                checkpoint["__analyzer_second_history_tail"] = json_value(dbrow["ppb_second_history_tail"])
+                checkpoint["__analyzer_minute_history_tail"] = json_value(dbrow["ppb_minute_history_tail"])
+
             clocks: Dict[str, Any] = {
                 "schema": json_value(dbrow["clocks_schema_payload"]),
                 "completed_pps_sequence": json_value(dbrow["completed_pps_sequence_payload"]),
@@ -2287,7 +2873,7 @@ def iter_rows(args: Args) -> Iterator[Tuple[int, str, Dict[str, Any]]]:
                 "stats": json_value(dbrow["stats_payload"]),
                 "control": json_value(dbrow["control_payload"]),
                 "gnss_raw": json_value(dbrow["gnss_raw_payload"]),
-                "ppb_restore_checkpoint": json_value(dbrow["ppb_restore_checkpoint_payload"]),
+                "ppb_restore_checkpoint": checkpoint,
             }
             payload: Dict[str, Any] = {
                 "schema": CLOCKS_SCHEMA,
@@ -2302,6 +2888,10 @@ def iter_rows(args: Args) -> Iterator[Tuple[int, str, Dict[str, Any]]]:
             recovery_custody = json_value(dbrow["recovery_custody_payload"])
             if recovery_custody is not None:
                 payload["recovery_custody"] = recovery_custody
+
+            recovery_receipt = json_value(dbrow["recovery_receipt_payload"])
+            if recovery_receipt is not None:
+                payload["recovery_receipt"] = recovery_receipt
 
             superseded = json_value(dbrow["superseded_payload"])
             if superseded is not None:
@@ -2334,8 +2924,11 @@ def scope_report() -> None:
                     WHERE COALESCE((payload #>> '{holistic_restore_superseded}')::boolean, false)
                 ) AS superseded_rows,
                 count(*) FILTER (
-                    WHERE COALESCE((payload #>> '{clocks,ppb_restore_checkpoint,recoverable}')::boolean, false)
-                ) AS recoverable_checkpoint_rows
+                    WHERE payload #>> '{recovery_receipt,schema}' = 'PI_CLOCKS_RECOVERY_RECEIPT_V1'
+                ) AS recovery_receipt_rows,
+                count(*) FILTER (
+                    WHERE payload #> '{clocks,ppb_restore_checkpoint}' IS NOT NULL
+                ) AS legacy_embedded_checkpoint_rows
             FROM campaign_detail
             WHERE campaign_type = %s
               AND payload #>> '{schema}' = %s
@@ -2367,7 +2960,8 @@ def scope_report() -> None:
         f"ambient={int(totals.get('ambient_rows') or 0):,}   "
         f"campaign={int(totals.get('campaign_rows') or 0):,}   "
         f"superseded={int(totals.get('superseded_rows') or 0):,}   "
-        f"ppb_recoverable={int(totals.get('recoverable_checkpoint_rows') or 0):,}"
+        f"receipts={int(totals.get('recovery_receipt_rows') or 0):,}   "
+        f"legacy_embedded_ppb={int(totals.get('legacy_embedded_checkpoint_rows') or 0):,}"
     )
     print(f"Time: {totals.get('first_ts')} -> {totals.get('last_ts')}")
     print("\nRECENT CAMPAIGNS")
@@ -2382,7 +2976,8 @@ def scope_report() -> None:
     print("  clocks_analyzer.py --all")
     print("  clocks_analyzer.py CAMPAIGN")
     print("  clocks_analyzer.py --all --from-id N --to-id N")
-    print("  Optional: --batch-size N --pause-ms N --limit N")
+    print("  Optional: --batch-size N --pause-ms N --limit N --deep-checkpoints")
+    print("  --deep-checkpoints applies only to legacy rows that still embed Pi rings; modern recovery is receipted.")
     print("\nNamed campaign scope includes every CLOCKS_V4 row between that campaign's first and last durable IDs,")
     print("so ambient/recovery testimony inside the campaign interval is not accidentally hidden.")
 
@@ -2395,12 +2990,17 @@ def parse_args(argv: Sequence[str]) -> Args:
     batch_size = DEFAULT_BATCH_SIZE
     pause_ms = DEFAULT_PAUSE_MS
     limit = 0
+    deep_checkpoints = False
 
     idx = 1
     while idx < len(argv):
         arg = argv[idx]
         if arg == "--all":
             all_rows = True
+            idx += 1
+            continue
+        if arg == "--deep-checkpoints":
+            deep_checkpoints = True
             idx += 1
             continue
         if arg in {"--from-id", "--to-id", "--batch-size", "--pause-ms", "--limit"}:
@@ -2451,12 +3051,32 @@ def parse_args(argv: Sequence[str]) -> Args:
         raise SystemExit("numeric options must be non-negative; --batch-size must be > 0")
     if from_id and to_id and from_id > to_id:
         raise SystemExit("--from-id must be <= --to-id")
-    return Args(campaign, all_rows, from_id, to_id, batch_size, pause_ms, limit)
+    return Args(campaign, all_rows, from_id, to_id, batch_size, pause_ms, limit, deep_checkpoints)
 
 
 # -----------------------------------------------------------------------------
 # Report / verdict
 # -----------------------------------------------------------------------------
+
+
+def finalize_audit(audit: Audit) -> None:
+    pending = audit.pending_gnss_raw_reinstatement
+    if pending is None:
+        return
+
+    # The audit can end on the receipted first-public row while a live campaign is
+    # still producing the next second.  That is incomplete evidence, not a failed
+    # recovery.  As soon as any later authoritative row exists, the streaming court
+    # above requires exact reinstatement or records a bounded durable gap/failure.
+    audit.gnss_raw_reinstatement_bounded_count += 1
+    audit.events["gnss_raw_reinstatement_pending_at_audit_tail"] += 1
+    audit.note(
+        "event:gnss_raw_reinstatement_pending_at_audit_tail",
+        f"boundary_db={pending.boundary_db_id} source_db={pending.source.db_id} "
+        f"source_n={pending.source.welford.n}; no later authoritative row was in audit scope",
+    )
+    audit.proof("pi_gnss_raw_lineage", "bounded")
+    audit.pending_gnss_raw_reinstatement = None
 
 
 def proof_status(lane: ProofLane) -> str:
@@ -2487,17 +3107,29 @@ def print_report(audit: Audit) -> None:
     print(f"Durable gaps:         {audit.durable_gaps:,} ({audit.durable_missing_rows:,} absent row(s))")
     print(f"Stats epoch births:   {audit.stats_resets:,}")
     print(f"Campaign splices:     {audit.campaign_splices:,}")
+    print(f"Recovery receipts:    {audit.recovery_receipts:,}")
+    print(
+        "Legacy embedded Pi rings: "
+        + (
+            "DEEP full endpoint walk"
+            if audit.deep_checkpoints
+            else "COMPACT counts/tails (modern rows use receipt fingerprints)"
+        )
+    )
 
     print("\nDIRECT PROOF COVERAGE")
     print(f"  Firmware Better-Buckets window checks: {audit.firmware_ppb_window_checks:,}")
-    print(f"  Firmware↔Pi checkpoint cross-checks:    {audit.firmware_pi_checkpoint_crosschecks:,}")
-    print(f"  Recoverable Pi checkpoint rows:         {audit.pi_checkpoint_recoverable_rows:,}")
-    print(f"  Warming/incomplete Pi checkpoint rows:  {audit.pi_checkpoint_warming_rows:,}")
+    print(f"  Legacy firmware↔embedded-Pi checks:     {audit.firmware_pi_checkpoint_crosschecks:,}")
+    print(f"  Legacy recoverable embedded Pi rows:    {audit.pi_checkpoint_recoverable_rows:,}")
+    print(f"  Legacy warming embedded Pi rows:        {audit.pi_checkpoint_warming_rows:,}")
     print(f"  Raw→checkpoint adjacent append checks:  {audit.append_delta_checks:,}")
     print(f"  Exact Welford one-step proofs:          {audit.exact_welford_steps:,}")
     print(f"  Serialization-bounded Welford proofs:   {audit.bounded_welford_steps:,}")
     print(f"  Exact DAC recurrence proofs:            {audit.exact_dac_steps:,}")
     print(f"  Exact GNSS_RAW recurrence proofs:       {audit.exact_gnss_raw_steps:,}")
+    print(f"  GNSS_RAW recovery handoffs opened:      {audit.gnss_raw_reinstatement_pending_count:,}")
+    print(f"  GNSS_RAW recovery handoffs proved:      {audit.gnss_raw_reinstatement_proved_count:,}")
+    print(f"  GNSS_RAW recovery handoffs bounded:     {audit.gnss_raw_reinstatement_bounded_count:,}")
     print(f"  OCXO TAU closure checks:                {audit.tau_checks:,}")
     print(f"  TOTAL PPB closure checks:               {audit.total_ppb_checks:,}")
 
@@ -2518,6 +3150,13 @@ def print_report(audit: Audit) -> None:
             print(f"  {name:<28s} {count:,}")
     else:
         print("  none (ambient CLOCKS only)")
+
+    print("\nRECOVERY RECEIPTS")
+    if audit.recovery_receipt_modes:
+        for mode, count in audit.recovery_receipt_modes.most_common():
+            print(f"  {mode:<42s} {count:,}")
+    else:
+        print("  none (pre-receipt history may still be structurally bounded)")
 
     print("\nRECOVERY EPISODES")
     if not audit.recovery_episodes:
@@ -2545,7 +3184,8 @@ def print_report(audit: Audit) -> None:
         "firmware_checkpoint_structure",
         "firmware_ppb_window",
         "firmware_append_from_raw",
-        "pi_resurrection_checkpoint",
+        "legacy_embedded_pi_checkpoint",
+        "recovery_receipt",
         "pi_dac_lineage",
         "pi_gnss_raw_lineage",
         "alpha_resurrection",
@@ -2618,7 +3258,7 @@ def main(argv: Sequence[str]) -> int:
         return 0
 
     scope = args.campaign if args.campaign is not None else "ALL CLOCKS_V4"
-    audit = Audit(scope=scope)
+    audit = Audit(scope=scope, deep_checkpoints=args.deep_checkpoints)
     for db_id, ts, payload in iter_rows(args):
         try:
             row = Row.parse(db_id, ts, payload)
@@ -2632,6 +3272,7 @@ def main(argv: Sequence[str]) -> int:
             continue
         process_row(audit, row)
 
+    finalize_audit(audit)
     print_report(audit)
     return 1 if audit.problems else 0
 
