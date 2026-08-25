@@ -393,8 +393,15 @@ def _enter_hard_failure(
                 "hard_failure": copy.deepcopy(snapshot),
             }
         logging.critical(
-            "🛑 [photons] HARD_FAILURE LATCHED — refusing automatic continuation. %s",
-            json.dumps(snapshot, sort_keys=True, separators=(",", ":"), default=str),
+            "🛑 [photons] HARD_FAILURE LATCHED: reason=%s source=%s; "
+            "queues fragment=%d persistence=%d, latest fragment=%s latest canonical=%s. "
+            "Optical persistence and campaign mutation are stopped; read-only reports remain available.",
+            reason,
+            source,
+            int(context["fragment_queue_depth"]),
+            int(context["persist_queue_depth"]),
+            context.get("latest_fragment_sequence"),
+            context.get("latest_photons_sequence"),
         )
         return snapshot
 
@@ -4209,8 +4216,16 @@ def _ppb_checkpoint_reacquire_loop() -> None:
             _ppb_checkpoint_reacquire_last_result = copy.deepcopy(result)
             _ppb_checkpoint_reacquire_last_failure = None
         logging.info(
-            "✅ [photons/ppb] live Better-Buckets custody repaired and durable after Pi observation gap: %s",
-            result,
+            "✅ [photons/ppb] Better-Buckets custody repaired after a Pi observation gap: "
+            "reset=%d producer update=%d durable update=%d; second=%d minute=%d; "
+            "exact live rendezvous took %d attempt(s) in %.3fs",
+            int(result["reset_count"]),
+            int(result["update_count"]),
+            int(result["durable_update_count"]),
+            int(result["second_count"]),
+            int(result["minute_count"]),
+            int(result["attempts"]),
+            float(result["waited_s"]),
         )
 
 
@@ -5962,8 +5977,10 @@ def _state_loop() -> None:
                         _fragments_rejected += 1
                         _last_structural_rejection = rejection
                     logging.exception(
-                        "💥 [photons] PHOTONS_FRAGMENT rejected by structural/accounting court: %s",
-                        rejection,
+                        "💥 [photons] rejected PHOTONS fragment sequence=%s schema=%s: %s",
+                        rejection.get("sequence"),
+                        rejection.get("schema") or "unknown",
+                        rejection.get("reason") or "structural/accounting court failure",
                     )
                     continue
 
@@ -6624,7 +6641,15 @@ def cmd_clear(_: Optional[dict]) -> Dict[str, Any]:
     with _state_lock:
         _clear_count += 1
         _last_maintenance = copy.deepcopy(result)
-    logging.warning("🗑️ [photons] CLEAR: %s", result)
+    logging.warning(
+        "🗑️ [photons] LANTERN history cleared: %d detail row(s), %d campaign master row(s); "
+        "%d queued ingress and %d pending persistence item(s) drained. "
+        "The optical instrument continues measuring.",
+        int(detail_count),
+        int(master_count),
+        int(ingress_drained),
+        int(persist_drained),
+    )
     return {"success": True, "message": "OK", "payload": result}
 
 
@@ -6790,7 +6815,14 @@ def cmd_truncate(_: Optional[dict]) -> Dict[str, Any]:
     with _state_lock:
         _truncate_count += 1
         _last_maintenance = copy.deepcopy(result)
-    logging.warning("🧨 [photons] TRUNCATE: %s", result)
+    logging.warning(
+        "🧨 [photons] LANTERN database epoch truncated and identities restarted; "
+        "%d queued ingress and %d pending persistence item(s) drained; "
+        "server truncate success=%s",
+        int(ingress_drained),
+        int(persist_drained),
+        bool(result["server_truncate_success"]),
+    )
     return {"success": True, "message": "OK", "payload": result}
 
 
@@ -7465,7 +7497,13 @@ def _stats_reset_terminal_failure(
     with _state_lock:
         _stats_reset_failures += 1
         _last_maintenance = copy.deepcopy(failure)
-    logging.error("💥 [photons] asynchronous STATS_RESET failed: %s", failure)
+    logging.error(
+        "💥 [photons] asynchronous STATS_RESET failed during %s: %s "
+        "(expected reset_count=%s)",
+        failure.get("stage") or "unknown stage",
+        failure.get("error") or "unspecified failure",
+        failure.get("expected_reset_count"),
+    )
 
 
 def _stats_reset_arm_worker(requested_at: str, before: Dict[str, Any]) -> None:
@@ -7643,7 +7681,13 @@ def _note_stats_reset_persisted(photons: Dict[str, Any], detail_id: int) -> None
             with _state_lock:
                 _stats_reset_failures += 1
                 _last_maintenance = copy.deepcopy(failure)
-            logging.error("💥 [photons] STATS_RESET durable birth proof failed: %s", failure)
+            logging.error(
+                "💥 [photons] STATS_RESET reached firmware but durable row-1 proof failed: "
+                "%s (expected reset_count=%s observed detail_id=%s)",
+                failure.get("error") or "unspecified proof failure",
+                failure.get("expected_reset_count"),
+                failure.get("observed_durable_detail_id"),
+            )
             return
 
         try:
@@ -8106,7 +8150,20 @@ def run() -> None:
             reason="phase5_recovery_complete",
             source="RUN",
         )
-        logging.info("✅ [photons] Phase-5 recovery complete: %s", recovery)
+        proof = recovery.get("proof") if isinstance(recovery.get("proof"), dict) else {}
+        logging.info(
+            "✅ [photons] startup recovery complete: mode=%s producer_mutated=%s; "
+            "source detail=%s update=%s -> durable proof update=%s; "
+            "Better-Buckets history=%s%s; campaign_restored=%s",
+            recovery.get("mode") or "unknown",
+            bool(recovery.get("producer_mutated")),
+            recovery.get("source_detail_id") or "none",
+            recovery.get("source_update_count") or "n/a",
+            proof.get("update_count") or "n/a",
+            recovery.get("ppb_history_scope") or "not applicable",
+            " (truncated)" if recovery.get("ppb_history_truncated") else "",
+            bool(recovery.get("campaign_restored_in_commit")),
+        )
 
     logging.info(
         "🏁 [photons] entering main loop operational_state=%s",

@@ -1272,7 +1272,14 @@ def _dac_initialize_hardware() -> Dict[str, Any]:
             "readback_code": int(lane.readback_code) if observed else None,
         }
     _dac_hardware_initialized = bool(all_ok)
-    logging.info("🔧 [clocks/dac] Pi DAC custody initialized: %s", result)
+    logging.info(
+        "🔧 [clocks/dac] Pi owns both OCXO DACs: "
+        "OCXO1 code=%s configured=%s; OCXO2 code=%s configured=%s",
+        result["ocxo1"].get("readback_code"),
+        result["ocxo1"].get("configured"),
+        result["ocxo2"].get("readback_code"),
+        result["ocxo2"].get("configured"),
+    )
     return result
 
 
@@ -2795,8 +2802,15 @@ def _enter_hard_failure(
         )
         _diag["last_hard_failure_hold"] = copy.deepcopy(snapshot)
         logging.critical(
-            "🛑 [clocks] HARD_FAILURE LATCHED — refusing automatic continuation. %s",
-            json.dumps(snapshot, sort_keys=True, separators=(",", ":"), default=str),
+            "🛑 [clocks] HARD_FAILURE LATCHED: reason=%s source=%s; "
+            "last CLOCKS sequence=%s, queues clocks=%d persistence=%d TEMPEST=%d. "
+            "Scientific authorship and DAC control are stopped; read-only reports remain available.",
+            reason,
+            source,
+            context.get("last_clocks_sequence"),
+            int(context["queues"]["clocks_state"]),
+            int(context["queues"]["clocks_persistence"]),
+            int(context["queues"]["tempest"]),
         )
         return snapshot
 
@@ -3252,10 +3266,12 @@ def _begin_recovery_clocks_custody(
         )
     elif newly_proved_physical_regression:
         logging.error(
-            "🧾 [recovery/custody] physical CLOCKS sequence regression proves a new "
-            "Teensy lifetime inside custody: generation=%s witness=%s",
+            "🧾 [recovery/custody] a CLOCKS sequence regression proves the Teensy restarted "
+            "while recovery custody was open: generation=%s previous_sequence=%s "
+            "observed_sequence=%s; this lifetime requires cold producer classification",
             snapshot.get("generation"),
-            details,
+            details.get("previous_sequence"),
+            details.get("observed_sequence"),
         )
 
     _diag["recovery_custody_active"] = True
@@ -3778,17 +3794,17 @@ def _finalize_recovery_clocks_custody(
     )
     _diag["last_recovery_custody"] = copy.deepcopy(result)
     logging.info(
-        "✅ [recovery/custody] classified generation=%s mode=%s promoted=%d "
-        "superseded=%d source_id=%d boundary_id=%d lineage_proved=%s "
-        "timing=%s",
-        generation,
+        "✅ [recovery/custody] recovery evidence classified: mode=%s generation=%s; "
+        "%d row(s) promoted, %d superseded; source detail %d -> boundary %d; "
+        "instrument lineage proved=%s in %.3fs",
         str(recover_mode).upper(),
+        generation,
         promoted,
         superseded,
         int(source_detail_id),
         boundary_id,
         lineage_proved,
-        result.get("timing"),
+        float(result["timing"]["total_s"]),
     )
     return result
 
@@ -4149,12 +4165,12 @@ def _timebase_silence_recovery(reason: str, details: Dict[str, Any]) -> None:
                         _diag.get("auto_recovery_retries", 0) + 1
                     )
                     logging.warning(
-                        "⚠️ [clocks] CLOCKS_FRAGMENT silence recovery retryable failure "
-                        "(attempt %d/%d): %s details=%s — retrying after %.1fs",
+                        "⚠️ [clocks] CLOCKS stream recovery attempt %d/%d could not complete: %s "
+                        "(firmware status=%s). The attempt was cleaned up and will retry after %.1fs",
                         attempts,
                         int(AUTO_RECOVERY_MAX_ATTEMPTS),
                         e.reason,
-                        e.details,
+                        str((e.details or {}).get("status") or "not reported"),
                         float(AUTO_RECOVERY_RETRY_DELAY_S),
                         exc_info=True,
                     )
@@ -4334,8 +4350,10 @@ def _begin_auto_recovery(reason: str, details: Dict[str, Any], *, source: str) -
         return False
 
     logging.error(
-        "💥 [clocks] %s: %s details=%s — initiating auto-recovery",
-        source, reason, details,
+        "💥 [clocks] %s reported %s; CLOCKS is suspending campaign authorship "
+        "and starting automatic recovery",
+        source,
+        reason,
     )
 
     _auto_recovery_in_progress = True
@@ -4362,8 +4380,12 @@ def _begin_auto_recovery(reason: str, details: Dict[str, Any], *, source: str) -
                     if isinstance(e, RecoveryInterrupted):
                         _diag["auto_recovery_interrupted"] = _diag.get("auto_recovery_interrupted", 0) + 1
                     logging.warning(
-                        "⚠️ [clocks] auto-recovery attempt %d/%d retryable failure: %s details=%s",
-                        attempt, int(AUTO_RECOVERY_MAX_ATTEMPTS), e.reason, e.details,
+                        "⚠️ [clocks] automatic recovery attempt %d/%d could not complete: %s "
+                        "(firmware status=%s); cleaning the attempt before retry",
+                        attempt,
+                        int(AUTO_RECOVERY_MAX_ATTEMPTS),
+                        e.reason,
+                        str((e.details or {}).get("status") or "not reported"),
                     )
                     if not getattr(e, "cleanup_sent", False):
                         _cleanup_after_recovery_failure(e.reason, e.details)
@@ -4423,8 +4445,11 @@ def _hard_fault(reason: str, details: Dict[str, Any]) -> None:
         raise RuntimeError(f"HARD FAULT: {reason} (recovery already in progress)")
 
     logging.error(
-        "💥 [clocks] HARD FAULT: %s  details=%s — initiating auto-recovery",
-        reason, details,
+        "💥 [clocks] HARD FAULT: %s — campaign authorship is suspended and "
+        "automatic recovery is starting (sequence=%s public_count=%s)",
+        reason,
+        details.get("sequence") if isinstance(details, dict) else None,
+        details.get("public_count") if isinstance(details, dict) else None,
     )
 
     _auto_recovery_in_progress = True
@@ -7803,20 +7828,24 @@ def _log_holistic_restore_row_court(waited_s: float, *, phase: str) -> None:
     payload = response.get("payload") if isinstance(response, dict) else None
     if not isinstance(response, dict) or not response.get("success") or not isinstance(payload, dict):
         logging.warning(
-            "⚠️ [holistic restore] no fresh CLOCKS_FRAGMENT after %.1fs; "
-            "REPORT_ROW_COURT unavailable during %s: %r",
+            "⚠️ [holistic restore] no fresh CLOCKS row after %.1fs and the firmware "
+            "row court is unavailable during %s (success=%s message=%s)",
             float(waited_s),
             phase,
-            response,
+            bool(response.get("success")) if isinstance(response, dict) else False,
+            response.get("message") if isinstance(response, dict) else "malformed response",
         )
         return
 
     logging.info(
-        "⚖️ [holistic restore] no fresh CLOCKS_FRAGMENT after %.1fs; "
-        "Alpha row court (%s): %s",
+        "⚖️ [holistic restore] no fresh CLOCKS row after %.1fs; firmware row court "
+        "during %s reports status=%s sequence=%s ready=%s reason=%s",
         float(waited_s),
         phase,
-        json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str),
+        payload.get("status") or "not reported",
+        payload.get("sequence") or payload.get("completed_pps_sequence") or "n/a",
+        payload.get("ready") if "ready" in payload else payload.get("restore_court_ready"),
+        payload.get("reason") or payload.get("status_reason") or "none",
     )
 
 
@@ -7912,6 +7941,33 @@ def _wait_for_fresh_survival_witness() -> Tuple[Dict[str, Any], Optional[float],
                 f"(last_age_s={age_s})"
             )
         time.sleep(0.05)
+
+
+def _alpha_lineage_reason_summary(reasons: List[str]) -> str:
+    """Translate internal lineage reason codes into one operator-facing explanation."""
+    reason_set = set(str(reason) for reason in reasons)
+    parts: List[str] = []
+    if "statistics_reset_count_changed" in reason_set:
+        parts.append("the Teensy statistics epoch restarted")
+    if "statistics_update_count_regressed" in reason_set:
+        parts.append("the live statistics count is behind the durable count")
+    if "better_buckets_current_sequence_regressed" in reason_set:
+        parts.append("the live Better-Buckets history is younger than the durable history")
+    faces = [str(r).split(":",1)[1] for r in reasons if str(r).startswith("clockface_regressed_or_missing:")]
+    if faces:
+        pretty={"gnss_ns":"GNSS","dwt_cycles":"DWT","ocxo1_ns":"OCXO1","ocxo2_ns":"OCXO2"}
+        parts.append(f"{'/'.join(pretty.get(x,x) for x in faces)} clockfaces restarted or are missing")
+    if "canonical_live_not_coherent_instrument_state" in reason_set:
+        parts.append("the live CLOCKS row is not yet a coherent restore witness")
+    if "canonical_live_stale" in reason_set:
+        parts.append("the newest live CLOCKS row is stale")
+    if "canonical_live_not_current_lifetime_proven_pre_epoch" in reason_set:
+        parts.append("the current Alpha epoch is not installed yet")
+    known={"statistics_reset_count_changed","statistics_update_count_regressed","better_buckets_current_sequence_regressed","canonical_live_not_coherent_instrument_state","canonical_live_stale","canonical_live_not_current_lifetime_proven_pre_epoch"}
+    unknown=[str(r) for r in reasons if str(r) not in known and not str(r).startswith("clockface_regressed_or_missing:")]
+    if unknown:
+        parts.append("additional continuity evidence is incomplete")
+    return "; ".join(parts) if parts else "no continuity objection"
 
 
 def _alpha_survival_lineage_court(
@@ -8220,53 +8276,24 @@ def _restore_instrument_from_clocks(
             f"alpha_lineage:{reason}" for reason in alpha_lineage.get("reasons", [])
         )
 
-    logging.info(
-        "🧭 [holistic restore/live probe] REPORT_RECOVERY court: %s",
-        json.dumps(
-            {
-                "pi_active_campaign": active_campaign_name or None,
-                "firmware_campaign": firmware_campaign or None,
-                "firmware_campaign_state": firmware_campaign_state or None,
-                "recover_lifecycle_active": _recovery_bool(
-                    lifecycle_status.get("recover_lifecycle_active")
-                ),
-                "recover_mode": str(
-                    lifecycle_status.get("recover_mode") or ""
-                ).strip().upper() or None,
-                "producer_restore_active": _recovery_bool(
-                    lifecycle_status.get("producer_restore_active")
-                ),
-                "instrument_statistics_owner": alpha_owner or None,
-                "instrument_statistics_preserved": alpha_preserved,
-                "restore_court_ready": restore_court_ready,
-                "recover_epoch_ready": recover_epoch_ready,
-                "current_lifetime_pre_epoch": current_lifetime_pre_epoch,
-                "alpha_lineage": alpha_lineage,
-                "surviving_alpha_eligible": report_alpha_survived,
-                "decline_reasons": report_decline_reasons,
-                "canonical_live": {
-                    "sequence": _as_int(startup_live_clocks.get("sequence")),
-                    "received_at_utc": startup_live_received_utc,
-                    "age_s": (
-                        None
-                        if startup_live_age_s is None
-                        else round(float(startup_live_age_s), 3)
-                    ),
-                    "campaign": startup_live_campaign_name or None,
-                    "campaign_state": startup_live_campaign_state or None,
-                    "campaign_public_count": _as_int(
-                        startup_live_campaign.get("public_count")
-                        if isinstance(startup_live_campaign, dict)
-                        else None
-                    ),
-                },
-                "raw_report_recovery": copy.deepcopy(lifecycle_status),
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-            default=str,
-        ),
-    )
+    lineage_reasons = list(alpha_lineage.get("reasons") or [])
+    lineage_summary = _alpha_lineage_reason_summary(lineage_reasons)
+    if report_alpha_survived:
+        logging.info(
+            "✅ [holistic restore/live probe] the current Teensy is the same Alpha producer: "
+            "statistics continue %s -> %s in reset epoch %s; live CLOCKS sequence=%s "
+            "is %.3fs old. Firmware campaign=%s/%s.",
+            alpha_lineage.get("durable_update_count"), alpha_lineage.get("live_update_count"),
+            alpha_lineage.get("live_reset_count"), _as_int(startup_live_clocks.get("sequence")),
+            float(startup_live_age_s or 0.0), firmware_campaign or "none", firmware_campaign_state or "none",
+        )
+    else:
+        logging.info(
+            "🧭 [holistic restore/live probe] the current Teensy is not proved to be the durable Alpha producer: "
+            "statistics reset=%s->%s update=%s->%s; %s. A restore decision is required.",
+            alpha_lineage.get("durable_reset_count"), alpha_lineage.get("live_reset_count"),
+            alpha_lineage.get("durable_update_count"), alpha_lineage.get("live_update_count"), lineage_summary,
+        )
 
     if report_alpha_survived:
         logging.info(
@@ -8311,36 +8338,11 @@ def _restore_instrument_from_clocks(
     status = str(payload.get("status") or "")
     campaign_state = str(payload.get("campaign_state") or "").strip().upper()
     logging.info(
-        "🧭 [holistic restore/live probe] RESTORE_MONITOR court: %s",
-        json.dumps(
-            {
-                "status": status or None,
-                "campaign": str(payload.get("campaign") or "").strip() or None,
-                "campaign_state": campaign_state or None,
-                "alpha_lineage_proved": alpha_lineage_proved,
-                "alpha_lineage_reasons": alpha_lineage.get("reasons", []),
-                "decision": "INSTRUMENT_RESTORE_PATH",
-                "raw_restore_monitor": copy.deepcopy(payload),
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-            default=str,
-        ),
-    )
-    # The read-only REPORT_RECOVERY + canonical lineage court did not prove
-    # producer reuse. RESTORE_MONITOR is now a dead-producer court only; it is
-    # never allowed to create a second live-recovery branch.
-    # Emit the final classification before retiring evidence so the log preserves
-    # the exact reason we entered resurrection.
-    logging.info(
-        "🧭 [holistic restore/live probe] surviving Alpha custody not proved; "
-        "entering instrument restore path: REPORT_RECOVERY_reasons=%s "
-        "RESTORE_MONITOR_status=%s campaign_state=%s canonical_live_campaign=%s/%s",
-        report_decline_reasons,
-        status or "missing",
-        campaign_state or "missing",
-        startup_live_campaign_name or "missing",
-        startup_live_campaign_state or "missing",
+        "🧭 [holistic restore/live probe] firmware agrees that instrument recovery is required: "
+        "status=%s; firmware campaign=%s/%s; live canonical campaign=%s/%s. "
+        "The Pi will preserve the durable source and restore from it rather than adopt this newborn producer.",
+        status or "not reported", str(payload.get("campaign") or "").strip() or "none",
+        campaign_state or "none", startup_live_campaign_name or "none", startup_live_campaign_state or "none",
     )
 
     # When this exact durable CLOCKS observation also carries the active TEMPEST
@@ -13449,7 +13451,12 @@ def _process_loop() -> None:
         clocks_fragment = clocks_fragment if isinstance(clocks_fragment, dict) else {}
 
         if not isinstance(raw_campaign, dict) or state_sequence is None or state_sequence <= 0:
-            logging.error("💥 [clocks] processor received malformed V4 campaign piece: %s", piece)
+            logging.error(
+                "💥 [clocks] processor received a malformed TEMPEST campaign piece "
+                "(type=%s keys=%s); row rejected",
+                type(piece).__name__,
+                ",".join(sorted(piece.keys())) if isinstance(piece, dict) else "none",
+            )
             continue
 
         try:
@@ -13842,34 +13849,33 @@ def _request_teensy_start(
     if not isinstance(resp, dict) or not resp.get("success"):
         _diag["teensy_start_rejected"] = _diag.get("teensy_start_rejected", 0) + 1
         logging.error(
-            "💥 [start] Teensy CLOCKS.START transport/RPC failure: campaign='%s' response=%s",
+            "💥 [start] could not deliver CLOCKS.START for campaign '%s': "
+            "RPC success=%s message=%s",
             campaign,
-            json.dumps(resp, sort_keys=True, default=str),
+            bool(resp.get("success")) if isinstance(resp, dict) else False,
+            resp.get("message") if isinstance(resp, dict) else "malformed response",
         )
         raise TeensyStartRejected(status or "outer_rpc_failure", resp if isinstance(resp, dict) else {})
 
     if not isinstance(payload, dict) or not status:
         _diag["teensy_start_malformed"] = _diag.get("teensy_start_malformed", 0) + 1
         logging.error(
-            "💥 [start] Teensy CLOCKS.START returned no usable handler status: "
-            "campaign='%s' outer_message=%s response=%s",
+            "💥 [start] Teensy received CLOCKS.START for campaign '%s' but returned "
+            "no usable firmware status (message=%s)",
             campaign,
             resp.get("message"),
-            json.dumps(resp, sort_keys=True, default=str),
         )
         raise TeensyStartRejected("missing_handler_status", resp)
 
     if status not in _TEENSY_START_ACCEPTED_STATUSES:
         _diag["teensy_start_rejected"] = _diag.get("teensy_start_rejected", 0) + 1
         logging.error(
-            "💥 [start] Teensy CLOCKS.START REJECTED: campaign='%s' status='%s' "
-            "error=%r outer_success=%s outer_message=%r handler_payload=%s",
+            "💥 [start] Teensy rejected CLOCKS.START for campaign '%s': "
+            "firmware status=%s error=%s (RPC message=%s)",
             campaign,
             status,
-            payload.get("error"),
-            resp.get("success"),
-            resp.get("message"),
-            json.dumps(payload, sort_keys=True, default=str),
+            payload.get("error") or "not reported",
+            resp.get("message") or "none",
         )
         raise TeensyStartRejected(status, resp)
 
@@ -14538,7 +14544,13 @@ def _perform_transitive_stats_reset(
                 "pi_reset_applied": False,
             }
             _diag["last_stats_reset"] = failure
-            logging.error("❌ [clocks] Teensy rejected STATS_RESET; Pi stats preserved: %s", teensy_response)
+            logging.error(
+                "❌ [clocks] Teensy rejected STATS_RESET; Pi statistics were left untouched "
+                "(success=%s status=%s message=%s)",
+                bool(teensy_response.get("success")) if isinstance(teensy_response, dict) else False,
+                _path_get(teensy_response, "payload.status") or "not reported",
+                teensy_response.get("message") if isinstance(teensy_response, dict) else "malformed response",
+            )
             return {
                 "success": False,
                 "message": "Teensy CLOCKS.STATS_RESET rejected",
@@ -14644,7 +14656,10 @@ def _stats_reset_worker(*, requested_at: str, pi_before: Dict[str, Any]) -> None
         if not isinstance(response, dict):
             raise RuntimeError(f"CLOCKS STATS_RESET worker returned malformed result: {response!r}")
         if not response.get("success"):
-            logging.error("💥 [clocks] asynchronous STATS_RESET failed: %s", response)
+            logging.error(
+                "💥 [clocks] asynchronous STATS_RESET did not complete: %s",
+                response.get("message") or _path_get(response, "payload.error") or "unspecified failure",
+            )
     except Exception as exc:
         failure = {
             "requested_at_utc": requested_at,
@@ -14799,12 +14814,12 @@ def _hard_failure_stats_repair_worker(
         )
         _diag["last_hard_failure_stats_repair"] = copy.deepcopy(repair_record)
         logging.critical(
-            "🧯 [clocks] HARD_FAILURE statistics repair proved a clean durable epoch: "
-            "reset_count=%d detail_id=%d ancestry=%s. HARD_FAILURE remains latched; "
-            "restart CLOCKS to resume normal operation.",
+            "🧯 [clocks] HARD_FAILURE statistics repair created a clean durable epoch: "
+            "reset_count=%d detail_id=%d, population ancestry valid=%s. "
+            "HARD_FAILURE remains latched; restart CLOCKS to resume normal operation.",
             new_reset_count,
             int(row["id"]),
-            ancestry,
+            bool(ancestry.get("valid")) if isinstance(ancestry, dict) else False,
         )
     except Exception as exc:
         repair_record.update({
@@ -15360,20 +15375,11 @@ def _restore_active_campaign_state(
         )
 
     logging.info(
-        "📐 [recovery] LAST TIMEBASE:\r\n"
-        "    pps_vclock_count = %d\r\n"
-        "    gnss_ns    = %d\r\n"
-        "    dwt_cycles = %d\r\n"
-        "    dwt_ns_arg = %d\r\n"
-        "    ocxo1_ns   = %d\r\n"
-        "    ocxo2_ns   = %d\r\n"
-        "    gn_raw_ns  = %d\r\n"
-        "    gn_raw_ref = %d\r\n"
-        "    gn_raw_mean_ppb = %.6f\r\n"
-        "    gnss_time  = %s",
-        last_pps_vclock_count, last_gnss_ns, last_dwt_cycles, last_dwt_ns,
-        last_ocxo1_ns, last_ocxo2_ns, last_gnss_raw_ns, last_gnss_raw_ref_ns,
-        last_gnss_raw_welford_mean, last_gnss_time_str,
+        "📐 [recovery] durable source is public count=%d at GNSS time %s; "
+        "instrument clockfaces GNSS=%d ns DWT=%d cycles OCXO1=%d ns OCXO2=%d ns. "
+        "GNSS_RAW mean drift at that boundary was %.6f ppb.",
+        last_pps_vclock_count, last_gnss_time_str, last_gnss_ns, last_dwt_cycles,
+        last_ocxo1_ns, last_ocxo2_ns, last_gnss_raw_welford_mean,
     )
 
     # ------------------------------------------------------------------
@@ -15470,23 +15476,10 @@ def _restore_active_campaign_state(
     tau_ocxo2 = float(tau["ocxo2"])
 
     logging.info(
-        "📐 [recovery] GNSS ELAPSED:\r\n"
-        "    last_gnss_time    = %s\r\n"
-        "    current_gnss_time = %s\r\n"
-        "    elapsed_seconds   = %d",
-        last_gnss_time_str, current_gnss_time_str, elapsed_seconds,
-    )
-    logging.info(
-        "📐 [recovery] declarative projection: last=%d elapsed=%d base=%d "
-        "first_public=%d; gnss_base=%d dwt_cycles=%d ocxo1=%d ocxo2=%d",
-        last_pps_vclock_count,
-        elapsed_seconds,
-        recover_base_pps_vclock_count,
-        expected_first_public_pps_vclock_count,
-        projected_gnss_ns,
-        projected_dwt_cycles,
-        projected_ocxo1_ns,
-        projected_ocxo2_ns,
+        "📐 [recovery] GNSS says %d second(s) elapsed since the durable boundary (%s -> %s), "
+        "so campaign count %d projects to restore base=%d and the first resumed public row must be %d.",
+        elapsed_seconds, last_gnss_time_str, current_gnss_time_str, last_pps_vclock_count,
+        recover_base_pps_vclock_count, expected_first_public_pps_vclock_count,
     )
 
     recovery_source_db_id = int(combined_snapshot.source_detail_id)
@@ -15818,9 +15811,9 @@ def _restore_active_campaign_state(
             teensy_pps_vclock_count,
             expected_first_public_pps_vclock_count,
             first_public_offset,
-            recovery_admission_verdict.get("blocking_reasons"),
-            recovery_admission_verdict.get("state_reasons"),
-            recovery_admission_verdict.get("report_reason"),
+            ",".join(recovery_admission_verdict.get("blocking_reasons") or []) or "none",
+            ",".join(recovery_admission_verdict.get("state_reasons") or []) or "none",
+            recovery_admission_verdict.get("report_reason") or "none",
         )
 
         # Release the processor thread to discard this row while campaign
@@ -17321,7 +17314,16 @@ def cmd_set_dac(args: Optional[dict]) -> Dict[str, Any]:
             "persistence": "CLOCKS",
             "status": "ok" if ok1 and ok2 else "dac_write_fault",
         }
-    logging.info("🔧 [clocks] Pi-owned SET_DAC: %s", result)
+    logging.info(
+        "🔧 [clocks] DAC outputs set by Pi: OCXO1 code=%d (%.4f V), "
+        "OCXO2 code=%d (%.4f V), mode=%s status=%s",
+        int(result["ocxo1_dac_hw_code"]),
+        float(result["ocxo1_dac_voltage"]),
+        int(result["ocxo2_dac_hw_code"]),
+        float(result["ocxo2_dac_voltage"]),
+        result["realization_mode"],
+        result["status"],
+    )
     return {
         "success": bool(ok1 and ok2),
         "message": "OK" if ok1 and ok2 else "DAC write fault",
@@ -17641,7 +17643,21 @@ def run() -> None:
         result["startup_watchdog_reconciliation"] = (
             _reconcile_deferred_startup_watchdogs()
         )
-        logging.info("✅ [holistic restore] complete: %s", result)
+        instrument = result.get("instrument") if isinstance(result.get("instrument"), dict) else {}
+        campaign_result = result.get("campaign") if isinstance(result.get("campaign"), dict) else {}
+        instrument_proof = instrument.get("proof") if isinstance(instrument.get("proof"), dict) else {}
+        observed = instrument_proof.get("observed") if isinstance(instrument_proof.get("observed"), dict) else {}
+        logging.info(
+            "✅ [holistic restore] startup reconciliation complete: campaign=%s; "
+            "producer=%s mode=%s; restored statistics update=%s; "
+            "campaign first public=%s science_clean=%s",
+            result.get("active_campaign") or "none",
+            "resurrected" if instrument.get("producer_resurrected_this_startup") else "survived",
+            instrument.get("mode") or "no instrument restore",
+            observed.get("ppb_checkpoint_update_count") or observed.get("update_count") or "n/a",
+            campaign_result.get("first_public_pps_vclock_count") or "n/a",
+            campaign_result.get("science_clean") if campaign_result else "n/a",
+        )
     except HardFailureRequired:
         # The restore court has already latched HARD_FAILURE with exact evidence.
         pass
