@@ -814,6 +814,14 @@ static void capture_core_record_from_entry(
     const crash_forensics_entry_context_t* entry,
     uint32_t sequence) {
     crash_forensics_core_record_t& record = g_crash_forensics_core_record;
+    // Raw entry is already durable.  Persistently invalidate the prior core
+    // header before replacement so a deeper capture fault cannot resurrect an
+    // older CRC-valid core record from RAM2 after the dirty cache is lost.
+    record.magic = 0U;
+    record.magic_inv = 0U;
+    crash_barrier();
+    arm_dcache_flush_delete(&record, 32U);
+    crash_barrier();
     zero_core_record(record);
 
     record.magic = CRASH_FORENSICS_CORE_MAGIC;
@@ -958,47 +966,89 @@ static void capture_core_record_from_entry(
 }
 
 
-static uint32_t coherent_prior_sequence(void) {
-    if (core_record_crc_valid(g_crash_forensics_core_record)) {
-        return g_crash_forensics_core_record.capture_sequence;
-    }
-
-    const crash_forensics_record_t& record = g_crash_forensics_record;
-    if (record.magic != CRASH_FORENSICS_MAGIC ||
-        record.magic_inv != ~CRASH_FORENSICS_MAGIC ||
-        record.schema_version != CRASH_FORENSICS_SCHEMA_VERSION ||
-        record.record_size != sizeof(crash_forensics_record_t) ||
-        record.committed != CRASH_FORENSICS_COMMITTED ||
-        record.committed_inv != ~CRASH_FORENSICS_COMMITTED ||
-        record_crc32(record) != record.crc32) {
-        return 0U;
-    }
-    return record.capture_sequence;
-}
-
 // ============================================================================
 // Earliest raw fault-entry witness
 // ============================================================================
 
 static bool crash_raw_entry_valid(const crash_raw_entry_record_t& r) {
+    const bool stage_coherent =
+        (r.capture_stage ^ r.capture_stage_inv) == 0xFFFFFFFFUL;
+    const bool stage_valid =
+        r.capture_stage == CRASH_RAW_ENTRY_STAGE_SCALARS_COMMITTED ||
+        r.capture_stage == CRASH_RAW_ENTRY_STAGE_STACK_COMMITTED;
     return r.magic == CRASH_RAW_ENTRY_MAGIC &&
            r.magic_inv == ~CRASH_RAW_ENTRY_MAGIC &&
            r.schema_version == CRASH_RAW_ENTRY_SCHEMA_VERSION &&
            r.record_size == sizeof(crash_raw_entry_record_t) &&
            r.sequence != 0U &&
            (r.sequence ^ r.sequence_inv) == 0xFFFFFFFFUL &&
+           stage_coherent && stage_valid &&
            r.word_count <= CRASH_RAW_ENTRY_WORDS;
 }
 
-static void capture_raw_entry_witness(
-    const crash_forensics_entry_context_t* entry) {
-    crash_raw_entry_record_t& r = g_crash_raw_entry_record;
-    uint32_t sequence = r.sequence + 1U;
-    if (sequence == 0U) sequence = 1U;
+static bool crash_sequence_newer(uint32_t candidate, uint32_t current) {
+    return candidate != 0U &&
+           (current == 0U || (int32_t)(candidate - current) > 0);
+}
 
+static uint32_t coherent_prior_sequence(void) {
+    uint32_t newest = 0U;
+
+    if (core_record_crc_valid(g_crash_forensics_core_record)) {
+        newest = g_crash_forensics_core_record.capture_sequence;
+    }
+
+    const crash_forensics_record_t& record = g_crash_forensics_record;
+    const bool extended_valid =
+        record.magic == CRASH_FORENSICS_MAGIC &&
+        record.magic_inv == ~CRASH_FORENSICS_MAGIC &&
+        record.schema_version == CRASH_FORENSICS_SCHEMA_VERSION &&
+        record.record_size == sizeof(crash_forensics_record_t) &&
+        record.committed == CRASH_FORENSICS_COMMITTED &&
+        record.committed_inv == ~CRASH_FORENSICS_COMMITTED &&
+        record_crc32(record) == record.crc32;
+    if (extended_valid &&
+        crash_sequence_newer(record.capture_sequence, newest)) {
+        newest = record.capture_sequence;
+    }
+
+    if (crash_raw_entry_valid(g_crash_raw_entry_record) &&
+        crash_sequence_newer(g_crash_raw_entry_record.sequence, newest)) {
+        newest = g_crash_raw_entry_record.sequence;
+    }
+
+    return newest;
+}
+
+static void crash_raw_entry_publish_stage(
+    crash_raw_entry_record_t& r,
+    crash_raw_entry_stage_t stage) {
+    const uint32_t value = static_cast<uint32_t>(stage);
+    r.capture_stage_inv = value;
+    crash_barrier();
+    r.capture_stage = value;
+    r.capture_stage_inv = ~value;
+    crash_barrier();
+    arm_dcache_flush_delete(&r, sizeof(r));
+    crash_barrier();
+}
+
+static void capture_raw_entry_witness(
+    const crash_forensics_entry_context_t* entry,
+    uint32_t sequence) {
+    crash_raw_entry_record_t& r = g_crash_raw_entry_record;
+
+    // Persistently retire the previous raw witness before constructing this
+    // one.  Otherwise a fault before the final cache flush can reboot with the
+    // old RAM2 image still looking valid.
     r.magic = 0U;
+    r.magic_inv = 0U;
     r.sequence = 0U;
     r.sequence_inv = 0U;
+    r.capture_stage = CRASH_RAW_ENTRY_STAGE_NONE;
+    r.capture_stage_inv = ~CRASH_RAW_ENTRY_STAGE_NONE;
+    crash_barrier();
+    arm_dcache_flush_delete(&r, 32U);
     crash_barrier();
 
     r.schema_version = CRASH_RAW_ENTRY_SCHEMA_VERSION;
@@ -1009,10 +1059,32 @@ static void capture_raw_entry_witness(
     r.original_msp = entry->msp;
     r.original_psp = entry->psp;
     r.dwt_cyccnt = reg32(REG_DWT_CYCCNT);
+    r.primask = entry->primask;
+    r.basepri = entry->basepri;
+    r.faultmask = entry->faultmask;
+    r.control = entry->control;
+    r.r4 = entry->r4;
+    r.r5 = entry->r5;
+    r.r6 = entry->r6;
+    r.r7 = entry->r7;
+    r.r8 = entry->r8;
+    r.r9 = entry->r9;
+    r.r10 = entry->r10;
+    r.r11 = entry->r11;
     r.cfsr = reg32(REG_CFSR);
     r.hfsr = reg32(REG_HFSR);
     r.icsr = reg32(REG_ICSR);
     r.word_count = 0U;
+
+    // Commit the scalar witness before touching suspect stack memory.  If the
+    // bounded raw-frame copy itself faults, this record still proves the new
+    // exception identity, callee-saved registers, and control state.
+    r.sequence_inv = ~sequence;
+    r.sequence = sequence;
+    r.magic_inv = ~CRASH_RAW_ENTRY_MAGIC;
+    r.magic = CRASH_RAW_ENTRY_MAGIC;
+    crash_raw_entry_publish_stage(
+        r, CRASH_RAW_ENTRY_STAGE_SCALARS_COMMITTED);
 
     uintptr_t begin = 0U, end = 0U;
     if ((entry->frame_sp & 3U) == 0U &&
@@ -1024,15 +1096,9 @@ static void capture_raw_entry_witness(
             reinterpret_cast<volatile const uint32_t*>(entry->frame_sp);
         for (size_t i = 0U; i < count; ++i) r.words[i] = source[i];
         r.word_count = static_cast<uint32_t>(count);
+        crash_raw_entry_publish_stage(
+            r, CRASH_RAW_ENTRY_STAGE_STACK_COMMITTED);
     }
-
-    r.sequence_inv = ~sequence;
-    r.sequence = sequence;
-    r.magic_inv = ~CRASH_RAW_ENTRY_MAGIC;
-    r.magic = CRASH_RAW_ENTRY_MAGIC;
-    crash_barrier();
-    arm_dcache_flush_delete(&r, sizeof(r));
-    crash_barrier();
 }
 
 // ============================================================================
@@ -1043,12 +1109,18 @@ extern "C" void crash_forensics_capture_from_entry(
     const crash_forensics_entry_context_t* entry) {
     if (!entry) return;
 
-    // First durable act: preserve the untouched architectural stack image.
-    capture_raw_entry_witness(entry);
-
-    crash_forensics_record_t& record = g_crash_forensics_record;
+    // One capture identity spans the raw, core, extended, and execution-trace
+    // layers.  Include any surviving raw-only capture when choosing the next
+    // sequence so a failed deeper capture can never make an older structured
+    // record look contemporaneous with a newer fault.
     uint32_t sequence = coherent_prior_sequence() + 1U;
     if (sequence == 0U) sequence = 1U;
+
+    // First durable act: preserve scalar entry state, then the untouched
+    // architectural stack image as a second-stage best effort.
+    capture_raw_entry_witness(entry, sequence);
+
+    crash_forensics_record_t& record = g_crash_forensics_record;
 
     // Phase 1: commit the small, direct-read core record before any MPU walk,
     // executable-window inspection, or extended stack capture can fault.
@@ -1064,6 +1136,13 @@ extern "C" void crash_forensics_capture_from_entry(
     core_record_publish_stage(CRASH_FORENSICS_STAGE_EXTENDED_BEGIN);
 
     // Phase 2: preserve the existing rich recorder as best-effort evidence.
+    // The core record is already durable, so retire any prior extended header
+    // in backing RAM before constructing its replacement.
+    record.magic = 0U;
+    record.magic_inv = 0U;
+    crash_barrier();
+    arm_dcache_flush_delete(&record, 32U);
+    crash_barrier();
     zero_record(record);
     record.magic = CRASH_FORENSICS_MAGIC;
     record.magic_inv = ~CRASH_FORENSICS_MAGIC;

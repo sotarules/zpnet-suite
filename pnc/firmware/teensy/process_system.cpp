@@ -560,6 +560,14 @@ static FLASHMEM Payload system_raw_fault_entry_payload(
   out.add("schema_version", r.schema_version);
   out.add("record_size", r.record_size);
   out.add("sequence", r.sequence);
+  const bool stage_coherent =
+      (r.capture_stage ^ r.capture_stage_inv) == 0xFFFFFFFFUL;
+  out.add("capture_stage_coherent", stage_coherent);
+  out.add("capture_stage_id", r.capture_stage);
+  out.add("capture_stage",
+          !stage_coherent ? "INCOHERENT" :
+          r.capture_stage == CRASH_RAW_ENTRY_STAGE_STACK_COMMITTED
+              ? "STACK_COMMITTED" : "SCALARS_COMMITTED");
   out.add("exception_number", r.exception_number);
   out.add("exception_name", crash_forensics_exception_name(r.exception_number));
   system_crash_add_hex32(out, "exc_return", r.exc_return);
@@ -567,6 +575,22 @@ static FLASHMEM Payload system_raw_fault_entry_payload(
   system_crash_add_hex32(out, "original_msp", r.original_msp);
   system_crash_add_hex32(out, "original_psp", r.original_psp);
   system_crash_add_hex32(out, "dwt", r.dwt_cyccnt);
+  Payload control;
+  system_crash_add_hex32(control, "primask", r.primask);
+  system_crash_add_hex32(control, "basepri", r.basepri);
+  system_crash_add_hex32(control, "faultmask", r.faultmask);
+  system_crash_add_hex32(control, "control", r.control);
+  out.add_object("processor_control", control);
+  Payload callee_saved;
+  system_crash_add_hex32(callee_saved, "r4", r.r4);
+  system_crash_add_hex32(callee_saved, "r5", r.r5);
+  system_crash_add_hex32(callee_saved, "r6", r.r6);
+  system_crash_add_hex32(callee_saved, "r7", r.r7);
+  system_crash_add_hex32(callee_saved, "r8", r.r8);
+  system_crash_add_hex32(callee_saved, "r9", r.r9);
+  system_crash_add_hex32(callee_saved, "r10", r.r10);
+  system_crash_add_hex32(callee_saved, "r11", r.r11);
+  out.add_object("callee_saved", callee_saved);
   system_crash_add_hex32(out, "cfsr", r.cfsr);
   system_crash_add_hex32(out, "hfsr", r.hfsr);
   system_crash_add_hex32(out, "icsr", r.icsr);
@@ -2714,15 +2738,41 @@ static FLASHMEM Payload system_crash_report_payload(void) {
   crash_forensics_status_t status{};
   crash_forensics_get_status(&status);
   Payload processor;
+  processor.add("forensics_installed_now", status.installed);
   processor.add("core_present", status.core_present);
   processor.add("core_header_valid", status.core_header_valid);
   processor.add("core_crc_valid", status.core_crc_valid);
   processor.add("extended_present", status.extended_present);
   processor.add("extended_header_valid", status.header_valid);
   processor.add("extended_crc_valid", status.crc_valid);
+  const crash_raw_entry_record_t* raw_entry = crash_forensics_raw_entry_record();
+  processor.add("raw_entry_present", raw_entry != nullptr);
+  if (raw_entry) {
+    processor.add("raw_capture_sequence", raw_entry->sequence);
+    processor.add("raw_exception_number", raw_entry->exception_number);
+    system_crash_add_hex32(processor, "raw_exc_return", raw_entry->exc_return);
+    system_crash_add_hex32(processor, "raw_cfsr", raw_entry->cfsr);
+    system_crash_add_hex32(processor, "raw_hfsr", raw_entry->hfsr);
+  }
+
   const crash_forensics_core_record_t* core = crash_forensics_core_record();
+  const bool matches_raw =
+      raw_entry && core && raw_entry->sequence == core->capture_sequence;
+  const bool stale_against_raw =
+      raw_entry && core &&
+      (int32_t)(raw_entry->sequence - core->capture_sequence) > 0;
+  processor.add("structured_record_present", core != nullptr);
+  processor.add("structured_matches_raw", matches_raw);
+  processor.add("structured_evidence_stale", stale_against_raw);
+  processor.add("structured_capture_incomplete",
+                raw_entry && !matches_raw);
   if (core) {
-    processor.add("capture_sequence", core->capture_sequence);
+    processor.add("structured_capture_sequence", core->capture_sequence);
+    processor.add("structured_record_role",
+                  !raw_entry ? "UNPROVED_NO_RAW_WITNESS" :
+                  matches_raw ? "CURRENT_CAPTURE" :
+                  stale_against_raw ? "PRIOR_RETAINED_CAPTURE" :
+                  "SEQUENCE_DIVERGENCE");
     processor.add("exception_number", core->exception_number);
     system_crash_add_hex32(processor, "exc_return", core->exc_return);
     system_crash_add_hex32(processor, "pc", core->stacked_pc);
@@ -2741,8 +2791,12 @@ static FLASHMEM Payload system_crash_report_payload(void) {
 
   Payload detail;
   detail.add("crash_report_text", "SYSTEM.CRASH_REPORT_TEXT");
+  detail.add("raw_fault_entry", "SYSTEM.RAW_FAULT_ENTRY");
   detail.add("crash_policy", "SYSTEM.CRASH_POLICY");
   detail.add("execution_trace", "SYSTEM.EXECUTION_TRACE");
+  detail.add("stack_watch", "SYSTEM.STACK_WATCH");
+  detail.add("stack_tripwire", "SYSTEM.STACK_TRIPWIRE");
+  detail.add("dispatch_breadcrumb", "SYSTEM.DISPATCH_BREADCRUMB");
   detail.add("payload_flight", "SYSTEM.PAYLOAD_FLIGHT_INFO");
   detail.add("payload_fatal", "SYSTEM.PAYLOAD_FATAL_INFO");
   detail.add("payload_append_trace", "SYSTEM.PAYLOAD_APPEND_TRACE");
@@ -3837,6 +3891,32 @@ static FLASHMEM Payload cmd_payload_contract_info(const Payload& /*args*/) {
 }
 
 // ------------------------------------------------------------
+// RAW_FAULT_ENTRY — earliest independently committed exception witness
+// ------------------------------------------------------------
+static FLASHMEM Payload cmd_raw_fault_entry(const Payload& /*args*/) {
+  const crash_raw_entry_record_t* raw = crash_forensics_raw_entry_record();
+  Payload out;
+  out.add("present", raw != nullptr);
+  if (raw) out.add_object("raw_entry", system_raw_fault_entry_payload(*raw));
+  return out;
+}
+
+// ------------------------------------------------------------
+// STACK_WATCH / STACK_TRIPWIRE / DISPATCH_BREADCRUMB — focused witnesses
+// ------------------------------------------------------------
+static FLASHMEM Payload cmd_stack_watch(const Payload& /*args*/) {
+  return system_stack_watch_payload();
+}
+
+static FLASHMEM Payload cmd_stack_tripwire(const Payload& /*args*/) {
+  return system_stack_tripwire_payload();
+}
+
+static FLASHMEM Payload cmd_dispatch_breadcrumb(const Payload& /*args*/) {
+  return system_dispatch_breadcrumb_payload();
+}
+
+// ------------------------------------------------------------
 // CRASH_INFO — core CrashReport plus retained structured exception evidence
 // ------------------------------------------------------------
 static FLASHMEM Payload cmd_crash_info(const Payload& /*args*/) {
@@ -3949,7 +4029,11 @@ static const process_command_entry_t SYSTEM_COMMANDS[] = {
   { "GET_FEATURE",      cmd_get_feature      },
   { "CRASH_INFO",       cmd_crash_info       },
   { "CRASH_REPORT_TEXT", cmd_crash_report_text },
+  { "RAW_FAULT_ENTRY",  cmd_raw_fault_entry  },
   { "CRASH_POLICY",     cmd_crash_policy     },
+  { "STACK_WATCH",      cmd_stack_watch      },
+  { "STACK_TRIPWIRE",   cmd_stack_tripwire   },
+  { "DISPATCH_BREADCRUMB", cmd_dispatch_breadcrumb },
   { "CRASH_CLEAR",      cmd_crash_clear      },
   { "EXECUTION_TRACE", cmd_execution_trace },
   { "TIMEPOP_DISPATCH_INFO", cmd_timepop_dispatch_info },

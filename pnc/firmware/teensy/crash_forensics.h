@@ -322,17 +322,26 @@ const char* crash_forensics_capture_skip_reason_name(uint32_t reason);
 // Earliest raw fault-entry witness
 // ============================================================================
 
-static constexpr uint32_t CRASH_RAW_ENTRY_SCHEMA_VERSION = 1U;
+static constexpr uint32_t CRASH_RAW_ENTRY_SCHEMA_VERSION = 2U;
 static constexpr size_t CRASH_RAW_ENTRY_WORDS = 26U;
+
+enum crash_raw_entry_stage_t : uint32_t {
+    CRASH_RAW_ENTRY_STAGE_NONE = 0U,
+    CRASH_RAW_ENTRY_STAGE_SCALARS_COMMITTED = 1U,
+    CRASH_RAW_ENTRY_STAGE_STACK_COMMITTED = 2U,
+};
 
 struct crash_raw_entry_record_t {
     uint32_t magic, magic_inv, schema_version, record_size;
     uint32_t sequence, sequence_inv;
+    uint32_t capture_stage, capture_stage_inv;
     uint32_t exception_number, exc_return, frame_sp;
     uint32_t original_msp, original_psp, dwt_cyccnt;
+    uint32_t primask, basepri, faultmask, control;
+    uint32_t r4, r5, r6, r7, r8, r9, r10, r11;
     uint32_t cfsr, hfsr, icsr, word_count;
     uint32_t words[CRASH_RAW_ENTRY_WORDS];
-    uint32_t reserved[6];
+    uint32_t reserved[8];
 };
 
 static_assert((sizeof(crash_raw_entry_record_t) % 32U) == 0U,

@@ -58,8 +58,11 @@
  *   • CRASH_INFO — return a bounded crash index and focused drill-down command
  *     names; it never embeds the full retained black-box corpus
  *   • CRASH_REPORT_TEXT — return only the cached Teensyduino CrashReport text
+ *   • RAW_FAULT_ENTRY — return only the earliest retained exception witness
  *   • CRASH_POLICY — return live CPU/FPU exception policy plus a compact
  *     consistency analysis of retained core and extended exception frames
+ *   • STACK_WATCH / STACK_TRIPWIRE / DISPATCH_BREADCRUMB — focused retained
+ *     witnesses for stack writes, alien frame placement, and deferred dispatch
  *   • PAYLOAD_FATAL_INFO — return the retained fatal-construction record,
  *     including the public operation that stopped the firmware and its last
  *     internal Payload error breadcrumb
