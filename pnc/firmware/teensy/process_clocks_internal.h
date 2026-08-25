@@ -1242,20 +1242,19 @@ bool clocks_alpha_ocxo_public_origin_ready(void);
 // surviving producer is proved and adopted read-only by the Pi and never enters
 // firmware RECOVER. The helpers below therefore belong only to a proved physical
 // Alpha discontinuity: dead-producer desired-state restore.
-bool clocks_alpha_recover_rearm_interrupt_service(void);
 
 // Dead-producer restore may invoke this only after the Pi custody court has
 // proved that the previous Alpha ancestry is no longer physically present.
 void clocks_alpha_recover_reprime_ocxo_state(void);
 uint32_t clocks_alpha_recover_reprime_count(void);
 
-// Compact recovery reattachment proof.  RECOVER deliberately cuts OCXO
+// Compact recovery proof.  RECOVER deliberately cuts OCXO
 // measurement custody.  Readiness is layered: a fresh integer clockface may be
 // published before the stricter PhaseLedger/refined-interval science proof is
 // complete.  Beta may therefore publish an explicitly degraded timeline row,
 // but Welford and PPB remain gated until science_ready is true for both
 // lanes.  This surface is report/control-plane evidence only.
-struct clocks_alpha_recover_reattach_snapshot_t {
+struct clocks_alpha_recover_proof_snapshot_t {
   // Readiness is deliberately split.  clockface_ready proves that the lane
   // can publish a fresh post-RECOVER OCXO clockface.  science_ready additionally
   // proves the PhaseLedger/refined interval required by Welford and PPB.
@@ -1300,7 +1299,7 @@ struct clocks_alpha_recover_reattach_snapshot_t {
   uint32_t static_prediction_completed_interval_count = 0;
   bool     static_prediction_valid = false;
 
-  // CounterLedger/PhaseLedger recovery reattachment proof.  In
+  // CounterLedger/PhaseLedger recovery proof.  In
   // PPS_COUNTERLEDGER mode, recover publication should not depend on legacy
   // PPS projection readiness; the public OCXO rail is the PPS-captured
   // counter ledger plus PhaseLedger suffix.
@@ -1414,10 +1413,10 @@ struct clocks_alpha_recover_reattach_snapshot_t {
   uint64_t counterledger_refined_interval_ns = 0;
 };
 
-bool clocks_alpha_ocxo_recover_reattach_snapshot(
+bool clocks_alpha_ocxo_recover_proof_snapshot(
     time_clock_id_t clock,
-    clocks_alpha_recover_reattach_snapshot_t* out);
-bool clocks_alpha_recover_ocxo_reattach_ready(void);
+    clocks_alpha_recover_proof_snapshot_t* out);
+bool clocks_alpha_recover_ocxo_proof_ready(void);
 
 // ============================================================================
 // Alpha OCXO PPS-edge projection forensics
@@ -1525,9 +1524,9 @@ static inline void clocks_capture_interrupt_diag(interrupt_capture_diag_t& dst,
 // public PPS1 (teensy_pps_vclock_count=1, gnss_ns=1e9). There is no fixed-N row
 // burial.
 //
-// RECOVER is different: it resumes an existing public identity and continues
-// emitting timeline candidates while reattachment/science readiness is exposed
-// explicitly.
+// DEAD_PRODUCER_RESTORE resumes the durable public identity on a newborn
+// Alpha epoch and emits timeline candidates while fresh-ancestry proof/science
+// readiness is exposed explicitly.
 
 // ============================================================================
 // Campaign state
@@ -1566,8 +1565,7 @@ extern uint64_t recover_ocxo2_ns;
 // (ppb for frequency clocks and ns for phase offsets).
 //
 // Alpha-owned always-on Welford instances, one per published prefix.  Their
-// lifetime is boot-to-reboot; START, STOP, FLASH_CUT, and warm RECOVER never
-// reset or restore them.  Beta may read them for campaign compatibility,
+// lifetime is boot-to-reboot; START, STOP, and FLASH_CUT never reset or restore them.  Beta may read them for campaign compatibility,
 // but Alpha is the sole update/reset authority.
 //
 //   welford_gnss         — exact GNSS reference residual, always 0 ns

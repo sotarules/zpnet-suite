@@ -475,7 +475,7 @@ static constexpr uint32_t CAMPAIGN_RECORD_STAGE_CANDIDATE = 8;
 static constexpr uint32_t CAMPAIGN_RECORD_STAGE_PER_SECOND = 9;
 static constexpr uint32_t CAMPAIGN_RECORD_STAGE_WELFORD = 10;
 static constexpr uint32_t CAMPAIGN_RECORD_STAGE_FLASH_CUT_GATE = 13;
-static constexpr uint32_t CAMPAIGN_RECORD_STAGE_RECOVER_REATTACH_GATE = 14;
+static constexpr uint32_t CAMPAIGN_RECORD_STAGE_RECOVER_PROOF_GATE = 14;
 static constexpr uint32_t CAMPAIGN_RECORD_STAGE_RECOVERING_NO_REQUEST_GATE = 15;
 static constexpr uint32_t CAMPAIGN_RECORD_STAGE_HANDOFF_BEGIN = 20;
 static constexpr uint32_t CAMPAIGN_RECORD_STAGE_HANDOFF_READY = 21;
@@ -1188,7 +1188,7 @@ static Payload clocks_fragment_campaign_payload(
                  snapshot.recovery.science_quarantine_active);
     recovery.add("science_quarantine_remaining",
                  snapshot.recovery.science_quarantine_remaining);
-    recovery.add("reattach_stalled", snapshot.recovery.reattach_stalled);
+    recovery.add("proof_stalled", snapshot.recovery.proof_stalled);
     campaign.add_object("recovery", recovery);
   }
 
@@ -2231,7 +2231,7 @@ static FLASHMEM const char* campaign_record_stage_name(uint32_t stage) {
     case CAMPAIGN_RECORD_STAGE_PER_SECOND: return "PER_SECOND";
     case CAMPAIGN_RECORD_STAGE_WELFORD: return "WELFORD";
     case CAMPAIGN_RECORD_STAGE_FLASH_CUT_GATE: return "FLASH_CUT_GATE";
-    case CAMPAIGN_RECORD_STAGE_RECOVER_REATTACH_GATE: return "RECOVER_REATTACH_GATE";
+    case CAMPAIGN_RECORD_STAGE_RECOVER_PROOF_GATE: return "RECOVER_PROOF_GATE";
     case CAMPAIGN_RECORD_STAGE_RECOVERING_NO_REQUEST_GATE: return "RECOVERING_NO_REQUEST_GATE";
     case CAMPAIGN_RECORD_STAGE_HANDOFF_BEGIN: return "HANDOFF_BEGIN";
     case CAMPAIGN_RECORD_STAGE_HANDOFF_READY: return "HANDOFF_READY";
@@ -2949,7 +2949,7 @@ struct clock_science_row_t : clocks_fragment_science_snapshot_t {
   // Alpha-owned always-on PhaseLedger TAU snapshot. These fields remain
   // side-channel frequency evidence.  Panel-facing campaign TAU/PPB is the
   // continuity-aligned public clockface ratio so RECOVER does not appear to
-  // restart the OCXO totals from a fresh reattachment intercept.
+  // restart the OCXO totals from a fresh fresh-ancestry intercept.
   bool     alpha_tau_valid = false;
   uint32_t alpha_tau_sample_count = 0;
   uint32_t alpha_tau_interval_count = 0;
@@ -3272,11 +3272,11 @@ static uint32_t g_science_residual_quarantine_last_public_count = 0;
 // A healthy proof normally appears almost immediately after the mandatory fresh
 // bookend.  Keep ordinary proof search silent; the sixth failed current-row proof
 // emits one observational CLOCKS_RECOVERY_STALLED event because that duration is
-// more suggestive of a programming/design error than normal reattachment latency.
+// more suggestive of a programming/design error than normal proof convergence latency.
 static constexpr uint32_t CLOCKS_RECOVER_PROOF_WARN_AFTER_ATTEMPTS = 5U;
 static uint32_t g_recover_proof_attempt_count = 0U;
 static uint32_t g_recover_proof_last_attempt_pps_sequence = 0U;
-static uint32_t g_recover_proof_release_count = 0U;
+static uint32_t g_recover_science_proof_release_count = 0U;
 static uint32_t g_recover_proof_last_release_pps_sequence = 0U;
 static volatile bool g_recover_proof_warning_pending = false;
 static bool g_recover_proof_warning_published = false;
@@ -3290,7 +3290,7 @@ static bool g_recover_proof_warning_published = false;
 // first complete OCXO rows.  The gate remains finite: after timeout, campaign
 // publication resumes in degraded mode and OCXO science remains quarantined/
 // invalid until PhaseLedger/reattach evidence catches up.
-static constexpr uint32_t CLOCKS_RECOVER_REATTACH_TIMEOUT_CANDIDATES = 32U;
+static constexpr uint32_t CLOCKS_RECOVER_PROOF_TIMEOUT_CANDIDATES = 32U;
 // Recovery publication is layered:
 //   * Timeline readiness (PPS/VCLOCK, GNSS, DWT) permits a public row.
 //   * OCXO clockface readiness proves a fresh post-RECOVER integer ledger.
@@ -3299,43 +3299,43 @@ static constexpr uint32_t CLOCKS_RECOVER_REATTACH_TIMEOUT_CANDIDATES = 32U;
 //
 // The Pi is expected to persist explicitly degraded timeline rows instead of
 // restarting RECOVER.  A later science-ready row naturally clears degradation.
-static constexpr bool     CLOCKS_RECOVER_REATTACH_TIMEOUT_RELEASE_DEGRADED = true;
-static volatile bool     g_recover_reattach_active = false;
-static volatile bool     g_recover_reattach_degraded_active = false;
-static volatile bool     g_recover_reattach_clockface_ready = false;
-static volatile bool     g_recover_reattach_science_ready = false;
-static uint32_t          g_recover_reattach_begin_count = 0;
-static uint32_t          g_recover_reattach_hold_count = 0;
-static uint32_t          g_recover_reattach_release_count = 0;
-static uint32_t          g_recover_reattach_timeout_count = 0;
-static uint32_t          g_recover_reattach_degraded_release_count = 0;
-static uint32_t          g_recover_reattach_degraded_clear_count = 0;
-static uint32_t          g_recover_reattach_degraded_public_row_count = 0;
-static uint32_t          g_recover_reattach_degraded_science_suppressed_count = 0;
+static constexpr bool     CLOCKS_RECOVER_PROOF_TIMEOUT_RELEASE_DEGRADED = true;
+static volatile bool     g_recover_proof_active = false;
+static volatile bool     g_recover_proof_degraded_active = false;
+static volatile bool     g_recover_proof_clockface_ready = false;
+static volatile bool     g_recover_proof_science_ready = false;
+static uint32_t          g_recover_proof_begin_count = 0;
+static uint32_t          g_recover_proof_hold_count = 0;
+static uint32_t          g_recover_proof_release_count = 0;
+static uint32_t          g_recover_proof_timeout_count = 0;
+static uint32_t          g_recover_proof_degraded_release_count = 0;
+static uint32_t          g_recover_proof_degraded_clear_count = 0;
+static uint32_t          g_recover_proof_degraded_public_row_count = 0;
+static uint32_t          g_recover_proof_degraded_science_suppressed_count = 0;
 // Stall means no movement toward the currently missing OCXO proof, not merely
 // a fixed number of degraded rows.  Sixty 1 Hz rows gives the resolver a full
 // minute before a dedicated CLOCKS_RECOVERY_STALLED event is emitted.
-static constexpr uint32_t CLOCKS_RECOVER_REATTACH_DEGRADED_STALL_CANDIDATES = 60U;
-static volatile bool     g_recover_reattach_stalled = false;
-static uint32_t          g_recover_reattach_stall_count = 0;
-static uint32_t          g_recover_reattach_stall_publish_count = 0;
-static uint32_t          g_recover_reattach_progress_count = 0;
-static uint32_t          g_recover_reattach_progress_resume_count = 0;
-static uint32_t          g_recover_reattach_no_progress_row_count = 0;
-static uint32_t          g_recover_reattach_degraded_window_row_count = 0;
-static uint32_t          g_recover_reattach_last_progress_public_count = 0;
-static uint32_t          g_recover_reattach_last_stall_public_count = 0;
-static char              g_recover_reattach_stall_reason[64] = "idle";
-static uint32_t          g_recover_reattach_hidden_candidate_count = 0;
-static uint32_t          g_recover_reattach_last_hidden_public_count = 0;
-static uint32_t          g_recover_reattach_last_release_public_count = 0;
-static uint32_t          g_recover_reattach_last_degraded_release_public_count = 0;
-static uint32_t          g_recover_reattach_last_degraded_public_count = 0;
-static char              g_recover_reattach_last_reason[64] = "idle";
-static clocks_alpha_recover_reattach_snapshot_t
-    g_recover_reattach_last_ocxo1 DMAMEM = {};
-static clocks_alpha_recover_reattach_snapshot_t
-    g_recover_reattach_last_ocxo2 DMAMEM = {};
+static constexpr uint32_t CLOCKS_RECOVER_PROOF_DEGRADED_STALL_CANDIDATES = 60U;
+static volatile bool     g_recover_proof_stalled = false;
+static uint32_t          g_recover_proof_stall_count = 0;
+static uint32_t          g_recover_proof_stall_publish_count = 0;
+static uint32_t          g_recover_proof_progress_count = 0;
+static uint32_t          g_recover_proof_progress_resume_count = 0;
+static uint32_t          g_recover_proof_no_progress_row_count = 0;
+static uint32_t          g_recover_proof_degraded_window_row_count = 0;
+static uint32_t          g_recover_proof_last_progress_public_count = 0;
+static uint32_t          g_recover_proof_last_stall_public_count = 0;
+static char              g_recover_proof_stall_reason[64] = "idle";
+static uint32_t          g_recover_proof_hidden_candidate_count = 0;
+static uint32_t          g_recover_proof_last_hidden_public_count = 0;
+static uint32_t          g_recover_proof_last_release_public_count = 0;
+static uint32_t          g_recover_proof_last_degraded_release_public_count = 0;
+static uint32_t          g_recover_proof_last_degraded_public_count = 0;
+static char              g_recover_proof_last_reason[64] = "idle";
+static clocks_alpha_recover_proof_snapshot_t
+    g_recover_proof_last_ocxo1 DMAMEM = {};
+static clocks_alpha_recover_proof_snapshot_t
+    g_recover_proof_last_ocxo2 DMAMEM = {};
 
 // Recovery stall detection tracks one-way readiness milestones, not ordinary
 // per-second activity.  Capture/sample/forensics counters advance on a healthy
@@ -3343,13 +3343,13 @@ static clocks_alpha_recover_reattach_snapshot_t
 // counting them as progress makes a true science stall impossible to detect.
 // The seen mask is monotonic for one RECOVER generation: a bit can prove new
 // progress only once.
-struct recover_reattach_progress_marker_t {
+struct recover_proof_progress_marker_t {
   uint32_t seen_readiness_mask = 0;
 };
 
-static bool g_recover_reattach_progress_marker_valid = false;
-static recover_reattach_progress_marker_t g_recover_reattach_progress_ocxo1 = {};
-static recover_reattach_progress_marker_t g_recover_reattach_progress_ocxo2 = {};
+static bool g_recover_proof_progress_marker_valid = false;
+static recover_proof_progress_marker_t g_recover_proof_progress_ocxo1 = {};
+static recover_proof_progress_marker_t g_recover_proof_progress_ocxo2 = {};
 
 // Recovery request flight recorder for Pi-side polling.  These values make
 // REPORT_RECOVERY useful while core.py waits for the first public pair.
@@ -3370,9 +3370,6 @@ static uint32_t          g_recover_lifecycle_begin_count = 0;
 static uint32_t          g_recover_lifecycle_pps_gate_count = 0;
 static uint32_t          g_recover_lifecycle_command_custody_reset_count = 0;
 static uint32_t          g_recover_lifecycle_gate_custody_reset_count = 0;
-static uint32_t          g_recover_lifecycle_interrupt_service_rearm_count = 0;
-static uint32_t          g_recover_lifecycle_interrupt_service_rearm_failure_count = 0;
-static bool              g_recover_lifecycle_last_interrupt_service_rearm_ok = false;
 
 enum class recover_lifecycle_mode_t : uint8_t {
   NONE                  = 0,
@@ -3421,16 +3418,16 @@ static int64_t  g_recover_continuity_ocxo1_correction_ns = 0;
 static int64_t  g_recover_continuity_ocxo2_correction_ns = 0;
 static char     g_recover_continuity_last_reason[64] = "idle";
 
-static FLASHMEM void recover_reattach_reset(const char* reason);
-static FLASHMEM void recover_reattach_begin(void);
-static FLASHMEM bool recover_reattach_should_hold(void);
-static FLASHMEM bool recover_reattach_degraded_science_hold_active(void);
-static FLASHMEM void recover_reattach_apply_degraded_science_hold(clock_science_row_t& row);
+static FLASHMEM void recover_proof_reset(const char* reason);
+static FLASHMEM void recover_proof_begin(void);
+static FLASHMEM bool recover_proof_should_hold(void);
+static FLASHMEM bool recover_proof_degraded_science_hold_active(void);
+static FLASHMEM void recover_proof_apply_degraded_science_hold(clock_science_row_t& row);
 
 static uint32_t clocks_row_lifecycle_science_hold_flags(void) {
   uint32_t flags = 0U;
-  if (g_recover_reattach_active) flags |= 1U << 0;
-  if (g_recover_reattach_degraded_active) flags |= 1U << 1;
+  if (g_recover_proof_active) flags |= 1U << 0;
+  if (g_recover_proof_degraded_active) flags |= 1U << 1;
   if (g_science_residual_quarantine_remaining != 0U) flags |= 1U << 2;
   if (g_recover_continuity_align_pending &&
       g_recover_continuity_align_science_hold) {
@@ -4152,15 +4149,15 @@ static bool campaign_start_prologue_should_hold(
     bool ocxo2_valid,
     const clocks_alpha_lane_forensics_t& ocxo2_f);
 static void flash_cut_clear_pending(void);
-static FLASHMEM void recover_reattach_begin(void);
-static FLASHMEM void recover_reattach_reset(const char* reason);
+static FLASHMEM void recover_proof_begin(void);
+static FLASHMEM void recover_proof_reset(const char* reason);
 
 static void campaign_warmup_begin(campaign_warmup_mode_t mode) {
   g_campaign_warmup_suppressed_total = 0;
 
   if (mode == campaign_warmup_mode_t::RECOVER) {
     // RECOVER no longer buries fixed rows, but the fresh dead-producer Alpha
-    // ancestry must prove OCXO reattachment before unrestricted science resumes.
+    // ancestry must prove fresh OCXO ancestry before unrestricted science resumes.
     interrupt_dwt_publication_launch_acquisition_end();
     g_campaign_warmup_mode = campaign_warmup_mode_t::NONE;
     g_campaign_warmup_remaining = 0;
@@ -4168,12 +4165,12 @@ static void campaign_warmup_begin(campaign_warmup_mode_t mode) {
     // RECOVER offsets are installed in the RECOVER gate before this fresh-Alpha
     // proof court begins.  Do not recompute them here from a partially matured
     // post-bootstrap presentation.
-    recover_reattach_begin();
+    recover_proof_begin();
     return;
   }
 
   if (mode == campaign_warmup_mode_t::START) {
-    recover_reattach_reset("not_recovering");
+    recover_proof_reset("not_recovering");
 
     // START owns a private acquisition bookend, not a public skipped row.
     // Interrupt and Alpha continue to run while campaign_seconds remains zero.
@@ -4190,33 +4187,33 @@ static void campaign_warmup_begin(campaign_warmup_mode_t mode) {
   g_campaign_warmup_mode = campaign_warmup_mode_t::NONE;
   g_campaign_warmup_remaining = 0;
   campaign_start_prologue_reset("none");
-  recover_reattach_reset("none_lifecycle");
+  recover_proof_reset("none_lifecycle");
   campaign_public_offsets_reset_to_current();
 }
 
 static bool campaign_warmup_active(void) {
   // Treat the entire RECOVER transition as not-yet-campaign-continuous for
   // watchdog arming.  The first degraded/quarantined rows exist only to prove
-  // liveness and reattach custody to the Pi; a DWT publication court verdict
+  // liveness and prove fresh custody to the Pi; a DWT publication court verdict
   // during that window must not fire a second campaign-surrender watchdog and
   // stop the only rows the Pi can use to observe recovery progress.
   return g_campaign_warmup_mode != campaign_warmup_mode_t::NONE ||
-         g_recover_reattach_active ||
-         g_recover_reattach_degraded_active ||
+         g_recover_proof_active ||
+         g_recover_proof_degraded_active ||
          g_science_residual_quarantine_remaining != 0U ||
          clocks_campaign_recovery_lifecycle_active();
 }
 
-static void recover_reattach_set_reason(const char* reason) {
-  safeCopy(g_recover_reattach_last_reason,
-           sizeof(g_recover_reattach_last_reason),
-           reason ? reason : "recover_reattach");
+static void recover_proof_set_reason(const char* reason) {
+  safeCopy(g_recover_proof_last_reason,
+           sizeof(g_recover_proof_last_reason),
+           reason ? reason : "recover_proof");
 }
 
-static void recover_reattach_set_stall_reason(const char* reason) {
-  safeCopy(g_recover_reattach_stall_reason,
-           sizeof(g_recover_reattach_stall_reason),
-           reason ? reason : "recover_reattach_stall");
+static void recover_proof_set_stall_reason(const char* reason) {
+  safeCopy(g_recover_proof_stall_reason,
+           sizeof(g_recover_proof_stall_reason),
+           reason ? reason : "recover_proof_stall");
 }
 
 static constexpr uint32_t RECOVER_READY_SNAPSHOT       = 1U << 0;
@@ -4230,8 +4227,8 @@ static constexpr uint32_t RECOVER_READY_REFINED        = 1U << 7;
 static constexpr uint32_t RECOVER_READY_REFINED_INT    = 1U << 8;
 static constexpr uint32_t RECOVER_READY_SCIENCE        = 1U << 9;
 
-static uint32_t recover_reattach_readiness_mask(
-    const clocks_alpha_recover_reattach_snapshot_t& s) {
+static uint32_t recover_proof_readiness_mask(
+    const clocks_alpha_recover_proof_snapshot_t& s) {
   uint32_t mask = 0U;
   if (s.counterledger_mode) {
     if (s.counterledger_snapshot_ok) mask |= RECOVER_READY_SNAPSHOT;
@@ -4258,9 +4255,9 @@ static uint32_t recover_reattach_readiness_mask(
   return mask;
 }
 
-static uint32_t recover_reattach_readiness_score(
-    const clocks_alpha_recover_reattach_snapshot_t& s) {
-  uint32_t mask = recover_reattach_readiness_mask(s);
+static uint32_t recover_proof_readiness_score(
+    const clocks_alpha_recover_proof_snapshot_t& s) {
+  uint32_t mask = recover_proof_readiness_mask(s);
   uint32_t score = 0U;
   while (mask != 0U) {
     score += mask & 1U;
@@ -4269,42 +4266,42 @@ static uint32_t recover_reattach_readiness_score(
   return score;
 }
 
-static bool recover_reattach_note_lane_progress(
-    recover_reattach_progress_marker_t& marker,
-    const clocks_alpha_recover_reattach_snapshot_t& s) {
-  const uint32_t current = recover_reattach_readiness_mask(s);
+static bool recover_proof_note_lane_progress(
+    recover_proof_progress_marker_t& marker,
+    const clocks_alpha_recover_proof_snapshot_t& s) {
+  const uint32_t current = recover_proof_readiness_mask(s);
   const uint32_t newly_proven = current & ~marker.seen_readiness_mask;
   marker.seen_readiness_mask |= current;
   return newly_proven != 0U;
 }
 
-static bool recover_reattach_note_progress(uint32_t public_count) {
-  const bool first = !g_recover_reattach_progress_marker_valid;
-  const bool ocxo1_progress = recover_reattach_note_lane_progress(
-      g_recover_reattach_progress_ocxo1,
-      g_recover_reattach_last_ocxo1);
-  const bool ocxo2_progress = recover_reattach_note_lane_progress(
-      g_recover_reattach_progress_ocxo2,
-      g_recover_reattach_last_ocxo2);
+static bool recover_proof_note_progress(uint32_t public_count) {
+  const bool first = !g_recover_proof_progress_marker_valid;
+  const bool ocxo1_progress = recover_proof_note_lane_progress(
+      g_recover_proof_progress_ocxo1,
+      g_recover_proof_last_ocxo1);
+  const bool ocxo2_progress = recover_proof_note_lane_progress(
+      g_recover_proof_progress_ocxo2,
+      g_recover_proof_last_ocxo2);
 
-  g_recover_reattach_progress_marker_valid = true;
+  g_recover_proof_progress_marker_valid = true;
   const bool progressed = first || ocxo1_progress || ocxo2_progress;
   if (progressed) {
-    g_recover_reattach_progress_count++;
-    g_recover_reattach_last_progress_public_count = public_count;
+    g_recover_proof_progress_count++;
+    g_recover_proof_last_progress_public_count = public_count;
   }
   return progressed;
 }
 
-static void recover_reattach_add_stall_lane(
+static void recover_proof_add_stall_lane(
     Payload& parent,
     const char* key,
-    const clocks_alpha_recover_reattach_snapshot_t& s) {
+    const clocks_alpha_recover_proof_snapshot_t& s) {
   Payload lane;
   lane.add("clockface_ready", s.clockface_ready);
   lane.add("science_ready", s.science_ready);
-  lane.add("readiness_score", recover_reattach_readiness_score(s));
-  lane.add("readiness_mask", recover_reattach_readiness_mask(s));
+  lane.add("readiness_score", recover_proof_readiness_score(s));
+  lane.add("readiness_mask", recover_proof_readiness_mask(s));
   lane.add("counterledger_pps_sequence", s.counterledger_pps_sequence);
   lane.add("counterledger_phase_pps_sequence",
            s.counterledger_phase_pps_sequence);
@@ -4325,7 +4322,7 @@ static void recover_reattach_add_stall_lane(
   parent.add_object(key, lane);
 }
 
-static void recover_reattach_publish_stalled_event(void) {
+static void recover_proof_publish_stalled_event(void) {
   Payload p;
   p.add("schema", "CLOCKS_RECOVERY_STALLED_V1");
   p.add("reason", "ocxo_science_reattach_no_progress");
@@ -4334,142 +4331,142 @@ static void recover_reattach_publish_stalled_event(void) {
   p.add("campaign_seconds", campaign_seconds);
   p.add("recovery_generation", g_recover_request_count);
   p.add("base_count", g_recover_last_base_count);
-  p.add("clockface_ready", (bool)g_recover_reattach_clockface_ready);
-  p.add("science_ready", (bool)g_recover_reattach_science_ready);
+  p.add("clockface_ready", (bool)g_recover_proof_clockface_ready);
+  p.add("science_ready", (bool)g_recover_proof_science_ready);
   p.add("degraded_publication_active",
-        (bool)g_recover_reattach_degraded_active);
-  p.add("no_progress_rows", g_recover_reattach_no_progress_row_count);
+        (bool)g_recover_proof_degraded_active);
+  p.add("no_progress_rows", g_recover_proof_no_progress_row_count);
   p.add("stall_threshold_rows",
-        (uint32_t)CLOCKS_RECOVER_REATTACH_DEGRADED_STALL_CANDIDATES);
+        (uint32_t)CLOCKS_RECOVER_PROOF_DEGRADED_STALL_CANDIDATES);
   p.add("last_progress_public_count",
-        g_recover_reattach_last_progress_public_count);
-  p.add("stall_count", g_recover_reattach_stall_count);
-  p.add("progress_count", g_recover_reattach_progress_count);
+        g_recover_proof_last_progress_public_count);
+  p.add("stall_count", g_recover_proof_stall_count);
+  p.add("progress_count", g_recover_proof_progress_count);
   p.add("progress_resume_count",
-        g_recover_reattach_progress_resume_count);
+        g_recover_proof_progress_resume_count);
 
   Payload lanes;
-  recover_reattach_add_stall_lane(
-      lanes, "ocxo1", g_recover_reattach_last_ocxo1);
-  recover_reattach_add_stall_lane(
-      lanes, "ocxo2", g_recover_reattach_last_ocxo2);
+  recover_proof_add_stall_lane(
+      lanes, "ocxo1", g_recover_proof_last_ocxo1);
+  recover_proof_add_stall_lane(
+      lanes, "ocxo2", g_recover_proof_last_ocxo2);
   p.add_object("lanes", lanes);
 
   publish("CLOCKS_RECOVERY_STALLED", p);
-  g_recover_reattach_stall_publish_count++;
+  g_recover_proof_stall_publish_count++;
 }
 
-static FLASHMEM bool recover_reattach_refresh_ready(void) {
+static FLASHMEM bool recover_proof_refresh_ready(void) {
   clocks_stack_witness_note_hot(CLOCKS_STACK_CONTEXT_RECOVER_REFRESH_READY);
 
   // Write directly into the cached recovery flight-recorder snapshots. This
   // keeps the recovery gate off the large-local-object path; REPORT_RECOVERY
   // later publishes these cached facts without re-entering Alpha or process_time.
   const bool ocxo1_snapshot_ok =
-      clocks_alpha_ocxo_recover_reattach_snapshot(
-          time_clock_id_t::OCXO1, &g_recover_reattach_last_ocxo1);
+      clocks_alpha_ocxo_recover_proof_snapshot(
+          time_clock_id_t::OCXO1, &g_recover_proof_last_ocxo1);
   const bool ocxo2_snapshot_ok =
-      clocks_alpha_ocxo_recover_reattach_snapshot(
-          time_clock_id_t::OCXO2, &g_recover_reattach_last_ocxo2);
+      clocks_alpha_ocxo_recover_proof_snapshot(
+          time_clock_id_t::OCXO2, &g_recover_proof_last_ocxo2);
 
-  g_recover_reattach_clockface_ready =
+  g_recover_proof_clockface_ready =
       ocxo1_snapshot_ok && ocxo2_snapshot_ok &&
-      g_recover_reattach_last_ocxo1.clockface_ready &&
-      g_recover_reattach_last_ocxo2.clockface_ready;
-  g_recover_reattach_science_ready =
+      g_recover_proof_last_ocxo1.clockface_ready &&
+      g_recover_proof_last_ocxo2.clockface_ready;
+  g_recover_proof_science_ready =
       ocxo1_snapshot_ok && ocxo2_snapshot_ok &&
-      g_recover_reattach_last_ocxo1.science_ready &&
-      g_recover_reattach_last_ocxo2.science_ready;
+      g_recover_proof_last_ocxo1.science_ready &&
+      g_recover_proof_last_ocxo2.science_ready;
 
-  return g_recover_reattach_science_ready;
+  return g_recover_proof_science_ready;
 }
-static FLASHMEM void recover_reattach_reset(const char* reason) {
+static FLASHMEM void recover_proof_reset(const char* reason) {
   recover_continuity_align_reset(reason ? reason : "reattach_reset");
-  g_recover_reattach_active = false;
-  g_recover_reattach_degraded_active = false;
-  g_recover_reattach_clockface_ready = false;
-  g_recover_reattach_science_ready = false;
-  g_recover_reattach_stalled = false;
-  g_recover_reattach_no_progress_row_count = 0;
-  g_recover_reattach_degraded_window_row_count = 0;
-  g_recover_reattach_last_progress_public_count = 0;
-  g_recover_reattach_progress_marker_valid = false;
-  g_recover_reattach_progress_ocxo1 = recover_reattach_progress_marker_t{};
-  g_recover_reattach_progress_ocxo2 = recover_reattach_progress_marker_t{};
-  recover_reattach_set_stall_reason(reason ? reason : "reset");
-  g_recover_reattach_hidden_candidate_count = 0;
-  g_recover_reattach_last_hidden_public_count = 0;
-  g_recover_reattach_last_degraded_public_count = 0;
-  g_recover_reattach_last_ocxo1 = clocks_alpha_recover_reattach_snapshot_t{};
-  g_recover_reattach_last_ocxo2 = clocks_alpha_recover_reattach_snapshot_t{};
+  g_recover_proof_active = false;
+  g_recover_proof_degraded_active = false;
+  g_recover_proof_clockface_ready = false;
+  g_recover_proof_science_ready = false;
+  g_recover_proof_stalled = false;
+  g_recover_proof_no_progress_row_count = 0;
+  g_recover_proof_degraded_window_row_count = 0;
+  g_recover_proof_last_progress_public_count = 0;
+  g_recover_proof_progress_marker_valid = false;
+  g_recover_proof_progress_ocxo1 = recover_proof_progress_marker_t{};
+  g_recover_proof_progress_ocxo2 = recover_proof_progress_marker_t{};
+  recover_proof_set_stall_reason(reason ? reason : "reset");
+  g_recover_proof_hidden_candidate_count = 0;
+  g_recover_proof_last_hidden_public_count = 0;
+  g_recover_proof_last_degraded_public_count = 0;
+  g_recover_proof_last_ocxo1 = clocks_alpha_recover_proof_snapshot_t{};
+  g_recover_proof_last_ocxo2 = clocks_alpha_recover_proof_snapshot_t{};
   g_recover_proof_attempt_count = 0U;
   g_recover_proof_last_attempt_pps_sequence = 0U;
   g_recover_proof_last_release_pps_sequence = 0U;
   g_recover_proof_warning_pending = false;
   g_recover_proof_warning_published = false;
-  recover_reattach_set_reason(reason ? reason : "reset");
+  recover_proof_set_reason(reason ? reason : "reset");
 }
 
-static FLASHMEM void recover_reattach_begin(void) {
+static FLASHMEM void recover_proof_begin(void) {
   recover_continuity_align_reset("recover_clockface_alignment_reset");
   recover_continuity_align_arm();
-  g_recover_reattach_active = true;
-  g_recover_reattach_degraded_active = false;
-  g_recover_reattach_clockface_ready = false;
-  g_recover_reattach_science_ready = false;
-  g_recover_reattach_stalled = false;
-  g_recover_reattach_no_progress_row_count = 0;
-  g_recover_reattach_degraded_window_row_count = 0;
-  g_recover_reattach_last_progress_public_count = 0;
-  g_recover_reattach_progress_marker_valid = false;
-  g_recover_reattach_progress_ocxo1 = recover_reattach_progress_marker_t{};
-  g_recover_reattach_progress_ocxo2 = recover_reattach_progress_marker_t{};
-  recover_reattach_set_stall_reason("not_stalled");
-  g_recover_reattach_hidden_candidate_count = 0;
-  g_recover_reattach_last_hidden_public_count = 0;
-  g_recover_reattach_last_degraded_public_count = 0;
-  g_recover_reattach_begin_count++;
-  g_recover_reattach_last_ocxo1 = clocks_alpha_recover_reattach_snapshot_t{};
-  g_recover_reattach_last_ocxo2 = clocks_alpha_recover_reattach_snapshot_t{};
+  g_recover_proof_active = true;
+  g_recover_proof_degraded_active = false;
+  g_recover_proof_clockface_ready = false;
+  g_recover_proof_science_ready = false;
+  g_recover_proof_stalled = false;
+  g_recover_proof_no_progress_row_count = 0;
+  g_recover_proof_degraded_window_row_count = 0;
+  g_recover_proof_last_progress_public_count = 0;
+  g_recover_proof_progress_marker_valid = false;
+  g_recover_proof_progress_ocxo1 = recover_proof_progress_marker_t{};
+  g_recover_proof_progress_ocxo2 = recover_proof_progress_marker_t{};
+  recover_proof_set_stall_reason("not_stalled");
+  g_recover_proof_hidden_candidate_count = 0;
+  g_recover_proof_last_hidden_public_count = 0;
+  g_recover_proof_last_degraded_public_count = 0;
+  g_recover_proof_begin_count++;
+  g_recover_proof_last_ocxo1 = clocks_alpha_recover_proof_snapshot_t{};
+  g_recover_proof_last_ocxo2 = clocks_alpha_recover_proof_snapshot_t{};
   g_recover_proof_attempt_count = 0U;
   g_recover_proof_last_attempt_pps_sequence = 0U;
   g_recover_proof_last_release_pps_sequence = 0U;
   g_recover_proof_warning_pending = false;
   g_recover_proof_warning_published = false;
-  recover_reattach_set_reason("waiting_for_ocxo_reattach");
+  recover_proof_set_reason("waiting_for_ocxo_reattach");
 }
 
-static FLASHMEM void recover_reattach_release(const char* reason, bool degraded) {
-  g_recover_reattach_active = false;
-  g_recover_reattach_release_count++;
-  g_recover_reattach_last_release_public_count =
+static FLASHMEM void recover_proof_release(const char* reason, bool degraded) {
+  g_recover_proof_active = false;
+  g_recover_proof_release_count++;
+  g_recover_proof_last_release_public_count =
       (uint32_t)(campaign_seconds + 1ULL);
 
   if (degraded) {
-    g_recover_reattach_degraded_active = true;
-    g_recover_reattach_stalled = false;
-    g_recover_reattach_degraded_window_row_count = 0;
-    recover_reattach_set_stall_reason("not_stalled");
-    g_recover_reattach_degraded_release_count++;
-    g_recover_reattach_last_degraded_release_public_count =
-        g_recover_reattach_last_release_public_count;
-    g_recover_reattach_last_degraded_public_count =
-        g_recover_reattach_last_release_public_count;
+    g_recover_proof_degraded_active = true;
+    g_recover_proof_stalled = false;
+    g_recover_proof_degraded_window_row_count = 0;
+    recover_proof_set_stall_reason("not_stalled");
+    g_recover_proof_degraded_release_count++;
+    g_recover_proof_last_degraded_release_public_count =
+        g_recover_proof_last_release_public_count;
+    g_recover_proof_last_degraded_public_count =
+        g_recover_proof_last_release_public_count;
   } else {
-    // Campaign clockface continuity was armed when RECOVER reattachment began
+    // Campaign clockface continuity was armed when RECOVER proof began
     // and therefore precedes every public row, including degraded testimony.
     // Science readiness must not author a second presentation intercept.
-    if (g_recover_reattach_degraded_active) {
-      g_recover_reattach_degraded_active = false;
-      g_recover_reattach_degraded_clear_count++;
+    if (g_recover_proof_degraded_active) {
+      g_recover_proof_degraded_active = false;
+      g_recover_proof_degraded_clear_count++;
     }
   }
 
-  recover_reattach_set_reason(reason ? reason : "ocxo_reattach_release");
+  recover_proof_set_reason(reason ? reason : "ocxo_reattach_release");
 }
 
 static bool recover_proof_lane_current_row_ready(
-    const clocks_alpha_recover_reattach_snapshot_t& lane,
+    const clocks_alpha_recover_proof_snapshot_t& lane,
     uint32_t pps_sequence) {
   if (!lane.science_ready || pps_sequence == 0U) return false;
 
@@ -4505,15 +4502,15 @@ static bool recover_proof_lane_current_row_ready(
 
 static FLASHMEM bool recover_proof_driven_release_try(uint32_t pps_sequence) {
   if (pps_sequence == 0U ||
-      (!g_recover_reattach_active && !g_recover_reattach_degraded_active)) {
+      (!g_recover_proof_active && !g_recover_proof_degraded_active)) {
     return false;
   }
 
-  (void)recover_reattach_refresh_ready();
+  (void)recover_proof_refresh_ready();
   const bool ocxo1_ready = recover_proof_lane_current_row_ready(
-      g_recover_reattach_last_ocxo1, pps_sequence);
+      g_recover_proof_last_ocxo1, pps_sequence);
   const bool ocxo2_ready = recover_proof_lane_current_row_ready(
-      g_recover_reattach_last_ocxo2, pps_sequence);
+      g_recover_proof_last_ocxo2, pps_sequence);
 
   if (ocxo1_ready && ocxo2_ready) {
     // Release before Alpha reads lifecycle hold_flags.  No value is repaired or
@@ -4521,23 +4518,23 @@ static FLASHMEM bool recover_proof_driven_release_try(uint32_t pps_sequence) {
     // lanes have independently proved clean post-boundary ancestry.  Do not reset
     // Beta residual state here: the previous recovered row is the lawful left
     // bookend required by this proving row's one-second Delta interval.
-    const bool was_stalled = g_recover_reattach_stalled;
-    if (g_recover_reattach_active) {
-      recover_reattach_release("ocxo_science_proof_driven_release", false);
-    } else if (g_recover_reattach_degraded_active) {
+    const bool was_stalled = g_recover_proof_stalled;
+    if (g_recover_proof_active) {
+      recover_proof_release("ocxo_science_proof_driven_release", false);
+    } else if (g_recover_proof_degraded_active) {
       // A prior clockface-only release already incremented release_count.  Clear
       // only the degraded science layer here so one RECOVER generation still has
       // one presentation-release accounting event.
-      g_recover_reattach_degraded_active = false;
-      g_recover_reattach_degraded_clear_count++;
-      recover_reattach_set_reason("ocxo_science_proof_driven_release");
+      g_recover_proof_degraded_active = false;
+      g_recover_proof_degraded_clear_count++;
+      recover_proof_set_reason("ocxo_science_proof_driven_release");
     }
-    g_recover_reattach_stalled = false;
-    if (was_stalled) g_recover_reattach_progress_resume_count++;
-    g_recover_reattach_no_progress_row_count = 0U;
-    g_recover_reattach_degraded_window_row_count = 0U;
-    recover_reattach_set_stall_reason("cleared_by_proof_driven_release");
-    g_recover_proof_release_count++;
+    g_recover_proof_stalled = false;
+    if (was_stalled) g_recover_proof_progress_resume_count++;
+    g_recover_proof_no_progress_row_count = 0U;
+    g_recover_proof_degraded_window_row_count = 0U;
+    recover_proof_set_stall_reason("cleared_by_proof_driven_release");
+    g_recover_science_proof_release_count++;
     g_recover_proof_last_release_pps_sequence = pps_sequence;
     g_recover_proof_warning_pending = false;
     return true;
@@ -4545,7 +4542,7 @@ static FLASHMEM bool recover_proof_driven_release_try(uint32_t pps_sequence) {
 
   // Count only real science-proof attempts after both integer OCXO clockfaces
   // exist.  Earlier rows are clockface acquisition, not failed science proofs.
-  if (g_recover_reattach_clockface_ready &&
+  if (g_recover_proof_clockface_ready &&
       g_recover_proof_last_attempt_pps_sequence != pps_sequence) {
     g_recover_proof_last_attempt_pps_sequence = pps_sequence;
     g_recover_proof_attempt_count++;
@@ -4570,8 +4567,8 @@ static void recover_proof_warning_publish_if_pending(void) {
   p.add("campaign_seconds", campaign_seconds);
   p.add("recovery_generation", g_recover_request_count);
   p.add("base_count", g_recover_last_base_count);
-  p.add("clockface_ready", (bool)g_recover_reattach_clockface_ready);
-  p.add("science_ready", (bool)g_recover_reattach_science_ready);
+  p.add("clockface_ready", (bool)g_recover_proof_clockface_ready);
+  p.add("science_ready", (bool)g_recover_proof_science_ready);
   p.add("proof_attempts", g_recover_proof_attempt_count);
   p.add("proof_warn_after_attempts",
         (uint32_t)CLOCKS_RECOVER_PROOF_WARN_AFTER_ATTEMPTS);
@@ -4579,14 +4576,14 @@ static void recover_proof_warning_publish_if_pending(void) {
         g_recover_proof_last_attempt_pps_sequence);
 
   Payload lanes;
-  recover_reattach_add_stall_lane(
-      lanes, "ocxo1", g_recover_reattach_last_ocxo1);
-  recover_reattach_add_stall_lane(
-      lanes, "ocxo2", g_recover_reattach_last_ocxo2);
+  recover_proof_add_stall_lane(
+      lanes, "ocxo1", g_recover_proof_last_ocxo1);
+  recover_proof_add_stall_lane(
+      lanes, "ocxo2", g_recover_proof_last_ocxo2);
   p.add_object("lanes", lanes);
 
   publish("CLOCKS_RECOVERY_STALLED", p);
-  g_recover_reattach_stall_publish_count++;
+  g_recover_proof_stall_publish_count++;
   g_recover_proof_warning_published = true;
   g_recover_proof_warning_pending = false;
 }
@@ -4637,7 +4634,7 @@ static void campaign_warmup_reset(void) {
   g_campaign_warmup_remaining = 0;
   g_campaign_warmup_suppressed_total = 0;
   campaign_start_prologue_reset("reset");
-  recover_reattach_reset("warmup_reset");
+  recover_proof_reset("warmup_reset");
   campaign_public_offsets_reset_to_current();
 }
 
@@ -4727,7 +4724,6 @@ static bool recover_lifecycle_enter_from_command(const char* reason) {
     return false;
   }
 
-  g_recover_lifecycle_last_interrupt_service_rearm_ok = false;
   clocks_watchdog_clear_surrender_for_new_lifecycle();
   clocks_watchdog_disarm_campaign_publication();
   campaign_state = clocks_campaign_state_t::RECOVERING;
@@ -4783,99 +4779,99 @@ static uint64_t campaign_public_gnss_ns(uint32_t public_count) {
   return (uint64_t)public_count * CLOCKS_BETA_NS_PER_SECOND;
 }
 
-static FLASHMEM bool recover_reattach_should_hold(void) {
+static FLASHMEM bool recover_proof_should_hold(void) {
   clocks_stack_witness_note_hot(CLOCKS_STACK_CONTEXT_RECOVER_SHOULD_HOLD);
-  if (!g_recover_reattach_active) return false;
+  if (!g_recover_proof_active) return false;
 
-  (void)recover_reattach_refresh_ready();
-  (void)recover_reattach_note_progress((uint32_t)campaign_seconds);
+  (void)recover_proof_refresh_ready();
+  (void)recover_proof_note_progress((uint32_t)campaign_seconds);
 
   // Generic science_ready is useful progress testimony, but only the pre-Alpha
   // proof-driven court may release science custody for a row.  Clockface-ready
   // candidates may still resume the truthful timeline in degraded mode.
-  if (g_recover_reattach_clockface_ready) {
+  if (g_recover_proof_clockface_ready) {
     // Timeline and both OCXO integer clockfaces are now fresh.  Publish the row
     // immediately, but keep refined science/Welford gated until the
     // PhaseLedger interval proves itself.
-    recover_reattach_release(
+    recover_proof_release(
         "ocxo_clockface_ready_science_initializing", true);
     return false;
   }
 
   // Legacy "hidden candidate" counters now count emitted recovery candidates.
   // The identity advances through the normal per-second path below; this gate
-  // only observes how long reattachment remains incomplete.
-  g_recover_reattach_hold_count++;
-  g_recover_reattach_hidden_candidate_count++;
-  g_recover_reattach_last_hidden_public_count =
+  // only observes how long proof convergence remains incomplete.
+  g_recover_proof_hold_count++;
+  g_recover_proof_hidden_candidate_count++;
+  g_recover_proof_last_hidden_public_count =
       (uint32_t)(campaign_seconds + 1ULL);
 
-  if (g_recover_reattach_hidden_candidate_count >=
-      CLOCKS_RECOVER_REATTACH_TIMEOUT_CANDIDATES) {
-    g_recover_reattach_timeout_count++;
-    if (CLOCKS_RECOVER_REATTACH_TIMEOUT_RELEASE_DEGRADED) {
-      recover_reattach_release("ocxo_reattach_timeout_degraded_release", true);
+  if (g_recover_proof_hidden_candidate_count >=
+      CLOCKS_RECOVER_PROOF_TIMEOUT_CANDIDATES) {
+    g_recover_proof_timeout_count++;
+    if (CLOCKS_RECOVER_PROOF_TIMEOUT_RELEASE_DEGRADED) {
+      recover_proof_release("ocxo_reattach_timeout_degraded_release", true);
       return false;
     }
-    recover_reattach_set_reason("ocxo_reattach_timeout_candidates_emitted");
-  } else if (!g_recover_reattach_last_ocxo1.clockface_ready &&
-             !g_recover_reattach_last_ocxo2.clockface_ready) {
-    recover_reattach_set_reason("emitting_without_both_ocxo_clockfaces");
-  } else if (!g_recover_reattach_last_ocxo1.clockface_ready) {
-    recover_reattach_set_reason("emitting_without_ocxo1_clockface");
-  } else if (!g_recover_reattach_last_ocxo2.clockface_ready) {
-    recover_reattach_set_reason("emitting_without_ocxo2_clockface");
+    recover_proof_set_reason("ocxo_reattach_timeout_candidates_emitted");
+  } else if (!g_recover_proof_last_ocxo1.clockface_ready &&
+             !g_recover_proof_last_ocxo2.clockface_ready) {
+    recover_proof_set_reason("emitting_without_both_ocxo_clockfaces");
+  } else if (!g_recover_proof_last_ocxo1.clockface_ready) {
+    recover_proof_set_reason("emitting_without_ocxo1_clockface");
+  } else if (!g_recover_proof_last_ocxo2.clockface_ready) {
+    recover_proof_set_reason("emitting_without_ocxo2_clockface");
   } else {
-    recover_reattach_set_reason("emitting_while_ocxo_science_initializes");
+    recover_proof_set_reason("emitting_while_ocxo_science_initializes");
   }
 
   // Reattachment state remains active, but it no longer gates campaign record.
   return false;
 }
 
-static FLASHMEM bool recover_reattach_degraded_science_hold_active(void) {
+static FLASHMEM bool recover_proof_degraded_science_hold_active(void) {
   clocks_stack_witness_note_hot(CLOCKS_STACK_CONTEXT_RECOVER_DEGRADED_HOLD);
-  if (!g_recover_reattach_degraded_active) return false;
+  if (!g_recover_proof_degraded_active) return false;
 
-  (void)recover_reattach_refresh_ready();
+  (void)recover_proof_refresh_ready();
   recover_proof_warning_publish_if_pending();
   const bool progressed =
-      recover_reattach_note_progress((uint32_t)campaign_seconds);
+      recover_proof_note_progress((uint32_t)campaign_seconds);
 
   // Stay degraded until the pre-Alpha proof court releases both lanes.  Merely
   // observing generic science_ready here is too late to admit this row into
   // Alpha's already-completed statistics transaction and is not a substitute for
   // explicit post-recovery ancestry.
-  g_recover_reattach_degraded_public_row_count++;
-  g_recover_reattach_degraded_window_row_count++;
-  g_recover_reattach_last_degraded_public_count =
+  g_recover_proof_degraded_public_row_count++;
+  g_recover_proof_degraded_window_row_count++;
+  g_recover_proof_last_degraded_public_count =
       (uint32_t)campaign_seconds;
 
   if (progressed) {
-    g_recover_reattach_no_progress_row_count = 0;
-    if (g_recover_reattach_stalled) {
-      g_recover_reattach_stalled = false;
-      g_recover_reattach_progress_resume_count++;
-      recover_reattach_set_stall_reason("progress_resumed");
+    g_recover_proof_no_progress_row_count = 0;
+    if (g_recover_proof_stalled) {
+      g_recover_proof_stalled = false;
+      g_recover_proof_progress_resume_count++;
+      recover_proof_set_stall_reason("progress_resumed");
     }
   } else {
-    g_recover_reattach_no_progress_row_count++;
+    g_recover_proof_no_progress_row_count++;
   }
 
-  if (!g_recover_reattach_stalled &&
-      g_recover_reattach_no_progress_row_count >=
-          CLOCKS_RECOVER_REATTACH_DEGRADED_STALL_CANDIDATES) {
-    g_recover_reattach_stalled = true;
-    g_recover_reattach_stall_count++;
-    g_recover_reattach_last_stall_public_count =
+  if (!g_recover_proof_stalled &&
+      g_recover_proof_no_progress_row_count >=
+          CLOCKS_RECOVER_PROOF_DEGRADED_STALL_CANDIDATES) {
+    g_recover_proof_stalled = true;
+    g_recover_proof_stall_count++;
+    g_recover_proof_last_stall_public_count =
         (uint32_t)campaign_seconds;
-    recover_reattach_set_stall_reason(
+    recover_proof_set_stall_reason(
         "ocxo_science_reattach_no_progress");
-    recover_reattach_publish_stalled_event();
+    recover_proof_publish_stalled_event();
   }
 
-  recover_reattach_set_reason(
-      g_recover_reattach_stalled
+  recover_proof_set_reason(
+      g_recover_proof_stalled
           ? "degraded_publication_science_stalled"
           : "degraded_publication_science_initializing");
   return true;
@@ -4905,9 +4901,9 @@ static FLASHMEM void ocxo_science_row_suppress_for_recover_hold(clock_science_ro
   row.total_fast_residual_ns_exact = 0.0;
 }
 
-static FLASHMEM void recover_reattach_apply_degraded_science_hold(clock_science_row_t& row) {
+static FLASHMEM void recover_proof_apply_degraded_science_hold(clock_science_row_t& row) {
   ocxo_science_row_suppress_for_recover_hold(row);
-  g_recover_reattach_degraded_science_suppressed_count++;
+  g_recover_proof_degraded_science_suppressed_count++;
 }
 
 static FLASHMEM bool science_residual_quarantine_apply(
@@ -4983,7 +4979,7 @@ static bool clocks_watchdog_publication_blocked(void) {
 
 bool clocks_watchdog_campaign_armed(void) {
   // Campaign name is operator/persistence metadata, not timing custody.
-  // Warm RECOVER can resume a known public clock ledger before the Pi has
+  // Dead-producer RECOVER can resume a known public clock ledger before the Pi has
   // supplied or restored a human campaign label; do not leave the campaign
   // continuity watchdog disarmed merely because the label is empty.
   return watchdog_campaign_publication_armed &&
@@ -6357,10 +6353,10 @@ static FLASHMEM void clocks_beta_cold_diagnostics_init(void) {
   g_clocks_report_busy_reject_count = 0U;
   g_clocks_report_max_duration_cycles = 0U;
 
-  g_recover_reattach_last_ocxo1 =
-      clocks_alpha_recover_reattach_snapshot_t{};
-  g_recover_reattach_last_ocxo2 =
-      clocks_alpha_recover_reattach_snapshot_t{};
+  g_recover_proof_last_ocxo1 =
+      clocks_alpha_recover_proof_snapshot_t{};
+  g_recover_proof_last_ocxo2 =
+      clocks_alpha_recover_proof_snapshot_t{};
 
   g_clocks_payload_numeric_integrity_failed = false;
   g_clocks_payload_numeric_integrity_fail_count = 0U;
@@ -6745,7 +6741,7 @@ static uint32_t clocks_beta_public_ocxo_science_invalid_mask(
     const clock_science_row_t& ocxo1_science,
     const clock_science_row_t& ocxo2_science) {
   if (public_count <= 2U) return 0U;
-  if (g_recover_reattach_degraded_active) return 0U;
+  if (g_recover_proof_degraded_active) return 0U;
   if (g_science_residual_quarantine_last_public_count == public_count) return 0U;
 
   uint32_t mask = 0U;
@@ -7976,7 +7972,6 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
     // service grids for this firmware generation. Starting a second RECOVER-owned
     // rephase here would create a circular wait; splice the durable state onto the
     // installed newborn epoch directly.
-    g_recover_lifecycle_last_interrupt_service_rearm_ok = true;
     recover_lifecycle_set_reason("recover_dead_producer_restore_commit_ready");
 
     if (g_campaign_restore_state.valid) {
@@ -8164,10 +8159,10 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
     return;
   }
 
-  // RECOVER resumes an existing public timeline, so its reattachment state is
+  // RECOVER resumes an existing public timeline, so its proof convergence state is
   // observational here and candidate identities continue to be emitted.  Run
   // that court only after exact completed-row custody has been proven.
-  (void)recover_reattach_should_hold();
+  (void)recover_proof_should_hold();
 
   // START consumes this exact candidate tuple privately while campaign_seconds
   // remains zero. The helper seeds PPS0 from the normal observed-edge inputs and
@@ -8295,10 +8290,10 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
       time_clock_id_t::OCXO2, &ocxo2_alpha_tau);
 
   // RECOVER degraded release keeps public GNSS/DWT/VCLOCK time moving after
-  // the finite OCXO reattachment timeout.  OCXO science/Welford input
+  // the finite fresh OCXO ancestry timeout.  OCXO science/Welford input
   // stays inert until Alpha proves fresh post-recovery OCXO custody.
   const bool recover_degraded_science_hold =
-      recover_reattach_degraded_science_hold_active();
+      recover_proof_degraded_science_hold_active();
 
   const uint64_t public_ocxo1_counterledger_ns =
       campaign_public_counterledger_ns(
@@ -8353,7 +8348,7 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   // Published OCXO TAU/PPB are campaign clockface ratios, not physical-period
   // Delta ratios: public_ocxo_ns / public_gnss_ns.  RECOVER may have just
   // applied a one-time presentation transform so this ratio continues from the
-  // Pi-projected campaign ledger instead of a fresh reattachment intercept.
+  // Pi-projected campaign ledger instead of a fresh fresh-ancestry intercept.
   // The one-second residuals and Welfords above remain Delta/PhaseLedger
   // evidence surfaces.
   clock_science_apply_campaign_public_ratio(ocxo1_science,
@@ -8373,8 +8368,8 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
                                 ocxo2_alpha_tau);
 
   if (recover_degraded_science_hold) {
-    recover_reattach_apply_degraded_science_hold(ocxo1_science);
-    recover_reattach_apply_degraded_science_hold(ocxo2_science);
+    recover_proof_apply_degraded_science_hold(ocxo1_science);
+    recover_proof_apply_degraded_science_hold(ocxo2_science);
   }
 
   const bool recover_science_quarantine_applied =
@@ -8392,8 +8387,8 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
       ocxo2_science.science_worthy &&
       ocxo2_science.antecedents_complete;
   const bool recover_transition_active =
-      g_recover_reattach_active ||
-      g_recover_reattach_degraded_active ||
+      g_recover_proof_active ||
+      g_recover_proof_degraded_active ||
       recover_science_quarantine_applied ||
       g_science_residual_quarantine_remaining != 0U ||
       g_recover_continuity_align_pending;
@@ -8526,14 +8521,14 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   // not carry an idle recovery transcript forever.
   const bool recovery_row =
       recover_transition_active ||
-      g_recover_reattach_active ||
-      g_recover_reattach_degraded_active ||
+      g_recover_proof_active ||
+      g_recover_proof_degraded_active ||
       recover_degraded_science_hold ||
       recover_science_quarantine_applied ||
       g_science_residual_quarantine_remaining != 0U ||
-      g_recover_reattach_stalled ||
+      g_recover_proof_stalled ||
       g_recover_continuity_align_last_public_count == public_count ||
-      g_recover_reattach_last_release_public_count == public_count;
+      g_recover_proof_last_release_public_count == public_count;
   if (recovery_row) {
     record.recovery.present = true;
     record.recovery.generation = g_recover_request_count;
@@ -8546,8 +8541,8 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
         g_science_residual_quarantine_remaining != 0U;
     record.recovery.science_quarantine_remaining =
         g_science_residual_quarantine_remaining;
-    record.recovery.degraded_active = g_recover_reattach_degraded_active;
-    record.recovery.reattach_stalled = g_recover_reattach_stalled;
+    record.recovery.degraded_active = g_recover_proof_degraded_active;
+    record.recovery.proof_stalled = g_recover_proof_stalled;
   }
 
   record.dwt_cycles = public_dwt_total;
@@ -9374,8 +9369,8 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
   const bool recovery_control_active =
       request_recover ||
       clocks_campaign_recovery_lifecycle_active() ||
-      g_recover_reattach_active ||
-      g_recover_reattach_degraded_active ||
+      g_recover_proof_active ||
+      g_recover_proof_degraded_active ||
       g_science_residual_quarantine_remaining != 0U ||
       g_recover_continuity_align_pending;
 
@@ -9395,13 +9390,13 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
     p.add("requested_base_count", requested_base_count);
     p.add("expected_first_public_count",
           g_recover_last_expected_first_public_count);
-    p.add("recover_reattach_active", (bool)g_recover_reattach_active);
+    p.add("recover_proof_active", (bool)g_recover_proof_active);
     p.add("recover_degraded_active",
-          (bool)g_recover_reattach_degraded_active);
+          (bool)g_recover_proof_degraded_active);
     p.add("recover_clockface_ready",
-          (bool)g_recover_reattach_clockface_ready);
+          (bool)g_recover_proof_clockface_ready);
     p.add("recover_science_ready",
-          (bool)g_recover_reattach_science_ready);
+          (bool)g_recover_proof_science_ready);
     p.add("campaign_state", clocks_campaign_state_name(campaign_state));
     return p;
   }
@@ -9461,18 +9456,12 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
   flash_cut_clear_pending();
 
   if (!recover_lifecycle_enter_from_command("recover_command_armed")) {
-    recover_lifecycle_abort("recover_interrupt_service_rearm_failed");
+    recover_lifecycle_abort("recover_dead_producer_epoch_prepare_failed");
 
     Payload err;
-    err.add("error", "failed to rearm VCLOCK/OCXO interrupt service");
-    err.add("status", "recover_rejected_interrupt_service_rearm");
+    err.add("error", "failed to prepare newborn Alpha epoch for dead-producer restore");
+    err.add("status", "recover_rejected_dead_producer_epoch_prepare");
     err.add("recovery_generation", g_recover_request_count);
-    err.add("recover_interrupt_service_rearm_count",
-            g_recover_lifecycle_interrupt_service_rearm_count);
-    err.add("recover_interrupt_service_rearm_failure_count",
-            g_recover_lifecycle_interrupt_service_rearm_failure_count);
-    err.add("recover_interrupt_service_rearm_ok",
-            g_recover_lifecycle_last_interrupt_service_rearm_ok);
     err.add("campaign_state", clocks_campaign_state_name(campaign_state));
     return err;
   }
@@ -9535,12 +9524,6 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
   p.add("restore_court_ready", recover_restore_court_ready_now());
   p.add("recover_command_custody_reset_count",
         g_recover_lifecycle_command_custody_reset_count);
-  p.add("recover_interrupt_service_rearm_count",
-        g_recover_lifecycle_interrupt_service_rearm_count);
-  p.add("recover_interrupt_service_rearm_failure_count",
-        g_recover_lifecycle_interrupt_service_rearm_failure_count);
-  p.add("recover_interrupt_service_rearm_ok",
-        g_recover_lifecycle_last_interrupt_service_rearm_ok);
   p.add("interrupt_recover_publication_reset_count",
         interrupt_recover_publication_custody_reset_count());
   return p;
@@ -9724,12 +9707,6 @@ static FLASHMEM Payload cmd_report_recovery(const Payload&) {
   p.add("recover_smartzero_complete", interrupt_smartzero_complete());
   p.add("recover_epoch_ready", clocks_alpha_installed_smartzero_backing_epoch());
   p.add("restore_court_ready", recover_restore_court_ready_now());
-  p.add("recover_interrupt_service_rearm_ok",
-        g_recover_lifecycle_last_interrupt_service_rearm_ok);
-  p.add("recover_interrupt_service_rearm_count",
-        g_recover_lifecycle_interrupt_service_rearm_count);
-  p.add("recover_interrupt_service_rearm_failure_count",
-        g_recover_lifecycle_interrupt_service_rearm_failure_count);
 
   p.add("recovery_generation", g_recover_request_count);
   p.add("request_count", g_recover_request_count);
@@ -9738,7 +9715,7 @@ static FLASHMEM Payload cmd_report_recovery(const Payload&) {
         g_recover_last_expected_first_public_count);
   p.add("last_public_count", g_campaign_record_last_public_count);
   p.add("candidate_count", g_campaign_record_candidate_count);
-  p.add("hidden_candidate_count", g_recover_reattach_hidden_candidate_count);
+  p.add("hidden_candidate_count", g_recover_proof_hidden_candidate_count);
   p.add("campaign_record_last_stage", g_campaign_record_last_stage);
   p.add("campaign_record_last_stage_name",
         campaign_record_stage_name(g_campaign_record_last_stage));
@@ -9828,24 +9805,26 @@ static FLASHMEM Payload cmd_report_recovery(const Payload&) {
   p.add("fragment_publication_idle_retry_last_attempt_count",
         g_clocks_fragment_publication_idle_retry_last_attempt_count);
 
-  p.add("recover_reattach_active", (bool)g_recover_reattach_active);
-  p.add("recover_reattach_degraded_active",
-        (bool)g_recover_reattach_degraded_active);
-  p.add("recover_reattach_reason", g_recover_reattach_last_reason);
-  p.add("recover_clockface_ready", (bool)g_recover_reattach_clockface_ready);
-  p.add("recover_science_ready", (bool)g_recover_reattach_science_ready);
-  p.add("recover_reattach_stalled", (bool)g_recover_reattach_stalled);
+  p.add("recover_proof_active", (bool)g_recover_proof_active);
+  p.add("recover_proof_degraded_active",
+        (bool)g_recover_proof_degraded_active);
+  p.add("recover_proof_reason", g_recover_proof_last_reason);
+  p.add("recover_clockface_ready", (bool)g_recover_proof_clockface_ready);
+  p.add("recover_science_ready", (bool)g_recover_proof_science_ready);
+  p.add("recover_proof_stalled", (bool)g_recover_proof_stalled);
   p.add("recover_proof_attempts", g_recover_proof_attempt_count);
   p.add("recover_proof_warn_after_attempts",
         (uint32_t)CLOCKS_RECOVER_PROOF_WARN_AFTER_ATTEMPTS);
   p.add("recover_proof_warning_published", g_recover_proof_warning_published);
   p.add("recover_proof_release_count", g_recover_proof_release_count);
+  p.add("recover_science_proof_release_count",
+        g_recover_science_proof_release_count);
   p.add("recover_proof_last_release_pps_sequence",
         g_recover_proof_last_release_pps_sequence);
   p.add("degraded_no_progress_row_count",
-        g_recover_reattach_no_progress_row_count);
+        g_recover_proof_no_progress_row_count);
   p.add("degraded_last_progress_public_count",
-        g_recover_reattach_last_progress_public_count);
+        g_recover_proof_last_progress_public_count);
   p.add("science_quarantine_remaining",
         g_science_residual_quarantine_remaining);
   p.add("instrument_statistics_owner", "ALPHA");

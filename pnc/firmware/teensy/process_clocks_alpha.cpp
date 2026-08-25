@@ -3120,7 +3120,7 @@ static void alpha_counterledger_reprime_lane_for_recover(
   // Preserve the absolute tick ledger and zero-offset authority.  Cut only
   // interval/phase custody so the first post-recovery edge-implied PPS identity
   // becomes a seed, and later clean identities must prove fresh CounterLedger +
-  // PhaseLedger continuity before RECOVER reattachment can clear.
+  // PhaseLedger continuity before RECOVER proof can clear.
   s.sample_count = 0;
   s.pps_sequence = 0;
   s.interval_valid = false;
@@ -7583,47 +7583,8 @@ volatile bool     g_alpha_runtime_epoch_capture_last_cap_valid = false;
 volatile bool     g_alpha_runtime_epoch_capture_last_cap_vclock_valid = false;
 volatile bool     g_alpha_runtime_epoch_capture_last_cap_all_lanes_valid = false;
 
-bool clocks_alpha_recover_rearm_interrupt_service(void) {
-  const clocks_alpha_ocxo_grid_rephase_status_t status =
-      clocks_alpha_ocxo_grid_rephase_status(
-          clocks_alpha_ocxo_grid_rephase_owner_t::RECOVER);
-  if (status == clocks_alpha_ocxo_grid_rephase_status_t::PENDING ||
-      status == clocks_alpha_ocxo_grid_rephase_status_t::COMPLETE) {
-    return true;
-  }
-  if (status == clocks_alpha_ocxo_grid_rephase_status_t::FAILED ||
-      !g_epoch_initialized || g_alpha_epoch_install_in_progress) {
-    return false;
-  }
-
-  // Explicit Alpha-discontinuity repair only.  Normal LIVE_REATTACH never calls
-  // this function: a Pi process/publication outage does not authorize physical
-  // OCXO grid replacement.  If a separate custody court has surrendered Alpha
-  // service ancestry, VCLOCK remains sovereign while the OCXO grids are rebuilt
-  // without replacing their logical zeros or long tick ledgers.
-  if (!interrupt_ensure_service(interrupt_subscriber_kind_t::VCLOCK)) {
-    return false;
-  }
-
-  interrupt_clock_snapshot_t ocxo1{};
-  interrupt_clock_snapshot_t ocxo2{};
-  if (!interrupt_clock_snapshot(interrupt_subscriber_kind_t::OCXO1, &ocxo1) ||
-      !interrupt_clock_snapshot(interrupt_subscriber_kind_t::OCXO2, &ocxo2)) {
-    return false;
-  }
-
-  return alpha_ocxo_grid_rephase_begin(
-      clocks_alpha_ocxo_grid_rephase_owner_t::RECOVER,
-      interrupt_ocxo_grid_rephase_mode_t::PRESERVE_LOGICAL_EPOCH,
-      ocxo1.counter32,
-      ocxo2.counter32,
-      g_alpha_epoch_sequence,
-      nullptr);
-}
-
 void clocks_alpha_recover_reprime_ocxo_state(void) {
-  // Explicit Alpha-discontinuity repair only.  This is not the normal
-  // LIVE_REATTACH path.  Preserve the installed epoch, visible/public origins,
+  // Explicit Alpha-discontinuity repair only.  Surviving producers never enter this path.  Preserve the installed epoch, visible/public origins,
   // DWT/GNSS calibration, and long logical tick ledgers while cutting only the
   // OCXO interval/phase ancestry that an independent custody court has already
   // declared unusable.
@@ -7685,18 +7646,18 @@ static bool alpha_recover_observed_forensics_ready(
          f->dwt_original_at_event != 0U;
 }
 
-bool clocks_alpha_ocxo_recover_reattach_snapshot(
+bool clocks_alpha_ocxo_recover_proof_snapshot(
     time_clock_id_t clock,
-    clocks_alpha_recover_reattach_snapshot_t* out) {
+    clocks_alpha_recover_proof_snapshot_t* out) {
   if (!out) return false;
-  *out = clocks_alpha_recover_reattach_snapshot_t{};
+  *out = clocks_alpha_recover_proof_snapshot_t{};
 
   if (clock != time_clock_id_t::OCXO1 &&
       clock != time_clock_id_t::OCXO2) {
     return false;
   }
 
-  clocks_alpha_recover_reattach_snapshot_t& r = *out;
+  clocks_alpha_recover_proof_snapshot_t& r = *out;
   r.clock_id = (uint32_t)((uint8_t)clock);
   r.reprime_count = g_alpha_recover_reprime_count;
 
@@ -8041,16 +8002,16 @@ bool clocks_alpha_ocxo_recover_reattach_snapshot(
   return true;
 }
 
-static clocks_alpha_recover_reattach_snapshot_t
+static clocks_alpha_recover_proof_snapshot_t
     g_alpha_recover_ready_probe_ocxo1 = {};
-static clocks_alpha_recover_reattach_snapshot_t
+static clocks_alpha_recover_proof_snapshot_t
     g_alpha_recover_ready_probe_ocxo2 = {};
 
-bool clocks_alpha_recover_ocxo_reattach_ready(void) {
-  return clocks_alpha_ocxo_recover_reattach_snapshot(
+bool clocks_alpha_recover_ocxo_proof_ready(void) {
+  return clocks_alpha_ocxo_recover_proof_snapshot(
              time_clock_id_t::OCXO1,
              &g_alpha_recover_ready_probe_ocxo1) &&
-         clocks_alpha_ocxo_recover_reattach_snapshot(
+         clocks_alpha_ocxo_recover_proof_snapshot(
              time_clock_id_t::OCXO2,
              &g_alpha_recover_ready_probe_ocxo2) &&
          g_alpha_recover_ready_probe_ocxo1.ready &&

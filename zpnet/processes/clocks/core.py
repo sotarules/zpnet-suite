@@ -191,7 +191,7 @@ GNSS_RAW_INFO_MAX_AGE_S = 2.5
 # Sync waits
 #
 # Cold START, Flash Cut, and zero-row cold recovery are readiness-gated.
-# Warm recovery uses its narrower recovery-specific lifecycle contract. The
+# Dead-producer recovery uses its narrower recovery-specific lifecycle contract. The
 # Pi no longer expects fixed row burial/warmup suppression during admission:
 # the first public CLOCKS_FRAGMENT campaign delta is supposed to be useful, and if it is not,
 # the responsible readiness or handoff gate should be fixed.
@@ -208,7 +208,7 @@ SYNC_RECOVER_CLEAN_TIMEOUT_S = 180.0
 
 # A recovery that produces no accepted CLOCKS_FRAGMENT campaign delta inside this window is not
 # merely "not clean yet".  Teensy should either publish a clean row or, after
-# its bounded private reattach window, publish degraded rows that let the Pi
+# its bounded private proof window, publish degraded rows that let the Pi
 # observe liveness.  If the first row never appears, abort the firmware
 # RECOVER lifecycle explicitly instead of recursively hard-faulting the Pi-side
 # recovery thread.
@@ -294,7 +294,7 @@ TIMEBASE_FINAL_COURT_DELTA_RAW_INTERVAL_GATE_CYCLES = 500
 # Second final-court rule: after the first startup/recovery maturity rows, an
 # OCXO lane may not publish as an all-zero science/public ledger.  A warm
 # RECOVER can legitimately hide early private candidates while firmware
-# reattaches OCXO custody, but once a public TIMEBASE row reaches the Pi,
+# proves fresh OCXO custody, but once a public TIMEBASE row reaches the Pi,
 # zero OCXO ns plus zero endpoints/intervals is lane absence, not science.
 TIMEBASE_FINAL_COURT_OCXO_ZERO_MATURE_PUBLIC_COUNT = 2
 
@@ -333,6 +333,10 @@ STARTUP_INFRASTRUCTURE_STATUS_LOG_INTERVAL_S = 30.0
 STARTUP_ALPHA_EPOCH_POLL_S = 1.0
 STARTUP_ALPHA_EPOCH_QUIET_GRACE_S = 30.0
 STARTUP_ALPHA_EPOCH_STATUS_LOG_INTERVAL_S = 30.0
+# Producer survival must be decided from current-lifetime canonical testimony.
+# A retained pre-flash row may be delivered immediately after firmware restart;
+# staleness is therefore inconclusive, never evidence authorizing mutation.
+STARTUP_SURVIVAL_FRESH_WITNESS_TIMEOUT_S = 10.0
 HOLISTIC_RESTORE_TIMEOUT_S = 60.0
 HOLISTIC_RESTORE_COMMAND_RETRY_S = 10.0
 
@@ -2483,7 +2487,7 @@ _HARD_FAILURE_STATS_REPAIR_REASONS = {
 
 _campaign_active: bool = False
 
-# Warm recovery may resume on a truthful degraded timeline row while the
+# Dead-producer recovery may resume on a truthful degraded timeline row while the
 # firmware completes its deterministic OCXO science quarantine.  Arm a one-shot
 # confirmation so the first later science-and-control eligible row closes the
 # recovery narrative explicitly.
@@ -4103,7 +4107,7 @@ def _timebase_silence_recovery(reason: str, details: Dict[str, Any]) -> None:
 
                     status = str((e.details or {}).get("status") or "")
                     terminal_firmware_rejection = (
-                        status == "recover_rejected_interrupt_service_rearm"
+                        status == "recover_rejected_dead_producer_epoch_prepare"
                     )
                     attempts_exhausted = attempts >= int(AUTO_RECOVERY_MAX_ATTEMPTS)
 
@@ -7879,6 +7883,38 @@ def _wait_for_holistic_restore(
     )
 
 
+def _wait_for_fresh_survival_witness() -> Tuple[Dict[str, Any], Optional[float], Optional[str]]:
+    """Return fresh canonical CLOCKS testimony before producer classification.
+
+    PUBSUB may replay a retained pre-restart row as soon as Pi CLOCKS reconnects.
+    That row is valuable evidence, but it cannot decide whether the current Alpha
+    lifetime survived. Once firmware says the current Alpha epoch is ready, wait
+    briefly for a canonical row fresh enough to belong to the current observation
+    stream. If none arrives, classification is undefined and startup fails loud
+    rather than mutating a producer on stale testimony.
+    """
+    deadline = time.monotonic() + STARTUP_SURVIVAL_FRESH_WITNESS_TIMEOUT_S
+    while True:
+        with _clocks_lock:
+            state = copy.deepcopy(_latest_clocks)
+            received_monotonic = _latest_clocks_received_monotonic
+            received_utc = _latest_clocks_received_utc
+        age_s = (
+            None
+            if received_monotonic is None
+            else max(0.0, time.monotonic() - received_monotonic)
+        )
+        if state and age_s is not None and age_s <= CLOCKS_PREFLIGHT_MAX_AGE_S:
+            return state, age_s, received_utc
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "cannot classify CLOCKS producer lifetime without fresh canonical "
+                f"testimony within {STARTUP_SURVIVAL_FRESH_WITNESS_TIMEOUT_S:.1f}s "
+                f"(last_age_s={age_s})"
+            )
+        time.sleep(0.05)
+
+
 def _alpha_survival_lineage_court(
     durable_clocks: Dict[str, Any],
     live_state: Dict[str, Any],
@@ -8090,14 +8126,13 @@ def _restore_instrument_from_clocks(
         lifecycle_status.get("recover_lifecycle_active")
     )
 
-    # Temporary startup courtroom transcript.  Keep the ordinary CLOCKS stream
-    # beside REPORT_RECOVERY in the log so one restart tells us which authority
-    # is carrying the live campaign identity and why the command-side court did
-    # or did not admit the Pi-only reattach branch.
-    with _clocks_lock:
-        startup_live_clocks = copy.deepcopy(_latest_clocks)
-        startup_live_received_monotonic = _latest_clocks_received_monotonic
-        startup_live_received_utc = _latest_clocks_received_utc
+    # Classify producer lifetime only from a fresh canonical observation. A
+    # retained pre-flash row may arrive first and is not evidence of either
+    # survival or death. Firmware epoch readiness plus this fresh witness form
+    # the minimum startup custody court.
+    startup_live_clocks, startup_live_age_s, startup_live_received_utc = (
+        _wait_for_fresh_survival_witness()
+    )
     startup_live_campaign = _state_campaign(startup_live_clocks)
     startup_live_campaign_name = (
         _tempest_campaign_name(startup_live_campaign)
@@ -8109,12 +8144,6 @@ def _restore_instrument_from_clocks(
         if isinstance(startup_live_campaign, dict)
         else ""
     ).strip().upper()
-    startup_live_age_s = (
-        None
-        if startup_live_received_monotonic is None
-        else max(0.0, time.monotonic() - startup_live_received_monotonic)
-    )
-
     # Producer survival is independent of campaign execution. REPORT_RECOVERY
     # contributes present-tense producer custody; canonical lineage proof remains
     # the authority for deciding whether this exact producer survived.
@@ -9202,7 +9231,7 @@ def _tempest_candidate_view(campaign: Dict[str, Any]) -> Dict[str, Any]:
             "recover_science_quarantine_remaining": recovery.get(
                 "science_quarantine_remaining"
             ),
-            "recover_reattach_stalled": recovery.get("reattach_stalled"),
+            "recover_proof_stalled": recovery.get("proof_stalled"),
         })
     return view
 
@@ -10061,25 +10090,16 @@ def _recovery_inflight_status_compact(status: Dict[str, Any]) -> Dict[str, Any]:
             status.get("recover_smartzero_complete")
         ),
         "recover_epoch_ready": _recovery_bool(status.get("recover_epoch_ready")),
-        "recover_interrupt_service_rearm_ok": _recovery_bool(
-            status.get("recover_interrupt_service_rearm_ok")
-        ),
-        "recover_interrupt_service_rearm_count": _as_int(
-            status.get("recover_interrupt_service_rearm_count")
-        ),
-        "recover_interrupt_service_rearm_failure_count": _as_int(
-            status.get("recover_interrupt_service_rearm_failure_count")
-        ),
-        "recover_reattach_active": _recovery_bool(status.get("recover_reattach_active")),
-        "recover_reattach_degraded_active": _recovery_bool(status.get("recover_reattach_degraded_active")),
-        "recover_reattach_reason": status.get("recover_reattach_reason"),
+        "recover_proof_active": _recovery_bool(status.get("recover_proof_active")),
+        "recover_proof_degraded_active": _recovery_bool(status.get("recover_proof_degraded_active")),
+        "recover_proof_reason": status.get("recover_proof_reason"),
         "recover_timeline_ready": _recovery_bool(status.get("recover_timeline_ready")),
         "recover_clockface_ready": _recovery_bool(status.get("recover_clockface_ready")),
         "recover_science_ready": _recovery_bool(status.get("recover_science_ready")),
-        "recover_reattach_stalled": bool(
+        "recover_proof_stalled": bool(
             _fragment_recovery_bool(
                 status,
-                "recover_reattach_stalled",
+                "recover_proof_stalled",
                 "degraded_publication_stalled",
             )
         ),
@@ -10114,8 +10134,8 @@ def _recovery_inflight_lost_reason(
         reported_generation = request_count
 
     lifecycle_active = _recovery_bool(status.get("recover_lifecycle_active"))
-    reattach_active = _recovery_bool(status.get("recover_reattach_active"))
-    degraded_active = _recovery_bool(status.get("recover_reattach_degraded_active"))
+    proof_active = _recovery_bool(status.get("recover_proof_active"))
+    degraded_active = _recovery_bool(status.get("recover_proof_degraded_active"))
     warmup_active = _recovery_bool(status.get("warmup_active"))
     campaign_state = str(status.get("campaign_state") or "").upper()
 
@@ -10144,7 +10164,7 @@ def _recovery_inflight_lost_reason(
         and base_count in (None, 0)
         and expected_first_reported in (None, 0)
         and not lifecycle_active
-        and not reattach_active
+        and not proof_active
         and not degraded_active
         and not warmup_active
         and campaign_state in ("", "STOPPED", "IDLE")
@@ -10183,8 +10203,8 @@ def _check_recovery_inflight_monitor(
         compact.get("recover_lifecycle_reason"),
         compact.get("recover_dead_producer_restore_epoch_ready"),
         compact.get("recover_dead_producer_restore_commit_count"),
-        compact.get("recover_reattach_active"),
-        compact.get("recover_reattach_degraded_active"),
+        compact.get("recover_proof_active"),
+        compact.get("recover_proof_degraded_active"),
         compact.get("recover_clockface_ready"),
         compact.get("recover_science_ready"),
         compact.get("candidate_count"),
@@ -10317,12 +10337,12 @@ def _recovery_admission_verdict(
 
     fragment_active = _fragment_recovery_bool(
         fragment,
-        "recover_reattach_active",
+        "recover_proof_active",
     )
     active = (
         fragment_active
         if fragment_active is not None
-        else _recovery_bool(status.get("recover_reattach_active"))
+        else _recovery_bool(status.get("recover_proof_active"))
     )
 
     fragment_degraded = _fragment_recovery_any_true(
@@ -10332,13 +10352,13 @@ def _recovery_admission_verdict(
     degraded = (
         fragment_degraded
         if fragment_degraded is not None
-        else _recovery_bool(status.get("recover_reattach_degraded_active"))
+        else _recovery_bool(status.get("recover_proof_degraded_active"))
     )
 
     stalled = bool(
-        _fragment_recovery_bool(fragment, "recover_reattach_stalled")
+        _fragment_recovery_bool(fragment, "recover_proof_stalled")
         or _recovery_bool(
-            status.get("recover_reattach_stalled")
+            status.get("recover_proof_stalled")
             or status.get("degraded_publication_stalled")
         )
     )
@@ -10374,7 +10394,7 @@ def _recovery_admission_verdict(
         if science_ready_explicit is not None
         else _recovery_bool(
             status.get("recover_science_ready")
-            or status.get("reattach_ready")
+            or status.get("proof_ready")
             or status.get("recover_clean_ready")
         )
     )
@@ -10421,7 +10441,7 @@ def _recovery_admission_verdict(
     if not report_available:
         state_reasons.append("report_recovery_unavailable")
     if active:
-        blocking_reasons.append("reattach_private_hold_active")
+        blocking_reasons.append("recovery_proof_private_hold_active")
     if campaign_state != "STARTED":
         blocking_reasons.append("campaign_not_started")
     if watchdog_blocked or watchdog_active:
@@ -10449,7 +10469,7 @@ def _recovery_admission_verdict(
     if not science_clean:
         state_reasons.append("ocxo_science_not_clean")
     if stalled:
-        state_reasons.append("ocxo_science_reattach_stalled")
+        state_reasons.append("ocxo_science_proof_stalled")
 
     science_complete = bool(
         clockface_ready
@@ -10491,13 +10511,13 @@ def _recovery_admission_verdict(
         "reasons": blocking_reasons + state_reasons,
         "pps_vclock_count": int(pps_vclock_count),
         "report_available": report_available,
-        "recover_reattach_active": bool(active),
-        "recover_reattach_degraded_active": bool(degraded),
+        "recover_proof_active": bool(active),
+        "recover_proof_degraded_active": bool(degraded),
         "recover_transition_active": transition_active,
         "recover_timeline_ready": timeline_ready,
         "recover_clockface_ready": bool(clockface_ready),
         "recover_science_ready": bool(science_ready),
-        "recover_reattach_stalled": stalled,
+        "recover_proof_stalled": stalled,
         "explicit_degraded": explicit_degraded,
         "watchdog_blocked": watchdog_blocked or watchdog_active,
         "science_quarantine_active": quarantine_active,
@@ -10505,16 +10525,16 @@ def _recovery_admission_verdict(
         "science_clean": science_clean,
         "lanes": lanes,
         "report_reason": (
-            fragment.get("recover_reattach_reason")
-            or status.get("recover_reattach_reason")
+            fragment.get("recover_proof_reason")
+            or status.get("recover_proof_reason")
         ),
         "stall_reason": (
-            status.get("recover_reattach_stall_reason")
+            status.get("recover_proof_stall_reason")
             or status.get("degraded_publication_stall_reason")
             or status.get("degraded_stall_reason")
         ),
         "degraded_window_row_count": _as_int(
-            status.get("recover_reattach_degraded_window_row_count")
+            status.get("recover_proof_degraded_window_row_count")
             or status.get("degraded_window_row_count")
         ),
         "degraded_no_progress_row_count": _as_int(
@@ -10526,7 +10546,7 @@ def _recovery_admission_verdict(
             or fragment.get("recover_last_progress_public_count")
         ),
         "degraded_stall_threshold": _as_int(
-            status.get("recover_reattach_degraded_stall_threshold")
+            status.get("recover_proof_degraded_stall_threshold")
             or status.get("degraded_stall_threshold")
         ),
         "hidden_candidate_count": _as_int(status.get("hidden_candidate_count")),
@@ -11996,7 +12016,7 @@ def on_recovery_stalled(payload: Payload) -> None:
     This event means the Teensy timeline is alive but OCXO science proof either
     exceeded its bounded proof-attempt expectation or stopped advancing.  It is
     deliberately not WATCHDOG_ANOMALY: restarting RECOVER here would destroy the
-    very reattachment state being diagnosed.
+    very proof convergence state being diagnosed.
     """
     _diag["recovery_stalled_events_received"] += 1
     # Compatibility counter: this is a science-cleanliness stall, but it no
@@ -12044,7 +12064,7 @@ def on_recovery_stalled(payload: Payload) -> None:
         )
     else:
         logging.error(
-            "🧭 [recovery] OCXO science reattachment reports no progress "
+            "🧭 [recovery] OCXO science proof convergence reports no progress "
             "(campaign=%s generation=%s rows=%s threshold=%s); "
             "timeline publication continues and RECOVER is not restarted",
             snapshot.get("campaign"),
@@ -15256,7 +15276,7 @@ def _restore_active_campaign_state(
     # ------------------------------------------------------------------
     # Step 2: Wait for preflight
     # ------------------------------------------------------------------
-    # Warm recovery deliberately bypasses the full START CLOCKS profile:
+    # Dead-producer recovery deliberately bypasses the full START CLOCKS profile:
     # SmartZero/Alpha-epoch/OCXO-origin leaves may be exactly what RECOVER must
     # reconstruct after a Teensy reboot.  Requiring them here would create a
     # circular wait.
@@ -16473,7 +16493,7 @@ def _check_preflight(
     """Check the CLOCKS policy gate plus fresh local Pi prerequisites.
 
     This path is used for cold START, Flash Cut, and zero-row cold recovery.
-    Warm recovery has its own narrower lifecycle contract.
+    Dead-producer recovery has its own narrower lifecycle contract.
     """
     reasons: list[str] = []
 

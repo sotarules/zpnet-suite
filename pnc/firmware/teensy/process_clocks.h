@@ -253,8 +253,8 @@ bool clocks_dwt_calibration_valid(void);
 // Alpha always-on OCXO TAU estimator
 // -----------------------------------------------------------------------------
 // Alpha estimates OCXO frequency continuously from lawful completed-row Delta
-// intervals.  It survives START, STOP, FLASH_CUT, warm RECOVER, and logical
-// epoch replacement; only reboot or CLOCKS.STATS_RESET clears the estimator.
+// intervals.  It survives START, STOP, and FLASH_CUT. Dead-producer RECOVER restores the
+// estimator from durable sufficient state; only CLOCKS.STATS_RESET intentionally clears it.
 // Beta can therefore publish a mature frequency estimate on the first campaign
 // row instead of rediscovering TAU from a launch-origin quotient.
 #ifndef CLOCKS_ALPHA_TAU_SNAPSHOT_T_DEFINED
@@ -569,7 +569,7 @@ struct clocks_fragment_recovery_snapshot_t {
   bool degraded_active = false;
   bool science_quarantine_active = false;
   uint32_t science_quarantine_remaining = 0;
-  bool reattach_stalled = false;
+  bool proof_stalled = false;
 };
 
 // Campaign-relative PPB is a genuine different scope from instrument TOTAL and
