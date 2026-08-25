@@ -5819,16 +5819,23 @@ bool Payload::_append_value(const char* key,
                                 key_offset, value_offset,
                                 shift, key_off, val_off);
 
+    // Publish only coordinates re-derived from guarded object state after the
+    // final call boundary; the earlier copy offsets are forensic/provisional.
+    Entry* const commit_entry = &_entries()[_count];
+    const volatile uint16_t& data_begin_now = _data_begin;
+
     Entry entry{};
-    entry.key_off = key_off;
+    entry.key_off =
+        (uint16_t)(data_begin_now - (uint16_t)additional_data);
     entry.key_len = (uint16_t)key_len;
-    entry.val_off = val_off;
+    entry.val_off =
+        (uint16_t)(data_begin_now - (uint16_t)(value_len + 1U));
     entry.val_len = (uint16_t)value_len;
     entry.kind = (uint8_t)kind;
     entry.reserved = 0U;
 
-    _entries()[_count] = entry;
-    _set_data_begin(key_off);
+    *commit_entry = entry;
+    _set_data_begin(entry.key_off);
     _set_count((uint16_t)(_count + 1U));
     payload_append_trace_record(payload_append_trace_stage_t::COMMIT,
                                 this,
@@ -5840,7 +5847,7 @@ bool Payload::_append_value(const char* key,
                                 _data_begin, _count,
                                 key_alias, value_alias,
                                 key_offset, value_offset,
-                                shift, key_off, val_off);
+                                shift, entry.key_off, entry.val_off);
 
     if (!_contract_finish_add(PAYLOAD_OP_APPEND_VALUE,
                               before,
@@ -6066,16 +6073,23 @@ bool Payload::_append_value_writer(const char* key,
     }
     storage[(size_t)key_off + key_len] = '\0';
 
+    // Publish only coordinates re-derived from guarded object state after the
+    // final call boundary; the earlier copy offsets are forensic/provisional.
+    Entry* const commit_entry = &_entries()[_count];
+    const volatile uint16_t& data_begin_now = _data_begin;
+
     Entry entry{};
-    entry.key_off = key_off;
+    entry.key_off =
+        (uint16_t)(data_begin_now - (uint16_t)additional_data);
     entry.key_len = (uint16_t)key_len;
-    entry.val_off = val_off;
+    entry.val_off =
+        (uint16_t)(data_begin_now - (uint16_t)(value_len + 1U));
     entry.val_len = (uint16_t)value_len;
     entry.kind = (uint8_t)kind;
     entry.reserved = 0U;
 
-    _entries()[_count] = entry;
-    _set_data_begin(key_off);
+    *commit_entry = entry;
+    _set_data_begin(entry.key_off);
     _set_count((uint16_t)(_count + 1U));
 
     if (!_contract_finish_add(PAYLOAD_OP_APPEND_WRITER,
