@@ -330,6 +330,11 @@ void setup() {
 // ============================================================================
 
 void loop() {
+  // Primitive terminal court first.  If SYSTEM.REBOOT has already returned its
+  // RPC acknowledgment and the DWT deadline has passed, reset before entering
+  // any timing, event, or subsystem service that may itself be unhealthy.
+  system_reboot_service();
+
   transport_note_runtime_loop();
 
   // Flush interrupt-authored scalar feature truth only from thread-mode

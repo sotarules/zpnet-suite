@@ -41,6 +41,7 @@ extern void transport_get_rx_dispatch_mailbox_info(
     uint32_t* incoming_req_id);
 
 static constexpr uint64_t FLASH_DELAY_NS = 5000000000ULL;  // 5 seconds
+static constexpr uint32_t REBOOT_DELAY_MS = 250U;
 
 // --------------------------------------------------------------
 // Forward declarations (terminal paths)
@@ -58,6 +59,8 @@ static void system_dmamem_ensure_initialized(void);
 // --------------------------------------------------------------
 static bool system_shutdown   = false;
 static bool system_bootloader = false;
+static bool system_reboot     = false;
+static uint32_t system_reboot_deadline_dwt = 0U;
 
 // Ordinary BSS flag: unlike DMAMEM, this is guaranteed zeroed by startup and
 // can safely guard the first RAM2 cold initialization.
@@ -1965,6 +1968,8 @@ static payload_append_trace_snapshot_t
     g_system_payload_append_trace_scratch DMAMEM;
 static payload_heap_resize_trace_snapshot_t
     g_system_payload_heap_resize_trace_scratch DMAMEM;
+static payload_stamp_trace_snapshot_t
+    g_system_payload_stamp_trace_scratch;
 
 static char system_hex_digit(uint8_t value) {
   return value < 10U ? (char)('0' + value)
@@ -2089,6 +2094,139 @@ static FLASHMEM Payload system_payload_fatal_payload(void) {
   out.add("watchdog_sent", fatal.watchdog_sent != 0U);
   return out;
 }
+
+
+// ================================================================
+// Payload contract-stamp lifecycle recorder — reporting surface
+// ================================================================
+
+static FLASHMEM Payload system_payload_stamp_trace_entry_payload(
+    const payload_stamp_trace_entry_t& entry) {
+  Payload out;
+  out.add("sequence", entry.sequence);
+  out.add("stage_id", entry.stage);
+  out.add("stage", payload_stamp_trace_stage_name(entry.stage));
+  out.add("operation_id", entry.operation_id);
+  out.add("operation", payload_operation_id_name(entry.operation_id));
+  system_crash_add_hex32(out, "this", entry.this_ptr);
+  system_crash_add_hex32(out, "caller_lr", entry.caller_lr);
+  system_crash_add_hex32(out, "caller_target", entry.caller_lr & ~1UL);
+  system_crash_add_hex32(out, "msp", entry.msp);
+  system_crash_add_hex32(out, "dwt", entry.dwt_cyccnt);
+  out.add("ipsr", entry.ipsr);
+
+  system_crash_add_hex32(out, "heap_block", entry.heap_block);
+  system_crash_add_hex32(out, "heap_block_guard", entry.heap_block_guard);
+  out.add("count", entry.count);
+  system_crash_add_hex32(out, "count_guard", entry.count_guard);
+  out.add("data_begin", entry.data_begin);
+  system_crash_add_hex32(out, "data_begin_guard", entry.data_begin_guard);
+
+  system_crash_add_hex32(out, "contract_generation",
+                         entry.contract_generation);
+  system_crash_add_hex32(out, "contract_generation_guard",
+                         entry.contract_generation_guard);
+  system_crash_add_hex32(out, "contract_fingerprint",
+                         entry.contract_fingerprint);
+  system_crash_add_hex32(out, "contract_fingerprint_guard",
+                         entry.contract_fingerprint_guard);
+  system_crash_add_hex32(out, "structural_fingerprint",
+                         entry.structural_fingerprint);
+  out.add("contract_incident_sequence",
+          entry.contract_incident_sequence);
+
+  const bool heap_guard_ok =
+      (entry.heap_block ^ entry.heap_block_guard) == 0xFFFFFFFFUL;
+  const bool count_guard_ok =
+      (uint16_t)(entry.count ^ entry.count_guard) == UINT16_MAX;
+  const bool data_begin_guard_ok =
+      (uint16_t)(entry.data_begin ^ entry.data_begin_guard) == UINT16_MAX;
+  const bool generation_guard_ok =
+      (entry.contract_generation ^ entry.contract_generation_guard) ==
+          0xFFFFFFFFUL;
+  const bool fingerprint_guard_ok =
+      (entry.contract_fingerprint ^ entry.contract_fingerprint_guard) ==
+          0xFFFFFFFFUL;
+  const bool stamp_valid =
+      generation_guard_ok && fingerprint_guard_ok &&
+      entry.contract_generation != 0U;
+
+  out.add("heap_guard_ok", heap_guard_ok);
+  out.add("count_guard_ok", count_guard_ok);
+  out.add("data_begin_guard_ok", data_begin_guard_ok);
+  out.add("contract_generation_guard_ok", generation_guard_ok);
+  out.add("contract_fingerprint_guard_ok", fingerprint_guard_ok);
+  out.add("contract_stamp_initialized", entry.contract_generation != 0U);
+  out.add("contract_stamp_valid", stamp_valid);
+  if (entry.structural_fingerprint != 0U) {
+    out.add("structural_matches_stamp",
+            entry.structural_fingerprint == entry.contract_fingerprint);
+  }
+  return out;
+}
+
+static uint32_t system_payload_stamp_trace_report_count(
+    const Payload& args) {
+  uint32_t count = args.has("count") ? args.getUInt("count") : 8U;
+  if (count == 0U) count = 1U;
+  if (count > PAYLOAD_STAMP_TRACE_ENTRIES) {
+    count = PAYLOAD_STAMP_TRACE_ENTRIES;
+  }
+  return count;
+}
+
+static FLASHMEM Payload system_payload_stamp_trace_payload(
+    const Payload& args) {
+  // Snapshot before constructing the response: response Payload activity must
+  // never become evidence in the transcript being reported.
+  payload_get_stamp_trace(&g_system_payload_stamp_trace_scratch);
+
+  bool bank_valid = true;
+  const bool live_bank = system_trace_report_live_bank(args, &bank_valid);
+  if (!bank_valid) {
+    Payload error;
+    error.add("error", "bank must be live or retained");
+    return error;
+  }
+
+  const uint32_t requested =
+      system_payload_stamp_trace_report_count(args);
+  const uint32_t offset = system_trace_report_offset(args);
+  const payload_stamp_trace_bank_snapshot_t& bank = live_bank
+      ? g_system_payload_stamp_trace_scratch.live
+      : g_system_payload_stamp_trace_scratch.retained;
+
+  uint32_t begin = 0U;
+  uint32_t end = 0U;
+  system_trace_bounds(bank.count, requested, offset, &begin, &end);
+
+  Payload out;
+  out.add("schema", "ZPNET_PAYLOAD_STAMP_TRACE_V1");
+  out.add("bank", live_bank ? "live" : "retained");
+  out.add("valid", bank.valid != 0U);
+  out.add("capacity", PAYLOAD_STAMP_TRACE_ENTRIES);
+  out.add("available_count", bank.count);
+  out.add("newest_sequence", bank.newest_sequence);
+  out.add("requested_count", requested);
+  out.add("returned_count", end - begin);
+  out.add("offset_from_newest", offset);
+  out.add("has_older", begin != 0U);
+  out.add("has_newer", offset != 0U && bank.count != 0U);
+  out.add("first_sequence", begin < end ? bank.entries[begin].sequence : 0U);
+  out.add("last_sequence",
+          begin < end ? bank.entries[end - 1U].sequence : 0U);
+
+  PayloadArray records;
+  for (uint32_t i = begin; i < end; ++i) {
+    Payload record =
+        system_payload_stamp_trace_entry_payload(bank.entries[i]);
+    record.add("bank_index", i);
+    records.add(record);
+  }
+  out.add_array("records", records);
+  return out;
+}
+
 
 // ================================================================
 // Payload v4.1 append transaction recorder — reporting surface
@@ -2799,6 +2937,7 @@ static FLASHMEM Payload system_crash_report_payload(void) {
   detail.add("dispatch_breadcrumb", "SYSTEM.DISPATCH_BREADCRUMB");
   detail.add("payload_flight", "SYSTEM.PAYLOAD_FLIGHT_INFO");
   detail.add("payload_fatal", "SYSTEM.PAYLOAD_FATAL_INFO");
+  detail.add("payload_stamp_trace", "SYSTEM.PAYLOAD_STAMP_TRACE");
   detail.add("payload_append_trace", "SYSTEM.PAYLOAD_APPEND_TRACE");
   detail.add("payload_heap_resize_trace", "SYSTEM.PAYLOAD_HEAP_RESIZE_TRACE");
   detail.add("payload_contract", "SYSTEM.PAYLOAD_CONTRACT_INFO");
@@ -2836,6 +2975,38 @@ static FLASHMEM void enter_bootloader_cb(timepop_ctx_t*, timepop_diag_t*, void*)
 
   // Absolute fallback (should never return)
   system_enter_quiescence();
+}
+
+static __attribute__((noreturn)) void system_reboot_now(void) {
+  // Cortex-M AIRCR write key plus SYSRESETREQ.  Preserve PRIGROUP so the reset
+  // request changes no interrupt policy during the final instruction window.
+  static constexpr uint32_t AIRCR_VECTKEY = 0x5FAUL << 16;
+  static constexpr uint32_t AIRCR_PRIGROUP_MASK = 7UL << 8;
+  static constexpr uint32_t AIRCR_SYSRESETREQ = 1UL << 2;
+
+  volatile uint32_t* const aircr =
+      reinterpret_cast<volatile uint32_t*>(SYSTEM_SCB_AIRCR);
+  const uint32_t prigroup = *aircr & AIRCR_PRIGROUP_MASK;
+
+  __asm__ volatile("dsb" ::: "memory");
+  *aircr = AIRCR_VECTKEY | prigroup | AIRCR_SYSRESETREQ;
+  __asm__ volatile("dsb\nisb" ::: "memory");
+
+  // SYSRESETREQ must not return to application code.
+  while (true) {}
+}
+
+void system_reboot_service(void) {
+  if (!system_reboot) return;
+
+  // DWT is enabled before SYSTEM exists and advances directly with the core
+  // clock.  Keep reboot custody below TimePop, events, GNSS, VCLOCK, and the
+  // Arduino millisecond tick: once the acknowledged deadline is reached or
+  // passed, the next foreground loop iteration resets immediately.
+  const uint32_t now = ARM_DWT_CYCCNT;
+  if ((int32_t)(now - system_reboot_deadline_dwt) < 0) return;
+
+  system_reboot_now();
 }
 
 bool system_is_shutdown(void) {
@@ -3748,6 +3919,31 @@ static FLASHMEM Payload cmd_enter_bootloader(const Payload& /*args*/) {
 }
 
 // ------------------------------------------------------------
+// REBOOT — acknowledged warm reset without entering the bootloader
+// ------------------------------------------------------------
+static FLASHMEM Payload cmd_reboot(const Payload& /*args*/) {
+  Payload resp = ok_payload();
+
+  if (system_reboot) {
+    resp.add("action", "already_scheduled");
+    resp.add("delay_ms", REBOOT_DELAY_MS);
+    return resp;
+  }
+
+  // Arm only ordinary scalar state.  Do not depend on TimePop or any other
+  // subsystem that REBOOT may eventually be used to recover.  The DWT delta
+  // is far below 2^31 cycles, so the foreground service can use the standard
+  // wrap-safe signed subtraction test.
+  const uint32_t delay_cycles = F_CPU_ACTUAL / 4U;  // 250 ms
+  system_reboot_deadline_dwt = ARM_DWT_CYCCNT + delay_cycles;
+  system_reboot = true;
+
+  resp.add("action", "scheduled");
+  resp.add("delay_ms", REBOOT_DELAY_MS);
+  return resp;
+}
+
+// ------------------------------------------------------------
 // SHUTDOWN — terminal, irreversible
 // ------------------------------------------------------------
 static FLASHMEM Payload cmd_shutdown(const Payload& /*args*/) {
@@ -3870,6 +4066,13 @@ static FLASHMEM Payload cmd_payload_fatal_info(const Payload& /*args*/) {
 }
 
 // ------------------------------------------------------------
+// PAYLOAD_STAMP_TRACE — retained/live contract-stamp lifecycle transcript
+// ------------------------------------------------------------
+static FLASHMEM Payload cmd_payload_stamp_trace(const Payload& args) {
+  return system_payload_stamp_trace_payload(args);
+}
+
+// ------------------------------------------------------------
 // PAYLOAD_APPEND_TRACE — bounded retained/live append transaction transcript
 // ------------------------------------------------------------
 static FLASHMEM Payload cmd_payload_append_trace(const Payload& args) {
@@ -3955,6 +4158,7 @@ static FLASHMEM Payload cmd_crash_clear(const Payload& /*args*/) {
 
   timepop_dispatch_trace_clear_retained();
   payload_fatal_record_clear();
+  payload_clear_retained_stamp_trace();
   payload_clear_retained_append_trace();
   payload_clear_retained_heap_resize_trace();
   payload_contract_clear_retained();
@@ -3969,6 +4173,7 @@ static FLASHMEM Payload cmd_crash_clear(const Payload& /*args*/) {
   resp.add("execution_trace_cleared", true);
   resp.add("timepop_dispatch_trace_cleared", true);
   resp.add("payload_fatal_cleared", true);
+  resp.add("payload_stamp_trace_cleared", true);
   resp.add("payload_append_trace_cleared", true);
   resp.add("payload_heap_resize_trace_cleared", true);
   resp.add("stack_watch_retained_cleared", true);
@@ -4021,6 +4226,7 @@ static const process_command_entry_t SYSTEM_COMMANDS[] = {
   { "TRANSPORT_INFO",   cmd_transport_info   },
   { "PAYLOAD_INFO",     cmd_payload_info     },
   { "ENTER_BOOTLOADER", cmd_enter_bootloader },
+  { "REBOOT",           cmd_reboot           },
   { "SHUTDOWN",         cmd_shutdown         },
   { "PROCESS_LIST",     cmd_process_list     },
   { "FEATURES",         cmd_features         },
@@ -4039,6 +4245,7 @@ static const process_command_entry_t SYSTEM_COMMANDS[] = {
   { "TIMEPOP_DISPATCH_INFO", cmd_timepop_dispatch_info },
   { "PAYLOAD_FLIGHT_INFO", cmd_payload_flight_info },
   { "PAYLOAD_FATAL_INFO", cmd_payload_fatal_info },
+  { "PAYLOAD_STAMP_TRACE", cmd_payload_stamp_trace },
   { "PAYLOAD_APPEND_TRACE", cmd_payload_append_trace },
   { "PAYLOAD_HEAP_RESIZE_TRACE", cmd_payload_heap_resize_trace },
   { "PAYLOAD_CONTRACT_INFO", cmd_payload_contract_info },

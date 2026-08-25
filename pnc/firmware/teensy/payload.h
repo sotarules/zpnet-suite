@@ -233,6 +233,76 @@ bool payload_fatal_record_get(payload_fatal_record_t* out);
 void payload_fatal_record_clear(void);
 
 // ============================================================================
+// Payload contract-stamp lifecycle recorder (retained, scalar-only)
+// ============================================================================
+//
+// This recorder is deliberately narrow. It captures only constructor exit,
+// clear entry, stamp failure, and fatal entry. No record traverses JSON bytes,
+// recomputes hashes, allocates, emits events, or changes Payload semantics.
+
+#define PAYLOAD_STAMP_TRACE_ENTRIES 16U
+
+enum class payload_stamp_trace_stage_t : uint32_t {
+  NONE          = 0,
+  CTOR_EXIT     = 1,
+  CLEAR_ENTER   = 2,
+  STAMP_FAILURE = 3,
+  FATAL_ENTER   = 4,
+};
+
+typedef struct {
+  uint32_t sequence;
+  uint32_t sequence_inv;
+  uint32_t stage;
+  uint32_t operation_id;
+  uint32_t this_ptr;
+  uint32_t caller_lr;
+  uint32_t msp;
+  uint32_t dwt_cyccnt;
+  uint32_t ipsr;
+
+  uint32_t heap_block;
+  uint32_t heap_block_guard;
+  uint32_t count;
+  uint32_t count_guard;
+  uint32_t data_begin;
+  uint32_t data_begin_guard;
+
+  uint32_t contract_generation;
+  uint32_t contract_generation_guard;
+  uint32_t contract_fingerprint;
+  uint32_t contract_fingerprint_guard;
+
+  // Already-computed value supplied by the contract court when available.
+  // Zero means no structural fingerprint was available at this stage.
+  uint32_t structural_fingerprint;
+
+  // Latest contract-incident sequence already committed when this stage was
+  // captured. At STAMP_FAILURE this is intentionally the sequence before the
+  // failure incident; FATAL_ENTER binds the subsequently committed one.
+  uint32_t contract_incident_sequence;
+} payload_stamp_trace_entry_t;
+
+static_assert(sizeof(payload_stamp_trace_entry_t) == 84U,
+              "Payload stamp trace entry geometry changed");
+
+typedef struct {
+  uint32_t valid;
+  uint32_t count;
+  uint32_t newest_sequence;
+  payload_stamp_trace_entry_t entries[PAYLOAD_STAMP_TRACE_ENTRIES];
+} payload_stamp_trace_bank_snapshot_t;
+
+typedef struct {
+  payload_stamp_trace_bank_snapshot_t live;
+  payload_stamp_trace_bank_snapshot_t retained;
+} payload_stamp_trace_snapshot_t;
+
+const char* payload_stamp_trace_stage_name(uint32_t stage);
+void payload_get_stamp_trace(payload_stamp_trace_snapshot_t* out);
+void payload_clear_retained_stamp_trace(void);
+
+// ============================================================================
 // Payload Instrumentation Snapshot (Read-Only, Monotonic)
 // ============================================================================
 
@@ -815,6 +885,7 @@ public:
 private:
     friend void payload_get_info(payload_info_t* out);
     friend struct payload_contract_prefix_access_t;
+    friend struct payload_stamp_trace_access_t;
     friend class PayloadArray;
 
     enum class ValueKind : uint8_t {

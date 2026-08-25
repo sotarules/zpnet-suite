@@ -1144,6 +1144,227 @@ static void payload_guarded_free(void* block,
 #endif
 
 
+// ---- Retained contract-stamp lifecycle recorder ----------------------------
+//
+// The failure under investigation preserves Payload's ordinary structural
+// invariants while the four object-local contract-stamp words become zero.
+// Capture only lifecycle boundaries capable of distinguishing:
+//   * never-constructed / lifetime-invalid object,
+//   * stamp already damaged before clear(),
+//   * stamp damaged while clear() enters the contract court, and
+//   * the exact object carried into the terminal fatal path.
+//
+// CTOR_EXIT is restricted at the call sites to OCRAM objects so ordinary stack
+// temporaries do not drown the ring. CLEAR_ENTER, STAMP_FAILURE, and FATAL_ENTER
+// are always retained. The recorder never traverses JSON bytes, recomputes a
+// hash, allocates, or changes Payload semantics.
+
+static constexpr uint32_t PAYLOAD_STAMP_TRACE_MAGIC = 0x50535431UL;  // 'PST1'
+static constexpr uint32_t PAYLOAD_STAMP_TRACE_SCHEMA_VERSION = 1U;
+
+struct payload_stamp_trace_bank_t {
+    uint32_t magic;
+    uint32_t magic_inv;
+    uint32_t schema_version;
+    uint32_t capacity;
+    payload_stamp_trace_entry_t entries[PAYLOAD_STAMP_TRACE_ENTRIES];
+};
+
+static payload_stamp_trace_bank_t
+    g_payload_stamp_trace_live PAYLOAD_RETAINED_MEM;
+static payload_stamp_trace_bank_t
+    g_payload_stamp_trace_retained PAYLOAD_RETAINED_MEM;
+static bool g_payload_stamp_trace_boot_latched = false;
+static volatile uint32_t g_payload_stamp_trace_next_sequence = 0U;
+
+struct payload_stamp_trace_access_t {
+    static void capture(const Payload& object,
+                        payload_stamp_trace_entry_t* entry) {
+        if (!entry) return;
+        entry->heap_block = (uint32_t)(uintptr_t)object._heap_block;
+        entry->heap_block_guard =
+            (uint32_t)(uintptr_t)object._heap_block_guard;
+        entry->count = (uint32_t)object._count;
+        entry->count_guard = (uint32_t)object._count_guard;
+        entry->data_begin = (uint32_t)object._data_begin;
+        entry->data_begin_guard = (uint32_t)object._data_begin_guard;
+        entry->contract_generation = object._contract_generation;
+        entry->contract_generation_guard = object._contract_generation_guard;
+        entry->contract_fingerprint = object._contract_fingerprint;
+        entry->contract_fingerprint_guard =
+            object._contract_fingerprint_guard;
+    }
+};
+
+static inline bool payload_stamp_trace_is_ocram_object(const void* self) {
+#if defined(__IMXRT1062__)
+    const uintptr_t address = (uintptr_t)self;
+    return address >= 0x20200000UL && address < 0x20280000UL;
+#else
+    (void)self;
+    return true;
+#endif
+}
+
+static FLASHMEM bool payload_stamp_trace_entry_valid(
+    const payload_stamp_trace_entry_t& entry) {
+    return entry.sequence != 0U &&
+           (entry.sequence ^ entry.sequence_inv) == 0xFFFFFFFFUL;
+}
+
+static FLASHMEM bool payload_stamp_trace_bank_valid(
+    const payload_stamp_trace_bank_t& bank) {
+    return bank.magic == PAYLOAD_STAMP_TRACE_MAGIC &&
+           (bank.magic ^ bank.magic_inv) == 0xFFFFFFFFUL &&
+           bank.schema_version == PAYLOAD_STAMP_TRACE_SCHEMA_VERSION &&
+           bank.capacity == PAYLOAD_STAMP_TRACE_ENTRIES;
+}
+
+static FLASHMEM void payload_stamp_trace_initialize_live() {
+    memset((void*)&g_payload_stamp_trace_live, 0,
+           sizeof(g_payload_stamp_trace_live));
+    g_payload_stamp_trace_live.schema_version =
+        PAYLOAD_STAMP_TRACE_SCHEMA_VERSION;
+    g_payload_stamp_trace_live.capacity = PAYLOAD_STAMP_TRACE_ENTRIES;
+    g_payload_stamp_trace_live.magic_inv = ~PAYLOAD_STAMP_TRACE_MAGIC;
+    g_payload_stamp_trace_live.magic = PAYLOAD_STAMP_TRACE_MAGIC;
+    g_payload_stamp_trace_next_sequence = 0U;
+    payload_retained_flush(&g_payload_stamp_trace_live,
+                           sizeof(g_payload_stamp_trace_live));
+}
+
+static FLASHMEM void payload_stamp_trace_boot_latch() {
+    if (g_payload_stamp_trace_boot_latched) return;
+    g_payload_stamp_trace_boot_latched = true;
+
+    // RAM2 is NOLOAD. Preserve the previous boot's final live ring before
+    // initializing this boot's live bank.
+    if (payload_stamp_trace_bank_valid(g_payload_stamp_trace_live)) {
+        g_payload_stamp_trace_retained = g_payload_stamp_trace_live;
+    } else {
+        memset((void*)&g_payload_stamp_trace_retained, 0,
+               sizeof(g_payload_stamp_trace_retained));
+    }
+    payload_retained_flush(&g_payload_stamp_trace_retained,
+                           sizeof(g_payload_stamp_trace_retained));
+    payload_stamp_trace_initialize_live();
+}
+
+static FLASHMEM void payload_stamp_trace_record(
+    payload_stamp_trace_stage_t stage,
+    uint32_t operation_id,
+    const Payload* self,
+    uint32_t caller_lr,
+    uint32_t structural_fingerprint,
+    uint32_t contract_incident_sequence) {
+    if (!self) return;
+    payload_stamp_trace_boot_latch();
+
+    // Best-effort lock-free sequence ownership. Validity is committed last;
+    // a preempted/interleaved slot is discarded by snapshot validation.
+    uint32_t sequence = g_payload_stamp_trace_next_sequence + 1U;
+    if (sequence == 0U) sequence = 1U;
+    g_payload_stamp_trace_next_sequence = sequence;
+
+    payload_stamp_trace_entry_t& entry =
+        g_payload_stamp_trace_live.entries[
+            (sequence - 1U) % PAYLOAD_STAMP_TRACE_ENTRIES];
+
+    entry.sequence = 0U;
+    entry.sequence_inv = 0U;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    payload_retained_flush(&entry, 2U * sizeof(uint32_t));
+
+    memset(reinterpret_cast<uint8_t*>(&entry) + 2U * sizeof(uint32_t),
+           0,
+           sizeof(entry) - 2U * sizeof(uint32_t));
+
+    entry.stage = (uint32_t)stage;
+    entry.operation_id = operation_id;
+    entry.this_ptr = (uint32_t)(uintptr_t)self;
+    entry.caller_lr = caller_lr;
+    entry.msp = payload_read_msp();
+    entry.dwt_cyccnt = payload_read_dwt();
+    entry.ipsr = payload_read_ipsr();
+    payload_stamp_trace_access_t::capture(*self, &entry);
+    entry.structural_fingerprint = structural_fingerprint;
+    entry.contract_incident_sequence = contract_incident_sequence;
+
+    entry.sequence_inv = ~sequence;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    entry.sequence = sequence;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    payload_retained_flush(&entry, sizeof(entry));
+}
+
+static FLASHMEM void payload_stamp_trace_snapshot_bank(
+    const payload_stamp_trace_bank_t& bank,
+    payload_stamp_trace_bank_snapshot_t* out) {
+    memset(out, 0, sizeof(*out));
+    if (!payload_stamp_trace_bank_valid(bank)) return;
+    out->valid = 1U;
+
+    for (uint32_t i = 0U; i < PAYLOAD_STAMP_TRACE_ENTRIES; ++i) {
+        const volatile payload_stamp_trace_entry_t* source =
+            &bank.entries[i];
+        const uint32_t sequence_before = source->sequence;
+        const uint32_t sequence_inv_before = source->sequence_inv;
+        if (sequence_before == 0U ||
+            (sequence_before ^ sequence_inv_before) != 0xFFFFFFFFUL) {
+            continue;
+        }
+
+        const payload_stamp_trace_entry_t candidate = bank.entries[i];
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        if (source->sequence != sequence_before ||
+            source->sequence_inv != sequence_inv_before ||
+            !payload_stamp_trace_entry_valid(candidate)) {
+            continue;
+        }
+
+        uint32_t pos = out->count;
+        while (pos > 0U &&
+               out->entries[pos - 1U].sequence > candidate.sequence) {
+            out->entries[pos] = out->entries[pos - 1U];
+            --pos;
+        }
+        out->entries[pos] = candidate;
+        ++out->count;
+    }
+
+    if (out->count != 0U) {
+        out->newest_sequence = out->entries[out->count - 1U].sequence;
+    }
+}
+
+FLASHMEM void payload_get_stamp_trace(payload_stamp_trace_snapshot_t* out) {
+    if (!out) return;
+    payload_stamp_trace_boot_latch();
+    memset(out, 0, sizeof(*out));
+    payload_stamp_trace_snapshot_bank(g_payload_stamp_trace_live, &out->live);
+    payload_stamp_trace_snapshot_bank(g_payload_stamp_trace_retained,
+                                      &out->retained);
+}
+
+FLASHMEM void payload_clear_retained_stamp_trace(void) {
+    payload_stamp_trace_boot_latch();
+    memset((void*)&g_payload_stamp_trace_retained, 0,
+           sizeof(g_payload_stamp_trace_retained));
+    payload_retained_flush(&g_payload_stamp_trace_retained,
+                           sizeof(g_payload_stamp_trace_retained));
+}
+
+FLASHMEM const char* payload_stamp_trace_stage_name(uint32_t stage) {
+    switch ((payload_stamp_trace_stage_t)stage) {
+        case payload_stamp_trace_stage_t::CTOR_EXIT: return "CTOR_EXIT";
+        case payload_stamp_trace_stage_t::CLEAR_ENTER: return "CLEAR_ENTER";
+        case payload_stamp_trace_stage_t::STAMP_FAILURE: return "STAMP_FAILURE";
+        case payload_stamp_trace_stage_t::FATAL_ENTER: return "FATAL_ENTER";
+        default: return "NONE";
+    }
+}
+
+
 // ---- Retained fatal construction court ------------------------------------
 //
 // This one-record court is the lifeboat for Payload construction failure.
@@ -3993,6 +4214,13 @@ bool Payload::_contract_begin(uint32_t operation_id,
         (_contract_fingerprint ^ _contract_fingerprint_guard) !=
             0xFFFFFFFFUL ||
         _contract_generation == 0U) {
+        payload_stamp_trace_record(
+            payload_stamp_trace_stage_t::STAMP_FAILURE,
+            operation_id,
+            this,
+            (uint32_t)(uintptr_t)__builtin_return_address(0),
+            state.structural_fingerprint,
+            g_payload_contract_next_sequence);
         payload_contract_record(payload_contract_phase_t::OBSERVED_DRIFT,
                                 payload_contract_reason_t::STAMP_GUARD,
                                 operation_id,
@@ -4010,6 +4238,13 @@ bool Payload::_contract_begin(uint32_t operation_id,
     }
 
     if (state.structural_fingerprint != _contract_fingerprint) {
+        payload_stamp_trace_record(
+            payload_stamp_trace_stage_t::STAMP_FAILURE,
+            operation_id,
+            this,
+            (uint32_t)(uintptr_t)__builtin_return_address(0),
+            state.structural_fingerprint,
+            g_payload_contract_next_sequence);
         payload_contract_record(payload_contract_phase_t::OBSERVED_DRIFT,
                                 payload_contract_reason_t::STAMP_MISMATCH,
                                 operation_id,
@@ -4653,6 +4888,15 @@ Payload::Payload()
             0U,
             0U);
     }
+    if (payload_stamp_trace_is_ocram_object(this)) {
+        payload_stamp_trace_record(
+            payload_stamp_trace_stage_t::CTOR_EXIT,
+            PAYLOAD_OP_CTOR,
+            this,
+            (uint32_t)(uintptr_t)__builtin_return_address(0),
+            state.structural_fingerprint,
+            g_payload_contract_next_sequence);
+    }
 }
 
 Payload::~Payload() {
@@ -4680,6 +4924,15 @@ Payload::Payload(Payload&& other) noexcept
     payload_contract_state_t empty{};
     if (_contract_inspect(&empty)) _contract_accept(empty);
     _move_from(other);
+    if (payload_stamp_trace_is_ocram_object(this)) {
+        payload_stamp_trace_record(
+            payload_stamp_trace_stage_t::CTOR_EXIT,
+            PAYLOAD_OP_MOVE_FROM,
+            this,
+            (uint32_t)(uintptr_t)__builtin_return_address(0),
+            _contract_fingerprint,
+            g_payload_contract_next_sequence);
+    }
 }
 
 Payload& Payload::operator=(Payload&& other) noexcept {
@@ -4736,6 +4989,15 @@ Payload::Payload(const Payload& other)
         payload_note_error(PAYLOAD_ERR_COPY_ALLOC_FAIL,
                            PAYLOAD_OP_COPY_CTOR,
                            this);
+    }
+    if (payload_stamp_trace_is_ocram_object(this)) {
+        payload_stamp_trace_record(
+            payload_stamp_trace_stage_t::CTOR_EXIT,
+            PAYLOAD_OP_COPY_CTOR,
+            this,
+            (uint32_t)(uintptr_t)__builtin_return_address(0),
+            _contract_fingerprint,
+            g_payload_contract_next_sequence);
     }
 }
 
@@ -5060,6 +5322,14 @@ size_t Payload::_append_required_bytes(size_t key_len,
 [[noreturn]] void Payload::_fatal(uint32_t fallback_error_code,
                                    uint32_t fallback_operation_id,
                                    size_t requested_bytes) const {
+    payload_stamp_trace_record(
+        payload_stamp_trace_stage_t::FATAL_ENTER,
+        fallback_operation_id,
+        this,
+        (uint32_t)(uintptr_t)__builtin_return_address(0),
+        0U,
+        g_payload_contract_next_sequence);
+
     uint32_t capacity = 0U;
     if (_heap_guard_ok()) {
         const size_t observed = _capacity();
@@ -5081,6 +5351,14 @@ size_t Payload::_append_required_bytes(size_t key_len,
 
 
 void Payload::clear() {
+    payload_stamp_trace_record(
+        payload_stamp_trace_stage_t::CLEAR_ENTER,
+        PAYLOAD_OP_CLEAR,
+        this,
+        (uint32_t)(uintptr_t)__builtin_return_address(0),
+        0U,
+        g_payload_contract_next_sequence);
+
     payload_contract_state_t before{};
     if (!_contract_begin(PAYLOAD_OP_CLEAR, &before)) {
         _fatal(PAYLOAD_ERR_INTEGRITY, PAYLOAD_OP_CLEAR);

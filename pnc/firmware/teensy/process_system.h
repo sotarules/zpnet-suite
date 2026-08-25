@@ -66,16 +66,20 @@
  *   • PAYLOAD_FATAL_INFO — return the retained fatal-construction record,
  *     including the public operation that stopped the firmware and its last
  *     internal Payload error breadcrumb
+ *   • PAYLOAD_STAMP_TRACE — return the bounded retained/live Payload contract-
+ *     stamp lifecycle transcript (constructor, clear, failure, fatal)
  *   • PAYLOAD_APPEND_TRACE — return the bounded retained/live append custody
  *     transcript, including stage-local source hashes and bounded key prefixes
  *   • PAYLOAD_HEAP_RESIZE_TRACE — return the retained/live realloc growth
  *     transcript with header words, owner/span verdicts, and contract outcome
  *   • PAYLOAD_CONTRACT_INFO — return design-by-contract counters plus the
  *     first/latest current-boot incident and latest retained incident
+ *   • REBOOT — acknowledge immediately, then issue a DWT-gated foreground
+ *     Cortex-M warm reset without TimePop, bootloader entry, or reflashing
  *
  * Terminal Transitions:
- *   • Shutdown and bootloader entry are explicit, irreversible boundary
- *     crossings
+ *   • Shutdown, warm reset, and bootloader entry are explicit, irreversible
+ *     boundary crossings
  *   • These transitions are expressed via commands and events, not
  *     lifecycle semantics
  *
@@ -84,6 +88,10 @@
 
 // Register SYSTEM command surface
 void process_system_register(void);
+
+// Primitive foreground warm-reset service.  Called at the top of loop() so an
+// acknowledged REBOOT does not depend on TimePop, CLOCKS, events, or GNSS.
+void system_reboot_service(void);
 
 // ============================================================================
 // Foreground crash breadcrumbs
