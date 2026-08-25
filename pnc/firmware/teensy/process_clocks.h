@@ -75,14 +75,17 @@
 // deliberately placing the recurring OCXO compare grids far apart in real
 // time:
 //
-//   OCXO1 install >= selected transaction reference + 50 ms
-//   OCXO2 install >= actual OCXO1 completion        + 50 ms
+//   OCXO1 install >= selected transaction reference + 10 ms
+//   OCXO2 install >= actual OCXO1 completion        + 10 ms
 //
 // TimePop one-shots enforce both waits; no foreground spin is permitted.
 // Priority-0 preemption may enlarge either gap, but must never compress it.
 // The physical offset remains invisible to the public clockface.
 //
-static constexpr uint32_t CLOCKS_OCXO_GRID_REPHASE_DELAY_MS = 50U;
+// Ten milliseconds is still orders of magnitude larger than interrupt/service
+// latency while avoiding 100 ms of fixed post-proof startup delay. The existing
+// measured minimum-separation court remains authoritative for both lanes.
+static constexpr uint32_t CLOCKS_OCXO_GRID_REPHASE_DELAY_MS = 10U;
 static constexpr uint64_t CLOCKS_OCXO_GRID_REPHASE_DELAY_NS =
     (uint64_t)CLOCKS_OCXO_GRID_REPHASE_DELAY_MS * 1000000ULL;
 

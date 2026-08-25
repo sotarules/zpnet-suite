@@ -1562,19 +1562,27 @@ static void smartzero_reset_lane(uint32_t index) {
   runtime.pub.required_counter_delta_ticks = OCXO_ONE_SECOND_TICKS;
 }
 
-static bool smartzero_is_current_lane(interrupt_subscriber_kind_t kind) {
+// All SmartZero lanes acquire concurrently.  current_lane_index is reporting
+// testimony for the oldest lane still waiting; it is not scheduling authority.
+// A lane may accept samples whenever the transaction is running and that lane
+// has not already proved its own repeatability quorum.
+static bool smartzero_lane_is_acquiring(interrupt_subscriber_kind_t kind) {
+  const int index = smartzero_index_for_kind(kind);
+  if (index < 0 || ocxo_kind_disabled(kind)) return false;
+
   for (uint32_t attempt = 0; attempt < 2U; ++attempt) {
     const uint32_t seq1 = g_smartzero.seq;
     if (seq1 & 1U) continue;
     dmb_barrier();
     const bool running = g_smartzero.running;
     const bool complete = g_smartzero.complete;
-    const uint32_t lane_index = g_smartzero.current_lane_index;
+    const interrupt_smartzero_lane_state_t state =
+        g_smartzero.lanes[index].pub.state;
     dmb_barrier();
     const uint32_t seq2 = g_smartzero.seq;
     if (seq1 == seq2 && (seq2 & 1U) == 0U) {
       return running && !complete &&
-          smartzero_kind_for_index(lane_index) == kind;
+          state == interrupt_smartzero_lane_state_t::ACQUIRING;
     }
   }
   return false;
@@ -1681,32 +1689,33 @@ static smartzero_vote_result_t smartzero_find_vote(
   return result;
 }
 
-static void smartzero_advance_or_complete(void) {
-  uint32_t next = g_smartzero.current_lane_index + 1U;
-  while (next < SMARTZERO_LANE_COUNT) {
-    const interrupt_subscriber_kind_t kind = smartzero_kind_for_index(next);
-    if (!ocxo_kind_disabled(kind)) break;
-    ++next;
+static void smartzero_refresh_progress_or_complete(void) {
+  // Every enabled lane owns an independent one-second history and quorum court.
+  // Completion is the conjunction of those courts, not a serial scheduler.
+  // Keep current_lane_index only as a compact report pointer to the first lane
+  // that has not locked yet.
+  for (uint32_t i = 0U; i < SMARTZERO_LANE_COUNT; ++i) {
+    const interrupt_subscriber_kind_t kind = smartzero_kind_for_index(i);
+    if (ocxo_kind_disabled(kind)) continue;
+    if (g_smartzero.lanes[i].pub.state !=
+        interrupt_smartzero_lane_state_t::LOCKED) {
+      g_smartzero.current_lane_index = i;
+      return;
+    }
   }
-  if (next >= SMARTZERO_LANE_COUNT) {
-    g_smartzero.running = false;
-    g_smartzero.complete = true;
-    g_smartzero.phase = interrupt_smartzero_phase_t::COMPLETE;
-    g_smartzero.complete_count++;
-    return;
-  }
-  g_smartzero.current_lane_index = next;
-  smartzero_lane_runtime_t& runtime = g_smartzero.lanes[next];
-  runtime.previous_present = false;
-  runtime.pub.state = interrupt_smartzero_lane_state_t::ACQUIRING;
-  runtime.pub.last_decision = interrupt_smartzero_decision_t::NONE;
+
+  g_smartzero.current_lane_index = SMARTZERO_LANE_COUNT;
+  g_smartzero.running = false;
+  g_smartzero.complete = true;
+  g_smartzero.phase = interrupt_smartzero_phase_t::COMPLETE;
+  g_smartzero.complete_count++;
 }
 
 static void smartzero_feed_one_second(interrupt_subscriber_kind_t kind,
                                       uint32_t dwt_at_event,
                                       uint32_t counter32_at_event,
                                       uint16_t target_low16) {
-  if (!smartzero_is_current_lane(kind)) return;
+  if (!smartzero_lane_is_acquiring(kind)) return;
   const int index = smartzero_index_for_kind(kind);
   if (index < 0) return;
 
@@ -1820,7 +1829,7 @@ static void smartzero_feed_one_second(interrupt_subscriber_kind_t kind,
   lane.anchor_hardware16 = vote.selected.current_hardware16;
   lane.anchor_pair_previous_dwt = vote.selected.previous_dwt;
   lane.anchor_pair_previous_counter32 = vote.selected.previous_counter32;
-  smartzero_advance_or_complete();
+  smartzero_refresh_progress_or_complete();
   smartzero_write_end();
 }
 
@@ -1836,9 +1845,13 @@ bool interrupt_smartzero_begin(void) {
   g_smartzero.current_lane_index = 0U;
   for (uint32_t i = 0; i < SMARTZERO_LANE_COUNT; ++i) {
     smartzero_reset_lane(i);
+    const interrupt_subscriber_kind_t kind = smartzero_kind_for_index(i);
+    if (!ocxo_kind_disabled(kind)) {
+      g_smartzero.lanes[i].pub.state =
+          interrupt_smartzero_lane_state_t::ACQUIRING;
+    }
   }
-  g_smartzero.lanes[0].pub.state =
-      interrupt_smartzero_lane_state_t::ACQUIRING;
+  smartzero_refresh_progress_or_complete();
   smartzero_write_end();
   interrupt_priority0_guard_exit(prior);
   return true;
@@ -6961,7 +6974,7 @@ static FLASHMEM Payload cmd_report_smartzero(const Payload&) {
   payload.add("abort_count", snapshot.abort_count);
   payload.add("current_lane_index", snapshot.current_lane_index);
   payload.add("current_lane", smartzero_lane_name(snapshot.current_lane));
-  payload.add("algorithm", "RECENT_THREE_VOTE");
+  payload.add("algorithm", "PARALLEL_RECENT_THREE_VOTE");
   payload.add("sample_rate_hz", snapshot.sample_rate_hz);
   payload.add("counter_delta_ticks", snapshot.counter_delta_ticks);
   payload.add("history_size", SMARTZERO_HISTORY_SIZE);

@@ -330,9 +330,8 @@ STARTUP_INFRASTRUCTURE_STATUS_LOG_INTERVAL_S = 30.0
 # Newborn Alpha acquisition is a physical startup phase, not part of the
 # restored-row proof deadline.  Poll REPORT_RECOVERY until firmware says the
 # current lifetime has an installed SmartZero-backed Alpha epoch.
-STARTUP_ALPHA_EPOCH_POLL_S = 1.0
-STARTUP_ALPHA_EPOCH_QUIET_GRACE_S = 30.0
-STARTUP_ALPHA_EPOCH_STATUS_LOG_INTERVAL_S = 30.0
+STARTUP_ALPHA_EPOCH_POLL_S = 0.25
+STARTUP_ALPHA_EPOCH_STATUS_LOG_INTERVAL_S = 10.0
 # Producer survival must be decided from current-lifetime canonical testimony.
 # A retained pre-flash row may be delivered immediately after firmware restart;
 # staleness is therefore inconclusive, never evidence authorizing mutation.
@@ -10050,6 +10049,110 @@ def _fetch_teensy_recovery_status() -> Dict[str, Any]:
     return {}
 
 
+def _fetch_teensy_smartzero_status() -> Dict[str, Any]:
+    """Return INTERRUPT.REPORT_SMARTZERO payload for startup diagnostics only.
+
+    SmartZero readiness remains owned entirely by firmware/CLOCKS. This helper
+    is observational: callers use it only when emitting an already-due progress
+    log, so diagnostic visibility cannot become a startup gate or high-rate RPC
+    workload.
+    """
+    try:
+        resp = send_command(
+            machine="TEENSY",
+            subsystem="INTERRUPT",
+            command="REPORT_SMARTZERO",
+            retries=1,
+            retry_delay_s=0.0,
+        )
+        if resp.get("success"):
+            payload = resp.get("payload", {})
+            return payload if isinstance(payload, dict) else {}
+    except Exception:
+        logging.debug(
+            "⚠️ [clocks/startup] REPORT_SMARTZERO diagnostic poll failed (ignored)"
+        )
+    return {}
+
+
+def _smartzero_lane_progress(
+    report: Dict[str, Any],
+    prefix: str,
+    label: str,
+) -> Dict[str, Any]:
+    """Extract one compact lane court from INTERRUPT.REPORT_SMARTZERO."""
+    state = str(report.get(f"{prefix}_state") or "UNKNOWN").strip().upper()
+    decision = str(report.get(f"{prefix}_last_decision") or "NONE").strip().upper()
+    return {
+        "lane": label,
+        "state": state,
+        "decision": decision,
+        "samples": _as_int(report.get(f"{prefix}_sample_count")) or 0,
+        "intervals": _as_int(report.get(f"{prefix}_valid_interval_count")) or 0,
+        "quorum": _as_int(report.get(f"{prefix}_quorum_count")) or 0,
+        "quorum_span": _as_int(report.get(f"{prefix}_quorum_span_cycles")) or 0,
+        "closest_three_span": _as_int(
+            report.get(f"{prefix}_closest_three_span_cycles")
+        ) or 0,
+        "accepted_interval": _as_int(
+            report.get(f"{prefix}_accepted_interval_cycles")
+        ) or 0,
+        "accepted_history_age": _as_int(
+            report.get(f"{prefix}_accepted_history_age")
+        ) or 0,
+    }
+
+
+def _smartzero_progress_snapshot(report: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize the three parallel SmartZero lane courts for Pi diagnostics."""
+    if not isinstance(report, dict) or not report:
+        return {}
+    return {
+        "report": report.get("report"),
+        "algorithm": report.get("algorithm"),
+        "phase": report.get("phase"),
+        "running": _recovery_bool(report.get("running")),
+        "complete": _recovery_bool(report.get("complete")),
+        "vote_span_cycles": _as_int(report.get("vote_span_cycles")),
+        "quorum_required": _as_int(report.get("quorum_required")),
+        "lanes": [
+            _smartzero_lane_progress(report, "vclock", "VCLOCK"),
+            _smartzero_lane_progress(report, "ocxo1", "OCXO1"),
+            _smartzero_lane_progress(report, "ocxo2", "OCXO2"),
+        ],
+    }
+
+
+def _smartzero_progress_text(progress: Dict[str, Any]) -> str:
+    """Render one single-line SmartZero lane summary for startup logs."""
+    lanes = progress.get("lanes") if isinstance(progress, dict) else None
+    if not isinstance(lanes, list) or not lanes:
+        return "SmartZero lane detail unavailable"
+
+    rendered: List[str] = []
+    for lane in lanes:
+        if not isinstance(lane, dict):
+            continue
+        state = str(lane.get("state") or "UNKNOWN")
+        samples = int(lane.get("samples") or 0)
+        intervals = int(lane.get("intervals") or 0)
+        quorum = int(lane.get("quorum") or 0)
+        closest = int(lane.get("closest_three_span") or 0)
+        span = int(lane.get("quorum_span") or 0)
+        if state == "LOCKED":
+            rendered.append(
+                f"{lane.get('lane')}={state} samples={samples} intervals={intervals} "
+                f"quorum={quorum} span={span}"
+            )
+        else:
+            closest_text = str(closest) if intervals >= 3 else "-"
+            rendered.append(
+                f"{lane.get('lane')}={state} samples={samples} intervals={intervals} "
+                f"closest3={closest_text}"
+            )
+    return "; ".join(rendered) if rendered else "SmartZero lane detail unavailable"
+
+
 def _recovery_inflight_status_compact(status: Dict[str, Any]) -> Dict[str, Any]:
     """Extract the flat RECOVER identity/lifecycle fields used by Pi."""
     generation = _as_int(status.get("recovery_generation"))
@@ -16229,8 +16332,14 @@ def _wait_for_startup_alpha_epoch() -> Dict[str, Any]:
     t0 = time.monotonic()
     last_log_at = t0
     last_signature: Optional[Tuple[Any, ...]] = None
-    logged_wait = False
+    smartzero_complete_announced = False
     checks = 0
+
+    logging.info(
+        "⏳ [clocks/startup] beginning SmartZero-backed Alpha epoch wait; "
+        "firmware remains authoritative and Pi will report progress every %.0fs",
+        STARTUP_ALPHA_EPOCH_STATUS_LOG_INTERVAL_S,
+    )
 
     while True:
         checks += 1
@@ -16261,13 +16370,20 @@ def _wait_for_startup_alpha_epoch() -> Dict[str, Any]:
         _diag["last_startup_alpha_epoch_wait"] = diag
 
         if recover_epoch_ready:
-            if logged_wait:
-                logging.info(
-                    "✅ [clocks/startup] newborn Alpha epoch ready after %.1fs; "
-                    "entering full CLOCKS/GNSS/chrony preflight",
-                    elapsed,
-                )
+            logging.info(
+                "✅ [clocks/startup] SmartZero-backed Alpha epoch installed after %.1fs; "
+                "continuing to full CLOCKS/GNSS/chrony preflight",
+                elapsed,
+            )
             return copy.deepcopy(diag)
+
+        if smartzero_complete and not smartzero_complete_announced:
+            logging.info(
+                "✅ [clocks/startup] SmartZero proof achieved after %.1fs; "
+                "waiting only for Alpha epoch installation",
+                elapsed,
+            )
+            smartzero_complete_announced = True
 
         signature = (
             bool(status),
@@ -16277,28 +16393,33 @@ def _wait_for_startup_alpha_epoch() -> Dict[str, Any]:
             firmware_campaign_state,
         )
         should_log = (
-            elapsed >= STARTUP_ALPHA_EPOCH_QUIET_GRACE_S
-            and (
-                not logged_wait
-                or signature != last_signature
-                or now - last_log_at >= STARTUP_ALPHA_EPOCH_STATUS_LOG_INTERVAL_S
-            )
+            signature != last_signature
+            or now - last_log_at >= STARTUP_ALPHA_EPOCH_STATUS_LOG_INTERVAL_S
         )
         if should_log:
+            smartzero_progress: Dict[str, Any] = {}
+            if smartzero_running or smartzero_complete:
+                smartzero_progress = _smartzero_progress_snapshot(
+                    _fetch_teensy_smartzero_status()
+                )
+                if smartzero_progress:
+                    diag["smartzero"] = copy.deepcopy(smartzero_progress)
+                    _diag["last_startup_alpha_epoch_wait"] = copy.deepcopy(diag)
+
             if not status:
                 detail = "REPORT_RECOVERY unavailable"
             elif smartzero_running:
-                detail = "SmartZero acquiring current-lifetime epoch"
+                detail = _smartzero_progress_text(smartzero_progress)
             elif smartzero_complete:
-                detail = "SmartZero complete; Alpha epoch install pending"
+                lane_detail = _smartzero_progress_text(smartzero_progress)
+                detail = f"SmartZero complete; Alpha epoch install pending; {lane_detail}"
             else:
                 detail = "Alpha epoch not ready"
             logging.info(
-                "⏳ [clocks/startup] waiting for newborn Alpha epoch (%.0fs): %s",
+                "⏳ [clocks/startup] SmartZero/Alpha epoch still pending (%.1fs): %s",
                 elapsed,
                 detail,
             )
-            logged_wait = True
             last_log_at = now
             last_signature = signature
 
