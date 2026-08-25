@@ -154,6 +154,15 @@ static volatile uint32_t tx_budget_fail    = 0;
 static volatile uint32_t tx_queue_full     = 0;
 static volatile uint32_t tx_rr_drop_count  = 0;
 
+// D1 is the command/control plane. Queue reserve prevents D0/D2 from rejecting
+// a response, but reserve alone does not prevent an accepted D1 job from sitting
+// behind a publication backlog. The TX pump therefore promotes the oldest unsent
+// D1 job to the next complete-frame boundary while preserving D0/D2 relative order.
+static volatile uint32_t tx_control_priority_scan_count = 0U;
+static volatile uint32_t tx_control_priority_promote_count = 0U;
+static volatile uint32_t tx_control_priority_last_distance = 0U;
+static volatile uint32_t tx_control_priority_max_distance = 0U;
+
 enum : uint32_t {
   TX_OUTCOME_NONE = 0U,
   TX_OUTCOME_REJECTED = 1U,
@@ -801,10 +810,58 @@ static void tx_release_current_job() {
   tx_jobs_sent++;
 }
 
+static void tx_promote_oldest_control_job_if_safe() {
+  if (tx_job_count < 2U)
+    return;
+
+  tx_job_t& current = tx_jobs[tx_job_tail];
+  if (tx_traffic_is_control(current.traffic) || current.sent != 0U)
+    return;
+
+  tx_control_priority_scan_count++;
+
+  // Find the oldest queued D1 response. Every job behind tx_job_tail is unsent:
+  // only the tail job may ever have crossed bytes onto the wire. Promotion is
+  // therefore legal only while the current tail is also unsent.
+  size_t control_distance = 0U;
+  for (size_t distance = 1U; distance < tx_job_count; ++distance) {
+    const size_t index = (tx_job_tail + distance) % TX_JOB_MAX;
+    if (tx_traffic_is_control(tx_jobs[index].traffic)) {
+      control_distance = distance;
+      break;
+    }
+  }
+
+  if (control_distance == 0U)
+    return;
+
+  // Stable extraction: [A,B,C(D1),D] -> [C(D1),A,B,D]. This promotes control
+  // without reordering any publication/debug jobs relative to each other.
+  const size_t control_index = (tx_job_tail + control_distance) % TX_JOB_MAX;
+  tx_job_t promoted = tx_jobs[control_index];
+  for (size_t distance = control_distance; distance > 0U; --distance) {
+    const size_t to = (tx_job_tail + distance) % TX_JOB_MAX;
+    const size_t from = (tx_job_tail + distance - 1U) % TX_JOB_MAX;
+    tx_jobs[to] = tx_jobs[from];
+  }
+  tx_jobs[tx_job_tail] = promoted;
+
+  tx_control_priority_promote_count++;
+  tx_control_priority_last_distance = (uint32_t)control_distance;
+  if (control_distance > (size_t)tx_control_priority_max_distance) {
+    tx_control_priority_max_distance = (uint32_t)control_distance;
+  }
+}
+
 static void tx_pump_once() {
 
   if (tx_job_count == 0)
     return;
+
+  // Never interleave a frame already started on USB. At every fresh frame
+  // boundary, however, D1 outranks queued D0/D2 work so a live command plane
+  // cannot be hidden behind historical publication custody.
+  tx_promote_oldest_control_job_if_safe();
 
   tx_job_t& job = tx_jobs[tx_job_tail];
 
@@ -1583,6 +1640,10 @@ FLASHMEM void transport_get_info(transport_info_t* out) {
   out->tx_budget_fail       = tx_budget_fail;
   out->tx_queue_full        = tx_queue_full;
   out->tx_rr_drop_count     = tx_rr_drop_count;
+  out->tx_control_priority_scan_count = tx_control_priority_scan_count;
+  out->tx_control_priority_promote_count = tx_control_priority_promote_count;
+  out->tx_control_priority_last_distance = tx_control_priority_last_distance;
+  out->tx_control_priority_max_distance = tx_control_priority_max_distance;
 
   out->tx_send_attempt_count = tx_send_attempt_count;
   out->tx_send_serialized_count = tx_send_serialized_count;

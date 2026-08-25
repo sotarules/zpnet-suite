@@ -27,6 +27,9 @@
 //   • Memory is bounded via soft budget cap (TX_BUDGET_MAX).
 //   • D1 command/response retains reserved byte + job custody; D0/D2 cannot
 //     exhaust the complete TX queue during startup or publication bursts.
+//   • At each complete-frame boundary, the oldest queued D1 job outranks D0/D2;
+//     an already-started frame is always completed first, so interleave remains
+//     structurally impossible.
 //   • TimePop is the sole physical RX/TX service path.
 //
 // Serial-only doctrine:
@@ -212,6 +215,10 @@ typedef struct {
   uint32_t tx_budget_fail;        // Budget cap would be exceeded
   uint32_t tx_queue_full;         // Job ring was full
   uint32_t tx_rr_drop_count;      // RR messages dropped (any reason)
+  uint32_t tx_control_priority_scan_count;     // Fresh-frame scans for queued D1
+  uint32_t tx_control_priority_promote_count;  // D1 jobs promoted ahead of D0/D2
+  uint32_t tx_control_priority_last_distance;  // Queue positions crossed by last promotion
+  uint32_t tx_control_priority_max_distance;   // Largest observed D1 promotion distance
 
   // ===========================================================
   // TX — Per-message custody transcript
