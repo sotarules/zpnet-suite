@@ -1238,21 +1238,14 @@ bool clocks_alpha_ocxo_public_origin_ready(void);
 // Alpha RECOVER re-prime
 // ============================================================================
 //
-// A Pi-side publication/process outage is not an Alpha observation outage.
-// LIVE_REATTACH therefore preserves the installed SmartZero/service epoch,
-// physical OCXO grids, CounterLedger/PhaseLedger state, public-origin offsets,
-// measured-edge ancestry, and long logical tick ledgers exactly.  Beta may
-// rebase only its campaign presentation namespace.
-//
-// The helpers below are retained as explicit Alpha-discontinuity utilities for
-// a topology that has independently proved Alpha service ancestry must be cut.
-// Normal LIVE_REATTACH and CAMPAIGN_BOOTSTRAP must not call them.  In particular,
-// Pi process restart is never sufficient authority to rephase or reprime Alpha.
+// A Pi-side publication/process outage is not an Alpha observation outage. A
+// surviving producer is proved and adopted read-only by the Pi and never enters
+// firmware RECOVER. The helpers below therefore belong only to a proved physical
+// Alpha discontinuity: dead-producer desired-state restore.
 bool clocks_alpha_recover_rearm_interrupt_service(void);
 
-// Explicit Alpha-discontinuity recovery may invoke this only after a separate
-// custody court has proved that surviving OCXO interval/phase ancestry is not
-// authoritative.  LIVE_REATTACH does not call it.
+// Dead-producer restore may invoke this only after the Pi custody court has
+// proved that the previous Alpha ancestry is no longer physically present.
 void clocks_alpha_recover_reprime_ocxo_state(void);
 uint32_t clocks_alpha_recover_reprime_count(void);
 
@@ -1874,7 +1867,7 @@ void clocks_watchdog_anomaly_payload(const char* reason,
 // Physical-grid rephase is a separate asynchronous installation fact.  START,
 // ZERO, and Alpha-affecting RECOVER paths share the same TimePop-staged
 // OCXO1-then-OCXO2 transaction; the owner determines whether logical epoch state
-// is replaced or preserved.  CAMPAIGN_BOOTSTRAP intentionally bypasses rephase
+// is replaced. Surviving Alpha ancestry never enters firmware RECOVER.
 // because it preserves already-proved Alpha and changes only Beta lifecycle.
 // Priority-0 preemption may enlarge either 50 ms gap; it must never compress it.
 enum class clocks_alpha_ocxo_grid_rephase_owner_t : uint8_t {

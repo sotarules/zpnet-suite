@@ -67,11 +67,9 @@
 // OCXO physical one-second grid rephase spacing
 // -----------------------------------------------------------------------------
 //
-// Autonomous startup, explicit ZERO, and Alpha-affecting RECOVER modes use the
-// staged physical-grid transaction.  CAMPAIGN_BOOTSTRAP is deliberately the
-// exception: it recreates only volatile Beta campaign state after Alpha has
-// already been resurrected and proved, so it must preserve the current grids and
-// Alpha edge ancestry exactly.  Campaign START is recording-only and never
+// Autonomous startup, explicit ZERO, and dead-producer RECOVER establish a new
+// Alpha physical boundary. Surviving producers are never sent RECOVER; the Pi
+// proves and adopts them read-only. Campaign START is recording-only and never
 // rebases Alpha.
 // The transaction keeps the logical clock doctrine owned by its caller while
 // deliberately placing the recurring OCXO compare grids far apart in real

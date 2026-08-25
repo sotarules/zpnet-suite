@@ -2538,11 +2538,10 @@ static FLASHMEM void payload_add_stack_witness(Payload& p) {
 // the next mature candidate as public PPS1.  No public campaign identity is
 // screened or skipped; public campaign time simply has not begun yet.
 //
-// RECOVER remains different: it resumes an existing public timeline.
-// LIVE_REATTACH/COLD_BOOTSTRAP may create a fresh Alpha custody boundary and
-// therefore expose reattachment/science state while candidate identities resume.
-// CAMPAIGN_BOOTSTRAP is narrower: Alpha is already proved and remains untouched;
-// only Beta campaign presentation is recreated at the projected public identity.
+// RECOVER is the dead-producer restore transaction. Surviving producers never
+// receive RECOVER: the Pi proves, reacquires, and adopts them read-only. RECOVER
+// therefore always creates a fresh Alpha custody boundary and resumes the durable
+// campaign at the projected public identity.
 //
 // RECOVER publishes the next PPS/VCLOCK row after the recovered base count.
 // Recovery science residuals may be quarantined for population hygiene, but
@@ -3285,11 +3284,9 @@ static bool g_recover_proof_warning_published = false;
 // Alpha-owned instrument statistics continue across RECOVER.  Beta gates the
 // current row until proof is complete; raw interval testimony remains visible.
 
-// RECOVER OCXO reattachment gate for a recovery topology that actually replaces
-// Alpha physical ancestry.  A true LIVE_REATTACH is explicitly excluded: the
-// Teensy/Alpha producer survived the Pi outage, so its physical grids,
-// CounterLedger, PhaseLedger, and measured-edge ancestry remain authoritative.
-// COLD_BOOTSTRAP may still use this gate while its fresh Alpha epoch proves the
+// RECOVER OCXO proof gate for the dead-producer restore transaction. Surviving
+// producers never enter firmware RECOVER, so every RECOVER generation owns a fresh
+// Alpha epoch whose first complete OCXO rows must prove new ancestry. The gate may
 // first complete OCXO rows.  The gate remains finite: after timeout, campaign
 // publication resumes in degraded mode and OCXO science remains quarantined/
 // invalid until PhaseLedger/reattach evidence catches up.
@@ -3359,12 +3356,6 @@ static recover_reattach_progress_marker_t g_recover_reattach_progress_ocxo2 = {}
 static uint32_t          g_recover_request_count = 0;
 static char              g_recover_last_campaign[64] = {0};
 static bool              g_recover_last_campaign_supplied = false;
-static bool              g_recover_last_restore_alpha_required = false;
-// Third recovery topology: Alpha has already been resurrected and proved by
-// holistic startup, but the volatile Beta campaign lifecycle died with power.
-// Pi carries that custody fact explicitly so RECOVER can rebuild only Beta while
-// leaving the newly authoritative Alpha epoch and physical edge ancestry intact.
-static bool              g_recover_last_campaign_bootstrap_required = false;
 static uint64_t          g_recover_last_base_count = 0;
 static uint64_t          g_recover_last_expected_first_public_count = 0;
 static uint64_t          g_recover_last_base_gnss_ns = 0;
@@ -3384,20 +3375,18 @@ static uint32_t          g_recover_lifecycle_interrupt_service_rearm_failure_cou
 static bool              g_recover_lifecycle_last_interrupt_service_rearm_ok = false;
 
 enum class recover_lifecycle_mode_t : uint8_t {
-  NONE               = 0,
-  LIVE_REATTACH      = 1,
-  COLD_BOOTSTRAP     = 2,
-  CAMPAIGN_BOOTSTRAP = 3,
+  NONE                  = 0,
+  DEAD_PRODUCER_RESTORE = 1,
 };
 
 static volatile recover_lifecycle_mode_t g_recover_lifecycle_mode =
     recover_lifecycle_mode_t::NONE;
-static bool     g_recover_lifecycle_cold_bootstrap_epoch_ready = false;
-static uint32_t g_recover_lifecycle_cold_bootstrap_begin_count = 0;
-static uint32_t g_recover_lifecycle_cold_bootstrap_wait_count = 0;
-static uint32_t g_recover_lifecycle_cold_bootstrap_ready_count = 0;
-static uint32_t g_recover_lifecycle_cold_bootstrap_commit_count = 0;
-static uint32_t g_recover_lifecycle_cold_bootstrap_start_failure_count = 0;
+static bool     g_recover_lifecycle_dead_producer_restore_epoch_ready = false;
+static uint32_t g_recover_lifecycle_dead_producer_restore_begin_count = 0;
+static uint32_t g_recover_lifecycle_dead_producer_restore_wait_count = 0;
+static uint32_t g_recover_lifecycle_dead_producer_restore_ready_count = 0;
+static uint32_t g_recover_lifecycle_dead_producer_restore_commit_count = 0;
+static uint32_t g_recover_lifecycle_dead_producer_restore_start_failure_count = 0;
 static uint32_t          g_recover_lifecycle_complete_count = 0;
 static uint32_t          g_recover_lifecycle_abort_count = 0;
 static uint32_t          g_recover_lifecycle_stale_gate_count = 0;
@@ -3415,10 +3404,8 @@ static char              g_recover_lifecycle_abort_reason[64] = "none";
 // One-second science and Welfords remain independently
 // gated until fresh post-recovery interval custody is complete.
 static volatile bool g_recover_continuity_align_pending = false;
-// Presentation alignment normally participates in the recovery science hold.
-// CAMPAIGN_BOOTSTRAP is the exception: Alpha has already been resurrected and
-// proved, so its first post-splice row must stay scientifically eligible while
-// Beta repairs only the campaign-visible OCXO intercept.
+// Presentation alignment participates in the recovery science hold until the
+// fresh dead-producer Alpha ancestry proves the current row.
 static bool g_recover_continuity_align_science_hold = false;
 static uint32_t g_recover_continuity_align_count = 0;
 static uint32_t g_recover_continuity_align_failure_count = 0;
@@ -4172,10 +4159,8 @@ static void campaign_warmup_begin(campaign_warmup_mode_t mode) {
   g_campaign_warmup_suppressed_total = 0;
 
   if (mode == campaign_warmup_mode_t::RECOVER) {
-    // Alpha-affecting RECOVER no longer buries fixed rows, but a fresh physical
-    // ancestry (currently COLD_BOOTSTRAP) must prove OCXO reattachment before
-    // unrestricted campaign science resumes.  LIVE_REATTACH never enters this
-    // warmup because surviving Alpha is preserved wholesale.
+    // RECOVER no longer buries fixed rows, but the fresh dead-producer Alpha
+    // ancestry must prove OCXO reattachment before unrestricted science resumes.
     interrupt_dwt_publication_launch_acquisition_end();
     g_campaign_warmup_mode = campaign_warmup_mode_t::NONE;
     g_campaign_warmup_remaining = 0;
@@ -4485,8 +4470,7 @@ static FLASHMEM void recover_reattach_release(const char* reason, bool degraded)
 
 static bool recover_proof_lane_current_row_ready(
     const clocks_alpha_recover_reattach_snapshot_t& lane,
-    uint32_t pps_sequence,
-    bool cold_bootstrap) {
+    uint32_t pps_sequence) {
   if (!lane.science_ready || pps_sequence == 0U) return false;
 
   if (!lane.counterledger_mode) {
@@ -4514,16 +4498,8 @@ static bool recover_proof_lane_current_row_ready(
       lane.counterledger_last_phase_resolve_pps_sequence == pps_sequence;
   if (!exact_current_identity) return false;
 
-  if (cold_bootstrap) {
-    // COLD_BOOTSTRAP owns a brand-new SmartZero epoch, so no pre-recovery edge
-    // can survive into this interval.  Exact current-row science readiness is
-    // therefore already sufficient ancestry proof.
-    return true;
-  }
-
-  // LIVE_REATTACH no longer cuts Alpha.  If a non-cold recovery gate is ever
-  // active, exact current-row identity is itself the proof: requiring RECOVER
-  // reprime counters would demand evidence from a mutation that must not occur.
+  // RECOVER owns a brand-new SmartZero epoch, so no pre-recovery edge can
+  // survive into this interval. Exact current-row readiness is sufficient proof.
   return true;
 }
 
@@ -4534,12 +4510,10 @@ static FLASHMEM bool recover_proof_driven_release_try(uint32_t pps_sequence) {
   }
 
   (void)recover_reattach_refresh_ready();
-  const bool cold_bootstrap =
-      g_recover_lifecycle_mode == recover_lifecycle_mode_t::COLD_BOOTSTRAP;
   const bool ocxo1_ready = recover_proof_lane_current_row_ready(
-      g_recover_reattach_last_ocxo1, pps_sequence, cold_bootstrap);
+      g_recover_reattach_last_ocxo1, pps_sequence);
   const bool ocxo2_ready = recover_proof_lane_current_row_ready(
-      g_recover_reattach_last_ocxo2, pps_sequence, cold_bootstrap);
+      g_recover_reattach_last_ocxo2, pps_sequence);
 
   if (ocxo1_ready && ocxo2_ready) {
     // Release before Alpha reads lifecycle hold_flags.  No value is repaired or
@@ -4684,27 +4658,11 @@ static void recover_lifecycle_set_abort_reason(const char* reason) {
 
 static const char* recover_lifecycle_mode_name(
     recover_lifecycle_mode_t mode) {
-  switch (mode) {
-    case recover_lifecycle_mode_t::LIVE_REATTACH:      return "LIVE_REATTACH";
-    case recover_lifecycle_mode_t::COLD_BOOTSTRAP:     return "COLD_BOOTSTRAP";
-    case recover_lifecycle_mode_t::CAMPAIGN_BOOTSTRAP: return "CAMPAIGN_BOOTSTRAP";
-    default:                                           return "NONE";
-  }
+  return mode == recover_lifecycle_mode_t::DEAD_PRODUCER_RESTORE
+      ? "DEAD_PRODUCER_RESTORE"
+      : "NONE";
 }
 
-// g_recover_last_restore_alpha_required is flight-recorder testimony about
-// what the most recent RECOVER request required. Do not expose that historical
-// fact as a present-tense obligation after cold bootstrap has already committed.
-// REPORT_RECOVERY must answer whether Alpha must be resurrected *now*.
-static bool recover_alpha_restore_required_now(void) {
-  return g_recover_last_restore_alpha_required &&
-         (request_recover || clocks_campaign_recovery_lifecycle_active());
-}
-
-static bool recover_campaign_bootstrap_required_now(void) {
-  return g_recover_last_campaign_bootstrap_required &&
-         (request_recover || clocks_campaign_recovery_lifecycle_active());
-}
 
 static bool recover_restore_court_ready_now(void) {
   // RESTORE_MONITOR may be accepted before startup SmartZero completes.  Its
@@ -4723,14 +4681,14 @@ static bool recover_restore_court_ready_now(void) {
          !clocks_campaign_recovery_lifecycle_active();
 }
 
-static bool recover_lifecycle_prepare_cold_bootstrap(void) {
-  g_recover_lifecycle_mode = recover_lifecycle_mode_t::COLD_BOOTSTRAP;
-  g_recover_lifecycle_cold_bootstrap_epoch_ready = false;
-  g_recover_lifecycle_cold_bootstrap_begin_count++;
+static bool recover_lifecycle_prepare_dead_producer_restore(void) {
+  g_recover_lifecycle_mode = recover_lifecycle_mode_t::DEAD_PRODUCER_RESTORE;
+  g_recover_lifecycle_dead_producer_restore_epoch_ready = false;
+  g_recover_lifecycle_dead_producer_restore_begin_count++;
 
   if (clocks_alpha_installed_smartzero_backing_epoch()) {
-    g_recover_lifecycle_cold_bootstrap_epoch_ready = true;
-    g_recover_lifecycle_cold_bootstrap_ready_count++;
+    g_recover_lifecycle_dead_producer_restore_epoch_ready = true;
+    g_recover_lifecycle_dead_producer_restore_ready_count++;
     return true;
   }
 
@@ -4744,104 +4702,36 @@ static bool recover_lifecycle_prepare_cold_bootstrap(void) {
     return true;
   }
 
-  if (!clocks_alpha_begin_smartzero_epoch("recover_cold_bootstrap")) {
-    g_recover_lifecycle_cold_bootstrap_start_failure_count++;
+  if (!clocks_alpha_begin_smartzero_epoch("recover_dead_producer_restore")) {
+    g_recover_lifecycle_dead_producer_restore_start_failure_count++;
     return false;
   }
 
   return true;
 }
 
-static bool recover_lifecycle_enter_from_command(
-    const char* reason,
-    bool restore_alpha_required,
-    bool campaign_bootstrap_required) {
+static bool recover_lifecycle_enter_from_command(const char* reason) {
   g_recover_lifecycle_begin_count++;
   g_recover_lifecycle_last_begin_campaign_seconds = (uint32_t)campaign_seconds;
   recover_lifecycle_set_reason(reason ? reason : "recover_command_armed");
   recover_lifecycle_set_abort_reason("none");
 
-  // A watchdog may have stopped the campaign while Pi/PUBSUB was absent.
-  // Reset both publication layers at command acceptance: process_interrupt's
-  // physical release court and CLOCKS' own retained transport transaction.
-  // The latter may contain a pre-outage retry snapshot/campaign handoff that
-  // cannot lawfully precede the newly projected RECOVER boundary.
+  // RECOVER has one meaning: install a Pi-authored dead-producer desired state.
+  // A surviving producer is never sent here; Pi proves and adopts it read-only.
   interrupt_recover_reset_publication_custody();
   clocks_fragment_recover_reset_publication_custody();
   g_recover_lifecycle_command_custody_reset_count++;
 
-  // Pi owns durable ancestry and also owns the distinction between current
-  // state and how that state came to exist.  CAMPAIGN_BOOTSTRAP is the third
-  // topology: holistic startup already resurrected and durably proved Alpha,
-  // while volatile Beta campaign state was lost.  Preserve that current Alpha
-  // exactly; do not rephase/re-prime OCXO custody and do not restore statistics
-  // a second time merely to recreate the recording lifecycle.
-  if (campaign_bootstrap_required) {
-    if (restore_alpha_required ||
-        !clocks_alpha_installed_smartzero_backing_epoch()) {
-      recover_lifecycle_set_reason("recover_campaign_bootstrap_invalid_alpha_state");
-      return false;
-    }
-
-    g_recover_lifecycle_mode = recover_lifecycle_mode_t::CAMPAIGN_BOOTSTRAP;
-    g_recover_lifecycle_cold_bootstrap_epoch_ready = true;
-    g_recover_lifecycle_last_interrupt_service_rearm_ok = true;
-    clocks_watchdog_clear_surrender_for_new_lifecycle();
-    clocks_watchdog_disarm_campaign_publication();
-    campaign_state = clocks_campaign_state_t::RECOVERING;
-    recover_lifecycle_set_reason("recover_campaign_bootstrap_preserve_alpha");
-    return true;
-  }
-
-  // A fresh post-flash Alpha may already have a perfectly healthy local
-  // SmartZero epoch, but that does not make it the descendant of durable Alpha.
-  // When Pi explicitly requires restoration, use COLD_BOOTSTRAP even if the
-  // local epoch is ready.  Absent that custody verdict, a Teensy with no
-  // installed epoch also needs the ordinary cold-bootstrap acquisition path.
-  const bool cold_bootstrap_required =
-      restore_alpha_required || !clocks_alpha_installed_smartzero_backing_epoch();
-  if (cold_bootstrap_required) {
-    if (!recover_lifecycle_prepare_cold_bootstrap()) {
-      recover_lifecycle_set_reason("recover_cold_bootstrap_start_failed");
-      return false;
-    }
-
-    g_recover_lifecycle_last_interrupt_service_rearm_ok = false;
-    clocks_watchdog_clear_surrender_for_new_lifecycle();
-    clocks_watchdog_disarm_campaign_publication();
-    campaign_state = clocks_campaign_state_t::RECOVERING;
-    recover_lifecycle_set_reason(
-        restore_alpha_required
-            ? "recover_durable_alpha_restore_required"
-            : "recover_cold_bootstrap_wait_smartzero");
-    return true;
-  }
-
-  g_recover_lifecycle_mode = recover_lifecycle_mode_t::LIVE_REATTACH;
-  g_recover_lifecycle_cold_bootstrap_epoch_ready = true;
-
-  // LIVE_REATTACH means the producer survived.  Verify the existing services
-  // are available, but do not rephase the physical OCXO grids and do not cut
-  // Alpha measurement ancestry merely because the Pi process restarted.
-  g_recover_lifecycle_interrupt_service_rearm_count++;
-  const bool vclock_service_ok =
-      interrupt_ensure_service(interrupt_subscriber_kind_t::VCLOCK);
-  const bool ocxo1_service_ok =
-      interrupt_ensure_service(interrupt_subscriber_kind_t::OCXO1);
-  const bool ocxo2_service_ok =
-      interrupt_ensure_service(interrupt_subscriber_kind_t::OCXO2);
-  g_recover_lifecycle_last_interrupt_service_rearm_ok =
-      vclock_service_ok && ocxo1_service_ok && ocxo2_service_ok;
-  if (!g_recover_lifecycle_last_interrupt_service_rearm_ok) {
-    g_recover_lifecycle_interrupt_service_rearm_failure_count++;
-    recover_lifecycle_set_reason("recover_interrupt_service_rearm_failed");
+  if (!recover_lifecycle_prepare_dead_producer_restore()) {
+    recover_lifecycle_set_reason("recover_dead_producer_restore_start_failed");
     return false;
   }
 
+  g_recover_lifecycle_last_interrupt_service_rearm_ok = false;
   clocks_watchdog_clear_surrender_for_new_lifecycle();
   clocks_watchdog_disarm_campaign_publication();
   campaign_state = clocks_campaign_state_t::RECOVERING;
-  recover_lifecycle_set_reason("recover_live_reattach_preserve_alpha");
+  recover_lifecycle_set_reason("recover_dead_producer_restore_armed");
   return true;
 }
 
@@ -4858,7 +4748,7 @@ static void recover_lifecycle_abort(const char* reason) {
   recover_lifecycle_set_reason("idle");
 
   if (g_recover_lifecycle_mode ==
-          recover_lifecycle_mode_t::COLD_BOOTSTRAP &&
+          recover_lifecycle_mode_t::DEAD_PRODUCER_RESTORE &&
       !clocks_alpha_installed_smartzero_backing_epoch()) {
     interrupt_smartzero_abort();
     clocks_alpha_smartzero_pending_clear();
@@ -7984,24 +7874,11 @@ FLASHMEM bool clocks_fragment_snapshot_take(
   *out = clocks_fragment_snapshot_t{};
   clocks_fragment_live_snapshot_fill(out->live);
 
-  // Publication-custody metadata only. During ordinary campaign operation, once
-  // public campaign time is advancing, SYSTEM must wait for the exact matching
-  // campaign delta before releasing this physical second.
-  //
-  // CAMPAIGN_BOOTSTRAP has one deliberately narrower boundary. Alpha has already
-  // been resurrected and proved, so a physical row that was open before RECOVER
-  // was armed may complete after Beta enters RECOVERING. Alpha commits that row
-  // before calling Beta; Beta has no truthful campaign interpretation for it.
-  // Preserve the completed live observation without manufacturing a campaign row.
-  // As soon as the recovery PPS gate returns to STARTED, exact campaign coupling
-  // resumes on the next public campaign row.
-  const bool campaign_bootstrap_live_only_boundary =
-      g_recover_lifecycle_mode ==
-          recover_lifecycle_mode_t::CAMPAIGN_BOOTSTRAP &&
-      (request_recover ||
-       campaign_state == clocks_campaign_state_t::RECOVERING);
+  // Publication-custody metadata only. Once public campaign time is advancing,
+  // CLOCKS must wait for the exact matching Beta delta before releasing the
+  // physical second. Dead-producer RECOVER does not create a campaign-less live
+  // boundary: producer and campaign desired state are installed as one transaction.
   out->campaign_row_expected =
-      !campaign_bootstrap_live_only_boundary &&
       campaign_state != clocks_campaign_state_t::STOPPED &&
       campaign_name[0] != '\0' &&
       campaign_seconds > 0ULL;
@@ -8080,63 +7957,29 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
     request_zero = false;
 
     if (g_recover_lifecycle_mode ==
-            recover_lifecycle_mode_t::COLD_BOOTSTRAP &&
+            recover_lifecycle_mode_t::DEAD_PRODUCER_RESTORE &&
         !clocks_alpha_installed_smartzero_backing_epoch()) {
-      g_recover_lifecycle_cold_bootstrap_wait_count++;
-      recover_lifecycle_set_reason("recover_cold_bootstrap_wait_smartzero");
+      g_recover_lifecycle_dead_producer_restore_wait_count++;
+      recover_lifecycle_set_reason("recover_dead_producer_restore_wait_smartzero");
       return;
     }
 
     if (g_recover_lifecycle_mode ==
-            recover_lifecycle_mode_t::COLD_BOOTSTRAP &&
-        !g_recover_lifecycle_cold_bootstrap_epoch_ready) {
-      g_recover_lifecycle_cold_bootstrap_epoch_ready = true;
-      g_recover_lifecycle_cold_bootstrap_ready_count++;
-      recover_lifecycle_set_reason("recover_cold_bootstrap_epoch_ready");
+            recover_lifecycle_mode_t::DEAD_PRODUCER_RESTORE &&
+        !g_recover_lifecycle_dead_producer_restore_epoch_ready) {
+      g_recover_lifecycle_dead_producer_restore_epoch_ready = true;
+      g_recover_lifecycle_dead_producer_restore_ready_count++;
+      recover_lifecycle_set_reason("recover_dead_producer_restore_epoch_ready");
     }
 
-    const bool cold_bootstrap_commit =
-        g_recover_lifecycle_mode ==
-            recover_lifecycle_mode_t::COLD_BOOTSTRAP;
-    const bool campaign_bootstrap_commit =
-        g_recover_lifecycle_mode ==
-            recover_lifecycle_mode_t::CAMPAIGN_BOOTSTRAP;
-    const bool live_reattach_commit =
-        g_recover_lifecycle_mode ==
-            recover_lifecycle_mode_t::LIVE_REATTACH;
+    // SmartZero has already created and physically staggered the fresh OCXO
+    // service grids for this firmware generation. Starting a second RECOVER-owned
+    // rephase here would create a circular wait; splice the durable state onto the
+    // installed newborn epoch directly.
+    g_recover_lifecycle_last_interrupt_service_rearm_ok = true;
+    recover_lifecycle_set_reason("recover_dead_producer_restore_commit_ready");
 
-    if (cold_bootstrap_commit) {
-      // SmartZero has already created and physically staggered the fresh OCXO
-      // service grids for this firmware generation.  Starting a second
-      // RECOVER-owned rephase here would stop those newly installed lanes while
-      // request_recover suppresses ordinary Alpha rows, creating a circular
-      // wait in which OCXO_PUBLIC_ORIGIN and STATIC_PREDICTION can never mature.
-      // Treat the installed SmartZero-backed epoch as the completed cold-service
-      // bootstrap and splice the durable campaign onto it directly below.
-      g_recover_lifecycle_last_interrupt_service_rearm_ok = true;
-      recover_lifecycle_set_reason("recover_cold_bootstrap_commit_ready");
-    } else if (campaign_bootstrap_commit) {
-      // Alpha was already restored and has continued authoring lawful completed
-      // rows while Beta remained STOPPED.  The campaign splice therefore needs
-      // no physical-grid transaction at all: preserve current interrupt/Alpha
-      // custody and recreate only the campaign presentation namespace below.
-      g_recover_lifecycle_last_interrupt_service_rearm_ok = true;
-      recover_lifecycle_set_reason("recover_campaign_bootstrap_commit_ready");
-    } else {
-      // LIVE_REATTACH is a Beta presentation splice over a producer that never
-      // stopped.  Command acceptance already verified the surviving VCLOCK/OCXO
-      // services.  Rephasing here would create a new Alpha physical boundary and
-      // destroy the very custody this mode claims to preserve.
-      if (!live_reattach_commit ||
-          !g_recover_lifecycle_last_interrupt_service_rearm_ok) {
-        g_recover_lifecycle_interrupt_service_rearm_failure_count++;
-        recover_lifecycle_abort("recover_live_reattach_service_not_ready");
-        return;
-      }
-      recover_lifecycle_set_reason("recover_live_reattach_commit_ready");
-    }
-
-    if (cold_bootstrap_commit && g_campaign_restore_state.valid) {
+    if (g_campaign_restore_state.valid) {
       if (!clocks_recovery_commit_statistics_and_clockfaces(
               g_campaign_restore_state)) {
         g_campaign_restore_failure_count++;
@@ -8155,9 +7998,7 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
 
     campaign_seconds = recover_gnss_ns / 1000000000ull;
 
-    // Rebase only Beta's campaign presentation.  COLD_BOOTSTRAP supplies a
-    // genuinely new Alpha epoch; CAMPAIGN_BOOTSTRAP and LIVE_REATTACH both
-    // preserve already-authoritative Alpha clockfaces and edge ancestry.
+    // Rebase only Beta's campaign presentation onto the genuinely new Alpha epoch.
     campaign_public_offsets_reset_for_recover();
     interrupt_recover_reset_publication_custody();
     g_recover_lifecycle_gate_custody_reset_count++;
@@ -8165,27 +8006,14 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
     // quarantine is armed; the pre-Alpha proof court releases science when both
     // lanes establish a fresh lawful ancestry chain.
     pps_interval_residuals_reset();
-    // Alpha-owned PPB/TAU/Welfords remain live across warm recovery.
+    // Alpha-owned PPB/TAU/Welfords were restored from the durable desired state.
 
     request_recover = false;
     g_campaign_restore_state = clocks_recovery_restore_state_t{};
     flash_cut_clear_pending();
-    if (cold_bootstrap_commit) {
-      g_recover_lifecycle_cold_bootstrap_commit_count++;
-    }
+    g_recover_lifecycle_dead_producer_restore_commit_count++;
     recover_lifecycle_complete_at_pps();
-    if (campaign_bootstrap_commit || live_reattach_commit) {
-      // Neither topology creates an Alpha custody boundary.  Align only the
-      // campaign-visible OCXO intercept on the exact first public base+1 row;
-      // do not demand post-cut PhaseLedger evidence when no cut occurred.
-      recover_reattach_reset(
-          campaign_bootstrap_commit
-              ? "campaign_bootstrap_preserves_alpha"
-              : "live_reattach_preserves_alpha");
-      recover_continuity_align_arm(false);
-    } else {
-      campaign_warmup_begin(campaign_warmup_mode_t::RECOVER);
-    }
+    campaign_warmup_begin(campaign_warmup_mode_t::RECOVER);
     return;
   }
 
@@ -9458,58 +9286,13 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
 
   g_campaign_restore_state = clocks_recovery_restore_state_t{};
   const bool recovery_state_supplied = args.has("restore_schema_version");
-  bool restore_alpha_required = false;
-  if (!restore_get_bool(args, "restore_alpha_required",
-                        restore_alpha_required, false)) {
+  if (!recovery_state_supplied) {
     Payload err;
-    err.add("error", "restore_alpha_required must be boolean");
-    err.add("status", "recover_rejected_restore_policy");
+    err.add("error", "RECOVER requires a complete dead-producer desired state");
+    err.add("status", "recover_rejected_missing_restore_state");
     return err;
   }
-  bool campaign_bootstrap_required = false;
-  if (!restore_get_bool(args, "campaign_bootstrap_required",
-                        campaign_bootstrap_required, false)) {
-    Payload err;
-    err.add("error", "campaign_bootstrap_required must be boolean");
-    err.add("status", "recover_rejected_campaign_bootstrap_policy");
-    return err;
-  }
-  if (restore_alpha_required && campaign_bootstrap_required) {
-    Payload err;
-    err.add("error", "Alpha restore and campaign-only bootstrap are mutually exclusive");
-    err.add("status", "recover_rejected_conflicting_recovery_policy");
-    return err;
-  }
-  if (campaign_bootstrap_required && recovery_state_supplied) {
-    Payload err;
-    err.add("error", "campaign-only bootstrap must not supply Alpha restore state");
-    err.add("status", "recover_rejected_campaign_bootstrap_with_restore_state");
-    return err;
-  }
-  if (campaign_bootstrap_required &&
-      campaign_state != clocks_campaign_state_t::STOPPED) {
-    Payload err;
-    err.add("error", "campaign-only bootstrap requires Beta campaign state STOPPED");
-    err.add("status", "recover_rejected_campaign_bootstrap_campaign_alive");
-    err.add("campaign_state", clocks_campaign_state_name(campaign_state));
-    return err;
-  }
-  if (campaign_bootstrap_required &&
-      !clocks_alpha_installed_smartzero_backing_epoch()) {
-    Payload err;
-    err.add("error", "campaign-only bootstrap requires an already authoritative Alpha epoch");
-    err.add("status", "recover_rejected_campaign_bootstrap_without_alpha");
-    return err;
-  }
-  if (restore_alpha_required && !recovery_state_supplied) {
-    Payload err;
-    err.add("error", "durable Alpha restore requires structured recovery state");
-    err.add("status", "recover_rejected_restore_policy_requires_state");
-    err.add("restore_alpha_required", true);
-    return err;
-  }
-  if (recovery_state_supplied &&
-      !clocks_recovery_state_from_args(
+  if (!clocks_recovery_state_from_args(
           args, g_campaign_restore_state)) {
     Payload err;
     err.add("error", "invalid structured recovery state");
@@ -9586,9 +9369,6 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
       dwt_ns == g_recover_last_base_dwt_ns &&
       ocxo1_ns == g_recover_last_base_ocxo1_ns &&
       ocxo2_ns == g_recover_last_base_ocxo2_ns &&
-      restore_alpha_required == g_recover_last_restore_alpha_required &&
-      campaign_bootstrap_required ==
-          g_recover_last_campaign_bootstrap_required &&
       strcmp(requested_campaign, g_recover_last_campaign) == 0;
 
   const bool recovery_control_active =
@@ -9623,12 +9403,6 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
     p.add("recover_science_ready",
           (bool)g_recover_reattach_science_ready);
     p.add("campaign_state", clocks_campaign_state_name(campaign_state));
-    p.add("restore_alpha_required", g_recover_last_restore_alpha_required);
-    p.add("requested_restore_alpha_required", restore_alpha_required);
-    p.add("campaign_bootstrap_required",
-          g_recover_last_campaign_bootstrap_required);
-    p.add("requested_campaign_bootstrap_required",
-          campaign_bootstrap_required);
     return p;
   }
 
@@ -9649,15 +9423,10 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
           g_recover_last_expected_first_public_count);
     p.add("last_public_count", g_campaign_record_last_public_count);
     p.add("campaign_state", clocks_campaign_state_name(campaign_state));
-    p.add("restore_alpha_required", g_recover_last_restore_alpha_required);
-    p.add("campaign_bootstrap_required",
-          g_recover_last_campaign_bootstrap_required);
     return p;
   }
 
   g_recover_last_campaign_supplied = campaign_supplied;
-  g_recover_last_restore_alpha_required = restore_alpha_required;
-  g_recover_last_campaign_bootstrap_required = campaign_bootstrap_required;
   if (campaign_supplied) {
     safeCopy(campaign_name, sizeof(campaign_name), requested_campaign);
   }
@@ -9680,9 +9449,8 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
   g_recover_last_base_ocxo2_ns = recover_ocxo2_ns;
 
   clocks_watchdog_disarm_campaign_publication();
-  // A live epoch may have a stray replacement SmartZero acquisition; abort it
-  // before live reattach.  After a flash there is no epoch yet, and startup
-  // SmartZero is the lawful bootstrap proof RECOVER must preserve.
+  // If this newborn lifetime already completed startup SmartZero, keep that
+  // installed epoch; otherwise preserve the in-flight startup acquisition.
   if (clocks_alpha_installed_smartzero_backing_epoch()) {
     interrupt_smartzero_abort();
   }
@@ -9692,10 +9460,7 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
   request_zero    = false;
   flash_cut_clear_pending();
 
-  if (!recover_lifecycle_enter_from_command(
-          "recover_command_armed",
-          restore_alpha_required,
-          campaign_bootstrap_required)) {
+  if (!recover_lifecycle_enter_from_command("recover_command_armed")) {
     recover_lifecycle_abort("recover_interrupt_service_rearm_failed");
 
     Payload err;
@@ -9712,46 +9477,24 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
     return err;
   }
 
-  if (g_recover_lifecycle_mode ==
-          recover_lifecycle_mode_t::LIVE_REATTACH &&
-      g_campaign_restore_state.valid) {
-    // Only an unconstrained live reattach may prefer the newer running Alpha.
-    // If Pi asserted durable ancestry authority above, mode selection must have
-    // forced COLD_BOOTSTRAP and this branch is unreachable.
-    if (restore_alpha_required) {
-      recover_lifecycle_abort("recover_restore_alpha_required_mode_mismatch");
-      Payload err;
-      err.add("error", "durable Alpha restore was not honored by mode selection");
-      err.add("status", "recover_rejected_restore_policy_mode_mismatch");
-      err.add("restore_alpha_required", true);
-      err.add("recover_mode",
-              recover_lifecycle_mode_name(g_recover_lifecycle_mode));
-      return err;
-    }
-    // The running Teensy is newer than the last durable CLOCKS row. Preserve
-    // its live statistics and all instrument control state.
-    g_campaign_restore_ignored_live_count++;
-    g_campaign_restore_state = clocks_recovery_restore_state_t{};
-  }
-
-  if (g_recover_lifecycle_mode == recover_lifecycle_mode_t::COLD_BOOTSTRAP) {
+  {
     if (!g_campaign_restore_state.valid) {
-      recover_lifecycle_abort("recover_cold_bootstrap_requires_structured_state");
+      recover_lifecycle_abort("recover_dead_producer_restore_requires_structured_state");
       Payload err;
-      err.add("error", "cold bootstrap requires structured instrument state");
-      err.add("status", "recover_rejected_cold_bootstrap_requires_state");
-      err.add("recover_mode", "COLD_BOOTSTRAP");
+      err.add("error", "dead-producer restore requires structured instrument state");
+      err.add("status", "recover_rejected_dead_producer_restore_requires_state");
+      err.add("recover_mode", "DEAD_PRODUCER_RESTORE");
       return err;
     }
     if (g_campaign_restore_state.stats.update_count != 0U &&
         !clocks_alpha_ppb_restore_ready(
             g_campaign_restore_state.stats.update_count)) {
       g_campaign_restore_state = clocks_recovery_restore_state_t{};
-      recover_lifecycle_abort("recover_cold_bootstrap_requires_ppb_state");
+      recover_lifecycle_abort("recover_dead_producer_restore_requires_ppb_state");
       Payload err;
-      err.add("error", "cold bootstrap requires committed Better-Buckets state");
-      err.add("status", "recover_rejected_cold_bootstrap_requires_ppb_state");
-      err.add("recover_mode", "COLD_BOOTSTRAP");
+      err.add("error", "dead-producer restore requires committed Better-Buckets state");
+      err.add("status", "recover_rejected_dead_producer_restore_requires_ppb_state");
+      err.add("recover_mode", "DEAD_PRODUCER_RESTORE");
       return err;
     }
   }
@@ -9760,23 +9503,12 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
   p.add("status", "recover_requested");
   p.add("idempotent", false);
   p.add("recovery_generation", g_recover_request_count);
-  p.add("instrument_statistics_preserved",
-        g_recover_lifecycle_mode != recover_lifecycle_mode_t::COLD_BOOTSTRAP);
-  p.add("instrument_statistics_restore_staged",
-        g_recover_lifecycle_mode == recover_lifecycle_mode_t::COLD_BOOTSTRAP &&
-        g_campaign_restore_state.valid);
+  p.add("instrument_statistics_preserved", false);
+  p.add("instrument_statistics_restore_staged", g_campaign_restore_state.valid);
   p.add("instrument_statistics_restored", false);
-  p.add("instrument_statistics_recovery_source",
-        g_recover_lifecycle_mode == recover_lifecycle_mode_t::COLD_BOOTSTRAP &&
-        g_campaign_restore_state.valid
-            ? "TIMEBASE_STRUCTURED_RESTORE"
-            : (g_recover_lifecycle_mode ==
-                       recover_lifecycle_mode_t::CAMPAIGN_BOOTSTRAP
-                   ? "PRESERVED_RESURRECTED_ALPHA"
-                   : "LIVE_ALPHA"));
+  p.add("instrument_statistics_recovery_source", "CLOCKS_RECOVERY_SNAPSHOT");
   p.add("recovery_state_supplied", recovery_state_supplied);
-  p.add("restore_alpha_required", restore_alpha_required);
-  p.add("campaign_bootstrap_required", campaign_bootstrap_required);
+  p.add("producer_restore_required", true);
   p.add("restore_schema_version", CLOCKS_STRUCTURED_RESTORE_VERSION);
   p.add("base_count", g_recover_last_base_count);
   p.add("expected_first_public_count",
@@ -9790,16 +9522,12 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
   p.add("recover_lifecycle_reason", g_recover_lifecycle_reason);
   p.add("recover_mode",
         recover_lifecycle_mode_name(g_recover_lifecycle_mode));
-  p.add("recover_cold_bootstrap_active",
+  p.add("recover_dead_producer_restore_active",
         g_recover_lifecycle_mode ==
-            recover_lifecycle_mode_t::COLD_BOOTSTRAP &&
+            recover_lifecycle_mode_t::DEAD_PRODUCER_RESTORE &&
         clocks_campaign_recovery_lifecycle_active());
-  p.add("recover_campaign_bootstrap_active",
-        g_recover_lifecycle_mode ==
-            recover_lifecycle_mode_t::CAMPAIGN_BOOTSTRAP &&
-        clocks_campaign_recovery_lifecycle_active());
-  p.add("recover_cold_bootstrap_epoch_ready",
-        g_recover_lifecycle_cold_bootstrap_epoch_ready);
+  p.add("recover_dead_producer_restore_epoch_ready",
+        g_recover_lifecycle_dead_producer_restore_epoch_ready);
   p.add("recover_smartzero_running", interrupt_smartzero_running());
   p.add("recover_smartzero_complete", interrupt_smartzero_complete());
   p.add("recover_epoch_ready",
@@ -9978,29 +9706,20 @@ static FLASHMEM Payload cmd_report_recovery(const Payload&) {
   p.add("recover_lifecycle_active", clocks_campaign_recovery_lifecycle_active());
   p.add("recover_lifecycle_reason", g_recover_lifecycle_reason);
   p.add("recover_mode", recover_lifecycle_mode_name(g_recover_lifecycle_mode));
-  p.add("restore_alpha_required", recover_alpha_restore_required_now());
-  p.add("alpha_restore_was_required", g_recover_last_restore_alpha_required);
-  p.add("campaign_bootstrap_required",
-        recover_campaign_bootstrap_required_now());
-  p.add("campaign_bootstrap_was_required",
-        g_recover_last_campaign_bootstrap_required);
-  p.add("recover_cold_bootstrap_active",
-        g_recover_lifecycle_mode == recover_lifecycle_mode_t::COLD_BOOTSTRAP &&
+  p.add("producer_restore_active", clocks_campaign_recovery_lifecycle_active());
+  p.add("recover_dead_producer_restore_active",
+        g_recover_lifecycle_mode == recover_lifecycle_mode_t::DEAD_PRODUCER_RESTORE &&
         clocks_campaign_recovery_lifecycle_active());
-  p.add("recover_campaign_bootstrap_active",
-        g_recover_lifecycle_mode ==
-            recover_lifecycle_mode_t::CAMPAIGN_BOOTSTRAP &&
-        clocks_campaign_recovery_lifecycle_active());
-  p.add("recover_cold_bootstrap_epoch_ready",
-        g_recover_lifecycle_cold_bootstrap_epoch_ready);
-  p.add("recover_cold_bootstrap_begin_count",
-        g_recover_lifecycle_cold_bootstrap_begin_count);
-  p.add("recover_cold_bootstrap_wait_count",
-        g_recover_lifecycle_cold_bootstrap_wait_count);
-  p.add("recover_cold_bootstrap_ready_count",
-        g_recover_lifecycle_cold_bootstrap_ready_count);
-  p.add("recover_cold_bootstrap_commit_count",
-        g_recover_lifecycle_cold_bootstrap_commit_count);
+  p.add("recover_dead_producer_restore_epoch_ready",
+        g_recover_lifecycle_dead_producer_restore_epoch_ready);
+  p.add("recover_dead_producer_restore_begin_count",
+        g_recover_lifecycle_dead_producer_restore_begin_count);
+  p.add("recover_dead_producer_restore_wait_count",
+        g_recover_lifecycle_dead_producer_restore_wait_count);
+  p.add("recover_dead_producer_restore_ready_count",
+        g_recover_lifecycle_dead_producer_restore_ready_count);
+  p.add("recover_dead_producer_restore_commit_count",
+        g_recover_lifecycle_dead_producer_restore_commit_count);
   p.add("recover_smartzero_running", interrupt_smartzero_running());
   p.add("recover_smartzero_complete", interrupt_smartzero_complete());
   p.add("recover_epoch_ready", clocks_alpha_installed_smartzero_backing_epoch());

@@ -38,7 +38,7 @@ Core contract:
     replayed or reconstructed.
 
     If producer continuity is not proved, the current declarative CLOCKS_RECOVERY
-    snapshot is projected to the current GNSS time and one structured COLD_BOOTSTRAP
+    snapshot is projected to the current GNSS time and one structured DEAD_PRODUCER_RESTORE
     transaction restores canonical producer state, its literal Pi Better-Buckets
     checkpoint, and the raw TEMPEST state captured at that same durable boundary.
     PostgreSQL history is never replayed to reconstruct firmware statistics. The Pi
@@ -216,9 +216,9 @@ RECOVERY_FIRST_ROW_TIMEOUT_S = 45.0
 
 # A post-flash RECOVER may first need startup SmartZero to acquire and install a
 # fresh local service epoch before firmware can launch the ordinary RECOVER grid
-# rephase. Dead-producer COLD_BOOTSTRAP receives the full recovery-admission
+# rephase. Dead-producer restore receives the full recovery-admission
 # window; surviving producers never enter this mutating path.
-RECOVERY_COLD_BOOTSTRAP_FIRST_ROW_TIMEOUT_S = 180.0
+RECOVERY_DEAD_PRODUCER_FIRST_ROW_TIMEOUT_S = 180.0
 
 # If a new WATCHDOG_ANOMALY arrives while an auto-recovery attempt is already
 # waiting for the first clean public row, the current attempt has been
@@ -3464,7 +3464,7 @@ def _finalize_recovery_clocks_custody(
                 boundary_update = _as_int(boundary_stats.get("update_count"))
 
                 cold_or_rebased = bool(
-                    str(recover_mode).upper() == "COLD_BOOTSTRAP"
+                    str(recover_mode).upper() == "DEAD_PRODUCER_RESTORE"
                     or physical_regression
                 )
                 boundary_ppb_checkpoint: Optional[Dict[str, Any]] = None
@@ -6421,7 +6421,7 @@ def _require_alpha_resurrection_checkpoint(
     raise AssertionError("unreachable after HARD_FAILURE")
 
 
-def _supersede_cold_bootstrap_rows(
+def _supersede_dead_producer_restore_rows(
     *,
     base_detail_id: int,
     campaign_name: str,
@@ -8086,11 +8086,8 @@ def _restore_instrument_from_clocks(
     firmware_campaign_state = str(
         lifecycle_status.get("campaign_state") or ""
     ).strip().upper()
-    firmware_recovery_active = bool(
-        _recovery_bool(lifecycle_status.get("recover_lifecycle_active"))
-        or _recovery_bool(lifecycle_status.get("recover_cold_bootstrap_active"))
-        or _recovery_bool(lifecycle_status.get("recover_campaign_bootstrap_active"))
-        or _recovery_bool(lifecycle_status.get("recover_reattach_active"))
+    firmware_recovery_active = _recovery_bool(
+        lifecycle_status.get("recover_lifecycle_active")
     )
 
     # Temporary startup courtroom transcript.  Keep the ordinary CLOCKS stream
@@ -8119,18 +8116,13 @@ def _restore_instrument_from_clocks(
     )
 
     # Producer survival is independent of campaign execution. REPORT_RECOVERY
-    # exposes the exact producer custody facts needed for that decision. Require
-    # restore_alpha_required to be explicitly present and false; absence is never
-    # permission to preserve a producer.
+    # contributes present-tense producer custody; canonical lineage proof remains
+    # the authority for deciding whether this exact producer survived.
     alpha_owner = str(
         lifecycle_status.get("instrument_statistics_owner") or ""
     ).strip().upper()
     alpha_preserved = _recovery_bool(
         lifecycle_status.get("instrument_statistics_preserved")
-    )
-    restore_alpha_present = "restore_alpha_required" in lifecycle_status
-    restore_alpha_required = _recovery_bool(
-        lifecycle_status.get("restore_alpha_required")
     )
     recover_epoch_ready_present = "recover_epoch_ready" in lifecycle_status
     recover_epoch_ready = _recovery_bool(
@@ -8179,8 +8171,6 @@ def _restore_instrument_from_clocks(
         lifecycle_status
         and alpha_owner == "ALPHA"
         and alpha_preserved
-        and restore_alpha_present
-        and not restore_alpha_required
         and recover_epoch_ready
         and not firmware_recovery_active
         and alpha_lineage_proved
@@ -8193,10 +8183,6 @@ def _restore_instrument_from_clocks(
         report_decline_reasons.append("instrument_statistics_owner_not_alpha")
     if not alpha_preserved:
         report_decline_reasons.append("instrument_statistics_not_preserved")
-    if not restore_alpha_present:
-        report_decline_reasons.append("restore_alpha_required_missing")
-    elif restore_alpha_required:
-        report_decline_reasons.append("restore_alpha_required")
     if not recover_epoch_ready:
         report_decline_reasons.append("recover_epoch_not_ready")
     if firmware_recovery_active:
@@ -8219,16 +8205,11 @@ def _restore_instrument_from_clocks(
                 "recover_mode": str(
                     lifecycle_status.get("recover_mode") or ""
                 ).strip().upper() or None,
-                "recover_cold_bootstrap_active": _recovery_bool(
-                    lifecycle_status.get("recover_cold_bootstrap_active")
-                ),
-                "recover_reattach_active": _recovery_bool(
-                    lifecycle_status.get("recover_reattach_active")
+                "producer_restore_active": _recovery_bool(
+                    lifecycle_status.get("producer_restore_active")
                 ),
                 "instrument_statistics_owner": alpha_owner or None,
                 "instrument_statistics_preserved": alpha_preserved,
-                "restore_alpha_required_present": restore_alpha_present,
-                "restore_alpha_required": restore_alpha_required,
                 "restore_court_ready": restore_court_ready,
                 "recover_epoch_ready": recover_epoch_ready,
                 "current_lifetime_pre_epoch": current_lifetime_pre_epoch,
@@ -8262,12 +8243,11 @@ def _restore_instrument_from_clocks(
     if report_alpha_survived:
         logging.info(
             "♻️ [holistic restore] REPORT_RECOVERY proves surviving Alpha custody: "
-            "owner=%s preserved=%s restore_alpha_required=%s recover_epoch_ready=%s "
+            "owner=%s preserved=%s recover_epoch_ready=%s "
             "lineage_reset=%s update=%s->%s; firmware campaign=%s/%s Pi campaign=%s. "
             "Restoring Pi-owned state only.",
             alpha_owner,
             alpha_preserved,
-            restore_alpha_required,
             recover_epoch_ready,
             alpha_lineage.get("live_reset_count"),
             alpha_lineage.get("durable_update_count"),
@@ -8337,7 +8317,7 @@ def _restore_instrument_from_clocks(
 
     # When this exact durable CLOCKS observation also carries the active TEMPEST
     # state, defer all producer mutation to the one combined desired-state
-    # COLD_BOOTSTRAP transaction.  Return an explicit LOST verdict here.
+    # DEAD_PRODUCER_RESTORE transaction.  Return an explicit LOST verdict here.
     durable_campaign = _state_campaign(detail)
     durable_campaign_name = (
         _tempest_campaign_name(durable_campaign)
@@ -8766,22 +8746,17 @@ def _adopt_surviving_clocks_producer(
     firmware_state = str(
         lifecycle_status.get("campaign_state") or ""
     ).strip().upper()
-    firmware_recovery_active = bool(
-        _recovery_bool(lifecycle_status.get("recover_lifecycle_active"))
-        or _recovery_bool(lifecycle_status.get("recover_cold_bootstrap_active"))
-        or _recovery_bool(lifecycle_status.get("recover_campaign_bootstrap_active"))
-        or _recovery_bool(lifecycle_status.get("recover_reattach_active"))
+    firmware_recovery_active = _recovery_bool(
+        lifecycle_status.get("recover_lifecycle_active")
     )
     if (
         firmware_recovery_active
         or not _recovery_bool(lifecycle_status.get("recover_epoch_ready"))
-        or _recovery_bool(lifecycle_status.get("restore_alpha_required"))
     ):
         raise RuntimeError(
             "CLOCKS producer changed eligibility before adoption: "
             f"recovery_active={firmware_recovery_active} "
             f"epoch_ready={lifecycle_status.get('recover_epoch_ready')} "
-            f"restore_alpha_required={lifecycle_status.get('restore_alpha_required')}"
         )
 
     with _clocks_lock:
@@ -9832,7 +9807,7 @@ def _gnss_raw_recovery_project_seed(
 
     GNSS_RAW is not a Teensy clock.  It is a Pi synthetic clock accumulated as
     one nominal GNSS second plus the GF-8802 drift_ppb confession.  Therefore a
-    warm recovery should project it from its own reference surface
+    dead-producer recovery should project it from its own reference surface
     (gnss_raw_ref_ns) and restored drift mean, not from the campaign GNSS ratio.
     """
     extra = _report_extra_clocks(last_tb)
@@ -10061,23 +10036,23 @@ def _recovery_inflight_status_compact(status: Dict[str, Any]) -> Dict[str, Any]:
         "recover_lifecycle_active": _recovery_bool(status.get("recover_lifecycle_active")),
         "recover_lifecycle_reason": status.get("recover_lifecycle_reason"),
         "recover_mode": str(status.get("recover_mode") or "NONE").upper(),
-        "recover_cold_bootstrap_active": _recovery_bool(
-            status.get("recover_cold_bootstrap_active")
+        "recover_dead_producer_restore_active": _recovery_bool(
+            status.get("recover_dead_producer_restore_active")
         ),
-        "recover_cold_bootstrap_epoch_ready": _recovery_bool(
-            status.get("recover_cold_bootstrap_epoch_ready")
+        "recover_dead_producer_restore_epoch_ready": _recovery_bool(
+            status.get("recover_dead_producer_restore_epoch_ready")
         ),
-        "recover_cold_bootstrap_begin_count": _as_int(
-            status.get("recover_cold_bootstrap_begin_count")
+        "recover_dead_producer_restore_begin_count": _as_int(
+            status.get("recover_dead_producer_restore_begin_count")
         ),
-        "recover_cold_bootstrap_wait_count": _as_int(
-            status.get("recover_cold_bootstrap_wait_count")
+        "recover_dead_producer_restore_wait_count": _as_int(
+            status.get("recover_dead_producer_restore_wait_count")
         ),
-        "recover_cold_bootstrap_ready_count": _as_int(
-            status.get("recover_cold_bootstrap_ready_count")
+        "recover_dead_producer_restore_ready_count": _as_int(
+            status.get("recover_dead_producer_restore_ready_count")
         ),
-        "recover_cold_bootstrap_commit_count": _as_int(
-            status.get("recover_cold_bootstrap_commit_count")
+        "recover_dead_producer_restore_commit_count": _as_int(
+            status.get("recover_dead_producer_restore_commit_count")
         ),
         "recover_smartzero_running": _recovery_bool(
             status.get("recover_smartzero_running")
@@ -10206,8 +10181,8 @@ def _check_recovery_inflight_monitor(
     now_monotonic = time.monotonic()
     progress_signature = (
         compact.get("recover_lifecycle_reason"),
-        compact.get("recover_cold_bootstrap_epoch_ready"),
-        compact.get("recover_cold_bootstrap_commit_count"),
+        compact.get("recover_dead_producer_restore_epoch_ready"),
+        compact.get("recover_dead_producer_restore_commit_count"),
         compact.get("recover_reattach_active"),
         compact.get("recover_reattach_degraded_active"),
         compact.get("recover_clockface_ready"),
@@ -15010,7 +14985,7 @@ def _restore_active_campaign_state(
     Surviving producers never reach this executor: they exit through the generic
     prove-and-adopt branch.  This function therefore has one mutation mode only:
     project the durable snapshot, install producer + campaign desired state in one
-    COLD_BOOTSTRAP transaction, prove exact producer N+1, and admit the projected
+    DEAD_PRODUCER_RESTORE transaction, prove exact producer N+1, and admit the projected
     first public TEMPEST row.
     """
     global _campaign_active, _accepted_pps_vclock_count
@@ -15302,7 +15277,7 @@ def _restore_active_campaign_state(
         "bypass_reason": "warm_recovery_after_teensy_reboot",
     }
     logging.info(
-        "%s bypassing START admission gate for warm recovery; "
+        "%s bypassing START admission gate for dead-producer restore; "
         "CLOCKS.RECOVER firmware verdict remains authoritative",
         PREFLIGHT_LOG_PREFIX,
     )
@@ -15314,12 +15289,12 @@ def _restore_active_campaign_state(
     # ------------------------------------------------------------------
     #
     # Surviving producers have already exited through the read-only adoption
-    # branch.  CLOCKS.RECOVER is therefore used here only for COLD_BOOTSTRAP:
+    # branch.  CLOCKS.RECOVER is therefore used here only for dead-producer restore:
     # install a fresh SmartZero-backed producer epoch mapped onto durable
     # campaign coordinates.  No STOP/START or campaign-only recovery is issued.
     logging.info(
         "📡 [recovery] @%s preserving durable campaign identity; "
-        "quiescing Pi CLOCKS_FRAGMENT campaign ingress before one COLD_BOOTSTRAP...",
+        "quiescing Pi CLOCKS_FRAGMENT campaign ingress before one dead-producer restore...",
         system_time_z(),
     )
 
@@ -15452,12 +15427,9 @@ def _restore_active_campaign_state(
         recovery_status_before.get("campaign_state") or ""
     ).strip().upper()
 
-    # Reaching this point means producer continuity was not proved.  The only
-    # lawful mutation is full desired-state installation.  Keep the retired
-    # campaign_bootstrap_required field false solely as firmware protocol
-    # compatibility; Pi never requests that recovery species.
-    teensy_recover_args["restore_alpha_required"] = True
-    teensy_recover_args["campaign_bootstrap_required"] = False
+    # Reaching this point means producer continuity was not proved. RECOVER now
+    # has one meaning on both machines: install this complete dead-producer
+    # desired state and prove its first successor.
     _diag["last_recovery"].update({
         "teensy_epoch_ready_before_recover": bool(epoch_ready_before_recover),
         "teensy_campaign_before_recover": reported_campaign_name or None,
@@ -15521,7 +15493,7 @@ def _restore_active_campaign_state(
     })
     logging.info(
         "♻️ [recovery] dead producer + TEMPEST '%s' prepared for one "
-        "COLD_BOOTSTRAP desired-state transaction from detail_id=%s "
+        "dead-producer desired-state transaction from detail_id=%s "
         "second=%d minute=%d source_update=%d",
         campaign_name,
         combined_source_detail_id,
@@ -15546,50 +15518,19 @@ def _restore_active_campaign_state(
         else {}
     )
 
-    teensy_restore_alpha_required = teensy_recover_payload.get(
-        "restore_alpha_required"
-    )
-    if teensy_restore_alpha_required is not True:
-        raise RecoveryRetryableFailure(
-            "recovery_restore_policy_echo_mismatch",
-            {
-                "campaign": campaign_name,
-                "requested_restore_alpha_required": True,
-                "teensy_restore_alpha_required": teensy_restore_alpha_required,
-                "teensy_recover_payload": teensy_recover_payload,
-            },
-        )
-
-    # Firmware still echoes this retired protocol field.  Anything except false
-    # is an unsupported procedural recovery mode and fails hard/loud.
-    teensy_campaign_bootstrap_required = teensy_recover_payload.get(
-        "campaign_bootstrap_required"
-    )
-    if teensy_campaign_bootstrap_required is not False:
-        raise RecoveryRetryableFailure(
-            "retired_campaign_bootstrap_requested_by_firmware",
-            {
-                "campaign": campaign_name,
-                "teensy_campaign_bootstrap_required":
-                    teensy_campaign_bootstrap_required,
-                "teensy_recover_payload": teensy_recover_payload,
-            },
-        )
-
     recover_mode = str(
         teensy_recover_payload.get("recover_mode") or ""
     ).strip().upper()
-    if recover_mode != "COLD_BOOTSTRAP":
+    if recover_mode != "DEAD_PRODUCER_RESTORE":
         raise RecoveryRetryableFailure(
-            "dead_producer_restore_not_cold_bootstrap",
+            "dead_producer_restore_contract_mismatch",
             {
                 "campaign": campaign_name,
                 "recover_mode": recover_mode or None,
                 "teensy_recover_payload": teensy_recover_payload,
             },
         )
-    cold_bootstrap = True
-    first_row_timeout_s = RECOVERY_COLD_BOOTSTRAP_FIRST_ROW_TIMEOUT_S
+    first_row_timeout_s = RECOVERY_DEAD_PRODUCER_FIRST_ROW_TIMEOUT_S
 
     if combined_restore_requested_monotonic is None:
         raise RuntimeError("combined CLOCKS restore has no command timestamp")
@@ -15604,27 +15545,26 @@ def _restore_active_campaign_state(
     )
     logging.info(
         "✅ [recovery] dead-producer exact N+1 proof durable; the same "
-        "COLD_BOOTSTRAP transaction is awaiting its projected TEMPEST first-public row"
+        "DEAD_PRODUCER_RESTORE transaction is awaiting its projected TEMPEST first-public row"
     )
 
     _diag["last_recovery"].update({
         "recover_mode": recover_mode,
-        "cold_bootstrap": True,
+        "dead_producer_restore": True,
         "producer_restore_required": True,
-        "teensy_restore_alpha_required": True,
         "combined_dead_producer_restore": True,
         "combined_alpha_proof": copy.deepcopy(combined_alpha_proof),
-        "recover_cold_bootstrap_active": bool(
-            teensy_recover_payload.get("recover_cold_bootstrap_active")
+        "recover_dead_producer_restore_active": bool(
+            teensy_recover_payload.get("recover_dead_producer_restore_active")
         ),
-        "recover_cold_bootstrap_epoch_ready": bool(
-            teensy_recover_payload.get("recover_cold_bootstrap_epoch_ready")
+        "recover_dead_producer_restore_epoch_ready": bool(
+            teensy_recover_payload.get("recover_dead_producer_restore_epoch_ready")
         ),
         "first_row_timeout_s": float(first_row_timeout_s),
     })
 
     logging.info(
-        "🧭 [recovery] Teensy selected COLD_BOOTSTRAP: preserving campaign "
+        "🧭 [recovery] Teensy accepted dead-producer restore: preserving campaign "
         "base=%d while installing the projected desired state",
         recover_base_pps_vclock_count,
     )
@@ -15636,13 +15576,13 @@ def _restore_active_campaign_state(
         "recovery_generation": _as_int(teensy_recover_payload.get("recovery_generation")),
         "recover_status": teensy_recover_payload.get("status"),
         "recover_mode": recover_mode,
-        "cold_bootstrap": True,
+        "dead_producer_restore": True,
         "producer_restore_required": True,
-        "recover_cold_bootstrap_active": bool(
-            teensy_recover_payload.get("recover_cold_bootstrap_active")
+        "recover_dead_producer_restore_active": bool(
+            teensy_recover_payload.get("recover_dead_producer_restore_active")
         ),
-        "recover_cold_bootstrap_epoch_ready": bool(
-            teensy_recover_payload.get("recover_cold_bootstrap_epoch_ready")
+        "recover_dead_producer_restore_epoch_ready": bool(
+            teensy_recover_payload.get("recover_dead_producer_restore_epoch_ready")
         ),
         "first_row_timeout_s": float(first_row_timeout_s),
         "sent_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -15661,7 +15601,7 @@ def _restore_active_campaign_state(
                 "campaign": campaign_name,
                 "expected_first_public_pps_vclock_count": int(expected_first_public_pps_vclock_count),
                 "recover_mode": recover_mode,
-                "cold_bootstrap": bool(cold_bootstrap),
+                "dead_producer_restore": True,
                 "first_row_timeout_s": float(first_row_timeout_s),
                 "discarded_transitional_rows": int(discarded_transitional_rows),
                 "last_admission_verdict": recovery_admission_verdict,
@@ -15689,7 +15629,7 @@ def _restore_active_campaign_state(
                 "recover_base_pps_vclock_count": int(recover_base_pps_vclock_count),
                 "expected_first_public_pps_vclock_count": int(expected_first_public_pps_vclock_count),
                 "recover_mode": recover_mode,
-                "cold_bootstrap": bool(cold_bootstrap),
+                "dead_producer_restore": True,
                 "first_row_timeout_s": float(first_row_timeout_s),
                 "discarded_transitional_rows": int(discarded_transitional_rows),
                 "last_admission_verdict": recovery_admission_verdict,
@@ -15766,28 +15706,26 @@ def _restore_active_campaign_state(
         time.sleep(0.05)
         _begin_sync_wait(expected_pps=int(teensy_pps_vclock_count) + 1)
 
-    cold_bootstrap_supersede: Optional[Dict[str, Any]] = None
-    if cold_bootstrap:
-        if recovery_source_db_id is None or recovery_source_db_id <= 0:
-            raise RecoveryRetryableFailure(
-                "cold_bootstrap_missing_recovery_source_db_id",
-                {"campaign": campaign_name, "last_timebase": last_tb},
-            )
-        cold_bootstrap_supersede = _supersede_cold_bootstrap_rows(
-            base_detail_id=int(recovery_source_db_id),
-            campaign_name=campaign_name,
-            first_public_count=int(teensy_pps_vclock_count),
+    if recovery_source_db_id is None or recovery_source_db_id <= 0:
+        raise RecoveryRetryableFailure(
+            "dead_producer_restore_missing_recovery_source_db_id",
+            {"campaign": campaign_name, "last_timebase": last_tb},
         )
-        _diag["last_recovery"]["cold_bootstrap_supersede"] = (
-            cold_bootstrap_supersede
-        )
-        logging.info(
-            "🧹 [recovery] cold-bootstrap evidence boundary: kept source id=%d, "
-            "recovered id=%d, marked %d intervening row(s) non-viable",
-            int(cold_bootstrap_supersede["base_detail_id"]),
-            int(cold_bootstrap_supersede["recovered_detail_id"]),
-            int(cold_bootstrap_supersede["rows_marked_nonviable"]),
-        )
+    dead_producer_restore_supersede = _supersede_dead_producer_restore_rows(
+        base_detail_id=int(recovery_source_db_id),
+        campaign_name=campaign_name,
+        first_public_count=int(teensy_pps_vclock_count),
+    )
+    _diag["last_recovery"]["dead_producer_restore_supersede"] = (
+        dead_producer_restore_supersede
+    )
+    logging.info(
+        "🧹 [recovery] dead-producer evidence boundary: kept source id=%d, "
+        "recovered id=%d, marked %d intervening row(s) non-viable",
+        int(dead_producer_restore_supersede["base_detail_id"]),
+        int(dead_producer_restore_supersede["recovered_detail_id"]),
+        int(dead_producer_restore_supersede["rows_marked_nonviable"]),
+    )
 
     recovery_custody = _finalize_recovery_clocks_custody(
         last_tb=last_tb,
@@ -15818,8 +15756,6 @@ def _restore_active_campaign_state(
         projection_details=gnss_raw_projection,
     )
 
-    if not isinstance(cold_bootstrap_supersede, dict):
-        raise RuntimeError("dead-producer CLOCKS recovery lacks durable first-public boundary")
     alpha_proof_sequence = _as_int(combined_alpha_proof.get("durable_proof_sequence"))
     source_stats = combined_recovery_clocks.get("stats")
     source_reset_count = (
@@ -15841,7 +15777,7 @@ def _restore_active_campaign_state(
         proof_sequence=int(alpha_proof_sequence),
     )
     recovery_receipt = _record_clocks_recovery_receipt(
-        boundary_detail_id=int(cold_bootstrap_supersede["recovered_detail_id"]),
+        boundary_detail_id=int(dead_producer_restore_supersede["recovered_detail_id"]),
         source_detail=combined_recovery_detail,
         source_checkpoint=cold_ppb_checkpoint,
         recovery_mode=recover_mode,
@@ -16369,12 +16305,7 @@ def _startup_restore_court_ready() -> Optional[Dict[str, Any]]:
     firmware_state = str(status.get("campaign_state") or "").strip().upper()
     restore_court_ready = _recovery_bool(status.get("restore_court_ready"))
     recover_epoch_ready = _recovery_bool(status.get("recover_epoch_ready"))
-    recovery_active = bool(
-        _recovery_bool(status.get("recover_lifecycle_active"))
-        or _recovery_bool(status.get("recover_cold_bootstrap_active"))
-        or _recovery_bool(status.get("recover_campaign_bootstrap_active"))
-        or _recovery_bool(status.get("recover_reattach_active"))
-    )
+    recovery_active = _recovery_bool(status.get("recover_lifecycle_active"))
 
     if (
         not firmware_campaign
