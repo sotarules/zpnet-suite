@@ -49,12 +49,15 @@
  *       - scaled-integer CPU usage metrics
  *       - internal diagnostics
  *       - floating-point environmental telemetry is intentionally excluded
- *   • EXECUTION_TRACE — return the bounded ISR-to-handoff-to-subscriber-to-
- *     TimePop control-flow transcript.  The live ring runs in RAM1; fault entry
- *     copies committed records into retained RAM2 before reboot.  Accepts
- *     bank=retained|live, count=1..8, offset=N; retained is the default.
- *   • TIMEPOP_DISPATCH_INFO — compatibility alias for EXECUTION_TRACE using
- *     the earlier TimePop report schema
+ *   • EXECUTION_TRACE — return bounded causal breadcrumbs from independent
+ *     PRIORITY0, PRIORITY16, PRIORITY32, and FOREGROUND notebooks.  Each live
+ *     ring runs in RAM1; fault entry freezes all committed notebooks into one
+ *     retained RAM2 set.  DWT is the shared timing ruler and lineage_id carries
+ *     event identity across custody layers.  Accepts bank=retained|live,
+ *     context=all|priority0|priority16|priority32|foreground, count=1..32,
+ *     offset=N; retained/all are the defaults.
+ *   • TIMEPOP_DISPATCH_INFO — compatibility view of the FOREGROUND execution
+ *     notebook using TimePop-oriented field aliases
  *   • CRASH_INFO — return a bounded crash index and focused drill-down command
  *     names; it never embeds the full retained black-box corpus
  *   • CRASH_REPORT_TEXT — return only the cached Teensyduino CrashReport text

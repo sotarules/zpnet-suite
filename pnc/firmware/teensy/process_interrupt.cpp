@@ -42,6 +42,7 @@
 #include "process_clocks.h"
 #include "process_system.h"
 #include "crash_forensics.h"
+#include "execution_trace.h"
 
 #include "config.h"
 #include "debug.h"
@@ -830,14 +831,16 @@ static bool interrupt_dispatch_begin(interrupt_subscriber_runtime_t& rt,
   const timepop_dispatch_trace_kind_t trace_kind =
       interrupt_execution_trace_subscriber_kind(rt.desc->kind);
   ZPNET_EXECUTION_TRACE(
+      execution_trace_context_t::PRIORITY32,
       timepop_dispatch_trace_stage_t::SUBSCRIBER_SELECTED,
       trace_kind,
+      (uint32_t)timepop_dispatch_trace_phase_t::IDLE,
+      event.counter32_at_event,
       (uint32_t)rt.desc->kind,
       event.counter32_at_event,
       (uint32_t)(uintptr_t)callback,
       (uint32_t)(uintptr_t)rt.sub.on_event,
       (uint32_t)(uintptr_t)callback_user_data,
-      (uint32_t)(uintptr_t)rt.desc->name,
       1U | (binding_generation << 16));
   return true;
 }
@@ -881,14 +884,16 @@ static bool interrupt_dispatch_foreground_one(
   const timepop_dispatch_trace_kind_t trace_kind =
       interrupt_execution_trace_subscriber_kind(rt.desc->kind);
   ZPNET_EXECUTION_TRACE(
+      execution_trace_context_t::FOREGROUND,
       timepop_dispatch_trace_stage_t::SUBSCRIBER_ENTER,
       trace_kind,
+      (uint32_t)timepop_dispatch_trace_phase_t::IDLE,
+      event.counter32_at_event,
       (uint32_t)rt.desc->kind,
       event.counter32_at_event,
       (uint32_t)(uintptr_t)callback,
       0U,
       (uint32_t)(uintptr_t)callback_user_data,
-      (uint32_t)(uintptr_t)rt.desc->name,
       event.counter32_at_event);
   rt.dispatch_count++;
   crash_dispatch_breadcrumb_note(
@@ -907,14 +912,16 @@ static bool interrupt_dispatch_foreground_one(
       (uint32_t)(uintptr_t)callback_user_data,
       (uint32_t)(uintptr_t)&rt);
   ZPNET_EXECUTION_TRACE(
+      execution_trace_context_t::FOREGROUND,
       timepop_dispatch_trace_stage_t::SUBSCRIBER_RETURN,
       trace_kind,
+      (uint32_t)timepop_dispatch_trace_phase_t::IDLE,
+      event.counter32_at_event,
       (uint32_t)rt.desc->kind,
       event.counter32_at_event,
       (uint32_t)(uintptr_t)callback,
       0U,
       (uint32_t)(uintptr_t)callback_user_data,
-      (uint32_t)(uintptr_t)rt.desc->name,
       event.counter32_at_event);
 
   crash_dispatch_breadcrumb_note(
@@ -4409,14 +4416,16 @@ static void process_ch2_packet(const ch2_capture_packet_t& packet) {
   // callback selection, recurring rearm, and compare selection are foreground.
   (void)timepop_foreground_mailbox_store_handoff(foreground);
   ZPNET_EXECUTION_TRACE(
+      execution_trace_context_t::PRIORITY32,
       timepop_dispatch_trace_stage_t::HANDOFF_DEQUEUE,
       timepop_dispatch_trace_kind_t::ISR_TIMED,
+      (uint32_t)timepop_dispatch_trace_phase_t::IDLE,
+      packet.target_counter32,
       QTIMER1_TIMEPOP_CH,
       packet.sequence,
       0U,
       0U,
-      packet.target_counter32,
-      (uint32_t)(uintptr_t)"QTIMER1_CH2_FOREGROUND",
+      0U,
       foreground.dwt_at_event);
 }
 
@@ -4813,14 +4822,16 @@ static void interrupt_handoff_service_isr(void) {
   }
 
   ZPNET_EXECUTION_TRACE(
+      execution_trace_context_t::PRIORITY32,
       timepop_dispatch_trace_stage_t::HANDOFF_ENTER,
       timepop_dispatch_trace_kind_t::INTERRUPT_HANDOFF,
+      (uint32_t)timepop_dispatch_trace_phase_t::IDLE,
+      0U,
       TIMEPOP_DISPATCH_TRACE_NO_SLOT,
       g_interrupt_handoff.entry_count,
       0U,
       0U,
       0U,
-      (uint32_t)(uintptr_t)"INTERRUPT_HANDOFF",
       entry_dwt);
 
   uint32_t drained = 0U;
@@ -4836,14 +4847,16 @@ static void interrupt_handoff_service_isr(void) {
   }
 
   ZPNET_EXECUTION_TRACE(
+      execution_trace_context_t::PRIORITY32,
       timepop_dispatch_trace_stage_t::HANDOFF_EXIT,
       timepop_dispatch_trace_kind_t::INTERRUPT_HANDOFF,
+      (uint32_t)timepop_dispatch_trace_phase_t::IDLE,
+      0U,
       TIMEPOP_DISPATCH_TRACE_NO_SLOT,
       g_interrupt_handoff.entry_count,
       0U,
       0U,
       0U,
-      (uint32_t)(uintptr_t)"INTERRUPT_HANDOFF",
       drained);
 
   g_interrupt_handoff.exit_count++;
@@ -5906,25 +5919,29 @@ static void interrupt_timepop_foreground_service(void) {
                        packet.sequence);
 
     ZPNET_EXECUTION_TRACE(
+        execution_trace_context_t::FOREGROUND,
         timepop_dispatch_trace_stage_t::SUBSCRIBER_ENTER,
         timepop_dispatch_trace_kind_t::ISR_TIMED,
+        (uint32_t)timepop_dispatch_trace_phase_t::IDLE,
+        packet.target_counter32,
         QTIMER1_TIMEPOP_CH,
         packet.sequence,
         (uint32_t)(uintptr_t)timepop_accept_ch2_event_foreground,
         0U,
-        packet.target_counter32,
-        (uint32_t)(uintptr_t)"QTIMER1_CH2_FOREGROUND",
+        0U,
         event.dwt_at_event);
     timepop_accept_ch2_event_foreground(event, diag);
     ZPNET_EXECUTION_TRACE(
+        execution_trace_context_t::FOREGROUND,
         timepop_dispatch_trace_stage_t::SUBSCRIBER_RETURN,
         timepop_dispatch_trace_kind_t::ISR_TIMED,
+        (uint32_t)timepop_dispatch_trace_phase_t::IDLE,
+        packet.target_counter32,
         QTIMER1_TIMEPOP_CH,
         packet.sequence,
         (uint32_t)(uintptr_t)timepop_accept_ch2_event_foreground,
         0U,
-        packet.target_counter32,
-        (uint32_t)(uintptr_t)"QTIMER1_CH2_FOREGROUND",
+        0U,
         event.dwt_at_event);
     g_timepop_foreground_diag.service_count++;
     interrupt_timepop_release_ch2_custody_foreground();

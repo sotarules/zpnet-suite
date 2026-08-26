@@ -15,6 +15,7 @@
 
 #include "process_system.h"
 #include "crash_forensics.h"
+#include "execution_trace.h"
 #include "config.h"
 #include "process.h"
 #include "events.h"
@@ -1514,9 +1515,9 @@ static FLASHMEM Payload system_runtime_ledger_payload(void) {
 
 
 static constexpr uint32_t SYSTEM_TRACE_REPORT_DEFAULT_COUNT = 8U;
-static constexpr uint32_t SYSTEM_TRACE_REPORT_MAX_COUNT = 8U;
+static constexpr uint32_t SYSTEM_TRACE_REPORT_MAX_COUNT = 32U;
 
-
+static execution_trace_snapshot_t g_system_execution_trace_scratch DMAMEM;
 
 static uint32_t system_trace_report_count(const Payload& args) {
   uint32_t count = args.has("count")
@@ -1561,145 +1562,130 @@ static void system_trace_bounds(uint32_t available,
   if (out_end) *out_end = end;
 }
 
+static bool system_trace_context_parse(const char* text,
+                                       execution_trace_context_t* out,
+                                       bool* all) {
+  if (out) *out = execution_trace_context_t::NONE;
+  if (all) *all = false;
+  if (!text || !*text || system_cstr_equal_ci(text, "all")) {
+    if (all) *all = true;
+    return true;
+  }
+  if (system_cstr_equal_ci(text, "priority0") ||
+      system_cstr_equal_ci(text, "p0")) {
+    if (out) *out = execution_trace_context_t::PRIORITY0;
+    return true;
+  }
+  if (system_cstr_equal_ci(text, "priority16") ||
+      system_cstr_equal_ci(text, "p16")) {
+    if (out) *out = execution_trace_context_t::PRIORITY16;
+    return true;
+  }
+  if (system_cstr_equal_ci(text, "priority32") ||
+      system_cstr_equal_ci(text, "p32")) {
+    if (out) *out = execution_trace_context_t::PRIORITY32;
+    return true;
+  }
+  if (system_cstr_equal_ci(text, "foreground") ||
+      system_cstr_equal_ci(text, "fg")) {
+    if (out) *out = execution_trace_context_t::FOREGROUND;
+    return true;
+  }
+  return false;
+}
+
+static int system_trace_context_index(execution_trace_context_t context) {
+  const uint32_t value = (uint32_t)context;
+  if (value < (uint32_t)execution_trace_context_t::PRIORITY0 ||
+      value > (uint32_t)execution_trace_context_t::FOREGROUND) {
+    return -1;
+  }
+  return (int)(value - (uint32_t)execution_trace_context_t::PRIORITY0);
+}
+
 // ============================================================================
-// Retained TimePop dispatch flight recorder — reporting surface
+// Per-execution-context causal breadcrumb reporting
 // ============================================================================
 //
-// The snapshot buffer lives in RAM2 so a report about main-stack control-flow
-// damage does not consume several kilobytes of that same stack.  The recorder
-// itself stores only scalar addresses; reporting classifies them but never
-// dereferences callback, user-data, or name pointers.
+// The four rings are independent testimony.  DWT is a shared 32-bit ruler;
+// firmware reports local deltas but does not manufacture a cross-context global
+// sequence.  Analysts may merge nearby records by DWT and lineage_id.
 
-static timepop_dispatch_trace_snapshot_t
-    g_system_timepop_dispatch_trace_scratch DMAMEM;
-
-static const char* timepop_dispatch_trace_stage_name(uint32_t stage) {
-  switch ((timepop_dispatch_trace_stage_t)stage) {
-    case timepop_dispatch_trace_stage_t::DISPATCH_ENTER:
-      return "DISPATCH_ENTER";
-    case timepop_dispatch_trace_stage_t::PHASE_ASAP:
-      return "PHASE_ASAP";
-    case timepop_dispatch_trace_stage_t::DEFERRED_SELECTED:
-      return "DEFERRED_SELECTED";
-    case timepop_dispatch_trace_stage_t::CALLBACK_ENTER:
-      return "CALLBACK_ENTER";
-    case timepop_dispatch_trace_stage_t::CALLBACK_RETURN:
-      return "CALLBACK_RETURN";
-    case timepop_dispatch_trace_stage_t::DEFERRED_CLEANUP:
-      return "DEFERRED_CLEANUP";
-    case timepop_dispatch_trace_stage_t::MUTATION_BARRIER_ENTER:
-      return "MUTATION_BARRIER_ENTER";
-    case timepop_dispatch_trace_stage_t::MUTATION_SELECTED:
-      return "MUTATION_SELECTED";
-    case timepop_dispatch_trace_stage_t::MUTATION_RESULT:
-      return "MUTATION_RESULT";
-    case timepop_dispatch_trace_stage_t::MUTATION_BARRIER_EXIT:
-      return "MUTATION_BARRIER_EXIT";
-    case timepop_dispatch_trace_stage_t::PHASE_TIMED:
-      return "PHASE_TIMED";
-    case timepop_dispatch_trace_stage_t::TIMED_SELECTED:
-      return "TIMED_SELECTED";
-    case timepop_dispatch_trace_stage_t::TIMED_SLOT_AFTER_CALLBACK:
-      return "TIMED_SLOT_AFTER_CALLBACK";
-    case timepop_dispatch_trace_stage_t::REARM_BEGIN:
-      return "REARM_BEGIN";
-    case timepop_dispatch_trace_stage_t::REARM_END:
-      return "REARM_END";
-    case timepop_dispatch_trace_stage_t::SLOT_RETIRED:
-      return "SLOT_RETIRED";
-    case timepop_dispatch_trace_stage_t::SLOT_REPLACED:
-      return "SLOT_REPLACED";
-    case timepop_dispatch_trace_stage_t::PHASE_ALAP:
-      return "PHASE_ALAP";
-    case timepop_dispatch_trace_stage_t::DISPATCH_LEAVE:
-      return "DISPATCH_LEAVE";
-    case timepop_dispatch_trace_stage_t::IRQ_SELECTED:
-      return "IRQ_SELECTED";
-    case timepop_dispatch_trace_stage_t::ISR_ENTER:
-      return "ISR_ENTER";
-    case timepop_dispatch_trace_stage_t::ISR_CAPTURED:
-      return "ISR_CAPTURED";
-    case timepop_dispatch_trace_stage_t::ISR_EXIT:
-      return "ISR_EXIT";
-    case timepop_dispatch_trace_stage_t::HANDOFF_ENTER:
-      return "HANDOFF_ENTER";
-    case timepop_dispatch_trace_stage_t::HANDOFF_DEQUEUE:
-      return "HANDOFF_DEQUEUE";
-    case timepop_dispatch_trace_stage_t::HANDOFF_EXIT:
-      return "HANDOFF_EXIT";
-    case timepop_dispatch_trace_stage_t::SUBSCRIBER_SELECTED:
-      return "SUBSCRIBER_SELECTED";
-    case timepop_dispatch_trace_stage_t::SUBSCRIBER_ENTER:
-      return "SUBSCRIBER_ENTER";
-    case timepop_dispatch_trace_stage_t::SUBSCRIBER_RETURN:
-      return "SUBSCRIBER_RETURN";
-    default:
-      return "NONE";
+static const char* execution_trace_stage_name(uint32_t stage) {
+  switch ((execution_trace_stage_t)stage) {
+    case execution_trace_stage_t::DISPATCH_ENTER: return "DISPATCH_ENTER";
+    case execution_trace_stage_t::PHASE_ASAP: return "PHASE_ASAP";
+    case execution_trace_stage_t::DEFERRED_SELECTED: return "DEFERRED_SELECTED";
+    case execution_trace_stage_t::CALLBACK_ENTER: return "CALLBACK_ENTER";
+    case execution_trace_stage_t::CALLBACK_RETURN: return "CALLBACK_RETURN";
+    case execution_trace_stage_t::DEFERRED_CLEANUP: return "DEFERRED_CLEANUP";
+    case execution_trace_stage_t::MUTATION_BARRIER_ENTER: return "MUTATION_BARRIER_ENTER";
+    case execution_trace_stage_t::MUTATION_SELECTED: return "MUTATION_SELECTED";
+    case execution_trace_stage_t::MUTATION_RESULT: return "MUTATION_RESULT";
+    case execution_trace_stage_t::MUTATION_BARRIER_EXIT: return "MUTATION_BARRIER_EXIT";
+    case execution_trace_stage_t::PHASE_TIMED: return "PHASE_TIMED";
+    case execution_trace_stage_t::TIMED_SELECTED: return "TIMED_SELECTED";
+    case execution_trace_stage_t::TIMED_SLOT_AFTER_CALLBACK: return "TIMED_SLOT_AFTER_CALLBACK";
+    case execution_trace_stage_t::REARM_BEGIN: return "REARM_BEGIN";
+    case execution_trace_stage_t::REARM_END: return "REARM_END";
+    case execution_trace_stage_t::SLOT_RETIRED: return "SLOT_RETIRED";
+    case execution_trace_stage_t::SLOT_REPLACED: return "SLOT_REPLACED";
+    case execution_trace_stage_t::PHASE_ALAP: return "PHASE_ALAP";
+    case execution_trace_stage_t::DISPATCH_LEAVE: return "DISPATCH_LEAVE";
+    case execution_trace_stage_t::IRQ_SELECTED: return "IRQ_SELECTED";
+    case execution_trace_stage_t::ISR_ENTER: return "ISR_ENTER";
+    case execution_trace_stage_t::ISR_CAPTURED: return "ISR_CAPTURED";
+    case execution_trace_stage_t::ISR_EXIT: return "ISR_EXIT";
+    case execution_trace_stage_t::HANDOFF_ENTER: return "HANDOFF_ENTER";
+    case execution_trace_stage_t::HANDOFF_DEQUEUE: return "HANDOFF_DEQUEUE";
+    case execution_trace_stage_t::HANDOFF_EXIT: return "HANDOFF_EXIT";
+    case execution_trace_stage_t::SUBSCRIBER_SELECTED: return "SUBSCRIBER_SELECTED";
+    case execution_trace_stage_t::SUBSCRIBER_ENTER: return "SUBSCRIBER_ENTER";
+    case execution_trace_stage_t::SUBSCRIBER_RETURN: return "SUBSCRIBER_RETURN";
+    default: return "NONE";
   }
 }
 
-static const char* timepop_dispatch_trace_kind_name(uint32_t kind) {
-  switch ((timepop_dispatch_trace_kind_t)kind) {
-    case timepop_dispatch_trace_kind_t::DISPATCH:
-      return "DISPATCH";
-    case timepop_dispatch_trace_kind_t::ASAP:
-      return "ASAP";
-    case timepop_dispatch_trace_kind_t::TIMED:
-      return "TIMED";
-    case timepop_dispatch_trace_kind_t::ALAP:
-      return "ALAP";
-    case timepop_dispatch_trace_kind_t::ISR_TIMED:
-      return "ISR_TIMED";
-    case timepop_dispatch_trace_kind_t::MUTATION:
-      return "MUTATION";
-    case timepop_dispatch_trace_kind_t::REARM:
-      return "REARM";
-    case timepop_dispatch_trace_kind_t::ISR_QTIMER1:
-      return "ISR_QTIMER1";
-    case timepop_dispatch_trace_kind_t::ISR_VCLOCK:
-      return "ISR_VCLOCK";
-    case timepop_dispatch_trace_kind_t::ISR_OCXO1:
-      return "ISR_OCXO1";
-    case timepop_dispatch_trace_kind_t::ISR_OCXO2:
-      return "ISR_OCXO2";
-    case timepop_dispatch_trace_kind_t::ISR_PPS:
-      return "ISR_PPS";
-    case timepop_dispatch_trace_kind_t::INTERRUPT_HANDOFF:
-      return "INTERRUPT_HANDOFF";
-    case timepop_dispatch_trace_kind_t::SUBSCRIBER_VCLOCK:
-      return "SUBSCRIBER_VCLOCK";
-    case timepop_dispatch_trace_kind_t::SUBSCRIBER_OCXO1:
-      return "SUBSCRIBER_OCXO1";
-    case timepop_dispatch_trace_kind_t::SUBSCRIBER_OCXO2:
-      return "SUBSCRIBER_OCXO2";
-    default:
-      return "NONE";
+static const char* execution_trace_kind_name(uint32_t kind) {
+  switch ((execution_trace_kind_t)kind) {
+    case execution_trace_kind_t::DISPATCH: return "DISPATCH";
+    case execution_trace_kind_t::ASAP: return "ASAP";
+    case execution_trace_kind_t::TIMED: return "TIMED";
+    case execution_trace_kind_t::ALAP: return "ALAP";
+    case execution_trace_kind_t::ISR_TIMED: return "ISR_TIMED";
+    case execution_trace_kind_t::MUTATION: return "MUTATION";
+    case execution_trace_kind_t::REARM: return "REARM";
+    case execution_trace_kind_t::ISR_QTIMER1: return "ISR_QTIMER1";
+    case execution_trace_kind_t::ISR_VCLOCK: return "ISR_VCLOCK";
+    case execution_trace_kind_t::ISR_OCXO1: return "ISR_OCXO1";
+    case execution_trace_kind_t::ISR_OCXO2: return "ISR_OCXO2";
+    case execution_trace_kind_t::ISR_PPS: return "ISR_PPS";
+    case execution_trace_kind_t::INTERRUPT_HANDOFF: return "INTERRUPT_HANDOFF";
+    case execution_trace_kind_t::SUBSCRIBER_VCLOCK: return "SUBSCRIBER_VCLOCK";
+    case execution_trace_kind_t::SUBSCRIBER_OCXO1: return "SUBSCRIBER_OCXO1";
+    case execution_trace_kind_t::SUBSCRIBER_OCXO2: return "SUBSCRIBER_OCXO2";
+    default: return "NONE";
   }
 }
 
-static const char* timepop_dispatch_trace_phase_name(uint32_t phase) {
-  switch ((timepop_dispatch_trace_phase_t)phase) {
-    case timepop_dispatch_trace_phase_t::ASAP:
-      return "ASAP";
-    case timepop_dispatch_trace_phase_t::TIMED:
-      return "TIMED";
-    case timepop_dispatch_trace_phase_t::ALAP:
-      return "ALAP";
-    case timepop_dispatch_trace_phase_t::APPLYING_MUTATIONS:
-      return "APPLYING_MUTATIONS";
-    default:
-      return "IDLE";
+static const char* execution_trace_phase_name(uint32_t phase) {
+  switch ((execution_trace_phase_t)phase) {
+    case execution_trace_phase_t::ASAP: return "ASAP";
+    case execution_trace_phase_t::TIMED: return "TIMED";
+    case execution_trace_phase_t::ALAP: return "ALAP";
+    case execution_trace_phase_t::APPLYING_MUTATIONS: return "APPLYING_MUTATIONS";
+    default: return "IDLE";
   }
 }
 
-static bool timepop_dispatch_trace_executable_address(uint32_t value) {
+static bool execution_trace_executable_address(uint32_t value) {
   if (value == 0U) return false;
   const uint32_t address = value & ~1U;
   if (address >= 0x00000400UL && address < 0x00080000UL) return true;
   return address >= 0x60000000UL && address < 0x61000000UL;
 }
 
-static const char* timepop_dispatch_trace_retire_reason(uint32_t reason) {
+static const char* execution_trace_retire_reason(uint32_t reason) {
   switch (reason) {
     case 1U: return "CALLBACK_OR_MUTATION_RETIRED_SLOT";
     case 2U: return "ABSOLUTE_GRID_NEXT_TARGET_FAILED";
@@ -1710,177 +1696,150 @@ static const char* timepop_dispatch_trace_retire_reason(uint32_t reason) {
   }
 }
 
-static const char* timepop_dispatch_trace_aux_meaning(uint32_t stage,
-                                                       uint32_t kind) {
-  const timepop_dispatch_trace_stage_t stage_id =
-      (timepop_dispatch_trace_stage_t)stage;
-  const timepop_dispatch_trace_kind_t kind_id =
-      (timepop_dispatch_trace_kind_t)kind;
-
+static const char* execution_trace_aux_meaning(uint32_t stage, uint32_t kind) {
+  const execution_trace_stage_t stage_id = (execution_trace_stage_t)stage;
+  const execution_trace_kind_t kind_id = (execution_trace_kind_t)kind;
   switch (stage_id) {
-    case timepop_dispatch_trace_stage_t::DISPATCH_ENTER:
-      return "dispatch_call_count";
-    case timepop_dispatch_trace_stage_t::PHASE_ASAP:
-    case timepop_dispatch_trace_stage_t::PHASE_ALAP:
-      return "pending_deferred_count";
-    case timepop_dispatch_trace_stage_t::PHASE_TIMED:
-      return "expired_count";
-    case timepop_dispatch_trace_stage_t::DEFERRED_SELECTED:
-      return "deferred_generation";
-    case timepop_dispatch_trace_stage_t::CALLBACK_ENTER:
-      return (kind_id == timepop_dispatch_trace_kind_t::ASAP ||
-              kind_id == timepop_dispatch_trace_kind_t::ALAP)
-          ? "deferred_generation"
-          : "slot_flags";
-    case timepop_dispatch_trace_stage_t::CALLBACK_RETURN:
-      return kind_id == timepop_dispatch_trace_kind_t::ISR_TIMED
-          ? "slot_flags"
-          : "callback_body_cycles";
-    case timepop_dispatch_trace_stage_t::DEFERRED_CLEANUP:
+    case execution_trace_stage_t::DISPATCH_ENTER: return "dispatch_call_count";
+    case execution_trace_stage_t::PHASE_ASAP:
+    case execution_trace_stage_t::PHASE_ALAP: return "pending_deferred_count";
+    case execution_trace_stage_t::PHASE_TIMED: return "expired_count";
+    case execution_trace_stage_t::DEFERRED_SELECTED: return "deferred_generation";
+    case execution_trace_stage_t::CALLBACK_ENTER:
+      return (kind_id == execution_trace_kind_t::ASAP ||
+              kind_id == execution_trace_kind_t::ALAP)
+          ? "deferred_generation" : "slot_flags";
+    case execution_trace_stage_t::CALLBACK_RETURN:
+      return kind_id == execution_trace_kind_t::ISR_TIMED
+          ? "slot_flags" : "callback_body_cycles";
+    case execution_trace_stage_t::DEFERRED_CLEANUP:
       return "pending(bit0)|dispatching(bit1)|generation(bits16-31)";
-    case timepop_dispatch_trace_stage_t::MUTATION_BARRIER_ENTER:
-      return "queued_mutation_count";
-    case timepop_dispatch_trace_stage_t::MUTATION_SELECTED:
-      return "mutation_kind_id";
-    case timepop_dispatch_trace_stage_t::MUTATION_RESULT:
+    case execution_trace_stage_t::MUTATION_BARRIER_ENTER: return "queued_mutation_count";
+    case execution_trace_stage_t::MUTATION_SELECTED: return "mutation_kind_id";
+    case execution_trace_stage_t::MUTATION_RESULT:
       return "kind(bits0-7)|ok(bit8)|remaining_queue(bits16-31)";
-    case timepop_dispatch_trace_stage_t::MUTATION_BARRIER_EXIT:
-      return "schedule_next_call_delta";
-    case timepop_dispatch_trace_stage_t::TIMED_SELECTED:
-      return "slot_flags|callback_already_ran(bit8)";
-    case timepop_dispatch_trace_stage_t::TIMED_SLOT_AFTER_CALLBACK:
+    case execution_trace_stage_t::MUTATION_BARRIER_EXIT: return "schedule_next_call_delta";
+    case execution_trace_stage_t::TIMED_SELECTED: return "slot_flags|callback_already_ran(bit8)";
+    case execution_trace_stage_t::TIMED_SLOT_AFTER_CALLBACK:
       return "slot_flags|already_ran(bit8)|handle_match(bit9)|callback_match(bit10)";
-    case timepop_dispatch_trace_stage_t::REARM_BEGIN:
-    case timepop_dispatch_trace_stage_t::REARM_END:
-    case timepop_dispatch_trace_stage_t::IRQ_SELECTED:
-      return "slot_deadline";
-    case timepop_dispatch_trace_stage_t::SLOT_RETIRED:
-      return "retire_reason_id";
-    case timepop_dispatch_trace_stage_t::SLOT_REPLACED:
-      return "prior_handle";
-    case timepop_dispatch_trace_stage_t::DISPATCH_LEAVE:
-      return "timepop_pending";
-    case timepop_dispatch_trace_stage_t::ISR_ENTER:
-      return "captured_counter_or_source_status";
-    case timepop_dispatch_trace_stage_t::ISR_CAPTURED:
-      return "capture_window_cycles";
-    case timepop_dispatch_trace_stage_t::ISR_EXIT:
-      return "captured_counter_or_source_status";
-    case timepop_dispatch_trace_stage_t::HANDOFF_ENTER:
-      return "pending";
-    case timepop_dispatch_trace_stage_t::HANDOFF_DEQUEUE:
-      return "handoff_entry_dwt";
-    case timepop_dispatch_trace_stage_t::HANDOFF_EXIT:
-      return "drained_count|pending_or_reentry(bit31)";
-    case timepop_dispatch_trace_stage_t::SUBSCRIBER_SELECTED:
+    case execution_trace_stage_t::REARM_BEGIN:
+    case execution_trace_stage_t::REARM_END:
+    case execution_trace_stage_t::IRQ_SELECTED: return "slot_deadline";
+    case execution_trace_stage_t::SLOT_RETIRED: return "retire_reason_id";
+    case execution_trace_stage_t::SLOT_REPLACED: return "prior_handle";
+    case execution_trace_stage_t::DISPATCH_LEAVE: return "timepop_pending";
+    case execution_trace_stage_t::HANDOFF_ENTER: return "handoff_entry_dwt";
+    case execution_trace_stage_t::HANDOFF_DEQUEUE: return "event_dwt";
+    case execution_trace_stage_t::HANDOFF_EXIT: return "drained_count|pending_or_reentry(bit31)";
+    case execution_trace_stage_t::SUBSCRIBER_SELECTED:
       return "dispatch_mode(bits0-1)|binding_generation(bits16-31)";
-    case timepop_dispatch_trace_stage_t::SUBSCRIBER_ENTER:
-    case timepop_dispatch_trace_stage_t::SUBSCRIBER_RETURN:
+    case execution_trace_stage_t::SUBSCRIBER_ENTER:
+    case execution_trace_stage_t::SUBSCRIBER_RETURN:
       return "event_counter32_or_source_specific";
-    default:
-      return "raw";
+    default: return "raw";
   }
 }
 
-static FLASHMEM Payload system_timepop_dispatch_trace_entry_payload(
-    const timepop_dispatch_trace_entry_t& entry) {
+static FLASHMEM Payload system_execution_trace_entry_payload(
+    const execution_trace_entry_t& entry,
+    bool legacy_aliases,
+    bool delta_valid,
+    uint32_t delta_cycles) {
   Payload out;
   out.add("sequence", entry.sequence);
+  out.add("context_id", entry.context);
+  out.add("context", execution_trace_context_name(entry.context));
   out.add("stage_id", entry.stage);
-  out.add("stage", timepop_dispatch_trace_stage_name(entry.stage));
+  out.add("stage", execution_trace_stage_name(entry.stage));
   out.add("phase_id", entry.phase);
-  out.add("phase", timepop_dispatch_trace_phase_name(entry.phase));
+  out.add("phase", execution_trace_phase_name(entry.phase));
   out.add("kind_id", entry.kind);
-  out.add("kind", timepop_dispatch_trace_kind_name(entry.kind));
-  out.add("slot_index", entry.slot_index);
-  out.add("has_slot", entry.slot_index != TIMEPOP_DISPATCH_TRACE_NO_SLOT);
-  out.add("handle", entry.handle);
-
-  // Generic Execution Trace aliases.  The established TimePop field names
-  // remain below for compatibility with TIMEPOP_DISPATCH_INFO.
-  out.add("subject_index", entry.slot_index);
-  out.add("identity", entry.handle);
-
-  system_crash_add_hex32(out, "callback", entry.callback);
-  out.add("callback_null", entry.callback == 0U);
-  system_crash_add_hex32(out, "slot_callback", entry.slot_callback);
-  out.add("callback_matches_slot",
-          entry.callback != 0U && entry.callback == entry.slot_callback);
-  out.add("callback_executable",
-          timepop_dispatch_trace_executable_address(entry.callback));
-  out.add("slot_callback_executable",
-          timepop_dispatch_trace_executable_address(entry.slot_callback));
-
-  system_crash_add_hex32(out, "target", entry.callback);
-  system_crash_add_hex32(out, "related_target", entry.slot_callback);
-  out.add("target_executable",
-          timepop_dispatch_trace_executable_address(entry.callback));
-
-  system_crash_add_hex32(out, "user_data", entry.user_data);
-  system_crash_add_hex32(out, "name_ptr", entry.name_ptr);
-  system_crash_add_hex32(out, "object", entry.user_data);
-  system_crash_add_hex32(out, "label_ptr", entry.name_ptr);
-  system_crash_add_hex32(out, "caller_sp", entry.caller_sp);
-  system_crash_add_hex32(out, "site_pc", entry.site_pc);
-  out.add("site_pc_executable",
-          timepop_dispatch_trace_executable_address(entry.site_pc));
+  out.add("kind", execution_trace_kind_name(entry.kind));
   system_crash_add_hex32(out, "dwt", entry.dwt);
+  out.add("dwt_delta_from_previous_valid", delta_valid);
+  if (delta_valid) out.add("dwt_delta_from_previous_cycles", delta_cycles);
   out.add("ipsr", entry.ipsr);
+  system_crash_add_hex32(out, "lineage_id", entry.lineage_id);
+  out.add("subject_index", entry.subject_index);
+  out.add("identity", entry.identity);
+  system_crash_add_hex32(out, "target", entry.target);
+  system_crash_add_hex32(out, "related_target", entry.related_target);
+  out.add("target_executable", execution_trace_executable_address(entry.target));
+  out.add("related_target_executable",
+          execution_trace_executable_address(entry.related_target));
+  system_crash_add_hex32(out, "object", entry.object);
+  system_crash_add_hex32(out, "site_pc", entry.site_pc);
+  out.add("site_pc_executable", execution_trace_executable_address(entry.site_pc));
   system_crash_add_hex32(out, "aux", entry.aux);
-  out.add("aux_meaning",
-          timepop_dispatch_trace_aux_meaning(entry.stage, entry.kind));
-  if ((timepop_dispatch_trace_stage_t)entry.stage ==
-      timepop_dispatch_trace_stage_t::SLOT_RETIRED) {
-    out.add("retire_reason",
-            timepop_dispatch_trace_retire_reason(entry.aux));
+  out.add("aux_meaning", execution_trace_aux_meaning(entry.stage, entry.kind));
+  if ((execution_trace_stage_t)entry.stage ==
+      execution_trace_stage_t::SLOT_RETIRED) {
+    out.add("retire_reason", execution_trace_retire_reason(entry.aux));
   }
-  if ((timepop_dispatch_trace_stage_t)entry.stage ==
-      timepop_dispatch_trace_stage_t::MUTATION_RESULT) {
+  if ((execution_trace_stage_t)entry.stage ==
+      execution_trace_stage_t::MUTATION_RESULT) {
     out.add("mutation_ok", (entry.aux & 0x00000100UL) != 0U);
     out.add("mutation_kind_id", entry.aux & 0xFFU);
     out.add("mutation_queue_remaining", entry.aux >> 16);
   }
+
+  if (legacy_aliases) {
+    out.add("slot_index", entry.subject_index);
+    out.add("has_slot", entry.subject_index != EXECUTION_TRACE_NO_SUBJECT);
+    out.add("handle", entry.identity);
+    system_crash_add_hex32(out, "callback", entry.target);
+    system_crash_add_hex32(out, "slot_callback", entry.related_target);
+    system_crash_add_hex32(out, "user_data", entry.object);
+    out.add("callback_matches_slot",
+            entry.target != 0U && entry.target == entry.related_target);
+  }
   return out;
 }
 
-static FLASHMEM Payload system_timepop_dispatch_trace_compact_entry_payload(
-    const timepop_dispatch_trace_entry_t& entry) {
+static FLASHMEM Payload system_execution_trace_context_payload(
+    const execution_trace_context_snapshot_t& context,
+    uint32_t requested,
+    uint32_t offset,
+    bool legacy_aliases) {
+  uint32_t begin = 0U;
+  uint32_t end = 0U;
+  system_trace_bounds(context.count, requested, offset, &begin, &end);
+
   Payload out;
-  out.add("sequence", entry.sequence);
-  out.add("stage_id", entry.stage);
-  out.add("stage", timepop_dispatch_trace_stage_name(entry.stage));
-  out.add("phase", timepop_dispatch_trace_phase_name(entry.phase));
-  out.add("kind", timepop_dispatch_trace_kind_name(entry.kind));
-  out.add("slot_index", entry.slot_index);
-  out.add("handle", entry.handle);
-  out.add("subject_index", entry.slot_index);
-  out.add("identity", entry.handle);
-  system_crash_add_hex32(out, "callback", entry.callback);
-  system_crash_add_hex32(out, "slot_callback", entry.slot_callback);
-  system_crash_add_hex32(out, "target", entry.callback);
-  system_crash_add_hex32(out, "related_target", entry.slot_callback);
-  out.add("callback_matches_slot",
-          entry.callback != 0U && entry.callback == entry.slot_callback);
-  out.add("callback_executable",
-          timepop_dispatch_trace_executable_address(entry.callback));
-  system_crash_add_hex32(out, "user_data", entry.user_data);
-  system_crash_add_hex32(out, "name_ptr", entry.name_ptr);
-  system_crash_add_hex32(out, "object", entry.user_data);
-  system_crash_add_hex32(out, "label_ptr", entry.name_ptr);
-  system_crash_add_hex32(out, "caller_sp", entry.caller_sp);
-  system_crash_add_hex32(out, "site_pc", entry.site_pc);
-  system_crash_add_hex32(out, "dwt", entry.dwt);
-  out.add("ipsr", entry.ipsr);
-  system_crash_add_hex32(out, "aux", entry.aux);
-  out.add("aux_meaning",
-          timepop_dispatch_trace_aux_meaning(entry.stage, entry.kind));
+  out.add("context_id", context.context);
+  out.add("context", execution_trace_context_name(context.context));
+  out.add("valid", context.valid);
+  out.add("capacity", EXECUTION_TRACE_ENTRIES_PER_CONTEXT);
+  out.add("available_count", context.count);
+  out.add("newest_sequence", context.newest_sequence);
+  out.add("sequence_at_capture", context.sequence_at_capture);
+  out.add("requested_count", requested);
+  out.add("returned_count", end - begin);
+  out.add("offset_from_newest", offset);
+  out.add("has_older", begin != 0U);
+  out.add("has_newer", offset != 0U && context.count != 0U);
+  out.add("first_sequence", begin < end ? context.entries[begin].sequence : 0U);
+  out.add("last_sequence", begin < end ? context.entries[end - 1U].sequence : 0U);
+
+  PayloadArray records;
+  for (uint32_t i = begin; i < end; ++i) {
+    const bool delta_valid = i > 0U;
+    const uint32_t delta = delta_valid
+        ? context.entries[i].dwt - context.entries[i - 1U].dwt
+        : 0U;
+    Payload record = system_execution_trace_entry_payload(
+        context.entries[i], legacy_aliases, delta_valid, delta);
+    record.add("bank_index", i);
+    records.add(record);
+  }
+  out.add_array("records", records);
   return out;
 }
 
 static FLASHMEM Payload system_execution_trace_payload(
     const Payload& args,
     bool legacy_timepop_schema) {
-  timepop_dispatch_trace_snapshot(&g_system_timepop_dispatch_trace_scratch);
+  execution_trace_snapshot(&g_system_execution_trace_scratch);
 
   bool bank_valid = true;
   const bool live_bank = system_trace_report_live_bank(args, &bank_valid);
@@ -1890,70 +1849,103 @@ static FLASHMEM Payload system_execution_trace_payload(
     return error;
   }
 
+  execution_trace_context_t requested_context =
+      execution_trace_context_t::NONE;
+  bool all_contexts = false;
+  const char* context_arg = legacy_timepop_schema
+      ? "foreground" : args.getString("context");
+  if (!system_trace_context_parse(context_arg,
+                                  &requested_context,
+                                  &all_contexts)) {
+    Payload error;
+    error.add("error",
+              "context must be all, priority0, priority16, priority32, or foreground");
+    return error;
+  }
+
   const uint32_t requested = system_trace_report_count(args);
   const uint32_t offset = system_trace_report_offset(args);
-  const timepop_dispatch_trace_bank_snapshot_t& bank = live_bank
-      ? g_system_timepop_dispatch_trace_scratch.live
-      : g_system_timepop_dispatch_trace_scratch.retained;
-  uint32_t begin = 0U;
-  uint32_t end = 0U;
-  system_trace_bounds(bank.count, requested, offset, &begin, &end);
 
   Payload out;
   out.add("schema", legacy_timepop_schema
-      ? "ZPNET_TIMEPOP_DISPATCH_TRACE_V2"
-      : "ZPNET_EXECUTION_TRACE_V1");
+      ? "ZPNET_TIMEPOP_DISPATCH_TRACE_V3"
+      : "ZPNET_EXECUTION_TRACE_V2");
   out.add("report", legacy_timepop_schema
-      ? "TIMEPOP_DISPATCH_INFO"
-      : "EXECUTION_TRACE");
+      ? "TIMEPOP_DISPATCH_INFO" : "EXECUTION_TRACE");
   out.add("bank", live_bank ? "live" : "retained");
-  out.add("valid", bank.valid);
-  out.add("fault_captured", bank.fault_captured);
-  system_crash_add_hex32(out, "fault_dwt", bank.fault_dwt);
-  out.add("crash_sequence", bank.crash_sequence);
-  out.add("trace_sequence_at_capture", bank.trace_sequence_at_capture);
-  out.add("capacity", TIMEPOP_DISPATCH_TRACE_ENTRIES);
-  out.add("available_count", bank.count);
-  out.add("newest_sequence", bank.newest_sequence);
-  out.add("requested_count", requested);
-  out.add("returned_count", end - begin);
-  out.add("offset_from_newest", offset);
-  out.add("has_older", begin != 0U);
-  out.add("has_newer", offset != 0U && bank.count != 0U);
-  out.add("first_sequence", begin < end ? bank.entries[begin].sequence : 0U);
-  out.add("last_sequence", begin < end ? bank.entries[end - 1U].sequence : 0U);
-
-  PayloadArray records;
-  for (uint32_t i = begin; i < end; ++i) {
-    Payload record =
-        system_timepop_dispatch_trace_compact_entry_payload(bank.entries[i]);
-    record.add("bank_index", i);
-    records.add(record);
+  out.add("context", all_contexts
+      ? "ALL" : execution_trace_context_name((uint32_t)requested_context));
+  out.add("context_count", EXECUTION_TRACE_CONTEXT_COUNT);
+  out.add("entries_per_context", EXECUTION_TRACE_ENTRIES_PER_CONTEXT);
+  out.add("ordering_model", "PER_CONTEXT_SEQUENCE_WITH_DWT_AND_LINEAGE_CORRELATION");
+  out.add("dwt_is_32_bit", true);
+  out.add("dwt_cross_context_merge_is_derived", true);
+  out.add("dwt_wrap_caveat",
+          "cross-context ordering is ambiguous across more than one 32-bit DWT wrap");
+  out.add("retained_valid", g_system_execution_trace_scratch.retained_valid);
+  out.add("fault_captured", g_system_execution_trace_scratch.fault_captured);
+  system_crash_add_hex32(out, "fault_dwt",
+                         g_system_execution_trace_scratch.fault_dwt);
+  out.add("crash_sequence", g_system_execution_trace_scratch.crash_sequence);
+  if (legacy_timepop_schema) {
+    out.add("compatibility_scope",
+            "FOREGROUND_CONTEXT_ONLY; generic recorder moved to execution_trace.*");
   }
-  out.add_array("records", records);
+
+  const execution_trace_context_snapshot_t* banks = live_bank
+      ? g_system_execution_trace_scratch.live
+      : g_system_execution_trace_scratch.retained;
+
+  if (!all_contexts) {
+    const int index = system_trace_context_index(requested_context);
+    if (index < 0) {
+      out.add("valid", false);
+      return out;
+    }
+    out.add_object("trace",
+                   system_execution_trace_context_payload(
+                       banks[index], requested, offset, legacy_timepop_schema));
+    return out;
+  }
+
+  PayloadArray contexts;
+  for (uint32_t i = 0U; i < EXECUTION_TRACE_CONTEXT_COUNT; ++i) {
+    contexts.add(system_execution_trace_context_payload(
+        banks[i], requested, offset, false));
+  }
+  out.add_array("contexts", contexts);
   return out;
 }
 
 static FLASHMEM Payload system_execution_trace_summary_payload(void) {
-  timepop_dispatch_trace_snapshot(&g_system_timepop_dispatch_trace_scratch);
-  const timepop_dispatch_trace_bank_snapshot_t& retained =
-      g_system_timepop_dispatch_trace_scratch.retained;
+  execution_trace_snapshot(&g_system_execution_trace_scratch);
 
   Payload out;
-  out.add("schema", "ZPNET_EXECUTION_TRACE_SUMMARY_V1");
-  out.add("retained_valid", retained.valid);
-  out.add("fault_captured", retained.fault_captured);
-  system_crash_add_hex32(out, "fault_dwt", retained.fault_dwt);
-  out.add("crash_sequence", retained.crash_sequence);
-  out.add("trace_sequence_at_capture", retained.trace_sequence_at_capture);
-  out.add("retained_count", retained.count);
-  out.add("newest_sequence", retained.newest_sequence);
-  if (retained.valid && retained.count != 0U) {
-    out.add_object(
-        "newest",
-        system_timepop_dispatch_trace_entry_payload(
-            retained.entries[retained.count - 1U]));
+  out.add("schema", "ZPNET_EXECUTION_TRACE_SUMMARY_V2");
+  out.add("retained_valid", g_system_execution_trace_scratch.retained_valid);
+  out.add("fault_captured", g_system_execution_trace_scratch.fault_captured);
+  system_crash_add_hex32(out, "fault_dwt",
+                         g_system_execution_trace_scratch.fault_dwt);
+  out.add("crash_sequence", g_system_execution_trace_scratch.crash_sequence);
+
+  PayloadArray contexts;
+  for (uint32_t i = 0U; i < EXECUTION_TRACE_CONTEXT_COUNT; ++i) {
+    const execution_trace_context_snapshot_t& context =
+        g_system_execution_trace_scratch.retained[i];
+    Payload item;
+    item.add("context_id", context.context);
+    item.add("context", execution_trace_context_name(context.context));
+    item.add("valid", context.valid);
+    item.add("retained_count", context.count);
+    item.add("newest_sequence", context.newest_sequence);
+    item.add("sequence_at_capture", context.sequence_at_capture);
+    if (context.valid && context.count != 0U) {
+      item.add_object("newest", system_execution_trace_entry_payload(
+          context.entries[context.count - 1U], false, false, 0U));
+    }
+    contexts.add(item);
   }
+  out.add_array("contexts", contexts);
   return out;
 }
 
@@ -3875,8 +3867,8 @@ static void system_dmamem_ensure_initialized(void) {
   system_feature_registry_reset();
   memset(g_system_crash_report_text, 0, sizeof(g_system_crash_report_text));
   memset(g_system_debug_buffer, 0, sizeof(g_system_debug_buffer));
-  memset((void*)&g_system_timepop_dispatch_trace_scratch, 0,
-         sizeof(g_system_timepop_dispatch_trace_scratch));
+  memset((void*)&g_system_execution_trace_scratch, 0,
+         sizeof(g_system_execution_trace_scratch));
   memset((void*)&g_system_payload_append_trace_scratch, 0,
          sizeof(g_system_payload_append_trace_scratch));
   memset((void*)&g_system_payload_heap_resize_trace_scratch, 0,
@@ -3891,8 +3883,8 @@ static void system_dmamem_ensure_initialized(void) {
   // The same custody applies to Payload flight rings and Payload append-trace
   // banks in payload.cpp: those remaining NOLOAD records are validated before
   // use and released only by explicit CRASH_CLEAR or their one-time boot latch.
-  // Runtime and TimePop live recorders are RAM1 in this deterministic-memory
-  // baseline and intentionally do not survive reboot.
+  // Runtime and Execution Trace live recorders are RAM1 in this deterministic-
+  // memory baseline and intentionally do not survive reboot.
   g_system_dmamem_initialized = true;
 }
 
@@ -4037,14 +4029,14 @@ static FLASHMEM Payload cmd_get_feature(const Payload& args) {
 
 
 // ------------------------------------------------------------
-// EXECUTION_TRACE — retained/live ISR-to-TimePop control-flow transcript
+// EXECUTION_TRACE — retained/live per-context causal breadcrumb notebooks
 // ------------------------------------------------------------
 static FLASHMEM Payload cmd_execution_trace(const Payload& args) {
   return system_execution_trace_payload(args, false);
 }
 
 // ------------------------------------------------------------
-// TIMEPOP_DISPATCH_INFO — compatibility alias for the shared transcript
+// TIMEPOP_DISPATCH_INFO — FOREGROUND compatibility view of Execution Trace
 // ------------------------------------------------------------
 static FLASHMEM Payload cmd_timepop_dispatch_info(const Payload& args) {
   return system_execution_trace_payload(args, true);
@@ -4156,7 +4148,7 @@ static FLASHMEM Payload cmd_crash_clear(const Payload& /*args*/) {
   memset((void*)&g_runtime_ledger_retained, 0,
          sizeof(g_runtime_ledger_retained));
 
-  timepop_dispatch_trace_clear_retained();
+  execution_trace_clear_retained();
   payload_fatal_record_clear();
   payload_clear_retained_stamp_trace();
   payload_clear_retained_append_trace();
