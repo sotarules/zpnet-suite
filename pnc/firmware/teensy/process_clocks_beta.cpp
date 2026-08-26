@@ -661,6 +661,13 @@ static uint32_t g_clocks_fragment_publication_idle_retry_last_attempt_count = 0U
 // stack local. CLOCKS owns this RAM2 snapshot and all serialization derived from it.
 static clocks_fragment_snapshot_t g_clocks_fragment_publication_clocks_snapshot DMAMEM = {};
 
+// The CLOCKS_FRAGMENT root is also rebuilt every second.  Its campaign-bearing
+// form is larger than 8 KiB, so a stack-local root repeatedly grows through the
+// allocator's 4 KiB -> 16 KiB storage classes and then returns that 16 KiB block
+// on destruction.  Keep one CLOCKS-owned root in RAM2 and admit its final storage
+// class once; clear() retains that capacity for every later row.
+static Payload g_clocks_fragment_root_payload DMAMEM;
+
 // The canonical statistics object is large and rebuilt every second. Keep one
 // CLOCKS-owned Payload scratch object in RAM2 so its admitted heap capacity is
 // reused across rows instead of returning an 8 KiB block to malloc each second.
@@ -733,6 +740,15 @@ static void clocks_fragment_publication_ensure_initialized(void) {
   g_clocks_fragment_publication_retry_tick_hold_count = 0U;
   g_clocks_fragment_publication_retry_schedule_count = 0U;
   g_clocks_fragment_publication_retry_success_count = 0U;
+
+  // CLOCKS_FRAGMENT is predictably larger than 8 KiB when campaign testimony is
+  // embedded.  Admit the final 16 KiB root storage class once at subsystem
+  // initialization rather than reallocating 4 KiB -> 16 KiB every public row.
+  // Payload::clear() preserves this capacity; reserve() remains fail-hard if the
+  // RAM2 heap cannot support the canonical publication substrate.
+  g_clocks_fragment_root_payload.clear();
+  g_clocks_fragment_root_payload.reserve(16384U);
+
   g_clocks_fragment_publication_initialized = true;
 }
 
@@ -1414,7 +1430,8 @@ static void clocks_fragment_publish_service(timepop_ctx_t*,
     return;
   }
 
-  Payload fragment;
+  Payload& fragment = g_clocks_fragment_root_payload;
+  fragment.clear();
   fragment.add("schema", "CLOCKS_FRAGMENT_V4");
   fragment.add("sequence",
                g_clocks_fragment_publication_clocks_snapshot.live.completed_pps_sequence);
