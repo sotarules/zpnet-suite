@@ -149,12 +149,13 @@ static constexpr float PHOTONS_LASER_EMIT_THRESHOLD_V = 0.75f;
 // train begins on that same tick.  Every hit still traverses the physical pin-33
 // jumper and real pin-34 ISR.
 //
-// PD200T MON on pin 38/A14 is not sampled while this emulator is installed.
-// Instead a plausible synthetic ADC value is maintained as slow telemetry.
-// Delete this entire block when the physical PD200T becomes authoritative.
+// When this emulator is enabled, PD200T PD OUT on pin 38/A14 is not sampled; a
+// plausible synthetic ADC value is maintained as slow telemetry instead.  With
+// the emulator disabled, physical PD OUT on pin 38/A14 and the independent pin
+// 34 TTL comparator IRQ are authoritative for hardware commissioning.
 // ============================================================================
 
-static constexpr bool PHOTONS_EMULATOR_ENABLED = true;
+static constexpr bool PHOTONS_EMULATOR_ENABLED = false;
 static constexpr int PHOTONS_EMULATOR_EDGE_OUTPUT_PIN = 33;
 static constexpr uint32_t PHOTONS_EMULATOR_LASER_PULSE_CYCLES = 20U;
 static constexpr uint32_t PHOTONS_EMULATOR_CADENCE_NS = 10000000U;  // synthetic 10 ms
@@ -174,10 +175,10 @@ static constexpr uint32_t PHOTONS_EMULATOR_LAP_JITTER_COUNT =
 static_assert((-3 + 1 + 2 - 1 + 3 - 2 + 0) == 0,
               "PHOTONS emulator lap jitter must be zero-mean");
 
-// Provisional PD200T MON range for bring-up only.  1200-1800 ADC counts maps to
+// Provisional PD200T PD OUT range for emulator bring-up only.  1200-1800 ADC counts maps to
 // roughly 0.97-1.45 V on the Teensy 3.3 V / 12-bit ADC scale.
-static constexpr uint16_t PHOTONS_EMULATOR_MON_RAW_MIN = 1200U;
-static constexpr uint16_t PHOTONS_EMULATOR_MON_RAW_MAX = 1800U;
+static constexpr uint16_t PHOTONS_EMULATOR_ANALOG_RAW_MIN = 1200U;
+static constexpr uint16_t PHOTONS_EMULATOR_ANALOG_RAW_MAX = 1800U;
 
 enum class photons_emulator_stage_t : uint8_t {
   IDLE = 0,
@@ -240,7 +241,7 @@ struct photons_emulator_state_t {
   uint32_t synthetic_target_unavailable_count = 0U;
   uint32_t projection_wait_count = 0U;
 
-  uint16_t mon_raw = PHOTONS_EMULATOR_MON_RAW_MIN;
+  uint16_t analog_raw = PHOTONS_EMULATOR_ANALOG_RAW_MIN;
 };
 
 
@@ -260,8 +261,8 @@ struct photons_device_snapshot_t {
   bool     laser_emitting = false;
 
   int      photodiode_edge_level = 0;
-  uint16_t photodiode_mon_raw = 0;
-  float    photodiode_mon_v = 0.0f;
+  uint16_t photodiode_analog_raw = 0;
+  float    photodiode_analog_v = 0.0f;
 };
 
 // ============================================================================
@@ -1954,15 +1955,15 @@ static const char* photons_emulator_stage_name(
 }
 
 
-static void photons_emulator_refresh_mon(void) {
+static void photons_emulator_refresh_analog(void) {
   // Slow synthetic telemetry only.  Deterministic bounded variation avoids
-  // touching an ADC merely to make the temporary PD200T MON surface move.
+  // touching an ADC merely to make the temporary PD200T PD OUT surface move.
   static uint16_t step = 0U;
   const uint16_t span =
-      PHOTONS_EMULATOR_MON_RAW_MAX - PHOTONS_EMULATOR_MON_RAW_MIN + 1U;
+      PHOTONS_EMULATOR_ANALOG_RAW_MAX - PHOTONS_EMULATOR_ANALOG_RAW_MIN + 1U;
   step = (uint16_t)((step + 137U) % span);
-  g_photons_emulator.mon_raw =
-      (uint16_t)(PHOTONS_EMULATOR_MON_RAW_MIN + step);
+  g_photons_emulator.analog_raw =
+      (uint16_t)(PHOTONS_EMULATOR_ANALOG_RAW_MIN + step);
 }
 
 static bool photons_emulator_projection_ready(void) {
@@ -2102,7 +2103,7 @@ static void photons_emulator_begin_train(void) {
   g_photons_emulator.lap_start_dwt = 0U;
   g_photons_emulator.previous_lap_endpoint_dwt = 0U;
 
-  photons_emulator_refresh_mon();
+  photons_emulator_refresh_analog();
 
   // Step 1: real laser pulse.
   photons_emulator_emit_laser_pulse();
@@ -2132,27 +2133,27 @@ static void photons_emulator_cadence_tick(
       return;
 
     case photons_emulator_stage_t::WAIT_HIT2:
-      photons_emulator_refresh_mon();
+      photons_emulator_refresh_analog();
       photons_emulator_emit_detector_edge(2U);
       g_photons_emulator.stage = photons_emulator_stage_t::WAIT_HIT3;
       return;
 
     case photons_emulator_stage_t::WAIT_HIT3:
-      photons_emulator_refresh_mon();
+      photons_emulator_refresh_analog();
       if (!photons_emulator_prepare_synthetic_lap()) return;
       photons_emulator_emit_detector_edge(3U);
       g_photons_emulator.stage = photons_emulator_stage_t::WAIT_HIT4;
       return;
 
     case photons_emulator_stage_t::WAIT_HIT4:
-      photons_emulator_refresh_mon();
+      photons_emulator_refresh_analog();
       if (!photons_emulator_prepare_synthetic_lap()) return;
       photons_emulator_emit_detector_edge(4U);
       g_photons_emulator.stage = photons_emulator_stage_t::WAIT_HIT5;
       return;
 
     case photons_emulator_stage_t::WAIT_HIT5:
-      photons_emulator_refresh_mon();
+      photons_emulator_refresh_analog();
       if (!photons_emulator_prepare_synthetic_lap()) return;
       photons_emulator_emit_detector_edge(5U);
       g_photons_emulator.train_active = false;
@@ -2181,7 +2182,7 @@ static void photons_emulator_prepare(void) {
 
   pinMode(PHOTONS_EMULATOR_EDGE_OUTPUT_PIN, OUTPUT);
   digitalWriteFast(PHOTONS_EMULATOR_EDGE_OUTPUT_PIN, LOW);
-  photons_emulator_refresh_mon();
+  photons_emulator_refresh_analog();
   g_photons_emulator.initialized = true;
 }
 
@@ -2204,7 +2205,7 @@ static void photons_laser_initialize_hardware(void) {
   photons_laser_inhibit();
 
   pinMode(LASER_MONITOR_PIN, INPUT);
-  pinMode(PHOTODIODE_MON_PIN, INPUT);
+  pinMode(PHOTODIODE_ANALOG_PIN, INPUT);
   analogReadResolution(12);
 
   photons_i2c_write(MP5491_REG_CTL0, MP5491_SYSEN_BIT);
@@ -2243,10 +2244,12 @@ static photons_device_snapshot_t photons_device_snapshot(void) {
   // from process_interrupt's PHOTODIODE edge capture.
   out.photodiode_edge_level = digitalRead(PHOTODIODE_EDGE_PIN);
 
-  // PD200T MON is emulated until the physical detector arrives.  Do not read
-  // pin 38/A14 in this bring-up configuration.
-  out.photodiode_mon_raw = g_photons_emulator.mon_raw;
-  out.photodiode_mon_v = photons_adc_voltage(out.photodiode_mon_raw);
+  // Preserve synthetic PD OUT telemetry only in emulator mode.  Physical PD200T
+  // commissioning reads the actual analog photodetector output on pin 38/A14.
+  out.photodiode_analog_raw = PHOTONS_EMULATOR_ENABLED
+      ? g_photons_emulator.analog_raw
+      : analogRead(PHOTODIODE_ANALOG_PIN);
+  out.photodiode_analog_v = photons_adc_voltage(out.photodiode_analog_raw);
 
   return out;
 }
@@ -4623,11 +4626,15 @@ static FLASHMEM Payload cmd_inject_problem(const Payload& args) {
 
 
 static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
+  // REPORT is deliberately the compact operational/device surface.
+  //
+  // Detailed science, Better-Buckets, and recovery testimony already have
+  // dedicated REPORT_PHOTONS / REPORT_STATS / REPORT_RECOVERY commands.  Do not
+  // duplicate those large surfaces here: this command must remain comfortably
+  // below the request/response transport ceiling and useful during hardware
+  // commissioning.
   photons_toy_capture_t capture{};
   (void)photons_toy_capture_snapshot(&capture);
-
-  photons_toy_fragment_t fragment{};
-  (void)photons_toy_fragment_snapshot(&fragment);
 
   photons_fragment_snapshot_t canonical{};
   (void)photons_fragment_snapshot(&canonical);
@@ -4638,40 +4645,29 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
   const photons_device_snapshot_t device = photons_device_snapshot();
 
   Payload p;
+  p.add("report", "PHOTONS");
+  p.add("schema", "PHOTONS_REPORT_V2");
 
+  // Runtime / publication identity.
   p.add("initialized", g_initialized);
   p.add("subscription_ok", g_subscription_ok);
   p.add("interrupt_started", g_interrupt_started);
   p.add("fragment_timer_armed",
         g_fragment_timer != TIMEPOP_INVALID_HANDLE);
   p.add("standard_lap_configured", g_standard_lap_configured);
-  p.add("fragment_publication_ready",
-        g_standard_lap_configured &&
-        g_photons_recovery.publication_started &&
-        g_fragment_timer != TIMEPOP_INVALID_HANDLE);
   if (g_standard_lap_configured) {
     p.add("standard_lap_ps", g_standard_lap_ps);
     p.add("standard_lap_ns",
           toFixedDecimal((double)g_standard_lap_ps / 1000.0, 3));
   }
-  p.add("recovery_publication_started",
-        g_photons_recovery.publication_started);
-  p.add("recovery_staging_active",
-        g_photons_recovery_protocol.active);
+  p.add("publication_started", g_photons_recovery.publication_started);
   p.add("recovery_restored", g_photons_recovery.restored);
   p.add("recovery_proof_pending", g_photons_recovery.proof_pending);
   p.add("recovery_proof_committed", g_photons_recovery.proof_committed);
   p.add("recovery_generation", g_photons_recovery.generation);
-  p.add("recovery_source_sequence",
-        g_photons_recovery.source_sequence);
-  p.add("recovery_source_update_count",
-        g_photons_recovery.source_update_count);
-  p.add("recovery_proof_sequence", g_photons_recovery.proof_sequence);
-  p.add("recovery_proof_update_count",
-        g_photons_recovery.proof_update_count);
-  p.add("recovery_dropped_pending_seed_count",
-        g_photons_recovery.dropped_pending_seed_count);
 
+  // Current campaign identity only.  Detailed campaign/statistical testimony
+  // belongs to REPORT_PHOTONS / REPORT_STATS.
   p.add("campaign_state", photons_campaign_state_name(g_photons_campaign_state));
   p.add("campaign_active",
         g_photons_campaign_state == photons_campaign_state_t::ACTIVE ||
@@ -4680,262 +4676,18 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
   if (g_photons_campaign_name[0]) {
     p.add("campaign", g_photons_campaign_name);
   }
-  p.add("campaign_start_after_sequence",
-        g_photons_campaign_start_after_sequence);
   p.add("campaign_public_count", g_photons_campaign_public_count);
-  if (g_photons_flash_cut_campaign_name[0]) {
-    p.add("flash_cut_campaign", g_photons_flash_cut_campaign_name);
-  }
-  p.add("flash_cut_request_count", g_photons_flash_cut_request_count);
-  p.add("flash_cut_commit_count", g_photons_flash_cut_commit_count);
-  p.add("flash_cut_reject_count", g_photons_flash_cut_reject_count);
-  p.add("campaign_origin_lap_count", g_photons_campaign_origin_lap_count);
-  p.add("campaign_origin_total_lap_gnss_ns",
-        g_photons_campaign_origin_total_lap_gnss_ns);
-  p.add("campaign_start_request_count",
-        g_photons_campaign_start_request_count);
-  p.add("campaign_start_commit_count",
-        g_photons_campaign_start_commit_count);
-  p.add("campaign_stop_request_count",
-        g_photons_campaign_stop_request_count);
-  p.add("campaign_stop_commit_count",
-        g_photons_campaign_stop_commit_count);
-  if (canonical.campaign.present) {
-    p.add("campaign_snapshot_public_count", canonical.campaign.public_count);
-    p.add("campaign_snapshot_final", canonical.campaign.final);
-    p.add("campaign_snapshot_lap_count", canonical.campaign.lap_count);
-    p.add("campaign_snapshot_total_lap_gnss_ns",
-          canonical.campaign.total_lap_gnss_ns);
-    p.add("campaign_snapshot_mean_lap_ns",
-          toFixedDecimal(canonical.campaign.mean_lap_ns, 6));
-    if (canonical.campaign.ppb.sample_count != 0ULL) {
-      p.add("campaign_snapshot_ppb",
-            toFixedDecimal(canonical.campaign.ppb.ppb, 6));
-    }
-  }
 
-  p.add("fragment_schema", "PHOTONS_FRAGMENT_V1");
+  // Latest canonical publication identity.
   p.add("fragment_snapshot_ok", canonical.snapshot_ok);
   p.add("fragment_valid", canonical.valid);
-  p.add("fragment_raw_lap_count", canonical.raw_lap_count);
-  p.add("fragment_projected_laps_this_fragment",
-        canonical.projected_laps_this_fragment);
+  p.add("fragment_sequence", canonical.sequence);
+  p.add("fragment_publish_count", g_publish_count);
+  p.add("fragment_publish_reject_count", g_publish_reject_count);
+  p.add("fragment_edge_count_total", canonical.edge_count_total);
+  p.add("fragment_edges_this_fragment", canonical.edges_this_fragment);
 
-  p.add("raw_cycles_completed_lap_count",
-        canonical.raw_cycles.completed_lap_count);
-  p.add("raw_cycles_observed_cycles",
-        canonical.raw_cycles.observed_cycles);
-  p.add("raw_cycles_previous_observed_cycles",
-        canonical.raw_cycles.previous_observed_cycles);
-  p.add("raw_cycles_static_prediction_valid",
-        canonical.raw_cycles.static_prediction_valid);
-  p.add("raw_cycles_static_prediction_cycles",
-        canonical.raw_cycles.static_prediction_cycles);
-  p.add("raw_cycles_static_residual_cycles",
-        canonical.raw_cycles.static_residual_cycles);
-  p.add("raw_cycles_mean_cycles_this_fragment",
-        toFixedDecimal(canonical.raw_cycles.mean_cycles_this_fragment, 6));
-  p.add("raw_cycles_previous_fragment_mean_valid",
-        canonical.raw_cycles.previous_fragment_mean_valid);
-  p.add("raw_cycles_previous_fragment_mean_cycles",
-        toFixedDecimal(canonical.raw_cycles.previous_fragment_mean_cycles, 6));
-  p.add("raw_cycles_fragment_mean_residual_cycles",
-        toFixedDecimal(canonical.raw_cycles.fragment_mean_residual_cycles, 6));
-
-  p.add("projection_anchor_cache_valid",
-        canonical.projection.anchor_cache_valid);
-  p.add("projection_anchor_pps_count",
-        canonical.projection.anchor_pps_count);
-  p.add("projection_anchor_dwt_cycles_per_second",
-        canonical.projection.anchor_dwt_cycles_per_second);
-  p.add("projection_attempt_count",
-        canonical.projection.attempt_count);
-  p.add("projection_success_count",
-        canonical.projection.success_count);
-  p.add("projection_reject_count",
-        canonical.projection.reject_count);
-  p.add("projection_queue_overflow_count",
-        canonical.projection.queue_overflow_count);
-  p.add("projection_last_valid",
-        canonical.projection.last_valid);
-  p.add("projection_last_start_dwt",
-        canonical.projection.last_start_dwt);
-  p.add("projection_last_end_dwt",
-        canonical.projection.last_end_dwt);
-  p.add("projection_last_lap_gnss_ns",
-        canonical.projection.last_lap_gnss_ns);
-
-  p.add("science_schema", "PHOTONS_SCIENCE_V2");
-  p.add("science_valid", canonical.science.valid);
-  p.add("science_candidate_count",
-        canonical.science.candidate_count);
-  p.add("science_candidates_this_fragment",
-        canonical.science.candidates_this_fragment);
-
-  p.add("science_accepted_count", canonical.science.accepted.count);
-  p.add("science_accepted_this_fragment",
-        canonical.science.accepted.count_this_fragment);
-  p.add("science_accepted_raw_cycles_n",
-        canonical.science.accepted.raw_cycles.n);
-  p.add("science_accepted_raw_cycles_mean",
-        toFixedDecimal(canonical.science.accepted.raw_cycles.mean, 6));
-  p.add("science_accepted_raw_cycles_stddev",
-        toFixedDecimal(canonical.science.accepted.raw_cycles.stddev, 6));
-  p.add("science_accepted_raw_cycles_min",
-        toFixedDecimal(canonical.science.accepted.raw_cycles.min, 6));
-  p.add("science_accepted_raw_cycles_max",
-        toFixedDecimal(canonical.science.accepted.raw_cycles.max, 6));
-  p.add("science_accepted_projected_lap_ns_n",
-        canonical.science.accepted.projected_lap_ns.n);
-  p.add("science_accepted_projected_lap_ns_mean",
-        toFixedDecimal(canonical.science.accepted.projected_lap_ns.mean, 6));
-  p.add("science_accepted_projected_lap_ns_stddev",
-        toFixedDecimal(canonical.science.accepted.projected_lap_ns.stddev, 6));
-  p.add("science_accepted_projected_lap_ns_min",
-        toFixedDecimal(canonical.science.accepted.projected_lap_ns.min, 6));
-  p.add("science_accepted_projected_lap_ns_max",
-        toFixedDecimal(canonical.science.accepted.projected_lap_ns.max, 6));
-
-  p.add("science_excluded_count", canonical.science.excluded.count);
-  p.add("science_excluded_this_fragment",
-        canonical.science.excluded.count_this_fragment);
-  p.add("science_excluded_raw_cycles_n",
-        canonical.science.excluded.raw_cycles.n);
-  p.add("science_excluded_raw_cycles_mean",
-        toFixedDecimal(canonical.science.excluded.raw_cycles.mean, 6));
-  p.add("science_excluded_raw_cycles_stddev",
-        toFixedDecimal(canonical.science.excluded.raw_cycles.stddev, 6));
-  p.add("science_excluded_raw_cycles_min",
-        toFixedDecimal(canonical.science.excluded.raw_cycles.min, 6));
-  p.add("science_excluded_raw_cycles_max",
-        toFixedDecimal(canonical.science.excluded.raw_cycles.max, 6));
-  p.add("science_excluded_projected_lap_ns_n",
-        canonical.science.excluded.projected_lap_ns.n);
-  p.add("science_excluded_projected_lap_ns_mean",
-        toFixedDecimal(canonical.science.excluded.projected_lap_ns.mean, 6));
-  p.add("science_excluded_projected_lap_ns_stddev",
-        toFixedDecimal(canonical.science.excluded.projected_lap_ns.stddev, 6));
-  p.add("science_excluded_projected_lap_ns_min",
-        toFixedDecimal(canonical.science.excluded.projected_lap_ns.min, 6));
-  p.add("science_excluded_projected_lap_ns_max",
-        toFixedDecimal(canonical.science.excluded.projected_lap_ns.max, 6));
-
-  p.add("science_exclusion_projection_invalid",
-        canonical.science.exclusion_reasons.projection_invalid);
-  p.add("science_exclusion_seed_disagreement",
-        canonical.science.exclusion_reasons.seed_disagreement);
-  p.add("science_exclusion_raw_cycle_excursion",
-        canonical.science.exclusion_reasons.raw_cycle_excursion);
-  p.add("science_exclusion_projection_invalid_this_fragment",
-        canonical.science.exclusion_reasons.projection_invalid_this_fragment);
-  p.add("science_exclusion_seed_disagreement_this_fragment",
-        canonical.science.exclusion_reasons.seed_disagreement_this_fragment);
-  p.add("science_exclusion_raw_cycle_excursion_this_fragment",
-        canonical.science.exclusion_reasons.raw_cycle_excursion_this_fragment);
-  p.add("science_predictor_valid",
-        canonical.science.predictor_valid);
-  p.add("science_predictor_cycles",
-        canonical.science.predictor_cycles);
-  p.add("science_gate_cycles",
-        canonical.science.gate_cycles);
-  p.add("science_reject_streak",
-        canonical.science.reject_streak);
-  p.add("science_max_reject_streak",
-        canonical.science.max_reject_streak);
-  p.add("science_seed_pending",
-        canonical.science.seed_pending);
-  p.add("science_last_disposition",
-        photons_lap_science_disposition_name(
-            canonical.science.last_disposition_id));
-  p.add("science_last_reason",
-        photons_lap_science_reason_name(
-            canonical.science.last_reason_code));
-  p.add("science_last_observed_cycles",
-        canonical.science.last_observed_cycles);
-  p.add("science_last_prediction_cycles",
-        canonical.science.last_prediction_cycles);
-  p.add("science_last_residual_cycles",
-        canonical.science.last_residual_cycles);
-  p.add("science_last_gate_cycles",
-        canonical.science.last_gate_cycles);
-
-  p.add("stats_valid", canonical.stats.valid);
-  p.add("stats_reset_count", canonical.stats.reset_count);
-  p.add("stats_reset_pending", g_photons_stats_reset_pending);
-  p.add("stats_reset_request_count", g_photons_stats_reset_request_count);
-  p.add("stats_reset_commit_count", g_photons_stats_reset_commit_count);
-  p.add("stats_lap_count", canonical.stats.lap_count);
-  p.add("stats_total_lap_gnss_ns",
-        canonical.stats.total_lap_gnss_ns);
-  p.add("stats_mean_lap_ns",
-        toFixedDecimal(canonical.stats.mean_lap_ns, 6));
-  p.add("stats_lap_welford_n",
-        canonical.stats.lap_time_welford.n);
-  p.add("stats_lap_welford_mean",
-        toFixedDecimal(canonical.stats.lap_time_welford.mean, 6));
-  p.add("stats_lap_welford_m2",
-        toFixedDecimal(canonical.stats.lap_time_welford.m2, 6));
-  p.add("stats_lap_welford_stddev",
-        toFixedDecimal(canonical.stats.lap_time_welford.stddev, 6));
-  p.add("stats_lap_welford_stderr",
-        toFixedDecimal(canonical.stats.lap_time_welford.stderr_value, 6));
-  p.add("stats_lap_welford_min",
-        toFixedDecimal(canonical.stats.lap_time_welford.min, 6));
-  p.add("stats_lap_welford_max",
-        toFixedDecimal(canonical.stats.lap_time_welford.max, 6));
-  p.add("stats_update_count", canonical.stats.update_count);
-  p.add("stats_rolling_ppb_current_sequence",
-        canonical.stats.rolling_ppb_current_sequence);
-  p.add("stats_rolling_ppb_endpoint_admitted",
-        canonical.stats.rolling_ppb_endpoint_admitted);
-  p.add("stats_rolling_ppb_interval_advanced",
-        canonical.stats.rolling_ppb_interval_advanced);
-  p.add("stats_ppb_second_history_count", g_photons_ppb_seconds_count);
-  p.add("stats_ppb_minute_history_count", g_photons_ppb_minutes_count);
-
-  p.add("stats_ppb_10_min_n",
-        canonical.stats.ppb_buckets.minute_10.sample_count);
-  if (canonical.stats.ppb_buckets.minute_10.sample_count != 0ULL) {
-    p.add("stats_ppb_10_min",
-          toFixedDecimal(canonical.stats.ppb_buckets.minute_10.ppb, 6));
-  }
-  p.add("stats_ppb_60_min_n",
-        canonical.stats.ppb_buckets.minute_60.sample_count);
-  if (canonical.stats.ppb_buckets.minute_60.sample_count != 0ULL) {
-    p.add("stats_ppb_60_min",
-          toFixedDecimal(canonical.stats.ppb_buckets.minute_60.ppb, 6));
-  }
-  p.add("stats_ppb_8_hour_n",
-        canonical.stats.ppb_buckets.hour_8.sample_count);
-  if (canonical.stats.ppb_buckets.hour_8.sample_count != 0ULL) {
-    p.add("stats_ppb_8_hour",
-          toFixedDecimal(canonical.stats.ppb_buckets.hour_8.ppb, 6));
-  }
-  p.add("stats_ppb_24_hour_n",
-        canonical.stats.ppb_buckets.hour_24.sample_count);
-  if (canonical.stats.ppb_buckets.hour_24.sample_count != 0ULL) {
-    p.add("stats_ppb_24_hour",
-          toFixedDecimal(canonical.stats.ppb_buckets.hour_24.ppb, 6));
-  }
-  p.add("custody_lap_count", g_photons_custody_lap_count);
-  p.add("custody_total_lap_gnss_ns", g_photons_custody_total_lap_gnss_ns);
-  p.add("problem_injection_armed",
-        __atomic_load_n(&g_photons_problem_injection_armed, __ATOMIC_ACQUIRE) == 2U);
-  p.add("problem_injection_arm_count", g_photons_problem_injection_arm_count);
-  p.add("problem_injection_fire_count", g_photons_problem_injection_fire_count);
-  p.add("problem_injection_last_extra_cycles",
-        g_photons_problem_injection_last_extra_cycles);
-
-  p.add("stats_ppb_total_n",
-        canonical.stats.ppb_buckets.total.sample_count);
-  if (canonical.stats.ppb_buckets.total.sample_count != 0ULL) {
-    p.add("stats_ppb_total",
-          toFixedDecimal(canonical.stats.ppb_buckets.total.ppb, 6));
-  }
-  p.add("baseline_present", canonical.baseline.present);
-  p.add("baseline_residual_valid",
-        canonical.baseline.residual_valid);
-
+  // Optical hardware.  These are the fields REPORT is primarily for.
   p.add("laser_enabled", device.laser_enabled);
   p.add("laser_id1_raw", device.laser_id1_raw);
   p.add("laser_id1_current_ma",
@@ -4947,93 +4699,16 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
 
   p.add("photodiode_edge_pin", PHOTODIODE_EDGE_PIN);
   p.add("photodiode_edge_level", device.photodiode_edge_level);
-  p.add("photodiode_mon_pin", PHOTODIODE_MON_PIN);
-  p.add("photodiode_mon_raw", device.photodiode_mon_raw);
-  p.add("photodiode_mon_v",
-        toFixedDecimal(device.photodiode_mon_v, 6));
-  p.add("photodiode_mon_emulated", PHOTONS_EMULATOR_ENABLED);
+  p.add("photodiode_interrupt_pin", PHOTODIODE_EDGE_PIN);
+  p.add("photodiode_interrupt_count", interrupt_diag.irq_count);
+  p.add("photodiode_analog_pin", PHOTODIODE_ANALOG_PIN);
+  p.add("photodiode_analog_raw", device.photodiode_analog_raw);
+  p.add("photodiode_analog_v",
+        toFixedDecimal(device.photodiode_analog_v, 6));
+  p.add("photodiode_analog_emulated", PHOTONS_EMULATOR_ENABLED);
 
-  p.add("emulator_enabled", PHOTONS_EMULATOR_ENABLED);
-  p.add("emulator_initialized", g_photons_emulator.initialized);
-  p.add("emulator_edge_output_pin", PHOTONS_EMULATOR_EDGE_OUTPUT_PIN);
-  p.add("emulator_loopback_input_pin", PHOTODIODE_EDGE_PIN);
-  p.add("emulator_timing_fidelity",
-        "STANDARD_LOCKED_SYNTHETIC_SCIENCE_WITH_PHYSICAL_EDGE_CUSTODY");
-  p.add("emulator_cadence_strategy", "ONE_RECURRING_TIMEPOP_TIMER");
-  if (g_standard_lap_configured) {
-    p.add("emulator_nominal_lap_ns",
-          toFixedDecimal((double)g_standard_lap_ps / 1000.0, 3));
-  }
-  p.add("emulator_cadence_period_ns", PHOTONS_EMULATOR_CADENCE_NS);
-  p.add("emulator_projection_wait_count",
-        g_photons_emulator.projection_wait_count);
-  p.add("emulator_synthetic_target_unavailable_count",
-        g_photons_emulator.synthetic_target_unavailable_count);
-  p.add("emulator_synthetic_target_cycles",
-        g_photons_emulator.synthetic_target_cycles);
-  p.add("emulator_synthetic_last_jitter_cycles",
-        g_photons_emulator.synthetic_last_jitter_cycles);
-  p.add("emulator_synthetic_last_lap_cycles",
-        g_photons_emulator.synthetic_last_lap_cycles);
-  p.add("emulator_synthetic_lap_count",
-        g_photons_emulator.synthetic_lap_count);
-  p.add("emulator_cadence_tick_count", g_photons_emulator.cadence_tick_count);
-  p.add("emulator_hits_per_train", PHOTONS_EMULATOR_HITS_PER_TRAIN);
-  p.add("emulator_measured_laps", PHOTONS_EMULATOR_MEASURED_LAPS);
-  p.add("emulator_stage", photons_emulator_stage_name(g_photons_emulator.stage));
-  p.add("emulator_train_active", g_photons_emulator.train_active);
-  p.add("emulator_train_count", g_photons_emulator.train_count);
-  p.add("emulator_relaunch_count", g_photons_emulator.relaunch_count);
-
-  p.add("emulator_laser_pulse_requested_cycles",
-        PHOTONS_EMULATOR_LASER_PULSE_CYCLES);
-  p.add("emulator_laser_pulse_count", g_photons_emulator.laser_pulse_count);
-  p.add("emulator_last_laser_pulse_cycles",
-        g_photons_emulator.last_laser_pulse_cycles);
-  p.add("emulator_max_laser_pulse_cycles",
-        g_photons_emulator.max_laser_pulse_cycles);
-
-  p.add("emulator_generated_edge_count",
-        g_photons_emulator.generated_edge_count);
-  p.add("emulator_expected_hit_ordinal",
-        g_photons_emulator.expected_hit_ordinal);
-  p.add("emulator_unexpected_edge_count",
-        g_photons_emulator.unexpected_edge_count);
-  p.add("emulator_state_error_count",
-        g_photons_emulator.state_error_count);
-  p.add("emulator_hit1_count", g_photons_emulator.hit1_count);
-  p.add("emulator_hit2_count", g_photons_emulator.hit2_count);
-  p.add("emulator_hit3_count", g_photons_emulator.hit3_count);
-  p.add("emulator_hit4_count", g_photons_emulator.hit4_count);
-  p.add("emulator_hit5_count", g_photons_emulator.hit5_count);
-  const uint32_t emulator_observed_hit_count =
-      g_photons_emulator.hit1_count +
-      g_photons_emulator.hit2_count +
-      g_photons_emulator.hit3_count +
-      g_photons_emulator.hit4_count +
-      g_photons_emulator.hit5_count;
-  p.add("emulator_observed_hit_count", emulator_observed_hit_count);
-
-  p.add("emulator_lap_start_count", g_photons_emulator.lap_start_count);
-  p.add("emulator_lap1_complete_count",
-        g_photons_emulator.lap1_complete_count);
-  p.add("emulator_lap2_complete_count",
-        g_photons_emulator.lap2_complete_count);
-  p.add("emulator_lap3_complete_count",
-        g_photons_emulator.lap3_complete_count);
-  p.add("emulator_dead_lap_count", g_photons_emulator.dead_lap_count);
-  p.add("emulator_lap_start_dwt", g_photons_emulator.lap_start_dwt);
-  p.add("emulator_lap1_last_cycles", g_photons_emulator.lap1_last_cycles);
-  p.add("emulator_lap2_last_cycles", g_photons_emulator.lap2_last_cycles);
-  p.add("emulator_lap3_last_cycles", g_photons_emulator.lap3_last_cycles);
-
-  p.add("emulator_cadence_timer_arm_count",
-        g_photons_emulator.cadence_timer_arm_count);
-  p.add("emulator_cadence_timer_arm_fail_count",
-        g_photons_emulator.cadence_timer_arm_fail_count);
-  p.add("emulator_cadence_timer_handle_valid",
-        g_photons_emulator.cadence_timer != TIMEPOP_INVALID_HANDLE);
-
+  // First-order detector custody.  Keep enough testimony here to commission the
+  // physical path without hauling the complete science/recovery court over RPC.
   p.add("capture_edge_count", capture.edge_count);
   p.add("capture_last_edge_sequence", capture.last_edge_sequence);
   p.add("capture_last_pps_sequence", capture.last_pps_sequence);
@@ -5041,21 +4716,12 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
   p.add("capture_last_isr_entry_dwt_raw", capture.last_isr_entry_dwt_raw);
   p.add("capture_isr_entry_to_edge_correction_cycles",
         capture.isr_entry_to_edge_correction_cycles);
-
   p.add("capture_interval_valid", capture.interval_valid);
-  p.add("capture_last_interval_cycles", capture.last_interval_cycles);
-  p.add("capture_min_interval_cycles", capture.min_interval_cycles);
-  p.add("capture_max_interval_cycles", capture.max_interval_cycles);
-
-  p.add("capture_prediction_valid", capture.prediction_valid);
-  p.add("capture_prediction_cycles", capture.prediction_cycles);
-  p.add("capture_residual_cycles", capture.residual_cycles);
-
-  p.add("fragment_sequence", fragment.sequence);
-  p.add("fragment_publish_count", g_publish_count);
-  p.add("fragment_publish_reject_count", g_publish_reject_count);
-  p.add("fragment_edge_count_total", fragment.edge_count_total);
-  p.add("fragment_edges_this_second", fragment.edges_this_second);
+  if (capture.interval_valid) {
+    p.add("capture_last_interval_cycles", capture.last_interval_cycles);
+    p.add("capture_min_interval_cycles", capture.min_interval_cycles);
+    p.add("capture_max_interval_cycles", capture.max_interval_cycles);
+  }
 
   p.add("interrupt_subscribed", interrupt_diag.subscribed);
   p.add("interrupt_active", interrupt_diag.active);
@@ -5071,6 +4737,24 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
   p.add("interrupt_max_callback_wall_cycles",
         interrupt_diag.max_callback_wall_cycles);
 
+  // The emulator is temporary and headed for deletion.  Retain only a compact
+  // witness here; its former exhaustive dump was the largest source of REPORT
+  // bloat and duplicated information available elsewhere.
+  p.add("emulator_enabled", PHOTONS_EMULATOR_ENABLED);
+  p.add("emulator_initialized", g_photons_emulator.initialized);
+  p.add("emulator_stage", photons_emulator_stage_name(g_photons_emulator.stage));
+  p.add("emulator_train_count", g_photons_emulator.train_count);
+  p.add("emulator_laser_pulse_count", g_photons_emulator.laser_pulse_count);
+  p.add("emulator_generated_edge_count",
+        g_photons_emulator.generated_edge_count);
+  p.add("emulator_synthetic_lap_count",
+        g_photons_emulator.synthetic_lap_count);
+  const uint32_t emulator_observed_hit_count =
+      g_photons_emulator.hit1_count +
+      g_photons_emulator.hit2_count +
+      g_photons_emulator.hit3_count +
+      g_photons_emulator.hit4_count +
+      g_photons_emulator.hit5_count;
   p.add("emulator_custody_counts_match",
         g_photons_emulator.generated_edge_count ==
             interrupt_diag.irq_count &&
@@ -5083,6 +4767,7 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
 
   return p;
 }
+
 
 static FLASHMEM Payload cmd_init(const Payload& /*args*/) {
   photons_laser_initialize_hardware();

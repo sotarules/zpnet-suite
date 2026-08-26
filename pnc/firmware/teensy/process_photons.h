@@ -45,8 +45,8 @@
 //       hit 5 lap 3 end;
 //   • the cadence tick after hit 5 is lap 4: no detector edge is emitted and
 //     the next real laser pulse/train begins on that same recurring tick;
-//   • pin 38/A14 MON telemetry is synthesized and is not ADC-read while the
-//     emulator is installed;
+//   • when the emulator is enabled, pin 38/A14 PD OUT telemetry is synthesized;
+//     with the physical PD200T selected, pin 38/A14 PD OUT is ADC-read directly;
 //   • the emulator is always on and independent of campaign state;
 //   • the TimePop cadence is bring-up transport timing, not optical truth.
 //
@@ -57,7 +57,9 @@
 //   • START               — start a LANTERN campaign, or hot-cut an active campaign to a new name
 //   • FLASH_CUT           — explicit hot campaign boundary preserving the always-on instrument epoch
 //   • STOP                — request campaign closure; the next published campaign fragment is final
-//   • REPORT              — unified laser, PD200T, interrupt, campaign, and measurement report
+//   • REPORT              — compact operational/device report for laser, PD200T pin 38/A14
+//                           PD OUT voltage, pin 34 comparator interrupt custody, publication
+//                           identity, and hardware commissioning
 //   • REPORT_PHOTONS      — compact always-on instrument + current CAMP report
 //   • REPORT_STATS        — detailed statistical/court/Better-Buckets report
 //   • STATS_RESET         — reset the always-on statistical epoch without changing CAMP custody
@@ -75,7 +77,7 @@
 //   • OFF                 — inhibit laser emission through LD_ON
 // ============================================================================
 
-// Cumulative ISR-authored optical-edge state.
+// Cumulative ISR-authored optical-edge state from PD200T TTL pin 34.
 struct photons_toy_capture_t {
   uint32_t edge_count = 0;
 

@@ -96,17 +96,18 @@ static const int LASER_MONITOR_PIN  = 20;
 //   Fast digital photodetector timing edge owned by process_interrupt.
 //   This is the authoritative optical timing signal.
 //
-// PHOTODIODE_MON_PIN:
-//   PD200T MON comparator-threshold output.
-//   Slow analog instrument/configuration telemetry on Teensy 4.1 A14.
-//   This value is never a timing endpoint.
+// PHOTODIODE_ANALOG_PIN:
+//   PD200T PD OUT analog photodetector waveform.
+//   Slow ADC telemetry on Teensy 4.1 A14 for optical-path commissioning.
+//   This is observed signal amplitude, not the comparator threshold and never
+//   a timing endpoint; pin 34 remains the sole optical timing declaration.
 //
-// The PD200T high-bandwidth analog PD out waveform is intentionally not
-// connected to the Teensy ADC in the current architecture.
+// PD200T MON is the comparator-threshold monitor from the blue threshold
+// potentiometer.  MON is not connected to the Teensy in the current hardware.
 //
 
 static const int PHOTODIODE_EDGE_PIN = 34;
-static const int PHOTODIODE_MON_PIN  = 38;  // Teensy 4.1 A14
+static const int PHOTODIODE_ANALOG_PIN = 38;  // Teensy 4.1 A14
 
 // --------------------------------------------------------------
 // GNSS timing pins
@@ -198,14 +199,14 @@ static const unsigned long GNSS_SILENCE_FLUSH_MS = 50;
 static const uint32_t PPS_EMIT_INTERVAL_MS = 10000;
 
 // --------------------------------------------------------------
-// PD200T analog monitor
+// PD200T analog photodetector telemetry
 // --------------------------------------------------------------
 //
-// PHOTODIODE_MON_PIN reports the PD200T comparator threshold through A14.
-// It is slow telemetry only; optical presence and timing are declared by the
+// PHOTODIODE_ANALOG_PIN carries PD OUT on A14.  It is slow ADC telemetry for
+// optical amplitude/commissioning only; authoritative timing is the independent
 // TTL comparator output on PHOTODIODE_EDGE_PIN.
 //
-// The former split-pin analog light-level episode detector is retired.
+// PD200T MON is not connected to the Teensy.
 //
 
 // --------------------------------------------------------------

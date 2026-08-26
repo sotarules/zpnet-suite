@@ -101,7 +101,7 @@ GND           Black         GND                Battery branching ground         
 23            Green         DAC_VREF_OUT       AD5693R VREF (both)
 32            Orange        GNSS_PPS_RELAY     GPIO relay to Pi
 34            Coax          PHOTODIODE_INT     Koheron PD200T TTL out                Comparator timing output / GPIO IRQ
-38            Coax          PHOTODIODE_MON_IN  Koheron PD200T MON                    Comparator threshold monitor / A14 ADC
+38            Coax          PHOTODIODE_ANALOG_IN  Koheron PD200T PD OUT              Analog photodetector output / A14 ADC
 
 30            Green         LASER_EN           EV5491-C-00A EN pin
 
@@ -181,17 +181,18 @@ Used outputs:
 Output / Signal      Teensy Pin    ZPNet Signal Name       Purpose
 ---------------------------------------------------------------------------
 TTL out              34            PHOTODIODE_INT          Comparator timing edge / GPIO IRQ
-MON                  38 / A14      PHOTODIODE_MON_IN       Comparator threshold monitor / ADC
+PD OUT               38 / A14      PHOTODIODE_ANALOG_IN    Analog photodetector output / ADC
 
 Notes:
 • TTL out is the authoritative digital photodetector timing signal presented
   to process_interrupt for DWT-at-edge capture.
-• MON is a slow analog instrument-state measurement of the comparator threshold.
-• Pin 38 is used through its Teensy 4.1 A14 analog-input function.
-• PD out is the high-bandwidth analog photodetector waveform and is not connected
-  to the Teensy ADC in the current architecture.
-• PHOTODIODE_MON_IN is telemetry/configuration testimony only and is never a
-  timing endpoint.
+• PD OUT is the analog photodetector waveform and is ADC-read on pin 38/A14.
+• During comparator-pot commissioning, pin 38/A14 shows received optical signal
+  amplitude while the independent pin 34 TTL interrupt count shows comparator
+  decisions.
+• MON is the blue-pot comparator-threshold monitor and is not connected to the
+  Teensy in the current architecture.
+• PHOTODIODE_ANALOG_IN is telemetry only and is never a timing endpoint.
 =============================================================================*/
 
 
