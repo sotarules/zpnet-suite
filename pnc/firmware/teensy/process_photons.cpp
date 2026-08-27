@@ -26,24 +26,23 @@
 // first-instruction DWT coordinate.
 //
 // PHOTONS consumes that immutable edge fact through the specialized high-rate
-// PHOTODIODE subscription.  The ISR callback below remains intentionally tiny:
-// scalar/ring updates only, no Payload, no publication, no CLOCKS/TIME call,
-// no floating-point statistics, and no TimePop mutation.
+// PHOTODIODE subscription. ISR callbacks remain intentionally tiny: first-edge
+// race/pulse latches plus scalar capture updates only; no Payload, publication,
+// CLOCKS/TIME call, floating-point statistics, ADC work, or TimePop mutation.
 //
-// Once per second a normal foreground TimePop callback drains completed raw lap
-// records, projects each pair of observed DWT endpoints through the cached
-// PPS/VCLOCK GNSS ruler, advances canonical Welford/ratio state, and publishes
-// PHOTONS_FRAGMENT_V1.  Physical/raw evidence is never erased by interpretation.
+// Once per second a foreground TimePop callback drains completed physical race
+// records, projects each DWT endpoint pair through its launch-captured PPS/VCLOCK
+// GNSS ruler, advances canonical Welford/ratio state, and publishes
+// PHOTONS_FRAGMENT_V1. Physical/raw evidence is never erased by interpretation.
 // ============================================================================
 
 static constexpr uint64_t PHOTONS_FRAGMENT_PERIOD_NS = 1000000000ULL;
 static constexpr uint64_t PHOTONS_NS_PER_SECOND = 1000000000ULL;
 
-// Bring-up raw-lap handoff.  The temporary emulator produces about 60 measured
-// laps/s, so 2048 entries provide roughly thirty seconds of foreground-latency
-// headroom instead of the ~4 s afforded by the original 256-entry ring.  A
-// future high-rate PD200T engine must replace this ring with a batch sufficient-
-// statistics path; overflow is explicit science data loss and remains fatal to
+// Interim 1 kHz race handoff. 2048 entries provide a little over two seconds
+// of worst-case headroom when every cadence cell completes. The future fast
+// switch will require a batch sufficient-statistics path rather than scaling
+// this raw ring. Overflow is explicit science data loss and remains fatal to
 // the current statistical/campaign custody.
 static constexpr uint32_t PHOTONS_LAP_RING_CAPACITY = 2048U;
 static constexpr uint32_t PHOTONS_LAP_RING_MASK =
@@ -109,145 +108,79 @@ static constexpr uint8_t PHOTONS_LASER_ID1_CURRENT_MSB = 0x14;
 static constexpr uint8_t PHOTONS_LASER_ID1_CURRENT_LSB = 0x00;
 
 static constexpr float PHOTONS_LASER_EMIT_THRESHOLD_V = 0.75f;
+static constexpr uint64_t PHOTONS_PULSE_DEFAULT_NS = 1000ULL;
+
+// Interim real-race geometry. One 1 ms cell contains one 91 us LD_ON pulse
+// followed by a long quiet receive/recovery interval. The actual LD_ON falling
+// edge is the temporary launch surrogate until the fast-switch daughterboard
+// supplies a true fast optical launch edge.
+static constexpr uint64_t PHOTONS_RACE_CADENCE_NS = 1000000ULL;
+static constexpr uint32_t PHOTONS_RACE_CADENCE_HZ = 1000U;
+static constexpr uint64_t PHOTONS_RACE_PULSE_NS = 91000ULL;
+static_assert(PHOTONS_NS_PER_SECOND / PHOTONS_RACE_CADENCE_NS ==
+                  PHOTONS_RACE_CADENCE_HZ,
+              "PHOTONS race cadence constant mismatch");
 
 
 // ============================================================================
-// Temporary PD200T physical emulator
+// Real single-pass race engine
 // ============================================================================
 //
-// Until the Koheron PD200T arrives, PHOTONS runs an always-on physical emulator
-// below the interrupt custody boundary:
-//
-//   pin 33 OUTPUT --> physical jumper --> pin 34 PHOTODIODE_EDGE_PIN
-//
-// PHOTONS never calls its own detector callback.  Every emulated detector edge
-// is a real electrical rising edge on pin 34 and therefore enters through
-// process_interrupt exactly as the future PD200T comparator will.
-//
-// The optical launch itself is real: LD_ON is pulsed for approximately 20 ns.
-// One ordinary recurring TimePop timer provides only the coarse 10 ms physical
-// edge cadence.  Foreground scheduling latency is NOT optical propagation.
-// For emulator-only science, each completed physical loopback edge is paired
-// with a synthetic start coordinate whose DWT separation is STANDARD_LAP_NS
-// converted through the current GNSS/DWT ruler plus a tiny zero-mean cycle
-// dither.  Physical edge timing remains visible in emulator/capture telemetry.
-//
-// One emulator train is fixed and explicit:
-//
-//   laser pulse
-//   hit 1  -- physical pin-33 -> pin-34 edge; ignored by lap semantics
-//   hit 2  -- lap start
-//   hit 3  -- lap 1 end
-//   hit 4  -- lap 2 end
-//   hit 5  -- lap 3 end
-//   dead lap -- one full synthetic-lap delay with no detector edge
-//   repeat at the next laser pulse
-//
-// Each cadence tick advances exactly one state.  Hit 1 is emitted immediately
-// after the real laser pulse; hit 2 follows on the next cadence tick.  After hit 5,
-// the next tick is the dead lap: no detector edge is emitted and the following
-// train begins on that same tick.  Every hit still traverses the physical pin-33
-// jumper and real pin-34 ISR.
-//
-// When this emulator is enabled, PD200T PD OUT on pin 38/A14 is not sampled; a
-// plausible synthetic ADC value is maintained as slow telemetry instead.  With
-// the emulator disabled, physical PD OUT on pin 38/A14 and the independent pin
-// 34 TTL comparator IRQ are authoritative for hardware commissioning.
+// TimePop owns the 1 kHz launch cadence. process_interrupt owns pin-34 DWT
+// custody. The PHOTODIODE callback only latches the first eligible receive edge;
+// the following cadence cell finalizes that race into the raw handoff ring.
+// No synthetic detector edges or synthetic lap intervals remain.
 // ============================================================================
 
-static constexpr bool PHOTONS_EMULATOR_ENABLED = false;
-static constexpr int PHOTONS_EMULATOR_EDGE_OUTPUT_PIN = 33;
-static constexpr uint32_t PHOTONS_EMULATOR_LASER_PULSE_CYCLES = 20U;
-static constexpr uint32_t PHOTONS_EMULATOR_CADENCE_NS = 10000000U;  // synthetic 10 ms
-static constexpr uint32_t PHOTONS_EMULATOR_HITS_PER_TRAIN = 5U;
-static constexpr uint32_t PHOTONS_EMULATOR_MEASURED_LAPS = 3U;
+struct photons_race_launch_slot_t {
+  bool     valid = false;
+  uint32_t sequence = 0U;
+  uint32_t ld_on_start_dwt = 0U;
+  bool     launch_surrogate_valid = false;
+  uint32_t launch_surrogate_dwt = 0U;
+  uint32_t target_high_cycles = 0U;
+  uint32_t cadence_cell_cycles = 0U;
+  uint32_t pulse_wall_cycles = 0U;
 
-// Temporary standard-locked science jitter.  One DWT cycle is approximately
-// one nanosecond on this build.  The pattern is deliberately tiny and has an
-// exact zero sum, so it exercises per-lap timing variation without building a
-// fake frequency offset into Better-Buckets.
-static constexpr int8_t PHOTONS_EMULATOR_LAP_JITTER_CYCLES[] = {
-  -3, 1, 2, -1, 3, -2, 0
-};
-static constexpr uint32_t PHOTONS_EMULATOR_LAP_JITTER_COUNT =
-    sizeof(PHOTONS_EMULATOR_LAP_JITTER_CYCLES) /
-    sizeof(PHOTONS_EMULATOR_LAP_JITTER_CYCLES[0]);
-static_assert((-3 + 1 + 2 - 1 + 3 - 2 + 0) == 0,
-              "PHOTONS emulator lap jitter must be zero-mean");
-
-// Provisional PD200T PD OUT range for emulator bring-up only.  1200-1800 ADC counts maps to
-// roughly 0.97-1.45 V on the Teensy 3.3 V / 12-bit ADC scale.
-static constexpr uint16_t PHOTONS_EMULATOR_ANALOG_RAW_MIN = 1200U;
-static constexpr uint16_t PHOTONS_EMULATOR_ANALOG_RAW_MAX = 1800U;
-
-enum class photons_emulator_stage_t : uint8_t {
-  IDLE = 0,
-  WAIT_HIT2,
-  WAIT_HIT3,
-  WAIT_HIT4,
-  WAIT_HIT5,
-  DEAD_LAP,
+  bool     anchor_valid = false;
+  uint32_t anchor_dwt_at_pps_vclock = 0U;
+  uint32_t anchor_dwt_cycles_per_second = 0U;
+  uint32_t anchor_pps_count = 0U;
 };
 
+struct photons_race_receive_value_t {
+  bool     seen = false;
+  uint32_t race_sequence = 0U;
+  uint32_t edge_sequence = 0U;
+  uint32_t pps_sequence = 0U;
+  uint32_t finish_dwt = 0U;
+};
 
-struct photons_emulator_state_t {
+struct photons_race_receive_state_t {
+  volatile uint32_t generation = 0U;
+  photons_race_receive_value_t value{};
+};
+
+struct photons_race_runtime_t {
   bool initialized = false;
-  bool train_active = false;
-
   timepop_handle_t cadence_timer = TIMEPOP_INVALID_HANDLE;
-  uint32_t cadence_timer_arm_count = 0U;
-  uint32_t cadence_timer_arm_fail_count = 0U;
-  uint32_t cadence_tick_count = 0U;
-
-  photons_emulator_stage_t stage = photons_emulator_stage_t::IDLE;
-  uint32_t train_count = 0U;
-  uint32_t relaunch_count = 0U;
-
-  uint32_t laser_pulse_count = 0U;
-  uint32_t last_laser_pulse_cycles = 0U;
-  uint32_t max_laser_pulse_cycles = 0U;
-
-  uint32_t generated_edge_count = 0U;
-  uint32_t expected_hit_ordinal = 0U;
-  uint32_t unexpected_edge_count = 0U;
-  uint32_t state_error_count = 0U;
-
-  uint32_t hit1_count = 0U;
-  uint32_t hit2_count = 0U;
-  uint32_t hit3_count = 0U;
-  uint32_t hit4_count = 0U;
-  uint32_t hit5_count = 0U;
-
-  uint32_t lap_start_count = 0U;
-  uint32_t lap1_complete_count = 0U;
-  uint32_t lap2_complete_count = 0U;
-  uint32_t lap3_complete_count = 0U;
-  uint32_t dead_lap_count = 0U;
-
-  uint32_t lap_start_dwt = 0U;
-  uint32_t previous_lap_endpoint_dwt = 0U;
-  // Physical TimePop-to-TimePop loopback spacing.  These remain telemetry only;
-  // emulator science below is standard-locked and does not consume them.
-  uint32_t lap1_last_cycles = 0U;
-  uint32_t lap2_last_cycles = 0U;
-  uint32_t lap3_last_cycles = 0U;
-
-  bool synthetic_lap_ready = false;
-  uint32_t synthetic_target_cycles = 0U;
-  int32_t synthetic_last_jitter_cycles = 0;
-  uint32_t synthetic_last_lap_cycles = 0U;
-  uint32_t synthetic_lap_count = 0U;
-  uint32_t synthetic_jitter_index = 0U;
-  uint32_t synthetic_target_unavailable_count = 0U;
-  uint32_t projection_wait_count = 0U;
-
-  uint16_t analog_raw = PHOTONS_EMULATOR_ANALOG_RAW_MIN;
+  uint32_t sequence = 0U;
+  uint64_t cadence_tick_count = 0ULL;
+  uint64_t attempt_count = 0ULL;
+  uint64_t completed_count = 0ULL;
+  uint64_t missed_count = 0ULL;
+  uint64_t skipped_not_quiet_count = 0ULL;
+  uint64_t skipped_projection_count = 0ULL;
+  uint64_t invalid_endpoint_count = 0ULL;
+  uint64_t enqueue_failure_count = 0ULL;
 };
 
+static photons_race_runtime_t g_photons_race{};
+static photons_race_launch_slot_t g_photons_race_launch{};
+static photons_race_receive_state_t g_photons_race_receive{};
+static volatile uint32_t g_race_armed_sequence = 0U;
 
-static photons_emulator_state_t g_photons_emulator{};
-
-static void photons_emulator_cadence_tick(
+static void photons_race_cadence_tick(
     timepop_ctx_t* ctx,
     timepop_diag_t* diag,
     void* user_data);
@@ -377,9 +310,11 @@ static uint32_t g_photons_stats_reset_commit_count = 0U;
 static uint64_t g_photons_custody_lap_count = 0ULL;
 static uint64_t g_photons_custody_total_lap_gnss_ns = 0ULL;
 
-// Required metrological authority installed by SET_STANDARD_LAP_NS before the
-// fragment/statistics clock begins.
+// Operator-authored lap reference. The exact authority is integer femtoseconds;
+// standard_lap_ps remains only a deprecated whole-ps compatibility mirror.
+// Re-referencing does not mutate physical N/T, Welford, or Better-Buckets custody.
 static bool g_standard_lap_configured = false;
+static uint64_t g_lap_baseline_fs = 0ULL;
 static uint64_t g_standard_lap_ps = 0ULL;
 
 // LANTERN lifecycle mirrors CLOCKS Beta conceptually: Pi owns the campaign
@@ -408,14 +343,6 @@ static char g_photons_flash_cut_campaign_name[64] = {0};
 static uint32_t g_photons_flash_cut_request_count = 0U;
 static uint32_t g_photons_flash_cut_commit_count = 0U;
 static uint32_t g_photons_flash_cut_reject_count = 0U;
-
-// One-shot diagnostic fault injection.  The current implementation is deliberately
-// emulator-only: it enlarges one synthetic raw lap by 25%, causing the ordinary
-// RAW_CYCLE_EXCURSION court to fire while physical pin/ISR custody stays real.
-static volatile uint32_t g_photons_problem_injection_armed = 0U;
-static uint32_t g_photons_problem_injection_arm_count = 0U;
-static uint32_t g_photons_problem_injection_fire_count = 0U;
-static uint32_t g_photons_problem_injection_last_extra_cycles = 0U;
 
 // Recovery is a boot-local transaction.  A rebooted Teensy remains held after
 // STANDARD_LAP_NS installation until the Pi either commits durable state or
@@ -751,22 +678,39 @@ static bool photons_recovery_stage_endpoint(bool minute_history,
 }
 
 
-static double photons_ppb_from_population(uint64_t total_lap_gnss_ns,
-                                          uint64_t lap_count) {
-  if (!g_standard_lap_configured || g_standard_lap_ps == 0ULL ||
-      lap_count == 0ULL || total_lap_gnss_ns == 0ULL) {
-    __builtin_trap();
-  }
+static double photons_observed_mean_fs(uint64_t total_lap_gnss_ns,
+                                       uint64_t lap_count) {
+  if (lap_count == 0ULL || total_lap_gnss_ns == 0ULL) __builtin_trap();
 
   // Divide first so TOTAL remains numerically well behaved after years of
-  // accumulation.  The quotient/remainder form avoids multiplying the lifetime
-  // nanosecond numerator by 1000 in uint64_t.
+  // accumulation. The quotient/remainder form avoids multiplying the lifetime
+  // nanosecond numerator by 1,000,000 in uint64_t.
   const uint64_t whole_ns = total_lap_gnss_ns / lap_count;
   const uint64_t remainder_ns = total_lap_gnss_ns % lap_count;
-  const double observed_mean_ps =
-      (double)whole_ns * 1000.0 +
-      ((double)remainder_ns * 1000.0) / (double)lap_count;
-  return (observed_mean_ps / (double)g_standard_lap_ps - 1.0) * 1.0e9;
+  return (double)whole_ns * 1000000.0 +
+      ((double)remainder_ns * 1000000.0) / (double)lap_count;
+}
+
+
+
+
+static double photons_residual_ns_from_population(
+    uint64_t total_lap_gnss_ns, uint64_t lap_count) {
+  if (!g_standard_lap_configured || g_lap_baseline_fs == 0ULL) {
+    __builtin_trap();
+  }
+  const double observed_mean_fs =
+      photons_observed_mean_fs(total_lap_gnss_ns, lap_count);
+  return (observed_mean_fs - (double)g_lap_baseline_fs) / 1000000.0;
+}
+
+
+static double photons_ppb_from_population(uint64_t total_lap_gnss_ns,
+                                          uint64_t lap_count) {
+  // PHOTONS uses the system-wide nanosecond coordinate: one nanosecond of
+  // mean baseline residual is one displayed PPB. The name is retained for
+  // Better-Buckets symmetry with CLOCKS; there is no fractional-lap scaling.
+  return photons_residual_ns_from_population(total_lap_gnss_ns, lap_count);
 }
 
 
@@ -791,6 +735,7 @@ static photons_fragment_ppb_value_snapshot_t photons_ppb_bucket_between(
   photons_fragment_ppb_value_snapshot_t out{};
   out.sample_count = lap_count;
   out.ppb = photons_ppb_from_population(total_ns, lap_count);
+  out.residual_ns = photons_residual_ns_from_population(total_ns, lap_count);
   return out;
 }
 
@@ -1092,6 +1037,8 @@ static photons_fragment_ppb_buckets_snapshot_t photons_ppb_buckets_snapshot(void
     out.total.sample_count = current.lap_count;
     out.total.ppb = photons_ppb_from_population(
         current.total_lap_gnss_ns, current.lap_count);
+    out.total.residual_ns = photons_residual_ns_from_population(
+        current.total_lap_gnss_ns, current.lap_count);
   } else if (current.total_lap_gnss_ns != 0ULL) {
     __builtin_trap();
   }
@@ -1162,6 +1109,8 @@ static photons_fragment_campaign_snapshot_t photons_campaign_snapshot(
   out.ppb.sample_count = out.lap_count;
   out.ppb.ppb =
       photons_ppb_from_population(out.total_lap_gnss_ns, out.lap_count);
+  out.ppb.residual_ns =
+      photons_residual_ns_from_population(out.total_lap_gnss_ns, out.lap_count);
   return out;
 }
 
@@ -1246,7 +1195,7 @@ static void photons_campaign_commit_after_publish(
 
 
 static void photons_instrument_statistics_reset_commit(void) {
-  if (!g_standard_lap_configured || g_standard_lap_ps == 0ULL) __builtin_trap();
+  if (!g_standard_lap_configured || g_lap_baseline_fs == 0ULL) __builtin_trap();
 
   photons_welford_reset(g_lap_time_welford);
   photons_welford_reset(g_accepted_raw_cycles_welford);
@@ -1268,8 +1217,6 @@ static void photons_instrument_statistics_reset_commit(void) {
   g_raw_lap_ring_data_loss = false;
   g_previous_fragment_mean_cycles_valid = false;
   g_previous_fragment_mean_cycles = 0.0;
-  __atomic_store_n(&g_photons_problem_injection_armed, 0U, __ATOMIC_RELEASE);
-
   g_photons_stats_reset_pending = false;
   g_photons_stats_reset_commit_count++;
 }
@@ -1417,10 +1364,7 @@ static bool photons_projection_anchor_snapshot(
 }
 
 
-static bool photons_raw_lap_enqueue(uint32_t start_dwt,
-                                    uint32_t end_dwt,
-                                    uint32_t raw_cycles,
-                                    uint32_t pps_sequence) {
+static bool photons_raw_lap_enqueue(const photons_raw_lap_record_t& record) {
   const uint32_t write = g_raw_lap_ring_write;
   const uint32_t next = (write + 1U) & PHOTONS_LAP_RING_MASK;
 
@@ -1430,26 +1374,11 @@ static bool photons_raw_lap_enqueue(uint32_t start_dwt,
     return false;
   }
 
-  photons_projection_anchor_value_t anchor{};
-  const bool anchor_snapshot_ok =
-      photons_projection_anchor_snapshot(anchor);
-
-  photons_raw_lap_record_t record{};
-  record.start_dwt = start_dwt;
-  record.end_dwt = end_dwt;
-  record.raw_cycles = raw_cycles;
-  record.pps_sequence = pps_sequence;
-  record.anchor_valid = anchor_snapshot_ok && anchor.valid;
-  record.anchor_dwt_at_pps_vclock = anchor.dwt_at_pps_vclock;
-  record.anchor_dwt_cycles_per_second = anchor.dwt_cycles_per_second;
-  record.anchor_pps_count = anchor.pps_count;
-
   g_raw_lap_ring[write] = record;
   photons_memory_barrier();
   g_raw_lap_ring_write = next;
   return true;
 }
-
 
 static bool photons_project_raw_lap(
     const photons_raw_lap_record_t& record,
@@ -1771,11 +1700,13 @@ struct photons_fragment_drain_result_t {
   uint64_t total_cycles = 0ULL;
   uint32_t min_cycles = 0U;
   uint32_t max_cycles = 0U;
+  photons_welford_state_t projected_flight_welford{};
 };
 
 
 static photons_fragment_drain_result_t photons_drain_raw_laps(void) {
   photons_fragment_drain_result_t result{};
+  photons_welford_reset(result.projected_flight_welford);
 
   g_photons_lap_science_state.candidates_this_fragment = 0U;
   g_photons_lap_science_state.accepted.count_this_fragment = 0U;
@@ -1862,6 +1793,12 @@ static photons_fragment_drain_result_t photons_drain_raw_laps(void) {
     g_projection_state.last_end_gnss_ns = end_gnss_ns;
     g_projection_state.last_lap_gnss_ns = lap_gnss_ns;
 
+    // Every successfully projected physical race enters the one-second metrics
+    // Welford. The science court below independently decides whether it may
+    // mutate the canonical lifetime population.
+    photons_welford_update(
+        result.projected_flight_welford, (double)lap_gnss_ns);
+
     science_candidate.lap_gnss_ns = lap_gnss_ns;
     photons_lap_science_projected_candidate(science_candidate);
     result.projected_laps++;
@@ -1941,262 +1878,257 @@ static void photons_laser_inhibit(void) {
 }
 
 
-static const char* photons_emulator_stage_name(
-    photons_emulator_stage_t stage) {
-  switch (stage) {
-    case photons_emulator_stage_t::IDLE:      return "IDLE";
-    case photons_emulator_stage_t::WAIT_HIT2: return "WAIT_HIT2";
-    case photons_emulator_stage_t::WAIT_HIT3: return "WAIT_HIT3";
-    case photons_emulator_stage_t::WAIT_HIT4: return "WAIT_HIT4";
-    case photons_emulator_stage_t::WAIT_HIT5: return "WAIT_HIT5";
-    case photons_emulator_stage_t::DEAD_LAP:  return "DEAD_LAP";
-    default:                                  return "UNKNOWN";
-  }
-}
+static bool photons_ns_to_dwt_cycles(uint64_t requested_ns,
+                                     uint32_t dwt_cycles_per_second,
+                                     uint32_t& out_cycles) {
+  out_cycles = 0U;
+  if (requested_ns == 0ULL || dwt_cycles_per_second == 0U) return false;
 
-
-static void photons_emulator_refresh_analog(void) {
-  // Slow synthetic telemetry only.  Deterministic bounded variation avoids
-  // touching an ADC merely to make the temporary PD200T PD OUT surface move.
-  static uint16_t step = 0U;
-  const uint16_t span =
-      PHOTONS_EMULATOR_ANALOG_RAW_MAX - PHOTONS_EMULATOR_ANALOG_RAW_MIN + 1U;
-  step = (uint16_t)((step + 137U) % span);
-  g_photons_emulator.analog_raw =
-      (uint16_t)(PHOTONS_EMULATOR_ANALOG_RAW_MIN + step);
-}
-
-static bool photons_emulator_projection_ready(void) {
-  if (!g_standard_lap_configured || g_standard_lap_ps == 0ULL) {
-    __builtin_trap();
-  }
-
-  photons_projection_anchor_value_t anchor{};
-  return photons_projection_anchor_snapshot(anchor) &&
-         anchor.valid &&
-         anchor.dwt_cycles_per_second != 0U;
-}
-
-
-static bool photons_emulator_prepare_synthetic_lap(void) {
-  if (!g_standard_lap_configured || g_standard_lap_ps == 0ULL) {
-    __builtin_trap();
-  }
-
-  photons_projection_anchor_value_t anchor{};
-  if (!photons_projection_anchor_snapshot(anchor) ||
-      !anchor.valid ||
-      anchor.dwt_cycles_per_second == 0U) {
-    g_photons_emulator.synthetic_lap_ready = false;
-    g_photons_emulator.synthetic_target_unavailable_count++;
+  const uint64_t whole_seconds = requested_ns / PHOTONS_NS_PER_SECOND;
+  const uint64_t remainder_ns = requested_ns % PHOTONS_NS_PER_SECOND;
+  if (whole_seconds > UINT64_MAX / (uint64_t)dwt_cycles_per_second) {
     return false;
   }
 
-  // This floating conversion occurs in the ordinary foreground TimePop callback,
-  // never in the PHOTODIODE ISR callback.  Double precision is far below one
-  // DWT cycle at this scale; the rounded integer is what crosses into ISR state.
-  const double exact_target_cycles =
-      ((double)g_standard_lap_ps *
-       (double)anchor.dwt_cycles_per_second) / 1.0e12;
-  if (!(exact_target_cycles >= 1.0) ||
-      exact_target_cycles > 4294967290.0) {
-    __builtin_trap();
+  const uint64_t whole_cycles =
+      whole_seconds * (uint64_t)dwt_cycles_per_second;
+  const uint64_t remainder_cycles =
+      (remainder_ns * (uint64_t)dwt_cycles_per_second +
+       PHOTONS_NS_PER_SECOND / 2ULL) /
+      PHOTONS_NS_PER_SECOND;
+
+  if (whole_cycles > (uint64_t)UINT32_MAX ||
+      remainder_cycles > (uint64_t)UINT32_MAX ||
+      whole_cycles > (uint64_t)UINT32_MAX - remainder_cycles) {
+    return false;
   }
 
-  const uint32_t target_cycles = (uint32_t)(exact_target_cycles + 0.5);
-  const int32_t jitter_cycles =
-      (int32_t)PHOTONS_EMULATOR_LAP_JITTER_CYCLES[
-          g_photons_emulator.synthetic_jitter_index %
-          PHOTONS_EMULATOR_LAP_JITTER_COUNT];
-  g_photons_emulator.synthetic_jitter_index++;
-
-  int64_t lap_cycles =
-      (int64_t)(uint64_t)target_cycles + (int64_t)jitter_cycles;
-
-  uint32_t injection_state = 2U;
-  if (__atomic_compare_exchange_n(&g_photons_problem_injection_armed,
-                                  &injection_state,
-                                  0U,
-                                  false,
-                                  __ATOMIC_ACQ_REL,
-                                  __ATOMIC_ACQUIRE)) {
-    const uint32_t extra_cycles = target_cycles / 4U;
-    if (extra_cycles == 0U) __builtin_trap();
-    lap_cycles += (int64_t)(uint64_t)extra_cycles;
-    g_photons_problem_injection_last_extra_cycles = extra_cycles;
-    g_photons_problem_injection_fire_count++;
-  }
-
-  if (lap_cycles <= 0LL || lap_cycles > 4294967295LL) {
-    __builtin_trap();
-  }
-
-  g_photons_emulator.synthetic_target_cycles = target_cycles;
-  g_photons_emulator.synthetic_last_jitter_cycles = jitter_cycles;
-  g_photons_emulator.synthetic_last_lap_cycles = (uint32_t)lap_cycles;
-  g_photons_emulator.synthetic_lap_ready = true;
+  const uint64_t total_cycles = whole_cycles + remainder_cycles;
+  if (total_cycles == 0ULL) return false;
+  out_cycles = (uint32_t)total_cycles;
   return true;
 }
 
+static void photons_race_receive_publish(
+    const photons_race_receive_value_t& value) {
+  g_photons_race_receive.generation++;
+  photons_memory_barrier();
+  g_photons_race_receive.value = value;
+  photons_memory_barrier();
+  g_photons_race_receive.generation++;
+}
 
-static void photons_emulator_enqueue_synthetic_lap(
+static bool photons_race_receive_snapshot(
+    photons_race_receive_value_t& out) {
+  for (;;) {
+    const uint32_t before = g_photons_race_receive.generation;
+    if (before & 1U) continue;
+
+    photons_memory_barrier();
+    const photons_race_receive_value_t snapshot =
+        g_photons_race_receive.value;
+    photons_memory_barrier();
+
+    const uint32_t after = g_photons_race_receive.generation;
+    if (before == after && !(after & 1U)) {
+      out = snapshot;
+      return true;
+    }
+  }
+}
+
+static void photons_race_observe_edge(
     const interrupt_photodiode_edge_t& edge) {
-  if (!g_photons_emulator.synthetic_lap_ready ||
-      g_photons_emulator.synthetic_last_lap_cycles == 0U) {
+  const uint32_t race_sequence = g_race_armed_sequence;
+  if (race_sequence == 0U) return;
+
+  // First physical RISING edge wins. Disarm before publishing the receive latch
+  // so comparator chatter cannot become additional race observations.
+  g_race_armed_sequence = 0U;
+  photons_memory_barrier();
+
+  photons_race_receive_value_t value{};
+  value.seen = true;
+  value.race_sequence = race_sequence;
+  value.edge_sequence = edge.sequence;
+  value.pps_sequence = edge.pps_sequence;
+  value.finish_dwt = edge.dwt_at_edge;
+  photons_race_receive_publish(value);
+}
+
+static void photons_race_finalize_previous(void) {
+  if (!g_photons_race_launch.valid) return;
+
+  // The cadence boundary is the explicit receive timeout. Close the arm before
+  // examining the latch so a late edge cannot bleed into the next race.
+  g_race_armed_sequence = 0U;
+  photons_memory_barrier();
+
+  photons_race_receive_value_t receive{};
+  (void)photons_race_receive_snapshot(receive);
+  const photons_race_launch_slot_t launch = g_photons_race_launch;
+
+  if (!launch.launch_surrogate_valid || !launch.anchor_valid ||
+      launch.anchor_dwt_cycles_per_second == 0U ||
+      launch.anchor_pps_count == 0U) {
     __builtin_trap();
   }
 
-  // Anchor the synthetic interval at the real physical loopback edge.  Only the
-  // start coordinate is moved.  The raw-lap handoff and downstream projection
-  // therefore exercise the normal PHOTONS path with a realistic tiny interval
-  // error while the actual TimePop spacing remains separately observable.
-  const uint32_t end_dwt = edge.dwt_at_edge;
-  const uint32_t raw_cycles = g_photons_emulator.synthetic_last_lap_cycles;
-  const uint32_t start_dwt = end_dwt - raw_cycles;
-  if (photons_raw_lap_enqueue(
-          start_dwt, end_dwt, raw_cycles, edge.pps_sequence)) {
-    g_photons_emulator.synthetic_lap_count++;
-  }
-  g_photons_emulator.synthetic_lap_ready = false;
-}
+  if (!receive.seen) {
+    g_photons_race.missed_count++;
+  } else {
+    if (receive.race_sequence != launch.sequence) __builtin_trap();
 
+    // Every valid interim flight endpoint must occur after the actual LD_ON LOW
+    // surrogate. At a 1 ms cadence the signed DWT difference is unambiguous even
+    // across a 32-bit DWT wrap. An early receive is evidence, not a measurement.
+    const uint32_t elapsed_from_cell_start =
+        receive.finish_dwt - launch.ld_on_start_dwt;
+    const int32_t signed_cycles =
+        (int32_t)(receive.finish_dwt - launch.launch_surrogate_dwt);
+    if (signed_cycles <= 0 ||
+        elapsed_from_cell_start > launch.cadence_cell_cycles) {
+      // Either the first edge preceded the actual LD_ON-low surrogate or a
+      // delayed foreground cadence left the receive arm open beyond its 1 ms
+      // cell. Preserve the injury as invalid endpoint testimony; never let it
+      // enter the flight Welford.
+      g_photons_race.invalid_endpoint_count++;
+    } else {
+      photons_raw_lap_record_t record{};
+      record.start_dwt = launch.launch_surrogate_dwt;
+      record.end_dwt = receive.finish_dwt;
+      record.raw_cycles = (uint32_t)signed_cycles;
+      record.pps_sequence = receive.pps_sequence;
+      record.anchor_valid = true;
+      record.anchor_dwt_at_pps_vclock =
+          launch.anchor_dwt_at_pps_vclock;
+      record.anchor_dwt_cycles_per_second =
+          launch.anchor_dwt_cycles_per_second;
+      record.anchor_pps_count = launch.anchor_pps_count;
 
-
-static void photons_emulator_emit_detector_edge(uint32_t hit_ordinal) {
-  // The ordinal is emulator intent only.  The resulting observation is still a
-  // real electrical edge on pin 34 whose timestamp belongs to process_interrupt.
-  g_photons_emulator.expected_hit_ordinal = hit_ordinal;
-  digitalWriteFast(PHOTONS_EMULATOR_EDGE_OUTPUT_PIN, HIGH);
-  digitalWriteFast(PHOTONS_EMULATOR_EDGE_OUTPUT_PIN, LOW);
-  g_photons_emulator.generated_edge_count++;
-}
-
-static void photons_emulator_emit_laser_pulse(void) {
-  // DWT runs at approximately 1.008 GHz, so twenty cycles is approximately
-  // 19.8 ns.  Measure the complete commanded HIGH/LOW transaction, not merely
-  // the busy-wait body, so REPORT shows the actual software pulse wall time.
-  const uint32_t pulse_start = ARM_DWT_CYCCNT;
-  digitalWriteFast(LD_ON_PIN, HIGH);
-  const uint32_t high_start = ARM_DWT_CYCCNT;
-  while ((uint32_t)(ARM_DWT_CYCCNT - high_start) <
-         PHOTONS_EMULATOR_LASER_PULSE_CYCLES) {
-  }
-  digitalWriteFast(LD_ON_PIN, LOW);
-  const uint32_t pulse_cycles = ARM_DWT_CYCCNT - pulse_start;
-
-  g_photons_emulator.laser_pulse_count++;
-  g_photons_emulator.last_laser_pulse_cycles = pulse_cycles;
-  if (pulse_cycles > g_photons_emulator.max_laser_pulse_cycles) {
-    g_photons_emulator.max_laser_pulse_cycles = pulse_cycles;
-  }
-}
-
-static void photons_emulator_begin_train(void) {
-  if (g_photons_emulator.train_count != 0U) {
-    g_photons_emulator.relaunch_count++;
+      if (photons_raw_lap_enqueue(record)) {
+        g_photons_race.completed_count++;
+      } else {
+        g_photons_race.enqueue_failure_count++;
+      }
+    }
   }
 
-  g_photons_emulator.train_count++;
-  g_photons_emulator.train_active = true;
-  g_photons_emulator.stage = photons_emulator_stage_t::WAIT_HIT2;
-  g_photons_emulator.expected_hit_ordinal = 0U;
-  g_photons_emulator.lap_start_dwt = 0U;
-  g_photons_emulator.previous_lap_endpoint_dwt = 0U;
-
-  photons_emulator_refresh_analog();
-
-  // Step 1: real laser pulse.
-  photons_emulator_emit_laser_pulse();
-
-  // Step 2: hit 1.  It remains a real pin-34 observation but is intentionally
-  // ignored as a lap endpoint by photons_emulator_observe_edge().
-  photons_emulator_emit_detector_edge(1U);
+  g_photons_race_launch = photons_race_launch_slot_t{};
+  photons_race_receive_publish(photons_race_receive_value_t{});
 }
 
-
-static void photons_emulator_cadence_tick(
+static void photons_race_cadence_tick(
     timepop_ctx_t* /*ctx*/,
     timepop_diag_t* /*diag*/,
     void* /*user_data*/) {
-  g_photons_emulator.cadence_tick_count++;
+  g_photons_race.cadence_tick_count++;
+  photons_race_finalize_previous();
 
-  switch (g_photons_emulator.stage) {
-    case photons_emulator_stage_t::IDLE:
-      // Do not begin a synthetic train until the normal PHOTONS projection ruler
-      // exists.  This avoids manufacturing a startup population that is known
-      // to be unprojectable.
-      if (!photons_emulator_projection_ready()) {
-        g_photons_emulator.projection_wait_count++;
-        return;
-      }
-      photons_emulator_begin_train();
-      return;
-
-    case photons_emulator_stage_t::WAIT_HIT2:
-      photons_emulator_refresh_analog();
-      photons_emulator_emit_detector_edge(2U);
-      g_photons_emulator.stage = photons_emulator_stage_t::WAIT_HIT3;
-      return;
-
-    case photons_emulator_stage_t::WAIT_HIT3:
-      photons_emulator_refresh_analog();
-      if (!photons_emulator_prepare_synthetic_lap()) return;
-      photons_emulator_emit_detector_edge(3U);
-      g_photons_emulator.stage = photons_emulator_stage_t::WAIT_HIT4;
-      return;
-
-    case photons_emulator_stage_t::WAIT_HIT4:
-      photons_emulator_refresh_analog();
-      if (!photons_emulator_prepare_synthetic_lap()) return;
-      photons_emulator_emit_detector_edge(4U);
-      g_photons_emulator.stage = photons_emulator_stage_t::WAIT_HIT5;
-      return;
-
-    case photons_emulator_stage_t::WAIT_HIT5:
-      photons_emulator_refresh_analog();
-      if (!photons_emulator_prepare_synthetic_lap()) return;
-      photons_emulator_emit_detector_edge(5U);
-      g_photons_emulator.train_active = false;
-      g_photons_emulator.stage = photons_emulator_stage_t::DEAD_LAP;
-      return;
-
-    case photons_emulator_stage_t::DEAD_LAP:
-      // This cadence cell deliberately emits no detector edge.  It represents
-      // the missing fourth lap, then starts the next train immediately.
-      g_photons_emulator.dead_lap_count++;
-      photons_emulator_begin_train();
-      return;
-
-    default:
-      g_photons_emulator.state_error_count++;
-      g_photons_emulator.train_active = false;
-      g_photons_emulator.expected_hit_ordinal = 0U;
-      g_photons_emulator.stage = photons_emulator_stage_t::IDLE;
-      return;
+  if (digitalRead(LD_ON_PIN) != LOW) {
+    // PHOTONS exclusively owns LD_ON while the race engine is live. Inhibit
+    // first for optical safety, then fail loudly on the ownership violation.
+    photons_laser_inhibit();
+    __builtin_trap();
   }
+
+  if (digitalRead(PHOTODIODE_EDGE_PIN) != LOW) {
+    g_photons_race.skipped_not_quiet_count++;
+    return;
+  }
+
+  photons_projection_anchor_value_t anchor{};
+  if (!photons_projection_anchor_snapshot(anchor) || !anchor.valid ||
+      anchor.dwt_cycles_per_second == 0U || anchor.pps_count == 0U) {
+    g_photons_race.skipped_projection_count++;
+    return;
+  }
+
+  uint32_t target_high_cycles = 0U;
+  uint32_t cadence_cell_cycles = 0U;
+  if (!photons_ns_to_dwt_cycles(
+          PHOTONS_RACE_PULSE_NS,
+          anchor.dwt_cycles_per_second,
+          target_high_cycles) ||
+      !photons_ns_to_dwt_cycles(
+          PHOTONS_RACE_CADENCE_NS,
+          anchor.dwt_cycles_per_second,
+          cadence_cell_cycles) ||
+      target_high_cycles >= cadence_cell_cycles) {
+    __builtin_trap();
+  }
+
+  g_photons_race.sequence++;
+  if (g_photons_race.sequence == 0U) g_photons_race.sequence++;
+  const uint32_t race_sequence = g_photons_race.sequence;
+
+  photons_race_receive_publish(photons_race_receive_value_t{});
+  photons_race_launch_slot_t launch{};
+  launch.valid = true;
+  launch.sequence = race_sequence;
+  launch.target_high_cycles = target_high_cycles;
+  launch.cadence_cell_cycles = cadence_cell_cycles;
+  launch.anchor_valid = true;
+  launch.anchor_dwt_at_pps_vclock = anchor.dwt_at_pps_vclock;
+  launch.anchor_dwt_cycles_per_second = anchor.dwt_cycles_per_second;
+  launch.anchor_pps_count = anchor.pps_count;
+
+  // Publish all launch facts the foreground owns before opening the receive arm.
+  // The ISR never reads this structure, but this ordering makes the ownership
+  // boundary explicit and prevents future refactors from creating a half-launch.
+  launch.ld_on_start_dwt = ARM_DWT_CYCCNT;
+  g_photons_race_launch = launch;
+  photons_memory_barrier();
+  g_race_armed_sequence = race_sequence;
+  photons_memory_barrier();
+
+  digitalWriteFast(LD_ON_PIN, HIGH);
+  const uint32_t high_start = ARM_DWT_CYCCNT;
+  while ((uint32_t)(ARM_DWT_CYCCNT - high_start) < target_high_cycles) {
+  }
+  digitalWriteFast(LD_ON_PIN, LOW);
+  const uint32_t ld_on_low_dwt = ARM_DWT_CYCCNT;
+
+  g_photons_race_launch.launch_surrogate_dwt = ld_on_low_dwt;
+  g_photons_race_launch.pulse_wall_cycles =
+      ld_on_low_dwt - g_photons_race_launch.ld_on_start_dwt;
+  if (g_photons_race_launch.pulse_wall_cycles >= cadence_cell_cycles) {
+    // LD_ON is already LOW here. A pulse transaction that consumes the whole
+    // cell is a scheduler/timing invariant failure, not a usable optical race.
+    __builtin_trap();
+  }
+  photons_memory_barrier();
+  g_photons_race_launch.launch_surrogate_valid = true;
+  g_photons_race.attempt_count++;
 }
 
-
-static void photons_emulator_prepare(void) {
-  g_photons_emulator = photons_emulator_state_t{};
-
-  pinMode(PHOTONS_EMULATOR_EDGE_OUTPUT_PIN, OUTPUT);
-  digitalWriteFast(PHOTONS_EMULATOR_EDGE_OUTPUT_PIN, LOW);
-  photons_emulator_refresh_analog();
-  g_photons_emulator.initialized = true;
+static void photons_race_prepare(void) {
+  g_race_armed_sequence = 0U;
+  g_photons_race = photons_race_runtime_t{};
+  g_photons_race_launch = photons_race_launch_slot_t{};
+  g_photons_race_receive.generation = 0U;
+  g_photons_race_receive.value = photons_race_receive_value_t{};
+  g_photons_race.initialized = true;
 }
 
-static void photons_emulator_start(void) {
-  g_photons_emulator.cadence_timer_arm_count++;
-  g_photons_emulator.cadence_timer =
-      timepop_arm(
-          PHOTONS_EMULATOR_CADENCE_NS,
-          true,
-          photons_emulator_cadence_tick,
-          nullptr,
-          "PHOTONS_EMULATOR_CADENCE");
-  if (g_photons_emulator.cadence_timer == TIMEPOP_INVALID_HANDLE) {
-    g_photons_emulator.cadence_timer_arm_fail_count++;
+static void photons_race_start(void) {
+  if (!g_photons_race.initialized ||
+      g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE) {
+    __builtin_trap();
+  }
+  if (digitalRead(LD_ON_PIN) != LOW) {
+    photons_laser_inhibit();
+    __builtin_trap();
+  }
+
+  g_photons_race.cadence_timer = timepop_arm(
+      PHOTONS_RACE_CADENCE_NS,
+      true,
+      photons_race_cadence_tick,
+      nullptr,
+      "PHOTONS_RACE_1KHZ");
+  if (g_photons_race.cadence_timer == TIMEPOP_INVALID_HANDLE) {
+    __builtin_trap();
   }
 }
 
@@ -2244,11 +2176,9 @@ static photons_device_snapshot_t photons_device_snapshot(void) {
   // from process_interrupt's PHOTODIODE edge capture.
   out.photodiode_edge_level = digitalRead(PHOTODIODE_EDGE_PIN);
 
-  // Preserve synthetic PD OUT telemetry only in emulator mode.  Physical PD200T
-  // commissioning reads the actual analog photodetector output on pin 38/A14.
-  out.photodiode_analog_raw = PHOTONS_EMULATOR_ENABLED
-      ? g_photons_emulator.analog_raw
-      : analogRead(PHOTODIODE_ANALOG_PIN);
+  // Pin 38/A14 is the real PD200T PD OUT commissioning telemetry. Timing
+  // authority remains the independent pin-34 comparator edge.
+  out.photodiode_analog_raw = analogRead(PHOTODIODE_ANALOG_PIN);
   out.photodiode_analog_v = photons_adc_voltage(out.photodiode_analog_raw);
 
   return out;
@@ -2296,6 +2226,26 @@ static photons_fragment_snapshot_t g_last_photons_fragment{};
 static uint32_t g_publish_count = 0;
 static uint32_t g_publish_reject_count = 0;
 static uint32_t g_last_published_edge_count = 0;
+static uint64_t g_last_fragment_race_cadence_tick_count = 0ULL;
+static uint64_t g_last_fragment_race_attempt_count = 0ULL;
+static uint64_t g_last_fragment_race_completed_count = 0ULL;
+static uint64_t g_last_fragment_race_missed_count = 0ULL;
+static uint64_t g_last_fragment_race_skipped_not_quiet_count = 0ULL;
+static uint64_t g_last_fragment_race_skipped_projection_count = 0ULL;
+static uint64_t g_last_fragment_race_invalid_endpoint_count = 0ULL;
+static uint64_t g_last_fragment_race_enqueue_failure_count = 0ULL;
+
+// process_interrupt injury counters are boot-lifetime forensic testimony.
+// Fresh physical ancestry snapshots their origins; rolling custody judges only
+// the unsigned deltas from this boundary so pre-publication startup edges remain
+// visible without poisoning every later PHOTONS fragment.
+struct photons_interrupt_ancestry_t {
+  bool valid = false;
+  uint32_t callback_missing_origin = 0U;
+  uint32_t inactive_edge_origin = 0U;
+};
+
+static photons_interrupt_ancestry_t g_interrupt_ancestry{};
 
 static bool g_initialized = false;
 static bool g_subscription_ok = false;
@@ -2307,84 +2257,93 @@ static inline void photons_compiler_barrier(void) {
   __asm__ volatile("" ::: "memory");
 }
 
-static void photons_emulator_observe_edge(
-    const interrupt_photodiode_edge_t& edge) {
-  if (!PHOTONS_EMULATOR_ENABLED) return;
+// -----------------------------------------------------------------------------
+// One-shot physical pulse testimony
+// -----------------------------------------------------------------------------
+//
+// Foreground owns launch authorship. process_interrupt owns the pin-34
+// first-instruction DWT coordinate. PHOTONS admits only the first comparator
+// RISING edge after a PULSE arm. The ISR stores only scalar edge facts; any
+// GNSS projection is deferred to foreground reporting. Each new PULSE replaces
+// the prior one-shot report state.
+//
+struct photons_pulse_launch_state_t {
+  bool     valid = false;
+  uint32_t sequence = 0U;
+  uint64_t requested_ns = 0ULL;
+  uint32_t target_high_cycles = 0U;
+  uint32_t start_dwt = 0U;
+  bool     start_gnss_valid = false;
+  uint64_t start_gnss_ns = 0ULL;
+  uint32_t pulse_wall_cycles = 0U;
+  uint32_t callback_count_start = 0U;
+};
 
-  const uint32_t hit = g_photons_emulator.expected_hit_ordinal;
-  g_photons_emulator.expected_hit_ordinal = 0U;
+struct photons_pulse_receive_value_t {
+  bool     seen = false;
+  uint32_t pulse_sequence = 0U;
+  uint32_t edge_sequence = 0U;
+  uint32_t pps_sequence = 0U;
+  uint32_t finish_dwt = 0U;
+};
 
-  switch (hit) {
-    case 1U:
-      g_photons_emulator.hit1_count++;
-      // Deliberately ignored for lap measurement.
-      return;
+struct photons_pulse_receive_state_t {
+  volatile uint32_t generation = 0U;
+  photons_pulse_receive_value_t value{};
+};
 
-    case 2U:
-      g_photons_emulator.hit2_count++;
-      g_photons_emulator.lap_start_count++;
-      g_photons_emulator.lap_start_dwt = edge.dwt_at_edge;
-      g_photons_emulator.previous_lap_endpoint_dwt = edge.dwt_at_edge;
-      return;
+static photons_pulse_launch_state_t g_last_pulse_launch{};
+static photons_pulse_receive_state_t g_last_pulse_receive{};
+static volatile uint32_t g_pulse_armed_sequence = 0U;
+static uint32_t g_pulse_sequence = 0U;
 
-    case 3U:
-      g_photons_emulator.hit3_count++;
-      if (g_photons_emulator.previous_lap_endpoint_dwt == 0U) {
-        g_photons_emulator.unexpected_edge_count++;
-        return;
-      }
-      {
-        const uint32_t start_dwt =
-            g_photons_emulator.previous_lap_endpoint_dwt;
-        const uint32_t raw_cycles = edge.dwt_at_edge - start_dwt;
-        g_photons_emulator.lap1_last_cycles = raw_cycles;
-        photons_emulator_enqueue_synthetic_lap(edge);
-      }
-      g_photons_emulator.previous_lap_endpoint_dwt = edge.dwt_at_edge;
-      g_photons_emulator.lap1_complete_count++;
-      return;
+static void photons_pulse_receive_publish(
+    const photons_pulse_receive_value_t& value) {
+  g_last_pulse_receive.generation++;
+  photons_compiler_barrier();
+  g_last_pulse_receive.value = value;
+  photons_compiler_barrier();
+  g_last_pulse_receive.generation++;
+}
 
-    case 4U:
-      g_photons_emulator.hit4_count++;
-      if (g_photons_emulator.previous_lap_endpoint_dwt == 0U) {
-        g_photons_emulator.unexpected_edge_count++;
-        return;
-      }
-      {
-        const uint32_t start_dwt =
-            g_photons_emulator.previous_lap_endpoint_dwt;
-        const uint32_t raw_cycles = edge.dwt_at_edge - start_dwt;
-        g_photons_emulator.lap2_last_cycles = raw_cycles;
-        photons_emulator_enqueue_synthetic_lap(edge);
-      }
-      g_photons_emulator.previous_lap_endpoint_dwt = edge.dwt_at_edge;
-      g_photons_emulator.lap2_complete_count++;
-      return;
+static bool photons_pulse_receive_snapshot(
+    photons_pulse_receive_value_t* out) {
+  if (!out) return false;
 
-    case 5U:
-      g_photons_emulator.hit5_count++;
-      if (g_photons_emulator.previous_lap_endpoint_dwt == 0U) {
-        g_photons_emulator.unexpected_edge_count++;
-        return;
-      }
-      {
-        const uint32_t start_dwt =
-            g_photons_emulator.previous_lap_endpoint_dwt;
-        const uint32_t raw_cycles = edge.dwt_at_edge - start_dwt;
-        g_photons_emulator.lap3_last_cycles = raw_cycles;
-        photons_emulator_enqueue_synthetic_lap(edge);
-      }
-      g_photons_emulator.previous_lap_endpoint_dwt = edge.dwt_at_edge;
-      g_photons_emulator.lap3_complete_count++;
-      return;
+  for (;;) {
+    const uint32_t before = g_last_pulse_receive.generation;
+    if (before & 1U) continue;
 
-    default:
-      // A physical photodiode edge without an emulator-authored role is still
-      // preserved by the ordinary PHOTONS capture path below.  It is merely
-      // unexpected with respect to this temporary state machine.
-      g_photons_emulator.unexpected_edge_count++;
-      return;
+    photons_compiler_barrier();
+    const photons_pulse_receive_value_t snapshot =
+        g_last_pulse_receive.value;
+    photons_compiler_barrier();
+
+    const uint32_t after = g_last_pulse_receive.generation;
+    if (before == after && !(after & 1U)) {
+      *out = snapshot;
+      return true;
+    }
   }
+}
+
+static void photons_pulse_observe_edge(
+    const interrupt_photodiode_edge_t& edge) {
+  const uint32_t pulse_sequence = g_pulse_armed_sequence;
+  if (pulse_sequence == 0U) return;
+
+  // First eligible RISING edge wins. Clear the latch before projection so
+  // comparator chatter cannot overwrite the first-return testimony.
+  g_pulse_armed_sequence = 0U;
+  photons_compiler_barrier();
+
+  photons_pulse_receive_value_t value{};
+  value.seen = true;
+  value.pulse_sequence = pulse_sequence;
+  value.edge_sequence = edge.sequence;
+  value.pps_sequence = edge.pps_sequence;
+  value.finish_dwt = edge.dwt_at_edge;
+  photons_pulse_receive_publish(value);
 }
 
 
@@ -2397,13 +2356,14 @@ static void photons_on_photodiode_edge(
     const interrupt_photodiode_diag_t& /*diag*/,
     void* /*user_data*/) {
 
+  photons_race_observe_edge(edge);
+  photons_pulse_observe_edge(edge);
+
   // Begin seqlock write: odd generation means foreground must retry.
   g_photons_live.generation++;
   photons_compiler_barrier();
 
   photons_toy_capture_t& c = g_photons_live.capture;
-
-  photons_emulator_observe_edge(edge);
 
   c.edge_count++;
   c.last_edge_sequence = edge.sequence;
@@ -2495,6 +2455,7 @@ bool photons_fragment_snapshot(photons_fragment_snapshot_t* out) {
 // diagnostics do not belong on the small DTCM stack.
 static Payload g_photons_fragment_root DMAMEM;
 static Payload g_photons_fragment_instrument DMAMEM;
+static Payload g_photons_fragment_race DMAMEM;
 static Payload g_photons_fragment_raw_cycles DMAMEM;
 static Payload g_photons_fragment_projection DMAMEM;
 static Payload g_photons_fragment_science DMAMEM;
@@ -2543,6 +2504,7 @@ static void photons_payload_add_ppb_value(
   obj.clear();
   obj.add("sample_count", value.sample_count);
   obj.add("ppb", toFixedDecimal(value.ppb, 6));
+  obj.add("residual_ns", toFixedDecimal(value.residual_ns, 6));
   parent.add_object(name, obj);
   obj.clear();
 }
@@ -2582,6 +2544,7 @@ static Payload& photons_fragment_payload(
     const photons_fragment_snapshot_t& f) {
   Payload& root = g_photons_fragment_root;
   Payload& instrument = g_photons_fragment_instrument;
+  Payload& race = g_photons_fragment_race;
   Payload& raw = g_photons_fragment_raw_cycles;
   Payload& projection = g_photons_fragment_projection;
   Payload& science = g_photons_fragment_science;
@@ -2599,6 +2562,7 @@ static Payload& photons_fragment_payload(
 
   root.clear();
   instrument.clear();
+  race.clear();
   raw.clear();
   projection.clear();
   science.clear();
@@ -2622,15 +2586,46 @@ static Payload& photons_fragment_payload(
   instrument.add("snapshot_ok", f.snapshot_ok);
   instrument.add("valid", f.valid);
   instrument.add("fragment_period_ns", f.fragment_period_ns);
-  instrument.add("source",
-                 PHOTONS_EMULATOR_ENABLED ? "EMULATOR" : "PD200T");
+  instrument.add("source", "PD200T_REAL_RACE");
   instrument.add("edge_count_total", f.edge_count_total);
   instrument.add("edges_this_fragment", f.edges_this_fragment);
+  // Legacy wire fields remain zero while downstream callers migrate naming.
   instrument.add("train_count", f.train_count);
   instrument.add("dead_lap_count", f.dead_lap_count);
   instrument.add("raw_lap_count", f.raw_lap_count);
   instrument.add("projected_laps_this_fragment",
                  f.projected_laps_this_fragment);
+
+  race.add("schema", "PHOTONS_RACE_V1");
+  race.add("cadence_hz", f.race_cadence_hz);
+  race.add("cadence_ns", PHOTONS_RACE_CADENCE_NS);
+  race.add("pulse_ns", f.race_pulse_ns);
+  race.add("launch_surrogate", "LD_ON_FALLING_EDGE");
+  race.add("flight_interpretation", "ESTIMATED");
+  race.add("cadence_tick_count_total", f.race_cadence_tick_count_total);
+  race.add("cadence_ticks_this_fragment", f.race_cadence_ticks_this_fragment);
+  race.add("attempt_count_total", f.race_attempt_count_total);
+  race.add("attempts_this_fragment", f.race_attempts_this_fragment);
+  race.add("completed_count_total", f.race_completed_count_total);
+  race.add("completed_this_fragment", f.race_completed_this_fragment);
+  race.add("missed_count_total", f.race_missed_count_total);
+  race.add("missed_this_fragment", f.race_missed_this_fragment);
+  race.add("skipped_not_quiet_total", f.race_skipped_not_quiet_total);
+  race.add("skipped_not_quiet_this_fragment",
+           f.race_skipped_not_quiet_this_fragment);
+  race.add("skipped_projection_total", f.race_skipped_projection_total);
+  race.add("skipped_projection_this_fragment",
+           f.race_skipped_projection_this_fragment);
+  race.add("invalid_endpoint_total", f.race_invalid_endpoint_total);
+  race.add("invalid_endpoint_this_fragment",
+           f.race_invalid_endpoint_this_fragment);
+  race.add("enqueue_failure_total", f.race_enqueue_failure_total);
+  race.add("enqueue_failure_this_fragment",
+           f.race_enqueue_failure_this_fragment);
+  photons_payload_add_welford(
+      race, "flight_ns", f.race_flight_this_fragment);
+  instrument.add_object("race", race);
+  race.clear();
 
   raw.add("valid", f.raw_cycles.valid);
   raw.add("completed_lap_count", f.raw_cycles.completed_lap_count);
@@ -2774,9 +2769,14 @@ static Payload& photons_fragment_payload(
   science.clear();
 
   stats.add("schema", "PHOTONS_INSTRUMENT_STATS_V1");
+  stats.add("ppb_semantics", "LAP_BASELINE_NS_OFFSET_V1");
   stats.add("valid", f.stats.valid);
   stats.add("reset_count", f.stats.reset_count);
   stats.add("update_count", f.stats.update_count);
+  stats.add("lap_baseline_fs", f.stats.lap_baseline_fs);
+  stats.add("lap_baseline_ns",
+            toFixedDecimal((double)f.stats.lap_baseline_fs / 1000000.0, 6));
+  // Deprecated compatibility mirror; reference arithmetic never uses this field.
   stats.add("standard_lap_ps", f.stats.standard_lap_ps);
   stats.add("standard_lap_ns",
             toFixedDecimal((double)f.stats.standard_lap_ps / 1000.0, 3));
@@ -2785,6 +2785,8 @@ static Payload& photons_fragment_payload(
   stats.add("lap_count", f.stats.lap_count);
   stats.add("total_lap_gnss_ns", f.stats.total_lap_gnss_ns);
   stats.add("mean_lap_ns", toFixedDecimal(f.stats.mean_lap_ns, 6));
+  stats.add("race_count", f.stats.lap_count);
+  stats.add("mean_flight_ns", toFixedDecimal(f.stats.mean_lap_ns, 6));
   photons_payload_add_welford(
       stats, "lap_time", f.stats.lap_time_welford);
 
@@ -2856,8 +2858,8 @@ static Payload& photons_fragment_payload(
                  toFixedDecimal(f.baseline.baseline_mean_lap_ns, 6));
   }
   if (f.baseline.residual_valid) {
-    baseline.add("mean_residual_ps",
-                 toFixedDecimal(f.baseline.mean_residual_ps, 3));
+    baseline.add("mean_residual_ns",
+                 toFixedDecimal(f.baseline.mean_residual_ns, 6));
   }
   instrument.add_object("baseline", baseline);
   baseline.clear();
@@ -2898,8 +2900,18 @@ static Payload& photons_fragment_payload(
   interrupt.add("callback_count", f.interrupt_callback_count);
   interrupt.add("callback_missing_count",
                 f.interrupt_callback_missing_count);
+  interrupt.add("ancestry_baseline_valid",
+                f.interrupt_ancestry_baseline_valid);
+  interrupt.add("callback_missing_count_origin",
+                f.interrupt_callback_missing_origin);
+  interrupt.add("callback_missing_count_since_ancestry",
+                f.interrupt_callback_missing_since_ancestry);
   interrupt.add("inactive_edge_count",
                 f.interrupt_inactive_edge_count);
+  interrupt.add("inactive_edge_count_origin",
+                f.interrupt_inactive_edge_origin);
+  interrupt.add("inactive_edge_count_since_ancestry",
+                f.interrupt_inactive_edge_since_ancestry);
   interrupt.add("source_pin", f.interrupt_source_pin);
   interrupt.add("last_callback_wall_cycles",
                 f.interrupt_last_callback_wall_cycles);
@@ -2926,8 +2938,13 @@ static Payload& photons_fragment_payload(
     if (f.campaign.lap_count != 0ULL) {
       campaign_stats.add("mean_lap_ns",
                          toFixedDecimal(f.campaign.mean_lap_ns, 6));
+      campaign_stats.add("race_count", f.campaign.lap_count);
+      campaign_stats.add("mean_flight_ns",
+                         toFixedDecimal(f.campaign.mean_lap_ns, 6));
       campaign_stats.add("sample_count", f.campaign.ppb.sample_count);
       campaign_stats.add("ppb", toFixedDecimal(f.campaign.ppb.ppb, 6));
+      campaign_stats.add("residual_ns",
+                         toFixedDecimal(f.campaign.ppb.residual_ns, 6));
     }
     campaign.add_object("stats", campaign_stats);
     campaign_stats.clear();
@@ -2947,7 +2964,7 @@ static void photons_fragment_tick(
   // PHOTONS_FRAGMENT is ready-to-eat testimony.  Until the Pi supplies the
   // required standard lap, PHOTONS has no authority to publish interpreted
   // optical statistics.
-  if (!g_standard_lap_configured ||
+  if (!g_standard_lap_configured || g_lap_baseline_fs == 0ULL ||
       !g_photons_recovery.publication_started) return;
 
   // Refresh the PHOTONS-owned immutable copy for laps that will arrive after
@@ -2959,7 +2976,16 @@ static void photons_fragment_tick(
   if (!photons_toy_capture_snapshot(&capture)) return;
 
   interrupt_photodiode_diag_t interrupt_diag{};
-  (void)interrupt_photodiode_snapshot(&interrupt_diag);
+  if (!interrupt_photodiode_snapshot(&interrupt_diag) ||
+      !g_interrupt_ancestry.valid) {
+    __builtin_trap();
+  }
+  const uint32_t interrupt_callback_missing_since_ancestry =
+      interrupt_diag.callback_missing_count -
+      g_interrupt_ancestry.callback_missing_origin;
+  const uint32_t interrupt_inactive_edge_since_ancestry =
+      interrupt_diag.inactive_edge_count -
+      g_interrupt_ancestry.inactive_edge_origin;
 
   const photons_fragment_drain_result_t drain =
       photons_drain_raw_laps();
@@ -2985,10 +3011,47 @@ static void photons_fragment_tick(
   fragment.edges_this_fragment =
       capture.edge_count - g_last_published_edge_count;
 
-  fragment.train_count = g_photons_emulator.train_count;
-  fragment.dead_lap_count = g_photons_emulator.dead_lap_count;
+  fragment.train_count = 0U;
+  fragment.dead_lap_count = 0U;
   fragment.raw_lap_count = g_raw_cycles_state.completed_lap_count;
   fragment.projected_laps_this_fragment = drain.projected_laps;
+
+  fragment.race_cadence_hz = PHOTONS_RACE_CADENCE_HZ;
+  fragment.race_pulse_ns = PHOTONS_RACE_PULSE_NS;
+  fragment.race_cadence_tick_count_total = g_photons_race.cadence_tick_count;
+  fragment.race_cadence_ticks_this_fragment = (uint32_t)(
+      g_photons_race.cadence_tick_count -
+      g_last_fragment_race_cadence_tick_count);
+  fragment.race_attempt_count_total = g_photons_race.attempt_count;
+  fragment.race_attempts_this_fragment = (uint32_t)(
+      g_photons_race.attempt_count - g_last_fragment_race_attempt_count);
+  fragment.race_completed_count_total = g_photons_race.completed_count;
+  fragment.race_completed_this_fragment = (uint32_t)(
+      g_photons_race.completed_count - g_last_fragment_race_completed_count);
+  fragment.race_missed_count_total = g_photons_race.missed_count;
+  fragment.race_missed_this_fragment = (uint32_t)(
+      g_photons_race.missed_count - g_last_fragment_race_missed_count);
+  fragment.race_skipped_not_quiet_total =
+      g_photons_race.skipped_not_quiet_count;
+  fragment.race_skipped_not_quiet_this_fragment = (uint32_t)(
+      g_photons_race.skipped_not_quiet_count -
+      g_last_fragment_race_skipped_not_quiet_count);
+  fragment.race_skipped_projection_total =
+      g_photons_race.skipped_projection_count;
+  fragment.race_skipped_projection_this_fragment = (uint32_t)(
+      g_photons_race.skipped_projection_count -
+      g_last_fragment_race_skipped_projection_count);
+  fragment.race_invalid_endpoint_total =
+      g_photons_race.invalid_endpoint_count;
+  fragment.race_invalid_endpoint_this_fragment = (uint32_t)(
+      g_photons_race.invalid_endpoint_count -
+      g_last_fragment_race_invalid_endpoint_count);
+  fragment.race_enqueue_failure_total = g_photons_race.enqueue_failure_count;
+  fragment.race_enqueue_failure_this_fragment = (uint32_t)(
+      g_photons_race.enqueue_failure_count -
+      g_last_fragment_race_enqueue_failure_count);
+  fragment.race_flight_this_fragment =
+      photons_welford_snapshot(drain.projected_flight_welford);
 
   fragment.raw_cycles = g_raw_cycles_state;
   fragment.projection = g_projection_state;
@@ -2996,6 +3059,7 @@ static void photons_fragment_tick(
 
   fragment.stats.reset_count = g_photons_stats_reset_count;
   fragment.stats.update_count = ++g_photons_stats_update_count;
+  fragment.stats.lap_baseline_fs = g_lap_baseline_fs;
   fragment.stats.standard_lap_ps = g_standard_lap_ps;
   fragment.stats.lap_count = g_lap_time_welford.n;
   fragment.stats.total_lap_gnss_ns = g_total_lap_gnss_ns;
@@ -3012,12 +3076,13 @@ static void photons_fragment_tick(
 
   // A lawful one-second cumulative endpoint may contain zero accepted laps.
   // Ordinary SCIENCE_EXCLUDE observations therefore do not break rolling
-  // ancestry.  Actual custody loss does: raw-ring overflow or a missing/inactive
-  // PHOTODIODE callback clears the rolling history rather than bridging it.
+  // ancestry. Actual custody loss does: raw-ring overflow or a post-ancestry
+  // missing/inactive PHOTODIODE callback clears rolling history rather than
+  // bridging it. Boot-lifetime injury counters remain visible separately.
   const bool ppb_endpoint_admitted =
       !g_raw_lap_ring_data_loss &&
-      interrupt_diag.callback_missing_count == 0U &&
-      interrupt_diag.inactive_edge_count == 0U;
+      interrupt_callback_missing_since_ancestry == 0U &&
+      interrupt_inactive_edge_since_ancestry == 0U;
   photons_ppb_windows_note_endpoint(
       fragment.stats.update_count,
       ppb_endpoint_admitted,
@@ -3039,17 +3104,40 @@ static void photons_fragment_tick(
   // origin, exactly like CLOCKS campaign offsets.
   fragment.campaign = photons_campaign_snapshot(fragment.sequence);
 
-  // Baseline control/provenance is deliberately deferred.  False validity is
-  // part of the canonical schema rather than a fabricated zero baseline.
+  // LAP_BASELINE_NS is an operator-authored coordinate reference, independent
+  // of campaign-to-campaign baseline provenance. Re-reference the current exact
+  // accepted N/T without mutating any physical/statistical custody.
   fragment.baseline = photons_fragment_baseline_snapshot_t{};
+  fragment.baseline.present =
+      g_standard_lap_configured && g_lap_baseline_fs != 0ULL;
+  if (fragment.baseline.present) {
+    fragment.baseline.baseline_mean_lap_ns =
+        (double)g_lap_baseline_fs / 1000000.0;
+    if (fragment.stats.lap_count != 0ULL) {
+      fragment.baseline.residual_valid = true;
+      fragment.baseline.mean_residual_ns =
+          photons_residual_ns_from_population(
+              fragment.stats.total_lap_gnss_ns, fragment.stats.lap_count);
+    }
+  }
   fragment.recovery = photons_recovery_snapshot();
 
   fragment.interrupt_irq_count = interrupt_diag.irq_count;
   fragment.interrupt_callback_count = interrupt_diag.callback_count;
   fragment.interrupt_callback_missing_count =
       interrupt_diag.callback_missing_count;
+  fragment.interrupt_ancestry_baseline_valid =
+      g_interrupt_ancestry.valid;
+  fragment.interrupt_callback_missing_origin =
+      g_interrupt_ancestry.callback_missing_origin;
+  fragment.interrupt_callback_missing_since_ancestry =
+      interrupt_callback_missing_since_ancestry;
   fragment.interrupt_inactive_edge_count =
       interrupt_diag.inactive_edge_count;
+  fragment.interrupt_inactive_edge_origin =
+      g_interrupt_ancestry.inactive_edge_origin;
+  fragment.interrupt_inactive_edge_since_ancestry =
+      interrupt_inactive_edge_since_ancestry;
   fragment.interrupt_source_pin = interrupt_diag.source_pin;
   fragment.interrupt_last_callback_wall_cycles =
       interrupt_diag.last_callback_wall_cycles;
@@ -3059,8 +3147,9 @@ static void photons_fragment_tick(
   fragment.valid =
       fragment.stats.valid &&
       fragment.projection.anchor_cache_valid &&
-      fragment.interrupt_callback_missing_count == 0U &&
-      fragment.interrupt_inactive_edge_count == 0U;
+      fragment.interrupt_ancestry_baseline_valid &&
+      fragment.interrupt_callback_missing_since_ancestry == 0U &&
+      fragment.interrupt_inactive_edge_since_ancestry == 0U;
 
   // Keep the historical toy snapshot alive only as a compatibility shell.
   photons_toy_fragment_t toy{};
@@ -3086,6 +3175,18 @@ static void photons_fragment_tick(
   g_last_fragment = toy;
   g_last_photons_fragment = fragment;
   g_last_published_edge_count = capture.edge_count;
+  g_last_fragment_race_cadence_tick_count = g_photons_race.cadence_tick_count;
+  g_last_fragment_race_attempt_count = g_photons_race.attempt_count;
+  g_last_fragment_race_completed_count = g_photons_race.completed_count;
+  g_last_fragment_race_missed_count = g_photons_race.missed_count;
+  g_last_fragment_race_skipped_not_quiet_count =
+      g_photons_race.skipped_not_quiet_count;
+  g_last_fragment_race_skipped_projection_count =
+      g_photons_race.skipped_projection_count;
+  g_last_fragment_race_invalid_endpoint_count =
+      g_photons_race.invalid_endpoint_count;
+  g_last_fragment_race_enqueue_failure_count =
+      g_photons_race.enqueue_failure_count;
 
   Payload& payload = photons_fragment_payload(fragment);
   if (publish("PHOTONS_FRAGMENT", payload)) {
@@ -3119,7 +3220,6 @@ static void photons_recovery_clear_physical_ancestry(void) {
   g_photons_lap_science_seed_pending = photons_lap_science_candidate_t{};
   g_previous_fragment_mean_cycles_valid = false;
   g_previous_fragment_mean_cycles = 0.0;
-  __atomic_store_n(&g_photons_problem_injection_armed, 0U, __ATOMIC_RELEASE);
 
   g_photons_live.generation++;
   photons_compiler_barrier();
@@ -3135,23 +3235,42 @@ static void photons_recovery_clear_physical_ancestry(void) {
   photons_compiler_barrier();
   g_photons_live.generation++;
 
-  photons_emulator_prepare();
+  photons_race_prepare();
   g_projection_anchor_cache = photons_projection_anchor_cache_t{};
   photons_projection_anchor_refresh();
+
+  interrupt_photodiode_diag_t interrupt_diag{};
+  g_interrupt_ancestry = photons_interrupt_ancestry_t{};
+  if (!interrupt_photodiode_snapshot(&interrupt_diag)) __builtin_trap();
+  g_interrupt_ancestry.callback_missing_origin =
+      interrupt_diag.callback_missing_count;
+  g_interrupt_ancestry.inactive_edge_origin =
+      interrupt_diag.inactive_edge_count;
+  photons_memory_barrier();
+  g_interrupt_ancestry.valid = true;
 
   photons_toy_capture_t capture{};
   if (!photons_toy_capture_snapshot(&capture)) __builtin_trap();
   g_last_published_edge_count = capture.edge_count;
+  g_last_fragment_race_cadence_tick_count = 0ULL;
+  g_last_fragment_race_attempt_count = 0ULL;
+  g_last_fragment_race_completed_count = 0ULL;
+  g_last_fragment_race_missed_count = 0ULL;
+  g_last_fragment_race_skipped_not_quiet_count = 0ULL;
+  g_last_fragment_race_skipped_projection_count = 0ULL;
+  g_last_fragment_race_invalid_endpoint_count = 0ULL;
+  g_last_fragment_race_enqueue_failure_count = 0ULL;
   g_last_fragment = photons_toy_fragment_t{};
   g_last_photons_fragment = photons_fragment_snapshot_t{};
 }
 
 
 static void photons_start_publication(void) {
-  if (!g_standard_lap_configured || g_standard_lap_ps == 0ULL ||
+  if (!g_standard_lap_configured || g_lap_baseline_fs == 0ULL ||
       g_photons_recovery.publication_started ||
       g_fragment_timer != TIMEPOP_INVALID_HANDLE ||
-      !g_photons_ppb_previous_endpoint_valid) {
+      !g_photons_ppb_previous_endpoint_valid ||
+      !g_interrupt_ancestry.valid) {
     __builtin_trap();
   }
 
@@ -3164,9 +3283,12 @@ static void photons_start_publication(void) {
   if (g_fragment_timer == TIMEPOP_INVALID_HANDLE) __builtin_trap();
 
   g_photons_recovery.publication_started = true;
-  if (PHOTONS_EMULATOR_ENABLED) {
-    photons_emulator_start();
-  }
+  // A commissioning PULSE may have been armed before recovery/publication. It
+  // has no authority to consume an edge once the recurring race engine starts.
+  g_pulse_armed_sequence = 0U;
+  photons_pulse_receive_publish(photons_pulse_receive_value_t{});
+  g_last_pulse_launch = photons_pulse_launch_state_t{};
+  photons_race_start();
 }
 
 
@@ -3184,10 +3306,20 @@ FLASHMEM void process_photons_init(void) {
   g_publish_count = 0U;
   g_publish_reject_count = 0U;
   g_last_published_edge_count = 0U;
+  g_last_fragment_race_cadence_tick_count = 0ULL;
+  g_last_fragment_race_attempt_count = 0ULL;
+  g_last_fragment_race_completed_count = 0ULL;
+  g_last_fragment_race_missed_count = 0ULL;
+  g_last_fragment_race_skipped_not_quiet_count = 0ULL;
+  g_last_fragment_race_skipped_projection_count = 0ULL;
+  g_last_fragment_race_invalid_endpoint_count = 0ULL;
+  g_last_fragment_race_enqueue_failure_count = 0ULL;
+  g_interrupt_ancestry = photons_interrupt_ancestry_t{};
   g_fragment_timer = TIMEPOP_INVALID_HANDLE;
   g_photons_recovery_protocol = photons_recovery_protocol_t{};
   g_photons_recovery = photons_recovery_runtime_t{};
   g_standard_lap_configured = false;
+  g_lap_baseline_fs = 0ULL;
   g_standard_lap_ps = 0ULL;
   g_photons_campaign_state = photons_campaign_state_t::STOPPED;
   g_photons_campaign_name[0] = '\0';
@@ -3203,10 +3335,6 @@ FLASHMEM void process_photons_init(void) {
   g_photons_flash_cut_request_count = 0U;
   g_photons_flash_cut_commit_count = 0U;
   g_photons_flash_cut_reject_count = 0U;
-  __atomic_store_n(&g_photons_problem_injection_armed, 0U, __ATOMIC_RELEASE);
-  g_photons_problem_injection_arm_count = 0U;
-  g_photons_problem_injection_fire_count = 0U;
-  g_photons_problem_injection_last_extra_cycles = 0U;
 
   g_projection_anchor_cache = photons_projection_anchor_cache_t{};
   g_raw_lap_ring_write = 0U;
@@ -3233,7 +3361,7 @@ FLASHMEM void process_photons_init(void) {
   g_previous_fragment_mean_cycles_valid = false;
   g_previous_fragment_mean_cycles = 0.0;
 
-  photons_emulator_prepare();
+  photons_race_prepare();
   photons_laser_initialize_hardware();
   photons_emit_laser_initialization_event();
 
@@ -3246,15 +3374,15 @@ FLASHMEM void process_photons_init(void) {
       g_subscription_ok &&
       interrupt_start(interrupt_subscriber_kind_t::PHOTODIODE);
 
-  // Prime the PHOTONS-owned projection cache before the emulator begins.  TIME
-  // may still be initializing; invalidity is preserved and early laps are
-  // rejected rather than projected through an invented ruler.
+  // Prime the PHOTONS-owned projection cache before the race engine begins. TIME
+  // may still be initializing; invalidity is preserved and early cadence cells
+  // are skipped rather than projected through an invented ruler.
   photons_projection_anchor_refresh();
 
-  // The fragment publisher and temporary emulator are intentionally not started
-  // here.  SET_STANDARD_LAP_NS installs only the immutable reference.  A later
+  // The fragment publisher and real race cadence are intentionally not started
+  // here. SET_LAP_BASELINE_NS installs the current operator reference. A later
   // RECOVERY_COMMIT or RECOVERY_COLD_START establishes the statistical origin,
-  // clears boot-local physical ancestry, and starts publication exactly once.
+  // clears boot-local physical ancestry, and starts both timers exactly once.
   g_initialized = true;
 }
 
@@ -3262,9 +3390,95 @@ FLASHMEM void process_photons_init(void) {
 // Commands
 // ============================================================================
 
-// Parse the Pi-authored fixed-decimal nanosecond reference exactly into
-// picoseconds.  The command contract is deliberately strict: one or more
-// integer digits, '.', and exactly three fractional digits.
+// Parse the operator-authored LAP_BASELINE_NS exactly into integer femtoseconds.
+// One or more integer digits, '.', and exactly six fractional digits are required.
+static bool photons_parse_lap_baseline_ns(const char* text,
+                                          uint64_t& lap_baseline_fs) {
+  lap_baseline_fs = 0ULL;
+  if (!text || !*text) return false;
+
+  const char* p = text;
+  uint64_t whole_ns = 0ULL;
+  uint32_t integer_digits = 0U;
+  while (*p >= '0' && *p <= '9') {
+    const uint32_t digit = (uint32_t)(*p - '0');
+    if (whole_ns > (UINT64_MAX - (uint64_t)digit) / 10ULL) return false;
+    whole_ns = whole_ns * 10ULL + (uint64_t)digit;
+    integer_digits++;
+    p++;
+  }
+  if (integer_digits == 0U || *p != '.') return false;
+  p++;
+
+  uint32_t fractional_fs = 0U;
+  for (uint32_t i = 0U; i < 6U; i++) {
+    if (*p < '0' || *p > '9') return false;
+    fractional_fs = fractional_fs * 10U + (uint32_t)(*p - '0');
+    p++;
+  }
+  if (*p != '\0') return false;
+  if (whole_ns > (UINT64_MAX - (uint64_t)fractional_fs) / 1000000ULL) {
+    return false;
+  }
+
+  lap_baseline_fs = whole_ns * 1000000ULL + (uint64_t)fractional_fs;
+  return lap_baseline_fs != 0ULL;
+}
+
+
+static void photons_install_lap_baseline_fs(uint64_t requested_fs) {
+  if (requested_fs == 0ULL) __builtin_trap();
+  g_lap_baseline_fs = requested_fs;
+  // Deprecated compatibility mirror only. Round to the nearest whole ps.
+  g_standard_lap_ps = requested_fs / 1000ULL +
+      ((requested_fs % 1000ULL) >= 500ULL ? 1ULL : 0ULL);
+  if (g_standard_lap_ps == 0ULL) __builtin_trap();
+  photons_memory_barrier();
+  g_standard_lap_configured = true;
+}
+
+
+static FLASHMEM Payload cmd_set_lap_baseline_ns(const Payload& args) {
+  const char* text = args.getString("lap_baseline_ns");
+  uint64_t requested_fs = 0ULL;
+  if (!photons_parse_lap_baseline_ns(text, requested_fs)) {
+    Payload err;
+    err.add("status", "lap_baseline_rejected_contract");
+    err.add("error",
+            "LAP_BASELINE_NS must be positive fixed decimal with exactly six fractional digits");
+    return err;
+  }
+  if (g_photons_recovery_protocol.active || g_photons_recovery.proof_pending ||
+      g_photons_stats_reset_pending) {
+    Payload err;
+    err.add("status", "lap_baseline_rejected_transition");
+    err.add("error", "PHOTONS recovery/statistics transition owns the reference boundary");
+    return err;
+  }
+
+  const bool was_configured = g_standard_lap_configured;
+  const uint64_t previous_fs = g_lap_baseline_fs;
+  const bool changed = !was_configured || requested_fs != previous_fs;
+  if (changed) photons_install_lap_baseline_fs(requested_fs);
+
+  Payload p;
+  p.add("status", "lap_baseline_set");
+  p.add("changed", changed);
+  p.add("lap_baseline_configured", g_standard_lap_configured);
+  p.add("lap_baseline_fs", g_lap_baseline_fs);
+  p.add("lap_baseline_ns",
+        toFixedDecimal((double)g_lap_baseline_fs / 1000000.0, 6));
+  p.add("previous_lap_baseline_fs", was_configured ? previous_fs : 0ULL);
+  p.add("publication_started", g_photons_recovery.publication_started);
+  p.add("measurement_history_preserved", true);
+  p.add("better_buckets_history_preserved", true);
+  p.add("campaign_state", photons_campaign_state_name(g_photons_campaign_state));
+  return p;
+}
+
+
+// Legacy 3-decimal startup alias. It may establish the reference on a newborn
+// producer, but it may not overwrite an exact six-decimal baseline.
 static bool photons_parse_standard_lap_ns(const char* text,
                                           uint64_t& standard_lap_ps) {
   standard_lap_ps = 0ULL;
@@ -3275,9 +3489,7 @@ static bool photons_parse_standard_lap_ns(const char* text,
   uint32_t integer_digits = 0U;
   while (*p >= '0' && *p <= '9') {
     const uint32_t digit = (uint32_t)(*p - '0');
-    if (whole_ns > (UINT64_MAX - (uint64_t)digit) / 10ULL) {
-      return false;
-    }
+    if (whole_ns > (UINT64_MAX - (uint64_t)digit) / 10ULL) return false;
     whole_ns = whole_ns * 10ULL + (uint64_t)digit;
     integer_digits++;
     p++;
@@ -3292,10 +3504,7 @@ static bool photons_parse_standard_lap_ns(const char* text,
     p++;
   }
   if (*p != '\0') return false;
-  if (whole_ns > (UINT64_MAX - (uint64_t)fractional_ps) / 1000ULL) {
-    return false;
-  }
-
+  if (whole_ns > (UINT64_MAX - (uint64_t)fractional_ps) / 1000ULL) return false;
   standard_lap_ps = whole_ns * 1000ULL + (uint64_t)fractional_ps;
   return standard_lap_ps != 0ULL;
 }
@@ -3304,35 +3513,31 @@ static bool photons_parse_standard_lap_ns(const char* text,
 static FLASHMEM Payload cmd_set_standard_lap_ns(const Payload& args) {
   const char* text = args.getString("standard_lap_ns");
   uint64_t requested_ps = 0ULL;
-  if (!photons_parse_standard_lap_ns(text, requested_ps)) {
-    // Malformed metrological configuration is a program/integration
-    // failure, not scientific invalidity.  Do not invent a default.
+  if (!photons_parse_standard_lap_ns(text, requested_ps) ||
+      requested_ps > UINT64_MAX / 1000ULL) {
     __builtin_trap();
   }
+  const uint64_t requested_fs = requested_ps * 1000ULL;
 
   if (g_standard_lap_configured) {
-    if (requested_ps != g_standard_lap_ps) {
-      // The reference is immutable for one Teensy runtime.  A changed
-      // standard requires a restart/new statistics lineage.
-      __builtin_trap();
-    }
+    if (requested_fs != g_lap_baseline_fs) __builtin_trap();
   } else {
-    g_standard_lap_ps = requested_ps;
-    photons_memory_barrier();
-    g_standard_lap_configured = true;
+    photons_install_lap_baseline_fs(requested_fs);
   }
 
   Payload p;
   p.add("standard_lap_configured", true);
-  p.add("publication_started",
-        g_photons_recovery.publication_started);
-  p.add("recovery_verdict_required",
-        !g_photons_recovery.publication_started);
+  p.add("publication_started", g_photons_recovery.publication_started);
+  p.add("recovery_verdict_required", !g_photons_recovery.publication_started);
   p.add("standard_lap_ps", g_standard_lap_ps);
   p.add("standard_lap_ns",
         toFixedDecimal((double)g_standard_lap_ps / 1000.0, 3));
+  p.add("lap_baseline_fs", g_lap_baseline_fs);
+  p.add("lap_baseline_ns",
+        toFixedDecimal((double)g_lap_baseline_fs / 1000000.0, 6));
   return p;
 }
+
 
 static bool photons_recovery_get_u32(const Payload& args,
                                      const char* key,
@@ -3412,6 +3617,9 @@ static FLASHMEM Payload cmd_ppb_export_meta(const Payload& /*args*/) {
       g_photons_ppb_minutes_count));
   p.add("last_minute_key", g_photons_ppb_last_minute_key);
   p.add("origin_valid", true);
+  p.add("lap_baseline_fs", g_lap_baseline_fs);
+  p.add("lap_baseline_ns",
+        toFixedDecimal((double)g_lap_baseline_fs / 1000000.0, 6));
   p.add("standard_lap_ps", g_standard_lap_ps);
   p.add("chunk_max_endpoints", PHOTONS_RECOVERY_CHUNK_MAX_ENDPOINTS);
   photons_ppb_export_add_endpoint(p, "current", current);
@@ -3555,10 +3763,10 @@ static Payload photons_recovery_reject(const char* status,
 
 
 static FLASHMEM Payload cmd_recovery_begin(const Payload& args) {
-  if (!g_standard_lap_configured || g_standard_lap_ps == 0ULL) {
+  if (!g_standard_lap_configured || g_lap_baseline_fs == 0ULL) {
     return photons_recovery_reject(
         "recovery_begin_rejected_standard_missing",
-        "STANDARD_LAP_NS must be installed before recovery");
+        "LAP_BASELINE_NS must be installed before recovery");
   }
   if (g_photons_recovery.publication_started) {
     return photons_recovery_reject(
@@ -4064,10 +4272,10 @@ static FLASHMEM Payload cmd_recovery_commit(const Payload& args) {
 
 
 static FLASHMEM Payload cmd_recovery_cold_start(const Payload& args) {
-  if (!g_standard_lap_configured || g_standard_lap_ps == 0ULL) {
+  if (!g_standard_lap_configured || g_lap_baseline_fs == 0ULL) {
     return photons_recovery_reject(
         "recovery_cold_start_rejected_standard_missing",
-        "STANDARD_LAP_NS must be installed before cold start");
+        "LAP_BASELINE_NS must be installed before cold start");
   }
   if (g_photons_recovery.publication_started ||
       g_photons_recovery_protocol.active) {
@@ -4172,6 +4380,9 @@ static FLASHMEM Payload cmd_report_recovery(const Payload& /*args*/) {
   p.add("schema", "PHOTONS_RECOVERY_REPORT_V1");
   p.add("restore_schema_version", PHOTONS_RECOVERY_SCHEMA_VERSION);
   p.add("standard_lap_configured", g_standard_lap_configured);
+  p.add("lap_baseline_fs", g_lap_baseline_fs);
+  p.add("lap_baseline_ns",
+        toFixedDecimal((double)g_lap_baseline_fs / 1000000.0, 6));
   p.add("standard_lap_ps", g_standard_lap_ps);
   p.add("publication_started", g_photons_recovery.publication_started);
   p.add("staging_active", g_photons_recovery_protocol.active);
@@ -4389,6 +4600,8 @@ static void photons_payload_add_flat_ppb_bucket(
   if (value.sample_count != 0ULL) {
     snprintf(key, sizeof(key), "%s_ppb", prefix);
     p.add(key, toFixedDecimal(value.ppb, 6));
+    snprintf(key, sizeof(key), "%s_residual_ns", prefix);
+    p.add(key, toFixedDecimal(value.residual_ns, 6));
   }
 }
 
@@ -4400,6 +4613,7 @@ static FLASHMEM Payload cmd_report_photons(const Payload& /*args*/) {
   Payload p;
   p.add("report", "PHOTONS_INSTRUMENT");
   p.add("schema", "PHOTONS_INSTRUMENT_REPORT_V1");
+  p.add("ppb_semantics", "LAP_BASELINE_NS_OFFSET_V1");
   p.add("instrument_always_on", true);
   p.add("instrument_owner", "TEENSY.PHOTONS");
   p.add("publication_started", g_photons_recovery.publication_started);
@@ -4410,7 +4624,11 @@ static FLASHMEM Payload cmd_report_photons(const Payload& /*args*/) {
   p.add("snapshot_ok", canonical.snapshot_ok);
   p.add("valid", canonical.valid);
   p.add("standard_lap_configured", g_standard_lap_configured);
+  p.add("lap_baseline_configured", g_standard_lap_configured);
   if (g_standard_lap_configured) {
+    p.add("lap_baseline_fs", g_lap_baseline_fs);
+    p.add("lap_baseline_ns",
+          toFixedDecimal((double)g_lap_baseline_fs / 1000000.0, 6));
     p.add("standard_lap_ps", g_standard_lap_ps);
     p.add("standard_lap_ns",
           toFixedDecimal((double)g_standard_lap_ps / 1000.0, 3));
@@ -4418,9 +4636,43 @@ static FLASHMEM Payload cmd_report_photons(const Payload& /*args*/) {
   p.add("stats_reset_count", canonical.stats.reset_count);
   p.add("stats_update_count", canonical.stats.update_count);
   p.add("stats_reset_pending", g_photons_stats_reset_pending);
+  p.add("race_engine_active",
+        g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE);
+  p.add("race_cadence_hz", PHOTONS_RACE_CADENCE_HZ);
+  p.add("race_pulse_ns", PHOTONS_RACE_PULSE_NS);
+  p.add("race_launch_surrogate", "LD_ON_FALLING_EDGE");
+  p.add("race_cadence_tick_count_total", canonical.race_cadence_tick_count_total);
+  p.add("race_cadence_ticks_this_fragment", canonical.race_cadence_ticks_this_fragment);
+  p.add("race_attempt_count_total", canonical.race_attempt_count_total);
+  p.add("race_attempts_this_fragment", canonical.race_attempts_this_fragment);
+  p.add("race_completed_count_total", canonical.race_completed_count_total);
+  p.add("race_completed_this_fragment", canonical.race_completed_this_fragment);
+  p.add("race_missed_count_total", canonical.race_missed_count_total);
+  p.add("race_missed_this_fragment", canonical.race_missed_this_fragment);
+  p.add("race_skipped_not_quiet_total", canonical.race_skipped_not_quiet_total);
+  p.add("race_skipped_projection_total", canonical.race_skipped_projection_total);
+  p.add("race_invalid_endpoint_total", canonical.race_invalid_endpoint_total);
+  p.add("race_enqueue_failure_total", canonical.race_enqueue_failure_total);
+  p.add("race_flight_n_this_fragment", canonical.race_flight_this_fragment.n);
+  p.add("race_flight_mean_ns_this_fragment",
+        toFixedDecimal(canonical.race_flight_this_fragment.mean, 6));
+  p.add("race_flight_stddev_ns_this_fragment",
+        toFixedDecimal(canonical.race_flight_this_fragment.stddev, 6));
+  p.add("race_flight_stderr_ns_this_fragment",
+        toFixedDecimal(canonical.race_flight_this_fragment.stderr_value, 6));
+  p.add("race_count", canonical.stats.lap_count);
+  p.add("total_flight_gnss_ns", canonical.stats.total_lap_gnss_ns);
+  p.add("mean_flight_ns", toFixedDecimal(canonical.stats.mean_lap_ns, 6));
+  // Legacy aliases remain during the schema-name migration.
   p.add("lap_count", canonical.stats.lap_count);
   p.add("total_lap_gnss_ns", canonical.stats.total_lap_gnss_ns);
   p.add("mean_lap_ns", toFixedDecimal(canonical.stats.mean_lap_ns, 6));
+  p.add("lap_baseline_ns",
+        toFixedDecimal((double)canonical.stats.lap_baseline_fs / 1000000.0, 6));
+  if (canonical.baseline.residual_valid) {
+    p.add("mean_residual_ns",
+          toFixedDecimal(canonical.baseline.mean_residual_ns, 6));
+  }
   photons_payload_add_flat_ppb_bucket(p, "ppb_10_min",
                                       canonical.stats.ppb_buckets.minute_10);
   photons_payload_add_flat_ppb_bucket(p, "ppb_60_min",
@@ -4439,10 +4691,15 @@ static FLASHMEM Payload cmd_report_photons(const Payload& /*args*/) {
   if (canonical.campaign.present &&
       !strcmp(canonical.campaign.campaign, g_photons_campaign_name) &&
       canonical.campaign.ppb.sample_count != 0ULL) {
+    p.add("campaign_race_count", canonical.campaign.lap_count);
+    p.add("campaign_mean_flight_ns",
+          toFixedDecimal(canonical.campaign.mean_lap_ns, 6));
     p.add("campaign_lap_count", canonical.campaign.lap_count);
     p.add("campaign_mean_lap_ns",
           toFixedDecimal(canonical.campaign.mean_lap_ns, 6));
     p.add("campaign_ppb", toFixedDecimal(canonical.campaign.ppb.ppb, 6));
+    p.add("campaign_residual_ns",
+          toFixedDecimal(canonical.campaign.ppb.residual_ns, 6));
   }
   p.add("custody_lap_count", g_photons_custody_lap_count);
   p.add("custody_total_lap_gnss_ns", g_photons_custody_total_lap_gnss_ns);
@@ -4457,6 +4714,7 @@ static FLASHMEM Payload cmd_report_stats(const Payload& /*args*/) {
   Payload p;
   p.add("report", "PHOTONS_STATS");
   p.add("schema", "PHOTONS_INSTRUMENT_STATS_REPORT_V1");
+  p.add("ppb_semantics", "LAP_BASELINE_NS_OFFSET_V1");
   p.add("publication_started", g_photons_recovery.publication_started);
   p.add("recovery_restored", g_photons_recovery.restored);
   p.add("recovery_proof_pending", g_photons_recovery.proof_pending);
@@ -4477,7 +4735,16 @@ static FLASHMEM Payload cmd_report_stats(const Payload& /*args*/) {
   p.add("reset_commit_count", g_photons_stats_reset_commit_count);
   p.add("lap_count", canonical.stats.lap_count);
   p.add("total_lap_gnss_ns", canonical.stats.total_lap_gnss_ns);
+  p.add("race_count", canonical.stats.lap_count);
+  p.add("mean_flight_ns", toFixedDecimal(canonical.stats.mean_lap_ns, 6));
   p.add("mean_lap_ns", toFixedDecimal(canonical.stats.mean_lap_ns, 6));
+  p.add("lap_baseline_fs", canonical.stats.lap_baseline_fs);
+  p.add("lap_baseline_ns",
+        toFixedDecimal((double)canonical.stats.lap_baseline_fs / 1000000.0, 6));
+  if (canonical.baseline.residual_valid) {
+    p.add("mean_residual_ns",
+          toFixedDecimal(canonical.baseline.mean_residual_ns, 6));
+  }
   p.add("lap_welford_n", canonical.stats.lap_time_welford.n);
   p.add("lap_welford_mean",
         toFixedDecimal(canonical.stats.lap_time_welford.mean, 6));
@@ -4524,7 +4791,9 @@ static FLASHMEM Payload cmd_report_stats(const Payload& /*args*/) {
     p.add("campaign_lap_count", canonical.campaign.lap_count);
     p.add("campaign_total_lap_gnss_ns", canonical.campaign.total_lap_gnss_ns);
     if (canonical.campaign.ppb.sample_count != 0ULL) {
-      p.add("campaign_ppb", toFixedDecimal(canonical.campaign.ppb.ppb, 6));
+        p.add("campaign_ppb", toFixedDecimal(canonical.campaign.ppb.ppb, 6));
+      p.add("campaign_residual_ns",
+            toFixedDecimal(canonical.campaign.ppb.residual_ns, 6));
     }
   }
   return p;
@@ -4563,219 +4832,292 @@ static FLASHMEM Payload cmd_stats_reset(const Payload& /*args*/) {
   p.add("campaign_changed", false);
   p.add("custody_preserved", true);
   p.add("standard_lap_preserved", true);
+  p.add("lap_baseline_preserved", true);
   p.add("next_report", "REPORT_STATS");
   return p;
 }
 
-static FLASHMEM Payload cmd_inject_problem(const Payload& args) {
-  if (!g_photons_recovery.publication_started ||
-      g_photons_recovery.proof_pending) {
-    return photons_recovery_reject(
-        "inject_problem_rejected_recovery_pending",
-        "PHOTONS recovery verdict is not complete");
-  }
-  const char* type = args.getString("type");
-  if (!type || strcmp(type, "excursion") != 0) {
-    Payload err;
-    err.add("status", "inject_problem_rejected_type");
-    err.add("error", type && *type ? "unsupported problem type"
-                                  : "missing problem type");
-    err.add("supported", "excursion");
-    return err;
-  }
-  if (!PHOTONS_EMULATOR_ENABLED) {
-    Payload err;
-    err.add("status", "inject_problem_rejected_source");
-    err.add("error", "excursion injection currently requires PHOTONS emulator");
-    return err;
-  }
-  if (g_photons_campaign_state != photons_campaign_state_t::ACTIVE) {
-    Payload err;
-    err.add("status", "inject_problem_rejected_campaign_state");
-    err.add("state", photons_campaign_state_name(g_photons_campaign_state));
-    return err;
-  }
-
-  uint32_t expected = 0U;
-  if (!__atomic_compare_exchange_n(&g_photons_problem_injection_armed,
-                                   &expected,
-                                   2U,
-                                   false,
-                                   __ATOMIC_ACQ_REL,
-                                   __ATOMIC_ACQUIRE)) {
-    Payload err;
-    err.add("status", "inject_problem_rejected_already_armed");
-    err.add("armed_state", expected);
-    return err;
-  }
-
-  g_photons_problem_injection_arm_count++;
+static FLASHMEM Payload cmd_inject_problem(const Payload& /*args*/) {
   Payload p;
-  p.add("status", "inject_problem_armed");
-  p.add("type", "excursion");
-  p.add("one_shot", true);
-  p.add("source", "EMULATOR_SYNTHETIC_RAW_LAP");
-  p.add("magnitude", "PLUS_25_PERCENT_TARGET_CYCLES");
-  p.add("physical_edge_custody_modified", false);
-  p.add("boundary", "next_emulator_science_lap");
-  p.add("campaign", g_photons_campaign_name);
-  p.add("arm_count", g_photons_problem_injection_arm_count);
-  p.add("fire_count", g_photons_problem_injection_fire_count);
+  p.add("status", "inject_problem_rejected_source");
+  p.add("error",
+        "synthetic excursion injection was retired with the PHOTONS emulator");
+  p.add("source", "PD200T_REAL_RACE");
+  p.add("physical_measurement_modified", false);
   return p;
 }
 
-
 static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
-  // REPORT is deliberately the compact operational/device surface.
-  //
-  // Detailed science, Better-Buckets, and recovery testimony already have
-  // dedicated REPORT_PHOTONS / REPORT_STATS / REPORT_RECOVERY commands.  Do not
-  // duplicate those large surfaces here: this command must remain comfortably
-  // below the request/response transport ceiling and useful during hardware
-  // commissioning.
-  photons_toy_capture_t capture{};
-  (void)photons_toy_capture_snapshot(&capture);
-
   photons_fragment_snapshot_t canonical{};
   (void)photons_fragment_snapshot(&canonical);
 
   interrupt_photodiode_diag_t interrupt_diag{};
   (void)interrupt_photodiode_snapshot(&interrupt_diag);
-
   const photons_device_snapshot_t device = photons_device_snapshot();
 
   Payload p;
   p.add("report", "PHOTONS");
-  p.add("schema", "PHOTONS_REPORT_V2");
-
-  // Runtime / publication identity.
+  p.add("schema", "PHOTONS_REPORT_V3");
+  p.add("ppb_semantics", "LAP_BASELINE_NS_OFFSET_V1");
   p.add("initialized", g_initialized);
-  p.add("subscription_ok", g_subscription_ok);
-  p.add("interrupt_started", g_interrupt_started);
-  p.add("fragment_timer_armed",
-        g_fragment_timer != TIMEPOP_INVALID_HANDLE);
-  p.add("standard_lap_configured", g_standard_lap_configured);
-  if (g_standard_lap_configured) {
-    p.add("standard_lap_ps", g_standard_lap_ps);
-    p.add("standard_lap_ns",
-          toFixedDecimal((double)g_standard_lap_ps / 1000.0, 3));
-  }
   p.add("publication_started", g_photons_recovery.publication_started);
+  p.add("standard_lap_configured", g_standard_lap_configured);
+  p.add("lap_baseline_configured", g_standard_lap_configured);
+  if (g_standard_lap_configured) {
+    p.add("lap_baseline_fs", g_lap_baseline_fs);
+    p.add("lap_baseline_ns",
+          toFixedDecimal((double)g_lap_baseline_fs / 1000000.0, 6));
+    p.add("standard_lap_ps", g_standard_lap_ps);
+  }
   p.add("recovery_restored", g_photons_recovery.restored);
   p.add("recovery_proof_pending", g_photons_recovery.proof_pending);
   p.add("recovery_proof_committed", g_photons_recovery.proof_committed);
   p.add("recovery_generation", g_photons_recovery.generation);
 
-  // Current campaign identity only.  Detailed campaign/statistical testimony
-  // belongs to REPORT_PHOTONS / REPORT_STATS.
   p.add("campaign_state", photons_campaign_state_name(g_photons_campaign_state));
-  p.add("campaign_active",
-        g_photons_campaign_state == photons_campaign_state_t::ACTIVE ||
-        g_photons_campaign_state == photons_campaign_state_t::STOP_PENDING ||
-        g_photons_campaign_state == photons_campaign_state_t::FLASH_CUT_PENDING);
   if (g_photons_campaign_name[0]) {
     p.add("campaign", g_photons_campaign_name);
+    p.add("campaign_start_after_sequence",
+          g_photons_campaign_start_after_sequence);
   }
   p.add("campaign_public_count", g_photons_campaign_public_count);
 
-  // Latest canonical publication identity.
-  p.add("fragment_snapshot_ok", canonical.snapshot_ok);
-  p.add("fragment_valid", canonical.valid);
   p.add("fragment_sequence", canonical.sequence);
-  p.add("fragment_publish_count", g_publish_count);
-  p.add("fragment_publish_reject_count", g_publish_reject_count);
-  p.add("fragment_edge_count_total", canonical.edge_count_total);
-  p.add("fragment_edges_this_fragment", canonical.edges_this_fragment);
-
-  // Optical hardware.  These are the fields REPORT is primarily for.
-  p.add("laser_enabled", device.laser_enabled);
-  p.add("laser_id1_raw", device.laser_id1_raw);
-  p.add("laser_id1_current_ma",
-        toFixedDecimal(device.laser_id1_current_ma, 6));
-  p.add("laser_monitor_raw", device.laser_monitor_raw);
-  p.add("laser_monitor_v",
-        toFixedDecimal(device.laser_monitor_v, 6));
-  p.add("laser_emitting", device.laser_emitting);
-
-  p.add("photodiode_edge_pin", PHOTODIODE_EDGE_PIN);
-  p.add("photodiode_edge_level", device.photodiode_edge_level);
-  p.add("photodiode_interrupt_pin", PHOTODIODE_EDGE_PIN);
-  p.add("photodiode_interrupt_count", interrupt_diag.irq_count);
-  p.add("photodiode_analog_pin", PHOTODIODE_ANALOG_PIN);
-  p.add("photodiode_analog_raw", device.photodiode_analog_raw);
-  p.add("photodiode_analog_v",
-        toFixedDecimal(device.photodiode_analog_v, 6));
-  p.add("photodiode_analog_emulated", PHOTONS_EMULATOR_ENABLED);
-
-  // First-order detector custody.  Keep enough testimony here to commission the
-  // physical path without hauling the complete science/recovery court over RPC.
-  p.add("capture_edge_count", capture.edge_count);
-  p.add("capture_last_edge_sequence", capture.last_edge_sequence);
-  p.add("capture_last_pps_sequence", capture.last_pps_sequence);
-  p.add("capture_last_dwt_at_edge", capture.last_dwt_at_edge);
-  p.add("capture_last_isr_entry_dwt_raw", capture.last_isr_entry_dwt_raw);
-  p.add("capture_isr_entry_to_edge_correction_cycles",
-        capture.isr_entry_to_edge_correction_cycles);
-  p.add("capture_interval_valid", capture.interval_valid);
-  if (capture.interval_valid) {
-    p.add("capture_last_interval_cycles", capture.last_interval_cycles);
-    p.add("capture_min_interval_cycles", capture.min_interval_cycles);
-    p.add("capture_max_interval_cycles", capture.max_interval_cycles);
+  p.add("fragment_valid", canonical.valid);
+  p.add("race_engine_active",
+        g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE);
+  p.add("race_cadence_hz", PHOTONS_RACE_CADENCE_HZ);
+  p.add("race_pulse_ns", PHOTONS_RACE_PULSE_NS);
+  p.add("race_launch_surrogate", "LD_ON_FALLING_EDGE");
+  p.add("race_cadence_tick_count_total", g_photons_race.cadence_tick_count);
+  p.add("race_cadence_ticks_this_fragment", canonical.race_cadence_ticks_this_fragment);
+  p.add("race_attempt_count_total", g_photons_race.attempt_count);
+  p.add("race_completed_count_total", g_photons_race.completed_count);
+  p.add("race_missed_count_total", g_photons_race.missed_count);
+  p.add("race_skipped_not_quiet_total",
+        g_photons_race.skipped_not_quiet_count);
+  p.add("race_skipped_projection_total",
+        g_photons_race.skipped_projection_count);
+  p.add("race_invalid_endpoint_total",
+        g_photons_race.invalid_endpoint_count);
+  p.add("race_enqueue_failure_total", g_photons_race.enqueue_failure_count);
+  p.add("race_attempts_this_fragment", canonical.race_attempts_this_fragment);
+  p.add("race_completed_this_fragment", canonical.race_completed_this_fragment);
+  p.add("race_missed_this_fragment", canonical.race_missed_this_fragment);
+  p.add("race_flight_n_this_fragment", canonical.race_flight_this_fragment.n);
+  if (canonical.race_flight_this_fragment.n != 0ULL) {
+    p.add("race_flight_mean_ns_this_fragment",
+          toFixedDecimal(canonical.race_flight_this_fragment.mean, 6));
+    p.add("race_flight_stddev_ns_this_fragment",
+          toFixedDecimal(canonical.race_flight_this_fragment.stddev, 6));
+    p.add("race_flight_stderr_ns_this_fragment",
+          toFixedDecimal(canonical.race_flight_this_fragment.stderr_value, 6));
+  }
+  p.add("race_count_total_science", canonical.stats.lap_count);
+  if (canonical.stats.lap_count != 0ULL) {
+    p.add("mean_flight_ns", toFixedDecimal(canonical.stats.mean_lap_ns, 6));
   }
 
-  p.add("interrupt_subscribed", interrupt_diag.subscribed);
-  p.add("interrupt_active", interrupt_diag.active);
-  p.add("interrupt_irq_count", interrupt_diag.irq_count);
   p.add("interrupt_callback_count", interrupt_diag.callback_count);
   p.add("interrupt_callback_missing_count",
         interrupt_diag.callback_missing_count);
-  p.add("interrupt_inactive_edge_count",
-        interrupt_diag.inactive_edge_count);
-  p.add("interrupt_source_pin", interrupt_diag.source_pin);
-  p.add("interrupt_last_callback_wall_cycles",
-        interrupt_diag.last_callback_wall_cycles);
-  p.add("interrupt_max_callback_wall_cycles",
-        interrupt_diag.max_callback_wall_cycles);
-
-  // The emulator is temporary and headed for deletion.  Retain only a compact
-  // witness here; its former exhaustive dump was the largest source of REPORT
-  // bloat and duplicated information available elsewhere.
-  p.add("emulator_enabled", PHOTONS_EMULATOR_ENABLED);
-  p.add("emulator_initialized", g_photons_emulator.initialized);
-  p.add("emulator_stage", photons_emulator_stage_name(g_photons_emulator.stage));
-  p.add("emulator_train_count", g_photons_emulator.train_count);
-  p.add("emulator_laser_pulse_count", g_photons_emulator.laser_pulse_count);
-  p.add("emulator_generated_edge_count",
-        g_photons_emulator.generated_edge_count);
-  p.add("emulator_synthetic_lap_count",
-        g_photons_emulator.synthetic_lap_count);
-  const uint32_t emulator_observed_hit_count =
-      g_photons_emulator.hit1_count +
-      g_photons_emulator.hit2_count +
-      g_photons_emulator.hit3_count +
-      g_photons_emulator.hit4_count +
-      g_photons_emulator.hit5_count;
-  p.add("emulator_custody_counts_match",
-        g_photons_emulator.generated_edge_count ==
-            interrupt_diag.irq_count &&
-        g_photons_emulator.generated_edge_count ==
-            interrupt_diag.callback_count &&
-        g_photons_emulator.generated_edge_count ==
-            capture.edge_count &&
-        g_photons_emulator.generated_edge_count ==
-            emulator_observed_hit_count);
-
+  p.add("interrupt_ancestry_baseline_valid", g_interrupt_ancestry.valid);
+  if (g_interrupt_ancestry.valid) {
+    p.add("interrupt_callback_missing_count_origin",
+          g_interrupt_ancestry.callback_missing_origin);
+    p.add("interrupt_callback_missing_count_since_ancestry",
+          interrupt_diag.callback_missing_count -
+              g_interrupt_ancestry.callback_missing_origin);
+    p.add("interrupt_inactive_edge_count_origin",
+          g_interrupt_ancestry.inactive_edge_origin);
+    p.add("interrupt_inactive_edge_count_since_ancestry",
+          interrupt_diag.inactive_edge_count -
+              g_interrupt_ancestry.inactive_edge_origin);
+  }
+  p.add("interrupt_inactive_edge_count", interrupt_diag.inactive_edge_count);
+  p.add("photodiode_edge_level", device.photodiode_edge_level);
+  p.add("photodiode_analog_v",
+        toFixedDecimal(device.photodiode_analog_v, 6));
+  p.add("laser_monitor_v", toFixedDecimal(device.laser_monitor_v, 6));
   return p;
 }
 
+static FLASHMEM Payload cmd_report_pulse(const Payload& /*args*/) {
+  interrupt_photodiode_diag_t interrupt_diag{};
+  (void)interrupt_photodiode_snapshot(&interrupt_diag);
+
+  photons_pulse_receive_value_t pulse_receive{};
+  (void)photons_pulse_receive_snapshot(&pulse_receive);
+  const photons_pulse_launch_state_t pulse_launch = g_last_pulse_launch;
+
+  Payload p;
+  p.add("report", "PHOTONS_PULSE");
+  p.add("schema", "PHOTONS_PULSE_REPORT_V2");
+  p.add("race_engine_active",
+        g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE);
+  p.add("interrupt_callback_count", interrupt_diag.callback_count);
+  p.add("interrupt_callback_missing_count",
+        interrupt_diag.callback_missing_count);
+  p.add("pulse_available", pulse_launch.valid);
+  if (!pulse_launch.valid) return p;
+
+  p.add("pulse_sequence", pulse_launch.sequence);
+  p.add("pulse_requested_ns", pulse_launch.requested_ns);
+  p.add("pulse_wall_cycles", pulse_launch.pulse_wall_cycles);
+  p.add("pulse_armed", g_pulse_armed_sequence == pulse_launch.sequence);
+  p.add("pulse_callback_delta",
+        interrupt_diag.callback_count - pulse_launch.callback_count_start);
+
+  const bool finish_seen =
+      pulse_receive.seen &&
+      pulse_receive.pulse_sequence == pulse_launch.sequence;
+  p.add("receive_seen", finish_seen);
+
+  uint64_t finish_gnss_ns = 0ULL;
+  const bool finish_gnss_valid =
+      finish_seen &&
+      time_clock_ns_at_dwt(time_clock_id_t::GNSS,
+                           pulse_receive.finish_dwt,
+                           &finish_gnss_ns);
+  const bool flight_time_valid =
+      pulse_launch.start_gnss_valid &&
+      finish_gnss_valid &&
+      finish_gnss_ns >= pulse_launch.start_gnss_ns;
+  p.add("flight_time_valid", flight_time_valid);
+  if (flight_time_valid) {
+    p.add("flight_time_gnss_ns",
+          finish_gnss_ns - pulse_launch.start_gnss_ns);
+  }
+  return p;
+}
 
 static FLASHMEM Payload cmd_init(const Payload& /*args*/) {
+  if (g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE) {
+    Payload p;
+    p.add("status", "init_rejected_race_engine_active");
+    return p;
+  }
   photons_laser_initialize_hardware();
   photons_emit_laser_initialization_event();
   return ok_payload();
 }
 
+static FLASHMEM Payload cmd_pulse(const Payload& args) {
+  if (g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE) {
+    Payload p;
+    p.add("status", "pulse_rejected_race_engine_active");
+    return p;
+  }
+
+  if (digitalRead(LD_ON_PIN) != LOW) {
+    Payload p;
+    p.add("status", "pulse_rejected_laser_not_inhibited");
+    return p;
+  }
+
+  if (digitalRead(PHOTODIODE_EDGE_PIN) != LOW) {
+    Payload p;
+    p.add("status", "pulse_rejected_detector_not_quiet");
+    return p;
+  }
+
+  // Manual PULSE remains a commissioning command. It requires the live GNSS/DWT
+  // ruler for width conversion and report projection but performs no ADC work
+  // inside the commanded HIGH interval.
+  time_clock_projection_t projection_preflight{};
+  if (!time_clock_projection(time_clock_id_t::GNSS,
+                             &projection_preflight)) {
+    Payload p;
+    p.add("status", "pulse_rejected_gnss_projection_unavailable");
+    return p;
+  }
+
+  uint64_t requested_ns = PHOTONS_PULSE_DEFAULT_NS;
+  if (args.has("ns") && !args.tryGetUInt64("ns", requested_ns)) {
+    Payload p;
+    p.add("status", "pulse_rejected_ns_invalid");
+    return p;
+  }
+
+  uint32_t target_high_cycles = 0U;
+  if (!photons_ns_to_dwt_cycles(
+          requested_ns,
+          projection_preflight.dwt_cycles_per_second,
+          target_high_cycles)) {
+    Payload p;
+    p.add("status", "pulse_rejected_ns_out_of_range");
+    p.add("requested_ns", requested_ns);
+    return p;
+  }
+
+  interrupt_photodiode_diag_t interrupt_before{};
+  if (!interrupt_photodiode_snapshot(&interrupt_before)) {
+    Payload p;
+    p.add("status", "pulse_rejected_interrupt_snapshot_unavailable");
+    return p;
+  }
+
+  const uint32_t overwritten_pending_sequence = g_pulse_armed_sequence;
+  g_pulse_armed_sequence = 0U;
+  photons_compiler_barrier();
+
+  g_pulse_sequence++;
+  if (g_pulse_sequence == 0U) g_pulse_sequence++;
+  const uint32_t pulse_sequence = g_pulse_sequence;
+
+  g_last_pulse_launch = photons_pulse_launch_state_t{};
+  photons_pulse_receive_publish(photons_pulse_receive_value_t{});
+  g_pulse_armed_sequence = pulse_sequence;
+  photons_compiler_barrier();
+
+  const uint32_t start_dwt = ARM_DWT_CYCCNT;
+  digitalWriteFast(LD_ON_PIN, HIGH);
+  const uint32_t high_start = ARM_DWT_CYCCNT;
+  while ((uint32_t)(ARM_DWT_CYCCNT - high_start) < target_high_cycles) {
+  }
+  digitalWriteFast(LD_ON_PIN, LOW);
+  const uint32_t pulse_wall_cycles = ARM_DWT_CYCCNT - start_dwt;
+
+  uint64_t start_gnss_ns = 0ULL;
+  const bool start_gnss_valid =
+      time_clock_ns_at_dwt(time_clock_id_t::GNSS,
+                           start_dwt,
+                           &start_gnss_ns);
+
+  g_last_pulse_launch.sequence = pulse_sequence;
+  g_last_pulse_launch.requested_ns = requested_ns;
+  g_last_pulse_launch.target_high_cycles = target_high_cycles;
+  g_last_pulse_launch.start_dwt = start_dwt;
+  g_last_pulse_launch.start_gnss_valid = start_gnss_valid;
+  g_last_pulse_launch.start_gnss_ns =
+      start_gnss_valid ? start_gnss_ns : 0ULL;
+  g_last_pulse_launch.pulse_wall_cycles = pulse_wall_cycles;
+  g_last_pulse_launch.callback_count_start = interrupt_before.callback_count;
+  photons_compiler_barrier();
+  g_last_pulse_launch.valid = true;
+
+  Payload p;
+  p.add("status", "pulse_fired");
+  p.add("pulse_sequence", pulse_sequence);
+  p.add("pulse_requested_ns", requested_ns);
+  p.add("pulse_target_high_cycles", target_high_cycles);
+  p.add("pulse_wall_cycles", pulse_wall_cycles);
+  p.add("pulse_start_dwt", start_dwt);
+  p.add("pulse_start_gnss_valid", start_gnss_valid);
+  if (start_gnss_valid) p.add("pulse_start_gnss_ns", start_gnss_ns);
+  p.add("previous_receive_pending", overwritten_pending_sequence != 0U);
+  if (overwritten_pending_sequence != 0U) {
+    p.add("overwritten_pending_sequence", overwritten_pending_sequence);
+  }
+  return p;
+}
+
 static FLASHMEM Payload cmd_on(const Payload& /*args*/) {
+  if (g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE) {
+    Payload p;
+    p.add("status", "on_rejected_race_engine_active");
+    return p;
+  }
   digitalWrite(LD_ON_PIN, HIGH);
 
   Payload ev;
@@ -4786,6 +5128,11 @@ static FLASHMEM Payload cmd_on(const Payload& /*args*/) {
 }
 
 static FLASHMEM Payload cmd_off(const Payload& /*args*/) {
+  if (g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE) {
+    Payload p;
+    p.add("status", "off_rejected_race_engine_active");
+    return p;
+  }
   photons_laser_inhibit();
 
   Payload ev;
@@ -4801,11 +5148,13 @@ static FLASHMEM Payload cmd_off(const Payload& /*args*/) {
 
 static const process_command_entry_t PHOTONS_COMMANDS[] = {
   { "INIT",                cmd_init                },
+  { "SET_LAP_BASELINE_NS", cmd_set_lap_baseline_ns },
   { "SET_STANDARD_LAP_NS", cmd_set_standard_lap_ns },
   { "START",               cmd_start               },
   { "FLASH_CUT",           cmd_flash_cut           },
   { "STOP",                cmd_stop                },
   { "REPORT",              cmd_report              },
+  { "REPORT_PULSE",        cmd_report_pulse        },
   { "REPORT_PHOTONS",      cmd_report_photons      },
   { "REPORT_STATS",        cmd_report_stats        },
   { "STATS_RESET",         cmd_stats_reset         },
@@ -4819,6 +5168,7 @@ static const process_command_entry_t PHOTONS_COMMANDS[] = {
   { "RECOVERY_PROOF_ACK",  cmd_recovery_proof_ack  },
   { "REPORT_RECOVERY",     cmd_report_recovery     },
   { "INJECT_PROBLEM",      cmd_inject_problem      },
+  { "PULSE",               cmd_pulse               },
   { "ON",                  cmd_on                  },
   { "OFF",                 cmd_off                 },
   { nullptr, nullptr }

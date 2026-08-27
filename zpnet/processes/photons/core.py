@@ -86,6 +86,11 @@ PHOTONS_FRAGMENT_SCHEMA = "PHOTONS_FRAGMENT_V1"
 PHOTONS_INSTRUMENT_SCHEMA = "PHOTONS_INSTRUMENT_V1"
 PHOTONS_SCIENCE_SCHEMA = "PHOTONS_SCIENCE_V2"
 PHOTONS_STATS_SCHEMA = "PHOTONS_INSTRUMENT_STATS_V1"
+PHOTONS_RACE_SCHEMA = "PHOTONS_RACE_V1"
+PHOTONS_RACE_CADENCE_HZ = 1000
+PHOTONS_RACE_CADENCE_NS = 1_000_000
+PHOTONS_RACE_PULSE_NS = 91_000
+PHOTONS_PPB_SEMANTICS = "LAP_BASELINE_NS_OFFSET_V1"
 
 PHOTONS_RECOVERY_SCHEMA_VERSION = 1
 PHOTONS_RECOVERY_CHUNK_MAX_ENDPOINTS = 4
@@ -273,9 +278,14 @@ _hard_failure_state_dropped = 0
 _hard_failure_persistence_dropped = 0
 _last_hard_failure: Optional[Dict[str, Any]] = None
 
+_lap_baseline_ns: Optional[str] = None
+_lap_baseline_fs: Optional[int] = None
+# Deprecated whole-picosecond compatibility mirror retained for recovery/report
+# interoperability with already-durable PHOTONS rows.
 _standard_lap_ns: Optional[str] = None
 _standard_lap_ps: Optional[int] = None
 _teensy_standard_configured = False
+_lap_baseline_set_count = 0
 
 
 # ---------------------------------------------------------------------
@@ -418,6 +428,13 @@ def _require_int(value: Any, path: str, *, minimum: int = 0) -> int:
     return int(value)
 
 
+def _require_u32(value: Any, path: str) -> int:
+    out = _require_int(value, path)
+    if out > 0xFFFFFFFF:
+        raise ValueError(f"{path} must fit uint32; got {value!r}")
+    return out
+
+
 def _require_bool(value: Any, path: str) -> bool:
     if not isinstance(value, bool):
         raise ValueError(f"{path} must be boolean; got {value!r}")
@@ -467,14 +484,14 @@ def _welford_grand_ratio_diagnostic(
     *,
     welford_mean_ns: float,
     ratio_mean_ns: float,
-    standard_lap_ps: int,
+    lap_baseline_fs: int,
 ) -> Dict[str, Any]:
     """Quantify Welford-vs-N/T drift without granting it custody authority."""
-    standard_lap_ns = float(standard_lap_ps) / 1000.0
-    if standard_lap_ns <= 0.0:
-        raise ValueError("PHOTONS Welford/grand-ratio diagnostic has nonpositive standard lap")
+    lap_baseline_ns = float(lap_baseline_fs) / 1_000_000.0
+    if lap_baseline_ns <= 0.0:
+        raise ValueError("PHOTONS Welford/grand-ratio diagnostic has nonpositive lap baseline")
     delta_ns = float(welford_mean_ns) - float(ratio_mean_ns)
-    delta_ppb = (delta_ns / standard_lap_ns) * 1.0e9
+    delta_ppb = delta_ns
     return {
         "schema": "PHOTONS_WELFORD_GRAND_RATIO_DIAGNOSTIC_V1",
         "welford_mean_ns": float(welford_mean_ns),
@@ -489,95 +506,113 @@ def _welford_grand_ratio_diagnostic(
     }
 
 
-def _load_standard_lap_ns() -> Tuple[str, int]:
-    """Load the required config.PHOTONS optical reference exactly once at startup."""
-    with open_db(row_dict=True) as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT payload ->> 'standard_lap_ns' AS standard_lap_ns
-            FROM config
-            WHERE config_key = 'PHOTONS'
-            """
-        )
-        row = cur.fetchone()
-
-    if row is None:
-        raise RuntimeError("config.PHOTONS row is required")
-
-    raw = row.get("standard_lap_ns")
-    if raw is None:
-        raise RuntimeError("config.PHOTONS.standard_lap_ns is required")
-
+def _normalize_lap_baseline_ns(raw: Any, *, path: str) -> Tuple[str, int]:
     try:
         value = Decimal(str(raw))
     except (InvalidOperation, ValueError) as exc:
-        raise RuntimeError(
-            f"config.PHOTONS.standard_lap_ns is not decimal: {raw!r}"
-        ) from exc
-
+        raise ValueError(f"{path} is not decimal: {raw!r}") from exc
     if not value.is_finite() or value <= 0:
-        raise RuntimeError(
-            f"config.PHOTONS.standard_lap_ns must be finite and > 0; got {raw!r}"
-        )
-
-    quantum = Decimal("0.001")
+        raise ValueError(f"{path} must be finite and > 0; got {raw!r}")
+    quantum = Decimal("0.000001")
     normalized = value.quantize(quantum)
     if normalized != value:
-        raise RuntimeError(
-            "config.PHOTONS.standard_lap_ns may have at most three decimal places; "
-            f"got {raw!r}"
+        raise ValueError(f"{path} may have at most six decimal places; got {raw!r}")
+    text = format(normalized, ".6f")
+    fs = int(normalized * 1_000_000)
+    if fs <= 0:
+        raise ValueError(f"{path} resolved to nonpositive femtoseconds")
+    return text, fs
+
+
+def _compat_standard_from_baseline_fs(lap_baseline_fs: int) -> Tuple[str, int]:
+    ps = int(lap_baseline_fs) // 1000 + (1 if int(lap_baseline_fs) % 1000 >= 500 else 0)
+    if ps <= 0:
+        raise ValueError("PHOTONS LAP_BASELINE_NS cannot be represented by compatibility ps mirror")
+    return format(Decimal(ps) / Decimal(1000), ".3f"), ps
+
+
+def _load_lap_baseline_ns() -> Tuple[str, int, str, int]:
+    """Load config.PHOTONS LAP_BASELINE_NS, explicitly migrating the legacy standard once."""
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT payload FROM config WHERE config_key = 'PHOTONS'")
+        row = cur.fetchone()
+        if row is None:
+            raise RuntimeError("config.PHOTONS row is required")
+        payload = row.get("payload")
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        payload = _require_dict(payload, "config.PHOTONS.payload")
+        raw = payload.get("lap_baseline_ns")
+        migrated = False
+        if raw is None:
+            raw = payload.get("standard_lap_ns")
+            if raw is None:
+                raise RuntimeError("config.PHOTONS.lap_baseline_ns is required")
+            migrated = True
+        baseline_text, baseline_fs = _normalize_lap_baseline_ns(
+            raw, path=("config.PHOTONS.standard_lap_ns" if migrated else "config.PHOTONS.lap_baseline_ns")
         )
+        if migrated:
+            cur.execute(
+                """
+                UPDATE config
+                SET payload = payload || jsonb_build_object(
+                    'lap_baseline_ns', %s::text,
+                    'lap_baseline_fs', %s::bigint,
+                    'lap_baseline_source', 'LEGACY_STANDARD_LAP_NS_MIGRATION',
+                    'lap_baseline_updated_at_utc', %s::text
+                )
+                WHERE config_key = 'PHOTONS'
+                """,
+                (baseline_text, baseline_fs, _utc_now_z()),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("config.PHOTONS legacy baseline migration did not update exactly one row")
+    if migrated:
+        logging.warning(
+            "📐 [photons] migrated legacy config.PHOTONS.standard_lap_ns=%s to LAP_BASELINE_NS=%s",
+            raw, baseline_text,
+        )
+    standard_text, standard_ps = _compat_standard_from_baseline_fs(baseline_fs)
+    return baseline_text, baseline_fs, standard_text, standard_ps
 
-    standard_text = format(normalized, ".3f")
-    standard_ps = int(normalized * 1000)
-    if standard_ps <= 0:
-        raise RuntimeError("config.PHOTONS.standard_lap_ns resolved to nonpositive picoseconds")
-    return standard_text, standard_ps
 
-
-def _configure_teensy_standard_lap() -> None:
-    """Install config.PHOTONS.standard_lap_ns before firmware publication begins."""
+def _configure_teensy_lap_baseline() -> None:
+    """Install the exact config.PHOTONS operator reference before recovery/publication."""
+    global _lap_baseline_ns
+    global _lap_baseline_fs
     global _standard_lap_ns
     global _standard_lap_ps
     global _teensy_standard_configured
 
-    standard_text, standard_ps = _load_standard_lap_ns()
+    baseline_text, baseline_fs, standard_text, standard_ps = _load_lap_baseline_ns()
     response = send_command(
         machine="TEENSY",
         subsystem=SUBSYSTEM,
-        command="SET_STANDARD_LAP_NS",
-        args={"standard_lap_ns": standard_text},
+        command="SET_LAP_BASELINE_NS",
+        args={"lap_baseline_ns": baseline_text},
     )
     payload = response.get("payload") if isinstance(response, dict) else None
-    if not isinstance(response, dict) or not response.get("success"):
-        raise RuntimeError(f"Teensy PHOTONS.SET_STANDARD_LAP_NS failed: {response!r}")
-    if not isinstance(payload, dict):
-        raise RuntimeError(
-            f"Teensy PHOTONS.SET_STANDARD_LAP_NS returned no payload: {response!r}"
-        )
-    if payload.get("standard_lap_configured") is not True:
-        raise RuntimeError(
-            f"Teensy did not confirm STANDARD_LAP_NS installation: {payload!r}"
-        )
-    echoed_ps = _require_int(
-        payload.get("standard_lap_ps"),
-        "PHOTONS.SET_STANDARD_LAP_NS.payload.standard_lap_ps",
-        minimum=1,
+    if not isinstance(response, dict) or not response.get("success") or not isinstance(payload, dict):
+        raise RuntimeError(f"Teensy PHOTONS.SET_LAP_BASELINE_NS failed: {response!r}")
+    if payload.get("lap_baseline_configured") is not True:
+        raise RuntimeError(f"Teensy did not confirm LAP_BASELINE_NS installation: {payload!r}")
+    echoed_fs = _require_int(
+        payload.get("lap_baseline_fs"), "PHOTONS.SET_LAP_BASELINE_NS.payload.lap_baseline_fs", minimum=1
     )
-    if echoed_ps != standard_ps:
+    if echoed_fs != baseline_fs:
         raise RuntimeError(
-            "Teensy STANDARD_LAP_NS echo mismatch: "
-            f"configured_ps={standard_ps} echoed_ps={echoed_ps}"
+            f"Teensy LAP_BASELINE_NS echo mismatch: configured_fs={baseline_fs} echoed_fs={echoed_fs}"
         )
-
+    _lap_baseline_ns = baseline_text
+    _lap_baseline_fs = baseline_fs
     _standard_lap_ns = standard_text
     _standard_lap_ps = standard_ps
     _teensy_standard_configured = True
     logging.info(
-        "✅ [photons] installed STANDARD_LAP_NS=%s ns (%d ps) on Teensy",
-        standard_text,
-        standard_ps,
+        "✅ [photons] installed LAP_BASELINE_NS=%s ns (%d fs) on Teensy",
+        baseline_text, baseline_fs,
     )
 
 
@@ -927,6 +962,9 @@ def _validate_photons_fragment(fragment: Payload) -> Tuple[int, int, Optional[in
     science = _require_dict(instrument.get("science"), "photons.science")
     stats = _require_dict(instrument.get("stats"), "photons.stats")
     projection = _require_dict(instrument.get("projection"), "photons.projection")
+    raw_cycles = _require_dict(instrument.get("raw_cycles"), "photons.raw_cycles")
+    race = _require_dict(instrument.get("race"), "photons.race")
+    interrupt = _require_dict(instrument.get("interrupt"), "photons.interrupt")
     accepted = _require_dict(science.get("accepted"), "photons.science.accepted")
     excluded = _require_dict(science.get("excluded"), "photons.science.excluded")
     reasons = _require_dict(
@@ -953,6 +991,208 @@ def _validate_photons_fragment(fragment: Payload) -> Tuple[int, int, Optional[in
         raise ValueError(f"unsupported PHOTONS science schema {science.get('schema')!r}")
     if stats.get("schema") != PHOTONS_STATS_SCHEMA:
         raise ValueError(f"unsupported PHOTONS stats schema {stats.get('schema')!r}")
+    if stats.get("ppb_semantics") != PHOTONS_PPB_SEMANTICS:
+        raise ValueError(
+            f"unsupported PHOTONS PPB semantics {stats.get('ppb_semantics')!r}"
+        )
+
+    # Real-race transport court.  The recurring 1 kHz source is physical testimony,
+    # not a second science authority: completed races feed the existing raw/projection/
+    # Welford court below.  Prove only the producer-authored geometry/accounting here.
+    if instrument.get("source") != "PD200T_REAL_RACE":
+        raise ValueError(
+            f"unsupported PHOTONS physical source {instrument.get('source')!r}"
+        )
+    if race.get("schema") != PHOTONS_RACE_SCHEMA:
+        raise ValueError(f"unsupported PHOTONS race schema {race.get('schema')!r}")
+
+    cadence_hz = _require_int(race.get("cadence_hz"), "photons.race.cadence_hz", minimum=1)
+    cadence_ns = _require_int(race.get("cadence_ns"), "photons.race.cadence_ns", minimum=1)
+    pulse_ns = _require_int(race.get("pulse_ns"), "photons.race.pulse_ns", minimum=1)
+    if (
+        cadence_hz != PHOTONS_RACE_CADENCE_HZ
+        or cadence_ns != PHOTONS_RACE_CADENCE_NS
+        or pulse_ns != PHOTONS_RACE_PULSE_NS
+    ):
+        raise ValueError(
+            "PHOTONS race geometry changed unexpectedly: "
+            f"cadence={cadence_hz}Hz/{cadence_ns}ns pulse={pulse_ns}ns"
+        )
+    if race.get("launch_surrogate") != "LD_ON_FALLING_EDGE":
+        raise ValueError(
+            f"unsupported PHOTONS launch surrogate {race.get('launch_surrogate')!r}"
+        )
+    if race.get("flight_interpretation") != "ESTIMATED":
+        raise ValueError(
+            f"unsupported PHOTONS flight interpretation {race.get('flight_interpretation')!r}"
+        )
+
+    # process_interrupt counters are lifetime forensic testimony. Firmware
+    # snapshots injury-counter origins when fresh physical ancestry begins and
+    # publishes the unsigned uint32 deltas used by the rolling-custody court.
+    # Prove that arithmetic here rather than trusting a derived validity flag.
+    if not _require_bool(
+        interrupt.get("ancestry_baseline_valid"),
+        "photons.interrupt.ancestry_baseline_valid",
+    ):
+        raise ValueError("PHOTONS interrupt ancestry baseline is not established")
+    callback_missing_lifetime = _require_u32(
+        interrupt.get("callback_missing_count"),
+        "photons.interrupt.callback_missing_count",
+    )
+    callback_missing_origin = _require_u32(
+        interrupt.get("callback_missing_count_origin"),
+        "photons.interrupt.callback_missing_count_origin",
+    )
+    callback_missing_since = _require_u32(
+        interrupt.get("callback_missing_count_since_ancestry"),
+        "photons.interrupt.callback_missing_count_since_ancestry",
+    )
+    inactive_lifetime = _require_u32(
+        interrupt.get("inactive_edge_count"),
+        "photons.interrupt.inactive_edge_count",
+    )
+    inactive_origin = _require_u32(
+        interrupt.get("inactive_edge_count_origin"),
+        "photons.interrupt.inactive_edge_count_origin",
+    )
+    inactive_since = _require_u32(
+        interrupt.get("inactive_edge_count_since_ancestry"),
+        "photons.interrupt.inactive_edge_count_since_ancestry",
+    )
+    if ((callback_missing_lifetime - callback_missing_origin) & 0xFFFFFFFF) != callback_missing_since:
+        raise ValueError("PHOTONS callback-missing ancestry delta does not close")
+    if ((inactive_lifetime - inactive_origin) & 0xFFFFFFFF) != inactive_since:
+        raise ValueError("PHOTONS inactive-edge ancestry delta does not close")
+    endpoint_admitted = _require_bool(
+        stats.get("rolling_ppb_endpoint_admitted"),
+        "photons.stats.rolling_ppb_endpoint_admitted",
+    )
+    if endpoint_admitted and (callback_missing_since != 0 or inactive_since != 0):
+        raise ValueError(
+            "PHOTONS rolling endpoint admitted despite post-ancestry interrupt injury"
+        )
+
+    race_cadence_ticks_total = _require_int(
+        race.get("cadence_tick_count_total"), "photons.race.cadence_tick_count_total"
+    )
+    race_attempts_total = _require_int(
+        race.get("attempt_count_total"), "photons.race.attempt_count_total"
+    )
+    race_completed_total = _require_int(
+        race.get("completed_count_total"), "photons.race.completed_count_total"
+    )
+    race_missed_total = _require_int(
+        race.get("missed_count_total"), "photons.race.missed_count_total"
+    )
+    race_invalid_total = _require_int(
+        race.get("invalid_endpoint_total"), "photons.race.invalid_endpoint_total"
+    )
+    race_enqueue_failure_total = _require_int(
+        race.get("enqueue_failure_total"), "photons.race.enqueue_failure_total"
+    )
+    race_skipped_not_quiet_total = _require_int(
+        race.get("skipped_not_quiet_total"), "photons.race.skipped_not_quiet_total"
+    )
+    race_skipped_projection_total = _require_int(
+        race.get("skipped_projection_total"), "photons.race.skipped_projection_total"
+    )
+    if race_cadence_ticks_total != (
+        race_attempts_total
+        + race_skipped_not_quiet_total
+        + race_skipped_projection_total
+    ):
+        raise ValueError(
+            "PHOTONS race cadence accounting does not close: "
+            f"ticks={race_cadence_ticks_total} attempts={race_attempts_total} "
+            f"not_quiet={race_skipped_not_quiet_total} "
+            f"projection={race_skipped_projection_total}"
+        )
+
+    finalized_total = (
+        race_completed_total
+        + race_missed_total
+        + race_invalid_total
+        + race_enqueue_failure_total
+    )
+    if finalized_total > race_attempts_total or race_attempts_total - finalized_total > 1:
+        raise ValueError(
+            "PHOTONS race lifetime accounting does not close: "
+            f"attempts={race_attempts_total} completed={race_completed_total} "
+            f"missed={race_missed_total} invalid={race_invalid_total} "
+            f"enqueue_failure={race_enqueue_failure_total}"
+        )
+
+    race_cadence_ticks_fragment = _require_int(
+        race.get("cadence_ticks_this_fragment"), "photons.race.cadence_ticks_this_fragment"
+    )
+    race_attempts_fragment = _require_int(
+        race.get("attempts_this_fragment"), "photons.race.attempts_this_fragment"
+    )
+    race_completed_fragment = _require_int(
+        race.get("completed_this_fragment"), "photons.race.completed_this_fragment"
+    )
+    _require_int(race.get("missed_this_fragment"), "photons.race.missed_this_fragment")
+    race_skipped_not_quiet_fragment = _require_int(
+        race.get("skipped_not_quiet_this_fragment"),
+        "photons.race.skipped_not_quiet_this_fragment",
+    )
+    race_skipped_projection_fragment = _require_int(
+        race.get("skipped_projection_this_fragment"),
+        "photons.race.skipped_projection_this_fragment",
+    )
+    if race_cadence_ticks_fragment != (
+        race_attempts_fragment
+        + race_skipped_not_quiet_fragment
+        + race_skipped_projection_fragment
+    ):
+        raise ValueError(
+            "PHOTONS race fragment cadence accounting does not close: "
+            f"ticks={race_cadence_ticks_fragment} attempts={race_attempts_fragment} "
+            f"not_quiet={race_skipped_not_quiet_fragment} "
+            f"projection={race_skipped_projection_fragment}"
+        )
+    _require_int(
+        race.get("invalid_endpoint_this_fragment"),
+        "photons.race.invalid_endpoint_this_fragment",
+    )
+    _require_int(
+        race.get("enqueue_failure_this_fragment"),
+        "photons.race.enqueue_failure_this_fragment",
+    )
+    if race_completed_fragment > race_attempts_fragment + 1:
+        # A race launched in the prior one-second fragment may lawfully complete
+        # in this one, so at most one completion can lead this fragment's attempts.
+        raise ValueError(
+            "PHOTONS race fragment completion/attempt geometry is impossible: "
+            f"attempts={race_attempts_fragment} completed={race_completed_fragment}"
+        )
+
+    race_flight = _validate_recovery_welford(
+        race.get("flight_ns"), "photons.race.flight_ns"
+    )
+    raw_laps_fragment = _require_int(
+        raw_cycles.get("laps_this_fragment"), "photons.raw_cycles.laps_this_fragment"
+    )
+    projected_laps_fragment = _require_int(
+        instrument.get("projected_laps_this_fragment"),
+        "photons.projected_laps_this_fragment",
+    )
+    if race_completed_fragment != raw_laps_fragment:
+        raise ValueError(
+            "PHOTONS completed-race/raw-ring mismatch: "
+            f"completed={race_completed_fragment} raw_laps={raw_laps_fragment}"
+        )
+    if int(race_flight["n"]) != projected_laps_fragment:
+        raise ValueError(
+            "PHOTONS race-flight/projection mismatch: "
+            f"race_flight_n={race_flight['n']} projected={projected_laps_fragment}"
+        )
+    if projected_laps_fragment > race_completed_fragment:
+        raise ValueError(
+            "PHOTONS projected race count exceeds physical completions: "
+            f"projected={projected_laps_fragment} completed={race_completed_fragment}"
+        )
 
     candidate_count = _require_int(
         science.get("candidate_count"), "photons.science.candidate_count"
@@ -1262,21 +1502,21 @@ def _ppb_endpoints_equal(a: Any, b: Any) -> bool:
 
 
 def _ppb_value_from_endpoints(
-    current: Dict[str, Any], anchor: Dict[str, Any], standard_lap_ps: int
+    current: Dict[str, Any], anchor: Dict[str, Any], lap_baseline_fs: int
 ) -> Dict[str, Any]:
     lap_count = int(current["lap_count"]) - int(anchor["lap_count"])
-    total_ns = int(current["total_lap_gnss_ns"]) - int(
-        anchor["total_lap_gnss_ns"]
-    )
-    if lap_count <= 0 or total_ns <= 0 or standard_lap_ps <= 0:
+    total_ns = int(current["total_lap_gnss_ns"]) - int(anchor["total_lap_gnss_ns"])
+    if lap_count <= 0 or total_ns <= 0 or lap_baseline_fs <= 0:
         raise ValueError(
-            "Better-Buckets proof has nonpositive endpoint population: "
-            f"lap_count={lap_count} total_ns={total_ns} standard_lap_ps={standard_lap_ps}"
+            "Better-Buckets proof has nonpositive endpoint population/reference: "
+            f"lap_count={lap_count} total_ns={total_ns} lap_baseline_fs={lap_baseline_fs}"
         )
-    mean_ps = (float(total_ns) * 1000.0) / float(lap_count)
+    mean_fs = (float(total_ns) * 1_000_000.0) / float(lap_count)
+    residual_ns = (mean_fs - float(lap_baseline_fs)) / 1_000_000.0
     return {
         "sample_count": lap_count,
-        "ppb": (mean_ps / float(standard_lap_ps) - 1.0) * 1.0e9,
+        "ppb": residual_ns,
+        "residual_ns": residual_ns,
     }
 
 
@@ -1291,6 +1531,11 @@ def _validate_firmware_ppb_checkpoint_delta(stats: Dict[str, Any]) -> Dict[str, 
         raise ValueError(
             "unsupported PHOTONS Better-Buckets checkpoint schema "
             f"{raw.get('schema')!r}"
+        )
+
+    if stats.get("ppb_semantics") != PHOTONS_PPB_SEMANTICS:
+        raise ValueError(
+            f"unsupported PHOTONS Better-Buckets semantics {stats.get('ppb_semantics')!r}"
         )
 
     reset_count = _require_int(stats.get("reset_count"), "photons.stats.reset_count")
@@ -1309,8 +1554,8 @@ def _validate_firmware_ppb_checkpoint_delta(stats: Dict[str, Any]) -> Dict[str, 
         stats.get("rolling_ppb_interval_advanced"),
         "photons.stats.rolling_ppb_interval_advanced",
     )
-    standard_lap_ps = _require_int(
-        stats.get("standard_lap_ps"), "photons.stats.standard_lap_ps", minimum=1
+    lap_baseline_fs = _require_int(
+        stats.get("lap_baseline_fs"), "photons.stats.lap_baseline_fs", minimum=1
     )
     stats_lap_count = _require_int(
         stats.get("lap_count"), "photons.stats.lap_count"
@@ -1480,7 +1725,7 @@ def _validate_firmware_ppb_checkpoint_delta(stats: Dict[str, Any]) -> Dict[str, 
         anchor = _ppb_endpoint_from_payload(
             node.get("anchor"), path=f"rolling_ppb_checkpoint.{key}.anchor"
         )
-        computed = _ppb_value_from_endpoints(current, anchor, standard_lap_ps)
+        computed = _ppb_value_from_endpoints(current, anchor, lap_baseline_fs)
         if computed["sample_count"] != sample_count:
             raise ValueError(
                 f"PHOTONS {key} proof N mismatch: "
@@ -1495,17 +1740,27 @@ def _validate_firmware_ppb_checkpoint_delta(stats: Dict[str, Any]) -> Dict[str, 
         recorded_ppb = _require_float(
             recorded.get("ppb"), f"photons.stats.ppb_buckets.{key}.ppb"
         )
+        recorded_residual_ns = _require_float(
+            recorded.get("residual_ns"), f"photons.stats.ppb_buckets.{key}.residual_ns"
+        )
         if recorded_n != sample_count:
             raise ValueError(
                 f"PHOTONS {key} bucket/proof N mismatch: "
                 f"bucket={recorded_n} proof={sample_count}"
             )
         delta_ppb = float(computed["ppb"]) - recorded_ppb
+        delta_residual_ns = float(computed["residual_ns"]) - recorded_residual_ns
         if abs(delta_ppb) > PHOTONS_RECOVERY_VERIFY_TOLERANCE:
             raise ValueError(
                 "PHOTONS Better-Buckets row-local proof mismatch: "
                 f"window={key} computed={computed['ppb']:.9f} "
                 f"recorded={recorded_ppb:.9f} delta={delta_ppb:.9f}"
+            )
+        if abs(delta_residual_ns) > 0.000001:
+            raise ValueError(
+                "PHOTONS Better-Buckets residual proof mismatch: "
+                f"window={key} computed={computed['residual_ns']:.6f} "
+                f"recorded={recorded_residual_ns:.6f} delta={delta_residual_ns:.6f}"
             )
         proof[key] = {
             "valid": True,
@@ -1514,6 +1769,9 @@ def _validate_firmware_ppb_checkpoint_delta(stats: Dict[str, Any]) -> Dict[str, 
             "computed_ppb": round(float(computed["ppb"]), 9),
             "recorded_ppb": round(recorded_ppb, 9),
             "delta_ppb": round(delta_ppb, 9),
+            "recorded_residual_ns": round(recorded_residual_ns, 6),
+            "computed_residual_ns": round(float(computed["residual_ns"]), 6),
+            "delta_residual_ns": round(delta_residual_ns, 6),
         }
         proof_checks += 1
 
@@ -1522,6 +1780,7 @@ def _validate_firmware_ppb_checkpoint_delta(stats: Dict[str, Any]) -> Dict[str, 
         "valid": True,
         "reset_count": reset_count,
         "update_count": update_count,
+        "lap_baseline_fs": lap_baseline_fs,
         "rolling_sequence": rolling_sequence,
         "second_count": second_count,
         "minute_count": minute_count,
@@ -1547,6 +1806,7 @@ def _ppb_checkpoint_delta_signature(delta: Dict[str, Any]) -> str:
             "valid",
             "reset_count",
             "update_count",
+            "lap_baseline_fs",
             "rolling_sequence",
             "second_count",
             "minute_count",
@@ -3038,6 +3298,42 @@ def _canonical_recovery_state_from_row(
     instrument = _require_dict(state.get("photons"), "PHOTONS.photons")
     if instrument.get("schema") != PHOTONS_INSTRUMENT_SCHEMA:
         raise ValueError("canonical PHOTONS instrument schema mismatch")
+
+    # Measurement-source migration is a hard scientific boundary.  Emulator-era
+    # PHOTONS rows are valid historical evidence, but they may never be resurrected
+    # as ancestors of the physical 1 kHz race population.  The operator must make
+    # the one-time STOP/CLEAR + producer reboot cut before this firmware generation.
+    # Refuse legacy durable ancestry rather than silently mixing synthetic laps with
+    # real optical flights.
+    if instrument.get("source") != "PD200T_REAL_RACE":
+        raise ValueError(
+            "durable PHOTONS source predates the real-race measurement epoch; "
+            "STOP/CLEAR the legacy LANTERN domain and reboot the producer before "
+            "starting PD200T_REAL_RACE"
+        )
+    race = _require_dict(instrument.get("race"), "PHOTONS.photons.race")
+    if race.get("schema") != PHOTONS_RACE_SCHEMA:
+        raise ValueError("durable PHOTONS race schema mismatch")
+    durable_race_geometry = (
+        _require_int(race.get("cadence_hz"), "PHOTONS.photons.race.cadence_hz", minimum=1),
+        _require_int(race.get("cadence_ns"), "PHOTONS.photons.race.cadence_ns", minimum=1),
+        _require_int(race.get("pulse_ns"), "PHOTONS.photons.race.pulse_ns", minimum=1),
+    )
+    if durable_race_geometry != (
+        PHOTONS_RACE_CADENCE_HZ,
+        PHOTONS_RACE_CADENCE_NS,
+        PHOTONS_RACE_PULSE_NS,
+    ):
+        raise ValueError(
+            "durable PHOTONS race geometry does not match this firmware epoch: "
+            f"durable={durable_race_geometry!r}"
+        )
+    if (
+        race.get("launch_surrogate") != "LD_ON_FALLING_EDGE"
+        or race.get("flight_interpretation") != "ESTIMATED"
+    ):
+        raise ValueError("durable PHOTONS race launch/interpretation contract changed")
+
     if _require_bool(instrument.get("snapshot_ok"), "PHOTONS.photons.snapshot_ok") is not True:
         raise ValueError("canonical PHOTONS snapshot is not coherent")
     # Top-level instrument.valid is live measurement-readiness testimony, not
@@ -3083,11 +3379,14 @@ def _canonical_recovery_state_from_row(
     standard_lap_ps = _require_int(
         stats.get("standard_lap_ps"), "PHOTONS.photons.stats.standard_lap_ps", minimum=1
     )
-    if _standard_lap_ps is None or standard_lap_ps != int(_standard_lap_ps):
-        raise ValueError(
-            "durable STANDARD_LAP_NS does not match config.PHOTONS: "
-            f"durable_ps={standard_lap_ps} config_ps={_standard_lap_ps}"
-        )
+    # The operator reference is not physical ancestry. Legacy durable rows may
+    # predate femtosecond baseline testimony; their whole-ps mirror remains enough
+    # to verify their own historical PPB while recovery restores only raw N/T.
+    source_lap_baseline_fs = (
+        _require_int(stats.get("lap_baseline_fs"), "PHOTONS.photons.stats.lap_baseline_fs", minimum=1)
+        if stats.get("lap_baseline_fs") is not None
+        else standard_lap_ps * 1000
+    )
 
     reset_count = _require_int(
         stats.get("reset_count"), "PHOTONS.photons.stats.reset_count"
@@ -3163,7 +3462,7 @@ def _canonical_recovery_state_from_row(
     welford_grand_ratio = _welford_grand_ratio_diagnostic(
         welford_mean_ns=float(accepted_projected["mean"]),
         ratio_mean_ns=ratio_mean,
-        standard_lap_ps=standard_lap_ps,
+        lap_baseline_fs=source_lap_baseline_fs,
     )
 
     seed_pending = _require_bool(
@@ -3230,9 +3529,21 @@ def _canonical_recovery_state_from_row(
     total_bucket_ppb = _require_float(
         total_bucket.get("ppb"), "PHOTONS.stats.ppb_buckets.total.ppb"
     )
-    expected_total_ppb = (
-        ((ratio_mean * 1000.0) / float(standard_lap_ps)) - 1.0
-    ) * 1.0e9
+    source_ppb_semantics = stats.get("ppb_semantics")
+    if source_ppb_semantics is None:
+        # Pre-normalization durable rows used conventional fractional-lap PPB.
+        # Their N/T and endpoint rings remain valid physical custody, so prove
+        # the historical derived value under its own semantics and then restore
+        # only the baseline-independent sufficient state.
+        expected_total_ppb = (
+            ((ratio_mean * 1_000_000.0) / float(source_lap_baseline_fs)) - 1.0
+        ) * 1.0e9
+    elif source_ppb_semantics == PHOTONS_PPB_SEMANTICS:
+        expected_total_ppb = ratio_mean - (float(source_lap_baseline_fs) / 1_000_000.0)
+    else:
+        raise ValueError(
+            f"unsupported durable PHOTONS PPB semantics {source_ppb_semantics!r}"
+        )
     if total_bucket_n != lap_count or abs(total_bucket_ppb - expected_total_ppb) > PHOTONS_RECOVERY_VERIFY_TOLERANCE:
         raise ValueError("canonical PHOTONS TOTAL PPB does not close")
 
@@ -3302,7 +3613,7 @@ def _canonical_recovery_state_from_row(
         "source_publish_count": publish_count,
         "source_reset_count": reset_count,
         "source_update_count": update_count,
-        "standard_lap_ps": standard_lap_ps,
+        "standard_lap_ps": int(_standard_lap_ps or 0),
         "stats_lap_count": lap_count,
         "stats_total_lap_gnss_ns": total_ns,
         "custody_lap_count": custody_lap_count,
@@ -3488,10 +3799,11 @@ def _load_newest_recoverable_photons_state(
                 FROM campaign_detail
                 WHERE campaign_type = %s
                   AND campaign = %s
+                  AND payload #>> '{photons,source}' = %s
                 ORDER BY id DESC
                 LIMIT 1
                 """,
-                (CAMPAIGN_TYPE_LANTERN, active_master["campaign"]),
+                (CAMPAIGN_TYPE_LANTERN, active_master["campaign"], "PD200T_REAL_RACE"),
             )
         else:
             cur.execute(
@@ -3499,10 +3811,11 @@ def _load_newest_recoverable_photons_state(
                 SELECT id, ts, campaign, viable, payload, sequence, pps_count
                 FROM campaign_detail
                 WHERE campaign_type = %s
+                  AND payload #>> '{photons,source}' = %s
                 ORDER BY id DESC
                 LIMIT 1
                 """,
-                (CAMPAIGN_TYPE_LANTERN,),
+                (CAMPAIGN_TYPE_LANTERN, "PD200T_REAL_RACE"),
             )
         row = cur.fetchone()
 
@@ -3552,6 +3865,61 @@ def _count_current_lantern_details() -> int:
         )
         row = cur.fetchone()
     return int(row["count"] if row else 0)
+
+
+def _count_current_real_race_details() -> int:
+    """Count durable rows belonging to the current physical race source epoch."""
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM campaign_detail
+            WHERE campaign_type = %s
+              AND payload #>> '{photons,source}' = %s
+            """,
+            (CAMPAIGN_TYPE_LANTERN, "PD200T_REAL_RACE"),
+        )
+        row = cur.fetchone()
+    return int(row["count"] if row else 0)
+
+
+def _retire_legacy_recovery_for_real_race_epoch(
+    *, legacy_detail_count: int
+) -> Dict[str, Any]:
+    """Cut incompatible continuation custody while preserving historical rows."""
+    if legacy_detail_count <= 0:
+        raise RuntimeError("real-race source migration requires legacy durable history")
+
+    with open_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM config WHERE config_key = %s",
+            (PHOTONS_RECOVERY_CONFIG_KEY,),
+        )
+        deleted = int(cur.rowcount or 0)
+        if deleted > 1:
+            raise RuntimeError(
+                f"config.{PHOTONS_RECOVERY_CONFIG_KEY} is not a singleton: rows={deleted}"
+            )
+
+    migration = {
+        "schema": "PHOTONS_SOURCE_EPOCH_MIGRATION_V1",
+        "from_source": "LEGACY_EMULATOR_OR_PRE_RACE",
+        "to_source": "PD200T_REAL_RACE",
+        "historical_detail_rows_preserved": int(legacy_detail_count),
+        "legacy_recovery_config_deleted": bool(deleted),
+        "producer_action": "COLD_START_NEW_MEASUREMENT_EPOCH",
+    }
+    logging.warning(
+        "🔬 [photons/recovery] source epoch migration: preserving %d historical "
+        "LANTERN detail row(s), retiring legacy config.%s=%s, and cold-starting "
+        "PD200T_REAL_RACE; no synthetic statistics will enter the new population",
+        int(legacy_detail_count),
+        PHOTONS_RECOVERY_CONFIG_KEY,
+        bool(deleted),
+    )
+    return migration
 
 
 def _send_teensy_recovery_command(
@@ -3612,15 +3980,15 @@ def _fetch_teensy_recovery_report() -> Dict[str, Any]:
         "PHOTONS.REPORT_RECOVERY.standard_lap_configured",
     ):
         raise RuntimeError("Teensy PHOTONS recovery report lacks STANDARD_LAP_NS")
-    standard_ps = _require_int(
-        payload.get("standard_lap_ps"),
-        "PHOTONS.REPORT_RECOVERY.standard_lap_ps",
+    baseline_fs = _require_int(
+        payload.get("lap_baseline_fs"),
+        "PHOTONS.REPORT_RECOVERY.lap_baseline_fs",
         minimum=1,
     )
-    if _standard_lap_ps is None or standard_ps != int(_standard_lap_ps):
+    if _lap_baseline_fs is None or baseline_fs != int(_lap_baseline_fs):
         raise RuntimeError(
-            "Teensy/config PHOTONS standard mismatch during recovery: "
-            f"teensy_ps={standard_ps} config_ps={_standard_lap_ps}"
+            "Teensy/config PHOTONS LAP_BASELINE_NS mismatch during recovery: "
+            f"teensy_fs={baseline_fs} config_fs={_lap_baseline_fs}"
         )
     for field in (
         "publication_started",
@@ -3688,16 +4056,30 @@ def _fetch_teensy_photons_report() -> Dict[str, Any]:
     payload = response.get("payload") if isinstance(response, dict) else None
     if not isinstance(response, dict) or not response.get("success") or not isinstance(payload, dict):
         raise RuntimeError(f"Teensy PHOTONS.REPORT unavailable: {response!r}")
+    if payload.get("schema") != "PHOTONS_REPORT_V3":
+        raise RuntimeError(
+            f"unsupported Teensy PHOTONS broad-report schema {payload.get('schema')!r}; "
+            "PD200T_REAL_RACE firmware is required"
+        )
+    if (
+        _require_int(payload.get("race_cadence_hz"), "PHOTONS.REPORT.race_cadence_hz", minimum=1)
+        != PHOTONS_RACE_CADENCE_HZ
+        or _require_int(payload.get("race_pulse_ns"), "PHOTONS.REPORT.race_pulse_ns", minimum=1)
+        != PHOTONS_RACE_PULSE_NS
+        or payload.get("race_launch_surrogate") != "LD_ON_FALLING_EDGE"
+    ):
+        raise RuntimeError("Teensy PHOTONS real-race geometry does not match Pi contract")
+    _require_bool(payload.get("race_engine_active"), "PHOTONS.REPORT.race_engine_active")
     if not _require_bool(
         payload.get("standard_lap_configured"),
         "PHOTONS.REPORT.standard_lap_configured",
     ):
         raise RuntimeError("Teensy PHOTONS broad report lacks STANDARD_LAP_NS")
-    standard_ps = _require_int(
-        payload.get("standard_lap_ps"), "PHOTONS.REPORT.standard_lap_ps", minimum=1
+    baseline_fs = _require_int(
+        payload.get("lap_baseline_fs"), "PHOTONS.REPORT.lap_baseline_fs", minimum=1
     )
-    if _standard_lap_ps is None or standard_ps != int(_standard_lap_ps):
-        raise RuntimeError("Teensy PHOTONS broad-report standard mismatch")
+    if _lap_baseline_fs is None or baseline_fs != int(_lap_baseline_fs):
+        raise RuntimeError("Teensy PHOTONS broad-report LAP_BASELINE_NS mismatch")
     return copy.deepcopy(payload)
 
 
@@ -3760,15 +4142,15 @@ def _fetch_teensy_ppb_export_meta() -> Dict[str, Any]:
             payload.get(key), f"PHOTONS.PPB_EXPORT_META.{key}"
         )
 
-    standard_lap_ps = _require_int(
-        payload.get("standard_lap_ps"),
-        "PHOTONS.PPB_EXPORT_META.standard_lap_ps",
+    lap_baseline_fs = _require_int(
+        payload.get("lap_baseline_fs"),
+        "PHOTONS.PPB_EXPORT_META.lap_baseline_fs",
         minimum=1,
     )
-    if _standard_lap_ps is None or standard_lap_ps != int(_standard_lap_ps):
+    if _lap_baseline_fs is None or lap_baseline_fs != int(_lap_baseline_fs):
         raise RuntimeError(
-            "PHOTONS Better-Buckets export standard disagrees with config: "
-            f"teensy={standard_lap_ps} config={_standard_lap_ps}"
+            "PHOTONS Better-Buckets export LAP_BASELINE_NS disagrees with config: "
+            f"teensy_fs={lap_baseline_fs} config_fs={_lap_baseline_fs}"
         )
     if meta["update_count"] <= 0 or meta["current_sequence"] != meta["update_count"]:
         raise RuntimeError("PHOTONS Better-Buckets export current chronology is invalid")
@@ -5181,13 +5563,24 @@ def _startup_held_restore(
 
 
 def _startup_cold_start(
-    *, active_master: Optional[Dict[str, Any]], rows_seen: int
+    *,
+    active_master: Optional[Dict[str, Any]],
+    rows_seen: int,
+    source_epoch_migration: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Create a fresh producer epoch without replaying a zero-row campaign."""
+    """Create a fresh producer epoch without inventing continuity across sources."""
     global _recovery_cold_start_count
 
-    if rows_seen != 0:
+    migration = copy.deepcopy(source_epoch_migration)
+    if rows_seen != 0 and not isinstance(migration, dict):
         raise RuntimeError("cold PHOTONS start was requested despite durable LANTERN rows")
+    if isinstance(migration, dict):
+        if active_master is not None:
+            raise RuntimeError("real-race source migration requires the legacy LANTERN campaign STOPPED")
+        if migration.get("to_source") != "PD200T_REAL_RACE":
+            raise RuntimeError("unsupported PHOTONS source-epoch migration target")
+        if int(migration.get("historical_detail_rows_preserved") or 0) != int(rows_seen):
+            raise RuntimeError("PHOTONS source-epoch migration row accounting changed")
 
     generation = _new_recovery_generation()
     _rehydrate_pi_campaign(
@@ -5203,6 +5596,7 @@ def _startup_cold_start(
         mode="COLD_START",
         generation=generation,
         ingress_rows_drained=drained,
+        source_epoch_migration=migration,
     )
     cold = _send_teensy_recovery_command(
         "RECOVERY_COLD_START",
@@ -5225,6 +5619,7 @@ def _startup_cold_start(
         "firmware": cold,
         "proof": proof,
         "campaign_adoption": campaign_adoption,
+        "source_epoch_migration": migration,
     }
     _recovery_status_set("COMPLETE", **result)
     return result
@@ -5332,6 +5727,7 @@ def _perform_phase5_recovery() -> Dict[str, Any]:
             else 0
         )
         total_detail_count = _count_current_lantern_details()
+        real_race_detail_count = _count_current_real_race_details()
         require_active_campaign = active_master is not None and active_detail_count > 0
         snapshot, skipped, rows_scanned = _load_newest_recoverable_photons_state(
             active_master=active_master,
@@ -5349,11 +5745,20 @@ def _perform_phase5_recovery() -> Dict[str, Any]:
             if isinstance(desired_state, dict)
             else None
         )
-        if snapshot is None and total_detail_count != 0:
+        source_epoch_migration: Optional[Dict[str, Any]] = None
+        legacy_source_migration_required = False
+        if snapshot is None and real_race_detail_count != 0:
             raise RuntimeError(
-                "durable PHOTONS history exists but no row satisfies the recovery court: "
+                "durable PD200T_REAL_RACE history exists but no row satisfies the recovery court: "
                 f"rows_scanned={rows_scanned} skipped={skipped!r}"
             )
+        if snapshot is None and total_detail_count != 0:
+            if active_master is not None:
+                raise RuntimeError(
+                    "legacy LANTERN campaign is still active during PD200T_REAL_RACE source "
+                    "migration; STOP it before deploying the real-race producer"
+                )
+            legacy_source_migration_required = True
 
         report = _fetch_teensy_recovery_report()
         if report["staging_active"] and not report["publication_started"]:
@@ -5361,6 +5766,22 @@ def _perform_phase5_recovery() -> Dict[str, Any]:
             report = _fetch_teensy_recovery_report()
         if report["staging_active"]:
             raise RuntimeError("Teensy PHOTONS recovery staging remains active")
+
+        # Pair this Pi generation only with the real-race firmware before touching
+        # incompatible legacy continuation state.  If a previous process already
+        # cold-started the new producer, live adoption is lawful.  A live producer
+        # that claims restored ancestry in a legacy-only durable domain is exactly
+        # the contamination we are preventing and requires a producer reboot.
+        broad_preflight = _fetch_teensy_photons_report()
+        if legacy_source_migration_required:
+            if report["publication_started"] and report["restored"]:
+                raise RuntimeError(
+                    "live PD200T_REAL_RACE producer carries restored legacy PHOTONS ancestry; "
+                    "reboot the Teensy before source-epoch migration"
+                )
+            source_epoch_migration = _retire_legacy_recovery_for_real_race_epoch(
+                legacy_detail_count=total_detail_count
+            )
 
         if snapshot is not None:
             # Seed live Pi recovery custody from the exact sidecar carried by the
@@ -5375,6 +5796,8 @@ def _perform_phase5_recovery() -> Dict[str, Any]:
             "active_campaign": active_master["campaign"] if active_master else None,
             "active_campaign_detail_count": active_detail_count,
             "total_detail_count": total_detail_count,
+            "real_race_detail_count": real_race_detail_count,
+            "source_epoch_migration": copy.deepcopy(source_epoch_migration),
             "source_detail_id": (
                 int(snapshot.source_detail_id) if snapshot is not None else None
             ),
@@ -5394,6 +5817,7 @@ def _perform_phase5_recovery() -> Dict[str, Any]:
             "damaged_rows_skipped": copy.deepcopy(skipped),
             "rows_scanned": rows_scanned,
             "teensy_publication_started": bool(report["publication_started"]),
+            "teensy_race_engine_active": bool(broad_preflight["race_engine_active"]),
         }
         _recovery_status_set("CLASSIFIED", **classification)
 
@@ -5417,6 +5841,7 @@ def _perform_phase5_recovery() -> Dict[str, Any]:
             return _startup_cold_start(
                 active_master=active_master,
                 rows_seen=total_detail_count,
+                source_epoch_migration=source_epoch_migration,
             )
         literal_history = _literal_recovery_history_from_source(source)
         return _startup_held_restore(
@@ -5579,6 +6004,8 @@ def _lantern_report_from_photons(photons: Payload) -> Dict[str, Any]:
     excluded = excluded if isinstance(excluded, dict) else {}
     stats = instrument.get("stats")
     stats = stats if isinstance(stats, dict) else {}
+    race = instrument.get("race")
+    race = race if isinstance(race, dict) else {}
     campaign_stats = campaign.get("stats")
     campaign_stats = campaign_stats if isinstance(campaign_stats, dict) else {}
 
@@ -5600,6 +6027,7 @@ def _lantern_report_from_photons(photons: Payload) -> Dict[str, Any]:
         "accepted_count": accepted.get("count"),
         "excluded_count": excluded.get("count"),
         "instrument_stats": copy.deepcopy(stats),
+        "race": copy.deepcopy(race),
         "location": copy.deepcopy(photons.get("location") or {}),
         "environment": copy.deepcopy(photons.get("environment") or {}),
     }
@@ -5947,8 +6375,20 @@ def _state_loop() -> None:
                                 "interrupt_callback_missing_count": interrupt.get(
                                     "callback_missing_count"
                                 ),
+                                "interrupt_callback_missing_count_origin": interrupt.get(
+                                    "callback_missing_count_origin"
+                                ),
+                                "interrupt_callback_missing_count_since_ancestry": interrupt.get(
+                                    "callback_missing_count_since_ancestry"
+                                ),
                                 "interrupt_inactive_edge_count": interrupt.get(
                                     "inactive_edge_count"
+                                ),
+                                "interrupt_inactive_edge_count_origin": interrupt.get(
+                                    "inactive_edge_count_origin"
+                                ),
+                                "interrupt_inactive_edge_count_since_ancestry": interrupt.get(
+                                    "inactive_edge_count_since_ancestry"
                                 ),
                                 "checkpoint_status": checkpoint.get("status"),
                                 "checkpoint_last_gap": copy.deepcopy(
@@ -6826,6 +7266,264 @@ def cmd_truncate(_: Optional[dict]) -> Dict[str, Any]:
     return {"success": True, "message": "OK", "payload": result}
 
 
+def cmd_set_lap_baseline_ns(args: Optional[dict]) -> Dict[str, Any]:
+    """Persist and realize one operator-authored LAP_BASELINE_NS reference."""
+    global _lap_baseline_ns
+    global _lap_baseline_fs
+    global _standard_lap_ns
+    global _standard_lap_ps
+    global _teensy_standard_configured
+    global _lap_baseline_set_count
+    global _last_maintenance
+
+    busy = _campaign_control_gate("SET_LAP_BASELINE_NS")
+    if busy is not None:
+        return busy
+
+    raw = (args or {}).get("ns")
+    if raw is None:
+        raw = (args or {}).get("lap_baseline_ns")
+    if raw is None:
+        return {"success": False, "message": "SET_LAP_BASELINE_NS requires ns=<nanoseconds>"}
+    try:
+        baseline_text, baseline_fs = _normalize_lap_baseline_ns(
+            raw, path="SET_LAP_BASELINE_NS.ns"
+        )
+        standard_text, standard_ps = _compat_standard_from_baseline_fs(baseline_fs)
+    except Exception as exc:
+        return {"success": False, "message": str(exc)}
+
+    requested_at = _utc_now_z()
+    with _maintenance_lock:
+        # Persist desired reference first. If transport realization is interrupted,
+        # the next PHOTONS process start converges the Teensy from config.PHOTONS.
+        try:
+            with open_db() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    UPDATE config
+                    SET payload = payload || jsonb_build_object(
+                        'lap_baseline_ns', %s::text,
+                        'lap_baseline_fs', %s::bigint,
+                        'lap_baseline_source', 'OPERATOR',
+                        'lap_baseline_updated_at_utc', %s::text
+                    )
+                    WHERE config_key = 'PHOTONS'
+                    """,
+                    (baseline_text, baseline_fs, requested_at),
+                )
+                if cur.rowcount != 1:
+                    raise RuntimeError("config.PHOTONS LAP_BASELINE_NS update did not affect exactly one row")
+        except Exception as exc:
+            logging.exception("❌ [photons] SET_LAP_BASELINE_NS persistence failed")
+            return {"success": False, "message": str(exc)}
+
+        try:
+            response = send_command(
+                machine="TEENSY",
+                subsystem=SUBSYSTEM,
+                command="SET_LAP_BASELINE_NS",
+                args={"lap_baseline_ns": baseline_text},
+            )
+            payload = response.get("payload") if isinstance(response, dict) else None
+            if (
+                not isinstance(response, dict)
+                or not response.get("success")
+                or not isinstance(payload, dict)
+                or payload.get("status") != "lap_baseline_set"
+            ):
+                raise RuntimeError(f"Teensy PHOTONS.SET_LAP_BASELINE_NS rejected: {response!r}")
+            echoed_fs = _require_int(
+                payload.get("lap_baseline_fs"),
+                "PHOTONS.SET_LAP_BASELINE_NS.payload.lap_baseline_fs",
+                minimum=1,
+            )
+            if echoed_fs != baseline_fs:
+                raise RuntimeError(
+                    f"Teensy LAP_BASELINE_NS echo mismatch: requested_fs={baseline_fs} echoed_fs={echoed_fs}"
+                )
+        except Exception as exc:
+            failure = {
+                "action": "SET_LAP_BASELINE_NS",
+                "requested_at_utc": requested_at,
+                "success": False,
+                "config_persisted": True,
+                "producer_realized": False,
+                "lap_baseline_ns": baseline_text,
+                "lap_baseline_fs": baseline_fs,
+                "error": str(exc),
+                "recovery_action": "retry command or restart PHOTONS to converge from config.PHOTONS",
+            }
+            with _state_lock:
+                _last_maintenance = copy.deepcopy(failure)
+            logging.exception("⚠️ [photons] LAP_BASELINE_NS persisted but Teensy realization failed")
+            return {"success": False, "message": str(exc), "payload": failure}
+
+        previous_text = _lap_baseline_ns
+        previous_fs = _lap_baseline_fs
+        _lap_baseline_ns = baseline_text
+        _lap_baseline_fs = baseline_fs
+        _standard_lap_ns = standard_text
+        _standard_lap_ps = standard_ps
+        _teensy_standard_configured = True
+
+    result = {
+        "action": "SET_LAP_BASELINE_NS",
+        "requested_at_utc": requested_at,
+        "success": True,
+        "changed": previous_fs != baseline_fs,
+        "previous_lap_baseline_ns": previous_text,
+        "previous_lap_baseline_fs": previous_fs,
+        "lap_baseline_ns": baseline_text,
+        "lap_baseline_fs": baseline_fs,
+        "config_key": "PHOTONS",
+        "config_field": "lap_baseline_ns",
+        "producer_realized": True,
+        "physical_measurement_unchanged": True,
+        "welford_preserved": True,
+        "better_buckets_history_preserved": True,
+        "effect": "REFERENCE_ONLY_NEXT_FRAGMENT_RECOMPUTES_PPB_AND_RESIDUALS",
+    }
+    with _state_lock:
+        _lap_baseline_set_count += 1
+        _last_maintenance = copy.deepcopy(result)
+    logging.warning(
+        "📐 [photons] LAP_BASELINE_NS %s -> %s ns (%d fs); physical N/T and Better-Buckets custody preserved",
+        previous_text or "UNSET", baseline_text, baseline_fs,
+    )
+    return {"success": True, "message": "OK", "payload": result}
+
+
+def cmd_set_lap_baseline_ns(args: Optional[dict]) -> Dict[str, Any]:
+    """Persist and realize one operator-authored LAP_BASELINE_NS reference."""
+    global _lap_baseline_ns
+    global _lap_baseline_fs
+    global _standard_lap_ns
+    global _standard_lap_ps
+    global _teensy_standard_configured
+    global _lap_baseline_set_count
+    global _last_maintenance
+
+    busy = _campaign_control_gate("SET_LAP_BASELINE_NS")
+    if busy is not None:
+        return busy
+
+    raw = (args or {}).get("ns")
+    if raw is None:
+        raw = (args or {}).get("lap_baseline_ns")
+    if raw is None:
+        return {"success": False, "message": "SET_LAP_BASELINE_NS requires ns=<nanoseconds>"}
+    try:
+        baseline_text, baseline_fs = _normalize_lap_baseline_ns(
+            raw, path="SET_LAP_BASELINE_NS.ns"
+        )
+        standard_text, standard_ps = _compat_standard_from_baseline_fs(baseline_fs)
+    except Exception as exc:
+        return {"success": False, "message": str(exc)}
+
+    requested_at = _utc_now_z()
+    with _maintenance_lock:
+        # Persist desired reference first. If transport realization is interrupted,
+        # the next PHOTONS process start converges the Teensy from config.PHOTONS.
+        try:
+            with open_db() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    UPDATE config
+                    SET payload = payload || jsonb_build_object(
+                        'lap_baseline_ns', %s::text,
+                        'lap_baseline_fs', %s::bigint,
+                        'lap_baseline_source', 'OPERATOR',
+                        'lap_baseline_updated_at_utc', %s::text
+                    )
+                    WHERE config_key = 'PHOTONS'
+                    """,
+                    (baseline_text, baseline_fs, requested_at),
+                )
+                if cur.rowcount != 1:
+                    raise RuntimeError("config.PHOTONS LAP_BASELINE_NS update did not affect exactly one row")
+        except Exception as exc:
+            logging.exception("❌ [photons] SET_LAP_BASELINE_NS persistence failed")
+            return {"success": False, "message": str(exc)}
+
+        try:
+            response = send_command(
+                machine="TEENSY",
+                subsystem=SUBSYSTEM,
+                command="SET_LAP_BASELINE_NS",
+                args={"lap_baseline_ns": baseline_text},
+            )
+            payload = response.get("payload") if isinstance(response, dict) else None
+            if (
+                not isinstance(response, dict)
+                or not response.get("success")
+                or not isinstance(payload, dict)
+                or payload.get("status") != "lap_baseline_set"
+            ):
+                raise RuntimeError(f"Teensy PHOTONS.SET_LAP_BASELINE_NS rejected: {response!r}")
+            echoed_fs = _require_int(
+                payload.get("lap_baseline_fs"),
+                "PHOTONS.SET_LAP_BASELINE_NS.payload.lap_baseline_fs",
+                minimum=1,
+            )
+            if echoed_fs != baseline_fs:
+                raise RuntimeError(
+                    f"Teensy LAP_BASELINE_NS echo mismatch: requested_fs={baseline_fs} echoed_fs={echoed_fs}"
+                )
+        except Exception as exc:
+            failure = {
+                "action": "SET_LAP_BASELINE_NS",
+                "requested_at_utc": requested_at,
+                "success": False,
+                "config_persisted": True,
+                "producer_realized": False,
+                "lap_baseline_ns": baseline_text,
+                "lap_baseline_fs": baseline_fs,
+                "error": str(exc),
+                "recovery_action": "retry command or restart PHOTONS to converge from config.PHOTONS",
+            }
+            with _state_lock:
+                _last_maintenance = copy.deepcopy(failure)
+            logging.exception("⚠️ [photons] LAP_BASELINE_NS persisted but Teensy realization failed")
+            return {"success": False, "message": str(exc), "payload": failure}
+
+        previous_text = _lap_baseline_ns
+        previous_fs = _lap_baseline_fs
+        _lap_baseline_ns = baseline_text
+        _lap_baseline_fs = baseline_fs
+        _standard_lap_ns = standard_text
+        _standard_lap_ps = standard_ps
+        _teensy_standard_configured = True
+
+    result = {
+        "action": "SET_LAP_BASELINE_NS",
+        "requested_at_utc": requested_at,
+        "success": True,
+        "changed": previous_fs != baseline_fs,
+        "previous_lap_baseline_ns": previous_text,
+        "previous_lap_baseline_fs": previous_fs,
+        "lap_baseline_ns": baseline_text,
+        "lap_baseline_fs": baseline_fs,
+        "config_key": "PHOTONS",
+        "config_field": "lap_baseline_ns",
+        "producer_realized": True,
+        "physical_measurement_unchanged": True,
+        "welford_preserved": True,
+        "better_buckets_history_preserved": True,
+        "effect": "REFERENCE_ONLY_NEXT_FRAGMENT_RECOMPUTES_PPB_AND_RESIDUALS",
+    }
+    with _state_lock:
+        _lap_baseline_set_count += 1
+        _last_maintenance = copy.deepcopy(result)
+    logging.warning(
+        "📐 [photons] LAP_BASELINE_NS %s -> %s ns (%d fs); physical N/T and Better-Buckets custody preserved",
+        previous_text or "UNSET", baseline_text, baseline_fs,
+    )
+    return {"success": True, "message": "OK", "payload": result}
+
+
 def cmd_set_baseline(args: Optional[dict]) -> Dict[str, Any]:
     """Relate the active LANTERN campaign to another campaign by durable ID."""
     global _baseline_set_count
@@ -7002,6 +7700,12 @@ def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
         payload = payload if isinstance(payload, dict) else {}
         report = payload.get("report")
         report = report if isinstance(report, dict) else {}
+        instrument_stats = report.get("instrument_stats")
+        instrument_stats = instrument_stats if isinstance(instrument_stats, dict) else {}
+        race = report.get("race")
+        race = race if isinstance(race, dict) else {}
+        race_flight = race.get("flight_ns")
+        race_flight = race_flight if isinstance(race_flight, dict) else {}
 
         campaigns.append(
             {
@@ -7021,11 +7725,17 @@ def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
                 "latest_pps_count": report.get("pps_count"),
                 "latest_accepted_count": report.get("accepted_count"),
                 "latest_excluded_count": report.get("excluded_count"),
-                "latest_mean_lap_ns": (
-                    (report.get("instrument_stats") or {}).get("mean_lap_ns")
-                    if isinstance(report.get("instrument_stats"), dict)
-                    else None
-                ),
+                # mean_flight_ns is the cumulative accepted population.  The
+                # race_* values are the exact producer-authored latest 1 s batch.
+                "latest_mean_flight_ns": instrument_stats.get("mean_flight_ns"),
+                "latest_race_cadence_ticks": race.get("cadence_ticks_this_fragment"),
+                "latest_race_attempts": race.get("attempts_this_fragment"),
+                "latest_race_completed": race.get("completed_this_fragment"),
+                "latest_race_missed": race.get("missed_this_fragment"),
+                "latest_race_flight_mean_ns": race_flight.get("mean"),
+                "latest_race_flight_stderr_ns": race_flight.get("stderr"),
+                # Legacy field remains during the lap->race naming migration.
+                "latest_mean_lap_ns": instrument_stats.get("mean_lap_ns"),
             }
         )
 
@@ -7076,6 +7786,11 @@ def _stats_epoch_snapshot_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
         "update_count": _require_int(
             stats.get("update_count"),
             "PHOTONS.photons.stats.update_count",
+            minimum=1,
+        ),
+        "lap_baseline_fs": _require_int(
+            stats.get("lap_baseline_fs"),
+            "PHOTONS.photons.stats.lap_baseline_fs",
             minimum=1,
         ),
         "standard_lap_ps": _require_int(
@@ -7133,8 +7848,10 @@ def _stats_reset_birth_court(
         raise ValueError(
             "PHOTONS physical publication chronology did not advance across STATS_RESET"
         )
+    if snapshot["lap_baseline_fs"] != int(before["lap_baseline_fs"]):
+        raise ValueError("PHOTONS STATS_RESET changed LAP_BASELINE_NS")
     if snapshot["standard_lap_ps"] != int(before["standard_lap_ps"]):
-        raise ValueError("PHOTONS STATS_RESET changed immutable STANDARD_LAP_NS")
+        raise ValueError("PHOTONS STATS_RESET changed compatibility standard_lap_ps")
     if snapshot["custody_lap_count"] < int(before["custody_lap_count"]):
         raise ValueError("PHOTONS STATS_RESET regressed monotonic accepted-lap custody")
     if snapshot["custody_total_lap_gnss_ns"] < int(
@@ -7272,7 +7989,7 @@ def _stats_reset_birth_court(
         welford_grand_ratio = _welford_grand_ratio_diagnostic(
             welford_mean_ns=float(lap_welford["mean"]),
             ratio_mean_ns=ratio_mean,
-            standard_lap_ps=int(snapshot["standard_lap_ps"]),
+            lap_baseline_fs=int(snapshot["lap_baseline_fs"]),
         )
 
     current_sequence = _require_int(
@@ -7393,6 +8110,8 @@ def _pi_report_surface() -> Dict[str, Any]:
             "rows_persisted": _rows_persisted,
             "ingress_queue_depth": _fragment_queue.qsize(),
             "persist_queue_depth": _persist_queue.qsize(),
+            "lap_baseline_ns": _lap_baseline_ns,
+            "lap_baseline_fs": _lap_baseline_fs,
             "standard_lap_ns": _standard_lap_ns,
             "standard_lap_ps": _standard_lap_ps,
             "teensy_standard_configured": _teensy_standard_configured,
@@ -7704,8 +8423,10 @@ def _note_stats_reset_persisted(photons: Dict[str, Any], detail_id: int) -> None
                 )
             if after["sequence"] < durable_birth["sequence"]:
                 raise RuntimeError("latest PHOTONS physical sequence regressed behind durable row 1")
+            if after["lap_baseline_fs"] != before["lap_baseline_fs"]:
+                raise RuntimeError("latest PHOTONS LAP_BASELINE_NS changed across STATS_RESET")
             if after["standard_lap_ps"] != before["standard_lap_ps"]:
-                raise RuntimeError("latest PHOTONS STANDARD_LAP_NS changed across STATS_RESET")
+                raise RuntimeError("latest PHOTONS compatibility standard_lap_ps changed across STATS_RESET")
             if after["campaign"] != before.get("campaign"):
                 raise RuntimeError("latest PHOTONS LANTERN identity/origin changed across STATS_RESET")
             if after["custody_lap_count"] < durable_birth["custody_lap_count"]:
@@ -7879,6 +8600,8 @@ def cmd_photons_info(_: Optional[dict]) -> Dict[str, Any]:
             "instrument_always_on": True,
             "teensy_science_authority": True,
             "pi_campaign_lifecycle_authority": True,
+            "lap_baseline_ns": _lap_baseline_ns,
+            "lap_baseline_fs": _lap_baseline_fs,
             "standard_lap_ns": _standard_lap_ns,
             "standard_lap_ps": _standard_lap_ps,
             "teensy_standard_configured": _teensy_standard_configured,
@@ -7898,6 +8621,7 @@ def cmd_photons_info(_: Optional[dict]) -> Dict[str, Any]:
             "stats_reset_success": _stats_reset_success,
             "stats_reset_failures": _stats_reset_failures,
             "stats_reset_in_progress": _stats_reset_in_progress.is_set(),
+            "lap_baseline_set_count": _lap_baseline_set_count,
             "report_photons_requests": _report_photons_requests,
             "report_stats_requests": _report_stats_requests,
             "clear_count": _clear_count,
@@ -7952,6 +8676,7 @@ def cmd_report(_: Optional[dict]) -> dict:
             "campaign_start_count": _campaign_start_count,
             "campaign_stop_count": _campaign_stop_count,
             "baseline_set_count": _baseline_set_count,
+            "lap_baseline_set_count": _lap_baseline_set_count,
             "stale_campaign_retire_count": _stale_campaign_retire_count,
             "stats_reset_requests": _stats_reset_requests,
             "stats_reset_success": _stats_reset_success,
@@ -7969,6 +8694,8 @@ def cmd_report(_: Optional[dict]) -> dict:
             "last_structural_rejection": copy.deepcopy(_last_structural_rejection),
             "last_system_report_failure": copy.deepcopy(_last_system_report_failure),
             "last_persistence_failure": copy.deepcopy(_last_persistence_failure),
+            "lap_baseline_ns": _lap_baseline_ns,
+            "lap_baseline_fs": _lap_baseline_fs,
             "standard_lap_ns": _standard_lap_ns,
             "standard_lap_ps": _standard_lap_ps,
             "teensy_standard_configured": _teensy_standard_configured,
@@ -8016,6 +8743,7 @@ COMMANDS = {
     "DELETE": cmd_delete,
     "TRUNCATE": cmd_truncate,
     "INJECT_PROBLEM": cmd_inject_problem,
+    "SET_LAP_BASELINE_NS": cmd_set_lap_baseline_ns,
     "SET_BASELINE": cmd_set_baseline,
     "BASELINE_INFO": cmd_baseline_info,
     "LIST_CAMPAIGNS": cmd_list_campaigns,
@@ -8130,7 +8858,7 @@ def run() -> None:
         source="RUN",
     )
     try:
-        _configure_teensy_standard_lap()
+        _configure_teensy_lap_baseline()
         recovery = _perform_phase5_recovery()
     except Exception as exc:
         _enter_hard_failure(

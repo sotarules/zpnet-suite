@@ -16,50 +16,45 @@
 //     DWT-at-edge custody.
 //   • PHOTONS consumes those edge facts and publishes PHOTONS_FRAGMENT.
 //
-// PHOTONS_FRAGMENT is now the canonical once-per-second optical instrument
-// handoff.  As in CLOCKS, physical testimony and interpreted statistics remain
-// separate: raw DWT lap intervals are preserved beside GNSS-projected lap time,
-// science-admission testimony, Welford sufficient state, and recovery totals.
+// PHOTONS_FRAGMENT is the canonical once-per-second optical instrument handoff.
+// Physical testimony and interpreted statistics remain separate: each completed
+// single-pass race preserves its raw DWT endpoints beside the GNSS-projected
+// estimated flight interval, science-admission testimony, Welford sufficient
+// state, and recovery totals.
 //
-// A projected lap is never silently discarded.  PHOTONS applies a CLOCKS-style
-// ACCEPT / SCIENCE_EXCLUDE court before mutating scientific statistics.  Raw and
-// projection testimony survives either verdict so downstream/Python analysis can
-// inspect excluded observations.  The temporary emulator remains only a source
-// of physical pin-34 edge facts while the PD200T is unavailable.
-//
-// Temporary bring-up emulator:
-//   • pin 33 is a detector-emulator output physically looped to pin 34;
-//   • process_interrupt still timestamps every resulting real pin-34 GPIO edge;
-//   • PHOTONS emits a real ~20-DWT-cycle LD_ON launch pulse;
-//   • one ordinary recurring TimePop timer supplies the coarse 10 ms edge cadence;
-//     its callback advances emulator state only and never arms/cancels TimePop;
-//   • physical loopback-edge timing remains visible as custody telemetry, while
-//     emulator-only science laps are synthesized around STANDARD_LAP_NS with a
-//     tiny bounded DWT-cycle variation so foreground scheduler jitter cannot
-//     masquerade as optical propagation;
-//   • each train emits exactly five physical detector edges:
-//       hit 1 ignored by lap semantics,
-//       hit 2 lap start,
-//       hit 3 lap 1 end,
-//       hit 4 lap 2 end,
-//       hit 5 lap 3 end;
-//   • the cadence tick after hit 5 is lap 4: no detector edge is emitted and
-//     the next real laser pulse/train begins on that same recurring tick;
-//   • when the emulator is enabled, pin 38/A14 PD OUT telemetry is synthesized;
-//     with the physical PD200T selected, pin 38/A14 PD OUT is ADC-read directly;
-//   • the emulator is always on and independent of campaign state;
-//   • the TimePop cadence is bring-up transport timing, not optical truth.
+// Real single-pass race engine:
+//   • one recurring 1 kHz TimePop cadence owns one race attempt per tick;
+//   • the interim MP5491 path drives LD_ON HIGH for 91,000 ns, then LOW;
+//   • actual LD_ON falling-edge DWT is the explicit interim launch surrogate;
+//   • process_interrupt owns the first-instruction DWT coordinate of every
+//     physical PD200T pin-34 RISING edge; PHOTONS admits only the first eligible
+//     edge for the armed race and ignores later comparator chatter for race science;
+//   • no ADC polling, GNSS projection, floating point, Payload work, or Welford
+//     mutation occurs in the detector callback;
+//   • the next cadence finalizes the previous race, explicitly counting a miss
+//     or unsafe/ambiguous endpoint instead of manufacturing a measurement;
+//   • the 1 Hz foreground drain projects completed races and advances both the
+//     canonical lifetime Welford and a one-fragment race Welford for metrics;
+//   • the launch-surrogate contract is intentionally replaceable: the future
+//     fast-switch daughterboard can supply a better launch edge without changing
+//     the downstream race/Welford/campaign/recovery architecture.
 //
 // Commands:
 //   • INIT                — reinitialize PHOTONS-owned optical hardware; laser is inhibited
-//   • SET_STANDARD_LAP_NS — install the required optical PPB reference; fragment publication
-//                           remains gated until this startup configuration is present
+//   • SET_LAP_BASELINE_NS — install/change the operator-authored lap reference with
+//                           six fractional ns digits (1 fs); Better-Buckets are
+//                           re-referenced in place without changing physical custody
+//   • SET_STANDARD_LAP_NS — legacy startup-compatible 3-decimal alias
 //   • START               — start a LANTERN campaign, or hot-cut an active campaign to a new name
 //   • FLASH_CUT           — explicit hot campaign boundary preserving the always-on instrument epoch
 //   • STOP                — request campaign closure; the next published campaign fragment is final
 //   • REPORT              — compact operational/device report for laser, PD200T pin 38/A14
 //                           PD OUT voltage, pin 34 comparator interrupt custody, publication
 //                           identity, and hardware commissioning
+//   • PULSE               — manual one-shot commissioning pulse while the recurring
+//                           race engine is not active; optional ns=<nanoseconds>
+//                           selects pulse width (default 1000 ns)
+//   • REPORT_PULSE        — minimal latest manual-shot commissioning report
 //   • REPORT_PHOTONS      — compact always-on instrument + current CAMP report
 //   • REPORT_STATS        — detailed statistical/court/Better-Buckets report
 //   • STATS_RESET         — reset the always-on statistical epoch without changing CAMP custody
@@ -72,7 +67,8 @@
 //   • RECOVERY_COLD_START — start a genuinely empty instrument when no durable state exists
 //   • RECOVERY_PROOF_ACK  — acknowledge that the first advancing post-restore row is durable
 //   • REPORT_RECOVERY     — report staging, restored source, and physical-ancestry testimony
-//   • INJECT_PROBLEM      — arm one synthetic lap excursion through the ordinary science court
+//   • INJECT_PROBLEM      — retained command identity; synthetic injection is unavailable
+//                           after retirement of the emulator
 //   • ON                  — permit laser emission through LD_ON
 //   • OFF                 — inhibit laser emission through LD_ON
 // ============================================================================
@@ -160,8 +156,9 @@ struct photons_fragment_raw_cycles_snapshot_t {
 
 
 // Projection testimony for the most recently accepted lap plus lifetime
-// admission counters.  PHOTONS consumes a cached immutable PPS/VCLOCK anchor;
-// the detector ISR never calls TIME/CLOCKS or performs Payload/statistical work.
+// admission counters. PHOTONS consumes a cached immutable PPS/VCLOCK anchor.
+// Ordinary detector ISR work never calls TIME/CLOCKS or performs Payload/statistical
+// work; the explicitly armed one-shot PULSE path projects its first return edge once.
 struct photons_fragment_projection_snapshot_t {
   bool anchor_cache_valid = false;
   uint32_t anchor_pps_count = 0;
@@ -276,6 +273,7 @@ struct photons_lap_science_snapshot_t {
 struct photons_fragment_ppb_value_snapshot_t {
   uint64_t sample_count = 0;
   double ppb = 0.0;
+  double residual_ns = 0.0;
 };
 
 
@@ -340,6 +338,9 @@ struct photons_fragment_stats_snapshot_t {
   bool valid = false;
   uint32_t reset_count = 0;
   uint32_t update_count = 0;
+  // Exact operator-authored reference. standard_lap_ps remains a deprecated
+  // whole-picosecond compatibility mirror; all reference arithmetic uses fs.
+  uint64_t lap_baseline_fs = 0;
   uint64_t standard_lap_ps = 0;
   uint64_t lap_count = 0;
   uint64_t total_lap_gnss_ns = 0;
@@ -378,14 +379,14 @@ struct photons_fragment_campaign_snapshot_t {
 };
 
 
-// Baseline comparison is intentionally present in the schema before baseline
-// control exists.  No fake zero baseline is authored: present/residual_valid
-// remain false until a future LANTERN/baseline command supplies provenance.
+// Operator-authored instrument reference. This is deliberately independent of
+// campaign-to-campaign baseline provenance: it is simply the scalar zero used to
+// express the current accepted-population mean as a residual.
 struct photons_fragment_baseline_snapshot_t {
   bool present = false;
   bool residual_valid = false;
   double baseline_mean_lap_ns = 0.0;
-  double mean_residual_ps = 0.0;
+  double mean_residual_ns = 0.0;
 };
 
 
@@ -431,10 +432,35 @@ struct photons_fragment_snapshot_t {
   uint32_t edge_count_total = 0;
   uint32_t edges_this_fragment = 0;
 
+  // Legacy schema fields retained at zero while downstream consumers migrate
+  // from the removed train/lap emulator terminology.
   uint32_t train_count = 0;
   uint32_t dead_lap_count = 0;
   uint64_t raw_lap_count = 0;
   uint32_t projected_laps_this_fragment = 0;
+
+  // Real single-pass race telemetry. Lifetime counters are boot-local physical
+  // testimony; the one-fragment Welford is derived only from completed projected
+  // races in this exact PHOTONS_FRAGMENT.
+  uint32_t race_cadence_hz = 0;
+  uint64_t race_pulse_ns = 0;
+  uint64_t race_cadence_tick_count_total = 0;
+  uint32_t race_cadence_ticks_this_fragment = 0;
+  uint64_t race_attempt_count_total = 0;
+  uint32_t race_attempts_this_fragment = 0;
+  uint64_t race_completed_count_total = 0;
+  uint32_t race_completed_this_fragment = 0;
+  uint64_t race_missed_count_total = 0;
+  uint32_t race_missed_this_fragment = 0;
+  uint64_t race_skipped_not_quiet_total = 0;
+  uint32_t race_skipped_not_quiet_this_fragment = 0;
+  uint64_t race_skipped_projection_total = 0;
+  uint32_t race_skipped_projection_this_fragment = 0;
+  uint64_t race_invalid_endpoint_total = 0;
+  uint32_t race_invalid_endpoint_this_fragment = 0;
+  uint64_t race_enqueue_failure_total = 0;
+  uint32_t race_enqueue_failure_this_fragment = 0;
+  photons_fragment_welford_snapshot_t race_flight_this_fragment{};
 
   photons_fragment_raw_cycles_snapshot_t raw_cycles{};
   photons_fragment_projection_snapshot_t projection{};
@@ -444,19 +470,28 @@ struct photons_fragment_snapshot_t {
   photons_fragment_baseline_snapshot_t baseline{};
   photons_fragment_recovery_snapshot_t recovery{};
 
-  // Snapshot of process_interrupt's PHOTODIODE lane testimony.
+  // Snapshot of process_interrupt's PHOTODIODE lane testimony. Lifetime
+  // counters remain forensic evidence. Fresh physical ancestry snapshots the
+  // two injury-counter origins; rolling custody judges only their unsigned
+  // deltas since that boundary, so pre-publication startup edges cannot poison
+  // every later fragment.
   uint32_t interrupt_irq_count = 0;
   uint32_t interrupt_callback_count = 0;
   uint32_t interrupt_callback_missing_count = 0;
+  bool     interrupt_ancestry_baseline_valid = false;
+  uint32_t interrupt_callback_missing_origin = 0;
+  uint32_t interrupt_callback_missing_since_ancestry = 0;
   uint32_t interrupt_inactive_edge_count = 0;
+  uint32_t interrupt_inactive_edge_origin = 0;
+  uint32_t interrupt_inactive_edge_since_ancestry = 0;
   uint32_t interrupt_source_pin = 0;
   uint32_t interrupt_last_callback_wall_cycles = 0;
   uint32_t interrupt_max_callback_wall_cycles = 0;
 };
 
-// Initialize PHOTONS runtime state, subscribe to the process_interrupt
-// PHOTODIODE lane, start that lane, arm the 1 Hz toy fragment publisher, and
-// start the temporary always-on detector emulator.
+// Initialize PHOTONS runtime state and subscribe to the process_interrupt
+// PHOTODIODE lane. After the recovery verdict, PHOTONS starts the 1 Hz fragment
+// publisher and the real 1 kHz single-pass race cadence.
 // Must run after process_interrupt_init() and timepop_init().
 void process_photons_init(void);
 

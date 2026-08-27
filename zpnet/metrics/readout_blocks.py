@@ -20,8 +20,9 @@ Stats policy:
   PostgreSQL is not in that live-tail path.  Durable campaign/baseline history
   remains a database read model.  This never synthesizes individual samples,
   changes admission, or feeds science back into PHOTONS.  PHOTONS CAMP is read
-  verbatim from the Teensy-authored campaign.stats.ppb surface.  PHOTONS RES_PS
-  is presentation math for the local accepted-lap mean minus STANDARD_LAP_NS;
+  verbatim from the Teensy-authored campaign.stats.ppb surface.  PHOTONS RES_NS
+  is presentation math for the local accepted-lap mean minus LAP_BASELINE_NS,
+  rendered in the system-wide nanosecond coordinate to six fractional digits;
   baseline campaign comparisons remain a separate BASE/NOW/DELTA surface.
 
 Clock row doctrine:
@@ -1928,11 +1929,14 @@ def _photons_producer_campaign_stats(payload: dict | None) -> dict:
     return stats
 
 
-def _photons_standard_lap_ns(payload: dict | None):
-    """Return the immutable PHOTONS metrological reference carried by the producer."""
+def _photons_lap_baseline_ns(payload: dict | None):
+    """Return the operator-authored PHOTONS nanosecond reference."""
     root = _json_object(payload)
     instrument = root.get("photons") if isinstance(root.get("photons"), dict) else {}
     stats = instrument.get("stats") if isinstance(instrument.get("stats"), dict) else {}
+    value = _to_float(stats.get("lap_baseline_ns"))
+    if value is not None:
+        return value
     return _to_float(stats.get("standard_lap_ns"))
 
 
@@ -2024,7 +2028,7 @@ def _get_lantern_campaign_summaries() -> list[dict]:
             "ppb_buckets": _photons_producer_ppb_buckets(last_payload),
             "campaign_ppb": _to_float(campaign_stats.get("ppb")),
             "campaign_mean_lap_ns": _to_float(campaign_stats.get("mean_lap_ns")),
-            "standard_lap_ns": _photons_standard_lap_ns(last_payload),
+            "lap_baseline_ns": _photons_lap_baseline_ns(last_payload),
             # Private presentation helpers used to derive live campaign
             # populations. They are never rendered as instrument testimony.
             "_prior_payload": prior_payload,
@@ -2038,14 +2042,14 @@ def _get_lantern_campaign_summaries() -> list[dict]:
         base_mean = base_stats.get("mean") if isinstance(base_stats, dict) else None
         summary["baseline_mean_lap_ns"] = base_mean
 
-        # RES_PS is the PHOTONS analogue of CLOCKS' immediate reference residual:
-        # campaign mean relative to the fixed STANDARD_LAP_NS.  Baseline deltas
+        # RES_NS is the PHOTONS analogue of CLOCKS' immediate reference residual:
+        # campaign mean relative to LAP_BASELINE_NS. Baseline deltas
         # remain a separate relationship and are never substituted here.
         campaign_mean = summary.get("campaign_mean_lap_ns")
-        standard_lap_ns = summary.get("standard_lap_ns")
-        summary["residual_ps"] = (
-            (float(campaign_mean) - float(standard_lap_ns)) * 1000.0
-            if campaign_mean is not None and standard_lap_ns is not None
+        lap_baseline_ns = summary.get("lap_baseline_ns")
+        summary["residual_ns"] = (
+            float(campaign_mean) - float(lap_baseline_ns)
+            if campaign_mean is not None and lap_baseline_ns is not None
             else None
         )
     return summaries
@@ -2096,7 +2100,7 @@ def _photons_rolling_rows(live: dict, summaries: list[dict]) -> list[dict]:
 
         producer_ppb = _photons_producer_ppb_buckets(current)
         producer_campaign_stats = _photons_producer_campaign_stats(current)
-        standard_lap_ns = _photons_standard_lap_ns(current)
+        lap_baseline_ns = _photons_lap_baseline_ns(current)
 
         rows.append({
             "sequence": sequence,
@@ -2114,9 +2118,9 @@ def _photons_rolling_rows(live: dict, summaries: list[dict]) -> list[dict]:
             "campaign_ppb": _to_float(producer_campaign_stats.get("ppb")),
             # Local one-second residual to the fixed metrological reference.
             # This remains meaningful with or without a campaign or baseline.
-            "residual_ps": (
-                (float(second_stats["mean"]) - float(standard_lap_ns)) * 1000.0
-                if second_stats.get("mean") is not None and standard_lap_ns is not None
+            "residual_ns": (
+                float(second_stats["mean"]) - float(lap_baseline_ns)
+                if second_stats.get("mean") is not None and lap_baseline_ns is not None
                 else None
             ),
             "mean": second_stats.get("mean"),
@@ -2198,17 +2202,17 @@ def photons_detail_readout() -> list[str]:
     except Exception:
         rolling = []
 
-    standard_lap_ns = _photons_standard_lap_ns(live)
-    current_residual_ps = (
-        (float(now_mean) - float(standard_lap_ns)) * 1000.0
-        if now_mean is not None and standard_lap_ns is not None
+    lap_baseline_ns = _photons_lap_baseline_ns(live)
+    current_residual_ns = (
+        float(now_mean) - float(lap_baseline_ns)
+        if now_mean is not None and lap_baseline_ns is not None
         else None
     )
 
     W_NAME = 4
     W_VALUE = 12
     W_PPB = 9
-    W_RES = 10
+    W_RES = 13
     W_MEAN = 12
     W_SD = 8
     W_SE = 8
@@ -2225,7 +2229,7 @@ def photons_detail_readout() -> list[str]:
         f"{'24-HOUR':>{W_PPB}}{G}"
         f"{'TOTAL':>{W_PPB}}{G}"
         f"{'CAMP':>{W_PPB}}{G}"
-        f"{'RES_PS':>{W_RES}}{G}"
+        f"{'RES_NS':>{W_RES}}{G}"
         f"{'MEAN':>{W_MEAN}}{G}"
         f"{'SD':>{W_SD}}{G}"
         f"{'SE':>{W_SE}}{G}"
@@ -2243,7 +2247,7 @@ def photons_detail_readout() -> list[str]:
             f"{_fmt(now_mean, f'>{W_VALUE}.3f', W_VALUE)}{G}"
             f"{G.join(_fmt(current_ppb.get(key), f'>{W_PPB}.3f', W_PPB) for key in PPB_BUCKET_KEYS)}{G}"
             f"{_fmt(campaign_ppb, f'>{W_PPB}.3f', W_PPB)}{G}"
-            f"{_fmt(current_residual_ps, f'>+{W_RES}.3f', W_RES)}{G}"
+            f"{_fmt(current_residual_ns, f'>+{W_RES}.6f', W_RES)}{G}"
             f"{_fmt(current_stats.get('mean'), f'>{W_MEAN}.3f', W_MEAN)}{G}"
             f"{_fmt(current_stats.get('stddev'), f'>{W_SD}.3f', W_SD)}{G}"
             f"{_fmt(current_stats.get('stderr'), f'>{W_SE}.3f', W_SE)}{G}"
@@ -2293,7 +2297,7 @@ def photons_detail_readout() -> list[str]:
         f"{'24-HOUR':>{W_PPB}}{G}"
         f"{'TOTAL':>{W_PPB}}{G}"
         f"{'CAMP':>{W_PPB}}{G}"
-        f"{'RES_PS':>{W_RES}}{G}"
+        f"{'RES_NS':>{W_RES}}{G}"
         f"{'MEAN':>{W_ROLL_MEAN}}{G}"
         f"{'SD':>{W_ROLL_SD}}{G}"
         f"{'SE':>{W_ROLL_SE}}{G}"
@@ -2323,7 +2327,7 @@ def photons_detail_readout() -> list[str]:
             f"{_fmt(_to_int(row.get('accepted')), f'>{W_ACC}d', W_ACC)}{G}"
             f"{_fmt(_to_int(row.get('excluded')), f'>{W_EXCL}d', W_EXCL)}{G}"
             f"{G.join(_fmt(v, f'>{W_PPB}.3f', W_PPB) for v in ppb_values)}{G}"
-            f"{_fmt(row.get('residual_ps'), f'>+{W_RES}.3f', W_RES)}{G}"
+            f"{_fmt(row.get('residual_ns'), f'>+{W_RES}.6f', W_RES)}{G}"
             f"{_fmt(row.get('mean'), f'>{W_ROLL_MEAN}.3f', W_ROLL_MEAN)}{G}"
             f"{_fmt(row.get('stddev'), f'>{W_ROLL_SD}.3f', W_ROLL_SD)}{G}"
             f"{_fmt(row.get('stderr'), f'>{W_ROLL_SE}.3f', W_ROLL_SE)}{G}"
@@ -2346,7 +2350,7 @@ def photons_campaigns_readout() -> list[str]:
     W_CAMPAIGN = 14
     W_VALUE = 12
     W_PPB = 8
-    W_RES = 8
+    W_RES = 13
     W_MEAN = 12
     W_SD = 7
     W_SE = 7
@@ -2363,7 +2367,7 @@ def photons_campaigns_readout() -> list[str]:
         f"{'24-HOUR':>{W_PPB}}{G}"
         f"{'TOTAL':>{W_PPB}}{G}"
         f"{'CAMP':>{W_PPB}}{G}"
-        f"{'RES_PS':>{W_RES}}{G}"
+        f"{'RES_NS':>{W_RES}}{G}"
         f"{'MEAN':>{W_MEAN}}{G}"
         f"{'SD':>{W_SD}}{G}"
         f"{'SE':>{W_SE}}{G}"
@@ -2395,7 +2399,7 @@ def photons_campaigns_readout() -> list[str]:
             f"{campaign_cell}{G}"
             f"{_fmt(stats.get('mean'), f'>{W_VALUE}.3f', W_VALUE)}{G}"
             f"{G.join(_fmt(v, f'>{W_PPB}.3f', W_PPB) for v in ppb_values)}{G}"
-            f"{_fmt(row.get('residual_ps'), f'>+{W_RES}.3f', W_RES)}{G}"
+            f"{_fmt(row.get('residual_ns'), f'>+{W_RES}.6f', W_RES)}{G}"
             f"{_fmt(stats.get('mean'), f'>{W_MEAN}.3f', W_MEAN)}{G}"
             f"{_fmt(stats.get('stddev'), f'>{W_SD}.3f', W_SD)}{G}"
             f"{_fmt(stats.get('stderr'), f'>{W_SE}.3f', W_SE)}{G}"
