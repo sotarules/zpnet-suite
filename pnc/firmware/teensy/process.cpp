@@ -105,7 +105,9 @@ static Payload make_error_payload(const char* msg) {
 }
 
 static bool copy_request_metadata_into_response(const Payload& request,
-                                                Payload& response) {
+                                                Payload& response,
+                                                uint32_t* out_req_id = nullptr,
+                                                uint64_t* out_req_ts_ms = nullptr) {
     uint32_t req_id = 0U;
     if (!request.tryGetUInt("req_id", req_id) || req_id == 0U) {
         debug_log("process.rpc_metadata_invalid_req_id", request);
@@ -124,6 +126,8 @@ static bool copy_request_metadata_into_response(const Payload& request,
     // complete, Payload publishes its fatal WATCHDOG_ANOMALY and does not return.
     response.add("req_id", req_id);
     response.add("req_ts_ms", req_ts_ms);
+    if (out_req_id) *out_req_id = req_id;
+    if (out_req_ts_ms) *out_req_ts_ms = req_ts_ms;
 
     return true;
 }
@@ -242,8 +246,11 @@ void process_command(const Payload& request) {
 
     rpc_received++;
 
+    uint32_t req_id = 0U;
+    uint64_t req_ts_ms = 0ULL;
     Payload response;
-    if (!copy_request_metadata_into_response(request, response)) {
+    if (!copy_request_metadata_into_response(
+            request, response, &req_id, &req_ts_ms)) {
         // Defenseless protocol boundary: malformed request identity is itself
         // the failure. Do not invoke a subsystem handler and do not synthesize
         // req_id=0. The Pi will log the identity-less response immediately.
@@ -315,11 +322,13 @@ void process_command(const Payload& request) {
 
     rpc_handler_completed++;
 
-    response.add("success", true);
-    response.add("message", "OK");
-    response.add_object("payload", payload);
-
-    send_response_or_overflow(request, response);
+    // The handler Payload may be large. Do not copy it into a second Payload
+    // merely to add the RPC envelope: transport writes the four small metadata
+    // fields and the handler JSON directly into the final queued wire image.
+    // This keeps peak RAM2 demand to the handler Payload plus one TX allocation.
+    if (!transport_send_response(req_id, req_ts_ms, true, "OK", payload)) {
+        send_overflow_response(request);
+    }
 
     rpc_response_sent++;
 }

@@ -1127,6 +1127,98 @@ bool transport_send(uint8_t traffic, const Payload& payload) {
 }
 
 // =============================================================
+// transport_send_response() — write RPC envelope directly into final wire
+// =============================================================
+
+bool transport_send_response(uint32_t req_id,
+                             uint64_t req_ts_ms,
+                             bool success,
+                             const char* message,
+                             const Payload& payload) {
+
+  const uint8_t traffic = TRAFFIC_REQUEST_RESPONSE;
+  const uint32_t sequence = ++tx_send_attempt_count;
+  static constexpr char PAYLOAD_KEY[] = "\"payload\":";
+  static constexpr size_t PAYLOAD_KEY_LEN = sizeof(PAYLOAD_KEY) - 1U;
+
+  // Keep only the small envelope prefix as a Payload so canonical integer, bool,
+  // string validation, and JSON escaping stay owned by Payload. The handler's
+  // potentially large result remains in its original storage and is written
+  // directly into the one final transport allocation.
+  Payload prefix;
+  prefix.add("req_id", req_id);
+  prefix.add("req_ts_ms", req_ts_ms);
+  prefix.add("success", success);
+  prefix.add("message", message ? message : "");
+
+  const size_t prefix_json_len = prefix.json_size();
+  const size_t payload_json_len = payload.json_size();
+  if (prefix_json_len < 2U || payload_json_len == 0U) {
+    tx_empty_serialization_count++;
+    tx_note_reject(sequence, traffic, nullptr, 0U, 0U,
+                   TX_REASON_EMPTY_SERIALIZATION, false);
+    return false;
+  }
+
+  // prefix is {"req_id":...,"req_ts_ms":...,"success":...,"message":...}.
+  // Replace its closing brace with a comma, append the handler Payload by value,
+  // then close the envelope. tx_allocate_wire() remains the authoritative size,
+  // budget, queue, and allocation court for the completed D1 message.
+  const size_t envelope_len =
+      prefix_json_len + PAYLOAD_KEY_LEN + payload_json_len + 1U;
+
+  uint8_t* data = nullptr;
+  size_t wire_len = 0U;
+  size_t json_offset = 0U;
+  if (!tx_allocate_wire(sequence, traffic, nullptr, envelope_len, false,
+                        &data, &wire_len, &json_offset)) {
+    return false;
+  }
+
+  const size_t prefix_written = prefix.write_json(
+      reinterpret_cast<char*>(data + json_offset), prefix_json_len + 1U);
+  if (prefix_written != prefix_json_len ||
+      data[json_offset + prefix_json_len - 1U] != (uint8_t)'}') {
+    free(data);
+    tx_empty_serialization_count++;
+    tx_note_reject(sequence, traffic, nullptr, envelope_len, wire_len,
+                   TX_REASON_EMPTY_SERIALIZATION, false);
+    return false;
+  }
+
+  size_t pos = json_offset + prefix_json_len;
+  data[pos - 1U] = (uint8_t)',';
+  memcpy(data + pos, PAYLOAD_KEY, PAYLOAD_KEY_LEN);
+  pos += PAYLOAD_KEY_LEN;
+
+  const size_t payload_written = payload.write_json(
+      reinterpret_cast<char*>(data + pos), payload_json_len + 1U);
+  if (payload_written != payload_json_len) {
+    free(data);
+    tx_empty_serialization_count++;
+    tx_note_reject(sequence, traffic, nullptr, envelope_len, wire_len,
+                   TX_REASON_EMPTY_SERIALIZATION, false);
+    return false;
+  }
+  pos += payload_written;
+  data[pos++] = (uint8_t)'}';
+
+  memcpy(data + pos, ETX_SEQ, ETX_LEN);
+  pos += ETX_LEN;
+
+  if (pos != wire_len) {
+    free(data);
+    tx_empty_serialization_count++;
+    tx_note_reject(sequence, traffic, nullptr, envelope_len, wire_len,
+                   TX_REASON_EMPTY_SERIALIZATION, false);
+    return false;
+  }
+
+  tx_commit_wire(sequence, traffic, nullptr, envelope_len, wire_len, data, false);
+  return true;
+}
+
+// =============================================================
 // transport_send_publish() — write pub/sub envelope directly into final wire
 // =============================================================
 

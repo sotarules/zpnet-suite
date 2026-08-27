@@ -1042,6 +1042,37 @@ static inline uint32_t payload_read_dwt(void) {
 #endif
 }
 
+// Final Payload metadata publication is only a handful of stores.  Use
+// PRIMASK rather than the normal BASEPRI critical section so even Priority-0
+// science IRQs cannot interrupt between final coordinate derivation and the
+// redundant metadata/guard writes.  The prior mask is restored exactly.
+static inline uint32_t payload_commit_irq_lock(void) {
+#if defined(__IMXRT1062__)
+    uint32_t primask;
+    __asm__ volatile(
+        "mrs %0, primask\n"
+        "cpsid i\n"
+        : "=r"(primask)
+        :
+        : "memory");
+    return primask;
+#else
+    return 0U;
+#endif
+}
+
+static inline void payload_commit_irq_unlock(uint32_t primask) {
+#if defined(__IMXRT1062__)
+    __asm__ volatile(
+        "msr primask, %0\n"
+        :
+        : "r"(primask)
+        : "memory");
+#else
+    (void)primask;
+#endif
+}
+
 static inline void payload_retained_flush(volatile void* addr, uint32_t size) {
 #if defined(__IMXRT1062__)
     // RAM2 is write-back cached; a reset can discard dirty lines.  Flush so
@@ -6038,94 +6069,134 @@ bool Payload::_append_value(const char* key,
         return false;
     }
 
-    const uint16_t val_off =
-        (uint16_t)(_data_begin - (uint16_t)(value_len + 1U));
-    const uint16_t key_off =
-        (uint16_t)(val_off - (uint16_t)(key_len + 1U));
+    // Append coordinates are derived state, not durable authority.  Never carry
+    // them across a function call: retained crash evidence has shown copied
+    // bytes can diverge while the guarded Payload object remains coherent.
+    // Each write below re-derives from guarded object state immediately before
+    // use.
+    auto fresh_coordinates = [&]() -> uint32_t {
+        const volatile uint16_t* const data_begin_ptr = &_data_begin;
+        const uint16_t data_begin = *data_begin_ptr;
+        const uint16_t val_off =
+            (uint16_t)(data_begin - (uint16_t)(value_len + 1U));
+        const uint16_t key_off =
+            (uint16_t)(val_off - (uint16_t)(key_len + 1U));
+        return ((uint32_t)key_off << 16) | (uint32_t)val_off;
+    };
 
-    payload_append_trace_record(payload_append_trace_stage_t::PRE_VALUE_COPY,
-                                this,
-                                key, key_len,
-                                value, value_len,
-                                true,
-                                (uint32_t)kind,
-                                storage, _capacity(),
-                                _data_begin, _count,
-                                key_alias, value_alias,
-                                key_offset, value_offset,
-                                shift, key_off, val_off);
-    if (value_len != 0U) {
-        memmove(storage + val_off, value, value_len);
+    {
+        const uint16_t value_copy_off = (uint16_t)fresh_coordinates();
+        if (value_len != 0U) {
+            memmove(storage + value_copy_off, value, value_len);
+        }
     }
-    storage[(size_t)val_off + value_len] = '\0';
-    payload_append_trace_record(payload_append_trace_stage_t::VALUE_COPY_DONE,
-                                this,
-                                key, key_len,
-                                value, value_len,
-                                true,
-                                (uint32_t)kind,
-                                storage, _capacity(),
-                                _data_begin, _count,
-                                key_alias, value_alias,
-                                key_offset, value_offset,
-                                shift, key_off, val_off);
-
-    payload_append_trace_record(payload_append_trace_stage_t::PRE_KEY_COPY,
-                                this,
-                                key, key_len,
-                                value, value_len,
-                                true,
-                                (uint32_t)kind,
-                                storage, _capacity(),
-                                _data_begin, _count,
-                                key_alias, value_alias,
-                                key_offset, value_offset,
-                                shift, key_off, val_off);
-    if (key_len != 0U) {
-        memmove(storage + key_off, key, key_len);
+    {
+        const uint16_t value_terminator_off = (uint16_t)fresh_coordinates();
+        storage[(size_t)value_terminator_off + value_len] = '\0';
     }
-    storage[(size_t)key_off + key_len] = '\0';
-    payload_append_trace_record(payload_append_trace_stage_t::KEY_COPY_DONE,
-                                this,
-                                key, key_len,
-                                value, value_len,
-                                true,
-                                (uint32_t)kind,
-                                storage, _capacity(),
-                                _data_begin, _count,
-                                key_alias, value_alias,
-                                key_offset, value_offset,
-                                shift, key_off, val_off);
+    {
+        const uint16_t key_copy_off =
+            (uint16_t)(fresh_coordinates() >> 16);
+        if (key_len != 0U) {
+            memmove(storage + key_copy_off, key, key_len);
+        }
+    }
+    {
+        const uint16_t key_terminator_off =
+            (uint16_t)(fresh_coordinates() >> 16);
+        storage[(size_t)key_terminator_off + key_len] = '\0';
+    }
 
-    // Publish only coordinates re-derived from guarded object state after the
-    // final call boundary; the earlier copy offsets are forensic/provisional.
-    Entry* const commit_entry = &_entries()[_count];
-    const volatile uint16_t& data_begin_now = _data_begin;
+    // Before directory publication, independently prove the candidate bytes at
+    // freshly derived coordinates.  A transient bad copy therefore cannot be
+    // promoted into semantic Payload state.
+    const uint32_t verified_coordinates = fresh_coordinates();
+    const uint16_t verified_val_off = (uint16_t)verified_coordinates;
+    const uint16_t verified_key_off =
+        (uint16_t)(verified_coordinates >> 16);
+    const size_t capacity = _capacity();
+    const size_t verified_key_end =
+        (size_t)verified_key_off + key_len;
+    const size_t verified_value_end =
+        (size_t)verified_val_off + value_len;
+    const bool candidate_bounds_ok =
+        verified_key_end < capacity && verified_value_end < capacity;
+    const bool candidate_terminators_ok =
+        candidate_bounds_ok &&
+        storage[verified_key_end] == '\0' &&
+        storage[verified_value_end] == '\0';
+    const bool candidate_hashes_ok =
+        candidate_terminators_ok &&
+        payload_contract_span_hash(storage + verified_key_off, key_len) ==
+            expected_key_hash &&
+        payload_contract_span_hash(storage + verified_val_off, value_len) ==
+            expected_value_hash;
+    if (!candidate_hashes_ok) {
+        payload_contract_record(
+            payload_contract_phase_t::MUTATION_FAILURE,
+            candidate_bounds_ok
+                ? (candidate_terminators_ok
+                       ? payload_contract_reason_t::EXPECTED_NEW_ENTRY
+                       : payload_contract_reason_t::PACKED_LAYOUT)
+                : payload_contract_reason_t::DIRECTORY_DATA_OVERLAP,
+            PAYLOAD_OP_APPEND_VALUE,
+            this,
+            nullptr,
+            _contract_generation,
+            before.count,
+            verified_key_off,
+            (uint32_t)verified_key_end,
+            verified_val_off,
+            (uint32_t)verified_value_end,
+            before.structural_fingerprint,
+            _contract_fingerprint);
+        _contract_abort(PAYLOAD_OP_APPEND_VALUE, before);
+        return false;
+    }
 
-    Entry entry{};
-    entry.key_off =
-        (uint16_t)(data_begin_now - (uint16_t)additional_data);
-    entry.key_len = (uint16_t)key_len;
-    entry.val_off =
-        (uint16_t)(data_begin_now - (uint16_t)(value_len + 1U));
-    entry.val_len = (uint16_t)value_len;
-    entry.kind = (uint8_t)kind;
-    entry.reserved = 0U;
+    // Re-derive once more with all maskable interrupts blocked.  No function
+    // call occurs between these final coordinates and the authoritative entry,
+    // count, data-begin, and complement writes.
+    const uint32_t saved_primask = payload_commit_irq_lock();
+    const uint32_t commit_coordinates = fresh_coordinates();
+    const uint16_t commit_val_off = (uint16_t)commit_coordinates;
+    const uint16_t commit_key_off =
+        (uint16_t)(commit_coordinates >> 16);
+    if (commit_key_off != verified_key_off ||
+        commit_val_off != verified_val_off) {
+        payload_commit_irq_unlock(saved_primask);
+        payload_contract_record(
+            payload_contract_phase_t::OBSERVED_DRIFT,
+            payload_contract_reason_t::EXPECTED_NEW_ENTRY,
+            PAYLOAD_OP_APPEND_VALUE,
+            this,
+            nullptr,
+            _contract_generation,
+            before.count,
+            verified_key_off,
+            commit_key_off,
+            verified_val_off,
+            commit_val_off,
+            before.structural_fingerprint,
+            _contract_fingerprint);
+        _contract_abort(PAYLOAD_OP_APPEND_VALUE, before);
+        return false;
+    }
 
-    *commit_entry = entry;
-    _set_data_begin(entry.key_off);
-    _set_count((uint16_t)(_count + 1U));
-    payload_append_trace_record(payload_append_trace_stage_t::COMMIT,
-                                this,
-                                key, key_len,
-                                value, value_len,
-                                true,
-                                (uint32_t)kind,
-                                storage, _capacity(),
-                                _data_begin, _count,
-                                key_alias, value_alias,
-                                key_offset, value_offset,
-                                shift, entry.key_off, entry.val_off);
+    Entry* const entries = reinterpret_cast<Entry*>(storage);
+    Entry& committed = entries[_count];
+    committed.key_off = commit_key_off;
+    committed.key_len = (uint16_t)key_len;
+    committed.val_off = commit_val_off;
+    committed.val_len = (uint16_t)value_len;
+    committed.kind = (uint8_t)kind;
+    committed.reserved = 0U;
+    _data_begin = commit_key_off;
+    _data_begin_guard = (uint16_t)~commit_key_off;
+    const uint16_t committed_count = (uint16_t)(_count + 1U);
+    _count = committed_count;
+    _count_guard = (uint16_t)~committed_count;
+    payload_commit_irq_unlock(saved_primask);
 
     if (!_contract_finish_add(PAYLOAD_OP_APPEND_VALUE,
                               before,
@@ -6136,6 +6207,20 @@ bool Payload::_append_value(const char* key,
                               expected_value_hash)) {
         return false;
     }
+
+    // COMMIT is testimony about an already accepted object.  It is deliberately
+    // outside the mutation-critical window.
+    payload_append_trace_record(payload_append_trace_stage_t::COMMIT,
+                                this,
+                                key, key_len,
+                                value, value_len,
+                                true,
+                                (uint32_t)kind,
+                                storage, _capacity(),
+                                _data_begin, _count,
+                                key_alias, value_alias,
+                                key_offset, value_offset,
+                                shift, committed.key_off, committed.val_off);
 
     if (_count > g_payload_entry_high_water_global) {
         g_payload_entry_high_water_global = _count;
@@ -6324,18 +6409,26 @@ bool Payload::_append_value_writer(const char* key,
         return false;
     }
 
-    const uint16_t val_off =
-        (uint16_t)(_data_begin - (uint16_t)(value_len + 1U));
-    const uint16_t key_off =
-        (uint16_t)(val_off - (uint16_t)(key_len + 1U));
+    auto fresh_coordinates = [&]() -> uint32_t {
+        const volatile uint16_t* const data_begin_ptr = &_data_begin;
+        const uint16_t data_begin = *data_begin_ptr;
+        const uint16_t val_off =
+            (uint16_t)(data_begin - (uint16_t)(value_len + 1U));
+        const uint16_t key_off =
+            (uint16_t)(val_off - (uint16_t)(key_len + 1U));
+        return ((uint32_t)key_off << 16) | (uint32_t)val_off;
+    };
 
     size_t written = 0U;
-    if (object_value) {
-        written = object_value->_write_json_unchecked(
-            reinterpret_cast<char*>(storage + val_off));
-    } else {
-        written = array_value->_write_json_unchecked(
-            reinterpret_cast<char*>(storage + val_off));
+    {
+        const uint16_t value_write_off = (uint16_t)fresh_coordinates();
+        if (object_value) {
+            written = object_value->_write_json_unchecked(
+                reinterpret_cast<char*>(storage + value_write_off));
+        } else {
+            written = array_value->_write_json_unchecked(
+                reinterpret_cast<char*>(storage + value_write_off));
+        }
     }
     if (written != value_len) {
         payload_note_error(PAYLOAD_ERR_SERIALIZE_OVERFLOW,
@@ -6344,31 +6437,111 @@ bool Payload::_append_value_writer(const char* key,
         _contract_abort(PAYLOAD_OP_APPEND_WRITER, before);
         return false;
     }
-    storage[(size_t)val_off + value_len] = '\0';
-
-    if (key_len != 0U) {
-        memmove(storage + key_off, key, key_len);
+    {
+        const uint16_t value_terminator_off = (uint16_t)fresh_coordinates();
+        storage[(size_t)value_terminator_off + value_len] = '\0';
     }
-    storage[(size_t)key_off + key_len] = '\0';
+    {
+        const uint16_t key_copy_off =
+            (uint16_t)(fresh_coordinates() >> 16);
+        if (key_len != 0U) {
+            memmove(storage + key_copy_off, key, key_len);
+        }
+    }
+    {
+        const uint16_t key_terminator_off =
+            (uint16_t)(fresh_coordinates() >> 16);
+        storage[(size_t)key_terminator_off + key_len] = '\0';
+    }
 
-    // Publish only coordinates re-derived from guarded object state after the
-    // final call boundary; the earlier copy offsets are forensic/provisional.
-    Entry* const commit_entry = &_entries()[_count];
-    const volatile uint16_t& data_begin_now = _data_begin;
+    const uint32_t verified_coordinates = fresh_coordinates();
+    const uint16_t verified_val_off = (uint16_t)verified_coordinates;
+    const uint16_t verified_key_off =
+        (uint16_t)(verified_coordinates >> 16);
+    const size_t capacity = _capacity();
+    const size_t verified_key_end =
+        (size_t)verified_key_off + key_len;
+    const size_t verified_value_end =
+        (size_t)verified_val_off + value_len;
+    const bool candidate_bounds_ok =
+        verified_key_end < capacity && verified_value_end < capacity;
+    const bool candidate_terminators_ok =
+        candidate_bounds_ok &&
+        storage[verified_key_end] == '\0' &&
+        storage[verified_value_end] == '\0';
+    const bool candidate_hashes_ok =
+        candidate_terminators_ok &&
+        payload_contract_span_hash(storage + verified_key_off, key_len) ==
+            expected_key_hash &&
+        payload_contract_span_hash(storage + verified_val_off, value_len) ==
+            expected_value_hash;
+    if (!candidate_hashes_ok) {
+        payload_contract_record(
+            payload_contract_phase_t::MUTATION_FAILURE,
+            candidate_bounds_ok
+                ? (candidate_terminators_ok
+                       ? payload_contract_reason_t::EXPECTED_NEW_ENTRY
+                       : payload_contract_reason_t::PACKED_LAYOUT)
+                : payload_contract_reason_t::DIRECTORY_DATA_OVERLAP,
+            PAYLOAD_OP_APPEND_WRITER,
+            this,
+            object_value
+                ? static_cast<const void*>(object_value)
+                : static_cast<const void*>(array_value),
+            _contract_generation,
+            before.count,
+            verified_key_off,
+            (uint32_t)verified_key_end,
+            verified_val_off,
+            (uint32_t)verified_value_end,
+            before.structural_fingerprint,
+            _contract_fingerprint);
+        _contract_abort(PAYLOAD_OP_APPEND_WRITER, before);
+        return false;
+    }
 
-    Entry entry{};
-    entry.key_off =
-        (uint16_t)(data_begin_now - (uint16_t)additional_data);
-    entry.key_len = (uint16_t)key_len;
-    entry.val_off =
-        (uint16_t)(data_begin_now - (uint16_t)(value_len + 1U));
-    entry.val_len = (uint16_t)value_len;
-    entry.kind = (uint8_t)kind;
-    entry.reserved = 0U;
+    const uint32_t saved_primask = payload_commit_irq_lock();
+    const uint32_t commit_coordinates = fresh_coordinates();
+    const uint16_t commit_val_off = (uint16_t)commit_coordinates;
+    const uint16_t commit_key_off =
+        (uint16_t)(commit_coordinates >> 16);
+    if (commit_key_off != verified_key_off ||
+        commit_val_off != verified_val_off) {
+        payload_commit_irq_unlock(saved_primask);
+        payload_contract_record(
+            payload_contract_phase_t::OBSERVED_DRIFT,
+            payload_contract_reason_t::EXPECTED_NEW_ENTRY,
+            PAYLOAD_OP_APPEND_WRITER,
+            this,
+            object_value
+                ? static_cast<const void*>(object_value)
+                : static_cast<const void*>(array_value),
+            _contract_generation,
+            before.count,
+            verified_key_off,
+            commit_key_off,
+            verified_val_off,
+            commit_val_off,
+            before.structural_fingerprint,
+            _contract_fingerprint);
+        _contract_abort(PAYLOAD_OP_APPEND_WRITER, before);
+        return false;
+    }
 
-    *commit_entry = entry;
-    _set_data_begin(entry.key_off);
-    _set_count((uint16_t)(_count + 1U));
+    Entry* const entries = reinterpret_cast<Entry*>(storage);
+    Entry& committed = entries[_count];
+    committed.key_off = commit_key_off;
+    committed.key_len = (uint16_t)key_len;
+    committed.val_off = commit_val_off;
+    committed.val_len = (uint16_t)value_len;
+    committed.kind = (uint8_t)kind;
+    committed.reserved = 0U;
+    _data_begin = commit_key_off;
+    _data_begin_guard = (uint16_t)~commit_key_off;
+    const uint16_t committed_count = (uint16_t)(_count + 1U);
+    _count = committed_count;
+    _count_guard = (uint16_t)~committed_count;
+    payload_commit_irq_unlock(saved_primask);
 
     if (!_contract_finish_add(PAYLOAD_OP_APPEND_WRITER,
                               before,

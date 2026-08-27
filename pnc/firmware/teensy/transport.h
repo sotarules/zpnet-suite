@@ -111,6 +111,17 @@ bool transport_send(
   const Payload& payload
 );
 
+// Enqueue one request/response envelope without constructing a second full
+// Payload object. Transport writes the RPC metadata and handler payload directly
+// into the final TRAFFIC_REQUEST_RESPONSE wire allocation.
+bool transport_send_response(
+  uint32_t req_id,
+  uint64_t req_ts_ms,
+  bool success,
+  const char* message,
+  const Payload& payload
+);
+
 // Enqueue one publish/subscribe envelope without constructing a second full
 // Payload object. Transport writes {"topic":...,"payload":...} directly into
 // the final TRAFFIC_PUBLISH_SUBSCRIBE wire allocation.
