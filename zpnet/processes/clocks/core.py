@@ -514,6 +514,11 @@ _diag: Dict[str, Any] = {
     "last_hard_failure_stats_repair": {},
     "last_hard_failure_hold": {},
 
+    # Lawful Alpha lineage surrender. Exact resurrection may be impossible
+    # without making the currently acquired clock substrate unusable.
+    "alpha_lineage_surrenders": 0,
+    "last_alpha_lineage_surrender": {},
+
     # Sync waits
     "sync_waits": 0,
     "sync_wait_success": 0,
@@ -2483,12 +2488,8 @@ _hard_failure_stats_repair_lock = threading.Lock()
 _HARD_FAILURE_STATS_REPAIR_REASONS = {
     "dac_restore_population_ancestry_impossible",
     "dac_recovery_boundary_population_ancestry_impossible",
-    # Once physical Alpha custody has been proved lost, an incomplete/malformed
-    # literal Better-Buckets image is information-theoretically terminal for that
-    # statistics lineage.  The only lawful operator repair is an explicit new
-    # systemwide statistics epoch; raw PostgreSQL replay remains prohibited.
-    "alpha_resurrection_impossible_checkpoint_incomplete",
-    "alpha_resurrection_impossible_checkpoint_invalid",
+    # Exact Alpha resurrection loss is handled automatically as a lawful lineage
+    # surrender during lifecycle reconciliation; it is not a subsystem failure.
 }
 
 _campaign_active: bool = False
@@ -2676,6 +2677,15 @@ _recovery_interruption_details: Dict[str, Any] = {}
 
 class HardFailureRequired(RuntimeError):
     """A proved condition for which CLOCKS must remain alive but stop authoring truth."""
+
+    def __init__(self, reason: str, details: Dict[str, Any]):
+        super().__init__(f"{reason}: {details}")
+        self.reason = str(reason)
+        self.details = copy.deepcopy(details)
+
+
+class AlphaResurrectionImpossible(RuntimeError):
+    """Exact old-Alpha continuity is dead; establish a new lineage instead."""
 
     def __init__(self, reason: str, details: Dict[str, Any]):
         super().__init__(f"{reason}: {details}")
@@ -4002,6 +4012,57 @@ def _ambient_instrument_recovery(regression: Dict[str, Any]) -> None:
             int(source_update),
             int(source_update) + 1,
         )
+    except AlphaResurrectionImpossible as exc:
+        try:
+            surrender = _surrender_unresurrectable_alpha_lineage(
+                verdict=exc,
+                active_campaign=None,
+                source="AMBIENT_PHYSICAL_LIFETIME_COURT",
+            )
+            result = {
+                "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "mode": "AMBIENT_ALPHA_LINEAGE_SURRENDER",
+                "success": True,
+                "source_detail_id": source_detail_id,
+                "physical_regression": copy.deepcopy(regression),
+                "lineage_surrender": copy.deepcopy(surrender),
+            }
+            _diag["ambient_instrument_recovery_completed"] = (
+                _diag.get("ambient_instrument_recovery_completed", 0) + 1
+            )
+            _diag["last_ambient_instrument_recovery"] = copy.deepcopy(result)
+            _set_operational_state(
+                OPERATIONAL_STATE_RUNNING,
+                reason="ambient_alpha_lineage_surrender_complete",
+                source="CLOCKS_PHYSICAL_LIFETIME_COURT",
+                details=result,
+            )
+            logging.critical(
+                "🧭 [ambient restore] old Alpha could not be resurrected exactly; "
+                "history was preserved, old restore authority surrendered, and a "
+                "fresh durable Alpha epoch is now running"
+            )
+        except Exception as surrender_exc:
+            _diag["ambient_instrument_recovery_failures"] = (
+                _diag.get("ambient_instrument_recovery_failures", 0) + 1
+            )
+            details = {
+                "error": str(surrender_exc),
+                "original_lineage_verdict": exc.reason,
+                "original_lineage_evidence": copy.deepcopy(exc.details),
+                "source_detail_id": source_detail_id,
+                "physical_regression": copy.deepcopy(regression),
+            }
+            logging.exception(
+                "💥 [ambient restore] lawful Alpha lineage surrender failed while "
+                "establishing the replacement epoch — entering HARD_FAILURE"
+            )
+            _enter_hard_failure(
+                "ambient_alpha_lineage_surrender_failed",
+                details,
+                source="CLOCKS_PHYSICAL_LIFETIME_COURT",
+            )
+        return
     except HardFailureRequired:
         return
     except Exception as exc:
@@ -6352,10 +6413,10 @@ def _require_alpha_resurrection_checkpoint(
 ) -> Dict[str, Any]:
     """Require exact durable Alpha state after live physical custody was lost.
 
-    Once a new Teensy lifetime has been proved, an incomplete/malformed checkpoint
-    cannot improve by retrying RECOVER: the missing producer-authored endpoints died
-    with the old Alpha RAM image.  Latch HARD_FAILURE immediately rather than
-    presenting an information-theoretic loss as a transient transport condition.
+    Missing producer-authored endpoints make *that lineage* impossible to resurrect,
+    not the current CLOCKS substrate impossible to operate. Preserve the proof and
+    raise a typed lineage verdict so the lifecycle owner can terminate old ancestry
+    and establish a fresh Alpha without weakening this court or replaying SQL history.
     """
     checkpoint = _ppb_restore_checkpoint_from_clocks(clocks)
     try:
@@ -6373,24 +6434,24 @@ def _require_alpha_resurrection_checkpoint(
             "raw_postgresql_replay_available": False,
             "operator_action": (
                 "Exact Alpha resurrection is impossible from the available durable "
-                "state. Preserve this HARD_FAILURE evidence and explicitly begin a "
-                "new statistics/campaign epoch when ready."
+                "state. Preserve the old observations as historical evidence, retire "
+                "their restore authority, and establish a fresh Alpha epoch."
             ),
         }
         _clear_sync_wait()
         logging.critical(
-            "🛑 [recovery] ALPHA RESURRECTION IMPOSSIBLE: durable Better-Buckets "
+            "🧭 [recovery] ALPHA RESURRECTION IMPOSSIBLE: durable Better-Buckets "
             "checkpoint is missing or invalid after physical custody loss; "
-            "campaign=%s source_detail_id=%s error=%s. No automatic retry will occur.",
+            "campaign=%s source_detail_id=%s error=%s. Exact old-lineage recovery "
+            "is refused; lifecycle will surrender that ancestry and birth a new Alpha.",
             campaign,
             recovery_source_db_id,
             exc,
         )
-        _require_hard_failure(
+        raise AlphaResurrectionImpossible(
             "alpha_resurrection_impossible_checkpoint_invalid",
             details,
-            source="CLOCKS_ALPHA_RESURRECTION_COURT",
-        )
+        ) from exc
 
     if saved.get("recoverable"):
         return saved
@@ -6422,17 +6483,18 @@ def _require_alpha_resurrection_checkpoint(
         "operator_action": (
             "The previous Alpha RAM lifetime is gone and the durable checkpoint does "
             "not contain every producer-authored endpoint required for exact restore. "
-            "Automatic recovery is permanently stopped for this lineage. Explicitly "
-            "start a new statistics/campaign epoch when ready."
+            "Do not reconstruct it. Terminate that restore lineage and establish a "
+            "fresh Alpha epoch while preserving the old observations as history."
         ),
     }
     _clear_sync_wait()
     logging.critical(
-        "🛑 [recovery] ALPHA RESURRECTION IMPOSSIBLE: physical Teensy custody was "
+        "🧭 [recovery] ALPHA RESURRECTION IMPOSSIBLE: physical Teensy custody was "
         "lost and the durable Better-Buckets checkpoint is incomplete "
         "(status=%s second=%d/%d missing=%d minute=%d/%d missing=%d). "
         "The missing producer-authored endpoints no longer exist; raw PostgreSQL "
-        "reconstruction is prohibited. No automatic retry will occur.",
+        "reconstruction is prohibited. Exact old-lineage recovery is refused; "
+        "lifecycle will surrender that ancestry and birth a new Alpha.",
         saved.get("status"),
         second_count,
         expected_second,
@@ -6441,12 +6503,10 @@ def _require_alpha_resurrection_checkpoint(
         expected_minute,
         max(0, expected_minute - minute_count),
     )
-    _require_hard_failure(
+    raise AlphaResurrectionImpossible(
         "alpha_resurrection_impossible_checkpoint_incomplete",
         details,
-        source="CLOCKS_ALPHA_RESURRECTION_COURT",
     )
-    raise AssertionError("unreachable after HARD_FAILURE")
 
 
 def _supersede_dead_producer_restore_rows(
@@ -9055,6 +9115,195 @@ def _adopt_surviving_clocks_producer(
 
 
 
+def _surrender_unresurrectable_alpha_lineage(
+    *,
+    verdict: AlphaResurrectionImpossible,
+    active_campaign: Optional[Dict[str, Any]],
+    source: str,
+) -> Dict[str, Any]:
+    """Terminate dead Alpha ancestry and birth a new durable statistics epoch.
+
+    This is not repair of the old lineage. Every old CLOCKS/TEMPEST row remains
+    historical evidence, but none may remain future restore authority. The active
+    TEMPEST namespace, if any, ends at its last durable row. Only the singleton
+    continuation image is deleted; then the existing transitive STATS_RESET epoch-
+    birth path proves update_count=1 durably before ordinary service resumes.
+    """
+    global _campaign_active, _ppb_checkpoint_runtime
+    global _accepted_pps_vclock_count, _last_pps_vclock_count_seen
+    global _recovery_custody_active, _recovery_custody_generation
+    global _recovery_custody_entered_at_utc, _recovery_custody_reason
+    global _recovery_custody_physical_sequence_regression
+    global _recovery_custody_regression_witness, _recovery_custody_last_checkpoint
+
+    reason = str(verdict.reason)
+    evidence = copy.deepcopy(verdict.details)
+    surrendered_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    campaign_name = (
+        str(active_campaign.get("campaign") or "").strip()
+        if isinstance(active_campaign, dict)
+        else ""
+    )
+
+    _request_teensy_stop_best_effort()
+    _request_teensy_recover_abort_best_effort("alpha_lineage_surrender")
+    _campaign_active = False
+    _clear_start_wait_state()
+    _clear_flash_cut_wait_state()
+    _clear_sync_wait()
+    candidate_drained = _reset_trackers()
+    _accepted_pps_vclock_count = None
+    _last_pps_vclock_count_seen = None
+    _diag["accepted_pps_count"] = None
+    _diag["accepted_pps_vclock_count"] = None
+    _gnss_canary_reset()
+
+    # Freeze ordinary persistence while the old restore-authority namespace is
+    # atomically retired. New epoch birth will reopen it before issuing STATS_RESET.
+    _clocks_persistence_enabled.clear()
+    _clocks_epoch_birth_pending.clear()
+    _clocks_epoch_birth_committed.clear()
+    _clocks_holistic_restore_proof_pending.clear()
+    _clocks_holistic_restore_proof_committed.clear()
+    _startup_instrument_restore_hold.clear()
+    _startup_physical_lifetime_unclassified.clear()
+
+    startup_custody = _retire_startup_clocks_custody(
+        "alpha_resurrection_impossible_lineage_surrender"
+    )
+
+    with _recovery_custody_lock:
+        recovery_custody = _recovery_custody_snapshot_locked()
+        _recovery_custody_active = False
+        _recovery_custody_generation = None
+        _recovery_custody_entered_at_utc = None
+        _recovery_custody_reason = None
+        _recovery_custody_physical_sequence_regression = False
+        _recovery_custody_regression_witness = {}
+        _recovery_custody_last_checkpoint = None
+
+    with _ppb_checkpoint_lock:
+        _ppb_checkpoint_runtime = _ppb_checkpoint_new_runtime(
+            reason="ALPHA_LINEAGE_SURRENDER_FRESH_EPOCH"
+        )
+
+    # A persistence item may already have been routed before the freeze. Drain it
+    # under the writer lock, then make the durable cut in one DB transaction.
+    with _clocks_persistence_lock:
+        state_drained = _drain_clocks_persistence_queue()
+        with open_db() as conn:
+            cur = conn.cursor()
+            master_rows_stopped = 0
+            if campaign_name:
+                cur.execute(
+                    """
+                    UPDATE campaign_master
+                    SET active = false,
+                        payload = payload
+                            || jsonb_build_object(
+                                'stopped_at', to_jsonb(%s::text),
+                                'continuity_surrendered', true,
+                                'continuity_surrendered_at', to_jsonb(%s::text),
+                                'continuity_surrender_reason', to_jsonb(%s::text),
+                                'alpha_lineage_resurrection_impossible', true
+                            )
+                            || CASE
+                                WHEN payload ? 'report'
+                                THEN jsonb_build_object(
+                                    'report',
+                                    (payload->'report') || '{"campaign_state":"STOPPED"}'::jsonb
+                                )
+                                ELSE '{}'::jsonb
+                               END
+                    WHERE campaign_type = %s
+                      AND campaign = %s
+                      AND active = true
+                    """,
+                    (
+                        surrendered_at,
+                        surrendered_at,
+                        reason,
+                        CAMPAIGN_TYPE_TEMPEST,
+                        campaign_name,
+                    ),
+                )
+                master_rows_stopped = int(cur.rowcount or 0)
+                if master_rows_stopped != 1:
+                    raise RuntimeError(
+                        "Alpha lineage surrender did not retire exactly one active "
+                        f"TEMPEST campaign {campaign_name!r}: rows={master_rows_stopped}"
+                    )
+
+            # Preserve all old observations, including their original viable/science
+            # verdicts, but make the pre-cut Alpha universe ineligible for resurrection.
+            cur.execute(
+                """
+                UPDATE campaign_detail
+                SET payload = payload || jsonb_build_object(
+                    'holistic_restore_superseded', true,
+                    'alpha_lineage_terminated', true,
+                    'alpha_lineage_terminated_at_utc', to_jsonb(%s::text),
+                    'alpha_lineage_termination_reason', to_jsonb(%s::text),
+                    'alpha_lineage_restore_authority', false
+                )
+                WHERE campaign_type = %s
+                  AND NOT (payload @> '{"holistic_restore_superseded":true}'::jsonb)
+                """,
+                (surrendered_at, reason, CAMPAIGN_TYPE_TEMPEST),
+            )
+            historical_rows_superseded = int(cur.rowcount or 0)
+
+            cur.execute(
+                "DELETE FROM config WHERE config_key = %s",
+                (CLOCKS_RECOVERY_CONFIG_KEY,),
+            )
+            recovery_config_deleted = int(cur.rowcount or 0)
+            if recovery_config_deleted > 1:
+                raise RuntimeError(
+                    f"config.{CLOCKS_RECOVERY_CONFIG_KEY} is not a singleton: "
+                    f"rows={recovery_config_deleted}"
+                )
+
+    logging.critical(
+        "🧭 [clocks] Alpha continuity surrendered without deleting history: "
+        "reason=%s campaign=%s stopped=%d historical_rows_superseded=%d "
+        "recovery_config_deleted=%d; establishing fresh durable statistics epoch",
+        reason,
+        campaign_name or "NONE",
+        master_rows_stopped,
+        historical_rows_superseded,
+        recovery_config_deleted,
+    )
+
+    epoch = _establish_fresh_durable_stats_epoch(
+        source="CLOCKS.ALPHA_LINEAGE_SURRENDER",
+    )
+
+    result = {
+        "schema": "PI_CLOCKS_ALPHA_LINEAGE_SURRENDER_V1",
+        "surrendered_at_utc": surrendered_at,
+        "reason": reason,
+        "source": str(source),
+        "old_lineage_preserved_as_history": True,
+        "raw_postgresql_replay_used": False,
+        "campaign": campaign_name or None,
+        "campaign_stopped": bool(master_rows_stopped),
+        "campaign_master_rows_stopped": master_rows_stopped,
+        "historical_rows_superseded_for_restore": historical_rows_superseded,
+        "recovery_config_deleted": bool(recovery_config_deleted),
+        "candidate_ingress_drained": int(candidate_drained),
+        "pending_state_rows_drained": int(state_drained),
+        "startup_custody": copy.deepcopy(startup_custody),
+        "recovery_custody_before_surrender": copy.deepcopy(recovery_custody),
+        "failure_evidence": evidence,
+        "fresh_epoch": copy.deepcopy(epoch),
+        "next_action": "CLOCKS is running on a fresh Alpha; start a new TEMPEST campaign when desired.",
+    }
+    _diag["alpha_lineage_surrenders"] = _diag.get("alpha_lineage_surrenders", 0) + 1
+    _diag["last_alpha_lineage_surrender"] = copy.deepcopy(result)
+    return result
+
+
 def _holistic_restore(
     *,
     preverified_location: Optional[Dict[str, Any]] = None,
@@ -9121,6 +9370,28 @@ def _holistic_restore(
             )
             _retire_startup_clocks_custody("fresh_statistics_epoch")
             result["instrument"] = _establish_fresh_durable_stats_epoch()
+    except AlphaResurrectionImpossible as exc:
+        surrender = _surrender_unresurrectable_alpha_lineage(
+            verdict=exc,
+            active_campaign=active_campaign,
+            source="STARTUP_INSTRUMENT_RESTORE",
+        )
+        result["instrument"] = {
+            "success": True,
+            "mode": "ALPHA_LINEAGE_SURRENDER_FRESH_EPOCH",
+            "producer_reuse": False,
+            "producer_resurrected_this_startup": False,
+            "lineage_surrender": copy.deepcopy(surrender),
+            "fresh_epoch": copy.deepcopy(surrender.get("fresh_epoch") or {}),
+        }
+        result["campaign"] = {
+            "state": "STOPPED",
+            "campaign": surrender.get("campaign"),
+            "continuity_surrendered": True,
+            "reason": exc.reason,
+        }
+        result["active_campaign"] = None
+        active_campaign = None
     finally:
         if not _hard_failure_active() and not _startup_clocks_custody_unresolved():
             _clocks_persistence_enabled.set()
@@ -9131,11 +9402,35 @@ def _holistic_restore(
         and instrument_verdict is not None
         and str(instrument_verdict.alpha_disposition).strip().upper() != "SURVIVED"
     ):
-        campaign_result = _restore_active_campaign_state(
-            preverified_location=preverified_location,
-            startup_instrument_verdict=instrument_verdict,
-        )
-        result["campaign"] = campaign_result
+        try:
+            campaign_result = _restore_active_campaign_state(
+                preverified_location=preverified_location,
+                startup_instrument_verdict=instrument_verdict,
+            )
+        except AlphaResurrectionImpossible as exc:
+            surrender = _surrender_unresurrectable_alpha_lineage(
+                verdict=exc,
+                active_campaign=active_campaign,
+                source="STARTUP_COMBINED_CAMPAIGN_RESTORE",
+            )
+            result["instrument"] = {
+                "success": True,
+                "mode": "ALPHA_LINEAGE_SURRENDER_FRESH_EPOCH",
+                "producer_reuse": False,
+                "producer_resurrected_this_startup": False,
+                "lineage_surrender": copy.deepcopy(surrender),
+                "fresh_epoch": copy.deepcopy(surrender.get("fresh_epoch") or {}),
+            }
+            result["campaign"] = {
+                "state": "STOPPED",
+                "campaign": surrender.get("campaign"),
+                "continuity_surrendered": True,
+                "reason": exc.reason,
+            }
+            result["active_campaign"] = None
+            campaign_result = result["campaign"]
+        else:
+            result["campaign"] = campaign_result
         if (
             str(instrument_verdict.alpha_disposition).strip().upper() == "LOST"
             and isinstance(campaign_result.get("combined_instrument_restore"), dict)
@@ -15130,7 +15425,8 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
         "coherent_rows_persist": True,
         "science_exclusions_are_audit_only": True,
         "continuity_fatal_triggers_recovery": True,
-        "unprovable_continuity_latches_hard_failure": True,
+        "unresurrectable_old_lineage_starts_fresh_alpha": True,
+        "raw_postgresql_reconstruction_prohibited": True,
     }
     if not row:
         return {
