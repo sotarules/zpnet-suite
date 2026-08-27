@@ -674,6 +674,12 @@ static Payload g_clocks_fragment_root_payload DMAMEM;
 // Retain that proven parent in RAM2 and reuse its admitted capacity across rows.
 static Payload g_clocks_fragment_campaign_payload DMAMEM;
 
+// The canonical instrument parent bridges compact instrument testimony to the
+// retained statistics child. Crash forensics proved this automatic Payload had
+// nine committed entries at 2 KiB, then required 6727 bytes while attaching
+// the final stats object. Retain its 8 KiB storage class across 1 Hz rows.
+static Payload g_clocks_fragment_clocks_payload DMAMEM;
+
 // The canonical statistics object is large and rebuilt every second. Keep one
 // CLOCKS-owned Payload scratch object in RAM2 so its admitted heap capacity is
 // reused across rows instead of returning an 8 KiB block to malloc each second.
@@ -760,6 +766,12 @@ static void clocks_fragment_publication_ensure_initialized(void) {
   // longer performs a recurring 2 KiB -> 4 KiB realloc/free transaction.
   g_clocks_fragment_campaign_payload.clear();
   g_clocks_fragment_campaign_payload.reserve(4096U);
+
+  // The mature instrument parent is 6727 bytes with the retained ~4.7 KiB
+  // statistics child attached. Admit its proven 8 KiB storage class once so
+  // canonical 1 Hz serialization never repeats the 2 KiB -> 8 KiB growth.
+  g_clocks_fragment_clocks_payload.clear();
+  g_clocks_fragment_clocks_payload.reserve(8192U);
 
   g_clocks_fragment_publication_initialized = true;
 }
@@ -1044,9 +1056,10 @@ static void clocks_fragment_add_science(
   parent.add_object("science", value);
 }
 
-static Payload clocks_fragment_clocks_payload(
+static Payload& clocks_fragment_clocks_payload(
     const clocks_fragment_live_snapshot_t& snapshot) {
-  Payload clocks;
+  Payload& clocks = g_clocks_fragment_clocks_payload;
+  clocks.clear();
   clocks.add("schema", "CLOCKS_INSTRUMENT_V1");
   clocks.add("snapshot_ok", snapshot.snapshot_ok);
   clocks.add("valid", snapshot.valid);
@@ -1465,10 +1478,10 @@ static void clocks_fragment_publish_service(timepop_ctx_t*,
   // its completed-row identity. Payload construction is now a hard invariant:
   // these attachments either return complete or Payload escalates through its
   // retained fatal WATCHDOG court and does not return to CLOCKS.
-  fragment.add_object(
-      "clocks",
-      clocks_fragment_clocks_payload(
-          g_clocks_fragment_publication_clocks_snapshot.live));
+  Payload& clocks = clocks_fragment_clocks_payload(
+      g_clocks_fragment_publication_clocks_snapshot.live);
+  fragment.add_object("clocks", clocks);
+  clocks.clear();
 
   fragment.add_object("features", clocks_fragment_features_payload());
 
