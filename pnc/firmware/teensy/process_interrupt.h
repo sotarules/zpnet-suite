@@ -7,9 +7,10 @@
 // one-second compare only after the target enters the safe programming window.
 //
 // Execution tiers:
-//   Priority 0  — PPS, OCXO1, OCXO2, PHOTODIODE sovereign science capture
+//   Priority 0  — PPS, OCXO1, OCXO2 sovereign science capture
 //   Priority 16 — shared QTimer1 VCLOCK + TimePop CH2 capture
 //   Priority 32 — continuation/handoff and compare rearm
+//   Priority 48 — PHOTODIODE receive edge; expendable optical testimony
 //   Foreground  — TimePop policy and application callbacks
 // ============================================================================
 
@@ -77,6 +78,7 @@ enum class interrupt_provider_kind_t : uint8_t {
   QTIMER2,
   QTIMER3,
   GPIO6789,
+  GPIO2,
 };
 
 enum class interrupt_lane_t : uint8_t {
@@ -148,9 +150,9 @@ static constexpr uint32_t INTERRUPT_DELAY_SOURCE_BIT_OCXO1 = 1U << 1;
 static constexpr uint32_t INTERRUPT_DELAY_SOURCE_BIT_OCXO2 = 1U << 2;
 static constexpr uint32_t INTERRUPT_DELAY_SOURCE_BIT_PPS = 1U << 3;
 static constexpr uint32_t INTERRUPT_DELAY_SOURCE_BIT_CONTINUATION = 1U << 4;
-// Logical blocker identity. PHOTODIODE shares GPIO6789 with PPS, so generic
-// NVIC pending testimony never sets this bit from the shared vector; pin-34
-// blocker tracing authors the PHOTODIODE source identity explicitly instead.
+// Dedicated target identity for the Priority-48 PHOTODIODE GPIO2[29] source.
+// Higher CLOCKS tiers may publish this bit when the detector edge is physically
+// pending; PHOTODIODE itself is too low-priority to block any CLOCKS source.
 static constexpr uint32_t INTERRUPT_DELAY_SOURCE_BIT_PHOTODIODE = 1U << 5;
 
 // First-instruction testimony captured before handler work.  This is intentionally
@@ -1193,6 +1195,10 @@ struct interrupt_photodiode_edge_t {
   uint32_t isr_entry_dwt_raw = 0;
   int32_t  isr_entry_to_edge_correction_cycles = 0;
   uint32_t pps_sequence = 0;
+
+  // Entry-delay testimony for this exact optical endpoint.  A delayed edge is
+  // never repaired here; PHOTONS may exclude the corresponding race instead.
+  interrupt_delay_forensics_t interrupt_delay{};
 };
 
 struct interrupt_photodiode_diag_t {
@@ -1202,7 +1208,7 @@ struct interrupt_photodiode_diag_t {
   interrupt_subscriber_kind_t kind =
       interrupt_subscriber_kind_t::PHOTODIODE;
   interrupt_provider_kind_t provider =
-      interrupt_provider_kind_t::GPIO6789;
+      interrupt_provider_kind_t::GPIO2;
   interrupt_lane_t lane =
       interrupt_lane_t::GPIO_PHOTODIODE_EDGE;
 
@@ -1233,8 +1239,36 @@ struct interrupt_photodiode_diag_t {
   uint32_t last_isr_entry_primask = 0;
   uint32_t last_isr_entry_ipsr = 0;
 
-  // Priority-0 blocker testimony. Only independent QTimer pending bits are
-  // sampled; the shared GPIO6789 pending bit cannot distinguish PPS from pin 34.
+  // Priority-48 entry-delay testimony.  CLOCKS is authoritative: if a PPS,
+  // OCXO, QTimer1, or continuation ISR delays detector entry, preserve that
+  // cause so PHOTONS can discard the expendable optical race rather than let
+  // PHOTODIODE perturb or reinterpret any clock endpoint.
+  bool last_entry_delay_valid = false;
+  interrupt_delay_verdict_t last_entry_delay_verdict =
+      interrupt_delay_verdict_t::UNKNOWN;
+  interrupt_delay_cause_t last_entry_delayed_by =
+      interrupt_delay_cause_t::NONE;
+  bool last_entry_delay_cycles_valid = false;
+  uint32_t last_entry_delay_cycles = 0;
+  uint32_t last_entry_delay_uncertainty_cycles = 0;
+  uint32_t delayed_entry_count = 0;
+  uint32_t delayed_by_qtimer1_count = 0;
+  uint32_t delayed_by_ocxo1_count = 0;
+  uint32_t delayed_by_ocxo2_count = 0;
+  uint32_t delayed_by_pps_count = 0;
+  uint32_t delayed_by_continuation_count = 0;
+  uint32_t delayed_by_unknown_count = 0;
+
+  // If a CLOCKS tier preempts after the detector ISR has already captured its
+  // first-instruction DWT, the endpoint itself was not delayed.  Count that
+  // separately so post-entry residence never becomes a false pathology label.
+  uint32_t preempted_after_entry_count = 0;
+  uint32_t last_isr_wall_cycles = 0;
+  uint32_t max_isr_wall_cycles = 0;
+
+  // Deprecated pre-isolation blocker testimony retained for source/wire
+  // compatibility.  Under the dedicated Priority-48 GPIO2 route these counters
+  // remain zero because PHOTODIODE can no longer serialize CLOCKS.
   uint32_t blocker_trace_count = 0;
   uint32_t blocked_qtimer1_count = 0;
   uint32_t blocked_ocxo1_count = 0;
@@ -1263,11 +1297,16 @@ void interrupt_photodiode_unsubscribe(void);
 // scalar diagnostic surface monotonically from its single GPIO source.
 bool interrupt_photodiode_snapshot(interrupt_photodiode_diag_t* out);
 
-// ISR custody boundary used by the installed pin-34 GPIO path and by
-// deterministic synthetic-edge tests. Pin 34 currently shares IRQ_GPIO6789
-// with PPS, so the physical vector remains Priority 0 until a future independent
-// lower-priority entry path is available. Caller supplies the first-instruction
-// ARM_DWT_CYCCNT value; this function never rereads DWT as event identity.
+// Authoritative ambient level for the remapped detector pin.  Pin 34 is moved
+// from Arduino's fast GPIO7[29] alias to ordinary GPIO2[29], so callers must not
+// assume the stock digitalRead(34) metadata follows that runtime remap.
+bool interrupt_photodiode_level_high(void);
+
+// Compatibility/synthetic custody boundary.  The installed physical pin-34 path
+// is GPIO2[29] on IRQ_GPIO2_16_31 at Priority 48 and enters through its dedicated
+// ISR, which attaches real entry-delay ancestry before invoking this custody
+// logic.  Direct callers supply only first-instruction DWT and therefore carry
+// UNKNOWN delay ancestry; this function never rereads DWT as event identity.
 void process_interrupt_photodiode_gpio_irq(uint32_t isr_entry_dwt_raw);
 
 using interrupt_subscriber_event_fn =

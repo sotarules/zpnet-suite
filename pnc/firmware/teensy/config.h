@@ -94,6 +94,11 @@ static const int LASER_MONITOR_PIN  = 20;
 // PHOTODIODE_EDGE_PIN:
 //   PD200T TTL comparator output.
 //   Fast digital photodetector timing edge owned by process_interrupt.
+//   Physical pin 34 / GPIO_B1_13 is remapped at runtime from the Teensy fast
+//   GPIO7[29] alias to ordinary GPIO2[29], then bound to IRQ_GPIO2_16_31 at
+//   expendable Priority 48 so every CLOCKS interrupt can preempt it.
+//   After that remap, process_interrupt's level accessor is authoritative; do
+//   not assume stock digitalRead(34) follows the changed GPIO bank.
 //   This is the authoritative optical timing signal.
 //
 // PHOTODIODE_ANALOG_PIN:
@@ -167,7 +172,10 @@ static constexpr uint32_t QTIMER1_CH0_MASK = 0xFFFF;
 //   Priority 0  — PPS GPIO, OCXO1, OCXO2 science captures
 //   Priority 16 — shared QTimer1 vector: native VCLOCK CH0 + TimePop CH2
 //   Priority 32 — process_interrupt continuation/handoff
+//   Priority 48 — PHOTODIODE GPIO2[29] receive edge; expendable race testimony
 //   Foreground  — TimePop scheduling policy and application callbacks
+//
+// CLOCKS may delay PHOTODIODE; PHOTODIODE must never delay CLOCKS.
 //
 
 // --------------------------------------------------------------

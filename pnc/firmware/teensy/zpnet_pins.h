@@ -100,7 +100,7 @@ GND           Black         GND                Battery branching ground         
 
 23            Green         DAC_VREF_OUT       AD5693R VREF (both)
 32            Orange        GNSS_PPS_RELAY     GPIO relay to Pi
-34            Coax          PHOTODIODE_INT     Koheron PD200T TTL out                Comparator timing output / GPIO IRQ
+34            Coax          PHOTODIODE_INT     Koheron PD200T TTL out                Comparator timing / GPIO2[29] IRQ P48
 38            Coax          PHOTODIODE_ANALOG_IN  Koheron PD200T PD OUT              Analog photodetector output / A14 ADC
 
 30            Green         LASER_EN           EV5491-C-00A EN pin
@@ -112,6 +112,18 @@ Timer hardware binding summary:
   Pin 13  →  QTimer2 CH0  OCXO1 count + compare authority
   Pin 15  →  QTimer3 CH3  OCXO2 count + compare authority
   QTimer1 CH2             TimePop scheduler only
+
+Interrupt priority / GPIO routing summary:
+
+  Priority 0   →  PPS GPIO, OCXO1, OCXO2 sovereign CLOCKS capture
+  Priority 16  →  QTimer1 VCLOCK + TimePop shared vector
+  Priority 32  →  process_interrupt continuation/handoff
+  Priority 48  →  PHOTODIODE_INT, pin 34 / GPIO2[29] / IRQ_GPIO2_16_31
+
+  Pin 34 wiring does NOT change.  process_interrupt remaps GPIO_B1_13 internally
+  from Teensy's fast GPIO7[29] alias to ordinary GPIO2[29] so the detector gets
+  an independently prioritizable vector below every CLOCKS tier.  CLOCKS may
+  delay PHOTODIODE; PHOTODIODE must never delay CLOCKS.
 
 =============================================================================*/
 
@@ -186,6 +198,10 @@ PD OUT               38 / A14      PHOTODIODE_ANALOG_IN    Analog photodetector 
 Notes:
 • TTL out is the authoritative digital photodetector timing signal presented
   to process_interrupt for DWT-at-edge capture.
+• The physical TTL coax remains on Teensy pin 34.  process_interrupt remaps that
+  pad to GPIO2[29] and services IRQ_GPIO2_16_31 at Priority 48, below the entire
+  CLOCKS timing hierarchy.  If CLOCKS delays detector ISR entry, the optical
+  endpoint retains that delay testimony and the corresponding race is expendable.
 • PD OUT is the analog photodetector waveform and is ADC-read on pin 38/A14.
 • During comparator-pot commissioning, pin 38/A14 shows received optical signal
   amplitude while the independent pin 34 TTL interrupt count shows comparator
