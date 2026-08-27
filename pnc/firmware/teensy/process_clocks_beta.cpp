@@ -668,6 +668,12 @@ static clocks_fragment_snapshot_t g_clocks_fragment_publication_clocks_snapshot 
 // class once; clear() retains that capacity for every later row.
 static Payload g_clocks_fragment_root_payload DMAMEM;
 
+// Campaign enrichment is also rebuilt once per public campaign second. Crash
+// forensics proved this parent reached 2 KiB with eight committed entries, then
+// failed while growing to the 4 KiB storage class for the next OCXO attachment.
+// Retain that proven parent in RAM2 and reuse its admitted capacity across rows.
+static Payload g_clocks_fragment_campaign_payload DMAMEM;
+
 // The canonical statistics object is large and rebuilt every second. Keep one
 // CLOCKS-owned Payload scratch object in RAM2 so its admitted heap capacity is
 // reused across rows instead of returning an 8 KiB block to malloc each second.
@@ -748,6 +754,12 @@ static void clocks_fragment_publication_ensure_initialized(void) {
   // RAM2 heap cannot support the canonical publication substrate.
   g_clocks_fragment_root_payload.clear();
   g_clocks_fragment_root_payload.reserve(16384U);
+
+  // The mature TEMPEST campaign parent crosses 2 KiB every public row. Admit
+  // its proven 4 KiB storage class once so canonical campaign serialization no
+  // longer performs a recurring 2 KiB -> 4 KiB realloc/free transaction.
+  g_clocks_fragment_campaign_payload.clear();
+  g_clocks_fragment_campaign_payload.reserve(4096U);
 
   g_clocks_fragment_publication_initialized = true;
 }
@@ -1156,9 +1168,10 @@ static void clocks_fragment_add_campaign_stats(
   parent.add_object("stats", stats);
 }
 
-static Payload clocks_fragment_campaign_payload(
+static Payload& clocks_fragment_campaign_payload(
     const clocks_fragment_campaign_snapshot_t& snapshot) {
-  Payload campaign;
+  Payload& campaign = g_clocks_fragment_campaign_payload;
+  campaign.clear();
   campaign.add("schema", "TEMPEST_FRAGMENT_V1");
   campaign.add("name", snapshot.campaign);
   campaign.add("state", snapshot.campaign_state);
@@ -1442,9 +1455,10 @@ static void clocks_fragment_publish_service(timepop_ctx_t*,
   // the always-on instrument snapshot merely to coordinate serialization.
   const bool campaign_embedded = campaign_available;
   if (campaign_available) {
-    Payload campaign = clocks_fragment_campaign_payload(
+    Payload& campaign = clocks_fragment_campaign_payload(
         g_clocks_fragment_publication_clocks_snapshot.campaign);
     fragment.add_object("campaign", campaign);
+    campaign.clear();
   }
 
   // instrument_row_exact above has already proved the typed Alpha snapshot and
