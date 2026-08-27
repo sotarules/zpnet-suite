@@ -9,7 +9,9 @@
 // Priority 0 is the sovereign science-capture tier:
 //   * PPS GPIO, OCXO1, and OCXO2 capture ARM_DWT_CYCCNT before handler work;
 //   * these sparse one-second sources may preempt every lower execution tier;
-//   * each source is minimally defused and a bounded scalar packet is enqueued.
+//   * each sparse source is minimally defused and a bounded scalar packet is enqueued;
+//   * high-rate PHOTODIODE also captures DWT first, then runs only its bounded
+//     synchronous edge callback before leaving the shared GPIO6789 vector.
 //
 // Priority 16 owns the shared QTimer1 capture vector:
 //   * native VCLOCK CH0 and TimePop CH2 necessarily share one NVIC priority;
@@ -3226,6 +3228,8 @@ static uint32_t interrupt_delay_source_bit(interrupt_execution_source_t source) 
       return INTERRUPT_DELAY_SOURCE_BIT_PPS;
     case interrupt_execution_source_t::CONTINUATION:
       return INTERRUPT_DELAY_SOURCE_BIT_CONTINUATION;
+    case interrupt_execution_source_t::PHOTODIODE:
+      return INTERRUPT_DELAY_SOURCE_BIT_PHOTODIODE;
     default:
       return 0U;
   }
@@ -3237,6 +3241,7 @@ static uint32_t interrupt_delay_source_priority(
     case interrupt_execution_source_t::OCXO1:
     case interrupt_execution_source_t::OCXO2:
     case interrupt_execution_source_t::PPS:
+    case interrupt_execution_source_t::PHOTODIODE:
       return INTERRUPT_PRIORITY_SCIENCE;
     case interrupt_execution_source_t::QTIMER1:
       return INTERRUPT_PRIORITY_VCLOCK_TIMEPOP;
@@ -3260,6 +3265,8 @@ static interrupt_delay_cause_t interrupt_delay_cause_from_source(
       return interrupt_delay_cause_t::PPS;
     case interrupt_execution_source_t::CONTINUATION:
       return interrupt_delay_cause_t::CONTINUATION;
+    case interrupt_execution_source_t::PHOTODIODE:
+      return interrupt_delay_cause_t::PHOTODIODE;
     default:
       return interrupt_delay_cause_t::UNKNOWN;
   }
@@ -3276,20 +3283,18 @@ static interrupt_delay_baseline_runtime_t* interrupt_delay_baseline_for(
   }
 }
 
-static uint32_t interrupt_delay_pending_mask(void) {
+static uint32_t interrupt_delay_qtimer_pending_mask_fast(void) {
   static_assert(((uint32_t)IRQ_QTIMER1 >> 5U) ==
                     ((uint32_t)IRQ_QTIMER2 >> 5U) &&
                 ((uint32_t)IRQ_QTIMER2 >> 5U) ==
                     ((uint32_t)IRQ_QTIMER3 >> 5U),
                 "QTimer delay witnesses must share one NVIC pending word");
 
-  // This executes only at sparse Priority-0 exits.  Read the three QTimer IRQs
-  // from one NVIC word so the witness minimally extends the collision it records.
+  // One NVIC word covers all three QTimer targets.  PHOTODIODE uses this
+  // specialized witness so its high-rate path never reads or interprets the
+  // shared GPIO6789 pending bit as though PPS and pin 34 were distinguishable.
   const uint32_t qtimer_pending =
       interrupt_nvic_ispr_word((uint32_t)IRQ_QTIMER1);
-  const uint32_t gpio_pending =
-      interrupt_nvic_ispr_word((uint32_t)IRQ_GPIO6789);
-
   uint32_t mask = 0U;
   if ((qtimer_pending & interrupt_nvic_irq_mask((uint32_t)IRQ_QTIMER1)) != 0U) {
     mask |= INTERRUPT_DELAY_SOURCE_BIT_QTIMER1;
@@ -3302,6 +3307,13 @@ static uint32_t interrupt_delay_pending_mask(void) {
       (qtimer_pending & interrupt_nvic_irq_mask((uint32_t)IRQ_QTIMER3)) != 0U) {
     mask |= INTERRUPT_DELAY_SOURCE_BIT_OCXO2;
   }
+  return mask;
+}
+
+static uint32_t interrupt_delay_pending_mask(void) {
+  uint32_t mask = interrupt_delay_qtimer_pending_mask_fast();
+  const uint32_t gpio_pending =
+      interrupt_nvic_ispr_word((uint32_t)IRQ_GPIO6789);
   if ((gpio_pending & interrupt_nvic_irq_mask((uint32_t)IRQ_GPIO6789)) != 0U) {
     mask |= INTERRUPT_DELAY_SOURCE_BIT_PPS;
   }
@@ -3313,7 +3325,8 @@ static uint32_t interrupt_delay_lower_active_mask(
   uint32_t mask = 0U;
   if (source == interrupt_execution_source_t::OCXO1 ||
       source == interrupt_execution_source_t::OCXO2 ||
-      source == interrupt_execution_source_t::PPS) {
+      source == interrupt_execution_source_t::PPS ||
+      source == interrupt_execution_source_t::PHOTODIODE) {
     if (g_interrupt_priority_runtime.qtimer1.active) {
       mask |= INTERRUPT_DELAY_SOURCE_BIT_QTIMER1;
     }
@@ -3501,6 +3514,53 @@ static void interrupt_delay_note_isr_exit(
       source, interrupt_execution_source_t::PPS,
       exit_dwt, blocker_wall_cycles,
       arrival.pending_mask_at_entry, pending_mask_at_exit);
+}
+
+// PHOTODIODE shares GPIO6789 with PPS, so it cannot use the generic pending
+// mask as a target witness without conflating two physical pins.  As a blocker,
+// however, its identity is exact: this callback is executing only because pin 34
+// dispatched it.  Read only the independent QTimer pending word at entry/exit
+// and publish PHOTODIODE as the predecessor for any serialized QTimer target.
+static void interrupt_delay_note_photodiode_exit(
+    uint32_t entry_dwt,
+    uint32_t qtimer_pending_at_entry) {
+  const uint32_t qtimer_pending_at_exit =
+      interrupt_delay_qtimer_pending_mask_fast();
+  const uint32_t exit_dwt = ARM_DWT_CYCCNT;
+  const uint32_t blocker_wall_cycles = exit_dwt - entry_dwt;
+
+  interrupt_photodiode_diag_t& diag = g_photodiode_subscription.diag;
+  diag.blocker_trace_count++;
+  diag.last_blocker_wall_cycles = blocker_wall_cycles;
+  if (blocker_wall_cycles > diag.max_blocker_wall_cycles) {
+    diag.max_blocker_wall_cycles = blocker_wall_cycles;
+  }
+  diag.last_qtimer_pending_at_entry_mask = qtimer_pending_at_entry;
+  diag.last_qtimer_pending_at_exit_mask = qtimer_pending_at_exit;
+  if ((qtimer_pending_at_exit & INTERRUPT_DELAY_SOURCE_BIT_QTIMER1) != 0U) {
+    diag.blocked_qtimer1_count++;
+    interrupt_delay_publish_blocker(
+        interrupt_execution_source_t::PHOTODIODE,
+        interrupt_execution_source_t::QTIMER1,
+        exit_dwt, blocker_wall_cycles,
+        qtimer_pending_at_entry, qtimer_pending_at_exit);
+  }
+  if ((qtimer_pending_at_exit & INTERRUPT_DELAY_SOURCE_BIT_OCXO1) != 0U) {
+    diag.blocked_ocxo1_count++;
+    interrupt_delay_publish_blocker(
+        interrupt_execution_source_t::PHOTODIODE,
+        interrupt_execution_source_t::OCXO1,
+        exit_dwt, blocker_wall_cycles,
+        qtimer_pending_at_entry, qtimer_pending_at_exit);
+  }
+  if ((qtimer_pending_at_exit & INTERRUPT_DELAY_SOURCE_BIT_OCXO2) != 0U) {
+    diag.blocked_ocxo2_count++;
+    interrupt_delay_publish_blocker(
+        interrupt_execution_source_t::PHOTODIODE,
+        interrupt_execution_source_t::OCXO2,
+        exit_dwt, blocker_wall_cycles,
+        qtimer_pending_at_entry, qtimer_pending_at_exit);
+  }
 }
 
 static void interrupt_delay_learn_spin_baseline(
@@ -5223,11 +5283,17 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
 }
 
 static void photodiode_gpio_isr(void) {
-  // Pin 34 currently shares IRQ_GPIO6789 with sovereign PPS.  Keep this entry
-  // microscopic: capture DWT immediately and hand the immutable edge fact to
-  // the dedicated high-rate PHOTODIODE custody path.
+  // Pin 34 currently shares IRQ_GPIO6789 with sovereign PPS.  Capture DWT first,
+  // then retain only the independent QTimer pending word needed to prove whether
+  // this Priority-0 PHOTODIODE residence serialized an authored clock compare.
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;
+  const uint32_t qtimer_pending_at_entry =
+      interrupt_delay_qtimer_pending_mask_fast();
   process_interrupt_photodiode_gpio_irq(isr_entry_dwt_raw);
+  // This is deliberately the final ISR action. A QTimer target arriving during
+  // the PHOTODIODE callback is therefore visible in the exit pending witness.
+  interrupt_delay_note_photodiode_exit(
+      isr_entry_dwt_raw, qtimer_pending_at_entry);
 }
 
 static void pps_gpio_isr(void) {
@@ -6689,6 +6755,16 @@ static FLASHMEM void add_photodiode_report(Payload& payload,
   add_u32("last_isr_entry_basepri", diag.last_isr_entry_basepri);
   add_u32("last_isr_entry_primask", diag.last_isr_entry_primask);
   add_u32("last_isr_entry_ipsr", diag.last_isr_entry_ipsr);
+  add_u32("blocker_trace_count", diag.blocker_trace_count);
+  add_u32("blocked_qtimer1_count", diag.blocked_qtimer1_count);
+  add_u32("blocked_ocxo1_count", diag.blocked_ocxo1_count);
+  add_u32("blocked_ocxo2_count", diag.blocked_ocxo2_count);
+  add_u32("last_blocker_wall_cycles", diag.last_blocker_wall_cycles);
+  add_u32("max_blocker_wall_cycles", diag.max_blocker_wall_cycles);
+  add_u32("last_qtimer_pending_at_entry_mask",
+          diag.last_qtimer_pending_at_entry_mask);
+  add_u32("last_qtimer_pending_at_exit_mask",
+          diag.last_qtimer_pending_at_exit_mask);
 
   // Pin 34 is physically installed, but it still shares the Arduino GPIO6789
   // NVIC vector and therefore the Priority-0 execution class used by PPS.
@@ -6746,6 +6822,8 @@ static FLASHMEM Payload cmd_report_priorities(const Payload&) {
               g_photodiode_physical_irq_installed);
   payload.add("photodiode_shared_gpio6789_vector_with_pps", true);
   payload.add("photodiode_independent_priority_ready", false);
+  payload.add("photodiode_execution_priority", INTERRUPT_PRIORITY_SCIENCE);
+  payload.add("photodiode_delay_blocker_traced", true);
   add_irq_priority_report(
       payload, "continuation", INTERRUPT_HANDOFF_IRQ_NUMBER,
       INTERRUPT_PRIORITY_CONTINUATION,
@@ -7590,6 +7668,7 @@ const char* interrupt_delay_cause_str(interrupt_delay_cause_t cause) {
     case interrupt_delay_cause_t::MASKING_OR_UNKNOWN_CPU:
       return "MASKING_OR_UNKNOWN_CPU";
     case interrupt_delay_cause_t::MULTIPLE_ISR: return "MULTIPLE_ISR";
+    case interrupt_delay_cause_t::PHOTODIODE: return "PHOTODIODE";
     default: return "UNKNOWN";
   }
 }
@@ -7602,6 +7681,7 @@ const char* interrupt_execution_source_str(
     case interrupt_execution_source_t::OCXO2: return "OCXO2";
     case interrupt_execution_source_t::PPS: return "PPS";
     case interrupt_execution_source_t::CONTINUATION: return "CONTINUATION";
+    case interrupt_execution_source_t::PHOTODIODE: return "PHOTODIODE";
     default: return "NONE";
   }
 }

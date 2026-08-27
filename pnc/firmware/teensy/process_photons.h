@@ -49,8 +49,8 @@
 //   • FLASH_CUT           — explicit hot campaign boundary preserving the always-on instrument epoch
 //   • STOP                — request campaign closure; the next published campaign fragment is final
 //   • REPORT              — compact operational/device report for laser, PD200T pin 38/A14
-//                           PD OUT voltage, pin 34 comparator interrupt custody, publication
-//                           identity, and hardware commissioning
+//                           PD OUT voltage, pin 34 comparator interrupt custody/blocker
+//                           forensics, publication identity, and hardware commissioning
 //   • PULSE               — manual one-shot commissioning pulse while the recurring
 //                           race engine is not active; optional ns=<nanoseconds>
 //                           selects pulse width (default 1000 ns)
@@ -475,6 +475,8 @@ struct photons_fragment_snapshot_t {
   // two injury-counter origins; rolling custody judges only their unsigned
   // deltas since that boundary, so pre-publication startup edges cannot poison
   // every later fragment.
+  bool     interrupt_subscribed = false;
+  bool     interrupt_active = false;
   uint32_t interrupt_irq_count = 0;
   uint32_t interrupt_callback_count = 0;
   uint32_t interrupt_callback_missing_count = 0;
@@ -487,6 +489,18 @@ struct photons_fragment_snapshot_t {
   uint32_t interrupt_source_pin = 0;
   uint32_t interrupt_last_callback_wall_cycles = 0;
   uint32_t interrupt_max_callback_wall_cycles = 0;
+
+  // Direct copy of process_interrupt's PHOTODIODE Priority-0 blocker testimony.
+  // The masks contain QTimer source bits only; GPIO6789 is intentionally absent
+  // because the shared vector cannot distinguish PPS from pin 34 pending state.
+  uint32_t interrupt_blocker_trace_count = 0;
+  uint32_t interrupt_blocked_qtimer1_count = 0;
+  uint32_t interrupt_blocked_ocxo1_count = 0;
+  uint32_t interrupt_blocked_ocxo2_count = 0;
+  uint32_t interrupt_last_blocker_wall_cycles = 0;
+  uint32_t interrupt_max_blocker_wall_cycles = 0;
+  uint32_t interrupt_last_qtimer_pending_at_entry_mask = 0;
+  uint32_t interrupt_last_qtimer_pending_at_exit_mask = 0;
 };
 
 // Initialize PHOTONS runtime state and subscribe to the process_interrupt

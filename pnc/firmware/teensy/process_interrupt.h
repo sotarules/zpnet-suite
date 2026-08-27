@@ -7,7 +7,7 @@
 // one-second compare only after the target enters the safe programming window.
 //
 // Execution tiers:
-//   Priority 0  — PPS, OCXO1, OCXO2 sovereign science capture
+//   Priority 0  — PPS, OCXO1, OCXO2, PHOTODIODE sovereign science capture
 //   Priority 16 — shared QTimer1 VCLOCK + TimePop CH2 capture
 //   Priority 32 — continuation/handoff and compare rearm
 //   Foreground  — TimePop policy and application callbacks
@@ -119,6 +119,7 @@ enum class interrupt_delay_cause_t : uint8_t {
   CONTINUATION = 5,
   MASKING_OR_UNKNOWN_CPU = 6,
   MULTIPLE_ISR = 7,
+  PHOTODIODE = 8,
   UNKNOWN = 255,
 };
 
@@ -139,6 +140,7 @@ enum class interrupt_execution_source_t : uint8_t {
   OCXO2 = 3,
   PPS = 4,
   CONTINUATION = 5,
+  PHOTODIODE = 6,
 };
 
 static constexpr uint32_t INTERRUPT_DELAY_SOURCE_BIT_QTIMER1 = 1U << 0;
@@ -146,6 +148,10 @@ static constexpr uint32_t INTERRUPT_DELAY_SOURCE_BIT_OCXO1 = 1U << 1;
 static constexpr uint32_t INTERRUPT_DELAY_SOURCE_BIT_OCXO2 = 1U << 2;
 static constexpr uint32_t INTERRUPT_DELAY_SOURCE_BIT_PPS = 1U << 3;
 static constexpr uint32_t INTERRUPT_DELAY_SOURCE_BIT_CONTINUATION = 1U << 4;
+// Logical blocker identity. PHOTODIODE shares GPIO6789 with PPS, so generic
+// NVIC pending testimony never sets this bit from the shared vector; pin-34
+// blocker tracing authors the PHOTODIODE source identity explicitly instead.
+static constexpr uint32_t INTERRUPT_DELAY_SOURCE_BIT_PHOTODIODE = 1U << 5;
 
 // First-instruction testimony captured before handler work.  This is intentionally
 // scalar-only so Priority 0 can preserve it without allocation or borrowed state.
@@ -1226,6 +1232,17 @@ struct interrupt_photodiode_diag_t {
   uint32_t last_isr_entry_basepri = 0;
   uint32_t last_isr_entry_primask = 0;
   uint32_t last_isr_entry_ipsr = 0;
+
+  // Priority-0 blocker testimony. Only independent QTimer pending bits are
+  // sampled; the shared GPIO6789 pending bit cannot distinguish PPS from pin 34.
+  uint32_t blocker_trace_count = 0;
+  uint32_t blocked_qtimer1_count = 0;
+  uint32_t blocked_ocxo1_count = 0;
+  uint32_t blocked_ocxo2_count = 0;
+  uint32_t last_blocker_wall_cycles = 0;
+  uint32_t max_blocker_wall_cycles = 0;
+  uint32_t last_qtimer_pending_at_entry_mask = 0;
+  uint32_t last_qtimer_pending_at_exit_mask = 0;
 };
 
 using interrupt_photodiode_edge_fn =

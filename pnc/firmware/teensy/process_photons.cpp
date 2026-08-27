@@ -2896,6 +2896,8 @@ static Payload& photons_fragment_payload(
   instrument.add_object("recovery", recovery);
   recovery.clear();
 
+  interrupt.add("subscribed", f.interrupt_subscribed);
+  interrupt.add("active", f.interrupt_active);
   interrupt.add("irq_count", f.interrupt_irq_count);
   interrupt.add("callback_count", f.interrupt_callback_count);
   interrupt.add("callback_missing_count",
@@ -2917,6 +2919,18 @@ static Payload& photons_fragment_payload(
                 f.interrupt_last_callback_wall_cycles);
   interrupt.add("max_callback_wall_cycles",
                 f.interrupt_max_callback_wall_cycles);
+  interrupt.add("blocker_trace_count", f.interrupt_blocker_trace_count);
+  interrupt.add("blocked_qtimer1_count", f.interrupt_blocked_qtimer1_count);
+  interrupt.add("blocked_ocxo1_count", f.interrupt_blocked_ocxo1_count);
+  interrupt.add("blocked_ocxo2_count", f.interrupt_blocked_ocxo2_count);
+  interrupt.add("last_blocker_wall_cycles",
+                f.interrupt_last_blocker_wall_cycles);
+  interrupt.add("max_blocker_wall_cycles",
+                f.interrupt_max_blocker_wall_cycles);
+  interrupt.add("last_qtimer_pending_at_entry_mask",
+                f.interrupt_last_qtimer_pending_at_entry_mask);
+  interrupt.add("last_qtimer_pending_at_exit_mask",
+                f.interrupt_last_qtimer_pending_at_exit_mask);
   instrument.add_object("interrupt", interrupt);
   interrupt.clear();
 
@@ -3122,6 +3136,8 @@ static void photons_fragment_tick(
   }
   fragment.recovery = photons_recovery_snapshot();
 
+  fragment.interrupt_subscribed = interrupt_diag.subscribed;
+  fragment.interrupt_active = interrupt_diag.active;
   fragment.interrupt_irq_count = interrupt_diag.irq_count;
   fragment.interrupt_callback_count = interrupt_diag.callback_count;
   fragment.interrupt_callback_missing_count =
@@ -3143,6 +3159,18 @@ static void photons_fragment_tick(
       interrupt_diag.last_callback_wall_cycles;
   fragment.interrupt_max_callback_wall_cycles =
       interrupt_diag.max_callback_wall_cycles;
+  fragment.interrupt_blocker_trace_count = interrupt_diag.blocker_trace_count;
+  fragment.interrupt_blocked_qtimer1_count = interrupt_diag.blocked_qtimer1_count;
+  fragment.interrupt_blocked_ocxo1_count = interrupt_diag.blocked_ocxo1_count;
+  fragment.interrupt_blocked_ocxo2_count = interrupt_diag.blocked_ocxo2_count;
+  fragment.interrupt_last_blocker_wall_cycles =
+      interrupt_diag.last_blocker_wall_cycles;
+  fragment.interrupt_max_blocker_wall_cycles =
+      interrupt_diag.max_blocker_wall_cycles;
+  fragment.interrupt_last_qtimer_pending_at_entry_mask =
+      interrupt_diag.last_qtimer_pending_at_entry_mask;
+  fragment.interrupt_last_qtimer_pending_at_exit_mask =
+      interrupt_diag.last_qtimer_pending_at_exit_mask;
 
   fragment.valid =
       fragment.stats.valid &&
@@ -4660,6 +4688,18 @@ static FLASHMEM Payload cmd_report_photons(const Payload& /*args*/) {
         toFixedDecimal(canonical.race_flight_this_fragment.stddev, 6));
   p.add("race_flight_stderr_ns_this_fragment",
         toFixedDecimal(canonical.race_flight_this_fragment.stderr_value, 6));
+  p.add("interrupt_subscribed", canonical.interrupt_subscribed);
+  p.add("interrupt_active", canonical.interrupt_active);
+  p.add("interrupt_blocker_trace_count", canonical.interrupt_blocker_trace_count);
+  p.add("interrupt_blocked_ocxo2_count", canonical.interrupt_blocked_ocxo2_count);
+  p.add("interrupt_last_blocker_wall_cycles",
+        canonical.interrupt_last_blocker_wall_cycles);
+  p.add("interrupt_max_blocker_wall_cycles",
+        canonical.interrupt_max_blocker_wall_cycles);
+  p.add("interrupt_last_qtimer_pending_at_entry_mask",
+        canonical.interrupt_last_qtimer_pending_at_entry_mask);
+  p.add("interrupt_last_qtimer_pending_at_exit_mask",
+        canonical.interrupt_last_qtimer_pending_at_exit_mask);
   p.add("race_count", canonical.stats.lap_count);
   p.add("total_flight_gnss_ns", canonical.stats.total_lap_gnss_ns);
   p.add("mean_flight_ns", toFixedDecimal(canonical.stats.mean_lap_ns, 6));
@@ -4918,6 +4958,8 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
     p.add("mean_flight_ns", toFixedDecimal(canonical.stats.mean_lap_ns, 6));
   }
 
+  p.add("interrupt_subscribed", interrupt_diag.subscribed);
+  p.add("interrupt_active", interrupt_diag.active);
   p.add("interrupt_callback_count", interrupt_diag.callback_count);
   p.add("interrupt_callback_missing_count",
         interrupt_diag.callback_missing_count);
@@ -4935,6 +4977,18 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
               g_interrupt_ancestry.inactive_edge_origin);
   }
   p.add("interrupt_inactive_edge_count", interrupt_diag.inactive_edge_count);
+  p.add("interrupt_blocker_trace_count", interrupt_diag.blocker_trace_count);
+  p.add("interrupt_blocked_qtimer1_count", interrupt_diag.blocked_qtimer1_count);
+  p.add("interrupt_blocked_ocxo1_count", interrupt_diag.blocked_ocxo1_count);
+  p.add("interrupt_blocked_ocxo2_count", interrupt_diag.blocked_ocxo2_count);
+  p.add("interrupt_last_blocker_wall_cycles",
+        interrupt_diag.last_blocker_wall_cycles);
+  p.add("interrupt_max_blocker_wall_cycles",
+        interrupt_diag.max_blocker_wall_cycles);
+  p.add("interrupt_last_qtimer_pending_at_entry_mask",
+        interrupt_diag.last_qtimer_pending_at_entry_mask);
+  p.add("interrupt_last_qtimer_pending_at_exit_mask",
+        interrupt_diag.last_qtimer_pending_at_exit_mask);
   p.add("photodiode_edge_level", device.photodiode_edge_level);
   p.add("photodiode_analog_v",
         toFixedDecimal(device.photodiode_analog_v, 6));
