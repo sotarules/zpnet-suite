@@ -1534,7 +1534,28 @@ static FLASHMEM Payload system_runtime_ledger_payload(void) {
 
 
 static constexpr uint32_t SYSTEM_TRACE_REPORT_DEFAULT_COUNT = 8U;
-static constexpr uint32_t SYSTEM_TRACE_REPORT_MAX_COUNT = 32U;
+static constexpr uint32_t SYSTEM_TRACE_REPORT_MAX_COUNT = 16U;
+static constexpr uint32_t SYSTEM_FORENSIC_RECORD_PAGE_SIZE = 4U;
+static constexpr uint32_t SYSTEM_FORENSIC_RECORD_PAGE_COUNT =
+    SYSTEM_TRACE_REPORT_MAX_COUNT / SYSTEM_FORENSIC_RECORD_PAGE_SIZE;
+static_assert(SYSTEM_TRACE_REPORT_MAX_COUNT %
+                  SYSTEM_FORENSIC_RECORD_PAGE_SIZE == 0U,
+              "forensic record pages must divide the maximum report count");
+
+static const char* const SYSTEM_FORENSIC_RECORD_PAGE_KEYS[] = {
+  "records_0", "records_1", "records_2", "records_3"
+};
+static const char* const SYSTEM_FORENSIC_ENTRY_PAGE_KEYS[] = {
+  "entries_0", "entries_1", "entries_2", "entries_3"
+};
+static_assert(sizeof(SYSTEM_FORENSIC_RECORD_PAGE_KEYS) /
+                  sizeof(SYSTEM_FORENSIC_RECORD_PAGE_KEYS[0]) ==
+                  SYSTEM_FORENSIC_RECORD_PAGE_COUNT,
+              "forensic record page key count mismatch");
+static_assert(sizeof(SYSTEM_FORENSIC_ENTRY_PAGE_KEYS) /
+                  sizeof(SYSTEM_FORENSIC_ENTRY_PAGE_KEYS[0]) ==
+                  SYSTEM_FORENSIC_RECORD_PAGE_COUNT,
+              "forensic entry page key count mismatch");
 
 static execution_trace_snapshot_t g_system_execution_trace_scratch DMAMEM;
 
@@ -1586,7 +1607,11 @@ static bool system_trace_context_parse(const char* text,
                                        bool* all) {
   if (out) *out = execution_trace_context_t::NONE;
   if (all) *all = false;
-  if (!text || !*text || system_cstr_equal_ci(text, "all")) {
+  if (!text || !*text) {
+    if (out) *out = execution_trace_context_t::FOREGROUND;
+    return true;
+  }
+  if (system_cstr_equal_ci(text, "all")) {
     if (all) *all = true;
     return true;
   }
@@ -1697,13 +1722,6 @@ static const char* execution_trace_phase_name(uint32_t phase) {
   }
 }
 
-static bool execution_trace_executable_address(uint32_t value) {
-  if (value == 0U) return false;
-  const uint32_t address = value & ~1U;
-  if (address >= 0x00000400UL && address < 0x00080000UL) return true;
-  return address >= 0x60000000UL && address < 0x61000000UL;
-}
-
 static const char* execution_trace_retire_reason(uint32_t reason) {
   switch (reason) {
     case 1U: return "CALLBACK_OR_MUTATION_RETIRED_SLOT";
@@ -1764,45 +1782,48 @@ static FLASHMEM Payload system_execution_trace_entry_payload(
     bool legacy_aliases,
     bool delta_valid,
     uint32_t delta_cycles) {
+  // Retained forensics transports raw custody first.  Human-readable stage/kind
+  // names, executable-address verdicts, and aux decoding are derived from these
+  // scalar IDs and addresses and therefore do not belong in every generic trace
+  // record.  Keeping the generic record compact prevents observer-induced heap
+  // exhaustion while preserving every authoritative recorder field.
   Payload out;
   out.add("sequence", entry.sequence);
   out.add("context_id", entry.context);
-  out.add("context", execution_trace_context_name(entry.context));
   out.add("stage_id", entry.stage);
-  out.add("stage", execution_trace_stage_name(entry.stage));
   out.add("phase_id", entry.phase);
-  out.add("phase", execution_trace_phase_name(entry.phase));
   out.add("kind_id", entry.kind);
-  out.add("kind", execution_trace_kind_name(entry.kind));
   system_crash_add_hex32(out, "dwt", entry.dwt);
-  out.add("dwt_delta_from_previous_valid", delta_valid);
-  if (delta_valid) out.add("dwt_delta_from_previous_cycles", delta_cycles);
+  if (delta_valid) out.add("delta_cycles", delta_cycles);
   out.add("ipsr", entry.ipsr);
   system_crash_add_hex32(out, "lineage_id", entry.lineage_id);
   out.add("subject_index", entry.subject_index);
   out.add("identity", entry.identity);
   system_crash_add_hex32(out, "target", entry.target);
   system_crash_add_hex32(out, "related_target", entry.related_target);
-  out.add("target_executable", execution_trace_executable_address(entry.target));
-  out.add("related_target_executable",
-          execution_trace_executable_address(entry.related_target));
   system_crash_add_hex32(out, "object", entry.object);
   system_crash_add_hex32(out, "site_pc", entry.site_pc);
-  out.add("site_pc_executable", execution_trace_executable_address(entry.site_pc));
   system_crash_add_hex32(out, "aux", entry.aux);
-  out.add("aux_meaning", execution_trace_aux_meaning(entry.stage, entry.kind));
-  if ((execution_trace_stage_t)entry.stage ==
-      execution_trace_stage_t::SLOT_RETIRED) {
-    out.add("retire_reason", execution_trace_retire_reason(entry.aux));
-  }
-  if ((execution_trace_stage_t)entry.stage ==
-      execution_trace_stage_t::MUTATION_RESULT) {
-    out.add("mutation_ok", (entry.aux & 0x00000100UL) != 0U);
-    out.add("mutation_kind_id", entry.aux & 0xFFU);
-    out.add("mutation_queue_remaining", entry.aux >> 16);
-  }
 
+  // TIMEPOP_DISPATCH_INFO remains a compatibility surface.  Its optional
+  // aliases and derived labels are retained there, but never paid for by the
+  // generic crash-forensics path.
   if (legacy_aliases) {
+    out.add("context", execution_trace_context_name(entry.context));
+    out.add("stage", execution_trace_stage_name(entry.stage));
+    out.add("phase", execution_trace_phase_name(entry.phase));
+    out.add("kind", execution_trace_kind_name(entry.kind));
+    out.add("aux_meaning", execution_trace_aux_meaning(entry.stage, entry.kind));
+    if ((execution_trace_stage_t)entry.stage ==
+        execution_trace_stage_t::SLOT_RETIRED) {
+      out.add("retire_reason", execution_trace_retire_reason(entry.aux));
+    }
+    if ((execution_trace_stage_t)entry.stage ==
+        execution_trace_stage_t::MUTATION_RESULT) {
+      out.add("mutation_ok", (entry.aux & 0x00000100UL) != 0U);
+      out.add("mutation_kind_id", entry.aux & 0xFFU);
+      out.add("mutation_queue_remaining", entry.aux >> 16);
+    }
     out.add("slot_index", entry.subject_index);
     out.add("has_slot", entry.subject_index != EXECUTION_TRACE_NO_SUBJECT);
     out.add("handle", entry.identity);
@@ -1815,7 +1836,8 @@ static FLASHMEM Payload system_execution_trace_entry_payload(
   return out;
 }
 
-static FLASHMEM Payload system_execution_trace_context_payload(
+static FLASHMEM void system_execution_trace_add_context_payload(
+    Payload& out,
     const execution_trace_context_snapshot_t& context,
     uint32_t requested,
     uint32_t offset,
@@ -1824,11 +1846,9 @@ static FLASHMEM Payload system_execution_trace_context_payload(
   uint32_t end = 0U;
   system_trace_bounds(context.count, requested, offset, &begin, &end);
 
-  Payload out;
-  out.add("context_id", context.context);
-  out.add("context", execution_trace_context_name(context.context));
-  out.add("valid", context.valid);
-  out.add("capacity", EXECUTION_TRACE_ENTRIES_PER_CONTEXT);
+  out.add("trace_context_id", context.context);
+  out.add("trace_valid", context.valid);
+  out.add("trace_capacity", EXECUTION_TRACE_ENTRIES_PER_CONTEXT);
   out.add("available_count", context.count);
   out.add("newest_sequence", context.newest_sequence);
   out.add("sequence_at_capture", context.sequence_at_capture);
@@ -1840,19 +1860,36 @@ static FLASHMEM Payload system_execution_trace_context_payload(
   out.add("first_sequence", begin < end ? context.entries[begin].sequence : 0U);
   out.add("last_sequence", begin < end ? context.entries[end - 1U].sequence : 0U);
 
-  PayloadArray records;
-  for (uint32_t i = begin; i < end; ++i) {
-    const bool delta_valid = i > 0U;
-    const uint32_t delta = delta_valid
-        ? context.entries[i].dwt - context.entries[i - 1U].dwt
-        : 0U;
-    Payload record = system_execution_trace_entry_payload(
-        context.entries[i], legacy_aliases, delta_valid, delta);
-    record.add("bank_index", i);
-    records.add(record);
+  uint32_t page_count = 0U;
+  for (uint32_t page_begin = begin;
+       page_begin < end;
+       page_begin += SYSTEM_FORENSIC_RECORD_PAGE_SIZE) {
+    if (page_count >= SYSTEM_FORENSIC_RECORD_PAGE_COUNT) break;
+    const uint32_t page_end =
+        page_begin + SYSTEM_FORENSIC_RECORD_PAGE_SIZE < end
+            ? page_begin + SYSTEM_FORENSIC_RECORD_PAGE_SIZE
+            : end;
+
+    // Only four serialized child records coexist here.  add_array() copies this
+    // bounded page into the final response before the page is destroyed, so the
+    // old 16-record 16-KiB intermediate allocation can never recur.
+    PayloadArray page;
+    for (uint32_t i = page_begin; i < page_end; ++i) {
+      const bool delta_valid = i > 0U;
+      const uint32_t delta = delta_valid
+          ? context.entries[i].dwt - context.entries[i - 1U].dwt
+          : 0U;
+      Payload record = system_execution_trace_entry_payload(
+          context.entries[i], legacy_aliases, delta_valid, delta);
+      record.add("bank_index", i);
+      page.add(record);
+    }
+    out.add_array(SYSTEM_FORENSIC_RECORD_PAGE_KEYS[page_count], page);
+    ++page_count;
   }
-  out.add_array("records", records);
-  return out;
+
+  out.add("record_page_size", SYSTEM_FORENSIC_RECORD_PAGE_SIZE);
+  out.add("record_page_count", page_count);
 }
 
 static FLASHMEM Payload system_execution_trace_payload(
@@ -1878,7 +1915,21 @@ static FLASHMEM Payload system_execution_trace_payload(
                                   &all_contexts)) {
     Payload error;
     error.add("error",
-              "context must be all, priority0, priority16, priority32, or foreground");
+              "context must be priority0, priority16, priority32, foreground, or all");
+    return error;
+  }
+
+  // One RPC owns one execution notebook.  The former context=all response built
+  // four already-large context documents and then copied them into another
+  // array, exactly the amplification pattern forbidden for crash interrogation.
+  // Comprehensive collection remains lossless by querying the four contexts
+  // independently, which is also the ordering model advertised by this report.
+  if (all_contexts) {
+    Payload error;
+    error.add("error", "context=all disabled for bounded crash forensics");
+    error.add("query_contexts",
+              "priority0 priority16 priority32 foreground");
+    error.add("max_count_per_query", SYSTEM_TRACE_REPORT_MAX_COUNT);
     return error;
   }
 
@@ -1887,20 +1938,21 @@ static FLASHMEM Payload system_execution_trace_payload(
 
   Payload out;
   out.add("schema", legacy_timepop_schema
-      ? "ZPNET_TIMEPOP_DISPATCH_TRACE_V3"
-      : "ZPNET_EXECUTION_TRACE_V2");
+      ? "ZPNET_TIMEPOP_DISPATCH_TRACE_V4"
+      : "ZPNET_EXECUTION_TRACE_V3");
   out.add("report", legacy_timepop_schema
       ? "TIMEPOP_DISPATCH_INFO" : "EXECUTION_TRACE");
+  out.add("entry_encoding", legacy_timepop_schema
+      ? "TIMEPOP_COMPAT_V1" : "RAW_SCALAR_V1");
   out.add("bank", live_bank ? "live" : "retained");
-  out.add("context", all_contexts
-      ? "ALL" : execution_trace_context_name((uint32_t)requested_context));
+  out.add("context",
+          execution_trace_context_name((uint32_t)requested_context));
   out.add("context_count", EXECUTION_TRACE_CONTEXT_COUNT);
   out.add("entries_per_context", EXECUTION_TRACE_ENTRIES_PER_CONTEXT);
-  out.add("ordering_model", "PER_CONTEXT_SEQUENCE_WITH_DWT_AND_LINEAGE_CORRELATION");
+  out.add("ordering_model",
+          "PER_CONTEXT_SEQUENCE_WITH_DWT_AND_LINEAGE_CORRELATION");
   out.add("dwt_is_32_bit", true);
   out.add("dwt_cross_context_merge_is_derived", true);
-  out.add("dwt_wrap_caveat",
-          "cross-context ordering is ambiguous across more than one 32-bit DWT wrap");
   out.add("retained_valid", g_system_execution_trace_scratch.retained_valid);
   out.add("fault_captured", g_system_execution_trace_scratch.fault_captured);
   system_crash_add_hex32(out, "fault_dwt",
@@ -1914,25 +1966,14 @@ static FLASHMEM Payload system_execution_trace_payload(
   const execution_trace_context_snapshot_t* banks = live_bank
       ? g_system_execution_trace_scratch.live
       : g_system_execution_trace_scratch.retained;
-
-  if (!all_contexts) {
-    const int index = system_trace_context_index(requested_context);
-    if (index < 0) {
-      out.add("valid", false);
-      return out;
-    }
-    out.add_object("trace",
-                   system_execution_trace_context_payload(
-                       banks[index], requested, offset, legacy_timepop_schema));
+  const int index = system_trace_context_index(requested_context);
+  if (index < 0) {
+    out.add("trace_valid", false);
     return out;
   }
 
-  PayloadArray contexts;
-  for (uint32_t i = 0U; i < EXECUTION_TRACE_CONTEXT_COUNT; ++i) {
-    contexts.add(system_execution_trace_context_payload(
-        banks[i], requested, offset, false));
-  }
-  out.add_array("contexts", contexts);
+  system_execution_trace_add_context_payload(
+      out, banks[index], requested, offset, legacy_timepop_schema);
   return out;
 }
 
@@ -1999,21 +2040,6 @@ static void system_bytes_hex(const uint8_t* bytes,
     out[i * 2U + 1U] = system_hex_digit((uint8_t)(bytes[i] & 0x0FU));
   }
   out[length * 2U] = '\0';
-}
-
-static void system_bytes_printable(const uint8_t* bytes,
-                                   size_t length,
-                                   char* out,
-                                   size_t out_capacity) {
-  if (!out || out_capacity == 0U) return;
-  const size_t bounded = length < out_capacity - 1U
-      ? length
-      : out_capacity - 1U;
-  for (size_t i = 0U; i < bounded; ++i) {
-    const uint8_t byte = bytes ? bytes[i] : 0U;
-    out[i] = (byte >= 0x20U && byte <= 0x7EU) ? (char)byte : '.';
-  }
-  out[bounded] = '\0';
 }
 
 static FLASHMEM Payload system_payload_flight_bank_payload(
@@ -2116,23 +2142,18 @@ static FLASHMEM Payload system_payload_stamp_trace_entry_payload(
   Payload out;
   out.add("sequence", entry.sequence);
   out.add("stage_id", entry.stage);
-  out.add("stage", payload_stamp_trace_stage_name(entry.stage));
   out.add("operation_id", entry.operation_id);
-  out.add("operation", payload_operation_id_name(entry.operation_id));
   system_crash_add_hex32(out, "this", entry.this_ptr);
   system_crash_add_hex32(out, "caller_lr", entry.caller_lr);
-  system_crash_add_hex32(out, "caller_target", entry.caller_lr & ~1UL);
   system_crash_add_hex32(out, "msp", entry.msp);
   system_crash_add_hex32(out, "dwt", entry.dwt_cyccnt);
   out.add("ipsr", entry.ipsr);
-
   system_crash_add_hex32(out, "heap_block", entry.heap_block);
   system_crash_add_hex32(out, "heap_block_guard", entry.heap_block_guard);
   out.add("count", entry.count);
   system_crash_add_hex32(out, "count_guard", entry.count_guard);
   out.add("data_begin", entry.data_begin);
   system_crash_add_hex32(out, "data_begin_guard", entry.data_begin_guard);
-
   system_crash_add_hex32(out, "contract_generation",
                          entry.contract_generation);
   system_crash_add_hex32(out, "contract_generation_guard",
@@ -2145,34 +2166,6 @@ static FLASHMEM Payload system_payload_stamp_trace_entry_payload(
                          entry.structural_fingerprint);
   out.add("contract_incident_sequence",
           entry.contract_incident_sequence);
-
-  const bool heap_guard_ok =
-      (entry.heap_block ^ entry.heap_block_guard) == 0xFFFFFFFFUL;
-  const bool count_guard_ok =
-      (uint16_t)(entry.count ^ entry.count_guard) == UINT16_MAX;
-  const bool data_begin_guard_ok =
-      (uint16_t)(entry.data_begin ^ entry.data_begin_guard) == UINT16_MAX;
-  const bool generation_guard_ok =
-      (entry.contract_generation ^ entry.contract_generation_guard) ==
-          0xFFFFFFFFUL;
-  const bool fingerprint_guard_ok =
-      (entry.contract_fingerprint ^ entry.contract_fingerprint_guard) ==
-          0xFFFFFFFFUL;
-  const bool stamp_valid =
-      generation_guard_ok && fingerprint_guard_ok &&
-      entry.contract_generation != 0U;
-
-  out.add("heap_guard_ok", heap_guard_ok);
-  out.add("count_guard_ok", count_guard_ok);
-  out.add("data_begin_guard_ok", data_begin_guard_ok);
-  out.add("contract_generation_guard_ok", generation_guard_ok);
-  out.add("contract_fingerprint_guard_ok", fingerprint_guard_ok);
-  out.add("contract_stamp_initialized", entry.contract_generation != 0U);
-  out.add("contract_stamp_valid", stamp_valid);
-  if (entry.structural_fingerprint != 0U) {
-    out.add("structural_matches_stamp",
-            entry.structural_fingerprint == entry.contract_fingerprint);
-  }
   return out;
 }
 
@@ -2180,16 +2173,14 @@ static uint32_t system_payload_stamp_trace_report_count(
     const Payload& args) {
   uint32_t count = args.has("count") ? args.getUInt("count") : 8U;
   if (count == 0U) count = 1U;
-  if (count > PAYLOAD_STAMP_TRACE_ENTRIES) {
-    count = PAYLOAD_STAMP_TRACE_ENTRIES;
+  if (count > SYSTEM_TRACE_REPORT_MAX_COUNT) {
+    count = SYSTEM_TRACE_REPORT_MAX_COUNT;
   }
   return count;
 }
 
 static FLASHMEM Payload system_payload_stamp_trace_payload(
     const Payload& args) {
-  // Snapshot before constructing the response: response Payload activity must
-  // never become evidence in the transcript being reported.
   payload_get_stamp_trace(&g_system_payload_stamp_trace_scratch);
 
   bool bank_valid = true;
@@ -2212,7 +2203,8 @@ static FLASHMEM Payload system_payload_stamp_trace_payload(
   system_trace_bounds(bank.count, requested, offset, &begin, &end);
 
   Payload out;
-  out.add("schema", "ZPNET_PAYLOAD_STAMP_TRACE_V1");
+  out.add("schema", "ZPNET_PAYLOAD_STAMP_TRACE_V2");
+  out.add("entry_encoding", "RAW_SCALAR_V1");
   out.add("bank", live_bank ? "live" : "retained");
   out.add("valid", bank.valid != 0U);
   out.add("capacity", PAYLOAD_STAMP_TRACE_ENTRIES);
@@ -2227,14 +2219,26 @@ static FLASHMEM Payload system_payload_stamp_trace_payload(
   out.add("last_sequence",
           begin < end ? bank.entries[end - 1U].sequence : 0U);
 
-  PayloadArray records;
-  for (uint32_t i = begin; i < end; ++i) {
-    Payload record =
-        system_payload_stamp_trace_entry_payload(bank.entries[i]);
-    record.add("bank_index", i);
-    records.add(record);
+  uint32_t page_count = 0U;
+  for (uint32_t page_begin = begin;
+       page_begin < end;
+       page_begin += SYSTEM_FORENSIC_RECORD_PAGE_SIZE) {
+    if (page_count >= SYSTEM_FORENSIC_RECORD_PAGE_COUNT) break;
+    const uint32_t page_end =
+        page_begin + SYSTEM_FORENSIC_RECORD_PAGE_SIZE < end
+            ? page_begin + SYSTEM_FORENSIC_RECORD_PAGE_SIZE
+            : end;
+    PayloadArray page;
+    for (uint32_t i = page_begin; i < page_end; ++i) {
+      Payload record = system_payload_stamp_trace_entry_payload(bank.entries[i]);
+      record.add("bank_index", i);
+      page.add(record);
+    }
+    out.add_array(SYSTEM_FORENSIC_RECORD_PAGE_KEYS[page_count], page);
+    ++page_count;
   }
-  out.add_array("records", records);
+  out.add("record_page_size", SYSTEM_FORENSIC_RECORD_PAGE_SIZE);
+  out.add("record_page_count", page_count);
   return out;
 }
 
@@ -2243,63 +2247,44 @@ static FLASHMEM Payload system_payload_stamp_trace_payload(
 // Payload v4.1 append transaction recorder — reporting surface
 // ================================================================
 
-static const char* payload_append_trace_stage_name(uint32_t stage) {
-  switch ((payload_append_trace_stage_t)stage) {
-    case payload_append_trace_stage_t::ENTER:           return "ENTER";
-    case payload_append_trace_stage_t::PRE_ENSURE:      return "PRE_ENSURE";
-    case payload_append_trace_stage_t::ENSURE_FAILED:   return "ENSURE_FAILED";
-    case payload_append_trace_stage_t::POST_ENSURE:     return "POST_ENSURE";
-    case payload_append_trace_stage_t::PRE_VALUE_COPY:  return "PRE_VALUE_COPY";
-    case payload_append_trace_stage_t::VALUE_COPY_DONE: return "VALUE_COPY_DONE";
-    case payload_append_trace_stage_t::PRE_KEY_COPY:    return "PRE_KEY_COPY";
-    case payload_append_trace_stage_t::KEY_COPY_DONE:   return "KEY_COPY_DONE";
-    case payload_append_trace_stage_t::COMMIT:          return "COMMIT";
-    case payload_append_trace_stage_t::FINAL_SPAN_FAIL: return "FINAL_SPAN_FAIL";
-    default:                                             return "NONE";
-  }
-}
-
 static FLASHMEM Payload system_payload_append_trace_entry_payload(
     const payload_append_trace_entry_t& entry) {
+  // V3 uses compact raw keys so sixteen complete append witnesses remain in the
+  // 8-KiB response class.  system_payload_append_trace_payload() publishes the
+  // field map once per response; no authoritative recorder field is discarded.
   Payload out;
-  out.add("sequence", entry.sequence);
-  out.add("stage_id", entry.stage);
-  out.add("stage", payload_append_trace_stage_name(entry.stage));
-  system_crash_add_hex32(out, "this", entry.this_ptr);
-  system_crash_add_hex32(out, "key_ptr", entry.key_ptr);
-  system_crash_add_hex32(out, "value_ptr", entry.value_ptr);
-  out.add("key_len", entry.key_len);
-  out.add("value_len", entry.value_len);
+  out.add("seq", entry.sequence);
+  out.add("stg", entry.stage);
+  system_crash_add_hex32(out, "self", entry.this_ptr);
+  system_crash_add_hex32(out, "kp", entry.key_ptr);
+  system_crash_add_hex32(out, "vp", entry.value_ptr);
+  out.add("kl", entry.key_len);
+  out.add("vl", entry.value_len);
   out.add("kind", entry.kind);
-  system_crash_add_hex32(out, "storage_ptr", entry.storage_ptr);
-  out.add("capacity", entry.capacity);
-  out.add("data_begin", entry.data_begin);
-  out.add("entry_count", entry.entry_count);
-  out.add("key_alias", (entry.alias_flags & 1U) != 0U);
-  out.add("value_alias", (entry.alias_flags & 2U) != 0U);
-  out.add("key_offset", entry.key_offset);
-  out.add("value_offset", entry.value_offset);
-  out.add("data_shift", entry.data_shift);
-  out.add("key_off", entry.key_off);
-  out.add("val_off", entry.val_off);
-  out.add("source_hash_valid", entry.source_hash_valid != 0U);
+  system_crash_add_hex32(out, "store", entry.storage_ptr);
+  out.add("cap", entry.capacity);
+  out.add("db", entry.data_begin);
+  out.add("ec", entry.entry_count);
+  system_crash_add_hex32(out, "alias", entry.alias_flags);
+  out.add("ko", entry.key_offset);
+  out.add("vo", entry.value_offset);
+  out.add("shift", entry.data_shift);
+  out.add("koff", entry.key_off);
+  out.add("voff", entry.val_off);
+  out.add("shv", entry.source_hash_valid != 0U);
   if (entry.source_hash_valid != 0U) {
-    system_crash_add_hex32(out, "key_hash", entry.key_hash);
-    system_crash_add_hex32(out, "value_hash", entry.value_hash);
-    out.add("key_prefix_len", entry.key_prefix_len);
+    system_crash_add_hex32(out, "kh", entry.key_hash);
+    system_crash_add_hex32(out, "vh", entry.value_hash);
+    out.add("kpl", entry.key_prefix_len);
 
     char prefix_hex[PAYLOAD_APPEND_TRACE_KEY_PREFIX_BYTES * 2U + 1U];
-    char prefix_printable[PAYLOAD_APPEND_TRACE_KEY_PREFIX_BYTES + 1U];
     const size_t prefix_len =
         entry.key_prefix_len < PAYLOAD_APPEND_TRACE_KEY_PREFIX_BYTES
             ? entry.key_prefix_len
             : PAYLOAD_APPEND_TRACE_KEY_PREFIX_BYTES;
     system_bytes_hex(entry.key_prefix, prefix_len,
                      prefix_hex, sizeof(prefix_hex));
-    system_bytes_printable(entry.key_prefix, prefix_len,
-                           prefix_printable, sizeof(prefix_printable));
-    out.add("key_prefix_hex", prefix_hex);
-    out.add("key_prefix_printable", prefix_printable);
+    out.add("kph", prefix_hex);
   }
   system_crash_add_hex32(out, "dwt", entry.dwt_cyccnt);
   out.add("ipsr", entry.ipsr);
@@ -2328,7 +2313,14 @@ static FLASHMEM Payload system_payload_append_trace_payload(
   system_trace_bounds(bank.count, requested, offset, &begin, &end);
 
   Payload out;
-  out.add("schema", "ZPNET_PAYLOAD_APPEND_TRACE_V2");
+  out.add("schema", "ZPNET_PAYLOAD_APPEND_TRACE_V3");
+  out.add("entry_encoding", "RAW_COMPACT_V1");
+  out.add("field_map",
+          "seq=sequence stg=stage_id self=this kp=key_ptr vp=value_ptr "
+          "kl=key_len vl=value_len store=storage_ptr cap=capacity db=data_begin "
+          "ec=entry_count alias=alias_flags ko=key_offset vo=value_offset "
+          "shift=data_shift koff=key_off voff=val_off shv=source_hash_valid "
+          "kh=key_hash vh=value_hash kpl=key_prefix_len kph=key_prefix_hex");
   out.add("bank", live_bank ? "live" : "retained");
   out.add("valid", bank.valid != 0U);
   out.add("capacity", PAYLOAD_APPEND_TRACE_ENTRIES);
@@ -2342,14 +2334,26 @@ static FLASHMEM Payload system_payload_append_trace_payload(
   out.add("first_sequence", begin < end ? bank.entries[begin].sequence : 0U);
   out.add("last_sequence", begin < end ? bank.entries[end - 1U].sequence : 0U);
 
-  PayloadArray records;
-  for (uint32_t i = begin; i < end; ++i) {
-    Payload record =
-        system_payload_append_trace_entry_payload(bank.entries[i]);
-    record.add("bank_index", i);
-    records.add(record);
+  uint32_t page_count = 0U;
+  for (uint32_t page_begin = begin;
+       page_begin < end;
+       page_begin += SYSTEM_FORENSIC_RECORD_PAGE_SIZE) {
+    if (page_count >= SYSTEM_FORENSIC_RECORD_PAGE_COUNT) break;
+    const uint32_t page_end =
+        page_begin + SYSTEM_FORENSIC_RECORD_PAGE_SIZE < end
+            ? page_begin + SYSTEM_FORENSIC_RECORD_PAGE_SIZE
+            : end;
+    PayloadArray page;
+    for (uint32_t i = page_begin; i < page_end; ++i) {
+      Payload record = system_payload_append_trace_entry_payload(bank.entries[i]);
+      record.add("bank_index", i);
+      page.add(record);
+    }
+    out.add_array(SYSTEM_FORENSIC_RECORD_PAGE_KEYS[page_count], page);
+    ++page_count;
   }
-  out.add_array("records", records);
+  out.add("record_page_size", SYSTEM_FORENSIC_RECORD_PAGE_SIZE);
+  out.add("record_page_count", page_count);
   return out;
 }
 
@@ -2376,33 +2380,15 @@ static FLASHMEM Payload system_payload_append_trace_summary_payload(void) {
 // Payload heap-resize transaction recorder — reporting surface
 // ================================================================
 
-static const char* payload_heap_resize_trace_stage_name(uint32_t stage) {
-  switch ((payload_heap_resize_trace_stage_t)stage) {
-    case payload_heap_resize_trace_stage_t::PRE_REALLOC:
-      return "PRE_REALLOC";
-    case payload_heap_resize_trace_stage_t::REALLOC_FAILED:
-      return "REALLOC_FAILED";
-    case payload_heap_resize_trace_stage_t::POST_REALLOC:
-      return "POST_REALLOC";
-    case payload_heap_resize_trace_stage_t::HEADER_WRITTEN:
-      return "HEADER_WRITTEN";
-    case payload_heap_resize_trace_stage_t::POST_DATA_MOVE:
-      return "POST_DATA_MOVE";
-    case payload_heap_resize_trace_stage_t::POST_OFFSET_REBASE:
-      return "POST_OFFSET_REBASE";
-    case payload_heap_resize_trace_stage_t::POST_CONTRACT:
-      return "POST_CONTRACT";
-    default:
-      return "NONE";
-  }
-}
+// ================================================================
+// Payload heap-resize transaction recorder — reporting surface
+// ================================================================
 
 static FLASHMEM Payload system_payload_heap_resize_trace_entry_payload(
     const payload_heap_resize_trace_entry_t& entry) {
   Payload out;
   out.add("sequence", entry.sequence);
   out.add("stage_id", entry.stage);
-  out.add("stage", payload_heap_resize_trace_stage_name(entry.stage));
   system_crash_add_hex32(out, "this", entry.this_ptr);
   system_crash_add_hex32(out, "old_raw", entry.old_raw);
   system_crash_add_hex32(out, "new_raw", entry.new_raw);
@@ -2416,26 +2402,6 @@ static FLASHMEM Payload system_payload_heap_resize_trace_entry_payload(
                          entry.expected_owner_cookie);
   out.add("span_remaining", entry.span_remaining);
   system_crash_add_hex32(out, "verdict_flags", entry.verdict_flags);
-  out.add("raw_present",
-          (entry.verdict_flags & PAYLOAD_HEAP_RESIZE_FLAG_RAW_PRESENT) != 0U);
-  out.add("aligned",
-          (entry.verdict_flags & PAYLOAD_HEAP_RESIZE_FLAG_ALIGNED) != 0U);
-  out.add("header_readable",
-          (entry.verdict_flags & PAYLOAD_HEAP_RESIZE_FLAG_HEADER_READABLE) != 0U);
-  out.add("capacity_complement_ok",
-          (entry.verdict_flags & PAYLOAD_HEAP_RESIZE_FLAG_CAP_COMPLEMENT) != 0U);
-  out.add("owner_complement_ok",
-          (entry.verdict_flags & PAYLOAD_HEAP_RESIZE_FLAG_OWNER_COMPLEMENT) != 0U);
-  out.add("owner_matches",
-          (entry.verdict_flags & PAYLOAD_HEAP_RESIZE_FLAG_OWNER_MATCH) != 0U);
-  out.add("capacity_expected",
-          (entry.verdict_flags & PAYLOAD_HEAP_RESIZE_FLAG_CAP_EXPECTED) != 0U);
-  out.add("storage_span_ok",
-          (entry.verdict_flags & PAYLOAD_HEAP_RESIZE_FLAG_STORAGE_SPAN) != 0U);
-  out.add("moved",
-          (entry.verdict_flags & PAYLOAD_HEAP_RESIZE_FLAG_MOVED) != 0U);
-  out.add("contract_ok",
-          (entry.verdict_flags & PAYLOAD_HEAP_RESIZE_FLAG_CONTRACT_OK) != 0U);
   out.add("alloc_overlap_count", entry.alloc_overlap_count);
   out.add("alloc_overlap_depth", entry.alloc_overlap_depth);
   system_crash_add_hex32(out, "dwt", entry.dwt_cyccnt);
@@ -2465,7 +2431,8 @@ static FLASHMEM Payload system_payload_heap_resize_trace_payload(
   system_trace_bounds(bank.count, requested, offset, &begin, &end);
 
   Payload out;
-  out.add("schema", "ZPNET_PAYLOAD_HEAP_RESIZE_TRACE_V1");
+  out.add("schema", "ZPNET_PAYLOAD_HEAP_RESIZE_TRACE_V2");
+  out.add("entry_encoding", "RAW_SCALAR_V1");
   out.add("bank", live_bank ? "live" : "retained");
   out.add("valid", bank.valid != 0U);
   out.add("capacity", PAYLOAD_HEAP_RESIZE_TRACE_ENTRIES);
@@ -2479,14 +2446,27 @@ static FLASHMEM Payload system_payload_heap_resize_trace_payload(
   out.add("first_sequence", begin < end ? bank.entries[begin].sequence : 0U);
   out.add("last_sequence", begin < end ? bank.entries[end - 1U].sequence : 0U);
 
-  PayloadArray records;
-  for (uint32_t i = begin; i < end; ++i) {
-    Payload record =
-        system_payload_heap_resize_trace_entry_payload(bank.entries[i]);
-    record.add("bank_index", i);
-    records.add(record);
+  uint32_t page_count = 0U;
+  for (uint32_t page_begin = begin;
+       page_begin < end;
+       page_begin += SYSTEM_FORENSIC_RECORD_PAGE_SIZE) {
+    if (page_count >= SYSTEM_FORENSIC_RECORD_PAGE_COUNT) break;
+    const uint32_t page_end =
+        page_begin + SYSTEM_FORENSIC_RECORD_PAGE_SIZE < end
+            ? page_begin + SYSTEM_FORENSIC_RECORD_PAGE_SIZE
+            : end;
+    PayloadArray page;
+    for (uint32_t i = page_begin; i < page_end; ++i) {
+      Payload record =
+          system_payload_heap_resize_trace_entry_payload(bank.entries[i]);
+      record.add("bank_index", i);
+      page.add(record);
+    }
+    out.add_array(SYSTEM_FORENSIC_RECORD_PAGE_KEYS[page_count], page);
+    ++page_count;
   }
-  out.add_array("records", records);
+  out.add("record_page_size", SYSTEM_FORENSIC_RECORD_PAGE_SIZE);
+  out.add("record_page_count", page_count);
   return out;
 }
 
@@ -2687,7 +2667,7 @@ static FLASHMEM Payload system_stack_watch_entry_payload(
     uint32_t watch_bytes) {
   Payload p;
   p.add("sequence", entry.sequence);
-  p.add("dwt", entry.dwt);
+  system_crash_add_hex32(p, "dwt", entry.dwt);
   system_crash_add_hex32(p, "pc", entry.pc);
   system_crash_add_hex32(p, "lr", entry.lr);
   system_crash_add_hex32(p, "xpsr", entry.xpsr);
@@ -2695,16 +2675,11 @@ static FLASHMEM Payload system_stack_watch_entry_payload(
   system_crash_add_hex32(p, "exc_return", entry.exc_return);
   p.add("anomalous",
         entry.writer_sp >= watch_address + watch_bytes);
-  PayloadArray watched;
-  for (size_t i = 0; i < 4U; ++i) {
-    Payload word;
-    word.add("index", (uint32_t)i);
-    system_crash_add_hex32(word, "address",
-                           watch_address + (uint32_t)(i * 4U));
-    system_crash_add_hex32(word, "value", entry.watched[i]);
-    watched.add(word);
-  }
-  p.add_array("watched", watched);
+  system_crash_add_hex32(p, "watched_base", watch_address);
+  system_crash_add_hex32(p, "watched_0", entry.watched[0]);
+  system_crash_add_hex32(p, "watched_1", entry.watched[1]);
+  system_crash_add_hex32(p, "watched_2", entry.watched[2]);
+  system_crash_add_hex32(p, "watched_3", entry.watched[3]);
   return p;
 }
 
@@ -2727,13 +2702,37 @@ static FLASHMEM Payload system_stack_watch_bank_payload(
                                                   watch_bytes));
   }
 
-  PayloadArray entries;
-  for (uint32_t i = 0U; i < bank.count; ++i) {
-    entries.add(system_stack_watch_entry_payload(bank.entries[i],
-                                                 watch_address,
-                                                 watch_bytes));
+  uint32_t page_count = 0U;
+  for (uint32_t page_begin = 0U;
+       page_begin < bank.count;
+       page_begin += SYSTEM_FORENSIC_RECORD_PAGE_SIZE) {
+    if (page_count >= SYSTEM_FORENSIC_RECORD_PAGE_COUNT) break;
+    const uint32_t page_end =
+        page_begin + SYSTEM_FORENSIC_RECORD_PAGE_SIZE < bank.count
+            ? page_begin + SYSTEM_FORENSIC_RECORD_PAGE_SIZE
+            : bank.count;
+    PayloadArray page;
+    for (uint32_t i = page_begin; i < page_end; ++i) {
+      page.add(system_stack_watch_entry_payload(bank.entries[i],
+                                                watch_address,
+                                                watch_bytes));
+    }
+    p.add_array(SYSTEM_FORENSIC_ENTRY_PAGE_KEYS[page_count], page);
+    ++page_count;
   }
-  p.add_array("entries", entries);
+  p.add("entry_page_size", SYSTEM_FORENSIC_RECORD_PAGE_SIZE);
+  p.add("entry_page_count", page_count);
+  return p;
+}
+
+static FLASHMEM Payload system_stack_watch_bank_summary_payload(
+    const crash_stack_watch_bank_snapshot_t& bank) {
+  Payload p;
+  p.add("valid", bank.valid);
+  p.add("count", bank.count);
+  p.add("newest_sequence", bank.newest_sequence);
+  p.add("hits_total", bank.hits_total);
+  p.add("anomalous_total", bank.anomalous_total);
   return p;
 }
 
@@ -2744,12 +2743,10 @@ static FLASHMEM Payload system_stack_watch_payload(void) {
   const crash_stack_watch_snapshot_t& snap = g_system_stack_watch_scratch;
 
   Payload p;
-  p.add("schema", "ZPNET_STACK_WATCH_V1");
+  p.add("schema", "ZPNET_STACK_WATCH_V2");
   p.add("enabled", snap.enabled);
   p.add("armed", snap.armed);
   p.add("arm_skip_reason", snap.arm_skip_reason);
-  p.add("arm_skip_reason_name",
-        crash_stack_watch_skip_reason_name(snap.arm_skip_reason));
   p.add("arm_attempts", snap.arm_attempts);
   system_crash_add_hex32(p, "last_dhcsr", snap.last_dhcsr);
   system_crash_add_hex32(p, "watch_address", snap.watch_address);
@@ -2757,14 +2754,15 @@ static FLASHMEM Payload system_stack_watch_payload(void) {
   system_crash_add_hex32(p, "effective_comp_address",
                          snap.effective_comp_address);
   p.add("effective_mask", snap.effective_mask);
+
+  // Previous-boot retained testimony is the crash evidence.  Preserve it in
+  // full; report the current boot only as a census so a live diagnostic ring
+  // cannot compete with the retained corpus for response memory.
   p.add_object("retained",
                system_stack_watch_bank_payload(snap.retained,
                                                snap.watch_address,
                                                snap.watch_bytes));
-  p.add_object("live",
-               system_stack_watch_bank_payload(snap.live,
-                                               snap.watch_address,
-                                               snap.watch_bytes));
+  p.add_object("live", system_stack_watch_bank_summary_payload(snap.live));
   return p;
 }
 
@@ -4297,10 +4295,10 @@ static FLASHMEM Payload cmd_timepop_dispatch_info(const Payload& args) {
 }
 
 // ------------------------------------------------------------
-// PAYLOAD_FLIGHT_INFO — retained + live Payload flight recorder
+// PAYLOAD_FLIGHT_INFO — retained Payload flight recorder
 // ------------------------------------------------------------
 static FLASHMEM Payload cmd_payload_flight_info(const Payload& /*args*/) {
-  return system_payload_flight_payload(false);
+  return system_payload_flight_payload(true);
 }
 
 

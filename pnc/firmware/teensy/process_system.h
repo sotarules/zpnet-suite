@@ -53,9 +53,13 @@
  *     PRIORITY0, PRIORITY16, PRIORITY32, and FOREGROUND notebooks.  Each live
  *     ring runs in RAM1; fault entry freezes all committed notebooks into one
  *     retained RAM2 set.  DWT is the shared timing ruler and lineage_id carries
- *     event identity across custody layers.  Accepts bank=retained|live,
- *     context=all|priority0|priority16|priority32|foreground, count=1..32,
- *     offset=N; retained/all are the defaults.
+ *     event identity across custody layers.  One RPC reports exactly one context;
+ *     context=all is deliberately rejected to prevent forensic document
+ *     amplification.  Accepts bank=retained|live,
+ *     context=priority0|priority16|priority32|foreground, count=1..16, offset=N;
+ *     retained/foreground are the defaults.  Generic V3 records carry the raw
+ *     authoritative scalar fields in records_0..records_3 pages of four entries;
+ *     names and other derived decorations are omitted from crash interrogation.
  *   • TIMEPOP_DISPATCH_INFO — compatibility view of the FOREGROUND execution
  *     notebook using TimePop-oriented field aliases
  *   • CRASH_INFO — return a bounded crash index and focused drill-down command
@@ -70,15 +74,17 @@
  *     retained crash evidence is never cleared implicitly
  *   • STACK_WATCH / STACK_TRIPWIRE / DISPATCH_BREADCRUMB — focused retained
  *     witnesses for stack writes, alien frame placement, and deferred dispatch
+ *   • PAYLOAD_FLIGHT_INFO — return retained crash-bound Payload flight custody;
+ *     current-boot live entries are intentionally excluded from this forensic RPC
  *   • PAYLOAD_FATAL_INFO — return the retained fatal-construction record,
  *     including the public operation that stopped the firmware and its last
  *     internal Payload error breadcrumb
- *   • PAYLOAD_STAMP_TRACE — return the bounded retained/live Payload contract-
- *     stamp lifecycle transcript (constructor, clear, failure, fatal)
- *   • PAYLOAD_APPEND_TRACE — return the bounded retained/live append custody
- *     transcript, including stage-local source hashes and bounded key prefixes
- *   • PAYLOAD_HEAP_RESIZE_TRACE — return the retained/live realloc growth
- *     transcript with header words, owner/span verdicts, and contract outcome
+ *   • PAYLOAD_STAMP_TRACE — return bounded retained/live raw contract-stamp
+ *     custody in four-record pages without a full-report intermediate array
+ *   • PAYLOAD_APPEND_TRACE — return bounded retained/live raw append custody,
+ *     including stage-local source hashes and bounded key prefixes, in pages
+ *   • PAYLOAD_HEAP_RESIZE_TRACE — return retained/live raw realloc custody with
+ *     header words, owner/span verdict flags, and bounded record pages
  *   • PAYLOAD_CONTRACT_INFO — return design-by-contract counters plus the
  *     first/latest current-boot incident and latest retained incident
  *   • REBOOT — acknowledge immediately, then issue a DWT-gated foreground
