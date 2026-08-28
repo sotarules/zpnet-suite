@@ -6953,6 +6953,131 @@ static bool payload_format_checked(char* out,
 }
 
 
+static volatile uint32_t g_payload_numeric_length_mismatch = 0;
+static volatile uint32_t g_payload_numeric_length_recovered = 0;
+static volatile uint32_t g_payload_numeric_length_unrecoverable = 0;
+static volatile uint32_t g_payload_last_numeric_length_op_id = 0;
+static volatile uint32_t g_payload_last_numeric_length_this = 0;
+static volatile uint32_t g_payload_last_numeric_length_reported = 0;
+static volatile uint32_t g_payload_last_numeric_length_observed = 0;
+static volatile uint32_t g_payload_last_numeric_length_capacity = 0;
+static volatile uint64_t g_payload_last_numeric_length_value_bits = 0;
+static volatile uint32_t g_payload_last_numeric_length_terminated = 0;
+static volatile uint32_t g_payload_last_numeric_length_roundtrip = 0;
+
+static bool payload_decimal_matches_unsigned(const char* text,
+                                             size_t length,
+                                             uint64_t expected) {
+    if (!text || length == 0U) return false;
+    if (length > 1U && text[0] == '0') return false;
+
+    uint64_t parsed = 0ULL;
+    for (size_t i = 0U; i < length; ++i) {
+        const uint8_t ch = (uint8_t)text[i];
+        if (ch < (uint8_t)'0' || ch > (uint8_t)'9') return false;
+        const uint64_t digit = (uint64_t)(ch - (uint8_t)'0');
+        if (digit > expected || parsed > (expected - digit) / 10ULL) {
+            return false;
+        }
+        parsed = parsed * 10ULL + digit;
+    }
+    return parsed == expected;
+}
+
+static bool payload_decimal_matches_signed(const char* text,
+                                           size_t length,
+                                           int64_t expected) {
+    if (!text || length == 0U) return false;
+    if (expected >= 0) {
+        return payload_decimal_matches_unsigned(
+            text, length, (uint64_t)expected);
+    }
+    if (text[0] != '-' || length == 1U) return false;
+    const uint64_t magnitude =
+        (uint64_t)(-(expected + 1LL)) + 1ULL;
+    return payload_decimal_matches_unsigned(text + 1U, length - 1U, magnitude);
+}
+
+static void payload_note_numeric_length_custody(uint32_t operation_id,
+                                                const void* self,
+                                                size_t reported,
+                                                size_t observed,
+                                                size_t capacity,
+                                                uint64_t value_bits,
+                                                bool terminated,
+                                                bool roundtrip,
+                                                bool recovered) {
+    g_payload_numeric_length_mismatch++;
+    if (recovered) {
+        g_payload_numeric_length_recovered++;
+    } else {
+        g_payload_numeric_length_unrecoverable++;
+    }
+    g_payload_last_numeric_length_op_id = operation_id;
+    g_payload_last_numeric_length_this = (uint32_t)(uintptr_t)self;
+    g_payload_last_numeric_length_reported = (uint32_t)reported;
+    g_payload_last_numeric_length_observed = (uint32_t)observed;
+    g_payload_last_numeric_length_capacity = (uint32_t)capacity;
+    g_payload_last_numeric_length_value_bits = value_bits;
+    g_payload_last_numeric_length_terminated = terminated ? 1U : 0U;
+    g_payload_last_numeric_length_roundtrip = roundtrip ? 1U : 0U;
+}
+
+static bool payload_reconcile_unsigned_length(const char* text,
+                                              size_t capacity,
+                                              size_t reported,
+                                              uint32_t operation_id,
+                                              const void* self,
+                                              uint64_t value,
+                                              size_t max_digits,
+                                              size_t* out_length) {
+    bool terminated = false;
+    const size_t observed =
+        payload_bounded_local_strlen(text, capacity, &terminated);
+    if (reported == observed) {
+        if (out_length) *out_length = reported;
+        return true;
+    }
+
+    const bool roundtrip =
+        terminated && observed <= max_digits &&
+        payload_decimal_matches_unsigned(text, observed, value);
+    payload_note_numeric_length_custody(
+        operation_id, self, reported, observed, capacity, value,
+        terminated, roundtrip, roundtrip);
+    if (!roundtrip) return false;
+    if (out_length) *out_length = observed;
+    return true;
+}
+
+static bool payload_reconcile_signed_length(const char* text,
+                                            size_t capacity,
+                                            size_t reported,
+                                            uint32_t operation_id,
+                                            const void* self,
+                                            int64_t value,
+                                            size_t max_chars,
+                                            size_t* out_length) {
+    bool terminated = false;
+    const size_t observed =
+        payload_bounded_local_strlen(text, capacity, &terminated);
+    if (reported == observed) {
+        if (out_length) *out_length = reported;
+        return true;
+    }
+
+    const bool roundtrip =
+        terminated && observed <= max_chars &&
+        payload_decimal_matches_signed(text, observed, value);
+    payload_note_numeric_length_custody(
+        operation_id, self, reported, observed, capacity,
+        (uint64_t)value, terminated, roundtrip, roundtrip);
+    if (!roundtrip) return false;
+    if (out_length) *out_length = observed;
+    return true;
+}
+
+
 // ============================================================================
 // Integer-only fixed-decimal rendering
 // ============================================================================
@@ -7139,7 +7264,10 @@ void Payload::add(const char* key, int32_t value) {
     size_t len = 0;
     if (!payload_format_checked(text, sizeof(text),
                                 snprintf(text, sizeof(text), "%ld", (long)value),
-                                PAYLOAD_OP_ADD_I32, this, &len)) {
+                                PAYLOAD_OP_ADD_I32, this, &len) ||
+        !payload_reconcile_signed_length(text, sizeof(text), len,
+                                         PAYLOAD_OP_ADD_I32, this,
+                                         (int64_t)value, 11U, &len)) {
         _fatal(PAYLOAD_ERR_STRING_TRUNCATION, PAYLOAD_OP_ADD_I32);
     }
     if (!_append_value(key ? key : "", key_len, text, len, ValueKind::NUMBER)) {
@@ -7159,7 +7287,10 @@ void Payload::add(const char* key, uint32_t value) {
     size_t len = 0;
     if (!payload_format_checked(text, sizeof(text),
                                 snprintf(text, sizeof(text), "%lu", (unsigned long)value),
-                                PAYLOAD_OP_ADD_U32, this, &len)) {
+                                PAYLOAD_OP_ADD_U32, this, &len) ||
+        !payload_reconcile_unsigned_length(text, sizeof(text), len,
+                                           PAYLOAD_OP_ADD_U32, this,
+                                           (uint64_t)value, 10U, &len)) {
         _fatal(PAYLOAD_ERR_STRING_TRUNCATION, PAYLOAD_OP_ADD_U32);
     }
     if (!_append_value(key ? key : "", key_len, text, len, ValueKind::NUMBER)) {
@@ -7179,7 +7310,10 @@ void Payload::add(const char* key, int64_t value) {
     size_t len = 0;
     if (!payload_format_checked(text, sizeof(text),
                                 snprintf(text, sizeof(text), "%lld", (long long)value),
-                                PAYLOAD_OP_ADD_I64, this, &len)) {
+                                PAYLOAD_OP_ADD_I64, this, &len) ||
+        !payload_reconcile_signed_length(text, sizeof(text), len,
+                                         PAYLOAD_OP_ADD_I64, this,
+                                         value, 20U, &len)) {
         _fatal(PAYLOAD_ERR_STRING_TRUNCATION, PAYLOAD_OP_ADD_I64);
     }
     if (!_append_value(key ? key : "", key_len, text, len, ValueKind::NUMBER)) {
@@ -7199,7 +7333,10 @@ void Payload::add(const char* key, uint64_t value) {
     size_t len = 0;
     if (!payload_format_checked(text, sizeof(text),
                                 snprintf(text, sizeof(text), "%llu", (unsigned long long)value),
-                                PAYLOAD_OP_ADD_U64, this, &len)) {
+                                PAYLOAD_OP_ADD_U64, this, &len) ||
+        !payload_reconcile_unsigned_length(text, sizeof(text), len,
+                                           PAYLOAD_OP_ADD_U64, this,
+                                           value, 20U, &len)) {
         _fatal(PAYLOAD_ERR_STRING_TRUNCATION, PAYLOAD_OP_ADD_U64);
     }
     if (!_append_value(key ? key : "", key_len, text, len, ValueKind::NUMBER)) {
@@ -9022,6 +9159,17 @@ FLASHMEM void payload_get_info(payload_info_t* out) {
     out->numeric_invalid_token = g_payload_numeric_invalid_token;
     out->numeric_format_failure = g_payload_numeric_format_failure;
     out->numeric_null_insert_fail = g_payload_numeric_null_insert_fail;
+    out->numeric_length_mismatch = g_payload_numeric_length_mismatch;
+    out->numeric_length_recovered = g_payload_numeric_length_recovered;
+    out->numeric_length_unrecoverable = g_payload_numeric_length_unrecoverable;
+    out->last_numeric_length_op_id = g_payload_last_numeric_length_op_id;
+    out->last_numeric_length_this = g_payload_last_numeric_length_this;
+    out->last_numeric_length_reported = g_payload_last_numeric_length_reported;
+    out->last_numeric_length_observed = g_payload_last_numeric_length_observed;
+    out->last_numeric_length_capacity = g_payload_last_numeric_length_capacity;
+    out->last_numeric_length_value_bits = g_payload_last_numeric_length_value_bits;
+    out->last_numeric_length_terminated = g_payload_last_numeric_length_terminated;
+    out->last_numeric_length_roundtrip = g_payload_last_numeric_length_roundtrip;
     out->last_numeric_reject_reason = g_payload_last_numeric_reject_reason;
     out->last_numeric_reject_op_id = g_payload_last_numeric_reject_op_id;
     out->last_numeric_reject_this = g_payload_last_numeric_reject_this;

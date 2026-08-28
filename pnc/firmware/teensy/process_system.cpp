@@ -2540,6 +2540,10 @@ static FLASHMEM Payload system_payload_contract_info_payload(void) {
       g_system_payload_contract_info_scratch;
 
   Payload out;
+  // This report appends three nested incident documents.  Acquire its final
+  // response arena before any child Payload exists so add_object() never has to
+  // grow the parent under peak forensic-construction heap pressure.
+  out.reserve(4096U);
   out.add("schema", "ZPNET_PAYLOAD_CONTRACT_V1");
   out.add("checks", info.checks);
   out.add("successful_mutations", info.successful_mutations);
@@ -2884,50 +2888,55 @@ static FLASHMEM Payload system_crash_report_payload(void) {
 
   crash_forensics_status_t status{};
   crash_forensics_get_status(&status);
-  Payload processor;
-  processor.add("forensics_installed_now", status.installed);
-  processor.add("core_present", status.core_present);
-  processor.add("core_header_valid", status.core_header_valid);
-  processor.add("core_crc_valid", status.core_crc_valid);
-  processor.add("extended_present", status.extended_present);
-  processor.add("extended_header_valid", status.header_valid);
-  processor.add("extended_crc_valid", status.crc_valid);
-  const crash_raw_entry_record_t* raw_entry = crash_forensics_raw_entry_record();
-  processor.add("raw_entry_present", raw_entry != nullptr);
-  if (raw_entry) {
-    processor.add("raw_capture_sequence", raw_entry->sequence);
-    processor.add("raw_exception_number", raw_entry->exception_number);
-    system_crash_add_hex32(processor, "raw_exc_return", raw_entry->exc_return);
-    system_crash_add_hex32(processor, "raw_cfsr", raw_entry->cfsr);
-    system_crash_add_hex32(processor, "raw_hfsr", raw_entry->hfsr);
-  }
+  {
+    // Keep the child arena alive only through add_object().  Crash interrogation
+    // must not accumulate serialized child Payload arenas while later forensic
+    // summaries are being constructed.
+    Payload processor;
+    processor.add("forensics_installed_now", status.installed);
+    processor.add("core_present", status.core_present);
+    processor.add("core_header_valid", status.core_header_valid);
+    processor.add("core_crc_valid", status.core_crc_valid);
+    processor.add("extended_present", status.extended_present);
+    processor.add("extended_header_valid", status.header_valid);
+    processor.add("extended_crc_valid", status.crc_valid);
+    const crash_raw_entry_record_t* raw_entry = crash_forensics_raw_entry_record();
+    processor.add("raw_entry_present", raw_entry != nullptr);
+    if (raw_entry) {
+      processor.add("raw_capture_sequence", raw_entry->sequence);
+      processor.add("raw_exception_number", raw_entry->exception_number);
+      system_crash_add_hex32(processor, "raw_exc_return", raw_entry->exc_return);
+      system_crash_add_hex32(processor, "raw_cfsr", raw_entry->cfsr);
+      system_crash_add_hex32(processor, "raw_hfsr", raw_entry->hfsr);
+    }
 
-  const crash_forensics_core_record_t* core = crash_forensics_core_record();
-  const bool matches_raw =
-      raw_entry && core && raw_entry->sequence == core->capture_sequence;
-  const bool stale_against_raw =
-      raw_entry && core &&
-      (int32_t)(raw_entry->sequence - core->capture_sequence) > 0;
-  processor.add("structured_record_present", core != nullptr);
-  processor.add("structured_matches_raw", matches_raw);
-  processor.add("structured_evidence_stale", stale_against_raw);
-  processor.add("structured_capture_incomplete",
-                raw_entry && !matches_raw);
-  if (core) {
-    processor.add("structured_capture_sequence", core->capture_sequence);
-    processor.add("structured_record_role",
-                  !raw_entry ? "UNPROVED_NO_RAW_WITNESS" :
-                  matches_raw ? "CURRENT_CAPTURE" :
-                  stale_against_raw ? "PRIOR_RETAINED_CAPTURE" :
-                  "SEQUENCE_DIVERGENCE");
-    processor.add("exception_number", core->exception_number);
-    system_crash_add_hex32(processor, "exc_return", core->exc_return);
-    system_crash_add_hex32(processor, "pc", core->stacked_pc);
-    system_crash_add_hex32(processor, "lr", core->stacked_lr);
-    system_crash_add_hex32(processor, "cfsr", core->cfsr);
-    system_crash_add_hex32(processor, "hfsr", core->hfsr);
+    const crash_forensics_core_record_t* core = crash_forensics_core_record();
+    const bool matches_raw =
+        raw_entry && core && raw_entry->sequence == core->capture_sequence;
+    const bool stale_against_raw =
+        raw_entry && core &&
+        (int32_t)(raw_entry->sequence - core->capture_sequence) > 0;
+    processor.add("structured_record_present", core != nullptr);
+    processor.add("structured_matches_raw", matches_raw);
+    processor.add("structured_evidence_stale", stale_against_raw);
+    processor.add("structured_capture_incomplete",
+                  raw_entry && !matches_raw);
+    if (core) {
+      processor.add("structured_capture_sequence", core->capture_sequence);
+      processor.add("structured_record_role",
+                    !raw_entry ? "UNPROVED_NO_RAW_WITNESS" :
+                    matches_raw ? "CURRENT_CAPTURE" :
+                    stale_against_raw ? "PRIOR_RETAINED_CAPTURE" :
+                    "SEQUENCE_DIVERGENCE");
+      processor.add("exception_number", core->exception_number);
+      system_crash_add_hex32(processor, "exc_return", core->exc_return);
+      system_crash_add_hex32(processor, "pc", core->stacked_pc);
+      system_crash_add_hex32(processor, "lr", core->stacked_lr);
+      system_crash_add_hex32(processor, "cfsr", core->cfsr);
+      system_crash_add_hex32(processor, "hfsr", core->hfsr);
+    }
+    p.add_object("processor", processor);
   }
-  p.add_object("processor", processor);
 
   p.add_object("payload_fatal", system_payload_fatal_payload());
   p.add_object("payload_contract", system_payload_contract_summary_payload());
@@ -2936,21 +2945,23 @@ static FLASHMEM Payload system_crash_report_payload(void) {
   p.add_object("payload_heap_resize_trace",
                system_payload_heap_resize_trace_summary_payload());
 
-  Payload detail;
-  detail.add("crash_report_text", "SYSTEM.CRASH_REPORT_TEXT");
-  detail.add("raw_fault_entry", "SYSTEM.RAW_FAULT_ENTRY");
-  detail.add("crash_policy", "SYSTEM.CRASH_POLICY");
-  detail.add("execution_trace", "SYSTEM.EXECUTION_TRACE");
-  detail.add("stack_watch", "SYSTEM.STACK_WATCH");
-  detail.add("stack_tripwire", "SYSTEM.STACK_TRIPWIRE");
-  detail.add("dispatch_breadcrumb", "SYSTEM.DISPATCH_BREADCRUMB");
-  detail.add("payload_flight", "SYSTEM.PAYLOAD_FLIGHT_INFO");
-  detail.add("payload_fatal", "SYSTEM.PAYLOAD_FATAL_INFO");
-  detail.add("payload_stamp_trace", "SYSTEM.PAYLOAD_STAMP_TRACE");
-  detail.add("payload_append_trace", "SYSTEM.PAYLOAD_APPEND_TRACE");
-  detail.add("payload_heap_resize_trace", "SYSTEM.PAYLOAD_HEAP_RESIZE_TRACE");
-  detail.add("payload_contract", "SYSTEM.PAYLOAD_CONTRACT_INFO");
-  p.add_object("detail_commands", detail);
+  {
+    Payload detail;
+    detail.add("crash_report_text", "SYSTEM.CRASH_REPORT_TEXT");
+    detail.add("raw_fault_entry", "SYSTEM.RAW_FAULT_ENTRY");
+    detail.add("crash_policy", "SYSTEM.CRASH_POLICY");
+    detail.add("execution_trace", "SYSTEM.EXECUTION_TRACE");
+    detail.add("stack_watch", "SYSTEM.STACK_WATCH");
+    detail.add("stack_tripwire", "SYSTEM.STACK_TRIPWIRE");
+    detail.add("dispatch_breadcrumb", "SYSTEM.DISPATCH_BREADCRUMB");
+    detail.add("payload_flight", "SYSTEM.PAYLOAD_FLIGHT_INFO");
+    detail.add("payload_fatal", "SYSTEM.PAYLOAD_FATAL_INFO");
+    detail.add("payload_stamp_trace", "SYSTEM.PAYLOAD_STAMP_TRACE");
+    detail.add("payload_append_trace", "SYSTEM.PAYLOAD_APPEND_TRACE");
+    detail.add("payload_heap_resize_trace", "SYSTEM.PAYLOAD_HEAP_RESIZE_TRACE");
+    detail.add("payload_contract", "SYSTEM.PAYLOAD_CONTRACT_INFO");
+    p.add_object("detail_commands", detail);
+  }
   return p;
 }
 
@@ -3853,6 +3864,32 @@ static FLASHMEM Payload cmd_payload_failure_info(const Payload& /*args*/) {
   p.add("payload_numeric_invalid_token", info.numeric_invalid_token);
   p.add("payload_numeric_format_failure", info.numeric_format_failure);
   p.add("payload_numeric_null_insert_fail", info.numeric_null_insert_fail);
+
+  // Primitive integer length-custody court. A recovered mismatch is not a
+  // numeric admission failure: the local formatted text independently proved
+  // the original source integer and only the reported span was repaired.
+  p.add("payload_numeric_length_mismatch", info.numeric_length_mismatch);
+  p.add("payload_numeric_length_recovered", info.numeric_length_recovered);
+  p.add("payload_numeric_length_unrecoverable",
+        info.numeric_length_unrecoverable);
+  p.add("payload_last_numeric_length_op_id", info.last_numeric_length_op_id);
+  p.add("payload_last_numeric_length_op_name",
+        payload_operation_id_name(info.last_numeric_length_op_id));
+  p.add_fmt("payload_last_numeric_length_this", "0x%08lX",
+            (unsigned long)info.last_numeric_length_this);
+  p.add("payload_last_numeric_length_reported",
+        info.last_numeric_length_reported);
+  p.add("payload_last_numeric_length_observed",
+        info.last_numeric_length_observed);
+  p.add("payload_last_numeric_length_capacity",
+        info.last_numeric_length_capacity);
+  p.add_fmt("payload_last_numeric_length_value_bits", "0x%016llX",
+            (unsigned long long)info.last_numeric_length_value_bits);
+  p.add("payload_last_numeric_length_terminated",
+        info.last_numeric_length_terminated != 0U);
+  p.add("payload_last_numeric_length_roundtrip",
+        info.last_numeric_length_roundtrip != 0U);
+
   p.add("payload_last_numeric_reject_reason", info.last_numeric_reject_reason);
   p.add("payload_last_numeric_reject_reason_name",
         payload_numeric_reject_reason_name(info.last_numeric_reject_reason));

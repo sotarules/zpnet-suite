@@ -13336,11 +13336,80 @@ def _ppb_restore_transition_row_expected(
     )
 
 
+def _holistic_restore_proof_custody_for_state(
+    state: Dict[str, Any],
+    ppb_restore_checkpoint: Dict[str, Any],
+) -> bool:
+    """Nominate/recognize rows belonging to the active holistic N+1 proof lane.
+
+    Recovery custody is a restore-authority classification, not a competing
+    persistence path.  A row may therefore be both recovery-quarantined and the
+    exact durable Alpha N+1 successor.  Nominate that proof identity before any
+    routing branch that can enqueue-and-continue.
+    """
+    global _clocks_holistic_restore_proof_sequence
+
+    if not _clocks_holistic_restore_proof_pending.is_set():
+        return False
+
+    stats = _clocks_payload(state).get("stats")
+    update_count = (
+        _as_int(stats.get("update_count"))
+        if isinstance(stats, dict)
+        else None
+    )
+    reset_count = (
+        _as_int(stats.get("reset_count"))
+        if isinstance(stats, dict)
+        else None
+    )
+
+    if _clocks_holistic_restore_proof_sequence is None:
+        observed = _holistic_restore_probe(state, ppb_restore_checkpoint)
+        if not (
+            reset_count == _clocks_holistic_restore_proof_reset_count
+            and update_count == _clocks_holistic_restore_proof_update_count
+            and _holistic_restore_probe_satisfied(
+                _clocks_holistic_restore_proof_expected, observed
+            )
+        ):
+            return False
+
+        _clocks_holistic_restore_proof_sequence = int(state.get("sequence") or 0)
+        logging.info(
+            "✅ [holistic restore] first restored statistics row entered "
+            "persistence custody: reset_count=%s update_count=%s sequence=%s",
+            reset_count,
+            update_count,
+            state.get("sequence"),
+        )
+        if _ambient_instrument_recovery_active.is_set():
+            _ambient_instrument_recovery_hold.clear()
+            logging.info(
+                "✅ [ambient restore] exact N+1 proof row admitted; "
+                "releasing newborn-row hold at sequence=%s",
+                state.get("sequence"),
+            )
+        if _startup_instrument_restore_hold.is_set():
+            _startup_instrument_restore_hold.clear()
+            logging.info(
+                "✅ [holistic restore] exact startup N+1 proof row admitted; "
+                "releasing newborn-row mutation hold at sequence=%s",
+                state.get("sequence"),
+            )
+        return True
+
+    return bool(
+        reset_count == _clocks_holistic_restore_proof_reset_count
+        and update_count is not None
+        and update_count >= _clocks_holistic_restore_proof_update_count
+    )
+
+
 def _clocks_state_loop() -> None:
     """Build and publish CLOCKS_V4 without storage latency stalling the live feed."""
     global _clocks_state_published, _clocks_state_dropped
     global _clocks_epoch_birth_reset_count
-    global _clocks_holistic_restore_proof_sequence
 
     _clocks_state_worker_started.set()
     logging.info("🚀 [clocks] canonical CLOCKS_V4 state worker started")
@@ -13524,6 +13593,15 @@ def _clocks_state_loop() -> None:
         # persistence-queue put. A continuity-surrender thread therefore cannot
         # open custody between our routing decision and durable enqueue.
         with _recovery_custody_lock:
+            if _recovery_custody_active:
+                # Recovery quarantine and holistic N+1 proof are orthogonal custody
+                # dimensions. Nominate the exact proof row before this branch's
+                # enqueue-and-continue so the persistence worker can close durable
+                # FRESH_CLOCKS_PROOF for the same quarantined observation.
+                _holistic_restore_proof_custody_for_state(
+                    state, ppb_restore_checkpoint
+                )
+
             if _decorate_recovery_custody_state_locked(
                 state, ppb_restore_checkpoint
             ):
@@ -13540,60 +13618,9 @@ def _clocks_state_loop() -> None:
                 if _retain_startup_clocks_item(item):
                     continue
 
-            restore_proof_custody = False
-            if _clocks_holistic_restore_proof_pending.is_set():
-                stats = _clocks_payload(state).get("stats")
-                update_count = (
-                    _as_int(stats.get("update_count"))
-                    if isinstance(stats, dict)
-                    else None
-                )
-                reset_count = (
-                    _as_int(stats.get("reset_count"))
-                    if isinstance(stats, dict)
-                    else None
-                )
-
-                if _clocks_holistic_restore_proof_sequence is None:
-                    observed = _holistic_restore_probe(
-                        state, ppb_restore_checkpoint
-                    )
-                    if (
-                        reset_count == _clocks_holistic_restore_proof_reset_count
-                        and update_count == _clocks_holistic_restore_proof_update_count
-                        and _holistic_restore_probe_satisfied(
-                            _clocks_holistic_restore_proof_expected, observed
-                        )
-                    ):
-                        _clocks_holistic_restore_proof_sequence = int(state.get("sequence") or 0)
-                        restore_proof_custody = True
-                        logging.info(
-                            "✅ [holistic restore] first restored statistics row entered "
-                            "persistence custody: reset_count=%s update_count=%s sequence=%s",
-                            reset_count,
-                            update_count,
-                            state.get("sequence"),
-                        )
-                        if _ambient_instrument_recovery_active.is_set():
-                            _ambient_instrument_recovery_hold.clear()
-                            logging.info(
-                                "✅ [ambient restore] exact N+1 proof row admitted; "
-                                "releasing newborn-row hold at sequence=%s",
-                                state.get("sequence"),
-                            )
-                        if _startup_instrument_restore_hold.is_set():
-                            _startup_instrument_restore_hold.clear()
-                            logging.info(
-                                "✅ [holistic restore] exact startup N+1 proof row admitted; "
-                                "releasing newborn-row mutation hold at sequence=%s",
-                                state.get("sequence"),
-                            )
-                else:
-                    restore_proof_custody = bool(
-                        reset_count == _clocks_holistic_restore_proof_reset_count
-                        and update_count is not None
-                        and update_count >= _clocks_holistic_restore_proof_update_count
-                    )
+            restore_proof_custody = _holistic_restore_proof_custody_for_state(
+                state, ppb_restore_checkpoint
+            )
 
             if not restore_proof_custody and not _clocks_persistence_enabled.is_set():
                 # A cold/full restore has classified and retired startup custody but

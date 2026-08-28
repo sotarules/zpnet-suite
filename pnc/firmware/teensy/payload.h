@@ -388,6 +388,22 @@ typedef struct {
   uint32_t numeric_invalid_token;
   uint32_t numeric_format_failure;
   uint32_t numeric_null_insert_fail;
+
+  // Primitive integer text-length custody. A mismatch may be repaired only when
+  // the bounded local text is terminated, canonical decimal, and round-trips
+  // exactly to the source integer; otherwise construction remains fatal.
+  uint32_t numeric_length_mismatch;
+  uint32_t numeric_length_recovered;
+  uint32_t numeric_length_unrecoverable;
+  uint32_t last_numeric_length_op_id;
+  uint32_t last_numeric_length_this;
+  uint32_t last_numeric_length_reported;
+  uint32_t last_numeric_length_observed;
+  uint32_t last_numeric_length_capacity;
+  uint64_t last_numeric_length_value_bits;
+  uint32_t last_numeric_length_terminated;
+  uint32_t last_numeric_length_roundtrip;
+
   uint32_t last_numeric_reject_reason;
   uint32_t last_numeric_reject_op_id;
   uint32_t last_numeric_reject_this;

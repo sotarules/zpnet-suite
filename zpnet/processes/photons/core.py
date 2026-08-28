@@ -4896,6 +4896,16 @@ def _arm_recovery_proof(expected: Dict[str, Any]) -> None:
         _recovery_proof_durable.clear()
 
 
+def _clear_recovery_proof_custody() -> None:
+    """Forget only process-local proof expectation after an invalidated producer generation."""
+    global _recovery_proof_expected
+    global _recovery_proof_persisted
+    with _recovery_lock:
+        _recovery_proof_expected = None
+        _recovery_proof_persisted = None
+        _recovery_proof_durable.clear()
+
+
 def _note_recovery_proof_persisted(
     photons: Dict[str, Any], detail_id: int
 ) -> None:
@@ -5284,6 +5294,7 @@ def _startup_finish_pending_recovery_proof(
     active_master: Optional[Dict[str, Any]],
     source: Optional[Dict[str, Any]],
     recovery_report: Dict[str, Any],
+    broad_report: Dict[str, Any],
     skipped: List[Dict[str, Any]],
     rows_scanned: int,
 ) -> Dict[str, Any]:
@@ -5375,6 +5386,7 @@ def _startup_finish_pending_recovery_proof(
         "ppb_live_refresh": ppb_live_refresh,
         "campaign_adoption": campaign_adoption,
         "producer_reuse": False,
+        "producer_mutated": True,
         "producer_mutation": "RECOVERY_PROOF_ACK_ONLY",
     }
     _recovery_status_set("COMPLETE", **result)
@@ -5589,6 +5601,7 @@ def _startup_held_restore(
         "recovery_receipt": copy.deepcopy(recovery_receipt),
         "campaign_restored_in_commit": campaign_restored_in_commit,
         "staged": staged,
+        "producer_mutated": True,
     }
     _recovery_status_set("COMPLETE", **result)
     return result
@@ -5659,6 +5672,7 @@ def _startup_cold_start(
         "proof": proof,
         "campaign_adoption": campaign_adoption,
         "source_epoch_migration": migration,
+        "producer_mutated": True,
     }
     _recovery_status_set("COMPLETE", **result)
     return result
@@ -5670,10 +5684,16 @@ def _startup_adopt_live_producer(
     active_master: Optional[Dict[str, Any]],
     source: Optional[Dict[str, Any]],
     recovery_report: Dict[str, Any],
+    broad_report: Dict[str, Any],
     skipped: List[Dict[str, Any]],
     rows_scanned: int,
 ) -> Dict[str, Any]:
-    """Prove and adopt a surviving PHOTONS producer without mutating it."""
+    """Prove and adopt a surviving PHOTONS producer without mutating it.
+
+    The caller owns one generation-pinned startup classification attempt and has
+    already obtained both firmware reports.  Reusing those exact witnesses avoids
+    two redundant Teensy RPCs during the busiest part of multi-process startup.
+    """
     global _recovery_live_adopt_count
 
     if bool(recovery_report.get("proof_pending")):
@@ -5681,12 +5701,7 @@ def _startup_adopt_live_producer(
             "pending restored-producer proof is not eligible for zero-mutation reuse"
         )
 
-    recovery_report = _fetch_teensy_recovery_report()
-    if bool(recovery_report.get("proof_pending")):
-        raise RuntimeError(
-            "PHOTONS producer entered pending recovery proof during live adoption"
-        )
-    broad = _fetch_teensy_photons_report()
+    broad = copy.deepcopy(broad_report)
     floor = _validate_live_teensy_against_durable_source(recovery_report, source)
 
     campaign_adoption = _adopt_live_lantern_state(
@@ -5865,6 +5880,7 @@ def _perform_phase5_recovery() -> Dict[str, Any]:
                 active_master=active_master,
                 source=source,
                 recovery_report=report,
+                broad_report=broad_preflight,
                 skipped=skipped,
                 rows_scanned=rows_scanned,
             )
@@ -5873,6 +5889,7 @@ def _perform_phase5_recovery() -> Dict[str, Any]:
                 active_master=active_master,
                 source=source,
                 recovery_report=report,
+                broad_report=broad_preflight,
                 skipped=skipped,
                 rows_scanned=rows_scanned,
             )
@@ -9102,6 +9119,86 @@ COMMANDS = {
 # Entrypoint
 # ---------------------------------------------------------------------
 
+def _startup_phase5_recovery_with_generation_retry() -> Tuple[Dict[str, Any], int]:
+    """Run Phase 5 against one proved Teensy transport generation at a time.
+
+    A generation change is infrastructure invalidation, not a PHOTONS scientific
+    contradiction. Discard only process-local proof expectation, wait for the
+    replacement RPC lease, reinstall the operator baseline, and classify again.
+    Any failure while the same generation remains proved is still terminal.
+    """
+    while True:
+        attempt_generation = _runtime_teensy_rpc_generation()
+        if attempt_generation is None:
+            _wait_for_startup_infrastructure()
+            continue
+
+        try:
+            _configure_teensy_lap_baseline()
+            recovery = _perform_phase5_recovery()
+        except Exception as exc:
+            current_generation = _runtime_teensy_rpc_generation()
+            if (
+                current_generation is not None
+                and int(current_generation) == int(attempt_generation)
+            ):
+                raise
+
+            _campaign_control_ready.clear()
+            _runtime_recovery_hold.clear()
+            _clear_recovery_proof_custody()
+            _recovery_status_set(
+                "WAITING_FOR_REATTACH",
+                invalidated_generation=int(attempt_generation),
+                observed_generation=(
+                    int(current_generation)
+                    if current_generation is not None
+                    else None
+                ),
+                error=str(exc),
+            )
+            logging.warning(
+                "⚠️ [photons/live restore] startup recovery on Teensy RPC "
+                "generation=%d was invalidated by a transport boundary: %s; "
+                "waiting for a proved replacement generation and reclassifying",
+                int(attempt_generation),
+                exc,
+            )
+            _wait_for_startup_infrastructure()
+            continue
+
+        current_generation = _runtime_teensy_rpc_generation()
+        if (
+            current_generation is not None
+            and int(current_generation) == int(attempt_generation)
+        ):
+            return recovery, int(current_generation)
+
+        # Phase 5 may have crossed durability immediately before the USB/producer
+        # boundary. That completed transaction remains historical truth, but it
+        # cannot authorize RUNNING against a different current Teensy lifetime.
+        _campaign_control_ready.clear()
+        _runtime_recovery_hold.clear()
+        _clear_recovery_proof_custody()
+        _recovery_status_set(
+            "WAITING_FOR_REATTACH",
+            invalidated_generation=int(attempt_generation),
+            observed_generation=(
+                int(current_generation)
+                if current_generation is not None
+                else None
+            ),
+            completed_attempt=True,
+        )
+        logging.warning(
+            "⚠️ [photons/live restore] Phase 5 completed on Teensy RPC generation=%d "
+            "but that generation was no longer current before RUNNING admission; "
+            "reclassifying the replacement producer",
+            int(attempt_generation),
+        )
+        _wait_for_startup_infrastructure()
+
+
 def run() -> None:
     setup_logging()
     _hard_failure_event.clear()
@@ -9147,8 +9244,7 @@ def run() -> None:
         source="RUN",
     )
     try:
-        _configure_teensy_lap_baseline()
-        recovery = _perform_phase5_recovery()
+        recovery, initial_generation = _startup_phase5_recovery_with_generation_retry()
     except Exception as exc:
         _enter_hard_failure(
             "phase5_startup_recovery_failed",
@@ -9160,7 +9256,8 @@ def run() -> None:
         )
     else:
         # START/STOP/baseline/maintenance control opens only after an advancing
-        # post-restart row has crossed the complete ordered persistence transaction.
+        # post-restart row has crossed the complete ordered persistence transaction
+        # on the same transport generation that was classified.
         _campaign_control_ready.set()
         _set_operational_state(
             OPERATIONAL_STATE_RUNNING,
@@ -9168,24 +9265,13 @@ def run() -> None:
             source="RUN",
         )
         proof = recovery.get("proof") if isinstance(recovery.get("proof"), dict) else {}
-        initial_generation = _runtime_teensy_rpc_generation()
-        if initial_generation is None:
-            _enter_hard_failure(
-                "runtime_generation_monitor_start_failed",
-                {
-                    "error": "startup recovery completed without proved Teensy RPC generation",
-                    "recovery": _recovery_report_surface(),
-                },
-                source="PHOTONS_RUNTIME_RECOVERY",
-            )
-        else:
-            _start_runtime_teensy_generation_monitor(initial_generation)
+        _start_runtime_teensy_generation_monitor(initial_generation)
         logging.info(
             "✅ [photons] startup recovery complete: mode=%s producer_mutated=%s; "
             "source detail=%s update=%s -> durable proof update=%s; "
             "Better-Buckets history=%s%s; campaign_restored=%s",
             recovery.get("mode") or "unknown",
-            bool(recovery.get("producer_mutated")),
+            recovery["producer_mutated"],
             recovery.get("source_detail_id") or "none",
             recovery.get("source_update_count") or "n/a",
             proof.get("update_count") or "n/a",
