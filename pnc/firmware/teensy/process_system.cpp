@@ -3523,7 +3523,112 @@ static FLASHMEM Payload cmd_payload_info(const Payload& /*args*/) {
   payload_info_t info{};
   payload_get_info(&info);
 
+  // PAYLOAD_INFO is the always-safe health/index surface.  The former
+  // monolithic report carried 196 top-level fields and necessarily forced its
+  // own dynamic Payload into the 16 KiB storage class before transport could
+  // allocate the final D1 wire frame.  That made the diagnostic command itself
+  // a material participant in the allocator state it was trying to observe.
+  //
+  // Keep this command compact and put the complete testimony on focused
+  // drill-down commands.  No Payload fact is discarded; it is merely
+  // partitioned so every diagnostic response has bounded allocation pressure.
   Payload p;
+  p.add("schema", "ZPNET_PAYLOAD_INFO_V2");
+
+  // ABI / lifetime
+  p.add("payload_object_size", info.payload_object_size);
+  p.add("payload_array_object_size", info.payload_array_object_size);
+  p.add("payload_max_entries", info.payload_max_entries);
+  p.add("payload_arena_max", info.payload_arena_max);
+  p.add("payload_instances_constructed", info.instances_constructed);
+  p.add("payload_instances_destroyed", info.instances_destroyed);
+  p.add("payload_alive_now", info.alive_now);
+  p.add("payload_alive_high_water", info.alive_high_water);
+
+  // Dynamic-storage pressure
+  p.add("payload_heap_bytes_alive",
+        info.entry_heap_bytes_alive + info.arena_heap_bytes_alive);
+  p.add("payload_heap_bytes_high_water",
+        info.entry_heap_bytes_high_water + info.arena_heap_bytes_high_water);
+  p.add("payload_arena_alloc_fail", info.arena_alloc_fail);
+  p.add("payload_arena_realloc_count", info.arena_realloc_count);
+  p.add("payload_arena_heap_alloc_count", info.arena_heap_alloc_count);
+  p.add("payload_arena_heap_resize_attempt_count",
+        info.arena_heap_resize_attempt_count);
+  p.add("payload_arena_heap_realloc_call_count",
+        info.arena_heap_realloc_call_count);
+  p.add("payload_arena_heap_realloc_in_place_count",
+        info.arena_heap_realloc_in_place_count);
+  p.add("payload_arena_heap_realloc_moved_count",
+        info.arena_heap_realloc_moved_count);
+  p.add("payload_arena_heap_realloc_fail_count",
+        info.arena_heap_realloc_fail_count);
+
+  // Health / integrity
+  p.add("payload_serialize_overflow", info.serialize_overflow);
+  p.add("payload_to_json_fail", info.to_json_fail);
+  p.add("payload_parse_error", info.parse_error);
+  p.add("payload_integrity_fail", info.integrity_fail);
+  p.add("payload_invalid_kind", info.invalid_kind);
+  p.add("payload_string_pointer_fault", info.string_pointer_fault);
+  p.add("payload_self_ok_fail", info.self_ok_fail);
+  p.add("payload_last_error_code", info.last_error_code);
+  p.add("payload_last_error_name",
+        payload_error_code_name(info.last_error_code));
+  p.add("payload_last_error_count", info.last_error_count);
+
+  // Execution / allocator overlap
+  p.add("payload_handler_ctx_ctor", info.handler_ctx_ctor);
+  p.add("payload_handler_ctx_mutate", info.handler_ctx_mutate);
+  p.add("payload_handler_ctx_alloc", info.handler_ctx_alloc);
+  p.add("payload_handler_ctx_free", info.handler_ctx_free);
+  p.add("payload_alloc_overlap_detected", info.alloc_overlap_detected);
+  p.add("payload_alloc_overlap_depth", info.alloc_overlap_depth);
+
+  // Contract court
+  p.add("payload_contract_checks", info.contract_checks);
+  p.add("payload_contract_successful_mutations",
+        info.contract_successful_mutations);
+  p.add("payload_contract_precondition_failures",
+        info.contract_precondition_failures);
+  p.add("payload_contract_pre_invariant_failures",
+        info.contract_pre_invariant_failures);
+  p.add("payload_contract_post_invariant_failures",
+        info.contract_post_invariant_failures);
+  p.add("payload_contract_postcondition_failures",
+        info.contract_postcondition_failures);
+  p.add("payload_contract_observed_drift_failures",
+        info.contract_observed_drift_failures);
+  p.add("payload_contract_mutation_failures",
+        info.contract_mutation_failures);
+  p.add("payload_contract_incidents", info.contract_incidents);
+
+  Payload detail;
+  detail.add("memory", "SYSTEM.PAYLOAD_MEMORY_INFO");
+  detail.add("failures", "SYSTEM.PAYLOAD_FAILURE_INFO");
+  detail.add("integrity", "SYSTEM.PAYLOAD_INTEGRITY_INFO");
+  detail.add("contract", "SYSTEM.PAYLOAD_CONTRACT_INFO");
+  detail.add("fatal", "SYSTEM.PAYLOAD_FATAL_INFO");
+  detail.add("flight", "SYSTEM.PAYLOAD_FLIGHT_INFO");
+  detail.add("stamp_trace", "SYSTEM.PAYLOAD_STAMP_TRACE");
+  detail.add("append_trace", "SYSTEM.PAYLOAD_APPEND_TRACE");
+  detail.add("heap_resize_trace", "SYSTEM.PAYLOAD_HEAP_RESIZE_TRACE");
+  p.add_object("detail_commands", detail);
+
+  return p;
+}
+
+
+// ------------------------------------------------------------
+// PAYLOAD_MEMORY_INFO — complete allocator / lifetime / context testimony
+// ------------------------------------------------------------
+static FLASHMEM Payload cmd_payload_memory_info(const Payload& /*args*/) {
+
+  payload_info_t info{};
+  payload_get_info(&info);
+
+  Payload p;
+  p.add("schema", "ZPNET_PAYLOAD_MEMORY_INFO_V1");
 
   // ==========================================================
   // ABI / geometry — proves stack footprint and hard limits
@@ -3597,6 +3702,53 @@ static FLASHMEM Payload cmd_payload_info(const Payload& /*args*/) {
         info.entry_heap_bytes_alive + info.arena_heap_bytes_alive);
   p.add("payload_heap_bytes_high_water",
         info.entry_heap_bytes_high_water + info.arena_heap_bytes_high_water);
+
+  // ==========================================================
+  // Execution-context census — handler-context Payload activity
+  // ==========================================================
+
+  p.add("payload_handler_ctx_ctor",   info.handler_ctx_ctor);
+  p.add("payload_handler_ctx_mutate", info.handler_ctx_mutate);
+  p.add("payload_handler_ctx_alloc",  info.handler_ctx_alloc);
+  p.add("payload_handler_ctx_free",   info.handler_ctx_free);
+  p.add("payload_last_handler_ctx_ipsr", info.last_handler_ctx_ipsr);
+  p.add("payload_last_handler_ctx_op_id", info.last_handler_ctx_op_id);
+  p.add("payload_last_handler_ctx_op_name",
+        payload_operation_id_name(info.last_handler_ctx_op_id));
+  p.add_fmt("payload_last_handler_ctx_this", "0x%08lX",
+            (unsigned long)info.last_handler_ctx_this);
+  p.add("payload_last_handler_ctx_dwt", info.last_handler_ctx_dwt);
+  p.add_fmt("payload_last_handler_ctx_msp", "0x%08lX",
+            (unsigned long)info.last_handler_ctx_msp);
+
+  // ==========================================================
+  // Allocator preemption-overlap tripwire
+  // ==========================================================
+
+  p.add("payload_alloc_overlap_detected", info.alloc_overlap_detected);
+  p.add("payload_alloc_overlap_ipsr", info.alloc_overlap_ipsr);
+  p.add("payload_alloc_overlap_op_id", info.alloc_overlap_op_id);
+  p.add("payload_alloc_overlap_op_name",
+        payload_operation_id_name(info.alloc_overlap_op_id));
+  p.add_fmt("payload_alloc_overlap_this", "0x%08lX",
+            (unsigned long)info.alloc_overlap_this);
+  p.add("payload_alloc_overlap_dwt", info.alloc_overlap_dwt);
+  p.add("payload_alloc_overlap_depth", info.alloc_overlap_depth);
+
+  return p;
+}
+
+
+// ------------------------------------------------------------
+// PAYLOAD_FAILURE_INFO — serialization, numeric, semantic, pointer and last-error testimony
+// ------------------------------------------------------------
+static FLASHMEM Payload cmd_payload_failure_info(const Payload& /*args*/) {
+
+  payload_info_t info{};
+  payload_get_info(&info);
+
+  Payload p;
+  p.add("schema", "ZPNET_PAYLOAD_FAILURE_INFO_V1");
 
   // ==========================================================
   // Serialization / parsing / integrity
@@ -3717,6 +3869,34 @@ static FLASHMEM Payload cmd_payload_info(const Payload& /*args*/) {
         info.last_string_pointer_fault_key);
 
   // ==========================================================
+  // Last error breadcrumb
+  // ==========================================================
+
+  p.add("payload_last_error_code",  info.last_error_code);
+  p.add("payload_last_error_name",  payload_error_code_name(info.last_error_code));
+  p.add("payload_last_error_count", info.last_error_count);
+  p.add("payload_last_error_op",    info.last_error_op);
+  p.add("payload_last_error_op_id", info.last_error_op_id);
+  p.add("payload_last_error_op_name",
+        payload_operation_id_name(info.last_error_op_id));
+  p.add_fmt("payload_last_error_this", "0x%08lX", (unsigned long)info.last_error_this);
+
+  return p;
+}
+
+
+// ------------------------------------------------------------
+// PAYLOAD_INTEGRITY_INFO — complete object-integrity courtroom testimony
+// ------------------------------------------------------------
+static FLASHMEM Payload cmd_payload_integrity_info(const Payload& /*args*/) {
+
+  payload_info_t info{};
+  payload_get_info(&info);
+
+  Payload p;
+  p.add("schema", "ZPNET_PAYLOAD_INTEGRITY_INFO_V1");
+
+  // ==========================================================
   // Payload object integrity courtroom
   // ==========================================================
 
@@ -3775,82 +3955,6 @@ static FLASHMEM Payload cmd_payload_info(const Payload& /*args*/) {
   p.add("payload_last_self_ok_fail_key_end", info.last_self_ok_fail_key_end);
   p.add("payload_last_self_ok_fail_val_end", info.last_self_ok_fail_val_end);
   p.add("payload_first_self_ok_fail_captured", info.first_self_ok_fail_captured);
-
-  // ==========================================================
-  // Last error breadcrumb
-  // ==========================================================
-
-  p.add("payload_last_error_code",  info.last_error_code);
-  p.add("payload_last_error_name",  payload_error_code_name(info.last_error_code));
-  p.add("payload_last_error_count", info.last_error_count);
-  p.add("payload_last_error_op",    info.last_error_op);
-  p.add("payload_last_error_op_id", info.last_error_op_id);
-  p.add("payload_last_error_op_name",
-        payload_operation_id_name(info.last_error_op_id));
-  p.add_fmt("payload_last_error_this", "0x%08lX", (unsigned long)info.last_error_this);
-
-  // ==========================================================
-  // Execution-context census — handler-context Payload activity
-  // ==========================================================
-
-  p.add("payload_handler_ctx_ctor",   info.handler_ctx_ctor);
-  p.add("payload_handler_ctx_mutate", info.handler_ctx_mutate);
-  p.add("payload_handler_ctx_alloc",  info.handler_ctx_alloc);
-  p.add("payload_handler_ctx_free",   info.handler_ctx_free);
-  p.add("payload_last_handler_ctx_ipsr", info.last_handler_ctx_ipsr);
-  p.add("payload_last_handler_ctx_op_id", info.last_handler_ctx_op_id);
-  p.add("payload_last_handler_ctx_op_name",
-        payload_operation_id_name(info.last_handler_ctx_op_id));
-  p.add_fmt("payload_last_handler_ctx_this", "0x%08lX",
-            (unsigned long)info.last_handler_ctx_this);
-  p.add("payload_last_handler_ctx_dwt", info.last_handler_ctx_dwt);
-  p.add_fmt("payload_last_handler_ctx_msp", "0x%08lX",
-            (unsigned long)info.last_handler_ctx_msp);
-
-  // ==========================================================
-  // Allocator preemption-overlap tripwire
-  // ==========================================================
-
-  p.add("payload_alloc_overlap_detected", info.alloc_overlap_detected);
-  p.add("payload_alloc_overlap_ipsr", info.alloc_overlap_ipsr);
-  p.add("payload_alloc_overlap_op_id", info.alloc_overlap_op_id);
-  p.add("payload_alloc_overlap_op_name",
-        payload_operation_id_name(info.alloc_overlap_op_id));
-  p.add_fmt("payload_alloc_overlap_this", "0x%08lX",
-            (unsigned long)info.alloc_overlap_this);
-  p.add("payload_alloc_overlap_dwt", info.alloc_overlap_dwt);
-  p.add("payload_alloc_overlap_depth", info.alloc_overlap_depth);
-
-  // ==========================================================
-  // Design-by-contract court
-  // ==========================================================
-
-  p.add("payload_contract_checks", info.contract_checks);
-  p.add("payload_contract_successful_mutations",
-        info.contract_successful_mutations);
-  p.add("payload_contract_precondition_failures",
-        info.contract_precondition_failures);
-  p.add("payload_contract_pre_invariant_failures",
-        info.contract_pre_invariant_failures);
-  p.add("payload_contract_post_invariant_failures",
-        info.contract_post_invariant_failures);
-  p.add("payload_contract_postcondition_failures",
-        info.contract_postcondition_failures);
-  p.add("payload_contract_observed_drift_failures",
-        info.contract_observed_drift_failures);
-  p.add("payload_contract_mutation_failures",
-        info.contract_mutation_failures);
-  p.add("payload_contract_incidents", info.contract_incidents);
-  p.add("payload_contract_pending_events",
-        info.contract_pending_events);
-  p.add("payload_contract_pending_overflow",
-        info.contract_pending_overflow);
-  p.add("payload_contract_event_emitted",
-        info.contract_event_emitted);
-  p.add("payload_contract_event_emit_failed",
-        info.contract_event_emit_failed);
-  p.add("payload_contract_event_incidents_suppressed",
-        info.contract_event_incidents_suppressed);
 
   return p;
 }
@@ -4217,6 +4321,9 @@ static const process_command_entry_t SYSTEM_COMMANDS[] = {
   { "PROCESS_INFO",     cmd_process_info     },
   { "TRANSPORT_INFO",   cmd_transport_info   },
   { "PAYLOAD_INFO",     cmd_payload_info     },
+  { "PAYLOAD_MEMORY_INFO", cmd_payload_memory_info },
+  { "PAYLOAD_FAILURE_INFO", cmd_payload_failure_info },
+  { "PAYLOAD_INTEGRITY_INFO", cmd_payload_integrity_info },
   { "ENTER_BOOTLOADER", cmd_enter_bootloader },
   { "REBOOT",           cmd_reboot           },
   { "SHUTDOWN",         cmd_shutdown         },

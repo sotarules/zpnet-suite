@@ -235,6 +235,8 @@ enum payload_error_code_t : uint32_t {
     PAYLOAD_ERR_INVALID_CHILD = 18,
     PAYLOAD_ERR_FIXED_DECIMAL_RANGE = 19,
     PAYLOAD_ERR_FLOAT_FORMAT_FORBIDDEN = 20,
+    PAYLOAD_ERR_FIXED_CAPACITY = 21,
+    PAYLOAD_ERR_FIXED_STORAGE = 22,
 };
 
 FLASHMEM const char* payload_error_code_name(uint32_t code) {
@@ -260,6 +262,8 @@ FLASHMEM const char* payload_error_code_name(uint32_t code) {
         case PAYLOAD_ERR_INVALID_CHILD:      return "INVALID_CHILD";
         case PAYLOAD_ERR_FIXED_DECIMAL_RANGE: return "FIXED_DECIMAL_RANGE";
         case PAYLOAD_ERR_FLOAT_FORMAT_FORBIDDEN: return "FLOAT_FORMAT_FORBIDDEN";
+        case PAYLOAD_ERR_FIXED_CAPACITY:     return "FIXED_CAPACITY";
+        case PAYLOAD_ERR_FIXED_STORAGE:      return "FIXED_STORAGE";
         default:                             return "UNKNOWN";
     }
 }
@@ -479,6 +483,8 @@ enum payload_operation_id_t : uint32_t {
     PAYLOAD_OP_ENTRY_CAPACITY = 0x8AA7EB40UL,
     PAYLOAD_OP_FIND_KEY = 0x3466FF4BUL,
     PAYLOAD_OP_FIND_LAYOUT = 0xD2714752UL,
+    PAYLOAD_OP_FIXED_BIND = 0xF844169EUL,
+    PAYLOAD_OP_FIXED_CAPACITY = 0x580770D9UL,
     PAYLOAD_OP_GETARRAY = 0xC97863F4UL,
     PAYLOAD_OP_GETARRAYVIEW = 0x073EA9EDUL,
     PAYLOAD_OP_GETPAYLOAD = 0x76B94E07UL,
@@ -596,6 +602,8 @@ FLASHMEM const char* payload_operation_id_name(uint32_t operation_id) {
         case PAYLOAD_OP_ENTRY_CAPACITY: return "entry_capacity";
         case PAYLOAD_OP_FIND_KEY: return "find.key";
         case PAYLOAD_OP_FIND_LAYOUT: return "find.layout";
+        case PAYLOAD_OP_FIXED_BIND: return "fixed.bind";
+        case PAYLOAD_OP_FIXED_CAPACITY: return "fixed.capacity";
         case PAYLOAD_OP_GETARRAY: return "getArray";
         case PAYLOAD_OP_GETARRAYVIEW: return "getArrayView";
         case PAYLOAD_OP_GETPAYLOAD: return "getPayload";
@@ -1867,6 +1875,9 @@ FLASHMEM const char* payload_contract_reason_name(uint32_t reason) {
         case payload_contract_reason_t::EXPECTED_PRESERVATION: return "EXPECTED_PRESERVATION";
         case payload_contract_reason_t::EXPECTED_ARRAY_DELTA: return "EXPECTED_ARRAY_DELTA";
         case payload_contract_reason_t::INTERNAL_FAILURE: return "INTERNAL_FAILURE";
+        case payload_contract_reason_t::STORAGE_MODE_GUARD: return "STORAGE_MODE_GUARD";
+        case payload_contract_reason_t::FIXED_STORAGE_GUARD: return "FIXED_STORAGE_GUARD";
+        case payload_contract_reason_t::FIXED_CAPACITY_GUARD: return "FIXED_CAPACITY_GUARD";
         default: return "NONE";
     }
 }
@@ -1875,10 +1886,12 @@ static payload_contract_reason_t payload_contract_reason_for_error(
     uint32_t code) {
     switch (code) {
         case PAYLOAD_ERR_BAD_STRING_POINTER:
+        case PAYLOAD_ERR_FIXED_STORAGE:
             return payload_contract_reason_t::INPUT_POINTER;
         case PAYLOAD_ERR_STRING_TOO_LONG:
         case PAYLOAD_ERR_ARENA_LIMIT:
         case PAYLOAD_ERR_ENTRY_OVERFLOW:
+        case PAYLOAD_ERR_FIXED_CAPACITY:
             return payload_contract_reason_t::INPUT_LENGTH;
         case PAYLOAD_ERR_JSON_INVALID:
         case PAYLOAD_ERR_PARSE_ERROR:
@@ -2444,6 +2457,30 @@ static void payload_note_bad_key(const char* key) {
     // very pointer whose custody is in question.
     g_payload_last_string_pointer_fault_key_ptr = (uint32_t)(uintptr_t)key;
     g_payload_last_string_pointer_fault_key[0] = '\0';
+}
+
+// FIXED Payload storage must be genuine writable RAM, not merely a readable
+// span. The binding is established once by the constructor and then guarded by
+// object-local pointer/capacity complements; no runtime allocator participates.
+static bool payload_fixed_storage_span_writable(const void* ptr, size_t len) {
+    if (!ptr || len == 0U) return false;
+    const uintptr_t addr = (uintptr_t)ptr;
+    if ((addr % Payload::FIXED_STORAGE_ALIGNMENT) != 0U ||
+        len > UINTPTR_MAX - addr) {
+        return false;
+    }
+#if defined(__IMXRT1062__)
+    const uintptr_t end = addr + len;
+    const uintptr_t dtcm_end = (uintptr_t)&_estack;
+    const bool in_dtcm =
+        dtcm_end > 0x20000000UL &&
+        addr >= 0x20000000UL && end <= dtcm_end;
+    const bool in_ocram =
+        addr >= 0x20200000UL && end <= 0x20280000UL;
+    return in_dtcm || in_ocram;
+#else
+    return addr >= 0x1000UL;
+#endif
 }
 
 // ============================================================================
@@ -4023,8 +4060,20 @@ bool Payload::_contract_inspect(payload_contract_state_t* out) const {
     if (!out) return false;
     *out = payload_contract_state_t{};
 
+    if (!_storage_mode_guard_ok()) {
+        out->reason = payload_contract_reason_t::STORAGE_MODE_GUARD;
+        return false;
+    }
     if (!_heap_guard_ok()) {
         out->reason = payload_contract_reason_t::HEAP_GUARD;
+        return false;
+    }
+    if (!_fixed_storage_guard_ok()) {
+        out->reason = payload_contract_reason_t::FIXED_STORAGE_GUARD;
+        return false;
+    }
+    if (!_fixed_capacity_guard_ok()) {
+        out->reason = payload_contract_reason_t::FIXED_CAPACITY_GUARD;
         return false;
     }
     if (!_count_guard_ok()) {
@@ -4036,21 +4085,41 @@ bool Payload::_contract_inspect(payload_contract_state_t* out) const {
         return false;
     }
 
+    const bool fixed = _fixed_mode();
     const uint8_t* storage = nullptr;
     uint32_t capacity = 0U;
-    if (_heap_block) {
-        if (!payload_contract_heap_capacity_pure(_heap_block,
-                                                 this,
-                                                 INLINE_STORAGE + 1U,
-                                                 STORAGE_MAX,
-                                                 &capacity)) {
-            out->reason = payload_contract_reason_t::HEAP_HEADER;
+    if (fixed) {
+        if (_heap_block != nullptr || !_fixed_storage ||
+            _fixed_capacity < INLINE_STORAGE ||
+            _fixed_capacity > STORAGE_MAX) {
+            out->reason = payload_contract_reason_t::STORAGE_MODE_GUARD;
             return false;
         }
-        storage = payload_heap_bytes((const void*)_heap_block);
+        capacity = _fixed_capacity;
+        storage = static_cast<const uint8_t*>(_fixed_storage);
+        if (!payload_fixed_storage_span_writable(storage, capacity)) {
+            out->reason = payload_contract_reason_t::STORAGE_UNREADABLE;
+            return false;
+        }
     } else {
-        capacity = INLINE_STORAGE;
-        storage = _inline_storage;
+        if (_fixed_storage != nullptr || _fixed_capacity != 0U) {
+            out->reason = payload_contract_reason_t::STORAGE_MODE_GUARD;
+            return false;
+        }
+        if (_heap_block) {
+            if (!payload_contract_heap_capacity_pure(_heap_block,
+                                                     this,
+                                                     INLINE_STORAGE + 1U,
+                                                     STORAGE_MAX,
+                                                     &capacity)) {
+                out->reason = payload_contract_reason_t::HEAP_HEADER;
+                return false;
+            }
+            storage = payload_heap_bytes((const void*)_heap_block);
+        } else {
+            capacity = INLINE_STORAGE;
+            storage = _inline_storage;
+        }
     }
 
     out->capacity = capacity;
@@ -4179,8 +4248,10 @@ bool Payload::_contract_inspect(payload_contract_state_t* out) const {
     }
 
     uint32_t structural = PAYLOAD_CONTRACT_HASH_SEED;
+    structural = payload_contract_hash_u32(structural, (uint32_t)_storage_mode);
     structural = payload_contract_hash_u32(
-        structural, (uint32_t)(uintptr_t)_heap_block);
+        structural,
+        (uint32_t)(uintptr_t)(fixed ? _fixed_storage : _heap_block));
     structural = payload_contract_hash_u32(structural, capacity);
     structural = payload_contract_hash_u32(structural, _count);
     structural = payload_contract_hash_u32(structural, _data_begin);
@@ -4894,6 +4965,12 @@ bool PayloadArray::_contract_abort(
 Payload::Payload()
     : _heap_block(nullptr),
       _heap_block_guard(UINTPTR_MAX),
+      _fixed_storage(nullptr),
+      _fixed_storage_guard(UINTPTR_MAX),
+      _fixed_capacity(0U),
+      _fixed_capacity_guard(UINT16_MAX),
+      _storage_mode((uint8_t)StorageMode::DYNAMIC),
+      _storage_mode_guard((uint8_t)~(uint8_t)StorageMode::DYNAMIC),
       _count(0),
       _count_guard(UINT16_MAX),
       _data_begin((uint16_t)INLINE_STORAGE),
@@ -4930,6 +5007,90 @@ Payload::Payload()
     }
 }
 
+Payload::Payload(StorageMode mode, void* storage, size_t capacity)
+    : _heap_block(nullptr),
+      _heap_block_guard(UINTPTR_MAX),
+      _fixed_storage(nullptr),
+      _fixed_storage_guard(UINTPTR_MAX),
+      _fixed_capacity(0U),
+      _fixed_capacity_guard(UINT16_MAX),
+      _storage_mode((uint8_t)StorageMode::DYNAMIC),
+      _storage_mode_guard((uint8_t)~(uint8_t)StorageMode::DYNAMIC),
+      _count(0),
+      _count_guard(UINT16_MAX),
+      _data_begin((uint16_t)INLINE_STORAGE),
+      _data_begin_guard((uint16_t)~(uint16_t)INLINE_STORAGE),
+      _contract_generation(0U),
+      _contract_generation_guard(0xFFFFFFFFUL),
+      _contract_fingerprint(0U),
+      _contract_fingerprint_guard(0xFFFFFFFFUL),
+      _inline_storage{} {
+    payload_mark_constructed();
+    payload_note_handler_context(PAYLOAD_OP_CTOR, this,
+                                 &g_payload_handler_ctx_ctor);
+    payload_flight_note(PAYLOAD_OP_CTOR, this, 0U);
+
+    const bool dynamic_request = mode == StorageMode::DYNAMIC;
+    const bool fixed_request = mode == StorageMode::FIXED;
+    const uintptr_t storage_begin = (uintptr_t)storage;
+    const uintptr_t storage_end =
+        capacity <= UINTPTR_MAX - storage_begin
+            ? storage_begin + capacity
+            : UINTPTR_MAX;
+    const uintptr_t object_begin = (uintptr_t)this;
+    const uintptr_t object_end = object_begin + sizeof(Payload);
+    const bool overlaps_object = storage && capacity != 0U &&
+        storage_begin < object_end && storage_end > object_begin;
+
+    if ((!dynamic_request && !fixed_request) ||
+        (dynamic_request && (storage != nullptr || capacity != 0U)) ||
+        (fixed_request &&
+         (!storage || capacity < INLINE_STORAGE ||
+          capacity > STORAGE_MAX || capacity > UINT16_MAX ||
+          overlaps_object ||
+          !payload_fixed_storage_span_writable(storage, capacity)))) {
+        payload_note_error(PAYLOAD_ERR_FIXED_STORAGE,
+                           PAYLOAD_OP_FIXED_BIND,
+                           this);
+        _fatal(PAYLOAD_ERR_FIXED_STORAGE,
+               PAYLOAD_OP_FIXED_BIND,
+               capacity);
+    }
+
+    if (fixed_request) {
+        _set_storage_mode(StorageMode::FIXED);
+        _set_fixed_storage(storage);
+        _set_fixed_capacity((uint16_t)capacity);
+        _set_data_begin((uint16_t)capacity);
+        memset(storage, 0, capacity);
+    }
+
+    payload_contract_state_t state{};
+    if (_contract_inspect(&state)) {
+        _contract_accept(state);
+    } else {
+        payload_contract_record_state_failure(
+            payload_contract_phase_t::POST_INVARIANT,
+            PAYLOAD_OP_FIXED_BIND,
+            this,
+            state,
+            0U,
+            0U);
+        _fatal(PAYLOAD_ERR_FIXED_STORAGE,
+               PAYLOAD_OP_FIXED_BIND,
+               capacity);
+    }
+    if (payload_stamp_trace_is_ocram_object(this)) {
+        payload_stamp_trace_record(
+            payload_stamp_trace_stage_t::CTOR_EXIT,
+            PAYLOAD_OP_CTOR,
+            this,
+            (uint32_t)(uintptr_t)__builtin_return_address(0),
+            state.structural_fingerprint,
+            g_payload_contract_next_sequence);
+    }
+}
+
 Payload::~Payload() {
     payload_flight_note(PAYLOAD_OP_DTOR, this, 0U);
     _release_storage();
@@ -4939,6 +5100,12 @@ Payload::~Payload() {
 Payload::Payload(Payload&& other) noexcept
     : _heap_block(nullptr),
       _heap_block_guard(UINTPTR_MAX),
+      _fixed_storage(nullptr),
+      _fixed_storage_guard(UINTPTR_MAX),
+      _fixed_capacity(0U),
+      _fixed_capacity_guard(UINT16_MAX),
+      _storage_mode((uint8_t)StorageMode::DYNAMIC),
+      _storage_mode_guard((uint8_t)~(uint8_t)StorageMode::DYNAMIC),
       _count(0),
       _count_guard(UINT16_MAX),
       _data_begin((uint16_t)INLINE_STORAGE),
@@ -5001,6 +5168,12 @@ Payload& Payload::operator=(Payload&& other) noexcept {
 Payload::Payload(const Payload& other)
     : _heap_block(nullptr),
       _heap_block_guard(UINTPTR_MAX),
+      _fixed_storage(nullptr),
+      _fixed_storage_guard(UINTPTR_MAX),
+      _fixed_capacity(0U),
+      _fixed_capacity_guard(UINT16_MAX),
+      _storage_mode((uint8_t)StorageMode::DYNAMIC),
+      _storage_mode_guard((uint8_t)~(uint8_t)StorageMode::DYNAMIC),
       _count(0),
       _count_guard(UINT16_MAX),
       _data_begin((uint16_t)INLINE_STORAGE),
@@ -5077,6 +5250,25 @@ bool Payload::_heap_guard_ok() const {
     return (((uintptr_t)_heap_block) ^ _heap_block_guard) == UINTPTR_MAX;
 }
 
+bool Payload::_fixed_storage_guard_ok() const {
+    return (((uintptr_t)_fixed_storage) ^ _fixed_storage_guard) == UINTPTR_MAX;
+}
+
+bool Payload::_fixed_capacity_guard_ok() const {
+    return (uint16_t)(_fixed_capacity ^ _fixed_capacity_guard) == UINT16_MAX;
+}
+
+bool Payload::_storage_mode_guard_ok() const {
+    if ((uint8_t)(_storage_mode ^ _storage_mode_guard) != UINT8_MAX) return false;
+    return _storage_mode == (uint8_t)StorageMode::DYNAMIC ||
+           _storage_mode == (uint8_t)StorageMode::FIXED;
+}
+
+bool Payload::_fixed_mode() const {
+    return _storage_mode_guard_ok() &&
+           _storage_mode == (uint8_t)StorageMode::FIXED;
+}
+
 bool Payload::_count_guard_ok() const {
     return (uint16_t)(_count ^ _count_guard) == UINT16_MAX;
 }
@@ -5090,6 +5282,21 @@ void Payload::_set_heap_block(void* block) {
     _heap_block_guard = ~((uintptr_t)block);
 }
 
+void Payload::_set_fixed_storage(void* storage) {
+    _fixed_storage = storage;
+    _fixed_storage_guard = ~((uintptr_t)storage);
+}
+
+void Payload::_set_fixed_capacity(uint16_t capacity) {
+    _fixed_capacity = capacity;
+    _fixed_capacity_guard = (uint16_t)~capacity;
+}
+
+void Payload::_set_storage_mode(StorageMode mode) {
+    _storage_mode = (uint8_t)mode;
+    _storage_mode_guard = (uint8_t)~(uint8_t)mode;
+}
+
 void Payload::_set_count(uint16_t count) {
     _count = count;
     _count_guard = (uint16_t)~count;
@@ -5101,19 +5308,57 @@ void Payload::_set_data_begin(uint16_t data_begin) {
 }
 
 uint8_t* Payload::_storage() {
-    if (!_heap_guard_ok()) return nullptr;
+    if (!_storage_mode_guard_ok() || !_heap_guard_ok() ||
+        !_fixed_storage_guard_ok() || !_fixed_capacity_guard_ok()) {
+        return nullptr;
+    }
+    if (_fixed_mode()) {
+        return _heap_block == nullptr && _fixed_storage &&
+               payload_fixed_storage_span_writable(_fixed_storage,
+                                                   _fixed_capacity)
+            ? static_cast<uint8_t*>(_fixed_storage)
+            : nullptr;
+    }
+    if (_fixed_storage != nullptr || _fixed_capacity != 0U) return nullptr;
     return _heap_block ? payload_heap_bytes(_heap_block) : _inline_storage;
 }
 
 const uint8_t* Payload::_storage() const {
-    if (!_heap_guard_ok()) return nullptr;
-    return _heap_block ? payload_heap_bytes((const void*)_heap_block) : _inline_storage;
+    if (!_storage_mode_guard_ok() || !_heap_guard_ok() ||
+        !_fixed_storage_guard_ok() || !_fixed_capacity_guard_ok()) {
+        return nullptr;
+    }
+    if (_fixed_mode()) {
+        return _heap_block == nullptr && _fixed_storage &&
+               payload_fixed_storage_span_writable(_fixed_storage,
+                                                   _fixed_capacity)
+            ? static_cast<const uint8_t*>(_fixed_storage)
+            : nullptr;
+    }
+    if (_fixed_storage != nullptr || _fixed_capacity != 0U) return nullptr;
+    return _heap_block ? payload_heap_bytes((const void*)_heap_block)
+                       : _inline_storage;
 }
 
 size_t Payload::_capacity() const {
-    if (!_heap_guard_ok()) return 0U;
+    if (!_storage_mode_guard_ok() || !_heap_guard_ok() ||
+        !_fixed_storage_guard_ok() || !_fixed_capacity_guard_ok()) {
+        return 0U;
+    }
+    if (_fixed_mode()) {
+        if (_heap_block != nullptr || !_fixed_storage ||
+            _fixed_capacity < INLINE_STORAGE ||
+            _fixed_capacity > STORAGE_MAX ||
+            !payload_fixed_storage_span_writable(_fixed_storage,
+                                                _fixed_capacity)) {
+            return 0U;
+        }
+        return _fixed_capacity;
+    }
+    if (_fixed_storage != nullptr || _fixed_capacity != 0U) return 0U;
     if (!_heap_block) return INLINE_STORAGE;
-    return payload_heap_capacity(_heap_block, this, INLINE_STORAGE + 1U, STORAGE_MAX);
+    return payload_heap_capacity(_heap_block, this,
+                                 INLINE_STORAGE + 1U, STORAGE_MAX);
 }
 
 size_t Payload::_data_used() const {
@@ -5132,10 +5377,30 @@ const Payload::Entry* Payload::_entries() const {
 }
 
 void Payload::_reset_empty() {
+    const bool preserve_fixed =
+        _fixed_mode() && _heap_guard_ok() && _heap_block == nullptr &&
+        _fixed_storage_guard_ok() && _fixed_capacity_guard_ok() &&
+        _fixed_storage && _fixed_capacity >= INLINE_STORAGE &&
+        _fixed_capacity <= STORAGE_MAX &&
+        payload_fixed_storage_span_writable(_fixed_storage, _fixed_capacity);
+
     _set_heap_block(nullptr);
     _set_count(0U);
-    _set_data_begin((uint16_t)INLINE_STORAGE);
     memset(_inline_storage, 0, sizeof(_inline_storage));
+
+    if (preserve_fixed) {
+        memset(_fixed_storage, 0, _fixed_capacity);
+        _set_data_begin(_fixed_capacity);
+    } else {
+        // A damaged storage-policy identity is never dereferenced in an attempt
+        // to recover it. Collapse only the local object back to canonical dynamic
+        // empty state; the preceding court remains the authoritative evidence.
+        _set_storage_mode(StorageMode::DYNAMIC);
+        _set_fixed_storage(nullptr);
+        _set_fixed_capacity(0U);
+        _set_data_begin((uint16_t)INLINE_STORAGE);
+    }
+
     payload_contract_state_t state{};
     if (_contract_inspect(&state)) {
         _contract_accept(state);
@@ -5152,8 +5417,29 @@ void Payload::_reset_empty() {
 
 
 void Payload::_release_storage() {
-    if (!_heap_guard_ok()) {
+    if (!_storage_mode_guard_ok() || !_heap_guard_ok() ||
+        !_fixed_storage_guard_ok() || !_fixed_capacity_guard_ok()) {
         payload_note_integrity(PAYLOAD_SELF_OK_ENTRIES_SPAN_UNREADABLE,
+                               PAYLOAD_OP_RELEASE_STORAGE_GUARD,
+                               this);
+        _reset_empty();
+        return;
+    }
+    if (_fixed_mode()) {
+        // FIXED storage is caller-owned and dedicated to this object's lifetime.
+        // Release means semantic reset only: never free, resize, or transfer it.
+        if (_heap_block != nullptr || !_fixed_storage ||
+            !payload_fixed_storage_span_writable(_fixed_storage,
+                                                _fixed_capacity)) {
+            payload_note_integrity(PAYLOAD_SELF_OK_ENTRIES_SPAN_UNREADABLE,
+                                   PAYLOAD_OP_RELEASE_STORAGE_GUARD,
+                                   this);
+        }
+        _reset_empty();
+        return;
+    }
+    if (_fixed_storage != nullptr || _fixed_capacity != 0U) {
+        payload_note_integrity(PAYLOAD_SELF_OK_INLINE_CAP_MISMATCH,
                                PAYLOAD_OP_RELEASE_STORAGE_GUARD,
                                this);
         _reset_empty();
@@ -5197,6 +5483,41 @@ void Payload::_move_from(Payload& other) {
     }
 
     const uint32_t expected_semantic = source.semantic_fingerprint;
+
+    // Fixed backing storage is identity, not movable ownership. If either side
+    // is FIXED, move the semantic value through the destination's own storage
+    // policy and then empty the source. Only dynamic->dynamic may transfer a
+    // heap block and rebind its owner cookie.
+    if (_fixed_mode() || other._fixed_mode()) {
+        if (!_copy_from(other)) return;
+        if (other._fixed_mode()) {
+            other.clear();
+        } else {
+            other._release_storage();
+        }
+
+        payload_contract_state_t source_after{};
+        if (!other._contract_inspect(&source_after) ||
+            source_after.count != 0U ||
+            source_after.data_used != 0U ||
+            !other.contract_valid()) {
+            payload_contract_record_postcondition(
+                PAYLOAD_OP_MOVE_FROM,
+                this,
+                &other,
+                _contract_generation,
+                payload_contract_reason_t::EXPECTED_MOVE_SOURCE_EMPTY,
+                0xFFFFFFFFUL,
+                0U,
+                source_after.count,
+                0U,
+                source_after.data_used,
+                before.structural_fingerprint,
+                source_after.structural_fingerprint);
+        }
+        return;
+    }
+
     if (other._heap_block) {
         if (!payload_heap_rebind_owner(other._heap_block,
                                        &other,
@@ -5274,7 +5595,15 @@ bool Payload::_copy_from(const Payload& other) {
         (size_t)other._count * sizeof(Entry) + source_data_used;
 
     size_t target_capacity = INLINE_STORAGE;
-    if (required > INLINE_STORAGE) {
+    if (_fixed_mode()) {
+        target_capacity = _capacity();
+        if (target_capacity == 0U || required > target_capacity) {
+            payload_note_error(PAYLOAD_ERR_FIXED_CAPACITY,
+                               PAYLOAD_OP_FIXED_CAPACITY,
+                               this);
+            return false;
+        }
+    } else if (required > INLINE_STORAGE) {
         target_capacity = payload_growth_capacity(INLINE_STORAGE,
                                                   required,
                                                   STORAGE_MAX);
@@ -5427,6 +5756,14 @@ void Payload::reserve(size_t minimum_capacity) {
         _fatal(PAYLOAD_ERR_ARENA_LIMIT, PAYLOAD_OP_RESERVE, minimum_capacity);
     }
     if (minimum_capacity <= before.capacity) return;
+    if (_fixed_mode()) {
+        payload_note_error(PAYLOAD_ERR_FIXED_CAPACITY,
+                           PAYLOAD_OP_FIXED_CAPACITY,
+                           this);
+        _fatal(PAYLOAD_ERR_FIXED_CAPACITY,
+               PAYLOAD_OP_RESERVE,
+               minimum_capacity);
+    }
 
     const size_t occupied =
         (size_t)before.count * sizeof(Entry) + (size_t)before.data_used;
@@ -5464,7 +5801,8 @@ size_t Payload::entry_capacity() const {
 }
 
 bool Payload::heap_entries() const {
-    return _heap_guard_ok() && _heap_block != nullptr && _capacity() != 0U;
+    return _storage_mode_guard_ok() && !_fixed_mode() &&
+           _heap_guard_ok() && _heap_block != nullptr && _capacity() != 0U;
 }
 
 // ============================================================================
@@ -5472,7 +5810,9 @@ bool Payload::heap_entries() const {
 // ============================================================================
 
 bool Payload::_self_ok(uint32_t operation_id) const {
-    if (!_heap_guard_ok() || !_count_guard_ok() || !_data_begin_guard_ok()) {
+    if (!_storage_mode_guard_ok() || !_heap_guard_ok() ||
+        !_fixed_storage_guard_ok() || !_fixed_capacity_guard_ok() ||
+        !_count_guard_ok() || !_data_begin_guard_ok()) {
         payload_note_integrity(PAYLOAD_SELF_OK_INLINE_CAP_MISMATCH, operation_id, this);
         return false;
     }
@@ -5685,6 +6025,16 @@ bool Payload::_ensure_room(size_t additional_entries,
         new_count * sizeof(Entry) + data_used + additional_data;
     const size_t old_capacity = _capacity();
     if (required <= old_capacity) return true;
+
+    if (_fixed_mode()) {
+        // FIXED mode is deliberately incapable of growing. The caller declared
+        // this document's maximum storage at construction; crossing it is a
+        // producer contract failure, not allocator backpressure.
+        payload_note_error(PAYLOAD_ERR_FIXED_CAPACITY,
+                           PAYLOAD_OP_FIXED_CAPACITY,
+                           this);
+        return false;
+    }
 
     const size_t new_capacity =
         payload_growth_capacity(old_capacity, required, STORAGE_MAX);
@@ -7869,8 +8219,9 @@ void Payload::debug_dump(const char* tag) const {
 
     char line[192];
     snprintf(line, sizeof(line),
-             "Payload v4 (%s): entries=%u data=%u/%u heap=%u sizeof=%u",
+             "Payload v4.2 (%s): mode=%s entries=%u data=%u/%u heap=%u sizeof=%u",
              safe_tag,
+             _fixed_mode() ? "FIXED" : "DYNAMIC",
              (unsigned)count(),
              (unsigned)arena_used(),
              (unsigned)arena_capacity(),

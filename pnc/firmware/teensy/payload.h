@@ -8,7 +8,7 @@
 
 /*
   ============================================================================
-  Payload v4.1 — Single-Store Typed JSON Carrier
+  Payload v4.2 — Bimodal Single-Store Typed JSON Carrier
   ============================================================================
 
   HARD CONTRACT:
@@ -38,17 +38,23 @@
       the established command-ingress contract.
     • Nested objects and arrays are written directly; no temporary JSON heap
       buffer is needed to attach a child.
-    • Empty and small Payloads use bounded inline storage. Larger Payloads use
-      one explicitly owned heap block, never independent entry/arena blocks.
-    • Object metadata is held with cheap redundant complements; heap blocks are
-      bound to their owning object by a pointer-derived cookie and complement.
+    • Storage policy is selected only at construction. Default Payloads retain
+      the existing dynamic inline/heap behavior; explicit FIXED Payloads use one
+      caller-supplied dedicated writable store for their entire lifetime.
+    • FIXED Payloads never allocate, resize, free, or transfer their backing store.
+      Exceeding the declared fixed capacity is a fatal producer contract failure.
+    • Object metadata is held with cheap redundant complements. Dynamic heap
+      blocks remain bound to their exact owning object by pointer-derived cookie;
+      fixed stores are bound by guarded pointer, capacity, and storage-mode state.
     • Corruption handling is fail-closed and quiet: no magic-number trap, stack
       walk, logging recursion, or diagnostic Payload construction.
 
   Compatibility:
 
-    The payload_info_t telemetry shape remains source-compatible with Payload
-    v3. Legacy entry/arena and floating-number diagnostic fields are retained;
+    Payload() remains the default constructor and retains dynamic behavior. No
+    existing caller must opt into or understand the fixed-storage path. The
+    payload_info_t telemetry shape remains source-compatible with Payload v3.
+    Legacy entry/arena and floating-number diagnostic fields are retained;
     retired fields remain zero unless an invalid fixed-decimal admission maps
     naturally onto the former numeric counters.
 
@@ -124,6 +130,9 @@ enum class payload_contract_reason_t : uint32_t {
   EXPECTED_PRESERVATION        = 34,
   EXPECTED_ARRAY_DELTA         = 35,
   INTERNAL_FAILURE             = 36,
+  STORAGE_MODE_GUARD           = 37,
+  FIXED_STORAGE_GUARD          = 38,
+  FIXED_CAPACITY_GUARD         = 39,
 };
 
 struct payload_contract_incident_t {
@@ -765,7 +774,19 @@ private:
 
 class Payload {
 public:
+    enum class StorageMode : uint8_t {
+        DYNAMIC = 0U,
+        FIXED   = 1U,
+    };
+
+    // Existing callers remain dynamic by default. FIXED is an explicit opt-in
+    // for bounded, high-frequency producers. The supplied store is dedicated to
+    // this Payload, must remain writable/alive for its lifetime, and is never
+    // allocated, resized, freed, or transferred by Payload.
+    static constexpr size_t FIXED_STORAGE_ALIGNMENT = 4U;
+
     Payload();
+    Payload(StorageMode mode, void* storage, size_t capacity);
     ~Payload();
 
     Payload(Payload&& other) noexcept;
@@ -919,6 +940,17 @@ private:
 
     void*     _heap_block;
     uintptr_t _heap_block_guard;
+
+    // Storage policy is immutable after construction. Dynamic mode keeps these
+    // fixed-store fields canonically null/zero; FIXED mode keeps _heap_block
+    // canonically null and binds the external store with redundant guards.
+    void*     _fixed_storage;
+    uintptr_t _fixed_storage_guard;
+    uint16_t  _fixed_capacity;
+    uint16_t  _fixed_capacity_guard;
+    uint8_t   _storage_mode;
+    uint8_t   _storage_mode_guard;
+
     uint16_t  _count;
     uint16_t  _count_guard;
     uint16_t  _data_begin;
@@ -930,9 +962,16 @@ private:
     alignas(uint32_t) uint8_t _inline_storage[INLINE_STORAGE];
 
     bool _heap_guard_ok() const;
+    bool _fixed_storage_guard_ok() const;
+    bool _fixed_capacity_guard_ok() const;
+    bool _storage_mode_guard_ok() const;
+    bool _fixed_mode() const;
     bool _count_guard_ok() const;
     bool _data_begin_guard_ok() const;
     void _set_heap_block(void* block);
+    void _set_fixed_storage(void* storage);
+    void _set_fixed_capacity(uint16_t capacity);
+    void _set_storage_mode(StorageMode mode);
     void _set_count(uint16_t count);
     void _set_data_begin(uint16_t data_begin);
 
