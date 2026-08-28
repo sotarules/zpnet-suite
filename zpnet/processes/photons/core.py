@@ -296,6 +296,15 @@ _hard_failure_state_dropped = 0
 _hard_failure_persistence_dropped = 0
 _last_hard_failure: Optional[Dict[str, Any]] = None
 
+# One general operator repair lane.  It may use read-only live-producer
+# reacquisition, an implicit STATS_RESET, or full Phase-5 recovery as needed.
+_repair_lock = threading.Lock()
+_repair_event = threading.Event()
+_repair_requests = 0
+_repair_success = 0
+_repair_failures = 0
+_last_repair: Optional[Dict[str, Any]] = None
+
 _lap_baseline_ns: Optional[str] = None
 _lap_baseline_fs: Optional[int] = None
 # Deprecated whole-picosecond compatibility mirror retained for recovery/report
@@ -321,6 +330,10 @@ def _operational_state_snapshot() -> Dict[str, Any]:
 
 def _hard_failure_active() -> bool:
     return _hard_failure_event.is_set()
+
+
+def _repair_active() -> bool:
+    return _repair_event.is_set()
 
 
 def _set_operational_state(
@@ -6313,7 +6326,7 @@ def on_photons_fragment(fragment: Payload) -> None:
     global _fragments_queued
     global _hard_failure_ingress_dropped
 
-    if _hard_failure_active():
+    if _hard_failure_active() and not _repair_active():
         with _state_lock:
             _hard_failure_ingress_dropped += 1
         return
@@ -6358,7 +6371,7 @@ def _state_loop() -> None:
                 pass
             if fragment is None:
                 pass
-            elif _hard_failure_active():
+            elif _hard_failure_active() and not _repair_active():
                 with _state_lock:
                     _hard_failure_state_dropped += 1
             else:
@@ -6367,7 +6380,7 @@ def _state_loop() -> None:
 
                 system_failure_logged = False
                 while True:
-                    if _hard_failure_active():
+                    if _hard_failure_active() and not _repair_active():
                         break
                     try:
                         system_context = _fetch_system_report()
@@ -6389,7 +6402,7 @@ def _state_loop() -> None:
                             system_failure_logged = True
                         time.sleep(PHOTONS_STATE_RETRY_S)
 
-                if _hard_failure_active():
+                if _hard_failure_active() and not _repair_active():
                     with _state_lock:
                         _hard_failure_state_dropped += 1
                     continue
@@ -6530,7 +6543,7 @@ def _persistence_loop() -> None:
                 )
             if photons is None:
                 pass
-            elif _hard_failure_active():
+            elif _hard_failure_active() and not _repair_active():
                 with _state_lock:
                     _hard_failure_persistence_dropped += 1
             else:
@@ -6541,7 +6554,7 @@ def _persistence_loop() -> None:
                         with _state_lock:
                             _rows_persisted += 1
                     except Exception as exc:
-                        if _hard_failure_active():
+                        if _hard_failure_active() and not _repair_active():
                             with _state_lock:
                                 _hard_failure_persistence_dropped += 1
                             break
@@ -8427,6 +8440,13 @@ def _pi_report_surface() -> Dict[str, Any]:
             "hard_failure_state_dropped": _hard_failure_state_dropped,
             "hard_failure_persistence_dropped": _hard_failure_persistence_dropped,
             "last_hard_failure": copy.deepcopy(_last_hard_failure),
+            "repair": {
+                **copy.deepcopy(_last_repair or {}),
+                "active": _repair_active(),
+                "requests": _repair_requests,
+                "success_count": _repair_success,
+                "failure_count": _repair_failures,
+            },
         }
     with _campaign_lock:
         state["lantern"] = {
@@ -8940,6 +8960,13 @@ def cmd_photons_info(_: Optional[dict]) -> Dict[str, Any]:
             "hard_failure_state_dropped": _hard_failure_state_dropped,
             "hard_failure_persistence_dropped": _hard_failure_persistence_dropped,
             "last_hard_failure": copy.deepcopy(_last_hard_failure),
+            "repair": {
+                **copy.deepcopy(_last_repair or {}),
+                "active": _repair_active(),
+                "requests": _repair_requests,
+                "success_count": _repair_success,
+                "failure_count": _repair_failures,
+            },
             "last_maintenance": copy.deepcopy(_last_maintenance),
             "last_campaign_transition": copy.deepcopy(_last_campaign_transition),
             "last_structural_rejection": copy.deepcopy(_last_structural_rejection),
@@ -8999,6 +9026,13 @@ def cmd_report(_: Optional[dict]) -> dict:
             "last_structural_rejection": copy.deepcopy(_last_structural_rejection),
             "last_system_report_failure": copy.deepcopy(_last_system_report_failure),
             "last_persistence_failure": copy.deepcopy(_last_persistence_failure),
+            "repair": {
+                **copy.deepcopy(_last_repair or {}),
+                "active": _repair_active(),
+                "requests": _repair_requests,
+                "success_count": _repair_success,
+                "failure_count": _repair_failures,
+            },
             "lap_baseline_ns": _lap_baseline_ns,
             "lap_baseline_fs": _lap_baseline_fs,
             "standard_lap_ns": _standard_lap_ns,
@@ -9035,6 +9069,279 @@ def cmd_report(_: Optional[dict]) -> dict:
     }
 
 
+def _release_after_repair(*, reason: str, details: Dict[str, Any]) -> Dict[str, Any]:
+    """Clear a proved PHOTONS wedge and reopen ordinary canonical authorship."""
+    global _operational_state
+    global _last_hard_failure
+
+    now_utc = _utc_now_z()
+    with _hard_failure_lock:
+        _hard_failure_event.clear()
+        _last_hard_failure = None
+        with _operational_state_lock:
+            _operational_state = {
+                "schema": OPERATIONAL_STATE_SCHEMA,
+                "subsystem": "PHOTONS",
+                "state": OPERATIONAL_STATE_RUNNING,
+                "entered_at_utc": now_utc,
+                "reason": str(reason),
+                "source": "PHOTONS.REPAIR",
+                "details": copy.deepcopy(details),
+            }
+            snapshot = copy.deepcopy(_operational_state)
+    _runtime_recovery_hold.clear()
+    _campaign_control_ready.set()
+    return snapshot
+
+
+def _repair_stats_reset_sync() -> Dict[str, Any]:
+    """Run the existing ordered PHOTONS STATS_RESET contract and wait for its proof."""
+    global _last_maintenance
+
+    before = _latest_stats_epoch()
+    requested_at = _utc_now_z()
+    with _stats_reset_control_lock:
+        if _stats_reset_in_progress.is_set():
+            raise RuntimeError("PHOTONS STATS_RESET is already in progress")
+        _stats_reset_in_progress.set()
+        with _state_lock:
+            _last_maintenance = {
+                "action": "STATS_RESET",
+                "requested_at_utc": requested_at,
+                "success": None,
+                "status": "statistics_reset_requested_by_repair",
+                "source": "PHOTONS.REPAIR",
+                "before": copy.deepcopy(before),
+            }
+    _stats_reset_arm_worker(requested_at, copy.deepcopy(before))
+
+    deadline = time.monotonic() + PHOTONS_RECOVERY_PROOF_TIMEOUT_S
+    while _stats_reset_in_progress.is_set():
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"PHOTONS.REPAIR STATS_RESET did not reach durable row 1 within {PHOTONS_RECOVERY_PROOF_TIMEOUT_S:.1f}s"
+            )
+        time.sleep(PHOTONS_PERSIST_RETRY_S)
+
+    with _state_lock:
+        result = copy.deepcopy(_last_maintenance or {})
+    if result.get("action") != "STATS_RESET" or result.get("success") is not True:
+        raise RuntimeError(f"PHOTONS.REPAIR implicit STATS_RESET failed: {result!r}")
+    return result
+
+
+def _repair_worker(*, trigger_state: Dict[str, Any], record: Dict[str, Any]) -> None:
+    """Repair known PHOTONS wedges, escalating only when a narrower remedy fails."""
+    global _repair_success, _repair_failures, _last_repair
+
+    attempts: List[Dict[str, Any]] = []
+    try:
+        record["phase"] = "CLASSIFYING_LIVE_PRODUCER"
+        with _state_lock:
+            _last_repair = copy.deepcopy(record)
+
+        _best_effort_recovery_abort()
+        _clear_recovery_proof_custody()
+        _runtime_recovery_hold.clear()
+        _configure_teensy_lap_baseline()
+        report = _fetch_teensy_recovery_report(require_baseline=True)
+        record["producer_publication_started"] = bool(report.get("publication_started"))
+
+        repaired_by = None
+        repair_result: Dict[str, Any] = {}
+        trigger_reason = str(trigger_state.get("reason") or "")
+        force_stats_reset = trigger_reason == "producer_rolling_custody_lost"
+        force_phase5 = trigger_reason in {
+            "post_commit_recovery_proof_adjudication_failed",
+            "ambient_producer_recovery_failed",
+            "phase5_startup_recovery_failed",
+        }
+
+        if report.get("publication_started") and force_stats_reset:
+            # Producer itself declared its rolling statistics custody unusable.
+            # A read-only export cannot cure producer-authored invalidity; start a
+            # new resettable statistics epoch while preserving physical lap custody.
+            record["phase"] = "RESETTING_STATISTICS"
+            with _state_lock:
+                _last_repair = copy.deepcopy(record)
+            stats_reset = _repair_stats_reset_sync()
+            attempts.append({"strategy": "IMPLICIT_STATS_RESET", "success": True})
+            repaired_by = "IMPLICIT_STATS_RESET"
+            repair_result = {"stats_reset": stats_reset}
+        elif force_phase5 or not report.get("publication_started"):
+            # Recovery/proof wedges belong to the existing Phase-5 court. It will
+            # decide live adoption, held resurrection, or cold start from current
+            # producer testimony and durable custody.
+            record["phase"] = "PHASE5_RECOVERY"
+            with _state_lock:
+                _last_repair = copy.deepcopy(record)
+            recovery = _perform_phase5_recovery()
+            attempts.append({"strategy": "PHASE5_RECOVERY", "success": True})
+            repaired_by = "PHASE5_RECOVERY"
+            repair_result = {"recovery": recovery}
+        else:
+            # Generic nonterminal wedge: first try the least destructive remedy,
+            # exact live-producer ring reacquisition. Escalate to STATS_RESET only
+            # if the producer cannot supply coherent bounded custody.
+            try:
+                record["phase"] = "REACQUIRING_LIVE_CUSTODY"
+                with _state_lock:
+                    _last_repair = copy.deepcopy(record)
+                reacquired = _refresh_ppb_checkpoint_from_live_photons()
+                attempts.append({"strategy": "LIVE_RING_REACQUIRE", "success": True})
+                repaired_by = "LIVE_RING_REACQUIRE"
+                repair_result = {"live_ring_reacquire": reacquired}
+            except Exception as reacquire_exc:
+                attempts.append({
+                    "strategy": "LIVE_RING_REACQUIRE",
+                    "success": False,
+                    "error": str(reacquire_exc),
+                })
+                record["phase"] = "RESETTING_STATISTICS"
+                with _state_lock:
+                    _last_repair = copy.deepcopy(record)
+                stats_reset = _repair_stats_reset_sync()
+                attempts.append({"strategy": "IMPLICIT_STATS_RESET", "success": True})
+                repaired_by = "IMPLICIT_STATS_RESET"
+                repair_result = {"stats_reset": stats_reset}
+
+        release_details = {
+            "repaired_by": repaired_by,
+            "attempts": copy.deepcopy(attempts),
+            **copy.deepcopy(repair_result),
+        }
+        operational_state = _release_after_repair(
+            reason="operator_repair_complete",
+            details=release_details,
+        )
+        record.update({
+            "phase": "SUCCEEDED",
+            "completed_at_utc": _utc_now_z(),
+            "success": True,
+            "repaired_by": repaired_by,
+            "attempts": copy.deepcopy(attempts),
+            "result": copy.deepcopy(repair_result),
+            "operational_state": operational_state,
+            "next_action": "PHOTONS is usable now.",
+        })
+        with _state_lock:
+            _repair_success += 1
+            _last_repair = copy.deepcopy(record)
+        logging.critical("🧯 [photons] REPAIR completed using %s", repaired_by)
+    except Exception as exc:
+        record.update({
+            "phase": "FAILED",
+            "completed_at_utc": _utc_now_z(),
+            "success": False,
+            "error": str(exc),
+            "attempts": copy.deepcopy(attempts),
+        })
+        with _state_lock:
+            _repair_failures += 1
+            _last_repair = copy.deepcopy(record)
+        if not _hard_failure_active():
+            _enter_hard_failure(
+                "operator_repair_failed",
+                {"error": str(exc), "attempts": copy.deepcopy(attempts)},
+                source="PHOTONS.REPAIR",
+            )
+        logging.exception("🛑 [photons] REPAIR failed; PHOTONS remains fail-closed")
+    finally:
+        _repair_event.clear()
+
+
+def cmd_repair(_: Optional[dict]) -> Dict[str, Any]:
+    """Diagnose and repair known PHOTONS wedges without operator mode arguments."""
+    global _repair_requests, _repair_failures, _last_repair
+
+    state = _operational_state_snapshot()
+    state_name = str(state.get("state") or "").strip().upper()
+    if (
+        state_name == OPERATIONAL_STATE_RUNNING
+        and _campaign_control_ready.is_set()
+        and not _hard_failure_active()
+        and not _runtime_recovery_hold.is_set()
+    ):
+        checkpoint = _ppb_checkpoint_report_surface().get("checkpoint")
+        return {
+            "success": True,
+            "message": "PHOTONS is already RUNNING; no repair required",
+            "payload": {
+                "action": "NO_ACTION_HEALTHY",
+                "operational_state": state,
+                "campaign_control_ready": True,
+                "checkpoint_recoverable": (
+                    bool(checkpoint.get("recoverable")) if isinstance(checkpoint, dict) else None
+                ),
+                "checkpoint_status": (
+                    checkpoint.get("status") if isinstance(checkpoint, dict) else None
+                ),
+            },
+        }
+
+    with _repair_lock:
+        if _repair_active():
+            with _state_lock:
+                current = copy.deepcopy(_last_repair or {})
+            return {
+                "success": True,
+                "message": "PHOTONS REPAIR is already in progress",
+                "payload": current,
+            }
+        if _stats_reset_in_progress.is_set():
+            return {
+                "success": False,
+                "message": "PHOTONS REPAIR deferred while an explicit STATS_RESET owns the statistics boundary",
+            }
+
+        requested_at = _utc_now_z()
+        record = {
+            "schema": "PI_PHOTONS_REPAIR_V1",
+            "requested_at_utc": requested_at,
+            "phase": "IN_PROGRESS",
+            "success": None,
+            "trigger_state": state_name,
+            "trigger_reason": state.get("reason"),
+            "operator_arguments_required": False,
+            "implicit_statistics_reset_allowed": True,
+            "repair_policy": "LIVE_REACQUIRE_THEN_STATS_RESET_OR_PHASE5",
+            "next_action": "Wait for PHOTONS.REPORT.repair.success=true.",
+        }
+        with _state_lock:
+            _repair_requests += 1
+            _last_repair = copy.deepcopy(record)
+        _repair_event.set()
+        try:
+            threading.Thread(
+                target=_repair_worker,
+                kwargs={"trigger_state": copy.deepcopy(state), "record": record},
+                daemon=True,
+                name="photons-repair",
+            ).start()
+        except Exception as exc:
+            _repair_event.clear()
+            record.update({
+                "phase": "FAILED_TO_START",
+                "completed_at_utc": _utc_now_z(),
+                "success": False,
+                "error": str(exc),
+            })
+            with _state_lock:
+                _repair_failures += 1
+                _last_repair = copy.deepcopy(record)
+            return {
+                "success": False,
+                "message": f"PHOTONS REPAIR could not start repair worker: {exc}",
+                "payload": record,
+            }
+
+    return {
+        "success": True,
+        "message": "PHOTONS REPAIR accepted",
+        "payload": copy.deepcopy(record),
+    }
+
+
 COMMANDS = {
     "START": cmd_start,
     "FLASH_CUT": cmd_flash_cut,
@@ -9044,6 +9351,7 @@ COMMANDS = {
     "REPORT_STATS": cmd_report_stats,
     "REPORT_RECOVERY": cmd_report_recovery,
     "STATS_RESET": cmd_stats_reset,
+    "REPAIR": cmd_repair,
     "CLEAR": cmd_clear,
     "DELETE": cmd_delete,
     "TRUNCATE": cmd_truncate,
@@ -9066,7 +9374,7 @@ _HARD_FAILURE_READ_ONLY_COMMANDS = {
 }
 
 
-_STATS_RESET_ALLOWED_COMMANDS = _HARD_FAILURE_READ_ONLY_COMMANDS | {"STATS_RESET"}
+_STATS_RESET_ALLOWED_COMMANDS = _HARD_FAILURE_READ_ONLY_COMMANDS | {"STATS_RESET", "REPAIR"}
 
 
 def _stats_reset_guard_command(
@@ -9096,7 +9404,11 @@ def _hard_failure_guard_command(
     handler,
 ):
     def guarded(args: Optional[dict]) -> Dict[str, Any]:
-        if _hard_failure_active() and command not in _HARD_FAILURE_READ_ONLY_COMMANDS:
+        if (
+            _hard_failure_active()
+            and command not in _HARD_FAILURE_READ_ONLY_COMMANDS
+            and command != "REPAIR"
+        ):
             return {
                 "success": False,
                 "message": f"PHOTONS.{command} refused: subsystem is latched in HARD_FAILURE",
@@ -9202,6 +9514,7 @@ def _startup_phase5_recovery_with_generation_retry() -> Tuple[Dict[str, Any], in
 def run() -> None:
     setup_logging()
     _hard_failure_event.clear()
+    _repair_event.clear()
     _set_operational_state(
         OPERATIONAL_STATE_STARTING,
         reason="process_start",

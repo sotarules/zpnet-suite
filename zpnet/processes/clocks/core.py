@@ -508,10 +508,10 @@ _diag: Dict[str, Any] = {
     "hard_failure_state_dropped": 0,
     "hard_failure_persistence_dropped": 0,
     "hard_failure_campaign_rows_dropped": 0,
-    "hard_failure_stats_repair_requests": 0,
-    "hard_failure_stats_repair_success": 0,
-    "hard_failure_stats_repair_failures": 0,
-    "last_hard_failure_stats_repair": {},
+    "repair_requests": 0,
+    "repair_success": 0,
+    "repair_failures": 0,
+    "last_repair": {},
     "last_hard_failure_hold": {},
 
     # Lawful Alpha lineage surrender. Exact resurrection may be impossible
@@ -2478,14 +2478,12 @@ _operational_state: Dict[str, Any] = {
 }
 _hard_failure_event = threading.Event()
 _hard_failure_lock = threading.Lock()
-# HARD_FAILURE normally closes the entire scientific data plane.  One narrowly
-# scoped operator repair may temporarily reopen only enough CLOCKS ingress and
-# persistence to establish row 1 of a brand-new transitive statistics epoch.
-# The HARD_FAILURE latch itself is never cleared by this repair; a normal process
-# restart is still required before CLOCKS can resume ordinary authorship.
+# HARD_FAILURE normally closes the entire scientific data plane.  One operator REPAIR transaction may temporarily reopen enough CLOCKS ingress and
+# persistence to establish row 1 of a replacement statistics epoch.  REPAIR owns
+# the authority to clear HARD_FAILURE after it proves a usable replacement lineage.
 _hard_failure_stats_repair_event = threading.Event()
 _hard_failure_stats_repair_lock = threading.Lock()
-_HARD_FAILURE_STATS_REPAIR_REASONS = {
+_DESTRUCTIVE_REPAIR_REASONS = {
     "dac_restore_population_ancestry_impossible",
     "dac_recovery_boundary_population_ancestry_impossible",
     # Exact Alpha resurrection loss is handled automatically as a lawful lineage
@@ -15139,11 +15137,12 @@ def cmd_stats_reset(_: Optional[dict]) -> Dict[str, Any]:
 
     return {"success": True, "message": "OK", "payload": accepted}
 
-def _destructive_hard_failure_lineage_reset() -> Dict[str, Any]:
+def _destructive_repair_lineage_reset() -> Dict[str, Any]:
     """Irrevocably abandon every durable TEMPEST/CLOCKS restore ancestor.
 
     This is the terminal escape hatch for an information-theoretically dead
-    statistics lineage.  The operator has already authorized RESET_CLOCK_STATISTICS;
+    statistics lineage.  The operator invoked CLOCKS.REPAIR; the repair planner selected a destructive
+    statistics-lineage cut because no narrower known remedy is sufficient.
     preserving a campaign namespace or stale CLOCKS_RECOVERY owner across that
     boundary would merely allow the next process lifetime to rediscover the poison.
     """
@@ -15154,7 +15153,7 @@ def _destructive_hard_failure_lineage_reset() -> Dict[str, Any]:
     global _recovery_custody_regression_witness, _recovery_custody_last_checkpoint
 
     _request_teensy_stop_best_effort()
-    _request_teensy_recover_abort_best_effort("hard_failure_statistics_lineage_repair")
+    _request_teensy_recover_abort_best_effort("operator_repair_destructive_lineage_reset")
     _campaign_active = False
     _clear_start_wait_state()
     _clear_flash_cut_wait_state()
@@ -15183,7 +15182,7 @@ def _destructive_hard_failure_lineage_reset() -> Dict[str, Any]:
 
     with _ppb_checkpoint_lock:
         _ppb_checkpoint_runtime = _ppb_checkpoint_new_runtime(
-            reason="DESTRUCTIVE_HARD_FAILURE_LINEAGE_RESET"
+            reason="DESTRUCTIVE_REPAIR_LINEAGE_RESET"
         )
 
     with _clocks_persistence_lock:
@@ -15216,7 +15215,7 @@ def _destructive_hard_failure_lineage_reset() -> Dict[str, Any]:
     }
 
 
-def _release_hard_failure_after_stats_repair(
+def _release_after_repair(
     *,
     reason: str,
     details: Dict[str, Any],
@@ -15234,7 +15233,7 @@ def _release_hard_failure_after_stats_repair(
                 "state": OPERATIONAL_STATE_RUNNING,
                 "entered_at_utc": now_utc,
                 "reason": str(reason),
-                "source": "CLOCKS.REPAIR_STATS_EPOCH",
+                "source": "CLOCKS.REPAIR",
                 "details": copy.deepcopy(details),
             }
             snapshot = copy.deepcopy(_operational_state)
@@ -15246,168 +15245,175 @@ def _release_hard_failure_after_stats_repair(
     return snapshot
 
 
+def _repair_fresh_epoch_witness(epoch: Dict[str, Any]) -> Dict[str, Any]:
+    """Prove row 1 of the replacement statistics epoch is durably usable."""
+    new_reset_count = int(epoch["reset_count"])
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, payload
+            FROM campaign_detail
+            WHERE campaign_type = %s
+              AND payload #>> '{schema}' = 'CLOCKS_V4'
+              AND (payload #>> '{clocks,stats,reset_count}')::bigint = %s
+              AND (payload #>> '{clocks,stats,update_count}')::bigint = 1
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (CAMPAIGN_TYPE_TEMPEST, new_reset_count),
+        )
+        row = cur.fetchone()
+
+    if row is None:
+        raise RuntimeError(
+            "fresh statistics epoch reported durable row 1 but PostgreSQL witness is missing"
+        )
+    durable = row["payload"]
+    if isinstance(durable, str):
+        durable = json.loads(durable)
+    if not isinstance(durable, dict):
+        raise RuntimeError("fresh statistics epoch row 1 payload is not an object")
+
+    ancestry = _dac_restore_population_ancestry_court(_clocks_payload(durable))
+    if not ancestry.get("available") or not ancestry.get("valid"):
+        raise RuntimeError(
+            "fresh statistics epoch row 1 failed DAC/OCXO population ancestry court: "
+            f"{ancestry!r}"
+        )
+    return {
+        "new_reset_count": new_reset_count,
+        "first_durable_update_count": 1,
+        "first_durable_detail_id": int(row["id"]),
+        "population_ancestry": copy.deepcopy(ancestry),
+    }
+
+
 def _hard_failure_stats_repair_worker(
     *,
     state: Dict[str, Any],
-    confirmation: str,
     repair_record: Dict[str, Any],
 ) -> None:
-    """Destroy the dead lineage, establish a fresh epoch, and resume in-process."""
+    """Execute the repair plan selected by CLOCKS.REPAIR and prove service release."""
     repaired = False
-    lineage_reset: Dict[str, Any] = {}
+    reset_details: Dict[str, Any] = {}
+    strategy = str(repair_record.get("strategy") or "")
     try:
-        repair_record["phase"] = "DESTROYING_DEAD_LINEAGE"
-        _diag["last_hard_failure_stats_repair"] = copy.deepcopy(repair_record)
-        lineage_reset = _destructive_hard_failure_lineage_reset()
-        repair_record["lineage_reset"] = copy.deepcopy(lineage_reset)
-
-        repair_record["phase"] = "RESETTING_STATISTICS"
-        _diag["last_hard_failure_stats_repair"] = copy.deepcopy(repair_record)
-        epoch = _establish_fresh_durable_stats_epoch(
-            source="CLOCKS.REPAIR_STATS_EPOCH",
-        )
-        new_reset_count = int(epoch["reset_count"])
-
-        with open_db(row_dict=True) as conn:
-            cur = conn.cursor()
-            cur.execute(
-                """
-                SELECT id, payload
-                FROM campaign_detail
-                WHERE campaign_type = %s
-                  AND payload #>> '{schema}' = 'CLOCKS_V4'
-                  AND (payload #>> '{clocks,stats,reset_count}')::bigint = %s
-                  AND (payload #>> '{clocks,stats,update_count}')::bigint = 1
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (CAMPAIGN_TYPE_TEMPEST, new_reset_count),
+        if strategy == "PRESERVE_HISTORY_FRESH_ALPHA":
+            repair_record["phase"] = "SURRENDERING_BROKEN_LINEAGE"
+            _diag["last_repair"] = copy.deepcopy(repair_record)
+            active_campaign = _get_active_campaign()
+            verdict = AlphaResurrectionImpossible(
+                "operator_repair_lineage_surrender",
+                {
+                    "operational_state": copy.deepcopy(state),
+                    "repair_strategy": strategy,
+                    "startup_control_ready": _startup_control_ready.is_set(),
+                },
             )
-            row = cur.fetchone()
-
-        if row is None:
-            raise RuntimeError(
-                "fresh statistics epoch reported durable row 1 but PostgreSQL witness is missing"
+            surrender = _surrender_unresurrectable_alpha_lineage(
+                verdict=verdict,
+                active_campaign=active_campaign,
+                source="CLOCKS.REPAIR",
             )
-        durable = row["payload"]
-        if isinstance(durable, str):
-            durable = json.loads(durable)
-        if not isinstance(durable, dict):
-            raise RuntimeError("fresh statistics epoch row 1 payload is not an object")
+            epoch = copy.deepcopy(surrender.get("fresh_epoch") or {})
+            if not epoch:
+                raise RuntimeError("lineage surrender did not return a fresh statistics epoch")
+            reset_details["lineage_surrender"] = copy.deepcopy(surrender)
+        elif strategy == "DESTRUCTIVE_STATS_LINEAGE_RESET":
+            repair_record["phase"] = "DESTROYING_DEAD_LINEAGE"
+            _diag["last_repair"] = copy.deepcopy(repair_record)
+            lineage_reset = _destructive_repair_lineage_reset()
+            reset_details["destructive_lineage_reset"] = copy.deepcopy(lineage_reset)
+            repair_record["phase"] = "RESETTING_STATISTICS"
+            _diag["last_repair"] = copy.deepcopy(repair_record)
+            epoch = _establish_fresh_durable_stats_epoch(source="CLOCKS.REPAIR")
+        else:
+            raise RuntimeError(f"unsupported CLOCKS.REPAIR strategy {strategy!r}")
 
-        ancestry = _dac_restore_population_ancestry_court(_clocks_payload(durable))
-        if not ancestry.get("available") or not ancestry.get("valid"):
-            raise RuntimeError(
-                "fresh statistics epoch row 1 failed DAC/OCXO population ancestry court: "
-                f"{ancestry!r}"
-            )
-
+        witness = _repair_fresh_epoch_witness(epoch)
         release_details = {
-            "destructive_lineage_reset": copy.deepcopy(lineage_reset),
-            "new_reset_count": new_reset_count,
-            "first_durable_update_count": 1,
-            "first_durable_detail_id": int(row["id"]),
-            "population_ancestry": copy.deepcopy(ancestry),
+            **copy.deepcopy(reset_details),
+            **copy.deepcopy(witness),
+            "strategy": strategy,
         }
-        operational_state = _release_hard_failure_after_stats_repair(
-            reason="hard_failure_statistics_lineage_repaired",
+        operational_state = _release_after_repair(
+            reason="operator_repair_complete",
             details=release_details,
         )
         repaired = True
 
         repair_record.update({
             "phase": "SUCCEEDED",
-            "completed_at_utc": datetime.now(timezone.utc)
-                .isoformat().replace("+00:00", "Z"),
+            "completed_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "success": True,
-            "new_reset_count": new_reset_count,
-            "first_durable_update_count": 1,
-            "first_durable_detail_id": int(row["id"]),
-            "population_ancestry": copy.deepcopy(ancestry),
+            **copy.deepcopy(witness),
             "stats_reset": copy.deepcopy(epoch.get("stats_reset") or {}),
+            "repair_details": copy.deepcopy(reset_details),
             "hard_failure_remains_latched": False,
             "restart_required": False,
             "operational_state": operational_state,
             "next_action": "CLOCKS is usable now; start a new campaign when desired.",
         })
-        _diag["hard_failure_stats_repair_success"] = (
-            _diag.get("hard_failure_stats_repair_success", 0) + 1
-        )
-        _diag["last_hard_failure_stats_repair"] = copy.deepcopy(repair_record)
+        _diag["repair_success"] = _diag.get("repair_success", 0) + 1
+        _diag["last_repair"] = copy.deepcopy(repair_record)
         logging.critical(
-            "🧯 [clocks] HARD_FAILURE statistics lineage amputated and service resumed: "
-            "reset_count=%d detail_id=%d population ancestry valid=%s; "
-            "old TEMPEST durability was destroyed and HARD_FAILURE is cleared.",
-            new_reset_count,
-            int(row["id"]),
-            bool(ancestry.get("valid")),
+            "🧯 [clocks] REPAIR completed: strategy=%s reset_count=%d detail_id=%d; service resumed",
+            strategy,
+            int(witness["new_reset_count"]),
+            int(witness["first_durable_detail_id"]),
         )
     except Exception as exc:
-        # Missing row-1 custody must never make the escape hatch itself terminal.
-        # The old durability domain was already destroyed, so no contradictory
-        # ancestor remains.  Erase any partial replacement rows/config and reopen
-        # ordinary persistence on the live producer; the next coherent row becomes
-        # the beginning of the new durability domain.
+        # REPAIR is the operator escape hatch. If the orderly lineage-preserving
+        # repair cannot prove a replacement row, amputate the entire continuation
+        # domain and reopen on the live producer rather than leaving CLOCKS wedged.
         logging.exception(
-            "⚠️ [clocks] exact fresh-row-1 proof failed during terminal repair; "
-            "falling back to empty-domain service restoration"
+            "⚠️ [clocks] selected REPAIR strategy failed; falling back to empty-domain service restoration"
         )
         try:
-            fallback_reset = _destructive_hard_failure_lineage_reset()
+            fallback_reset = _destructive_repair_lineage_reset()
             _clocks_epoch_birth_pending.clear()
             _clocks_epoch_birth_committed.clear()
             release_details = {
-                "destructive_lineage_reset": copy.deepcopy(lineage_reset),
+                "selected_strategy": strategy,
+                "selected_strategy_error": str(exc),
                 "fallback_lineage_reset": copy.deepcopy(fallback_reset),
-                "row1_proof_error": str(exc),
                 "durability_basis": "EMPTY_DOMAIN_NEXT_COHERENT_ROW",
             }
-            operational_state = _release_hard_failure_after_stats_repair(
-                reason="hard_failure_statistics_lineage_repaired_empty_domain_fallback",
+            operational_state = _release_after_repair(
+                reason="operator_repair_empty_domain_fallback",
                 details=release_details,
             )
             repaired = True
             repair_record.update({
                 "phase": "SUCCEEDED_EMPTY_DOMAIN_FALLBACK",
-                "completed_at_utc": datetime.now(timezone.utc)
-                    .isoformat().replace("+00:00", "Z"),
+                "completed_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "success": True,
-                "row1_proof_error": str(exc),
+                "selected_strategy_error": str(exc),
                 "fallback_lineage_reset": copy.deepcopy(fallback_reset),
                 "hard_failure_remains_latched": False,
                 "restart_required": False,
                 "operational_state": operational_state,
                 "next_action": (
-                    "CLOCKS is usable now; the next coherent live row begins the new "
-                    "durability domain. Start a new campaign when desired."
+                    "CLOCKS is usable now; the next coherent live row begins the new durability domain."
                 ),
             })
-            _diag["hard_failure_stats_repair_success"] = (
-                _diag.get("hard_failure_stats_repair_success", 0) + 1
-            )
-            _diag["last_hard_failure_stats_repair"] = copy.deepcopy(repair_record)
+            _diag["repair_success"] = _diag.get("repair_success", 0) + 1
+            _diag["last_repair"] = copy.deepcopy(repair_record)
             logging.critical(
-                "🧯 [clocks] HARD_FAILURE cleared through empty-domain fallback; "
-                "all prior TEMPEST/CLOCKS restore ancestry is gone and ordinary "
-                "persistence is reopened."
+                "🧯 [clocks] REPAIR recovered through empty-domain fallback; prior restore ancestry is retired"
             )
         except Exception as fallback_exc:
             repair_record.update({
                 "phase": "FAILED",
-                "completed_at_utc": datetime.now(timezone.utc)
-                    .isoformat().replace("+00:00", "Z"),
+                "completed_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "success": False,
                 "error": str(exc),
                 "fallback_error": str(fallback_exc),
             })
-            _diag["hard_failure_stats_repair_failures"] = (
-                _diag.get("hard_failure_stats_repair_failures", 0) + 1
-            )
-            _diag["last_hard_failure_stats_repair"] = copy.deepcopy(repair_record)
-            logging.exception(
-                "🛑 [clocks] terminal lineage repair could not reset durable storage; "
-                "HARD_FAILURE remains latched"
-            )
+            _diag["repair_failures"] = _diag.get("repair_failures", 0) + 1
+            _diag["last_repair"] = copy.deepcopy(repair_record)
+            logging.exception("🛑 [clocks] REPAIR failed; CLOCKS remains fail-closed")
     finally:
         _hard_failure_stats_repair_event.clear()
         _clocks_epoch_birth_pending.clear()
@@ -15415,127 +15421,112 @@ def _hard_failure_stats_repair_worker(
             _clocks_persistence_enabled.clear()
 
 
-def cmd_repair_stats_epoch(args: Optional[dict]) -> Dict[str, Any]:
-    """Accept one explicit terminal-lineage repair and execute it asynchronously.
-
-    The command returns as soon as the narrowly scoped repair worker owns the
-    HARD_FAILURE repair lane. CLOCKS.REPORT exposes the authoritative progress
-    and terminal result under ``stats_epoch_repair``.
-    """
-    if not _hard_failure_active():
-        return {
-            "success": False,
-            "message": "REPAIR_STATS_EPOCH is available only while CLOCKS is in HARD_FAILURE",
-        }
-
+def cmd_repair(_: Optional[dict]) -> Dict[str, Any]:
+    """Diagnose known CLOCKS wedges and execute the least-destructive known repair."""
     state = _operational_state_snapshot()
+    state_name = str(state.get("state") or "").strip().upper()
     failure_reason = str(state.get("reason") or "")
-    if failure_reason not in _HARD_FAILURE_STATS_REPAIR_REASONS:
-        return {
-            "success": False,
-            "message": (
-                "REPAIR_STATS_EPOCH refuses this HARD_FAILURE reason; "
-                "only proved terminal statistics-lineage loss is repairable"
-            ),
-            "payload": {
-                "hard_failure_reason": failure_reason,
-                "repairable_reasons": sorted(_HARD_FAILURE_STATS_REPAIR_REASONS),
-                "operational_state": state,
-            },
-        }
+    startup_ready = _startup_control_ready.is_set()
 
-    confirmation = str((args or {}).get("confirm") or "").strip().upper()
-    if confirmation != "RESET_CLOCK_STATISTICS":
+    if (
+        state_name == OPERATIONAL_STATE_RUNNING
+        and startup_ready
+        and not _hard_failure_active()
+    ):
+        with _ppb_checkpoint_lock:
+            checkpoint = _ppb_checkpoint_snapshot_locked(
+                _ppb_checkpoint_runtime_ensure_locked()
+            )
         return {
-            "success": False,
-            "message": (
-                "REPAIR_STATS_EPOCH requires confirm=RESET_CLOCK_STATISTICS; "
-                "the repair intentionally starts a new systemwide CLOCKS statistics epoch"
-            ),
+            "success": True,
+            "message": "CLOCKS is already RUNNING; no repair required",
             "payload": {
-                "hard_failure_reason": failure_reason,
-                "required_confirmation": "RESET_CLOCK_STATISTICS",
+                "action": "NO_ACTION_HEALTHY",
+                "operational_state": state,
+                "startup_control_ready": True,
+                "checkpoint_recoverable": bool(checkpoint.get("recoverable")),
+                "checkpoint_status": checkpoint.get("status"),
             },
         }
 
     with _hard_failure_stats_repair_lock:
         if _hard_failure_stats_repair_active():
-            current = copy.deepcopy(
-                _diag.get("last_hard_failure_stats_repair") or {}
-            )
             return {
                 "success": True,
-                "message": "REPAIR_STATS_EPOCH is already in progress",
-                "payload": current,
+                "message": "CLOCKS REPAIR is already in progress",
+                "payload": copy.deepcopy(_diag.get("last_repair") or {}),
             }
-        if _auto_recovery_in_progress or _timebase_silence_recovery_active:
+        if _stats_reset_in_progress.is_set():
             return {
                 "success": False,
-                "message": "REPAIR_STATS_EPOCH refused while automatic recovery is still active",
+                "message": "CLOCKS REPAIR deferred while an explicit STATS_RESET owns the epoch boundary",
+                "payload": {"last_stats_reset": copy.deepcopy(_diag.get("last_stats_reset") or {})},
+            }
+        if _auto_recovery_in_progress or _timebase_silence_recovery_active or _ambient_instrument_recovery_active.is_set():
+            return {
+                "success": False,
+                "message": "CLOCKS REPAIR deferred while an automatic recovery transaction is actively progressing",
+                "payload": {
+                    "auto_recovery_in_progress": bool(_auto_recovery_in_progress),
+                    "timebase_silence_recovery_active": bool(_timebase_silence_recovery_active),
+                    "ambient_instrument_recovery_active": _ambient_instrument_recovery_active.is_set(),
+                },
             }
 
-        requested_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        _diag["hard_failure_stats_repair_requests"] = (
-            _diag.get("hard_failure_stats_repair_requests", 0) + 1
+        strategy = (
+            "DESTRUCTIVE_STATS_LINEAGE_RESET"
+            if _hard_failure_active() and failure_reason in _DESTRUCTIVE_REPAIR_REASONS
+            else "PRESERVE_HISTORY_FRESH_ALPHA"
         )
+        requested_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        _diag["repair_requests"] = _diag.get("repair_requests", 0) + 1
         repair_record: Dict[str, Any] = {
-            "schema": "PI_CLOCKS_HARD_FAILURE_STATS_REPAIR_V2",
+            "schema": "PI_CLOCKS_REPAIR_V1",
             "requested_at_utc": requested_at,
-            "hard_failure_reason": failure_reason,
-            "hard_failure_entered_at_utc": state.get("entered_at_utc"),
-            "confirmation": confirmation,
             "phase": "IN_PROGRESS",
             "success": None,
-            "hard_failure_remains_latched": True,
-            "restart_required": False,
-            "destructive": True,
-            "next_action": (
-                "Wait for stats_epoch_repair.success=true in CLOCKS.REPORT; "
-                "the repair itself returns CLOCKS to service."
-            ),
+            "strategy": strategy,
+            "trigger_state": state_name,
+            "trigger_reason": failure_reason,
+            "startup_control_ready": startup_ready,
+            "destructive": strategy == "DESTRUCTIVE_STATS_LINEAGE_RESET",
+            "implicit_statistics_reset_allowed": True,
+            "operator_arguments_required": False,
+            "next_action": "Wait for CLOCKS.REPORT.repair.success=true.",
         }
-        _diag["last_hard_failure_stats_repair"] = copy.deepcopy(repair_record)
-
-        # Set ownership before starting the worker so a second command cannot race
-        # between thread creation and the first worker instruction.
+        _diag["last_repair"] = copy.deepcopy(repair_record)
         _hard_failure_stats_repair_event.set()
         try:
             threading.Thread(
                 target=_hard_failure_stats_repair_worker,
                 kwargs={
                     "state": copy.deepcopy(state),
-                    "confirmation": confirmation,
                     "repair_record": repair_record,
                 },
                 daemon=True,
-                name="clocks-hard-failure-stats-repair",
+                name="clocks-repair",
             ).start()
         except Exception as exc:
             _hard_failure_stats_repair_event.clear()
             repair_record.update({
                 "phase": "FAILED_TO_START",
                 "success": False,
-                "completed_at_utc": datetime.now(timezone.utc)
-                    .isoformat().replace("+00:00", "Z"),
+                "completed_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "error": str(exc),
             })
-            _diag["hard_failure_stats_repair_failures"] = (
-                _diag.get("hard_failure_stats_repair_failures", 0) + 1
-            )
-            _diag["last_hard_failure_stats_repair"] = copy.deepcopy(repair_record)
+            _diag["repair_failures"] = _diag.get("repair_failures", 0) + 1
+            _diag["last_repair"] = copy.deepcopy(repair_record)
             return {
                 "success": False,
-                "message": f"REPAIR_STATS_EPOCH could not start repair worker: {exc}",
+                "message": f"CLOCKS REPAIR could not start repair worker: {exc}",
                 "payload": repair_record,
             }
 
     return {
         "success": True,
-        "message": "REPAIR_STATS_EPOCH accepted; repair is running",
+        "message": f"CLOCKS REPAIR accepted; selected {strategy}",
         "payload": copy.deepcopy(repair_record),
     }
-
-
 
 def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
     row = _get_active_campaign()
@@ -15561,9 +15552,10 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
                 "integrity_contract": contract,
                 "startup": _start_status_payload(),
                 "operational_state": _operational_state_snapshot(),
-                "stats_epoch_repair": copy.deepcopy(
-                    _diag.get("last_hard_failure_stats_repair") or {}
-                ),
+                "repair": {
+                    **copy.deepcopy(_diag.get("last_repair") or {}),
+                    "active": _hard_failure_stats_repair_active(),
+                },
                 "ppb_restore_checkpoint": copy.deepcopy(ppb_checkpoint),
             },
         }
@@ -15574,9 +15566,10 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
     payload["integrity_contract"] = contract
     payload["startup"] = _start_status_payload()
     payload["operational_state"] = _operational_state_snapshot()
-    payload["stats_epoch_repair"] = copy.deepcopy(
-        _diag.get("last_hard_failure_stats_repair") or {}
-    )
+    payload["repair"] = {
+        **copy.deepcopy(_diag.get("last_repair") or {}),
+        "active": _hard_failure_stats_repair_active(),
+    }
     payload["ppb_restore_checkpoint"] = copy.deepcopy(ppb_checkpoint)
     return {"success": True, "message": "OK", "payload": payload}
 
@@ -18007,7 +18000,7 @@ COMMANDS = {
     "REPORT_CLOCKS": cmd_report_clocks,
     "REPORT_STATS": cmd_report_stats,
     "STATS_RESET": cmd_stats_reset,
-    "REPAIR_STATS_EPOCH": cmd_repair_stats_epoch,
+    "REPAIR": cmd_repair,
     "CLEAR": cmd_clear,
     "DELETE": cmd_delete,
     "TRUNCATE": cmd_truncate,
@@ -18033,11 +18026,11 @@ _HARD_FAILURE_READ_ONLY_COMMANDS = {
     "CLOCKS_INFO",
 }
 _HARD_FAILURE_OPERATOR_REPAIR_COMMANDS = {
-    "REPAIR_STATS_EPOCH",
+    "REPAIR",
 }
 
 
-_STATS_RESET_ALLOWED_COMMANDS = _HARD_FAILURE_READ_ONLY_COMMANDS | {"STATS_RESET"}
+_STATS_RESET_ALLOWED_COMMANDS = _HARD_FAILURE_READ_ONLY_COMMANDS | {"STATS_RESET", "REPAIR"}
 
 
 def _stats_reset_guard_command(
@@ -18277,11 +18270,21 @@ def run() -> None:
                 "for read-only diagnostics; persistence/control stay closed"
             )
         elif _startup_clocks_custody_unresolved():
-            _startup_control_ready.clear()
-            _diag["startup_control_ready"] = False
+            details = {
+                "startup_custody_unresolved": True,
+                "startup_instrument_restore_hold": _startup_instrument_restore_hold.is_set(),
+                "holistic_restore_proof_pending": _clocks_holistic_restore_proof_pending.is_set(),
+                "holistic_restore_proof_committed": _clocks_holistic_restore_proof_committed.is_set(),
+                "action": "Run CLOCKS.REPAIR; unresolved startup custody may not remain indefinitely RECOVERING.",
+            }
             logging.error(
-                "💥 [clocks] startup reconciliation incomplete — CLOCKS persistence and "
-                "START/RESUME remain closed while retained startup evidence is unresolved"
+                "💥 [clocks] startup reconciliation returned with unresolved custody — "
+                "promoting RECOVERING limbo to HARD_FAILURE so CLOCKS.REPAIR has explicit authority"
+            )
+            _enter_hard_failure(
+                "startup_reconciliation_custody_unresolved",
+                details,
+                source="RUN_HOLISTIC_RESTORE_FINALIZER",
             )
         else:
             _clocks_persistence_enabled.set()
