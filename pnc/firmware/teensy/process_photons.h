@@ -207,6 +207,9 @@ enum class photons_lap_science_exclusion_reason_t : uint16_t {
 
 
 struct photons_lap_science_population_snapshot_t {
+  // ACCEPT owns these fields directly.  For the excluded population they are
+  // publication-only conveniences derived from the exclusion-reason ledger;
+  // PHOTONS never advances a second mutable aggregate exclusion counter.
   uint64_t count = 0;
   uint32_t count_this_fragment = 0;
 
@@ -220,6 +223,8 @@ struct photons_lap_science_population_snapshot_t {
 
 
 struct photons_lap_science_reason_counts_snapshot_t {
+  // Sole authority for the excluded population.  Every SCIENCE_EXCLUDE owns
+  // exactly one reason, so excluded.count is sum(these three counters).
   uint64_t projection_invalid = 0;
   uint64_t seed_disagreement = 0;
   uint64_t raw_cycle_excursion = 0;

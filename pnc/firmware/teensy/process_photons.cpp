@@ -286,6 +286,9 @@ static volatile bool g_raw_lap_ring_data_loss = false;
 
 static photons_fragment_raw_cycles_snapshot_t g_raw_cycles_state{};
 static photons_fragment_projection_snapshot_t g_projection_state{};
+// Runtime exclusion authority lives only in exclusion_reasons + Welford witnesses.
+// excluded.count/count_this_fragment are left non-authoritative here and materialized
+// only into immutable publication/report snapshots.
 static photons_lap_science_snapshot_t g_photons_lap_science_state{};
 static photons_lap_science_candidate_t g_photons_lap_science_seed_pending{};
 
@@ -1583,6 +1586,72 @@ static void photons_lap_science_count_exclusion_reason(
 }
 
 
+// Exclusion population has one authority: the authored reason ledger.  The
+// aggregate excluded counts carried by PHOTONS_FRAGMENT remain convenient schema
+// fields, but they are derived testimony and are never independently advanced.
+static uint64_t photons_lap_science_excluded_count_from_reasons(
+    const photons_lap_science_reason_counts_snapshot_t& reasons) {
+  if (UINT64_MAX - reasons.projection_invalid < reasons.seed_disagreement) {
+    __builtin_trap();
+  }
+  const uint64_t partial =
+      reasons.projection_invalid + reasons.seed_disagreement;
+  if (UINT64_MAX - partial < reasons.raw_cycle_excursion) {
+    __builtin_trap();
+  }
+  return partial + reasons.raw_cycle_excursion;
+}
+
+
+static uint32_t photons_lap_science_excluded_this_fragment_from_reasons(
+    const photons_lap_science_reason_counts_snapshot_t& reasons) {
+  const uint64_t total =
+      (uint64_t)reasons.projection_invalid_this_fragment +
+      (uint64_t)reasons.seed_disagreement_this_fragment +
+      (uint64_t)reasons.raw_cycle_excursion_this_fragment;
+  if (total > (uint64_t)UINT32_MAX) __builtin_trap();
+  return (uint32_t)total;
+}
+
+
+static void photons_lap_science_validate_exclusion_ledger(
+    const photons_lap_science_snapshot_t& science) {
+  const uint64_t excluded_count =
+      photons_lap_science_excluded_count_from_reasons(
+          science.exclusion_reasons);
+
+  // Every finalized exclusion enters the raw-cycle Welford exactly once.  Its N
+  // is an independent witness, not a second exclusion-count authority.
+  if (science.excluded.raw_cycles.n != excluded_count ||
+      science.excluded.projected_lap_ns.n > excluded_count) {
+    __builtin_trap();
+  }
+
+  if (UINT64_MAX - science.accepted.count < excluded_count) {
+    __builtin_trap();
+  }
+  const uint64_t finalized_count =
+      science.accepted.count + excluded_count;
+  const uint64_t pending_count = science.seed_pending ? 1ULL : 0ULL;
+  if (UINT64_MAX - finalized_count < pending_count ||
+      science.candidate_count != finalized_count + pending_count) {
+    __builtin_trap();
+  }
+}
+
+
+static void photons_lap_science_materialize_derived_exclusion_counts(
+    photons_lap_science_snapshot_t& science) {
+  photons_lap_science_validate_exclusion_ledger(science);
+  science.excluded.count =
+      photons_lap_science_excluded_count_from_reasons(
+          science.exclusion_reasons);
+  science.excluded.count_this_fragment =
+      photons_lap_science_excluded_this_fragment_from_reasons(
+          science.exclusion_reasons);
+}
+
+
 static void photons_lap_science_exclude(
     const photons_lap_science_candidate_t& candidate,
     photons_lap_science_exclusion_reason_t reason,
@@ -1590,8 +1659,8 @@ static void photons_lap_science_exclude(
     uint32_t prediction_cycles,
     int32_t residual_cycles,
     uint32_t gate_cycles) {
-  g_photons_lap_science_state.excluded.count++;
-  g_photons_lap_science_state.excluded.count_this_fragment++;
+  // The reason ledger is the sole exclusion-population authority.  Do not
+  // maintain a parallel aggregate counter here; it is derived at snapshot time.
   photons_lap_science_count_exclusion_reason(reason);
 
   photons_welford_update(
@@ -1710,7 +1779,6 @@ static photons_fragment_drain_result_t photons_drain_raw_laps(void) {
 
   g_photons_lap_science_state.candidates_this_fragment = 0U;
   g_photons_lap_science_state.accepted.count_this_fragment = 0U;
-  g_photons_lap_science_state.excluded.count_this_fragment = 0U;
   g_photons_lap_science_state.exclusion_reasons.projection_invalid_this_fragment = 0U;
   g_photons_lap_science_state.exclusion_reasons.seed_disagreement_this_fragment = 0U;
   g_photons_lap_science_state.exclusion_reasons.raw_cycle_excursion_this_fragment = 0U;
@@ -1849,6 +1917,12 @@ static photons_fragment_drain_result_t photons_drain_raw_laps(void) {
       photons_welford_snapshot(g_excluded_raw_cycles_welford);
   g_photons_lap_science_state.excluded.projected_lap_ns =
       photons_welford_snapshot(g_excluded_lap_time_welford);
+
+  // The mutable runtime never owns excluded.count.  Prove the reason ledger
+  // against the independent excluded raw-Welford population before it can leave
+  // the science court.
+  photons_lap_science_validate_exclusion_ledger(
+      g_photons_lap_science_state);
 
   return result;
 }
@@ -2715,9 +2789,16 @@ static Payload& photons_fragment_payload(
   science.add_object("accepted", accepted);
   accepted.clear();
 
-  excluded.add("count", f.science.excluded.count);
-  excluded.add("count_this_fragment",
-               f.science.excluded.count_this_fragment);
+  // Re-derive on the wire boundary as well: even the convenience fields in the
+  // immutable snapshot are not granted exclusion-population authority.
+  excluded.add(
+      "count",
+      photons_lap_science_excluded_count_from_reasons(
+          f.science.exclusion_reasons));
+  excluded.add(
+      "count_this_fragment",
+      photons_lap_science_excluded_this_fragment_from_reasons(
+          f.science.exclusion_reasons));
   photons_payload_add_welford(
       excluded, "raw_cycles", f.science.excluded.raw_cycles);
   photons_payload_add_welford(
@@ -3084,6 +3165,9 @@ static void photons_fragment_tick(
   fragment.raw_cycles = g_raw_cycles_state;
   fragment.projection = g_projection_state;
   fragment.science = g_photons_lap_science_state;
+  // Materialize schema convenience counts only in the immutable publication
+  // snapshot.  They are functions of the reason ledger, never mutable authority.
+  photons_lap_science_materialize_derived_exclusion_counts(fragment.science);
 
   fragment.stats.reset_count = g_photons_stats_reset_count;
   fragment.stats.update_count = ++g_photons_stats_update_count;
@@ -4019,8 +4103,20 @@ static void photons_recovery_install_science_state(
     const photons_welford_state_t& accepted_raw,
     const photons_welford_state_t& excluded_raw,
     const photons_welford_state_t& excluded_projected) {
-  if (UINT64_MAX - accepted_count < excluded_count) __builtin_trap();
-  const uint64_t candidate_count = accepted_count + excluded_count;
+  photons_lap_science_reason_counts_snapshot_t recovery_reasons{};
+  recovery_reasons.projection_invalid = projection_invalid;
+  recovery_reasons.seed_disagreement = seed_disagreement;
+  recovery_reasons.raw_cycle_excursion = raw_cycle_excursion;
+  const uint64_t derived_excluded_count =
+      photons_lap_science_excluded_count_from_reasons(recovery_reasons);
+  if (excluded_count != derived_excluded_count ||
+      excluded_raw.n != derived_excluded_count ||
+      excluded_projected.n > derived_excluded_count ||
+      UINT64_MAX - accepted_count < derived_excluded_count) {
+    __builtin_trap();
+  }
+  const uint64_t candidate_count =
+      accepted_count + derived_excluded_count;
 
   g_raw_cycles_state = photons_fragment_raw_cycles_snapshot_t{};
   g_raw_cycles_state.valid = candidate_count != 0ULL;
@@ -4035,7 +4131,8 @@ static void photons_recovery_install_science_state(
   g_photons_lap_science_state.valid = candidate_count != 0ULL;
   g_photons_lap_science_state.candidate_count = candidate_count;
   g_photons_lap_science_state.accepted.count = accepted_count;
-  g_photons_lap_science_state.excluded.count = excluded_count;
+  // excluded_count is recovery testimony only.  The installed producer derives
+  // its aggregate exclusion population from the three reason counters below.
   g_photons_lap_science_state.exclusion_reasons.projection_invalid =
       projection_invalid;
   g_photons_lap_science_state.exclusion_reasons.seed_disagreement =
@@ -4054,6 +4151,12 @@ static void photons_recovery_install_science_state(
   // Predictor, last-candidate testimony, reject streak, and pending seed are
   // intentionally fresh.  The first post-restart laps reacquire them physically.
   g_photons_lap_science_seed_pending = photons_lap_science_candidate_t{};
+
+  // RECOVERY_COMMIT already proved excluded_count == sum(reasons).  Prove the
+  // installed state again from its sole authority and independent raw-Welford N;
+  // do not install the redundant aggregate as producer state.
+  photons_lap_science_validate_exclusion_ledger(
+      g_photons_lap_science_state);
 }
 
 
@@ -4144,18 +4247,21 @@ static FLASHMEM Payload cmd_recovery_commit(const Payload& args) {
         "aggregate recovery state is missing, malformed, or mismatched");
   }
 
+  photons_lap_science_reason_counts_snapshot_t recovery_reasons{};
+  recovery_reasons.projection_invalid = projection_invalid;
+  recovery_reasons.seed_disagreement = seed_disagreement;
+  recovery_reasons.raw_cycle_excursion = raw_cycle_excursion;
+  const uint64_t derived_excluded_count =
+      photons_lap_science_excluded_count_from_reasons(recovery_reasons);
+
   if (accepted_count == 0ULL || stats_lap_count != accepted_count ||
       stats_total_ns == 0ULL || custody_lap_count < stats_lap_count ||
       custody_total_ns < stats_total_ns ||
       accepted_projected.n != accepted_count ||
       accepted_raw.n != accepted_count ||
-      excluded_raw.n != excluded_count ||
-      excluded_projected.n > excluded_count ||
-      projection_invalid > excluded_count ||
-      seed_disagreement > excluded_count ||
-      raw_cycle_excursion > excluded_count ||
-      projection_invalid + seed_disagreement + raw_cycle_excursion !=
-          excluded_count) {
+      excluded_count != derived_excluded_count ||
+      excluded_raw.n != derived_excluded_count ||
+      excluded_projected.n > derived_excluded_count) {
     return photons_recovery_reject(
         "recovery_commit_rejected_accounting",
         "aggregate population accounting does not close");
@@ -4810,7 +4916,10 @@ static FLASHMEM Payload cmd_report_stats(const Payload& /*args*/) {
         toFixedDecimal(canonical.stats.lap_time_welford.stderr_value, 6));
   p.add("science_candidate_count", canonical.science.candidate_count);
   p.add("science_accepted_count", canonical.science.accepted.count);
-  p.add("science_excluded_count", canonical.science.excluded.count);
+  p.add(
+      "science_excluded_count",
+      photons_lap_science_excluded_count_from_reasons(
+          canonical.science.exclusion_reasons));
   p.add("science_exclusion_projection_invalid",
         canonical.science.exclusion_reasons.projection_invalid);
   p.add("science_exclusion_seed_disagreement",
