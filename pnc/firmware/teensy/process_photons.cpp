@@ -2451,29 +2451,51 @@ bool photons_fragment_snapshot(photons_fragment_snapshot_t* out) {
 // PHOTONS_FRAGMENT canonical publication
 // ============================================================================
 
-// Reused RAM2 Payload headers.  CLOCKS learned the hard way that rich nested
-// diagnostics do not belong on the small DTCM stack.
-static Payload g_photons_fragment_root DMAMEM;
-static Payload g_photons_fragment_instrument DMAMEM;
-static Payload g_photons_fragment_race DMAMEM;
-static Payload g_photons_fragment_raw_cycles DMAMEM;
-static Payload g_photons_fragment_projection DMAMEM;
-static Payload g_photons_fragment_science DMAMEM;
-static Payload g_photons_fragment_science_accepted DMAMEM;
-static Payload g_photons_fragment_science_excluded DMAMEM;
-static Payload g_photons_fragment_science_reasons DMAMEM;
-static Payload g_photons_fragment_stats DMAMEM;
-static Payload g_photons_fragment_welford DMAMEM;
-static Payload g_photons_fragment_ppb_buckets DMAMEM;
-static Payload g_photons_fragment_ppb_value DMAMEM;
-static Payload g_photons_fragment_ppb_checkpoint DMAMEM;
-static Payload g_photons_fragment_ppb_endpoint DMAMEM;
-static Payload g_photons_fragment_ppb_window_proof DMAMEM;
-static Payload g_photons_fragment_campaign DMAMEM;
-static Payload g_photons_fragment_campaign_stats DMAMEM;
-static Payload g_photons_fragment_baseline DMAMEM;
-static Payload g_photons_fragment_recovery DMAMEM;
-static Payload g_photons_fragment_interrupt DMAMEM;
+// PHOTONS_FRAGMENT is a bounded, single-owner foreground serializer. Every
+// schema node that can exceed Payload's inline store is explicitly FIXED; the
+// few proven-inline leaves remain ordinary local Payloads. The two large
+// canonical parents keep RAM2 backing, while bounded nested scratch uses RAM1
+// so deterministic serialization does not consume transport's RAM2 heap runway.
+//
+// Capacity exhaustion is a schema-contract failure, not an invitation to grow:
+// Payload records FIXED_CAPACITY and fails hard.
+#define PHOTONS_FRAGMENT_FIXED_RAM2(name, capacity)                        \
+  alignas(Payload::FIXED_STORAGE_ALIGNMENT)                               \
+  static uint8_t name##_storage[capacity] DMAMEM;                         \
+  static Payload name DMAMEM(                                             \
+      Payload::StorageMode::FIXED,                                        \
+      name##_storage,                                                     \
+      sizeof(name##_storage))
+
+#define PHOTONS_FRAGMENT_FIXED_RAM1(name, capacity)                        \
+  alignas(Payload::FIXED_STORAGE_ALIGNMENT)                               \
+  static uint8_t name##_storage[capacity];                                \
+  static Payload name DMAMEM(                                             \
+      Payload::StorageMode::FIXED,                                        \
+      name##_storage,                                                     \
+      sizeof(name##_storage))
+
+PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_root, 12288U);
+PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_instrument, 12288U);
+
+PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_race, 1536U);
+PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_raw_cycles, 1024U);
+PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_projection, 1024U);
+PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_science, 3072U);
+PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_science_accepted, 768U);
+PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_science_excluded, 768U);
+PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_science_reasons, 512U);
+PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_stats, 4096U);
+PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_welford, 512U);
+PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_ppb_buckets, 1024U);
+PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_ppb_checkpoint, 2048U);
+PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_campaign, 768U);
+PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_campaign_stats, 512U);
+PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_recovery, 1024U);
+PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_interrupt, 1280U);
+
+#undef PHOTONS_FRAGMENT_FIXED_RAM1
+#undef PHOTONS_FRAGMENT_FIXED_RAM2
 
 
 static void photons_payload_add_welford(
@@ -2500,13 +2522,11 @@ static void photons_payload_add_ppb_value(
     const photons_fragment_ppb_value_snapshot_t& value) {
   if (value.sample_count == 0ULL) return;
 
-  Payload& obj = g_photons_fragment_ppb_value;
-  obj.clear();
+  Payload obj;
   obj.add("sample_count", value.sample_count);
   obj.add("ppb", toFixedDecimal(value.ppb, 6));
   obj.add("residual_ns", toFixedDecimal(value.residual_ns, 6));
   parent.add_object(name, obj);
-  obj.clear();
 }
 
 
@@ -2514,13 +2534,11 @@ static void photons_payload_add_ppb_endpoint(
     Payload& parent,
     const char* name,
     const photons_fragment_ppb_endpoint_snapshot_t& endpoint) {
-  Payload& obj = g_photons_fragment_ppb_endpoint;
-  obj.clear();
+  Payload obj;
   obj.add("sequence", endpoint.sequence);
   obj.add("lap_count", endpoint.lap_count);
   obj.add("total_lap_gnss_ns", endpoint.total_lap_gnss_ns);
   parent.add_object(name, obj);
-  obj.clear();
 }
 
 
@@ -2528,15 +2546,13 @@ static void photons_payload_add_ppb_window_proof(
     Payload& parent,
     const char* name,
     const photons_fragment_ppb_window_proof_snapshot_t& proof) {
-  Payload& obj = g_photons_fragment_ppb_window_proof;
-  obj.clear();
+  Payload obj;
   obj.add("valid", proof.valid);
   obj.add("sample_count", proof.sample_count);
   if (proof.valid) {
     photons_payload_add_ppb_endpoint(obj, "anchor", proof.anchor);
   }
   parent.add_object(name, obj);
-  obj.clear();
 }
 
 
@@ -2556,7 +2572,7 @@ static Payload& photons_fragment_payload(
   Payload& ppb_checkpoint = g_photons_fragment_ppb_checkpoint;
   Payload& campaign = g_photons_fragment_campaign;
   Payload& campaign_stats = g_photons_fragment_campaign_stats;
-  Payload& baseline = g_photons_fragment_baseline;
+  Payload baseline;
   Payload& recovery = g_photons_fragment_recovery;
   Payload& interrupt = g_photons_fragment_interrupt;
 
@@ -2574,7 +2590,6 @@ static Payload& photons_fragment_payload(
   ppb_checkpoint.clear();
   campaign.clear();
   campaign_stats.clear();
-  baseline.clear();
   recovery.clear();
   interrupt.clear();
 
@@ -2862,7 +2877,6 @@ static Payload& photons_fragment_payload(
                  toFixedDecimal(f.baseline.mean_residual_ns, 6));
   }
   instrument.add_object("baseline", baseline);
-  baseline.clear();
 
   recovery.add("restored", f.recovery.restored);
   recovery.add("proof_pending", f.recovery.proof_pending);

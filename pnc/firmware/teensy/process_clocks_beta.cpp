@@ -661,31 +661,60 @@ static uint32_t g_clocks_fragment_publication_idle_retry_last_attempt_count = 0U
 // stack local. CLOCKS owns this RAM2 snapshot and all serialization derived from it.
 static clocks_fragment_snapshot_t g_clocks_fragment_publication_clocks_snapshot DMAMEM = {};
 
-// The CLOCKS_FRAGMENT root is also rebuilt every second.  Its campaign-bearing
-// form is larger than 8 KiB, so a stack-local root repeatedly grows through the
-// allocator's 4 KiB -> 16 KiB storage classes and then returns that 16 KiB block
-// on destruction.  Keep one CLOCKS-owned root in RAM2 and admit its final storage
-// class once; clear() retains that capacity for every later row.
-static Payload g_clocks_fragment_root_payload DMAMEM;
+// CLOCKS_FRAGMENT serialization is a bounded, single-owner foreground workload.
+// Large canonical parents live in fixed RAM2 stores so they never enter the
+// general heap. Nested scratch that can exceed Payload's 256-byte inline store
+// uses dedicated fixed RAM1 backing. Inline-only locals remain ordinary Payloads.
+//
+// These capacities are part of the canonical schema contract, not allocator
+// tuning. Growth beyond one of them is a fail-hard FIXED_CAPACITY event and must
+// be accompanied by an explicit schema/storage review.
+#define CLOCKS_FRAGMENT_FIXED_RAM2(name, capacity)                         \
+  alignas(Payload::FIXED_STORAGE_ALIGNMENT)                               \
+  static uint8_t name##_storage[capacity] DMAMEM;                         \
+  static Payload name DMAMEM(                                             \
+      Payload::StorageMode::FIXED,                                        \
+      name##_storage,                                                     \
+      sizeof(name##_storage))
 
-// Campaign enrichment is also rebuilt once per public campaign second. Crash
-// forensics proved this parent reached 2 KiB with eight committed entries, then
-// failed while growing to the 4 KiB storage class for the next OCXO attachment.
-// Retain that proven parent in RAM2 and reuse its admitted capacity across rows.
-static Payload g_clocks_fragment_campaign_payload DMAMEM;
+#define CLOCKS_FRAGMENT_FIXED_RAM1(name, capacity)                         \
+  alignas(Payload::FIXED_STORAGE_ALIGNMENT)                               \
+  static uint8_t name##_storage[capacity];                                \
+  static Payload name DMAMEM(                                             \
+      Payload::StorageMode::FIXED,                                        \
+      name##_storage,                                                     \
+      sizeof(name##_storage))
 
-// The canonical instrument parent bridges compact instrument testimony to the
-// retained statistics child. Crash forensics proved this automatic Payload had
-// nine committed entries at 2 KiB, then required 6727 bytes while attaching
-// the final stats object. Retain its 8 KiB storage class across 1 Hz rows.
-static Payload g_clocks_fragment_clocks_payload DMAMEM;
+// Canonical parents. Conservative max-width schema sizing leaves explicit
+// headroom over the currently observed mature rows.
+CLOCKS_FRAGMENT_FIXED_RAM2(g_clocks_fragment_root_payload, 16384U);
+CLOCKS_FRAGMENT_FIXED_RAM2(g_clocks_fragment_campaign_payload, 6144U);
+CLOCKS_FRAGMENT_FIXED_RAM2(g_clocks_fragment_clocks_payload, 12288U);
+CLOCKS_FRAGMENT_FIXED_RAM2(g_clocks_fragment_stats_payload, 8192U);
 
-// The canonical statistics object is large and rebuilt every second. Keep one
-// CLOCKS-owned Payload scratch object in RAM2 so its admitted heap capacity is
-// reused across rows instead of returning an 8 KiB block to malloc each second.
-// Serialization is single-owner foreground work; add_object() copies the child
-// JSON image before this scratch is cleared for the next row.
-static Payload g_clocks_fragment_stats_payload DMAMEM;
+// Nested fragment scratch that can exceed Payload's inline store.
+CLOCKS_FRAGMENT_FIXED_RAM1(g_clocks_fragment_features_teensy_payload, 512U);
+CLOCKS_FRAGMENT_FIXED_RAM1(g_clocks_fragment_features_root_payload, 512U);
+CLOCKS_FRAGMENT_FIXED_RAM1(g_clocks_fragment_welford_payload, 512U);
+CLOCKS_FRAGMENT_FIXED_RAM1(g_clocks_fragment_ppb_endpoint_payload, 512U);
+CLOCKS_FRAGMENT_FIXED_RAM1(g_clocks_fragment_ppb_window_payload, 512U);
+CLOCKS_FRAGMENT_FIXED_RAM1(g_clocks_fragment_ppb_checkpoint_payload, 3072U);
+CLOCKS_FRAGMENT_FIXED_RAM1(g_clocks_fragment_ppb_second_append_payload, 512U);
+CLOCKS_FRAGMENT_FIXED_RAM1(g_clocks_fragment_ppb_minute_append_payload, 512U);
+CLOCKS_FRAGMENT_FIXED_RAM1(g_clocks_fragment_stats_clock_payload, 1024U);
+CLOCKS_FRAGMENT_FIXED_RAM1(g_clocks_fragment_tau_state_payload, 1280U);
+CLOCKS_FRAGMENT_FIXED_RAM1(g_clocks_fragment_aux_welford_payload, 512U);
+CLOCKS_FRAGMENT_FIXED_RAM1(g_clocks_fragment_raw_lane_payload, 768U);
+CLOCKS_FRAGMENT_FIXED_RAM1(g_clocks_fragment_raw_payload, 3072U);
+CLOCKS_FRAGMENT_FIXED_RAM1(g_clocks_fragment_science_payload, 768U);
+CLOCKS_FRAGMENT_FIXED_RAM1(g_clocks_fragment_candidate_payload, 512U);
+CLOCKS_FRAGMENT_FIXED_RAM1(g_clocks_fragment_candidates_payload, 1536U);
+CLOCKS_FRAGMENT_FIXED_RAM1(g_clocks_fragment_campaign_ocxo_payload, 2048U);
+CLOCKS_FRAGMENT_FIXED_RAM1(g_clocks_fragment_campaign_disposition_payload, 512U);
+CLOCKS_FRAGMENT_FIXED_RAM1(g_clocks_fragment_campaign_recovery_payload, 512U);
+
+#undef CLOCKS_FRAGMENT_FIXED_RAM1
+#undef CLOCKS_FRAGMENT_FIXED_RAM2
 
 static void clocks_fragment_schedule_publish(void);
 
@@ -699,7 +728,7 @@ static inline uint32_t clocks_fragment_current_ipsr(void) {
 #endif
 }
 
-static FLASHMEM Payload clocks_fragment_features_payload(void) {
+static FLASHMEM Payload& clocks_fragment_features_payload(void) {
   Payload clocks;
   bool clocks_present = false;
 #define CLOCKS_ADD_FEATURE(name) \
@@ -730,11 +759,13 @@ static FLASHMEM Payload clocks_fragment_features_payload(void) {
   CLOCKS_ADD_INTERRUPT_FEATURE("QTIMER_COUNTER_CUSTODY");
 #undef CLOCKS_ADD_INTERRUPT_FEATURE
 
-  Payload teensy;
+  Payload& teensy = g_clocks_fragment_features_teensy_payload;
+  teensy.clear();
   if (clocks_present) teensy.add_object("CLOCKS", clocks);
   if (interrupt_present) teensy.add_object("INTERRUPT", interrupt);
 
-  Payload root;
+  Payload& root = g_clocks_fragment_features_root_payload;
+  root.clear();
   root.add_object("TEENSY", teensy);
   return root;
 }
@@ -752,26 +783,6 @@ static void clocks_fragment_publication_ensure_initialized(void) {
   g_clocks_fragment_publication_retry_tick_hold_count = 0U;
   g_clocks_fragment_publication_retry_schedule_count = 0U;
   g_clocks_fragment_publication_retry_success_count = 0U;
-
-  // CLOCKS_FRAGMENT is predictably larger than 8 KiB when campaign testimony is
-  // embedded.  Admit the final 16 KiB root storage class once at subsystem
-  // initialization rather than reallocating 4 KiB -> 16 KiB every public row.
-  // Payload::clear() preserves this capacity; reserve() remains fail-hard if the
-  // RAM2 heap cannot support the canonical publication substrate.
-  g_clocks_fragment_root_payload.clear();
-  g_clocks_fragment_root_payload.reserve(16384U);
-
-  // The mature TEMPEST campaign parent crosses 2 KiB every public row. Admit
-  // its proven 4 KiB storage class once so canonical campaign serialization no
-  // longer performs a recurring 2 KiB -> 4 KiB realloc/free transaction.
-  g_clocks_fragment_campaign_payload.clear();
-  g_clocks_fragment_campaign_payload.reserve(4096U);
-
-  // The mature instrument parent is 6727 bytes with the retained ~4.7 KiB
-  // statistics child attached. Admit its proven 8 KiB storage class once so
-  // canonical 1 Hz serialization never repeats the 2 KiB -> 8 KiB growth.
-  g_clocks_fragment_clocks_payload.clear();
-  g_clocks_fragment_clocks_payload.reserve(8192U);
 
   g_clocks_fragment_publication_initialized = true;
 }
@@ -798,7 +809,8 @@ static void clocks_fragment_add_welford(
     Payload& parent,
     const char* key,
     const clocks_fragment_welford_snapshot_t& sample) {
-  Payload value;
+  Payload& value = g_clocks_fragment_welford_payload;
+  value.clear();
   value.add("n", sample.n);
   value.add("mean", toFixedDecimal(sample.mean, 12));
   value.add("m2", toFixedDecimal(sample.m2, 12));
@@ -833,7 +845,8 @@ static void clocks_fragment_add_ppb_endpoint(
     Payload& parent,
     const char* key,
     const clocks_fragment_ppb_endpoint_snapshot_t& endpoint) {
-  Payload value;
+  Payload& value = g_clocks_fragment_ppb_endpoint_payload;
+  value.clear();
   value.add("reference_ns", endpoint.reference_ns);
   value.add("dwt_error_cycles", toFixedDecimal(endpoint.dwt_error_cycles, 12));
   value.add("ocxo1_error_ns", endpoint.ocxo1_error_ns);
@@ -847,7 +860,8 @@ static void clocks_fragment_add_ppb_window_proof(
     Payload& parent,
     const char* key,
     const clocks_fragment_ppb_window_proof_snapshot_t& proof) {
-  Payload value;
+  Payload& value = g_clocks_fragment_ppb_window_payload;
+  value.clear();
   value.add("valid", proof.valid);
   value.add("sample_count", proof.sample_count);
   if (proof.valid) {
@@ -859,7 +873,8 @@ static void clocks_fragment_add_ppb_window_proof(
 static void clocks_fragment_add_ppb_checkpoint(
     Payload& parent,
     const clocks_fragment_ppb_checkpoint_delta_snapshot_t& checkpoint) {
-  Payload value;
+  Payload& value = g_clocks_fragment_ppb_checkpoint_payload;
+  value.clear();
   value.add("schema", "CLOCKS_PPB_CHECKPOINT_DELTA_V1");
   value.add("valid", checkpoint.valid);
   value.add("rolling_sequence", checkpoint.rolling_sequence);
@@ -886,7 +901,8 @@ static void clocks_fragment_add_ppb_checkpoint(
   clocks_fragment_add_ppb_window_proof(
       value, "24_hour", checkpoint.hour_24);
 
-  Payload second_append;
+  Payload& second_append = g_clocks_fragment_ppb_second_append_payload;
+  second_append.clear();
   second_append.add("valid", checkpoint.second_append_valid);
   if (checkpoint.second_append_valid) {
     clocks_fragment_add_ppb_endpoint(
@@ -894,7 +910,8 @@ static void clocks_fragment_add_ppb_checkpoint(
   }
   value.add_object("second_append", second_append);
 
-  Payload minute_append;
+  Payload& minute_append = g_clocks_fragment_ppb_minute_append_payload;
+  minute_append.clear();
   minute_append.add("valid", checkpoint.minute_append_valid);
   if (checkpoint.minute_append_valid) {
     clocks_fragment_add_ppb_endpoint(
@@ -909,7 +926,8 @@ static void clocks_fragment_add_stats_clock(
     Payload& parent,
     const char* key,
     const clocks_fragment_stats_clock_snapshot_t& clock) {
-  Payload value;
+  Payload& value = g_clocks_fragment_stats_clock_payload;
+  value.clear();
   clocks_fragment_add_welford(value, "welford", clock.welford);
   if (clock.frequency_present) {
     value.add("tau", toFixedDecimal(clock.tau, 12));
@@ -923,7 +941,8 @@ static void clocks_fragment_add_tau_state(
     Payload& parent,
     const char* key,
     const clocks_fragment_tau_recovery_snapshot_t& state) {
-  Payload value;
+  Payload& value = g_clocks_fragment_tau_state_payload;
+  value.clear();
   value.add("valid", state.valid);
   value.add("reset_count", state.reset_count);
   value.add("sample_count", state.sample_count);
@@ -955,14 +974,6 @@ static void clocks_fragment_add_stats(
   Payload& stats = g_clocks_fragment_stats_payload;
   stats.clear();
 
-  // This canonical object is predictably larger than 4 KiB: five clock lanes,
-  // the rolling checkpoint, two full TAU recovery states, and auxiliary Welford
-  // testimony are present every second.  Admit its final storage class up front.
-  // The RAM2 scratch retains that capacity across clear(), so after the first
-  // row this path performs no allocator growth for the stats parent at all.
-  // Payload::reserve() remains contract-governed and fatal on failure.
-  stats.reserve(8192U);
-
   stats.add("schema", "CLOCKS_INSTRUMENT_STATS_V4");
   stats.add("snapshot_ok", snapshot.snapshot_ok);
   stats.add("valid", snapshot.valid);
@@ -992,7 +1003,8 @@ static void clocks_fragment_add_stats(
   clocks_fragment_add_tau_state(
       stats, "ocxo2_tau_state", snapshot.ocxo2_tau_state);
 
-  Payload auxiliary_welford;
+  Payload& auxiliary_welford = g_clocks_fragment_aux_welford_payload;
+  auxiliary_welford.clear();
   clocks_fragment_add_welford(
       auxiliary_welford, "pps_witness", snapshot.pps_witness.welford);
   stats.add_object("auxiliary_welford", auxiliary_welford);
@@ -1005,7 +1017,8 @@ static void clocks_fragment_add_raw_cycles_lane(
     Payload& parent,
     const char* key,
     const clocks_fragment_raw_cycles_lane_t& sample) {
-  Payload lane;
+  Payload& lane = g_clocks_fragment_raw_lane_payload;
+  lane.clear();
   lane.add("snapshot_ok", sample.snapshot_ok);
   lane.add("forensics_snapshot_ok", sample.forensics_snapshot_ok);
   lane.add("valid", sample.valid);
@@ -1026,7 +1039,8 @@ static void clocks_fragment_add_raw_cycles_lane(
 static void clocks_fragment_add_raw_cycles(
     Payload& parent,
     const clocks_fragment_raw_cycles_snapshot_t& snapshot) {
-  Payload raw;
+  Payload& raw = g_clocks_fragment_raw_payload;
+  raw.clear();
   clocks_fragment_add_raw_cycles_lane(raw, "pps", snapshot.pps);
   clocks_fragment_add_raw_cycles_lane(raw, "vclock", snapshot.vclock);
   clocks_fragment_add_raw_cycles_lane(raw, "ocxo1", snapshot.ocxo1);
@@ -1037,7 +1051,8 @@ static void clocks_fragment_add_raw_cycles(
 static void clocks_fragment_add_science(
     Payload& parent,
     const clocks_fragment_science_snapshot_t& science) {
-  Payload value;
+  Payload& value = g_clocks_fragment_science_payload;
+  value.clear();
   value.add("valid", science.valid);
   value.add("science_worthy", science.science_worthy);
   value.add("antecedents_complete", science.antecedents_complete);
@@ -1109,7 +1124,8 @@ static void clocks_fragment_add_clock_candidate(
     Payload& parent,
     const char* key,
     const clocks_fragment_clock_candidate_t& candidate) {
-  Payload out;
+  Payload& out = g_clocks_fragment_candidate_payload;
+  out.clear();
   out.add("available", candidate.available);
   out.add("continuity_valid", candidate.continuity_valid);
   out.add("status_id", (uint32_t)candidate.status);
@@ -1130,7 +1146,8 @@ static void clocks_fragment_add_clock_candidate(
 static void clocks_fragment_add_clock_candidates(
     Payload& parent,
     const clocks_fragment_clock_candidates_snapshot_t& snapshot) {
-  Payload candidates;
+  Payload& candidates = g_clocks_fragment_candidates_payload;
+  candidates.clear();
   candidates.add("schema", "OCXO_CLOCK_CANDIDATES_V1");
   candidates.add("published_source", snapshot.published_source);
   clocks_fragment_add_clock_candidate(
@@ -1153,7 +1170,8 @@ static void clocks_fragment_add_campaign_ocxo(
     const char* key,
     const clocks_fragment_clock_candidates_snapshot_t& clock_candidates,
     const clocks_fragment_science_snapshot_t& science) {
-  Payload lane;
+  Payload& lane = g_clocks_fragment_campaign_ocxo_payload;
+  lane.clear();
   clocks_fragment_add_clock_candidates(lane, clock_candidates);
   clocks_fragment_add_science(lane, science);
   parent.add_object(key, lane);
@@ -1203,7 +1221,8 @@ static Payload& clocks_fragment_campaign_payload(
   status.add("ocxo_science_valid", snapshot.ocxo_science_valid);
   campaign.add_object("status", status);
 
-  Payload disposition;
+  Payload& disposition = g_clocks_fragment_campaign_disposition_payload;
+  disposition.clear();
   disposition.add("status", snapshot.disposition);
   disposition.add("use", snapshot.science_eligible && snapshot.control_eligible
       ? "SCIENCE_AND_CONTROL"
@@ -1219,7 +1238,8 @@ static Payload& clocks_fragment_campaign_payload(
   campaign.add_object("disposition", disposition);
 
   if (snapshot.recovery.present) {
-    Payload recovery;
+    Payload& recovery = g_clocks_fragment_campaign_recovery_payload;
+    recovery.clear();
     recovery.add("generation", snapshot.recovery.generation);
     recovery.add("transition_active", snapshot.recovery.transition_active);
     recovery.add("timeline_ready", snapshot.recovery.timeline_ready);
