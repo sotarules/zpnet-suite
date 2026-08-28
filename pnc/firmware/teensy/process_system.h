@@ -64,6 +64,10 @@
  *   • RAW_FAULT_ENTRY — return only the earliest retained exception witness
  *   • CRASH_POLICY — return live CPU/FPU exception policy plus a compact
  *     consistency analysis of retained core and extended exception frames
+ *   • CRASH_TEST — acknowledge and then deliberately fault from foreground
+ *     after 250 ms; requires type=UDF|IACCVIOL and accepts optional fp=0|1.
+ *     fp=1 deliberately exercises floating-point state before the fault;
+ *     retained crash evidence is never cleared implicitly
  *   • STACK_WATCH / STACK_TRIPWIRE / DISPATCH_BREADCRUMB — focused retained
  *     witnesses for stack writes, alien frame placement, and deferred dispatch
  *   • PAYLOAD_FATAL_INFO — return the retained fatal-construction record,
@@ -92,8 +96,9 @@
 // Register SYSTEM command surface
 void process_system_register(void);
 
-// Primitive foreground warm-reset service.  Called at the top of loop() so an
-// acknowledged REBOOT does not depend on TimePop, CLOCKS, events, or GNSS.
+// Primitive foreground terminal service.  Called at the top of loop() so an
+// acknowledged REBOOT or CRASH_TEST does not depend on TimePop, CLOCKS, events,
+// or GNSS.
 void system_reboot_service(void);
 
 // ============================================================================

@@ -43,6 +43,7 @@ extern void transport_get_rx_dispatch_mailbox_info(
 
 static constexpr uint64_t FLASH_DELAY_NS = 5000000000ULL;  // 5 seconds
 static constexpr uint32_t REBOOT_DELAY_MS = 250U;
+static constexpr uint32_t CRASH_TEST_DELAY_MS = 250U;
 
 // --------------------------------------------------------------
 // Forward declarations (terminal paths)
@@ -62,6 +63,23 @@ static bool system_shutdown   = false;
 static bool system_bootloader = false;
 static bool system_reboot     = false;
 static uint32_t system_reboot_deadline_dwt = 0U;
+
+enum class system_crash_test_type_t : uint8_t {
+  NONE = 0U,
+  UDF = 1U,
+  IACCVIOL = 2U,
+};
+
+static bool system_crash_test_pending = false;
+static bool system_crash_test_touch_fp = false;
+static system_crash_test_type_t system_crash_test_type =
+    system_crash_test_type_t::NONE;
+static uint32_t system_crash_test_deadline_dwt = 0U;
+
+// Named non-executable RAM2 target for deterministic IACCVIOL injection.
+// The branch uses Thumb bit 0 while the MPU XN policy rejects instruction
+// fetches from this DMAMEM object.  Its address is returned by CRASH_TEST.
+alignas(32) static uint32_t g_system_crash_test_xn_target[8] DMAMEM;
 
 // Ordinary BSS flag: unlike DMAMEM, this is guaranteed zeroed by startup and
 // can safely guard the first RAM2 cold initialization.
@@ -2970,6 +2988,33 @@ static FLASHMEM void enter_bootloader_cb(timepop_ctx_t*, timepop_diag_t*, void*)
   system_enter_quiescence();
 }
 
+static __attribute__((noinline)) void system_crash_test_activate_fp(void) {
+  // Volatile arithmetic guarantees real floating-point work in this build.
+  // With automatic FP context preservation enabled, this deliberately makes
+  // the upcoming exception eligible for an EXTENDED_FP hardware frame.
+  volatile float lhs = 1.25f;
+  volatile float rhs = 2.5f;
+  volatile float result = lhs * rhs + 0.5f;
+  (void)result;
+  __asm__ volatile("dsb\nisb" ::: "memory");
+}
+
+static __attribute__((noreturn, noinline))
+void system_crash_test_udf_now(void) {
+  __asm__ volatile("udf #0" ::: "memory");
+  __builtin_unreachable();
+}
+
+static __attribute__((noreturn, noinline))
+void system_crash_test_iaccviol_now(void) {
+  using crash_target_t = void (*)(void);
+  const uintptr_t target =
+      reinterpret_cast<uintptr_t>(&g_system_crash_test_xn_target[0]) | 1U;
+  __asm__ volatile("dsb\nisb" ::: "memory");
+  reinterpret_cast<crash_target_t>(target)();
+  __builtin_unreachable();
+}
+
 static __attribute__((noreturn)) void system_reboot_now(void) {
   // Cortex-M AIRCR write key plus SYSRESETREQ.  Preserve PRIGROUP so the reset
   // request changes no interrupt policy during the final instruction window.
@@ -2990,13 +3035,42 @@ static __attribute__((noreturn)) void system_reboot_now(void) {
 }
 
 void system_reboot_service(void) {
+  const uint32_t now = ARM_DWT_CYCCNT;
+
+  // CRASH_TEST deliberately shares this primitive foreground service so the
+  // acknowledged RPC response can leave the Teensy before the fault occurs,
+  // without acquiring a TimePop or subsystem dependency.
+  if (system_crash_test_pending &&
+      (int32_t)(now - system_crash_test_deadline_dwt) >= 0) {
+    const system_crash_test_type_t type = system_crash_test_type;
+    const bool touch_fp = system_crash_test_touch_fp;
+
+    // Retire the pending command before crossing the intentional fault boundary.
+    system_crash_test_pending = false;
+    system_crash_test_type = system_crash_test_type_t::NONE;
+    system_crash_test_touch_fp = false;
+
+    if (touch_fp) system_crash_test_activate_fp();
+
+    switch (type) {
+      case system_crash_test_type_t::UDF:
+        system_crash_test_udf_now();
+      case system_crash_test_type_t::IACCVIOL:
+        system_crash_test_iaccviol_now();
+      case system_crash_test_type_t::NONE:
+      default:
+        // Armed state is closed over the enum above; reaching NONE is an
+        // internal invariant violation, so fail as an unmistakable UDF.
+        system_crash_test_udf_now();
+    }
+  }
+
   if (!system_reboot) return;
 
   // DWT is enabled before SYSTEM exists and advances directly with the core
   // clock.  Keep reboot custody below TimePop, events, GNSS, VCLOCK, and the
   // Arduino millisecond tick: once the acknowledged deadline is reached or
   // passed, the next foreground loop iteration resets immediately.
-  const uint32_t now = ARM_DWT_CYCCNT;
   if ((int32_t)(now - system_reboot_deadline_dwt) < 0) return;
 
   system_reboot_now();
@@ -4021,6 +4095,11 @@ static FLASHMEM Payload cmd_enter_bootloader(const Payload& /*args*/) {
 static FLASHMEM Payload cmd_reboot(const Payload& /*args*/) {
   Payload resp = ok_payload();
 
+  if (system_crash_test_pending) {
+    resp.add("action", "rejected_crash_test_pending");
+    return resp;
+  }
+
   if (system_reboot) {
     resp.add("action", "already_scheduled");
     resp.add("delay_ms", REBOOT_DELAY_MS);
@@ -4037,6 +4116,76 @@ static FLASHMEM Payload cmd_reboot(const Payload& /*args*/) {
 
   resp.add("action", "scheduled");
   resp.add("delay_ms", REBOOT_DELAY_MS);
+  return resp;
+}
+
+// ------------------------------------------------------------
+// CRASH_TEST — acknowledged deliberate Cortex-M fault injection
+// ------------------------------------------------------------
+static FLASHMEM Payload cmd_crash_test(const Payload& args) {
+  const char* type_text = args.getString("type");
+  if (!type_text || !*type_text) {
+    Payload err;
+    err.add("error", "CRASH_TEST requires type=UDF|IACCVIOL");
+    return err;
+  }
+
+  system_crash_test_type_t type = system_crash_test_type_t::NONE;
+  if (system_cstr_equal_ci(type_text, "UDF")) {
+    type = system_crash_test_type_t::UDF;
+  } else if (system_cstr_equal_ci(type_text, "IACCVIOL")) {
+    type = system_crash_test_type_t::IACCVIOL;
+  } else {
+    Payload err;
+    err.add("error", "type must be UDF or IACCVIOL");
+    return err;
+  }
+
+  const uint32_t fp_value = args.has("fp") ? args.getUInt("fp") : 0U;
+  if (fp_value > 1U) {
+    Payload err;
+    err.add("error", "fp must be 0 or 1");
+    return err;
+  }
+
+  if (system_crash_test_pending) {
+    Payload err;
+    err.add("error", "crash test already scheduled");
+    return err;
+  }
+  if (system_reboot) {
+    Payload err;
+    err.add("error", "reboot already scheduled");
+    return err;
+  }
+  if (system_shutdown || system_bootloader) {
+    Payload err;
+    err.add("error", "terminal transition already active");
+    return err;
+  }
+
+  const uint32_t delay_cycles = F_CPU_ACTUAL / 4U;  // 250 ms
+  system_crash_test_type = type;
+  system_crash_test_touch_fp = fp_value != 0U;
+  system_crash_test_deadline_dwt = ARM_DWT_CYCCNT + delay_cycles;
+  system_crash_test_pending = true;
+
+  Payload resp = ok_payload();
+  resp.add("action", "scheduled");
+  resp.add("type", type == system_crash_test_type_t::UDF
+                       ? "UDF" : "IACCVIOL");
+  resp.add("delay_ms", CRASH_TEST_DELAY_MS);
+  resp.add("fp_touch_requested", system_crash_test_touch_fp);
+  resp.add("fp_zero_guarantees_basic_frame", false);
+  resp.add("retained_evidence_cleared", false);
+  if (type == system_crash_test_type_t::IACCVIOL) {
+    const uintptr_t storage =
+        reinterpret_cast<uintptr_t>(&g_system_crash_test_xn_target[0]);
+    system_crash_add_hex32(resp, "xn_storage_address",
+                           static_cast<uint32_t>(storage));
+    system_crash_add_hex32(resp, "branch_target",
+                           static_cast<uint32_t>(storage | 1U));
+  }
   return resp;
 }
 
@@ -4327,6 +4476,7 @@ static const process_command_entry_t SYSTEM_COMMANDS[] = {
   { "PAYLOAD_INTEGRITY_INFO", cmd_payload_integrity_info },
   { "ENTER_BOOTLOADER", cmd_enter_bootloader },
   { "REBOOT",           cmd_reboot           },
+  { "CRASH_TEST",       cmd_crash_test       },
   { "SHUTDOWN",         cmd_shutdown         },
   { "PROCESS_LIST",     cmd_process_list     },
   { "FEATURES",         cmd_features         },

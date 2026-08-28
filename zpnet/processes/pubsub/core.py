@@ -455,25 +455,37 @@ def _teensy_rpc_exchange(
     reply_timeout_s: float = REPLY_TIMEOUT_S,
     max_stable_timeouts: int = MAX_TEENSY_RETRIES,
     log_timeouts: bool = True,
-    retry_across_generations: bool = True,
 ) -> Dict[str, Any]:
-    """Perform one semantic RPC across ephemeral transport lifetimes.
+    """Perform one semantic RPC within exactly one transport generation.
 
-    Ordinary callers retain the established 3 x 30-second semantics.  The
-    readiness monitor uses one quiet short probe bound to the current generation
-    so probing readiness cannot itself become a 90-second startup prerequisite.
+    Before the first successful send, startup transport churn is ordinary and
+    the caller may wait for a sendable generation.  Once a command is transmitted,
+    that generation owns the RPC.  Same-generation no-response timeouts may retry;
+    loss of the bound generation terminates the RPC immediately and the command is
+    never replayed into a successor generation.
     """
     timeout_s = float(reply_timeout_s)
     timeout_limit = int(max_stable_timeouts)
     if timeout_s <= 0.0 or timeout_limit <= 0:
         raise ValueError("RPC timeout and stable-timeout limit must be positive")
     stable_timeouts = 0
+    bound_generation: Optional[int] = None
 
     while stable_timeouts < timeout_limit:
-        generation = _wait_for_transport_generation()
-        ready, current_generation = _transport_state_snapshot()
-        if not ready or current_generation != generation:
-            continue
+        if bound_generation is None:
+            generation = _wait_for_transport_generation()
+            ready, current_generation = _transport_state_snapshot()
+            if not ready or current_generation != generation:
+                continue
+        else:
+            ready, current_generation = _transport_state_snapshot()
+            if not ready or current_generation != bound_generation:
+                return {
+                    "success": False,
+                    "message": "TEENSY transport generation changed during RPC",
+                    "payload": {},
+                }
+            generation = bound_generation
 
         req_id = _next_req_id()
         req_ts_ms = int(time.monotonic() * 1000)
@@ -494,6 +506,8 @@ def _teensy_rpc_exchange(
 
         try:
             transport_send(TRAFFIC_REQUEST_RESPONSE, req)
+            if bound_generation is None:
+                bound_generation = generation
         except RuntimeError as exc:
             if str(exc) != "SERIAL transport is not ready":
                 _retire_pending_reply(req_id, "SEND_FAILURE")
@@ -526,14 +540,9 @@ def _teensy_rpc_exchange(
             return reply
 
         if transport_lost:
-            # A known physical transport break is not a failed semantic command.
-            # Ordinary callers wait for the next generation without consuming the
-            # bounded no-response budget.  A readiness probe is generation-bound.
-            if retry_across_generations:
-                continue
             return {
                 "success": False,
-                "message": "TEENSY transport generation changed during RPC probe",
+                "message": "TEENSY transport generation changed during RPC",
                 "payload": {},
             }
 
@@ -635,7 +644,6 @@ def _teensy_rpc_readiness_loop() -> None:
             reply_timeout_s=TEENSY_RPC_PROBE_TIMEOUT_S,
             max_stable_timeouts=1,
             log_timeouts=False,
-            retry_across_generations=False,
         )
 
         still_ready, observed_generation = _transport_state_snapshot()
