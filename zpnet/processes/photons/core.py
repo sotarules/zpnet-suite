@@ -142,6 +142,15 @@ STARTUP_INFRASTRUCTURE_POLL_S = 0.5
 STARTUP_INFRASTRUCTURE_QUIET_GRACE_S = 5.0
 STARTUP_INFRASTRUCTURE_STATUS_LOG_INTERVAL_S = 30.0
 
+# Runtime producer-lifetime reconciliation.  PUBSUB transport generation is an
+# infrastructure boundary, not by itself proof that the Teensy rebooted.  PHOTONS
+# pauses canonical authorship on a proved generation change, then asks the
+# firmware recovery surface whether publication survived.  A surviving producer
+# is released untouched; a newborn held producer is resurrected from the newest
+# durable PHOTONS boundary through the same exact-N+1 court used at startup.
+PHOTONS_RUNTIME_RECOVERY_POLL_S = 0.25
+PHOTONS_RUNTIME_RECOVERY_BARRIER_LOG_S = 30.0
+
 # SYSTEM owns these platform/context objects.  PHOTONS copies them transitively
 # and does not derive replacement values or reinterpret their scientific meaning.
 SYSTEM_CONTEXT_FIELDS = (
@@ -237,6 +246,15 @@ _recovery_partial_history_restore_count = 0
 _recovery_live_adopt_count = 0
 _recovery_cold_start_count = 0
 _recovery_failure_count = 0
+
+_runtime_recovery_hold = threading.Event()
+_runtime_recovery_monitor_started = threading.Event()
+_runtime_recovery_generation = 0
+_runtime_recovery_count = 0
+_runtime_recovery_surviving_reattach_count = 0
+_runtime_recovery_failure_count = 0
+_runtime_recovery_rows_retired = 0
+_runtime_recovery_last: Optional[Dict[str, Any]] = None
 
 _ppb_checkpoint_lock = threading.RLock()
 _ppb_checkpoint_runtime: Optional[Dict[str, Any]] = None
@@ -3955,7 +3973,9 @@ def _send_teensy_recovery_command(
     return copy.deepcopy(payload)
 
 
-def _fetch_teensy_recovery_report() -> Dict[str, Any]:
+def _fetch_teensy_recovery_report(
+    *, require_baseline: bool = True
+) -> Dict[str, Any]:
     response = send_command(
         machine="TEENSY",
         subsystem=SUBSYSTEM,
@@ -3975,20 +3995,27 @@ def _fetch_teensy_recovery_report() -> Dict[str, Any]:
         "PHOTONS.REPORT_RECOVERY.restore_schema_version",
     ) != PHOTONS_RECOVERY_SCHEMA_VERSION:
         raise RuntimeError("Teensy PHOTONS recovery schema version mismatch")
-    if not _require_bool(
+    baseline_configured = _require_bool(
         payload.get("standard_lap_configured"),
         "PHOTONS.REPORT_RECOVERY.standard_lap_configured",
-    ):
+    )
+    if require_baseline and not baseline_configured:
         raise RuntimeError("Teensy PHOTONS recovery report lacks STANDARD_LAP_NS")
     baseline_fs = _require_int(
         payload.get("lap_baseline_fs"),
         "PHOTONS.REPORT_RECOVERY.lap_baseline_fs",
-        minimum=1,
     )
-    if _lap_baseline_fs is None or baseline_fs != int(_lap_baseline_fs):
+    if baseline_configured:
+        if baseline_fs <= 0:
+            raise RuntimeError("Teensy PHOTONS recovery report has invalid LAP_BASELINE_NS")
+        if _lap_baseline_fs is not None and baseline_fs != int(_lap_baseline_fs):
+            raise RuntimeError(
+                "Teensy/config PHOTONS LAP_BASELINE_NS mismatch during recovery: "
+                f"teensy_fs={baseline_fs} config_fs={_lap_baseline_fs}"
+            )
+    elif baseline_fs != 0:
         raise RuntimeError(
-            "Teensy/config PHOTONS LAP_BASELINE_NS mismatch during recovery: "
-            f"teensy_fs={baseline_fs} config_fs={_lap_baseline_fs}"
+            "Teensy PHOTONS recovery report publishes LAP_BASELINE_NS before configuration"
         )
     for field in (
         "publication_started",
@@ -5483,6 +5510,12 @@ def _startup_held_restore(
         source=source,
         literal_history=literal_history,
     )
+    if _runtime_recovery_hold.is_set():
+        _runtime_recovery_hold.clear()
+        logging.info(
+            "♻️ [photons/ambient restore] producer cutover committed; releasing "
+            "new-lifetime PHOTONS_FRAGMENT testimony for exact N+1 proof"
+        )
     if history_truncated:
         logging.warning(
             "🧾 [photons/recovery] held restore preserved exact aggregate ancestry "
@@ -5603,6 +5636,12 @@ def _startup_cold_start(
         args={"generation": generation},
         accepted_statuses={"recovery_cold_start_committed"},
     )
+    if _runtime_recovery_hold.is_set():
+        _runtime_recovery_hold.clear()
+        logging.info(
+            "♻️ [photons/ambient restore] cold producer cutover committed; releasing "
+            "new-lifetime PHOTONS_FRAGMENT testimony for first durable proof"
+        )
     _start_workers()
     proof = _wait_for_recovery_proof()
     live = _fetch_teensy_photons_report()
@@ -6292,6 +6331,9 @@ def _state_loop() -> None:
 
     while True:
         fragment = None
+        if _runtime_recovery_hold.is_set():
+            time.sleep(0.01)
+            continue
         with _maintenance_lock:
             try:
                 fragment = _fragment_queue.get_nowait()
@@ -6532,6 +6574,244 @@ def _persistence_loop() -> None:
         if photons is None:
             time.sleep(0.01)
 
+
+
+def _runtime_teensy_rpc_generation() -> Optional[int]:
+    """Return one currently proved PUBSUB->Teensy RPC generation, or None."""
+    feature = _read_startup_system_feature("PI.PUBSUB.TEENSY_RPC")
+    if not feature.get("known") or str(feature.get("status") or "") != "NOMINAL":
+        return None
+    if feature.get("expired") is not False:
+        return None
+    generation = feature.get("generation")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation <= 0:
+        raise RuntimeError(
+            f"PI.PUBSUB.TEENSY_RPC has malformed runtime generation: {feature!r}"
+        )
+    return int(generation)
+
+
+def _wait_for_runtime_recovery_persistence_boundary() -> Dict[str, Any]:
+    """Prove every pre-boundary canonical row has crossed ordered durability."""
+    started = time.monotonic()
+    last_log = started
+    while True:
+        if _hard_failure_active():
+            raise RuntimeError("PHOTONS entered HARD_FAILURE before ambient persistence barrier")
+        if _persist_queue.empty():
+            # Empty alone is insufficient: the persistence worker may already own
+            # an item.  Crossing _maintenance_lock proves that any such transaction
+            # has completed before the recovery source is selected.
+            with _maintenance_lock:
+                if _persist_queue.empty():
+                    return {
+                        "waited_s": round(time.monotonic() - started, 3),
+                        "persist_queue_depth": 0,
+                    }
+        now = time.monotonic()
+        if now - last_log >= PHOTONS_RUNTIME_RECOVERY_BARRIER_LOG_S:
+            logging.info(
+                "⏳ [photons/ambient restore] waiting for pre-boundary persistence "
+                "custody queue_depth=%d waited_s=%.1f",
+                _persist_queue.qsize(),
+                now - started,
+            )
+            last_log = now
+        time.sleep(0.05)
+
+
+def _runtime_reconcile_teensy_generation(previous_generation: int,
+                                         observed_generation: int) -> None:
+    """Classify one RPC generation boundary and resurrect only a newborn producer."""
+    global _runtime_recovery_generation
+    global _runtime_recovery_count
+    global _runtime_recovery_surviving_reattach_count
+    global _runtime_recovery_failure_count
+    global _runtime_recovery_rows_retired
+    global _runtime_recovery_last
+
+    _runtime_recovery_hold.set()
+    _campaign_control_ready.clear()
+    _set_operational_state(
+        OPERATIONAL_STATE_RECOVERING,
+        reason="teensy_rpc_generation_changed",
+        source="RUNTIME_GENERATION_MONITOR",
+        details={
+            "previous_generation": int(previous_generation),
+            "observed_generation": int(observed_generation),
+        },
+    )
+    with _state_lock:
+        _runtime_recovery_count += 1
+
+    logging.error(
+        "🧭 [photons/ambient restore] Teensy RPC generation changed %d -> %d; "
+        "suspending canonical authorship until producer continuity is classified",
+        int(previous_generation),
+        int(observed_generation),
+    )
+
+    try:
+        barrier = _wait_for_runtime_recovery_persistence_boundary()
+        report = _fetch_teensy_recovery_report(require_baseline=False)
+
+        if bool(report.get("publication_started")):
+            # Transport was replaced but the producer lifetime survived.  Do not
+            # invoke recovery and do not disturb live Welford/Better-Buckets state.
+            _runtime_recovery_hold.clear()
+            _campaign_control_ready.set()
+            _runtime_recovery_generation = int(observed_generation)
+            with _state_lock:
+                _runtime_recovery_surviving_reattach_count += 1
+                _runtime_recovery_last = {
+                    "mode": "SURVIVING_PRODUCER_REATTACH",
+                    "previous_generation": int(previous_generation),
+                    "observed_generation": int(observed_generation),
+                    "persistence_barrier": copy.deepcopy(barrier),
+                    "producer_mutated": False,
+                    "completed_at_utc": _utc_now_z(),
+                }
+            _set_operational_state(
+                OPERATIONAL_STATE_RUNNING,
+                reason="surviving_producer_reattached",
+                source="RUNTIME_GENERATION_MONITOR",
+                details=copy.deepcopy(_runtime_recovery_last),
+            )
+            logging.info(
+                "✅ [photons/ambient restore] transport generation=%d reattached to "
+                "the surviving PHOTONS producer; no producer state was mutated",
+                int(observed_generation),
+            )
+            return
+
+        # A newborn Teensy is intentionally silent: firmware publication remains
+        # held until this Pi supplies baseline + one explicit recovery verdict.
+        # Retire any queued prefix that never crossed the canonical/durable court.
+        retired = _drain_queue(_fragment_queue)
+        with _state_lock:
+            _runtime_recovery_rows_retired += int(retired)
+        logging.error(
+            "🧭 [photons/ambient restore] generation=%d is a newborn held producer; "
+            "retired %d uncustodied ingress row(s) and restoring from the newest "
+            "durable PHOTONS boundary",
+            int(observed_generation),
+            int(retired),
+        )
+
+        _configure_teensy_lap_baseline()
+        recovery = _perform_phase5_recovery()
+        current_generation = _runtime_teensy_rpc_generation()
+        if current_generation != int(observed_generation):
+            raise RuntimeError(
+                "Teensy RPC generation changed again before PHOTONS ambient recovery completed: "
+                f"expected={observed_generation} observed={current_generation}"
+            )
+
+        _runtime_recovery_hold.clear()
+        _campaign_control_ready.set()
+        _runtime_recovery_generation = int(observed_generation)
+        with _state_lock:
+            _runtime_recovery_last = {
+                "mode": "AMBIENT_PRODUCER_RESURRECTION",
+                "previous_generation": int(previous_generation),
+                "observed_generation": int(observed_generation),
+                "persistence_barrier": copy.deepcopy(barrier),
+                "retired_ingress_rows": int(retired),
+                "recovery": copy.deepcopy(recovery),
+                "producer_mutated": bool(recovery.get("producer_mutated", True)),
+                "completed_at_utc": _utc_now_z(),
+            }
+        _set_operational_state(
+            OPERATIONAL_STATE_RUNNING,
+            reason="ambient_producer_resurrection_complete",
+            source="RUNTIME_GENERATION_MONITOR",
+            details=copy.deepcopy(_runtime_recovery_last),
+        )
+        proof = recovery.get("proof") if isinstance(recovery.get("proof"), dict) else {}
+        logging.info(
+            "✅ [photons/ambient restore] producer resurrection complete on generation=%d: "
+            "mode=%s source_detail=%s source_update=%s -> durable proof update=%s",
+            int(observed_generation),
+            recovery.get("mode") or "unknown",
+            recovery.get("source_detail_id") or "none",
+            recovery.get("source_update_count") or "n/a",
+            proof.get("update_count") or "n/a",
+        )
+    except Exception:
+        with _state_lock:
+            _runtime_recovery_failure_count += 1
+        raise
+
+
+def _runtime_teensy_generation_monitor_loop() -> None:
+    """Reconcile every proved PUBSUB generation change without replaying RPC intent."""
+    global _runtime_recovery_generation
+
+    _runtime_recovery_monitor_started.set()
+    logging.info(
+        "🚀 [photons] Teensy producer-lifetime monitor started generation=%d",
+        int(_runtime_recovery_generation),
+    )
+    while True:
+        if _hard_failure_active():
+            time.sleep(PHOTONS_RUNTIME_RECOVERY_POLL_S)
+            continue
+        try:
+            observed = _runtime_teensy_rpc_generation()
+        except Exception:
+            logging.exception("⚠️ [photons/ambient restore] runtime RPC-generation read failed")
+            time.sleep(PHOTONS_RUNTIME_RECOVERY_POLL_S)
+            continue
+        if observed is None or observed == _runtime_recovery_generation:
+            time.sleep(PHOTONS_RUNTIME_RECOVERY_POLL_S)
+            continue
+
+        previous = int(_runtime_recovery_generation)
+        target = int(observed)
+        try:
+            _runtime_reconcile_teensy_generation(previous, target)
+        except Exception as exc:
+            # A second transport loss while recovery is in flight invalidates the
+            # attempt but is not a scientific contradiction.  Keep authorship held
+            # and wait for the next proved generation.  A failure on the still-live
+            # target generation is semantic and therefore terminal.
+            try:
+                current = _runtime_teensy_rpc_generation()
+            except Exception:
+                current = None
+            if current is None or current != target:
+                logging.warning(
+                    "⚠️ [photons/ambient restore] recovery on generation=%d was "
+                    "invalidated by another transport boundary: %s; awaiting reattach",
+                    target,
+                    exc,
+                )
+                time.sleep(PHOTONS_RUNTIME_RECOVERY_POLL_S)
+                continue
+            _enter_hard_failure(
+                "ambient_producer_recovery_failed",
+                {
+                    "previous_generation": previous,
+                    "observed_generation": target,
+                    "error": str(exc),
+                    "recovery": _recovery_report_surface(),
+                },
+                source="PHOTONS_RUNTIME_RECOVERY",
+            )
+
+
+def _start_runtime_teensy_generation_monitor(initial_generation: int) -> None:
+    global _runtime_recovery_generation
+    if initial_generation <= 0:
+        raise RuntimeError("PHOTONS runtime generation monitor requires positive generation")
+    _runtime_recovery_generation = int(initial_generation)
+    if _runtime_recovery_monitor_started.is_set():
+        return
+    threading.Thread(
+        target=_runtime_teensy_generation_monitor_loop,
+        daemon=True,
+        name="photons-teensy-generation",
+    ).start()
 
 def _start_workers() -> None:
     if not _state_worker_started.is_set():
@@ -8094,6 +8374,14 @@ def _recovery_report_surface() -> Dict[str, Any]:
                 "live_adopt_count": _recovery_live_adopt_count,
                 "cold_start_count": _recovery_cold_start_count,
                 "failure_count": _recovery_failure_count,
+                "runtime_generation_monitor_started": _runtime_recovery_monitor_started.is_set(),
+                "runtime_generation": _runtime_recovery_generation,
+                "runtime_recovery_hold": _runtime_recovery_hold.is_set(),
+                "runtime_recovery_count": _runtime_recovery_count,
+                "runtime_surviving_reattach_count": _runtime_recovery_surviving_reattach_count,
+                "runtime_failure_count": _runtime_recovery_failure_count,
+                "runtime_rows_retired": _runtime_recovery_rows_retired,
+                "runtime_last": copy.deepcopy(_runtime_recovery_last),
             }
         )
     return payload
@@ -8825,6 +9113,7 @@ def run() -> None:
     _campaign_control_ready.clear()
     _recovery_proof_durable.clear()
     _ppb_checkpoint_reacquire_requested.clear()
+    _runtime_recovery_hold.clear()
 
     logging.info(
         "[photons] starting canonical PHOTONS_V1 with Phase-3 literal durable recovery, "
@@ -8879,6 +9168,18 @@ def run() -> None:
             source="RUN",
         )
         proof = recovery.get("proof") if isinstance(recovery.get("proof"), dict) else {}
+        initial_generation = _runtime_teensy_rpc_generation()
+        if initial_generation is None:
+            _enter_hard_failure(
+                "runtime_generation_monitor_start_failed",
+                {
+                    "error": "startup recovery completed without proved Teensy RPC generation",
+                    "recovery": _recovery_report_surface(),
+                },
+                source="PHOTONS_RUNTIME_RECOVERY",
+            )
+        else:
+            _start_runtime_teensy_generation_monitor(initial_generation)
         logging.info(
             "✅ [photons] startup recovery complete: mode=%s producer_mutated=%s; "
             "source detail=%s update=%s -> durable proof update=%s; "

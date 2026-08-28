@@ -4104,6 +4104,39 @@ def _begin_ambient_instrument_recovery(
     if not _startup_control_ready.is_set() or _campaign_active:
         return False
 
+    # _campaign_active is intentionally lowered as soon as campaign recovery owns
+    # a continuity loss.  It is therefore an authorship gate, not proof that no
+    # durable TEMPEST lifecycle exists.  A physical sequence regression observed
+    # while recovery custody is open belongs to that one recovery transaction.
+    # Let the row continue into _advance_gnss_raw_instrument(), which records the
+    # regression as cold-producer custody, rather than starting a competing ambient
+    # Alpha resurrection that can steal the exact N+1 persistence lane.
+    recovery_custody = _recovery_custody_snapshot()
+    if (
+        _auto_recovery_in_progress
+        or _timebase_silence_recovery_active
+        or bool(recovery_custody.get("active"))
+    ):
+        deferred = {
+            "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "previous_sequence": int(previous_sequence),
+            "observed_sequence": int(observed_sequence),
+            "recovery_custody": copy.deepcopy(recovery_custody),
+        }
+        _diag["ambient_instrument_recovery_deferred_to_recovery_custody"] = (
+            _diag.get("ambient_instrument_recovery_deferred_to_recovery_custody", 0) + 1
+        )
+        _diag["last_ambient_instrument_recovery_deferred"] = copy.deepcopy(deferred)
+        logging.warning(
+            "🧭 [clocks] physical CLOCKS sequence rebased %d -> %d while live "
+            "recovery custody generation=%s owns producer classification; deferring "
+            "to that recovery instead of opening a competing ambient Alpha restore",
+            int(previous_sequence),
+            int(observed_sequence),
+            recovery_custody.get("generation") or "pending",
+        )
+        return False
+
     regression = {
         "observed_sequence": int(observed_sequence),
         "previous_sequence": int(previous_sequence),
@@ -4153,6 +4186,8 @@ def _timebase_silence_recovery(reason: str, details: Dict[str, Any]) -> None:
     attempts = 0
     try:
         while True:
+            if _hard_failure_active():
+                return
             if _teensy_clocks_health_ok():
                 logging.info(
                     "✅ [clocks] @%s Teensy CLOCKS REPORT_RECOVERY responded after CLOCKS_FRAGMENT silence — "
@@ -7972,14 +8007,15 @@ def _wait_for_holistic_restore(
 
 
 def _wait_for_fresh_survival_witness() -> Tuple[Dict[str, Any], Optional[float], Optional[str]]:
-    """Return fresh canonical CLOCKS testimony before producer classification.
+    """Return testimony sufficient to classify current Alpha producer lifetime.
 
-    PUBSUB may replay a retained pre-restart row as soon as Pi CLOCKS reconnects.
-    That row is valuable evidence, but it cannot decide whether the current Alpha
-    lifetime survived. Once firmware says the current Alpha epoch is ready, wait
-    briefly for a canonical row fresh enough to belong to the current observation
-    stream. If none arrives, classification is undefined and startup fails loud
-    rather than mutating a producer on stale testimony.
+    Ordinarily this requires a fresh canonical CLOCKS row: PUBSUB may deliver a
+    retained pre-restart row immediately after reconnect, and receipt freshness is
+    not producer-lifetime freshness.  During live recovery, however, a regression
+    of the boot-local physical CLOCKS sequence is already positive proof that the
+    prior producer lifetime ended.  Once recovery custody owns that witness, do not
+    wait for a row whose only purpose was to decide survival; return the best current
+    canonical testimony and let the caller force the dead-producer branch.
     """
     deadline = time.monotonic() + STARTUP_SURVIVAL_FRESH_WITNESS_TIMEOUT_S
     while True:
@@ -7992,6 +8028,8 @@ def _wait_for_fresh_survival_witness() -> Tuple[Dict[str, Any], Optional[float],
             if received_monotonic is None
             else max(0.0, time.monotonic() - received_monotonic)
         )
+        if _recovery_custody_requires_cold_restore():
+            return state, age_s, received_utc
         if state and age_s is not None and age_s <= CLOCKS_PREFLIGHT_MAX_AGE_S:
             return state, age_s, received_utc
         if time.monotonic() >= deadline:
@@ -8023,7 +8061,9 @@ def _alpha_lineage_reason_summary(reasons: List[str]) -> str:
         parts.append("the newest live CLOCKS row is stale")
     if "canonical_live_not_current_lifetime_proven_pre_epoch" in reason_set:
         parts.append("the current Alpha epoch is not installed yet")
-    known={"statistics_reset_count_changed","statistics_update_count_regressed","better_buckets_current_sequence_regressed","canonical_live_not_coherent_instrument_state","canonical_live_stale","canonical_live_not_current_lifetime_proven_pre_epoch"}
+    if "physical_sequence_regression_during_recovery_custody" in reason_set:
+        parts.append("the boot-local CLOCKS sequence proved a new Teensy lifetime")
+    known={"statistics_reset_count_changed","statistics_update_count_regressed","better_buckets_current_sequence_regressed","canonical_live_not_coherent_instrument_state","canonical_live_stale","canonical_live_not_current_lifetime_proven_pre_epoch","physical_sequence_regression_during_recovery_custody"}
     unknown=[str(r) for r in reasons if str(r) not in known and not str(r).startswith("clockface_regressed_or_missing:")]
     if unknown:
         parts.append("additional continuity evidence is incomplete")
@@ -8309,6 +8349,62 @@ def _restore_instrument_from_clocks(
         }
     else:
         alpha_lineage["current_lifetime_eligible"] = True
+
+    physical_reboot_custody = _recovery_custody_requires_cold_restore()
+    if physical_reboot_custody:
+        reasons = list(alpha_lineage.get("reasons") or [])
+        reason = "physical_sequence_regression_during_recovery_custody"
+        if reason not in reasons:
+            reasons.append(reason)
+        alpha_lineage["reasons"] = reasons
+        alpha_lineage["proved"] = False
+        alpha_lineage["current_lifetime_eligible"] = False
+        alpha_lineage["physical_reboot_custody"] = _recovery_custody_snapshot()
+
+        # A boot-local physical sequence regression is stronger than absence of a
+        # fresh survival witness: it positively proves that the producer lifetime
+        # changed.  If this durable source also owns the active campaign, do not
+        # open the standalone RESTORE_MONITOR Alpha path at all.  Return LOST and
+        # let _restore_active_campaign_state() perform the one combined producer +
+        # TEMPEST DEAD_PRODUCER_RESTORE transaction.
+        durable_campaign = _state_campaign(detail)
+        durable_campaign_name = (
+            _tempest_campaign_name(durable_campaign)
+            if isinstance(durable_campaign, dict) and durable_campaign
+            else ""
+        )
+        if active_campaign_name and durable_campaign_name == active_campaign_name:
+            loss_proof = {
+                "proved": True,
+                "alpha_lost": True,
+                "basis": "PHYSICAL_SEQUENCE_REGRESSION_DURING_RECOVERY_CUSTODY",
+                "report_recovery": copy.deepcopy(lifecycle_status),
+                "survival_lineage": copy.deepcopy(alpha_lineage),
+                "source_detail_id": _as_int(detail.get("_db_detail_id")),
+                "campaign": active_campaign_name,
+            }
+            logging.info(
+                "🧭 [holistic restore] recovery custody positively proved a new Teensy "
+                "lifetime; dead Alpha + durable campaign '%s' will converge only in "
+                "the combined CLOCKS.RECOVER transaction",
+                active_campaign_name,
+            )
+            return (
+                {
+                    "success": True,
+                    "mode": "DEFERRED_COMBINED_ALPHA_CAMPAIGN_RESTORE",
+                    "alpha_resurrected_this_startup": False,
+                    "teensy_probe": copy.deepcopy(lifecycle_status),
+                    "proof": copy.deepcopy(loss_proof),
+                },
+                _HolisticInstrumentVerdict(
+                    alpha_disposition="LOST",
+                    alpha_basis="PHYSICAL_SEQUENCE_REGRESSION_DURING_RECOVERY_CUSTODY",
+                    alpha_proof=copy.deepcopy(loss_proof),
+                    observed_campaign_name=firmware_campaign,
+                    observed_campaign_state=firmware_campaign_state,
+                ),
+            )
 
     alpha_lineage_proved = bool(alpha_lineage.get("proved"))
     report_alpha_survived = bool(
