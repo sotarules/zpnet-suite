@@ -2148,6 +2148,10 @@ def photons_detail_readout() -> list[str]:
 
     campaign = live.get("campaign") if isinstance(live.get("campaign"), dict) else {}
     recoverable_str = _recoverable_status(PHOTONS_RECOVERY_CONFIG_KEY)
+    lap_baseline_ns = _photons_lap_baseline_ns(live)
+    lap_baseline_str = (
+        f"{lap_baseline_ns:.6f} ns" if lap_baseline_ns is not None else "---"
+    )
     campaign_id = _to_int(campaign.get("campaign_id"))
     summary_by_id = {s.get("id"): s for s in summaries}
     active_summary = summary_by_id.get(campaign_id)
@@ -2165,13 +2169,17 @@ def photons_detail_readout() -> list[str]:
             active_summary.get("baseline_campaign") if isinstance(active_summary, dict) else None
         )
         identity = (
-            f"PHOTONS  CAMPAIGN: {campaign_name}  ELAPSED: {_seconds_to_hms(elapsed_s)}"
+            f"PHOTONS  CAMPAIGN: {campaign_name}"
+            f"  LAP BASELINE: {lap_baseline_str}"
+            f"  ELAPSED: {_seconds_to_hms(elapsed_s)}"
             f"  BASELINE: {baseline_name or 'NONE'}"
             f"  RECOVERABLE: {recoverable_str}"
         )
     else:
         identity = (
-            "PHOTONS  CAMPAIGN: STOPPED  INSTRUMENT: ALWAYS ON  BASELINE: NONE"
+            "PHOTONS  CAMPAIGN: STOPPED"
+            f"  LAP BASELINE: {lap_baseline_str}"
+            "  INSTRUMENT: ALWAYS ON  BASELINE: NONE"
             f"  RECOVERABLE: {recoverable_str}"
         )
 
@@ -2202,7 +2210,6 @@ def photons_detail_readout() -> list[str]:
     except Exception:
         rolling = []
 
-    lap_baseline_ns = _photons_lap_baseline_ns(live)
     current_residual_ns = (
         float(now_mean) - float(lap_baseline_ns)
         if now_mean is not None and lap_baseline_ns is not None
