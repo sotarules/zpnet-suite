@@ -16,8 +16,8 @@
 // naturally aligned, and simple to validate after reboot.
 // ============================================================================
 
-static constexpr uint32_t CRASH_FORENSICS_SCHEMA_VERSION = 2U;
-static constexpr uint32_t CRASH_FORENSICS_CORE_SCHEMA_VERSION = 1U;
+static constexpr uint32_t CRASH_FORENSICS_SCHEMA_VERSION = 3U;
+static constexpr uint32_t CRASH_FORENSICS_CORE_SCHEMA_VERSION = 2U;
 static constexpr size_t CRASH_FORENSICS_NVIC_WORDS = 5U;
 static constexpr size_t CRASH_FORENSICS_MPU_REGIONS = 16U;
 static constexpr size_t CRASH_FORENSICS_FP_FRAME_WORDS = 18U;
@@ -249,7 +249,8 @@ struct crash_forensics_record_t {
     uint32_t mpu_rbar[CRASH_FORENSICS_MPU_REGIONS];
     uint32_t mpu_rasr[CRASH_FORENSICS_MPU_REGIONS];
 
-    // Raw low floating-point exception frame: S0-S15, FPSCR, reserved word.
+    // Raw low floating-point extension following the eight core frame words:
+    // S0-S15, FPSCR, reserved word.
     uint32_t fp_frame_word_count;
     uint32_t fp_frame_words[CRASH_FORENSICS_FP_FRAME_WORDS];
 

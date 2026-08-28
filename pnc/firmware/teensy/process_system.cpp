@@ -465,7 +465,7 @@ static FLASHMEM Payload system_crash_word_window_payload(uint32_t base,
 static FLASHMEM Payload system_crash_core_forensics_payload(
     const crash_forensics_core_record_t& record) {
   Payload out;
-  out.add("schema", "ZPNET_CRASH_FORENSICS_CORE_V1");
+  out.add("schema", "ZPNET_CRASH_FORENSICS_CORE_V2");
   out.add("schema_version", record.schema_version);
   out.add("record_size", record.record_size);
   out.add("capture_sequence", record.capture_sequence);
@@ -622,7 +622,7 @@ static FLASHMEM Payload system_crash_forensics_payload(void) {
   crash_forensics_get_status(&status);
 
   Payload out;
-  out.add("schema", "ZPNET_CRASH_FORENSICS_V3");
+  out.add("schema", "ZPNET_CRASH_FORENSICS_V4");
   out.add("installed_now", status.installed);
   out.add("present", status.present);
 
@@ -895,9 +895,10 @@ static FLASHMEM Payload system_crash_forensics_payload(void) {
 //   bit 3: 0 = return to Handler mode, 1 = return to Thread mode
 //   bit 4: 0 = extended FP frame, 1 = basic frame
 //
-// An extended FP frame contributes 18 words before the eight-word basic frame.
-// The optional stack-alignment word follows the basic frame and is identified
-// by stacked xPSR bit 9.
+// The eight core words begin at the selected exception stack pointer for both
+// basic and extended frames.  When EXC_RETURN[4] is zero, the 18-word FP
+// extension follows those core words.  An optional alignment word follows the
+// complete hardware frame and is identified by stacked xPSR bit 9.
 
 static constexpr uintptr_t SYSTEM_SCS_ACTLR  = 0xE000E008UL;
 static constexpr uintptr_t SYSTEM_SCB_CPUID  = 0xE000ED00UL;
@@ -1094,12 +1095,12 @@ static FLASHMEM Payload system_crash_policy_record_payload(
   const bool extended_frame = !basic_frame;
   const uint32_t extension_words = extended_frame ? 18U : 0U;
   const uint32_t selected_sp = use_psp ? record.original_psp : record.original_msp;
-  const uint32_t expected_basic =
-      record.raw_frame_address + extension_words * sizeof(uint32_t);
+  const uint32_t expected_basic = record.raw_frame_address;
   const bool stack_alignment_word =
       (record.stacked_xpsr & (1UL << 9)) != 0U;
   const uint32_t expected_interrupted_sp =
-      expected_basic + 8U * sizeof(uint32_t) +
+      record.raw_frame_address +
+      (8U + extension_words) * sizeof(uint32_t) +
       (stack_alignment_word ? sizeof(uint32_t) : 0U);
 
   const uint32_t xpsr_exception_number = record.stacked_xpsr & 0x1FFU;
@@ -1429,7 +1430,7 @@ static FLASHMEM Payload system_crash_policy_payload(void) {
   crash_forensics_get_status(&status);
 
   Payload out;
-  out.add("schema", "ZPNET_CRASH_POLICY_V1");
+  out.add("schema", "ZPNET_CRASH_POLICY_V2");
   out.add("architecture", "ARMV7M_CORTEX_M7");
   out.add("frame_source_rule", "EXC_RETURN[2]: 0=MSP 1=PSP");
   out.add("return_mode_rule", "EXC_RETURN[3]: 0=HANDLER 1=THREAD");

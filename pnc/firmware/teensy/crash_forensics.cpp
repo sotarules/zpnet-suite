@@ -687,92 +687,33 @@ static bool core_lr_plausible(uint32_t lr) {
 
 struct crash_basic_frame_selection_t {
     bool readable;
-    bool plausible;
-    bool lr_plausible;
-    uint32_t offset_words;
     uint32_t address;
 };
 
 static crash_basic_frame_selection_t core_basic_frame_candidate(
-    uint32_t frame_sp,
-    uint32_t offset_words) {
+    uint32_t frame_sp) {
     crash_basic_frame_selection_t candidate{};
-    candidate.offset_words = offset_words;
+    if ((frame_sp & 3U) != 0U) return candidate;
 
-    const uint32_t offset_bytes = offset_words * sizeof(uint32_t);
-    if ((frame_sp & 3U) != 0U ||
-        frame_sp > UINT32_MAX - offset_bytes) {
-        return candidate;
-    }
-
-    candidate.address = frame_sp + offset_bytes;
+    // Cortex-M always places the eight core state words at the exception
+    // frame base: R0-R3, R12, LR, PC, xPSR.  When EXC_RETURN[4] is zero,
+    // the 18-word floating-point extension follows those eight words; it does
+    // not move the core frame forward by 18 words.
+    candidate.address = frame_sp;
     candidate.readable =
         core_stack_span_readable(candidate.address, 8U * sizeof(uint32_t));
-    if (!candidate.readable) return candidate;
-
-    const volatile uint32_t* const basic =
-        reinterpret_cast<volatile const uint32_t*>(candidate.address);
-    const uint32_t lr = basic[5];
-    const uint32_t pc = basic[6];
-    const uint32_t xpsr = basic[7];
-    candidate.lr_plausible = core_lr_plausible(lr);
-    candidate.plausible =
-        (xpsr & (1UL << 24)) != 0U &&
-        core_pc_plausible(pc);
     return candidate;
 }
 
 static crash_basic_frame_selection_t extended_basic_frame_candidate(
-    uint32_t frame_sp,
-    uint32_t offset_words) {
+    uint32_t frame_sp) {
     crash_basic_frame_selection_t candidate{};
-    candidate.offset_words = offset_words;
+    if ((frame_sp & 3U) != 0U) return candidate;
 
-    const uint32_t offset_bytes = offset_words * sizeof(uint32_t);
-    if ((frame_sp & 3U) != 0U ||
-        frame_sp > UINT32_MAX - offset_bytes) {
-        return candidate;
-    }
-
-    candidate.address = frame_sp + offset_bytes;
+    candidate.address = frame_sp;
     candidate.readable =
         stack_span_readable(candidate.address, 8U * sizeof(uint32_t));
-    if (!candidate.readable) return candidate;
-
-    const volatile uint32_t* const basic =
-        reinterpret_cast<volatile const uint32_t*>(candidate.address);
-    const uint32_t lr = basic[5];
-    const uint32_t pc = basic[6];
-    const uint32_t xpsr = basic[7];
-    candidate.lr_plausible = stacked_lr_plausible(lr);
-    candidate.plausible =
-        (xpsr & (1UL << 24)) != 0U &&
-        stacked_pc_plausible(pc);
     return candidate;
-}
-
-static crash_basic_frame_selection_t select_basic_frame(
-    const crash_basic_frame_selection_t& architectural,
-    const crash_basic_frame_selection_t& alternate) {
-    // EXC_RETURN defines the architectural frame shape.  An alternate offset is
-    // useful only when it independently proves a complete control-flow frame:
-    // lawful xPSR, executable PC, and lawful LR.  Requiring all three prevents
-    // ordinary stack/register residue from winning merely because two words
-    // happen to resemble a Thumb PC and xPSR.
-    const bool architectural_fully_plausible =
-        architectural.plausible && architectural.lr_plausible;
-    const bool alternate_fully_plausible =
-        alternate.plausible && alternate.lr_plausible;
-
-    if (architectural_fully_plausible) return architectural;
-    if (alternate_fully_plausible) return alternate;
-
-    // When neither candidate proves a complete frame, retain the architectural
-    // candidate whenever it is readable.  Its malformed LR/PC/xPSR are primary
-    // crash evidence; an unproven alternate must not replace them and create a
-    // convincing but false source attribution.
-    if (architectural.readable) return architectural;
-    return alternate;
 }
 
 static bool core_record_header_valid(
@@ -880,20 +821,9 @@ static void capture_core_record_from_entry(
         record.flags |= CRASH_FORENSICS_FLAG_STACKING_FAULT;
     }
 
-    const uint32_t architectural_offset_words =
-        extended_frame ? 18U : 0U;
-    const uint32_t alternate_offset_words =
-        extended_frame ? 0U : 18U;
-    const crash_basic_frame_selection_t architectural =
-        core_basic_frame_candidate(entry->frame_sp,
-                                   architectural_offset_words);
-    const crash_basic_frame_selection_t alternate =
-        core_basic_frame_candidate(entry->frame_sp,
-                                   alternate_offset_words);
     const crash_basic_frame_selection_t selected =
-        select_basic_frame(architectural, alternate);
+        core_basic_frame_candidate(entry->frame_sp);
 
-    const uint32_t selected_basic_offset_words = selected.offset_words;
     record.basic_frame_address = selected.address;
     const bool frame_readable = selected.readable;
     if (frame_readable) {
@@ -916,7 +846,8 @@ static void capture_core_record_from_entry(
         record.interrupted_exception_number = record.stacked_xpsr & 0x1FFU;
         record.flags |= CRASH_FORENSICS_FLAG_BASIC_FRAME_VALID;
 
-        uint32_t complete_frame_words = selected_basic_offset_words + 8U;
+        uint32_t complete_frame_words =
+            8U + (extended_frame ? CRASH_FORENSICS_FP_FRAME_WORDS : 0U);
         if ((record.stacked_xpsr & (1UL << 9)) != 0U) {
             complete_frame_words++;
             record.flags |= CRASH_FORENSICS_FLAG_STACK_ALIGNMENT_WORD;
@@ -1212,20 +1143,9 @@ extern "C" void crash_forensics_capture_from_entry(
         record.flags |= CRASH_FORENSICS_FLAG_STACKING_FAULT;
     }
 
-    const uint32_t architectural_offset_words =
-        extended_frame ? 18U : 0U;
-    const uint32_t alternate_offset_words =
-        extended_frame ? 0U : 18U;
-    const crash_basic_frame_selection_t architectural =
-        extended_basic_frame_candidate(entry->frame_sp,
-                                       architectural_offset_words);
-    const crash_basic_frame_selection_t alternate =
-        extended_basic_frame_candidate(entry->frame_sp,
-                                       alternate_offset_words);
     const crash_basic_frame_selection_t selected =
-        select_basic_frame(architectural, alternate);
+        extended_basic_frame_candidate(entry->frame_sp);
 
-    const uint32_t selected_basic_offset_words = selected.offset_words;
     record.basic_frame_address = selected.address;
     const bool frame_readable = selected.readable;
     if (frame_readable) {
@@ -1233,8 +1153,6 @@ extern "C" void crash_forensics_capture_from_entry(
     }
 
     if (frame_readable && !stacking_fault) {
-        const volatile uint32_t* const raw_frame =
-            reinterpret_cast<volatile const uint32_t*>(entry->frame_sp);
         const volatile uint32_t* const basic =
             reinterpret_cast<volatile const uint32_t*>(
                 record.basic_frame_address);
@@ -1281,15 +1199,23 @@ extern "C" void crash_forensics_capture_from_entry(
             record.flags |= CRASH_FORENSICS_FLAG_STACK_ALIGNMENT_WORD;
         }
 
+        const uint32_t fp_frame_offset_bytes = 8U * sizeof(uint32_t);
         if (extended_frame &&
-            selected_basic_offset_words == 18U && stack_span_readable(
-                entry->frame_sp,
-                CRASH_FORENSICS_FP_FRAME_WORDS * sizeof(uint32_t))) {
-            record.fp_frame_word_count = CRASH_FORENSICS_FP_FRAME_WORDS;
-            for (size_t i = 0; i < CRASH_FORENSICS_FP_FRAME_WORDS; ++i) {
-                record.fp_frame_words[i] = raw_frame[i];
+            entry->frame_sp <= UINT32_MAX - fp_frame_offset_bytes) {
+            const uint32_t fp_frame_address =
+                entry->frame_sp + fp_frame_offset_bytes;
+            if (stack_span_readable(
+                    fp_frame_address,
+                    CRASH_FORENSICS_FP_FRAME_WORDS * sizeof(uint32_t))) {
+                const volatile uint32_t* const fp_frame =
+                    reinterpret_cast<volatile const uint32_t*>(
+                        fp_frame_address);
+                record.fp_frame_word_count = CRASH_FORENSICS_FP_FRAME_WORDS;
+                for (size_t i = 0; i < CRASH_FORENSICS_FP_FRAME_WORDS; ++i) {
+                    record.fp_frame_words[i] = fp_frame[i];
+                }
+                record.flags |= CRASH_FORENSICS_FLAG_FP_FRAME_CAPTURED;
             }
-            record.flags |= CRASH_FORENSICS_FLAG_FP_FRAME_CAPTURED;
         }
     }
 
