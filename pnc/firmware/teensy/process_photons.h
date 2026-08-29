@@ -349,6 +349,13 @@ struct photons_fragment_stats_snapshot_t {
   uint64_t standard_lap_ps = 0;
   uint64_t lap_count = 0;
   uint64_t total_lap_gnss_ns = 0;
+
+  // Monotonic accepted-lap custody survives STATS_RESET and is part of the
+  // immutable publication value.  The serializer must never reach back into
+  // live PHOTONS globals for these totals.
+  uint64_t custody_lap_count = 0;
+  uint64_t custody_total_lap_gnss_ns = 0;
+
   double mean_lap_ns = 0.0;
   photons_fragment_welford_snapshot_t lap_time_welford{};
   photons_fragment_ppb_buckets_snapshot_t ppb_buckets{};

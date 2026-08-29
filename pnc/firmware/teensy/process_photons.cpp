@@ -2284,6 +2284,69 @@ static photons_live_state_t g_photons_live{};
 
 static photons_toy_fragment_t g_last_fragment{};
 static photons_fragment_snapshot_t g_last_photons_fragment{};
+
+// Canonical PHOTONS_FRAGMENT publication crosses one explicit SPSC ownership
+// boundary.  The once-per-second capture side owns the write slot while it
+// drains/derives live state; after commit, Payload construction and publish() may
+// read only the consumer-owned queue front.
+static constexpr uint32_t PHOTONS_FRAGMENT_PUBLICATION_QUEUE_CAPACITY = 2U;
+static photons_fragment_snapshot_t
+    g_photons_fragment_publication_queue[
+        PHOTONS_FRAGMENT_PUBLICATION_QUEUE_CAPACITY] DMAMEM = {};
+static volatile uint32_t g_photons_fragment_publication_queue_read = 0U;
+static volatile uint32_t g_photons_fragment_publication_queue_write = 0U;
+static volatile uint32_t g_photons_fragment_publication_queue_count = 0U;
+
+static photons_fragment_snapshot_t*
+photons_fragment_publication_queue_acquire_write(void) {
+  if (g_photons_fragment_publication_queue_count >=
+      PHOTONS_FRAGMENT_PUBLICATION_QUEUE_CAPACITY) {
+    __builtin_trap();
+  }
+  return &g_photons_fragment_publication_queue[
+      g_photons_fragment_publication_queue_write];
+}
+
+static void photons_fragment_publication_queue_commit_write(void) {
+  photons_memory_barrier();
+  g_photons_fragment_publication_queue_write =
+      (g_photons_fragment_publication_queue_write + 1U) %
+      PHOTONS_FRAGMENT_PUBLICATION_QUEUE_CAPACITY;
+  g_photons_fragment_publication_queue_count++;
+  photons_memory_barrier();
+}
+
+static const photons_fragment_snapshot_t*
+photons_fragment_publication_queue_front(void) {
+  photons_memory_barrier();
+  if (g_photons_fragment_publication_queue_count == 0U) return nullptr;
+  return &g_photons_fragment_publication_queue[
+      g_photons_fragment_publication_queue_read];
+}
+
+static void photons_fragment_publication_queue_release(void) {
+  if (g_photons_fragment_publication_queue_count == 0U) __builtin_trap();
+  photons_fragment_snapshot_t& item =
+      g_photons_fragment_publication_queue[
+          g_photons_fragment_publication_queue_read];
+  memset(&item, 0, sizeof(item));
+  photons_memory_barrier();
+  g_photons_fragment_publication_queue_read =
+      (g_photons_fragment_publication_queue_read + 1U) %
+      PHOTONS_FRAGMENT_PUBLICATION_QUEUE_CAPACITY;
+  g_photons_fragment_publication_queue_count--;
+  photons_memory_barrier();
+}
+
+static void photons_fragment_publication_queue_reset(void) {
+  memset(g_photons_fragment_publication_queue, 0,
+         sizeof(g_photons_fragment_publication_queue));
+  g_photons_fragment_publication_queue_read = 0U;
+  g_photons_fragment_publication_queue_write = 0U;
+  g_photons_fragment_publication_queue_count = 0U;
+  photons_memory_barrier();
+}
+
 static uint32_t g_publish_count = 0;
 static uint32_t g_publish_reject_count = 0;
 static uint32_t g_last_published_edge_count = 0;
@@ -2863,8 +2926,9 @@ static Payload& photons_fragment_payload(
   stats.add("standard_lap_ps", f.stats.standard_lap_ps);
   stats.add("standard_lap_ns",
             toFixedDecimal((double)f.stats.standard_lap_ps / 1000.0, 3));
-  stats.add("custody_lap_count", g_photons_custody_lap_count);
-  stats.add("custody_total_lap_gnss_ns", g_photons_custody_total_lap_gnss_ns);
+  stats.add("custody_lap_count", f.stats.custody_lap_count);
+  stats.add("custody_total_lap_gnss_ns",
+            f.stats.custody_total_lap_gnss_ns);
   stats.add("lap_count", f.stats.lap_count);
   stats.add("total_lap_gnss_ns", f.stats.total_lap_gnss_ns);
   stats.add("mean_lap_ns", toFixedDecimal(f.stats.mean_lap_ns, 6));
@@ -3072,16 +3136,15 @@ static void photons_fragment_tick(
   if (!photons_toy_capture_snapshot(&capture)) return;
 
   interrupt_photodiode_diag_t interrupt_diag{};
-  if (!interrupt_photodiode_snapshot(&interrupt_diag) ||
-      !g_interrupt_ancestry.valid) {
-    __builtin_trap();
-  }
+  if (!interrupt_photodiode_snapshot(&interrupt_diag)) __builtin_trap();
+  const photons_interrupt_ancestry_t interrupt_ancestry = g_interrupt_ancestry;
+  if (!interrupt_ancestry.valid) __builtin_trap();
   const uint32_t interrupt_callback_missing_since_ancestry =
       interrupt_diag.callback_missing_count -
-      g_interrupt_ancestry.callback_missing_origin;
+      interrupt_ancestry.callback_missing_origin;
   const uint32_t interrupt_inactive_edge_since_ancestry =
       interrupt_diag.inactive_edge_count -
-      g_interrupt_ancestry.inactive_edge_origin;
+      interrupt_ancestry.inactive_edge_origin;
 
   const photons_fragment_drain_result_t drain =
       photons_drain_raw_laps();
@@ -3097,7 +3160,13 @@ static void photons_fragment_tick(
   g_projection_state.anchor_dwt_cycles_per_second =
       current_anchor.dwt_cycles_per_second;
 
-  photons_fragment_snapshot_t fragment{};
+  const photons_race_runtime_t race = g_photons_race;
+
+  if (g_photons_fragment_publication_queue_count != 0U) __builtin_trap();
+  photons_fragment_snapshot_t* producer_item =
+      photons_fragment_publication_queue_acquire_write();
+  memset(producer_item, 0, sizeof(*producer_item));
+  photons_fragment_snapshot_t& fragment = *producer_item;
   fragment.snapshot_ok = true;
   fragment.sequence = ++g_fragment_sequence;
   fragment.publish_count = g_publish_count + 1U;
@@ -3114,37 +3183,37 @@ static void photons_fragment_tick(
 
   fragment.race_cadence_hz = PHOTONS_RACE_CADENCE_HZ;
   fragment.race_pulse_ns = PHOTONS_RACE_PULSE_NS;
-  fragment.race_cadence_tick_count_total = g_photons_race.cadence_tick_count;
+  fragment.race_cadence_tick_count_total = race.cadence_tick_count;
   fragment.race_cadence_ticks_this_fragment = (uint32_t)(
-      g_photons_race.cadence_tick_count -
+      race.cadence_tick_count -
       g_last_fragment_race_cadence_tick_count);
-  fragment.race_attempt_count_total = g_photons_race.attempt_count;
+  fragment.race_attempt_count_total = race.attempt_count;
   fragment.race_attempts_this_fragment = (uint32_t)(
-      g_photons_race.attempt_count - g_last_fragment_race_attempt_count);
-  fragment.race_completed_count_total = g_photons_race.completed_count;
+      race.attempt_count - g_last_fragment_race_attempt_count);
+  fragment.race_completed_count_total = race.completed_count;
   fragment.race_completed_this_fragment = (uint32_t)(
-      g_photons_race.completed_count - g_last_fragment_race_completed_count);
-  fragment.race_missed_count_total = g_photons_race.missed_count;
+      race.completed_count - g_last_fragment_race_completed_count);
+  fragment.race_missed_count_total = race.missed_count;
   fragment.race_missed_this_fragment = (uint32_t)(
-      g_photons_race.missed_count - g_last_fragment_race_missed_count);
+      race.missed_count - g_last_fragment_race_missed_count);
   fragment.race_skipped_not_quiet_total =
-      g_photons_race.skipped_not_quiet_count;
+      race.skipped_not_quiet_count;
   fragment.race_skipped_not_quiet_this_fragment = (uint32_t)(
-      g_photons_race.skipped_not_quiet_count -
+      race.skipped_not_quiet_count -
       g_last_fragment_race_skipped_not_quiet_count);
   fragment.race_skipped_projection_total =
-      g_photons_race.skipped_projection_count;
+      race.skipped_projection_count;
   fragment.race_skipped_projection_this_fragment = (uint32_t)(
-      g_photons_race.skipped_projection_count -
+      race.skipped_projection_count -
       g_last_fragment_race_skipped_projection_count);
   fragment.race_invalid_endpoint_total =
-      g_photons_race.invalid_endpoint_count;
+      race.invalid_endpoint_count;
   fragment.race_invalid_endpoint_this_fragment = (uint32_t)(
-      g_photons_race.invalid_endpoint_count -
+      race.invalid_endpoint_count -
       g_last_fragment_race_invalid_endpoint_count);
-  fragment.race_enqueue_failure_total = g_photons_race.enqueue_failure_count;
+  fragment.race_enqueue_failure_total = race.enqueue_failure_count;
   fragment.race_enqueue_failure_this_fragment = (uint32_t)(
-      g_photons_race.enqueue_failure_count -
+      race.enqueue_failure_count -
       g_last_fragment_race_enqueue_failure_count);
   fragment.race_flight_this_fragment =
       photons_welford_snapshot(drain.projected_flight_welford);
@@ -3162,6 +3231,9 @@ static void photons_fragment_tick(
   fragment.stats.standard_lap_ps = g_standard_lap_ps;
   fragment.stats.lap_count = g_lap_time_welford.n;
   fragment.stats.total_lap_gnss_ns = g_total_lap_gnss_ns;
+  fragment.stats.custody_lap_count = g_photons_custody_lap_count;
+  fragment.stats.custody_total_lap_gnss_ns =
+      g_photons_custody_total_lap_gnss_ns;
   fragment.stats.mean_lap_ns =
       (g_lap_time_welford.n != 0ULL)
           ? (double)g_total_lap_gnss_ns /
@@ -3228,15 +3300,15 @@ static void photons_fragment_tick(
   fragment.interrupt_callback_missing_count =
       interrupt_diag.callback_missing_count;
   fragment.interrupt_ancestry_baseline_valid =
-      g_interrupt_ancestry.valid;
+      interrupt_ancestry.valid;
   fragment.interrupt_callback_missing_origin =
-      g_interrupt_ancestry.callback_missing_origin;
+      interrupt_ancestry.callback_missing_origin;
   fragment.interrupt_callback_missing_since_ancestry =
       interrupt_callback_missing_since_ancestry;
   fragment.interrupt_inactive_edge_count =
       interrupt_diag.inactive_edge_count;
   fragment.interrupt_inactive_edge_origin =
-      g_interrupt_ancestry.inactive_edge_origin;
+      interrupt_ancestry.inactive_edge_origin;
   fragment.interrupt_inactive_edge_since_ancestry =
       interrupt_inactive_edge_since_ancestry;
   fragment.interrupt_source_pin = interrupt_diag.source_pin;
@@ -3288,41 +3360,57 @@ static void photons_fragment_tick(
   g_last_fragment = toy;
   g_last_photons_fragment = fragment;
   g_last_published_edge_count = capture.edge_count;
-  g_last_fragment_race_cadence_tick_count = g_photons_race.cadence_tick_count;
-  g_last_fragment_race_attempt_count = g_photons_race.attempt_count;
-  g_last_fragment_race_completed_count = g_photons_race.completed_count;
-  g_last_fragment_race_missed_count = g_photons_race.missed_count;
+  g_last_fragment_race_cadence_tick_count =
+      fragment.race_cadence_tick_count_total;
+  g_last_fragment_race_attempt_count = fragment.race_attempt_count_total;
+  g_last_fragment_race_completed_count = fragment.race_completed_count_total;
+  g_last_fragment_race_missed_count = fragment.race_missed_count_total;
   g_last_fragment_race_skipped_not_quiet_count =
-      g_photons_race.skipped_not_quiet_count;
+      fragment.race_skipped_not_quiet_total;
   g_last_fragment_race_skipped_projection_count =
-      g_photons_race.skipped_projection_count;
+      fragment.race_skipped_projection_total;
   g_last_fragment_race_invalid_endpoint_count =
-      g_photons_race.invalid_endpoint_count;
+      fragment.race_invalid_endpoint_total;
   g_last_fragment_race_enqueue_failure_count =
-      g_photons_race.enqueue_failure_count;
+      fragment.race_enqueue_failure_total;
 
-  Payload& payload = photons_fragment_payload(fragment);
+  photons_fragment_publication_queue_commit_write();
+  const photons_fragment_snapshot_t* consumer_item =
+      photons_fragment_publication_queue_front();
+  if (!consumer_item || consumer_item->sequence != fragment.sequence) {
+    __builtin_trap();
+  }
+  const photons_fragment_snapshot_t& owned_fragment = *consumer_item;
+
+  // From this point through publish(), all runtime Payload input is owned by the
+  // consumer queue slot.
+  Payload& payload = photons_fragment_payload(owned_fragment);
   if (publish("PHOTONS_FRAGMENT", payload)) {
     g_publish_count++;
     g_last_fragment.publish_count = g_publish_count;
     g_last_photons_fragment.publish_count = g_publish_count;
-    if (fragment.recovery.restored &&
-        fragment.recovery.proof_pending &&
-        fragment.recovery.proof_advanced &&
+    if (owned_fragment.recovery.restored &&
+        owned_fragment.recovery.proof_pending &&
+        owned_fragment.recovery.proof_advanced &&
         !g_photons_recovery.proof_advanced_published) {
-      g_photons_recovery.proof_sequence = fragment.sequence;
-      g_photons_recovery.proof_update_count = fragment.stats.update_count;
+      g_photons_recovery.proof_sequence = owned_fragment.sequence;
+      g_photons_recovery.proof_update_count = owned_fragment.stats.update_count;
       g_photons_recovery.proof_advanced_published = true;
     }
-    photons_campaign_commit_after_publish(fragment);
+    photons_campaign_commit_after_publish(owned_fragment);
     photons_stats_reset_commit_after_publish();
   } else {
     g_publish_reject_count++;
   }
+
+  photons_fragment_publication_queue_release();
 }
 
 
 static void photons_recovery_clear_physical_ancestry(void) {
+  // No publication queue value may straddle a physical-ancestry boundary.
+  photons_fragment_publication_queue_reset();
+
   // Discard every observation that could have begun before the recovery
   // boundary.  Aggregate statistics are installed separately; none of these
   // boot-local physical facts may cross the outage.
@@ -3415,6 +3503,7 @@ FLASHMEM void process_photons_init(void) {
   g_photons_live = photons_live_state_t{};
   g_last_fragment = photons_toy_fragment_t{};
   g_last_photons_fragment = photons_fragment_snapshot_t{};
+  photons_fragment_publication_queue_reset();
   g_fragment_sequence = 0U;
   g_publish_count = 0U;
   g_publish_reject_count = 0U;

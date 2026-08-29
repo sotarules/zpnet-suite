@@ -657,9 +657,95 @@ static uint32_t g_clocks_fragment_publication_idle_retry_abandon_count = 0U;
 static uint32_t g_clocks_fragment_publication_idle_retry_last_sequence = 0U;
 static uint32_t g_clocks_fragment_publication_idle_retry_last_attempt_count = 0U;
 
-// The CLOCKS handoff is intentionally large and must never become a foreground
-// stack local. CLOCKS owns this RAM2 snapshot and all serialization derived from it.
-static clocks_fragment_snapshot_t g_clocks_fragment_publication_clocks_snapshot DMAMEM = {};
+// The CLOCKS publication handoff is intentionally large and must never become a
+// foreground stack local.  Publication now crosses one explicit SPSC ownership
+// boundary: the capture side owns the write slot until commit; the serializer owns
+// the read slot until publish succeeds or the observation is explicitly retired.
+// No Payload builder may reach back into live CLOCKS/SYSTEM state.
+static constexpr uint32_t CLOCKS_FRAGMENT_PUBLICATION_QUEUE_CAPACITY = 2U;
+
+struct clocks_fragment_feature_value_t {
+  bool present = false;
+  system_feature_status_t status = system_feature_status_t::INITIALIZING;
+};
+
+struct clocks_fragment_features_snapshot_t {
+  clocks_fragment_feature_value_t alpha_epoch{};
+  clocks_fragment_feature_value_t dwt_calibration{};
+  clocks_fragment_feature_value_t ocxo_public_origin{};
+  clocks_fragment_feature_value_t static_prediction{};
+  clocks_fragment_feature_value_t counter32_lineage{};
+  clocks_fragment_feature_value_t observed_edge_authority{};
+  clocks_fragment_feature_value_t pps_vclock_authority{};
+  clocks_fragment_feature_value_t qtimer_counter_custody{};
+};
+
+struct clocks_fragment_publication_item_t {
+  uint32_t sequence = 0U;
+  clocks_fragment_snapshot_t clocks{};
+  clocks_fragment_features_snapshot_t features{};
+};
+
+static clocks_fragment_publication_item_t
+    g_clocks_fragment_publication_queue[CLOCKS_FRAGMENT_PUBLICATION_QUEUE_CAPACITY]
+        DMAMEM = {};
+static volatile uint32_t g_clocks_fragment_publication_queue_read = 0U;
+static volatile uint32_t g_clocks_fragment_publication_queue_write = 0U;
+static volatile uint32_t g_clocks_fragment_publication_queue_count = 0U;
+
+static inline void clocks_fragment_publication_queue_barrier(void) {
+  __asm__ volatile("dmb" ::: "memory");
+}
+
+static clocks_fragment_publication_item_t*
+clocks_fragment_publication_queue_acquire_write(void) {
+  if (g_clocks_fragment_publication_queue_count >=
+      CLOCKS_FRAGMENT_PUBLICATION_QUEUE_CAPACITY) {
+    __builtin_trap();
+  }
+  return &g_clocks_fragment_publication_queue[
+      g_clocks_fragment_publication_queue_write];
+}
+
+static void clocks_fragment_publication_queue_commit_write(void) {
+  clocks_fragment_publication_queue_barrier();
+  g_clocks_fragment_publication_queue_write =
+      (g_clocks_fragment_publication_queue_write + 1U) %
+      CLOCKS_FRAGMENT_PUBLICATION_QUEUE_CAPACITY;
+  g_clocks_fragment_publication_queue_count++;
+  clocks_fragment_publication_queue_barrier();
+}
+
+static clocks_fragment_publication_item_t*
+clocks_fragment_publication_queue_front(void) {
+  clocks_fragment_publication_queue_barrier();
+  if (g_clocks_fragment_publication_queue_count == 0U) return nullptr;
+  return &g_clocks_fragment_publication_queue[
+      g_clocks_fragment_publication_queue_read];
+}
+
+static void clocks_fragment_publication_queue_release(void) {
+  if (g_clocks_fragment_publication_queue_count == 0U) __builtin_trap();
+  clocks_fragment_publication_item_t& item =
+      g_clocks_fragment_publication_queue[
+          g_clocks_fragment_publication_queue_read];
+  memset(&item, 0, sizeof(item));
+  clocks_fragment_publication_queue_barrier();
+  g_clocks_fragment_publication_queue_read =
+      (g_clocks_fragment_publication_queue_read + 1U) %
+      CLOCKS_FRAGMENT_PUBLICATION_QUEUE_CAPACITY;
+  g_clocks_fragment_publication_queue_count--;
+  clocks_fragment_publication_queue_barrier();
+}
+
+static void clocks_fragment_publication_queue_reset(void) {
+  memset(g_clocks_fragment_publication_queue, 0,
+         sizeof(g_clocks_fragment_publication_queue));
+  g_clocks_fragment_publication_queue_read = 0U;
+  g_clocks_fragment_publication_queue_write = 0U;
+  g_clocks_fragment_publication_queue_count = 0U;
+  clocks_fragment_publication_queue_barrier();
+}
 
 // CLOCKS_FRAGMENT serialization is a bounded, single-owner foreground workload.
 // Large canonical parents live in fixed RAM2 stores so they never enter the
@@ -728,41 +814,68 @@ static inline uint32_t clocks_fragment_current_ipsr(void) {
 #endif
 }
 
-static FLASHMEM Payload& clocks_fragment_features_payload(void) {
+static void clocks_fragment_feature_snapshot_take(
+    clocks_fragment_feature_value_t& out,
+    const char* subsystem,
+    const char* name) {
+  out = clocks_fragment_feature_value_t{};
+  if (!system_feature_has(subsystem, name)) return;
+  const char* status = system_feature_get_status(subsystem, name);
+  if (!status || !system_feature_status_parse(status, &out.status)) {
+    __builtin_trap();
+  }
+  out.present = true;
+}
+
+static void clocks_fragment_features_snapshot_take(
+    clocks_fragment_features_snapshot_t& out) {
+  out = clocks_fragment_features_snapshot_t{};
+  clocks_fragment_feature_snapshot_take(
+      out.alpha_epoch, "CLOCKS", "ALPHA_EPOCH");
+  clocks_fragment_feature_snapshot_take(
+      out.dwt_calibration, "CLOCKS", "DWT_CALIBRATION");
+  clocks_fragment_feature_snapshot_take(
+      out.ocxo_public_origin, "CLOCKS", "OCXO_PUBLIC_ORIGIN");
+  clocks_fragment_feature_snapshot_take(
+      out.static_prediction, "CLOCKS", "STATIC_PREDICTION");
+  clocks_fragment_feature_snapshot_take(
+      out.counter32_lineage, "INTERRUPT", "COUNTER32_LINEAGE");
+  clocks_fragment_feature_snapshot_take(
+      out.observed_edge_authority, "INTERRUPT", "OBSERVED_EDGE_AUTHORITY");
+  clocks_fragment_feature_snapshot_take(
+      out.pps_vclock_authority, "INTERRUPT", "PPS_VCLOCK_AUTHORITY");
+  clocks_fragment_feature_snapshot_take(
+      out.qtimer_counter_custody, "INTERRUPT", "QTIMER_COUNTER_CUSTODY");
+}
+
+static FLASHMEM Payload& clocks_fragment_features_payload(
+    const clocks_fragment_features_snapshot_t& snapshot) {
   Payload clocks;
-  bool clocks_present = false;
-#define CLOCKS_ADD_FEATURE(name) \
-  do { \
-    if (system_feature_has("CLOCKS", name)) { \
-      clocks.add(name, system_feature_get_status("CLOCKS", name)); \
-      clocks_present = true; \
-    } \
-  } while (0)
-  CLOCKS_ADD_FEATURE("ALPHA_EPOCH");
-  CLOCKS_ADD_FEATURE("DWT_CALIBRATION");
-  CLOCKS_ADD_FEATURE("OCXO_PUBLIC_ORIGIN");
-  CLOCKS_ADD_FEATURE("STATIC_PREDICTION");
-#undef CLOCKS_ADD_FEATURE
+  if (snapshot.alpha_epoch.present)
+    clocks.add("ALPHA_EPOCH", system_feature_status_str(snapshot.alpha_epoch.status));
+  if (snapshot.dwt_calibration.present)
+    clocks.add("DWT_CALIBRATION", system_feature_status_str(snapshot.dwt_calibration.status));
+  if (snapshot.ocxo_public_origin.present)
+    clocks.add("OCXO_PUBLIC_ORIGIN", system_feature_status_str(snapshot.ocxo_public_origin.status));
+  if (snapshot.static_prediction.present)
+    clocks.add("STATIC_PREDICTION", system_feature_status_str(snapshot.static_prediction.status));
 
   Payload interrupt;
-  bool interrupt_present = false;
-#define CLOCKS_ADD_INTERRUPT_FEATURE(name) \
-  do { \
-    if (system_feature_has("INTERRUPT", name)) { \
-      interrupt.add(name, system_feature_get_status("INTERRUPT", name)); \
-      interrupt_present = true; \
-    } \
-  } while (0)
-  CLOCKS_ADD_INTERRUPT_FEATURE("COUNTER32_LINEAGE");
-  CLOCKS_ADD_INTERRUPT_FEATURE("OBSERVED_EDGE_AUTHORITY");
-  CLOCKS_ADD_INTERRUPT_FEATURE("PPS_VCLOCK_AUTHORITY");
-  CLOCKS_ADD_INTERRUPT_FEATURE("QTIMER_COUNTER_CUSTODY");
-#undef CLOCKS_ADD_INTERRUPT_FEATURE
+  if (snapshot.counter32_lineage.present)
+    interrupt.add("COUNTER32_LINEAGE", system_feature_status_str(snapshot.counter32_lineage.status));
+  if (snapshot.observed_edge_authority.present)
+    interrupt.add("OBSERVED_EDGE_AUTHORITY",
+                  system_feature_status_str(snapshot.observed_edge_authority.status));
+  if (snapshot.pps_vclock_authority.present)
+    interrupt.add("PPS_VCLOCK_AUTHORITY", system_feature_status_str(snapshot.pps_vclock_authority.status));
+  if (snapshot.qtimer_counter_custody.present)
+    interrupt.add("QTIMER_COUNTER_CUSTODY",
+                  system_feature_status_str(snapshot.qtimer_counter_custody.status));
 
   Payload& teensy = g_clocks_fragment_features_teensy_payload;
   teensy.clear();
-  if (clocks_present) teensy.add_object("CLOCKS", clocks);
-  if (interrupt_present) teensy.add_object("INTERRUPT", interrupt);
+  if (!clocks.empty()) teensy.add_object("CLOCKS", clocks);
+  if (!interrupt.empty()) teensy.add_object("INTERRUPT", interrupt);
 
   Payload& root = g_clocks_fragment_features_root_payload;
   root.clear();
@@ -773,7 +886,7 @@ static FLASHMEM Payload& clocks_fragment_features_payload(void) {
 static void clocks_fragment_publication_ensure_initialized(void) {
   if (g_clocks_fragment_publication_initialized) return;
 
-  g_clocks_fragment_publication_clocks_snapshot = clocks_fragment_snapshot_t{};
+  clocks_fragment_publication_queue_reset();
   g_clocks_fragment_publication_retry_snapshot_valid = false;
   g_clocks_fragment_publication_retry_pi_only = false;
   g_clocks_fragment_publication_retry_sequence = 0U;
@@ -1331,8 +1444,10 @@ static void clocks_fragment_retry_retire_observation(uint32_t sequence,
   g_clocks_fragment_publication_retry_attempt_count = 0U;
   g_clocks_fragment_publication_retry_reason_id =
       CLOCKS_FRAGMENT_RETRY_REASON_NONE;
-  g_clocks_fragment_publication_clocks_snapshot =
-      clocks_fragment_snapshot_t{};
+  clocks_fragment_publication_item_t* item =
+      clocks_fragment_publication_queue_front();
+  if (!item || item->sequence != sequence) __builtin_trap();
+  clocks_fragment_publication_queue_release();
   if (g_clocks_fragment_publication_pending) {
     clocks_fragment_schedule_publish();
   }
@@ -1418,21 +1533,30 @@ static void clocks_fragment_publish_service(timepop_ctx_t*,
 
   uint32_t sequence = 0U;
   bool clocks_snapshot_ok = false;
+  clocks_fragment_publication_item_t* publication_item = nullptr;
   if (retrying_snapshot) {
     sequence = g_clocks_fragment_publication_retry_sequence;
+    publication_item = clocks_fragment_publication_queue_front();
+    if (!publication_item || publication_item->sequence != sequence) {
+      __builtin_trap();
+    }
     clocks_snapshot_ok = true;
   } else {
+    if (g_clocks_fragment_publication_queue_count != 0U) __builtin_trap();
     sequence = g_clocks_fragment_publication_pending_sequence;
     g_clocks_fragment_publication_pending = false;
-    g_clocks_fragment_publication_clocks_snapshot = clocks_fragment_snapshot_t{};
+    publication_item = clocks_fragment_publication_queue_acquire_write();
+    memset(publication_item, 0, sizeof(*publication_item));
+    publication_item->sequence = sequence;
     clocks_snapshot_ok = clocks_fragment_snapshot_take(
-        sequence, &g_clocks_fragment_publication_clocks_snapshot);
+        sequence, &publication_item->clocks);
   }
 
+  clocks_fragment_snapshot_t& clocks_snapshot = publication_item->clocks;
   const bool instrument_row_exact = clocks_snapshot_ok &&
-      g_clocks_fragment_publication_clocks_snapshot.live.snapshot_ok &&
-      g_clocks_fragment_publication_clocks_snapshot.live.completed_row_coherent &&
-      g_clocks_fragment_publication_clocks_snapshot.live.completed_pps_sequence == sequence;
+      clocks_snapshot.live.snapshot_ok &&
+      clocks_snapshot.live.completed_row_coherent &&
+      clocks_snapshot.live.completed_pps_sequence == sequence;
 
   if (!instrument_row_exact) {
     // The interrupt-side PPS notification arrives before both post-PPS OCXO edges
@@ -1448,17 +1572,16 @@ static void clocks_fragment_publish_service(timepop_ctx_t*,
     }
     g_clocks_fragment_publication_pending_sequence = sequence;
     g_clocks_fragment_publication_pending = true;
-    g_clocks_fragment_publication_clocks_snapshot = clocks_fragment_snapshot_t{};
+    memset(publication_item, 0, sizeof(*publication_item));
     return;
   }
 
   const bool campaign_available = clocks_snapshot_ok &&
-      g_clocks_fragment_publication_clocks_snapshot.campaign.present &&
-      g_clocks_fragment_publication_clocks_snapshot.campaign.completed_second_sequence ==
-          sequence;
+      clocks_snapshot.campaign.present &&
+      clocks_snapshot.campaign.completed_second_sequence == sequence;
 
   if (clocks_snapshot_ok &&
-      g_clocks_fragment_publication_clocks_snapshot.campaign_row_expected &&
+      clocks_snapshot.campaign_row_expected &&
       !campaign_available) {
     // Public campaign time is already advancing, so this exact physical second
     // must wait for Beta's matching campaign delta.  This custody bit is never
@@ -1472,15 +1595,30 @@ static void clocks_fragment_publish_service(timepop_ctx_t*,
     }
     g_clocks_fragment_publication_pending_sequence = sequence;
     g_clocks_fragment_publication_pending = true;
-    g_clocks_fragment_publication_clocks_snapshot = clocks_fragment_snapshot_t{};
+    memset(publication_item, 0, sizeof(*publication_item));
     return;
   }
+
+  if (!retrying_snapshot) {
+    clocks_fragment_features_snapshot_take(publication_item->features);
+    clocks_fragment_publication_queue_commit_write();
+    publication_item = clocks_fragment_publication_queue_front();
+    if (!publication_item || publication_item->sequence != sequence) {
+      __builtin_trap();
+    }
+  }
+
+  // From this point through publish(), every runtime Payload input belongs to
+  // this consumer-owned immutable queue entry.
+  const clocks_fragment_snapshot_t& owned_clocks = publication_item->clocks;
+  const clocks_fragment_features_snapshot_t& owned_features =
+      publication_item->features;
 
   Payload& fragment = g_clocks_fragment_root_payload;
   fragment.clear();
   fragment.add("schema", "CLOCKS_FRAGMENT_V4");
   fragment.add("sequence",
-               g_clocks_fragment_publication_clocks_snapshot.live.completed_pps_sequence);
+               owned_clocks.live.completed_pps_sequence);
 
   // Campaign is optional enrichment. If Beta has not frozen it yet, publish the
   // instrument row now; campaign_row_ready() will schedule a same-sequence
@@ -1489,7 +1627,7 @@ static void clocks_fragment_publish_service(timepop_ctx_t*,
   const bool campaign_embedded = campaign_available;
   if (campaign_available) {
     Payload& campaign = clocks_fragment_campaign_payload(
-        g_clocks_fragment_publication_clocks_snapshot.campaign);
+        owned_clocks.campaign);
     fragment.add_object("campaign", campaign);
     campaign.clear();
   }
@@ -1499,11 +1637,12 @@ static void clocks_fragment_publish_service(timepop_ctx_t*,
   // these attachments either return complete or Payload escalates through its
   // retained fatal WATCHDOG court and does not return to CLOCKS.
   Payload& clocks = clocks_fragment_clocks_payload(
-      g_clocks_fragment_publication_clocks_snapshot.live);
+      owned_clocks.live);
   fragment.add_object("clocks", clocks);
   clocks.clear();
 
-  fragment.add_object("features", clocks_fragment_features_payload());
+  fragment.add_object("features",
+                      clocks_fragment_features_payload(owned_features));
 
   const uint32_t next_publish_count = g_clocks_fragment_publication_publish_count + 1U;
   const uint32_t next_campaign_rows_embedded =
@@ -1545,7 +1684,10 @@ static void clocks_fragment_publish_service(timepop_ctx_t*,
   g_clocks_fragment_publication_retry_reason_id =
       CLOCKS_FRAGMENT_RETRY_REASON_NONE;
 
-  g_clocks_fragment_publication_clocks_snapshot = clocks_fragment_snapshot_t{};
+  clocks_fragment_publication_item_t* completed_item =
+      clocks_fragment_publication_queue_front();
+  if (!completed_item || completed_item->sequence != sequence) __builtin_trap();
+  clocks_fragment_publication_queue_release();
   if (g_clocks_fragment_publication_pending) clocks_fragment_schedule_publish();
 }
 
@@ -1615,7 +1757,7 @@ static void clocks_fragment_accept_tick(uint32_t requested_sequence) {
   g_clocks_fragment_publication_last_tick_sequence = requested_sequence;
   g_clocks_fragment_publication_last_tick_valid = true;
 
-  // A retained campaign retry already owns g_clocks_fragment_publication_clocks_snapshot.
+  // A retained campaign retry already owns the SPSC queue front.
   // While that exact row remains in transport custody, a newer physical tick
   // must not replace the pending sequence selected by Beta's next immutable
   // campaign row. Doing so creates a permanent head-of-line mismatch: Beta
@@ -1820,7 +1962,7 @@ static void clocks_fragment_recover_reset_publication_custody(bool count_recover
   g_clocks_fragment_publication_last_tick_sequence = 0U;
   g_clocks_fragment_publication_campaign_ready_last_valid = false;
   g_clocks_fragment_publication_campaign_ready_last_sequence = 0U;
-  g_clocks_fragment_publication_clocks_snapshot = clocks_fragment_snapshot_t{};
+  clocks_fragment_publication_queue_reset();
 
   clocks_fragment_campaign_record_ready_retry_cancel();
   g_clocks_fragment_campaign_record = clocks_fragment_campaign_snapshot_t{};
@@ -7920,7 +8062,7 @@ static FLASHMEM void clocks_fragment_live_snapshot_fill(
       g_beta_clocks_fragment_vclock_prediction,
       g_beta_clocks_fragment_ocxo1_prediction,
       g_beta_clocks_fragment_ocxo2_prediction,
-      g_pps_witness_diag.interrupt_delay,
+      g_beta_clocks_fragment_vclock_forensics.interrupt_delay,
       g_beta_clocks_fragment_vclock_forensics,
       g_beta_clocks_fragment_ocxo1_forensics,
       g_beta_clocks_fragment_ocxo2_forensics);
