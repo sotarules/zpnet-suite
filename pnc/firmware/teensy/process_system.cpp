@@ -25,6 +25,7 @@
 #include "transport.h"   // <-- NEW (for transport_get_info)
 
 #include <string.h>
+#include <stdlib.h>
 #include <CrashReport.h>
 
 extern void transport_get_rx_dispatch_mailbox_info(
@@ -446,9 +447,9 @@ static FLASHMEM Payload system_features_tree_payload(void) {
 //   • CrashReport.printTo() remains explicit because it clears the core record.
 //
 // Important Teensyduino behavior: CrashReport.printTo() clears the underlying
-// core crash/reset record after printing.  We therefore cache the first printed
-// text in a static buffer so repeated CRASH_INFO calls during this boot do not
-// destroy the operator's view of the evidence.
+// core crash/reset record after printing.  Preserve repeatable operator access,
+// but allocate the text cache lazily only when an explicit crash command asks
+// for it; normal scientific operation pays no permanent 2 KiB RAM2 cost.
 //
 
 static FLASHMEM void system_crash_add_hex32(Payload& payload,
@@ -1555,7 +1556,8 @@ static_assert(sizeof(SYSTEM_FORENSIC_ENTRY_PAGE_KEYS) /
                   SYSTEM_FORENSIC_RECORD_PAGE_COUNT,
               "forensic entry page key count mismatch");
 
-static execution_trace_snapshot_t g_system_execution_trace_scratch DMAMEM;
+// Execution Trace reporting snapshots one requested context at a time.  Do not
+// permanently duplicate the complete live+retained trace corpus in SYSTEM.
 
 static uint32_t system_trace_report_count(const Payload& args) {
   uint32_t count = args.has("count")
@@ -1893,8 +1895,6 @@ static FLASHMEM void system_execution_trace_add_context_payload(
 static FLASHMEM Payload system_execution_trace_payload(
     const Payload& args,
     bool legacy_timepop_schema) {
-  execution_trace_snapshot(&g_system_execution_trace_scratch);
-
   bool bank_valid = true;
   const bool live_bank = system_trace_report_live_bank(args, &bank_valid);
   if (!bank_valid) {
@@ -1934,6 +1934,14 @@ static FLASHMEM Payload system_execution_trace_payload(
   const uint32_t requested = system_trace_report_count(args);
   const uint32_t offset = system_trace_report_offset(args);
 
+  // Snapshot only the notebook this RPC will render.  The old SYSTEM scratch
+  // duplicated all eight live/retained notebooks permanently in RAM2.
+  execution_trace_metadata_t metadata{};
+  execution_trace_get_metadata(&metadata);
+  execution_trace_context_snapshot_t context{};
+  (void)execution_trace_snapshot_context(
+      !live_bank, requested_context, &context);
+
   Payload out;
   out.add("schema", legacy_timepop_schema
       ? "ZPNET_TIMEPOP_DISPATCH_TRACE_V4"
@@ -1951,45 +1959,39 @@ static FLASHMEM Payload system_execution_trace_payload(
           "PER_CONTEXT_SEQUENCE_WITH_DWT_AND_LINEAGE_CORRELATION");
   out.add("dwt_is_32_bit", true);
   out.add("dwt_cross_context_merge_is_derived", true);
-  out.add("retained_valid", g_system_execution_trace_scratch.retained_valid);
-  out.add("fault_captured", g_system_execution_trace_scratch.fault_captured);
-  system_crash_add_hex32(out, "fault_dwt",
-                         g_system_execution_trace_scratch.fault_dwt);
-  out.add("crash_sequence", g_system_execution_trace_scratch.crash_sequence);
+  out.add("retained_valid", metadata.retained_valid);
+  out.add("fault_captured", metadata.fault_captured);
+  system_crash_add_hex32(out, "fault_dwt", metadata.fault_dwt);
+  out.add("crash_sequence", metadata.crash_sequence);
   if (legacy_timepop_schema) {
     out.add("compatibility_scope",
             "FOREGROUND_CONTEXT_ONLY; generic recorder moved to execution_trace.*");
   }
 
-  const execution_trace_context_snapshot_t* banks = live_bank
-      ? g_system_execution_trace_scratch.live
-      : g_system_execution_trace_scratch.retained;
-  const int index = system_trace_context_index(requested_context);
-  if (index < 0) {
-    out.add("trace_valid", false);
-    return out;
-  }
-
   system_execution_trace_add_context_payload(
-      out, banks[index], requested, offset, legacy_timepop_schema);
+      out, context, requested, offset, legacy_timepop_schema);
   return out;
 }
 
 static FLASHMEM Payload system_execution_trace_summary_payload(void) {
-  execution_trace_snapshot(&g_system_execution_trace_scratch);
+  execution_trace_metadata_t metadata{};
+  execution_trace_get_metadata(&metadata);
 
   Payload out;
   out.add("schema", "ZPNET_EXECUTION_TRACE_SUMMARY_V2");
-  out.add("retained_valid", g_system_execution_trace_scratch.retained_valid);
-  out.add("fault_captured", g_system_execution_trace_scratch.fault_captured);
-  system_crash_add_hex32(out, "fault_dwt",
-                         g_system_execution_trace_scratch.fault_dwt);
-  out.add("crash_sequence", g_system_execution_trace_scratch.crash_sequence);
+  out.add("retained_valid", metadata.retained_valid);
+  out.add("fault_captured", metadata.fault_captured);
+  system_crash_add_hex32(out, "fault_dwt", metadata.fault_dwt);
+  out.add("crash_sequence", metadata.crash_sequence);
 
   PayloadArray contexts;
   for (uint32_t i = 0U; i < EXECUTION_TRACE_CONTEXT_COUNT; ++i) {
-    const execution_trace_context_snapshot_t& context =
-        g_system_execution_trace_scratch.retained[i];
+    const execution_trace_context_t context_id =
+        (execution_trace_context_t)(
+            (uint32_t)execution_trace_context_t::PRIORITY0 + i);
+    execution_trace_context_snapshot_t context{};
+    (void)execution_trace_snapshot_context(true, context_id, &context);
+
     Payload item;
     item.add("context_id", context.context);
     item.add("context", execution_trace_context_name(context.context));
@@ -2011,15 +2013,9 @@ static FLASHMEM Payload system_execution_trace_summary_payload(void) {
 // Payload flight recorder — reporting surface
 // ================================================================
 
-// The snapshot is taken into static storage before response construction
-// begins, because building the response mutates the live ring.
-static payload_flight_info_t g_system_payload_flight_scratch;
-static payload_append_trace_snapshot_t
-    g_system_payload_append_trace_scratch DMAMEM;
-static payload_heap_resize_trace_snapshot_t
-    g_system_payload_heap_resize_trace_scratch DMAMEM;
-static payload_stamp_trace_snapshot_t
-    g_system_payload_stamp_trace_scratch;
+// Forensic reports snapshot into transient function-local value objects before
+// constructing their Payload responses.  This preserves the old observation
+// boundary without permanently duplicating complete diagnostic banks.
 
 static char system_hex_digit(uint8_t value) {
   return value < 10U ? (char)('0' + value)
@@ -2069,8 +2065,8 @@ static FLASHMEM Payload system_payload_flight_bank_payload(
 }
 
 static FLASHMEM Payload system_payload_flight_payload(bool retained_only) {
-  payload_get_flight_info(&g_system_payload_flight_scratch);
-  const payload_flight_info_t& f = g_system_payload_flight_scratch;
+  payload_flight_info_t f{};
+  payload_get_flight_info(&f);
 
   Payload out;
   out.add("schema", "ZPNET_PAYLOAD_FLIGHT_V1");
@@ -2179,7 +2175,8 @@ static uint32_t system_payload_stamp_trace_report_count(
 
 static FLASHMEM Payload system_payload_stamp_trace_payload(
     const Payload& args) {
-  payload_get_stamp_trace(&g_system_payload_stamp_trace_scratch);
+  payload_stamp_trace_snapshot_t snapshot{};
+  payload_get_stamp_trace(&snapshot);
 
   bool bank_valid = true;
   const bool live_bank = system_trace_report_live_bank(args, &bank_valid);
@@ -2193,8 +2190,8 @@ static FLASHMEM Payload system_payload_stamp_trace_payload(
       system_payload_stamp_trace_report_count(args);
   const uint32_t offset = system_trace_report_offset(args);
   const payload_stamp_trace_bank_snapshot_t& bank = live_bank
-      ? g_system_payload_stamp_trace_scratch.live
-      : g_system_payload_stamp_trace_scratch.retained;
+      ? snapshot.live
+      : snapshot.retained;
 
   uint32_t begin = 0U;
   uint32_t end = 0U;
@@ -2291,7 +2288,8 @@ static FLASHMEM Payload system_payload_append_trace_entry_payload(
 
 static FLASHMEM Payload system_payload_append_trace_payload(
     const Payload& args) {
-  payload_get_append_trace(&g_system_payload_append_trace_scratch);
+  payload_append_trace_snapshot_t snapshot{};
+  payload_get_append_trace(&snapshot);
 
   bool bank_valid = true;
   const bool live_bank = system_trace_report_live_bank(args, &bank_valid);
@@ -2304,8 +2302,8 @@ static FLASHMEM Payload system_payload_append_trace_payload(
   const uint32_t requested = system_trace_report_count(args);
   const uint32_t offset = system_trace_report_offset(args);
   const payload_append_trace_bank_snapshot_t& bank = live_bank
-      ? g_system_payload_append_trace_scratch.live
-      : g_system_payload_append_trace_scratch.retained;
+      ? snapshot.live
+      : snapshot.retained;
   uint32_t begin = 0U;
   uint32_t end = 0U;
   system_trace_bounds(bank.count, requested, offset, &begin, &end);
@@ -2356,9 +2354,9 @@ static FLASHMEM Payload system_payload_append_trace_payload(
 }
 
 static FLASHMEM Payload system_payload_append_trace_summary_payload(void) {
-  payload_get_append_trace(&g_system_payload_append_trace_scratch);
-  const payload_append_trace_bank_snapshot_t& retained =
-      g_system_payload_append_trace_scratch.retained;
+  payload_append_trace_snapshot_t snapshot{};
+  payload_get_append_trace(&snapshot);
+  const payload_append_trace_bank_snapshot_t& retained = snapshot.retained;
 
   Payload out;
   out.add("schema", "ZPNET_PAYLOAD_APPEND_TRACE_SUMMARY_V2");
@@ -2409,7 +2407,8 @@ static FLASHMEM Payload system_payload_heap_resize_trace_entry_payload(
 
 static FLASHMEM Payload system_payload_heap_resize_trace_payload(
     const Payload& args) {
-  payload_get_heap_resize_trace(&g_system_payload_heap_resize_trace_scratch);
+  payload_heap_resize_trace_snapshot_t snapshot{};
+  payload_get_heap_resize_trace(&snapshot);
 
   bool bank_valid = true;
   const bool live_bank = system_trace_report_live_bank(args, &bank_valid);
@@ -2422,8 +2421,8 @@ static FLASHMEM Payload system_payload_heap_resize_trace_payload(
   const uint32_t requested = system_trace_report_count(args);
   const uint32_t offset = system_trace_report_offset(args);
   const payload_heap_resize_trace_bank_snapshot_t& bank = live_bank
-      ? g_system_payload_heap_resize_trace_scratch.live
-      : g_system_payload_heap_resize_trace_scratch.retained;
+      ? snapshot.live
+      : snapshot.retained;
   uint32_t begin = 0U;
   uint32_t end = 0U;
   system_trace_bounds(bank.count, requested, offset, &begin, &end);
@@ -2469,9 +2468,9 @@ static FLASHMEM Payload system_payload_heap_resize_trace_payload(
 }
 
 static FLASHMEM Payload system_payload_heap_resize_trace_summary_payload(void) {
-  payload_get_heap_resize_trace(&g_system_payload_heap_resize_trace_scratch);
-  const payload_heap_resize_trace_bank_snapshot_t& retained =
-      g_system_payload_heap_resize_trace_scratch.retained;
+  payload_heap_resize_trace_snapshot_t snapshot{};
+  payload_get_heap_resize_trace(&snapshot);
+  const payload_heap_resize_trace_bank_snapshot_t& retained = snapshot.retained;
 
   Payload out;
   out.add("schema", "ZPNET_PAYLOAD_HEAP_RESIZE_TRACE_SUMMARY_V1");
@@ -2492,8 +2491,7 @@ static FLASHMEM Payload system_payload_heap_resize_trace_summary_payload(void) {
 // Payload design-by-contract — reporting and event service
 // ================================================================
 
-static payload_contract_info_t
-    g_system_payload_contract_info_scratch DMAMEM;
+// Contract summary reports use one transient scalar snapshot.
 
 static bool system_payload_contract_incident_valid(
     const payload_contract_incident_t& incident) {
@@ -2533,9 +2531,8 @@ static FLASHMEM Payload system_payload_contract_incident_payload(
 }
 
 static FLASHMEM Payload system_payload_contract_info_payload(void) {
-  payload_contract_get_info(&g_system_payload_contract_info_scratch);
-  const payload_contract_info_t& info =
-      g_system_payload_contract_info_scratch;
+  payload_contract_info_t info{};
+  payload_contract_get_info(&info);
 
   Payload out;
   // This report appends three nested incident documents.  Acquire its final
@@ -2571,9 +2568,8 @@ static FLASHMEM Payload system_payload_contract_info_payload(void) {
 }
 
 static FLASHMEM Payload system_payload_contract_summary_payload(void) {
-  payload_contract_get_info(&g_system_payload_contract_info_scratch);
-  const payload_contract_info_t& info =
-      g_system_payload_contract_info_scratch;
+  payload_contract_info_t info{};
+  payload_contract_get_info(&info);
 
   Payload out;
   out.add("schema", "ZPNET_PAYLOAD_CONTRACT_SUMMARY_V1");
@@ -2593,7 +2589,8 @@ static bool g_system_crash_report_captured = false;
 static bool g_system_crash_report_core_fault_present = false;
 static bool g_system_crash_report_truncated = false;
 static uint32_t g_system_crash_report_bytes = 0;
-static char g_system_crash_report_text[SYSTEM_CRASH_REPORT_TEXT_MAX] DMAMEM = {0};
+static uint32_t g_system_crash_report_alloc_fail_count = 0;
+static char* g_system_crash_report_text = nullptr;
 
 class system_crash_buffer_print_t : public Print {
  public:
@@ -2647,20 +2644,30 @@ static FLASHMEM void system_crash_report_capture_once(void) {
     return;
   }
 
-  g_system_crash_report_captured = true;
+  if (!g_system_crash_report_text) {
+    g_system_crash_report_text =
+        static_cast<char*>(malloc(SYSTEM_CRASH_REPORT_TEXT_MAX));
+    if (!g_system_crash_report_text) {
+      g_system_crash_report_alloc_fail_count++;
+      return;
+    }
+  }
+
   g_system_crash_report_core_fault_present = (bool)CrashReport;
 
   system_crash_buffer_print_t out(
       g_system_crash_report_text,
-      sizeof(g_system_crash_report_text));
+      SYSTEM_CRASH_REPORT_TEXT_MAX);
 
+  // printTo() clears Teensyduino's core crash/reset record.  Do this only
+  // after the lazy cache allocation succeeded so an allocation failure can
+  // never destroy evidence.
   CrashReport.printTo(out);
 
   g_system_crash_report_bytes = (uint32_t)out.length();
   g_system_crash_report_truncated = out.truncated();
+  g_system_crash_report_captured = true;
 }
-
-static crash_stack_watch_snapshot_t g_system_stack_watch_scratch DMAMEM;
 
 static FLASHMEM Payload system_stack_watch_entry_payload(
     const crash_stack_watch_entry_t& entry,
@@ -2740,8 +2747,8 @@ static FLASHMEM Payload system_stack_watch_bank_summary_payload(
 static FLASHMEM Payload system_stack_watch_payload(void) {
   system_dmamem_ensure_initialized();
   crash_stack_watch_service();
-  crash_stack_watch_snapshot(&g_system_stack_watch_scratch);
-  const crash_stack_watch_snapshot_t& snap = g_system_stack_watch_scratch;
+  crash_stack_watch_snapshot_t snap{};
+  crash_stack_watch_snapshot(&snap);
 
   Payload p;
   p.add("schema", "ZPNET_STACK_WATCH_V2");
@@ -2767,7 +2774,7 @@ static FLASHMEM Payload system_stack_watch_payload(void) {
   return p;
 }
 
-static crash_stack_tripwire_snapshot_t g_system_stack_tripwire_scratch DMAMEM;
+// Stack-tripwire reports use a transient snapshot.
 
 static FLASHMEM Payload system_stack_tripwire_entry_payload(
     const crash_stack_tripwire_entry_t& entry) {
@@ -2808,8 +2815,8 @@ static FLASHMEM Payload system_stack_tripwire_bank_payload(
 
 static FLASHMEM Payload system_stack_tripwire_payload(void) {
   system_dmamem_ensure_initialized();
-  crash_stack_tripwire_snapshot(&g_system_stack_tripwire_scratch);
-  const crash_stack_tripwire_snapshot_t& snap = g_system_stack_tripwire_scratch;
+  crash_stack_tripwire_snapshot_t snap{};
+  crash_stack_tripwire_snapshot(&snap);
 
   Payload p;
   p.add("schema", "ZPNET_STACK_TRIPWIRE_V1");
@@ -2821,8 +2828,7 @@ static FLASHMEM Payload system_stack_tripwire_payload(void) {
   return p;
 }
 
-static crash_dispatch_breadcrumb_snapshot_t
-    g_system_dispatch_breadcrumb_scratch DMAMEM;
+// Dispatch-breadcrumb reports use a transient snapshot.
 
 static FLASHMEM Payload system_dispatch_breadcrumb_entry_payload(
     bool valid,
@@ -2852,21 +2858,19 @@ static FLASHMEM Payload system_dispatch_breadcrumb_entry_payload(
 
 static FLASHMEM Payload system_dispatch_breadcrumb_payload(void) {
   system_dmamem_ensure_initialized();
-  crash_dispatch_breadcrumb_snapshot(
-      &g_system_dispatch_breadcrumb_scratch);
+  crash_dispatch_breadcrumb_snapshot_t snapshot{};
+  crash_dispatch_breadcrumb_snapshot(&snapshot);
 
   Payload p;
   p.add("schema", "ZPNET_DISPATCH_BREADCRUMB_V1");
   p.add_object(
       "retained",
       system_dispatch_breadcrumb_entry_payload(
-          g_system_dispatch_breadcrumb_scratch.retained_valid,
-          g_system_dispatch_breadcrumb_scratch.retained));
+          snapshot.retained_valid, snapshot.retained));
   p.add_object(
       "live",
       system_dispatch_breadcrumb_entry_payload(
-          g_system_dispatch_breadcrumb_scratch.live_valid,
-          g_system_dispatch_breadcrumb_scratch.live));
+          snapshot.live_valid, snapshot.live));
   return p;
 }
 
@@ -2882,6 +2886,10 @@ static FLASHMEM Payload system_crash_report_payload(void) {
   p.add("captured_core_fault_present", g_system_crash_report_core_fault_present);
   p.add("crash_report_bytes", g_system_crash_report_bytes);
   p.add("crash_report_truncated", g_system_crash_report_truncated);
+  p.add("crash_report_cache_allocated",
+        g_system_crash_report_text != nullptr);
+  p.add("crash_report_alloc_fail_count",
+        g_system_crash_report_alloc_fail_count);
 
   crash_forensics_status_t status{};
   crash_forensics_get_status(&status);
@@ -2970,7 +2978,11 @@ static FLASHMEM Payload system_crash_report_text_payload(void) {
   p.add("captured_core_fault_present", g_system_crash_report_core_fault_present);
   p.add("bytes", g_system_crash_report_bytes);
   p.add("truncated", g_system_crash_report_truncated);
-  p.add("text", g_system_crash_report_text);
+  p.add("cache_allocated", g_system_crash_report_text != nullptr);
+  p.add("alloc_fail_count", g_system_crash_report_alloc_fail_count);
+  p.add("text", g_system_crash_report_text
+                    ? g_system_crash_report_text
+                    : "");
   return p;
 }
 
@@ -4064,31 +4076,18 @@ static FLASHMEM Payload cmd_payload_integrity_info(const Payload& /*args*/) {
 static void system_dmamem_ensure_initialized(void) {
   if (g_system_dmamem_initialized) return;
 
-  // Explicitly initialize the remaining SYSTEM RAM2 scratch objects. RAM1
-  // operational state is reset here as well so the one-time startup transaction
-  // is deterministic. The function remains lazy because feature publishers may
-  // run before process_system_register().
+  // SYSTEM no longer owns permanent RAM2 report scratch.  Initialize only the
+  // ordinary operational state whose one-time startup transaction belongs here.
+  // The function remains lazy because feature publishers may run before
+  // process_system_register().
   runtime_ledger_boot_latch();
   system_feature_registry_reset();
-  memset(g_system_crash_report_text, 0, sizeof(g_system_crash_report_text));
-  memset((void*)&g_system_execution_trace_scratch, 0,
-         sizeof(g_system_execution_trace_scratch));
-  memset((void*)&g_system_payload_append_trace_scratch, 0,
-         sizeof(g_system_payload_append_trace_scratch));
-  memset((void*)&g_system_payload_heap_resize_trace_scratch, 0,
-         sizeof(g_system_payload_heap_resize_trace_scratch));
-  memset((void*)&g_system_payload_contract_info_scratch, 0,
-         sizeof(g_system_payload_contract_info_scratch));
-  memset((void*)&g_system_dispatch_breadcrumb_scratch, 0,
-         sizeof(g_system_dispatch_breadcrumb_scratch));
 
   // crash_forensics.cpp owns its retained RAM2 record.  Never initialize or
   // clear that record here; it may be the only surviving witness to a reboot.
-  // The same custody applies to Payload flight rings and Payload append-trace
-  // banks in payload.cpp: those remaining NOLOAD records are validated before
-  // use and released only by explicit CRASH_CLEAR or their one-time boot latch.
-  // Runtime and Execution Trace live recorders are RAM1 in this deterministic-
-  // memory baseline and intentionally do not survive reboot.
+  // The same custody applies to Payload flight/trace banks in payload.cpp and
+  // Execution Trace retained state.  Focused SYSTEM reports use transient
+  // snapshots and never establish a second permanent forensic corpus.
   g_system_dmamem_initialized = true;
 }
 
@@ -4411,7 +4410,11 @@ static FLASHMEM Payload cmd_crash_clear(const Payload& /*args*/) {
   g_system_crash_report_core_fault_present = false;
   g_system_crash_report_truncated = false;
   g_system_crash_report_bytes = 0;
-  g_system_crash_report_text[0] = '\0';
+  g_system_crash_report_alloc_fail_count = 0;
+  if (g_system_crash_report_text) {
+    free(g_system_crash_report_text);
+    g_system_crash_report_text = nullptr;
+  }
   memset((void*)&g_runtime_ledger_retained, 0,
          sizeof(g_runtime_ledger_retained));
 

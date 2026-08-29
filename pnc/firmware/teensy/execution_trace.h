@@ -132,6 +132,16 @@ struct execution_trace_snapshot_t {
   execution_trace_context_snapshot_t retained[EXECUTION_TRACE_CONTEXT_COUNT];
 };
 
+// Bounded reporting view. SYSTEM normally renders exactly one execution
+// context, so reporting should not require a permanent full live+retained
+// snapshot of every context.
+struct execution_trace_metadata_t {
+  bool retained_valid;
+  bool fault_captured;
+  uint32_t fault_dwt;
+  uint32_t crash_sequence;
+};
+
 const char* execution_trace_context_name(uint32_t context);
 
 void execution_trace_record(execution_trace_context_t context,
@@ -145,6 +155,12 @@ void execution_trace_record(execution_trace_context_t context,
                             uint32_t related_target,
                             uint32_t object,
                             uint32_t aux);
+
+void execution_trace_get_metadata(execution_trace_metadata_t* out);
+bool execution_trace_snapshot_context(
+    bool retained,
+    execution_trace_context_t context,
+    execution_trace_context_snapshot_t* out);
 
 void execution_trace_snapshot(execution_trace_snapshot_t* out);
 void execution_trace_clear_retained(void);

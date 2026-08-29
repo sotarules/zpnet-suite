@@ -1247,8 +1247,6 @@ static bool interrupt_foreground_work_pending_locked(void);
 // ============================================================================
 
 static interrupt_integrity_snapshot_t g_interrupt_integrity{};
-static interrupt_integrity_snapshot_t g_interrupt_integrity_report_scratch
-    DMAMEM{};
 
 static interrupt_integrity_counter_check_t* integrity_counter_for(
     interrupt_subscriber_kind_t kind) {
@@ -1493,8 +1491,7 @@ bool interrupt_integrity_snapshot(interrupt_integrity_snapshot_t* out) {
       g_interrupt_integrity.ocxo1_qtimer_dwt.valid ||
       g_interrupt_integrity.ocxo2_qtimer_dwt.valid ||
       g_interrupt_integrity.vclock_pps_interval.valid;
-  g_interrupt_integrity_report_scratch = g_interrupt_integrity;
-  *out = g_interrupt_integrity_report_scratch;
+  *out = g_interrupt_integrity;
   return out->valid;
 }
 

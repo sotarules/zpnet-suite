@@ -218,6 +218,44 @@ static void execution_trace_snapshot_bank(
   }
 }
 
+void execution_trace_get_metadata(execution_trace_metadata_t* out) {
+  if (!out) return;
+  memset((void*)out, 0, sizeof(*out));
+
+  out->retained_valid = execution_trace_retained_valid();
+  if (!out->retained_valid) return;
+
+  out->fault_captured =
+      (g_execution_trace_retained.flags &
+       EXECUTION_TRACE_FLAG_FAULT_CAPTURED) != 0U;
+  out->fault_dwt = g_execution_trace_retained.fault_dwt;
+  out->crash_sequence = g_execution_trace_retained.crash_sequence;
+}
+
+bool execution_trace_snapshot_context(
+    bool retained,
+    execution_trace_context_t context,
+    execution_trace_context_snapshot_t* out) {
+  if (!out) return false;
+  memset((void*)out, 0, sizeof(*out));
+  out->context = (uint32_t)context;
+
+  const int index = execution_trace_context_index(context);
+  if (index < 0) return false;
+
+  if (retained) {
+    if (!execution_trace_retained_valid()) return false;
+    execution_trace_snapshot_bank(
+        g_execution_trace_retained.banks[index], context, out);
+    return out->valid;
+  }
+
+  execution_trace_bank_t* const live = execution_trace_live_bank(context);
+  if (!live) return false;
+  execution_trace_snapshot_bank(*live, context, out);
+  return out->valid;
+}
+
 void execution_trace_snapshot(execution_trace_snapshot_t* out) {
   if (!out) return;
   memset((void*)out, 0, sizeof(*out));
