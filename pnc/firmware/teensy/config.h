@@ -179,20 +179,6 @@ static constexpr uint32_t QTIMER1_CH0_MASK = 0xFFFF;
 //
 
 // --------------------------------------------------------------
-// Event bus sizing (authoritative)
-// --------------------------------------------------------------
-//
-// These define the maximum durable telemetry backlog.
-// Events are small, frequent, and cheap.
-// Large payloads belong in request/response, not events.
-//
-// Overflow results in dropped events (explicitly observable).
-//
-static constexpr size_t EVT_MAX      = 128;
-static constexpr size_t EVT_TYPE_MAX = 32;
-static constexpr size_t EVT_BODY_MAX = 512;
-
-// --------------------------------------------------------------
 // GNSS ingestion limits
 // --------------------------------------------------------------
 static const size_t GNSS_LINE_MAX                = 192;

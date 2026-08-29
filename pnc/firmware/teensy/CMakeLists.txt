@@ -67,7 +67,6 @@ set(ZPNET_SOURCES
     process_clocks_alpha.cpp
     process_clocks_beta.cpp
     process_clocks_gamma.cpp
-    process_events.cpp
     process_interrupt.cpp
     process_performance.cpp
     process_photons.cpp
@@ -88,13 +87,11 @@ set(ZPNET_HEADERS
     bootloader.h
     config.h
     debug.h
-    events.h
     memory_info.h
     payload.h
     process.h
     process_clocks.h
     process_clocks_internal.h
-    process_events.h
     process_interrupt.h
     process_performance.h
     process_photons.h

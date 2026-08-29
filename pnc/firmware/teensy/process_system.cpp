@@ -18,7 +18,6 @@
 #include "execution_trace.h"
 #include "config.h"
 #include "process.h"
-#include "events.h"
 #include "payload.h"
 #include "util.h"
 #include "timepop.h"
@@ -3098,12 +3097,6 @@ void system_request_shutdown(void) {
 
   system_shutdown = true;
 
-  {
-    Payload ev;
-    ev.add("status", "REQUESTED");
-    enqueueEvent("SYSTEM_SHUTDOWN", ev);
-  }
-
   system_enter_quiescence();
 }
 
@@ -4115,12 +4108,6 @@ static FLASHMEM Payload cmd_enter_bootloader(const Payload& /*args*/) {
     "bootloader-flash"
   );
 
-  {
-    Payload ev;
-    ev.add("action", "scheduled");
-    enqueueEvent("SYSTEM_ENTER_BOOTLOADER", ev);
-  }
-
   return ok_payload();
 }
 
@@ -4228,12 +4215,6 @@ static FLASHMEM Payload cmd_crash_test(const Payload& args) {
 // SHUTDOWN — terminal, irreversible
 // ------------------------------------------------------------
 static FLASHMEM Payload cmd_shutdown(const Payload& /*args*/) {
-
-  {
-    Payload ev;
-    ev.add("action", "requested");
-    enqueueEvent("SYSTEM_SHUTDOWN", ev);
-  }
 
   system_request_shutdown();
   return ok_payload();

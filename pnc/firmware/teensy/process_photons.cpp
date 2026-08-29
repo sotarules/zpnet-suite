@@ -1,7 +1,6 @@
 #include "process_photons.h"
 
 #include "config.h"
-#include "events.h"
 #include "payload.h"
 #include "process.h"
 #include "process_interrupt.h"
@@ -2258,18 +2257,6 @@ static photons_device_snapshot_t photons_device_snapshot(void) {
   return out;
 }
 
-static void photons_emit_laser_initialization_event(void) {
-  const photons_device_snapshot_t device = photons_device_snapshot();
-
-  Payload p;
-  p.add("id1_raw", device.laser_id1_raw);
-  p.add("id1_current_ma",
-        toFixedDecimal(device.laser_id1_current_ma, 6));
-  p.add("pd_voltage", toFixedDecimal(device.laser_monitor_v, 6));
-  p.add("laser_emitting", device.laser_emitting);
-  enqueueEvent("LASER_INITIALIZATION", p);
-}
-
 // -----------------------------------------------------------------------------
 // ISR-authored live state
 // -----------------------------------------------------------------------------
@@ -3489,7 +3476,6 @@ FLASHMEM void process_photons_init(void) {
 
   photons_race_prepare();
   photons_laser_initialize_hardware();
-  photons_emit_laser_initialization_event();
 
   interrupt_photodiode_subscription_t subscription{};
   subscription.on_edge = photons_on_photodiode_edge;
@@ -5175,7 +5161,6 @@ static FLASHMEM Payload cmd_init(const Payload& /*args*/) {
     return p;
   }
   photons_laser_initialize_hardware();
-  photons_emit_laser_initialization_event();
   return ok_payload();
 }
 
@@ -5297,10 +5282,6 @@ static FLASHMEM Payload cmd_on(const Payload& /*args*/) {
   }
   digitalWrite(LD_ON_PIN, HIGH);
 
-  Payload ev;
-  ev.add("action", "allow_emission");
-  enqueueEvent("LASER_ON", ev);
-
   return ok_payload();
 }
 
@@ -5311,10 +5292,6 @@ static FLASHMEM Payload cmd_off(const Payload& /*args*/) {
     return p;
   }
   photons_laser_inhibit();
-
-  Payload ev;
-  ev.add("action", "inhibit_emission");
-  enqueueEvent("LASER_OFF", ev);
 
   return ok_payload();
 }

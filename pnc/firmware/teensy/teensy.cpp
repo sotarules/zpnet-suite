@@ -9,7 +9,6 @@
 #include "crash_forensics.h"
 #include "memory_info.h"
 #include "timepop.h"
-#include "events.h"
 #include "process.h"
 #include "transport.h"
 #include "payload.h"
@@ -18,7 +17,6 @@
 #include "process_interrupt.h"
 #include "process_clocks.h"
 #include "process_photons.h"
-#include "process_events.h"
 #include "process_timepop.h"
 #include "process_system.h"
 #include "process_pubsub.h"
@@ -226,29 +224,6 @@ void setup() {
   debug_log("boot", "process_init done");
 
   // ----------------------------------------------------------
-  // Events subsystem
-  // ----------------------------------------------------------
-
-  debug_log("boot", "process_events_init");
-  process_events_init();
-  debug_log("boot", "process_events_init done");
-
-  debug_log("boot", "process_events_register");
-  process_events_register();
-  debug_log("boot", "process_events_register done");
-
-  // ----------------------------------------------------------
-  // Boot event
-  // ----------------------------------------------------------
-
-  debug_log("boot", "enqueue TEENSY_BOOT");
-  Payload ev;
-  ev.add("status", "READY");
-  ev.add("cpu_mhz", (uint32_t)(F_CPU_ACTUAL / 1000000UL));
-  enqueueEvent("TEENSY_BOOT", ev);
-  debug_log("boot", "enqueue TEENSY_BOOT done");
-
-  // ----------------------------------------------------------
   // Interrupt subsystem — runtime + ISR vectors
   // ----------------------------------------------------------
 
@@ -332,7 +307,7 @@ void setup() {
 void loop() {
   // Primitive terminal court first.  If SYSTEM.REBOOT has already returned its
   // RPC acknowledgment and the DWT deadline has passed, reset before entering
-  // any timing, event, or subsystem service that may itself be unhealthy.
+  // any timing or subsystem service that may itself be unhealthy.
   system_reboot_service();
 
   transport_note_runtime_loop();
