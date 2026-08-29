@@ -14,7 +14,6 @@
 
 #include "process.h"
 #include "transport.h"
-#include "debug.h"
 #include "process_pubsub.h"
 
 #include <Arduino.h>
@@ -110,13 +109,11 @@ static bool copy_request_metadata_into_response(const Payload& request,
                                                 uint64_t* out_req_ts_ms = nullptr) {
     uint32_t req_id = 0U;
     if (!request.tryGetUInt("req_id", req_id) || req_id == 0U) {
-        debug_log("process.rpc_metadata_invalid_req_id", request);
         return false;
     }
 
     uint64_t req_ts_ms = 0ULL;
     if (!request.tryGetUInt64("req_ts_ms", req_ts_ms)) {
-        debug_log("process.rpc_metadata_invalid_req_ts", request);
         return false;
     }
 
@@ -134,9 +131,7 @@ static bool copy_request_metadata_into_response(const Payload& request,
 
 static void send_overflow_response(const Payload& request) {
     Payload response;
-    if (!copy_request_metadata_into_response(request, response)) {
-        debug_log("process.rpc_overflow_metadata_lost", request);
-    }
+    (void)copy_request_metadata_into_response(request, response);
     response.add("success", false);
     response.add("message", "OVERFLOW");
     response.add_object("payload", make_error_payload("payload_overflow"));

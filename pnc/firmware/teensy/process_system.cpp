@@ -22,7 +22,6 @@
 #include "util.h"
 #include "timepop.h"
 #include "process_timepop.h"
-#include "debug.h"
 #include "transport.h"   // <-- NEW (for transport_get_info)
 
 #include <string.h>
@@ -2595,7 +2594,6 @@ static bool g_system_crash_report_core_fault_present = false;
 static bool g_system_crash_report_truncated = false;
 static uint32_t g_system_crash_report_bytes = 0;
 static char g_system_crash_report_text[SYSTEM_CRASH_REPORT_TEXT_MAX] DMAMEM = {0};
-static char g_system_debug_buffer[1024] DMAMEM = {0};
 
 class system_crash_buffer_print_t : public Print {
  public:
@@ -4073,7 +4071,6 @@ static void system_dmamem_ensure_initialized(void) {
   runtime_ledger_boot_latch();
   system_feature_registry_reset();
   memset(g_system_crash_report_text, 0, sizeof(g_system_crash_report_text));
-  memset(g_system_debug_buffer, 0, sizeof(g_system_debug_buffer));
   memset((void*)&g_system_execution_trace_scratch, 0,
          sizeof(g_system_execution_trace_scratch));
   memset((void*)&g_system_payload_append_trace_scratch, 0,
@@ -4445,33 +4442,6 @@ static FLASHMEM Payload cmd_crash_clear(const Payload& /*args*/) {
 }
 
 // ------------------------------------------------------------
-// DEBUG — raw debug channel test
-// ------------------------------------------------------------
-static FLASHMEM Payload cmd_debug(const Payload& args) {
-
-  Payload resp;
-
-  if (!args.has("length")) {
-    resp.add("error", "missing length");
-    return resp;
-  }
-
-  uint32_t length = args.getUInt("length");
-  if (length == 0 || length > 1024) {
-    resp.add("error", "length must be 1..1024");
-    return resp;
-  }
-
-  memset(g_system_debug_buffer, 'A', length);
-  debug_log(
-    "system.debug",
-    reinterpret_cast<const uint8_t*>(g_system_debug_buffer),
-    length
-  );
-  return ok_payload();
-}
-
-// ------------------------------------------------------------
 // STATUS — simple response of liveness
 // ------------------------------------------------------------
 static FLASHMEM Payload cmd_status(const Payload& /*args*/) {
@@ -4515,7 +4485,6 @@ static const process_command_entry_t SYSTEM_COMMANDS[] = {
   { "PAYLOAD_APPEND_TRACE", cmd_payload_append_trace },
   { "PAYLOAD_HEAP_RESIZE_TRACE", cmd_payload_heap_resize_trace },
   { "PAYLOAD_CONTRACT_INFO", cmd_payload_contract_info },
-  { "DEBUG",            cmd_debug            },
   { "STATUS",           cmd_status           },
   { nullptr,            nullptr }
 };

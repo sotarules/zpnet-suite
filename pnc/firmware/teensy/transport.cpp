@@ -32,7 +32,6 @@
 
 #include "transport.h"
 #include "config.h"
-#include "debug.h"
 #include "process_performance.h"
 #include "timepop.h"
 #include "crash_forensics.h"
@@ -89,10 +88,6 @@ static constexpr size_t STX_LEN   = 5;
 
 static constexpr char   ETX_SEQ[] = "<ETX>";
 static constexpr size_t ETX_LEN   = 5;
-
-static const char* BUILD_FINGERPRINT =
-    "__FP__ZPNET_SERIAL_CANONICAL_WIRE_RX_DMAMEM_GUARDED_D1_RESERVE__";
-static const char* TRANSPORT_LIFELINE_FINGERPRINT = "__FP__ZPNET_TRANSPORT_TIMEPOP_RX_ALAP__";
 
 // =============================================================
 // Traffic Validation
@@ -522,19 +517,6 @@ static void rx_guard_note_failure(rx_guard_stage_t stage,
   rx_guard_last_index = index;
   rx_guard_last_expected = expected;
   rx_guard_last_observed = observed;
-
-  char line[192];
-  snprintf(line, sizeof(line),
-           "RX_GUARD stage=%lu side=%lu index=%lu expected=0x%08lX "
-           "observed=0x%08lX rx_len=%lu buffer=0x%08lX",
-           (unsigned long)stage,
-           (unsigned long)side,
-           (unsigned long)index,
-           (unsigned long)expected,
-           (unsigned long)observed,
-           (unsigned long)rx_len,
-           (unsigned long)(uintptr_t)rx_buffer());
-  debug_log("transport.rx_guard", line);
 }
 
 static bool rx_guard_check(rx_guard_stage_t stage) {
@@ -1871,7 +1853,4 @@ void transport_init(void) {
     nullptr,
     "TRANSPORT_TX"
   );
-
-  debug_log("transport", BUILD_FINGERPRINT);
-  debug_log("transport", TRANSPORT_LIFELINE_FINGERPRINT);
 }

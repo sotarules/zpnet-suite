@@ -97,17 +97,16 @@ static inline void led_off() { digitalWrite(LED_BUILTIN, LOW); }
 //                                          process_interrupt
 //   5. process_clocks_init_hardware()    — DWT enable, rolling helper baselines
 //   6. transport_init()                  — arms RX/TX timers
-//   7. debug_init()                      — transport-routed logging
-//   8. process framework + subsystems    — everything else
-//   9. process_interrupt_init()          — runtime subscriber tables
-//  10. process_interrupt_enable_irqs()   — ISR vectors + NVIC enable;
+//   7. process framework + subsystems    — everything else
+//   8. process_interrupt_init()          — runtime subscriber tables
+//   9. process_interrupt_enable_irqs()   — ISR vectors + NVIC enable;
 //                                          IRQ_QTIMER1, IRQ_QTIMER3,
 //                                          IRQ_GPIO6789 all go live.
 //                                          Any pending CH2 TCF1 from
 //                                          step 4's schedule_next()
 //                                          fires immediately and
 //                                          dispatches to TimePop.
-//  11. process_clocks_init()             — subscribes VCLOCK/OCXO,
+//  10. process_clocks_init()             — subscribes VCLOCK/OCXO,
 //                                          registers PPS edge dispatch,
 //                                          requests startup epoch zero,
 //                                          starts providers (which arms
@@ -207,45 +206,26 @@ void setup() {
   transport_init();
 
   // ----------------------------------------------------------
-  // Phase 3: Debug subsystem becomes valid (transport-routed)
-  // ----------------------------------------------------------
-
-  debug_init();
-
-  debug_log("boot", "setup begin");
-  debug_log("boot.cpu_mhz", (uint32_t)(F_CPU_ACTUAL / 1000000UL));
-
-  // ----------------------------------------------------------
   // Process framework
   // ----------------------------------------------------------
 
-  debug_log("boot", "process_init");
   process_init();
-  debug_log("boot", "process_init done");
 
   // ----------------------------------------------------------
   // Interrupt subsystem — runtime + ISR vectors
   // ----------------------------------------------------------
 
-  debug_log("boot", "process_interrupt_init");
   process_interrupt_init();
-  debug_log("boot", "process_interrupt_init done");
 
-  debug_log("boot", "process_interrupt_enable_irqs");
   process_interrupt_enable_irqs();
-  debug_log("boot", "process_interrupt_enable_irqs done");
 
-  debug_log("boot", "process_interrupt_register");
   process_interrupt_register();
-  debug_log("boot", "process_interrupt_register done");
 
   // ----------------------------------------------------------
   // TimePop process registration
   // ----------------------------------------------------------
 
-  debug_log("boot", "process_timepop_register");
   process_timepop_register();
-  debug_log("boot", "process_timepop_register done");
 
   // ----------------------------------------------------------
   // Clocks subsystem
@@ -261,43 +241,27 @@ void setup() {
   // for the nanosecond clocks.
   // ----------------------------------------------------------
 
-  debug_log("boot", "process_clocks_init");
   process_clocks_init();
-  debug_log("boot", "process_clocks_init done");
 
-  debug_log("boot", "process_clocks_register");
   process_clocks_register();
-  debug_log("boot", "process_clocks_register done");
 
   // ----------------------------------------------------------
   // PHOTONS optical subsystem
   // ----------------------------------------------------------
 
-  debug_log("boot", "process_photons_init");
   process_photons_init();
-  debug_log("boot", "process_photons_init done");
 
-  debug_log("boot", "process_photons_register");
   process_photons_register();
-  debug_log("boot", "process_photons_register done");
 
   // ----------------------------------------------------------
   // Remaining subsystems
   // ----------------------------------------------------------
 
-  debug_log("boot", "process_pubsub_register");
   process_pubsub_register();
-  debug_log("boot", "process_pubsub_register done");
 
-  debug_log("boot", "process_system_register");
   process_system_register();
-  debug_log("boot", "process_system_register done");
 
-  debug_log("boot", "process_performance_register");
   process_performance_register();
-  debug_log("boot", "process_performance_register done");
-
-  debug_log("boot", "setup complete");
 }
 
 // ============================================================================
