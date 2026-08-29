@@ -468,8 +468,6 @@ struct photons_fragment_snapshot_t {
   uint32_t race_skipped_not_quiet_this_fragment = 0;
   uint64_t race_skipped_projection_total = 0;
   uint32_t race_skipped_projection_this_fragment = 0;
-  uint64_t race_skipped_backpressure_total = 0;
-  uint32_t race_skipped_backpressure_this_fragment = 0;
   uint64_t race_invalid_endpoint_total = 0;
   uint32_t race_invalid_endpoint_this_fragment = 0;
   uint64_t race_enqueue_failure_total = 0;
