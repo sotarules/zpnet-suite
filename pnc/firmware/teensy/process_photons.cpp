@@ -46,9 +46,19 @@ static constexpr uint64_t PHOTONS_NS_PER_SECOND = 1000000000ULL;
 static constexpr uint32_t PHOTONS_LAP_RING_CAPACITY = 2048U;
 static constexpr uint32_t PHOTONS_LAP_RING_MASK =
     PHOTONS_LAP_RING_CAPACITY - 1U;
+// Stop launching new races before the foreground handoff ring can fill.  This
+// is lossless acquisition backpressure, not a larger hidden buffer: completed
+// physical records already in custody remain drainable, while skipped cadence
+// cells are explicit telemetry.  Actual enqueue overflow remains a fatal
+// invariant and is not reclassified or repaired.
+static constexpr uint32_t PHOTONS_LAP_RING_BACKPRESSURE_HIGH_WATER = 1536U;
 static_assert((PHOTONS_LAP_RING_CAPACITY &
                (PHOTONS_LAP_RING_CAPACITY - 1U)) == 0U,
               "PHOTONS lap ring capacity must be a power of two");
+static_assert(PHOTONS_LAP_RING_BACKPRESSURE_HIGH_WATER > 0U &&
+              PHOTONS_LAP_RING_BACKPRESSURE_HIGH_WATER <
+                  PHOTONS_LAP_RING_CAPACITY - 1U,
+              "PHOTONS lap ring backpressure watermark must leave headroom");
 
 static constexpr uint64_t PHOTONS_PROJECTION_MAX_AGE_NS = 3000000000ULL;
 
@@ -170,6 +180,7 @@ struct photons_race_runtime_t {
   uint64_t missed_count = 0ULL;
   uint64_t skipped_not_quiet_count = 0ULL;
   uint64_t skipped_projection_count = 0ULL;
+  uint64_t skipped_backpressure_count = 0ULL;
   uint64_t invalid_endpoint_count = 0ULL;
   uint64_t enqueue_failure_count = 0ULL;
 };
@@ -282,6 +293,14 @@ static volatile uint32_t g_raw_lap_ring_write = 0U;
 static volatile uint32_t g_raw_lap_ring_read = 0U;
 static volatile uint32_t g_raw_lap_ring_overflow_count = 0U;
 static volatile bool g_raw_lap_ring_data_loss = false;
+
+static uint32_t photons_raw_lap_ring_occupancy(void) {
+  photons_memory_barrier();
+  const uint32_t write = g_raw_lap_ring_write;
+  const uint32_t read = g_raw_lap_ring_read;
+  photons_memory_barrier();
+  return (write - read) & PHOTONS_LAP_RING_MASK;
+}
 
 static photons_fragment_raw_cycles_snapshot_t g_raw_cycles_state{};
 static photons_fragment_projection_snapshot_t g_projection_state{};
@@ -2098,6 +2117,17 @@ static void photons_race_cadence_tick(
   g_photons_race.cadence_tick_count++;
   photons_race_finalize_previous();
 
+  // The 1 kHz producer must never outrun the foreground drain into irreversible
+  // completed-record loss. Once occupancy reaches the high-water mark, author
+  // an explicit skipped cadence cell instead of launching another race. The
+  // previous in-flight race was finalized above, so every completed observation
+  // still has one chance to enter the ring before backpressure takes effect.
+  if (photons_raw_lap_ring_occupancy() >=
+      PHOTONS_LAP_RING_BACKPRESSURE_HIGH_WATER) {
+    g_photons_race.skipped_backpressure_count++;
+    return;
+  }
+
   if (digitalRead(LD_ON_PIN) != LOW) {
     // PHOTONS exclusively owns LD_ON while the race engine is live. Inhibit
     // first for optical safety, then fail loudly on the ownership violation.
@@ -2300,6 +2330,7 @@ static uint64_t g_last_fragment_race_completed_count = 0ULL;
 static uint64_t g_last_fragment_race_missed_count = 0ULL;
 static uint64_t g_last_fragment_race_skipped_not_quiet_count = 0ULL;
 static uint64_t g_last_fragment_race_skipped_projection_count = 0ULL;
+static uint64_t g_last_fragment_race_skipped_backpressure_count = 0ULL;
 static uint64_t g_last_fragment_race_invalid_endpoint_count = 0ULL;
 static uint64_t g_last_fragment_race_enqueue_failure_count = 0ULL;
 
@@ -2699,6 +2730,9 @@ static Payload& photons_fragment_payload(
   race.add("skipped_projection_total", f.race_skipped_projection_total);
   race.add("skipped_projection_this_fragment",
            f.race_skipped_projection_this_fragment);
+  race.add("skipped_backpressure_total", f.race_skipped_backpressure_total);
+  race.add("skipped_backpressure_this_fragment",
+           f.race_skipped_backpressure_this_fragment);
   race.add("invalid_endpoint_total", f.race_invalid_endpoint_total);
   race.add("invalid_endpoint_this_fragment",
            f.race_invalid_endpoint_this_fragment);
@@ -3150,6 +3184,11 @@ static void photons_fragment_tick(
   fragment.race_skipped_projection_this_fragment = (uint32_t)(
       race.skipped_projection_count -
       g_last_fragment_race_skipped_projection_count);
+  fragment.race_skipped_backpressure_total =
+      race.skipped_backpressure_count;
+  fragment.race_skipped_backpressure_this_fragment = (uint32_t)(
+      race.skipped_backpressure_count -
+      g_last_fragment_race_skipped_backpressure_count);
   fragment.race_invalid_endpoint_total =
       race.invalid_endpoint_count;
   fragment.race_invalid_endpoint_this_fragment = (uint32_t)(
@@ -3313,6 +3352,8 @@ static void photons_fragment_tick(
       fragment.race_skipped_not_quiet_total;
   g_last_fragment_race_skipped_projection_count =
       fragment.race_skipped_projection_total;
+  g_last_fragment_race_skipped_backpressure_count =
+      fragment.race_skipped_backpressure_total;
   g_last_fragment_race_invalid_endpoint_count =
       fragment.race_invalid_endpoint_total;
   g_last_fragment_race_enqueue_failure_count =
@@ -3391,6 +3432,7 @@ static void photons_recovery_clear_physical_ancestry(void) {
   g_last_fragment_race_missed_count = 0ULL;
   g_last_fragment_race_skipped_not_quiet_count = 0ULL;
   g_last_fragment_race_skipped_projection_count = 0ULL;
+  g_last_fragment_race_skipped_backpressure_count = 0ULL;
   g_last_fragment_race_invalid_endpoint_count = 0ULL;
   g_last_fragment_race_enqueue_failure_count = 0ULL;
   g_last_fragment = photons_toy_fragment_t{};
@@ -3445,6 +3487,7 @@ FLASHMEM void process_photons_init(void) {
   g_last_fragment_race_missed_count = 0ULL;
   g_last_fragment_race_skipped_not_quiet_count = 0ULL;
   g_last_fragment_race_skipped_projection_count = 0ULL;
+  g_last_fragment_race_skipped_backpressure_count = 0ULL;
   g_last_fragment_race_invalid_endpoint_count = 0ULL;
   g_last_fragment_race_enqueue_failure_count = 0ULL;
   g_interrupt_ancestry = photons_interrupt_ancestry_t{};
@@ -4805,6 +4848,7 @@ static FLASHMEM Payload cmd_report_photons(const Payload& /*args*/) {
   p.add("race_missed_this_fragment", canonical.race_missed_this_fragment);
   p.add("race_skipped_not_quiet_total", canonical.race_skipped_not_quiet_total);
   p.add("race_skipped_projection_total", canonical.race_skipped_projection_total);
+  p.add("race_skipped_backpressure_total", canonical.race_skipped_backpressure_total);
   p.add("race_invalid_endpoint_total", canonical.race_invalid_endpoint_total);
   p.add("race_enqueue_failure_total", canonical.race_enqueue_failure_total);
   p.add("race_flight_n_this_fragment", canonical.race_flight_this_fragment.n);
@@ -5067,6 +5111,8 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
         g_photons_race.skipped_not_quiet_count);
   p.add("race_skipped_projection_total",
         g_photons_race.skipped_projection_count);
+  p.add("race_skipped_backpressure_total",
+        g_photons_race.skipped_backpressure_count);
   p.add("race_invalid_endpoint_total",
         g_photons_race.invalid_endpoint_count);
   p.add("race_enqueue_failure_total", g_photons_race.enqueue_failure_count);

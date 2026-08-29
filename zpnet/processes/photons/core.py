@@ -1134,16 +1134,21 @@ def _validate_photons_fragment(fragment: Payload) -> Tuple[int, int, Optional[in
     race_skipped_projection_total = _require_int(
         race.get("skipped_projection_total"), "photons.race.skipped_projection_total"
     )
+    race_skipped_backpressure_total = _require_int(
+        race.get("skipped_backpressure_total"), "photons.race.skipped_backpressure_total"
+    )
     if race_cadence_ticks_total != (
         race_attempts_total
         + race_skipped_not_quiet_total
         + race_skipped_projection_total
+        + race_skipped_backpressure_total
     ):
         raise ValueError(
             "PHOTONS race cadence accounting does not close: "
             f"ticks={race_cadence_ticks_total} attempts={race_attempts_total} "
             f"not_quiet={race_skipped_not_quiet_total} "
-            f"projection={race_skipped_projection_total}"
+            f"projection={race_skipped_projection_total} "
+            f"backpressure={race_skipped_backpressure_total}"
         )
 
     finalized_total = (
@@ -1178,16 +1183,22 @@ def _validate_photons_fragment(fragment: Payload) -> Tuple[int, int, Optional[in
         race.get("skipped_projection_this_fragment"),
         "photons.race.skipped_projection_this_fragment",
     )
+    race_skipped_backpressure_fragment = _require_int(
+        race.get("skipped_backpressure_this_fragment"),
+        "photons.race.skipped_backpressure_this_fragment",
+    )
     if race_cadence_ticks_fragment != (
         race_attempts_fragment
         + race_skipped_not_quiet_fragment
         + race_skipped_projection_fragment
+        + race_skipped_backpressure_fragment
     ):
         raise ValueError(
             "PHOTONS race fragment cadence accounting does not close: "
             f"ticks={race_cadence_ticks_fragment} attempts={race_attempts_fragment} "
             f"not_quiet={race_skipped_not_quiet_fragment} "
-            f"projection={race_skipped_projection_fragment}"
+            f"projection={race_skipped_projection_fragment} "
+            f"backpressure={race_skipped_backpressure_fragment}"
         )
     _require_int(
         race.get("invalid_endpoint_this_fragment"),
