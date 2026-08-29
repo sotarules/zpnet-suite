@@ -235,6 +235,12 @@ _last_system_report_failure: Optional[Dict[str, Any]] = None
 _last_persistence_failure: Optional[Dict[str, Any]] = None
 _recovery_proof_expected: Optional[Dict[str, Any]] = None
 _recovery_proof_persisted: Optional[Dict[str, Any]] = None
+# LIVE_PRODUCER_ADOPT temporarily owns rolling-custody reconciliation while
+# the ordinary state worker catches the retained restart backlog up to an exact
+# read-only producer-ring rendezvous.  This is transaction ownership, not a
+# validity flag: outside this narrow startup court, rolling custody loss remains
+# an immediate HARD_FAILURE.
+_startup_live_adopt_custody_active = threading.Event()
 _recovery_status: Dict[str, Any] = {
     "schema": "PHOTONS_PI_RECOVERY_V1",
     "state": "NOT_STARTED",
@@ -5733,9 +5739,13 @@ def _startup_adopt_live_producer(
             "during zero-mutation producer adoption",
             preserved,
         )
-    _start_workers()
-    proof = _wait_for_recovery_proof()
-    ppb_live_refresh = _refresh_ppb_checkpoint_from_live_photons()
+    _startup_live_adopt_custody_active.set()
+    try:
+        _start_workers()
+        proof = _wait_for_recovery_proof()
+        ppb_live_refresh = _refresh_ppb_checkpoint_from_live_photons()
+    finally:
+        _startup_live_adopt_custody_active.clear()
 
     generation = int(recovery_report["generation"])
     if campaign_adoption["active_master"]:
@@ -6434,39 +6444,50 @@ def _state_loop() -> None:
                             instrument.get("interrupt"),
                             "PHOTONS.photons.interrupt",
                         )
+                        failure = {
+                            "sequence": photons.get("sequence"),
+                            "reset_count": stats.get("reset_count"),
+                            "update_count": stats.get("update_count"),
+                            "lap_count": stats.get("lap_count"),
+                            "raw_lap_ring_overflow_count": projection.get(
+                                "queue_overflow_count"
+                            ),
+                            "interrupt_callback_missing_count": interrupt.get(
+                                "callback_missing_count"
+                            ),
+                            "interrupt_callback_missing_count_origin": interrupt.get(
+                                "callback_missing_count_origin"
+                            ),
+                            "interrupt_callback_missing_count_since_ancestry": interrupt.get(
+                                "callback_missing_count_since_ancestry"
+                            ),
+                            "interrupt_inactive_edge_count": interrupt.get(
+                                "inactive_edge_count"
+                            ),
+                            "interrupt_inactive_edge_count_origin": interrupt.get(
+                                "inactive_edge_count_origin"
+                            ),
+                            "interrupt_inactive_edge_count_since_ancestry": interrupt.get(
+                                "inactive_edge_count_since_ancestry"
+                            ),
+                            "checkpoint_status": checkpoint.get("status"),
+                            "checkpoint_last_gap": copy.deepcopy(
+                                checkpoint.get("last_gap")
+                            ),
+                        }
+                        if _startup_live_adopt_custody_active.is_set():
+                            logging.warning(
+                                "🧭 [photons/recovery] retained startup row sequence=%s "
+                                "reported rolling custody loss during LIVE_PRODUCER_ADOPT; "
+                                "quarantining this row while exact surviving-producer "
+                                "Better-Buckets reacquisition owns custody resolution: %s",
+                                photons.get("sequence"),
+                                failure,
+                            )
+                            continue
                         _enter_hard_failure(
                             "producer_rolling_custody_lost",
-                            {
-                                "sequence": photons.get("sequence"),
-                                "reset_count": stats.get("reset_count"),
-                                "update_count": stats.get("update_count"),
-                                "lap_count": stats.get("lap_count"),
-                                "raw_lap_ring_overflow_count": projection.get(
-                                    "queue_overflow_count"
-                                ),
-                                "interrupt_callback_missing_count": interrupt.get(
-                                    "callback_missing_count"
-                                ),
-                                "interrupt_callback_missing_count_origin": interrupt.get(
-                                    "callback_missing_count_origin"
-                                ),
-                                "interrupt_callback_missing_count_since_ancestry": interrupt.get(
-                                    "callback_missing_count_since_ancestry"
-                                ),
-                                "interrupt_inactive_edge_count": interrupt.get(
-                                    "inactive_edge_count"
-                                ),
-                                "interrupt_inactive_edge_count_origin": interrupt.get(
-                                    "inactive_edge_count_origin"
-                                ),
-                                "interrupt_inactive_edge_count_since_ancestry": interrupt.get(
-                                    "inactive_edge_count_since_ancestry"
-                                ),
-                                "checkpoint_status": checkpoint.get("status"),
-                                "checkpoint_last_gap": copy.deepcopy(
-                                    checkpoint.get("last_gap")
-                                ),
-                            },
+                            failure,
                             source="PHOTONS_FRAGMENT_CUSTODY",
                         )
                         continue
@@ -9522,6 +9543,7 @@ def run() -> None:
     )
     _campaign_control_ready.clear()
     _recovery_proof_durable.clear()
+    _startup_live_adopt_custody_active.clear()
     _ppb_checkpoint_reacquire_requested.clear()
     _runtime_recovery_hold.clear()
 
