@@ -1446,6 +1446,8 @@ void crash_forensics_fault_entry(void) {
     );
 }
 
+#if 0  // Phase 2 retired: Stack Watch and Stack Tripwire investigations.
+
 // ============================================================================
 // Retained stack watchpoint (DWT comparator 1 + DebugMonitor)
 // ============================================================================
@@ -1929,6 +1931,42 @@ FLASHMEM const char* crash_stack_tripwire_site_name(uint32_t site) {
     }
 }
 
+#endif
+
+// Stateless compatibility shells: command/report ABI remains, investigation
+// state and DebugMonitor/Tripwire activity do not.
+void crash_stack_watch_service(void) {}
+
+FLASHMEM void crash_stack_watch_snapshot(crash_stack_watch_snapshot_t* out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    out->arm_skip_reason = CRASH_STACK_WATCH_SKIP_DISABLED;
+}
+
+FLASHMEM void crash_stack_watch_clear_retained(void) {}
+
+FLASHMEM const char* crash_stack_watch_skip_reason_name(uint32_t reason) {
+    return reason == CRASH_STACK_WATCH_SKIP_DISABLED ? "DISABLED" : "RETIRED";
+}
+
+volatile uint32_t g_crash_stack_tripwire_floor = 0U;
+volatile uint32_t g_crash_stack_tripwire_floor_publish_count = 0U;
+
+void crash_stack_tripwire_latch(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) {}
+
+FLASHMEM void crash_stack_tripwire_snapshot(crash_stack_tripwire_snapshot_t* out) {
+    if (out) memset(out, 0, sizeof(*out));
+}
+
+FLASHMEM void crash_stack_tripwire_clear_retained(void) {}
+
+FLASHMEM const char* crash_stack_tripwire_site_name(uint32_t) {
+    return "RETIRED";
+}
+
+#define crash_stack_watch_arm(...) ((void)0)
+#define crash_stack_tripwire_boot_latch(...) ((void)0)
+
 // ============================================================================
 // Retained deferred-dispatch breadcrumb
 // ============================================================================
@@ -2038,6 +2076,10 @@ FLASHMEM const char* crash_dispatch_breadcrumb_stage_name(
 FLASHMEM void crash_forensics_install(void) {
     const uint32_t saved_primask = read_primask();
     disable_interrupts();
+
+    // Phase 2: defensively defuse any comparator-1 watch state that survived
+    // a reset boundary from the retired Stack Watch investigation.
+    reg32_write(REG_DWT_FUNCTION1, 0U);
 
     _VectorsRam[CRASH_FORENSICS_VECTOR_HARDFAULT] = crash_forensics_fault_entry;
     _VectorsRam[CRASH_FORENSICS_VECTOR_MEMMANAGE] = crash_forensics_fault_entry;

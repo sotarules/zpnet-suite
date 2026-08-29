@@ -51,6 +51,10 @@
 #include "crash_forensics.h"
 #include "execution_trace.h"
 
+// Phase 2: the boot-crash Stack Tripwire investigation is retired.
+// Erase every historical packet-path probe at preprocessing time.
+#define crash_stack_tripwire_isr_check(...) ((void)0)
+
 #include "config.h"
 #include "debug.h"
 #include "process.h"

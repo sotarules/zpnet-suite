@@ -867,10 +867,10 @@ static void payload_note_semantic_failure(uint32_t reason,
                             key_len);
 }
 
-// Flight recorder (defined with the execution-context census below).  The
-// note path is scalar-only and allocator-free, so failure bookkeeping may
-// call it directly.
-static void payload_flight_note(uint32_t op_id, const void* self, uint16_t flags);
+// Phase 2: the historical Payload flight recorder is retired.  Keep the
+// call-site vocabulary as a compile-time no-op so no arguments are evaluated
+// and no runtime observation state survives.
+#define payload_flight_note(...) ((void)0)
 
 static inline void payload_note_error(uint32_t code,
                                       uint32_t operation_id,
@@ -1966,6 +1966,8 @@ static void payload_contract_note_integrity(uint32_t operation_id,
                             0U);
 }
 
+#if 0  // Phase 2 retired: Payload Append Trace and Payload Flight history.
+
 // ---- Retained append transaction recorder --------------------------------
 //
 // This recorder is intentionally independent of the general Payload flight
@@ -2311,6 +2313,21 @@ FLASHMEM void payload_get_flight_info(payload_flight_info_t* out) {
     }
 }
 
+#endif
+
+// Stateless compatibility shells: report ABI remains, historical state does not.
+void payload_get_append_trace(payload_append_trace_snapshot_t* out) {
+    if (out) memset(out, 0, sizeof(*out));
+}
+
+void payload_clear_retained_append_trace() {}
+
+FLASHMEM void payload_get_flight_info(payload_flight_info_t* out) {
+    if (out) memset(out, 0, sizeof(*out));
+}
+
+#define payload_append_trace_record(...) ((void)0)
+
 // ============================================================================
 // Pointer custody
 // ============================================================================
@@ -2530,6 +2547,8 @@ static bool payload_heap_header_span_readable(const void* block) {
 #endif
 }
 
+#if 0  // Phase 2 retired: Payload Heap Resize transaction history.
+
 // ---- Retained heap-resize transaction recorder -----------------------------
 
 static constexpr uint32_t PAYLOAD_HEAP_RESIZE_TRACE_MAGIC = 0x48525A31UL;  // 'HRZ1'
@@ -2741,6 +2760,16 @@ void payload_clear_retained_heap_resize_trace() {
     payload_retained_flush(&g_payload_heap_resize_trace_retained,
                            sizeof(g_payload_heap_resize_trace_retained));
 }
+
+#endif
+
+void payload_get_heap_resize_trace(payload_heap_resize_trace_snapshot_t* out) {
+    if (out) memset(out, 0, sizeof(*out));
+}
+
+void payload_clear_retained_heap_resize_trace() {}
+
+#define payload_heap_resize_trace_record(...) ((void)0)
 
 static bool payload_heap_read_capacity(const void* raw,
                                        const void* expected_owner,
@@ -6052,10 +6081,6 @@ bool Payload::_ensure_room(size_t additional_entries,
     const int32_t shift =
         (int32_t)new_data_begin - (int32_t)old_data_begin;
 
-    const bool heap_resize = _heap_block != nullptr;
-    const void* old_heap_block = _heap_block;
-    void* resized_heap_block = nullptr;
-
     if (_heap_block) {
         // Heap-backed growth uses realloc so the allocator gets the opportunity
         // to extend this exact block in place.  Failure leaves _heap_block and
@@ -6069,7 +6094,6 @@ bool Payload::_ensure_room(size_t additional_entries,
                                this);
             return false;
         }
-        resized_heap_block = resized_block;
         _set_heap_block(resized_block);
         payload_flight_note(PAYLOAD_OP_ENSURE_ROOM_ALLOC, this, 0U);
 
@@ -6079,11 +6103,6 @@ bool Payload::_ensure_room(size_t additional_entries,
                     storage + old_data_begin,
                     data_used);
         }
-        payload_heap_resize_trace_record(
-            payload_heap_resize_trace_stage_t::POST_DATA_MOVE,
-            this, old_heap_block, resized_block,
-            old_capacity, new_capacity, new_capacity);
-
         Entry* entries = reinterpret_cast<Entry*>(storage);
         for (size_t i = 0U; i < _count; ++i) {
             entries[i].key_off =
@@ -6092,10 +6111,6 @@ bool Payload::_ensure_room(size_t additional_entries,
                 (uint16_t)((int32_t)entries[i].val_off + shift);
         }
         _set_data_begin(new_data_begin);
-        payload_heap_resize_trace_record(
-            payload_heap_resize_trace_stage_t::POST_OFFSET_REBASE,
-            this, old_heap_block, resized_block,
-            old_capacity, new_capacity, new_capacity);
         payload_note_heap_delta((int32_t)new_capacity -
                                 (int32_t)old_capacity);
     } else {
@@ -6146,12 +6161,6 @@ bool Payload::_ensure_room(size_t additional_entries,
     if (data_shift) *data_shift = shift;
     const bool contract_ok = _contract_finish_preserve(
         PAYLOAD_OP_ENSURE_ROOM, before, required);
-    if (heap_resize) {
-        payload_heap_resize_trace_record(
-            payload_heap_resize_trace_stage_t::POST_CONTRACT,
-            this, old_heap_block, resized_heap_block,
-            old_capacity, new_capacity, new_capacity, contract_ok);
-    }
     return contract_ok;
 }
 
