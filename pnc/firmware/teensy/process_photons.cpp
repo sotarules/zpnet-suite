@@ -2285,67 +2285,11 @@ static photons_live_state_t g_photons_live{};
 static photons_toy_fragment_t g_last_fragment{};
 static photons_fragment_snapshot_t g_last_photons_fragment{};
 
-// Canonical PHOTONS_FRAGMENT publication crosses one explicit SPSC ownership
-// boundary.  The once-per-second capture side owns the write slot while it
-// drains/derives live state; after commit, Payload construction and publish() may
-// read only the consumer-owned queue front.
-static constexpr uint32_t PHOTONS_FRAGMENT_PUBLICATION_QUEUE_CAPACITY = 2U;
-static photons_fragment_snapshot_t
-    g_photons_fragment_publication_queue[
-        PHOTONS_FRAGMENT_PUBLICATION_QUEUE_CAPACITY] DMAMEM = {};
-static volatile uint32_t g_photons_fragment_publication_queue_read = 0U;
-static volatile uint32_t g_photons_fragment_publication_queue_write = 0U;
-static volatile uint32_t g_photons_fragment_publication_queue_count = 0U;
-
-static photons_fragment_snapshot_t*
-photons_fragment_publication_queue_acquire_write(void) {
-  if (g_photons_fragment_publication_queue_count >=
-      PHOTONS_FRAGMENT_PUBLICATION_QUEUE_CAPACITY) {
-    __builtin_trap();
-  }
-  return &g_photons_fragment_publication_queue[
-      g_photons_fragment_publication_queue_write];
-}
-
-static void photons_fragment_publication_queue_commit_write(void) {
-  photons_memory_barrier();
-  g_photons_fragment_publication_queue_write =
-      (g_photons_fragment_publication_queue_write + 1U) %
-      PHOTONS_FRAGMENT_PUBLICATION_QUEUE_CAPACITY;
-  g_photons_fragment_publication_queue_count++;
-  photons_memory_barrier();
-}
-
-static const photons_fragment_snapshot_t*
-photons_fragment_publication_queue_front(void) {
-  photons_memory_barrier();
-  if (g_photons_fragment_publication_queue_count == 0U) return nullptr;
-  return &g_photons_fragment_publication_queue[
-      g_photons_fragment_publication_queue_read];
-}
-
-static void photons_fragment_publication_queue_release(void) {
-  if (g_photons_fragment_publication_queue_count == 0U) __builtin_trap();
-  photons_fragment_snapshot_t& item =
-      g_photons_fragment_publication_queue[
-          g_photons_fragment_publication_queue_read];
-  memset(&item, 0, sizeof(item));
-  photons_memory_barrier();
-  g_photons_fragment_publication_queue_read =
-      (g_photons_fragment_publication_queue_read + 1U) %
-      PHOTONS_FRAGMENT_PUBLICATION_QUEUE_CAPACITY;
-  g_photons_fragment_publication_queue_count--;
-  photons_memory_barrier();
-}
-
-static void photons_fragment_publication_queue_reset(void) {
-  memset(g_photons_fragment_publication_queue, 0,
-         sizeof(g_photons_fragment_publication_queue));
-  g_photons_fragment_publication_queue_read = 0U;
-  g_photons_fragment_publication_queue_write = 0U;
-  g_photons_fragment_publication_queue_count = 0U;
-  photons_memory_barrier();
-}
+// PHOTONS_FRAGMENT publication is one foreground transaction.  The producer
+// first freezes every live/runtime dependency into a complete value snapshot;
+// Payload construction and publish() then consume only that immutable local
+// value.  Unlike CLOCKS, PHOTONS has no retry lifetime or asynchronous consumer
+// requiring a publication queue between capture and serialization.
 
 static uint32_t g_publish_count = 0;
 static uint32_t g_publish_reject_count = 0;
@@ -3162,11 +3106,11 @@ static void photons_fragment_tick(
 
   const photons_race_runtime_t race = g_photons_race;
 
-  if (g_photons_fragment_publication_queue_count != 0U) __builtin_trap();
-  photons_fragment_snapshot_t* producer_item =
-      photons_fragment_publication_queue_acquire_write();
-  memset(producer_item, 0, sizeof(*producer_item));
-  photons_fragment_snapshot_t& fragment = *producer_item;
+  // This complete foreground-owned value is the publication custody boundary.
+  // From the first Payload mutation onward, the serializer may read only this
+  // snapshot plus constants/pure formatting helpers; it never reaches back into
+  // mutable PHOTONS or process_interrupt state.
+  photons_fragment_snapshot_t fragment{};
   fragment.snapshot_ok = true;
   fragment.sequence = ++g_fragment_sequence;
   fragment.publish_count = g_publish_count + 1U;
@@ -3374,43 +3318,31 @@ static void photons_fragment_tick(
   g_last_fragment_race_enqueue_failure_count =
       fragment.race_enqueue_failure_total;
 
-  photons_fragment_publication_queue_commit_write();
-  const photons_fragment_snapshot_t* consumer_item =
-      photons_fragment_publication_queue_front();
-  if (!consumer_item || consumer_item->sequence != fragment.sequence) {
-    __builtin_trap();
-  }
-  const photons_fragment_snapshot_t& owned_fragment = *consumer_item;
-
-  // From this point through publish(), all runtime Payload input is owned by the
-  // consumer queue slot.
-  Payload& payload = photons_fragment_payload(owned_fragment);
+  // Payload remains a renderer of this frozen value.  Keep the completed root
+  // populated after publish: the next one-second root.clear() intentionally
+  // remains an integrity canary for any out-of-band RAM2 mutation.
+  Payload& payload = photons_fragment_payload(fragment);
   if (publish("PHOTONS_FRAGMENT", payload)) {
     g_publish_count++;
     g_last_fragment.publish_count = g_publish_count;
     g_last_photons_fragment.publish_count = g_publish_count;
-    if (owned_fragment.recovery.restored &&
-        owned_fragment.recovery.proof_pending &&
-        owned_fragment.recovery.proof_advanced &&
+    if (fragment.recovery.restored &&
+        fragment.recovery.proof_pending &&
+        fragment.recovery.proof_advanced &&
         !g_photons_recovery.proof_advanced_published) {
-      g_photons_recovery.proof_sequence = owned_fragment.sequence;
-      g_photons_recovery.proof_update_count = owned_fragment.stats.update_count;
+      g_photons_recovery.proof_sequence = fragment.sequence;
+      g_photons_recovery.proof_update_count = fragment.stats.update_count;
       g_photons_recovery.proof_advanced_published = true;
     }
-    photons_campaign_commit_after_publish(owned_fragment);
+    photons_campaign_commit_after_publish(fragment);
     photons_stats_reset_commit_after_publish();
   } else {
     g_publish_reject_count++;
   }
-
-  photons_fragment_publication_queue_release();
 }
 
 
 static void photons_recovery_clear_physical_ancestry(void) {
-  // No publication queue value may straddle a physical-ancestry boundary.
-  photons_fragment_publication_queue_reset();
-
   // Discard every observation that could have begun before the recovery
   // boundary.  Aggregate statistics are installed separately; none of these
   // boot-local physical facts may cross the outage.
@@ -3503,7 +3435,6 @@ FLASHMEM void process_photons_init(void) {
   g_photons_live = photons_live_state_t{};
   g_last_fragment = photons_toy_fragment_t{};
   g_last_photons_fragment = photons_fragment_snapshot_t{};
-  photons_fragment_publication_queue_reset();
   g_fragment_sequence = 0U;
   g_publish_count = 0U;
   g_publish_reject_count = 0U;
