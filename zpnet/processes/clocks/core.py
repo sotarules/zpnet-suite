@@ -12460,6 +12460,44 @@ def _reconcile_deferred_startup_watchdogs() -> Dict[str, Any]:
     return result
 
 
+def _log_watchdog_anomaly_forensics(anomaly: Dict[str, Any]) -> None:
+    """Emit one deliberately exhaustive log record for a continuity surrender."""
+    now = time.monotonic()
+    last_clocks_age_ms = (
+        None
+        if _latest_clocks_received_monotonic is None
+        else round(max(0.0, now - _latest_clocks_received_monotonic) * 1000.0, 3)
+    )
+    testimony = {
+        "received_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "pi_context": {
+            "pid": os.getpid(),
+            "thread": threading.current_thread().name,
+            "operational_state": _operational_state_snapshot(),
+            "startup_control_ready": _startup_control_ready.is_set(),
+            "campaign_active": bool(_campaign_active),
+            "auto_recovery_in_progress": bool(_auto_recovery_in_progress),
+            "last_clocks_sequence": _last_clocks_state_sequence,
+            "last_clocks_age_ms": last_clocks_age_ms,
+            "last_pps_vclock_count_seen": _last_pps_vclock_count_seen,
+            "accepted_pps_vclock_count": _accepted_pps_vclock_count,
+            "queues": {
+                "clocks_state": _clocks_state_queue.qsize(),
+                "clocks_persistence": _clocks_persist_queue.qsize(),
+                "tempest": _fragment_queue.qsize(),
+            },
+        },
+        "teensy_payload": copy.deepcopy(anomaly),
+    }
+    encoded = json.dumps(testimony, indent=2, sort_keys=True, default=str)
+    logging.error(
+        "💥 [clocks] WATCHDOG_ANOMALY FORENSIC TESTIMONY — full event follows "
+        "(json_bytes=%d):\n%s",
+        len(encoded.encode("utf-8")),
+        encoded,
+    )
+
+
 def on_watchdog_anomaly(payload: Payload) -> None:
     """
     PUBSUB handler for WATCHDOG_ANOMALY from Teensy CLOCKS.
@@ -12472,6 +12510,7 @@ def on_watchdog_anomaly(payload: Payload) -> None:
     _diag["watchdog_anomalies_received"] += 1
 
     anomaly = dict(payload)
+    _log_watchdog_anomaly_forensics(anomaly)
     _diag["last_watchdog_anomaly"] = {
         "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "reason": anomaly.get("reason"),
