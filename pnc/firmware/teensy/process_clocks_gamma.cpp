@@ -339,8 +339,10 @@ static void time_pps_vclock_publish(uint32_t dwt_at_pps_vclock,
 void time_pps_vclock_update(uint32_t dwt_at_pps_vclock,
                             uint32_t dwt_cycles_per_pps_vclock_s,
                             uint32_t counter32_at_pps_vclock) {
-  const uint32_t next_count = g_time_anchor.pps_vclock_count
-      ? (g_time_anchor.pps_vclock_count + 1U)
+  const time_anchor_value_t prior = time_anchor_load();
+  if (!prior.snapshot_ok) __builtin_trap();
+  const uint32_t next_count = prior.pps_vclock_count
+      ? (prior.pps_vclock_count + 1U)
       : 1U;
 
   time_pps_vclock_publish(dwt_at_pps_vclock,

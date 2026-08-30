@@ -21,9 +21,10 @@
 #include <stdbool.h>
 
 // Foreground loop service.  Call once per loop() pass before timepop_dispatch().
-// It drains immutable CH2 fire facts, executes application subscriber callbacks,
-// and flushes scalar feature state.  No TimePop scheduler mutation or application
-// behavior is performed by Priority 0, Priority 16, or Priority 32.
+// It drains immutable CH2 fire facts and complete subscriber SPSC values, executes
+// application callbacks while foreground owns the read slots, and flushes scalar
+// feature state. No TimePop scheduler mutation or application behavior is performed
+// by Priority 0, Priority 16, or Priority 32.
 void process_interrupt_foreground_service(void);
 
 // Optional TimePop pressure marker.  The recorder itself remains owned by
@@ -1309,6 +1310,10 @@ bool interrupt_photodiode_level_high(void);
 // UNKNOWN delay ancestry; this function never rereads DWT as event identity.
 void process_interrupt_photodiode_gpio_irq(uint32_t isr_entry_dwt_raw);
 
+// event and diag are members of one immutable foreground-owned SPSC read slot.
+// They remain valid only for the synchronous duration of the callback. Consumers
+// must copy any fact they intend to retain; no producer-owned runtime pointer is
+// exposed through this ABI.
 using interrupt_subscriber_event_fn =
     void (*)(const interrupt_event_t& event,
              const interrupt_capture_diag_t* diag,
@@ -1367,9 +1372,6 @@ bool interrupt_stop(interrupt_subscriber_kind_t kind);
 
 void interrupt_request_pps_rebootstrap(void);
 bool interrupt_pps_rebootstrap_pending(void);
-
-const interrupt_event_t*        interrupt_last_event(interrupt_subscriber_kind_t kind);
-const interrupt_capture_diag_t* interrupt_last_diag (interrupt_subscriber_kind_t kind);
 
 void interrupt_pps_edge_register_dispatch(pps_edge_dispatch_fn fn);
 

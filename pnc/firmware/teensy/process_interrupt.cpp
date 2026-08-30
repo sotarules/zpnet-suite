@@ -690,14 +690,29 @@ static constexpr interrupt_subscriber_descriptor_t PHOTODIODE_DESCRIPTOR{
   interrupt_lane_t::GPIO_PHOTODIODE_EDGE,
 };
 
-struct interrupt_deferred_dispatch_t {
-  bool pending = false;
-  uint32_t binding_generation = 0;
+static constexpr uint32_t INTERRUPT_SUBSCRIBER_DISPATCH_QUEUE_CAPACITY = 2U;
+static_assert((INTERRUPT_SUBSCRIBER_DISPATCH_QUEUE_CAPACITY &
+               (INTERRUPT_SUBSCRIBER_DISPATCH_QUEUE_CAPACITY - 1U)) == 0U,
+              "subscriber dispatch queue capacity must be a power of two");
+
+// Priority 32 owns one write slot until write_sequence advances. Foreground
+// owns one read slot until every callback using that value has returned and
+// read_sequence advances. No callback may borrow producer-owned runtime state.
+struct interrupt_foreground_dispatch_value_t {
+  uint32_t binding_generation = 0U;
   interrupt_subscriber_event_fn callback = nullptr;
   void* user_data = nullptr;
   interrupt_event_t event{};
+  interrupt_capture_diag_t diag{};
   bool pps_continuation_valid = false;
   pps_edge_snapshot_t pps_continuation{};
+};
+
+struct interrupt_foreground_dispatch_queue_t {
+  interrupt_foreground_dispatch_value_t
+      values[INTERRUPT_SUBSCRIBER_DISPATCH_QUEUE_CAPACITY]{};
+  volatile uint32_t write_sequence = 0U;
+  volatile uint32_t read_sequence = 0U;
 };
 
 struct interrupt_delay_history_t {
@@ -716,6 +731,8 @@ struct interrupt_subscriber_runtime_t {
   interrupt_subscription_t sub{};
   bool subscribed = false;
   bool active = false;
+  // Priority-32-owned construction state. These objects never cross into
+  // foreground by pointer; each completed value is copied into a queue slot.
   interrupt_event_t last_event{};
   interrupt_capture_diag_t last_diag{};
 
@@ -723,9 +740,8 @@ struct interrupt_subscriber_runtime_t {
   // contamination of the next one-second interval.
   interrupt_delay_history_t delay_history{};
 
-  bool has_fired = false;
   uint32_t binding_generation = 1U;
-  interrupt_deferred_dispatch_t deferred{};
+  interrupt_foreground_dispatch_queue_t dispatch_queue{};
   bool dispatch_running = false;
   uint32_t dispatch_busy_drop_count = 0;
   uint32_t dispatch_stale_drop_count = 0;
@@ -820,106 +836,123 @@ static timepop_dispatch_trace_kind_t interrupt_execution_trace_subscriber_kind(
   }
 }
 
+static uint32_t interrupt_dispatch_queue_depth(
+    const interrupt_subscriber_runtime_t& rt) {
+  const uint32_t read_sequence = rt.dispatch_queue.read_sequence;
+  dmb_barrier();
+  const uint32_t write_sequence = rt.dispatch_queue.write_sequence;
+  const uint32_t depth = write_sequence - read_sequence;
+  if (depth > INTERRUPT_SUBSCRIBER_DISPATCH_QUEUE_CAPACITY) {
+    __builtin_trap();
+  }
+  return depth;
+}
+
 static void interrupt_dispatch_invalidate_locked(
     interrupt_subscriber_runtime_t& rt) {
   rt.binding_generation++;
   if (rt.binding_generation == 0U) rt.binding_generation = 1U;
-  if (!rt.dispatch_running) rt.deferred = interrupt_deferred_dispatch_t{};
+
+  // The foreground consumer may discard unread stale values. An actively
+  // executing callback still owns its front slot and releases it on return.
+  if (!rt.dispatch_running) {
+    dmb_barrier();
+    rt.dispatch_queue.read_sequence = rt.dispatch_queue.write_sequence;
+    dmb_barrier();
+  }
 }
 
-static bool interrupt_dispatch_begin(interrupt_subscriber_runtime_t& rt,
-                                     const interrupt_event_t& event) {
-  interrupt_subscriber_event_fn callback = nullptr;
-  void* callback_user_data = nullptr;
-  uint32_t binding_generation = 0;
+static interrupt_foreground_dispatch_value_t*
+interrupt_dispatch_write_acquire(
+    interrupt_subscriber_runtime_t& rt,
+    uint32_t& write_sequence) {
+  if (!rt.subscribed || !rt.active || !rt.sub.on_event) return nullptr;
 
-  const uint32_t prior_basepri = interrupt_priority0_guard_enter();
-  if (!rt.subscribed || !rt.active || !rt.sub.on_event ||
-      rt.dispatch_running || rt.deferred.pending) {
-    if (rt.dispatch_running || rt.deferred.pending) {
-      rt.dispatch_busy_drop_count++;
-    }
-    interrupt_priority0_guard_exit(prior_basepri);
-    return false;
-  }
-
-  callback = rt.sub.on_event;
-  callback_user_data = rt.sub.user_data;
-  binding_generation = rt.binding_generation;
+  const interrupt_subscriber_event_fn callback = rt.sub.on_event;
   if (!interrupt_subscriber_callback_executable(callback)) {
     rt.dispatch_invalid_callback_count++;
-    interrupt_priority0_guard_exit(prior_basepri);
-    return false;
+    return nullptr;
   }
 
-  // Priority 32 authors only an immutable foreground fact.  It does not call
-  // TimePop, mutate a TimePop mailbox, or execute application behavior.
-  rt.deferred.pending = true;
-  rt.deferred.binding_generation = binding_generation;
-  rt.deferred.callback = callback;
-  rt.deferred.user_data = callback_user_data;
-  rt.deferred.event = event;
+  interrupt_foreground_dispatch_queue_t& queue = rt.dispatch_queue;
+  const uint32_t write = queue.write_sequence;
+  dmb_barrier();
+  const uint32_t read = queue.read_sequence;
+  const uint32_t depth = write - read;
+  if (depth > INTERRUPT_SUBSCRIBER_DISPATCH_QUEUE_CAPACITY) {
+    __builtin_trap();
+  }
+  if (depth == INTERRUPT_SUBSCRIBER_DISPATCH_QUEUE_CAPACITY) {
+    rt.dispatch_busy_drop_count++;
+    return nullptr;
+  }
+
+  interrupt_foreground_dispatch_value_t& value =
+      queue.values[write & (INTERRUPT_SUBSCRIBER_DISPATCH_QUEUE_CAPACITY - 1U)];
+  value.binding_generation = rt.binding_generation;
+  value.callback = callback;
+  value.user_data = rt.sub.user_data;
+  value.pps_continuation_valid = false;
+  write_sequence = write;
+  return &value;
+}
+
+static void interrupt_dispatch_write_commit(
+    interrupt_subscriber_runtime_t& rt,
+    uint32_t write_sequence) {
+  interrupt_foreground_dispatch_queue_t& queue = rt.dispatch_queue;
+  if (queue.write_sequence != write_sequence) __builtin_trap();
+  dmb_barrier();
+  queue.write_sequence = write_sequence + 1U;
   g_process_interrupt_foreground_pending = true;
+  dmb_barrier();
+}
 
-  if (rt.desc->kind == interrupt_subscriber_kind_t::VCLOCK) {
-    rt.deferred.pps_continuation_valid =
-        interrupt_last_pps_edge(&rt.deferred.pps_continuation);
-  }
-  interrupt_priority0_guard_exit(prior_basepri);
-
-  const timepop_dispatch_trace_kind_t trace_kind =
-      interrupt_execution_trace_subscriber_kind(rt.desc->kind);
-  ZPNET_EXECUTION_TRACE(
-      execution_trace_context_t::PRIORITY32,
-      timepop_dispatch_trace_stage_t::SUBSCRIBER_SELECTED,
-      trace_kind,
-      (uint32_t)timepop_dispatch_trace_phase_t::IDLE,
-      event.counter32_at_event,
-      (uint32_t)rt.desc->kind,
-      event.counter32_at_event,
-      (uint32_t)(uintptr_t)callback,
-      (uint32_t)(uintptr_t)rt.sub.on_event,
-      (uint32_t)(uintptr_t)callback_user_data,
-      1U | (binding_generation << 16));
-  return true;
+static void interrupt_dispatch_read_release(
+    interrupt_subscriber_runtime_t& rt,
+    uint32_t read_sequence) {
+  interrupt_foreground_dispatch_queue_t& queue = rt.dispatch_queue;
+  if (queue.read_sequence != read_sequence) __builtin_trap();
+  dmb_barrier();
+  queue.read_sequence = read_sequence + 1U;
+  dmb_barrier();
 }
 
 static bool interrupt_dispatch_foreground_one(
     interrupt_subscriber_runtime_t& rt) {
-  interrupt_subscriber_event_fn callback = nullptr;
-  void* callback_user_data = nullptr;
-  interrupt_event_t event{};
-  bool pps_continuation_valid = false;
-  pps_edge_snapshot_t pps_continuation{};
-
-  const uint32_t prior_basepri = interrupt_priority0_guard_enter();
-  if (!rt.deferred.pending || rt.dispatch_running) {
-    interrupt_priority0_guard_exit(prior_basepri);
-    return false;
+  interrupt_foreground_dispatch_queue_t& queue = rt.dispatch_queue;
+  const uint32_t read_sequence = queue.read_sequence;
+  dmb_barrier();
+  const uint32_t write_sequence = queue.write_sequence;
+  const uint32_t depth = write_sequence - read_sequence;
+  if (depth == 0U) return false;
+  if (depth > INTERRUPT_SUBSCRIBER_DISPATCH_QUEUE_CAPACITY) {
+    __builtin_trap();
   }
+  if (rt.dispatch_running) __builtin_trap();
+
+  interrupt_foreground_dispatch_value_t& value =
+      queue.values[read_sequence &
+                   (INTERRUPT_SUBSCRIBER_DISPATCH_QUEUE_CAPACITY - 1U)];
+  dmb_barrier();
+
   if (!rt.subscribed || !rt.active ||
-      rt.deferred.binding_generation != rt.binding_generation) {
+      value.binding_generation != rt.binding_generation) {
     rt.dispatch_stale_drop_count++;
-    rt.deferred = interrupt_deferred_dispatch_t{};
-    interrupt_priority0_guard_exit(prior_basepri);
-    return false;
+    interrupt_dispatch_read_release(rt, read_sequence);
+    return true;
   }
 
-  callback = rt.deferred.callback;
-  callback_user_data = rt.deferred.user_data;
+  const interrupt_subscriber_event_fn callback = value.callback;
+  void* const callback_user_data = value.user_data;
+  const uint32_t event_counter32 = value.event.counter32_at_event;
   if (!interrupt_subscriber_callback_executable(callback)) {
     rt.dispatch_invalid_callback_count++;
-    rt.deferred = interrupt_deferred_dispatch_t{};
-    interrupt_priority0_guard_exit(prior_basepri);
-    return false;
+    interrupt_dispatch_read_release(rt, read_sequence);
+    return true;
   }
 
-  event = rt.deferred.event;
-  pps_continuation_valid = rt.deferred.pps_continuation_valid;
-  pps_continuation = rt.deferred.pps_continuation;
   rt.dispatch_running = true;
-  interrupt_priority0_guard_exit(prior_basepri);
-
   const timepop_dispatch_trace_kind_t trace_kind =
       interrupt_execution_trace_subscriber_kind(rt.desc->kind);
   ZPNET_EXECUTION_TRACE(
@@ -927,27 +960,27 @@ static bool interrupt_dispatch_foreground_one(
       timepop_dispatch_trace_stage_t::SUBSCRIBER_ENTER,
       trace_kind,
       (uint32_t)timepop_dispatch_trace_phase_t::IDLE,
-      event.counter32_at_event,
+      event_counter32,
       (uint32_t)rt.desc->kind,
-      event.counter32_at_event,
+      event_counter32,
       (uint32_t)(uintptr_t)callback,
-      0U,
+      (uint32_t)(uintptr_t)&value.event,
       (uint32_t)(uintptr_t)callback_user_data,
-      event.counter32_at_event);
+      event_counter32);
   rt.dispatch_count++;
   crash_dispatch_breadcrumb_note(
       CRASH_DISPATCH_BREADCRUMB_SUBSCRIBER_ENTER,
       (uint32_t)(uintptr_t)callback,
       (uint32_t)rt.desc->kind,
-      event.counter32_at_event,
+      event_counter32,
       (uint32_t)(uintptr_t)callback_user_data,
       (uint32_t)(uintptr_t)&rt);
-  callback(event, &rt.last_diag, callback_user_data);
+  callback(value.event, &value.diag, callback_user_data);
   crash_dispatch_breadcrumb_note(
       CRASH_DISPATCH_BREADCRUMB_SUBSCRIBER_RETURN,
       (uint32_t)(uintptr_t)callback,
       (uint32_t)rt.desc->kind,
-      event.counter32_at_event,
+      event_counter32,
       (uint32_t)(uintptr_t)callback_user_data,
       (uint32_t)(uintptr_t)&rt);
   ZPNET_EXECUTION_TRACE(
@@ -955,40 +988,40 @@ static bool interrupt_dispatch_foreground_one(
       timepop_dispatch_trace_stage_t::SUBSCRIBER_RETURN,
       trace_kind,
       (uint32_t)timepop_dispatch_trace_phase_t::IDLE,
-      event.counter32_at_event,
+      event_counter32,
       (uint32_t)rt.desc->kind,
-      event.counter32_at_event,
+      event_counter32,
       (uint32_t)(uintptr_t)callback,
-      0U,
+      (uint32_t)(uintptr_t)&value.event,
       (uint32_t)(uintptr_t)callback_user_data,
-      event.counter32_at_event);
+      event_counter32);
+
+  // The VCLOCK continuation is part of the same immutable queue value. Keep
+  // foreground ownership until both consumers have returned.
+  if (rt.desc->kind == interrupt_subscriber_kind_t::VCLOCK &&
+      value.pps_continuation_valid) {
+    const pps_edge_dispatch_fn callback_pps = g_pps_edge_dispatch;
+    if (interrupt_callback_address_executable((uintptr_t)callback_pps)) {
+      callback_pps(value.pps_continuation);
+    }
+  }
 
   crash_dispatch_breadcrumb_note(
       CRASH_DISPATCH_BREADCRUMB_CLEANUP_ENTER,
       (uint32_t)(uintptr_t)callback,
       (uint32_t)rt.desc->kind,
-      event.counter32_at_event,
+      event_counter32,
       (uint32_t)(uintptr_t)callback_user_data,
       (uint32_t)(uintptr_t)&rt);
-  const uint32_t finish_basepri = interrupt_priority0_guard_enter();
   rt.dispatch_running = false;
-  rt.deferred = interrupt_deferred_dispatch_t{};
-  interrupt_priority0_guard_exit(finish_basepri);
+  interrupt_dispatch_read_release(rt, read_sequence);
   crash_dispatch_breadcrumb_note(
       CRASH_DISPATCH_BREADCRUMB_CLEANUP_COMPLETE,
       (uint32_t)(uintptr_t)callback,
       (uint32_t)rt.desc->kind,
-      event.counter32_at_event,
+      event_counter32,
       (uint32_t)(uintptr_t)callback_user_data,
       (uint32_t)(uintptr_t)&rt);
-
-  if (rt.desc->kind == interrupt_subscriber_kind_t::VCLOCK &&
-      pps_continuation_valid) {
-    const pps_edge_dispatch_fn callback_pps = g_pps_edge_dispatch;
-    if (interrupt_callback_address_executable((uintptr_t)callback_pps)) {
-      callback_pps(pps_continuation);
-    }
-  }
   return true;
 }
 
@@ -1486,6 +1519,7 @@ static void integrity_note_dwt_interval(interrupt_subscriber_kind_t kind,
 
 bool interrupt_integrity_snapshot(interrupt_integrity_snapshot_t* out) {
   if (!out) return false;
+  const uint32_t prior = interrupt_priority0_guard_enter();
   g_interrupt_integrity.snapshot_count++;
   g_interrupt_integrity.valid =
       g_interrupt_integrity.vclock_counter.valid ||
@@ -1496,7 +1530,9 @@ bool interrupt_integrity_snapshot(interrupt_integrity_snapshot_t* out) {
       g_interrupt_integrity.ocxo2_qtimer_dwt.valid ||
       g_interrupt_integrity.vclock_pps_interval.valid;
   *out = g_interrupt_integrity;
-  return out->valid;
+  const bool valid = out->valid;
+  interrupt_priority0_guard_exit(prior);
+  return valid;
 }
 
 // ============================================================================
@@ -1915,12 +1951,36 @@ void interrupt_smartzero_abort(void) {
   interrupt_priority0_guard_exit(prior);
 }
 
+static void smartzero_state_load(bool& running, bool& complete) {
+  for (uint32_t attempt = 0U; attempt < 4U; ++attempt) {
+    const uint32_t seq1 = g_smartzero.seq;
+    if (seq1 & 1U) continue;
+    dmb_barrier();
+    const bool snapshot_running = g_smartzero.running;
+    const bool snapshot_complete = g_smartzero.complete;
+    dmb_barrier();
+    const uint32_t seq2 = g_smartzero.seq;
+    if (seq1 == seq2 && (seq2 & 1U) == 0U) {
+      running = snapshot_running;
+      complete = snapshot_complete;
+      return;
+    }
+  }
+  __builtin_trap();
+}
+
 bool interrupt_smartzero_running(void) {
-  return g_smartzero.running && !g_smartzero.complete;
+  bool running = false;
+  bool complete = false;
+  smartzero_state_load(running, complete);
+  return running && !complete;
 }
 
 bool interrupt_smartzero_complete(void) {
-  return g_smartzero.complete;
+  bool running = false;
+  bool complete = false;
+  smartzero_state_load(running, complete);
+  return complete;
 }
 
 static bool smartzero_snapshot_load(
@@ -2361,21 +2421,27 @@ void interrupt_ocxo_logical_grid_epoch(uint32_t ocxo1_epoch_counter32,
 bool interrupt_clock_snapshot(interrupt_subscriber_kind_t kind,
                               interrupt_clock_snapshot_t* out) {
   if (!out) return false;
+  const uint32_t prior = interrupt_priority0_guard_enter();
   if (kind == interrupt_subscriber_kind_t::VCLOCK) {
     const uint16_t hardware16 = qtimer1_ch0_counter_now();
     out->hardware16 = hardware16;
     out->counter32 = vclock_synthetic_from_hardware_low16(hardware16);
     out->ns64 = (uint64_t)out->counter32 * 100ULL;
+    interrupt_priority0_guard_exit(prior);
     return true;
   }
   const ocxo_binding_t* ctx = ocxo_binding_for(kind);
-  if (!ctx || !ctx->lane->initialized || !ctx->clock32->zeroed) return false;
+  if (!ctx || !ctx->lane->initialized || !ctx->clock32->zeroed) {
+    interrupt_priority0_guard_exit(prior);
+    return false;
+  }
   const uint16_t hardware16 = ocxo_counter_now(*ctx->lane);
   const uint32_t delta =
       (uint32_t)((uint16_t)(hardware16 - ctx->clock32->hardware16));
   out->hardware16 = hardware16;
   out->counter32 = ctx->clock32->current_counter32 + delta;
   out->ns64 = ctx->clock32->current_ns + (uint64_t)delta * 100ULL;
+  interrupt_priority0_guard_exit(prior);
   return true;
 }
 
@@ -4308,11 +4374,10 @@ static bool emit_observed_event(
     bool preempted_after_entry = false) {
   if (!rt.active || !rt.desc || dwt_at_event == 0U) return false;
 
-  const uint32_t prior = interrupt_priority0_guard_enter();
-  const bool busy = rt.dispatch_running || rt.deferred.pending;
-  if (busy) rt.dispatch_busy_drop_count++;
-  interrupt_priority0_guard_exit(prior);
-  if (busy) return false;
+  uint32_t write_sequence = 0U;
+  interrupt_foreground_dispatch_value_t* const value =
+      interrupt_dispatch_write_acquire(rt, write_sequence);
+  if (!value) return false;
 
   rt.last_event = interrupt_event_t{};
   rt.last_event.kind = rt.desc->kind;
@@ -4337,9 +4402,34 @@ static bool emit_observed_event(
       rt.delay_history,
       arrival.delay,
       rt.last_diag.interrupt_delay);
-  rt.has_fired = true;
+  value->event = rt.last_event;
+  value->diag = rt.last_diag;
+  if (rt.desc->kind == interrupt_subscriber_kind_t::VCLOCK) {
+    value->pps_continuation_valid =
+        interrupt_last_pps_edge(&value->pps_continuation);
+  }
+
+  const interrupt_subscriber_event_fn callback = value->callback;
+  void* const callback_user_data = value->user_data;
+  const uint32_t binding_generation = value->binding_generation;
   rt.event_count++;
-  return interrupt_dispatch_begin(rt, rt.last_event);
+  interrupt_dispatch_write_commit(rt, write_sequence);
+
+  const timepop_dispatch_trace_kind_t trace_kind =
+      interrupt_execution_trace_subscriber_kind(rt.desc->kind);
+  ZPNET_EXECUTION_TRACE(
+      execution_trace_context_t::PRIORITY32,
+      timepop_dispatch_trace_stage_t::SUBSCRIBER_SELECTED,
+      trace_kind,
+      (uint32_t)timepop_dispatch_trace_phase_t::IDLE,
+      counter32_at_event,
+      (uint32_t)rt.desc->kind,
+      counter32_at_event,
+      (uint32_t)(uintptr_t)callback,
+      (uint32_t)(uintptr_t)callback,
+      (uint32_t)(uintptr_t)callback_user_data,
+      1U | (binding_generation << 16));
+  return true;
 }
 
 static void publish_observed_pps_vclock(uint32_t sequence,
@@ -5424,102 +5514,109 @@ bool interrupt_last_pps_vclock(pps_vclock_t* out) {
 bool interrupt_last_pps_vclock_phase_estimate(
     pps_vclock_phase_estimate_t* out) {
   if (!out) return false;
-  const pps_vclock_edge_authority_t authority =
+  *out = pps_vclock_phase_estimate_t{};
+  const uint32_t prior = interrupt_priority0_guard_enter();
+  const pps_vclock_edge_authority_t& authority =
       g_pps_vclock_edge_authority;
-  pps_vclock_phase_estimate_t estimate{};
-  estimate.valid = authority.valid;
-  estimate.lattice_dwt_at_edge = authority.authority_dwt_at_edge;
-  estimate.estimated_dwt_at_edge = authority.authority_dwt_at_edge;
-  estimate.correction_cycles = 0;
-  estimate.phase_mod_scaled_cycles = 0U;
-  estimate.tick_scaled_cycles = 0U;
-  estimate.scale = 1U;
-  estimate.dwt_cycles_per_second = authority.dwt_cycles_per_second;
-  estimate.pps_sequence = authority.sequence;
-  estimate.pvc_sequence = authority.sequence;
-  estimate.pps_dwt_at_edge = authority.pps_dwt_at_edge;
-  estimate.pps_counter32_at_edge = authority.counter32_at_edge;
-  estimate.pvc_counter32_at_edge = authority.counter32_at_edge;
-  *out = estimate;
-  return estimate.valid;
+  out->valid = authority.valid;
+  out->lattice_dwt_at_edge = authority.authority_dwt_at_edge;
+  out->estimated_dwt_at_edge = authority.authority_dwt_at_edge;
+  out->correction_cycles = 0;
+  out->phase_mod_scaled_cycles = 0U;
+  out->tick_scaled_cycles = 0U;
+  out->scale = 1U;
+  out->dwt_cycles_per_second = authority.dwt_cycles_per_second;
+  out->pps_sequence = authority.sequence;
+  out->pvc_sequence = authority.sequence;
+  out->pps_dwt_at_edge = authority.pps_dwt_at_edge;
+  out->pps_counter32_at_edge = authority.counter32_at_edge;
+  out->pvc_counter32_at_edge = authority.counter32_at_edge;
+  const bool valid = out->valid;
+  interrupt_priority0_guard_exit(prior);
+  return valid;
 }
 
 bool interrupt_last_pps_edge(pps_edge_snapshot_t* out) {
   if (!out) return false;
   *out = pps_edge_snapshot_t{};
 
+  const uint32_t prior = interrupt_priority0_guard_enter();
   pps_t pps{};
   pps_vclock_t pvc{};
-  if (!store_load(pps, pvc)) return false;
+  if (!store_load(pps, pvc)) {
+    interrupt_priority0_guard_exit(prior);
+    return false;
+  }
 
-  pps_edge_snapshot_t local{};
-  local.snapshot_ok = true;
-  local.sequence = pvc.sequence;
-  local.dwt_at_edge = pvc.dwt_at_edge;
-  local.dwt_raw_at_edge = pvc.dwt_at_edge;
-  local.counter32_at_edge = pvc.counter32_at_edge;
-  local.ch3_at_edge = pvc.ch3_at_edge;
-  local.gnss_ns_at_edge = -1;
-  local.physical_pps_dwt_raw_at_edge = pps.dwt_at_edge;
-  local.physical_pps_dwt_normalized_at_edge = pps.dwt_at_edge;
-  local.physical_pps_counter32_at_read = pps.counter32_at_edge;
-  local.physical_pps_ch3_at_read = pps.ch3_at_edge;
+  out->snapshot_ok = true;
+  out->sequence = pvc.sequence;
+  out->dwt_at_edge = pvc.dwt_at_edge;
+  out->dwt_raw_at_edge = pvc.dwt_at_edge;
+  out->counter32_at_edge = pvc.counter32_at_edge;
+  out->ch3_at_edge = pvc.ch3_at_edge;
+  out->gnss_ns_at_edge = -1;
+  out->physical_pps_dwt_raw_at_edge = pps.dwt_at_edge;
+  out->physical_pps_dwt_normalized_at_edge = pps.dwt_at_edge;
+  out->physical_pps_counter32_at_read = pps.counter32_at_edge;
+  out->physical_pps_ch3_at_read = pps.ch3_at_edge;
   const interrupt_delay_baseline_runtime_t* pps_delay_runtime =
       interrupt_delay_baseline_for(interrupt_execution_source_t::PPS);
-  local.physical_pps_arrival.valid = g_pps_arrival_entry_dwt != 0U;
-  local.physical_pps_arrival.capture = g_pps_arrival_capture;
-  local.physical_pps_arrival.spinidle_shadow_valid =
+  out->physical_pps_arrival.valid = g_pps_arrival_entry_dwt != 0U;
+  out->physical_pps_arrival.capture = g_pps_arrival_capture;
+  out->physical_pps_arrival.spinidle_shadow_valid =
       g_pps_arrival_capture.spinidle_running &&
       g_pps_arrival_capture.spinidle_shadow_dwt != 0U;
-  local.physical_pps_arrival.spinidle_age_cycles =
-      local.physical_pps_arrival.spinidle_shadow_valid
+  out->physical_pps_arrival.spinidle_age_cycles =
+      out->physical_pps_arrival.spinidle_shadow_valid
           ? (uint32_t)(g_pps_arrival_entry_dwt -
                        g_pps_arrival_capture.spinidle_shadow_dwt)
           : 0U;
-  local.physical_pps_arrival.spinidle_valid_threshold_cycles =
+  out->physical_pps_arrival.spinidle_valid_threshold_cycles =
       pps_delay_runtime && pps_delay_runtime->spin_valid
           ? pps_delay_runtime->spin_baseline_cycles +
                 INTERRUPT_DELAY_SPIN_GUARD_CYCLES
           : 0U;
-  local.physical_pps_arrival.spinidle_excess_cycles =
-      local.physical_pps_arrival.spinidle_shadow_valid &&
+  out->physical_pps_arrival.spinidle_excess_cycles =
+      out->physical_pps_arrival.spinidle_shadow_valid &&
               pps_delay_runtime && pps_delay_runtime->spin_valid &&
-              local.physical_pps_arrival.spinidle_age_cycles >
+              out->physical_pps_arrival.spinidle_age_cycles >
                   pps_delay_runtime->spin_baseline_cycles
-          ? local.physical_pps_arrival.spinidle_age_cycles -
+          ? out->physical_pps_arrival.spinidle_age_cycles -
                 pps_delay_runtime->spin_baseline_cycles
           : 0U;
-  local.physical_pps_arrival.preempted_after_entry = false;
+  out->physical_pps_arrival.preempted_after_entry = false;
 
-  local.spinidle_shadow_valid =
-      local.physical_pps_arrival.spinidle_shadow_valid;
-  local.spinidle_shadow_dwt =
-      local.physical_pps_arrival.capture.spinidle_shadow_dwt;
-  local.spinidle_shadow_to_isr_entry_cycles =
-      local.physical_pps_arrival.spinidle_age_cycles;
-  local.spinidle_shadow_valid_threshold_cycles =
-      local.physical_pps_arrival.spinidle_valid_threshold_cycles;
-  local.interrupt_delay = g_pps_interrupt_delay;
-  local.vclock_epoch_counter32 = pvc.counter32_at_edge;
-  local.vclock_epoch_ch3 = pvc.ch3_at_edge;
-  local.vclock_epoch_ticks_after_pps =
+  out->spinidle_shadow_valid =
+      out->physical_pps_arrival.spinidle_shadow_valid;
+  out->spinidle_shadow_dwt =
+      out->physical_pps_arrival.capture.spinidle_shadow_dwt;
+  out->spinidle_shadow_to_isr_entry_cycles =
+      out->physical_pps_arrival.spinidle_age_cycles;
+  out->spinidle_shadow_valid_threshold_cycles =
+      out->physical_pps_arrival.spinidle_valid_threshold_cycles;
+  out->interrupt_delay = g_pps_interrupt_delay;
+  out->vclock_epoch_counter32 = pvc.counter32_at_edge;
+  out->vclock_epoch_ch3 = pvc.ch3_at_edge;
+  out->vclock_epoch_ticks_after_pps =
       VCLOCK_EPOCH_TICKS_AFTER_PHYSICAL_PPS;
-  local.vclock_epoch_counter32_offset_ticks =
+  out->vclock_epoch_counter32_offset_ticks =
       VCLOCK_EPOCH_COUNTER32_OFFSET_TICKS;
-  local.vclock_epoch_dwt_offset_cycles = 0;
-  local.vclock_epoch_selected = pvc.sequence != 0U;
-  local.vclock_edge_authority = g_pps_vclock_edge_authority;
-  *out = local;
+  out->vclock_epoch_dwt_offset_cycles = 0;
+  out->vclock_epoch_selected = pvc.sequence != 0U;
+  out->vclock_edge_authority = g_pps_vclock_edge_authority;
+  interrupt_priority0_guard_exit(prior);
   return true;
 }
 
 interrupt_pps_edge_heartbeat_t interrupt_pps_edge_heartbeat(void) {
   interrupt_pps_edge_heartbeat_t out{};
+  const uint32_t prior = interrupt_priority0_guard_enter();
   out.edge_count = g_pps_gpio_heartbeat.edge_count;
   out.last_dwt = g_pps_gpio_heartbeat.last_dwt;
   out.last_gnss_ns = g_pps_gpio_heartbeat.last_gnss_ns;
   out.gpio_irq_count = g_gpio_irq_count;
   out.gpio_miss_count = g_gpio_miss_count;
+  interrupt_priority0_guard_exit(prior);
   return out;
 }
 
@@ -5539,6 +5636,7 @@ bool interrupt_dwt_publication_launch_acquisition_active(void) {
 }
 
 void interrupt_recover_reset_publication_custody(void) {
+  const uint32_t prior = interrupt_priority0_guard_enter();
   g_recover_publication_custody_reset_count++;
   g_ocxo1_lane.previous_event_valid = false;
   g_ocxo1_lane.previous_event_counter32 = 0U;
@@ -5554,6 +5652,7 @@ void interrupt_recover_reset_publication_custody(void) {
       interrupt_integrity_qtimer_dwt_match_check_t{};
   g_interrupt_integrity.ocxo2_qtimer_dwt =
       interrupt_integrity_qtimer_dwt_match_check_t{};
+  interrupt_priority0_guard_exit(prior);
 }
 
 uint32_t interrupt_recover_publication_custody_reset_count(void) {
@@ -5820,7 +5919,6 @@ ocxo_rephase_runtime_reset(interrupt_subscriber_runtime_t& runtime,
   runtime.last_diag = interrupt_capture_diag_t{};
   runtime.delay_history = interrupt_delay_history_t{};
   seen_delay_token = delay_latch.publish_token;
-  runtime.has_fired = false;
   runtime.active = active;
 }
 
@@ -6046,18 +6144,6 @@ void interrupt_request_pps_rebootstrap(void) {
 
 bool interrupt_pps_rebootstrap_pending(void) {
   return g_pps_rebootstrap_pending;
-}
-
-const interrupt_event_t* interrupt_last_event(
-    interrupt_subscriber_kind_t kind) {
-  interrupt_subscriber_runtime_t* rt = runtime_for(kind);
-  return (!rt || !rt->has_fired) ? nullptr : &rt->last_event;
-}
-
-const interrupt_capture_diag_t* interrupt_last_diag(
-    interrupt_subscriber_kind_t kind) {
-  interrupt_subscriber_runtime_t* rt = runtime_for(kind);
-  return (!rt || !rt->has_fired) ? nullptr : &rt->last_diag;
 }
 
 static void interrupt_timepop_release_ch2_custody_foreground(void) {
@@ -6355,7 +6441,7 @@ static bool interrupt_foreground_work_pending_locked(void) {
     return true;
   }
   for (uint32_t i = 0U; i < INTERRUPT_SUBSCRIBER_COUNT; ++i) {
-    if (g_subscribers[i].deferred.pending) return true;
+    if (interrupt_dispatch_queue_depth(g_subscribers[i]) != 0U) return true;
   }
   return false;
 }
@@ -6555,9 +6641,9 @@ FLASHMEM void process_interrupt_init_hardware(void) {
 
 FLASHMEM static void runtime_init_subscribers(void) {
   g_subscriber_count = 0U;
-  for (interrupt_subscriber_runtime_t& rt : g_subscribers) {
-    rt = interrupt_subscriber_runtime_t{};
-  }
+  // g_subscribers has static-duration default initialization and this routine
+  // runs exactly once. Do not manufacture a multi-kilobyte automatic aggregate
+  // merely to assign the same initial state back into static storage.
   for (uint32_t i = 0U; i < INTERRUPT_SUBSCRIBER_COUNT; ++i) {
     g_subscribers[i].desc = &DESCRIPTORS[i];
   }
@@ -6706,6 +6792,10 @@ static FLASHMEM void add_runtime_summary(Payload& payload,
   payload.add(key, rt ? rt->dispatch_count : 0U);
   snprintf(key, sizeof(key), "%s_dispatch_busy_drop_count", prefix);
   payload.add(key, rt ? rt->dispatch_busy_drop_count : 0U);
+  snprintf(key, sizeof(key), "%s_dispatch_queue_depth", prefix);
+  payload.add(key, rt ? interrupt_dispatch_queue_depth(*rt) : 0U);
+  snprintf(key, sizeof(key), "%s_dispatch_queue_capacity", prefix);
+  payload.add(key, INTERRUPT_SUBSCRIBER_DISPATCH_QUEUE_CAPACITY);
   snprintf(key, sizeof(key), "%s_dispatch_arm_fail_count", prefix);
   payload.add(key, rt ? rt->dispatch_arm_fail_count : 0U);
 }
