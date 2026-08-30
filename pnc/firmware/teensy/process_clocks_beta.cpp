@@ -607,6 +607,11 @@ static bool g_clocks_fragment_publication_initialized = false;
 static volatile uint32_t g_clocks_fragment_publication_pending_sequence = 0U;
 static volatile bool g_clocks_fragment_publication_pending = false;
 static volatile bool g_clocks_fragment_publication_service_armed = false;
+// Foreground publication has one owner from snapshot acquisition through queue
+// release. A wake observed while that owner is active remains represented by
+// scalar pending/retry state and is armed only after ownership returns.
+static bool g_clocks_fragment_publication_service_active = false;
+static bool g_clocks_fragment_publication_service_rearm_deferred = false;
 static timepop_handle_t g_clocks_fragment_publication_service_handle =
     TIMEPOP_INVALID_HANDLE;
 static uint32_t g_clocks_fragment_publication_service_generation = 0U;
@@ -1512,6 +1517,13 @@ static bool clocks_fragment_retry_finish_if_exhausted(uint32_t sequence) {
   return false;
 }
 
+static void clocks_fragment_publish_service_release_owner(void) {
+  g_clocks_fragment_publication_service_active = false;
+  if (!g_clocks_fragment_publication_service_rearm_deferred) return;
+  g_clocks_fragment_publication_service_rearm_deferred = false;
+  clocks_fragment_schedule_publish();
+}
+
 static void clocks_fragment_publish_service(timepop_ctx_t*,
                                                    timepop_diag_t*,
                                                    void* user_data) {
@@ -1528,6 +1540,13 @@ static void clocks_fragment_publish_service(timepop_ctx_t*,
 
   const bool retrying_snapshot = g_clocks_fragment_publication_retry_snapshot_valid;
   if (!retrying_snapshot && !g_clocks_fragment_publication_pending) return;
+
+  // From snapshot acquisition through queue release this service is the sole
+  // owner of CLOCKS publication storage. Scheduling requests raised while it is
+  // active become one deferred wake; they cannot arm a nested serializer.
+  if (g_clocks_fragment_publication_service_active) __builtin_trap();
+  g_clocks_fragment_publication_service_active = true;
+  g_clocks_fragment_publication_service_rearm_deferred = false;
 
   clocks_fragment_publication_ensure_initialized();
 
@@ -1573,6 +1592,7 @@ static void clocks_fragment_publish_service(timepop_ctx_t*,
     g_clocks_fragment_publication_pending_sequence = sequence;
     g_clocks_fragment_publication_pending = true;
     memset(publication_item, 0, sizeof(*publication_item));
+    clocks_fragment_publish_service_release_owner();
     return;
   }
 
@@ -1596,6 +1616,7 @@ static void clocks_fragment_publish_service(timepop_ctx_t*,
     g_clocks_fragment_publication_pending_sequence = sequence;
     g_clocks_fragment_publication_pending = true;
     memset(publication_item, 0, sizeof(*publication_item));
+    clocks_fragment_publish_service_release_owner();
     return;
   }
 
@@ -1665,10 +1686,14 @@ static void clocks_fragment_publish_service(timepop_ctx_t*,
     if (!retrying_snapshot && campaign_embedded) {
       g_clocks_fragment_publication_campaign_retry_count++;
     }
-    if (clocks_fragment_retry_finish_if_exhausted(sequence)) return;
+    if (clocks_fragment_retry_finish_if_exhausted(sequence)) {
+      clocks_fragment_publish_service_release_owner();
+      return;
+    }
 
     g_clocks_fragment_publication_retry_schedule_count++;
     clocks_fragment_schedule_publish();
+    clocks_fragment_publish_service_release_owner();
     return;
   }
 
@@ -1689,12 +1714,19 @@ static void clocks_fragment_publish_service(timepop_ctx_t*,
   if (!completed_item || completed_item->sequence != sequence) __builtin_trap();
   clocks_fragment_publication_queue_release();
   if (g_clocks_fragment_publication_pending) clocks_fragment_schedule_publish();
+  clocks_fragment_publish_service_release_owner();
 }
 
 static void clocks_fragment_schedule_publish(void) {
-  if ((!g_clocks_fragment_publication_pending &&
-       !g_clocks_fragment_publication_retry_snapshot_valid) ||
-      g_clocks_fragment_publication_service_armed) {
+  if (!g_clocks_fragment_publication_pending &&
+      !g_clocks_fragment_publication_retry_snapshot_valid) {
+    return;
+  }
+  if (g_clocks_fragment_publication_service_active) {
+    g_clocks_fragment_publication_service_rearm_deferred = true;
+    return;
+  }
+  if (g_clocks_fragment_publication_service_armed) {
     return;
   }
 
