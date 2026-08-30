@@ -2699,6 +2699,12 @@ static Payload& photons_fragment_payload(
   race.add("skipped_projection_total", f.race_skipped_projection_total);
   race.add("skipped_projection_this_fragment",
            f.race_skipped_projection_this_fragment);
+  // Step-2 contract probe only. The producer does not yet own a mutable
+  // backpressure counter and race authorship is unchanged. Publish explicit
+  // zero testimony so Pi cadence accounting can prove the new wire shape
+  // independently of any runtime-state or acquisition-behavior change.
+  race.add("skipped_backpressure_total", (uint64_t)0ULL);
+  race.add("skipped_backpressure_this_fragment", (uint32_t)0U);
   race.add("invalid_endpoint_total", f.race_invalid_endpoint_total);
   race.add("invalid_endpoint_this_fragment",
            f.race_invalid_endpoint_this_fragment);
