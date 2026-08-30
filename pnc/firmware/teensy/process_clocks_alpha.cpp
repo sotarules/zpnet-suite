@@ -1828,6 +1828,33 @@ static uint32_t g_instrument_stats_vclock_interval_reject_count = 0U;
 static uint32_t g_instrument_stats_ocxo1_interval_reject_count = 0U;
 static uint32_t g_instrument_stats_ocxo2_interval_reject_count = 0U;
 
+// Instrument statistics have one mutable Alpha writer operation.  The sequence
+// protects readers, but a seqlock alone does not serialize two writers.  Reset,
+// completed-row update, and dead-producer restore must therefore acquire the same
+// explicit owner before touching any state covered by g_instrument_stats_seq.
+static volatile uint32_t g_instrument_stats_writer_owner = 0U;
+
+// Alpha authors one complete immutable statistics value while it owns the writer
+// transaction.  Readers copy only this committed object; they never reconstruct a
+// row by independently walking live Better-Buckets/Welford/TAU authorities.
+static clocks_instrument_stats_snapshot_t
+    g_instrument_stats_committed DMAMEM = {};
+
+static void alpha_instrument_stats_writer_begin(void) {
+  uint32_t expected = 0U;
+  if (!__atomic_compare_exchange_n(&g_instrument_stats_writer_owner,
+                                   &expected,
+                                   1U,
+                                   false,
+                                   __ATOMIC_ACQ_REL,
+                                   __ATOMIC_ACQUIRE) ||
+      (g_instrument_stats_seq & 1U) != 0U) {
+    __builtin_trap();
+  }
+  g_instrument_stats_seq++;
+  clocks_alpha_dmb();
+}
+
 // Four frequency-bearing always-on lanes share one bounded endpoint history.
 //
 // The rolling values are not averages of one-second PPB estimates.  Every
@@ -2313,6 +2340,10 @@ bool clocks_alpha_ppb_export_snapshot(
   if (!out) return false;
   *out = clocks_alpha_ppb_export_snapshot_t{};
 
+  // Recovery staging is a second lawful writer of the bounded rings.  Serialize
+  // this recovery/report reader with that writer instead of assuming the ordinary
+  // instrument-statistics generation alone covers both ownership domains.
+  const uint32_t prior_basepri = alpha_ppb_restore_irq_save();
   for (int attempt = 0; attempt < 4; ++attempt) {
     const uint32_t seq1 = g_instrument_stats_seq;
     clocks_alpha_dmb();
@@ -2348,9 +2379,11 @@ bool clocks_alpha_ppb_export_snapshot(
     if (seq1 == seq2 && (seq2 & 1U) == 0U) {
       local.snapshot_ok = true;
       *out = local;
+      alpha_ppb_restore_irq_restore(prior_basepri);
       return true;
     }
   }
+  alpha_ppb_restore_irq_restore(prior_basepri);
   return false;
 }
 
@@ -2449,23 +2482,26 @@ static void alpha_ppb_checkpoint_delta_snapshot(
   }
 }
 
-static clocks_instrument_ppb_value_snapshot_t alpha_ppb_window_value(
+static clocks_instrument_ppb_value_snapshot_t alpha_ppb_value_from_proof(
     alpha_ppb_lane_t lane,
-    uint32_t window_seconds,
-    bool exact_second_history) {
+    const clocks_alpha_ppb_cumulative_endpoint_snapshot_t& current,
+    const clocks_alpha_ppb_window_proof_snapshot_t& proof) {
   clocks_instrument_ppb_value_snapshot_t out{};
-  alpha_ppb_cumulative_endpoint_t anchor{};
-  if (!alpha_ppb_window_anchor(window_seconds,
-                               exact_second_history,
-                               anchor)) {
-    return out;
+  if (!proof.valid) return out;
+  if (proof.sample_count == 0U ||
+      current.interval_count < proof.anchor.interval_count ||
+      current.reference_ns <= proof.anchor.reference_ns) {
+    __builtin_trap();
   }
 
   const uint32_t interval_count =
-      g_alpha_ppb_current.interval_count - anchor.interval_count;
+      current.interval_count - proof.anchor.interval_count;
   const uint64_t reference_ns =
-      g_alpha_ppb_current.reference_ns - anchor.reference_ns;
-  if (interval_count == 0U || reference_ns == 0ULL) return out;
+      current.reference_ns - proof.anchor.reference_ns;
+  if (interval_count == 0U || interval_count != proof.sample_count ||
+      reference_ns == 0ULL) {
+    __builtin_trap();
+  }
 
   out.sample_count = interval_count;
   switch (lane) {
@@ -2473,9 +2509,9 @@ static clocks_instrument_ppb_value_snapshot_t alpha_ppb_window_value(
       const double expected_cycles =
           ((double)reference_ns * (double)DWT_EXPECTED_PER_PPS) /
           (double)NS_PER_SECOND_U64;
-      if (expected_cycles <= 0.0) return clocks_instrument_ppb_value_snapshot_t{};
+      if (expected_cycles <= 0.0) __builtin_trap();
       const double error_cycles =
-          g_alpha_ppb_current.dwt_error_cycles - anchor.dwt_error_cycles;
+          current.dwt_error_cycles - proof.anchor.dwt_error_cycles;
       out.ppb = error_cycles * 1.0e9 / expected_cycles;
       break;
     }
@@ -2486,13 +2522,13 @@ static clocks_instrument_ppb_value_snapshot_t alpha_ppb_window_value(
       break;
     case alpha_ppb_lane_t::OCXO1: {
       const int64_t error_ns =
-          g_alpha_ppb_current.ocxo1_error_ns - anchor.ocxo1_error_ns;
+          current.ocxo1_error_ns - proof.anchor.ocxo1_error_ns;
       out.ppb = (double)error_ns * 1.0e9 / (double)reference_ns;
       break;
     }
     case alpha_ppb_lane_t::OCXO2: {
       const int64_t error_ns =
-          g_alpha_ppb_current.ocxo2_error_ns - anchor.ocxo2_error_ns;
+          current.ocxo2_error_ns - proof.anchor.ocxo2_error_ns;
       out.ppb = (double)error_ns * 1.0e9 / (double)reference_ns;
       break;
     }
@@ -2500,27 +2536,32 @@ static clocks_instrument_ppb_value_snapshot_t alpha_ppb_window_value(
   return out;
 }
 
-static clocks_instrument_ppb_buckets_snapshot_t alpha_ppb_windows_snapshot(
-    alpha_ppb_lane_t lane) {
+static clocks_instrument_ppb_buckets_snapshot_t
+alpha_ppb_windows_from_checkpoint(
+    alpha_ppb_lane_t lane,
+    const clocks_alpha_ppb_checkpoint_delta_snapshot_t& checkpoint) {
   clocks_instrument_ppb_buckets_snapshot_t out{};
-  out.minute_10 = alpha_ppb_window_value(
-      lane, ALPHA_PPB_MINUTE_10_SECONDS, true);
-  out.minute_60 = alpha_ppb_window_value(
-      lane, ALPHA_PPB_MINUTE_60_SECONDS, false);
-  out.hour_8 = alpha_ppb_window_value(
-      lane, ALPHA_PPB_HOUR_8_SECONDS, false);
-  out.hour_24 = alpha_ppb_window_value(
-      lane, ALPHA_PPB_HOUR_24_SECONDS, false);
+  if (!checkpoint.valid) return out;
+
+  // One selected anchor authors both the row-local proof and its recorded value.
+  // Never walk the live rings a second time to derive the published bucket.
+  out.minute_10 = alpha_ppb_value_from_proof(
+      lane, checkpoint.current, checkpoint.minute_10);
+  out.minute_60 = alpha_ppb_value_from_proof(
+      lane, checkpoint.current, checkpoint.minute_60);
+  out.hour_8 = alpha_ppb_value_from_proof(
+      lane, checkpoint.current, checkpoint.hour_8);
+  out.hour_24 = alpha_ppb_value_from_proof(
+      lane, checkpoint.current, checkpoint.hour_24);
   return out;
 }
 
 static void alpha_ppb_attach_windows(
     clocks_instrument_frequency_snapshot_t& frequency,
     alpha_ppb_lane_t lane,
-    uint32_t current_rolling_sequence) {
-  (void)current_rolling_sequence;
+    const clocks_alpha_ppb_checkpoint_delta_snapshot_t& checkpoint) {
   clocks_instrument_ppb_buckets_snapshot_t buckets =
-      alpha_ppb_windows_snapshot(lane);
+      alpha_ppb_windows_from_checkpoint(lane, checkpoint);
   if (frequency.valid) {
     buckets.total.sample_count = frequency.sample_count;
     buckets.total.ppb = frequency.ppb;
@@ -2552,9 +2593,84 @@ alpha_frequency_from_tau(const clocks_alpha_tau_snapshot_t& tau) {
   return f;
 }
 
-void clocks_alpha_instrument_stats_reset(void) {
+static bool alpha_instrument_stats_build_committed_locked(
+    clocks_instrument_stats_snapshot_t& out) {
+  out = clocks_instrument_stats_snapshot_t{};
+  out.valid = g_instrument_stats_completed_row_coherent;
+  out.reset_count = g_instrument_stats_reset_count;
+  out.update_count = g_instrument_stats_update_count;
+  out.last_pps_sequence = g_instrument_stats_last_pps_sequence;
+  out.rolling_ppb_current_sequence = g_alpha_ppb_current.rolling_sequence;
+  out.rolling_ppb_endpoint_admitted = g_alpha_ppb_last_endpoint_admitted;
+  out.rolling_ppb_interval_advanced = g_alpha_ppb_last_interval_advanced;
+  alpha_ppb_checkpoint_delta_snapshot(out.rolling_ppb_checkpoint);
+  out.completed_row_coherent = g_instrument_stats_completed_row_coherent;
+  out.gnss_ns = g_instrument_stats_gnss_ns;
+  out.dwt_cycles = g_instrument_stats_dwt_cycles;
+  out.ocxo1_ns = g_instrument_stats_ocxo1_ns;
+  out.ocxo2_ns = g_instrument_stats_ocxo2_ns;
+  out.dwt_at_pps_vclock = g_instrument_stats_dwt_at_pps_vclock;
+  out.counter32_at_pps_vclock = g_instrument_stats_counter32_at_pps_vclock;
+  out.dwt_cycles_per_second = g_instrument_stats_dwt_cycles_per_second;
+  out.selected_reference_interval_cycles =
+      g_instrument_stats_reference_interval_cycles;
+  out.vclock_interval_cycles = g_instrument_stats_vclock_interval_cycles;
+  out.ocxo1_interval_cycles = g_instrument_stats_ocxo1_interval_cycles;
+  out.ocxo2_interval_cycles = g_instrument_stats_ocxo2_interval_cycles;
+  out.vclock_interval_reject_count =
+      g_instrument_stats_vclock_interval_reject_count;
+  out.ocxo1_interval_reject_count =
+      g_instrument_stats_ocxo1_interval_reject_count;
+  out.ocxo2_interval_reject_count =
+      g_instrument_stats_ocxo2_interval_reject_count;
+
+  out.dwt_frequency = alpha_frequency_from_welford(welford_dwt);
+  out.vclock_frequency = alpha_frequency_from_welford(welford_vclock);
+  if (!clocks_alpha_ocxo_tau_snapshot(
+          time_clock_id_t::OCXO1, &out.ocxo1_tau_state) ||
+      !clocks_alpha_ocxo_tau_snapshot(
+          time_clock_id_t::OCXO2, &out.ocxo2_tau_state)) {
+    return false;
+  }
+  out.ocxo1_frequency = alpha_frequency_from_tau(out.ocxo1_tau_state);
+  out.ocxo2_frequency = alpha_frequency_from_tau(out.ocxo2_tau_state);
+
+  alpha_ppb_attach_windows(
+      out.dwt_frequency, alpha_ppb_lane_t::DWT, out.rolling_ppb_checkpoint);
+  alpha_ppb_attach_windows(
+      out.vclock_frequency, alpha_ppb_lane_t::VCLOCK, out.rolling_ppb_checkpoint);
+  alpha_ppb_attach_windows(
+      out.ocxo1_frequency, alpha_ppb_lane_t::OCXO1, out.rolling_ppb_checkpoint);
+  alpha_ppb_attach_windows(
+      out.ocxo2_frequency, alpha_ppb_lane_t::OCXO2, out.rolling_ppb_checkpoint);
+
+  out.gnss_welford = welford_gnss;
+  out.dwt_welford = welford_dwt;
+  out.vclock_welford = welford_vclock;
+  out.ocxo1_welford = welford_ocxo1;
+  out.ocxo2_welford = welford_ocxo2;
+  out.pps_witness_welford = welford_pps_witness;
+  out.snapshot_ok = true;
+  return true;
+}
+
+static void alpha_instrument_stats_writer_commit(void) {
+  if (__atomic_load_n(&g_instrument_stats_writer_owner, __ATOMIC_ACQUIRE) != 1U ||
+      (g_instrument_stats_seq & 1U) == 0U) {
+    __builtin_trap();
+  }
+  if (!alpha_instrument_stats_build_committed_locked(
+          g_instrument_stats_committed)) {
+    __builtin_trap();
+  }
+  clocks_alpha_dmb();
   g_instrument_stats_seq++;
   clocks_alpha_dmb();
+  __atomic_store_n(&g_instrument_stats_writer_owner, 0U, __ATOMIC_RELEASE);
+}
+
+void clocks_alpha_instrument_stats_reset(void) {
+  alpha_instrument_stats_writer_begin();
 
   welford_reset(welford_gnss);
   welford_reset(welford_dwt);
@@ -2573,8 +2689,7 @@ void clocks_alpha_instrument_stats_reset(void) {
   g_instrument_stats_ocxo1_interval_reject_count = 0U;
   g_instrument_stats_ocxo2_interval_reject_count = 0U;
 
-  clocks_alpha_dmb();
-  g_instrument_stats_seq++;
+  alpha_instrument_stats_writer_commit();
 }
 
 static double alpha_instrument_delta_fast_ns(uint32_t reference_cycles,
@@ -2597,8 +2712,7 @@ static void alpha_instrument_stats_note_completed_row(
     return;
   }
 
-  g_instrument_stats_seq++;
-  clocks_alpha_dmb();
+  alpha_instrument_stats_writer_begin();
 
   const uint32_t cps = g_dwt_cycles_between_pps_vclock;
   const uint32_t reference_cycles =
@@ -2713,8 +2827,7 @@ static void alpha_instrument_stats_note_completed_row(
   g_instrument_stats_last_pps_sequence = pps_sequence;
   g_instrument_stats_update_count++;
 
-  clocks_alpha_dmb();
-  g_instrument_stats_seq++;
+  alpha_instrument_stats_writer_commit();
 }
 
 FLASHMEM bool clocks_alpha_instrument_stats_snapshot(
@@ -2725,88 +2838,19 @@ FLASHMEM bool clocks_alpha_instrument_stats_snapshot(
   for (int attempt = 0; attempt < 4; attempt++) {
     const uint32_t seq1 = g_instrument_stats_seq;
     clocks_alpha_dmb();
+    if ((seq1 & 1U) != 0U) continue;
 
-    clocks_instrument_stats_snapshot_t local{};
-    local.valid = g_instrument_stats_completed_row_coherent;
-    local.reset_count = g_instrument_stats_reset_count;
-    local.update_count = g_instrument_stats_update_count;
-    local.last_pps_sequence = g_instrument_stats_last_pps_sequence;
-    local.rolling_ppb_current_sequence =
-        g_alpha_ppb_current.rolling_sequence;
-    local.rolling_ppb_endpoint_admitted =
-        g_alpha_ppb_last_endpoint_admitted;
-    local.rolling_ppb_interval_advanced =
-        g_alpha_ppb_last_interval_advanced;
-    alpha_ppb_checkpoint_delta_snapshot(
-        local.rolling_ppb_checkpoint);
-    local.completed_row_coherent =
-        g_instrument_stats_completed_row_coherent;
-    local.gnss_ns = g_instrument_stats_gnss_ns;
-    local.dwt_cycles = g_instrument_stats_dwt_cycles;
-    local.ocxo1_ns = g_instrument_stats_ocxo1_ns;
-    local.ocxo2_ns = g_instrument_stats_ocxo2_ns;
-    local.dwt_at_pps_vclock =
-        g_instrument_stats_dwt_at_pps_vclock;
-    local.counter32_at_pps_vclock =
-        g_instrument_stats_counter32_at_pps_vclock;
-    local.dwt_cycles_per_second =
-        g_instrument_stats_dwt_cycles_per_second;
-    local.selected_reference_interval_cycles =
-        g_instrument_stats_reference_interval_cycles;
-    local.vclock_interval_cycles =
-        g_instrument_stats_vclock_interval_cycles;
-    local.ocxo1_interval_cycles =
-        g_instrument_stats_ocxo1_interval_cycles;
-    local.ocxo2_interval_cycles =
-        g_instrument_stats_ocxo2_interval_cycles;
-    local.vclock_interval_reject_count =
-        g_instrument_stats_vclock_interval_reject_count;
-    local.ocxo1_interval_reject_count =
-        g_instrument_stats_ocxo1_interval_reject_count;
-    local.ocxo2_interval_reject_count =
-        g_instrument_stats_ocxo2_interval_reject_count;
-
-    local.dwt_frequency = alpha_frequency_from_welford(welford_dwt);
-    local.vclock_frequency = alpha_frequency_from_welford(welford_vclock);
-    const bool ocxo1_tau_snapshot_ok = clocks_alpha_ocxo_tau_snapshot(
-        time_clock_id_t::OCXO1, &local.ocxo1_tau_state);
-    const bool ocxo2_tau_snapshot_ok = clocks_alpha_ocxo_tau_snapshot(
-        time_clock_id_t::OCXO2, &local.ocxo2_tau_state);
-    if (!ocxo1_tau_snapshot_ok || !ocxo2_tau_snapshot_ok) {
-      continue;
-    }
-    local.ocxo1_frequency =
-        alpha_frequency_from_tau(local.ocxo1_tau_state);
-    local.ocxo2_frequency =
-        alpha_frequency_from_tau(local.ocxo2_tau_state);
-
-    alpha_ppb_attach_windows(local.dwt_frequency,
-                             alpha_ppb_lane_t::DWT,
-                             local.last_pps_sequence);
-    alpha_ppb_attach_windows(local.vclock_frequency,
-                             alpha_ppb_lane_t::VCLOCK,
-                             local.last_pps_sequence);
-    alpha_ppb_attach_windows(local.ocxo1_frequency,
-                             alpha_ppb_lane_t::OCXO1,
-                             local.last_pps_sequence);
-    alpha_ppb_attach_windows(local.ocxo2_frequency,
-                             alpha_ppb_lane_t::OCXO2,
-                             local.last_pps_sequence);
-
-    local.gnss_welford = welford_gnss;
-    local.dwt_welford = welford_dwt;
-    local.vclock_welford = welford_vclock;
-    local.ocxo1_welford = welford_ocxo1;
-    local.ocxo2_welford = welford_ocxo2;
-    local.pps_witness_welford = welford_pps_witness;
+    // Reader custody is deliberately boring: copy one already-authored value.
+    // No reader may walk live Better-Buckets rings or derive a second version
+    // of a fact that Alpha has already committed.
+    *out = g_instrument_stats_committed;
 
     clocks_alpha_dmb();
     const uint32_t seq2 = g_instrument_stats_seq;
-    if (seq1 == seq2 && (seq1 & 1U) == 0U) {
-      local.snapshot_ok = true;
-      *out = local;
+    if (seq1 == seq2 && (seq2 & 1U) == 0U && out->snapshot_ok) {
       return true;
     }
+    *out = clocks_instrument_stats_snapshot_t{};
   }
 
   return false;
@@ -2834,8 +2878,7 @@ bool clocks_alpha_instrument_stats_restore(
     return false;
   }
 
-  g_instrument_stats_seq++;
-  clocks_alpha_dmb();
+  alpha_instrument_stats_writer_begin();
 
   (void)welford_restore(welford_gnss, state->gnss_welford);
   (void)welford_restore(welford_dwt, state->dwt_welford);
@@ -2901,8 +2944,7 @@ bool clocks_alpha_instrument_stats_restore(
     g_alpha_ppb_restore_minute_received = 0U;
   }
 
-  clocks_alpha_dmb();
-  g_instrument_stats_seq++;
+  alpha_instrument_stats_writer_commit();
   return true;
 }
 

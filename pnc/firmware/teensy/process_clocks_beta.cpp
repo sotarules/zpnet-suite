@@ -548,13 +548,105 @@ static clocks_alpha_ocxo_counterledger_snapshot_t
 // lives in RAM2 so the completed-row path never places the handoff object on the
 // scarce DTCM stack. The CLOCKS publisher consumes it only when the requested PPS sequence
 // matches exactly; an unconsumed record is never overwritten.
+static constexpr uint32_t CLOCKS_FRAGMENT_CAMPAIGN_QUEUE_CAPACITY = 2U;
 static clocks_fragment_campaign_snapshot_t
-    g_clocks_fragment_campaign_record DMAMEM = {};
-static bool     g_clocks_fragment_campaign_record_pending = false;
-static uint32_t g_clocks_fragment_campaign_record_sequence = 0U;
+    g_clocks_fragment_campaign_queue[CLOCKS_FRAGMENT_CAMPAIGN_QUEUE_CAPACITY]
+        DMAMEM = {};
+static volatile uint32_t g_clocks_fragment_campaign_queue_read = 0U;
+static volatile uint32_t g_clocks_fragment_campaign_queue_write = 0U;
 static uint32_t g_clocks_fragment_campaign_record_stage_count = 0U;
 static uint32_t g_clocks_fragment_campaign_record_take_count = 0U;
 static uint32_t g_clocks_fragment_campaign_record_backlog_count = 0U;
+
+static inline void clocks_fragment_campaign_queue_barrier(void) {
+  __asm__ volatile("dmb" ::: "memory");
+}
+
+static uint32_t clocks_fragment_campaign_queue_depth(void) {
+  const uint32_t write = g_clocks_fragment_campaign_queue_write;
+  clocks_fragment_campaign_queue_barrier();
+  const uint32_t read = g_clocks_fragment_campaign_queue_read;
+  clocks_fragment_campaign_queue_barrier();
+  return write - read;
+}
+
+static clocks_fragment_campaign_snapshot_t*
+clocks_fragment_campaign_queue_acquire_write(void) {
+  const uint32_t write = g_clocks_fragment_campaign_queue_write;
+  clocks_fragment_campaign_queue_barrier();
+  const uint32_t read = g_clocks_fragment_campaign_queue_read;
+  if ((write - read) >= CLOCKS_FRAGMENT_CAMPAIGN_QUEUE_CAPACITY) {
+    return nullptr;
+  }
+  return &g_clocks_fragment_campaign_queue[
+      write % CLOCKS_FRAGMENT_CAMPAIGN_QUEUE_CAPACITY];
+}
+
+static void clocks_fragment_campaign_queue_commit_write(void) {
+  const uint32_t write = g_clocks_fragment_campaign_queue_write;
+  clocks_fragment_campaign_queue_barrier();
+  const uint32_t read = g_clocks_fragment_campaign_queue_read;
+  if ((write - read) >= CLOCKS_FRAGMENT_CAMPAIGN_QUEUE_CAPACITY) {
+    __builtin_trap();
+  }
+  clocks_fragment_campaign_queue_barrier();
+  g_clocks_fragment_campaign_queue_write = write + 1U;
+}
+
+static clocks_fragment_campaign_snapshot_t*
+clocks_fragment_campaign_queue_front(void) {
+  const uint32_t read = g_clocks_fragment_campaign_queue_read;
+  clocks_fragment_campaign_queue_barrier();
+  const uint32_t write = g_clocks_fragment_campaign_queue_write;
+  if (read == write) return nullptr;
+  return &g_clocks_fragment_campaign_queue[
+      read % CLOCKS_FRAGMENT_CAMPAIGN_QUEUE_CAPACITY];
+}
+
+static uint32_t clocks_fragment_campaign_queue_front_sequence(void) {
+  clocks_fragment_campaign_snapshot_t* front =
+      clocks_fragment_campaign_queue_front();
+  return front ? front->completed_second_sequence : 0U;
+}
+
+static void clocks_fragment_campaign_queue_release(void) {
+  const uint32_t read = g_clocks_fragment_campaign_queue_read;
+  clocks_fragment_campaign_queue_barrier();
+  if (read == g_clocks_fragment_campaign_queue_write) __builtin_trap();
+  g_clocks_fragment_campaign_queue[
+      read % CLOCKS_FRAGMENT_CAMPAIGN_QUEUE_CAPACITY] =
+      clocks_fragment_campaign_snapshot_t{};
+  clocks_fragment_campaign_queue_barrier();
+  g_clocks_fragment_campaign_queue_read = read + 1U;
+}
+
+static void clocks_fragment_campaign_queue_reset(void) {
+  for (uint32_t i = 0U; i < CLOCKS_FRAGMENT_CAMPAIGN_QUEUE_CAPACITY; ++i) {
+    g_clocks_fragment_campaign_queue[i] = clocks_fragment_campaign_snapshot_t{};
+  }
+  g_clocks_fragment_campaign_queue_read = 0U;
+  g_clocks_fragment_campaign_queue_write = 0U;
+  clocks_fragment_campaign_queue_barrier();
+}
+
+static volatile uint32_t g_clocks_beta_pps_owner = 0U;
+
+struct clocks_beta_pps_owner_guard_t {
+  clocks_beta_pps_owner_guard_t() {
+    uint32_t expected = 0U;
+    if (!__atomic_compare_exchange_n(&g_clocks_beta_pps_owner,
+                                     &expected,
+                                     1U,
+                                     false,
+                                     __ATOMIC_ACQ_REL,
+                                     __ATOMIC_ACQUIRE)) {
+      __builtin_trap();
+    }
+  }
+  ~clocks_beta_pps_owner_guard_t() {
+    __atomic_store_n(&g_clocks_beta_pps_owner, 0U, __ATOMIC_RELEASE);
+  }
+};
 
 // ============================================================================
 // CLOCKS_FRAGMENT publication ownership
@@ -696,51 +788,62 @@ static clocks_fragment_publication_item_t
         DMAMEM = {};
 static volatile uint32_t g_clocks_fragment_publication_queue_read = 0U;
 static volatile uint32_t g_clocks_fragment_publication_queue_write = 0U;
-static volatile uint32_t g_clocks_fragment_publication_queue_count = 0U;
 
 static inline void clocks_fragment_publication_queue_barrier(void) {
   __asm__ volatile("dmb" ::: "memory");
 }
 
+static uint32_t clocks_fragment_publication_queue_depth(void) {
+  const uint32_t write = g_clocks_fragment_publication_queue_write;
+  clocks_fragment_publication_queue_barrier();
+  const uint32_t read = g_clocks_fragment_publication_queue_read;
+  clocks_fragment_publication_queue_barrier();
+  return write - read;
+}
+
 static clocks_fragment_publication_item_t*
 clocks_fragment_publication_queue_acquire_write(void) {
-  if (g_clocks_fragment_publication_queue_count >=
-      CLOCKS_FRAGMENT_PUBLICATION_QUEUE_CAPACITY) {
+  const uint32_t write = g_clocks_fragment_publication_queue_write;
+  clocks_fragment_publication_queue_barrier();
+  const uint32_t read = g_clocks_fragment_publication_queue_read;
+  if ((write - read) >= CLOCKS_FRAGMENT_PUBLICATION_QUEUE_CAPACITY) {
     __builtin_trap();
   }
   return &g_clocks_fragment_publication_queue[
-      g_clocks_fragment_publication_queue_write];
+      write % CLOCKS_FRAGMENT_PUBLICATION_QUEUE_CAPACITY];
 }
 
 static void clocks_fragment_publication_queue_commit_write(void) {
+  const uint32_t write = g_clocks_fragment_publication_queue_write;
   clocks_fragment_publication_queue_barrier();
-  g_clocks_fragment_publication_queue_write =
-      (g_clocks_fragment_publication_queue_write + 1U) %
-      CLOCKS_FRAGMENT_PUBLICATION_QUEUE_CAPACITY;
-  g_clocks_fragment_publication_queue_count++;
+  const uint32_t read = g_clocks_fragment_publication_queue_read;
+  if ((write - read) >= CLOCKS_FRAGMENT_PUBLICATION_QUEUE_CAPACITY) {
+    __builtin_trap();
+  }
   clocks_fragment_publication_queue_barrier();
+  g_clocks_fragment_publication_queue_write = write + 1U;
 }
 
 static clocks_fragment_publication_item_t*
 clocks_fragment_publication_queue_front(void) {
+  const uint32_t read = g_clocks_fragment_publication_queue_read;
   clocks_fragment_publication_queue_barrier();
-  if (g_clocks_fragment_publication_queue_count == 0U) return nullptr;
+  const uint32_t write = g_clocks_fragment_publication_queue_write;
+  if (read == write) return nullptr;
   return &g_clocks_fragment_publication_queue[
-      g_clocks_fragment_publication_queue_read];
+      read % CLOCKS_FRAGMENT_PUBLICATION_QUEUE_CAPACITY];
 }
 
 static void clocks_fragment_publication_queue_release(void) {
-  if (g_clocks_fragment_publication_queue_count == 0U) __builtin_trap();
+  const uint32_t read = g_clocks_fragment_publication_queue_read;
+  clocks_fragment_publication_queue_barrier();
+  if (read == g_clocks_fragment_publication_queue_write) __builtin_trap();
   clocks_fragment_publication_item_t& item =
       g_clocks_fragment_publication_queue[
-          g_clocks_fragment_publication_queue_read];
+          read % CLOCKS_FRAGMENT_PUBLICATION_QUEUE_CAPACITY];
   memset(&item, 0, sizeof(item));
   clocks_fragment_publication_queue_barrier();
-  g_clocks_fragment_publication_queue_read =
-      (g_clocks_fragment_publication_queue_read + 1U) %
-      CLOCKS_FRAGMENT_PUBLICATION_QUEUE_CAPACITY;
-  g_clocks_fragment_publication_queue_count--;
-  clocks_fragment_publication_queue_barrier();
+  g_clocks_fragment_publication_queue_read = read + 1U;
 }
 
 static void clocks_fragment_publication_queue_reset(void) {
@@ -748,7 +851,6 @@ static void clocks_fragment_publication_queue_reset(void) {
          sizeof(g_clocks_fragment_publication_queue));
   g_clocks_fragment_publication_queue_read = 0U;
   g_clocks_fragment_publication_queue_write = 0U;
-  g_clocks_fragment_publication_queue_count = 0U;
   clocks_fragment_publication_queue_barrier();
 }
 
@@ -1561,7 +1663,7 @@ static void clocks_fragment_publish_service(timepop_ctx_t*,
     }
     clocks_snapshot_ok = true;
   } else {
-    if (g_clocks_fragment_publication_queue_count != 0U) __builtin_trap();
+    if (clocks_fragment_publication_queue_depth() != 0U) __builtin_trap();
     sequence = g_clocks_fragment_publication_pending_sequence;
     g_clocks_fragment_publication_pending = false;
     publication_item = clocks_fragment_publication_queue_acquire_write();
@@ -1923,13 +2025,12 @@ static void clocks_fragment_campaign_record_ready_retry_cancel(void) {
 static void clocks_fragment_campaign_record_ready_retry_callback(
     timepop_ctx_t*, timepop_diag_t*, void*) {
   g_clocks_fragment_campaign_record_ready_retry_handle = TIMEPOP_INVALID_HANDLE;
-  if (!g_clocks_fragment_campaign_record_pending ||
-      g_clocks_fragment_campaign_record_sequence == 0U) {
-    return;
-  }
+  const uint32_t pending_sequence =
+      clocks_fragment_campaign_queue_front_sequence();
+  if (pending_sequence == 0U) return;
 
   g_clocks_fragment_campaign_record_ready_retry_fire_count++;
-  clocks_fragment_campaign_row_ready(g_clocks_fragment_campaign_record_sequence);
+  clocks_fragment_campaign_row_ready(pending_sequence);
 }
 
 static void clocks_fragment_campaign_record_ready_retry_arm(void) {
@@ -1965,9 +2066,7 @@ static void clocks_fragment_recover_reset_publication_custody(bool count_recover
           ? g_clocks_fragment_publication_pending_sequence
           : 0U;
   g_clocks_fragment_publication_recovery_retired_campaign_sequence =
-      g_clocks_fragment_campaign_record_pending
-          ? g_clocks_fragment_campaign_record_sequence
-          : 0U;
+      clocks_fragment_campaign_queue_front_sequence();
 
   if (g_clocks_fragment_publication_service_handle != TIMEPOP_INVALID_HANDLE) {
     const bool cancelled =
@@ -1997,9 +2096,7 @@ static void clocks_fragment_recover_reset_publication_custody(bool count_recover
   clocks_fragment_publication_queue_reset();
 
   clocks_fragment_campaign_record_ready_retry_cancel();
-  g_clocks_fragment_campaign_record = clocks_fragment_campaign_snapshot_t{};
-  g_clocks_fragment_campaign_record_pending = false;
-  g_clocks_fragment_campaign_record_sequence = 0U;
+  clocks_fragment_campaign_queue_reset();
   if (count_recovery) {
     g_clocks_fragment_publication_recovery_reset_count++;
   }
@@ -2020,9 +2117,7 @@ static void clocks_fragment_watchdog_reset_publication_custody(void) {
           ? g_clocks_fragment_publication_pending_sequence
           : 0U;
   g_clocks_fragment_publication_watchdog_retired_campaign_sequence =
-      g_clocks_fragment_campaign_record_pending
-          ? g_clocks_fragment_campaign_record_sequence
-          : 0U;
+      clocks_fragment_campaign_queue_front_sequence();
   clocks_fragment_recover_reset_publication_custody(false);
   g_clocks_fragment_publication_watchdog_reset_count++;
 }
@@ -2425,9 +2520,7 @@ FLASHMEM void clocks_beta_features_init(void) {
   // the rest of Beta so the first completed Alpha row never depends on a lazy
   // callback-side initialization transaction.
   clocks_fragment_publication_ensure_initialized();
-  g_clocks_fragment_campaign_record = clocks_fragment_campaign_snapshot_t{};
-  g_clocks_fragment_campaign_record_pending = false;
-  g_clocks_fragment_campaign_record_sequence = 0U;
+  clocks_fragment_campaign_queue_reset();
   g_report_clocks_payload.clear();
   g_report_stats_payload.clear();
   g_report_smartzero_payload.clear();
@@ -8117,14 +8210,20 @@ FLASHMEM bool clocks_fragment_snapshot_take(
       campaign_name[0] != '\0' &&
       campaign_seconds > 0ULL;
 
-  if (g_clocks_fragment_campaign_record_pending &&
-      g_clocks_fragment_campaign_record_sequence == completed_second_sequence) {
-    out->campaign = g_clocks_fragment_campaign_record;
-    g_clocks_fragment_campaign_record = clocks_fragment_campaign_snapshot_t{};
-    g_clocks_fragment_campaign_record_pending = false;
-    g_clocks_fragment_campaign_record_sequence = 0U;
+  clocks_fragment_campaign_snapshot_t* campaign_front =
+      clocks_fragment_campaign_queue_front();
+  if (campaign_front &&
+      campaign_front->completed_second_sequence == completed_second_sequence) {
+    out->campaign = *campaign_front;
+    clocks_fragment_campaign_queue_release();
     g_clocks_fragment_campaign_record_take_count++;
     clocks_fragment_campaign_record_ready_retry_cancel();
+  } else if (campaign_front &&
+             (int32_t)(completed_second_sequence -
+                       campaign_front->completed_second_sequence) > 0) {
+    // A newer physical row may never step past older unconsumed campaign
+    // testimony.  That would be silent custody loss, not coalescing.
+    __builtin_trap();
   }
 
   return true;
@@ -8140,6 +8239,7 @@ FLASHMEM bool clocks_fragment_snapshot_take(
 // exact CounterLedger + PhaseLedger clockfaces for that same PPS.
 
 void clocks_beta_pps(uint32_t completed_pps_sequence) {
+  clocks_beta_pps_owner_guard_t operation_owner{};
   clocks_stack_witness_note_hot(CLOCKS_STACK_CONTEXT_BETA_PPS_ENTRY);
   campaign_record_stage(CAMPAIGN_RECORD_STAGE_ENTRY);
 
@@ -8703,20 +8803,22 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   campaign_record_stage(CAMPAIGN_RECORD_STAGE_HANDOFF_BEGIN);
   clocks_stack_witness_note_hot(CLOCKS_STACK_CONTEXT_BETA_PPS_BUILD);
 
-  // Never overwrite an unconsumed record. Transport pressure must become an
-  // explicit structural failure rather than silent campaign data loss.
-  if (g_clocks_fragment_campaign_record_pending) {
+  // Producer owns one queue slot until commit.  Transport pressure may occupy
+  // the other slot, but Beta never overwrites committed campaign testimony.
+  clocks_fragment_campaign_snapshot_t* record_slot =
+      clocks_fragment_campaign_queue_acquire_write();
+  if (!record_slot) {
     campaign_record_stage(CAMPAIGN_RECORD_STAGE_HANDOFF_BACKLOG);
     g_clocks_fragment_campaign_record_backlog_count++;
     clocks_watchdog_anomaly("clocks_fragment_campaign_record_backlog",
-                            g_clocks_fragment_campaign_record_sequence,
+                            clocks_fragment_campaign_queue_front_sequence(),
                             completed_pps_sequence,
                             g_clocks_fragment_campaign_record_backlog_count,
                             public_count);
     return;
   }
 
-  clocks_fragment_campaign_snapshot_t& record = g_clocks_fragment_campaign_record;
+  clocks_fragment_campaign_snapshot_t& record = *record_slot;
   record = clocks_fragment_campaign_snapshot_t{};
   record.present = true;
   record.completed_second_sequence = completed_pps_sequence;
@@ -8816,8 +8918,7 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
       public_ocxo2_ns);
 
   clocks_stack_witness_note_hot(CLOCKS_STACK_CONTEXT_BETA_PPS_PUBLISH);
-  g_clocks_fragment_campaign_record_sequence = completed_pps_sequence;
-  g_clocks_fragment_campaign_record_pending = true;
+  clocks_fragment_campaign_queue_commit_write();
   g_clocks_fragment_campaign_record_stage_count++;
   campaign_record_stage(CAMPAIGN_RECORD_STAGE_HANDOFF_READY);
 
@@ -9957,9 +10058,10 @@ static FLASHMEM Payload cmd_report_recovery(const Payload&) {
   p.add("campaign_record_last_stage", g_campaign_record_last_stage);
   p.add("campaign_record_last_stage_name",
         campaign_record_stage_name(g_campaign_record_last_stage));
-  p.add("campaign_record_pending", g_clocks_fragment_campaign_record_pending);
+  p.add("campaign_record_pending",
+        clocks_fragment_campaign_queue_depth() != 0U);
   p.add("campaign_record_pending_sequence",
-        g_clocks_fragment_campaign_record_sequence);
+        clocks_fragment_campaign_queue_front_sequence());
   p.add("campaign_record_stage_count",
         g_clocks_fragment_campaign_record_stage_count);
   p.add("campaign_record_take_count",

@@ -329,8 +329,9 @@ bool clocks_alpha_tau_snapshot(time_clock_id_t clock,
 // clocks_fragment_snapshot_take() returns whether the typed handoff package was
 // constructed. live.snapshot_ok separately reports whether Alpha supplied a
 // coherent live instrument snapshot. If Beta has completed a public campaign
-// record for the requested sequence, that campaign-only record is copied into
-// campaign and atomically consumed.
+// record for the requested sequence, that campaign-only record is consumed from
+// Beta's bounded SPSC handoff and copied into campaign.  A committed record is
+// immutable until the CLOCKS publisher releases its queue slot.
 
 static constexpr size_t CLOCKS_FRAGMENT_CAMPAIGN_NAME_MAX = 64U;
 static constexpr size_t CLOCKS_FRAGMENT_STATE_NAME_MAX = 40U;

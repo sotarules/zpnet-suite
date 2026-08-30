@@ -1606,7 +1606,9 @@ double welford_stderr(const welford_t& w);
 // a complete lawful PPS/VCLOCK + OCXO row exists, including while campaign_state
 // is STOPPED.  Campaign code may snapshot and serialize it, but must not rebase,
 // restore, or reset it as part of campaign lifecycle. Command reports and the
-// completed-row campaign path must use separate snapshot/Payload scratch. Report
+// completed-row campaign path must use separate snapshot/Payload scratch. Alpha
+// commits one complete clocks_instrument_stats_snapshot_t per writer transaction;
+// readers copy that value and never re-derive Better-Buckets from live rings. Report
 // construction keeps Priority 0 capture live and excludes only the Priority 16
 // TimePop/handoff tier until the response has been fully copied.
 
