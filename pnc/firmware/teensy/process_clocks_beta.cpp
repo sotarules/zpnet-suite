@@ -93,6 +93,7 @@ uint64_t campaign_seconds  = 0;
 volatile bool request_start   = false;
 volatile bool request_stop    = false;
 volatile bool request_recover = false;
+volatile bool request_rearm   = false;
 volatile bool request_zero    = false;
 
 // FLASH_CUT is a hot campaign boundary: preserve the installed Alpha/service
@@ -477,6 +478,7 @@ static constexpr uint32_t CAMPAIGN_RECORD_STAGE_WELFORD = 10;
 static constexpr uint32_t CAMPAIGN_RECORD_STAGE_FLASH_CUT_GATE = 13;
 static constexpr uint32_t CAMPAIGN_RECORD_STAGE_RECOVER_PROOF_GATE = 14;
 static constexpr uint32_t CAMPAIGN_RECORD_STAGE_RECOVERING_NO_REQUEST_GATE = 15;
+static constexpr uint32_t CAMPAIGN_RECORD_STAGE_REARM_GATE = 16;
 static constexpr uint32_t CAMPAIGN_RECORD_STAGE_HANDOFF_BEGIN = 20;
 static constexpr uint32_t CAMPAIGN_RECORD_STAGE_HANDOFF_READY = 21;
 static constexpr uint32_t CAMPAIGN_RECORD_STAGE_HANDOFF_BACKLOG = 22;
@@ -2564,6 +2566,7 @@ static FLASHMEM const char* campaign_record_stage_name(uint32_t stage) {
     case CAMPAIGN_RECORD_STAGE_FLASH_CUT_GATE: return "FLASH_CUT_GATE";
     case CAMPAIGN_RECORD_STAGE_RECOVER_PROOF_GATE: return "RECOVER_PROOF_GATE";
     case CAMPAIGN_RECORD_STAGE_RECOVERING_NO_REQUEST_GATE: return "RECOVERING_NO_REQUEST_GATE";
+    case CAMPAIGN_RECORD_STAGE_REARM_GATE: return "REARM_GATE";
     case CAMPAIGN_RECORD_STAGE_HANDOFF_BEGIN: return "HANDOFF_BEGIN";
     case CAMPAIGN_RECORD_STAGE_HANDOFF_READY: return "HANDOFF_READY";
     case CAMPAIGN_RECORD_STAGE_HANDOFF_BACKLOG: return "HANDOFF_BACKLOG";
@@ -2974,9 +2977,10 @@ static char     g_start_candidate_last_first_problem[48] = "not_checked";
 //   public = raw_alpha_service_value + signed_campaign_offset
 //
 // START/FLASH_CUT use a negative offset to make the first public campaign
-// row begin at zero.  RECOVER uses a positive/negative offset to make the
-// current Alpha service ledger appear as the Pi-projected campaign ledger at
-// the recovery PPS.  This is deliberately signed; the old unsigned base model
+// row begin at zero.  DEAD_PRODUCER_RESTORE and surviving-Alpha REARM use a
+// positive/negative offset to make the current Alpha service ledger appear as
+// the Pi-projected campaign ledger at the resume boundary.  This is deliberately
+// signed; the old unsigned base model
 // could not represent current_raw < recovered_public after a system
 // restart/SmartZero epoch.
 static int64_t g_campaign_public_dwt_offset = 0;
@@ -3138,7 +3142,7 @@ static void delta_clock_candidates_seed_zero(void) {
   delta_clock_candidate_seed(g_delta_clock_candidate_ocxo2, 0ULL, 0U);
 }
 
-static void delta_clock_candidates_seed_recover(void) {
+static void delta_clock_candidates_seed_projected_resume(void) {
   const uint32_t recovered_public_count =
       (uint32_t)(recover_gnss_ns / CLOCKS_BETA_NS_PER_SECOND);
   delta_clock_candidate_seed(g_delta_clock_candidate_ocxo1,
@@ -3694,6 +3698,21 @@ static uint64_t          g_recover_last_base_dwt_ns = 0;
 static uint64_t          g_recover_last_base_ocxo1_ns = 0;
 static uint64_t          g_recover_last_base_ocxo2_ns = 0;
 
+// Surviving-Alpha campaign rearm flight recorder.  REARM is deliberately
+// Beta-only: it restores the durable recording coordinate after a Pi outage or
+// watchdog surrender without touching Alpha statistics, clockfaces, or epoch.
+static uint32_t          g_rearm_request_count = 0;
+static uint32_t          g_rearm_commit_count = 0;
+static uint32_t          g_rearm_reject_count = 0;
+static uint64_t          g_rearm_last_base_count = 0;
+static uint64_t          g_rearm_last_expected_first_public_count = 0;
+static uint64_t          g_rearm_last_base_gnss_ns = 0;
+static uint64_t          g_rearm_last_base_dwt_ns = 0;
+static uint64_t          g_rearm_last_base_ocxo1_ns = 0;
+static uint64_t          g_rearm_last_base_ocxo2_ns = 0;
+static char              g_rearm_last_campaign[64] = {0};
+static char              g_rearm_last_status[48] = "idle";
+
 // RECOVER lifecycle flight recorder.  RECOVER is intentionally promoted to a
 // visible campaign state at command time so watchdog recovery cannot leave the
 // firmware in STOPPED + request_recover limbo while Pi waits for campaign record.
@@ -4122,7 +4141,7 @@ static void campaign_public_counterledger_offsets_reset_to_current(void) {
       : 0;
 }
 
-static void campaign_public_counterledger_offsets_reset_for_recover(void) {
+static void campaign_public_counterledger_offsets_reset_for_projected_resume(void) {
   const uint64_t o1 = current_raw_counterledger_ns(time_clock_id_t::OCXO1);
   const uint64_t o2 = current_raw_counterledger_ns(time_clock_id_t::OCXO2);
   g_campaign_public_counterledger_ocxo1_offset = o1
@@ -4151,8 +4170,8 @@ static void campaign_public_offsets_reset_to_current(void) {
   delta_clock_candidates_seed_zero();
 }
 
-static void campaign_public_offsets_reset_for_recover(void) {
-  recover_continuity_align_reset("recover_offsets_seeded");
+static void campaign_public_offsets_reset_for_projected_resume(void) {
+  recover_continuity_align_reset("projected_resume_offsets_seeded");
   g_campaign_public_dwt_offset =
       campaign_public_offset_for_recovered_value(g_dwt_cycle_count_total,
                                                  dwt_ns_to_cycles(recover_dwt_ns));
@@ -4171,8 +4190,8 @@ static void campaign_public_offsets_reset_for_recover(void) {
   g_campaign_public_ocxo2_measured_offset =
       campaign_public_offset_for_recovered_value(current_raw_ocxo_measured_ns(time_clock_id_t::OCXO2),
                                                  recover_ocxo2_ns);
-  campaign_public_counterledger_offsets_reset_for_recover();
-  delta_clock_candidates_seed_recover();
+  campaign_public_counterledger_offsets_reset_for_projected_resume();
+  delta_clock_candidates_seed_projected_resume();
 }
 
 static void campaign_start_phaseledger_set_reason(const char* reason,
@@ -5003,6 +5022,7 @@ static bool recover_restore_court_ready_now(void) {
          !request_start &&
          !request_stop &&
          !request_recover &&
+         !request_rearm &&
          !request_zero &&
          !request_flash_cut &&
          !g_clocks_restore_requested &&
@@ -5084,6 +5104,7 @@ static void recover_lifecycle_abort(const char* reason) {
   clocks_alpha_ocxo_grid_rephase_acknowledge(
       clocks_alpha_ocxo_grid_rephase_owner_t::RECOVER);
   request_recover = false;
+  request_rearm = false;
   g_campaign_restore_state = clocks_recovery_restore_state_t{};
   request_start = false;
   request_stop = false;
@@ -5320,6 +5341,7 @@ bool clocks_watchdog_campaign_armed(void) {
          !request_start &&
          !request_stop &&
          !request_recover &&
+         !request_rearm &&
          !request_zero &&
          !request_flash_cut &&
          !campaign_warmup_active();
@@ -7609,6 +7631,7 @@ static void campaign_start_prologue_abort_launch(const char* reason) {
   request_start = false;
   request_stop = false;
   request_recover = false;
+  request_rearm = false;
   request_zero = false;
   flash_cut_clear_pending();
 
@@ -7915,7 +7938,8 @@ static void flash_cut_clear_pending(void) {
 
 static bool flash_cut_busy(void) {
   return request_flash_cut || request_start || request_stop ||
-         request_recover || request_zero || g_clocks_restore_requested ||
+         request_recover || request_rearm || request_zero ||
+         g_clocks_restore_requested ||
          interrupt_smartzero_running() ||
          clocks_alpha_epoch_install_in_progress();
 }
@@ -8084,6 +8108,7 @@ static void clocks_finish_start_accounting(void) {
   campaign_accounting_reset_common();
   request_zero = false;
   request_start = false;
+  request_rearm = false;
   clocks_watchdog_clear_surrender_for_new_lifecycle();
   campaign_state = clocks_campaign_state_t::STARTED;
   campaign_warmup_begin(campaign_warmup_mode_t::START);
@@ -8282,6 +8307,47 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
     return;
   }
 
+  if (request_rearm) {
+    campaign_record_stage(CAMPAIGN_RECORD_STAGE_REARM_GATE);
+    clocks_watchdog_disarm_campaign_publication();
+    clocks_watchdog_clear_surrender_for_new_lifecycle();
+    clocks_row_objection_clear();
+
+    if (campaign_state != clocks_campaign_state_t::STOPPED ||
+        recover_gnss_ns == 0ULL || recover_dwt_ns == 0ULL ||
+        recover_ocxo1_ns == 0ULL || recover_ocxo2_ns == 0ULL ||
+        (recover_gnss_ns % CLOCKS_BETA_NS_PER_SECOND) != 0ULL) {
+      __builtin_trap();
+    }
+
+    // The durable campaign remains active on the Pi.  This boundary restores
+    // only Beta's recording coordinate on the already-proved live Alpha.  The
+    // boundary row itself is not a campaign row; the next completed PPS is the
+    // exact projected public N+1.
+    clocks_fragment_recover_reset_publication_custody(false);
+    dwt_cycle_count_total = dwt_ns_to_cycles(recover_dwt_ns);
+    gnss_raw_64 = recover_gnss_ns / 100ULL;
+    ocxo1_measured_gnss_ticks_64 = recover_ocxo1_ns / 100ULL;
+    ocxo2_measured_gnss_ticks_64 = recover_ocxo2_ns / 100ULL;
+    campaign_seconds = recover_gnss_ns / CLOCKS_BETA_NS_PER_SECOND;
+
+    pps_interval_residuals_reset();
+    campaign_public_offsets_reset_for_projected_resume();
+    recover_proof_reset("surviving_alpha_campaign_rearm");
+
+    request_rearm = false;
+    request_start = false;
+    request_stop = false;
+    request_recover = false;
+    request_zero = false;
+    flash_cut_clear_pending();
+    campaign_state = clocks_campaign_state_t::STARTED;
+    g_rearm_commit_count++;
+    safeCopy(g_rearm_last_status, sizeof(g_rearm_last_status),
+             "rearm_committed");
+    return;
+  }
+
   if (request_recover) {
     clocks_watchdog_disarm_campaign_publication();
     g_recover_lifecycle_pps_gate_count++;
@@ -8332,7 +8398,7 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
     campaign_seconds = recover_gnss_ns / 1000000000ull;
 
     // Rebase only Beta's campaign presentation onto the genuinely new Alpha epoch.
-    campaign_public_offsets_reset_for_recover();
+    campaign_public_offsets_reset_for_projected_resume();
     interrupt_recover_reset_publication_custody();
     g_recover_lifecycle_gate_custody_reset_count++;
     // Cut Beta's interval totals at the same custody boundary.  No fixed row
@@ -9052,6 +9118,13 @@ static FLASHMEM Payload cmd_start(const Payload& args) {
     return cmd_flash_cut(args);
   }
 
+  if (request_rearm) {
+    Payload err;
+    err.add("error", "campaign rearm is active");
+    err.add("status", "start_rejected_rearming");
+    return err;
+  }
+
   if (clocks_campaign_recovery_lifecycle_active() || request_recover) {
     Payload err;
     err.add("error", "campaign recovery is active");
@@ -9101,6 +9174,183 @@ static FLASHMEM Payload cmd_start(const Payload& args) {
 }
 
 
+static FLASHMEM Payload cmd_rearm(const Payload& args) {
+  clocks_payload_numeric_integrity_reset();
+
+  const char* name = args.getString("campaign");
+  if (!name || !*name) {
+    Payload err;
+    err.add("error", "missing campaign");
+    err.add("status", "rearm_rejected_missing_campaign");
+    g_rearm_reject_count++;
+    return err;
+  }
+
+  uint64_t dwt_ns = 0ULL;
+  uint64_t gnss_ns = 0ULL;
+  uint64_t ocxo1_ns = 0ULL;
+  uint64_t ocxo2_ns = 0ULL;
+  const clocks_payload_checked_status_t dwt_status =
+      clocks_payload_try_get_u64_checked(args, "dwt_ns",
+                                         "command_rearm_base", "args",
+                                         "base", "dwt_ns", dwt_ns);
+  const clocks_payload_checked_status_t gnss_status =
+      clocks_payload_try_get_u64_checked(args, "gnss_ns",
+                                         "command_rearm_base", "args",
+                                         "base", "gnss_ns", gnss_ns);
+  const clocks_payload_checked_status_t ocxo1_status =
+      clocks_payload_try_get_u64_checked(args, "ocxo1_ns",
+                                         "command_rearm_base", "args",
+                                         "base", "ocxo1_ns", ocxo1_ns);
+  const clocks_payload_checked_status_t ocxo2_status =
+      clocks_payload_try_get_u64_checked(args, "ocxo2_ns",
+                                         "command_rearm_base", "args",
+                                         "base", "ocxo2_ns", ocxo2_ns);
+  if (g_clocks_payload_numeric_integrity_failed) {
+    g_rearm_reject_count++;
+    return clocks_payload_numeric_reject_response(
+        "rearm_rejected_numeric_integrity");
+  }
+  if (dwt_status != CLOCKS_PAYLOAD_FIELD_OK ||
+      gnss_status != CLOCKS_PAYLOAD_FIELD_OK ||
+      ocxo1_status != CLOCKS_PAYLOAD_FIELD_OK ||
+      ocxo2_status != CLOCKS_PAYLOAD_FIELD_OK ||
+      dwt_ns == 0ULL || gnss_ns == 0ULL ||
+      ocxo1_ns == 0ULL || ocxo2_ns == 0ULL ||
+      (gnss_ns % CLOCKS_BETA_NS_PER_SECOND) != 0ULL) {
+    Payload err;
+    err.add("error", "REARM requires positive projected dwt/gnss/ocxo clockfaces");
+    err.add("status", "rearm_rejected_projection");
+    g_rearm_reject_count++;
+    return err;
+  }
+
+  const uint64_t base_count = gnss_ns / CLOCKS_BETA_NS_PER_SECOND;
+  const uint64_t expected_first_public_count = base_count + 1ULL;
+  const bool same_identity =
+      g_rearm_request_count != 0U &&
+      strcmp(name, g_rearm_last_campaign) == 0 &&
+      base_count == g_rearm_last_base_count &&
+      gnss_ns == g_rearm_last_base_gnss_ns &&
+      dwt_ns == g_rearm_last_base_dwt_ns &&
+      ocxo1_ns == g_rearm_last_base_ocxo1_ns &&
+      ocxo2_ns == g_rearm_last_base_ocxo2_ns;
+
+  if (request_rearm) {
+    Payload p;
+    p.add("status", same_identity
+                        ? "rearm_already_active"
+                        : "rearm_rejected_busy");
+    p.add("idempotent", same_identity);
+    p.add("campaign", campaign_name);
+    p.add("requested_campaign", name);
+    p.add("base_count", g_rearm_last_base_count);
+    p.add("requested_base_count", base_count);
+    p.add("expected_first_public_count",
+          g_rearm_last_expected_first_public_count);
+    if (!same_identity) {
+      p.add("error", "different campaign rearm already active");
+      g_rearm_reject_count++;
+    }
+    return p;
+  }
+
+  if (same_identity &&
+      campaign_state == clocks_campaign_state_t::STARTED &&
+      g_campaign_record_last_public_count >=
+          g_rearm_last_expected_first_public_count) {
+    Payload p;
+    p.add("status", "rearm_already_completed");
+    p.add("idempotent", true);
+    p.add("campaign", campaign_name);
+    p.add("base_count", g_rearm_last_base_count);
+    p.add("expected_first_public_count",
+          g_rearm_last_expected_first_public_count);
+    p.add("last_public_count", g_campaign_record_last_public_count);
+    p.add("alpha_mutated", false);
+    return p;
+  }
+
+  if (campaign_state != clocks_campaign_state_t::STOPPED ||
+      request_start || request_stop || request_recover || request_zero ||
+      request_flash_cut || g_clocks_restore_requested ||
+      g_ppb_restore_protocol_active ||
+      clocks_campaign_recovery_lifecycle_active()) {
+    Payload err;
+    err.add("error", "campaign lifecycle is not idle for REARM");
+    err.add("status", "rearm_rejected_busy");
+    err.add("campaign_state", clocks_campaign_state_name(campaign_state));
+    g_rearm_reject_count++;
+    return err;
+  }
+
+  if (!clocks_alpha_installed_smartzero_backing_epoch() ||
+      clocks_alpha_epoch_install_in_progress()) {
+    Payload err;
+    err.add("error", "surviving Alpha epoch is not ready");
+    err.add("status", "rearm_rejected_alpha_not_ready");
+    g_rearm_reject_count++;
+    return err;
+  }
+
+  if (campaign_name[0] == '\0' || strcmp(campaign_name, name) != 0) {
+    Payload err;
+    err.add("error", "REARM campaign does not match retained Beta identity");
+    err.add("status", "rearm_rejected_campaign_identity");
+    err.add("campaign", campaign_name);
+    err.add("requested_campaign", name);
+    g_rearm_reject_count++;
+    return err;
+  }
+
+  if (base_count < campaign_seconds) {
+    Payload err;
+    err.add("error", "REARM projection regresses retained campaign time");
+    err.add("status", "rearm_rejected_count_regression");
+    err.add("campaign_seconds", campaign_seconds);
+    err.add("requested_base_count", base_count);
+    g_rearm_reject_count++;
+    return err;
+  }
+
+  recover_dwt_ns = dwt_ns;
+  recover_gnss_ns = gnss_ns;
+  recover_ocxo1_ns = ocxo1_ns;
+  recover_ocxo2_ns = ocxo2_ns;
+  request_rearm = true;
+  request_start = false;
+  request_stop = false;
+  request_recover = false;
+  request_zero = false;
+  flash_cut_clear_pending();
+  clocks_watchdog_disarm_campaign_publication();
+
+  g_rearm_request_count++;
+  g_rearm_last_base_count = base_count;
+  g_rearm_last_expected_first_public_count = expected_first_public_count;
+  g_rearm_last_base_gnss_ns = gnss_ns;
+  g_rearm_last_base_dwt_ns = dwt_ns;
+  g_rearm_last_base_ocxo1_ns = ocxo1_ns;
+  g_rearm_last_base_ocxo2_ns = ocxo2_ns;
+  safeCopy(g_rearm_last_campaign, sizeof(g_rearm_last_campaign), name);
+  safeCopy(g_rearm_last_status, sizeof(g_rearm_last_status),
+           "rearm_requested");
+
+  Payload p;
+  p.add("status", "rearm_requested");
+  p.add("idempotent", false);
+  p.add("campaign", campaign_name);
+  p.add("base_count", base_count);
+  p.add("expected_first_public_count", expected_first_public_count);
+  p.add("recording_boundary", "NEXT_COMPLETED_PPS");
+  p.add("alpha_mutated", false);
+  p.add("instrument_statistics_preserved", true);
+  p.add("service_epoch_preserved", true);
+  p.add("rearm_mode", "SURVIVING_ALPHA_CAMPAIGN_REARM");
+  return p;
+}
+
+
 static FLASHMEM Payload cmd_stop(const Payload&) {
   clocks_ppb_restore_protocol_clear(true);
   g_clocks_restore_requested = false;
@@ -9109,6 +9359,7 @@ static FLASHMEM Payload cmd_stop(const Payload&) {
   const bool had_pending_start = request_start;
   const bool had_pending_zero = request_zero;
   const bool had_pending_recover = request_recover;
+  const bool had_pending_rearm = request_rearm;
   const bool had_recovering = clocks_campaign_recovery_lifecycle_active();
 
   interrupt_smartzero_abort();
@@ -9119,12 +9370,13 @@ static FLASHMEM Payload cmd_stop(const Payload&) {
   request_start = false;
   request_zero = false;
   request_recover = false;
+  request_rearm = false;
   flash_cut_clear_pending();
 
   Payload p;
 
   if (campaign_state == clocks_campaign_state_t::STARTED &&
-      !had_pending_recover && !had_recovering) {
+      !had_pending_recover && !had_pending_rearm && !had_recovering) {
     request_stop = true;
     p.add("status", "stop_requested");
     p.add("service_epoch_preserved", true);
@@ -9167,6 +9419,7 @@ static FLASHMEM Payload cmd_zero(const Payload&) {
   request_start = false;
   request_stop = false;
   request_recover = false;
+  request_rearm = false;
   flash_cut_clear_pending();
   request_zero = true;
   campaign_state = clocks_campaign_state_t::STOPPED;
@@ -9707,6 +9960,7 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
 
   const bool recovery_control_active =
       request_recover ||
+      request_rearm ||
       clocks_campaign_recovery_lifecycle_active() ||
       g_recover_proof_active ||
       g_recover_proof_degraded_active ||
@@ -10024,6 +10278,20 @@ static FLASHMEM Payload cmd_report_recovery(const Payload&) {
   p.add("campaign_state", clocks_campaign_state_name(campaign_state));
   p.add("campaign", campaign_name);
   p.add("campaign_seconds", campaign_seconds);
+
+  p.add("rearm_active", (bool)request_rearm);
+  p.add("rearm_request_count", g_rearm_request_count);
+  p.add("rearm_commit_count", g_rearm_commit_count);
+  p.add("rearm_reject_count", g_rearm_reject_count);
+  p.add("rearm_base_count", g_rearm_last_base_count);
+  p.add("rearm_expected_first_public_count",
+        g_rearm_last_expected_first_public_count);
+  p.add("rearm_base_gnss_ns", g_rearm_last_base_gnss_ns);
+  p.add("rearm_base_dwt_ns", g_rearm_last_base_dwt_ns);
+  p.add("rearm_base_ocxo1_ns", g_rearm_last_base_ocxo1_ns);
+  p.add("rearm_base_ocxo2_ns", g_rearm_last_base_ocxo2_ns);
+  p.add("rearm_campaign", g_rearm_last_campaign);
+  p.add("rearm_status", g_rearm_last_status);
 
   p.add("recover_lifecycle_active", clocks_campaign_recovery_lifecycle_active());
   p.add("recover_lifecycle_reason", g_recover_lifecycle_reason);
@@ -10518,6 +10786,7 @@ static FLASHMEM Payload cmd_stack_witness_reset(const Payload&) {
 
 static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "START",               cmd_start               },
+  { "REARM",               cmd_rearm               },
   { "FLASH_CUT",           cmd_flash_cut           },
   { "STOP",                cmd_stop                },
   { "ZERO",                cmd_zero                },

@@ -8897,6 +8897,165 @@ def _finalize_live_recovery_custody_without_campaign(
     return result
 
 
+def _rearm_surviving_clocks_campaign(
+    *,
+    snapshot_detail: Dict[str, Any],
+    active_campaign: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    """Restore Beta recording execution on a proved surviving Alpha producer.
+
+    This is intentionally narrower than RECOVER.  The Alpha instrument/statistical
+    lifetime has already been proved continuous, so the Teensy must not receive a
+    structured instrument restore or a fresh SmartZero epoch.  Pi durable campaign
+    intent remains authoritative; REARM projects only the campaign presentation
+    coordinate across the observer outage, then waits for the exact projected N+1
+    campaign row before reopening Pi campaign processing.
+    """
+    global _campaign_active, _accepted_pps_vclock_count
+    global _last_pps_vclock_count_seen
+
+    campaign_name = str(active_campaign.get("campaign") or "").strip()
+    if not campaign_name:
+        raise RuntimeError("surviving campaign rearm requires durable active campaign identity")
+
+    source_detail_id = _as_int(snapshot_detail.get("_db_detail_id"))
+    if source_detail_id is None or source_detail_id <= 0:
+        raise RuntimeError("surviving campaign rearm source lacks durable CLOCKS identity")
+
+    last_tb = _recovery_timebase_from_clocks_state(
+        snapshot_detail,
+        campaign_name,
+        source_detail_id=int(source_detail_id),
+        source_campaign=campaign_name,
+    )
+    recovery_snapshot = _recovery_timebase_snapshot(last_tb)
+    if not recovery_snapshot.get("recoverable"):
+        raise RuntimeError(
+            "surviving Alpha campaign rearm lacks a recoverable durable campaign boundary"
+        )
+
+    last_durable_count = int(recovery_snapshot["last_pps_vclock_count"])
+    last_gnss_time_str = str(recovery_snapshot["last_gnss_time_str"])
+
+    drained = _drain_timebase_ingress()
+    if drained:
+        logging.info(
+            "🧹 [rearm] drained %d stale campaign delta(s) before surviving-Alpha rearm",
+            drained,
+        )
+
+    # Use the same GNSS-aligned projection boundary as dead-producer RECOVER.
+    # The only difference is ownership: Alpha remains untouched and only Beta's
+    # public campaign transform is reinstalled.
+    now_frac = time.time() % 1.0
+    sleep_to_boundary = (1.0 - now_frac) + 0.050
+    time.sleep(sleep_to_boundary)
+    current_gnss_time_str = _wait_for_gnss_time()
+    current_gnss_utc = datetime.fromisoformat(
+        current_gnss_time_str.replace("Z", "+00:00")
+    )
+    desired_state = _project_clocks_recovery_snapshot(
+        recovery_snapshot, current_gnss_utc
+    )
+
+    elapsed_seconds = int(desired_state["elapsed_seconds"])
+    base_count = int(desired_state["recover_base_pps_vclock_count"])
+    expected_first = int(desired_state["expected_first_public_pps_vclock_count"])
+    rearm_args = dict(desired_state["teensy_recover_args"])
+
+    _begin_sync_wait(expected_pps=expected_first)
+    try:
+        response = _request_teensy_rearm(
+            campaign_name,
+            base_count,
+            rearm_args,
+        )
+        payload = response.get("payload") if isinstance(response, dict) else None
+        payload = payload if isinstance(payload, dict) else {}
+
+        frag, waited_s = _end_sync_wait(timeout_s=SYNC_RECOVER_TIMEOUT_S)
+        first_public_count = _as_int(frag.get("public_count"))
+        if first_public_count != expected_first:
+            raise RuntimeError(
+                "surviving Alpha campaign REARM did not resume at exact projected N+1: "
+                f"expected={expected_first} observed={first_public_count}"
+            )
+
+        seed_pps_vclock_count = int(first_public_count) - 1
+        if seed_pps_vclock_count < last_durable_count:
+            raise RuntimeError(
+                "surviving Alpha campaign REARM baseline regressed behind durable state"
+            )
+        gnss_raw_projection = _gnss_raw_recovery_project_seed(
+            last_tb=last_tb,
+            last_pps_vclock_count=last_durable_count,
+            seed_pps_vclock_count=seed_pps_vclock_count,
+        )
+        seed_gnss_ns = seed_pps_vclock_count * NS_PER_SECOND
+        if not _restore_gnss_raw_from_last_timebase(
+            last_tb=last_tb,
+            projected_gnss_ns=int(seed_gnss_ns),
+            projected_gnss_raw_ns=int(
+                gnss_raw_projection.get("seed_raw_ns") or 0
+            ),
+            projected_gnss_raw_ref_ns=int(
+                gnss_raw_projection.get("seed_ref_ns") or seed_gnss_ns
+            ),
+            projection_details=gnss_raw_projection,
+        ):
+            raise RuntimeError("surviving Alpha campaign REARM GNSS_RAW projection failed")
+
+        recovery_custody: Optional[Dict[str, Any]] = None
+        if _recovery_custody_snapshot().get("active"):
+            recovery_custody = _finalize_recovery_clocks_custody(
+                last_tb=last_tb,
+                campaign_name=campaign_name,
+                first_public_count=int(first_public_count),
+                recover_mode="LIVE_PRODUCER_ADOPT",
+            )
+
+        _accepted_pps_vclock_count = seed_pps_vclock_count
+        _last_pps_vclock_count_seen = seed_pps_vclock_count
+        _diag["accepted_pps_count"] = seed_pps_vclock_count
+        _diag["accepted_pps_vclock_count"] = seed_pps_vclock_count
+        _gnss_canary_reset()
+        _clear_start_wait_state()
+        _campaign_active = True
+        _arm_timebase_silence_watch("SURVIVING_ALPHA_CAMPAIGN_REARM")
+        _sync_resume_event.set()
+
+        adoption = {
+            "state": "STARTED",
+            "mode": "SURVIVING_ALPHA_CAMPAIGN_REARM",
+            "campaign": campaign_name,
+            "source_detail_id": int(source_detail_id),
+            "last_durable_pps_vclock_count": int(last_durable_count),
+            "last_durable_gnss_time": last_gnss_time_str,
+            "current_gnss_time": current_gnss_time_str,
+            "elapsed_seconds": int(elapsed_seconds),
+            "baseline_pps_vclock_count": seed_pps_vclock_count,
+            "first_public_pps_vclock_count": int(first_public_count),
+            "waited_s": round(float(waited_s), 3),
+            "gnss_raw_projection": gnss_raw_projection,
+            "teensy": copy.deepcopy(payload),
+            "alpha_mutated": False,
+            "campaign_execution_mutated": True,
+        }
+        logging.info(
+            "✅ [rearm] surviving Alpha preserved; campaign '%s' rearmed at "
+            "base=%d first_public=%d after %d elapsed GNSS second(s)",
+            campaign_name,
+            seed_pps_vclock_count,
+            int(first_public_count),
+            elapsed_seconds,
+        )
+        return adoption, recovery_custody
+    except Exception:
+        _campaign_active = False
+        _clear_sync_wait()
+        raise
+
+
 def _adopt_surviving_clocks_producer(
     *,
     snapshot_detail: Dict[str, Any],
@@ -9101,84 +9260,53 @@ def _adopt_surviving_clocks_producer(
                 f"identity: producer={firmware_campaign!r} durable={campaign_name!r}"
             )
 
-        adopted_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        master_mutated = False
-
-        # Close the recovery-custody court before retiring durable campaign intent.
-        # If custody finalization fails, the active campaign remains available to
-        # the retry path instead of being converted into a false "nothing to restore".
-        if _recovery_custody_snapshot().get("active"):
-            recovery_custody = _finalize_live_recovery_custody_without_campaign(
-                source_detail=snapshot_detail,
-            )
-
         if active_campaign is not None:
-            with open_db() as conn:
-                cur = conn.cursor()
-                cur.execute(
-                    """
-                    UPDATE campaign_master
-                    SET active = false,
-                        payload = payload
-                            || jsonb_build_object(
-                                'stopped_at', to_jsonb(%s::text),
-                                'producer_state_adopted_at', to_jsonb(%s::text),
-                                'producer_state_adoption', to_jsonb(%s::text)
-                            )
-                            || CASE
-                                WHEN payload ? 'report'
-                                THEN jsonb_build_object(
-                                    'report',
-                                    (payload->'report')
-                                        || '{"campaign_state":"STOPPED"}'::jsonb
-                                )
-                                ELSE '{}'::jsonb
-                               END
-                    WHERE campaign_type = %s
-                      AND campaign = %s
-                      AND active = true
-                    """,
-                    (
-                        adopted_at,
-                        adopted_at,
-                        "SURVIVING_PRODUCER_STOPPED",
-                        CAMPAIGN_TYPE_TEMPEST,
-                        campaign_name,
-                    ),
+            # Durable Pi intent still says RUNNING.  A STOPPED Beta on the same
+            # proved Alpha therefore means recording execution was surrendered,
+            # not that the operator stopped the campaign.  Rearm only Beta.
+            campaign_adoption, recovery_custody = _rearm_surviving_clocks_campaign(
+                snapshot_detail=snapshot_detail,
+                active_campaign=active_campaign,
+            )
+        else:
+            if _recovery_custody_snapshot().get("active"):
+                recovery_custody = _finalize_live_recovery_custody_without_campaign(
+                    source_detail=snapshot_detail,
                 )
-                if cur.rowcount != 1:
-                    raise RuntimeError(
-                        "surviving CLOCKS STOPPED adoption did not retire exactly "
-                        "one active TEMPEST campaign"
-                    )
-            master_mutated = True
 
-        _campaign_active = False
-        _accepted_pps_vclock_count = None
-        _last_pps_vclock_count_seen = None
-        _diag["accepted_pps_count"] = None
-        _diag["accepted_pps_vclock_count"] = None
-        _clear_sync_wait()
-        _clear_start_wait_state()
-        _clear_flash_cut_wait_state()
-        _gnss_canary_reset()
-        campaign_adoption = {
-            "state": "STOPPED",
-            "campaign": campaign_name or None,
-            "master_mutated": master_mutated,
-            "adopted_at_utc": adopted_at,
-        }
+            _campaign_active = False
+            _accepted_pps_vclock_count = None
+            _last_pps_vclock_count_seen = None
+            _diag["accepted_pps_count"] = None
+            _diag["accepted_pps_vclock_count"] = None
+            _clear_sync_wait()
+            _clear_start_wait_state()
+            _clear_flash_cut_wait_state()
+            _gnss_canary_reset()
+            campaign_adoption = {
+                "state": "STOPPED",
+                "campaign": firmware_campaign or None,
+                "master_mutated": False,
+                "alpha_mutated": False,
+                "campaign_execution_mutated": False,
+            }
     else:
         raise RuntimeError(
             f"surviving CLOCKS producer is in non-adoptable campaign state {firmware_state!r}"
         )
 
+    campaign_execution_mutated = bool(
+        campaign_adoption.get("campaign_execution_mutated")
+    )
     result = {
         "success": True,
         "mode": "LIVE_PRODUCER_ADOPT",
         "producer_reuse": True,
-        "producer_mutated": False,
-        "producer_mutation_commands": [],
+        "producer_mutated": campaign_execution_mutated,
+        "producer_mutation_commands": (
+            ["CLOCKS.REARM"] if campaign_execution_mutated else []
+        ),
+        "alpha_mutated": False,
         "snapshot_detail_id": _as_int(snapshot_detail.get("_db_detail_id")),
         "producer_descendant_proof": descendant,
         "firmware_campaign_state": firmware_state or "STOPPED",
@@ -9200,10 +9328,11 @@ def _adopt_surviving_clocks_producer(
         **copy.deepcopy(result),
     }
     logging.info(
-        "✅ [holistic restore] surviving CLOCKS producer proved and adopted with "
-        "zero producer mutation: campaign=%s state=%s",
+        "✅ [holistic restore] surviving Alpha proved and adopted: campaign=%s "
+        "observed_state=%s campaign_execution_mutated=%s",
         firmware_campaign or "NONE",
         firmware_state or "STOPPED",
+        campaign_execution_mutated,
     )
     return result
 
@@ -11975,72 +12104,66 @@ def _tempest_detail_from_state_snapshot(state: Dict[str, Any]) -> Dict[str, Any]
     }
 
 
-def _recovery_timebase_from_clocks_snapshot(
-    snapshot: _ClocksRecoverySnapshot,
+def _recovery_timebase_from_clocks_state(
+    state: Dict[str, Any],
     campaign_name: str,
+    *,
+    source_detail_id: int,
+    source_campaign: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Form dead-producer TEMPEST observation from one CLOCKS recovery snapshot.
+    """Form one recovery observation from an already-bound durable CLOCKS state.
 
-    ``campaign.adjudication`` is intentionally irrelevant here. Canonical CLOCKS is
-    persisted before the asynchronous Pi TEMPEST court attaches that observer-plane
-    decoration, so shutdown may lawfully leave the newest recovery snapshot ahead of
-    the newest adjudicated campaign row. The raw firmware campaign delta captured in
-    the snapshot is the campaign component of the same desired-state image.
-
-    This adapter performs no database access or process mutation. Pi-owned GNSS_RAW
-    sufficient state comes from the same snapshot. Campaign-relative GNSS_RAW N/T is
-    not invented when the observer plane lagged; the existing projection layer will
-    deterministically rebuild that presentation coordinate from the saved Welford mean.
+    The caller supplies the exact durable row identity.  This adapter performs no
+    database lookup and therefore cannot drift to a newer no-campaign restore
+    authority while startup persistence is reopening.
     """
-    if not isinstance(snapshot, _ClocksRecoverySnapshot):
-        raise TypeError("CLOCKS dead recovery requires _ClocksRecoverySnapshot")
+    if not isinstance(state, dict):
+        raise TypeError("CLOCKS recovery state must be an object")
+    detail_id = int(source_detail_id)
+    if detail_id <= 0:
+        raise ValueError("CLOCKS recovery state requires positive durable detail identity")
 
-    state = copy.deepcopy(snapshot.canonical)
-    campaign = copy.deepcopy(snapshot.campaign)
-    if not isinstance(campaign, dict):
-        raise ValueError("CLOCKS recovery snapshot has no TEMPEST campaign state")
+    state = copy.deepcopy(state)
+    campaign = copy.deepcopy(_state_campaign(state))
+    if not isinstance(campaign, dict) or not campaign:
+        raise ValueError("CLOCKS recovery state has no TEMPEST campaign state")
     if campaign.get("schema") != "TEMPEST_FRAGMENT_V1":
         raise ValueError(
-            f"CLOCKS recovery snapshot has unsupported TEMPEST schema {campaign.get('schema')!r}"
+            f"CLOCKS recovery state has unsupported TEMPEST schema {campaign.get('schema')!r}"
         )
 
     observed_campaign = _tempest_campaign_name(campaign)
     if observed_campaign != str(campaign_name):
         raise ValueError(
-            "CLOCKS recovery snapshot campaign disagrees with active master: "
+            "CLOCKS recovery state campaign disagrees with active master: "
             f"snapshot={observed_campaign!r} active={campaign_name!r}"
         )
-    if snapshot.source_campaign not in (None, observed_campaign):
+    if source_campaign not in (None, observed_campaign):
         raise ValueError(
-            "CLOCKS recovery snapshot row label disagrees with raw TEMPEST state: "
-            f"row={snapshot.source_campaign!r} campaign={observed_campaign!r}"
+            "CLOCKS recovery row label disagrees with raw TEMPEST state: "
+            f"row={source_campaign!r} campaign={observed_campaign!r}"
         )
     campaign_state = str(campaign.get("state") or "").strip().upper()
     public_count = _tempest_public_count(campaign)
     if campaign_state != "STARTED" or public_count <= 0:
         raise ValueError(
-            "CLOCKS recovery snapshot does not contain a running TEMPEST boundary: "
+            "CLOCKS recovery state does not contain a running TEMPEST boundary: "
             f"campaign={observed_campaign!r} state={campaign_state!r} "
             f"public_count={public_count}"
         )
 
     source_sequence = _as_int(state.get("sequence"))
-    if source_sequence != int(snapshot.source_sequence) or source_sequence is None:
-        raise ValueError(
-            "CLOCKS recovery snapshot sequence identity changed inside canonical state: "
-            f"snapshot={snapshot.source_sequence} canonical={source_sequence}"
-        )
+    if source_sequence is None or source_sequence <= 0:
+        raise ValueError("CLOCKS recovery state lacks positive physical sequence identity")
 
     clocks = _clocks_payload(state)
-    gnss_raw = copy.deepcopy(snapshot.gnss_raw)
+    gnss_raw = _clocks_gnss_raw_payload(state)
     instrument = gnss_raw.get("instrument") if isinstance(gnss_raw, dict) else None
     welford = gnss_raw.get("welford") if isinstance(gnss_raw, dict) else None
     if not isinstance(instrument, dict) or not isinstance(welford, dict):
-        raise ValueError("CLOCKS recovery snapshot lacks complete Pi GNSS_RAW state")
+        raise ValueError("CLOCKS recovery state lacks complete Pi GNSS_RAW state")
 
     fragment = copy.deepcopy(campaign)
-    # Pi adjudication may already be present on a fully processed row, but it is
-    # observer-plane testimony and is never part of the producer restore image.
     fragment.pop("adjudication", None)
 
     extra_clocks = {
@@ -12078,10 +12201,31 @@ def _recovery_timebase_from_clocks_snapshot(
         "environment": copy.deepcopy(state.get("environment")),
         "gnss": copy.deepcopy(state.get("gnss")),
         "extra_clocks": extra_clocks,
-        "_db_detail_id": int(snapshot.source_detail_id),
+        "_db_detail_id": detail_id,
         "_recovery_authority": "CLOCKS_RECOVERY_SNAPSHOT",
         "_campaign_adjudication_required": False,
     }
+
+
+def _recovery_timebase_from_clocks_snapshot(
+    snapshot: _ClocksRecoverySnapshot,
+    campaign_name: str,
+) -> Dict[str, Any]:
+    """Form dead-producer TEMPEST observation from one CLOCKS recovery snapshot."""
+    if not isinstance(snapshot, _ClocksRecoverySnapshot):
+        raise TypeError("CLOCKS dead recovery requires _ClocksRecoverySnapshot")
+    state_sequence = _as_int(snapshot.canonical.get("sequence"))
+    if state_sequence != int(snapshot.source_sequence):
+        raise ValueError(
+            "CLOCKS recovery snapshot sequence identity changed inside canonical state: "
+            f"snapshot={snapshot.source_sequence} canonical={state_sequence}"
+        )
+    return _recovery_timebase_from_clocks_state(
+        snapshot.canonical,
+        campaign_name,
+        source_detail_id=int(snapshot.source_detail_id),
+        source_campaign=snapshot.source_campaign,
+    )
 
 
 def _has_tempest_state_details(campaign_name: str) -> bool:
@@ -14348,6 +14492,57 @@ _TEENSY_RECOVER_ACCEPTED_STATUSES = {
     "recover_already_active",
     "recover_already_completed",
 }
+
+
+_TEENSY_REARM_ACCEPTED_STATUSES = {
+    "rearm_requested",
+    "rearm_already_active",
+    "rearm_already_completed",
+}
+
+
+def _request_teensy_rearm(
+    campaign: str,
+    pps_vclock_count: int,
+    args: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Rearm Beta campaign execution without mutating the proved live Alpha."""
+    teensy_args = dict(args)
+    teensy_args.update({
+        "campaign": str(campaign),
+        "pps_count": str(int(pps_vclock_count)),
+        "pps_vclock_count": str(int(pps_vclock_count)),
+    })
+    response = send_command(
+        machine="TEENSY",
+        subsystem="CLOCKS",
+        command="REARM",
+        args=teensy_args,
+    )
+    payload = response.get("payload") if isinstance(response, dict) else None
+    payload = payload if isinstance(payload, dict) else {}
+    status = str(payload.get("status") or "")
+    if (
+        not isinstance(response, dict)
+        or not response.get("success")
+        or status not in _TEENSY_REARM_ACCEPTED_STATUSES
+    ):
+        raise RuntimeError(
+            "Teensy CLOCKS.REARM rejected surviving-Alpha campaign restoration: "
+            f"status={status or 'missing_handler_status'} response={response!r}"
+        )
+    if status == "rearm_requested":
+        if str(payload.get("rearm_mode") or "").strip().upper() != (
+            "SURVIVING_ALPHA_CAMPAIGN_REARM"
+        ):
+            raise RuntimeError(
+                "Teensy CLOCKS.REARM accepted without the surviving-Alpha contract"
+            )
+        if payload.get("alpha_mutated") is not False:
+            raise RuntimeError(
+                "Teensy CLOCKS.REARM did not explicitly preserve Alpha custody"
+            )
+    return response
 
 
 def _request_teensy_recover(
