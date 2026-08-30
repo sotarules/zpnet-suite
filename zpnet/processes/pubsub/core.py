@@ -207,6 +207,11 @@ teensy_rpc_readiness_probe_count = 0
 teensy_rpc_readiness_success_count = 0
 teensy_rpc_readiness_failure_count = 0
 teensy_rpc_readiness_ever_ready = False
+# The readiness worker is infrastructure and must survive ordinary USB/flash churn.
+# Count escaped exceptions as forensic testimony rather than letting the daemon retain
+# a permanently stale INITIALIZING/HOLD lease after the worker thread dies.
+teensy_rpc_readiness_worker_exception_count = 0
+teensy_rpc_readiness_last_worker_exception: Optional[str] = None
 teensy_rpc_feature_publish_count = 0
 teensy_rpc_feature_publish_fail_count = 0
 
@@ -297,6 +302,8 @@ def _teensy_rpc_readiness_snapshot() -> Dict[str, Any]:
             ),
             "feature_publish_count": int(teensy_rpc_feature_publish_count),
             "feature_publish_fail_count": int(teensy_rpc_feature_publish_fail_count),
+            "worker_exception_count": int(teensy_rpc_readiness_worker_exception_count),
+            "last_worker_exception": teensy_rpc_readiness_last_worker_exception,
             "probe_interval_s": float(TEENSY_RPC_PROBE_INTERVAL_S),
             "probe_timeout_s": float(TEENSY_RPC_PROBE_TIMEOUT_S),
             "feature_ttl_s": float(TEENSY_RPC_FEATURE_TTL_S),
@@ -591,105 +598,165 @@ def _publish_teensy_rpc_feature() -> None:
 
 
 def _teensy_rpc_readiness_loop() -> None:
-    """Continuously prove semantic RPC on the current serial generation."""
+    """Continuously prove semantic RPC and route custody on each serial generation."""
     global teensy_rpc_readiness_last_probe_monotonic
     global teensy_rpc_readiness_last_success_monotonic
     global teensy_rpc_readiness_probe_count, teensy_rpc_readiness_success_count
     global teensy_rpc_readiness_failure_count, teensy_rpc_readiness_ever_ready
+    global teensy_rpc_readiness_worker_exception_count
+    global teensy_rpc_readiness_last_worker_exception
 
     last_failure_log = 0.0
     while True:
-        ready, generation = _transport_state_snapshot()
-        if not ready or generation <= 0:
-            with teensy_rpc_readiness_lock:
-                prior_ready = bool(teensy_rpc_readiness_ever_ready)
-            _set_teensy_rpc_readiness(
-                "HOLD" if prior_ready else "INITIALIZING",
-                generation,
-                "TRANSPORT_UNAVAILABLE",
+        try:
+            ready, generation = _transport_state_snapshot()
+            if not ready or generation <= 0:
+                with teensy_rpc_readiness_lock:
+                    prior_ready = bool(teensy_rpc_readiness_ever_ready)
+                _set_teensy_rpc_readiness(
+                    "HOLD" if prior_ready else "INITIALIZING",
+                    generation,
+                    "TRANSPORT_UNAVAILABLE",
+                )
+                _publish_teensy_rpc_feature()
+                teensy_rpc_readiness_wakeup.wait(timeout=TEENSY_RPC_PROBE_INTERVAL_S)
+                teensy_rpc_readiness_wakeup.clear()
+                continue
+
+            before_probe = _teensy_rpc_readiness_snapshot()
+            prior_ready = bool(before_probe.get("ever_ready"))
+            already_nominal = bool(
+                before_probe.get("status") == "NOMINAL"
+                and int(before_probe.get("generation") or 0) == int(generation)
             )
+            if not already_nominal:
+                _set_teensy_rpc_readiness(
+                    "HOLD" if prior_ready else "INITIALIZING",
+                    generation,
+                    "AWAITING_RPC_ROUND_TRIP",
+                )
+                _publish_teensy_rpc_feature()
+
+            request = {
+                "machine": "TEENSY",
+                "subsystem": "PUBSUB",
+                "command": "REPORT",
+            }
+            with teensy_rpc_readiness_lock:
+                teensy_rpc_readiness_probe_count += 1
+                teensy_rpc_readiness_last_probe_monotonic = time.monotonic()
+
+            response = _teensy_rpc_exchange(
+                request,
+                subsystem="PUBSUB",
+                command="REPORT",
+                source="READINESS_PROBE",
+                reply_timeout_s=TEENSY_RPC_PROBE_TIMEOUT_S,
+                max_stable_timeouts=1,
+                log_timeouts=False,
+            )
+
+            still_ready, observed_generation = _transport_state_snapshot()
+            if not still_ready or observed_generation != generation:
+                # The transport monitor owns the generation transition; never promote
+                # testimony obtained across a different physical transport lifetime.
+                continue
+
+            if isinstance(response, dict) and response.get("success"):
+                with teensy_rpc_readiness_lock:
+                    teensy_rpc_readiness_success_count += 1
+                    teensy_rpc_readiness_ever_ready = True
+                    teensy_rpc_readiness_last_success_monotonic = time.monotonic()
+
+                # A fresh Teensy can answer RPC while its volatile PUBSUB route table
+                # is still empty.  Application readiness therefore requires both the
+                # generation-bound round trip and convergence of the cached route union.
+                # Use the REPORT payload we just proved so the common non-empty case
+                # costs no second RPC.
+                if already_nominal:
+                    route_ok, route_reason = True, "ALREADY_ADMITTED"
+                else:
+                    payload = response.get("payload")
+                    route_ok, route_reason = _ensure_teensy_route_custody(
+                        generation,
+                        payload if isinstance(payload, dict) else None,
+                        source="READINESS",
+                    )
+                if route_ok:
+                    _set_teensy_rpc_readiness(
+                        "NOMINAL", generation, "PUBSUB_REPORT_AND_ROUTES_PROVED"
+                    )
+                    if not already_nominal:
+                        logging.info(
+                            "✅ [pubsub/readiness] Teensy RPC and route custody proved "
+                            "on transport generation=%d",
+                            generation,
+                        )
+                else:
+                    _set_teensy_rpc_readiness(
+                        "HOLD",
+                        generation,
+                        f"ROUTE_CUSTODY_NOT_PROVED:{route_reason}",
+                    )
+                    now = time.monotonic()
+                    if now - last_failure_log >= TEENSY_RPC_STATUS_LOG_INTERVAL_S:
+                        logging.info(
+                            "⏳ [pubsub/readiness] transport generation=%d has RPC "
+                            "but route custody is not yet proved: %s",
+                            generation, route_reason,
+                        )
+                        last_failure_log = now
+            else:
+                with teensy_rpc_readiness_lock:
+                    teensy_rpc_readiness_failure_count += 1
+                    prior_ready = bool(teensy_rpc_readiness_ever_ready)
+                reason = str(
+                    response.get("message") if isinstance(response, dict) else "malformed response"
+                )
+                _set_teensy_rpc_readiness(
+                    "HOLD" if prior_ready else "INITIALIZING",
+                    generation,
+                    f"RPC_PROBE_FAILED:{reason}",
+                )
+                now = time.monotonic()
+                if now - last_failure_log >= TEENSY_RPC_STATUS_LOG_INTERVAL_S:
+                    logging.info(
+                        "⏳ [pubsub/readiness] transport generation=%d is attached but "
+                        "Teensy RPC is not yet proved: %s",
+                        generation, reason,
+                    )
+                    last_failure_log = now
+
             _publish_teensy_rpc_feature()
             teensy_rpc_readiness_wakeup.wait(timeout=TEENSY_RPC_PROBE_INTERVAL_S)
             teensy_rpc_readiness_wakeup.clear()
-            continue
 
-        before_probe = _teensy_rpc_readiness_snapshot()
-        prior_ready = bool(before_probe.get("ever_ready"))
-        already_nominal = bool(
-            before_probe.get("status") == "NOMINAL"
-            and int(before_probe.get("generation") or 0) == int(generation)
-        )
-        if not already_nominal:
+        except Exception as exc:
+            # USB disappearance may race a readiness probe after the transport monitor
+            # observed the generation as ready.  transport_send() can then raise from
+            # the serial flush path (for example termios EIO).  That is transport churn,
+            # not permission for this daemon-lifetime worker to die.  Preserve the
+            # traceback as testimony, publish a non-NOMINAL lease, and retry forever.
+            teensy_rpc_readiness_worker_exception_count += 1
+            teensy_rpc_readiness_last_worker_exception = (
+                f"{type(exc).__module__}.{type(exc).__name__}: {exc}"
+            )
+            ready_now, generation_now = _transport_state_snapshot()
+            with teensy_rpc_readiness_lock:
+                prior_ready = bool(teensy_rpc_readiness_ever_ready)
             _set_teensy_rpc_readiness(
                 "HOLD" if prior_ready else "INITIALIZING",
-                generation,
-                "AWAITING_RPC_ROUND_TRIP",
+                generation_now,
+                f"READINESS_WORKER_EXCEPTION:{type(exc).__name__}",
+            )
+            logging.exception(
+                "⚠️ [pubsub/readiness] readiness iteration failed but worker remains "
+                "alive: transport_ready=%s generation=%d exception_count=%d",
+                ready_now, generation_now, teensy_rpc_readiness_worker_exception_count,
             )
             _publish_teensy_rpc_feature()
-
-        request = {
-            "machine": "TEENSY",
-            "subsystem": "PUBSUB",
-            "command": "REPORT",
-        }
-        with teensy_rpc_readiness_lock:
-            teensy_rpc_readiness_probe_count += 1
-            teensy_rpc_readiness_last_probe_monotonic = time.monotonic()
-
-        response = _teensy_rpc_exchange(
-            request,
-            subsystem="PUBSUB",
-            command="REPORT",
-            source="READINESS_PROBE",
-            reply_timeout_s=TEENSY_RPC_PROBE_TIMEOUT_S,
-            max_stable_timeouts=1,
-            log_timeouts=False,
-        )
-
-        still_ready, observed_generation = _transport_state_snapshot()
-        if not still_ready or observed_generation != generation:
-            # The transport monitor owns the generation transition; never promote
-            # testimony obtained across a different physical transport lifetime.
-            continue
-
-        if isinstance(response, dict) and response.get("success"):
-            with teensy_rpc_readiness_lock:
-                teensy_rpc_readiness_success_count += 1
-                teensy_rpc_readiness_ever_ready = True
-                teensy_rpc_readiness_last_success_monotonic = time.monotonic()
-            _set_teensy_rpc_readiness(
-                "NOMINAL", generation, "PUBSUB_REPORT_ROUND_TRIP_PROVED"
-            )
-            if not already_nominal:
-                logging.info(
-                    "✅ [pubsub/readiness] Teensy RPC round trip proved on transport generation=%d",
-                    generation,
-                )
-        else:
-            with teensy_rpc_readiness_lock:
-                teensy_rpc_readiness_failure_count += 1
-                prior_ready = bool(teensy_rpc_readiness_ever_ready)
-            reason = str(
-                response.get("message") if isinstance(response, dict) else "malformed response"
-            )
-            _set_teensy_rpc_readiness(
-                "HOLD" if prior_ready else "INITIALIZING",
-                generation,
-                f"RPC_PROBE_FAILED:{reason}",
-            )
-            now = time.monotonic()
-            if now - last_failure_log >= TEENSY_RPC_STATUS_LOG_INTERVAL_S:
-                logging.info(
-                    "⏳ [pubsub/readiness] transport generation=%d is attached but "
-                    "Teensy RPC is not yet proved: %s",
-                    generation, reason,
-                )
-                last_failure_log = now
-
-        _publish_teensy_rpc_feature()
-        teensy_rpc_readiness_wakeup.wait(timeout=TEENSY_RPC_PROBE_INTERVAL_S)
-        teensy_rpc_readiness_wakeup.clear()
-
+            teensy_rpc_readiness_wakeup.wait(timeout=TRANSPORT_RETRY_INTERVAL_S)
+            teensy_rpc_readiness_wakeup.clear()
 
 def _send_client_bytes_best_effort(conn: socket.socket, raw: bytes, *, context: str) -> bool:
     """A caller disappearing before its reply arrives is ordinary IPC churn."""
@@ -843,7 +910,12 @@ teensy_route_monitor_last_empty_ts: Optional[float] = None
 teensy_route_monitor_last_reapply_ts: Optional[float] = None
 teensy_route_monitor_last_reapply_topic_count = 0
 teensy_route_monitor_last_reapply_subscription_count = 0
-teensy_route_monitor_last_status = "DISABLED_STATIC_TOPOLOGY"
+teensy_route_monitor_last_status = "NOT_STARTED"
+# One owner serializes route inspection/reapply/verification across immediate
+# generation admission and the periodic custody monitor.
+teensy_route_custody_lock = threading.Lock()
+teensy_route_custody_worker_exception_count = 0
+teensy_route_custody_last_worker_exception: Optional[str] = None
 
 # ---------------------------------------------------------------------
 # Ad-hoc diagnostic tap state
@@ -2321,6 +2393,8 @@ def cmd_diagnostics(_: Optional[dict]) -> Dict[str, Any]:
             "last_reapply_topic_count": teensy_route_monitor_last_reapply_topic_count,
             "last_reapply_subscription_count": teensy_route_monitor_last_reapply_subscription_count,
             "last_status": teensy_route_monitor_last_status,
+            "worker_exception_count": teensy_route_custody_worker_exception_count,
+            "last_worker_exception": teensy_route_custody_last_worker_exception,
         }
 
     with pi_delivery_lock:
@@ -2661,92 +2735,79 @@ def _copy_applied_union_for_teensy_route_reapply() -> Dict[str, Any]:
         return json.loads(json.dumps(applied_union))
 
 
-def _teensy_route_report() -> Optional[Dict[str, Any]]:
-    """
-    Ask Teensy PUBSUB for its current route table.
-
-    Returns the response payload on success, or None when Teensy is not
-    reachable / not ready.  Failures are intentionally quiet because this
-    thread is a background custody probe.
-    """
+def _teensy_route_report(*, source: str = "ROUTE_MONITOR") -> Optional[Dict[str, Any]]:
+    """Ask Teensy PUBSUB for its current route table."""
     resp = _server_command_to_teensy(
-        "PUBSUB", "REPORT", None, source="ROUTE_MONITOR"
+        "PUBSUB", "REPORT", None, source=source
     )
     if not resp.get("success"):
         return None
     payload = resp.get("payload")
-    return payload if isinstance(payload, dict) else {}
+    return payload if isinstance(payload, dict) else None
 
 
-def _teensy_route_count(payload: Dict[str, Any]) -> int:
+def _teensy_route_count(payload: Dict[str, Any]) -> Optional[int]:
     routes = payload.get("routes")
-    return len(routes) if isinstance(routes, list) else 0
+    return len(routes) if isinstance(routes, list) else None
 
 
-def _teensy_route_reapply_cached_union(union_payload: Dict[str, Any]) -> bool:
-    """
-    Reapply the cached Pi-side union to Teensy with SETSUBSCRIPTIONS.
-    """
+def _teensy_route_reapply_cached_union(
+    union_payload: Dict[str, Any], *, source: str = "ROUTE_MONITOR_REAPPLY"
+) -> bool:
+    """Reapply the cached Pi-side union to Teensy with SETSUBSCRIPTIONS."""
     resp = _server_command_to_teensy(
-        "PUBSUB", "SETSUBSCRIPTIONS", union_payload, source="ROUTE_MONITOR_REAPPLY"
+        "PUBSUB", "SETSUBSCRIPTIONS", union_payload, source=source
     )
     return bool(resp.get("success"))
 
 
-def teensy_route_monitor_loop() -> None:
-    """
-    Periodically verify that Teensy's PUBSUB route table still exists.
-
-    The monitor is specifically for Teensy reboot recovery.  A reboot clears
-    process_pubsub's in-firmware routing state, while the Pi-side PUBSUB process
-    still has the authoritative last committed union in applied_union.  When
-    Teensy reports an empty route table and the Pi has a non-empty cached union,
-    foist that cached union back onto Teensy without repolling every service.
-    """
-    global teensy_route_monitor_probe_count
-    global teensy_route_monitor_probe_fail_count
+def _ensure_teensy_route_custody(
+    generation: int,
+    initial_report: Optional[Dict[str, Any]] = None,
+    *,
+    source: str,
+) -> Tuple[bool, str]:
+    """Prove or restore the volatile Teensy route table for one transport generation."""
     global teensy_route_monitor_report_ok_count
     global teensy_route_monitor_empty_count
     global teensy_route_monitor_reapply_count
     global teensy_route_monitor_reapply_fail_count
     global teensy_route_monitor_last_route_count
-    global teensy_route_monitor_last_probe_ts
     global teensy_route_monitor_last_empty_ts
     global teensy_route_monitor_last_reapply_ts
     global teensy_route_monitor_last_reapply_topic_count
     global teensy_route_monitor_last_reapply_subscription_count
     global teensy_route_monitor_last_status
 
-    logging.info(
-        "🧭 [pubsub] Teensy route monitor armed (interval=%.1fs)",
-        TEENSY_ROUTE_MONITOR_INTERVAL_S,
-    )
+    with teensy_route_custody_lock:
+        ready, current_generation = _transport_state_snapshot()
+        if not ready or current_generation != int(generation):
+            teensy_route_monitor_last_status = "GENERATION_CHANGED"
+            return False, "TRANSPORT_GENERATION_CHANGED"
 
-    while True:
-        time.sleep(TEENSY_ROUTE_MONITOR_INTERVAL_S)
-
-        teensy_route_monitor_probe_count += 1
-        teensy_route_monitor_last_probe_ts = time.time()
-
-        payload = _teensy_route_report()
+        payload = initial_report
         if payload is None:
-            teensy_route_monitor_probe_fail_count += 1
+            payload = _teensy_route_report(source=f"{source}_REPORT")
+        if payload is None:
             teensy_route_monitor_last_status = "TEENSY_UNREACHABLE"
-            continue
+            return False, "ROUTE_REPORT_UNAVAILABLE"
+
+        route_count = _teensy_route_count(payload)
+        if route_count is None:
+            teensy_route_monitor_last_status = "ROUTE_REPORT_INVALID"
+            return False, "ROUTE_REPORT_INVALID"
 
         teensy_route_monitor_report_ok_count += 1
-        route_count = _teensy_route_count(payload)
         teensy_route_monitor_last_route_count = route_count
-
         if route_count != 0:
             teensy_route_monitor_last_status = "NOMINAL"
-            continue
+            return True, "ROUTES_PRESENT"
 
         union_payload = _copy_applied_union_for_teensy_route_reapply()
         subscriptions = union_payload.get("subscriptions")
         if not isinstance(subscriptions, list) or len(subscriptions) == 0:
             teensy_route_monitor_last_status = "EMPTY_NO_CACHED_UNION"
-            continue
+            return False, "EMPTY_NO_CACHED_UNION"
 
         topic_names = set()
         for row in subscriptions:
@@ -2758,25 +2819,121 @@ def teensy_route_monitor_loop() -> None:
 
         teensy_route_monitor_empty_count += 1
         teensy_route_monitor_last_empty_ts = time.time()
-
         logging.info(
-            "🔄 [pubsub] Teensy route table empty; reapplying cached union "
-            "(%d subscriptions, %d topics)",
-            len(subscriptions),
-            len(topic_names),
+            "🔄 [pubsub] Teensy route table empty on generation=%d; "
+            "reapplying cached union (%d subscriptions, %d topics) source=%s",
+            generation, len(subscriptions), len(topic_names), source,
         )
 
-        if _teensy_route_reapply_cached_union(union_payload):
-            teensy_route_monitor_reapply_count += 1
-            teensy_route_monitor_last_reapply_ts = time.time()
-            teensy_route_monitor_last_reapply_topic_count = len(topic_names)
-            teensy_route_monitor_last_reapply_subscription_count = len(subscriptions)
-            teensy_route_monitor_last_status = "REAPPLIED_CACHED_UNION"
-            logging.info("✅ [pubsub] Teensy route table restored from cached union")
-        else:
+        if not _teensy_route_reapply_cached_union(
+            union_payload, source=f"{source}_REAPPLY"
+        ):
             teensy_route_monitor_reapply_fail_count += 1
             teensy_route_monitor_last_status = "REAPPLY_FAILED"
+            return False, "REAPPLY_FAILED"
 
+        # SETSUBSCRIPTIONS success is not the proof.  Read back the same producer
+        # generation and require a non-empty route table before application admission.
+        ready, current_generation = _transport_state_snapshot()
+        if not ready or current_generation != int(generation):
+            teensy_route_monitor_last_status = "GENERATION_CHANGED_AFTER_REAPPLY"
+            return False, "TRANSPORT_GENERATION_CHANGED_AFTER_REAPPLY"
+
+        verify_payload = _teensy_route_report(source=f"{source}_VERIFY")
+        if verify_payload is None:
+            teensy_route_monitor_reapply_fail_count += 1
+            teensy_route_monitor_last_status = "REAPPLY_VERIFY_UNAVAILABLE"
+            return False, "REAPPLY_VERIFY_UNAVAILABLE"
+
+        verify_count = _teensy_route_count(verify_payload)
+        if verify_count is None or verify_count == 0:
+            teensy_route_monitor_reapply_fail_count += 1
+            teensy_route_monitor_last_route_count = verify_count
+            teensy_route_monitor_last_status = "REAPPLY_VERIFY_FAILED"
+            return False, "REAPPLY_VERIFY_FAILED"
+
+        teensy_route_monitor_reapply_count += 1
+        teensy_route_monitor_last_reapply_ts = time.time()
+        teensy_route_monitor_last_reapply_topic_count = len(topic_names)
+        teensy_route_monitor_last_reapply_subscription_count = len(subscriptions)
+        teensy_route_monitor_last_route_count = verify_count
+        teensy_route_monitor_last_status = "REAPPLIED_CACHED_UNION"
+        logging.info(
+            "✅ [pubsub] Teensy route table restored and read-back proved "
+            "on generation=%d routes=%d",
+            generation, verify_count,
+        )
+        return True, "REAPPLIED_AND_VERIFIED"
+
+
+def teensy_route_monitor_loop() -> None:
+    """Periodically prove route custody even after generation admission."""
+    global teensy_route_monitor_probe_count
+    global teensy_route_monitor_probe_fail_count
+    global teensy_route_monitor_last_probe_ts
+    global teensy_route_monitor_last_status
+    global teensy_route_custody_worker_exception_count
+    global teensy_route_custody_last_worker_exception
+
+    logging.info(
+        "🧭 [pubsub] Teensy route monitor armed (interval=%.1fs)",
+        TEENSY_ROUTE_MONITOR_INTERVAL_S,
+    )
+
+    while True:
+        time.sleep(TEENSY_ROUTE_MONITOR_INTERVAL_S)
+        try:
+            ready, generation = _transport_state_snapshot()
+            if not ready or generation <= 0:
+                teensy_route_monitor_last_status = "TRANSPORT_UNAVAILABLE"
+                continue
+
+            teensy_route_monitor_probe_count += 1
+            teensy_route_monitor_last_probe_ts = time.time()
+            ok, reason = _ensure_teensy_route_custody(
+                generation, source="ROUTE_MONITOR"
+            )
+            if not ok:
+                teensy_route_monitor_probe_fail_count += 1
+                ready_now, observed_generation = _transport_state_snapshot()
+                if ready_now and observed_generation == generation:
+                    with teensy_rpc_readiness_lock:
+                        prior_ready = bool(teensy_rpc_readiness_ever_ready)
+                    _set_teensy_rpc_readiness(
+                        "HOLD" if prior_ready else "INITIALIZING",
+                        generation,
+                        f"ROUTE_MONITOR_NOT_PROVED:{reason}",
+                    )
+                    _publish_teensy_rpc_feature()
+                    teensy_rpc_readiness_wakeup.set()
+                    logging.info(
+                        "⏳ [pubsub] periodic Teensy route custody not proved "
+                        "generation=%d reason=%s; readiness held for immediate retry",
+                        generation, reason,
+                    )
+        except Exception as exc:
+            teensy_route_custody_worker_exception_count += 1
+            teensy_route_custody_last_worker_exception = (
+                f"{type(exc).__module__}.{type(exc).__name__}: {exc}"
+            )
+            teensy_route_monitor_last_status = (
+                f"WORKER_EXCEPTION:{type(exc).__name__}"
+            )
+            ready_now, generation_now = _transport_state_snapshot()
+            with teensy_rpc_readiness_lock:
+                prior_ready = bool(teensy_rpc_readiness_ever_ready)
+            _set_teensy_rpc_readiness(
+                "HOLD" if prior_ready else "INITIALIZING",
+                generation_now,
+                f"ROUTE_MONITOR_EXCEPTION:{type(exc).__name__}",
+            )
+            _publish_teensy_rpc_feature()
+            teensy_rpc_readiness_wakeup.set()
+            logging.exception(
+                "⚠️ [pubsub] route custody monitor iteration failed but worker "
+                "remains alive: exception_count=%d",
+                teensy_route_custody_worker_exception_count,
+            )
 
 # ---------------------------------------------------------------------
 # Declarations
@@ -2844,6 +3001,11 @@ def run() -> None:
         target=_teensy_rpc_readiness_loop,
         daemon=True,
         name="pubsub-teensy-rpc-readiness",
+    ).start()
+    threading.Thread(
+        target=teensy_route_monitor_loop,
+        daemon=True,
+        name="pubsub-teensy-route-custody",
     ).start()
 
     # PUBSUB's own command surface is also independent of serial readiness.
