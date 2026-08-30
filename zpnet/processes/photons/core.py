@@ -2649,6 +2649,10 @@ def _record_photons_recovery_receipt(
                 "surrendered_minute_endpoints": int(
                     history.get("surrendered_minute_endpoints") or 0
                 ),
+                "second_origin_promoted": bool(history.get("second_origin_promoted")),
+                "minute_origin_promoted": bool(history.get("minute_origin_promoted")),
+                "second_current_promoted": bool(history.get("second_current_promoted")),
+                "minute_current_promoted": bool(history.get("minute_current_promoted")),
             }
 
         campaign = boundary.get("campaign")
@@ -2869,9 +2873,12 @@ def _literal_recovery_history_from_source(source: Dict[str, Any]) -> Dict[str, A
 
     A complete checkpoint restores the complete bounded producer rings.  A
     structurally valid checkpoint that is merely warming after an observation
-    gap may instead restore its exact retained suffix.  The missing older ring
-    ancestry is explicitly surrendered; SQL is never consulted and no endpoint
-    is synthesized.  A lost/empty/contradictory rolling lineage still fails.
+    gap may instead restore only exact retained testimony.  The bounded-ring
+    representation may promote the separately durable epoch origin and/or exact
+    current cumulative endpoint when retained ring entries are absent.  Those
+    facts are producer-authored already; no unseen intermediate endpoint is
+    synthesized.  Missing older ring ancestry is explicitly surrendered, while
+    contradictory rolling lineage still fails.
     """
     raw = source.get("ppb_restore_checkpoint")
     saved = _normalize_saved_ppb_checkpoint(raw)
@@ -2918,6 +2925,8 @@ def _literal_recovery_history_from_source(source: Dict[str, Any]) -> Dict[str, A
     origin = copy.deepcopy(saved.get("origin") or _ppb_zero_endpoint())
     second_origin_promoted = False
     minute_origin_promoted = False
+    second_current_promoted = False
+    minute_current_promoted = False
 
     # The exact epoch origin is producer-authored testimony carried separately
     # from the bounded rings.  When the statistical epoch is younger than a
@@ -2940,6 +2949,38 @@ def _literal_recovery_history_from_source(source: Dict[str, Any]) -> Dict[str, A
             minute_history.insert(0, copy.deepcopy(origin))
             minute_origin_promoted = True
 
+        # RECOVERY_COMMIT requires SECOND history to terminate at the aggregate
+        # source endpoint.  ``current`` is already exact producer-authored
+        # checkpoint testimony, so promoting it into a sparse/empty staged ring
+        # changes representation only; it does not reconstruct any unseen row.
+        if not second_history or not _ppb_endpoints_equal(second_history[-1], current):
+            if len(second_history) >= expected_second:
+                raise RuntimeError(
+                    "PHOTONS literal SECOND history has no capacity for exact current endpoint"
+                )
+            if second_history and int(second_history[-1]["sequence"]) >= int(current["sequence"]):
+                raise RuntimeError(
+                    "PHOTONS literal SECOND history does not precede exact current endpoint"
+                )
+            second_history.append(copy.deepcopy(current))
+            second_current_promoted = True
+
+        # Firmware also requires at least one MINUTE endpoint.  If Pi retained no
+        # minute-ring entry (or only promoted the exact epoch origin above), the
+        # exact current cumulative endpoint is a lawful minimal new ring image.
+        # Future minute history then warms forward from testimony we actually own.
+        if not minute_history or (
+            minute_origin_promoted
+            and len(minute_history) == 1
+            and _ppb_endpoints_equal(minute_history[0], origin)
+        ):
+            if len(minute_history) >= expected_minute:
+                raise RuntimeError(
+                    "PHOTONS literal MINUTE history has no capacity for exact current endpoint"
+                )
+            minute_history.append(copy.deepcopy(current))
+            minute_current_promoted = True
+
     if not second_history or not minute_history:
         raise RuntimeError(
             "durable PHOTONS checkpoint has no literal Better-Buckets history to stage"
@@ -2959,6 +3000,12 @@ def _literal_recovery_history_from_source(source: Dict[str, Any]) -> Dict[str, A
 
     if complete:
         history_scope = "COMPLETE_PRODUCER_RING"
+    elif (second_current_promoted or minute_current_promoted) and (
+        second_origin_promoted or minute_origin_promoted
+    ):
+        history_scope = "LITERAL_SUFFIX_WITH_EXACT_BOUNDARY_TESTIMONY"
+    elif second_current_promoted or minute_current_promoted:
+        history_scope = "LITERAL_SUFFIX_WITH_EXACT_CURRENT"
     elif second_origin_promoted or minute_origin_promoted:
         history_scope = "LITERAL_SUFFIX_WITH_EXACT_EPOCH_ORIGIN"
     else:
@@ -2983,6 +3030,8 @@ def _literal_recovery_history_from_source(source: Dict[str, Any]) -> Dict[str, A
         "surrendered_minute_endpoints": missing_minute,
         "second_origin_promoted": second_origin_promoted,
         "minute_origin_promoted": minute_origin_promoted,
+        "second_current_promoted": second_current_promoted,
+        "minute_current_promoted": minute_current_promoted,
         "second_history": second_history,
         "minute_history": minute_history,
     }
@@ -3089,25 +3138,33 @@ def _adopt_held_restore_checkpoint_runtime(
             source_values: List[Dict[str, Any]],
             *,
             origin_promoted: bool,
+            current_promoted: bool,
         ) -> bool:
-            if not origin_promoted:
-                return staged_values == source_values
-            return bool(
-                staged_values
-                and _ppb_endpoints_equal(staged_values[0], expected_origin)
-                and staged_values[1:] == source_values
-            )
+            expected_values = copy.deepcopy(source_values)
+            if origin_promoted and (
+                not expected_values
+                or not _ppb_endpoints_equal(expected_values[0], expected_origin)
+            ):
+                expected_values.insert(0, copy.deepcopy(expected_origin))
+            if current_promoted and (
+                not expected_values
+                or not _ppb_endpoints_equal(expected_values[-1], current)
+            ):
+                expected_values.append(copy.deepcopy(current))
+            return staged_values == expected_values
 
         if not staged_history_matches_source(
             second_history,
             source_second_history,
             origin_promoted=bool(literal_history.get("second_origin_promoted")),
+            current_promoted=bool(literal_history.get("second_current_promoted")),
         ):
             raise RuntimeError("Pi PHOTONS second history changed while held restore was staged")
         if not staged_history_matches_source(
             minute_history,
             source_minute_history,
             origin_promoted=bool(literal_history.get("minute_origin_promoted")),
+            current_promoted=bool(literal_history.get("minute_current_promoted")),
         ):
             raise RuntimeError("Pi PHOTONS minute history changed while held restore was staged")
 
@@ -5527,6 +5584,8 @@ def _startup_held_restore(
             ),
             "second_origin_promoted": literal_history.get("second_origin_promoted"),
             "minute_origin_promoted": literal_history.get("minute_origin_promoted"),
+            "second_current_promoted": literal_history.get("second_current_promoted"),
+            "minute_current_promoted": literal_history.get("minute_current_promoted"),
         },
         exact_successor={
             "sequence": int(source["sequence"]) + 1,
@@ -5566,7 +5625,8 @@ def _startup_held_restore(
             "🧾 [photons/recovery] held restore preserved exact aggregate ancestry "
             "while surrendering unseen Better-Buckets history: source_detail=%d "
             "staged_second=%d/%d staged_minute=%d/%d surrendered_second=%d "
-            "surrendered_minute=%d exact_origin_promoted(second=%s minute=%s)",
+            "surrendered_minute=%d promoted(origin_second=%s origin_minute=%s "
+            "current_second=%s current_minute=%s)",
             int(source["db_detail_id"]),
             int(literal_history.get("staged_second_count") or 0),
             int(literal_history.get("source_expected_second_count") or 0),
@@ -5576,6 +5636,8 @@ def _startup_held_restore(
             int(literal_history.get("surrendered_minute_endpoints") or 0),
             bool(literal_history.get("second_origin_promoted")),
             bool(literal_history.get("minute_origin_promoted")),
+            bool(literal_history.get("second_current_promoted")),
+            bool(literal_history.get("minute_current_promoted")),
         )
 
     _start_workers()

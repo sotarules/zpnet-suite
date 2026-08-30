@@ -176,6 +176,14 @@ struct photons_race_runtime_t {
 
 static photons_race_runtime_t g_photons_race{};
 static photons_race_launch_slot_t g_photons_race_launch{};
+
+// Cross-context race custody is intentionally asymmetric:
+//   * foreground is the sole writer of g_race_armed_sequence; the detector
+//     callback may only read it;
+//   * the detector callback is the sole writer of g_photons_race_receive;
+//     foreground may only take coherent snapshots.
+// Stale receive testimony is never cleared by foreground. Race sequence identity
+// is preserved across recovery so stale mailbox contents cannot alias a new race.
 static photons_race_receive_state_t g_photons_race_receive{};
 static volatile uint32_t g_race_armed_sequence = 0U;
 
@@ -1982,7 +1990,7 @@ static bool photons_ns_to_dwt_cycles(uint64_t requested_ns,
   return true;
 }
 
-static void photons_race_receive_publish(
+static void photons_race_receive_isr_publish(
     const photons_race_receive_value_t& value) {
   g_photons_race_receive.generation++;
   photons_memory_barrier();
@@ -2015,10 +2023,14 @@ static void photons_race_observe_edge(
   const uint32_t race_sequence = g_race_armed_sequence;
   if (race_sequence == 0U) return;
 
-  // First physical RISING edge wins. Disarm before publishing the receive latch
-  // so comparator chatter cannot become additional race observations.
-  g_race_armed_sequence = 0U;
-  photons_memory_barrier();
+  // Foreground owns the arm scalar. The detector callback never clears or
+  // rewrites foreground state. First-edge-wins is enforced entirely inside the
+  // ISR-owned mailbox: once this race sequence has been published, comparator
+  // chatter for the same arm is ignored.
+  if (g_photons_race_receive.value.seen &&
+      g_photons_race_receive.value.race_sequence == race_sequence) {
+    return;
+  }
 
   photons_race_receive_value_t value{};
   value.seen = true;
@@ -2026,7 +2038,7 @@ static void photons_race_observe_edge(
   value.edge_sequence = edge.sequence;
   value.pps_sequence = edge.pps_sequence;
   value.finish_dwt = edge.dwt_at_edge;
-  photons_race_receive_publish(value);
+  photons_race_receive_isr_publish(value);
 }
 
 static void photons_race_finalize_previous(void) {
@@ -2047,11 +2059,14 @@ static void photons_race_finalize_previous(void) {
     __builtin_trap();
   }
 
-  if (!receive.seen) {
+  const bool receive_matches_launch =
+      receive.seen && receive.race_sequence == launch.sequence;
+  if (!receive_matches_launch) {
+    // The ISR-owned mailbox may lawfully retain testimony from an older race.
+    // Sequence identity, not destructive clearing, decides whether this launch
+    // actually received an edge.
     g_photons_race.missed_count++;
   } else {
-    if (receive.race_sequence != launch.sequence) __builtin_trap();
-
     // Every valid interim flight endpoint must occur after the actual LD_ON LOW
     // surrogate. At a 1 ms cadence the signed DWT difference is unambiguous even
     // across a 32-bit DWT wrap. An early receive is evidence, not a measurement.
@@ -2088,7 +2103,6 @@ static void photons_race_finalize_previous(void) {
   }
 
   g_photons_race_launch = photons_race_launch_slot_t{};
-  photons_race_receive_publish(photons_race_receive_value_t{});
 }
 
 static void photons_race_cadence_tick(
@@ -2135,7 +2149,6 @@ static void photons_race_cadence_tick(
   if (g_photons_race.sequence == 0U) g_photons_race.sequence++;
   const uint32_t race_sequence = g_photons_race.sequence;
 
-  photons_race_receive_publish(photons_race_receive_value_t{});
   photons_race_launch_slot_t launch{};
   launch.valid = true;
   launch.sequence = race_sequence;
@@ -2176,11 +2189,18 @@ static void photons_race_cadence_tick(
 }
 
 static void photons_race_prepare(void) {
+  // Resetting a live TimePop producer would orphan its scheduled callback while
+  // making foreground state claim it was stopped. That is an ownership failure.
+  if (g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE) __builtin_trap();
+
+  // Recovery may reset boot-local race counters, but it must not reuse a race
+  // identity that could still exist in the ISR-owned receive mailbox.
+  const uint32_t preserved_sequence = g_photons_race.sequence;
   g_race_armed_sequence = 0U;
+  photons_memory_barrier();
   g_photons_race = photons_race_runtime_t{};
+  g_photons_race.sequence = preserved_sequence;
   g_photons_race_launch = photons_race_launch_slot_t{};
-  g_photons_race_receive.generation = 0U;
-  g_photons_race_receive.value = photons_race_receive_value_t{};
   g_photons_race.initialized = true;
 }
 
@@ -2261,9 +2281,11 @@ static photons_device_snapshot_t photons_device_snapshot(void) {
 // ISR-authored live state
 // -----------------------------------------------------------------------------
 //
-// Single writer: PHOTODIODE callback.
-// Foreground readers use generation as a tiny seqlock.  No interrupt masking is
-// required, so PHOTONS reporting/publication never delays sovereign CLOCKS IRQs.
+// Single writer: PHOTODIODE callback. Foreground never resets or edits this
+// state after the subscription is live; recovery establishes new ancestry by
+// rebasing foreground origins instead of rewriting ISR testimony. Foreground
+// readers use generation as a tiny seqlock. No interrupt masking is required, so
+// PHOTONS reporting/publication never delays sovereign CLOCKS IRQs.
 //
 struct photons_live_state_t {
   volatile uint32_t generation = 0;
@@ -2283,7 +2305,14 @@ static photons_live_state_t g_photons_live{};
 // -----------------------------------------------------------------------------
 
 static photons_toy_fragment_t g_last_fragment{};
-static photons_fragment_snapshot_t g_last_photons_fragment{};
+// Large foreground-only canonical values live in RAM2, not on MSP/DTCM stack.
+// A generation protects the completed publication value so a future scheduling
+// change cannot turn REPORT into a torn reader. process_photons_init() explicitly
+// establishes every DMAMEM object because RAM2 is NOLOAD.
+static volatile uint32_t g_last_fragment_generation = 0U;
+static photons_fragment_snapshot_t g_last_photons_fragment DMAMEM = {};
+static photons_fragment_snapshot_t g_photons_fragment_build DMAMEM = {};
+static photons_fragment_snapshot_t g_photons_report_snapshot DMAMEM = {};
 
 // PHOTONS_FRAGMENT publication is one foreground transaction.  The producer
 // first freezes every live/runtime dependency into a complete value snapshot;
@@ -2321,10 +2350,6 @@ static bool g_interrupt_started = false;
 
 static timepop_handle_t g_fragment_timer = TIMEPOP_INVALID_HANDLE;
 
-static inline void photons_compiler_barrier(void) {
-  __asm__ volatile("" ::: "memory");
-}
-
 // -----------------------------------------------------------------------------
 // One-shot physical pulse testimony
 // -----------------------------------------------------------------------------
@@ -2361,16 +2386,20 @@ struct photons_pulse_receive_state_t {
 };
 
 static photons_pulse_launch_state_t g_last_pulse_launch{};
+// Foreground is the sole writer of the pulse arm/launch state. The detector
+// callback is the sole writer of the receive mailbox. Stale receive testimony
+// remains immutable until a later ISR observation replaces it and is admitted
+// only by exact pulse_sequence identity.
 static photons_pulse_receive_state_t g_last_pulse_receive{};
 static volatile uint32_t g_pulse_armed_sequence = 0U;
 static uint32_t g_pulse_sequence = 0U;
 
-static void photons_pulse_receive_publish(
+static void photons_pulse_receive_isr_publish(
     const photons_pulse_receive_value_t& value) {
   g_last_pulse_receive.generation++;
-  photons_compiler_barrier();
+  photons_memory_barrier();
   g_last_pulse_receive.value = value;
-  photons_compiler_barrier();
+  photons_memory_barrier();
   g_last_pulse_receive.generation++;
 }
 
@@ -2382,10 +2411,10 @@ static bool photons_pulse_receive_snapshot(
     const uint32_t before = g_last_pulse_receive.generation;
     if (before & 1U) continue;
 
-    photons_compiler_barrier();
+    photons_memory_barrier();
     const photons_pulse_receive_value_t snapshot =
         g_last_pulse_receive.value;
-    photons_compiler_barrier();
+    photons_memory_barrier();
 
     const uint32_t after = g_last_pulse_receive.generation;
     if (before == after && !(after & 1U)) {
@@ -2400,10 +2429,12 @@ static void photons_pulse_observe_edge(
   const uint32_t pulse_sequence = g_pulse_armed_sequence;
   if (pulse_sequence == 0U) return;
 
-  // First eligible RISING edge wins. Clear the latch before projection so
-  // comparator chatter cannot overwrite the first-return testimony.
-  g_pulse_armed_sequence = 0U;
-  photons_compiler_barrier();
+  // Foreground owns the arm scalar. First-edge-wins is an ISR-local mailbox
+  // rule, so the callback never writes foreground state.
+  if (g_last_pulse_receive.value.seen &&
+      g_last_pulse_receive.value.pulse_sequence == pulse_sequence) {
+    return;
+  }
 
   photons_pulse_receive_value_t value{};
   value.seen = true;
@@ -2411,7 +2442,7 @@ static void photons_pulse_observe_edge(
   value.edge_sequence = edge.sequence;
   value.pps_sequence = edge.pps_sequence;
   value.finish_dwt = edge.dwt_at_edge;
-  photons_pulse_receive_publish(value);
+  photons_pulse_receive_isr_publish(value);
 }
 
 
@@ -2429,7 +2460,7 @@ static void photons_on_photodiode_edge(
 
   // Begin seqlock write: odd generation means foreground must retry.
   g_photons_live.generation++;
-  photons_compiler_barrier();
+  photons_memory_barrier();
 
   photons_toy_capture_t& c = g_photons_live.capture;
 
@@ -2475,7 +2506,7 @@ static void photons_on_photodiode_edge(
   g_photons_live.previous_dwt_at_edge = edge.dwt_at_edge;
   g_photons_live.previous_edge_valid = true;
 
-  photons_compiler_barrier();
+  photons_memory_barrier();
   g_photons_live.generation++;  // commit: even generation
 }
 
@@ -2490,9 +2521,9 @@ bool photons_toy_capture_snapshot(photons_toy_capture_t* out) {
     const uint32_t before = g_photons_live.generation;
     if (before & 1U) continue;
 
-    photons_compiler_barrier();
+    photons_memory_barrier();
     const photons_toy_capture_t snapshot = g_photons_live.capture;
-    photons_compiler_barrier();
+    photons_memory_barrier();
 
     const uint32_t after = g_photons_live.generation;
     if (before == after && !(after & 1U)) {
@@ -2502,17 +2533,64 @@ bool photons_toy_capture_snapshot(photons_toy_capture_t* out) {
   }
 }
 
+static void photons_last_fragment_store(
+    const photons_toy_fragment_t& toy,
+    const photons_fragment_snapshot_t& fragment) {
+  // Foreground is the sole writer. Generation still makes the completed value a
+  // proper publication boundary if command/report scheduling is ever refactored.
+  g_last_fragment_generation++;
+  photons_memory_barrier();
+  g_last_fragment = toy;
+  g_last_photons_fragment = fragment;
+  photons_memory_barrier();
+  g_last_fragment_generation++;
+}
+
+
+static void photons_last_fragment_reset(void) {
+  g_last_fragment_generation++;
+  photons_memory_barrier();
+  g_last_fragment = photons_toy_fragment_t{};
+  memset(&g_last_photons_fragment, 0, sizeof(g_last_photons_fragment));
+  photons_memory_barrier();
+  g_last_fragment_generation++;
+}
+
+
 bool photons_toy_fragment_snapshot(photons_toy_fragment_t* out) {
   if (!out) return false;
-  *out = g_last_fragment;
-  return true;
+  for (;;) {
+    const uint32_t before = g_last_fragment_generation;
+    if (before & 1U) continue;
+    photons_memory_barrier();
+    *out = g_last_fragment;
+    photons_memory_barrier();
+    const uint32_t after = g_last_fragment_generation;
+    if (before == after && !(after & 1U)) return true;
+  }
 }
 
 
 bool photons_fragment_snapshot(photons_fragment_snapshot_t* out) {
   if (!out) return false;
-  *out = g_last_photons_fragment;
-  return out->snapshot_ok;
+  for (;;) {
+    const uint32_t before = g_last_fragment_generation;
+    if (before & 1U) continue;
+    photons_memory_barrier();
+    *out = g_last_photons_fragment;
+    photons_memory_barrier();
+    const uint32_t after = g_last_fragment_generation;
+    if (before == after && !(after & 1U)) return out->snapshot_ok;
+  }
+}
+
+
+static const photons_fragment_snapshot_t& photons_report_fragment_snapshot(void) {
+  // REPORT commands are foreground-serialized, so one dedicated RAM2 scratch is
+  // sufficient. The source copy itself remains generation-validated in case the
+  // completed-fragment writer ever moves to a preempting execution context.
+  (void)photons_fragment_snapshot(&g_photons_report_snapshot);
+  return g_photons_report_snapshot;
 }
 
 // ============================================================================
@@ -3113,10 +3191,13 @@ static void photons_fragment_tick(
   const photons_race_runtime_t race = g_photons_race;
 
   // This complete foreground-owned value is the publication custody boundary.
+  // Keep the large canonical object in a dedicated RAM2 build slot rather than
+  // placing ~1.7 KiB on MSP. This callback is the slot's sole owner; it completes
+  // the value before either the canonical snapshot or Payload serializer sees it.
   // From the first Payload mutation onward, the serializer may read only this
-  // snapshot plus constants/pure formatting helpers; it never reaches back into
-  // mutable PHOTONS or process_interrupt state.
-  photons_fragment_snapshot_t fragment{};
+  // frozen value plus constants/pure formatting helpers.
+  photons_fragment_snapshot_t& fragment = g_photons_fragment_build;
+  memset(&fragment, 0, sizeof(fragment));
   fragment.snapshot_ok = true;
   fragment.sequence = ++g_fragment_sequence;
   fragment.publish_count = g_publish_count + 1U;
@@ -3307,8 +3388,7 @@ static void photons_fragment_tick(
 
   // Author both foreground snapshots before transport admission so REPORT can
   // show exactly what PHOTONS attempted to publish.
-  g_last_fragment = toy;
-  g_last_photons_fragment = fragment;
+  photons_last_fragment_store(toy, fragment);
   g_last_published_edge_count = capture.edge_count;
   g_last_fragment_race_cadence_tick_count =
       fragment.race_cadence_tick_count_total;
@@ -3330,8 +3410,6 @@ static void photons_fragment_tick(
   Payload& payload = photons_fragment_payload(fragment);
   if (publish("PHOTONS_FRAGMENT", payload)) {
     g_publish_count++;
-    g_last_fragment.publish_count = g_publish_count;
-    g_last_photons_fragment.publish_count = g_publish_count;
     if (fragment.recovery.restored &&
         fragment.recovery.proof_pending &&
         fragment.recovery.proof_advanced &&
@@ -3360,20 +3438,9 @@ static void photons_recovery_clear_physical_ancestry(void) {
   g_previous_fragment_mean_cycles_valid = false;
   g_previous_fragment_mean_cycles = 0.0;
 
-  g_photons_live.generation++;
-  photons_compiler_barrier();
-  g_photons_live.previous_edge_valid = false;
-  g_photons_live.previous_dwt_at_edge = 0U;
-  g_photons_live.previous_interval_valid = false;
-  g_photons_live.previous_interval_cycles = 0U;
-  g_photons_live.capture.interval_valid = false;
-  g_photons_live.capture.last_interval_cycles = 0U;
-  g_photons_live.capture.prediction_valid = false;
-  g_photons_live.capture.prediction_cycles = 0U;
-  g_photons_live.capture.residual_cycles = 0;
-  photons_compiler_barrier();
-  g_photons_live.generation++;
-
+  // g_photons_live is ISR-owned cumulative testimony. Recovery must never become
+  // a second writer to its seqlock. Reclaim ancestry by draining foreground
+  // custody and rebasing publication origins on a coherent live snapshot below.
   photons_race_prepare();
   g_projection_anchor_cache = photons_projection_anchor_cache_t{};
   photons_projection_anchor_refresh();
@@ -3399,8 +3466,7 @@ static void photons_recovery_clear_physical_ancestry(void) {
   g_last_fragment_race_skipped_projection_count = 0ULL;
   g_last_fragment_race_invalid_endpoint_count = 0ULL;
   g_last_fragment_race_enqueue_failure_count = 0ULL;
-  g_last_fragment = photons_toy_fragment_t{};
-  g_last_photons_fragment = photons_fragment_snapshot_t{};
+  photons_last_fragment_reset();
 }
 
 
@@ -3425,7 +3491,7 @@ static void photons_start_publication(void) {
   // A commissioning PULSE may have been armed before recovery/publication. It
   // has no authority to consume an edge once the recurring race engine starts.
   g_pulse_armed_sequence = 0U;
-  photons_pulse_receive_publish(photons_pulse_receive_value_t{});
+  photons_memory_barrier();
   g_last_pulse_launch = photons_pulse_launch_state_t{};
   photons_race_start();
 }
@@ -3438,9 +3504,14 @@ static void photons_start_publication(void) {
 FLASHMEM void process_photons_init(void) {
   if (g_initialized) return;
 
+  // This is the only foreground initialization of ISR-owned live capture and it
+  // occurs before PHOTODIODE subscription/start below. After interrupt_start(),
+  // only the detector callback may mutate g_photons_live.
   g_photons_live = photons_live_state_t{};
-  g_last_fragment = photons_toy_fragment_t{};
-  g_last_photons_fragment = photons_fragment_snapshot_t{};
+  g_last_fragment_generation = 0U;
+  photons_last_fragment_reset();
+  memset(&g_photons_fragment_build, 0, sizeof(g_photons_fragment_build));
+  memset(&g_photons_report_snapshot, 0, sizeof(g_photons_report_snapshot));
   g_fragment_sequence = 0U;
   g_publish_count = 0U;
   g_publish_reject_count = 0U;
@@ -3453,6 +3524,19 @@ FLASHMEM void process_photons_init(void) {
   g_last_fragment_race_skipped_projection_count = 0ULL;
   g_last_fragment_race_invalid_endpoint_count = 0ULL;
   g_last_fragment_race_enqueue_failure_count = 0ULL;
+
+  // Establish cross-context mailboxes before the PHOTODIODE subscription exists.
+  // After interrupt_start() below, only the detector callback may mutate receive
+  // mailbox contents; foreground owns only the arm/launch side of each handoff.
+  g_race_armed_sequence = 0U;
+  g_photons_race_receive.generation = 0U;
+  g_photons_race_receive.value = photons_race_receive_value_t{};
+  g_pulse_armed_sequence = 0U;
+  g_pulse_sequence = 0U;
+  g_last_pulse_launch = photons_pulse_launch_state_t{};
+  g_last_pulse_receive.generation = 0U;
+  g_last_pulse_receive.value = photons_pulse_receive_value_t{};
+
   g_interrupt_ancestry = photons_interrupt_ancestry_t{};
   g_fragment_timer = TIMEPOP_INVALID_HANDLE;
   g_photons_recovery_protocol = photons_recovery_protocol_t{};
@@ -4534,8 +4618,19 @@ static FLASHMEM Payload cmd_recovery_proof_ack(const Payload& args) {
 }
 
 
+static constexpr size_t PHOTONS_OPERATIONAL_REPORT_RESERVE_BYTES = 4096U;
+
+static void photons_prepare_operational_report(Payload& p) {
+  // Substantial command reports should not mutate through Payload's small inline
+  // representation and then grow mid-document. Establish one complete backing
+  // store before the first semantic mutation.
+  p.reserve(PHOTONS_OPERATIONAL_REPORT_RESERVE_BYTES);
+}
+
+
 static FLASHMEM Payload cmd_report_recovery(const Payload& /*args*/) {
   Payload p;
+  photons_prepare_operational_report(p);
   p.add("report", "PHOTONS_RECOVERY");
   p.add("schema", "PHOTONS_RECOVERY_REPORT_V1");
   p.add("restore_schema_version", PHOTONS_RECOVERY_SCHEMA_VERSION);
@@ -4767,10 +4862,14 @@ static void photons_payload_add_flat_ppb_bucket(
 
 
 static FLASHMEM Payload cmd_report_photons(const Payload& /*args*/) {
-  photons_fragment_snapshot_t canonical{};
-  (void)photons_fragment_snapshot(&canonical);
+  // Both the canonical publisher and command dispatcher are foreground-owned;
+  // use the immutable last-completed value directly instead of placing another
+  // ~1.7 KiB copy on MSP.
+  const photons_fragment_snapshot_t& canonical =
+      photons_report_fragment_snapshot();
 
   Payload p;
+  photons_prepare_operational_report(p);
   p.add("report", "PHOTONS_INSTRUMENT");
   p.add("schema", "PHOTONS_INSTRUMENT_REPORT_V1");
   p.add("ppb_semantics", "LAP_BASELINE_NS_OFFSET_V1");
@@ -4880,10 +4979,11 @@ static FLASHMEM Payload cmd_report_photons(const Payload& /*args*/) {
 
 
 static FLASHMEM Payload cmd_report_stats(const Payload& /*args*/) {
-  photons_fragment_snapshot_t canonical{};
-  (void)photons_fragment_snapshot(&canonical);
+  const photons_fragment_snapshot_t& canonical =
+      photons_report_fragment_snapshot();
 
   Payload p;
+  photons_prepare_operational_report(p);
   p.add("report", "PHOTONS_STATS");
   p.add("schema", "PHOTONS_INSTRUMENT_STATS_REPORT_V1");
   p.add("ppb_semantics", "LAP_BASELINE_NS_OFFSET_V1");
@@ -5023,14 +5123,15 @@ static FLASHMEM Payload cmd_inject_problem(const Payload& /*args*/) {
 }
 
 static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
-  photons_fragment_snapshot_t canonical{};
-  (void)photons_fragment_snapshot(&canonical);
+  const photons_fragment_snapshot_t& canonical =
+      photons_report_fragment_snapshot();
 
   interrupt_photodiode_diag_t interrupt_diag{};
   (void)interrupt_photodiode_snapshot(&interrupt_diag);
   const photons_device_snapshot_t device = photons_device_snapshot();
 
   Payload p;
+  photons_prepare_operational_report(p);
   p.add("report", "PHOTONS");
   p.add("schema", "PHOTONS_REPORT_V3");
   p.add("ppb_semantics", "LAP_BASELINE_NS_OFFSET_V1");
@@ -5140,6 +5241,7 @@ static FLASHMEM Payload cmd_report_pulse(const Payload& /*args*/) {
   const photons_pulse_launch_state_t pulse_launch = g_last_pulse_launch;
 
   Payload p;
+  photons_prepare_operational_report(p);
   p.add("report", "PHOTONS_PULSE");
   p.add("schema", "PHOTONS_PULSE_REPORT_V2");
   p.add("race_engine_active",
@@ -5153,13 +5255,13 @@ static FLASHMEM Payload cmd_report_pulse(const Payload& /*args*/) {
   p.add("pulse_sequence", pulse_launch.sequence);
   p.add("pulse_requested_ns", pulse_launch.requested_ns);
   p.add("pulse_wall_cycles", pulse_launch.pulse_wall_cycles);
-  p.add("pulse_armed", g_pulse_armed_sequence == pulse_launch.sequence);
-  p.add("pulse_callback_delta",
-        interrupt_diag.callback_count - pulse_launch.callback_count_start);
-
   const bool finish_seen =
       pulse_receive.seen &&
       pulse_receive.pulse_sequence == pulse_launch.sequence;
+  p.add("pulse_armed",
+        g_pulse_armed_sequence == pulse_launch.sequence && !finish_seen);
+  p.add("pulse_callback_delta",
+        interrupt_diag.callback_count - pulse_launch.callback_count_start);
   p.add("receive_seen", finish_seen);
 
   uint64_t finish_gnss_ns = 0ULL;
@@ -5245,18 +5347,26 @@ static FLASHMEM Payload cmd_pulse(const Payload& args) {
     return p;
   }
 
-  const uint32_t overwritten_pending_sequence = g_pulse_armed_sequence;
+  // Close the old arm first, then snapshot the ISR-owned mailbox. If an edge had
+  // already entered the callback under the old arm it completes before foreground
+  // resumes; any later callback observes arm=0. This gives one exact pending verdict.
+  const uint32_t previous_armed_sequence = g_pulse_armed_sequence;
   g_pulse_armed_sequence = 0U;
-  photons_compiler_barrier();
+  photons_memory_barrier();
+  photons_pulse_receive_value_t previous_receive{};
+  (void)photons_pulse_receive_snapshot(&previous_receive);
+  const bool previous_receive_pending =
+      previous_armed_sequence != 0U &&
+      !(previous_receive.seen &&
+        previous_receive.pulse_sequence == previous_armed_sequence);
 
   g_pulse_sequence++;
   if (g_pulse_sequence == 0U) g_pulse_sequence++;
   const uint32_t pulse_sequence = g_pulse_sequence;
 
   g_last_pulse_launch = photons_pulse_launch_state_t{};
-  photons_pulse_receive_publish(photons_pulse_receive_value_t{});
   g_pulse_armed_sequence = pulse_sequence;
-  photons_compiler_barrier();
+  photons_memory_barrier();
 
   const uint32_t start_dwt = ARM_DWT_CYCCNT;
   digitalWriteFast(LD_ON_PIN, HIGH);
@@ -5281,7 +5391,7 @@ static FLASHMEM Payload cmd_pulse(const Payload& args) {
       start_gnss_valid ? start_gnss_ns : 0ULL;
   g_last_pulse_launch.pulse_wall_cycles = pulse_wall_cycles;
   g_last_pulse_launch.callback_count_start = interrupt_before.callback_count;
-  photons_compiler_barrier();
+  photons_memory_barrier();
   g_last_pulse_launch.valid = true;
 
   Payload p;
@@ -5293,9 +5403,9 @@ static FLASHMEM Payload cmd_pulse(const Payload& args) {
   p.add("pulse_start_dwt", start_dwt);
   p.add("pulse_start_gnss_valid", start_gnss_valid);
   if (start_gnss_valid) p.add("pulse_start_gnss_ns", start_gnss_ns);
-  p.add("previous_receive_pending", overwritten_pending_sequence != 0U);
-  if (overwritten_pending_sequence != 0U) {
-    p.add("overwritten_pending_sequence", overwritten_pending_sequence);
+  p.add("previous_receive_pending", previous_receive_pending);
+  if (previous_receive_pending) {
+    p.add("overwritten_pending_sequence", previous_armed_sequence);
   }
   return p;
 }
