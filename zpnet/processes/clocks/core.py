@@ -334,8 +334,10 @@ STARTUP_ALPHA_EPOCH_POLL_S = 0.25
 STARTUP_ALPHA_EPOCH_STATUS_LOG_INTERVAL_S = 10.0
 # Producer survival must be decided from current-lifetime canonical testimony.
 # A retained pre-flash row may be delivered immediately after firmware restart;
-# staleness is therefore inconclusive, never evidence authorizing mutation.
-STARTUP_SURVIVAL_FRESH_WITNESS_TIMEOUT_S = 10.0
+# receipt freshness is therefore insufficient. Wait through the bounded newborn-
+# Alpha acquisition window for a row that actually entered CLOCKS after the current
+# transport/session admission barrier.
+STARTUP_SURVIVAL_FRESH_WITNESS_TIMEOUT_S = RECOVERY_DEAD_PRODUCER_FIRST_ROW_TIMEOUT_S
 HOLISTIC_RESTORE_TIMEOUT_S = 60.0
 HOLISTIC_RESTORE_COMMAND_RETRY_S = 10.0
 
@@ -2629,6 +2631,10 @@ _latest_clocks: Dict[str, Any] = {}
 _latest_clocks_ppb_restore_checkpoint: Optional[Dict[str, Any]] = None
 _latest_clocks_received_monotonic: Optional[float] = None
 _latest_clocks_received_utc: Optional[str] = None
+# A startup survival witness must have entered CLOCKS after the current Teensy
+# transport was admitted.  PUBSUB may replay an old producer tail into the new
+# process before that point; state-worker processing time must never freshen it.
+_startup_survival_ingress_barrier_monotonic: Optional[float] = None
 
 _last_pps_vclock_count_seen: Optional[int] = None
 
@@ -8098,15 +8104,17 @@ def _wait_for_holistic_restore(
 
 
 def _wait_for_fresh_survival_witness() -> Tuple[Dict[str, Any], Optional[float], Optional[str]]:
-    """Return testimony sufficient to classify current Alpha producer lifetime.
+    """Return current-session testimony sufficient to classify Alpha lifetime.
 
-    Ordinarily this requires a fresh canonical CLOCKS row: PUBSUB may deliver a
-    retained pre-restart row immediately after reconnect, and receipt freshness is
-    not producer-lifetime freshness.  During live recovery, however, a regression
-    of the boot-local physical CLOCKS sequence is already positive proof that the
-    prior producer lifetime ended.  Once recovery custody owns that witness, do not
-    wait for a row whose only purpose was to decide survival; return the best current
-    canonical testimony and let the caller force the dead-producer branch.
+    PUBSUB may deliver a retained pre-flash producer tail into a newly started
+    CLOCKS process.  The state worker can process that tail much later, so cache
+    processing time is not producer-lifetime freshness.  A startup survival row
+    is eligible only when its original PUBSUB ingress timestamp follows the
+    current Teensy transport-admission barrier.
+
+    During live recovery a proved boot-local physical sequence regression remains
+    positive evidence that the prior producer lifetime ended and may return the
+    best current testimony immediately.
     """
     deadline = time.monotonic() + STARTUP_SURVIVAL_FRESH_WITNESS_TIMEOUT_S
     while True:
@@ -8121,13 +8129,27 @@ def _wait_for_fresh_survival_witness() -> Tuple[Dict[str, Any], Optional[float],
         )
         if _recovery_custody_requires_cold_restore():
             return state, age_s, received_utc
-        if state and age_s is not None and age_s <= CLOCKS_PREFLIGHT_MAX_AGE_S:
+        current_session_ingress = bool(
+            received_monotonic is not None
+            and (
+                _startup_survival_ingress_barrier_monotonic is None
+                or received_monotonic > _startup_survival_ingress_barrier_monotonic
+            )
+        )
+        if (
+            state
+            and current_session_ingress
+            and age_s is not None
+            and age_s <= CLOCKS_PREFLIGHT_MAX_AGE_S
+        ):
             return state, age_s, received_utc
         if time.monotonic() >= deadline:
             raise RuntimeError(
-                "cannot classify CLOCKS producer lifetime without fresh canonical "
-                f"testimony within {STARTUP_SURVIVAL_FRESH_WITNESS_TIMEOUT_S:.1f}s "
-                f"(last_age_s={age_s})"
+                "cannot classify CLOCKS producer lifetime without current-session "
+                "canonical testimony after the transport admission barrier within "
+                f"{STARTUP_SURVIVAL_FRESH_WITNESS_TIMEOUT_S:.1f}s "
+                f"(last_age_s={age_s} ingress={received_monotonic} "
+                f"barrier={_startup_survival_ingress_barrier_monotonic})"
             )
         time.sleep(0.05)
 
@@ -8363,6 +8385,71 @@ def _restore_instrument_from_clocks(
         if isinstance(active_campaign, dict)
         else ""
     )
+
+    # Pi-only restart fast path: the canonical CLOCKS_FRAGMENT stream is the
+    # producer-survival court.  If one fresh row proves lawful descent from the
+    # durable Alpha and no physical sequence regression has been observed, return
+    # before issuing *any* Teensy RPC.
+    startup_live_clocks, startup_live_age_s, startup_live_received_utc = (
+        _wait_for_fresh_survival_witness()
+    )
+    startup_live_campaign = _state_campaign(startup_live_clocks)
+    startup_live_campaign_name = (
+        _tempest_campaign_name(startup_live_campaign)
+        if isinstance(startup_live_campaign, dict) and startup_live_campaign
+        else ""
+    )
+    startup_live_campaign_state = str(
+        startup_live_campaign.get("state")
+        if isinstance(startup_live_campaign, dict)
+        else ""
+    ).strip().upper()
+    startup_alpha_lineage = _alpha_survival_lineage_court(
+        clocks,
+        startup_live_clocks,
+        live_age_s=startup_live_age_s,
+    )
+    if (
+        startup_alpha_lineage.get("proved") is True
+        and not _recovery_custody_requires_cold_restore()
+    ):
+        producer_witness = {
+            "source": "CLOCKS_FRAGMENT",
+            "sequence": _as_int(startup_live_clocks.get("sequence")),
+            "received_at_utc": startup_live_received_utc,
+            "age_s": (
+                None
+                if startup_live_age_s is None
+                else round(float(startup_live_age_s), 3)
+            ),
+            "campaign": startup_live_campaign_name or None,
+            "campaign_state": startup_live_campaign_state or None,
+            "statistics_reset_count": startup_alpha_lineage.get("live_reset_count"),
+            "statistics_update_count": startup_alpha_lineage.get("live_update_count"),
+            "teensy_rpc_used": False,
+        }
+        logging.info(
+            "✅ [holistic restore/live probe] flowing CLOCKS_FRAGMENT proves surviving "
+            "Alpha with zero Teensy RPC: statistics continue %s -> %s in reset epoch "
+            "%s; live CLOCKS sequence=%s age=%.3fs campaign=%s/%s",
+            startup_alpha_lineage.get("durable_update_count"),
+            startup_alpha_lineage.get("live_update_count"),
+            startup_alpha_lineage.get("live_reset_count"),
+            _as_int(startup_live_clocks.get("sequence")),
+            float(startup_live_age_s or 0.0),
+            startup_live_campaign_name or "NONE",
+            startup_live_campaign_state or "NONE",
+        )
+        return complete_surviving_producer_proof(
+            producer_witness,
+            basis="CLOCKS_FRAGMENT_DESCENDANT_SURVIVING_ALPHA",
+            alpha_proof=startup_alpha_lineage,
+            observed_campaign_name=startup_live_campaign_name,
+            observed_campaign_state=startup_live_campaign_state,
+        )
+
+    # Only a producer that failed the canonical descendant court may enter the
+    # existing firmware lifecycle/dead-producer court below.
     lifecycle_status = _fetch_teensy_recovery_status()
     firmware_campaign = str(lifecycle_status.get("campaign") or "").strip()
     firmware_campaign_state = str(
@@ -9177,24 +9264,6 @@ def _adopt_surviving_clocks_producer(
     ) or gnss_raw is None:
         raise RuntimeError("live CLOCKS adoption snapshot lacks Pi recovery custody")
 
-    lifecycle_status = _fetch_teensy_recovery_status()
-    firmware_campaign = str(lifecycle_status.get("campaign") or "").strip()
-    firmware_state = str(
-        lifecycle_status.get("campaign_state") or ""
-    ).strip().upper()
-    firmware_recovery_active = _recovery_bool(
-        lifecycle_status.get("recover_lifecycle_active")
-    )
-    if (
-        firmware_recovery_active
-        or not _recovery_bool(lifecycle_status.get("recover_epoch_ready"))
-    ):
-        raise RuntimeError(
-            "CLOCKS producer changed eligibility before adoption: "
-            f"recovery_active={firmware_recovery_active} "
-            f"epoch_ready={lifecycle_status.get('recover_epoch_ready')} "
-        )
-
     with _clocks_lock:
         live_state = copy.deepcopy(_latest_clocks)
         live_received_monotonic = _latest_clocks_received_monotonic
@@ -9215,8 +9284,27 @@ def _adopt_surviving_clocks_producer(
             f"{descendant!r}"
         )
 
-    # Everything below this point is read-only producer access or Pi-owned state.
-    ppb_refresh = _refresh_ppb_checkpoint_from_proved_alpha()
+    # Everything below this point is Pi-owned state.  Better-Buckets resumes from
+    # the durable singleton plus the ordinary producer-authored deltas already
+    # carried on CLOCKS_FRAGMENT.  Do not query Alpha with PPB_EXPORT_* merely to
+    # accelerate convergence after an observer gap.
+    with _ppb_checkpoint_lock:
+        ppb_runtime = _ppb_checkpoint_runtime_ensure_locked()
+        ppb_snapshot = _ppb_checkpoint_snapshot_locked(ppb_runtime)
+    ppb_refresh = {
+        "refreshed": False,
+        "basis": "CLOCKS_FRAGMENT_DELTA_CUSTODY",
+        "teensy_rpc_used": False,
+        "recoverable": bool(ppb_snapshot.get("recoverable")),
+        "status": ppb_snapshot.get("status"),
+        "reset_count": ppb_snapshot.get("reset_count"),
+        "update_count": ppb_snapshot.get("update_count"),
+        "second_count": int(ppb_snapshot.get("second_count") or 0),
+        "expected_second_count": int(ppb_snapshot.get("expected_second_count") or 0),
+        "minute_count": int(ppb_snapshot.get("minute_count") or 0),
+        "expected_minute_count": int(ppb_snapshot.get("expected_minute_count") or 0),
+        "gap_count": int(ppb_snapshot.get("gap_count") or 0),
+    }
     pi_control = _dac_restore_control_from_clocks(clocks, realize=True)
     gnss_raw_result = _restore_gnss_raw_payload(gnss_raw)
     if not gnss_raw_result.get("restored"):
@@ -9252,10 +9340,10 @@ def _adopt_surviving_clocks_producer(
 
     campaign_adoption: Dict[str, Any]
     recovery_custody: Optional[Dict[str, Any]] = None
-    if firmware_state == "STARTED":
-        if not campaign_name or firmware_campaign != campaign_name:
+    if live_campaign_state == "STARTED":
+        if not campaign_name or live_campaign_name != campaign_name:
             raise RuntimeError(
-                "surviving CLOCKS producer owns an active campaign that does not "
+                "surviving CLOCKS_FRAGMENT owns an active campaign that does not "
                 "match durable Pi intent"
             )
         if (
@@ -9346,20 +9434,18 @@ def _adopt_surviving_clocks_producer(
             _campaign_active = False
             _clear_sync_wait()
             raise
-    elif firmware_state in {"", "STOPPED", "IDLE", "NONE"}:
-        if firmware_campaign and campaign_name and firmware_campaign != campaign_name:
+    elif live_campaign_state in {"", "STOPPED", "IDLE", "NONE"}:
+        if live_campaign_name and campaign_name and live_campaign_name != campaign_name:
             raise RuntimeError(
-                "stopped surviving CLOCKS producer retains a different campaign "
-                f"identity: producer={firmware_campaign!r} durable={campaign_name!r}"
+                "stopped surviving CLOCKS_FRAGMENT retains a different campaign "
+                f"identity: producer={live_campaign_name!r} durable={campaign_name!r}"
             )
 
         if active_campaign is not None:
-            # Durable Pi intent still says RUNNING.  A STOPPED Beta on the same
-            # proved Alpha therefore means recording execution was surrendered,
-            # not that the operator stopped the campaign.  Rearm only Beta.
-            campaign_adoption, recovery_custody = _rearm_surviving_clocks_campaign(
-                snapshot_detail=snapshot_detail,
-                active_campaign=active_campaign,
+            raise RuntimeError(
+                "durable TEMPEST intent is active but the proved surviving "
+                "CLOCKS_FRAGMENT stream says Beta is stopped; zero-RPC live recovery "
+                "refuses CLOCKS.REARM or any other Teensy command"
             )
         else:
             if _recovery_custody_snapshot().get("active"):
@@ -9378,32 +9464,30 @@ def _adopt_surviving_clocks_producer(
             _gnss_canary_reset()
             campaign_adoption = {
                 "state": "STOPPED",
-                "campaign": firmware_campaign or None,
+                "campaign": live_campaign_name or None,
                 "master_mutated": False,
                 "alpha_mutated": False,
                 "campaign_execution_mutated": False,
             }
     else:
         raise RuntimeError(
-            f"surviving CLOCKS producer is in non-adoptable campaign state {firmware_state!r}"
+            f"surviving CLOCKS_FRAGMENT producer is in non-adoptable campaign state {live_campaign_state!r}"
         )
 
-    campaign_execution_mutated = bool(
-        campaign_adoption.get("campaign_execution_mutated")
-    )
     result = {
         "success": True,
         "mode": "LIVE_PRODUCER_ADOPT",
         "producer_reuse": True,
-        "producer_mutated": campaign_execution_mutated,
-        "producer_mutation_commands": (
-            ["CLOCKS.REARM"] if campaign_execution_mutated else []
-        ),
+        "producer_mutated": False,
+        "producer_mutation_commands": [],
+        "teensy_rpc_used": False,
         "alpha_mutated": False,
         "snapshot_detail_id": _as_int(snapshot_detail.get("_db_detail_id")),
         "producer_descendant_proof": descendant,
-        "firmware_campaign_state": firmware_state or "STOPPED",
-        "firmware_campaign": firmware_campaign or None,
+        # Compatibility field names; values come from CLOCKS_FRAGMENT, not RPC.
+        "firmware_campaign_state": live_campaign_state or "STOPPED",
+        "firmware_campaign": live_campaign_name or None,
+        "campaign_witness_source": "CLOCKS_FRAGMENT",
         "canonical_probe_sequence": _as_int(live_state.get("sequence")),
         "canonical_probe_received_at_utc": live_received_utc,
         "canonical_probe_age_s": (
@@ -9421,11 +9505,10 @@ def _adopt_surviving_clocks_producer(
         **copy.deepcopy(result),
     }
     logging.info(
-        "✅ [holistic restore] surviving Alpha proved and adopted: campaign=%s "
-        "observed_state=%s campaign_execution_mutated=%s",
-        firmware_campaign or "NONE",
-        firmware_state or "STOPPED",
-        campaign_execution_mutated,
+        "✅ [holistic restore] surviving Alpha/Beta adopted from CLOCKS_FRAGMENT with "
+        "zero Teensy RPC: campaign=%s observed_state=%s",
+        live_campaign_name or "NONE",
+        live_campaign_state or "STOPPED",
     )
     return result
 
@@ -12538,36 +12621,13 @@ def _first_float(*values: Any) -> Optional[float]:
             return f
     return None
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 def _normalize_start_args(args: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Return campaign lifecycle arguments without control-plane rewriting."""
     return dict(args or {})
 
-
-
-
 # ---------------------------------------------------------------------
 # Asynchronous START helpers
 # ---------------------------------------------------------------------
-
 
 def _mark_start_waiting(campaign: str) -> None:
     """Record that START returned before the first CLOCKS_FRAGMENT campaign delta."""
@@ -13436,6 +13496,9 @@ def _persist_clocks_state(
 def _cache_clocks_state(
     state: Dict[str, Any],
     ppb_restore_checkpoint: Optional[Dict[str, Any]] = None,
+    *,
+    received_monotonic: Optional[float] = None,
+    received_utc: Optional[str] = None,
 ) -> None:
     global _latest_clocks, _latest_clocks_ppb_restore_checkpoint
     global _latest_clocks_received_monotonic, _latest_clocks_received_utc
@@ -13446,15 +13509,28 @@ def _cache_clocks_state(
             if isinstance(ppb_restore_checkpoint, dict)
             else None
         )
-        _latest_clocks_received_monotonic = time.monotonic()
-        _latest_clocks_received_utc = str(state.get("published_at_utc") or system_time_z())
+        _latest_clocks_received_monotonic = (
+            float(received_monotonic)
+            if received_monotonic is not None
+            else time.monotonic()
+        )
+        _latest_clocks_received_utc = str(
+            received_utc or state.get("published_at_utc") or system_time_z()
+        )
     _diag["preflight_clocks_updates"] += 1
 
 
-def _queue_clocks_state(fragment: Dict[str, Any]) -> None:
+def _queue_clocks_state(
+    fragment: Dict[str, Any],
+    *,
+    ingress_monotonic: float,
+    ingress_utc: str,
+) -> None:
     global _clocks_state_enqueued, _clocks_state_dropped
     item = {
         "fragment": copy.deepcopy(fragment),
+        "ingress_monotonic": float(ingress_monotonic),
+        "ingress_utc": str(ingress_utc),
         "ppb_restore_transaction_ingress": _ppb_restore_transaction_active.is_set(),
     }
     try:
@@ -13830,6 +13906,16 @@ def _clocks_state_loop() -> None:
     while True:
         queue_item = _clocks_state_queue.get()
         clocks_fragment = queue_item.get("fragment") if isinstance(queue_item, dict) else None
+        ingress_monotonic = (
+            queue_item.get("ingress_monotonic")
+            if isinstance(queue_item, dict)
+            else None
+        )
+        ingress_utc = (
+            queue_item.get("ingress_utc")
+            if isinstance(queue_item, dict)
+            else None
+        )
         ingress_during_ppb_restore = bool(
             queue_item.get("ppb_restore_transaction_ingress")
             if isinstance(queue_item, dict)
@@ -13991,7 +14077,14 @@ def _clocks_state_loop() -> None:
                 )
                 continue
 
-        _cache_clocks_state(state, ppb_restore_checkpoint)
+        _cache_clocks_state(
+            state,
+            ppb_restore_checkpoint,
+            received_monotonic=(
+                float(ingress_monotonic) if ingress_monotonic is not None else None
+            ),
+            received_utc=(str(ingress_utc) if ingress_utc is not None else None),
+        )
         if not _hard_failure_active():
             publish(CLOCKS_TOPIC, state)
             _clocks_state_published += 1
@@ -14221,6 +14314,8 @@ def on_clocks_fragment(payload: Payload) -> None:
         _diag["clocks_fragments_malformed"] = _diag.get("clocks_fragments_malformed", 0) + 1
         return
 
+    ingress_monotonic = time.monotonic()
+    ingress_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     fragment = dict(payload)
     if fragment.get("schema") != "CLOCKS_FRAGMENT_V4":
         _diag["clocks_fragments_malformed"] = _diag.get("clocks_fragments_malformed", 0) + 1
@@ -14252,7 +14347,11 @@ def on_clocks_fragment(payload: Payload) -> None:
             _diag.get("clocks_fragments_observation_only", 0) + 1
         )
 
-    _queue_clocks_state(fragment)
+    _queue_clocks_state(
+        fragment,
+        ingress_monotonic=ingress_monotonic,
+        ingress_utc=ingress_utc,
+    )
 
 
 
@@ -18706,6 +18805,8 @@ def on_publication(topic: str, payload: Dict[str, Any]) -> None:
 # ---------------------------------------------------------------------
 
 def run() -> None:
+    global _startup_survival_ingress_barrier_monotonic
+
     setup_logging()
     _setup_invalid_timebase_logger()
     _hard_failure_event.clear()
@@ -18733,6 +18834,7 @@ def run() -> None:
     _startup_instrument_restore_hold.clear()
     _startup_physical_lifetime_unclassified.clear()
     _ambient_instrument_recovery_hold.clear()
+    _startup_survival_ingress_barrier_monotonic = None
     _diag["startup_control_ready"] = False
 
     _dac_start_control_thread()
@@ -18787,15 +18889,20 @@ def run() -> None:
         name="clocks-tempest",
     ).start()
 
-    # Cold power-up is physical, not a timer contract.  First make the durable
-    # SYSTEM location real on the GF-8802.  Then let the newborn Teensy lifetime
-    # earn its SmartZero-backed Alpha epoch before any restored-row proof clock
-    # starts.  Only after that physical boundary exists do we require the normal
-    # full preflight: fresh CLOCKS heartbeat, exact TPS4 FINE_LOCK, receiver mode,
-    # and chrony PPS selection.  The 60-second holistic proof deadline begins
-    # later, inside restore, when firmware is actually capable of producing it.
+    # Rows delivered before this point may be PUBSUB's retained tail from a
+    # producer lifetime that disappeared during flash. Preserve them as evidence,
+    # but never let later state-worker processing freshen them into survival proof.
+    _startup_survival_ingress_barrier_monotonic = time.monotonic()
+    logging.info(
+        "🧭 [clocks/startup] armed current-session CLOCKS_FRAGMENT survival barrier; "
+        "only rows entering PUBSUB/CLOCKS after worker admission can prove Alpha survived"
+    )
+
+    # First prove startup from the ordinary CLOCKS_FRAGMENT stream.  A surviving
+    # Teensy therefore receives no lifecycle/status RPC at all during Pi-only
+    # recovery.  If canonical descendant proof later fails, the existing dead-
+    # producer branch is still free to wait for Alpha and use firmware recovery.
     startup_location = _wait_for_startup_location()
-    _wait_for_startup_alpha_epoch()
     required_receiver_mode = str(
         startup_location.get("verified_pos_mode_name") or ""
     ).upper()
@@ -18804,7 +18911,7 @@ def run() -> None:
         required_gnss_freq_mode=STARTUP_REQUIRED_GNSS_FREQ_MODE,
         required_gnss_freq_mode_name="FINE_LOCK",
         required_receiver_mode=required_receiver_mode,
-        allow_restore_court_entry=True,
+        allow_restore_court_entry=False,
     )
 
     _set_operational_state(

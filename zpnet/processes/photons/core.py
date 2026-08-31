@@ -27,9 +27,9 @@ Baselines remain campaign-to-campaign relationships stored by campaign_master ID
 No baseline statistics are copied into firmware and ``photons.baseline`` remains
 untouched.  Durable recovery restores aggregate sufficient state plus only the
 bounded PPB endpoint history the Pi literally possesses.  A surviving producer is
-never repaired or replayed: Pi proves monotonic descent from the durable snapshot,
-reacquires the producer's exact current bounded rings through the read-only export
-court, restores Pi-owned custody, and adopts the producer's current LANTERN state.
+never repaired, replayed, or interrogated merely because the Pi restarted: current-
+session PHOTONS_FRAGMENT testimony proves monotonic descent, Pi restores only its
+own custody, and ordinary producer-authored deltas warm any observations it missed.
 If the producer was lost, held restore may deliberately install only the literal
 suffix Pi already possesses and surrender unseen rolling ancestry instead of
 inventing it.  Physical edge ancestry is always reacquired after restart.
@@ -142,12 +142,18 @@ STARTUP_INFRASTRUCTURE_POLL_S = 0.5
 STARTUP_INFRASTRUCTURE_QUIET_GRACE_S = 5.0
 STARTUP_INFRASTRUCTURE_STATUS_LOG_INTERVAL_S = 30.0
 
+# A healthy always-on producer emits PHOTONS_FRAGMENT at 1 Hz.  After a new Pi
+# observer or transport generation is admitted, give that canonical stream a
+# bounded opportunity to prove survival before issuing any Teensy-side recovery
+# RPC.  A newborn PHOTONS producer is intentionally held/silent, so timeout is not
+# failure: it is permission to enter the existing firmware recovery court.
+PHOTONS_SURVIVAL_FRAGMENT_TIMEOUT_S = 5.0
+
 # Runtime producer-lifetime reconciliation.  PUBSUB transport generation is an
 # infrastructure boundary, not by itself proof that the Teensy rebooted.  PHOTONS
-# pauses canonical authorship on a proved generation change, then asks the
-# firmware recovery surface whether publication survived.  A surviving producer
-# is released untouched; a newborn held producer is resurrected from the newest
-# durable PHOTONS boundary through the same exact-N+1 court used at startup.
+# first waits for post-boundary PHOTONS_FRAGMENT descent.  A surviving producer is
+# released untouched; only a producer not proved healthy by the stream enters the
+# firmware recovery surface and, if newborn/held, exact-N+1 resurrection.
 PHOTONS_RUNTIME_RECOVERY_POLL_S = 0.25
 PHOTONS_RUNTIME_RECOVERY_BARRIER_LOG_S = 30.0
 
@@ -213,6 +219,8 @@ _state_worker_maintenance_quiescent = threading.Event()
 _persistence_worker_maintenance_quiescent = threading.Event()
 
 _latest_fragment: Optional[Payload] = None
+_latest_fragment_received_monotonic: Optional[float] = None
+_latest_fragment_received_utc: Optional[str] = None
 _latest_photons: Optional[Payload] = None
 
 # One active Pi lifecycle plus any STOP-requested lifecycle whose firmware-authored
@@ -264,10 +272,11 @@ _last_persistence_failure: Optional[Dict[str, Any]] = None
 _recovery_proof_expected: Optional[Dict[str, Any]] = None
 _recovery_proof_persisted: Optional[Dict[str, Any]] = None
 # LIVE_PRODUCER_ADOPT temporarily owns rolling-custody reconciliation while
-# the ordinary state worker catches the retained restart backlog up to an exact
-# read-only producer-ring rendezvous.  This is transaction ownership, not a
-# validity flag: outside this narrow startup court, rolling custody loss remains
-# an immediate HARD_FAILURE.
+# the ordinary state worker catches the retained restart backlog.  Healthy startup
+# does not query/export producer rings: any Pi observation gap remains explicit and
+# the literal checkpoint warms forward from ordinary PHOTONS_FRAGMENT deltas.  This
+# is transaction ownership, not a validity flag: outside this narrow startup court,
+# producer-declared rolling custody loss remains an immediate HARD_FAILURE.
 _startup_live_adopt_custody_active = threading.Event()
 _recovery_status: Dict[str, Any] = {
     "schema": "PHOTONS_PI_RECOVERY_V1",
@@ -2178,11 +2187,11 @@ def _ppb_checkpoint_ingest(stats: Dict[str, Any]) -> Dict[str, Any]:
 
             # A Pi observation gap destroys Pi-owned literal ring custody, but it
             # does not destroy the surviving Teensy producer's Better-Buckets
-            # ancestry.  Startup live adoption already performs an explicit full-ring
-            # export before campaign control opens.  During ordinary RUNNING state,
-            # request the same read-only producer-authority reacquisition asynchronously
-            # so the state worker can continue ingesting rows and meet the export court
-            # at one exact live endpoint.  Never reconstruct the missing rows locally.
+            # ancestry.  During startup live adoption we deliberately do not query the
+            # healthy producer; the checkpoint remains warming from ordinary deltas.
+            # During ordinary RUNNING state, a newly detected gap may still request the
+            # existing read-only producer-authority reacquisition asynchronously.
+            # Never reconstruct the missing rows locally.
             if _campaign_control_ready.is_set():
                 _ppb_checkpoint_reacquire_request_count += 1
                 _ppb_checkpoint_reacquire_requested.set()
@@ -4972,6 +4981,149 @@ def _validate_live_teensy_against_durable_source(
     return floor
 
 
+def _wait_for_current_session_photons_fragment(
+    *,
+    ingress_barrier_monotonic: float,
+    timeout_s: float = PHOTONS_SURVIVAL_FRAGMENT_TIMEOUT_S,
+) -> Tuple[Optional[Payload], Optional[float], Optional[str]]:
+    """Return one fragment that entered PHOTONS after the current session barrier.
+
+    PUBSUB may deliver a retained pre-flash tail into a newly started process.
+    Survival therefore depends on the timestamp captured in on_photons_fragment(),
+    never on when a later worker happens to consume the queued row.  Timeout is a
+    classification result, not an error: newborn PHOTONS is intentionally silent.
+    """
+    deadline = time.monotonic() + float(timeout_s)
+    while True:
+        with _state_lock:
+            fragment = copy.deepcopy(_latest_fragment)
+            received_monotonic = _latest_fragment_received_monotonic
+            received_utc = _latest_fragment_received_utc
+        if (
+            isinstance(fragment, dict)
+            and received_monotonic is not None
+            and float(received_monotonic) > float(ingress_barrier_monotonic)
+        ):
+            age_s = max(0.0, time.monotonic() - float(received_monotonic))
+            return fragment, age_s, received_utc
+        if time.monotonic() >= deadline:
+            return None, None, None
+        time.sleep(0.05)
+
+
+def _live_fragment_recovery_witness(
+    fragment: Payload,
+    *,
+    source: Optional[Dict[str, Any]],
+    active_master: Optional[Dict[str, Any]],
+    active_detail_present: bool,
+) -> Dict[str, Any]:
+    """Project the normal PHOTONS_FRAGMENT into a zero-RPC survival witness."""
+    sequence, publish_count, _pps_count, instrument = _validate_photons_fragment(fragment)
+    stats = _require_dict(instrument.get("stats"), "PHOTONS_FRAGMENT.photons.stats")
+    recovery = _require_dict(
+        instrument.get("recovery"), "PHOTONS_FRAGMENT.photons.recovery"
+    )
+
+    baseline_fs = _require_int(
+        stats.get("lap_baseline_fs"),
+        "PHOTONS_FRAGMENT.photons.stats.lap_baseline_fs",
+        minimum=1,
+    )
+    if _lap_baseline_fs is None or int(baseline_fs) != int(_lap_baseline_fs):
+        raise RuntimeError(
+            "current-session PHOTONS_FRAGMENT LAP_BASELINE_NS disagrees with config: "
+            f"fragment_fs={baseline_fs} config_fs={_lap_baseline_fs}"
+        )
+
+    report_like = {
+        "fragment_sequence": int(sequence),
+        "publish_count": int(publish_count),
+        "stats_reset_count": _require_int(
+            stats.get("reset_count"), "PHOTONS_FRAGMENT.photons.stats.reset_count"
+        ),
+        "stats_update_count": _require_int(
+            stats.get("update_count"),
+            "PHOTONS_FRAGMENT.photons.stats.update_count",
+            minimum=1,
+        ),
+        "stats_lap_count": _require_int(
+            stats.get("lap_count"), "PHOTONS_FRAGMENT.photons.stats.lap_count"
+        ),
+        "stats_total_lap_gnss_ns": _require_int(
+            stats.get("total_lap_gnss_ns"),
+            "PHOTONS_FRAGMENT.photons.stats.total_lap_gnss_ns",
+        ),
+        "custody_lap_count": _require_int(
+            stats.get("custody_lap_count"),
+            "PHOTONS_FRAGMENT.photons.stats.custody_lap_count",
+        ),
+        "custody_total_lap_gnss_ns": _require_int(
+            stats.get("custody_total_lap_gnss_ns"),
+            "PHOTONS_FRAGMENT.photons.stats.custody_total_lap_gnss_ns",
+        ),
+    }
+    floor = _validate_live_teensy_against_durable_source(report_like, source)
+
+    proof_pending = _require_bool(
+        recovery.get("proof_pending"), "PHOTONS_FRAGMENT.photons.recovery.proof_pending"
+    )
+    recovery_generation_raw = recovery.get("generation")
+    recovery_generation = (
+        int(recovery_generation_raw)
+        if isinstance(recovery_generation_raw, int)
+        and not isinstance(recovery_generation_raw, bool)
+        and recovery_generation_raw >= 0
+        else 0
+    )
+
+    raw_campaign = fragment.get("campaign")
+    live_campaign: Dict[str, Any] = {
+        "campaign_state": "STOPPED",
+        "campaign": "",
+        "campaign_public_count": 0,
+    }
+    if isinstance(raw_campaign, dict):
+        campaign = _validate_firmware_campaign(fragment, int(sequence))
+        if not isinstance(campaign, dict):
+            raise RuntimeError("PHOTONS fragment campaign disappeared during validation")
+        live_campaign = {
+            "campaign_state": ("STOPPED" if bool(campaign.get("final")) else "ACTIVE"),
+            "campaign": str(campaign.get("campaign") or ""),
+            "campaign_start_after_sequence": _require_int(
+                campaign.get("start_after_sequence"),
+                "PHOTONS_FRAGMENT.campaign.start_after_sequence",
+                minimum=1,
+            ),
+            "campaign_public_count": _require_int(
+                campaign.get("public_count"),
+                "PHOTONS_FRAGMENT.campaign.public_count",
+                minimum=1,
+            ),
+        }
+    elif active_master is not None and not active_detail_present:
+        master_payload = _require_dict(
+            active_master.get("master_payload"), "active LANTERN campaign_master.payload"
+        )
+        if bool(master_payload.get("start_boundary_pending")):
+            live_campaign = {
+                "campaign_state": "START_PENDING",
+                "campaign": str(active_master.get("campaign") or ""),
+                "campaign_public_count": 0,
+            }
+
+    return {
+        "source": "PHOTONS_FRAGMENT",
+        "floor": floor,
+        "campaign_report": live_campaign,
+        "proof_pending": bool(proof_pending),
+        "producer_recovery_generation": int(recovery_generation),
+        "recovery_restored": bool(recovery.get("restored")),
+        "recovery_proof_committed": bool(recovery.get("proof_committed")),
+        "fresh_physical_ancestry": True,
+    }
+
+
 def _recovery_proof_matches(
     photons: Dict[str, Any], expected: Dict[str, Any]
 ) -> bool:
@@ -5879,31 +6031,27 @@ def _startup_cold_start(
 def _startup_adopt_live_producer(
     *,
     active_master: Optional[Dict[str, Any]],
-    source: Optional[Dict[str, Any]],
-    recovery_report: Dict[str, Any],
-    broad_report: Dict[str, Any],
+    source: Dict[str, Any],
+    live_witness: Dict[str, Any],
+    transport_generation: int,
     skipped: List[Dict[str, Any]],
     rows_scanned: int,
 ) -> Dict[str, Any]:
-    """Prove and adopt a surviving PHOTONS producer without mutating it.
-
-    The caller owns one generation-pinned startup classification attempt and has
-    already obtained both firmware reports.  Reusing those exact witnesses avoids
-    two redundant Teensy RPCs during the busiest part of multi-process startup.
-    """
+    """Adopt a current-session PHOTONS_FRAGMENT descendant with zero Teensy RPC."""
     global _recovery_live_adopt_count
 
-    if bool(recovery_report.get("proof_pending")):
+    if bool(live_witness.get("proof_pending")):
         raise RuntimeError(
-            "pending restored-producer proof is not eligible for zero-mutation reuse"
+            "pending restored-producer proof is not eligible for zero-RPC reuse"
         )
-
-    broad = copy.deepcopy(broad_report)
-    floor = _validate_live_teensy_against_durable_source(recovery_report, source)
+    floor = _require_dict(live_witness.get("floor"), "live PHOTONS floor")
+    live_report = _require_dict(
+        live_witness.get("campaign_report"), "live PHOTONS campaign report"
+    )
 
     campaign_adoption = _adopt_live_lantern_state(
         active_master,
-        live_report=broad,
+        live_report=live_report,
         durable_cursor_source=source,
     )
 
@@ -5914,23 +6062,45 @@ def _startup_adopt_live_producer(
     if preserved:
         logging.info(
             "📥 [photons/recovery] preserving %d queued PHOTONS_FRAGMENT rows "
-            "during zero-mutation producer adoption",
+            "during zero-RPC producer adoption",
             preserved,
         )
     _startup_live_adopt_custody_active.set()
     try:
         _start_workers()
         proof = _wait_for_recovery_proof()
-        ppb_live_refresh = _refresh_ppb_checkpoint_from_live_photons()
+        with _ppb_checkpoint_lock:
+            ppb_snapshot = _ppb_checkpoint_snapshot_locked(
+                _ppb_checkpoint_runtime_ensure_locked()
+            )
+        ppb_live_refresh = {
+            "refreshed": False,
+            "basis": "PHOTONS_FRAGMENT_DELTA_CUSTODY",
+            "teensy_rpc_used": False,
+            "recoverable": bool(ppb_snapshot.get("recoverable")),
+            "status": ppb_snapshot.get("status"),
+            "reset_count": ppb_snapshot.get("reset_count"),
+            "update_count": ppb_snapshot.get("update_count"),
+            "second_count": int(ppb_snapshot.get("second_count") or 0),
+            "expected_second_count": int(
+                ppb_snapshot.get("expected_second_count") or 0
+            ),
+            "minute_count": int(ppb_snapshot.get("minute_count") or 0),
+            "expected_minute_count": int(
+                ppb_snapshot.get("expected_minute_count") or 0
+            ),
+            "gap_count": int(ppb_snapshot.get("gap_count") or 0),
+        }
     finally:
         _startup_live_adopt_custody_active.clear()
 
-    generation = int(recovery_report["generation"])
+    producer_generation = int(live_witness.get("producer_recovery_generation") or 0)
+    recovery_generation = producer_generation or int(transport_generation)
     if campaign_adoption["active_master"]:
         _mark_active_campaign_recovered(
             active_master,
             mode="LIVE_PRODUCER_ADOPT",
-            generation=generation,
+            generation=recovery_generation,
             source=source,
             proof=proof,
         )
@@ -5939,25 +6109,42 @@ def _startup_adopt_live_producer(
         _recovery_live_adopt_count += 1
     result = {
         "mode": "LIVE_PRODUCER_ADOPT",
-        "generation": generation,
-        "source_detail_id": int(source["db_detail_id"]) if source else None,
+        "generation": recovery_generation,
+        "producer_recovery_generation": producer_generation,
+        "transport_generation": int(transport_generation),
+        "source_detail_id": int(source["db_detail_id"]),
         "source_rows_scanned": rows_scanned,
         "damaged_rows_skipped": copy.deepcopy(skipped),
         "ingress_rows_drained": 0,
         "ingress_rows_preserved_at_worker_start": preserved,
-        "live_floor": floor,
+        "live_floor": copy.deepcopy(floor),
         "proof": proof,
         "ppb_live_refresh": ppb_live_refresh,
         "campaign_adoption": campaign_adoption,
         "producer_reuse": True,
         "producer_mutated": False,
         "producer_mutation_commands": [],
+        "teensy_rpc_used": False,
+        "survival_witness_source": "PHOTONS_FRAGMENT",
     }
     _recovery_status_set("COMPLETE", **result)
+    logging.info(
+        "✅ [photons/recovery] current-session PHOTONS_FRAGMENT proved surviving "
+        "producer with zero Teensy RPC: sequence=%s update=%s campaign=%s/%s",
+        floor.get("sequence"),
+        floor.get("update_count"),
+        live_report.get("campaign") or "NONE",
+        live_report.get("campaign_state") or "STOPPED",
+    )
     return result
 
 
-def _perform_phase5_recovery() -> Dict[str, Any]:
+
+def _perform_phase5_recovery(
+    *,
+    transport_generation: Optional[int] = None,
+    survival_ingress_barrier_monotonic: Optional[float] = None,
+) -> Dict[str, Any]:
     global _recovery_attempt_count
     global _recovery_failure_count
 
@@ -6034,9 +6221,110 @@ def _perform_phase5_recovery() -> Dict[str, Any]:
                 )
             legacy_source_migration_required = True
 
-        # REPORT_RECOVERY is the producer-lifetime fork. Match CLOCKS: prove and
-        # adopt a producer that is already publishing; mutate only a held/newborn
-        # producer that actually needs durable restore or cold-start admission.
+        if snapshot is not None:
+            # Seed Pi-owned literal custody before either live adoption or held
+            # resurrection.  This is local/durable state only; no Teensy command.
+            _restore_ppb_checkpoint_runtime(
+                snapshot.ppb_restore_checkpoint,
+                source_db_detail_id=int(snapshot.source_detail_id),
+            )
+
+        # CLOCKS parity: a healthy surviving producer proves itself through the
+        # normal canonical stream.  Only a fragment that physically entered this
+        # PHOTONS process after the caller's current transport/session barrier may
+        # authorize zero-RPC reuse.  Newborn PHOTONS is intentionally silent, so a
+        # bounded timeout simply falls through to the existing firmware court.
+        if (
+            source is not None
+            and transport_generation is not None
+            and survival_ingress_barrier_monotonic is not None
+        ):
+            live_fragment, live_age_s, live_received_utc = (
+                _wait_for_current_session_photons_fragment(
+                    ingress_barrier_monotonic=float(
+                        survival_ingress_barrier_monotonic
+                    )
+                )
+            )
+            if live_fragment is not None:
+                try:
+                    live_witness = _live_fragment_recovery_witness(
+                        live_fragment,
+                        source=source,
+                        active_master=active_master,
+                        active_detail_present=bool(active_detail_present),
+                    )
+                except Exception as exc:
+                    logging.info(
+                        "🧭 [photons/recovery] current-session PHOTONS_FRAGMENT did "
+                        "not prove durable producer continuity; entering firmware "
+                        "recovery court: %s",
+                        exc,
+                    )
+                else:
+                    if not live_witness.get("proof_pending"):
+                        classification = {
+                            "active_campaign": (
+                                active_master["campaign"] if active_master else None
+                            ),
+                            "active_campaign_detail_present": bool(active_detail_present),
+                            "historical_count_scan_performed": snapshot is None,
+                            "active_campaign_detail_count": active_detail_count,
+                            "total_detail_count": total_detail_count,
+                            "real_race_detail_count": real_race_detail_count,
+                            "source_epoch_migration": None,
+                            "source_detail_id": int(snapshot.source_detail_id),
+                            "desired_state_schema": (
+                                desired_state.get("schema")
+                                if isinstance(desired_state, dict)
+                                else None
+                            ),
+                            "time_translation": (
+                                desired_state.get("time_translation")
+                                if isinstance(desired_state, dict)
+                                else None
+                            ),
+                            "source_welford_grand_ratio_diagnostic": copy.deepcopy(
+                                source.get("welford_grand_ratio_diagnostic")
+                            ),
+                            "damaged_rows_skipped": copy.deepcopy(skipped),
+                            "rows_scanned": rows_scanned,
+                            "teensy_publication_started": True,
+                            "teensy_race_engine_active": True,
+                            "survival_witness_source": "PHOTONS_FRAGMENT",
+                            "survival_witness_received_at_utc": live_received_utc,
+                            "survival_witness_age_s": (
+                                None
+                                if live_age_s is None
+                                else round(float(live_age_s), 3)
+                            ),
+                            "teensy_rpc_used": False,
+                        }
+                        _recovery_status_set("CLASSIFIED", **classification)
+                        return _startup_adopt_live_producer(
+                            active_master=active_master,
+                            source=source,
+                            live_witness=live_witness,
+                            transport_generation=int(transport_generation),
+                            skipped=skipped,
+                            rows_scanned=rows_scanned,
+                        )
+                    logging.info(
+                        "🧭 [photons/recovery] current-session PHOTONS_FRAGMENT "
+                        "shows an incomplete recovery proof; healthy zero-RPC "
+                        "adoption is unavailable and the firmware recovery court owns it"
+                    )
+            else:
+                logging.info(
+                    "🧭 [photons/recovery] no current-session PHOTONS_FRAGMENT arrived "
+                    "within %.1fs; newborn/held producer remains possible, entering "
+                    "firmware recovery court",
+                    float(PHOTONS_SURVIVAL_FRAGMENT_TIMEOUT_S),
+                )
+
+        # No current-session canonical descendant proved a healthy producer.  The
+        # existing REPORT_RECOVERY path now classifies only the held/newborn,
+        # pending-proof, or otherwise ambiguous cases.
         report = _fetch_teensy_recovery_report(require_baseline=False)
         if report["publication_started"]:
             _confirm_live_teensy_lap_baseline(report)
@@ -6056,12 +6344,15 @@ def _perform_phase5_recovery() -> Dict[str, Any]:
         if report["staging_active"]:
             raise RuntimeError("Teensy PHOTONS recovery staging remains active")
 
-        # Pair this Pi generation only with the real-race firmware before touching
-        # incompatible legacy continuation state.  If a previous process already
-        # cold-started the new producer, live adoption is lawful.  A live producer
-        # that claims restored ancestry in a legacy-only durable domain is exactly
-        # the contamination we are preventing and requires a producer reboot.
-        broad_preflight = _fetch_teensy_photons_report()
+        # Broad PHOTONS.REPORT is not part of held/newborn classification.
+        # REPORT_RECOVERY has already proved publication is stopped, and a durable
+        # source can proceed directly into HELD_RESTORE without constructing the
+        # large operational report on the Teensy.  Keep the broad report only for
+        # branches that still require its live campaign/race-engine testimony.
+        broad_preflight: Optional[Dict[str, Any]] = None
+        if report["publication_started"] or legacy_source_migration_required:
+            broad_preflight = _fetch_teensy_photons_report()
+
         if legacy_source_migration_required:
             if report["publication_started"] and report["restored"]:
                 raise RuntimeError(
@@ -6070,15 +6361,6 @@ def _perform_phase5_recovery() -> Dict[str, Any]:
                 )
             source_epoch_migration = _retire_legacy_recovery_for_real_race_epoch(
                 legacy_detail_count=int(total_detail_count or 0)
-            )
-
-        if snapshot is not None:
-            # Seed live Pi recovery custody from the exact sidecar carried by the
-            # explicit snapshot. Historical SQL rows have no role in Better-Buckets
-            # resurrection or startup reconstruction.
-            _restore_ppb_checkpoint_runtime(
-                snapshot.ppb_restore_checkpoint,
-                source_db_detail_id=int(snapshot.source_detail_id),
             )
 
         classification = {
@@ -6108,11 +6390,18 @@ def _perform_phase5_recovery() -> Dict[str, Any]:
             "damaged_rows_skipped": copy.deepcopy(skipped),
             "rows_scanned": rows_scanned,
             "teensy_publication_started": bool(report["publication_started"]),
-            "teensy_race_engine_active": bool(broad_preflight["race_engine_active"]),
+            "teensy_race_engine_active": (
+                bool(broad_preflight["race_engine_active"])
+                if isinstance(broad_preflight, dict)
+                else None
+            ),
+            "broad_preflight_used": isinstance(broad_preflight, dict),
         }
         _recovery_status_set("CLASSIFIED", **classification)
 
         if report["publication_started"] and report["proof_pending"]:
+            if not isinstance(broad_preflight, dict):
+                raise RuntimeError("live pending PHOTONS recovery lacks broad preflight testimony")
             return _startup_finish_pending_recovery_proof(
                 active_master=active_master,
                 source=source,
@@ -6122,6 +6411,8 @@ def _perform_phase5_recovery() -> Dict[str, Any]:
                 rows_scanned=rows_scanned,
             )
         if report["publication_started"]:
+            if not isinstance(broad_preflight, dict):
+                raise RuntimeError("live PHOTONS recovery lacks broad preflight testimony")
             return _startup_adopt_live_producer(
                 active_master=active_master,
                 source=source,
@@ -6664,6 +6955,7 @@ def _leave_maintenance_queue_hold() -> None:
 def on_photons_fragment(fragment: Payload) -> None:
     """PUBSUB fast path: copy one firmware fragment into the ingress queue."""
     global _latest_fragment
+    global _latest_fragment_received_monotonic, _latest_fragment_received_utc
     global _fragments_received
     global _fragments_queued
     global _hard_failure_ingress_dropped
@@ -6674,9 +6966,13 @@ def on_photons_fragment(fragment: Payload) -> None:
         return
 
     copied = copy.deepcopy(fragment)
+    ingress_monotonic = time.monotonic()
+    ingress_utc = _utc_now_z()
     with _state_lock:
         _fragments_received += 1
         _latest_fragment = copied
+        _latest_fragment_received_monotonic = ingress_monotonic
+        _latest_fragment_received_utc = ingress_utc
 
     # Both Phase-2 queues are unbounded, so put_nowait() does not turn a
     # downstream stall into PUBSUB backpressure.  Memory growth is observable
@@ -7050,11 +7346,45 @@ def _runtime_reconcile_teensy_generation(previous_generation: int,
 
     try:
         barrier = _wait_for_runtime_recovery_persistence_boundary()
-        report = _fetch_teensy_recovery_report(require_baseline=False)
 
-        if bool(report.get("publication_started")):
-            # Transport was replaced but the producer lifetime survived.  Do not
-            # invoke recovery and do not disturb live Welford/Better-Buckets state.
+        # The new transport generation is not producer-lifetime proof.  Arm a fresh
+        # ingress boundary and let the normal 1 Hz stream speak first.  The current
+        # Pi process retains its campaign/checkpoint custody, so a lawful descendant
+        # can simply release the hold with zero Teensy RPC.
+        survival_barrier = time.monotonic()
+        active_master = _load_active_lantern_master()
+        active_detail_present = (
+            _lantern_campaign_has_details(active_master["campaign"])
+            if active_master is not None
+            else False
+        )
+        snapshot, _skipped, _rows_scanned = _load_newest_recoverable_photons_state(
+            active_master=active_master,
+            require_active_campaign=bool(active_master is not None and active_detail_present),
+        )
+        source = snapshot.restore_source() if snapshot is not None else None
+        live_fragment, live_age_s, live_received_utc = (
+            _wait_for_current_session_photons_fragment(
+                ingress_barrier_monotonic=survival_barrier
+            )
+        )
+        live_witness = None
+        if live_fragment is not None and source is not None:
+            try:
+                live_witness = _live_fragment_recovery_witness(
+                    live_fragment,
+                    source=source,
+                    active_master=active_master,
+                    active_detail_present=bool(active_detail_present),
+                )
+            except Exception as exc:
+                logging.info(
+                    "🧭 [photons/ambient restore] post-generation PHOTONS_FRAGMENT "
+                    "did not prove surviving producer continuity: %s",
+                    exc,
+                )
+
+        if live_witness is not None and not live_witness.get("proof_pending"):
             _runtime_recovery_hold.clear()
             _campaign_control_ready.set()
             _runtime_recovery_generation = int(observed_generation)
@@ -7065,7 +7395,16 @@ def _runtime_reconcile_teensy_generation(previous_generation: int,
                     "previous_generation": int(previous_generation),
                     "observed_generation": int(observed_generation),
                     "persistence_barrier": copy.deepcopy(barrier),
+                    "survival_witness_source": "PHOTONS_FRAGMENT",
+                    "survival_witness_received_at_utc": live_received_utc,
+                    "survival_witness_age_s": (
+                        None
+                        if live_age_s is None
+                        else round(float(live_age_s), 3)
+                    ),
+                    "survival_floor": copy.deepcopy(live_witness.get("floor")),
                     "producer_mutated": False,
+                    "teensy_rpc_used": False,
                     "completed_at_utc": _utc_now_z(),
                 }
             _set_operational_state(
@@ -7076,8 +7415,37 @@ def _runtime_reconcile_teensy_generation(previous_generation: int,
             )
             logging.info(
                 "✅ [photons/ambient restore] transport generation=%d reattached to "
-                "the surviving PHOTONS producer; no producer state was mutated",
+                "the surviving PHOTONS producer from PHOTONS_FRAGMENT with zero Teensy RPC",
                 int(observed_generation),
+            )
+            return
+
+        # The stream did not prove a healthy survivor.  REPORT_RECOVERY is now a
+        # fallback court for the newborn/held or otherwise ambiguous case only.
+        report = _fetch_teensy_recovery_report(require_baseline=False)
+        if bool(report.get("publication_started")) and live_fragment is None:
+            # No canonical row was observed in the bounded window, but firmware says
+            # publication survived. Preserve the prior non-mutating behavior rather
+            # than inventing producer death from transport silence alone.
+            _runtime_recovery_hold.clear()
+            _campaign_control_ready.set()
+            _runtime_recovery_generation = int(observed_generation)
+            with _state_lock:
+                _runtime_recovery_surviving_reattach_count += 1
+                _runtime_recovery_last = {
+                    "mode": "SURVIVING_PRODUCER_REATTACH_FALLBACK_REPORT",
+                    "previous_generation": int(previous_generation),
+                    "observed_generation": int(observed_generation),
+                    "persistence_barrier": copy.deepcopy(barrier),
+                    "producer_mutated": False,
+                    "teensy_rpc_used": True,
+                    "completed_at_utc": _utc_now_z(),
+                }
+            _set_operational_state(
+                OPERATIONAL_STATE_RUNNING,
+                reason="surviving_producer_reattached_fallback_report",
+                source="RUNTIME_GENERATION_MONITOR",
+                details=copy.deepcopy(_runtime_recovery_last),
             )
             return
 
@@ -9832,8 +10200,17 @@ def _startup_phase5_recovery_with_generation_retry() -> Tuple[Dict[str, Any], in
             _wait_for_startup_infrastructure()
             continue
 
+        survival_barrier = time.monotonic()
+        logging.info(
+            "🧭 [photons/startup] armed current-session PHOTONS_FRAGMENT survival "
+            "barrier on transport generation=%d; healthy producer reuse will issue zero Teensy RPC",
+            int(attempt_generation),
+        )
         try:
-            recovery = _perform_phase5_recovery()
+            recovery = _perform_phase5_recovery(
+                transport_generation=int(attempt_generation),
+                survival_ingress_barrier_monotonic=survival_barrier,
+            )
         except Exception as exc:
             current_generation = _runtime_teensy_rpc_generation()
             if (
