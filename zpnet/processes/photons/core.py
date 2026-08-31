@@ -643,15 +643,41 @@ def _load_lap_baseline_ns() -> Tuple[str, int, str, int]:
     return baseline_text, baseline_fs, standard_text, standard_ps
 
 
-def _configure_teensy_lap_baseline() -> None:
-    """Install the exact config.PHOTONS operator reference before recovery/publication."""
+def _load_local_lap_baseline() -> Tuple[str, int, str, int]:
+    """Load config.PHOTONS reference into Pi custody without touching the Teensy."""
     global _lap_baseline_ns
     global _lap_baseline_fs
     global _standard_lap_ns
     global _standard_lap_ps
-    global _teensy_standard_configured
 
     baseline_text, baseline_fs, standard_text, standard_ps = _load_lap_baseline_ns()
+    _lap_baseline_ns = baseline_text
+    _lap_baseline_fs = baseline_fs
+    _standard_lap_ns = standard_text
+    _standard_lap_ps = standard_ps
+    return baseline_text, baseline_fs, standard_text, standard_ps
+
+
+def _confirm_live_teensy_lap_baseline(report: Dict[str, Any]) -> None:
+    """Adopt already-proved live baseline custody without issuing a Teensy command."""
+    global _teensy_standard_configured
+
+    if not report.get("publication_started"):
+        raise RuntimeError("PHOTONS live-baseline adoption requires a publishing producer")
+    if not report.get("standard_lap_configured"):
+        raise RuntimeError(
+            "live Teensy PHOTONS producer is publishing without LAP_BASELINE_NS"
+        )
+    # _fetch_teensy_recovery_report() has already proved equality with the
+    # Pi-local config value whenever the firmware says the baseline is configured.
+    _teensy_standard_configured = True
+
+
+def _configure_teensy_lap_baseline() -> None:
+    """Install config.PHOTONS reference on a held producer that requires restore."""
+    global _teensy_standard_configured
+
+    baseline_text, baseline_fs, _standard_text, _standard_ps = _load_local_lap_baseline()
     response = send_command(
         machine="TEENSY",
         subsystem=SUBSYSTEM,
@@ -670,10 +696,6 @@ def _configure_teensy_lap_baseline() -> None:
         raise RuntimeError(
             f"Teensy LAP_BASELINE_NS echo mismatch: configured_fs={baseline_fs} echoed_fs={echoed_fs}"
         )
-    _lap_baseline_ns = baseline_text
-    _lap_baseline_fs = baseline_fs
-    _standard_lap_ns = standard_text
-    _standard_lap_ps = standard_ps
     _teensy_standard_configured = True
     logging.info(
         "✅ [photons] installed LAP_BASELINE_NS=%s ns (%d fs) on Teensy",
@@ -4158,6 +4180,10 @@ def _fetch_teensy_recovery_report(
         "PHOTONS.REPORT_RECOVERY.restore_schema_version",
     ) != PHOTONS_RECOVERY_SCHEMA_VERSION:
         raise RuntimeError("Teensy PHOTONS recovery schema version mismatch")
+    publication_started = _require_bool(
+        payload.get("publication_started"),
+        "PHOTONS.REPORT_RECOVERY.publication_started",
+    )
     baseline_configured = _require_bool(
         payload.get("standard_lap_configured"),
         "PHOTONS.REPORT_RECOVERY.standard_lap_configured",
@@ -4171,9 +4197,13 @@ def _fetch_teensy_recovery_report(
     if baseline_configured:
         if baseline_fs <= 0:
             raise RuntimeError("Teensy PHOTONS recovery report has invalid LAP_BASELINE_NS")
-        if _lap_baseline_fs is not None and baseline_fs != int(_lap_baseline_fs):
+        if (
+            _lap_baseline_fs is not None
+            and baseline_fs != int(_lap_baseline_fs)
+            and (require_baseline or publication_started)
+        ):
             raise RuntimeError(
-                "Teensy/config PHOTONS LAP_BASELINE_NS mismatch during recovery: "
+                "live/configured Teensy PHOTONS LAP_BASELINE_NS mismatch during recovery: "
                 f"teensy_fs={baseline_fs} config_fs={_lap_baseline_fs}"
             )
     elif baseline_fs != 0:
@@ -4181,7 +4211,6 @@ def _fetch_teensy_recovery_report(
             "Teensy PHOTONS recovery report publishes LAP_BASELINE_NS before configuration"
         )
     for field in (
-        "publication_started",
         "staging_active",
         "restored",
         "proof_pending",
@@ -4230,7 +4259,7 @@ def _fetch_teensy_recovery_report(
         "custody_total_lap_gnss_ns",
     ):
         _require_int(payload.get(field), f"PHOTONS.REPORT_RECOVERY.{field}")
-    if payload["publication_started"] and not payload["fresh_physical_ancestry"]:
+    if publication_started and not payload["fresh_physical_ancestry"]:
         raise RuntimeError("live PHOTONS recovery report lacks fresh physical ancestry")
     return copy.deepcopy(payload)
 
@@ -5936,6 +5965,11 @@ def _perform_phase5_recovery() -> Dict[str, Any]:
         _recovery_attempt_count += 1
     _recovery_status_set("CLASSIFYING")
     try:
+        # CLOCKS parity: first establish the expected operator reference in Pi
+        # custody, then classify the producer using read-only testimony. A live
+        # producer must never receive restore/reference mutation merely because
+        # the Pi process restarted.
+        _load_local_lap_baseline()
         empty_domain = _retire_orphaned_photons_recovery_config_if_domain_empty()
         if empty_domain.get("domain_empty"):
             logging.warning(
@@ -6000,10 +6034,25 @@ def _perform_phase5_recovery() -> Dict[str, Any]:
                 )
             legacy_source_migration_required = True
 
-        report = _fetch_teensy_recovery_report()
-        if report["staging_active"] and not report["publication_started"]:
-            _best_effort_recovery_abort()
-            report = _fetch_teensy_recovery_report()
+        # REPORT_RECOVERY is the producer-lifetime fork. Match CLOCKS: prove and
+        # adopt a producer that is already publishing; mutate only a held/newborn
+        # producer that actually needs durable restore or cold-start admission.
+        report = _fetch_teensy_recovery_report(require_baseline=False)
+        if report["publication_started"]:
+            _confirm_live_teensy_lap_baseline(report)
+        else:
+            if report["staging_active"]:
+                _best_effort_recovery_abort()
+                report = _fetch_teensy_recovery_report(require_baseline=False)
+            if report["staging_active"]:
+                raise RuntimeError("Teensy PHOTONS recovery staging remains active")
+
+            # The read-only court has now proved that this producer is held. Only
+            # this branch may install the reference needed by RECOVERY_BEGIN or
+            # RECOVERY_COLD_START.
+            _configure_teensy_lap_baseline()
+            report = _fetch_teensy_recovery_report(require_baseline=True)
+
         if report["staging_active"]:
             raise RuntimeError("Teensy PHOTONS recovery staging remains active")
 
@@ -7046,7 +7095,6 @@ def _runtime_reconcile_teensy_generation(previous_generation: int,
             int(retired),
         )
 
-        _configure_teensy_lap_baseline()
         recovery = _perform_phase5_recovery()
         current_generation = _runtime_teensy_rpc_generation()
         if current_generation != int(observed_generation):
@@ -9477,11 +9525,12 @@ def _repair_worker(*, trigger_state: Dict[str, Any], record: Dict[str, Any]) -> 
         with _state_lock:
             _last_repair = copy.deepcopy(record)
 
-        _best_effort_recovery_abort()
         _clear_recovery_proof_custody()
         _runtime_recovery_hold.clear()
-        _configure_teensy_lap_baseline()
-        report = _fetch_teensy_recovery_report(require_baseline=True)
+        _load_local_lap_baseline()
+        report = _fetch_teensy_recovery_report(require_baseline=False)
+        if report.get("publication_started"):
+            _confirm_live_teensy_lap_baseline(report)
         record["producer_publication_started"] = bool(report.get("publication_started"))
 
         repaired_by = None
@@ -9773,8 +9822,9 @@ def _startup_phase5_recovery_with_generation_retry() -> Tuple[Dict[str, Any], in
 
     A generation change is infrastructure invalidation, not a PHOTONS scientific
     contradiction. Discard only process-local proof expectation, wait for the
-    replacement RPC lease, reinstall the operator baseline, and classify again.
-    Any failure while the same generation remains proved is still terminal.
+    replacement RPC lease, and classify again. Surviving producers are read-only;
+    baseline installation belongs only to the held/newborn restore branch. Any
+    failure while the same generation remains proved is still terminal.
     """
     while True:
         attempt_generation = _runtime_teensy_rpc_generation()
@@ -9783,7 +9833,6 @@ def _startup_phase5_recovery_with_generation_retry() -> Tuple[Dict[str, Any], in
             continue
 
         try:
-            _configure_teensy_lap_baseline()
             recovery = _perform_phase5_recovery()
         except Exception as exc:
             current_generation = _runtime_teensy_rpc_generation()

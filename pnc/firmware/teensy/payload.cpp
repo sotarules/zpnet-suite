@@ -1004,15 +1004,16 @@ static void payload_note_heap_delta(int32_t delta) {
 //
 // Crash1 evidence implicated Payload guard-code working state, written from
 // handler context, adjacent to (or over) a stacked exception frame.  The
-// facilities below exist to *attribute*, not to prevent:
+// facilities below attribute cross-context activity and, at the one shared
+// mutable boundary Payload cannot otherwise defend, enforce single ownership:
 //
 //   • The context census counts lifecycle/mutation/allocator activity that
 //     executes while IPSR != 0 and latches the most recent handler-context
 //     actor (IPSR, op, this, MSP, DWT).
-//   • The allocator overlap tripwire detects a Payload allocator call that
-//     preempted another in-flight Payload allocator call — the one shared
-//     mutable resource (the newlib heap) that Payload's own arithmetic
-//     cannot defend.  Detection only; behavior is unchanged.
+//   • The allocator overlap gate detects a Payload allocator call that
+//     preempted another in-flight Payload allocator call.  The newlib heap is
+//     single-owner: overlapping malloc/realloc is rejected and overlapping
+//     free is skipped rather than re-entering allocator metadata mid-operation.
 //   • The flight recorder keeps a ring of recent lifecycle/mutation/failure
 //     records in RAM2 (NOLOAD) so the final Payload operations before a
 //     crash survive the reboot; each write is flushed through the data
@@ -1127,25 +1128,30 @@ static volatile uint32_t g_payload_alloc_overlap_this = 0;
 static volatile uint32_t g_payload_alloc_overlap_dwt = 0;
 static volatile uint32_t g_payload_alloc_overlap_depth = 0;
 
-static void payload_note_alloc_overlap(uint32_t op_id, const void* self) {
+static bool payload_note_alloc_overlap(uint32_t op_id, const void* self) {
     const uint32_t depth = g_payload_alloc_depth;
-    if (depth == 0U) return;
-    // A Payload allocator call is already in flight on this single core, so
-    // this call preempted it mid-heap-operation.  Record and proceed: the
-    // heap may already be the victim, and the evidence must outlive it.
+    if (depth == 0U) return false;
+
+    // The newlib heap is a single-owner operation on this single core.  If an
+    // interrupt-context Payload allocation preempts a foreground allocator call,
+    // entering malloc/realloc/free again can corrupt allocator metadata before
+    // Payload's own guards ever get a chance to testify.  Preserve the overlap
+    // evidence, but fail closed at the allocator boundary instead of proceeding.
     g_payload_alloc_overlap_detected++;
     g_payload_alloc_overlap_ipsr = payload_read_ipsr();
     g_payload_alloc_overlap_op_id = op_id;
     g_payload_alloc_overlap_this = (uint32_t)(uintptr_t)self;
     g_payload_alloc_overlap_dwt = payload_read_dwt();
     g_payload_alloc_overlap_depth = depth;
+    return true;
 }
 
 static void* payload_guarded_malloc(size_t total,
                                     uint32_t op_id,
                                     const void* self) {
     payload_note_handler_context(op_id, self, &g_payload_handler_ctx_alloc);
-    payload_note_alloc_overlap(op_id, self);
+    if (payload_note_alloc_overlap(op_id, self)) return nullptr;
+
     g_payload_alloc_depth++;
     void* raw = malloc(total);
     g_payload_alloc_depth--;
@@ -1157,21 +1163,29 @@ static void* payload_guarded_realloc(void* block,
                                      uint32_t op_id,
                                      const void* self) {
     payload_note_handler_context(op_id, self, &g_payload_handler_ctx_alloc);
-    payload_note_alloc_overlap(op_id, self);
+    if (payload_note_alloc_overlap(op_id, self)) return nullptr;
+
     g_payload_alloc_depth++;
     void* raw = realloc(block, total);
     g_payload_alloc_depth--;
     return raw;
 }
 
-static void payload_guarded_free(void* block,
+static bool payload_guarded_free(void* block,
                                  uint32_t op_id,
                                  const void* self) {
     payload_note_handler_context(op_id, self, &g_payload_handler_ctx_free);
-    payload_note_alloc_overlap(op_id, self);
+    if (payload_note_alloc_overlap(op_id, self)) {
+        // Leaking one block is preferable to entering a heap operation whose
+        // ownership is already held by the preempted context.  Callers retain
+        // heap-byte telemetry until a free actually succeeds.
+        return false;
+    }
+
     g_payload_alloc_depth++;
     free(block);
     g_payload_alloc_depth--;
+    return true;
 }
 
 // ---- Retained flight recorder ---------------------------------------------
@@ -2808,7 +2822,7 @@ static void* payload_heap_allocate(size_t capacity, const void* owner) {
     void* raw = payload_guarded_malloc(total, PAYLOAD_OP_HEAP_BLOCK, owner);
     if (!raw) return nullptr;
     if (((uintptr_t)raw % PAYLOAD_HEAP_ALIGNMENT) != 0U) {
-        payload_guarded_free(raw, PAYLOAD_OP_HEAP_BLOCK, owner);
+        (void)payload_guarded_free(raw, PAYLOAD_OP_HEAP_BLOCK, owner);
         return nullptr;
     }
 
@@ -5478,8 +5492,11 @@ void Payload::_release_storage() {
         const size_t capacity =
             payload_heap_capacity(_heap_block, this, INLINE_STORAGE + 1U, STORAGE_MAX);
         if (capacity != 0) {
-            payload_note_heap_delta(-(int32_t)capacity);
-            payload_guarded_free(_heap_block, PAYLOAD_OP_RELEASE_STORAGE, this);
+            if (payload_guarded_free(_heap_block,
+                                     PAYLOAD_OP_RELEASE_STORAGE,
+                                     this)) {
+                payload_note_heap_delta(-(int32_t)capacity);
+            }
         } else {
             // Fail closed. A questionable pointer is leaked rather than passed
             // to free(); this is the only safe destructor policy after header
@@ -7823,14 +7840,14 @@ String Payload::to_json() const {
 
     const size_t written = _write_json_unchecked(buffer);
     if (written != needed) {
-        payload_guarded_free(buffer, PAYLOAD_OP_TO_JSON_ALLOC, this);
+        (void)payload_guarded_free(buffer, PAYLOAD_OP_TO_JSON_ALLOC, this);
         g_payload_to_json_fail++;
         payload_note_error(PAYLOAD_ERR_TO_JSON_FAIL, PAYLOAD_OP_TO_JSON_WRITE, this);
         return String("{}");
     }
 
     String result(buffer);
-    payload_guarded_free(buffer, PAYLOAD_OP_TO_JSON_ALLOC, this);
+    (void)payload_guarded_free(buffer, PAYLOAD_OP_TO_JSON_ALLOC, this);
     return result;
 }
 
@@ -8714,10 +8731,11 @@ void PayloadArray::_release_storage() {
                                   INLINE_STORAGE + 1U,
                                   STORAGE_MAX);
         if (capacity != 0U) {
-            payload_note_heap_delta(-(int32_t)capacity);
-            payload_guarded_free(_heap_block,
-                                 PAYLOAD_OP_ARRAY_RELEASE_STORAGE,
-                                 this);
+            if (payload_guarded_free(_heap_block,
+                                     PAYLOAD_OP_ARRAY_RELEASE_STORAGE,
+                                     this)) {
+                payload_note_heap_delta(-(int32_t)capacity);
+            }
         } else {
             payload_note_integrity(PAYLOAD_SELF_OK_ENTRIES_SPAN_UNREADABLE,
                                    PAYLOAD_OP_ARRAY_RELEASE_STORAGE,
