@@ -2694,6 +2694,10 @@ struct interrupt_handoff_diag_t {
 };
 
 static interrupt_handoff_diag_t g_interrupt_handoff{};
+// Atomic admission for the multi-source request transaction. The winner owns
+// pending/last_request_dwt/request_count until Priority 32 snapshots the first
+// request and releases the claim. Contending higher-priority ISRs never spin.
+static uint32_t g_interrupt_handoff_request_claim = 0U;
 static interrupt_handoff_source_diag_t g_handoff_vclock{};
 static interrupt_handoff_source_diag_t g_handoff_ch2{};
 static interrupt_handoff_source_diag_t g_handoff_ocxo1{};
@@ -2708,6 +2712,22 @@ static uint32_t g_interrupt_capture_sequence = 0U;
 static inline uint32_t interrupt_capture_sequence_next_isr(void) {
   return __atomic_add_fetch(
       &g_interrupt_capture_sequence, 1U, __ATOMIC_RELAXED);
+}
+
+static inline bool interrupt_handoff_request_try_claim_isr(void) {
+  uint32_t expected = 0U;
+  return __atomic_compare_exchange_n(
+      &g_interrupt_handoff_request_claim,
+      &expected,
+      1U,
+      false,
+      __ATOMIC_ACQUIRE,
+      __ATOMIC_RELAXED);
+}
+
+static inline void interrupt_handoff_request_release_isr(void) {
+  __atomic_store_n(
+      &g_interrupt_handoff_request_claim, 0U, __ATOMIC_RELEASE);
 }
 
 // Minimal entry witness types are public in process_interrupt.h so the exact
@@ -4162,9 +4182,11 @@ static bool handoff_any_pending(void) {
 }
 
 static void interrupt_handoff_request_isr(uint32_t request_dwt) {
-  // Preserve the first capture that created this pending continuation.  A
-  // same-vector VCLOCK/TimePop pair therefore performs exactly one NVIC pend.
-  if (g_interrupt_handoff.pending) return;
+  // Preserve the first capture that created this pending continuation. A
+  // Priority-16 claimant may be preempted by Priority 0, so the ownership
+  // decision itself must be atomic. A contender never waits on a preempted
+  // owner; it coalesces behind the already-promised Priority-32 service.
+  if (!interrupt_handoff_request_try_claim_isr()) return;
   g_interrupt_handoff.last_request_dwt = request_dwt;
   g_interrupt_handoff.pending = true;
   g_interrupt_handoff.request_count++;
@@ -5012,6 +5034,8 @@ static void interrupt_handoff_service_isr(void) {
   const uint32_t request_dwt = g_interrupt_handoff.last_request_dwt;
   g_interrupt_handoff.running = true;
   g_interrupt_handoff.pending = false;
+  dmb_barrier();
+  interrupt_handoff_request_release_isr();
   g_interrupt_handoff.entry_count++;
   g_interrupt_handoff.last_entry_dwt = entry_dwt;
 
