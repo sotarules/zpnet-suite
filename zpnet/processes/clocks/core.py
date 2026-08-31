@@ -356,6 +356,8 @@ PPB_PROOF_VERIFY_TOLERANCE_PPB = 0.00001
 PPB_FIRMWARE_DELTA_SCHEMA = "CLOCKS_PPB_CHECKPOINT_DELTA_V1"
 PPB_PI_CHECKPOINT_SCHEMA = "PI_CLOCKS_PPB_RESTORE_CHECKPOINT_V1"
 CLOCKS_RECOVERY_CONFIG_KEY = "CLOCKS_RECOVERY"
+CLOCKS_ALPHA_LINEAGE_CUTOFF_CONFIG_KEY = "CLOCKS_ALPHA_LINEAGE_CUTOFF"
+CLOCKS_ALPHA_LINEAGE_CUTOFF_SCHEMA = "PI_CLOCKS_ALPHA_LINEAGE_CUTOFF_V1"
 CLOCKS_RECOVERY_SNAPSHOT_SCHEMA = "PI_CLOCKS_RECOVERY_SNAPSHOT_V1"
 CLOCKS_RECOVERY_DESIRED_STATE_SCHEMA = "PI_CLOCKS_RECOVERY_DESIRED_STATE_V1"
 CLOCKS_RECOVERY_RECEIPT_SCHEMA = "PI_CLOCKS_RECOVERY_RECEIPT_V1"
@@ -397,8 +399,9 @@ FEATURE_PREFLIGHT_PROFILE = "CAMPAIGN_PREFLIGHT"
 FEATURE_PREFLIGHT_REQUIRED = (
     # Concrete readiness leaves from the unified CLOCKS.features tree.
     # Do not gate on the retired FEATURE_STATUS aggregate nodes or the old
-    # FEATURE_STATUS-driven Teensy import sentinel.
-    "PI.SYSTEM.HOST",
+    # FEATURE_STATUS-driven Teensy import sentinel. HOST is intentionally
+    # telemetry-only: transient Pi load/temperature/memory pressure must not
+    # block scientific campaign admission.
     "PI.SYSTEM.POWER",
     "PI.GNSS.REPORT",
     "TEENSY.INTERRUPT.PPS_VCLOCK_AUTHORITY",
@@ -2483,6 +2486,12 @@ _hard_failure_lock = threading.Lock()
 # the authority to clear HARD_FAILURE after it proves a usable replacement lineage.
 _hard_failure_stats_repair_event = threading.Event()
 _hard_failure_stats_repair_lock = threading.Lock()
+# REPAIR request ownership is separate from the narrow HARD_FAILURE data-plane
+# override above.  A REPAIR command may arrive while boot reconciliation is still
+# legitimately mutating startup custody.  In that case the request waits for the
+# startup transaction to finish before it is allowed to reopen HARD_FAILURE ingress.
+_repair_request_in_progress = threading.Event()
+_startup_reconciliation_active = threading.Event()
 _DESTRUCTIVE_REPAIR_REASONS = {
     "dac_restore_population_ancestry_impossible",
     "dac_recovery_boundary_population_ancestry_impossible",
@@ -6204,8 +6213,85 @@ def _record_clocks_recovery_receipt(
     return receipt
 
 
+def _write_alpha_lineage_cutoff_config(
+    cur: Any,
+    *,
+    cutoff_detail_id: int,
+    terminated_at_utc: str,
+    reason: str,
+    source: str,
+    campaign: Optional[str],
+) -> Dict[str, Any]:
+    """Persist one O(1) boundary retiring every prior TEMPEST row as restore authority."""
+    cutoff = int(cutoff_detail_id)
+    if cutoff < 0:
+        raise ValueError("Alpha lineage cutoff detail_id may not be negative")
+    marker = {
+        "schema": CLOCKS_ALPHA_LINEAGE_CUTOFF_SCHEMA,
+        "cutoff_detail_id": cutoff,
+        "terminated_at_utc": str(terminated_at_utc),
+        "reason": str(reason),
+        "source": str(source),
+        "campaign": str(campaign) if campaign else None,
+    }
+    encoded = json.dumps(marker, separators=(",", ":"), ensure_ascii=False)
+    cur.execute(
+        "UPDATE config SET payload = %s::jsonb WHERE config_key = %s",
+        (encoded, CLOCKS_ALPHA_LINEAGE_CUTOFF_CONFIG_KEY),
+    )
+    if cur.rowcount > 1:
+        raise RuntimeError(
+            f"config.{CLOCKS_ALPHA_LINEAGE_CUTOFF_CONFIG_KEY} is not a singleton: "
+            f"rows={cur.rowcount}"
+        )
+    if cur.rowcount == 0:
+        cur.execute(
+            "INSERT INTO config (config_key, payload) VALUES (%s, %s::jsonb)",
+            (CLOCKS_ALPHA_LINEAGE_CUTOFF_CONFIG_KEY, encoded),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError(
+                "Alpha lineage cutoff insert did not create exactly one config row"
+            )
+    return marker
+
+
+def _read_alpha_lineage_cutoff_config() -> Optional[Dict[str, Any]]:
+    """Return the durable global TEMPEST restore-authority cutoff, if one exists."""
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT payload FROM config WHERE config_key = %s",
+            (CLOCKS_ALPHA_LINEAGE_CUTOFF_CONFIG_KEY,),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    payload = row["payload"]
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    if not isinstance(payload, dict) or payload.get("schema") != CLOCKS_ALPHA_LINEAGE_CUTOFF_SCHEMA:
+        raise RuntimeError(
+            f"config.{CLOCKS_ALPHA_LINEAGE_CUTOFF_CONFIG_KEY} is malformed"
+        )
+    cutoff = _as_int(payload.get("cutoff_detail_id"))
+    if cutoff is None or cutoff < 0:
+        raise RuntimeError(
+            f"config.{CLOCKS_ALPHA_LINEAGE_CUTOFF_CONFIG_KEY} has invalid cutoff_detail_id"
+        )
+    result = copy.deepcopy(payload)
+    result["cutoff_detail_id"] = int(cutoff)
+    return result
+
+
+def _alpha_lineage_cutoff_detail_id() -> int:
+    marker = _read_alpha_lineage_cutoff_config()
+    return int(marker.get("cutoff_detail_id") or 0) if marker is not None else 0
+
+
 def _legacy_clocks_recovery_checkpoint() -> Optional[Dict[str, Any]]:
     """One-time migration bridge from pre-singleton CLOCKS rows."""
+    cutoff_detail_id = _alpha_lineage_cutoff_detail_id()
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
         cur.execute(
@@ -6213,13 +6299,14 @@ def _legacy_clocks_recovery_checkpoint() -> Optional[Dict[str, Any]]:
             SELECT id, campaign, payload
             FROM campaign_detail
             WHERE campaign_type = %s
+              AND id > %s
               AND NOT (payload @> '{"holistic_restore_superseded":true}'::jsonb)
               AND payload #>> '{schema}' = 'CLOCKS_V4'
               AND payload #> '{clocks,ppb_restore_checkpoint}' IS NOT NULL
             ORDER BY id DESC
             LIMIT 64
             """,
-            (CAMPAIGN_TYPE_TEMPEST,),
+            (CAMPAIGN_TYPE_TEMPEST, int(cutoff_detail_id)),
         )
         rows = cur.fetchall()
 
@@ -6299,6 +6386,12 @@ def _clocks_recovery_source_row(checkpoint: Dict[str, Any]) -> Optional[Dict[str
     if source_detail_id is None or source_detail_id <= 0:
         raise RuntimeError(
             f"config.{CLOCKS_RECOVERY_CONFIG_KEY} lacks durable_source_detail_id"
+        )
+    cutoff_detail_id = _alpha_lineage_cutoff_detail_id()
+    if cutoff_detail_id and int(source_detail_id) <= int(cutoff_detail_id):
+        raise RuntimeError(
+            f"config.{CLOCKS_RECOVERY_CONFIG_KEY} source detail_id={source_detail_id} "
+            f"belongs to terminated Alpha lineage cutoff<={cutoff_detail_id}"
         )
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
@@ -9367,7 +9460,26 @@ def _surrender_unresurrectable_alpha_lineage(
         if isinstance(active_campaign, dict)
         else ""
     )
+    surrender_started = time.monotonic()
 
+    def note_surrender_phase(phase: str, **detail: Any) -> None:
+        snapshot = {
+            "phase": str(phase),
+            "elapsed_s": round(time.monotonic() - surrender_started, 3),
+            "campaign": campaign_name or None,
+            "source": str(source),
+            **copy.deepcopy(detail),
+        }
+        _diag["last_alpha_lineage_surrender_progress"] = snapshot
+        logging.info(
+            "🔬 [clocks/lineage-surrender] phase=%s elapsed=%.3fs campaign=%s detail=%s",
+            phase,
+            float(snapshot["elapsed_s"]),
+            campaign_name or "NONE",
+            detail or {},
+        )
+
+    note_surrender_phase("BEGIN")
     _request_teensy_stop_best_effort()
     _request_teensy_recover_abort_best_effort("alpha_lineage_surrender")
     _campaign_active = False
@@ -9395,7 +9507,13 @@ def _surrender_unresurrectable_alpha_lineage(
         "alpha_resurrection_impossible_lineage_surrender"
     )
 
+    recovery_lock_started = time.monotonic()
+    note_surrender_phase("WAIT_RECOVERY_CUSTODY_LOCK")
     with _recovery_custody_lock:
+        note_surrender_phase(
+            "RECOVERY_CUSTODY_LOCK_ACQUIRED",
+            waited_s=round(time.monotonic() - recovery_lock_started, 6),
+        )
         recovery_custody = _recovery_custody_snapshot_locked()
         _recovery_custody_active = False
         _recovery_custody_generation = None
@@ -9405,19 +9523,84 @@ def _surrender_unresurrectable_alpha_lineage(
         _recovery_custody_regression_witness = {}
         _recovery_custody_last_checkpoint = None
 
+    ppb_lock_started = time.monotonic()
+    note_surrender_phase("WAIT_PPB_CHECKPOINT_LOCK")
     with _ppb_checkpoint_lock:
+        note_surrender_phase(
+            "PPB_CHECKPOINT_LOCK_ACQUIRED",
+            waited_s=round(time.monotonic() - ppb_lock_started, 6),
+        )
         _ppb_checkpoint_runtime = _ppb_checkpoint_new_runtime(
             reason="ALPHA_LINEAGE_SURRENDER_FRESH_EPOCH"
         )
+    note_surrender_phase("PPB_CHECKPOINT_RESET")
 
     # A persistence item may already have been routed before the freeze. Drain it
-    # under the writer lock, then make the durable cut in one DB transaction.
-    with _clocks_persistence_lock:
+    # under the writer lock, then make the durable cut in one DB transaction.  Do
+    # not rewrite historical campaign_detail rows: one monotonic detail-id tombstone
+    # retires the entire old restore-authority universe in O(1) database work.
+    cut_started = time.monotonic()
+    persistence_wait_started = time.monotonic()
+    next_persistence_wait_log = persistence_wait_started + 10.0
+    note_surrender_phase(
+        "WAIT_PERSISTENCE_LOCK",
+        lock_locked=_clocks_persistence_lock.locked(),
+        persistence_worker=copy.deepcopy(_diag.get("clocks_persistence_worker") or {}),
+    )
+    while not _clocks_persistence_lock.acquire(timeout=1.0):
+        now = time.monotonic()
+        if now >= next_persistence_wait_log:
+            worker = copy.deepcopy(_diag.get("clocks_persistence_worker") or {})
+            waited = now - persistence_wait_started
+            _diag["last_alpha_lineage_surrender_progress"] = {
+                "phase": "WAIT_PERSISTENCE_LOCK",
+                "elapsed_s": round(now - surrender_started, 3),
+                "persistence_lock_waited_s": round(waited, 3),
+                "campaign": campaign_name or None,
+                "source": str(source),
+                "persistence_worker": worker,
+            }
+            logging.warning(
+                "🔬 [clocks/lineage-surrender] still waiting for CLOCKS persistence "
+                "lock after %.1fs; worker_phase=%s worker_sequence=%s worker_detail=%s",
+                waited,
+                worker.get("phase") or "UNKNOWN",
+                worker.get("sequence"),
+                worker,
+            )
+            next_persistence_wait_log = now + 10.0
+    try:
+        note_surrender_phase(
+            "PERSISTENCE_LOCK_ACQUIRED",
+            waited_s=round(time.monotonic() - persistence_wait_started, 6),
+        )
         state_drained = _drain_clocks_persistence_queue()
-        with open_db() as conn:
+        note_surrender_phase("PERSISTENCE_QUEUE_DRAINED", rows=state_drained)
+        note_surrender_phase("DB_OPEN")
+        with open_db(row_dict=True) as conn:
             cur = conn.cursor()
+            note_surrender_phase("DB_CUTOFF_SELECT")
+            cur.execute(
+                """
+                SELECT id AS cutoff_detail_id
+                FROM campaign_detail
+                WHERE campaign_type = %s
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (CAMPAIGN_TYPE_TEMPEST,),
+            )
+            cutoff_row = cur.fetchone()
+            note_surrender_phase("DB_CUTOFF_SELECTED")
+            lineage_cutoff_detail_id = (
+                int(cutoff_row.get("cutoff_detail_id") or 0)
+                if isinstance(cutoff_row, dict)
+                else 0
+            )
+
             master_rows_stopped = 0
             if campaign_name:
+                note_surrender_phase("DB_CAMPAIGN_STOP")
                 cur.execute(
                     """
                     UPDATE campaign_master
@@ -9451,51 +9634,58 @@ def _surrender_unresurrectable_alpha_lineage(
                     ),
                 )
                 master_rows_stopped = int(cur.rowcount or 0)
+                note_surrender_phase("DB_CAMPAIGN_STOPPED", rows=master_rows_stopped)
                 if master_rows_stopped != 1:
                     raise RuntimeError(
                         "Alpha lineage surrender did not retire exactly one active "
                         f"TEMPEST campaign {campaign_name!r}: rows={master_rows_stopped}"
                     )
 
-            # Preserve all old observations, including their original viable/science
-            # verdicts, but make the pre-cut Alpha universe ineligible for resurrection.
-            cur.execute(
-                """
-                UPDATE campaign_detail
-                SET payload = payload || jsonb_build_object(
-                    'holistic_restore_superseded', true,
-                    'alpha_lineage_terminated', true,
-                    'alpha_lineage_terminated_at_utc', to_jsonb(%s::text),
-                    'alpha_lineage_termination_reason', to_jsonb(%s::text),
-                    'alpha_lineage_restore_authority', false
-                )
-                WHERE campaign_type = %s
-                  AND NOT (payload @> '{"holistic_restore_superseded":true}'::jsonb)
-                """,
-                (surrendered_at, reason, CAMPAIGN_TYPE_TEMPEST),
+            note_surrender_phase("DB_CUTOFF_WRITE")
+            lineage_cutoff = _write_alpha_lineage_cutoff_config(
+                cur,
+                cutoff_detail_id=lineage_cutoff_detail_id,
+                terminated_at_utc=surrendered_at,
+                reason=reason,
+                source=source,
+                campaign=campaign_name or None,
             )
-            historical_rows_superseded = int(cur.rowcount or 0)
+            note_surrender_phase(
+                "DB_CUTOFF_WRITTEN", cutoff_detail_id=lineage_cutoff_detail_id
+            )
 
+            note_surrender_phase("DB_RECOVERY_CONFIG_DELETE")
             cur.execute(
                 "DELETE FROM config WHERE config_key = %s",
                 (CLOCKS_RECOVERY_CONFIG_KEY,),
             )
             recovery_config_deleted = int(cur.rowcount or 0)
+            note_surrender_phase(
+                "DB_RECOVERY_CONFIG_DELETED", rows=recovery_config_deleted
+            )
             if recovery_config_deleted > 1:
                 raise RuntimeError(
                     f"config.{CLOCKS_RECOVERY_CONFIG_KEY} is not a singleton: "
                     f"rows={recovery_config_deleted}"
                 )
+            note_surrender_phase("DB_COMMIT")
+        note_surrender_phase("DB_COMMITTED")
+    finally:
+        _clocks_persistence_lock.release()
+        note_surrender_phase("PERSISTENCE_LOCK_RELEASED")
+    lineage_cut_s = time.monotonic() - cut_started
+    historical_rows_superseded = 0
 
     logging.critical(
-        "🧭 [clocks] Alpha continuity surrendered without deleting history: "
-        "reason=%s campaign=%s stopped=%d historical_rows_superseded=%d "
-        "recovery_config_deleted=%d; establishing fresh durable statistics epoch",
+        "🧭 [clocks] Alpha continuity surrendered without deleting or rewriting history: "
+        "reason=%s campaign=%s stopped=%d cutoff_detail_id=%d historical_rows_rewritten=0 "
+        "recovery_config_deleted=%d cut_s=%.3f; establishing fresh durable statistics epoch",
         reason,
         campaign_name or "NONE",
         master_rows_stopped,
-        historical_rows_superseded,
+        lineage_cutoff_detail_id,
         recovery_config_deleted,
+        lineage_cut_s,
     )
 
     epoch = _establish_fresh_durable_stats_epoch(
@@ -9513,6 +9703,10 @@ def _surrender_unresurrectable_alpha_lineage(
         "campaign_stopped": bool(master_rows_stopped),
         "campaign_master_rows_stopped": master_rows_stopped,
         "historical_rows_superseded_for_restore": historical_rows_superseded,
+        "historical_rows_rewritten": 0,
+        "lineage_cutoff_detail_id": int(lineage_cutoff_detail_id),
+        "lineage_cutoff": copy.deepcopy(lineage_cutoff),
+        "lineage_cut_s": round(float(lineage_cut_s), 6),
         "recovery_config_deleted": bool(recovery_config_deleted),
         "candidate_ingress_drained": int(candidate_drained),
         "pending_state_rows_drained": int(state_drained),
@@ -13130,6 +13324,24 @@ def _clocks_detail_viable(state: Dict[str, Any]) -> bool:
     return bool(disposition.get("science_eligible"))
 
 
+def _set_clocks_persistence_worker_phase(
+    phase: str,
+    *,
+    sequence: Optional[int] = None,
+    detail: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Publish lock-free diagnostic testimony about the single persistence worker."""
+    snapshot: Dict[str, Any] = {
+        "phase": str(phase),
+        "sequence": None if sequence is None else int(sequence),
+        "at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "queue_depth": _clocks_persist_queue.qsize(),
+    }
+    if isinstance(detail, dict) and detail:
+        snapshot.update(copy.deepcopy(detail))
+    _diag["clocks_persistence_worker"] = snapshot
+
+
 def _persist_clocks_state(
     state: Dict[str, Any], checkpoint: Dict[str, Any]
 ) -> str:
@@ -13139,8 +13351,10 @@ def _persist_clocks_state(
     campaign = _clocks_detail_campaign(state)
     viable = _clocks_detail_viable(state)
     persist_recovery = _clocks_state_owns_recovery_config(state, checkpoint)
+    _set_clocks_persistence_worker_phase("DB_OPEN", sequence=_as_int(sequence))
     with open_db() as conn:
         cur = conn.cursor()
+        _set_clocks_persistence_worker_phase("DB_MERGE_UPDATE", sequence=_as_int(sequence))
         cur.execute(
             """
             UPDATE campaign_detail
@@ -13166,16 +13380,26 @@ def _persist_clocks_state(
                 CAMPAIGN_TYPE_TEMPEST, sequence, pps_count,
             ),
         )
+        _set_clocks_persistence_worker_phase("DB_MERGE_FETCH", sequence=_as_int(sequence))
         merged_row = cur.fetchone()
         if merged_row is not None:
             detail_id = int(
                 merged_row["id"] if isinstance(merged_row, dict) else merged_row[0]
             )
             if persist_recovery:
+                _set_clocks_persistence_worker_phase(
+                    "DB_RECOVERY_CONFIG_MERGE", sequence=_as_int(sequence),
+                    detail={"detail_id": detail_id},
+                )
                 _write_clocks_recovery_config(
                     cur, checkpoint, source_detail_id=detail_id
                 )
+            _set_clocks_persistence_worker_phase(
+                "DB_COMMIT_MERGED", sequence=_as_int(sequence),
+                detail={"detail_id": detail_id},
+            )
             return "merged"
+        _set_clocks_persistence_worker_phase("DB_INSERT", sequence=_as_int(sequence))
         cur.execute(
             """
             INSERT INTO campaign_detail
@@ -13187,6 +13411,7 @@ def _persist_clocks_state(
                 CAMPAIGN_TYPE_TEMPEST, campaign, viable, encoded, sequence, pps_count,
             ),
         )
+        _set_clocks_persistence_worker_phase("DB_INSERT_FETCH", sequence=_as_int(sequence))
         inserted_row = cur.fetchone()
         if inserted_row is None:
             raise RuntimeError("CLOCKS insert returned no durable detail identity")
@@ -13194,9 +13419,17 @@ def _persist_clocks_state(
             inserted_row["id"] if isinstance(inserted_row, dict) else inserted_row[0]
         )
         if persist_recovery:
+            _set_clocks_persistence_worker_phase(
+                "DB_RECOVERY_CONFIG_INSERT", sequence=_as_int(sequence),
+                detail={"detail_id": detail_id},
+            )
             _write_clocks_recovery_config(
                 cur, checkpoint, source_detail_id=detail_id
             )
+        _set_clocks_persistence_worker_phase(
+            "DB_COMMIT_INSERT", sequence=_as_int(sequence),
+            detail={"detail_id": detail_id},
+        )
     return "inserted"
 
 
@@ -13873,10 +14106,21 @@ def _clocks_persistence_loop() -> None:
         failure_logged = False
         while True:
             try:
+                worker_sequence = _as_int(state.get("sequence"))
+                _set_clocks_persistence_worker_phase("WAIT_LOCK", sequence=worker_sequence)
                 with _clocks_persistence_lock:
+                    _set_clocks_persistence_worker_phase("LOCK_ACQUIRED", sequence=worker_sequence)
                     disposition = _persist_clocks_state(
                         state, ppb_restore_checkpoint
                     )
+                    _set_clocks_persistence_worker_phase(
+                        "LOCK_RELEASING", sequence=worker_sequence,
+                        detail={"disposition": disposition},
+                    )
+                _set_clocks_persistence_worker_phase(
+                    "IDLE", sequence=worker_sequence,
+                    detail={"last_disposition": disposition},
+                )
                 _clocks_state_persisted += 1
                 if disposition == "merged":
                     _clocks_state_merged += 1
@@ -15528,11 +15772,124 @@ def _hard_failure_stats_repair_worker(
     state: Dict[str, Any],
     repair_record: Dict[str, Any],
 ) -> None:
-    """Execute the repair plan selected by CLOCKS.REPAIR and prove service release."""
+    """Execute one CLOCKS.REPAIR request without racing startup reconciliation.
+
+    The command socket is intentionally live before holistic startup reconciliation
+    completes.  A repair request received in that window is therefore a queued
+    operator intent, not authority to run a second lineage transaction concurrently
+    with the startup owner.  Wait for startup to reach a terminal state, then
+    re-diagnose from current truth and only then open the narrow HARD_FAILURE repair
+    data plane.
+    """
     repaired = False
     reset_details: Dict[str, Any] = {}
     strategy = str(repair_record.get("strategy") or "")
+    repair_plane_open = False
     try:
+        if _startup_reconciliation_active.is_set():
+            repair_record["phase"] = "WAITING_FOR_STARTUP_RECONCILIATION"
+            repair_record["startup_reconciliation_active"] = True
+            repair_record["next_action"] = (
+                "REPAIR is queued behind the one startup reconciliation owner; "
+                "no concurrent lineage mutation will be attempted."
+            )
+            _diag["last_repair"] = copy.deepcopy(repair_record)
+            logging.warning(
+                "🧯 [clocks] REPAIR queued while startup reconciliation owns CLOCKS; "
+                "waiting for that transaction to reach a terminal state"
+            )
+            wait_started = time.monotonic()
+            next_wait_log = wait_started + 10.0
+            while _startup_reconciliation_active.is_set():
+                now = time.monotonic()
+                if now >= next_wait_log:
+                    wait_state = _operational_state_snapshot()
+                    wait_snapshot = {
+                        "phase": "WAITING_FOR_STARTUP_RECONCILIATION",
+                        "startup_reconciliation_active": True,
+                        "waited_s": round(now - wait_started, 3),
+                        "operational_state": wait_state,
+                        "startup_control_ready": _startup_control_ready.is_set(),
+                        "startup_custody_unresolved": _startup_clocks_custody_unresolved(),
+                        "startup_instrument_restore_hold": _startup_instrument_restore_hold.is_set(),
+                        "holistic_restore_proof_pending": _clocks_holistic_restore_proof_pending.is_set(),
+                        "epoch_birth_pending": _clocks_epoch_birth_pending.is_set(),
+                        "ppb_restore_transaction_active": _ppb_restore_transaction_active.is_set(),
+                    }
+                    repair_record.update(wait_snapshot)
+                    repair_record["next_action"] = (
+                        "Startup still owns reconciliation; REPAIR remains queued and will "
+                        "begin automatically when that ownership boundary is released."
+                    )
+                    _diag["last_repair"] = copy.deepcopy(repair_record)
+                    logging.warning(
+                        "🧯 [clocks] REPAIR still queued after %.1fs: state=%s "
+                        "startup_custody_unresolved=%s restore_hold=%s proof_pending=%s "
+                        "epoch_birth_pending=%s ppb_restore_active=%s",
+                        now - wait_started,
+                        wait_state.get("state"),
+                        wait_snapshot["startup_custody_unresolved"],
+                        wait_snapshot["startup_instrument_restore_hold"],
+                        wait_snapshot["holistic_restore_proof_pending"],
+                        wait_snapshot["epoch_birth_pending"],
+                        wait_snapshot["ppb_restore_transaction_active"],
+                    )
+                    next_wait_log = now + 10.0
+                time.sleep(0.05)
+
+            state = _operational_state_snapshot()
+            state_name = str(state.get("state") or "").strip().upper()
+            startup_ready = _startup_control_ready.is_set()
+            if (
+                state_name == OPERATIONAL_STATE_RUNNING
+                and startup_ready
+                and not _hard_failure_active()
+            ):
+                repaired = True
+                repair_record.update({
+                    "phase": "NO_ACTION_STARTUP_SELF_REPAIRED",
+                    "completed_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "success": True,
+                    "strategy": "NO_ACTION_STARTUP_SELF_REPAIRED",
+                    "startup_reconciliation_active": False,
+                    "operational_state": state,
+                    "hard_failure_remains_latched": False,
+                    "restart_required": False,
+                    "next_action": "Startup reconciliation completed successfully; no additional repair was required.",
+                })
+                _diag["repair_success"] = _diag.get("repair_success", 0) + 1
+                _diag["last_repair"] = copy.deepcopy(repair_record)
+                logging.critical(
+                    "🧯 [clocks] queued REPAIR closed as no-op: startup reconciliation repaired CLOCKS itself"
+                )
+                return
+
+            # The startup owner has finished and left CLOCKS non-running. Re-plan
+            # against the terminal state rather than executing the stale strategy
+            # selected when the command first arrived.
+            failure_reason = str(state.get("reason") or "")
+            strategy = (
+                "DESTRUCTIVE_STATS_LINEAGE_RESET"
+                if _hard_failure_active() and failure_reason in _DESTRUCTIVE_REPAIR_REASONS
+                else "PRESERVE_HISTORY_FRESH_ALPHA"
+            )
+            repair_record.update({
+                "phase": "IN_PROGRESS",
+                "strategy": strategy,
+                "trigger_state_after_startup": state_name,
+                "trigger_reason_after_startup": failure_reason,
+                "startup_reconciliation_active": False,
+                "startup_control_ready": startup_ready,
+                "destructive": strategy == "DESTRUCTIVE_STATS_LINEAGE_RESET",
+                "next_action": "Wait for CLOCKS.REPORT.repair.success=true.",
+            })
+            _diag["last_repair"] = copy.deepcopy(repair_record)
+
+        # Only the actual repair transaction receives permission to pass the
+        # HARD_FAILURE ingress/persistence gates.  Waiting requests never do.
+        _hard_failure_stats_repair_event.set()
+        repair_plane_open = True
+
         if strategy == "PRESERVE_HISTORY_FRESH_ALPHA":
             repair_record["phase"] = "SURRENDERING_BROKEN_LINEAGE"
             _diag["last_repair"] = copy.deepcopy(repair_record)
@@ -15649,7 +16006,9 @@ def _hard_failure_stats_repair_worker(
             _diag["last_repair"] = copy.deepcopy(repair_record)
             logging.exception("🛑 [clocks] REPAIR failed; CLOCKS remains fail-closed")
     finally:
-        _hard_failure_stats_repair_event.clear()
+        if repair_plane_open:
+            _hard_failure_stats_repair_event.clear()
+        _repair_request_in_progress.clear()
         _clocks_epoch_birth_pending.clear()
         if not repaired:
             _clocks_persistence_enabled.clear()
@@ -15684,7 +16043,7 @@ def cmd_repair(_: Optional[dict]) -> Dict[str, Any]:
         }
 
     with _hard_failure_stats_repair_lock:
-        if _hard_failure_stats_repair_active():
+        if _repair_request_in_progress.is_set():
             return {
                 "success": True,
                 "message": "CLOCKS REPAIR is already in progress",
@@ -15728,8 +16087,14 @@ def cmd_repair(_: Optional[dict]) -> Dict[str, Any]:
             "operator_arguments_required": False,
             "next_action": "Wait for CLOCKS.REPORT.repair.success=true.",
         }
+        if _startup_reconciliation_active.is_set():
+            repair_record["phase"] = "WAITING_FOR_STARTUP_RECONCILIATION"
+            repair_record["startup_reconciliation_active"] = True
+            repair_record["next_action"] = (
+                "REPAIR is queued behind startup reconciliation; wait for CLOCKS.REPORT.repair.success=true."
+            )
         _diag["last_repair"] = copy.deepcopy(repair_record)
-        _hard_failure_stats_repair_event.set()
+        _repair_request_in_progress.set()
         try:
             threading.Thread(
                 target=_hard_failure_stats_repair_worker,
@@ -15741,6 +16106,7 @@ def cmd_repair(_: Optional[dict]) -> Dict[str, Any]:
                 name="clocks-repair",
             ).start()
         except Exception as exc:
+            _repair_request_in_progress.clear()
             _hard_failure_stats_repair_event.clear()
             repair_record.update({
                 "phase": "FAILED_TO_START",
@@ -17828,8 +18194,12 @@ def cmd_truncate(args: Optional[dict]) -> Dict[str, Any]:
                     "TRUNCATE TABLE campaign_detail, campaign_master RESTART IDENTITY"
                 )
                 cur.execute(
-                    "DELETE FROM config WHERE config_key IN (%s, %s)",
-                    (CLOCKS_RECOVERY_CONFIG_KEY, "PHOTONS_RECOVERY"),
+                    "DELETE FROM config WHERE config_key IN (%s, %s, %s)",
+                    (
+                        CLOCKS_RECOVERY_CONFIG_KEY,
+                        CLOCKS_ALPHA_LINEAGE_CUTOFF_CONFIG_KEY,
+                        "PHOTONS_RECOVERY",
+                    ),
                 )
     except Exception as e:
         logging.exception("❌ [clocks] TRUNCATE failed")
@@ -18340,6 +18710,11 @@ def run() -> None:
     _setup_invalid_timebase_logger()
     _hard_failure_event.clear()
     _hard_failure_stats_repair_event.clear()
+    _repair_request_in_progress.clear()
+    # From command-server exposure through the holistic finalizer there is exactly
+    # one startup owner.  REPAIR requests may queue during this interval but may
+    # not mutate lineage concurrently with it.
+    _startup_reconciliation_active.set()
     _set_operational_state(
         OPERATIONAL_STATE_STARTING,
         reason="process_start",
@@ -18495,42 +18870,60 @@ def run() -> None:
             source="RUN_HOLISTIC_RESTORE",
         )
     finally:
-        if _hard_failure_active():
-            _startup_control_ready.clear()
-            _clocks_persistence_enabled.clear()
-            _diag["startup_control_ready"] = False
-            logging.critical(
-                "🛑 [clocks] startup entered HARD_FAILURE — service remains alive "
-                "for read-only diagnostics; persistence/control stay closed"
-            )
-        elif _startup_clocks_custody_unresolved():
-            details = {
-                "startup_custody_unresolved": True,
-                "startup_instrument_restore_hold": _startup_instrument_restore_hold.is_set(),
-                "holistic_restore_proof_pending": _clocks_holistic_restore_proof_pending.is_set(),
-                "holistic_restore_proof_committed": _clocks_holistic_restore_proof_committed.is_set(),
-                "action": "Run CLOCKS.REPAIR; unresolved startup custody may not remain indefinitely RECOVERING.",
-            }
-            logging.error(
-                "💥 [clocks] startup reconciliation returned with unresolved custody — "
-                "promoting RECOVERING limbo to HARD_FAILURE so CLOCKS.REPAIR has explicit authority"
-            )
-            _enter_hard_failure(
-                "startup_reconciliation_custody_unresolved",
-                details,
-                source="RUN_HOLISTIC_RESTORE_FINALIZER",
-            )
-        else:
-            _clocks_persistence_enabled.set()
-            _startup_control_ready.set()
-            _diag["startup_control_ready"] = True
-            _set_operational_state(
-                OPERATIONAL_STATE_RUNNING,
-                reason="startup_reconciliation_complete",
-                source="RUN",
-            )
+        # Startup reconciliation is a single-owner transaction.  The ownership
+        # event is also the queue barrier for CLOCKS.REPAIR, so it must be released
+        # even if the terminal finalizer itself discovers (or throws while reporting)
+        # a failure.  Previously the clear lived *after* this finally block; any
+        # exception in the finalizer could therefore strand REPAIR forever behind an
+        # owner that no longer had executable work.
+        try:
+            if _hard_failure_active():
+                _startup_control_ready.clear()
+                _clocks_persistence_enabled.clear()
+                _diag["startup_control_ready"] = False
+                logging.critical(
+                    "🛑 [clocks] startup entered HARD_FAILURE — service remains alive "
+                    "for read-only diagnostics; persistence/control stay closed"
+                )
+            elif _startup_clocks_custody_unresolved():
+                details = {
+                    "startup_custody_unresolved": True,
+                    "startup_instrument_restore_hold": _startup_instrument_restore_hold.is_set(),
+                    "holistic_restore_proof_pending": _clocks_holistic_restore_proof_pending.is_set(),
+                    "holistic_restore_proof_committed": _clocks_holistic_restore_proof_committed.is_set(),
+                    "action": "Run CLOCKS.REPAIR; unresolved startup custody may not remain indefinitely RECOVERING.",
+                }
+                logging.error(
+                    "💥 [clocks] startup reconciliation returned with unresolved custody — "
+                    "promoting RECOVERING limbo to HARD_FAILURE so CLOCKS.REPAIR has explicit authority"
+                )
+                _enter_hard_failure(
+                    "startup_reconciliation_custody_unresolved",
+                    details,
+                    source="RUN_HOLISTIC_RESTORE_FINALIZER",
+                )
+            else:
+                _clocks_persistence_enabled.set()
+                _startup_control_ready.set()
+                _diag["startup_control_ready"] = True
+                _set_operational_state(
+                    OPERATIONAL_STATE_RUNNING,
+                    reason="startup_reconciliation_complete",
+                    source="RUN",
+                )
+                logging.info(
+                    "✅ [clocks] startup state reconciliation complete — START/RESUME enabled"
+                )
+        finally:
+            # This is the definitive ownership release.  A queued REPAIR worker may
+            # re-diagnose only after this point, never concurrently with startup.
+            _startup_reconciliation_active.clear()
             logging.info(
-                "✅ [clocks] startup state reconciliation complete — START/RESUME enabled"
+                "🧯 [clocks/startup] startup reconciliation ownership released: state=%s "
+                "hard_failure=%s startup_control_ready=%s",
+                _operational_state_snapshot().get("state"),
+                _hard_failure_active(),
+                _startup_control_ready.is_set(),
             )
 
     threading.Thread(

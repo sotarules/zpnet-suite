@@ -2699,7 +2699,16 @@ static interrupt_handoff_source_diag_t g_handoff_ch2{};
 static interrupt_handoff_source_diag_t g_handoff_ocxo1{};
 static interrupt_handoff_source_diag_t g_handoff_ocxo2{};
 static interrupt_handoff_source_diag_t g_handoff_pps{};
-static volatile uint32_t g_interrupt_capture_sequence = 0U;
+static uint32_t g_interrupt_capture_sequence = 0U;
+
+// Capture sequence is a cross-ring ordering token. Priority 0 may preempt
+// Priority 16 while both are publishing otherwise-SPSC rings, so allocation
+// itself must be one atomic operation. Ring publication ordering remains
+// governed separately by the existing DMB/head handoff.
+static inline uint32_t interrupt_capture_sequence_next_isr(void) {
+  return __atomic_add_fetch(
+      &g_interrupt_capture_sequence, 1U, __ATOMIC_RELAXED);
+}
 
 // Minimal entry witness types are public in process_interrupt.h so the exact
 // first-instruction transcript can cross Interrupt -> Alpha -> Beta losslessly.
@@ -4061,7 +4070,7 @@ static bool capture_ring_push_isr(
     diag.overrun_count++;
     return false;
   }
-  packet.sequence = ++g_interrupt_capture_sequence;
+  packet.sequence = interrupt_capture_sequence_next_isr();
   ring.items[head % N] = packet;
   dmb_barrier();
   ring.head = head + 1U;
