@@ -324,6 +324,21 @@ static volatile uint32_t transport_rx_poll_count = 0;
 static volatile uint32_t transport_tx_poll_count = 0;
 static volatile uint32_t transport_runtime_loop_count = 0;
 
+// Host-session custody is distinct from the Teensy producer lifetime.  DTR is
+// the physical witness that the current Pi serial owner exists.  Only the RX
+// TimePop path mutates this state; TX reads host_session_connected as a gate.
+static bool host_session_dtr_known = false;
+static volatile bool host_session_connected = false;
+static volatile bool host_session_tx_rewind_requested = false;
+static volatile uint32_t host_session_generation = 0U;
+static volatile uint32_t host_session_connect_count = 0U;
+static volatile uint32_t host_session_disconnect_count = 0U;
+static volatile uint32_t host_session_rx_partial_retire_count = 0U;
+static volatile uint32_t host_session_rx_partial_retired_bytes = 0U;
+static volatile uint32_t host_session_tx_partial_rewind_count = 0U;
+static volatile uint32_t host_session_tx_partial_rewound_bytes = 0U;
+static volatile uint32_t host_session_last_transition_dwt = 0U;
+
 
 // =============================================================
 // RX State
@@ -837,6 +852,26 @@ static void tx_promote_oldest_control_job_if_safe() {
 
 static void tx_pump_once() {
 
+  // RX owns DTR/session detection; TX owns every tx_job_t byte offset.  A DTR
+  // loss therefore crosses this boundary as one scalar retirement request.
+  if (host_session_tx_rewind_requested) {
+    if (tx_job_count != 0U) {
+      tx_job_t& current = tx_jobs[tx_job_tail];
+      if (current.sent > current.length) __builtin_trap();
+      if (current.sent != 0U && current.sent < current.length) {
+        host_session_tx_partial_rewind_count++;
+        host_session_tx_partial_rewound_bytes += (uint32_t)current.sent;
+        current.sent = 0U;
+      }
+    }
+    host_session_tx_rewind_requested = false;
+  }
+
+  // A semantic TX job may outlive the Pi, but a byte offset may not.  Never
+  // advance bytes while no host session owns the other end of USB CDC.
+  if (!host_session_connected)
+    return;
+
   if (tx_job_count == 0)
     return;
 
@@ -1315,6 +1350,53 @@ static void rx_reset_hard() {
   rx_traffic = 0;
 }
 
+static void transport_host_session_poll() {
+  const bool dtr_now = ZPNET_SERIAL.dtr() != 0U;
+
+  if (!host_session_dtr_known) {
+    host_session_dtr_known = true;
+    host_session_connected = dtr_now;
+    if (dtr_now) {
+      host_session_generation = 1U;
+      host_session_connect_count++;
+      host_session_last_transition_dwt = ARM_DWT_CYCCNT;
+    }
+    return;
+  }
+
+  if (dtr_now == host_session_connected)
+    return;
+
+  host_session_last_transition_dwt = ARM_DWT_CYCCNT;
+
+  if (!dtr_now) {
+    // The old Pi can never complete an RX frame that has not crossed the
+    // semantic parser boundary.  Retire only that incomplete byte custody;
+    // completed deferred-dispatch Payloads are already semantic values.
+    if (rx_have_traffic || rx_len != 0U) {
+      host_session_rx_partial_retire_count++;
+      host_session_rx_partial_retired_bytes += (uint32_t)rx_len;
+      rx_len = 0U;
+      rx_have_traffic = false;
+      rx_traffic = 0U;
+    }
+
+    // A partially transmitted frame is not a complete semantic handoff.  RX
+    // cannot edit TX-owned job state, so hand one scalar retirement request
+    // to the TX TimePop owner; it will rewind only the partial current frame.
+    host_session_tx_rewind_requested = true;
+
+    host_session_connected = false;
+    host_session_disconnect_count++;
+    return;
+  }
+
+  host_session_connected = true;
+  host_session_connect_count++;
+  host_session_generation++;
+  if (host_session_generation == 0U) host_session_generation = 1U;
+}
+
 static inline bool rx_stx_accepts(uint8_t b) {
   if (rx_len >= STX_LEN)
     return true;
@@ -1595,7 +1677,9 @@ static void transport_rx_timepop(
 ) {
   transport_poll_count++;
   transport_rx_poll_count++;
-  rx_serial_tick();
+  transport_host_session_poll();
+  if (host_session_connected)
+    rx_serial_tick();
 }
 
 static void transport_tx_timepop(
@@ -1696,6 +1780,21 @@ FLASHMEM void transport_get_info(transport_info_t* out) {
   out->tx_poll_count           = transport_tx_poll_count;
   out->runtime_loop_count      = transport_runtime_loop_count;
   out->poll_interval_us        = (uint32_t)(TRANSPORT_SERVICE_PERIOD_NS / 1000ULL);
+
+  out->host_session_dtr_known = host_session_dtr_known ? 1U : 0U;
+  out->host_session_connected = host_session_connected ? 1U : 0U;
+  out->host_session_generation = host_session_generation;
+  out->host_session_connect_count = host_session_connect_count;
+  out->host_session_disconnect_count = host_session_disconnect_count;
+  out->host_session_rx_partial_retire_count =
+      host_session_rx_partial_retire_count;
+  out->host_session_rx_partial_retired_bytes =
+      host_session_rx_partial_retired_bytes;
+  out->host_session_tx_partial_rewind_count =
+      host_session_tx_partial_rewind_count;
+  out->host_session_tx_partial_rewound_bytes =
+      host_session_tx_partial_rewound_bytes;
+  out->host_session_last_transition_dwt = host_session_last_transition_dwt;
 
   out->tx_budget_max        = TX_BUDGET_MAX;
   out->tx_budget_used       = tx_budget_used;
@@ -1837,6 +1936,9 @@ void transport_init(void) {
   rx_dispatch_pending = false;
   rx_dispatch_traffic = 0;
   rx_dispatch_payload.clear();
+  host_session_dtr_known = false;
+  host_session_connected = false;
+  host_session_tx_rewind_requested = false;
 
   timepop_arm(
     TRANSPORT_SERVICE_PERIOD_NS,

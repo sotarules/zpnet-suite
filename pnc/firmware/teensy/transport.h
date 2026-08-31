@@ -202,6 +202,21 @@ typedef struct {
   uint32_t poll_interval_us;        // Scheduled callback period in microseconds
 
   // ===========================================================
+  // Host session — Pi lifetime boundary over USB CDC DTR
+  // ===========================================================
+
+  uint32_t host_session_dtr_known;
+  uint32_t host_session_connected;
+  uint32_t host_session_generation;
+  uint32_t host_session_connect_count;
+  uint32_t host_session_disconnect_count;
+  uint32_t host_session_rx_partial_retire_count;
+  uint32_t host_session_rx_partial_retired_bytes;
+  uint32_t host_session_tx_partial_rewind_count;
+  uint32_t host_session_tx_partial_rewound_bytes;
+  uint32_t host_session_last_transition_dwt;
+
+  // ===========================================================
   // TX — Budget / Queue Health
   // ===========================================================
 

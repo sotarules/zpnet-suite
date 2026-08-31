@@ -90,6 +90,7 @@ _RETRY_MAX_SLEEP_S = 0.50
 # callbacks are installed before transport_init(), so parse/deliver every valid
 # frame during the settle window before declaring Pi->Teensy writes ready.
 _ATTACH_INGEST_S = 1.00
+_HOST_SESSION_ASSERT_SETTLE_S = 0.010
 _READY_SEND_TIMEOUT_S = 10.0
 
 # ---------------------------------------------------------------------
@@ -106,6 +107,7 @@ _transport_ready_lock = threading.Lock()
 _transport_ready_generation = 0
 _transport_attach_count = 0
 _transport_attach_ingest_bytes = 0
+_transport_host_session_begin_count = 0
 _transport_last_ready_ts: Optional[float] = None
 
 # ---------------------------------------------------------------------
@@ -126,8 +128,11 @@ def _open_serial(path: str) -> None:
     if _ser is not None:
         return
 
+    # Construct the port unopened so the new Pi transport lifetime can assert
+    # DTR=False before USB CDC opens.  The surviving Teensy therefore observes
+    # an explicit host-session gap before this process is allowed to send.
     kwargs = {
-        "port": path,
+        "port": None,
         "baudrate": getattr(constants, "TEENSY_BAUDRATE", 115200),
         "timeout": None,
     }
@@ -135,11 +140,23 @@ def _open_serial(path: str) -> None:
     # POSIX pyserial supports exclusive=True.  It gives us a cheap proof that
     # zpnet-pubsub is the only process physically touching the serial device.
     try:
-        _ser = serial.Serial(**kwargs, exclusive=True)
+        ser = serial.Serial(**kwargs, exclusive=True)
     except TypeError:
-        _ser = serial.Serial(**kwargs)
+        ser = serial.Serial(**kwargs)
 
-    logging.info("[transport] SERIAL device opened: %s", path)
+    try:
+        ser.port = path
+        ser.dtr = False
+        ser.open()
+    except Exception:
+        try:
+            ser.close()
+        except Exception:
+            pass
+        raise
+
+    _ser = ser
+    logging.info("[transport] SERIAL device opened with DTR low: %s", path)
 
 
 def _transport_mark_not_ready() -> None:
@@ -175,6 +192,27 @@ def _close_serial() -> None:
 
 def _reset_host_rx_state() -> None:
     _rx_reset()
+
+
+def _serial_begin_host_session() -> None:
+    """Raise DTR only after old-session ingress has been consumed."""
+    global _transport_host_session_begin_count
+
+    ser = _ser
+    if ser is None:
+        raise RuntimeError("SERIAL transport is not open")
+
+    ser.dtr = True
+    _transport_host_session_begin_count += 1
+
+    # Teensy polls DTR from its 2 ms RX TimePop owner.  Do not advertise Pi TX
+    # readiness until that owner has had several opportunities to commit the new
+    # host-session generation and retire any old byte-offset custody.
+    time.sleep(_HOST_SESSION_ASSERT_SETTLE_S)
+    logging.info(
+        "[transport] host session asserted via DTR (session=%d)",
+        _transport_host_session_begin_count,
+    )
 
 
 def _serial_reset_output_buffer() -> None:
@@ -527,6 +565,7 @@ def _supervisor_loop() -> None:
             _reset_host_rx_state()
             _serial_reset_output_buffer()
             _ingest_attach_stream()
+            _serial_begin_host_session()
             if announced:
                 logging.info("✅ [transport] SERIAL device available — RX loop starting")
                 announced = False
@@ -568,6 +607,7 @@ def transport_diagnostics() -> dict:
             "ready_generation": _transport_ready_generation,
             "attach_count": _transport_attach_count,
             "attach_ingest_bytes": _transport_attach_ingest_bytes,
+            "host_session_begin_count": _transport_host_session_begin_count,
             "last_ready_ts": _transport_last_ready_ts,
         }
 

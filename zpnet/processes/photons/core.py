@@ -151,6 +151,12 @@ STARTUP_INFRASTRUCTURE_STATUS_LOG_INTERVAL_S = 30.0
 PHOTONS_RUNTIME_RECOVERY_POLL_S = 0.25
 PHOTONS_RUNTIME_RECOVERY_BARRIER_LOG_S = 30.0
 
+# Worker-owned queue control. Once a Phase-2 worker starts, no other thread may
+# remove entries from its data queue. Recovery/maintenance request retirement
+# from the owner and wait for an explicit acknowledgement instead.
+PHOTONS_QUEUE_OWNER_WAIT_LOG_S = 30.0
+PHOTONS_QUEUE_OWNER_CONTROL_TIMEOUT_S = 180.0
+
 # SYSTEM owns these platform/context objects.  PHOTONS copies them transitively
 # and does not derive replacement values or reinterpret their scientific meaning.
 SYSTEM_CONTEXT_FIELDS = (
@@ -183,6 +189,28 @@ _state_worker_started = threading.Event()
 _persistence_worker_started = threading.Event()
 _campaign_control_ready = threading.Event()
 _recovery_proof_durable = threading.Event()
+
+# Data queues remain permanently single-consumer after worker ownership begins.
+# These scalar control handoffs ask the owner to retire its own queued values;
+# requesters never remove entries from somebody else's queue.
+_state_queue_retire_control_lock = threading.Lock()
+_state_queue_retire_requested = threading.Event()
+_state_queue_retire_completed = threading.Event()
+_state_queue_retire_reason = ""
+_state_queue_retire_result = 0
+
+_persist_queue_retire_control_lock = threading.Lock()
+_persist_queue_retire_requested = threading.Event()
+_persist_queue_retire_completed = threading.Event()
+_persist_queue_retire_reason = ""
+_persist_queue_retire_result = 0
+
+# Destructive maintenance first quiesces both queue owners. Owners continue to
+# service retirement control while held, but they do not consume ordinary data.
+_maintenance_control_lock = threading.Lock()
+_maintenance_queue_hold = threading.Event()
+_state_worker_maintenance_quiescent = threading.Event()
+_persistence_worker_maintenance_quiescent = threading.Event()
 
 _latest_fragment: Optional[Payload] = None
 _latest_photons: Optional[Payload] = None
@@ -2418,6 +2446,10 @@ def _retire_orphaned_photons_recovery_config_if_domain_empty() -> Dict[str, Any]
     a leftover config.PHOTONS_RECOVERY row has no durable owner and must not
     influence the new database epoch.
 
+    Startup needs an emptiness verdict, not historical cardinality.  Use bounded
+    existence probes so a large campaign_detail table cannot turn recovery
+    classification into a full-history scan.
+
     Any surviving LANTERN master or detail keeps the ordinary fail-closed recovery
     courts intact.
     """
@@ -2426,22 +2458,34 @@ def _retire_orphaned_photons_recovery_config_if_domain_empty() -> Dict[str, Any]
         cur.execute(
             """
             SELECT
-                (SELECT COUNT(*) FROM campaign_master WHERE campaign_type = %s) AS master_count,
-                (SELECT COUNT(*) FROM campaign_detail WHERE campaign_type = %s) AS detail_count
+                (
+                    SELECT id
+                    FROM campaign_master
+                    WHERE campaign_type = %s
+                    ORDER BY id DESC
+                    LIMIT 1
+                ) AS master_id,
+                (
+                    SELECT id
+                    FROM campaign_detail
+                    WHERE campaign_type = %s
+                    ORDER BY id DESC
+                    LIMIT 1
+                ) AS detail_id
             """,
             (CAMPAIGN_TYPE_LANTERN, CAMPAIGN_TYPE_LANTERN),
         )
         row = cur.fetchone()
         if not isinstance(row, dict):
-            raise RuntimeError("PHOTONS empty-domain court returned no count row")
+            raise RuntimeError("PHOTONS empty-domain court returned no existence row")
 
-        master_count = int(row.get("master_count") or 0)
-        detail_count = int(row.get("detail_count") or 0)
-        if master_count != 0 or detail_count != 0:
+        master_present = row.get("master_id") is not None
+        detail_present = row.get("detail_id") is not None
+        if master_present or detail_present:
             return {
                 "domain_empty": False,
-                "master_count": master_count,
-                "detail_count": detail_count,
+                "master_present": master_present,
+                "detail_present": detail_present,
                 "recovery_config_deleted": False,
             }
 
@@ -2457,8 +2501,8 @@ def _retire_orphaned_photons_recovery_config_if_domain_empty() -> Dict[str, Any]
 
     return {
         "domain_empty": True,
-        "master_count": 0,
-        "detail_count": 0,
+        "master_present": False,
+        "detail_present": False,
         "recovery_config_deleted": bool(deleted),
     }
 
@@ -3352,6 +3396,29 @@ def _load_active_lantern_master() -> Optional[Dict[str, Any]]:
     return out
 
 
+def _lantern_campaign_has_details(campaign_name: str) -> bool:
+    """Return whether this campaign owns any durable detail without counting history."""
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id
+            FROM campaign_detail
+            WHERE campaign_type = %s
+              AND campaign = %s
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (CAMPAIGN_TYPE_LANTERN, campaign_name),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return False
+    if not isinstance(row, dict) or row.get("id") is None:
+        raise RuntimeError("PHOTONS campaign-detail existence court returned malformed testimony")
+    return True
+
+
 def _count_lantern_campaign_details(campaign_name: str) -> int:
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
@@ -3975,21 +4042,27 @@ def _count_current_lantern_details() -> int:
     return int(row["count"] if row else 0)
 
 
-def _count_current_real_race_details() -> int:
-    """Count durable rows belonging to the current physical race source epoch."""
+def _current_real_race_has_details() -> bool:
+    """Return whether any durable row belongs to the current physical source epoch."""
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT COUNT(*) AS count
+            SELECT id
             FROM campaign_detail
             WHERE campaign_type = %s
               AND payload #>> '{photons,source}' = %s
+            ORDER BY id DESC
+            LIMIT 1
             """,
             (CAMPAIGN_TYPE_LANTERN, "PD200T_REAL_RACE"),
         )
         row = cur.fetchone()
-    return int(row["count"] if row else 0)
+    if row is None:
+        return False
+    if not isinstance(row, dict) or row.get("id") is None:
+        raise RuntimeError("PHOTONS real-race existence court returned malformed testimony")
+    return True
 
 
 def _retire_legacy_recovery_for_real_race_epoch(
@@ -5531,7 +5604,7 @@ def _startup_held_restore(
         live_report=None,
         allow_first_public_count_splice=True,
     )
-    drained = _drain_queue(_fragment_queue)
+    drained = _retire_fragment_queue_via_owner("HELD_RESTORE")
     expected = {
         "mode": "HELD_RESTORE",
         "generation": generation,
@@ -5730,7 +5803,7 @@ def _startup_cold_start(
         live_report=None,
         allow_first_public_count_splice=False,
     )
-    drained = _drain_queue(_fragment_queue)
+    drained = _retire_fragment_queue_via_owner("COLD_START")
     _arm_recovery_proof({"mode": "COLD_START", "generation": generation})
     _recovery_status_set(
         "COLD_STARTING",
@@ -5874,18 +5947,37 @@ def _perform_phase5_recovery() -> Dict[str, Any]:
             )
 
         active_master = _load_active_lantern_master()
-        active_detail_count = (
-            _count_lantern_campaign_details(active_master["campaign"])
+        active_detail_present = (
+            _lantern_campaign_has_details(active_master["campaign"])
             if active_master is not None
-            else 0
+            else False
         )
-        total_detail_count = _count_current_lantern_details()
-        real_race_detail_count = _count_current_real_race_details()
-        require_active_campaign = active_master is not None and active_detail_count > 0
+        require_active_campaign = active_master is not None and active_detail_present
         snapshot, skipped, rows_scanned = _load_newest_recoverable_photons_state(
             active_master=active_master,
             require_active_campaign=require_active_campaign,
         )
+
+        # Exact historical cardinality is irrelevant when the newest authoritative
+        # real-race snapshot already exists.  Keep those full scans off the normal
+        # restart path; perform them only for the one-time legacy source migration
+        # where the preserved-row count itself becomes durable testimony.
+        active_detail_count: Optional[int] = None
+        total_detail_count: Optional[int] = None
+        real_race_detail_count: Optional[int] = None
+        if snapshot is None:
+            if _current_real_race_has_details():
+                raise RuntimeError(
+                    "durable PD200T_REAL_RACE history exists but no row satisfies the recovery court: "
+                    f"rows_scanned={rows_scanned} skipped={skipped!r}"
+                )
+            total_detail_count = _count_current_lantern_details()
+            active_detail_count = (
+                _count_lantern_campaign_details(active_master["campaign"])
+                if active_master is not None
+                else 0
+            )
+            real_race_detail_count = 0
         desired_state = (
             _project_photons_recovery_snapshot(
                 snapshot, datetime.now(timezone.utc)
@@ -5900,12 +5992,7 @@ def _perform_phase5_recovery() -> Dict[str, Any]:
         )
         source_epoch_migration: Optional[Dict[str, Any]] = None
         legacy_source_migration_required = False
-        if snapshot is None and real_race_detail_count != 0:
-            raise RuntimeError(
-                "durable PD200T_REAL_RACE history exists but no row satisfies the recovery court: "
-                f"rows_scanned={rows_scanned} skipped={skipped!r}"
-            )
-        if snapshot is None and total_detail_count != 0:
+        if snapshot is None and int(total_detail_count or 0) != 0:
             if active_master is not None:
                 raise RuntimeError(
                     "legacy LANTERN campaign is still active during PD200T_REAL_RACE source "
@@ -5933,7 +6020,7 @@ def _perform_phase5_recovery() -> Dict[str, Any]:
                     "reboot the Teensy before source-epoch migration"
                 )
             source_epoch_migration = _retire_legacy_recovery_for_real_race_epoch(
-                legacy_detail_count=total_detail_count
+                legacy_detail_count=int(total_detail_count or 0)
             )
 
         if snapshot is not None:
@@ -5947,6 +6034,8 @@ def _perform_phase5_recovery() -> Dict[str, Any]:
 
         classification = {
             "active_campaign": active_master["campaign"] if active_master else None,
+            "active_campaign_detail_present": bool(active_detail_present),
+            "historical_count_scan_performed": snapshot is None,
             "active_campaign_detail_count": active_detail_count,
             "total_detail_count": total_detail_count,
             "real_race_detail_count": real_race_detail_count,
@@ -5995,7 +6084,7 @@ def _perform_phase5_recovery() -> Dict[str, Any]:
         if source is None:
             return _startup_cold_start(
                 active_master=active_master,
-                rows_seen=total_detail_count,
+                rows_seen=int(total_detail_count or 0),
                 source_epoch_migration=source_epoch_migration,
             )
         literal_history = _literal_recovery_history_from_source(source)
@@ -6405,6 +6494,124 @@ def _note_persist_queue_depth() -> None:
             _persist_queue_depth_max = depth
 
 
+def _wait_for_queue_owner_event(event: threading.Event, *, owner: str, reason: str) -> None:
+    started = time.monotonic()
+    last_log = started
+    while not event.wait(timeout=0.05):
+        now = time.monotonic()
+        waited = now - started
+        if waited >= PHOTONS_QUEUE_OWNER_CONTROL_TIMEOUT_S:
+            raise RuntimeError(
+                f"PHOTONS {owner} queue owner did not acknowledge control "
+                f"reason={reason!r} within {waited:.1f}s"
+            )
+        if now - last_log >= PHOTONS_QUEUE_OWNER_WAIT_LOG_S:
+            logging.info(
+                "⏳ [photons/queue-owner] waiting for %s owner control reason=%s waited_s=%.1f",
+                owner,
+                reason,
+                waited,
+            )
+            last_log = now
+
+
+def _state_worker_service_fragment_retirement() -> bool:
+    global _state_queue_retire_reason
+    global _state_queue_retire_result
+    if not _state_queue_retire_requested.is_set():
+        return False
+    reason = str(_state_queue_retire_reason or "unspecified")
+    retired = _drain_queue(_fragment_queue)
+    _state_queue_retire_result = int(retired)
+    _state_queue_retire_reason = ""
+    _state_queue_retire_requested.clear()
+    _state_queue_retire_completed.set()
+    logging.info(
+        "🧹 [photons/queue-owner] state worker retired %d ingress row(s) reason=%s",
+        retired,
+        reason,
+    )
+    return True
+
+
+def _persistence_worker_service_retirement() -> bool:
+    global _persist_queue_retire_reason
+    global _persist_queue_retire_result
+    if not _persist_queue_retire_requested.is_set():
+        return False
+    reason = str(_persist_queue_retire_reason or "unspecified")
+    retired = _drain_queue(_persist_queue)
+    _persist_queue_retire_result = int(retired)
+    _persist_queue_retire_reason = ""
+    _persist_queue_retire_requested.clear()
+    _persist_queue_retire_completed.set()
+    logging.info(
+        "🧹 [photons/queue-owner] persistence worker retired %d row(s) reason=%s",
+        retired,
+        reason,
+    )
+    return True
+
+
+def _retire_fragment_queue_via_owner(reason: str) -> int:
+    global _state_queue_retire_reason
+    global _state_queue_retire_result
+    reason = str(reason or "unspecified")
+    if not _state_worker_started.is_set():
+        # Before _state_loop() starts, startup still owns the queue.
+        return _drain_queue(_fragment_queue)
+    with _state_queue_retire_control_lock:
+        _state_queue_retire_completed.clear()
+        _state_queue_retire_result = 0
+        _state_queue_retire_reason = reason
+        _state_queue_retire_requested.set()
+        _wait_for_queue_owner_event(
+            _state_queue_retire_completed, owner="state", reason=reason
+        )
+        return int(_state_queue_retire_result)
+
+
+def _retire_persist_queue_via_owner(reason: str) -> int:
+    global _persist_queue_retire_reason
+    global _persist_queue_retire_result
+    reason = str(reason or "unspecified")
+    if not _persistence_worker_started.is_set():
+        # Before _persistence_loop() starts, startup still owns the queue.
+        return _drain_queue(_persist_queue)
+    with _persist_queue_retire_control_lock:
+        _persist_queue_retire_completed.clear()
+        _persist_queue_retire_result = 0
+        _persist_queue_retire_reason = reason
+        _persist_queue_retire_requested.set()
+        _wait_for_queue_owner_event(
+            _persist_queue_retire_completed, owner="persistence", reason=reason
+        )
+        return int(_persist_queue_retire_result)
+
+
+def _enter_maintenance_queue_hold(reason: str) -> None:
+    reason = str(reason or "maintenance")
+    _maintenance_queue_hold.set()
+    try:
+        if _state_worker_started.is_set():
+            _wait_for_queue_owner_event(
+                _state_worker_maintenance_quiescent, owner="state-quiesce", reason=reason
+            )
+        if _persistence_worker_started.is_set():
+            _wait_for_queue_owner_event(
+                _persistence_worker_maintenance_quiescent,
+                owner="persistence-quiesce",
+                reason=reason,
+            )
+    except Exception:
+        _maintenance_queue_hold.clear()
+        raise
+
+
+def _leave_maintenance_queue_hold() -> None:
+    _maintenance_queue_hold.clear()
+
+
 def on_photons_fragment(fragment: Payload) -> None:
     """PUBSUB fast path: copy one firmware fragment into the ingress queue."""
     global _latest_fragment
@@ -6446,6 +6653,13 @@ def _state_loop() -> None:
     logging.info("🚀 [photons] canonical PHOTONS_V1 state worker started")
 
     while True:
+        _state_worker_service_fragment_retirement()
+        if _maintenance_queue_hold.is_set():
+            _state_worker_maintenance_quiescent.set()
+            time.sleep(0.01)
+            continue
+        _state_worker_maintenance_quiescent.clear()
+
         fragment = None
         if _runtime_recovery_hold.is_set():
             time.sleep(0.01)
@@ -6624,6 +6838,13 @@ def _persistence_loop() -> None:
     logging.info("🚀 [photons] ordered PHOTONS persistence worker started")
 
     while True:
+        _persistence_worker_service_retirement()
+        if _maintenance_queue_hold.is_set():
+            _persistence_worker_maintenance_quiescent.set()
+            time.sleep(0.01)
+            continue
+        _persistence_worker_maintenance_quiescent.clear()
+
         persist_item = None
         photons = None
         checkpoint = None
@@ -6814,7 +7035,7 @@ def _runtime_reconcile_teensy_generation(previous_generation: int,
         # A newborn Teensy is intentionally silent: firmware publication remains
         # held until this Pi supplies baseline + one explicit recovery verdict.
         # Retire any queued prefix that never crossed the canonical/durable court.
-        retired = _drain_queue(_fragment_queue)
+        retired = _retire_fragment_queue_via_owner("AMBIENT_PRODUCER_RESURRECTION")
         with _state_lock:
             _runtime_recovery_rows_retired += int(retired)
         logging.error(
@@ -7413,6 +7634,7 @@ def _pending_persist_campaign_names() -> set[str]:
 
 
 def _drain_queue(q: queue.Queue) -> int:
+    """Owner-internal drain; use the owner handoff after worker custody begins."""
     drained = 0
     while True:
         try:
@@ -7450,29 +7672,38 @@ def cmd_clear(_: Optional[dict]) -> Dict[str, Any]:
     if busy is not None:
         return busy
 
-    with _maintenance_lock:
-        ingress_drained = _drain_queue(_fragment_queue)
-        persist_drained = _drain_queue(_persist_queue)
+    with _maintenance_control_lock:
+        _enter_maintenance_queue_hold("CLEAR")
         try:
-            with open_db() as conn:
-                cur = conn.cursor()
-                cur.execute(
-                    "DELETE FROM campaign_detail WHERE campaign_type = %s",
-                    (CAMPAIGN_TYPE_LANTERN,),
-                )
-                detail_count = int(cur.rowcount or 0)
-                cur.execute(
-                    "DELETE FROM campaign_master WHERE campaign_type = %s",
-                    (CAMPAIGN_TYPE_LANTERN,),
-                )
-                master_count = int(cur.rowcount or 0)
-                cur.execute(
-                    "DELETE FROM config WHERE config_key = %s",
-                    (PHOTONS_RECOVERY_CONFIG_KEY,),
-                )
-        except Exception as exc:
-            logging.exception("❌ [photons] CLEAR failed")
-            return {"success": False, "message": str(exc)}
+            try:
+                with _maintenance_lock:
+                    with open_db() as conn:
+                        cur = conn.cursor()
+                        cur.execute(
+                            "DELETE FROM campaign_detail WHERE campaign_type = %s",
+                            (CAMPAIGN_TYPE_LANTERN,),
+                        )
+                        detail_count = int(cur.rowcount or 0)
+                        cur.execute(
+                            "DELETE FROM campaign_master WHERE campaign_type = %s",
+                            (CAMPAIGN_TYPE_LANTERN,),
+                        )
+                        master_count = int(cur.rowcount or 0)
+                        cur.execute(
+                            "DELETE FROM config WHERE config_key = %s",
+                            (PHOTONS_RECOVERY_CONFIG_KEY,),
+                        )
+                    ingress_drained = _retire_fragment_queue_via_owner(
+                        "CLEAR_POST_DB_CUTOVER"
+                    )
+                    persist_drained = _retire_persist_queue_via_owner(
+                        "CLEAR_POST_DB_CUTOVER"
+                    )
+            except Exception as exc:
+                logging.exception("❌ [photons] CLEAR failed")
+                return {"success": False, "message": str(exc)}
+        finally:
+            _leave_maintenance_queue_hold()
 
     result = {
         "action": "CLEAR",
@@ -7617,22 +7848,31 @@ def cmd_truncate(_: Optional[dict]) -> Dict[str, Any]:
     if busy is not None:
         return busy
 
-    with _maintenance_lock:
-        ingress_drained = _drain_queue(_fragment_queue)
-        persist_drained = _drain_queue(_persist_queue)
+    with _maintenance_control_lock:
+        _enter_maintenance_queue_hold("TRUNCATE")
         try:
-            with open_db() as conn:
-                cur = conn.cursor()
-                cur.execute(
-                    "TRUNCATE TABLE campaign_detail, campaign_master RESTART IDENTITY"
-                )
-                cur.execute(
-                    "DELETE FROM config WHERE config_key IN (%s, %s)",
-                    ("CLOCKS_RECOVERY", PHOTONS_RECOVERY_CONFIG_KEY),
-                )
-        except Exception as exc:
-            logging.exception("❌ [photons] TRUNCATE failed")
-            return {"success": False, "message": str(exc)}
+            try:
+                with _maintenance_lock:
+                    with open_db() as conn:
+                        cur = conn.cursor()
+                        cur.execute(
+                            "TRUNCATE TABLE campaign_detail, campaign_master RESTART IDENTITY"
+                        )
+                        cur.execute(
+                            "DELETE FROM config WHERE config_key IN (%s, %s)",
+                            ("CLOCKS_RECOVERY", PHOTONS_RECOVERY_CONFIG_KEY),
+                        )
+                    ingress_drained = _retire_fragment_queue_via_owner(
+                        "TRUNCATE_POST_DB_CUTOVER"
+                    )
+                    persist_drained = _retire_persist_queue_via_owner(
+                        "TRUNCATE_POST_DB_CUTOVER"
+                    )
+            except Exception as exc:
+                logging.exception("❌ [photons] TRUNCATE failed")
+                return {"success": False, "message": str(exc)}
+        finally:
+            _leave_maintenance_queue_hold()
 
     server_args = {
         "source": "PHOTONS.TRUNCATE",
