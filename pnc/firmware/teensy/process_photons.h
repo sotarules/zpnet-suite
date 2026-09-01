@@ -15,6 +15,10 @@
 //   • process_interrupt owns PD200T comparator edge capture and immutable
 //     DWT-at-edge custody.
 //   • PHOTONS consumes those edge facts and publishes PHOTONS_FRAGMENT.
+//   • all non-ISR PHOTONS mutation has one foreground owner at a time: the
+//     1 kHz race cadence, 1 Hz fragment transaction, or one RPC command. These
+//     ownership classes may never nest; illegal overlap is a system-integrity
+//     fault rather than a recoverable busy condition.
 //
 // PHOTONS_FRAGMENT is the canonical once-per-second optical instrument handoff.
 // Physical testimony and interpreted statistics remain separate: each completed

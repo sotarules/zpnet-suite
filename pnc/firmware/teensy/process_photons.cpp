@@ -38,6 +38,18 @@
 static constexpr uint64_t PHOTONS_FRAGMENT_PERIOD_NS = 1000000000ULL;
 static constexpr uint64_t PHOTONS_NS_PER_SECOND = 1000000000ULL;
 
+// i.MX RT1062 RAM2 is write-back cached in 32-byte lines.  PHOTONS places only
+// large value stores/history in RAM2; align every PHOTONS-owned RAM2 object to a
+// complete cache-line boundary so unrelated ownership domains never share one
+// cache line merely because the linker packed them together.
+static constexpr size_t PHOTONS_RAM2_CACHE_LINE_BYTES = 32U;
+static_assert((PHOTONS_RAM2_CACHE_LINE_BYTES &
+               (PHOTONS_RAM2_CACHE_LINE_BYTES - 1U)) == 0U,
+              "PHOTONS RAM2 cache-line alignment must be a power of two");
+static_assert((PHOTONS_RAM2_CACHE_LINE_BYTES %
+               Payload::FIXED_STORAGE_ALIGNMENT) == 0U,
+              "PHOTONS RAM2 alignment must satisfy Payload fixed storage");
+
 // Interim 1 kHz race handoff. 2048 entries provide a little over two seconds
 // of worst-case headroom when every cadence cell completes. The future fast
 // switch will require a batch sufficient-statistics path rather than scaling
@@ -214,6 +226,79 @@ static inline void photons_memory_barrier(void) {
 }
 
 
+// All non-ISR PHOTONS mutation belongs to one foreground execution domain.
+// TimePop and the command dispatcher currently serialize that domain, but that
+// scheduler property is not sufficient custody: a future local callback or
+// dispatch refactor must not make two PHOTONS mutation transactions legal.
+//
+// The owner court therefore makes the architectural rule executable:
+//   * RACE_CADENCE owns one complete 1 kHz launch/finalize transaction;
+//   * FRAGMENT owns drain -> snapshot -> Payload render -> synchronous publish
+//     -> post-publish commit as one indivisible foreground transaction;
+//   * COMMAND owns every PHOTONS RPC handler from entry through returned Payload
+//     construction.
+//
+// ISR code never touches this owner.  Its only cross-context communication is
+// through the dedicated one-writer arm scalars / generation mailboxes below.
+enum class photons_foreground_owner_t : uint8_t {
+  NONE = 0U,
+  RACE_CADENCE = 1U,
+  FRAGMENT = 2U,
+  COMMAND = 3U,
+};
+
+static photons_foreground_owner_t g_photons_foreground_owner =
+    photons_foreground_owner_t::NONE;
+
+static inline void photons_foreground_owner_acquire(
+    photons_foreground_owner_t owner) {
+  if (owner == photons_foreground_owner_t::NONE ||
+      g_photons_foreground_owner != photons_foreground_owner_t::NONE) {
+    __builtin_trap();
+  }
+  g_photons_foreground_owner = owner;
+  photons_memory_barrier();
+}
+
+static inline void photons_foreground_owner_release(
+    photons_foreground_owner_t owner) {
+  photons_memory_barrier();
+  if (owner == photons_foreground_owner_t::NONE ||
+      g_photons_foreground_owner != owner) {
+    __builtin_trap();
+  }
+  g_photons_foreground_owner = photons_foreground_owner_t::NONE;
+  photons_memory_barrier();
+}
+
+static inline void photons_foreground_owner_assert(
+    photons_foreground_owner_t owner) {
+  if (owner == photons_foreground_owner_t::NONE ||
+      g_photons_foreground_owner != owner) {
+    __builtin_trap();
+  }
+}
+
+class photons_foreground_custody_t {
+ public:
+  explicit photons_foreground_custody_t(photons_foreground_owner_t owner)
+      : owner_(owner) {
+    photons_foreground_owner_acquire(owner_);
+  }
+
+  ~photons_foreground_custody_t() {
+    photons_foreground_owner_release(owner_);
+  }
+
+  photons_foreground_custody_t(const photons_foreground_custody_t&) = delete;
+  photons_foreground_custody_t& operator=(
+      const photons_foreground_custody_t&) = delete;
+
+ private:
+  photons_foreground_owner_t owner_;
+};
+
+
 struct photons_projection_anchor_cache_t {
   volatile uint32_t seq = 0U;
   bool valid = false;
@@ -284,6 +369,7 @@ struct photons_lap_science_candidate_t {
 
 
 static photons_projection_anchor_cache_t g_projection_anchor_cache{};
+alignas(PHOTONS_RAM2_CACHE_LINE_BYTES)
 static photons_raw_lap_record_t
     g_raw_lap_ring[PHOTONS_LAP_RING_CAPACITY] DMAMEM = {};
 static volatile uint32_t g_raw_lap_ring_write = 0U;
@@ -401,8 +487,10 @@ struct photons_recovery_runtime_t {
 static photons_recovery_protocol_t g_photons_recovery_protocol{};
 static photons_recovery_runtime_t g_photons_recovery{};
 
+alignas(PHOTONS_RAM2_CACHE_LINE_BYTES)
 static photons_ppb_endpoint_t
     g_photons_ppb_seconds[PHOTONS_PPB_SECOND_CAPACITY] DMAMEM = {};
+alignas(PHOTONS_RAM2_CACHE_LINE_BYTES)
 static photons_ppb_endpoint_t
     g_photons_ppb_minutes[PHOTONS_PPB_MINUTE_CAPACITY] DMAMEM = {};
 static uint32_t g_photons_ppb_seconds_head = 0U;
@@ -919,6 +1007,7 @@ static void photons_ppb_windows_note_endpoint(uint32_t sequence,
                                               bool admitted,
                                               uint64_t lap_count,
                                               uint64_t total_lap_gnss_ns) {
+  photons_foreground_owner_assert(photons_foreground_owner_t::FRAGMENT);
   g_photons_ppb_endpoint_admitted = admitted;
   g_photons_ppb_interval_advanced = false;
   g_photons_ppb_last_minute_appended = false;
@@ -1131,6 +1220,7 @@ static photons_fragment_campaign_snapshot_t photons_campaign_snapshot(
 // STOP publishes one final campaign fragment, then closes the firmware window.
 static void photons_campaign_commit_after_publish(
     const photons_fragment_snapshot_t& fragment) {
+  photons_foreground_owner_assert(photons_foreground_owner_t::FRAGMENT);
   if (fragment.campaign.present) {
     if (g_photons_campaign_state != photons_campaign_state_t::ACTIVE &&
         g_photons_campaign_state != photons_campaign_state_t::STOP_PENDING &&
@@ -1233,6 +1323,7 @@ static void photons_instrument_statistics_reset_commit(void) {
 
 
 static void photons_stats_reset_commit_after_publish(void) {
+  photons_foreground_owner_assert(photons_foreground_owner_t::FRAGMENT);
   if (!g_photons_stats_reset_pending) return;
   photons_instrument_statistics_reset_commit();
 }
@@ -1375,6 +1466,7 @@ static bool photons_projection_anchor_snapshot(
 
 
 static bool photons_raw_lap_enqueue(const photons_raw_lap_record_t& record) {
+  photons_foreground_owner_assert(photons_foreground_owner_t::RACE_CADENCE);
   const uint32_t write = g_raw_lap_ring_write;
   const uint32_t next = (write + 1U) & PHOTONS_LAP_RING_MASK;
 
@@ -1781,6 +1873,7 @@ struct photons_fragment_drain_result_t {
 
 
 static photons_fragment_drain_result_t photons_drain_raw_laps(void) {
+  photons_foreground_owner_assert(photons_foreground_owner_t::FRAGMENT);
   photons_fragment_drain_result_t result{};
   photons_welford_reset(result.projected_flight_welford);
 
@@ -2042,6 +2135,7 @@ static void photons_race_observe_edge(
 }
 
 static void photons_race_finalize_previous(void) {
+  photons_foreground_owner_assert(photons_foreground_owner_t::RACE_CADENCE);
   if (!g_photons_race_launch.valid) return;
 
   // The cadence boundary is the explicit receive timeout. Close the arm before
@@ -2109,6 +2203,8 @@ static void photons_race_cadence_tick(
     timepop_ctx_t* /*ctx*/,
     timepop_diag_t* /*diag*/,
     void* /*user_data*/) {
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::RACE_CADENCE);
   g_photons_race.cadence_tick_count++;
   photons_race_finalize_previous();
 
@@ -2310,8 +2406,11 @@ static photons_toy_fragment_t g_last_fragment{};
 // change cannot turn REPORT into a torn reader. process_photons_init() explicitly
 // establishes every DMAMEM object because RAM2 is NOLOAD.
 static volatile uint32_t g_last_fragment_generation = 0U;
+alignas(PHOTONS_RAM2_CACHE_LINE_BYTES)
 static photons_fragment_snapshot_t g_last_photons_fragment DMAMEM = {};
+alignas(PHOTONS_RAM2_CACHE_LINE_BYTES)
 static photons_fragment_snapshot_t g_photons_fragment_build DMAMEM = {};
+alignas(PHOTONS_RAM2_CACHE_LINE_BYTES)
 static photons_fragment_snapshot_t g_photons_report_snapshot DMAMEM = {};
 
 // PHOTONS_FRAGMENT publication is one foreground transaction.  The producer
@@ -2599,16 +2698,21 @@ static const photons_fragment_snapshot_t& photons_report_fragment_snapshot(void)
 
 // PHOTONS_FRAGMENT is a bounded, single-owner foreground serializer. Every
 // schema node that can exceed Payload's inline store is explicitly FIXED; the
-// few proven-inline leaves remain ordinary local Payloads. The two large
-// canonical parents keep RAM2 backing, while bounded nested scratch uses RAM1
-// so deterministic serialization does not consume transport's RAM2 heap runway.
+// few proven-inline leaves remain ordinary local Payloads.  RAM2 is used only
+// for the two large canonical byte stores.  Every Payload control block --
+// pointer/capacity guards, mutation generation, and contract fingerprint -- lives
+// in ordinary RAM1 with its sole foreground owner.  A RAM2 backing-store injury
+// therefore cannot silently rewrite the ownership metadata that is meant to
+// detect it.  Bounded nested scratch is entirely RAM1.
 //
 // Capacity exhaustion is a schema-contract failure, not an invitation to grow:
 // Payload records FIXED_CAPACITY and fails hard.
 #define PHOTONS_FRAGMENT_FIXED_RAM2(name, capacity)                        \
-  alignas(Payload::FIXED_STORAGE_ALIGNMENT)                               \
+  static_assert(((capacity) % PHOTONS_RAM2_CACHE_LINE_BYTES) == 0U,       \
+                "PHOTONS RAM2 fixed store must fill cache lines");        \
+  alignas(PHOTONS_RAM2_CACHE_LINE_BYTES)                                  \
   static uint8_t name##_storage[capacity] DMAMEM;                         \
-  static Payload name DMAMEM(                                             \
+  static Payload name(                                                    \
       Payload::StorageMode::FIXED,                                        \
       name##_storage,                                                     \
       sizeof(name##_storage))
@@ -2616,7 +2720,7 @@ static const photons_fragment_snapshot_t& photons_report_fragment_snapshot(void)
 #define PHOTONS_FRAGMENT_FIXED_RAM1(name, capacity)                        \
   alignas(Payload::FIXED_STORAGE_ALIGNMENT)                               \
   static uint8_t name##_storage[capacity];                                \
-  static Payload name DMAMEM(                                             \
+  static Payload name(                                                    \
       Payload::StorageMode::FIXED,                                        \
       name##_storage,                                                     \
       sizeof(name##_storage))
@@ -2648,6 +2752,7 @@ static void photons_payload_add_welford(
     Payload& parent,
     const char* name,
     const photons_fragment_welford_snapshot_t& w) {
+  photons_foreground_owner_assert(photons_foreground_owner_t::FRAGMENT);
   Payload& obj = g_photons_fragment_welford;
   obj.clear();
   obj.add("n", w.n);
@@ -2704,6 +2809,7 @@ static void photons_payload_add_ppb_window_proof(
 
 static Payload& photons_fragment_payload(
     const photons_fragment_snapshot_t& f) {
+  photons_foreground_owner_assert(photons_foreground_owner_t::FRAGMENT);
   Payload& root = g_photons_fragment_root;
   Payload& instrument = g_photons_fragment_instrument;
   Payload& race = g_photons_fragment_race;
@@ -3155,13 +3261,16 @@ static void photons_fragment_tick(
   if (!g_standard_lap_configured || g_lap_baseline_fs == 0ULL ||
       !g_photons_recovery.publication_started) return;
 
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::FRAGMENT);
+
   // Refresh the PHOTONS-owned immutable copy for laps that will arrive after
   // this boundary.  Records already in the ring carry the anchor that was
   // current when their physical DWT endpoints were observed.
   photons_projection_anchor_refresh();
 
   photons_toy_capture_t capture{};
-  if (!photons_toy_capture_snapshot(&capture)) return;
+  if (!photons_toy_capture_snapshot(&capture)) __builtin_trap();
 
   interrupt_photodiode_diag_t interrupt_diag{};
   if (!interrupt_photodiode_snapshot(&interrupt_diag)) __builtin_trap();
@@ -3504,6 +3613,11 @@ static void photons_start_publication(void) {
 FLASHMEM void process_photons_init(void) {
   if (g_initialized) return;
 
+  // Initialization runs before PHOTONS publishes any foreground work. Establish
+  // the one foreground mutation domain explicitly before the ISR subscription
+  // becomes live.
+  g_photons_foreground_owner = photons_foreground_owner_t::NONE;
+
   // This is the only foreground initialization of ISR-owned live capture and it
   // occurs before PHOTODIODE subscription/start below. After interrupt_start(),
   // only the detector callback may mutate g_photons_live.
@@ -3661,6 +3775,8 @@ static void photons_install_lap_baseline_fs(uint64_t requested_fs) {
 
 
 static FLASHMEM Payload cmd_set_lap_baseline_ns(const Payload& args) {
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::COMMAND);
   const char* text = args.getString("lap_baseline_ns");
   uint64_t requested_fs = 0ULL;
   if (!photons_parse_lap_baseline_ns(text, requested_fs)) {
@@ -3733,6 +3849,8 @@ static bool photons_parse_standard_lap_ns(const char* text,
 
 
 static FLASHMEM Payload cmd_set_standard_lap_ns(const Payload& args) {
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::COMMAND);
   const char* text = args.getString("standard_lap_ns");
   uint64_t requested_ps = 0ULL;
   if (!photons_parse_standard_lap_ns(text, requested_ps) ||
@@ -3804,6 +3922,8 @@ static bool photons_ppb_export_live_ready(void) {
 
 
 static FLASHMEM Payload cmd_ppb_export_meta(const Payload& /*args*/) {
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::COMMAND);
   if (!photons_ppb_export_live_ready()) {
     Payload err;
     err.add("status", "ppb_export_snapshot_unavailable");
@@ -3851,6 +3971,8 @@ static FLASHMEM Payload cmd_ppb_export_meta(const Payload& /*args*/) {
 
 
 static FLASHMEM Payload cmd_ppb_export_chunk(const Payload& args) {
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::COMMAND);
   uint32_t reset_count = 0U;
   uint32_t before_sequence = 0U;
   uint32_t count = 0U;
@@ -3985,6 +4107,8 @@ static Payload photons_recovery_reject(const char* status,
 
 
 static FLASHMEM Payload cmd_recovery_begin(const Payload& args) {
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::COMMAND);
   if (!g_standard_lap_configured || g_lap_baseline_fs == 0ULL) {
     return photons_recovery_reject(
         "recovery_begin_rejected_standard_missing",
@@ -4061,6 +4185,8 @@ static bool photons_recovery_endpoint_follows(
 
 
 static FLASHMEM Payload cmd_recovery_chunk(const Payload& args) {
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::COMMAND);
   photons_recovery_protocol_t& protocol = g_photons_recovery_protocol;
   if (!protocol.active || g_photons_recovery.publication_started) {
     return photons_recovery_reject(
@@ -4175,6 +4301,8 @@ static FLASHMEM Payload cmd_recovery_chunk(const Payload& args) {
 
 
 static FLASHMEM Payload cmd_recovery_abort(const Payload& /*args*/) {
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::COMMAND);
   if (g_photons_recovery.publication_started) {
     return photons_recovery_reject(
         "recovery_abort_rejected_live",
@@ -4257,6 +4385,8 @@ static void photons_recovery_install_science_state(
 
 
 static FLASHMEM Payload cmd_recovery_commit(const Payload& args) {
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::COMMAND);
   photons_recovery_protocol_t& protocol = g_photons_recovery_protocol;
   if (!protocol.active || g_photons_recovery.publication_started) {
     return photons_recovery_reject(
@@ -4516,6 +4646,8 @@ static FLASHMEM Payload cmd_recovery_commit(const Payload& args) {
 
 
 static FLASHMEM Payload cmd_recovery_cold_start(const Payload& args) {
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::COMMAND);
   if (!g_standard_lap_configured || g_lap_baseline_fs == 0ULL) {
     return photons_recovery_reject(
         "recovery_cold_start_rejected_standard_missing",
@@ -4574,6 +4706,8 @@ static FLASHMEM Payload cmd_recovery_cold_start(const Payload& args) {
 
 
 static FLASHMEM Payload cmd_recovery_proof_ack(const Payload& args) {
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::COMMAND);
   uint32_t generation = 0U;
   uint32_t sequence = 0U;
   uint32_t update_count = 0U;
@@ -4629,6 +4763,8 @@ static void photons_prepare_operational_report(Payload& p) {
 
 
 static FLASHMEM Payload cmd_report_recovery(const Payload& /*args*/) {
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::COMMAND);
   Payload p;
   photons_prepare_operational_report(p);
   p.add("report", "PHOTONS_RECOVERY");
@@ -4701,7 +4837,7 @@ static FLASHMEM Payload cmd_report_recovery(const Payload& /*args*/) {
 }
 
 
-static FLASHMEM Payload cmd_flash_cut(const Payload& args) {
+static FLASHMEM Payload photons_flash_cut_command_body(const Payload& args) {
   if (!g_photons_recovery.publication_started ||
       g_photons_recovery.proof_pending) {
     return photons_recovery_reject(
@@ -4756,7 +4892,16 @@ static FLASHMEM Payload cmd_flash_cut(const Payload& args) {
 }
 
 
+static FLASHMEM Payload cmd_flash_cut(const Payload& args) {
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::COMMAND);
+  return photons_flash_cut_command_body(args);
+}
+
+
 static FLASHMEM Payload cmd_start(const Payload& args) {
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::COMMAND);
   if (!g_photons_recovery.publication_started ||
       g_photons_recovery.proof_pending) {
     return photons_recovery_reject(
@@ -4778,7 +4923,7 @@ static FLASHMEM Payload cmd_start(const Payload& args) {
     return err;
   }
   if (g_photons_campaign_state == photons_campaign_state_t::ACTIVE) {
-    return cmd_flash_cut(args);
+    return photons_flash_cut_command_body(args);
   }
   if (g_photons_campaign_state != photons_campaign_state_t::STOPPED) {
     Payload err;
@@ -4800,6 +4945,8 @@ static FLASHMEM Payload cmd_start(const Payload& args) {
 
 
 static FLASHMEM Payload cmd_stop(const Payload& /*args*/) {
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::COMMAND);
   if (!g_photons_recovery.publication_started ||
       g_photons_recovery.proof_pending) {
     return photons_recovery_reject(
@@ -4862,6 +5009,8 @@ static void photons_payload_add_flat_ppb_bucket(
 
 
 static FLASHMEM Payload cmd_report_photons(const Payload& /*args*/) {
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::COMMAND);
   // Both the canonical publisher and command dispatcher are foreground-owned;
   // use the immutable last-completed value directly instead of placing another
   // ~1.7 KiB copy on MSP.
@@ -4979,6 +5128,8 @@ static FLASHMEM Payload cmd_report_photons(const Payload& /*args*/) {
 
 
 static FLASHMEM Payload cmd_report_stats(const Payload& /*args*/) {
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::COMMAND);
   const photons_fragment_snapshot_t& canonical =
       photons_report_fragment_snapshot();
 
@@ -5076,6 +5227,8 @@ static FLASHMEM Payload cmd_report_stats(const Payload& /*args*/) {
 
 
 static FLASHMEM Payload cmd_stats_reset(const Payload& /*args*/) {
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::COMMAND);
   if (!g_photons_recovery.publication_started ||
       g_photons_recovery.proof_pending) {
     return photons_recovery_reject(
@@ -5113,6 +5266,8 @@ static FLASHMEM Payload cmd_stats_reset(const Payload& /*args*/) {
 }
 
 static FLASHMEM Payload cmd_inject_problem(const Payload& /*args*/) {
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::COMMAND);
   Payload p;
   p.add("status", "inject_problem_rejected_source");
   p.add("error",
@@ -5123,6 +5278,8 @@ static FLASHMEM Payload cmd_inject_problem(const Payload& /*args*/) {
 }
 
 static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::COMMAND);
   const photons_fragment_snapshot_t& canonical =
       photons_report_fragment_snapshot();
 
@@ -5233,6 +5390,8 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
 }
 
 static FLASHMEM Payload cmd_report_pulse(const Payload& /*args*/) {
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::COMMAND);
   interrupt_photodiode_diag_t interrupt_diag{};
   (void)interrupt_photodiode_snapshot(&interrupt_diag);
 
@@ -5283,6 +5442,8 @@ static FLASHMEM Payload cmd_report_pulse(const Payload& /*args*/) {
 }
 
 static FLASHMEM Payload cmd_init(const Payload& /*args*/) {
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::COMMAND);
   if (g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE) {
     Payload p;
     p.add("status", "init_rejected_race_engine_active");
@@ -5293,6 +5454,8 @@ static FLASHMEM Payload cmd_init(const Payload& /*args*/) {
 }
 
 static FLASHMEM Payload cmd_pulse(const Payload& args) {
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::COMMAND);
   if (g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE) {
     Payload p;
     p.add("status", "pulse_rejected_race_engine_active");
@@ -5411,6 +5574,8 @@ static FLASHMEM Payload cmd_pulse(const Payload& args) {
 }
 
 static FLASHMEM Payload cmd_on(const Payload& /*args*/) {
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::COMMAND);
   if (g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE) {
     Payload p;
     p.add("status", "on_rejected_race_engine_active");
@@ -5422,6 +5587,8 @@ static FLASHMEM Payload cmd_on(const Payload& /*args*/) {
 }
 
 static FLASHMEM Payload cmd_off(const Payload& /*args*/) {
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::COMMAND);
   if (g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE) {
     Payload p;
     p.add("status", "off_rejected_race_engine_active");
