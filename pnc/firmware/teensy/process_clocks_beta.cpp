@@ -632,10 +632,18 @@ static clocks_alpha_ocxo_counterledger_snapshot_t
 static clocks_alpha_ocxo_counterledger_snapshot_t
     g_beta_ocxo2_counterledger_row DMAMEM = {};
 
-// One immutable completed campaign record may await the CLOCKS publisher.  The typed snapshot
-// lives in RAM2 so the completed-row path never places the handoff object on the
-// scarce DTCM stack. The CLOCKS publisher consumes it only when the requested PPS sequence
-// matches exactly; an unconsumed record is never overwritten.
+// At most two immutable completed campaign records may await the CLOCKS publisher.
+// The typed snapshots live in RAM2 so the completed-row path never places the
+// handoff object on the scarce DTCM stack. The CLOCKS publisher consumes a record
+// only when the requested PPS sequence matches exactly; an unconsumed committed
+// record is never overwritten.
+//
+// A long observer outage is different from a producer/science failure.  If this
+// bounded handoff fills while a stable STARTED campaign continues, Beta retires
+// the new Pi observation at the producer boundary instead of surrendering the
+// campaign.  The producer never advances the consumer index.  A monotonically
+// advancing observer-loss watermark tells the CLOCKS publisher which older
+// undelivered observations it may explicitly retire once publication runs again.
 static constexpr uint32_t CLOCKS_FRAGMENT_CAMPAIGN_QUEUE_CAPACITY = 2U;
 alignas(CLOCKS_RAM2_CACHE_LINE_BYTES)
 static clocks_fragment_campaign_snapshot_t
@@ -646,6 +654,19 @@ static volatile uint32_t g_clocks_fragment_campaign_queue_write = 0U;
 static uint32_t g_clocks_fragment_campaign_record_stage_count = 0U;
 static uint32_t g_clocks_fragment_campaign_record_take_count = 0U;
 static uint32_t g_clocks_fragment_campaign_record_backlog_count = 0U;
+
+// Observer-loss testimony is intentionally scalar and bounded.  It does not
+// replay or reconstruct missing rows; it proves only that a stable Beta producer
+// continued after the Pi-facing handoff saturated.  The watermark is physical
+// completed-row identity, not campaign public_count.
+static bool     g_clocks_fragment_campaign_observer_loss_seen = false;
+static uint32_t g_clocks_fragment_campaign_observer_retired_through_sequence = 0U;
+static uint32_t g_clocks_fragment_campaign_observer_drop_count = 0U;
+static uint32_t g_clocks_fragment_campaign_observer_drop_first_sequence = 0U;
+static uint32_t g_clocks_fragment_campaign_observer_drop_last_sequence = 0U;
+static uint32_t g_clocks_fragment_campaign_observer_drop_last_public_count = 0U;
+static uint32_t g_clocks_fragment_campaign_observer_queue_retire_count = 0U;
+static uint32_t g_clocks_fragment_campaign_observer_queue_retire_last_sequence = 0U;
 
 static inline void clocks_fragment_campaign_queue_barrier(void) {
   __asm__ volatile("dmb" ::: "memory");
@@ -716,6 +737,56 @@ static void clocks_fragment_campaign_queue_reset(void) {
   g_clocks_fragment_campaign_queue_read = 0U;
   g_clocks_fragment_campaign_queue_write = 0U;
   clocks_fragment_campaign_queue_barrier();
+}
+
+static void clocks_fragment_campaign_observer_loss_reset_epoch(void) {
+  g_clocks_fragment_campaign_observer_loss_seen = false;
+  g_clocks_fragment_campaign_observer_retired_through_sequence = 0U;
+}
+
+static bool clocks_fragment_campaign_sequence_observer_retired(
+    uint32_t sequence) {
+  if (!g_clocks_fragment_campaign_observer_loss_seen || sequence == 0U) {
+    return false;
+  }
+  return (int32_t)(
+      g_clocks_fragment_campaign_observer_retired_through_sequence -
+      sequence) >= 0;
+}
+
+static void clocks_fragment_campaign_note_observer_drop(
+    uint32_t completed_second_sequence,
+    uint32_t public_count) {
+  if (completed_second_sequence == 0U) __builtin_trap();
+  if (!g_clocks_fragment_campaign_observer_loss_seen) {
+    g_clocks_fragment_campaign_observer_loss_seen = true;
+    g_clocks_fragment_campaign_observer_drop_first_sequence =
+        completed_second_sequence;
+  }
+  g_clocks_fragment_campaign_observer_retired_through_sequence =
+      completed_second_sequence;
+  g_clocks_fragment_campaign_observer_drop_last_sequence =
+      completed_second_sequence;
+  g_clocks_fragment_campaign_observer_drop_last_public_count = public_count;
+  g_clocks_fragment_campaign_observer_drop_count++;
+}
+
+static void clocks_fragment_campaign_retire_observer_queue_through(
+    uint32_t sequence) {
+  while (true) {
+    clocks_fragment_campaign_snapshot_t* front =
+        clocks_fragment_campaign_queue_front();
+    if (!front) return;
+    if ((int32_t)(sequence - front->completed_second_sequence) < 0) return;
+    if (!clocks_fragment_campaign_sequence_observer_retired(
+            front->completed_second_sequence)) {
+      __builtin_trap();
+    }
+    g_clocks_fragment_campaign_observer_queue_retire_last_sequence =
+        front->completed_second_sequence;
+    g_clocks_fragment_campaign_observer_queue_retire_count++;
+    clocks_fragment_campaign_queue_release();
+  }
 }
 
 static volatile uint32_t g_clocks_beta_pps_owner = 0U;
@@ -842,6 +913,8 @@ static uint32_t g_clocks_fragment_publication_watchdog_retired_campaign_sequence
 static uint32_t g_clocks_fragment_publication_idle_retry_abandon_count = 0U;
 static uint32_t g_clocks_fragment_publication_idle_retry_last_sequence = 0U;
 static uint32_t g_clocks_fragment_publication_idle_retry_last_attempt_count = 0U;
+static uint32_t g_clocks_fragment_publication_observer_retire_count = 0U;
+static uint32_t g_clocks_fragment_publication_observer_retire_last_sequence = 0U;
 
 // The CLOCKS publication handoff is intentionally large and must never become a
 // foreground stack local.  Publication now crosses one explicit SPSC ownership
@@ -1781,6 +1854,31 @@ static void clocks_fragment_publish_service(timepop_ctx_t*,
 
   clocks_fragment_publication_ensure_initialized();
 
+  // Beta can establish observer loss only after later completed rows fail to
+  // enter the bounded campaign handoff.  Once that positive watermark covers
+  // an older retained transport retry, continuing to retry that immutable Pi
+  // observation is a head-of-line liveness bug: the producer has advanced and
+  // the missing observer interval cannot be replayed.  The publication consumer
+  // therefore retires its own stale retry and every committed campaign record
+  // covered by the same watermark.  Beta never advances either consumer index.
+  if (retrying_snapshot &&
+      clocks_fragment_retry_reason_is_observer_plane(
+          g_clocks_fragment_publication_retry_reason_id) &&
+      clocks_fragment_campaign_sequence_observer_retired(
+          g_clocks_fragment_publication_retry_sequence)) {
+    const uint32_t retired_retry_sequence =
+        g_clocks_fragment_publication_retry_sequence;
+    clocks_fragment_campaign_retire_observer_queue_through(
+        g_clocks_fragment_campaign_observer_retired_through_sequence);
+    g_clocks_fragment_publication_observer_retire_count++;
+    g_clocks_fragment_publication_observer_retire_last_sequence =
+        retired_retry_sequence;
+    clocks_fragment_retry_retire_observation(
+        retired_retry_sequence, false);
+    clocks_fragment_publish_service_release_owner();
+    return;
+  }
+
   uint32_t sequence = 0U;
   bool clocks_snapshot_ok = false;
   clocks_fragment_publication_item_t* publication_item = nullptr;
@@ -1795,6 +1893,24 @@ static void clocks_fragment_publish_service(timepop_ctx_t*,
     if (clocks_fragment_publication_queue_depth() != 0U) __builtin_trap();
     sequence = g_clocks_fragment_publication_pending_sequence;
     g_clocks_fragment_publication_pending = false;
+
+    // A stable STARTED campaign may outlive its Pi observer.  Once Beta has
+    // positively recorded handoff saturation, exact physical observations at or
+    // before that watermark are no longer deliverable: Alpha's latest snapshot
+    // cannot replay them, and the bounded campaign queue must not be grown to
+    // simulate an arbitrarily long host outage.  The publisher is the campaign
+    // queue consumer, so it explicitly retires only those committed records and
+    // drops this Pi observation.  The next fresh Beta row remains eligible for
+    // ordinary exact publication with campaign testimony.
+    if (clocks_fragment_campaign_sequence_observer_retired(sequence)) {
+      clocks_fragment_campaign_retire_observer_queue_through(
+          g_clocks_fragment_campaign_observer_retired_through_sequence);
+      g_clocks_fragment_publication_observer_retire_count++;
+      g_clocks_fragment_publication_observer_retire_last_sequence = sequence;
+      clocks_fragment_publish_service_release_owner();
+      return;
+    }
+
     publication_item = clocks_fragment_publication_queue_acquire_write();
     memset(publication_item, 0, sizeof(*publication_item));
     publication_item->sequence = sequence;
@@ -2229,6 +2345,7 @@ static void clocks_fragment_recover_reset_publication_custody(bool count_recover
 
   clocks_fragment_campaign_record_ready_retry_cancel();
   clocks_fragment_campaign_queue_reset();
+  clocks_fragment_campaign_observer_loss_reset_epoch();
   if (count_recovery) {
     g_clocks_fragment_publication_recovery_reset_count++;
   }
@@ -9006,6 +9123,22 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   if (!record_slot) {
     campaign_record_stage(CAMPAIGN_RECORD_STAGE_HANDOFF_BACKLOG);
     g_clocks_fragment_campaign_record_backlog_count++;
+
+    // Handoff saturation during a stable public campaign is observer loss, not
+    // producer/science failure.  Do not overwrite either committed SPSC slot and
+    // do not make the producer advance the consumer index.  Retire only this new
+    // Pi observation at the producer boundary; Beta's campaign/public_count and
+    // Alpha statistics continue.  The CLOCKS publisher will later retire older
+    // undeliverable committed observations from the consumer side.
+    if (clocks_watchdog_campaign_armed()) {
+      clocks_fragment_campaign_note_observer_drop(
+          completed_pps_sequence, public_count);
+      return;
+    }
+
+    // Outside a stable STARTED campaign preserve the existing lifecycle court.
+    // A recovery/start transition is not allowed to reinterpret structural
+    // saturation as ordinary observer absence.
     clocks_watchdog_anomaly("clocks_fragment_campaign_record_backlog",
                             clocks_fragment_campaign_queue_front_sequence(),
                             completed_pps_sequence,
@@ -10504,6 +10637,22 @@ static FLASHMEM Payload cmd_report_recovery(const Payload&) {
         g_clocks_fragment_campaign_record_take_count);
   p.add("campaign_record_backlog_count",
         g_clocks_fragment_campaign_record_backlog_count);
+  p.add("campaign_record_observer_loss_seen",
+        g_clocks_fragment_campaign_observer_loss_seen);
+  p.add("campaign_record_observer_retired_through_sequence",
+        g_clocks_fragment_campaign_observer_retired_through_sequence);
+  p.add("campaign_record_observer_drop_count",
+        g_clocks_fragment_campaign_observer_drop_count);
+  p.add("campaign_record_observer_drop_first_sequence",
+        g_clocks_fragment_campaign_observer_drop_first_sequence);
+  p.add("campaign_record_observer_drop_last_sequence",
+        g_clocks_fragment_campaign_observer_drop_last_sequence);
+  p.add("campaign_record_observer_drop_last_public_count",
+        g_clocks_fragment_campaign_observer_drop_last_public_count);
+  p.add("campaign_record_observer_queue_retire_count",
+        g_clocks_fragment_campaign_observer_queue_retire_count);
+  p.add("campaign_record_observer_queue_retire_last_sequence",
+        g_clocks_fragment_campaign_observer_queue_retire_last_sequence);
   p.add("campaign_record_ready_retry_armed",
         g_clocks_fragment_campaign_record_ready_retry_handle != TIMEPOP_INVALID_HANDLE);
   p.add("campaign_record_ready_retry_arm_count",
@@ -10580,6 +10729,10 @@ static FLASHMEM Payload cmd_report_recovery(const Payload&) {
         g_clocks_fragment_publication_idle_retry_last_sequence);
   p.add("fragment_publication_idle_retry_last_attempt_count",
         g_clocks_fragment_publication_idle_retry_last_attempt_count);
+  p.add("fragment_publication_observer_retire_count",
+        g_clocks_fragment_publication_observer_retire_count);
+  p.add("fragment_publication_observer_retire_last_sequence",
+        g_clocks_fragment_publication_observer_retire_last_sequence);
 
   p.add("recover_proof_active", (bool)g_recover_proof_active);
   p.add("recover_proof_degraded_active",
