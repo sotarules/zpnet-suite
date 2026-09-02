@@ -368,6 +368,9 @@ CLOCKS_RECOVERY_RECEIPT_SCHEMA = "PI_CLOCKS_RECOVERY_RECEIPT_V1"
 TIMEBASE_SILENCE_TIMEOUT_S = 30.0
 TIMEBASE_SILENCE_MONITOR_POLL_S = 1.0
 TEENSY_HEALTH_RETRY_S = 60.0
+# Two independent REPORT_RECOVERY samples may positively prove that Beta is
+# still completing campaign rows while CLOCKS_FRAGMENT itself is silent.
+TIMEBASE_SILENCE_PRODUCER_PROGRESS_SAMPLE_S = 1.25
 
 # Async START/Flash Cut silence is not the same thing as a live campaign
 # going dark. START/Flash Cut may still take several seconds while Teensy
@@ -704,6 +707,9 @@ _diag: Dict[str, Any] = {
     "timebase_silence_checks": 0,
     "timebase_silence_detected": 0,
     "timebase_silence_recovery_started": 0,
+    "timebase_silence_producer_progress_checks": 0,
+    "timebase_silence_producer_progress_proved": 0,
+    "last_timebase_silence_producer_progress": {},
     "teensy_health_probe_attempts": 0,
     "teensy_health_probe_failures": 0,
     "teensy_health_probe_success": 0,
@@ -4186,6 +4192,92 @@ def _begin_ambient_instrument_recovery(
     return True
 
 
+def _timebase_silence_producer_progress_court(
+    *,
+    expected_campaign: str,
+    activity_baseline_monotonic: Optional[float],
+) -> Dict[str, Any]:
+    """Prove only positive producer progress; absence of progress proves nothing."""
+    _diag["timebase_silence_producer_progress_checks"] = (
+        _diag.get("timebase_silence_producer_progress_checks", 0) + 1
+    )
+
+    def canonical_resumed() -> bool:
+        return bool(
+            activity_baseline_monotonic is not None
+            and _timebase_last_activity_monotonic is not None
+            and _timebase_last_activity_monotonic > activity_baseline_monotonic
+        )
+
+    def view(status: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "campaign": str(status.get("campaign") or "").strip(),
+            "campaign_state": str(status.get("campaign_state") or "").strip().upper(),
+            "candidate_count": _as_int(status.get("candidate_count")),
+            "last_public_count": _as_int(status.get("last_public_count")),
+            "owner": str(status.get("instrument_statistics_owner") or "").strip().upper(),
+            "preserved": _recovery_bool(status.get("instrument_statistics_preserved")),
+            "epoch_ready": _recovery_bool(status.get("recover_epoch_ready")),
+            "recover_active": _recovery_bool(status.get("recover_lifecycle_active")),
+            "publication_retry": _recovery_bool(
+                status.get("fragment_publication_retry_active")
+            ),
+            "publication_retry_reason": str(
+                status.get("fragment_publication_retry_reason") or ""
+            ),
+        }
+
+    first_raw = _fetch_teensy_recovery_status()
+    if canonical_resumed():
+        return {"classification": "CANONICAL_RESUMED", "proved": False}
+    time.sleep(TIMEBASE_SILENCE_PRODUCER_PROGRESS_SAMPLE_S)
+    if canonical_resumed():
+        return {"classification": "CANONICAL_RESUMED", "proved": False}
+    second_raw = _fetch_teensy_recovery_status()
+    first = view(first_raw)
+    second = view(second_raw)
+
+    candidate_delta = (
+        second["candidate_count"] - first["candidate_count"]
+        if first["candidate_count"] is not None and second["candidate_count"] is not None
+        else None
+    )
+    public_delta = (
+        second["last_public_count"] - first["last_public_count"]
+        if first["last_public_count"] is not None and second["last_public_count"] is not None
+        else None
+    )
+    proved = bool(
+        first_raw
+        and second_raw
+        and expected_campaign
+        and first["campaign"] == expected_campaign == second["campaign"]
+        and first["campaign_state"] == second["campaign_state"] == "STARTED"
+        and first["owner"] == second["owner"] == "ALPHA"
+        and first["preserved"] and second["preserved"]
+        and first["epoch_ready"] and second["epoch_ready"]
+        and not first["recover_active"] and not second["recover_active"]
+        and candidate_delta is not None and candidate_delta > 0
+        and public_delta is not None and public_delta > 0
+        and not _recovery_custody_requires_cold_restore()
+    )
+    result = {
+        "classification": "PUBLICATION_PATH_STALLED" if proved else "UNCLASSIFIED",
+        "proved": proved,
+        "campaign": expected_campaign or None,
+        "candidate_delta": candidate_delta,
+        "public_count_delta": public_delta,
+        "first": first,
+        "second": second,
+    }
+    if proved:
+        _diag["timebase_silence_producer_progress_proved"] = (
+            _diag.get("timebase_silence_producer_progress_proved", 0) + 1
+        )
+    _diag["last_timebase_silence_producer_progress"] = copy.deepcopy(result)
+    return result
+
+
 def _timebase_silence_recovery(reason: str, details: Dict[str, Any]) -> None:
     """
     Wait quietly for Teensy communication to return, then invoke campaign recovery.
@@ -4206,9 +4298,55 @@ def _timebase_silence_recovery(reason: str, details: Dict[str, Any]) -> None:
             if _teensy_clocks_health_ok():
                 logging.info(
                     "✅ [clocks] @%s Teensy CLOCKS REPORT_RECOVERY responded after CLOCKS_FRAGMENT silence — "
-                    "invoking campaign recovery",
+                    "classifying producer progress before any recovery mutation",
                     system_time_z(),
                 )
+                activity_baseline = _timebase_last_activity_monotonic
+                expected_campaign = ""
+                try:
+                    active_campaign = _get_active_campaign()
+                    expected_campaign = (
+                        str(active_campaign.get("campaign") or "").strip()
+                        if isinstance(active_campaign, dict)
+                        else ""
+                    )
+                except Exception:
+                    logging.exception(
+                        "⚠️ [clocks] durable campaign lookup failed during silence "
+                        "classification; ordinary recovery remains authoritative"
+                    )
+
+                progress = _timebase_silence_producer_progress_court(
+                    expected_campaign=expected_campaign,
+                    activity_baseline_monotonic=activity_baseline,
+                )
+                if progress.get("proved"):
+                    logging.warning(
+                        "🧭 [clocks] CLOCKS_FRAGMENT observer path is silent while Beta "
+                        "continues campaign '%s' (candidate_delta=%s public_count_delta=%s); "
+                        "holding recovery custody and refusing producer mutation until "
+                        "canonical publication resumes",
+                        expected_campaign or "NONE",
+                        progress.get("candidate_delta"),
+                        progress.get("public_count_delta"),
+                    )
+                    while not _hard_failure_active():
+                        if _recovery_custody_requires_cold_restore():
+                            break
+                        if (
+                            activity_baseline is not None
+                            and _timebase_last_activity_monotonic is not None
+                            and _timebase_last_activity_monotonic > activity_baseline
+                        ):
+                            logging.info(
+                                "✅ [clocks] canonical CLOCKS_FRAGMENT publication resumed; "
+                                "re-entering the ordinary fresh-row lineage/adoption court"
+                            )
+                            break
+                        time.sleep(0.1)
+                    if _hard_failure_active():
+                        return
+
                 attempts += 1
                 _diag["auto_recovery_attempts"] = _diag.get("auto_recovery_attempts", 0) + 1
                 _diag["timebase_silence_recovery_started"] += 1
