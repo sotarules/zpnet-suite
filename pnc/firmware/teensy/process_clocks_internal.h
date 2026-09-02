@@ -9,6 +9,14 @@
 //   says.  This prevents diffusion of authority and gives every downstream
 //   consumer a single well-defined source of truth.
 //
+// Operation ownership:
+//
+//   SPSC applies to operations as well as queues. A seqlock makes one writer
+//   visible coherently to readers but never grants multi-writer permission.
+//   Alpha stores with reset/update/restore paths therefore have one explicit
+//   writer owner; Beta row authorship, CLOCKS_FRAGMENT serialization, and command
+//   Payload construction likewise retain custody for their complete transaction.
+//
 // Candidate disposition:
 //
 //   After public PPS1, every survivable campaign second is published and

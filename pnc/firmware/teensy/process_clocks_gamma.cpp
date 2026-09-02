@@ -46,6 +46,33 @@ static inline void dmb(void) {
   __asm__ volatile ("dmb" ::: "memory");
 }
 
+
+// Gamma readers use seqlocks, but seqlocks do not serialize writers.  Keep one
+// explicit owner for the PPS/VCLOCK anchor and one owner per projection slot so
+// epoch reset, ordinary update, and global reset cannot overlap on the same store.
+class time_writer_custody_t {
+ public:
+  explicit time_writer_custody_t(volatile uint32_t& owner) : owner_(owner) {
+    uint32_t expected = 0U;
+    if (!__atomic_compare_exchange_n(&owner_,
+                                     &expected,
+                                     1U,
+                                     false,
+                                     __ATOMIC_ACQ_REL,
+                                     __ATOMIC_ACQUIRE)) {
+      __builtin_trap();
+    }
+  }
+  ~time_writer_custody_t() {
+    if (__atomic_load_n(&owner_, __ATOMIC_ACQUIRE) != 1U) __builtin_trap();
+    __atomic_store_n(&owner_, 0U, __ATOMIC_RELEASE);
+  }
+  time_writer_custody_t(const time_writer_custody_t&) = delete;
+  time_writer_custody_t& operator=(const time_writer_custody_t&) = delete;
+ private:
+  volatile uint32_t& owner_;
+};
+
 static inline void seqlock_write_begin(volatile uint32_t& sequence) {
   sequence++;
   dmb();
@@ -70,6 +97,7 @@ struct time_anchor_store_t {
 };
 
 static time_anchor_store_t g_time_anchor{};
+static volatile uint32_t g_time_anchor_writer_owner = 0U;
 
 // Immutable value copied from the live anchor store. Once acquired, callers
 // can project from it without observing later writer mutations.
@@ -106,7 +134,10 @@ static time_anchor_value_t time_anchor_load(void) {
   return time_anchor_value_t{};
 }
 
-static void time_anchor_publish(const time_anchor_value_t& value) {
+static void time_anchor_publish_owned(const time_anchor_value_t& value) {
+  if (__atomic_load_n(&g_time_anchor_writer_owner, __ATOMIC_ACQUIRE) != 1U) {
+    __builtin_trap();
+  }
   seqlock_write_begin(g_time_anchor.seq);
   g_time_anchor.dwt_at_pps_vclock = value.dwt_at_pps_vclock;
   g_time_anchor.dwt_cycles_per_pps_vclock_s =
@@ -157,6 +188,7 @@ struct time_projection_store_t {
 };
 
 static time_projection_store_t g_time_projection_stores[TIME_PROJECTION_SLOT_COUNT]{};
+static volatile uint32_t g_time_projection_writer_owner[TIME_PROJECTION_SLOT_COUNT] = {};
 
 static int time_projection_index(time_clock_id_t clock) {
   switch (clock) {
@@ -210,6 +242,8 @@ static void time_projection_clear(time_projection_store_t& store) {
 
 void time_clock_reset_all(void) {
   for (uint32_t i = 0U; i < TIME_PROJECTION_SLOT_COUNT; ++i) {
+    const time_writer_custody_t writer_custody(
+        g_time_projection_writer_owner[i]);
     time_projection_store_t& store = g_time_projection_stores[i];
     seqlock_write_begin(store.seq);
     time_projection_clear(store);
@@ -222,6 +256,8 @@ bool time_clock_epoch_reset(time_clock_id_t clock,
                             uint64_t ns_at_update) {
   const int idx = time_projection_index(clock);
   if (idx < 0) return false;
+  const time_writer_custody_t writer_custody(
+      g_time_projection_writer_owner[(uint32_t)idx]);
   time_projection_store_t& store = g_time_projection_stores[idx];
 
   seqlock_write_begin(store.seq);
@@ -239,6 +275,8 @@ bool time_clock_update(time_clock_id_t clock,
                        uint64_t ns_at_update) {
   const int idx = time_projection_index(clock);
   if (idx < 0) return false;
+  const time_writer_custody_t writer_custody(
+      g_time_projection_writer_owner[(uint32_t)idx]);
   time_projection_store_t& c = g_time_projection_stores[idx];
 
   seqlock_write_begin(c.seq);
@@ -314,24 +352,28 @@ bool time_clock_snapshot(time_clock_id_t clock,
 
 void time_pps_vclock_epoch_reset(uint32_t dwt_at_pps_vclock,
                                  uint32_t counter32_at_pps_vclock) {
+  const time_writer_custody_t writer_custody(g_time_anchor_writer_owner);
   time_anchor_value_t value{};
   value.dwt_at_pps_vclock = dwt_at_pps_vclock;
   value.counter32_at_pps_vclock = counter32_at_pps_vclock;
   value.pps_vclock_count = 1U;
-  time_anchor_publish(value);
+  time_anchor_publish_owned(value);
 }
 
 static void time_pps_vclock_publish(uint32_t dwt_at_pps_vclock,
                                     uint32_t dwt_cycles_per_pps_vclock_s,
                                     uint32_t counter32_at_pps_vclock,
                                     uint32_t pps_vclock_count) {
+  if (__atomic_load_n(&g_time_anchor_writer_owner, __ATOMIC_ACQUIRE) != 1U) {
+    __builtin_trap();
+  }
   time_anchor_value_t value{};
   value.dwt_at_pps_vclock = dwt_at_pps_vclock;
   value.dwt_cycles_per_pps_vclock_s = dwt_cycles_per_pps_vclock_s;
   value.counter32_at_pps_vclock = counter32_at_pps_vclock;
   value.pps_vclock_count = pps_vclock_count ? pps_vclock_count : 1U;
   value.valid = dwt_cycles_per_pps_vclock_s > 0U;
-  time_anchor_publish(value);
+  time_anchor_publish_owned(value);
 }
 
 // Historical 3-argument order used by CLOCKS/Alpha:
@@ -339,6 +381,7 @@ static void time_pps_vclock_publish(uint32_t dwt_at_pps_vclock,
 void time_pps_vclock_update(uint32_t dwt_at_pps_vclock,
                             uint32_t dwt_cycles_per_pps_vclock_s,
                             uint32_t counter32_at_pps_vclock) {
+  const time_writer_custody_t writer_custody(g_time_anchor_writer_owner);
   const time_anchor_value_t prior = time_anchor_load();
   if (!prior.snapshot_ok) __builtin_trap();
   const uint32_t next_count = prior.pps_vclock_count
@@ -358,6 +401,7 @@ void time_pps_vclock_update(uint32_t dwt_at_pps_vclock,
                             uint32_t counter32_at_pps_vclock,
                             uint32_t pps_vclock_count,
                             uint32_t dwt_cycles_per_pps_vclock_s) {
+  const time_writer_custody_t writer_custody(g_time_anchor_writer_owner);
   time_pps_vclock_publish(dwt_at_pps_vclock,
                                   dwt_cycles_per_pps_vclock_s,
                                   counter32_at_pps_vclock,
@@ -412,6 +456,12 @@ bool time_valid(void) {
 }
 
 void time_init(void) {
+  // Init is the only pre-publication direct reset.  Establish writer-owner state
+  // before any seqlock mutation path becomes reachable.
+  g_time_anchor_writer_owner = 0U;
+  for (uint32_t i = 0U; i < TIME_PROJECTION_SLOT_COUNT; ++i) {
+    g_time_projection_writer_owner[i] = 0U;
+  }
   g_time_anchor = time_anchor_store_t{};
   time_clock_reset_all();
 }

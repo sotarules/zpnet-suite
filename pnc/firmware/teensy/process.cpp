@@ -144,16 +144,15 @@ static bool response_serializes(const Payload& response) {
         return true;
     }
 
-    String json = response.to_json();
-    if (json.length() == 0) {
+    // Payload already owns an allocation-free exact-size court.  Do not create
+    // a temporary Arduino String merely to ask whether the response serializes;
+    // that would introduce an unowned newlib allocation beside Payload/transport.
+    const size_t json_len = response.json_size();
+    if (json_len == 0U || json_len == 2U) {
         return false;
     }
 
-    if (json == "{}") {
-        return false;
-    }
-
-    return json.length() <= TRANSPORT_MAX_MESSAGE;
+    return json_len <= TRANSPORT_MAX_MESSAGE;
 }
 
 static void send_response_or_overflow(const Payload& request, const Payload& response) {

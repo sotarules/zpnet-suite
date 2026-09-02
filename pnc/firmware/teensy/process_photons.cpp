@@ -247,16 +247,25 @@ enum class photons_foreground_owner_t : uint8_t {
   COMMAND = 3U,
 };
 
-static photons_foreground_owner_t g_photons_foreground_owner =
-    photons_foreground_owner_t::NONE;
+// The ownership court must be stronger than the scheduler assumption it is
+// checking.  Use one non-spinning atomic claim so a future preempting foreground
+// path cannot pass a check-then-store window and become a second writer.
+static volatile uint32_t g_photons_foreground_owner =
+    (uint32_t)photons_foreground_owner_t::NONE;
 
 static inline void photons_foreground_owner_acquire(
     photons_foreground_owner_t owner) {
-  if (owner == photons_foreground_owner_t::NONE ||
-      g_photons_foreground_owner != photons_foreground_owner_t::NONE) {
+  if (owner == photons_foreground_owner_t::NONE) __builtin_trap();
+  uint32_t expected = (uint32_t)photons_foreground_owner_t::NONE;
+  if (!__atomic_compare_exchange_n(
+          &g_photons_foreground_owner,
+          &expected,
+          (uint32_t)owner,
+          false,
+          __ATOMIC_ACQ_REL,
+          __ATOMIC_ACQUIRE)) {
     __builtin_trap();
   }
-  g_photons_foreground_owner = owner;
   photons_memory_barrier();
 }
 
@@ -264,17 +273,21 @@ static inline void photons_foreground_owner_release(
     photons_foreground_owner_t owner) {
   photons_memory_barrier();
   if (owner == photons_foreground_owner_t::NONE ||
-      g_photons_foreground_owner != owner) {
+      __atomic_load_n(&g_photons_foreground_owner, __ATOMIC_ACQUIRE) !=
+          (uint32_t)owner) {
     __builtin_trap();
   }
-  g_photons_foreground_owner = photons_foreground_owner_t::NONE;
+  __atomic_store_n(&g_photons_foreground_owner,
+                   (uint32_t)photons_foreground_owner_t::NONE,
+                   __ATOMIC_RELEASE);
   photons_memory_barrier();
 }
 
 static inline void photons_foreground_owner_assert(
     photons_foreground_owner_t owner) {
   if (owner == photons_foreground_owner_t::NONE ||
-      g_photons_foreground_owner != owner) {
+      __atomic_load_n(&g_photons_foreground_owner, __ATOMIC_ACQUIRE) !=
+          (uint32_t)owner) {
     __builtin_trap();
   }
 }
@@ -3517,7 +3530,20 @@ static void photons_fragment_tick(
   // populated after publish: the next one-second root.clear() intentionally
   // remains an integrity canary for any out-of-band RAM2 mutation.
   Payload& payload = photons_fragment_payload(fragment);
-  if (publish("PHOTONS_FRAGMENT", payload)) {
+  const bool published = publish("PHOTONS_FRAGMENT", payload);
+
+  // publish() is a synchronous custody boundary: local fan-out may only borrow
+  // the immutable value and transport must finish copying it into its own wire
+  // allocation before returning.  Prove that boundary immediately.  If either
+  // layer ever mutates the caller-owned root, clear() deliberately re-enters the
+  // normal Payload fatal court while the offending publication is still the
+  // immediately preceding operation.  A valid root remains populated so the
+  // next one-second clear retains the existing between-transaction canary.
+  if (!payload.contract_valid()) {
+    payload.clear();  // does not return when the preservation court is broken
+  }
+
+  if (published) {
     g_publish_count++;
     if (fragment.recovery.restored &&
         fragment.recovery.proof_pending &&
@@ -3616,7 +3642,9 @@ FLASHMEM void process_photons_init(void) {
   // Initialization runs before PHOTONS publishes any foreground work. Establish
   // the one foreground mutation domain explicitly before the ISR subscription
   // becomes live.
-  g_photons_foreground_owner = photons_foreground_owner_t::NONE;
+  __atomic_store_n(&g_photons_foreground_owner,
+                   (uint32_t)photons_foreground_owner_t::NONE,
+                   __ATOMIC_RELEASE);
 
   // This is the only foreground initialization of ISR-owned live capture and it
   // occurs before PHOTODIODE subscription/start below. After interrupt_start(),

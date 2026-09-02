@@ -10583,7 +10583,7 @@ def _end_sync_wait(
 
 
 def _signal_sync_candidate_if_needed(fragment: Dict[str, Any], pps_vclock_count: int) -> bool:
-    """Satisfy RECOVER sync only after the Pi court accepts a candidate."""
+    """Satisfy RECOVER sync after the final court preserves a candidate row."""
     global _sync_fragment
 
     with _sync_lock:
@@ -10593,7 +10593,7 @@ def _signal_sync_candidate_if_needed(fragment: Dict[str, Any], pps_vclock_count:
         match = int(pps_vclock_count) >= int(_sync_expected_pps_vclock)
         if match:
             logging.info(
-                "✅ [recovery] first accepted CLOCKS_FRAGMENT campaign delta observed: count=%d expected>=%d",
+                "✅ [recovery] first final-court-preserved CLOCKS_FRAGMENT candidate reached sync: count=%d expected>=%d",
                 int(pps_vclock_count), int(_sync_expected_pps_vclock),
             )
             _sync_fragment = dict(fragment)
@@ -11232,7 +11232,14 @@ def _recovery_admission_verdict(
     A degraded row is admissible only when the Teensy explicitly identifies the
     transition; mere absence of science is never silently reclassified.
     """
-    science_clean, lanes = _fragment_ocxo_science_clean(fragment)
+    lane_science_clean, lanes = _fragment_ocxo_science_clean(fragment)
+    firmware_exclusion = _firmware_science_exclusion(fragment)
+    firmware_science_excluded = bool(firmware_exclusion)
+    # Per-lane OCXO science can remain internally coherent on a row that the
+    # firmware has explicitly excluded at the whole-row court (for example a
+    # cross-rail cycle excursion).  Recovery may retain such a row as audit
+    # evidence, but it may never call that row clean science.
+    science_clean = bool(lane_science_clean and not firmware_science_excluded)
     report_available = bool(status)
 
     fragment_active = _fragment_recovery_bool(
@@ -11366,6 +11373,8 @@ def _recovery_admission_verdict(
         state_reasons.append("ocxo_clockface_not_ready")
     if not science_ready:
         state_reasons.append("ocxo_science_not_ready")
+    if firmware_science_excluded:
+        state_reasons.append("firmware_science_excluded")
     if not science_clean:
         state_reasons.append("ocxo_science_not_clean")
     if stalled:
@@ -11422,6 +11431,9 @@ def _recovery_admission_verdict(
         "watchdog_blocked": watchdog_blocked or watchdog_active,
         "science_quarantine_active": quarantine_active,
         "science_quarantine_remaining": int(quarantine_remaining),
+        "lane_science_clean": bool(lane_science_clean),
+        "firmware_science_excluded": firmware_science_excluded,
+        "firmware_science_exclusion": copy.deepcopy(firmware_exclusion),
         "science_clean": science_clean,
         "lanes": lanes,
         "report_reason": (
@@ -18010,12 +18022,19 @@ def _wait_for_preflight(
     A post-flash startup may enter the existing holistic restore court earlier
     when firmware explicitly proves that the durable active campaign no longer
     exists on Teensy and the recovery epoch is ready.
+
+    When the only missing prerequisite is the canonical CLOCKS heartbeat, keep
+    readiness stream-owned but restore the historical SmartZero operator view.
+    After one 10-second visibility grace, issue only read-only diagnostic reports
+    at the existing SmartZero status cadence; their contents never participate in
+    preflight admission or producer-lifetime classification.
     """
     attempt = 0
     t0 = time.monotonic()
     last_log_at = t0
     last_signature: Optional[Tuple[str, ...]] = None
     logged_wait = False
+    smartzero_diag_active = False
 
     while True:
         restore_entry = (
@@ -18038,6 +18057,17 @@ def _wait_for_preflight(
                 "checks": int(attempt + 1),
                 "waited_s": round(float(elapsed), 3),
             }
+            if smartzero_diag_active:
+                final_progress = _smartzero_progress_snapshot(
+                    _fetch_teensy_smartzero_status()
+                )
+                if final_progress:
+                    logging.info(
+                        "✅ [clocks/startup] SmartZero/Alpha startup boundary visible "
+                        "after %.1fs: %s",
+                        elapsed,
+                        _smartzero_progress_text(final_progress),
+                    )
             if logged_wait:
                 logging.info(
                     "%s %s admitted after %.1fs: %s features NOMINAL; "
@@ -18095,6 +18125,15 @@ def _wait_for_preflight(
         pending = _preflight_wait_items(reasons)
         signature = tuple(pending)
         expected_clocks_absence = _preflight_wait_is_expected_clocks_absence(pending)
+        smartzero_log_due = (
+            context in {"startup", "holistic_startup"}
+            and expected_clocks_absence
+            and elapsed >= STARTUP_ALPHA_EPOCH_STATUS_LOG_INTERVAL_S
+            and (
+                not smartzero_diag_active
+                or now - last_log_at >= STARTUP_ALPHA_EPOCH_STATUS_LOG_INTERVAL_S
+            )
+        )
         should_log = (
             not expected_clocks_absence
             and elapsed >= PREFLIGHT_QUIET_GRACE_S
@@ -18114,6 +18153,59 @@ def _wait_for_preflight(
             "pending": pending,
             "expected_clocks_absence": bool(expected_clocks_absence),
         }
+
+        if smartzero_log_due:
+            # The stream remains the admission authority. These RPCs restore only
+            # the operator display that was lost when the blocking startup
+            # _wait_for_startup_alpha_epoch() call was removed for live adoption.
+            status = _fetch_teensy_recovery_status()
+            smartzero_running = _recovery_bool(
+                status.get("recover_smartzero_running")
+            )
+            smartzero_complete = _recovery_bool(
+                status.get("recover_smartzero_complete")
+            )
+            smartzero_progress: Dict[str, Any] = {}
+            if smartzero_running or smartzero_complete:
+                smartzero_progress = _smartzero_progress_snapshot(
+                    _fetch_teensy_smartzero_status()
+                )
+
+            if smartzero_running:
+                detail = _smartzero_progress_text(smartzero_progress)
+            elif smartzero_complete:
+                detail = (
+                    "SmartZero complete; Alpha epoch/CLOCKS row pending; "
+                    f"{_smartzero_progress_text(smartzero_progress)}"
+                )
+            elif status:
+                detail = "Alpha epoch/CLOCKS row pending; SmartZero not currently active"
+            else:
+                detail = "canonical CLOCKS row absent; SmartZero status unavailable"
+
+            _diag["last_startup_alpha_epoch_wait"] = {
+                "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "status": "WAITING",
+                "waited_s": round(float(elapsed), 3),
+                "report_available": bool(status),
+                "recover_smartzero_running": bool(smartzero_running),
+                "recover_smartzero_complete": bool(smartzero_complete),
+                "smartzero": copy.deepcopy(smartzero_progress),
+                "observational_only": True,
+                "preflight_authority": "CLOCKS_FRAGMENT",
+            }
+            _diag["preflight_wait_log_count"] = (
+                _diag.get("preflight_wait_log_count", 0) + 1
+            )
+            logging.info(
+                "⏳ [clocks/startup] SmartZero/Alpha epoch still pending (%.1fs): %s",
+                elapsed,
+                detail,
+            )
+            smartzero_diag_active = True
+            logged_wait = True
+            last_log_at = now
+            last_signature = signature
 
         if should_log:
             _diag["preflight_wait_log_count"] = (

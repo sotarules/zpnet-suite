@@ -18,10 +18,12 @@
 //   • Campaign Flash Cut: hot campaign boundary without Alpha epoch rebase
 //   • PPS/VCLOCK-selected truth capture
 //   • Deferred 1 Hz canonical publication after both post-PPS OCXO edges complete
-//   • Serialized command reporting: Priority 0 capture remains live while the
-//     Priority 16 TimePop/handoff tier is excluded from re-entering command
-//     report construction; CLOCKS independently owns CLOCKS_FRAGMENT formatting,
-//     exact-sequence retry custody, and publication
+//   • Explicit operation ownership: Alpha/Beta science producers may continue
+//     across immutable SPSC handoffs, but every mutable writer domain and every
+//     Payload-construction transaction has exactly one owner. Priority 0 capture
+//     remains live while command/event Payload custody excludes the Priority 16
+//     TimePop/handoff tier; CLOCKS_FRAGMENT owns exact-sequence serialization,
+//     retry custody, and publication until its queue slot is released.
 //   • Continuous DWT-to-GNSS calibration (campaign-independent)
 //   • Static PPS/GPIO-based one-second prediction audit for VCLOCK and OCXO lanes
 //   • VCLOCK heartbeat and OCXO one-second compare consumption as observed
@@ -173,6 +175,13 @@ void clocks_row_exclude(clocks_row_objection_source_t source,
 // Alpha calls this before irreversible statistical mutation; Beta consumes and
 // serializes the same objection at the candidate boundary.
 bool clocks_row_science_eligible(uint32_t pps_sequence = 0U);
+
+// When Alpha proves that one incomplete PPS row has been overtaken by its
+// immediate successor, hold that successor out of science so the missing
+// antecedent cannot contaminate an accumulator. The physical sequence gap
+// remains visible testimony; larger/regressive sequence injuries remain
+// WATCHDOG conditions.
+void clocks_row_hold_successor(uint32_t source_pps, uint32_t lane_mask);
 
 // -----------------------------------------------------------------------------
 // Direct accessors (escape hatches)

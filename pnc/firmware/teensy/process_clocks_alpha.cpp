@@ -260,6 +260,7 @@ volatile bool     g_pps_dwt_cycles_between_edges_valid = false;
 volatile int32_t  g_pps_vclock_phase_cycles = 0;
 
 static volatile uint32_t g_pps_vclock_edge_forensics_seq = 0;
+static volatile uint32_t g_pps_vclock_edge_forensics_writer_owner = 0U;
 static clocks_pps_vclock_edge_forensics_t g_pps_vclock_edge_forensics DMAMEM = {};
 
 static volatile uint32_t g_prev_pps_dwt_at_edge = 0;
@@ -286,11 +287,44 @@ static uint32_t alpha_pps_vclock_phase_cycles_from_edges(uint32_t pps_dwt_at_edg
 
 static inline void clocks_alpha_dmb(void);
 
+
+// A seqlock makes readers coherent; it does not serialize competing writers.
+// Every Alpha store that has more than one legal mutation path therefore carries
+// an explicit fail-hard writer owner.  This is the same SPSC operation-ownership
+// rule used by PHOTONS and by Alpha instrument statistics below.
+class alpha_writer_custody_t {
+ public:
+  explicit alpha_writer_custody_t(volatile uint32_t& owner) : owner_(owner) {
+    uint32_t expected = 0U;
+    if (!__atomic_compare_exchange_n(&owner_,
+                                     &expected,
+                                     1U,
+                                     false,
+                                     __ATOMIC_ACQ_REL,
+                                     __ATOMIC_ACQUIRE)) {
+      __builtin_trap();
+    }
+  }
+
+  ~alpha_writer_custody_t() {
+    if (__atomic_load_n(&owner_, __ATOMIC_ACQUIRE) != 1U) __builtin_trap();
+    __atomic_store_n(&owner_, 0U, __ATOMIC_RELEASE);
+  }
+
+  alpha_writer_custody_t(const alpha_writer_custody_t&) = delete;
+  alpha_writer_custody_t& operator=(const alpha_writer_custody_t&) = delete;
+
+ private:
+  volatile uint32_t& owner_;
+};
+
 static uint64_t alpha_pps_vclock_abs_i64(int64_t value) {
   return (value >= 0) ? (uint64_t)value : (uint64_t)(-value);
 }
 
 static void alpha_pps_vclock_edge_forensics_reset(void) {
+  const alpha_writer_custody_t writer_custody(
+      g_pps_vclock_edge_forensics_writer_owner);
   g_pps_vclock_edge_forensics_seq++;
   clocks_alpha_dmb();
   g_pps_vclock_edge_forensics = clocks_pps_vclock_edge_forensics_t{};
@@ -308,6 +342,8 @@ static void alpha_pps_vclock_edge_forensics_publish(
     uint32_t effective_dwt_cycles_per_second,
     bool counter_identity_valid,
     uint64_t counter_identity_ns) {
+  const alpha_writer_custody_t writer_custody(
+      g_pps_vclock_edge_forensics_writer_owner);
   const uint32_t prior_update_count = g_pps_vclock_edge_forensics.update_count;
   const pps_vclock_edge_authority_t& a = snap.vclock_edge_authority;
 
@@ -762,6 +798,7 @@ FLASHMEM bool clocks_alpha_integrity_snapshot(clocks_alpha_integrity_snapshot_t*
 // The former private 179-field mirror duplicated clocks_alpha_lane_forensics_t
 // exactly and required manual field-by-field reset/copy code.
 struct alpha_lane_forensics_store_t : clocks_alpha_lane_forensics_t {
+  volatile uint32_t writer_owner = 0U;
   volatile uint32_t seq = 0U;
 };
 
@@ -1518,6 +1555,13 @@ struct alpha_tau_estimator_t {
 
 static alpha_tau_estimator_t g_ocxo1_tau = {};
 static alpha_tau_estimator_t g_ocxo2_tau = {};
+static volatile uint32_t g_ocxo1_tau_writer_owner = 0U;
+static volatile uint32_t g_ocxo2_tau_writer_owner = 0U;
+
+static volatile uint32_t* alpha_tau_writer_owner(time_clock_id_t clock) {
+  return alpha_ocxo_store_for(
+      clock, &g_ocxo1_tau_writer_owner, &g_ocxo2_tau_writer_owner);
+}
 
 static alpha_tau_estimator_t* alpha_tau_store_mut(time_clock_id_t clock) {
   return alpha_ocxo_store_for(clock, &g_ocxo1_tau, &g_ocxo2_tau);
@@ -1529,6 +1573,9 @@ static const alpha_tau_estimator_t* alpha_tau_store(time_clock_id_t clock) {
 
 static void alpha_tau_reset_lane(alpha_tau_estimator_t& s,
                                  time_clock_id_t clock) {
+  volatile uint32_t* writer_owner = alpha_tau_writer_owner(clock);
+  if (!writer_owner) __builtin_trap();
+  const alpha_writer_custody_t writer_custody(*writer_owner);
   const uint32_t prior_reset_count = s.reset_count;
 
   // Preserve the seqlock generation outside the aggregate reset.  Assigning
@@ -1616,6 +1663,9 @@ static void alpha_tau_note_delta_interval(time_clock_id_t clock,
                                           uint64_t clockface_ns) {
   alpha_tau_estimator_t* s = alpha_tau_store_mut(clock);
   if (!s || pps_sequence == 0U) return;
+  volatile uint32_t* writer_owner = alpha_tau_writer_owner(clock);
+  if (!writer_owner) __builtin_trap();
+  const alpha_writer_custody_t writer_custody(*writer_owner);
 
   s->seq++;
   clocks_alpha_dmb();
@@ -1758,6 +1808,9 @@ bool clocks_alpha_ocxo_tau_restore(
   if (!dst || !state || !alpha_tau_restore_state_valid(clock, *state)) {
     return false;
   }
+  volatile uint32_t* writer_owner = alpha_tau_writer_owner(clock);
+  if (!writer_owner) __builtin_trap();
+  const alpha_writer_custody_t writer_custody(*writer_owner);
 
   uint32_t seq = dst->seq;
   if (seq & 1U) seq++;
@@ -4144,6 +4197,7 @@ static inline void clocks_alpha_dmb(void) {
 //   OCXO2  — OCXO2 authored edge-to-edge DWT interval
 
 struct alpha_static_prediction_store_t {
+  volatile uint32_t writer_owner = 0U;
   volatile uint32_t seq = 0;
   bool     valid = false;
   uint32_t completed_interval_count = 0;
@@ -4165,6 +4219,7 @@ static alpha_static_prediction_store_t* alpha_static_prediction_store(time_clock
 }
 
 static void alpha_static_prediction_reset_store(alpha_static_prediction_store_t& s) {
+  const alpha_writer_custody_t writer_custody(s.writer_owner);
   s.seq++;
   clocks_alpha_dmb();
 
@@ -4195,6 +4250,7 @@ static void alpha_static_prediction_record(time_clock_id_t clock,
   if (actual_cycles == 0) return;
   alpha_static_prediction_store_t* s = alpha_static_prediction_store(clock);
   if (!s) return;
+  const alpha_writer_custody_t writer_custody(s->writer_owner);
 
   const uint32_t prior_actual = s->last_actual_cycles;
   const bool actual_plausible =
@@ -4227,6 +4283,7 @@ static void alpha_static_prediction_record_pps(uint32_t actual_cycles) {
   if (actual_cycles == 0) return;
 
   alpha_static_prediction_store_t& s = g_static_prediction_pps;
+  const alpha_writer_custody_t writer_custody(s.writer_owner);
   const uint32_t prior_actual = s.last_actual_cycles;
   const bool actual_plausible =
       alpha_instrument_interval_plausible(actual_cycles);
@@ -4366,6 +4423,7 @@ static void alpha_static_prediction_forget_antecedent(uint32_t lane_bit) {
     store = &g_static_prediction_ocxo2;
   }
   if (!store) return;
+  const alpha_writer_custody_t writer_custody(store->writer_owner);
 
   store->seq++;
   clocks_alpha_dmb();
@@ -4804,6 +4862,7 @@ static FLASHMEM void clocks_alpha_cold_diagnostics_init(void) {
   g_ocxo1_interrupt_diag = interrupt_capture_diag_t{};
   g_ocxo2_interrupt_diag = interrupt_capture_diag_t{};
 
+  g_pps_vclock_edge_forensics_writer_owner = 0U;
   g_pps_vclock_edge_forensics_seq = 0U;
   g_pps_vclock_edge_forensics = clocks_pps_vclock_edge_forensics_t{};
   g_alpha_integrity = clocks_alpha_integrity_snapshot_t{};
@@ -5968,6 +6027,42 @@ static void alpha_completed_row_clear(void) {
   g_alpha_pending_completed_row = alpha_pending_completed_row_t{};
 }
 
+static uint32_t alpha_completed_row_incomplete_lane_mask(void) {
+  if (!g_alpha_pending_completed_row.open) return 0U;
+  uint32_t lane_mask = 0U;
+  if (!g_alpha_pending_completed_row.ocxo1_complete) {
+    lane_mask |= CLOCKS_ROW_LANE_OCXO1;
+  }
+  if (!g_alpha_pending_completed_row.ocxo2_complete) {
+    lane_mask |= CLOCKS_ROW_LANE_OCXO2;
+  }
+  return lane_mask;
+}
+
+// OCXO callbacks and the PPS selector are independently scheduled foreground
+// continuations. Either side may first observe that the next physical PPS has
+// arrived while the prior row is still incomplete. An exact +1 advance proves
+// one missing observation, not loss of Alpha lineage: retire that impossible
+// row, hold its successor out of science, and leave the sequence gap visible.
+// Any larger advance or regression remains a continuity failure.
+static bool alpha_completed_row_retire_if_immediate_successor(
+    uint32_t observed_sequence) {
+  if (!g_alpha_pending_completed_row.open || observed_sequence == 0U) {
+    return false;
+  }
+
+  const uint32_t retired_sequence =
+      g_alpha_pending_completed_row.pps_sequence;
+  if ((uint32_t)(observed_sequence - retired_sequence) != 1U) {
+    return false;
+  }
+
+  clocks_row_hold_successor(
+      retired_sequence, alpha_completed_row_incomplete_lane_mask());
+  alpha_completed_row_clear();
+  return true;
+}
+
 static void alpha_completed_row_reset_all(void) {
   alpha_completed_row_clear();
   g_alpha_last_ocxo1_pps_sequence = 0U;
@@ -6190,18 +6285,35 @@ static void alpha_completed_row_note_ocxo_event(
 
   if (!g_alpha_pending_completed_row.open) return;
 
-  if (event.pps_sequence != g_alpha_pending_completed_row.pps_sequence) {
+  // The raw OCXO event identity and the PPS row completed by that edge are
+  // different sequence species.  In the normal right-bookend ordering, event
+  // N+1 may be exactly the edge that resolves CounterLedger/PhaseLedger row N.
+  // Ask the row-owned authority first; only an edge that did NOT complete the
+  // owned row may testify that the row was overtaken.
+  const uint32_t owned_sequence =
+      g_alpha_pending_completed_row.pps_sequence;
+  if (alpha_completed_row_lane_ready(clock, owned_sequence)) {
+    *row_complete = true;
+    alpha_completed_row_try_complete();
+    return;
+  }
+
+  if (event.pps_sequence != owned_sequence) {
+    if (alpha_completed_row_retire_if_immediate_successor(
+            event.pps_sequence)) {
+      return;
+    }
     clocks_watchdog_anomaly(
         "alpha_timebase_ocxo_sequence_mismatch",
         (uint32_t)((uint8_t)clock),
-        g_alpha_pending_completed_row.pps_sequence,
+        owned_sequence,
         event.pps_sequence,
         event.counter32_at_event);
     alpha_completed_row_clear();
     return;
   }
 
-  *row_complete = alpha_completed_row_lane_ready(clock, event.pps_sequence);
+  *row_complete = alpha_completed_row_lane_ready(clock, owned_sequence);
   alpha_completed_row_try_complete();
 }
 
@@ -6230,11 +6342,14 @@ static void alpha_completed_row_open(uint32_t pps_sequence) {
 
   g_alpha_pending_completed_row.open = true;
   g_alpha_pending_completed_row.pps_sequence = pps_sequence;
+
+  // Completion belongs to the row-resolved CounterLedger/PhaseLedger identity,
+  // not to the label on the most recently observed raw OCXO edge.  A lawful
+  // N+1 right bookend may already have completed row N before this selector
+  // continuation opens it.
   g_alpha_pending_completed_row.ocxo1_complete =
-      g_alpha_last_ocxo1_pps_sequence == pps_sequence &&
       alpha_completed_row_lane_ready(time_clock_id_t::OCXO1, pps_sequence);
   g_alpha_pending_completed_row.ocxo2_complete =
-      g_alpha_last_ocxo2_pps_sequence == pps_sequence &&
       alpha_completed_row_lane_ready(time_clock_id_t::OCXO2, pps_sequence);
   alpha_completed_row_try_complete();
 }
@@ -6459,6 +6574,7 @@ static uint64_t alpha_ocxo_project_measured_ns_to_dwt_live(time_clock_id_t clock
 }
 
 static void alpha_forensics_reset_store(alpha_lane_forensics_store_t& store) {
+  const alpha_writer_custody_t writer_custody(store.writer_owner);
   store.seq++;
   clocks_alpha_dmb();
   static_cast<clocks_alpha_lane_forensics_t&>(store) =
@@ -6499,6 +6615,7 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
     alpha_event_flow_note_forensics_missing_store(clock_id);
     return;
   }
+  const alpha_writer_custody_t writer_custody(s->writer_owner);
 
   const bool had_prior_counter_event = s->valid;
   const uint64_t previous_counter_ns = s->nominal_ns_from_counter32_epoch;
@@ -9267,14 +9384,16 @@ static void pps_selector_callback(const pps_edge_snapshot_t& snap) {
   // older row that is still waiting for either OCXO lane.
   if (g_alpha_pending_completed_row.open &&
       g_alpha_pending_completed_row.pps_sequence != snap.sequence) {
-    clocks_watchdog_anomaly(
-        "alpha_timebase_row_overlap",
-        g_alpha_pending_completed_row.pps_sequence,
-        snap.sequence,
-        g_alpha_last_ocxo1_pps_sequence,
-        g_alpha_last_ocxo2_pps_sequence);
-    alpha_completed_row_clear();
-    return;
+    if (!alpha_completed_row_retire_if_immediate_successor(snap.sequence)) {
+      clocks_watchdog_anomaly(
+          "alpha_timebase_row_overlap",
+          g_alpha_pending_completed_row.pps_sequence,
+          snap.sequence,
+          g_alpha_last_ocxo1_pps_sequence,
+          g_alpha_last_ocxo2_pps_sequence);
+      alpha_completed_row_clear();
+      return;
+    }
   }
 
   // Once an Alpha epoch exists, the selected PPS/VCLOCK continuation must be

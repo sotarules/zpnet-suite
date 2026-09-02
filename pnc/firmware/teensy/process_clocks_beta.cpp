@@ -80,6 +80,81 @@
 #include <string.h>
 #include <strings.h>
 
+
+// ============================================================================
+// CLOCKS Payload / foreground ownership court
+// ============================================================================
+//
+// CLOCKS intentionally permits Alpha/Beta acquisition to continue while an older
+// immutable CLOCKS_FRAGMENT queue entry is being serialized.  What may not overlap
+// is Payload construction itself.  Command handlers, the canonical fragment
+// serializer, and exceptional Beta/watchdog event builders therefore share one
+// explicit fail-hard Payload owner.
+//
+// Payload custody is an operation owner, not an interrupt mask.  QTimer1 at
+// Priority 16 and process_interrupt continuation at Priority 32 must remain live
+// even while a foreground command is constructing a Payload: continuation is
+// what extends the 16-bit 10 MHz timer domains across low-word revolutions.
+// TimePop application callbacks, including CLOCKS_FRAGMENT serialization, are
+// foreground-owned after immutable interrupt facts have escaped handler context.
+// If any execution context nevertheless attempts a competing Payload mutation,
+// the atomic owner below traps rather than hiding the architecture violation.
+static constexpr size_t CLOCKS_RAM2_CACHE_LINE_BYTES = 32U;
+static_assert((CLOCKS_RAM2_CACHE_LINE_BYTES &
+               (CLOCKS_RAM2_CACHE_LINE_BYTES - 1U)) == 0U,
+              "CLOCKS RAM2 cache-line alignment must be a power of two");
+static_assert((CLOCKS_RAM2_CACHE_LINE_BYTES %
+               Payload::FIXED_STORAGE_ALIGNMENT) == 0U,
+              "CLOCKS RAM2 alignment must satisfy Payload fixed storage");
+
+enum class clocks_payload_owner_t : uint32_t {
+  NONE = 0U,
+  FRAGMENT = 1U,
+  COMMAND = 2U,
+  EVENT = 3U,
+};
+
+static volatile uint32_t g_clocks_payload_owner = 0U;
+
+static inline void clocks_payload_owner_assert(clocks_payload_owner_t owner) {
+  if (owner == clocks_payload_owner_t::NONE ||
+      __atomic_load_n(&g_clocks_payload_owner, __ATOMIC_ACQUIRE) !=
+          (uint32_t)owner) {
+    __builtin_trap();
+  }
+}
+
+class clocks_payload_custody_t {
+ public:
+  explicit clocks_payload_custody_t(clocks_payload_owner_t owner)
+      : owner_(owner) {
+    if (owner_ == clocks_payload_owner_t::NONE) __builtin_trap();
+    uint32_t expected = 0U;
+    if (!__atomic_compare_exchange_n(&g_clocks_payload_owner,
+                                     &expected,
+                                     (uint32_t)owner_,
+                                     false,
+                                     __ATOMIC_ACQ_REL,
+                                     __ATOMIC_ACQUIRE)) {
+      __builtin_trap();
+    }
+  }
+
+  ~clocks_payload_custody_t() {
+    if (__atomic_load_n(&g_clocks_payload_owner, __ATOMIC_ACQUIRE) !=
+        (uint32_t)owner_) {
+      __builtin_trap();
+    }
+    __atomic_store_n(&g_clocks_payload_owner, 0U, __ATOMIC_RELEASE);
+  }
+
+  clocks_payload_custody_t(const clocks_payload_custody_t&) = delete;
+  clocks_payload_custody_t& operator=(const clocks_payload_custody_t&) = delete;
+
+ private:
+  clocks_payload_owner_t owner_;
+};
+
 // ============================================================================
 // Campaign state — definitions
 // ============================================================================
@@ -210,13 +285,12 @@ static bool clocks_row_objection_requires_antecedent_hold(
           clocks_row_objection_reason_t::ALPHA_CYCLE_INTERVAL_IMPLAUSIBLE;
 }
 
-static void clocks_row_antecedent_hold_arm(
-    clocks_row_objection_reason_t reason,
-    uint32_t lane_mask,
-    uint32_t source_pps) {
-  if (!clocks_row_objection_requires_antecedent_hold(reason) ||
-      source_pps == 0U) {
-    return;
+static void clocks_row_antecedent_hold_arm_exact(
+    uint32_t source_pps,
+    uint32_t lane_mask) {
+  if (source_pps == 0U) return;
+  if (lane_mask == 0U) {
+    lane_mask = CLOCKS_ROW_LANE_OCXO1 | CLOCKS_ROW_LANE_OCXO2;
   }
 
   const uint32_t target_pps = source_pps + 1U;
@@ -239,6 +313,18 @@ static void clocks_row_antecedent_hold_arm(
   __atomic_store_n(&g_row_antecedent_hold_target_pps,
                    target_pps,
                    __ATOMIC_RELEASE);
+}
+
+void clocks_row_hold_successor(uint32_t source_pps, uint32_t lane_mask) {
+  clocks_row_antecedent_hold_arm_exact(source_pps, lane_mask);
+}
+
+static void clocks_row_antecedent_hold_arm(
+    clocks_row_objection_reason_t reason,
+    uint32_t lane_mask,
+    uint32_t source_pps) {
+  if (!clocks_row_objection_requires_antecedent_hold(reason)) return;
+  clocks_row_antecedent_hold_arm_exact(source_pps, lane_mask);
 }
 
 static void clocks_row_antecedent_hold_apply(uint32_t pps_sequence) {
@@ -551,6 +637,7 @@ static clocks_alpha_ocxo_counterledger_snapshot_t
 // scarce DTCM stack. The CLOCKS publisher consumes it only when the requested PPS sequence
 // matches exactly; an unconsumed record is never overwritten.
 static constexpr uint32_t CLOCKS_FRAGMENT_CAMPAIGN_QUEUE_CAPACITY = 2U;
+alignas(CLOCKS_RAM2_CACHE_LINE_BYTES)
 static clocks_fragment_campaign_snapshot_t
     g_clocks_fragment_campaign_queue[CLOCKS_FRAGMENT_CAMPAIGN_QUEUE_CAPACITY]
         DMAMEM = {};
@@ -704,8 +791,8 @@ static volatile bool g_clocks_fragment_publication_service_armed = false;
 // Foreground publication has one owner from snapshot acquisition through queue
 // release. A wake observed while that owner is active remains represented by
 // scalar pending/retry state and is armed only after ownership returns.
-static bool g_clocks_fragment_publication_service_active = false;
-static bool g_clocks_fragment_publication_service_rearm_deferred = false;
+static volatile uint32_t g_clocks_fragment_publication_service_active = 0U;
+static volatile uint32_t g_clocks_fragment_publication_service_rearm_deferred = 0U;
 static timepop_handle_t g_clocks_fragment_publication_service_handle =
     TIMEPOP_INVALID_HANDLE;
 static uint32_t g_clocks_fragment_publication_service_generation = 0U;
@@ -785,6 +872,7 @@ struct clocks_fragment_publication_item_t {
   clocks_fragment_features_snapshot_t features{};
 };
 
+alignas(CLOCKS_RAM2_CACHE_LINE_BYTES)
 static clocks_fragment_publication_item_t
     g_clocks_fragment_publication_queue[CLOCKS_FRAGMENT_PUBLICATION_QUEUE_CAPACITY]
         DMAMEM = {};
@@ -857,17 +945,20 @@ static void clocks_fragment_publication_queue_reset(void) {
 }
 
 // CLOCKS_FRAGMENT serialization is a bounded, single-owner foreground workload.
-// Large canonical parents live in fixed RAM2 stores so they never enter the
-// general heap. Nested scratch that can exceed Payload's 256-byte inline store
-// uses dedicated fixed RAM1 backing. Inline-only locals remain ordinary Payloads.
+// Large canonical byte stores live in RAM2 so they never enter the general heap,
+// but every Payload control block (guards, capacity, generation, fingerprint)
+// lives in ordinary RAM1. Nested fixed scratch is entirely RAM1. Inline-only
+// locals remain ordinary Payloads.
 //
 // These capacities are part of the canonical schema contract, not allocator
 // tuning. Growth beyond one of them is a fail-hard FIXED_CAPACITY event and must
 // be accompanied by an explicit schema/storage review.
 #define CLOCKS_FRAGMENT_FIXED_RAM2(name, capacity)                         \
-  alignas(Payload::FIXED_STORAGE_ALIGNMENT)                               \
+  static_assert(((capacity) % CLOCKS_RAM2_CACHE_LINE_BYTES) == 0U,        \
+                "CLOCKS RAM2 fixed store must fill cache lines");         \
+  alignas(CLOCKS_RAM2_CACHE_LINE_BYTES)                                   \
   static uint8_t name##_storage[capacity] DMAMEM;                         \
-  static Payload name DMAMEM(                                             \
+  static Payload name(                                                    \
       Payload::StorageMode::FIXED,                                        \
       name##_storage,                                                     \
       sizeof(name##_storage))
@@ -875,7 +966,7 @@ static void clocks_fragment_publication_queue_reset(void) {
 #define CLOCKS_FRAGMENT_FIXED_RAM1(name, capacity)                         \
   alignas(Payload::FIXED_STORAGE_ALIGNMENT)                               \
   static uint8_t name##_storage[capacity];                                \
-  static Payload name DMAMEM(                                             \
+  static Payload name(                                                    \
       Payload::StorageMode::FIXED,                                        \
       name##_storage,                                                     \
       sizeof(name##_storage))
@@ -959,6 +1050,7 @@ static void clocks_fragment_features_snapshot_take(
 
 static FLASHMEM Payload& clocks_fragment_features_payload(
     const clocks_fragment_features_snapshot_t& snapshot) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::FRAGMENT);
   Payload clocks;
   if (snapshot.alpha_epoch.present)
     clocks.add("ALPHA_EPOCH", system_feature_status_str(snapshot.alpha_epoch.status));
@@ -1031,6 +1123,7 @@ static void clocks_fragment_add_welford(
     Payload& parent,
     const char* key,
     const clocks_fragment_welford_snapshot_t& sample) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::FRAGMENT);
   Payload& value = g_clocks_fragment_welford_payload;
   value.clear();
   value.add("n", sample.n);
@@ -1047,6 +1140,7 @@ static void clocks_fragment_add_ppb_bucket(
     Payload& buckets,
     const char* key,
     const clocks_fragment_ppb_value_snapshot_t& sample) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::FRAGMENT);
   if (sample.sample_count == 0ULL) return;
   buckets.add(key, toFixedDecimal(sample.ppb, 6));
 }
@@ -1054,6 +1148,7 @@ static void clocks_fragment_add_ppb_bucket(
 static void clocks_fragment_add_ppb_buckets(
     Payload& clock,
     const clocks_fragment_ppb_buckets_snapshot_t& buckets) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::FRAGMENT);
   Payload values;
   clocks_fragment_add_ppb_bucket(values, "10_min", buckets.minute_10);
   clocks_fragment_add_ppb_bucket(values, "60_min", buckets.minute_60);
@@ -1067,6 +1162,7 @@ static void clocks_fragment_add_ppb_endpoint(
     Payload& parent,
     const char* key,
     const clocks_fragment_ppb_endpoint_snapshot_t& endpoint) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::FRAGMENT);
   Payload& value = g_clocks_fragment_ppb_endpoint_payload;
   value.clear();
   value.add("reference_ns", endpoint.reference_ns);
@@ -1082,6 +1178,7 @@ static void clocks_fragment_add_ppb_window_proof(
     Payload& parent,
     const char* key,
     const clocks_fragment_ppb_window_proof_snapshot_t& proof) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::FRAGMENT);
   Payload& value = g_clocks_fragment_ppb_window_payload;
   value.clear();
   value.add("valid", proof.valid);
@@ -1095,6 +1192,7 @@ static void clocks_fragment_add_ppb_window_proof(
 static void clocks_fragment_add_ppb_checkpoint(
     Payload& parent,
     const clocks_fragment_ppb_checkpoint_delta_snapshot_t& checkpoint) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::FRAGMENT);
   Payload& value = g_clocks_fragment_ppb_checkpoint_payload;
   value.clear();
   value.add("schema", "CLOCKS_PPB_CHECKPOINT_DELTA_V1");
@@ -1148,6 +1246,7 @@ static void clocks_fragment_add_stats_clock(
     Payload& parent,
     const char* key,
     const clocks_fragment_stats_clock_snapshot_t& clock) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::FRAGMENT);
   Payload& value = g_clocks_fragment_stats_clock_payload;
   value.clear();
   clocks_fragment_add_welford(value, "welford", clock.welford);
@@ -1163,6 +1262,7 @@ static void clocks_fragment_add_tau_state(
     Payload& parent,
     const char* key,
     const clocks_fragment_tau_recovery_snapshot_t& state) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::FRAGMENT);
   Payload& value = g_clocks_fragment_tau_state_payload;
   value.clear();
   value.add("valid", state.valid);
@@ -1193,6 +1293,7 @@ static void clocks_fragment_add_tau_state(
 static void clocks_fragment_add_stats(
     Payload& parent,
     const clocks_fragment_stats_snapshot_t& snapshot) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::FRAGMENT);
   Payload& stats = g_clocks_fragment_stats_payload;
   stats.clear();
 
@@ -1239,6 +1340,7 @@ static void clocks_fragment_add_raw_cycles_lane(
     Payload& parent,
     const char* key,
     const clocks_fragment_raw_cycles_lane_t& sample) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::FRAGMENT);
   Payload& lane = g_clocks_fragment_raw_lane_payload;
   lane.clear();
   lane.add("snapshot_ok", sample.snapshot_ok);
@@ -1261,6 +1363,7 @@ static void clocks_fragment_add_raw_cycles_lane(
 static void clocks_fragment_add_raw_cycles(
     Payload& parent,
     const clocks_fragment_raw_cycles_snapshot_t& snapshot) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::FRAGMENT);
   Payload& raw = g_clocks_fragment_raw_payload;
   raw.clear();
   clocks_fragment_add_raw_cycles_lane(raw, "pps", snapshot.pps);
@@ -1273,6 +1376,7 @@ static void clocks_fragment_add_raw_cycles(
 static void clocks_fragment_add_science(
     Payload& parent,
     const clocks_fragment_science_snapshot_t& science) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::FRAGMENT);
   Payload& value = g_clocks_fragment_science_payload;
   value.clear();
   value.add("valid", science.valid);
@@ -1295,6 +1399,7 @@ static void clocks_fragment_add_science(
 
 static Payload& clocks_fragment_clocks_payload(
     const clocks_fragment_live_snapshot_t& snapshot) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::FRAGMENT);
   Payload& clocks = g_clocks_fragment_clocks_payload;
   clocks.clear();
   clocks.add("schema", "CLOCKS_INSTRUMENT_V1");
@@ -1346,6 +1451,7 @@ static void clocks_fragment_add_clock_candidate(
     Payload& parent,
     const char* key,
     const clocks_fragment_clock_candidate_t& candidate) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::FRAGMENT);
   Payload& out = g_clocks_fragment_candidate_payload;
   out.clear();
   out.add("available", candidate.available);
@@ -1368,6 +1474,7 @@ static void clocks_fragment_add_clock_candidate(
 static void clocks_fragment_add_clock_candidates(
     Payload& parent,
     const clocks_fragment_clock_candidates_snapshot_t& snapshot) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::FRAGMENT);
   Payload& candidates = g_clocks_fragment_candidates_payload;
   candidates.clear();
   candidates.add("schema", "OCXO_CLOCK_CANDIDATES_V1");
@@ -1392,6 +1499,7 @@ static void clocks_fragment_add_campaign_ocxo(
     const char* key,
     const clocks_fragment_clock_candidates_snapshot_t& clock_candidates,
     const clocks_fragment_science_snapshot_t& science) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::FRAGMENT);
   Payload& lane = g_clocks_fragment_campaign_ocxo_payload;
   lane.clear();
   clocks_fragment_add_clock_candidates(lane, clock_candidates);
@@ -1403,6 +1511,7 @@ static void clocks_fragment_add_campaign_ppb(
     Payload& ppb,
     const char* key,
     const clocks_fragment_ppb_value_snapshot_t& sample) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::FRAGMENT);
   if (sample.sample_count == 0ULL) return;
   ppb.add(key, toFixedDecimal(sample.ppb, 6));
 }
@@ -1410,6 +1519,7 @@ static void clocks_fragment_add_campaign_ppb(
 static void clocks_fragment_add_campaign_stats(
     Payload& parent,
     const clocks_fragment_campaign_stats_snapshot_t& snapshot) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::FRAGMENT);
   Payload stats;
   Payload ppb;
   clocks_fragment_add_campaign_ppb(ppb, "gnss", snapshot.gnss);
@@ -1423,6 +1533,7 @@ static void clocks_fragment_add_campaign_stats(
 
 static Payload& clocks_fragment_campaign_payload(
     const clocks_fragment_campaign_snapshot_t& snapshot) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::FRAGMENT);
   Payload& campaign = g_clocks_fragment_campaign_payload;
   campaign.clear();
   campaign.add("schema", "TEMPEST_FRAGMENT_V1");
@@ -1622,10 +1733,14 @@ static bool clocks_fragment_retry_finish_if_exhausted(uint32_t sequence) {
 }
 
 static void clocks_fragment_publish_service_release_owner(void) {
-  g_clocks_fragment_publication_service_active = false;
-  if (!g_clocks_fragment_publication_service_rearm_deferred) return;
-  g_clocks_fragment_publication_service_rearm_deferred = false;
-  clocks_fragment_schedule_publish();
+  __atomic_store_n(&g_clocks_fragment_publication_service_active,
+                   0U,
+                   __ATOMIC_RELEASE);
+  const bool deferred =
+      __atomic_exchange_n(&g_clocks_fragment_publication_service_rearm_deferred,
+                          0U,
+                          __ATOMIC_ACQ_REL) != 0U;
+  if (deferred) clocks_fragment_schedule_publish();
 }
 
 static void clocks_fragment_publish_service(timepop_ctx_t*,
@@ -1648,9 +1763,21 @@ static void clocks_fragment_publish_service(timepop_ctx_t*,
   // From snapshot acquisition through queue release this service is the sole
   // owner of CLOCKS publication storage. Scheduling requests raised while it is
   // active become one deferred wake; they cannot arm a nested serializer.
-  if (g_clocks_fragment_publication_service_active) __builtin_trap();
-  g_clocks_fragment_publication_service_active = true;
-  g_clocks_fragment_publication_service_rearm_deferred = false;
+  uint32_t expected_service_owner = 0U;
+  if (!__atomic_compare_exchange_n(
+          &g_clocks_fragment_publication_service_active,
+          &expected_service_owner,
+          1U,
+          false,
+          __ATOMIC_ACQ_REL,
+          __ATOMIC_ACQUIRE)) {
+    __builtin_trap();
+  }
+  __atomic_store_n(&g_clocks_fragment_publication_service_rearm_deferred,
+                   0U,
+                   __ATOMIC_RELEASE);
+  const clocks_payload_custody_t payload_custody(
+      clocks_payload_owner_t::FRAGMENT);
 
   clocks_fragment_publication_ensure_initialized();
 
@@ -1826,8 +1953,11 @@ static void clocks_fragment_schedule_publish(void) {
       !g_clocks_fragment_publication_retry_snapshot_valid) {
     return;
   }
-  if (g_clocks_fragment_publication_service_active) {
-    g_clocks_fragment_publication_service_rearm_deferred = true;
+  if (__atomic_load_n(&g_clocks_fragment_publication_service_active,
+                      __ATOMIC_ACQUIRE) != 0U) {
+    __atomic_store_n(&g_clocks_fragment_publication_service_rearm_deferred,
+                     1U,
+                     __ATOMIC_RELEASE);
     return;
   }
   if (g_clocks_fragment_publication_service_armed) {
@@ -2124,28 +2254,27 @@ static void clocks_fragment_watchdog_reset_publication_custody(void) {
   g_clocks_fragment_publication_watchdog_reset_count++;
 }
 
-// Command-report construction is a serialized foreground service. Priority-0
-// capture remains live, but the priority-16 TimePop/handoff tier may not enter a
-// second Payload-building path while a report owns the allocator/formatting
-// surface. The typed CLOCKS handoff uses separate RAM2 state and never enters
-// the command-report Payload arena.
-static constexpr uint32_t CLOCKS_REPORT_BASEPRI_GUARD = 16U;
-static volatile bool g_clocks_report_build_active = false;
+// Command-report construction is a serialized foreground service.  The outer
+// COMMAND Payload custody keeps Priority-0 capture live while excluding the
+// Priority-16 TimePop/handoff tier for the complete command transaction.  This
+// report-local owner then proves that the reusable report scratch itself has one
+// writer.  The typed CLOCKS handoff uses separate immutable queue state.
+static volatile uint32_t g_clocks_report_build_active = 0U;
 static uint32_t g_clocks_report_build_count = 0U;
 static uint32_t g_clocks_report_busy_reject_count = 0U;
 static uint32_t g_clocks_report_max_duration_cycles = 0U;
 
 static clocks_instrument_stats_snapshot_t
     g_beta_report_instrument_stats DMAMEM = {};
-static Payload g_report_clocks_payload DMAMEM;
-static Payload g_report_stats_payload DMAMEM;
-static Payload g_report_smartzero_payload DMAMEM;
-static Payload g_report_child_clocks DMAMEM;
-static Payload g_report_child_stats DMAMEM;
-static Payload g_report_child_clock DMAMEM;
-static Payload g_report_child_welford DMAMEM;
-static Payload g_report_child_maturity DMAMEM;
-static Payload g_report_child_admission DMAMEM;
+static Payload g_report_clocks_payload;
+static Payload g_report_stats_payload;
+static Payload g_report_smartzero_payload;
+static Payload g_report_child_clocks;
+static Payload g_report_child_stats;
+static Payload g_report_child_clock;
+static Payload g_report_child_welford;
+static Payload g_report_child_maturity;
+static Payload g_report_child_admission;
 
 // Dedicated CLOCKS snapshot scratch. The 1 Hz side rail never borrows command
 // report Payload headers and never constructs transport objects inside CLOCKS.
@@ -2240,22 +2369,6 @@ static int64_t g_instrument_ocxo1_offset = 0;
 static int64_t g_instrument_ocxo2_offset = 0;
 static uint32_t g_instrument_continuity_install_count = 0U;
 static uint32_t g_instrument_continuity_reset_count = 0U;
-
-static inline uint32_t clocks_report_irq_save(void) {
-  uint32_t prior_basepri = 0U;
-  __asm__ volatile ("mrs %0, basepri" : "=r" (prior_basepri) :: "memory");
-  if (prior_basepri == 0U || prior_basepri > CLOCKS_REPORT_BASEPRI_GUARD) {
-    __asm__ volatile ("msr basepri, %0"
-                      :: "r" (CLOCKS_REPORT_BASEPRI_GUARD) : "memory");
-  }
-  __asm__ volatile ("dmb" ::: "memory");
-  return prior_basepri;
-}
-
-static inline void clocks_report_irq_restore(uint32_t prior_basepri) {
-  __asm__ volatile ("dmb" ::: "memory");
-  __asm__ volatile ("msr basepri, %0" :: "r" (prior_basepri) : "memory");
-}
 
 static bool clocks_recovery_restore_statistics_valid(
     const clocks_recovery_restore_state_t& state) {
@@ -2459,21 +2572,24 @@ static bool clocks_recovery_state_from_args(
 static FLASHMEM Payload clocks_report_busy_response(const char* report);
 
 struct clocks_report_build_guard_t {
-  uint32_t prior_basepri = 0U;
   uint32_t begin_dwt = 0U;
   bool acquired = false;
 
   clocks_report_build_guard_t() {
-    prior_basepri = clocks_report_irq_save();
-    if (!g_clocks_report_build_active) {
-      g_clocks_report_build_active = true;
-      g_clocks_report_build_count++;
-      begin_dwt = DWT_CYCCNT;
-      acquired = true;
-    } else {
+    clocks_payload_owner_assert(clocks_payload_owner_t::COMMAND);
+    uint32_t expected = 0U;
+    if (!__atomic_compare_exchange_n(&g_clocks_report_build_active,
+                                     &expected,
+                                     1U,
+                                     false,
+                                     __ATOMIC_ACQ_REL,
+                                     __ATOMIC_ACQUIRE)) {
       g_clocks_report_busy_reject_count++;
-      clocks_report_irq_restore(prior_basepri);
+      __builtin_trap();
     }
+    g_clocks_report_build_count++;
+    begin_dwt = DWT_CYCCNT;
+    acquired = true;
   }
 
   ~clocks_report_build_guard_t() {
@@ -2482,8 +2598,7 @@ struct clocks_report_build_guard_t {
     if (elapsed > g_clocks_report_max_duration_cycles) {
       g_clocks_report_max_duration_cycles = elapsed;
     }
-    g_clocks_report_build_active = false;
-    clocks_report_irq_restore(prior_basepri);
+    __atomic_store_n(&g_clocks_report_build_active, 0U, __ATOMIC_RELEASE);
   }
 };
 
@@ -4647,6 +4762,7 @@ static void recover_proof_add_stall_lane(
     Payload& parent,
     const char* key,
     const clocks_alpha_recover_proof_snapshot_t& s) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::EVENT);
   Payload lane;
   lane.add("clockface_ready", s.clockface_ready);
   lane.add("science_ready", s.science_ready);
@@ -4673,6 +4789,7 @@ static void recover_proof_add_stall_lane(
 }
 
 static void recover_proof_publish_stalled_event(void) {
+  const clocks_payload_custody_t payload_custody(clocks_payload_owner_t::EVENT);
   Payload p;
   p.add("schema", "CLOCKS_RECOVERY_STALLED_V1");
   p.add("reason", "ocxo_science_reattach_no_progress");
@@ -4905,6 +5022,7 @@ static FLASHMEM bool recover_proof_driven_release_try(uint32_t pps_sequence) {
 }
 
 static void recover_proof_warning_publish_if_pending(void) {
+  const clocks_payload_custody_t payload_custody(clocks_payload_owner_t::EVENT);
   if (!g_recover_proof_warning_pending || g_recover_proof_warning_published) {
     return;
   }
@@ -5509,6 +5627,7 @@ static FLASHMEM void clocks_payload_numeric_emit_watchdog(
     const char* field,
     const char* key,
     const clocks_payload_numeric_court_t& court) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::COMMAND);
   clocks_payload_numeric_note_failure(path, key, court);
 
   if (!clocks_watchdog_campaign_armed() && !watchdog_campaign_surrendered) {
@@ -5881,6 +6000,7 @@ static FLASHMEM clocks_payload_checked_status_t clocks_payload_try_get_double_ch
 
 static FLASHMEM Payload clocks_payload_numeric_reject_response(
     const char* status) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::COMMAND);
   Payload err;
   err.add("error", "payload numeric integrity failure");
   err.add("status", status ? status : "rejected_numeric_integrity");
@@ -5934,6 +6054,7 @@ static const char* smartzero_decision_name_beta(interrupt_smartzero_decision_t d
 static FLASHMEM void payload_add_smartzero_lane(Payload& parent,
                                        const char* key,
                                        const interrupt_smartzero_lane_snapshot_t& z) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::COMMAND);
   Payload lane;
   lane.add("kind", interrupt_subscriber_kind_str(z.kind));
   lane.add("state", smartzero_lane_state_name_beta(z.state));
@@ -6029,6 +6150,7 @@ static FLASHMEM void payload_add_prefixed_smartzero_compact(
 }
 
 static FLASHMEM void payload_add_smartzero_delay_transaction(Payload& p) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::COMMAND);
   clocks_alpha_smartzero_delay_snapshot_t& s =
       g_beta_report_smartzero_delay_scratch;
   s = clocks_alpha_smartzero_delay_snapshot_t{};
@@ -6089,6 +6211,7 @@ static FLASHMEM void payload_add_smartzero_delay_transaction(Payload& p) {
 }
 
 static FLASHMEM void payload_add_smartzero_install_transaction(Payload& p) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::COMMAND);
   p.add("smartzero_install_in_progress", clocks_alpha_epoch_install_in_progress());
   p.add("smartzero_install_attempt_count",
         clocks_alpha_smartzero_install_attempt_count());
@@ -6126,6 +6249,7 @@ static FLASHMEM void payload_add_smartzero_install_transaction(Payload& p) {
 static FLASHMEM void payload_add_visible_origin_snapshot(Payload& parent,
                                                 const char* key,
                                                 time_clock_id_t clock) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::COMMAND);
   clocks_alpha_ocxo_visible_origin_snapshot_t& s = g_beta_report_visible_origin_scratch;
   s = clocks_alpha_ocxo_visible_origin_snapshot_t{};
   const bool snapshot_ok =
@@ -6172,6 +6296,7 @@ static FLASHMEM void payload_add_visible_origin_snapshot(Payload& parent,
 }
 
 static FLASHMEM void payload_add_visible_origin_summary(Payload& p) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::COMMAND);
   Payload visible_origin;
   payload_add_visible_origin_snapshot(visible_origin, "ocxo1",
                                       time_clock_id_t::OCXO1);
@@ -6181,6 +6306,7 @@ static FLASHMEM void payload_add_visible_origin_summary(Payload& p) {
 }
 
 static FLASHMEM void payload_add_smartzero_summary(Payload& p) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::COMMAND);
   interrupt_smartzero_snapshot_t& live = g_beta_report_live_smartzero_scratch;
   live = interrupt_smartzero_snapshot_t{};
   const bool live_snapshot_ok = interrupt_smartzero_live_snapshot(&live);
@@ -6298,12 +6424,13 @@ static double campaign_total_ppb_from_tau(double tau) {
   return (tau - 1.0) * 1.0e9;
 }
 
-// Report-only serializer: every child Payload header lives in RAM2 and is reused.
-// It is called only while clocks_report_build_guard_t excludes priority-16
-// TimePop/handoff entry. Typed CLOCKS snapshots use independent RAM2 state.
+// Report-only serializer: reusable Payload control blocks live in RAM1. The outer
+// COMMAND custody excludes priority-16 TimePop/handoff entry for the complete
+// response transaction; typed CLOCKS snapshots use independent RAM2 value state.
 static FLASHMEM void report_add_welford_object(Payload& parent,
                                                const char* key,
                                                const welford_t& w) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::COMMAND);
   Payload& obj = g_report_child_welford;
   obj.clear();
   obj.add("n", w.n);
@@ -6321,6 +6448,7 @@ static FLASHMEM void report_add_stats_clock(Payload& parent,
                                              const welford_t& w,
                                              bool include_frequency,
                                              double ppb_value = 0.0) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::COMMAND);
   Payload& obj = g_report_child_clock;
   obj.clear();
   report_add_welford_object(obj, "welford", w);
@@ -6332,6 +6460,7 @@ static FLASHMEM void report_add_stats_clock(Payload& parent,
 static FLASHMEM void report_add_stats_summary_from_snapshot(
     Payload& p,
     const clocks_instrument_stats_snapshot_t& instrument) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::COMMAND);
   Payload& stats = g_report_child_stats;
   stats.clear();
   stats.add("schema", "CLOCKS_INSTRUMENT_STATS_V2");
@@ -8038,6 +8167,7 @@ static bool clocks_watchdog_surrender_now(const char* reason,
 }
 
 static void clocks_watchdog_anomaly_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
+  const clocks_payload_custody_t payload_custody(clocks_payload_owner_t::EVENT);
   if (!watchdog_anomaly_publish_pending) {
     clocks_force_stop_campaign();
     return;
@@ -9031,7 +9161,7 @@ static bool payload_try_get_double_alias(const Payload& args,
   return false;
 }
 
-static FLASHMEM Payload cmd_flash_cut(const Payload& args) {
+static FLASHMEM Payload clocks_flash_cut_command_body(const Payload& args) {
   const char* name = args.getString("campaign");
   if (!name || !*name) {
     g_flash_cut_reject_count++;
@@ -9093,7 +9223,15 @@ static FLASHMEM Payload cmd_flash_cut(const Payload& args) {
 }
 
 
+static FLASHMEM Payload cmd_flash_cut(const Payload& args) {
+  const clocks_payload_custody_t payload_custody(
+      clocks_payload_owner_t::COMMAND);
+  return clocks_flash_cut_command_body(args);
+}
+
 static FLASHMEM Payload cmd_start(const Payload& args) {
+  const clocks_payload_custody_t payload_custody(
+      clocks_payload_owner_t::COMMAND);
   if (g_ppb_restore_protocol_active) {
     Payload err;
     err.add("error", "Better-Buckets restore is staged");
@@ -9115,7 +9253,7 @@ static FLASHMEM Payload cmd_start(const Payload& args) {
   }
 
   if (campaign_state == clocks_campaign_state_t::STARTED) {
-    return cmd_flash_cut(args);
+    return clocks_flash_cut_command_body(args);
   }
 
   if (request_rearm) {
@@ -9175,6 +9313,8 @@ static FLASHMEM Payload cmd_start(const Payload& args) {
 
 
 static FLASHMEM Payload cmd_rearm(const Payload& args) {
+  const clocks_payload_custody_t payload_custody(
+      clocks_payload_owner_t::COMMAND);
   clocks_payload_numeric_integrity_reset();
 
   const char* name = args.getString("campaign");
@@ -9352,6 +9492,8 @@ static FLASHMEM Payload cmd_rearm(const Payload& args) {
 
 
 static FLASHMEM Payload cmd_stop(const Payload&) {
+  const clocks_payload_custody_t payload_custody(
+      clocks_payload_owner_t::COMMAND);
   clocks_ppb_restore_protocol_clear(true);
   g_clocks_restore_requested = false;
   g_clocks_restore_state = clocks_recovery_restore_state_t{};
@@ -9410,6 +9552,8 @@ static FLASHMEM Payload cmd_stop(const Payload&) {
 
 
 static FLASHMEM Payload cmd_zero(const Payload&) {
+  const clocks_payload_custody_t payload_custody(
+      clocks_payload_owner_t::COMMAND);
   clocks_ppb_restore_protocol_clear(true);
   g_clocks_restore_requested = false;
   g_clocks_restore_state = clocks_recovery_restore_state_t{};
@@ -9503,6 +9647,8 @@ static void clocks_ppb_export_add_endpoint(
 }
 
 static FLASHMEM Payload cmd_ppb_export_meta(const Payload&) {
+  const clocks_payload_custody_t payload_custody(
+      clocks_payload_owner_t::COMMAND);
   clocks_report_build_guard_t guard;
   if (!guard.acquired) return clocks_report_busy_response("CLOCKS_PPB_EXPORT_META");
 
@@ -9538,6 +9684,8 @@ static FLASHMEM Payload cmd_ppb_export_meta(const Payload&) {
 }
 
 static FLASHMEM Payload cmd_ppb_export_chunk(const Payload& args) {
+  const clocks_payload_custody_t payload_custody(
+      clocks_payload_owner_t::COMMAND);
   clocks_report_build_guard_t guard;
   if (!guard.acquired) return clocks_report_busy_response("CLOCKS_PPB_EXPORT_CHUNK");
 
@@ -9598,6 +9746,8 @@ static FLASHMEM Payload cmd_ppb_export_chunk(const Payload& args) {
 }
 
 static FLASHMEM Payload cmd_ppb_restore_begin(const Payload& args) {
+  const clocks_payload_custody_t payload_custody(
+      clocks_payload_owner_t::COMMAND);
   if (!clocks_ppb_restore_lifecycle_idle()) {
     Payload err;
     err.add("error", "instrument lifecycle busy");
@@ -9648,6 +9798,8 @@ static FLASHMEM Payload cmd_ppb_restore_begin(const Payload& args) {
 }
 
 static FLASHMEM Payload cmd_ppb_restore_chunk(const Payload& args) {
+  const clocks_payload_custody_t payload_custody(
+      clocks_payload_owner_t::COMMAND);
   if (!g_ppb_restore_protocol_active || g_ppb_restore_protocol_committed) {
     Payload err;
     err.add("error", "Better-Buckets restore is not accepting chunks");
@@ -9742,6 +9894,8 @@ static FLASHMEM Payload cmd_ppb_restore_chunk(const Payload& args) {
 }
 
 static FLASHMEM Payload cmd_ppb_restore_commit(const Payload& args) {
+  const clocks_payload_custody_t payload_custody(
+      clocks_payload_owner_t::COMMAND);
   uint32_t rolling_sequence = 0U;
   if (!restore_get_u32(args, "rolling_sequence", rolling_sequence)) {
     Payload err;
@@ -9791,6 +9945,8 @@ static FLASHMEM Payload cmd_ppb_restore_commit(const Payload& args) {
 }
 
 static FLASHMEM Payload cmd_ppb_restore_abort(const Payload&) {
+  const clocks_payload_custody_t payload_custody(
+      clocks_payload_owner_t::COMMAND);
   const uint32_t prior_sequence = g_ppb_restore_protocol_sequence;
   clocks_ppb_restore_protocol_clear(true);
   Payload p;
@@ -9800,6 +9956,8 @@ static FLASHMEM Payload cmd_ppb_restore_abort(const Payload&) {
 }
 
 static FLASHMEM Payload cmd_restore_clocks_state(const Payload& args) {
+  const clocks_payload_custody_t payload_custody(
+      clocks_payload_owner_t::COMMAND);
   if (campaign_state != clocks_campaign_state_t::STOPPED ||
       request_start || request_stop || request_recover || request_zero ||
       request_flash_cut || g_clocks_restore_requested ||
@@ -9862,6 +10020,8 @@ static FLASHMEM Payload cmd_restore_clocks_state(const Payload& args) {
 }
 
 static FLASHMEM Payload cmd_recover(const Payload& args) {
+  const clocks_payload_custody_t payload_custody(
+      clocks_payload_owner_t::COMMAND);
   clocks_payload_numeric_integrity_reset();
 
   if (g_clocks_restore_requested) {
@@ -10123,6 +10283,8 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
 }
 
 static FLASHMEM Payload cmd_recover_abort(const Payload& args) {
+  const clocks_payload_custody_t payload_custody(
+      clocks_payload_owner_t::COMMAND);
   const char* reason = args.getString("reason");
   recover_lifecycle_abort(reason && *reason
                               ? reason
@@ -10138,6 +10300,8 @@ static FLASHMEM Payload cmd_recover_abort(const Payload& args) {
 }
 
 static FLASHMEM Payload cmd_watchdog_test(const Payload&) {
+  const clocks_payload_custody_t payload_custody(
+      clocks_payload_owner_t::COMMAND);
   clocks_watchdog_anomaly("watchdog_test");
   Payload p;
   p.add("status", "watchdog_anomaly_requested");
@@ -10155,6 +10319,8 @@ static uint32_t clocks_problem_injection_lane_parse(const char* lane) {
 }
 
 static FLASHMEM Payload cmd_inject_problem(const Payload& args) {
+  const clocks_payload_custody_t payload_custody(
+      clocks_payload_owner_t::COMMAND);
   const char* type = args.getString("type");
   if (!type || !*type || strcasecmp(type, "excursion") != 0) {
     Payload err;
@@ -10269,6 +10435,8 @@ static FLASHMEM Payload cmd_inject_problem(const Payload& args) {
 // ============================================================================
 
 static FLASHMEM Payload cmd_report_recovery(const Payload&) {
+  const clocks_payload_custody_t payload_custody(
+      clocks_payload_owner_t::COMMAND);
   clocks_stack_witness_note_command(CLOCKS_STACK_CONTEXT_REPORT_RECOVERY);
 
   Payload p;
@@ -10459,6 +10627,7 @@ static FLASHMEM Payload cmd_report_recovery(const Payload&) {
 static FLASHMEM void report_add_instrument_clock_values(
     Payload& parent,
     const clocks_instrument_stats_snapshot_t& instrument) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::COMMAND);
   Payload& clocks = g_report_child_clocks;
   clocks.clear();
   clocks.add("gnss_ns", instrument.gnss_ns);
@@ -10478,6 +10647,7 @@ static FLASHMEM void report_add_instrument_clock_values(
 }
 
 static FLASHMEM Payload clocks_report_busy_response(const char* report) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::COMMAND);
   Payload p;
   p.add("error", "clock report builder busy");
   p.add("status", "report_deferred_busy");
@@ -10492,6 +10662,7 @@ static FLASHMEM void report_add_common_metadata(
     const char* report,
     const char* schema,
     bool snapshot_ok) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::COMMAND);
   p.add("report", report);
   p.add("schema", schema);
   p.add("instrument_always_on", true);
@@ -10583,6 +10754,8 @@ static FLASHMEM void report_add_row_court_lane(
 }
 
 static FLASHMEM Payload cmd_report_row_court(const Payload&) {
+  const clocks_payload_custody_t payload_custody(
+      clocks_payload_owner_t::COMMAND);
   clocks_report_build_guard_t guard;
   if (!guard.acquired) return clocks_report_busy_response("CLOCKS_ROW_COURT");
 
@@ -10665,6 +10838,8 @@ static FLASHMEM Payload cmd_report_row_court(const Payload&) {
 }
 
 static FLASHMEM Payload cmd_report_smartzero(const Payload&) {
+  const clocks_payload_custody_t payload_custody(
+      clocks_payload_owner_t::COMMAND);
   clocks_report_build_guard_t guard;
   if (!guard.acquired) return clocks_report_busy_response("CLOCKS_SMARTZERO");
 
@@ -10689,6 +10864,8 @@ static FLASHMEM Payload cmd_report_smartzero(const Payload&) {
 }
 
 static FLASHMEM Payload cmd_report_clocks(const Payload&) {
+  const clocks_payload_custody_t payload_custody(
+      clocks_payload_owner_t::COMMAND);
   clocks_report_build_guard_t guard;
   if (!guard.acquired) return clocks_report_busy_response("CLOCKS_INSTRUMENT");
 
@@ -10730,6 +10907,8 @@ static FLASHMEM Payload cmd_report_clocks(const Payload&) {
 }
 
 static FLASHMEM Payload cmd_report_stats(const Payload&) {
+  const clocks_payload_custody_t payload_custody(
+      clocks_payload_owner_t::COMMAND);
   clocks_report_build_guard_t guard;
   if (!guard.acquired) return clocks_report_busy_response("CLOCKS_STATS");
 
@@ -10751,6 +10930,8 @@ static FLASHMEM Payload cmd_report_stats(const Payload&) {
 }
 
 static FLASHMEM Payload cmd_stats_reset(const Payload&) {
+  const clocks_payload_custody_t payload_custody(
+      clocks_payload_owner_t::COMMAND);
   clocks_ppb_restore_protocol_clear(true);
   clocks_alpha_instrument_stats_reset();
 
@@ -10769,6 +10950,8 @@ static FLASHMEM Payload cmd_stats_reset(const Payload&) {
 }
 
 static FLASHMEM Payload cmd_stack_witness_reset(const Payload&) {
+  const clocks_payload_custody_t payload_custody(
+      clocks_payload_owner_t::COMMAND);
   clocks_stack_witness_reset();
   clocks_stack_witness_note_command(CLOCKS_STACK_CONTEXT_REPORT_STACK);
   Payload p;

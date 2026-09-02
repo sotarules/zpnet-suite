@@ -24,6 +24,8 @@
 //   • Recurring TimePop callbacks perform bounded physical I/O.
 //   • The pump advances only by bytes actually accepted by Serial.
 //   • Each job owns its heap allocation — freed on completion.
+//   • Wire allocations join Payload's atomic single-owner newlib heap court;
+//     transport never becomes an independent allocator writer.
 //   • Memory is bounded via soft budget cap (TX_BUDGET_MAX).
 //   • D1 command/response retains reserved byte + job custody; D0/D2 cannot
 //     exhaust the complete TX queue during startup or publication bursts.
@@ -31,6 +33,8 @@
 //     an already-started frame is always completed first, so interleave remains
 //     structurally impossible.
 //   • TimePop is the sole physical RX/TX service path.
+//   • Parsed RX owns one committed semantic mailbox slot through the complete
+//     foreground callback; RX applies backpressure rather than overwriting it.
 //
 // Serial-only doctrine:
 //

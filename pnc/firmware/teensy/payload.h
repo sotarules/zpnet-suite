@@ -312,6 +312,20 @@ void payload_get_stamp_trace(payload_stamp_trace_snapshot_t* out);
 void payload_clear_retained_stamp_trace(void);
 
 // ============================================================================
+// Shared newlib heap custody
+// ============================================================================
+//
+// ZPNet runs on one core, but exception preemption can still create two software
+// writers to newlib allocator metadata.  Payload and transport share this
+// non-spinning court; any additional preemptible raw allocator path must join the
+// same ownership domain.  The returned block has ordinary malloc semantics. A
+// competing software owner is an architectural fault and traps; nullptr remains
+// reserved for an actual allocator failure.
+void* payload_shared_heap_malloc(size_t bytes);
+void* payload_shared_heap_realloc(void* block, size_t bytes);
+bool  payload_shared_heap_free(void* block);
+
+// ============================================================================
 // Payload Instrumentation Snapshot (Read-Only, Monotonic)
 // ============================================================================
 
@@ -526,10 +540,10 @@ typedef struct {
   uint32_t last_handler_ctx_dwt;
   uint32_t last_handler_ctx_msp;
 
-  // Allocator preemption-overlap tripwire — a Payload allocator call observed
-  // another Payload allocator call already in flight on this single core.
-  // This is the exact system-level invariant violation the Payload design
-  // documents as its one undefendable residual risk.
+  // Allocator preemption-overlap tripwire — one shared newlib heap owner was
+  // already active when another Payload/transport allocation attempted entry.
+  // The court is an atomic claim, so the detector itself has no check/increment
+  // race and allocator metadata is never entered by the losing writer.
   uint32_t alloc_overlap_detected;
   uint32_t alloc_overlap_ipsr;
   uint32_t alloc_overlap_op_id;

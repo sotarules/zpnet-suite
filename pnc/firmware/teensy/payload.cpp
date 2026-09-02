@@ -1010,10 +1010,9 @@ static void payload_note_heap_delta(int32_t delta) {
 //   • The context census counts lifecycle/mutation/allocator activity that
 //     executes while IPSR != 0 and latches the most recent handler-context
 //     actor (IPSR, op, this, MSP, DWT).
-//   • The allocator overlap gate detects a Payload allocator call that
-//     preempted another in-flight Payload allocator call.  The newlib heap is
-//     single-owner: overlapping malloc/realloc is rejected and overlapping
-//     free is skipped rather than re-entering allocator metadata mid-operation.
+//   • The allocator ownership court is shared with transport and claims newlib
+//     metadata atomically.  A contending malloc/realloc/free never enters the
+//     allocator behind a preempted owner.
 //   • The flight recorder keeps a ring of recent lifecycle/mutation/failure
 //     records in RAM2 (NOLOAD) so the final Payload operations before a
 //     crash survive the reboot; each write is flushed through the data
@@ -1118,8 +1117,12 @@ static void payload_note_handler_context(uint32_t op_id,
     g_payload_last_handler_ctx_msp = payload_read_msp();
 }
 
-// ---- Allocator preemption-overlap tripwire --------------------------------
+// ---- Shared newlib allocator ownership court -------------------------------
 
+// This word is an owner bit, not a nesting depth.  The old check-then-increment
+// sequence admitted a real race: a preempting allocator could observe zero after
+// the first writer checked but before it incremented.  Claim the allocator with
+// one CAS instead.  No writer spins behind a preempted owner.
 static volatile uint32_t g_payload_alloc_depth = 0;
 static volatile uint32_t g_payload_alloc_overlap_detected = 0;
 static volatile uint32_t g_payload_alloc_overlap_ipsr = 0;
@@ -1128,33 +1131,40 @@ static volatile uint32_t g_payload_alloc_overlap_this = 0;
 static volatile uint32_t g_payload_alloc_overlap_dwt = 0;
 static volatile uint32_t g_payload_alloc_overlap_depth = 0;
 
-static bool payload_note_alloc_overlap(uint32_t op_id, const void* self) {
-    const uint32_t depth = g_payload_alloc_depth;
-    if (depth == 0U) return false;
+static bool payload_allocator_claim(uint32_t op_id, const void* self) {
+    uint32_t expected = 0U;
+    if (__atomic_compare_exchange_n(&g_payload_alloc_depth,
+                                    &expected,
+                                    1U,
+                                    false,
+                                    __ATOMIC_ACQ_REL,
+                                    __ATOMIC_ACQUIRE)) {
+        return true;
+    }
 
-    // The newlib heap is a single-owner operation on this single core.  If an
-    // interrupt-context Payload allocation preempts a foreground allocator call,
-    // entering malloc/realloc/free again can corrupt allocator metadata before
-    // Payload's own guards ever get a chance to testify.  Preserve the overlap
-    // evidence, but fail closed at the allocator boundary instead of proceeding.
     g_payload_alloc_overlap_detected++;
     g_payload_alloc_overlap_ipsr = payload_read_ipsr();
     g_payload_alloc_overlap_op_id = op_id;
     g_payload_alloc_overlap_this = (uint32_t)(uintptr_t)self;
     g_payload_alloc_overlap_dwt = payload_read_dwt();
-    g_payload_alloc_overlap_depth = depth;
-    return true;
+    g_payload_alloc_overlap_depth = expected != 0U ? expected : 1U;
+    return false;
+}
+
+static void payload_allocator_release(void) {
+    if (__atomic_load_n(&g_payload_alloc_depth, __ATOMIC_ACQUIRE) != 1U) {
+        __builtin_trap();
+    }
+    __atomic_store_n(&g_payload_alloc_depth, 0U, __ATOMIC_RELEASE);
 }
 
 static void* payload_guarded_malloc(size_t total,
                                     uint32_t op_id,
                                     const void* self) {
     payload_note_handler_context(op_id, self, &g_payload_handler_ctx_alloc);
-    if (payload_note_alloc_overlap(op_id, self)) return nullptr;
-
-    g_payload_alloc_depth++;
+    if (!payload_allocator_claim(op_id, self)) return nullptr;
     void* raw = malloc(total);
-    g_payload_alloc_depth--;
+    payload_allocator_release();
     return raw;
 }
 
@@ -1163,11 +1173,9 @@ static void* payload_guarded_realloc(void* block,
                                      uint32_t op_id,
                                      const void* self) {
     payload_note_handler_context(op_id, self, &g_payload_handler_ctx_alloc);
-    if (payload_note_alloc_overlap(op_id, self)) return nullptr;
-
-    g_payload_alloc_depth++;
+    if (!payload_allocator_claim(op_id, self)) return nullptr;
     void* raw = realloc(block, total);
-    g_payload_alloc_depth--;
+    payload_allocator_release();
     return raw;
 }
 
@@ -1175,16 +1183,35 @@ static bool payload_guarded_free(void* block,
                                  uint32_t op_id,
                                  const void* self) {
     payload_note_handler_context(op_id, self, &g_payload_handler_ctx_free);
-    if (payload_note_alloc_overlap(op_id, self)) {
+    if (!payload_allocator_claim(op_id, self)) {
         // Leaking one block is preferable to entering a heap operation whose
-        // ownership is already held by the preempted context.  Callers retain
-        // heap-byte telemetry until a free actually succeeds.
+        // ownership is already held by the preempted context.
         return false;
     }
-
-    g_payload_alloc_depth++;
     free(block);
-    g_payload_alloc_depth--;
+    payload_allocator_release();
+    return true;
+}
+
+void* payload_shared_heap_malloc(size_t bytes) {
+    if (!payload_allocator_claim(PAYLOAD_OP_NONE, nullptr)) __builtin_trap();
+    void* raw = malloc(bytes);
+    payload_allocator_release();
+    return raw;
+}
+
+void* payload_shared_heap_realloc(void* block, size_t bytes) {
+    if (!payload_allocator_claim(PAYLOAD_OP_NONE, nullptr)) __builtin_trap();
+    void* raw = realloc(block, bytes);
+    payload_allocator_release();
+    return raw;
+}
+
+bool payload_shared_heap_free(void* block) {
+    if (!block) return true;
+    if (!payload_allocator_claim(PAYLOAD_OP_NONE, nullptr)) __builtin_trap();
+    free(block);
+    payload_allocator_release();
     return true;
 }
 

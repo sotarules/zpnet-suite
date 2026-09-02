@@ -394,9 +394,9 @@ static volatile uint32_t rx_dispatch_invalid_callback = 0;
 static volatile uint32_t rx_dispatch_stack_mismatch = 0;
 
 // A complete frame must not overwrite the one-slot semantic-dispatch mailbox
-// before ALAP has taken custody.  For now this is forensic only: record the
-// exact collision and leave behavior unchanged so the instrument can tell us
-// whether this boundary participates in the sparse RPC anomaly.
+// before ALAP has released consumer custody.  RX stops consuming USB bytes while
+// the slot is owned; the counters below remain as fail-hard testimony should a
+// future refactor violate that SPSC boundary.
 static volatile uint32_t rx_dispatch_pending_collision_count = 0;
 static volatile uint32_t rx_dispatch_pending_collision_dwt = 0;
 static volatile uint32_t rx_dispatch_pending_collision_pending_traffic = 0;
@@ -601,6 +601,13 @@ static inline size_t serial_write_some(const uint8_t* buf, size_t len) {
   return n;
 }
 
+static inline void tx_release_wire_allocation(void* data) {
+  if (!data) return;
+  // Transport and Payload share one newlib heap. A failed ownership release is
+  // an architectural collision, not a recoverable queue condition.
+  if (!payload_shared_heap_free(data)) __builtin_trap();
+}
+
 // =============================================================
 // Allocator-free fatal WATCHDOG_ANOMALY lifeboat
 // =============================================================
@@ -797,7 +804,7 @@ static void tx_release_current_job() {
     tx_timebase_last_reason_id = TX_REASON_NONE;
   }
 
-  free(job.data);
+  tx_release_wire_allocation(job.data);
   job = tx_job_t{};
 
   tx_budget_used -= released_length;
@@ -1001,7 +1008,7 @@ static bool tx_allocate_wire(uint32_t sequence,
   }
 
   // One allocation owns the complete frame for its entire queued lifetime.
-  uint8_t* data = (uint8_t*)malloc(wire_len);
+  uint8_t* data = (uint8_t*)payload_shared_heap_malloc(wire_len);
   if (!data) {
     tx_alloc_fail++;
     tx_note_reject(sequence, traffic, topic, json_len, wire_len,
@@ -1120,7 +1127,7 @@ bool transport_send(uint8_t traffic, const Payload& payload) {
   const size_t written = payload.write_json(
       reinterpret_cast<char*>(data + json_offset), json_len + 1U);
   if (written != json_len) {
-    free(data);
+    tx_release_wire_allocation(data);
     tx_empty_serialization_count++;
     tx_note_reject(sequence, traffic, topic, json_len, wire_len,
                    TX_REASON_EMPTY_SERIALIZATION, timebase);
@@ -1132,7 +1139,7 @@ bool transport_send(uint8_t traffic, const Payload& payload) {
   pos += ETX_LEN;
 
   if (pos != wire_len) {
-    free(data);
+    tx_release_wire_allocation(data);
     tx_empty_serialization_count++;
     tx_note_reject(sequence, traffic, topic, json_len, wire_len,
                    TX_REASON_EMPTY_SERIALIZATION, timebase);
@@ -1196,7 +1203,7 @@ bool transport_send_response(uint32_t req_id,
       reinterpret_cast<char*>(data + json_offset), prefix_json_len + 1U);
   if (prefix_written != prefix_json_len ||
       data[json_offset + prefix_json_len - 1U] != (uint8_t)'}') {
-    free(data);
+    tx_release_wire_allocation(data);
     tx_empty_serialization_count++;
     tx_note_reject(sequence, traffic, nullptr, envelope_len, wire_len,
                    TX_REASON_EMPTY_SERIALIZATION, false);
@@ -1211,7 +1218,7 @@ bool transport_send_response(uint32_t req_id,
   const size_t payload_written = payload.write_json(
       reinterpret_cast<char*>(data + pos), payload_json_len + 1U);
   if (payload_written != payload_json_len) {
-    free(data);
+    tx_release_wire_allocation(data);
     tx_empty_serialization_count++;
     tx_note_reject(sequence, traffic, nullptr, envelope_len, wire_len,
                    TX_REASON_EMPTY_SERIALIZATION, false);
@@ -1224,7 +1231,7 @@ bool transport_send_response(uint32_t req_id,
   pos += ETX_LEN;
 
   if (pos != wire_len) {
-    free(data);
+    tx_release_wire_allocation(data);
     tx_empty_serialization_count++;
     tx_note_reject(sequence, traffic, nullptr, envelope_len, wire_len,
                    TX_REASON_EMPTY_SERIALIZATION, false);
@@ -1294,7 +1301,7 @@ bool transport_send_publish(const char* topic, const Payload& payload) {
       reinterpret_cast<char*>(data + json_offset), topic_json_len + 1U);
   if (topic_written != topic_json_len ||
       data[json_offset + topic_json_len - 1U] != (uint8_t)'}') {
-    free(data);
+    tx_release_wire_allocation(data);
     tx_empty_serialization_count++;
     tx_note_reject(sequence, traffic, topic, envelope_len, wire_len,
                    TX_REASON_EMPTY_SERIALIZATION, timebase);
@@ -1309,7 +1316,7 @@ bool transport_send_publish(const char* topic, const Payload& payload) {
   const size_t payload_written = payload.write_json(
       reinterpret_cast<char*>(data + pos), payload_json_len + 1U);
   if (payload_written != payload_json_len) {
-    free(data);
+    tx_release_wire_allocation(data);
     tx_empty_serialization_count++;
     tx_note_reject(sequence, traffic, topic, envelope_len, wire_len,
                    TX_REASON_EMPTY_SERIALIZATION, timebase);
@@ -1322,7 +1329,7 @@ bool transport_send_publish(const char* topic, const Payload& payload) {
   pos += ETX_LEN;
 
   if (pos != wire_len) {
-    free(data);
+    tx_release_wire_allocation(data);
     tx_empty_serialization_count++;
     tx_note_reject(sequence, traffic, topic, envelope_len, wire_len,
                    TX_REASON_EMPTY_SERIALIZATION, timebase);
@@ -1448,7 +1455,7 @@ static void rx_dispatch_alap(
   const transport_receive_cb_t callback = recv_cb[traffic];
   const uint32_t msp_before = transport_read_msp();
   g_rx_dispatch_min_msp = msp_before;
-  rx_dispatch_pending = false;
+  if (!rx_dispatch_pending) __builtin_trap();
   rx_dispatch_breadcrumb_note(TRANSPORT_RX_DISPATCH_ENTER,
                               traffic, callback, msp_before, 0U);
 
@@ -1473,6 +1480,11 @@ static void rx_dispatch_alap(
   rx_dispatch_breadcrumb_note(TRANSPORT_RX_DISPATCH_CALLBACK_RETURN,
                               traffic, callback, msp_before, msp_after);
   rx_dispatch_payload.clear();
+  rx_dispatch_traffic = 0U;
+  // Release the one-slot SPSC value only after the consumer has returned and
+  // the owned Payload has been retired.  The producer cannot reuse this slot
+  // while a callback still holds the const reference it received.
+  rx_dispatch_pending = false;
   if (!rx_guard_check(rx_guard_stage_t::AFTER_DISPATCH)) rx_reset_hard();
   rx_dispatch_breadcrumb_note(TRANSPORT_RX_DISPATCH_COMPLETE,
                               traffic, callback, msp_before,
@@ -1594,6 +1606,10 @@ static bool dispatch_if_complete() {
         pending_req_id_valid ? 1U : 0U;
     rx_dispatch_pending_collision_incoming_req_id_valid =
         incoming_req_id_valid ? 1U : 0U;
+
+    // One committed mailbox value has one consumer.  Overwriting it would make
+    // the callback's const Payload reference alias producer mutation.
+    __builtin_trap();
   }
 
   rx_dispatch_traffic = rx_traffic;
@@ -1620,6 +1636,11 @@ static bool dispatch_if_complete() {
 static void rx_serial_tick() {
 
   transport_rx_entered();
+
+  // The one-slot semantic mailbox is a real SPSC queue.  Leave bytes in USB
+  // custody while its committed slot belongs to the ALAP consumer; do not parse
+  // a second frame merely to overwrite an owned value.
+  if (rx_dispatch_pending) return;
 
   bool appended = false;
 
