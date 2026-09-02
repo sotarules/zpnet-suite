@@ -191,10 +191,12 @@ GNSS_RAW_INFO_MAX_AGE_S = 2.5
 # Sync waits
 #
 # Cold START, Flash Cut, and zero-row cold recovery are readiness-gated.
-# Dead-producer recovery uses its narrower recovery-specific lifecycle contract. The
-# Pi no longer expects fixed row burial/warmup suppression during admission:
-# the first public CLOCKS_FRAGMENT campaign delta is supposed to be useful, and if it is not,
-# the responsible readiness or handoff gate should be fixed.
+# Dead-producer recovery uses its narrower recovery-specific lifecycle contract.
+# The projected first public count is chronology identity, not a promise that the
+# corresponding row is scientifically admissible. Firmware may explicitly exclude
+# that row while preserving it as audit evidence; Pi may advance to a later admitted
+# row only when every intervening public identity is explicitly retired and the final
+# recovery receipt proves the admitted offset equals that retirement count.
 RECOVERY_FIRST_PUBLIC_OFFSET = 1
 SYNC_FRAGMENT_TIMEOUT_S = 35.0
 SYNC_RECOVER_TIMEOUT_S = 45.0
@@ -5960,13 +5962,17 @@ def _record_clocks_recovery_receipt(
     campaign_boundary_detail_id: Optional[int] = None,
     source_public_count: Optional[int] = None,
     expected_first_public_count: Optional[int] = None,
+    discarded_transitional_rows: int = 0,
     elapsed_seconds: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Attach one immutable Pi recovery receipt to the authoritative CLOCKS boundary.
 
     The receipt is deliberately compact.  It fingerprints the exact private
     config.CLOCKS_RECOVERY image used for resurrection, but never copies the
-    bounded endpoint rings back into canonical CLOCKS.
+    bounded endpoint rings back into canonical CLOCKS. For campaign recovery,
+    projected first-public identity and first scientifically admitted identity are
+    separate facts; any offset must be explained exactly by explicitly retired
+    transitional rows.
     """
     source_id = _as_int(source_detail.get("_db_detail_id"))
     if source_id is None or source_id <= 0:
@@ -6119,26 +6125,53 @@ def _record_clocks_recovery_receipt(
                     "CLOCKS recovery receipt boundary campaign mismatch: "
                     f"expected={campaign_name!r} observed={boundary_campaign!r}"
                 )
-            if (
-                expected_first_public_count is not None
-                and actual_public != int(expected_first_public_count)
-            ):
+            retired_rows = int(discarded_transitional_rows)
+            if retired_rows < 0:
                 raise RuntimeError(
-                    "CLOCKS recovery receipt first-public mismatch: "
-                    f"expected={expected_first_public_count} actual={actual_public}"
+                    "CLOCKS recovery receipt has negative transitional-row count: "
+                    f"discarded={retired_rows}"
                 )
+
+            projected_first_public: Optional[int] = None
+            admission_offset: Optional[int] = None
+            if expected_first_public_count is not None:
+                projected_first_public = int(expected_first_public_count)
+                admission_offset = int(actual_public) - projected_first_public
+                if admission_offset < 0:
+                    raise RuntimeError(
+                        "CLOCKS recovery admitted boundary precedes projected first-public: "
+                        f"projected={projected_first_public} admitted={actual_public}"
+                    )
+                if admission_offset != retired_rows:
+                    raise RuntimeError(
+                        "CLOCKS recovery admitted-boundary transition is unexplained: "
+                        f"projected={projected_first_public} admitted={actual_public} "
+                        f"offset={admission_offset} discarded={retired_rows}"
+                    )
+            elif retired_rows != 0:
+                raise RuntimeError(
+                    "CLOCKS recovery receipt cannot account transitional rows without "
+                    "a projected first-public identity"
+                )
+
             campaign_receipt = {
                 "campaign": str(campaign_name),
                 "first_public_detail_id": campaign_boundary_id,
                 "source_public_count": (
                     int(source_public_count) if source_public_count is not None else None
                 ),
-                "expected_first_public_count": (
-                    int(expected_first_public_count)
-                    if expected_first_public_count is not None
-                    else None
-                ),
+                # Compatibility names retained, but their species are now explicit
+                # below: expected=projected chronology; actual=first admitted row.
+                "expected_first_public_count": projected_first_public,
                 "actual_first_public_count": int(actual_public),
+                "projected_first_public_count": projected_first_public,
+                "first_admitted_public_count": int(actual_public),
+                "admission_offset": admission_offset,
+                "discarded_transitional_rows": retired_rows,
+                "transition_accounting_proved": bool(
+                    projected_first_public is None
+                    or admission_offset == retired_rows
+                ),
                 "elapsed_seconds": int(elapsed_seconds) if elapsed_seconds is not None else None,
             }
 
@@ -17178,6 +17211,7 @@ def _restore_active_campaign_state(
         campaign_name=campaign_name,
         source_public_count=int(last_pps_vclock_count),
         expected_first_public_count=int(expected_first_public_pps_vclock_count),
+        discarded_transitional_rows=int(discarded_transitional_rows),
         elapsed_seconds=int(elapsed_seconds),
     )
     _diag["last_recovery"]["recovery_receipt"] = copy.deepcopy(recovery_receipt)
@@ -17196,8 +17230,12 @@ def _restore_active_campaign_state(
         "seed_gnss_raw_ns": int(seed_gnss_raw_ns),
         "seed_gnss_raw_ref_ns": int(seed_gnss_raw_ref_ns),
         "gnss_raw_projection": gnss_raw_projection,
+        "projected_first_public_pps_vclock_count": int(
+            expected_first_public_pps_vclock_count
+        ),
+        "first_admitted_public_pps_vclock_count": int(teensy_pps_vclock_count),
         "first_public_offset": int(first_public_offset),
-        "skipped_records_expected": False,
+        "skipped_records_expected": bool(discarded_transitional_rows),
         "gnss_raw_recovery_uses_seed_before_first_public": True,
         "clean_recovery_verdict": recovery_admission_verdict,
         "recovery_admission_verdict": recovery_admission_verdict,
@@ -17234,7 +17272,7 @@ def _restore_active_campaign_state(
     )
     logging.info(
         "✅ [recovery] campaign '%s' timeline recovered — canonical TIMEBASE resumes with "
-        "first public count=%d science_clean=%s",
+        "first admitted public count=%d science_clean=%s",
         campaign_name,
         teensy_pps_vclock_count,
         bool(recovery_admission_verdict.get("fully_clean")),
@@ -17259,7 +17297,14 @@ def _restore_active_campaign_state(
         "firmware_recover_mode": recover_mode,
         "combined_dead_producer_restore": True,
         "campaign": campaign_name,
+        # Compatibility alias: this is the first row admitted by the recovery
+        # court, which may follow the projected first-public identity.
         "first_public_pps_vclock_count": int(teensy_pps_vclock_count),
+        "projected_first_public_pps_vclock_count": int(
+            expected_first_public_pps_vclock_count
+        ),
+        "first_admitted_public_pps_vclock_count": int(teensy_pps_vclock_count),
+        "discarded_transitional_rows": int(discarded_transitional_rows),
         "science_clean": bool(recovery_admission_verdict.get("fully_clean")),
         "combined_instrument_restore": combined_instrument_restore,
         "recovery_receipt": copy.deepcopy(recovery_receipt),
@@ -18259,6 +18304,7 @@ def cmd_delete(args: Optional[dict]) -> Dict[str, Any]:
             }
 
     try:
+        delete_started = time.monotonic()
         with open_db(row_dict=True) as conn:
             cur = conn.cursor()
             cur.execute(
@@ -18283,6 +18329,11 @@ def cmd_delete(args: Optional[dict]) -> Dict[str, Any]:
                     ),
                 }
 
+            # Operator DELETE is an explicitly requested maintenance transaction.
+            # Large historical campaigns may legitimately exceed the ordinary
+            # interactive statement timeout; keep the override transaction-local.
+            cur.execute("SET LOCAL statement_timeout = 0")
+
             cur.execute(
                 """
                 DELETE FROM campaign_detail
@@ -18306,13 +18357,15 @@ def cmd_delete(args: Optional[dict]) -> Dict[str, Any]:
     if master_count == 0:
         return {"success": False, "message": f"No TEMPEST campaign named '{campaign_name}'"}
 
+    delete_elapsed_s = time.monotonic() - delete_started
     logging.info(
         "🗑️ [clocks] DELETE: type=%s campaign='%s' — %d master row(s), "
-        "%d associated detail row(s) deleted",
+        "%d associated detail row(s) deleted in %.3fs",
         CAMPAIGN_TYPE_TEMPEST,
         campaign_name,
         master_count,
         detail_count,
+        delete_elapsed_s,
     )
 
     server_args = {
@@ -18334,6 +18387,7 @@ def cmd_delete(args: Optional[dict]) -> Dict[str, Any]:
             "campaign": campaign_name,
             "campaign_master_deleted": master_count,
             "campaign_details_deleted": detail_count,
+            "elapsed_s": round(float(delete_elapsed_s), 3),
         },
     }
 
