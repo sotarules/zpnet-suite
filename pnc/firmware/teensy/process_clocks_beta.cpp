@@ -8527,9 +8527,14 @@ FLASHMEM bool clocks_fragment_snapshot_take(
   } else if (campaign_front &&
              (int32_t)(completed_second_sequence -
                        campaign_front->completed_second_sequence) > 0) {
-    // A newer physical row may never step past older unconsumed campaign
-    // testimony.  That would be silent custody loss, not coalescing.
-    __builtin_trap();
+    // A newer publication request is scheduling intent, not permission to
+    // consume or overwrite this older committed SPSC campaign record. Leave
+    // the queue front untouched and return without campaign enrichment. The
+    // publication service will hold the newer exact row at its existing
+    // campaign-row-expected court. If the mismatch persists, Beta may fill
+    // the bounded handoff and establish observer-loss testimony; only then may
+    // this consumer explicitly retire committed rows covered by that watermark.
+    // Merely observing an out-of-order request is not itself a custody fault.
   }
 
   return true;
