@@ -2645,8 +2645,8 @@ static FLASHMEM void system_crash_report_capture_once(void) {
   }
 
   if (!g_system_crash_report_text) {
-    g_system_crash_report_text =
-        static_cast<char*>(malloc(SYSTEM_CRASH_REPORT_TEXT_MAX));
+    g_system_crash_report_text = static_cast<char*>(
+        payload_shared_heap_malloc(SYSTEM_CRASH_REPORT_TEXT_MAX));
     if (!g_system_crash_report_text) {
       g_system_crash_report_alloc_fail_count++;
       return;
@@ -4412,7 +4412,9 @@ static FLASHMEM Payload cmd_crash_clear(const Payload& /*args*/) {
   g_system_crash_report_bytes = 0;
   g_system_crash_report_alloc_fail_count = 0;
   if (g_system_crash_report_text) {
-    free(g_system_crash_report_text);
+    if (!payload_shared_heap_free(g_system_crash_report_text)) {
+      __builtin_trap();
+    }
     g_system_crash_report_text = nullptr;
   }
   memset((void*)&g_runtime_ledger_retained, 0,

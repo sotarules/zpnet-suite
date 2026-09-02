@@ -13,6 +13,7 @@
 #include <Wire.h>
 #include <errno.h>
 #include <math.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2738,7 +2739,50 @@ static const photons_fragment_snapshot_t& photons_report_fragment_snapshot(void)
       name##_storage,                                                     \
       sizeof(name##_storage))
 
-PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_root, 12288U);
+static constexpr size_t PHOTONS_FRAGMENT_ROOT_CAPACITY = 12288U;
+static constexpr size_t PHOTONS_FRAGMENT_ROOT_GUARD_WORDS =
+    PHOTONS_RAM2_CACHE_LINE_BYTES / sizeof(uint32_t);
+static constexpr size_t PHOTONS_FRAGMENT_ROOT_SECTOR_BYTES = 1024U;
+static constexpr size_t PHOTONS_FRAGMENT_ROOT_SECTOR_COUNT =
+    PHOTONS_FRAGMENT_ROOT_CAPACITY / PHOTONS_FRAGMENT_ROOT_SECTOR_BYTES;
+static constexpr uint32_t PHOTONS_FRAGMENT_ROOT_GUARD_BEFORE = 0x50524742UL; // 'PRGB'
+static constexpr uint32_t PHOTONS_FRAGMENT_ROOT_GUARD_AFTER  = 0x50524741UL; // 'PRGA'
+static constexpr uint32_t PHOTONS_FRAGMENT_ROOT_WITNESS_MAGIC = 0x50525731UL; // 'PRW1'
+static constexpr uint32_t PHOTONS_FRAGMENT_ROOT_WITNESS_SCHEMA_VERSION = 1U;
+static constexpr uint32_t PHOTONS_FRAGMENT_ROOT_HASH_OFFSET = 2166136261UL;
+static constexpr uint32_t PHOTONS_FRAGMENT_ROOT_HASH_PRIME = 16777619UL;
+
+static_assert((PHOTONS_FRAGMENT_ROOT_CAPACITY %
+               PHOTONS_RAM2_CACHE_LINE_BYTES) == 0U,
+              "PHOTONS root store must fill complete cache lines");
+static_assert((PHOTONS_FRAGMENT_ROOT_CAPACITY %
+               PHOTONS_FRAGMENT_ROOT_SECTOR_BYTES) == 0U,
+              "PHOTONS root witness sectors must divide the root store");
+static_assert(PHOTONS_FRAGMENT_ROOT_SECTOR_COUNT <= 32U,
+              "PHOTONS root sector mismatch mask exceeds uint32_t");
+
+struct alignas(PHOTONS_RAM2_CACHE_LINE_BYTES)
+photons_fragment_root_storage_t {
+  uint32_t guard_before[PHOTONS_FRAGMENT_ROOT_GUARD_WORDS];
+  uint8_t storage[PHOTONS_FRAGMENT_ROOT_CAPACITY];
+  uint32_t guard_after[PHOTONS_FRAGMENT_ROOT_GUARD_WORDS];
+};
+
+static_assert(offsetof(photons_fragment_root_storage_t, storage) ==
+                  PHOTONS_RAM2_CACHE_LINE_BYTES,
+              "PHOTONS root body must begin on its own cache line");
+static_assert((offsetof(photons_fragment_root_storage_t, guard_after) %
+               PHOTONS_RAM2_CACHE_LINE_BYTES) == 0U,
+              "PHOTONS trailing root guard must begin on a cache line");
+static_assert((sizeof(photons_fragment_root_storage_t) %
+               PHOTONS_RAM2_CACHE_LINE_BYTES) == 0U,
+              "PHOTONS guarded root region must fill cache lines");
+
+static photons_fragment_root_storage_t g_photons_fragment_root_region DMAMEM;
+static Payload g_photons_fragment_root(
+    Payload::StorageMode::FIXED,
+    g_photons_fragment_root_region.storage,
+    sizeof(g_photons_fragment_root_region.storage));
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_instrument, 12288U);
 
 PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_race, 1536U);
@@ -2759,6 +2803,370 @@ PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_interrupt, 1280U);
 
 #undef PHOTONS_FRAGMENT_FIXED_RAM1
 #undef PHOTONS_FRAGMENT_FIXED_RAM2
+
+
+enum class photons_fragment_root_mismatch_stage_t : uint32_t {
+  NONE = 0U,
+  RENDER = 1U,
+  PUBLISH = 2U,
+  POST_PUBLISH = 3U,
+  QUIESCENT = 4U,
+};
+
+struct photons_fragment_root_snapshot_t {
+  bool valid = false;
+  uint32_t fragment_sequence = 0U;
+  uint32_t dwt = 0U;
+  uint32_t hash = 0U;
+  uint32_t sector_hash[PHOTONS_FRAGMENT_ROOT_SECTOR_COUNT] = {};
+  uint32_t first_line[PHOTONS_FRAGMENT_ROOT_GUARD_WORDS] = {};
+  uint32_t last_line[PHOTONS_FRAGMENT_ROOT_GUARD_WORDS] = {};
+  uint32_t guard_failure_mask = 0U;  // bit 0=before, bit 1=after
+  uint32_t guard_index = 0xFFFFFFFFUL;
+  uint32_t guard_expected = 0U;
+  uint32_t guard_observed = 0U;
+};
+
+struct alignas(PHOTONS_RAM2_CACHE_LINE_BYTES)
+photons_fragment_root_mismatch_record_t {
+  uint32_t magic;
+  uint32_t magic_inv;
+  uint32_t schema_version;
+  uint32_t record_size;
+  uint32_t sequence;
+  uint32_t sequence_inv;
+  uint32_t stage;
+  uint32_t fragment_sequence;
+  uint32_t expected_fragment_sequence;
+  uint32_t dwt;
+  uint32_t storage_begin;
+  uint32_t storage_end;
+  uint32_t expected_hash;
+  uint32_t observed_hash;
+  uint32_t sector_mismatch_mask;
+  uint32_t guard_failure_mask;
+  uint32_t guard_index;
+  uint32_t guard_expected;
+  uint32_t guard_observed;
+  uint32_t expected_first_line[PHOTONS_FRAGMENT_ROOT_GUARD_WORDS];
+  uint32_t observed_first_line[PHOTONS_FRAGMENT_ROOT_GUARD_WORDS];
+  uint32_t expected_last_line[PHOTONS_FRAGMENT_ROOT_GUARD_WORDS];
+  uint32_t observed_last_line[PHOTONS_FRAGMENT_ROOT_GUARD_WORDS];
+  uint32_t reserved[5];
+};
+
+static_assert(sizeof(photons_fragment_root_mismatch_record_t) == 224U,
+              "PHOTONS root mismatch record geometry changed");
+static_assert((sizeof(photons_fragment_root_mismatch_record_t) %
+               PHOTONS_RAM2_CACHE_LINE_BYTES) == 0U,
+              "PHOTONS root mismatch record must fill cache lines");
+
+// The expected quiescent image is current-boot RAM1 state.  Only an actual
+// mismatch is retained in RAM2.  Thus ordinary publication does not add another
+// recurring retained write/cache-maintenance path.
+static photons_fragment_root_snapshot_t g_photons_fragment_root_quiescent{};
+static photons_fragment_root_mismatch_record_t
+    g_photons_fragment_root_mismatch_retained DMAMEM;
+
+static FLASHMEM const char* photons_fragment_root_mismatch_stage_name(uint32_t stage) {
+  switch ((photons_fragment_root_mismatch_stage_t)stage) {
+    case photons_fragment_root_mismatch_stage_t::RENDER:       return "RENDER";
+    case photons_fragment_root_mismatch_stage_t::PUBLISH:      return "PUBLISH";
+    case photons_fragment_root_mismatch_stage_t::POST_PUBLISH: return "POST_PUBLISH";
+    case photons_fragment_root_mismatch_stage_t::QUIESCENT:    return "QUIESCENT";
+    default:                                                   return "NONE";
+  }
+}
+
+static FLASHMEM bool photons_fragment_root_mismatch_record_valid(
+    const photons_fragment_root_mismatch_record_t& record) {
+  return record.magic == PHOTONS_FRAGMENT_ROOT_WITNESS_MAGIC &&
+      record.magic_inv == ~PHOTONS_FRAGMENT_ROOT_WITNESS_MAGIC &&
+      record.schema_version == PHOTONS_FRAGMENT_ROOT_WITNESS_SCHEMA_VERSION &&
+      record.record_size == sizeof(record) &&
+      record.sequence != 0U &&
+      (record.sequence ^ record.sequence_inv) == 0xFFFFFFFFUL;
+}
+
+static FLASHMEM void photons_fragment_root_initialize_runtime(void) {
+  for (size_t i = 0U; i < PHOTONS_FRAGMENT_ROOT_GUARD_WORDS; ++i) {
+    g_photons_fragment_root_region.guard_before[i] =
+        PHOTONS_FRAGMENT_ROOT_GUARD_BEFORE;
+    g_photons_fragment_root_region.guard_after[i] =
+        PHOTONS_FRAGMENT_ROOT_GUARD_AFTER;
+  }
+  g_photons_fragment_root_quiescent = photons_fragment_root_snapshot_t{};
+  photons_memory_barrier();
+}
+
+static FLASHMEM void photons_fragment_root_snapshot_capture(
+    uint32_t fragment_sequence,
+    photons_fragment_root_snapshot_t* out) {
+  if (!out) __builtin_trap();
+  *out = photons_fragment_root_snapshot_t{};
+  out->valid = true;
+  out->fragment_sequence = fragment_sequence;
+  out->dwt = ARM_DWT_CYCCNT;
+
+  bool guard_recorded = false;
+  for (size_t i = 0U; i < PHOTONS_FRAGMENT_ROOT_GUARD_WORDS; ++i) {
+    const uint32_t observed =
+        *reinterpret_cast<volatile const uint32_t*>(
+            &g_photons_fragment_root_region.guard_before[i]);
+    if (observed == PHOTONS_FRAGMENT_ROOT_GUARD_BEFORE) continue;
+    out->guard_failure_mask |= 1U << 0;
+    if (!guard_recorded) {
+      out->guard_index = (uint32_t)i;
+      out->guard_expected = PHOTONS_FRAGMENT_ROOT_GUARD_BEFORE;
+      out->guard_observed = observed;
+      guard_recorded = true;
+    }
+  }
+  for (size_t i = 0U; i < PHOTONS_FRAGMENT_ROOT_GUARD_WORDS; ++i) {
+    const uint32_t observed =
+        *reinterpret_cast<volatile const uint32_t*>(
+            &g_photons_fragment_root_region.guard_after[i]);
+    if (observed == PHOTONS_FRAGMENT_ROOT_GUARD_AFTER) continue;
+    out->guard_failure_mask |= 1U << 1;
+    if (!guard_recorded) {
+      out->guard_index = (uint32_t)i;
+      out->guard_expected = PHOTONS_FRAGMENT_ROOT_GUARD_AFTER;
+      out->guard_observed = observed;
+      guard_recorded = true;
+    }
+  }
+
+  volatile const uint8_t* const storage =
+      reinterpret_cast<volatile const uint8_t*>(
+          g_photons_fragment_root_region.storage);
+  uint32_t whole_hash = PHOTONS_FRAGMENT_ROOT_HASH_OFFSET;
+  for (size_t sector = 0U;
+       sector < PHOTONS_FRAGMENT_ROOT_SECTOR_COUNT;
+       ++sector) {
+    uint32_t sector_hash = PHOTONS_FRAGMENT_ROOT_HASH_OFFSET;
+    const size_t base = sector * PHOTONS_FRAGMENT_ROOT_SECTOR_BYTES;
+    for (size_t offset = 0U;
+         offset < PHOTONS_FRAGMENT_ROOT_SECTOR_BYTES;
+         ++offset) {
+      const uint8_t value = storage[base + offset];
+      whole_hash = (whole_hash ^ value) * PHOTONS_FRAGMENT_ROOT_HASH_PRIME;
+      sector_hash = (sector_hash ^ value) * PHOTONS_FRAGMENT_ROOT_HASH_PRIME;
+    }
+    out->sector_hash[sector] = sector_hash;
+  }
+  out->hash = whole_hash;
+
+  volatile const uint32_t* const first =
+      reinterpret_cast<volatile const uint32_t*>(
+          g_photons_fragment_root_region.storage);
+  volatile const uint32_t* const last =
+      reinterpret_cast<volatile const uint32_t*>(
+          g_photons_fragment_root_region.storage +
+          PHOTONS_FRAGMENT_ROOT_CAPACITY - PHOTONS_RAM2_CACHE_LINE_BYTES);
+  for (size_t i = 0U; i < PHOTONS_FRAGMENT_ROOT_GUARD_WORDS; ++i) {
+    out->first_line[i] = first[i];
+    out->last_line[i] = last[i];
+  }
+}
+
+static FLASHMEM uint32_t photons_fragment_root_sector_mismatch_mask(
+    const photons_fragment_root_snapshot_t& expected,
+    const photons_fragment_root_snapshot_t& observed) {
+  if (!expected.valid || !observed.valid) return 0U;
+  uint32_t mask = 0U;
+  for (size_t i = 0U; i < PHOTONS_FRAGMENT_ROOT_SECTOR_COUNT; ++i) {
+    if (expected.sector_hash[i] != observed.sector_hash[i]) {
+      mask |= 1UL << i;
+    }
+  }
+  return mask;
+}
+
+static FLASHMEM void photons_fragment_root_mismatch_commit(
+    photons_fragment_root_mismatch_stage_t stage,
+    uint32_t fragment_sequence,
+    const photons_fragment_root_snapshot_t& expected,
+    const photons_fragment_root_snapshot_t& observed) {
+  const bool previous_valid = photons_fragment_root_mismatch_record_valid(
+      g_photons_fragment_root_mismatch_retained);
+  uint32_t sequence = previous_valid
+      ? g_photons_fragment_root_mismatch_retained.sequence + 1U
+      : 1U;
+  if (sequence == 0U) sequence = 1U;
+
+  photons_fragment_root_mismatch_record_t record{};
+  record.schema_version = PHOTONS_FRAGMENT_ROOT_WITNESS_SCHEMA_VERSION;
+  record.record_size = sizeof(record);
+  record.sequence = sequence;
+  record.sequence_inv = ~sequence;
+  record.stage = (uint32_t)stage;
+  record.fragment_sequence = fragment_sequence;
+  record.expected_fragment_sequence = expected.fragment_sequence;
+  record.dwt = ARM_DWT_CYCCNT;
+  record.storage_begin = (uint32_t)(uintptr_t)
+      g_photons_fragment_root_region.storage;
+  record.storage_end = record.storage_begin + PHOTONS_FRAGMENT_ROOT_CAPACITY;
+  record.expected_hash = expected.valid ? expected.hash : 0U;
+  record.observed_hash = observed.valid ? observed.hash : 0U;
+  record.sector_mismatch_mask =
+      photons_fragment_root_sector_mismatch_mask(expected, observed);
+  record.guard_failure_mask = observed.guard_failure_mask;
+  record.guard_index = observed.guard_index;
+  record.guard_expected = observed.guard_expected;
+  record.guard_observed = observed.guard_observed;
+  if (expected.valid) {
+    for (size_t i = 0U; i < PHOTONS_FRAGMENT_ROOT_GUARD_WORDS; ++i) {
+      record.expected_first_line[i] = expected.first_line[i];
+      record.expected_last_line[i] = expected.last_line[i];
+    }
+  }
+  if (observed.valid) {
+    for (size_t i = 0U; i < PHOTONS_FRAGMENT_ROOT_GUARD_WORDS; ++i) {
+      record.observed_first_line[i] = observed.first_line[i];
+      record.observed_last_line[i] = observed.last_line[i];
+    }
+  }
+
+  // Commit envelope last.  The record occupies complete cache lines, so this
+  // flush cannot sweep an unrelated RAM2 owner into the persistence operation.
+  g_photons_fragment_root_mismatch_retained.magic = 0U;
+  g_photons_fragment_root_mismatch_retained.magic_inv = 0U;
+  photons_memory_barrier();
+  arm_dcache_flush(&g_photons_fragment_root_mismatch_retained,
+                   PHOTONS_RAM2_CACHE_LINE_BYTES);
+  __asm__ volatile("dsb\nisb" ::: "memory");
+
+  g_photons_fragment_root_mismatch_retained = record;
+  photons_memory_barrier();
+  g_photons_fragment_root_mismatch_retained.magic_inv =
+      ~PHOTONS_FRAGMENT_ROOT_WITNESS_MAGIC;
+  g_photons_fragment_root_mismatch_retained.magic =
+      PHOTONS_FRAGMENT_ROOT_WITNESS_MAGIC;
+  photons_memory_barrier();
+  arm_dcache_flush(&g_photons_fragment_root_mismatch_retained,
+                   sizeof(g_photons_fragment_root_mismatch_retained));
+  __asm__ volatile("dsb\nisb" ::: "memory");
+}
+
+static FLASHMEM void photons_fragment_root_fail(
+    photons_fragment_root_mismatch_stage_t stage,
+    uint32_t fragment_sequence,
+    const photons_fragment_root_snapshot_t& expected,
+    const photons_fragment_root_snapshot_t& observed) {
+  photons_fragment_root_mismatch_commit(
+      stage, fragment_sequence, expected, observed);
+
+  // Preserve the established Payload fatal testimony whenever the document's
+  // own contract is also broken.  A guard-only or slack-byte injury is outside
+  // Payload's semantic document, but is still an ownership violation and traps.
+  if (!g_photons_fragment_root.contract_valid()) {
+    g_photons_fragment_root.clear();  // does not return on contract injury
+  }
+  __builtin_trap();
+}
+
+static FLASHMEM void photons_fragment_root_verify_expected(
+    photons_fragment_root_mismatch_stage_t stage,
+    uint32_t fragment_sequence,
+    const photons_fragment_root_snapshot_t& expected,
+    photons_fragment_root_snapshot_t* observed_out) {
+  photons_fragment_root_snapshot_t observed{};
+  photons_fragment_root_snapshot_capture(fragment_sequence, &observed);
+  const uint32_t sector_mismatch =
+      photons_fragment_root_sector_mismatch_mask(expected, observed);
+  if (!expected.valid ||
+      expected.guard_failure_mask != 0U ||
+      observed.guard_failure_mask != 0U ||
+      expected.hash != observed.hash ||
+      sector_mismatch != 0U) {
+    photons_fragment_root_fail(stage, fragment_sequence, expected, observed);
+  }
+  if (observed_out) *observed_out = observed;
+}
+
+static FLASHMEM void photons_fragment_root_verify_quiescent(
+    uint32_t next_fragment_sequence) {
+  photons_fragment_root_snapshot_t observed{};
+  photons_fragment_root_snapshot_capture(next_fragment_sequence, &observed);
+
+  if (!g_photons_fragment_root_quiescent.valid) {
+    if (observed.guard_failure_mask != 0U) {
+      const photons_fragment_root_snapshot_t expected{};
+      photons_fragment_root_fail(
+          photons_fragment_root_mismatch_stage_t::QUIESCENT,
+          next_fragment_sequence,
+          expected,
+          observed);
+    }
+    return;
+  }
+
+  const photons_fragment_root_snapshot_t expected =
+      g_photons_fragment_root_quiescent;
+  const uint32_t sector_mismatch =
+      photons_fragment_root_sector_mismatch_mask(expected, observed);
+  if (expected.guard_failure_mask != 0U ||
+      observed.guard_failure_mask != 0U ||
+      expected.hash != observed.hash ||
+      sector_mismatch != 0U) {
+    photons_fragment_root_fail(
+        photons_fragment_root_mismatch_stage_t::QUIESCENT,
+        next_fragment_sequence,
+        expected,
+        observed);
+  }
+
+  // The next root.clear() is now the sole lawful mutation boundary.
+  g_photons_fragment_root_quiescent.valid = false;
+  photons_memory_barrier();
+}
+
+static FLASHMEM void photons_fragment_root_add_report(Payload& parent) {
+  photons_foreground_owner_assert(photons_foreground_owner_t::COMMAND);
+  Payload custody;
+  custody.add("schema", "PHOTONS_ROOT_STORAGE_CUSTODY_V1");
+  custody.add("storage_begin", (uint32_t)(uintptr_t)
+      g_photons_fragment_root_region.storage);
+  custody.add("storage_end", (uint32_t)(uintptr_t)
+      (g_photons_fragment_root_region.storage +
+       PHOTONS_FRAGMENT_ROOT_CAPACITY));
+  custody.add("storage_capacity", (uint32_t)PHOTONS_FRAGMENT_ROOT_CAPACITY);
+  custody.add("guard_before_address", (uint32_t)(uintptr_t)
+      g_photons_fragment_root_region.guard_before);
+  custody.add("guard_after_address", (uint32_t)(uintptr_t)
+      g_photons_fragment_root_region.guard_after);
+  custody.add("quiescent_witness_valid",
+              g_photons_fragment_root_quiescent.valid);
+  custody.add("quiescent_fragment_sequence",
+              g_photons_fragment_root_quiescent.fragment_sequence);
+  custody.add("quiescent_hash", g_photons_fragment_root_quiescent.hash);
+
+  const bool mismatch_valid = photons_fragment_root_mismatch_record_valid(
+      g_photons_fragment_root_mismatch_retained);
+  custody.add("retained_mismatch_valid", mismatch_valid);
+  if (mismatch_valid) {
+    const photons_fragment_root_mismatch_record_t& mismatch =
+        g_photons_fragment_root_mismatch_retained;
+    custody.add("retained_mismatch_sequence", mismatch.sequence);
+    custody.add("retained_mismatch_stage_id", mismatch.stage);
+    custody.add("retained_mismatch_stage",
+                photons_fragment_root_mismatch_stage_name(mismatch.stage));
+    custody.add("retained_fragment_sequence", mismatch.fragment_sequence);
+    custody.add("retained_expected_fragment_sequence",
+                mismatch.expected_fragment_sequence);
+    custody.add("retained_expected_hash", mismatch.expected_hash);
+    custody.add("retained_observed_hash", mismatch.observed_hash);
+    custody.add("retained_sector_mismatch_mask",
+                mismatch.sector_mismatch_mask);
+    custody.add("retained_guard_failure_mask",
+                mismatch.guard_failure_mask);
+    custody.add("retained_guard_index", mismatch.guard_index);
+    custody.add("retained_guard_expected", mismatch.guard_expected);
+    custody.add("retained_guard_observed", mismatch.guard_observed);
+    custody.add("retained_dwt", mismatch.dwt);
+  }
+  parent.add_object("root_storage_custody", custody);
+}
 
 
 static void photons_payload_add_welford(
@@ -2841,6 +3249,7 @@ static Payload& photons_fragment_payload(
   Payload& recovery = g_photons_fragment_recovery;
   Payload& interrupt = g_photons_fragment_interrupt;
 
+  photons_fragment_root_verify_quiescent(f.sequence);
   root.clear();
   instrument.clear();
   race.clear();
@@ -3530,15 +3939,30 @@ static void photons_fragment_tick(
   // populated after publish: the next one-second root.clear() intentionally
   // remains an integrity canary for any out-of-band RAM2 mutation.
   Payload& payload = photons_fragment_payload(fragment);
+
+  photons_fragment_root_snapshot_t root_before_publish{};
+  photons_fragment_root_snapshot_capture(
+      fragment.sequence, &root_before_publish);
+  if (root_before_publish.guard_failure_mask != 0U) {
+    photons_fragment_root_fail(
+        photons_fragment_root_mismatch_stage_t::RENDER,
+        fragment.sequence,
+        photons_fragment_root_snapshot_t{},
+        root_before_publish);
+  }
+
   const bool published = publish("PHOTONS_FRAGMENT", payload);
 
   // publish() is a synchronous custody boundary: local fan-out may only borrow
   // the immutable value and transport must finish copying it into its own wire
-  // allocation before returning.  Prove that boundary immediately.  If either
-  // layer ever mutates the caller-owned root, clear() deliberately re-enters the
-  // normal Payload fatal court while the offending publication is still the
-  // immediately preceding operation.  A valid root remains populated so the
-  // next one-second clear retains the existing between-transaction canary.
+  // allocation before returning.  Prove both the complete fixed byte store and
+  // Payload's semantic contract before any post-publish PHOTONS mutation.
+  photons_fragment_root_snapshot_t root_after_publish{};
+  photons_fragment_root_verify_expected(
+      photons_fragment_root_mismatch_stage_t::PUBLISH,
+      fragment.sequence,
+      root_before_publish,
+      &root_after_publish);
   if (!payload.contract_valid()) {
     payload.clear();  // does not return when the preservation court is broken
   }
@@ -3558,6 +3982,18 @@ static void photons_fragment_tick(
   } else {
     g_publish_reject_count++;
   }
+
+  // FRAGMENT custody includes every post-publish lifecycle/statistics commit.
+  // Prove those operations did not touch the completed root, then establish the
+  // exact image that must remain immutable until next second's clear boundary.
+  photons_fragment_root_snapshot_t root_at_release{};
+  photons_fragment_root_verify_expected(
+      photons_fragment_root_mismatch_stage_t::POST_PUBLISH,
+      fragment.sequence,
+      root_after_publish,
+      &root_at_release);
+  g_photons_fragment_root_quiescent = root_at_release;
+  photons_memory_barrier();
 }
 
 
@@ -3645,6 +4081,7 @@ FLASHMEM void process_photons_init(void) {
   __atomic_store_n(&g_photons_foreground_owner,
                    (uint32_t)photons_foreground_owner_t::NONE,
                    __ATOMIC_RELEASE);
+  photons_fragment_root_initialize_runtime();
 
   // This is the only foreground initialization of ISR-owned live capture and it
   // occurs before PHOTODIODE subscription/start below. After interrupt_start(),
@@ -5151,6 +5588,7 @@ static FLASHMEM Payload cmd_report_photons(const Payload& /*args*/) {
   }
   p.add("custody_lap_count", g_photons_custody_lap_count);
   p.add("custody_total_lap_gnss_ns", g_photons_custody_total_lap_gnss_ns);
+  photons_fragment_root_add_report(p);
   return p;
 }
 

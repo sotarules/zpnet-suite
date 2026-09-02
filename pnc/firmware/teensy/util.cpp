@@ -1,5 +1,6 @@
 #include "util.h"
 #include "debug.h"
+#include "payload.h"
 #include <malloc.h>
 #include <string.h>
 #include <math.h>
@@ -209,9 +210,13 @@ uint32_t maxAllocBytes() {
   uint32_t lo = 0, hi = 256 * 1024; // Teensy 4.1 has plenty; clamp as needed
   while (lo + 1 < hi) {
     uint32_t mid = (lo + hi) / 2;
-    void* p = malloc(mid);
-    if (p) { free(p); lo = mid; }
-    else { hi = mid; }
+    void* p = payload_shared_heap_malloc(mid);
+    if (p) {
+      if (!payload_shared_heap_free(p)) __builtin_trap();
+      lo = mid;
+    } else {
+      hi = mid;
+    }
   }
   return lo;
 }
