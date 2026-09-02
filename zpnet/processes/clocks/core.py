@@ -2532,6 +2532,8 @@ _clocks_epoch_birth_pending = threading.Event()
 _clocks_epoch_birth_committed = threading.Event()
 _clocks_epoch_birth_prior_reset_count = -1
 _clocks_epoch_birth_reset_count = -1
+_clocks_epoch_birth_last_seen_reset_count = -1
+_clocks_epoch_birth_last_seen_update_count = -1
 
 # A cold holistic restore must not use an ephemeral CLOCKS row as its proof of
 # convergence.  While ordinary startup persistence remains closed, this narrow
@@ -14083,6 +14085,8 @@ def _clocks_state_loop() -> None:
     """Build and publish CLOCKS_V4 without storage latency stalling the live feed."""
     global _clocks_state_published, _clocks_state_dropped
     global _clocks_epoch_birth_reset_count
+    global _clocks_epoch_birth_last_seen_reset_count
+    global _clocks_epoch_birth_last_seen_update_count
 
     _clocks_state_worker_started.set()
     logging.info("🚀 [clocks] canonical CLOCKS_V4 state worker started")
@@ -14330,6 +14334,10 @@ def _clocks_state_loop() -> None:
                     if isinstance(stats, dict)
                     else None
                 )
+                if reset_count is not None:
+                    _clocks_epoch_birth_last_seen_reset_count = int(reset_count)
+                if update_count is not None:
+                    _clocks_epoch_birth_last_seen_update_count = int(update_count)
                 if (
                     update_count != 1
                     or reset_count is None
@@ -15666,18 +15674,66 @@ def _current_live_stats_reset_count() -> int:
         raise RuntimeError("latest live CLOCKS state has no usable stats.reset_count")
     return int(reset_count)
 
+def _teensy_live_stats_chronology() -> Dict[str, int]:
+    """Read the physical Alpha statistics identity directly from Teensy."""
+    response = send_command(
+        machine="TEENSY",
+        subsystem="CLOCKS",
+        command="REPORT_CLOCKS",
+        retries=1,
+        retry_delay_s=0.0,
+    )
+    payload = response.get("payload") if isinstance(response, dict) else None
+    if not isinstance(response, dict) or not response.get("success") or not isinstance(payload, dict):
+        raise RuntimeError(
+            f"Teensy CLOCKS.REPORT_CLOCKS chronology unavailable: {response!r}"
+        )
+    reset_count = _as_int(payload.get("stats_reset_count"))
+    update_count = _as_int(payload.get("stats_update_count"))
+    if (
+        reset_count is None
+        or reset_count < 0
+        or update_count is None
+        or update_count < 0
+    ):
+        raise RuntimeError(
+            "Teensy CLOCKS.REPORT_CLOCKS lacks usable physical statistics chronology: "
+            f"reset_count={payload.get('stats_reset_count')!r} "
+            f"update_count={payload.get('stats_update_count')!r}"
+        )
+    return {
+        "reset_count": int(reset_count),
+        "update_count": int(update_count),
+    }
+
 
 def _perform_transitive_stats_reset(
     *,
     requested_at: str,
     pi_before: Dict[str, Any],
     source: str,
+    physical_prior_stats: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Any]:
     """Reset Teensy-owned and Pi-owned CLOCKS statistics as one transaction."""
     global _dac_stats_reset_fence_count
 
-    prior_reset_count = _current_live_stats_reset_count()
     with _dac_stats_epoch_lock:
+        prior_stats = (
+            copy.deepcopy(physical_prior_stats)
+            if physical_prior_stats is not None
+            else _teensy_live_stats_chronology()
+        )
+        prior_reset_count = _as_int(prior_stats.get("reset_count"))
+        prior_update_count = _as_int(prior_stats.get("update_count"))
+        if (
+            prior_reset_count is None
+            or prior_reset_count < 0
+            or prior_update_count is None
+            or prior_update_count < 0
+        ):
+            raise RuntimeError(
+                f"invalid physical Teensy statistics baseline: {prior_stats!r}"
+            )
         try:
             teensy_response = send_command(
                 machine="TEENSY",
@@ -15752,6 +15808,10 @@ def _perform_transitive_stats_reset(
         "campaign_unchanged": True,
         "clockfaces_unchanged": True,
         "teensy": teensy_response,
+        "teensy_prior_stats": {
+            "reset_count": int(prior_reset_count),
+            "update_count": int(prior_update_count),
+        },
         "pi_gnss_raw_before": pi_previous,
         "pi_gnss_raw_after": pi_after,
         "pi_dac_welford": dac_stats,
@@ -15775,11 +15835,29 @@ def _establish_fresh_durable_stats_epoch(
     """Align fresh Alpha epoch birth with the durable persistence boundary."""
     global _clocks_epoch_birth_prior_reset_count
     global _clocks_epoch_birth_reset_count
+    global _clocks_epoch_birth_last_seen_reset_count
+    global _clocks_epoch_birth_last_seen_update_count
 
-    prior_reset_count = _current_live_stats_reset_count()
+    physical_prior_stats = _teensy_live_stats_chronology()
+    prior_reset_count = int(physical_prior_stats["reset_count"])
+    prior_update_count = int(physical_prior_stats["update_count"])
+    try:
+        canonical_prior_reset_count: Optional[int] = _current_live_stats_reset_count()
+    except Exception:
+        canonical_prior_reset_count = None
     _clocks_epoch_birth_prior_reset_count = int(prior_reset_count)
     _clocks_epoch_birth_reset_count = -1
+    _clocks_epoch_birth_last_seen_reset_count = -1
+    _clocks_epoch_birth_last_seen_update_count = -1
     _clocks_epoch_birth_committed.clear()
+
+    logging.info(
+        "🧭 [clocks] fresh statistics epoch birth is anchored to physical Alpha: "
+        "Teensy reset=%d update=%d; cached canonical reset=%s is diagnostic only",
+        prior_reset_count,
+        prior_update_count,
+        str(canonical_prior_reset_count) if canonical_prior_reset_count is not None else "unavailable",
+    )
 
     _diag["stats_reset_requests"] = _diag.get("stats_reset_requests", 0) + 1
     requested_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -15796,6 +15874,7 @@ def _establish_fresh_durable_stats_epoch(
         requested_at=requested_at,
         pi_before=pi_before,
         source=source,
+        physical_prior_stats=physical_prior_stats,
     )
     if not response.get("success"):
         raise RuntimeError(
@@ -15807,8 +15886,11 @@ def _establish_fresh_durable_stats_epoch(
         raise RuntimeError(
             "fresh CLOCKS statistics epoch did not durably commit update_count=1 "
             f"within {HOLISTIC_RESTORE_TIMEOUT_S:.1f}s "
-            f"(prior_reset_count={prior_reset_count}, "
-            f"observed_reset_count={_clocks_epoch_birth_reset_count})"
+            f"(physical_prior_reset_count={prior_reset_count}, "
+            f"physical_prior_update_count={prior_update_count}, "
+            f"canonical_prior_reset_count={canonical_prior_reset_count}, "
+            f"observed_reset_count={_clocks_epoch_birth_last_seen_reset_count}, "
+            f"observed_update_count={_clocks_epoch_birth_last_seen_update_count})"
         )
 
     return {

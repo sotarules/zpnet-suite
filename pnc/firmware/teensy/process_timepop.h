@@ -178,6 +178,27 @@ struct timepop_idle_witness_snapshot_t {
 
 bool timepop_idle_witness_snapshot(timepop_idle_witness_snapshot_t* out);
 
+// Read-only foreground custody query for a previously returned TimePop handle.
+//
+// A valid timed one-shot handle is an exact-event appointment, not a promise
+// that its callback will eventually run: missed/too-close exact deadlines may
+// be quarantined and removed without callback.  Clients that cache a handle as
+// their own logical "armed" state may use this court to verify that TimePop
+// still owns the appointment before suppressing a replacement arm.
+//
+// Custody includes active/expired timed slots, pending or currently-dispatching
+// ASAP/ALAP mailboxes, and arm mutations that have reserved a handle but have
+// not yet reached the timed-slot table.  This function does not mutate TimePop.
+enum class timepop_handle_custody_t : uint8_t {
+  NONE = 0U,
+  TIMED_SLOT = 1U,
+  DEFERRED_PENDING = 2U,
+  DEFERRED_DISPATCHING = 3U,
+  DISPATCH_MUTATION_ARM = 4U,
+};
+
+timepop_handle_custody_t timepop_handle_custody(timepop_handle_t handle);
+
 // ============================================================================
 // Execution Trace ABI
 // ============================================================================

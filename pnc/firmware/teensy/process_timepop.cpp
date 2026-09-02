@@ -5012,6 +5012,53 @@ void timepop_epoch_changed(uint32_t epoch_sequence) {
 // Introspection
 // ============================================================================
 
+timepop_handle_custody_t timepop_handle_custody(timepop_handle_t handle) {
+  if (handle == TIMEPOP_INVALID_HANDLE) {
+    return timepop_handle_custody_t::NONE;
+  }
+
+  // TimePop scheduler state has one foreground owner.  This is deliberately a
+  // read-only scan rather than an interrupt-masked ownership substitute.
+  for (uint32_t i = 0U; i < MAX_SLOTS; ++i) {
+    if (slots[i].active && slots[i].handle == handle) {
+      return timepop_handle_custody_t::TIMED_SLOT;
+    }
+  }
+
+  for (uint32_t i = 0U; i < MAX_ASAP_SLOTS; ++i) {
+    if (asap_slots[i].pending && asap_slots[i].handle == handle) {
+      return timepop_handle_custody_t::DEFERRED_PENDING;
+    }
+    if (asap_slots[i].dispatching &&
+        asap_slots[i].dispatch_handle == handle) {
+      return timepop_handle_custody_t::DEFERRED_DISPATCHING;
+    }
+  }
+
+  for (uint32_t i = 0U; i < MAX_ALAP_SLOTS; ++i) {
+    if (alap_slots[i].pending && alap_slots[i].handle == handle) {
+      return timepop_handle_custody_t::DEFERRED_PENDING;
+    }
+    if (alap_slots[i].dispatching &&
+        alap_slots[i].dispatch_handle == handle) {
+      return timepop_handle_custody_t::DEFERRED_DISPATCHING;
+    }
+  }
+
+  // Arms requested from inside a dispatch callback reserve their public handle
+  // before the mutation barrier installs the corresponding timed slot.  Treat
+  // that queued arm as real custody so a caller cannot falsely conclude that a
+  // just-returned handle has already been orphaned.
+  for (uint32_t i = 0U; i < dispatch_mutation_count; ++i) {
+    if (dispatch_mutation_is_arm(dispatch_mutations[i].kind) &&
+        dispatch_mutations[i].reserved_handle == handle) {
+      return timepop_handle_custody_t::DISPATCH_MUTATION_ARM;
+    }
+  }
+
+  return timepop_handle_custody_t::NONE;
+}
+
 uint32_t timepop_active_count(void) {
   uint32_t n = 0;
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {

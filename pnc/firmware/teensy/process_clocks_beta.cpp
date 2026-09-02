@@ -59,6 +59,7 @@
 #include "process_clocks.h"
 #include "process_interrupt.h"
 #include "process_system.h"
+#include "process_timepop.h"
 
 #include "debug.h"
 #include "time.h"
@@ -872,6 +873,15 @@ static uint32_t g_clocks_fragment_publication_service_forced_rearm_count = 0U;
 static uint32_t g_clocks_fragment_publication_service_cancel_count = 0U;
 static uint32_t g_clocks_fragment_publication_service_cancel_failure_count = 0U;
 static uint32_t g_clocks_fragment_publication_service_stale_callback_count = 0U;
+// A timed TimePop one-shot is an exact appointment and may be lawfully
+// quarantined without callback if its edge is missed.  These counters record
+// cases where CLOCKS' cached logical arm outlived actual TimePop custody and
+// the ordinary publication scheduler repaired that stale belief.
+static uint32_t g_clocks_fragment_publication_service_orphan_repair_count = 0U;
+static timepop_handle_t g_clocks_fragment_publication_service_orphan_last_handle =
+    TIMEPOP_INVALID_HANDLE;
+static uint32_t g_clocks_fragment_publication_service_orphan_last_generation = 0U;
+static uint32_t g_clocks_fragment_publication_service_orphan_last_retry_sequence = 0U;
 static bool g_clocks_fragment_publication_campaign_ready_last_valid = false;
 static uint32_t g_clocks_fragment_publication_campaign_ready_last_sequence = 0U;
 static uint32_t g_clocks_fragment_publication_campaign_ready_signal_count = 0U;
@@ -2077,7 +2087,31 @@ static void clocks_fragment_schedule_publish(void) {
     return;
   }
   if (g_clocks_fragment_publication_service_armed) {
-    return;
+    const timepop_handle_t claimed_handle =
+        g_clocks_fragment_publication_service_handle;
+    if (timepop_handle_custody(claimed_handle) !=
+        timepop_handle_custody_t::NONE) {
+      return;
+    }
+
+    // CLOCKS caches TimePop custody only to suppress duplicate publication arms.
+    // Exact timed one-shots, including the 25 ms transport retry, may be
+    // truthfully quarantined by TimePop without callback when their physical edge
+    // is missed.  In that case the cached boolean is no longer authoritative.
+    // Retire only the stale scheduling belief; retry snapshot / campaign queue
+    // custody remains untouched and the ordinary arm path below re-establishes
+    // future service.  No producer-side queue index is advanced here.
+    g_clocks_fragment_publication_service_orphan_repair_count++;
+    g_clocks_fragment_publication_service_orphan_last_handle = claimed_handle;
+    g_clocks_fragment_publication_service_orphan_last_generation =
+        g_clocks_fragment_publication_service_armed_generation;
+    g_clocks_fragment_publication_service_orphan_last_retry_sequence =
+        g_clocks_fragment_publication_retry_snapshot_valid
+            ? g_clocks_fragment_publication_retry_sequence
+            : 0U;
+    g_clocks_fragment_publication_service_handle = TIMEPOP_INVALID_HANDLE;
+    g_clocks_fragment_publication_service_armed_generation = 0U;
+    g_clocks_fragment_publication_service_armed = false;
   }
 
   uint32_t generation = g_clocks_fragment_publication_service_generation + 1U;
@@ -10690,6 +10724,14 @@ static FLASHMEM Payload cmd_report_recovery(const Payload&) {
         g_clocks_fragment_publication_campaign_row_embed_fail_count);
   p.add("fragment_publication_service_arm_failures",
         g_clocks_fragment_publication_service_arm_failures);
+  p.add("fragment_publication_service_orphan_repair_count",
+        g_clocks_fragment_publication_service_orphan_repair_count);
+  p.add("fragment_publication_service_orphan_last_handle",
+        g_clocks_fragment_publication_service_orphan_last_handle);
+  p.add("fragment_publication_service_orphan_last_generation",
+        g_clocks_fragment_publication_service_orphan_last_generation);
+  p.add("fragment_publication_service_orphan_last_retry_sequence",
+        g_clocks_fragment_publication_service_orphan_last_retry_sequence);
   p.add("fragment_publication_active_retry_max_attempts",
         (uint32_t)CLOCKS_FRAGMENT_ACTIVE_RETRY_MAX_ATTEMPTS);
   p.add("fragment_publication_active_retry_exhaustion_count",
