@@ -75,7 +75,8 @@
 // foreground context while incident recursion is suppressed.
 
 #define PAYLOAD_CONTRACT_INCIDENT_ENTRIES 16U
-#define PAYLOAD_CONTRACT_PENDING_ENTRIES  8U
+// RAM1 initiative: retain only two pending foreground anomaly events.
+#define PAYLOAD_CONTRACT_PENDING_ENTRIES  2U
 #define PAYLOAD_CONTRACT_PREFIX_BYTES     96U
 
 // The contract implementation contains no conditional assembly and no inline

@@ -1575,7 +1575,6 @@ static volatile uint32_t g_payload_contract_pending_head = 0U;
 static volatile uint32_t g_payload_contract_pending_tail = 0U;
 static volatile uint32_t g_payload_contract_pending_count = 0U;
 static payload_contract_incident_t g_payload_contract_first_this_boot;
-static payload_contract_snapshot_t g_payload_contract_info_scratch;
 
 static void payload_contract_capture_prefix(
     uint32_t operation_id,
@@ -1775,6 +1774,44 @@ static void payload_contract_snapshot_bank(
     }
 }
 
+// RAM1 initiative: payload_contract_get_info() needs only the newest incident
+// from each retained bank.  Scan in place instead of keeping a permanent full
+// live+retained snapshot scratch buffer in DTCM.
+static bool payload_contract_latest_incident(
+    const payload_contract_bank_t& bank,
+    payload_contract_incident_t* out) {
+    if (!out) return false;
+    *out = payload_contract_incident_t{};
+    if (!payload_contract_bank_valid(bank)) return false;
+
+    bool found = false;
+    uint32_t newest_sequence = 0U;
+    for (uint32_t i = 0U; i < PAYLOAD_CONTRACT_INCIDENT_ENTRIES; ++i) {
+        const volatile payload_contract_incident_t* source = &bank.entries[i];
+        const uint32_t sequence_before = source->sequence;
+        const uint32_t sequence_inv_before = source->sequence_inv;
+        if (sequence_before == 0U ||
+            (sequence_before ^ sequence_inv_before) != 0xFFFFFFFFUL) {
+            continue;
+        }
+
+        const payload_contract_incident_t candidate = bank.entries[i];
+        payload_contract_dmb();
+        if (source->sequence != sequence_before ||
+            source->sequence_inv != sequence_inv_before ||
+            !payload_contract_incident_valid(candidate)) {
+            continue;
+        }
+
+        if (!found || candidate.sequence > newest_sequence) {
+            *out = candidate;
+            newest_sequence = candidate.sequence;
+            found = true;
+        }
+    }
+    return found;
+}
+
 FLASHMEM void payload_contract_get_snapshot(payload_contract_snapshot_t* out) {
     if (!out) return;
     payload_contract_boot_latch();
@@ -1786,9 +1823,7 @@ FLASHMEM void payload_contract_get_snapshot(payload_contract_snapshot_t* out) {
 
 FLASHMEM void payload_contract_get_info(payload_contract_info_t* out) {
     if (!out) return;
-    payload_contract_get_snapshot(&g_payload_contract_info_scratch);
-    const payload_contract_snapshot_t& snapshot =
-        g_payload_contract_info_scratch;
+    payload_contract_boot_latch();
     memset(out, 0, sizeof(*out));
 
     out->checks = g_payload_contract_checks;
@@ -1812,14 +1847,10 @@ FLASHMEM void payload_contract_get_info(payload_contract_info_t* out) {
             g_payload_contract_first_this_boot)) {
         out->first_this_boot = g_payload_contract_first_this_boot;
     }
-    if (snapshot.live.count != 0U) {
-        out->latest_this_boot =
-            snapshot.live.entries[snapshot.live.count - 1U];
-    }
-    if (snapshot.retained.count != 0U) {
-        out->latest_retained =
-            snapshot.retained.entries[snapshot.retained.count - 1U];
-    }
+    (void)payload_contract_latest_incident(
+        g_payload_contract_live, &out->latest_this_boot);
+    (void)payload_contract_latest_incident(
+        g_payload_contract_retained, &out->latest_retained);
 }
 
 bool payload_contract_event_peek(payload_contract_event_t* out) {
