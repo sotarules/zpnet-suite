@@ -12,7 +12,7 @@
 
 static constexpr uint32_t EXECUTION_TRACE_BANK_MAGIC = 0x45544233UL;  // 'ETB3'
 static constexpr uint32_t EXECUTION_TRACE_SET_MAGIC  = 0x45545333UL;  // 'ETS3'
-static constexpr uint32_t EXECUTION_TRACE_SCHEMA_VERSION = 3U;
+static constexpr uint32_t EXECUTION_TRACE_SCHEMA_VERSION = 4U;
 static constexpr uint32_t EXECUTION_TRACE_FLAG_FAULT_CAPTURED = 1U;
 
 struct alignas(32) execution_trace_bank_t {

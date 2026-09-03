@@ -15,7 +15,7 @@
 // entries into one retained RAM2 set before Teensyduino performs its reboot.
 // Reporting may merge rings by DWT, but the per-context rings are the testimony.
 
-static constexpr uint32_t EXECUTION_TRACE_ENTRIES_PER_CONTEXT = 32U;
+static constexpr uint32_t EXECUTION_TRACE_ENTRIES_PER_CONTEXT = 8U;
 static constexpr uint32_t EXECUTION_TRACE_CONTEXT_COUNT = 4U;
 static constexpr uint32_t EXECUTION_TRACE_NO_SUBJECT = 0xFFFFFFFFUL;
 
