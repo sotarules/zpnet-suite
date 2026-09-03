@@ -85,6 +85,12 @@ static const unsigned long GNSSDO_BAUD     = 38400;
 static const int LD_ON_PIN          = 30;
 static const int LASER_MONITOR_PIN  = 20;
 
+// Active-low LANTERN SDM gate between EV5491 ID1 and laser LD+.
+// HIGH is the electrically safe/inhibited state; LOW permits ID1 current.
+// process_interrupt establishes HIGH during the earliest boot-safe-output
+// phase; PHOTONS will assume operational gate custody in a later change.
+static const int LASER_GATE_PIN     = 35;
+
 // --------------------------------------------------------------
 // Koheron PD200T optical receiver
 // --------------------------------------------------------------

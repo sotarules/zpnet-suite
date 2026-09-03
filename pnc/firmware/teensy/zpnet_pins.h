@@ -101,6 +101,7 @@ GND           Black         GND                Battery branching ground         
 23            Green         DAC_VREF_OUT       AD5693R VREF (both)
 32            Orange        GNSS_PPS_RELAY     GPIO relay to Pi
 34            Coax          PHOTODIODE_INT     Koheron PD200T TTL out                Comparator timing / GPIO2[29] IRQ P48
+35            --            LASER_GATE         ZPNet SDM GATE                       Active-low: HIGH inhibits laser; LOW permits ID1 current
 38            Coax          PHOTODIODE_ANALOG_IN  Koheron PD200T PD OUT              Analog photodetector output / A14 ADC
 
 30            Green         LASER_EN           EV5491-C-00A EN pin
@@ -229,7 +230,7 @@ Pin #    Wire Color    Signal Name      Electrical / Voltage       Notes
 ---------------------------------------------------------------------------
 1        Blue          CASE_GND         Chassis / case             Parked
 2        Black         LD- / PD-        GND (EV5491 GND)           Common return
-3        Red           LD+              ~1.397 V                   EV5491 ID1
+3        Red           LD+              ~1.397 V                   ZPNet SDM output; switched EV5491 ID1
 4        White         PD+              ~0.918 V                   Monitored (laser on/off)
 
 ---------------------------------------------------------------------------
@@ -259,7 +260,7 @@ Control / Signal Connections
 Signal     Wire Color    Connected To        Teensy Pin    Notes
 ---------------------------------------------------------------------------
 EN         Green         Teensy GPIO         30            Laser enable
-ID1        Red           Laser diode LD+     N/A           Drives LD+ (~1.397 V)
+ID1        Red           ZPNet SDM input      N/A           SDM switches ID1 path to laser LD+
 GND        Black         Laser diode GND     N/A           Common return
 
 -------------------------------------------------------------------------------
@@ -286,7 +287,8 @@ GND        Black         Backplane           GND            I2C reference
 -------------------------------------------------------------------------------
 Notes:
 • EN is the only controller signal driven by the Teensy.
-• ID1 directly drives the laser diode LD+ pin.
+• ID1 feeds the ZPNet SDM; the SDM output drives the laser diode LD+ pin.
+• SDM GATE is Teensy pin 35 and is active-low: HIGH inhibits laser output.
 • All controller power is sourced from the +3V3 rail.
 • I2C is present for configuration/monitoring as supported.
 • Unused controller pins are intentionally left undocumented.

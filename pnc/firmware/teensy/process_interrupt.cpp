@@ -6602,6 +6602,19 @@ FLASHMEM static void qtimer1_init_ch2_scheduler(void) {
   IMXRT_TMR1.CH[QTIMER1_RETIRED_AUX_CH].CMPLD2 = 0;
 }
 
+// Establish electrically safe output levels before TimePop, interrupt hardware,
+// or application subsystems can become active.  This is boot-only custody;
+// the owning subsystem assumes operational control later.
+//
+// LASER_GATE_PIN is the first active-low output in ZPNet: LOW permits the
+// LANTERN SDM to pass ID1 current to LD+, while HIGH inhibits the laser.
+// Preload HIGH while the pad is still an input, then enable output drive so
+// firmware never deliberately authors a LOW pulse during the mode transition.
+FLASHMEM void process_interrupt_init_safe_outputs(void) {
+  digitalWrite(LASER_GATE_PIN, HIGH);
+  pinMode(LASER_GATE_PIN, OUTPUT);
+}
+
 FLASHMEM void process_interrupt_init_hardware(void) {
   if (!interrupt_fpu_context_policy_install_once()) return;
   if (g_interrupt_hw_ready) return;

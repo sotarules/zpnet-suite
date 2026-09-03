@@ -86,27 +86,29 @@ static inline void led_off() { digitalWrite(LED_BUILTIN, LOW); }
 // Boot order is critical. The dependency chain is:
 //
 //   0. crash_forensics_install()         — reassert retained fault vectors
-//   1. maximize_dwt_determinism()        — CPU clock, DWT counter
-//   2. memory_info_init()                — stack sentinel painting
-//   3. process_interrupt_init_hardware() — QTimer1 CH0/CH1/CH2/CH3 +
+//   1. process_interrupt_init_safe_outputs()
+//                                       — establish unsafe-until-driven outputs
+//   2. maximize_dwt_determinism()        — CPU clock, DWT counter
+//   3. memory_info_init()                — stack sentinel painting
+//   4. process_interrupt_init_hardware() — QTimer1 CH0/CH1/CH2/CH3 +
 //                                          QTimer3 CH2/CH3 hardware setup
 //                                          (all compare channels start
 //                                          disabled; no spurious ISRs)
-//   4. timepop_init()                    — slot tables + register
+//   5. timepop_init()                    — slot tables + register
 //                                          QTimer1 CH2 handler with
 //                                          process_interrupt
-//   5. process_clocks_init_hardware()    — DWT enable, rolling helper baselines
-//   6. transport_init()                  — arms RX/TX timers
-//   7. process framework + subsystems    — everything else
-//   8. process_interrupt_init()          — runtime subscriber tables
-//   9. process_interrupt_enable_irqs()   — ISR vectors + NVIC enable;
+//   6. process_clocks_init_hardware()    — DWT enable, rolling helper baselines
+//   7. transport_init()                  — arms RX/TX timers
+//   8. process framework + subsystems    — everything else
+//   9. process_interrupt_init()          — runtime subscriber tables
+//  10. process_interrupt_enable_irqs()   — ISR vectors + NVIC enable;
 //                                          IRQ_QTIMER1, IRQ_QTIMER3,
 //                                          IRQ_GPIO6789 all go live.
 //                                          Any pending CH2 TCF1 from
-//                                          step 4's schedule_next()
+//                                          step 5's schedule_next()
 //                                          fires immediately and
 //                                          dispatches to TimePop.
-//  10. process_clocks_init()             — subscribes VCLOCK/OCXO,
+//  11. process_clocks_init()             — subscribes VCLOCK/OCXO,
 //                                          registers PPS edge dispatch,
 //                                          requests startup epoch zero,
 //                                          starts providers (which arms
@@ -144,6 +146,12 @@ void setup() {
   // startup_late_hook() installs before global constructors.  Reassert here
   // before any setup work in case a constructor replaced a core fault vector.
   crash_forensics_install();
+
+  // Establish unsafe-until-driven hardware before any boot delay, TimePop
+  // scheduling, or interrupt-vector activation.  process_interrupt owns this
+  // temporary electrical-safety boundary; application subsystems take runtime
+  // custody later.
+  process_interrupt_init_safe_outputs();
 
   // ----------------------------------------------------------
   // Phase 0: Pre-transport boot (NO DEBUG LOGGING ALLOWED)
