@@ -135,8 +135,9 @@ static constexpr uint32_t HANDOFF_PPS_RING_SIZE = 4U;
 // Foreground black-box recorder.  Two milliseconds is deliberately above
 // the observed normal callback/idle scale while remaining tiny beside the
 // suspected 50 ms event.  CH2 event age retains a tighter 100 us trigger.
-static constexpr uint32_t INTERRUPT_FORENSIC_RING_SIZE = 16U;
-static constexpr uint32_t INTERRUPT_FORENSIC_REPORT_MAX_RECORDS = 8U;
+// RAM1 initiative: retain only the four newest exceptional records.
+static constexpr uint32_t INTERRUPT_FORENSIC_RING_SIZE = 4U;
+static constexpr uint32_t INTERRUPT_FORENSIC_REPORT_MAX_RECORDS = 4U;
 static_assert(INTERRUPT_FORENSIC_REPORT_MAX_RECORDS <=
                   INTERRUPT_FORENSIC_RING_SIZE,
               "forensic report limit must fit the retained ring");
