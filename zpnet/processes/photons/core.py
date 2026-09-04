@@ -4580,10 +4580,20 @@ def _fetch_teensy_bringup_report() -> Optional[Dict[str, Any]]:
         "PHOTONS.REPORT.race_engine_active",
     ) is not False:
         raise RuntimeError("PHOTONS bring-up report unexpectedly has race engine active")
+    # Step-4 bisect contract: firmware explicitly authors whether the coarse source
+    # is enabled at boot.  The active-low SDM gate must remain closed either way,
+    # and LD_ON must exactly agree with the declared commissioning switch.
+    coarse_source_boot_enabled = _require_bool(
+        payload.get("coarse_source_boot_enabled"),
+        "PHOTONS.REPORT.coarse_source_boot_enabled",
+    )
+    expected_ld_on_level = 1 if coarse_source_boot_enabled else 0
     if _require_int(payload.get("laser_gate_level"), "PHOTONS.REPORT.laser_gate_level") != 1:
         raise RuntimeError("PHOTONS bring-up report says active-low laser gate is not inhibited")
-    if _require_int(payload.get("ld_on_level"), "PHOTONS.REPORT.ld_on_level") != 0:
-        raise RuntimeError("PHOTONS bring-up report says coarse laser source is not inhibited")
+    if _require_int(payload.get("ld_on_level"), "PHOTONS.REPORT.ld_on_level") != expected_ld_on_level:
+        raise RuntimeError(
+            "PHOTONS bring-up report coarse-source state disagrees with its Step-4 boot switch"
+        )
     _require_u32(payload.get("interrupt_irq_count"), "PHOTONS.REPORT.interrupt_irq_count")
     _require_u32(
         payload.get("interrupt_callback_count"),
@@ -6705,6 +6715,7 @@ def _perform_phase5_recovery(
         # No current-session canonical descendant proved a healthy producer.  The
         # existing REPORT_RECOVERY path now classifies only the held/newborn,
         # pending-proof, or otherwise ambiguous cases.
+        detector_activation: Optional[Dict[str, Any]] = None
         report = _fetch_teensy_recovery_report(require_baseline=False)
         if report["publication_started"]:
             _confirm_live_teensy_lap_baseline(report)
@@ -6715,9 +6726,30 @@ def _perform_phase5_recovery(
             if report["staging_active"]:
                 raise RuntimeError("Teensy PHOTONS recovery staging remains active")
 
-            # The read-only court has now proved that this producer is held. Only
-            # this branch may install the reference needed by RECOVERY_BEGIN or
-            # RECOVERY_COLD_START.
+            # Detector activation is boot-local physical custody. Every held
+            # producer resurrection path (HELD_RESTORE or COLD_START) requires
+            # that lane to be live before recovery mutates producer state. Prove
+            # the compact commissioning envelope first; never infer safety from
+            # the recovery report alone.
+            bringup = _fetch_teensy_bringup_report()
+            if bringup is None:
+                raise RuntimeError(
+                    "held PHOTONS producer lacks PHOTONS_BRINGUP_REPORT_V2 before recovery"
+                )
+            detector_activation = _startup_activate_detector_for_heartbeat(bringup)
+            logging.info(
+                "[photons/recovery] held producer detector prerequisite proved: "
+                "changed=%s active=%s gate=%s LD_ON=%s coarse_source_boot_enabled=%s",
+                bool(detector_activation.get("changed")),
+                bool(detector_activation.get("interrupt_active")),
+                detector_activation.get("laser_gate_level"),
+                detector_activation.get("ld_on_level"),
+                detector_activation.get("coarse_source_boot_enabled"),
+            )
+
+            # The read-only court plus explicit detector proof now establish the
+            # held-producer prerequisite envelope. Only this branch may install
+            # the reference needed by RECOVERY_BEGIN or RECOVERY_COLD_START.
             _configure_teensy_lap_baseline()
             report = _fetch_teensy_recovery_report(require_baseline=True)
 
@@ -6777,6 +6809,7 @@ def _perform_phase5_recovery(
                 else None
             ),
             "broad_preflight_used": isinstance(broad_preflight, dict),
+            "detector_activation": copy.deepcopy(detector_activation),
         }
         _recovery_status_set("CLASSIFIED", **classification)
 
@@ -10578,6 +10611,11 @@ def _startup_activate_detector_for_heartbeat(
     bringup: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Make only the already-proved safe PD200T detector lane live."""
+    coarse_source_boot_enabled = _require_bool(
+        bringup.get("coarse_source_boot_enabled"),
+        "PHOTONS commissioning bringup.coarse_source_boot_enabled",
+    )
+    expected_ld_on_level = 1 if coarse_source_boot_enabled else 0
     if _require_bool(
         bringup.get("interrupt_active"),
         "PHOTONS commissioning bringup.interrupt_active",
@@ -10588,7 +10626,8 @@ def _startup_activate_detector_for_heartbeat(
             "interrupt_subscribed": True,
             "interrupt_active": True,
             "laser_gate_level": 1,
-            "ld_on_level": 0,
+            "ld_on_level": expected_ld_on_level,
+            "coarse_source_boot_enabled": coarse_source_boot_enabled,
             "publication_started": False,
             "race_engine_active": False,
         }
@@ -10624,7 +10663,11 @@ def _startup_activate_detector_for_heartbeat(
         or _require_int(
             payload.get("ld_on_level"),
             "PHOTONS.DETECTOR_ACTIVATE.ld_on_level",
-        ) != 0
+        ) != expected_ld_on_level
+        or _require_bool(
+            payload.get("coarse_source_boot_enabled"),
+            "PHOTONS.DETECTOR_ACTIVATE.coarse_source_boot_enabled",
+        ) != coarse_source_boot_enabled
         or _require_bool(
             payload.get("publication_started"),
             "PHOTONS.DETECTOR_ACTIVATE.publication_started",
@@ -10897,8 +10940,11 @@ def run() -> None:
             )
             logging.warning(
                 "🧪 [photons] commissioning hold admitted without HARD_FAILURE: "
-                "publication=false race_engine=false detector_active=%s gate=HIGH LD_ON=LOW",
+                "publication=false race_engine=false detector_active=%s gate=HIGH "
+                "LD_ON=%s coarse_source_boot_enabled=%s",
                 bool((recovery.get("bringup_report") or {}).get("interrupt_active")),
+                (recovery.get("bringup_report") or {}).get("ld_on_level"),
+                (recovery.get("bringup_report") or {}).get("coarse_source_boot_enabled"),
             )
         else:
             # START/STOP/baseline/maintenance control opens only after an advancing

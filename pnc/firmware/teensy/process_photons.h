@@ -31,8 +31,10 @@
 //
 // Real single-pass race engine:
 //   • one recurring 1 kHz TimePop cadence owns one race attempt per tick;
-//   • the interim MP5491 path drives LD_ON HIGH for 91,000 ns, then LOW;
-//   • actual LD_ON falling-edge DWT is the explicit interim launch surrogate;
+//   • Step 4 keeps that producer held while optical authority migrates from the
+//     legacy LD_ON pulse path to the active-low SDM gate;
+//   • the dormant LD_ON falling-edge launch surrogate must not be activated in
+//     this baseline and will be replaced by the gate-timed path in a later step;
 //   • process_interrupt owns the first-instruction DWT coordinate of every
 //     physical PD200T pin-34 RISING edge; PHOTONS admits only the first eligible
 //     edge for the armed race and ignores later comparator chatter for race science;
@@ -47,9 +49,12 @@
 //     the downstream race/Welford/campaign/recovery architecture.
 //
 // Commands:
-//   • INIT                — reinitialize PHOTONS-owned optical hardware; laser is inhibited
+//   • INIT                — reinitialize PHOTONS-owned optical hardware; active-low gate
+//                           closes first; the Step-4 boot coarse-source switch is currently
+//                           neutralized, so LD_ON remains LOW after MP5491 configuration
 //   • DETECTOR_ACTIVATE   — commissioning-only activation of the already-subscribed PD200T
-//                           interrupt lane; laser remains inhibited and no race/publisher starts
+//                           interrupt lane; gate remains closed, LD_ON follows the Step-4
+//                           boot switch (currently LOW), and no race/publisher starts
 //   • SET_LAP_BASELINE_NS — install/change the operator-authored lap reference with
 //                           six fractional ns digits (1 fs); Better-Buckets are
 //                           re-referenced in place without changing physical custody
@@ -60,9 +65,8 @@
 //   • REPORT              — compact operational/device report for laser, PD200T pin 38/A14
 //                           PD OUT voltage, pin 34 comparator interrupt custody/blocker
 //                           forensics, publication identity, and hardware commissioning
-//   • PULSE               — manual one-shot commissioning pulse while the recurring
-//                           race engine is not active; optional ns=<nanoseconds>
-//                           selects pulse width (default 1000 ns)
+//   • PULSE               — Step-4 transition hold: rejected until Step 5 moves manual
+//                           pulse authorship from LD_ON to the active-low SDM gate
 //   • REPORT_PULSE        — minimal latest manual-shot commissioning report
 //   • REPORT_PHOTONS      — compact always-on instrument + current CAMP report
 //   • REPORT_STATS        — detailed statistical/court/Better-Buckets report
@@ -78,8 +82,11 @@
 //   • REPORT_RECOVERY     — report staging, restored source, and physical-ancestry testimony
 //   • INJECT_PROBLEM      — retained command identity; synthetic injection is unavailable
 //                           after retirement of the emulator
-//   • ON                  — permit laser emission through LD_ON
-//   • OFF                 — inhibit laser emission through LD_ON
+//   • ON                  — rejected/hard-inhibited while the Step-4 boot coarse-source switch
+//                           is neutralized; when later enabled, opens active-low SDM gate
+//                           with LD_ON already HIGH
+//   • OFF                 — hard-inhibits while the Step-4 boot switch is neutralized; when
+//                           later enabled, closes the gate while leaving LD_ON HIGH
 // ============================================================================
 
 // Cumulative ISR-authored optical-edge state from PD200T TTL pin 34.
