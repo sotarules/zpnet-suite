@@ -4058,6 +4058,7 @@ static void photons_start_publication(void) {
       g_photons_recovery.publication_started ||
       g_fragment_timer != TIMEPOP_INVALID_HANDLE ||
       !g_photons_ppb_previous_endpoint_valid ||
+      !g_interrupt_started ||
       !g_interrupt_ancestry.valid) {
     __builtin_trap();
   }
@@ -4096,8 +4097,9 @@ FLASHMEM void process_photons_init(void) {
   photons_fragment_root_initialize_runtime();
 
   // This is the only foreground initialization of ISR-owned live capture and it
-  // occurs before PHOTODIODE subscription/start below. After interrupt_start(),
-  // only the detector callback may mutate g_photons_live.
+  // occurs before the PHOTODIODE subscription exists. Step 2 deliberately binds
+  // the callback without activating the detector lane; once a later explicit
+  // activation occurs, only the detector callback may mutate g_photons_live.
   g_photons_live = photons_live_state_t{};
   g_last_fragment_generation = 0U;
   photons_last_fragment_reset();
@@ -4117,8 +4119,9 @@ FLASHMEM void process_photons_init(void) {
   g_last_fragment_race_enqueue_failure_count = 0ULL;
 
   // Establish cross-context mailboxes before the PHOTODIODE subscription exists.
-  // After interrupt_start() below, only the detector callback may mutate receive
-  // mailbox contents; foreground owns only the arm/launch side of each handoff.
+  // Subscription alone does not make the detector callback live. After a later
+  // explicit activation, only the detector callback may mutate receive mailbox
+  // contents; foreground owns only the arm/launch side of each handoff.
   g_race_armed_sequence = 0U;
   g_photons_race_receive.generation = 0U;
   g_photons_race_receive.value = photons_race_receive_value_t{};
@@ -4183,9 +4186,10 @@ FLASHMEM void process_photons_init(void) {
   subscription.user_data = nullptr;
 
   g_subscription_ok = interrupt_photodiode_subscribe(subscription);
-  g_interrupt_started =
-      g_subscription_ok &&
-      interrupt_start(interrupt_subscriber_kind_t::PHOTODIODE);
+  // Step 2 separates callback identity from hardware activation. The physical
+  // PHOTODIODE lane remains inactive until a later commissioning step explicitly
+  // starts it; ordinary ZPNet operation therefore cannot enter PHOTONS ISR work.
+  g_interrupt_started = false;
 
   // Prime the PHOTONS-owned projection cache before the race engine begins. TIME
   // may still be initializing; invalidity is preserved and early cadence cells
@@ -4870,6 +4874,11 @@ static FLASHMEM Payload cmd_recovery_commit(const Payload& args) {
         "recovery_commit_rejected_not_staging",
         "RECOVERY_BEGIN must own a complete held transaction");
   }
+  if (!g_interrupt_started) {
+    return photons_recovery_reject(
+        "recovery_commit_rejected_detector_inactive",
+        "PHOTODIODE must be explicitly activated before publication");
+  }
   if (protocol.accepted_second_count != protocol.expected_second_count ||
       protocol.accepted_minute_count != protocol.expected_minute_count ||
       !protocol.previous_second_valid || !protocol.previous_minute_valid) {
@@ -5135,6 +5144,11 @@ static FLASHMEM Payload cmd_recovery_cold_start(const Payload& args) {
     return photons_recovery_reject(
         "recovery_cold_start_rejected_busy",
         "cold start requires a held instrument with no staged restore");
+  }
+  if (!g_interrupt_started) {
+    return photons_recovery_reject(
+        "recovery_cold_start_rejected_detector_inactive",
+        "PHOTODIODE must be explicitly activated before cold start");
   }
 
   uint32_t generation = 0U;
@@ -5758,6 +5772,26 @@ static FLASHMEM Payload cmd_inject_problem(const Payload& /*args*/) {
 static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
+
+  // Step 2 intentionally leaves the detector subscribed but inactive. Keep the
+  // ordinary REPORT command usable in that commissioning state without entering
+  // the legacy broad-report serializer. The latter is not required to prove this
+  // step and has demonstrated an independent Payload/control-path failure when
+  // invoked while the detector is held inactive. Seven inline fields keep this
+  // safety/status witness bounded and allocation-free.
+  if (!g_interrupt_started) {
+    Payload p;
+    p.add("report", "PHOTONS");
+    p.add("schema", "PHOTONS_BRINGUP_REPORT_V1");
+    p.add("initialized", g_initialized);
+    p.add("publication_started", g_photons_recovery.publication_started);
+    p.add("interrupt_subscribed", g_subscription_ok);
+    p.add("interrupt_active", false);
+    p.add("race_engine_active",
+          g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE);
+    return p;
+  }
+
   const photons_fragment_snapshot_t& canonical =
       photons_report_fragment_snapshot();
 
