@@ -45,6 +45,8 @@
 //
 // Commands:
 //   • INIT                — reinitialize PHOTONS-owned optical hardware; laser is inhibited
+//   • DETECTOR_ACTIVATE   — commissioning-only activation of the already-subscribed PD200T
+//                           interrupt lane; laser remains inhibited and no race/publisher starts
 //   • SET_LAP_BASELINE_NS — install/change the operator-authored lap reference with
 //                           six fractional ns digits (1 fs); Better-Buckets are
 //                           re-referenced in place without changing physical custody

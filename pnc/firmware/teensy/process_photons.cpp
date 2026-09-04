@@ -5773,20 +5773,31 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
 
-  // Step 2 intentionally leaves the detector subscribed but inactive. Keep the
-  // ordinary REPORT command usable in that commissioning state without entering
-  // the legacy broad-report serializer. The latter is not required to prove this
-  // step and has demonstrated an independent Payload/control-path failure when
-  // invoked while the detector is held inactive. Seven inline fields keep this
-  // safety/status witness bounded and allocation-free.
-  if (!g_interrupt_started) {
+  // Bring-up REPORT remains compact until publication begins. Step 3 may activate
+  // the detector while the laser is still doubly inhibited; that commissioning
+  // state must not fall through into the legacy broad-report serializer merely
+  // because pin-34 interrupt custody became live. Keep this path observational:
+  // it reports detector activity and the two optical inhibit pins without starting
+  // publication, race cadence, pulse generation, or any recovery transition.
+  if (!g_photons_recovery.publication_started) {
+    interrupt_photodiode_diag_t interrupt_diag{};
+    if (!interrupt_photodiode_snapshot(&interrupt_diag) ||
+        interrupt_diag.active != g_interrupt_started) {
+      __builtin_trap();
+    }
+
     Payload p;
     p.add("report", "PHOTONS");
-    p.add("schema", "PHOTONS_BRINGUP_REPORT_V1");
+    p.add("schema", "PHOTONS_BRINGUP_REPORT_V2");
     p.add("initialized", g_initialized);
-    p.add("publication_started", g_photons_recovery.publication_started);
-    p.add("interrupt_subscribed", g_subscription_ok);
-    p.add("interrupt_active", false);
+    p.add("publication_started", false);
+    p.add("interrupt_subscribed", interrupt_diag.subscribed);
+    p.add("interrupt_active", interrupt_diag.active);
+    p.add("interrupt_irq_count", interrupt_diag.irq_count);
+    p.add("interrupt_callback_count", interrupt_diag.callback_count);
+    p.add("interrupt_inactive_edge_count", interrupt_diag.inactive_edge_count);
+    p.add("laser_gate_level", digitalRead(LASER_GATE_PIN));
+    p.add("ld_on_level", digitalRead(LD_ON_PIN));
     p.add("race_engine_active",
           g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE);
     return p;
@@ -5800,7 +5811,12 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
   const photons_device_snapshot_t device = photons_device_snapshot();
 
   Payload p;
-  photons_prepare_operational_report(p);
+  // Do not eagerly reserve 4 KiB for REPORT. The historical deterministic
+  // REPORT failure entered Payload integrity machinery from this large-response
+  // path, and the eager reserve forces a heap-backed representation before the
+  // first semantic field exists. Preserve the exact REPORT schema while letting
+  // Payload grow transactionally only if the document actually crosses inline
+  // capacity. Other detailed report commands remain unchanged in this bounded fix.
   p.add("report", "PHOTONS");
   p.add("schema", "PHOTONS_REPORT_V3");
   p.add("ppb_semantics", "LAP_BASELINE_NS_OFFSET_V1");
@@ -5952,6 +5968,61 @@ static FLASHMEM Payload cmd_report_pulse(const Payload& /*args*/) {
   }
   return p;
 }
+
+static FLASHMEM Payload cmd_detector_activate(const Payload& /*args*/) {
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::COMMAND);
+
+  if (g_photons_recovery.publication_started ||
+      g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE) {
+    Payload p;
+    p.add("status", "detector_activate_rejected_instrument_running");
+    return p;
+  }
+
+  // Step 3 is detector-only commissioning. Reassert the already-accepted optical
+  // safety envelope before making pin-34 interrupt custody live: active-low gate
+  // HIGH inhibits the SDM and LD_ON LOW removes the coarse MP5491 source. No
+  // command in this step may author LASER_GATE_PIN LOW.
+  photons_laser_inhibit();
+
+  if (!g_initialized || !g_subscription_ok) __builtin_trap();
+
+  if (!g_interrupt_started) {
+    (void)interrupt_start(interrupt_subscriber_kind_t::PHOTODIODE);
+
+    interrupt_photodiode_diag_t started_diag{};
+    if (!interrupt_photodiode_snapshot(&started_diag) ||
+        !started_diag.subscribed || !started_diag.active) {
+      __builtin_trap();
+    }
+    g_interrupt_started = true;
+  }
+
+  interrupt_photodiode_diag_t interrupt_diag{};
+  if (!interrupt_photodiode_snapshot(&interrupt_diag) ||
+      !interrupt_diag.subscribed || !interrupt_diag.active) {
+    __builtin_trap();
+  }
+  if (digitalRead(LASER_GATE_PIN) != HIGH ||
+      digitalRead(LD_ON_PIN) != LOW ||
+      g_photons_recovery.publication_started ||
+      g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE) {
+    photons_laser_inhibit();
+    __builtin_trap();
+  }
+
+  Payload p;
+  p.add("status", "detector_activated");
+  p.add("interrupt_subscribed", true);
+  p.add("interrupt_active", true);
+  p.add("laser_gate_level", HIGH);
+  p.add("ld_on_level", LOW);
+  p.add("publication_started", false);
+  p.add("race_engine_active", false);
+  return p;
+}
+
 
 static FLASHMEM Payload cmd_init(const Payload& /*args*/) {
   const photons_foreground_custody_t custody(
@@ -6117,6 +6188,7 @@ static FLASHMEM Payload cmd_off(const Payload& /*args*/) {
 
 static const process_command_entry_t PHOTONS_COMMANDS[] = {
   { "INIT",                cmd_init                },
+  { "DETECTOR_ACTIVATE",   cmd_detector_activate   },
   { "SET_LAP_BASELINE_NS", cmd_set_lap_baseline_ns },
   { "SET_STANDARD_LAP_NS", cmd_set_standard_lap_ns },
   { "START",               cmd_start               },
