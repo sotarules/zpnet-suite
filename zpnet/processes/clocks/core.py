@@ -8289,16 +8289,19 @@ def _wait_for_fresh_survival_witness() -> Tuple[Dict[str, Any], Optional[float],
     positive evidence that the prior producer lifetime ended and may return the
     best current testimony immediately.
     """
-    deadline = time.monotonic() + STARTUP_SURVIVAL_FRESH_WITNESS_TIMEOUT_S
+    t0 = time.monotonic()
+    deadline = t0 + STARTUP_SURVIVAL_FRESH_WITNESS_TIMEOUT_S
+    next_smartzero_log = t0 + STARTUP_ALPHA_EPOCH_STATUS_LOG_INTERVAL_S
     while True:
         with _clocks_lock:
             state = copy.deepcopy(_latest_clocks)
             received_monotonic = _latest_clocks_received_monotonic
             received_utc = _latest_clocks_received_utc
+        now = time.monotonic()
         age_s = (
             None
             if received_monotonic is None
-            else max(0.0, time.monotonic() - received_monotonic)
+            else max(0.0, now - received_monotonic)
         )
         if _recovery_custody_requires_cold_restore():
             return state, age_s, received_utc
@@ -8316,7 +8319,36 @@ def _wait_for_fresh_survival_witness() -> Tuple[Dict[str, Any], Optional[float],
             and age_s <= CLOCKS_PREFLIGHT_MAX_AGE_S
         ):
             return state, age_s, received_utc
-        if time.monotonic() >= deadline:
+
+        # Live-adoption startup deliberately gives the canonical stream the first
+        # opportunity to prove producer survival with zero Teensy RPC.  If that
+        # proof remains absent beyond the existing 10-second visibility grace,
+        # restore the operator's SmartZero view with a read-only diagnostic poll.
+        # This testimony never participates in producer classification or startup
+        # admission; it only explains the physical acquisition occurring while
+        # this loop is already waiting for current-session CLOCKS_FRAGMENT truth.
+        if now >= next_smartzero_log:
+            smartzero_progress = _smartzero_progress_snapshot(
+                _fetch_teensy_smartzero_status()
+            )
+            detail = _smartzero_progress_text(smartzero_progress)
+            _diag["last_startup_alpha_epoch_wait"] = {
+                "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "status": "WAITING_FOR_CURRENT_SESSION_CLOCKS_FRAGMENT",
+                "waited_s": round(float(now - t0), 3),
+                "smartzero": copy.deepcopy(smartzero_progress),
+                "observational_only": True,
+                "producer_authority": "CLOCKS_FRAGMENT",
+            }
+            logging.info(
+                "⏳ [clocks/startup] waiting for current-session CLOCKS_FRAGMENT "
+                "while SmartZero acquires (%.1fs): %s",
+                now - t0,
+                detail,
+            )
+            next_smartzero_log = now + STARTUP_ALPHA_EPOCH_STATUS_LOG_INTERVAL_S
+
+        if now >= deadline:
             raise RuntimeError(
                 "cannot classify CLOCKS producer lifetime without current-session "
                 "canonical testimony after the transport admission barrier within "
