@@ -718,7 +718,6 @@ void payload_clear_retained_append_trace();
 #define PAYLOAD_HEAP_RESIZE_FLAG_STORAGE_SPAN     (1UL << 7)
 #define PAYLOAD_HEAP_RESIZE_FLAG_MOVED            (1UL << 8)
 #define PAYLOAD_HEAP_RESIZE_FLAG_CONTRACT_OK      (1UL << 9)
-#define PAYLOAD_HEAP_RESIZE_FLAG_CAP_RANGE        (1UL << 10)
 
 enum class payload_heap_resize_trace_stage_t : uint32_t {
   NONE               = 0,
@@ -729,7 +728,6 @@ enum class payload_heap_resize_trace_stage_t : uint32_t {
   POST_DATA_MOVE     = 5,
   POST_OFFSET_REBASE = 6,
   POST_CONTRACT      = 7,
-  VALIDATION_FAILED  = 8,
 };
 
 typedef struct {
