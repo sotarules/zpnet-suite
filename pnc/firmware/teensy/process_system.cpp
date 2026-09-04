@@ -4073,6 +4073,491 @@ static FLASHMEM Payload cmd_payload_integrity_info(const Payload& /*args*/) {
 }
 
 
+
+// ============================================================================
+// PAYLOAD Phase 2 — synthetic construction / custody laboratory
+// ============================================================================
+//
+// These commands deliberately exercise Payload through its public API only.
+// PHOTONS, CLOCKS, publication, and application-owned science state are absent
+// from the experiment.  A compact test returns PASS only after the test body
+// completes with no new Payload failure testimony.  Impossible test results
+// trap rather than being converted into a reassuring boolean.
+//
+// PAYLOAD_TEST_RESPONSE is intentionally different: it returns the large test
+// Payload itself so transport/command return-by-value sees the same class of
+// object that exposed the original broad-report failure.
+// ============================================================================
+
+static constexpr size_t SYSTEM_PAYLOAD_TEST_MAX_JSON_BYTES = 8192U;
+static constexpr uint32_t SYSTEM_PAYLOAD_TEST_MAX_FILL_FIELDS = 128U;
+static const char SYSTEM_PAYLOAD_TEST_CHUNK[] =
+    "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz+-"
+    "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz+-";
+
+struct system_payload_test_counters_t {
+  uint32_t contract_checks;
+  uint32_t successful_mutations;
+  uint32_t contract_incidents;
+  uint32_t integrity_fail;
+  uint32_t self_ok_fail;
+  uint32_t last_error_count;
+  uint32_t serialize_overflow;
+  uint32_t to_json_fail;
+  uint32_t parse_error;
+  uint32_t string_pointer_fault;
+  uint32_t arena_alloc_fail;
+  uint32_t heap_alloc_count;
+  uint32_t heap_resize_attempt_count;
+  uint32_t heap_realloc_in_place_count;
+  uint32_t heap_realloc_moved_count;
+  uint32_t heap_realloc_fail_count;
+  uint32_t alloc_overlap_detected;
+  uint32_t handler_ctx_ctor;
+  uint32_t handler_ctx_mutate;
+  uint32_t handler_ctx_alloc;
+  uint32_t handler_ctx_free;
+};
+
+static FLASHMEM system_payload_test_counters_t
+system_payload_test_counters_snapshot(void) {
+  payload_info_t info{};
+  payload_get_info(&info);
+  system_payload_test_counters_t out{};
+  out.contract_checks = info.contract_checks;
+  out.successful_mutations = info.contract_successful_mutations;
+  out.contract_incidents = info.contract_incidents;
+  out.integrity_fail = info.integrity_fail;
+  out.self_ok_fail = info.self_ok_fail;
+  out.last_error_count = info.last_error_count;
+  out.serialize_overflow = info.serialize_overflow;
+  out.to_json_fail = info.to_json_fail;
+  out.parse_error = info.parse_error;
+  out.string_pointer_fault = info.string_pointer_fault;
+  out.arena_alloc_fail = info.arena_alloc_fail;
+  out.heap_alloc_count = info.arena_heap_alloc_count;
+  out.heap_resize_attempt_count = info.arena_heap_resize_attempt_count;
+  out.heap_realloc_in_place_count = info.arena_heap_realloc_in_place_count;
+  out.heap_realloc_moved_count = info.arena_heap_realloc_moved_count;
+  out.heap_realloc_fail_count = info.arena_heap_realloc_fail_count;
+  out.alloc_overlap_detected = info.alloc_overlap_detected;
+  out.handler_ctx_ctor = info.handler_ctx_ctor;
+  out.handler_ctx_mutate = info.handler_ctx_mutate;
+  out.handler_ctx_alloc = info.handler_ctx_alloc;
+  out.handler_ctx_free = info.handler_ctx_free;
+  return out;
+}
+
+static FLASHMEM void system_payload_test_require_clean(
+    const system_payload_test_counters_t& before,
+    const system_payload_test_counters_t& after) {
+  if (after.contract_incidents != before.contract_incidents) __builtin_trap();
+  if (after.integrity_fail != before.integrity_fail) __builtin_trap();
+  if (after.self_ok_fail != before.self_ok_fail) __builtin_trap();
+  if (after.last_error_count != before.last_error_count) __builtin_trap();
+  if (after.serialize_overflow != before.serialize_overflow) __builtin_trap();
+  if (after.to_json_fail != before.to_json_fail) __builtin_trap();
+  if (after.parse_error != before.parse_error) __builtin_trap();
+  if (after.string_pointer_fault != before.string_pointer_fault) __builtin_trap();
+  if (after.arena_alloc_fail != before.arena_alloc_fail) __builtin_trap();
+  if (after.heap_realloc_fail_count != before.heap_realloc_fail_count) __builtin_trap();
+  if (after.alloc_overlap_detected != before.alloc_overlap_detected) __builtin_trap();
+  if (after.handler_ctx_ctor != before.handler_ctx_ctor) __builtin_trap();
+  if (after.handler_ctx_mutate != before.handler_ctx_mutate) __builtin_trap();
+  if (after.handler_ctx_alloc != before.handler_ctx_alloc) __builtin_trap();
+  if (after.handler_ctx_free != before.handler_ctx_free) __builtin_trap();
+}
+
+static FLASHMEM Payload system_payload_test_pass_payload(
+    const char* test,
+    const system_payload_test_counters_t& before,
+    const system_payload_test_counters_t& after) {
+  system_payload_test_require_clean(before, after);
+  Payload out;
+  out.add("schema", "ZPNET_PAYLOAD_TEST_V1");
+  out.add("test", test);
+  out.add("status", "PASS");
+  out.add("contract_checks_delta", after.contract_checks - before.contract_checks);
+  out.add("successful_mutations_delta",
+          after.successful_mutations - before.successful_mutations);
+  out.add("heap_alloc_delta", after.heap_alloc_count - before.heap_alloc_count);
+  out.add("heap_resize_attempt_delta",
+          after.heap_resize_attempt_count - before.heap_resize_attempt_count);
+  out.add("heap_realloc_in_place_delta",
+          after.heap_realloc_in_place_count - before.heap_realloc_in_place_count);
+  out.add("heap_realloc_moved_delta",
+          after.heap_realloc_moved_count - before.heap_realloc_moved_count);
+  return out;
+}
+
+static FLASHMEM void system_payload_test_make_key(uint32_t index,
+                                                   char key[5]) {
+  if (!key || index > 999U) __builtin_trap();
+  key[0] = 'f';
+  key[1] = (char)('0' + ((index / 100U) % 10U));
+  key[2] = (char)('0' + ((index / 10U) % 10U));
+  key[3] = (char)('0' + (index % 10U));
+  key[4] = '\0';
+}
+
+static FLASHMEM uint32_t system_payload_test_fill_to(
+    Payload& payload,
+    size_t target_json_bytes,
+    uint32_t start_index = 0U) {
+  uint32_t next = start_index;
+  while (true) {
+    const size_t current = payload.json_size();
+    if (current == 0U) __builtin_trap();
+    if (current >= target_json_bytes) return next;
+    if (next >= SYSTEM_PAYLOAD_TEST_MAX_FILL_FIELDS) __builtin_trap();
+    char key[5];
+    system_payload_test_make_key(next, key);
+    payload.add(key, SYSTEM_PAYLOAD_TEST_CHUNK);
+    ++next;
+  }
+}
+
+static FLASHMEM size_t system_payload_test_serialize_exact(
+    const Payload& payload) {
+  if (!payload.contract_valid()) __builtin_trap();
+  const size_t bytes = payload.json_size();
+  if (bytes < 2U || bytes > Payload::ARENA_MAX) __builtin_trap();
+  char* buffer = static_cast<char*>(payload_shared_heap_malloc(bytes + 1U));
+  if (!buffer) __builtin_trap();
+  const size_t written = payload.write_json(buffer, bytes + 1U);
+  const bool shape_ok =
+      written == bytes && buffer[bytes] == '\0' &&
+      buffer[0] == '{' && buffer[bytes - 1U] == '}';
+  if (!payload_shared_heap_free(buffer)) __builtin_trap();
+  if (!shape_ok) __builtin_trap();
+  return bytes;
+}
+
+static FLASHMEM void system_payload_test_require_equal_json(
+    const Payload& a,
+    const Payload& b) {
+  const size_t a_bytes = a.json_size();
+  const size_t b_bytes = b.json_size();
+  if (a_bytes == 0U || a_bytes != b_bytes || a_bytes > Payload::ARENA_MAX) {
+    __builtin_trap();
+  }
+  const size_t total = (a_bytes + 1U) * 2U;
+  char* storage = static_cast<char*>(payload_shared_heap_malloc(total));
+  if (!storage) __builtin_trap();
+  char* a_json = storage;
+  char* b_json = storage + a_bytes + 1U;
+  const size_t a_written = a.write_json(a_json, a_bytes + 1U);
+  const size_t b_written = b.write_json(b_json, b_bytes + 1U);
+  const bool equal =
+      a_written == a_bytes && b_written == b_bytes &&
+      memcmp(a_json, b_json, a_bytes + 1U) == 0;
+  if (!payload_shared_heap_free(storage)) __builtin_trap();
+  if (!equal) __builtin_trap();
+}
+
+static FLASHMEM Payload cmd_payload_test_inline(const Payload& /*args*/) {
+  const system_payload_test_counters_t before =
+      system_payload_test_counters_snapshot();
+
+  Payload sample;
+  sample.add("alpha", 1U);
+  sample.add("beta", "two");
+  sample.add("gamma", true);
+  if (!sample.contract_valid() || sample.count() != 3U) __builtin_trap();
+
+  const char expected[] = "{\"alpha\":1,\"beta\":\"two\",\"gamma\":true}";
+  char json[sizeof(expected)];
+  const size_t written = sample.write_json(json, sizeof(json));
+  if (written != sizeof(expected) - 1U || strcmp(json, expected) != 0) {
+    __builtin_trap();
+  }
+
+  const system_payload_test_counters_t after =
+      system_payload_test_counters_snapshot();
+  Payload out = system_payload_test_pass_payload("INLINE", before, after);
+  out.add("json_bytes", written);
+  out.add("entry_count", (uint32_t)sample.count());
+  return out;
+}
+
+static FLASHMEM Payload cmd_payload_test_reserve(const Payload& /*args*/) {
+  const system_payload_test_counters_t before =
+      system_payload_test_counters_snapshot();
+
+  Payload sample;
+  sample.add("sentinel", 0x12345678UL);
+  static constexpr size_t requests[] = {1024U, 2048U, 4096U, 8192U};
+  for (size_t i = 0U; i < sizeof(requests) / sizeof(requests[0]); ++i) {
+    sample.reserve(requests[i]);
+    if (!sample.contract_valid()) __builtin_trap();
+    if (sample.count() != 1U || sample.getUInt("sentinel") != 0x12345678UL) {
+      __builtin_trap();
+    }
+  }
+  const size_t json_bytes = system_payload_test_serialize_exact(sample);
+
+  const system_payload_test_counters_t after =
+      system_payload_test_counters_snapshot();
+  Payload out = system_payload_test_pass_payload("RESERVE", before, after);
+  out.add("final_requested_capacity", 8192U);
+  out.add("arena_capacity", (uint32_t)sample.arena_capacity());
+  out.add("json_bytes", (uint32_t)json_bytes);
+  return out;
+}
+
+static FLASHMEM Payload cmd_payload_test_growth(const Payload& /*args*/) {
+  const system_payload_test_counters_t before =
+      system_payload_test_counters_snapshot();
+
+  Payload sample;
+  const uint32_t fields =
+      system_payload_test_fill_to(sample, SYSTEM_PAYLOAD_TEST_MAX_JSON_BYTES);
+  if (!sample.contract_valid() || sample.count() != fields) __builtin_trap();
+  char last_key[5];
+  system_payload_test_make_key(fields - 1U, last_key);
+  const char* last_value = sample.getString(last_key);
+  if (!last_value || strcmp(last_value, SYSTEM_PAYLOAD_TEST_CHUNK) != 0) {
+    __builtin_trap();
+  }
+  const size_t json_bytes = system_payload_test_serialize_exact(sample);
+  if (json_bytes < SYSTEM_PAYLOAD_TEST_MAX_JSON_BYTES) __builtin_trap();
+
+  const system_payload_test_counters_t after =
+      system_payload_test_counters_snapshot();
+  Payload out = system_payload_test_pass_payload("GROWTH", before, after);
+  out.add("target_json_bytes", (uint32_t)SYSTEM_PAYLOAD_TEST_MAX_JSON_BYTES);
+  out.add("actual_json_bytes", (uint32_t)json_bytes);
+  out.add("field_count", fields);
+  out.add("arena_capacity", (uint32_t)sample.arena_capacity());
+  return out;
+}
+
+static FLASHMEM Payload cmd_payload_test_copy(const Payload& /*args*/) {
+  const system_payload_test_counters_t before =
+      system_payload_test_counters_snapshot();
+
+  Payload source;
+  const uint32_t fields = system_payload_test_fill_to(source, 4096U);
+  const size_t source_bytes = system_payload_test_serialize_exact(source);
+
+  Payload copied(source);
+  Payload cloned = source.clone();
+  Payload assigned;
+  assigned = source;
+
+  if (!source.contract_valid() || !copied.contract_valid() ||
+      !cloned.contract_valid() || !assigned.contract_valid()) {
+    __builtin_trap();
+  }
+  if (copied.count() != fields || cloned.count() != fields ||
+      assigned.count() != fields) {
+    __builtin_trap();
+  }
+  system_payload_test_require_equal_json(source, copied);
+  system_payload_test_require_equal_json(source, cloned);
+  system_payload_test_require_equal_json(source, assigned);
+
+  const system_payload_test_counters_t after =
+      system_payload_test_counters_snapshot();
+  Payload out = system_payload_test_pass_payload("COPY", before, after);
+  out.add("source_json_bytes", (uint32_t)source_bytes);
+  out.add("field_count", fields);
+  out.add("copy_forms", 3U);
+  return out;
+}
+
+static FLASHMEM Payload cmd_payload_test_move(const Payload& /*args*/) {
+  const system_payload_test_counters_t before =
+      system_payload_test_counters_snapshot();
+
+  Payload source;
+  const uint32_t construct_fields = system_payload_test_fill_to(source, 4096U);
+  const size_t construct_bytes = source.json_size();
+  Payload moved(static_cast<Payload&&>(source));
+  if (!moved.contract_valid() || moved.count() != construct_fields ||
+      !source.contract_valid() || !source.empty()) {
+    __builtin_trap();
+  }
+  if (system_payload_test_serialize_exact(moved) != construct_bytes) {
+    __builtin_trap();
+  }
+
+  Payload source2;
+  const uint32_t assign_fields = system_payload_test_fill_to(source2, 2048U);
+  const size_t assign_bytes = source2.json_size();
+  Payload assigned;
+  assigned.add("discarded", 1U);
+  assigned = static_cast<Payload&&>(source2);
+  if (!assigned.contract_valid() || assigned.count() != assign_fields ||
+      !source2.contract_valid() || !source2.empty()) {
+    __builtin_trap();
+  }
+  if (system_payload_test_serialize_exact(assigned) != assign_bytes) {
+    __builtin_trap();
+  }
+
+  const system_payload_test_counters_t after =
+      system_payload_test_counters_snapshot();
+  Payload out = system_payload_test_pass_payload("MOVE", before, after);
+  out.add("move_construct_json_bytes", (uint32_t)construct_bytes);
+  out.add("move_assign_json_bytes", (uint32_t)assign_bytes);
+  out.add("moved_from_sources_empty", true);
+  return out;
+}
+
+static FLASHMEM Payload cmd_payload_test_array(const Payload& /*args*/) {
+  const system_payload_test_counters_t before =
+      system_payload_test_counters_snapshot();
+
+  PayloadArray array;
+  static constexpr uint32_t ITEM_COUNT = 32U;
+  for (uint32_t i = 0U; i < ITEM_COUNT; ++i) {
+    Payload child;
+    child.add("index", i);
+    child.add("text", SYSTEM_PAYLOAD_TEST_CHUNK);
+    array.add(child);
+  }
+  if (!array.contract_valid() || array.size() != ITEM_COUNT) __builtin_trap();
+  Payload last = array.get(ITEM_COUNT - 1U);
+  if (!last.contract_valid() || last.getUInt("index") != ITEM_COUNT - 1U) {
+    __builtin_trap();
+  }
+
+  PayloadArray copied_ctor(array);
+  PayloadArray copied_assign;
+  copied_assign = array;
+  PayloadArray move_source(array);
+  PayloadArray moved(static_cast<PayloadArray&&>(move_source));
+  PayloadArray move_assign_source(array);
+  PayloadArray move_assigned;
+  move_assigned = static_cast<PayloadArray&&>(move_assign_source);
+  if (!copied_ctor.contract_valid() || !copied_assign.contract_valid() ||
+      !moved.contract_valid() || !move_assigned.contract_valid() ||
+      copied_ctor.size() != ITEM_COUNT || copied_assign.size() != ITEM_COUNT ||
+      moved.size() != ITEM_COUNT || move_assigned.size() != ITEM_COUNT ||
+      !move_source.contract_valid() || !move_source.empty() ||
+      !move_assign_source.contract_valid() || !move_assign_source.empty()) {
+    __builtin_trap();
+  }
+
+  Payload parent;
+  parent.add_array("items", array);
+  PayloadArray copied = parent.getArray("items");
+  if (!parent.contract_valid() || !copied.contract_valid() ||
+      copied.size() != ITEM_COUNT) {
+    __builtin_trap();
+  }
+  const size_t json_bytes = system_payload_test_serialize_exact(parent);
+
+  const system_payload_test_counters_t after =
+      system_payload_test_counters_snapshot();
+  Payload out = system_payload_test_pass_payload("ARRAY", before, after);
+  out.add("item_count", ITEM_COUNT);
+  out.add("parent_json_bytes", (uint32_t)json_bytes);
+  return out;
+}
+
+static FLASHMEM Payload cmd_payload_test_nested(const Payload& /*args*/) {
+  const system_payload_test_counters_t before =
+      system_payload_test_counters_snapshot();
+
+  Payload leaf;
+  leaf.add("answer", 42U);
+  leaf.add("label", "leaf");
+
+  PayloadArray items;
+  for (uint32_t i = 0U; i < 8U; ++i) {
+    Payload item;
+    item.add("index", i);
+    item.add("payload", SYSTEM_PAYLOAD_TEST_CHUNK);
+    items.add(item);
+  }
+
+  Payload middle;
+  middle.add_object("leaf", leaf);
+  middle.add_array("items", items);
+
+  Payload root;
+  root.add("schema", "ZPNET_PAYLOAD_NESTED_TEST_V1");
+  root.add_object("middle", middle);
+  if (!root.contract_valid()) __builtin_trap();
+
+  const size_t json_bytes = root.json_size();
+  if (json_bytes == 0U || json_bytes > Payload::ARENA_MAX) __builtin_trap();
+  uint8_t* json = static_cast<uint8_t*>(payload_shared_heap_malloc(json_bytes + 1U));
+  if (!json) __builtin_trap();
+  const size_t written = root.write_json(reinterpret_cast<char*>(json),
+                                         json_bytes + 1U);
+  if (written != json_bytes) __builtin_trap();
+
+  Payload parsed;
+  const bool parsed_ok = parsed.parseJSON(json, json_bytes);
+  if (!payload_shared_heap_free(json)) __builtin_trap();
+  if (!parsed_ok || !parsed.contract_valid()) __builtin_trap();
+
+  Payload parsed_middle = parsed.getPayload("middle");
+  Payload parsed_leaf = parsed_middle.getPayload("leaf");
+  PayloadArray parsed_items = parsed_middle.getArray("items");
+  if (!parsed_middle.contract_valid() || !parsed_leaf.contract_valid() ||
+      !parsed_items.contract_valid() || parsed_leaf.getUInt("answer") != 42U ||
+      parsed_items.size() != 8U) {
+    __builtin_trap();
+  }
+
+  const system_payload_test_counters_t after =
+      system_payload_test_counters_snapshot();
+  Payload out = system_payload_test_pass_payload("NESTED", before, after);
+  out.add("json_bytes", (uint32_t)json_bytes);
+  out.add("roundtrip_parse", "PASS");
+  out.add("nested_array_items", 8U);
+  return out;
+}
+
+static FLASHMEM bool system_payload_test_response_size_allowed(uint32_t bytes) {
+  return bytes == 512U || bytes == 1024U || bytes == 2048U ||
+         bytes == 4096U || bytes == 8192U;
+}
+
+static FLASHMEM Payload cmd_payload_test_response(const Payload& args) {
+  const uint32_t target = args.has("bytes") ? args.getUInt("bytes") : 4096U;
+  if (!system_payload_test_response_size_allowed(target)) {
+    Payload error;
+    error.add("error", "bytes must be 512, 1024, 2048, 4096, or 8192");
+    return error;
+  }
+
+  const system_payload_test_counters_t before =
+      system_payload_test_counters_snapshot();
+
+  // Match the original broad-report geometry deliberately: reserve first, then
+  // populate a large returned document.  Returning from this function is itself
+  // part of the test; do not replace this object with a compact summary.
+  Payload out;
+  out.reserve(target);
+  out.add("schema", "ZPNET_PAYLOAD_TEST_RESPONSE_V1");
+  out.add("test", "RESPONSE");
+  out.add("status", "PASS");
+  out.add("target_json_bytes", target);
+  const uint32_t next = system_payload_test_fill_to(out, target);
+  out.add("field_count", next);
+  const size_t actual_before_counters = out.json_size();
+  if (actual_before_counters < target || !out.contract_valid()) __builtin_trap();
+
+  const system_payload_test_counters_t after =
+      system_payload_test_counters_snapshot();
+  system_payload_test_require_clean(before, after);
+  out.add("body_contract_checks_delta", after.contract_checks - before.contract_checks);
+  out.add("body_successful_mutations_delta",
+          after.successful_mutations - before.successful_mutations);
+  out.add("body_heap_alloc_delta", after.heap_alloc_count - before.heap_alloc_count);
+  out.add("body_heap_resize_attempt_delta",
+          after.heap_resize_attempt_count - before.heap_resize_attempt_count);
+  out.add("body_heap_realloc_moved_delta",
+          after.heap_realloc_moved_count - before.heap_realloc_moved_count);
+  out.add("json_bytes_before_counter_fields", (uint32_t)actual_before_counters);
+  return out;
+}
+
 static void system_dmamem_ensure_initialized(void) {
   if (g_system_dmamem_initialized) return;
 
@@ -4490,6 +4975,14 @@ static const process_command_entry_t SYSTEM_COMMANDS[] = {
   { "PAYLOAD_APPEND_TRACE", cmd_payload_append_trace },
   { "PAYLOAD_HEAP_RESIZE_TRACE", cmd_payload_heap_resize_trace },
   { "PAYLOAD_CONTRACT_INFO", cmd_payload_contract_info },
+  { "PAYLOAD_TEST_INLINE", cmd_payload_test_inline },
+  { "PAYLOAD_TEST_RESERVE", cmd_payload_test_reserve },
+  { "PAYLOAD_TEST_GROWTH", cmd_payload_test_growth },
+  { "PAYLOAD_TEST_COPY", cmd_payload_test_copy },
+  { "PAYLOAD_TEST_MOVE", cmd_payload_test_move },
+  { "PAYLOAD_TEST_ARRAY", cmd_payload_test_array },
+  { "PAYLOAD_TEST_NESTED", cmd_payload_test_nested },
+  { "PAYLOAD_TEST_RESPONSE", cmd_payload_test_response },
   { "STATUS",           cmd_status           },
   { nullptr,            nullptr }
 };

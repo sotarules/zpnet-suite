@@ -2841,12 +2841,186 @@ void payload_clear_retained_heap_resize_trace() {
 
 #endif
 
-void payload_get_heap_resize_trace(payload_heap_resize_trace_snapshot_t* out) {
-    if (out) memset(out, 0, sizeof(*out));
+// ---- Phase 2b exact heap-validation failure witness -------------------------
+//
+// Keep the historical multi-stage heap-resize recorder above disabled.  Its
+// cache flushes before the failing court could perturb the very transient being
+// investigated.  This replacement writes only after a heap validation has
+// already rejected state, using the exact header words consumed by that court.
+// No diagnostic reread, allocation, retry, repair, or semantic behavior change
+// is permitted on this path.
+
+static constexpr uint32_t PAYLOAD_HEAP_VALIDATION_MAGIC = 0x48564632UL;  // 'HVF2'
+static constexpr uint32_t PAYLOAD_HEAP_VALIDATION_SCHEMA_VERSION = 2U;
+
+struct payload_heap_validation_bank_t {
+    uint32_t magic;
+    uint32_t magic_inv;
+    uint32_t schema_version;
+    uint32_t capacity;
+    payload_heap_resize_trace_entry_t entries[PAYLOAD_HEAP_RESIZE_TRACE_ENTRIES];
+};
+
+static payload_heap_validation_bank_t
+    g_payload_heap_validation_live PAYLOAD_RETAINED_MEM;
+static payload_heap_validation_bank_t
+    g_payload_heap_validation_retained PAYLOAD_RETAINED_MEM;
+static bool g_payload_heap_validation_boot_latched = false;
+static volatile uint32_t g_payload_heap_validation_next_sequence = 0U;
+
+static FLASHMEM bool payload_heap_validation_bank_valid(
+    const payload_heap_validation_bank_t& bank) {
+    return bank.magic == PAYLOAD_HEAP_VALIDATION_MAGIC &&
+           (bank.magic ^ bank.magic_inv) == 0xFFFFFFFFUL &&
+           bank.schema_version == PAYLOAD_HEAP_VALIDATION_SCHEMA_VERSION &&
+           bank.capacity == PAYLOAD_HEAP_RESIZE_TRACE_ENTRIES;
 }
 
-void payload_clear_retained_heap_resize_trace() {}
+static FLASHMEM bool payload_heap_validation_entry_valid(
+    const payload_heap_resize_trace_entry_t& entry) {
+    return entry.sequence != 0U &&
+           (entry.sequence ^ entry.sequence_inv) == 0xFFFFFFFFUL;
+}
 
+static FLASHMEM void payload_heap_validation_initialize_live() {
+    memset((void*)&g_payload_heap_validation_live, 0,
+           sizeof(g_payload_heap_validation_live));
+    g_payload_heap_validation_live.schema_version =
+        PAYLOAD_HEAP_VALIDATION_SCHEMA_VERSION;
+    g_payload_heap_validation_live.capacity = PAYLOAD_HEAP_RESIZE_TRACE_ENTRIES;
+    g_payload_heap_validation_live.magic_inv = ~PAYLOAD_HEAP_VALIDATION_MAGIC;
+    g_payload_heap_validation_live.magic = PAYLOAD_HEAP_VALIDATION_MAGIC;
+    g_payload_heap_validation_next_sequence = 0U;
+    payload_retained_flush(&g_payload_heap_validation_live,
+                           sizeof(g_payload_heap_validation_live));
+}
+
+static FLASHMEM void payload_heap_validation_boot_latch() {
+    if (g_payload_heap_validation_boot_latched) return;
+    g_payload_heap_validation_boot_latched = true;
+
+    if (payload_heap_validation_bank_valid(g_payload_heap_validation_live)) {
+        g_payload_heap_validation_retained = g_payload_heap_validation_live;
+    } else {
+        memset((void*)&g_payload_heap_validation_retained, 0,
+               sizeof(g_payload_heap_validation_retained));
+    }
+    payload_retained_flush(&g_payload_heap_validation_retained,
+                           sizeof(g_payload_heap_validation_retained));
+    payload_heap_validation_initialize_live();
+}
+
+static FLASHMEM void payload_heap_validation_failure_record(
+    const void* raw,
+    const void* expected_owner,
+    const uint32_t observed_header[4],
+    uint32_t verdict_flags,
+    size_t span_remaining) {
+    payload_heap_validation_boot_latch();
+
+    uint32_t sequence = g_payload_heap_validation_next_sequence + 1U;
+    if (sequence == 0U) sequence = 1U;
+    g_payload_heap_validation_next_sequence = sequence;
+
+    payload_heap_resize_trace_entry_t& entry =
+        g_payload_heap_validation_live.entries[
+            (sequence - 1U) % PAYLOAD_HEAP_RESIZE_TRACE_ENTRIES];
+
+    entry.sequence = 0U;
+    entry.sequence_inv = 0U;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    payload_retained_flush(&entry, 2U * sizeof(uint32_t));
+    memset(reinterpret_cast<uint8_t*>(&entry) + 2U * sizeof(uint32_t),
+           0,
+           sizeof(entry) - 2U * sizeof(uint32_t));
+
+    entry.stage = (uint32_t)payload_heap_resize_trace_stage_t::VALIDATION_FAILED;
+    entry.this_ptr = (uint32_t)(uintptr_t)expected_owner;
+    entry.old_raw = (uint32_t)(uintptr_t)raw;
+    entry.new_raw = (uint32_t)(uintptr_t)raw;
+    entry.old_capacity = observed_header ? observed_header[0] : 0U;
+    entry.new_capacity = entry.old_capacity;
+    if (observed_header) {
+        entry.header0 = observed_header[0];
+        entry.header1 = observed_header[1];
+        entry.header2 = observed_header[2];
+        entry.header3 = observed_header[3];
+    }
+    entry.expected_owner_cookie = expected_owner
+        ? payload_heap_owner_cookie(expected_owner) : 0U;
+    entry.span_remaining = span_remaining > UINT32_MAX
+        ? UINT32_MAX : (uint32_t)span_remaining;
+    entry.verdict_flags = verdict_flags;
+    entry.alloc_overlap_count = g_payload_alloc_overlap_detected;
+    entry.alloc_overlap_depth = g_payload_alloc_depth;
+    entry.dwt_cyccnt = payload_read_dwt();
+    entry.ipsr = payload_read_ipsr();
+
+    entry.sequence_inv = ~sequence;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    entry.sequence = sequence;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    payload_retained_flush(&entry, sizeof(entry));
+}
+
+static FLASHMEM void payload_heap_validation_snapshot_bank(
+    const payload_heap_validation_bank_t& bank,
+    payload_heap_resize_trace_bank_snapshot_t* out) {
+    memset(out, 0, sizeof(*out));
+    if (!payload_heap_validation_bank_valid(bank)) return;
+    out->valid = 1U;
+
+    for (uint32_t i = 0U; i < PAYLOAD_HEAP_RESIZE_TRACE_ENTRIES; ++i) {
+        const volatile payload_heap_resize_trace_entry_t* source =
+            &bank.entries[i];
+        const uint32_t sequence_before = source->sequence;
+        const uint32_t sequence_inv_before = source->sequence_inv;
+        if (sequence_before == 0U ||
+            (sequence_before ^ sequence_inv_before) != 0xFFFFFFFFUL) {
+            continue;
+        }
+
+        const payload_heap_resize_trace_entry_t candidate = bank.entries[i];
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        if (source->sequence != sequence_before ||
+            source->sequence_inv != sequence_inv_before ||
+            !payload_heap_validation_entry_valid(candidate)) {
+            continue;
+        }
+
+        uint32_t pos = out->count;
+        while (pos > 0U &&
+               out->entries[pos - 1U].sequence > candidate.sequence) {
+            out->entries[pos] = out->entries[pos - 1U];
+            --pos;
+        }
+        out->entries[pos] = candidate;
+        ++out->count;
+    }
+
+    if (out->count != 0U) {
+        out->newest_sequence = out->entries[out->count - 1U].sequence;
+    }
+}
+
+FLASHMEM void payload_get_heap_resize_trace(payload_heap_resize_trace_snapshot_t* out) {
+    if (!out) return;
+    payload_heap_validation_boot_latch();
+    memset(out, 0, sizeof(*out));
+    payload_heap_validation_snapshot_bank(
+        g_payload_heap_validation_live, &out->live);
+    payload_heap_validation_snapshot_bank(
+        g_payload_heap_validation_retained, &out->retained);
+}
+
+FLASHMEM void payload_clear_retained_heap_resize_trace() {
+    memset((void*)&g_payload_heap_validation_retained, 0,
+           sizeof(g_payload_heap_validation_retained));
+    payload_retained_flush(&g_payload_heap_validation_retained,
+                           sizeof(g_payload_heap_validation_retained));
+}
+
+// All historical PRE/POST resize call sites remain compile-time no-ops.
 #define payload_heap_resize_trace_record(...) ((void)0)
 
 static bool payload_heap_read_capacity(const void* raw,
@@ -3991,24 +4165,74 @@ static bool payload_contract_heap_capacity_pure(const void* raw,
                                                 size_t maximum,
                                                 uint32_t* out_capacity) {
     if (out_capacity) *out_capacity = 0U;
-    if (!raw || !expected_owner || !payload_heap_header_span_readable(raw)) {
-        return false;
+
+    uint32_t flags = 0U;
+    if (raw) {
+        flags |= PAYLOAD_HEAP_RESIZE_FLAG_RAW_PRESENT;
+        if (((uintptr_t)raw % PAYLOAD_HEAP_ALIGNMENT) == 0U) {
+            flags |= PAYLOAD_HEAP_RESIZE_FLAG_ALIGNED;
+        }
+    }
+    const bool header_readable =
+        raw && payload_heap_header_span_readable(raw);
+    if (header_readable) {
+        flags |= PAYLOAD_HEAP_RESIZE_FLAG_HEADER_READABLE;
     }
 
     uint32_t header[4] = {0U, 0U, 0U, 0U};
+    if (!raw || !expected_owner || !header_readable) {
+        payload_heap_validation_failure_record(
+            raw, expected_owner, header, flags, 0U);
+        return false;
+    }
+
+    // This is the one authoritative header read. Every verdict and the retained
+    // Phase-2b witness are derived from these exact four words.
     memcpy(header, raw, sizeof(header));
     const uint32_t capacity = header[0];
     const uint32_t owner_cookie = payload_heap_owner_cookie(expected_owner);
-    if ((capacity ^ header[1]) != 0xFFFFFFFFUL ||
-        (header[2] ^ header[3]) != 0xFFFFFFFFUL ||
-        header[2] != owner_cookie ||
-        capacity < minimum || capacity > maximum) {
+    const bool capacity_complement_ok =
+        (capacity ^ header[1]) == 0xFFFFFFFFUL;
+    const bool owner_complement_ok =
+        (header[2] ^ header[3]) == 0xFFFFFFFFUL;
+    const bool owner_match = header[2] == owner_cookie;
+    const bool capacity_range_ok =
+        capacity >= minimum && capacity <= maximum;
+
+    if (capacity_complement_ok) {
+        flags |= PAYLOAD_HEAP_RESIZE_FLAG_CAP_COMPLEMENT;
+    }
+    if (owner_complement_ok) {
+        flags |= PAYLOAD_HEAP_RESIZE_FLAG_OWNER_COMPLEMENT;
+    }
+    if (owner_match) {
+        flags |= PAYLOAD_HEAP_RESIZE_FLAG_OWNER_MATCH;
+    }
+    if (capacity_range_ok) {
+        flags |= PAYLOAD_HEAP_RESIZE_FLAG_CAP_RANGE;
+    }
+
+    if (!capacity_complement_ok || !owner_complement_ok ||
+        !owner_match || !capacity_range_ok) {
+        payload_heap_validation_failure_record(
+            raw, expected_owner, header, flags, 0U);
         return false;
     }
-    if (!payload_contract_span_readable_pure(payload_heap_bytes(raw),
-                                             capacity)) {
+
+    size_t remaining = 0U;
+    uint32_t ignored_reason = 0U;
+    const bool storage_span_ok =
+        payload_pointer_remaining(payload_heap_bytes(raw),
+                                  &remaining,
+                                  &ignored_reason) &&
+        (size_t)capacity <= remaining;
+    if (!storage_span_ok) {
+        payload_heap_validation_failure_record(
+            raw, expected_owner, header, flags, remaining);
         return false;
     }
+    flags |= PAYLOAD_HEAP_RESIZE_FLAG_STORAGE_SPAN;
+
     if (out_capacity) *out_capacity = capacity;
     return true;
 }
