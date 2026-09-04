@@ -82,11 +82,11 @@
 //   • REPORT_RECOVERY     — report staging, restored source, and physical-ancestry testimony
 //   • INJECT_PROBLEM      — retained command identity; synthetic injection is unavailable
 //                           after retirement of the emulator
-//   • ON                  — rejected/hard-inhibited while the Step-4 boot coarse-source switch
-//                           is neutralized; when later enabled, opens active-low SDM gate
-//                           with LD_ON already HIGH
-//   • OFF                 — hard-inhibits while the Step-4 boot switch is neutralized; when
-//                           later enabled, closes the gate while leaving LD_ON HIGH
+//   • ON                  — with the Step-4 boot switch neutralized, enable LD_ON only after
+//                           re-proving the active-low SDM gate HIGH/closed; if the boot switch
+//                           is later enabled, ON resumes opening the gate with LD_ON already HIGH
+//   • OFF                 — while the Step-4 boot switch is neutralized, close the gate and
+//                           return LD_ON LOW; if later enabled, close the gate and leave LD_ON HIGH
 // ============================================================================
 
 // Cumulative ISR-authored optical-edge state from PD200T TTL pin 34.

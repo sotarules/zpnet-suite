@@ -2067,10 +2067,11 @@ static float photons_adc_voltage(uint16_t raw) {
   return (raw / ADC_FS_COUNTS) * ADC_FS_VOLTS;
 }
 
-// Optical authority is intentionally split.  The SDM/LANTERN gate is active-low
-// and owns normal optical ON/OFF.  LD_ON is the slower MP5491 coarse-source
-// enable: Step 4 leaves it HIGH continuously once initialization has proved the
-// fast gate closed.  A hard inhibit still exists for boot/fault containment only.
+// Optical authority is intentionally split.  The SDM/LANTERN gate is active-low.
+// LD_ON is the slower MP5491 coarse-source enable.  The current bisect baseline
+// keeps LD_ON LOW at boot; the first incremental commissioning step may raise it
+// explicitly while the gate remains physically re-proved closed.  Hard inhibit
+// always closes the gate first and removes the coarse source second.
 static void photons_laser_hard_inhibit(void) {
   digitalWrite(LASER_GATE_PIN, HIGH);
   digitalWrite(LD_ON_PIN, LOW);
@@ -6236,14 +6237,16 @@ static FLASHMEM Payload cmd_on(const Payload& /*args*/) {
     return p;
   }
   if (!PHOTONS_STEP4_COARSE_SOURCE_BOOT_ENABLED) {
-    // Harmless bisect baseline: ON cannot manufacture light or energize the
-    // coarse source. Keep both inhibits asserted and return explicit testimony.
-    photons_laser_hard_inhibit();
+    // First post-baseline commissioning increment: energize only the slow
+    // MP5491 coarse source.  The active-low SDM gate must remain HIGH/closed,
+    // so this command cannot intentionally author optical emission.
+    photons_laser_coarse_source_enable_behind_closed_gate();
     Payload p;
-    p.add("status", "on_rejected_step4_coarse_source_boot_disabled");
+    p.add("status", "coarse_source_enabled_gate_closed");
     p.add("laser_gate_level", HIGH);
-    p.add("ld_on_level", LOW);
+    p.add("ld_on_level", HIGH);
     p.add("coarse_source_boot_enabled", false);
+    p.add("gate_active_low", true);
     return p;
   }
   if (digitalRead(LD_ON_PIN) != HIGH) {
