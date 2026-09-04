@@ -2061,7 +2061,12 @@ static float photons_adc_voltage(uint16_t raw) {
   return (raw / ADC_FS_COUNTS) * ADC_FS_VOLTS;
 }
 
+// Runtime optical-safety invariant.  The fast LANTERN gate is active-low, so
+// close it before removing the MP5491 coarse source.  Until a later
+// commissioning step explicitly introduces a gate-open transaction, PHOTONS
+// has no lawful writer of LASER_GATE_PIN LOW.
 static void photons_laser_inhibit(void) {
+  digitalWrite(LASER_GATE_PIN, HIGH);
   digitalWrite(LD_ON_PIN, LOW);
 }
 
@@ -2336,6 +2341,13 @@ static void photons_race_start(void) {
 }
 
 static void photons_laser_initialize_hardware(void) {
+  // Take runtime custody from the early-boot safety boundary without ever
+  // authoring an emitting intermediate state.  Preload both output latches
+  // while their modes are still whatever boot left behind, then drive them.
+  // Gate HIGH is the primary optical inhibit; LD_ON LOW removes the coarse
+  // source.  Both are established before any MP5491 configuration write.
+  photons_laser_inhibit();
+  pinMode(LASER_GATE_PIN, OUTPUT);
   pinMode(LD_ON_PIN, OUTPUT);
   photons_laser_inhibit();
 
