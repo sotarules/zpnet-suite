@@ -200,10 +200,10 @@ static volatile uint32_t g_payload_contract_event_emit_failed = 0;
 static volatile uint32_t g_payload_contract_event_incidents_suppressed = 0;
 static volatile uint32_t g_payload_contract_suppression_depth = 0;
 
-static void payload_contract_note_error(uint32_t code,
+static FLASHMEM void payload_contract_note_error(uint32_t code,
                                         uint32_t operation_id,
                                         const void* self);
-static void payload_contract_note_integrity(uint32_t operation_id,
+static FLASHMEM void payload_contract_note_integrity(uint32_t operation_id,
                                             const void* self,
                                             uint32_t entry_index,
                                             uint32_t expected,
@@ -668,7 +668,7 @@ struct payload_layout_evidence_t {
 // Small, non-recursive diagnostics
 // ============================================================================
 
-static void payload_copy_label(char* dst, size_t cap, const char* src) {
+static FLASHMEM void payload_copy_label(char* dst, size_t cap, const char* src) {
     if (!dst || cap == 0) return;
     if (!src) src = "?";
     size_t i = 0;
@@ -680,7 +680,7 @@ static void payload_copy_label(char* dst, size_t cap, const char* src) {
 }
 
 
-static void payload_copy_span_label(char* dst,
+static FLASHMEM void payload_copy_span_label(char* dst,
                                     size_t cap,
                                     const char* src,
                                     size_t len) {
@@ -705,12 +705,12 @@ static size_t payload_bounded_local_strlen(const char* text,
     return capacity;
 }
 
-static char payload_hex_digit(uint8_t value) {
+static FLASHMEM char payload_hex_digit(uint8_t value) {
     return value < 10U ? (char)('0' + value)
                        : (char)('A' + (value - 10U));
 }
 
-static void payload_capture_numeric_text(const char* text,
+static FLASHMEM void payload_capture_numeric_text(const char* text,
                                          size_t capacity,
                                          int formatter_return) {
     bool terminated = false;
@@ -742,7 +742,7 @@ static void payload_capture_numeric_text(const char* text,
          (size_t)formatter_return >= capacity) ? 1U : 0U;
 }
 
-static void payload_note_numeric_reject(uint32_t reason,
+static FLASHMEM void payload_note_numeric_reject(uint32_t reason,
                                         uint32_t operation_id,
                                         const void* self,
                                         const char* key,
@@ -806,7 +806,7 @@ static void payload_note_numeric_reject(uint32_t reason,
     }
 }
 
-static void payload_increment_semantic_reason(uint32_t reason) {
+static FLASHMEM void payload_increment_semantic_reason(uint32_t reason) {
     switch (reason) {
         case PAYLOAD_SEMANTIC_FAIL_INVALID_KIND:
             g_payload_semantic_invalid_kind++;
@@ -837,7 +837,7 @@ static void payload_increment_semantic_reason(uint32_t reason) {
     }
 }
 
-static void payload_note_semantic_failure(uint32_t reason,
+static FLASHMEM void payload_note_semantic_failure(uint32_t reason,
                                           uint32_t operation_id,
                                           const void* self,
                                           size_t entry_index,
@@ -872,7 +872,7 @@ static void payload_note_semantic_failure(uint32_t reason,
 // and no runtime observation state survives.
 #define payload_flight_note(...) ((void)0)
 
-static inline void payload_note_error(uint32_t code,
+static FLASHMEM void payload_note_error(uint32_t code,
                                       uint32_t operation_id,
                                       const void* self) {
     // Failure bookkeeping is scalar-only. operation_id is already numeric;
@@ -886,7 +886,7 @@ static inline void payload_note_error(uint32_t code,
     payload_contract_note_error(code, operation_id, self);
 }
 
-static void payload_increment_integrity_reason(uint32_t reason) {
+static FLASHMEM void payload_increment_integrity_reason(uint32_t reason) {
     switch (reason) {
         case PAYLOAD_SELF_OK_MAGIC_BAD: g_payload_self_ok_magic_bad++; break;
         case PAYLOAD_SELF_OK_ENTRIES_NULL: g_payload_self_ok_entries_null++; break;
@@ -915,7 +915,7 @@ static void payload_increment_integrity_reason(uint32_t reason) {
     }
 }
 
-static void payload_note_integrity(
+static FLASHMEM void payload_note_integrity(
     uint32_t reason,
     uint32_t operation_id,
     const void* self,
@@ -1455,7 +1455,7 @@ FLASHMEM const char* payload_stamp_trace_stage_name(uint32_t stage) {
 static constexpr uint32_t PAYLOAD_FATAL_MAGIC = 0x50464154UL;  // 'PFAT'
 static payload_fatal_record_t g_payload_fatal_record PAYLOAD_RETAINED_MEM;
 
-static bool payload_fatal_record_valid(const payload_fatal_record_t& record) {
+static FLASHMEM bool payload_fatal_record_valid(const payload_fatal_record_t& record) {
     return record.magic == PAYLOAD_FATAL_MAGIC &&
            (record.magic ^ record.magic_inv) == 0xFFFFFFFFUL &&
            record.schema_version == PAYLOAD_FATAL_SCHEMA_VERSION &&
@@ -1463,7 +1463,7 @@ static bool payload_fatal_record_valid(const payload_fatal_record_t& record) {
            (record.sequence ^ record.sequence_inv) == 0xFFFFFFFFUL;
 }
 
-bool payload_fatal_record_get(payload_fatal_record_t* out) {
+FLASHMEM bool payload_fatal_record_get(payload_fatal_record_t* out) {
     if (!out) return false;
     if (!payload_fatal_record_valid(g_payload_fatal_record)) {
         memset(out, 0, sizeof(*out));
@@ -1473,13 +1473,13 @@ bool payload_fatal_record_get(payload_fatal_record_t* out) {
     return payload_fatal_record_valid(*out);
 }
 
-void payload_fatal_record_clear(void) {
+FLASHMEM void payload_fatal_record_clear(void) {
     memset((void*)&g_payload_fatal_record, 0, sizeof(g_payload_fatal_record));
     payload_retained_flush(&g_payload_fatal_record,
                            sizeof(g_payload_fatal_record));
 }
 
-[[noreturn]] static void payload_fatal_stop(uint32_t error_code,
+[[noreturn]] static FLASHMEM void payload_fatal_stop(uint32_t error_code,
                                             uint32_t operation_id,
                                             const void* self,
                                             size_t requested_bytes,
@@ -1576,7 +1576,7 @@ static volatile uint32_t g_payload_contract_pending_tail = 0U;
 static volatile uint32_t g_payload_contract_pending_count = 0U;
 static payload_contract_incident_t g_payload_contract_first_this_boot;
 
-static void payload_contract_capture_prefix(
+static FLASHMEM void payload_contract_capture_prefix(
     uint32_t operation_id,
     const void* self,
     payload_contract_event_t* event);
@@ -1626,7 +1626,7 @@ static void payload_contract_boot_latch(void) {
     payload_contract_initialize_live();
 }
 
-static void payload_contract_increment_phase(uint32_t phase) {
+static FLASHMEM void payload_contract_increment_phase(uint32_t phase) {
     switch ((payload_contract_phase_t)phase) {
         case payload_contract_phase_t::PRECONDITION:
             g_payload_contract_precondition_failures++;
@@ -1651,7 +1651,7 @@ static void payload_contract_increment_phase(uint32_t phase) {
     }
 }
 
-static void payload_contract_record(
+static FLASHMEM void payload_contract_record(
     payload_contract_phase_t phase,
     payload_contract_reason_t reason,
     uint32_t operation_id,
@@ -1741,7 +1741,7 @@ static void payload_contract_record(
     critical_exit(saved);
 }
 
-static void payload_contract_snapshot_bank(
+static FLASHMEM void payload_contract_snapshot_bank(
     const payload_contract_bank_t& bank,
     payload_contract_bank_snapshot_t* out) {
     memset(out, 0, sizeof(*out));
@@ -1783,7 +1783,7 @@ static void payload_contract_snapshot_bank(
 // RAM1 initiative: payload_contract_get_info() needs only the newest incident
 // from each retained bank.  Scan in place instead of keeping a permanent full
 // live+retained snapshot scratch buffer in DTCM.
-static bool payload_contract_latest_incident(
+static FLASHMEM bool payload_contract_latest_incident(
     const payload_contract_bank_t& bank,
     payload_contract_incident_t* out) {
     if (!out) return false;
@@ -1895,7 +1895,7 @@ void payload_contract_event_end(bool emitted) {
     critical_exit(saved);
 }
 
-void payload_contract_clear_retained(void) {
+FLASHMEM void payload_contract_clear_retained(void) {
     memset((void*)&g_payload_contract_retained, 0,
            sizeof(g_payload_contract_retained));
     payload_retained_flush(&g_payload_contract_retained,
@@ -1960,7 +1960,7 @@ FLASHMEM const char* payload_contract_reason_name(uint32_t reason) {
     }
 }
 
-static payload_contract_reason_t payload_contract_reason_for_error(
+static FLASHMEM payload_contract_reason_t payload_contract_reason_for_error(
     uint32_t code) {
     switch (code) {
         case PAYLOAD_ERR_BAD_STRING_POINTER:
@@ -1997,7 +1997,7 @@ static payload_contract_reason_t payload_contract_reason_for_error(
     }
 }
 
-static void payload_contract_note_error(uint32_t code,
+static FLASHMEM void payload_contract_note_error(uint32_t code,
                                         uint32_t operation_id,
                                         const void* self) {
     const payload_contract_reason_t reason =
@@ -2024,7 +2024,7 @@ static void payload_contract_note_error(uint32_t code,
                             0U);
 }
 
-static void payload_contract_note_integrity(uint32_t operation_id,
+static FLASHMEM void payload_contract_note_integrity(uint32_t operation_id,
                                             const void* self,
                                             uint32_t entry_index,
                                             uint32_t expected,
@@ -2472,7 +2472,7 @@ static bool payload_pointer_remaining(const void* ptr,
 #endif
 }
 
-static void payload_note_string_pointer_fault(uint32_t reason,
+static FLASHMEM void payload_note_string_pointer_fault(uint32_t reason,
                                               const void* ptr,
                                               uint32_t operation_id) {
     g_payload_string_pointer_fault++;
@@ -2547,7 +2547,7 @@ static bool payload_cstr_len_checked(const char* str,
     return false;
 }
 
-static void payload_note_bad_key(const char* key) {
+static FLASHMEM void payload_note_bad_key(const char* key) {
     // Preserve only the address.  A bad-key breadcrumb must never inspect the
     // very pointer whose custody is in question.
     g_payload_last_string_pointer_fault_key_ptr = (uint32_t)(uintptr_t)key;
@@ -4030,7 +4030,7 @@ enum class payload_contract_prefix_kind_t : uint32_t {
     ARRAY = 2U,
 };
 
-static payload_contract_prefix_kind_t
+static FLASHMEM payload_contract_prefix_kind_t
 payload_contract_prefix_kind_for_operation(uint32_t operation_id) {
     switch (operation_id) {
         case PAYLOAD_OP_ARRAY_ADD_WRITE:
@@ -4063,7 +4063,7 @@ payload_contract_prefix_kind_for_operation(uint32_t operation_id) {
     }
 }
 
-static void payload_contract_capture_prefix(
+static FLASHMEM void payload_contract_capture_prefix(
     uint32_t operation_id,
     const void* self,
     payload_contract_event_t* event) {
@@ -4237,7 +4237,7 @@ static bool payload_contract_heap_capacity_pure(const void* raw,
     return true;
 }
 
-static void payload_contract_record_state_failure(
+static FLASHMEM void payload_contract_record_state_failure(
     payload_contract_phase_t phase,
     uint32_t operation_id,
     const void* self,
@@ -4259,7 +4259,7 @@ static void payload_contract_record_state_failure(
                             false);
 }
 
-static void payload_contract_record_postcondition(
+static FLASHMEM void payload_contract_record_postcondition(
     uint32_t operation_id,
     const void* self,
     const void* related,
@@ -6041,7 +6041,7 @@ size_t Payload::_append_required_bytes(size_t key_len,
 }
 
 
-[[noreturn]] void Payload::_fatal(uint32_t fallback_error_code,
+[[noreturn]] FLASHMEM void Payload::_fatal(uint32_t fallback_error_code,
                                    uint32_t fallback_operation_id,
                                    size_t requested_bytes) const {
     payload_contract_state_t state{};
@@ -7333,7 +7333,7 @@ static bool payload_decimal_matches_signed(const char* text,
     return payload_decimal_matches_unsigned(text + 1U, length - 1U, magnitude);
 }
 
-static void payload_note_numeric_length_custody(uint32_t operation_id,
+static FLASHMEM void payload_note_numeric_length_custody(uint32_t operation_id,
                                                 const void* self,
                                                 size_t reported,
                                                 size_t observed,
@@ -8673,7 +8673,7 @@ PayloadArrayView Payload::getArrayView(const char* key) const {
 // Explicit debug dump
 // ============================================================================
 
-void Payload::debug_dump(const char* tag) const {
+FLASHMEM void Payload::debug_dump(const char* tag) const {
     char safe_tag[32];
     size_t tag_len = 0;
     if (!tag || !payload_cstr_len_checked(tag,
@@ -9210,7 +9210,7 @@ bool PayloadArray::_copy_from(const PayloadArray& other) {
 }
 
 
-[[noreturn]] void PayloadArray::_fatal(uint32_t fallback_error_code,
+[[noreturn]] FLASHMEM void PayloadArray::_fatal(uint32_t fallback_error_code,
                                         uint32_t fallback_operation_id,
                                         size_t requested_bytes) const {
     payload_contract_state_t state{};
