@@ -1101,6 +1101,7 @@ def _validate_photons_fragment(fragment: Payload) -> Tuple[int, int, Optional[in
         )
     if race.get("schema") != PHOTONS_RACE_SCHEMA:
         raise ValueError(f"unsupported PHOTONS race schema {race.get('schema')!r}")
+    _require_bool(race.get("active"), "photons.race.active")
 
     cadence_hz = _require_int(race.get("cadence_hz"), "photons.race.cadence_hz", minimum=1)
     cadence_ns = _require_int(race.get("cadence_ns"), "photons.race.cadence_ns", minimum=1)
@@ -3984,6 +3985,279 @@ def _project_photons_recovery_snapshot(
     }
 
 
+def _load_newest_empty_photons_heartbeat_state(
+    *,
+    active_master: Optional[Dict[str, Any]],
+    require_active_campaign: bool,
+) -> Optional[Dict[str, Any]]:
+    """Recognize only a durable zero-race/zero-science heartbeat epoch.
+
+    This is not a resurrection source and never authorizes fallback to older
+    scientific history. It exists solely to distinguish a truthful empty heartbeat
+    from corrupted newest ancestry. Any race attempt, candidate, accepted/excluded
+    observation, custody, active campaign, restored lineage, or malformed field
+    makes the row ineligible for this classification.
+    """
+    if active_master is not None or require_active_campaign:
+        return None
+
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, ts, campaign, viable, payload, sequence, pps_count
+            FROM campaign_detail
+            WHERE campaign_type = %s
+              AND payload #>> '{photons,source}' = %s
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (CAMPAIGN_TYPE_LANTERN, "PD200T_REAL_RACE"),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+
+    try:
+        if not bool(row.get("viable")) or row.get("campaign") not in (None, ""):
+            return None
+        state = row.get("payload")
+        if isinstance(state, str):
+            state = json.loads(state)
+        state = _require_dict(state, "empty-heartbeat campaign_detail.payload")
+        if state.get("schema") != PHOTONS_SCHEMA:
+            return None
+
+        sequence = _require_int(
+            state.get("sequence"), "empty-heartbeat PHOTONS.sequence", minimum=1
+        )
+        instrument = _require_dict(
+            state.get("photons"), "empty-heartbeat PHOTONS.photons"
+        )
+        if (
+            instrument.get("schema") != PHOTONS_INSTRUMENT_SCHEMA
+            or instrument.get("source") != "PD200T_REAL_RACE"
+            or _require_bool(
+                instrument.get("snapshot_ok"),
+                "empty-heartbeat PHOTONS.photons.snapshot_ok",
+            ) is not True
+            or _require_bool(
+                instrument.get("valid"),
+                "empty-heartbeat PHOTONS.photons.valid",
+            ) is not False
+        ):
+            return None
+        if state.get("campaign") is not None:
+            return None
+
+        race = _require_dict(
+            instrument.get("race"), "empty-heartbeat PHOTONS.photons.race"
+        )
+        if race.get("schema") != PHOTONS_RACE_SCHEMA:
+            return None
+        if (
+            _require_int(
+                race.get("cadence_hz"),
+                "empty-heartbeat PHOTONS.photons.race.cadence_hz",
+                minimum=1,
+            ) != PHOTONS_RACE_CADENCE_HZ
+            or _require_int(
+                race.get("cadence_ns"),
+                "empty-heartbeat PHOTONS.photons.race.cadence_ns",
+                minimum=1,
+            ) != PHOTONS_RACE_CADENCE_NS
+            or _require_int(
+                race.get("pulse_ns"),
+                "empty-heartbeat PHOTONS.photons.race.pulse_ns",
+                minimum=1,
+            ) != PHOTONS_RACE_PULSE_NS
+            or race.get("launch_surrogate") != "LD_ON_FALLING_EDGE"
+            or race.get("flight_interpretation") != "ESTIMATED"
+        ):
+            return None
+
+        for field in (
+            "cadence_tick_count_total",
+            "attempt_count_total",
+            "completed_count_total",
+            "missed_count_total",
+            "skipped_not_quiet_total",
+            "skipped_projection_total",
+            "invalid_endpoint_total",
+            "enqueue_failure_total",
+        ):
+            if _require_int(
+                race.get(field), f"empty-heartbeat PHOTONS.photons.race.{field}"
+            ) != 0:
+                return None
+        if _require_int(
+            race.get("skipped_backpressure_total", 0),
+            "empty-heartbeat PHOTONS.photons.race.skipped_backpressure_total",
+        ) != 0:
+            return None
+
+        stats = _require_dict(
+            instrument.get("stats"), "empty-heartbeat PHOTONS.photons.stats"
+        )
+        science = _require_dict(
+            instrument.get("science"), "empty-heartbeat PHOTONS.photons.science"
+        )
+        projection = _require_dict(
+            instrument.get("projection"), "empty-heartbeat PHOTONS.photons.projection"
+        )
+        recovery = _require_dict(
+            instrument.get("recovery"), "empty-heartbeat PHOTONS.photons.recovery"
+        )
+        if (
+            stats.get("schema") != PHOTONS_STATS_SCHEMA
+            or science.get("schema") != PHOTONS_SCIENCE_SCHEMA
+            or _require_bool(
+                stats.get("valid"), "empty-heartbeat PHOTONS.photons.stats.valid"
+            ) is not False
+            or _require_bool(
+                recovery.get("restored"),
+                "empty-heartbeat PHOTONS.photons.recovery.restored",
+            ) is not False
+            or _require_bool(
+                recovery.get("fresh_physical_ancestry"),
+                "empty-heartbeat PHOTONS.photons.recovery.fresh_physical_ancestry",
+            ) is not True
+        ):
+            return None
+
+        zero_stats = (
+            _require_int(
+                stats.get("lap_count"),
+                "empty-heartbeat PHOTONS.photons.stats.lap_count",
+            ),
+            _require_int(
+                stats.get("total_lap_gnss_ns"),
+                "empty-heartbeat PHOTONS.photons.stats.total_lap_gnss_ns",
+            ),
+            _require_int(
+                stats.get("custody_lap_count"),
+                "empty-heartbeat PHOTONS.photons.stats.custody_lap_count",
+            ),
+            _require_int(
+                stats.get("custody_total_lap_gnss_ns"),
+                "empty-heartbeat PHOTONS.photons.stats.custody_total_lap_gnss_ns",
+            ),
+        )
+        if any(zero_stats):
+            return None
+
+        lap_welford = _validate_recovery_welford(
+            stats.get("lap_time"), "empty-heartbeat PHOTONS.photons.stats.lap_time"
+        )
+        accepted = _require_dict(
+            science.get("accepted"), "empty-heartbeat PHOTONS.photons.science.accepted"
+        )
+        excluded = _require_dict(
+            science.get("excluded"), "empty-heartbeat PHOTONS.photons.science.excluded"
+        )
+        if (
+            _require_int(
+                science.get("candidate_count"),
+                "empty-heartbeat PHOTONS.photons.science.candidate_count",
+            ) != 0
+            or _require_bool(
+                science.get("seed_pending"),
+                "empty-heartbeat PHOTONS.photons.science.seed_pending",
+            )
+            or _require_int(
+                accepted.get("count"),
+                "empty-heartbeat PHOTONS.photons.science.accepted.count",
+            ) != 0
+            or _require_int(
+                excluded.get("count"),
+                "empty-heartbeat PHOTONS.photons.science.excluded.count",
+            ) != 0
+            or _require_int(
+                projection.get("attempt_count"),
+                "empty-heartbeat PHOTONS.photons.projection.attempt_count",
+            ) != 0
+            or int(lap_welford["n"]) != 0
+        ):
+            return None
+        for population_name, population in (
+            ("accepted", accepted),
+            ("excluded", excluded),
+        ):
+            for welford_name in ("raw_cycles", "projected_lap_ns"):
+                w = _validate_recovery_welford(
+                    population.get(welford_name),
+                    f"empty-heartbeat PHOTONS.photons.science.{population_name}.{welford_name}",
+                )
+                if int(w["n"]) != 0:
+                    return None
+
+        reset_count = _require_int(
+            stats.get("reset_count"),
+            "empty-heartbeat PHOTONS.photons.stats.reset_count",
+        )
+        update_count = _require_int(
+            stats.get("update_count"),
+            "empty-heartbeat PHOTONS.photons.stats.update_count",
+            minimum=1,
+        )
+    except Exception:
+        return None
+
+    return {
+        "schema": "PHOTONS_EMPTY_HEARTBEAT_EPOCH_V1",
+        "detail_id": int(row["id"]),
+        "sequence": int(sequence),
+        "reset_count": int(reset_count),
+        "update_count": int(update_count),
+        "from_source": "PD200T_REAL_RACE_EMPTY_HEARTBEAT",
+        "to_source": "PD200T_REAL_RACE",
+        "producer_action": "COLD_START_EMPTY_HEARTBEAT_EPOCH",
+        "historical_detail_rows_preserved": 0,
+    }
+
+
+def _load_newest_recovery_or_empty_heartbeat(
+    *,
+    active_master: Optional[Dict[str, Any]],
+    require_active_campaign: bool,
+) -> Tuple[
+    Optional[_PhotonsRecoverySnapshot],
+    List[Dict[str, Any]],
+    int,
+    Optional[Dict[str, Any]],
+]:
+    """Classify newest durable PHOTONS without treating empty heartbeat as corruption."""
+    try:
+        snapshot, skipped, rows_scanned = _load_newest_recoverable_photons_state(
+            active_master=active_master,
+            require_active_campaign=require_active_campaign,
+        )
+        return snapshot, skipped, rows_scanned, None
+    except RuntimeError as exc:
+        empty = _load_newest_empty_photons_heartbeat_state(
+            active_master=active_master,
+            require_active_campaign=require_active_campaign,
+        )
+        if empty is None:
+            raise
+        logging.warning(
+            "🫀 [photons/recovery] newest durable PHOTONS row id=%d is a lawful "
+            "zero-race heartbeat epoch, not a resurrection source; preserving it "
+            "without falling back to older science: %s",
+            int(empty["detail_id"]),
+            exc,
+        )
+        return (
+            None,
+            [{
+                "id": int(empty["detail_id"]),
+                "reason": "LAWFUL_EMPTY_HEARTBEAT_NOT_RESURRECTION_SOURCE",
+            }],
+            1,
+            empty,
+        )
+
+
 def _load_newest_recoverable_photons_state(
     *,
     active_master: Optional[Dict[str, Any]],
@@ -4270,6 +4544,55 @@ def _fetch_teensy_recovery_report(
         _require_int(payload.get(field), f"PHOTONS.REPORT_RECOVERY.{field}")
     if publication_started and not payload["fresh_physical_ancestry"]:
         raise RuntimeError("live PHOTONS recovery report lacks fresh physical ancestry")
+    return copy.deepcopy(payload)
+
+
+def _fetch_teensy_bringup_report() -> Optional[Dict[str, Any]]:
+    """Return explicit PHOTONS bring-up testimony, or None for a live broad report."""
+    response = send_command(
+        machine="TEENSY",
+        subsystem=SUBSYSTEM,
+        command="REPORT",
+        retries=1,
+        retry_delay_s=0.0,
+    )
+    payload = response.get("payload") if isinstance(response, dict) else None
+    if not isinstance(response, dict) or not response.get("success") or not isinstance(payload, dict):
+        raise RuntimeError(f"Teensy PHOTONS.REPORT unavailable: {response!r}")
+    if payload.get("schema") != "PHOTONS_BRINGUP_REPORT_V2":
+        return None
+
+    if _require_bool(payload.get("initialized"), "PHOTONS.REPORT.initialized") is not True:
+        raise RuntimeError("PHOTONS bring-up report says firmware is not initialized")
+    if _require_bool(
+        payload.get("interrupt_subscribed"),
+        "PHOTONS.REPORT.interrupt_subscribed",
+    ) is not True:
+        raise RuntimeError("PHOTONS bring-up report lacks detector subscription")
+    _require_bool(payload.get("interrupt_active"), "PHOTONS.REPORT.interrupt_active")
+    if _require_bool(
+        payload.get("publication_started"),
+        "PHOTONS.REPORT.publication_started",
+    ) is not False:
+        raise RuntimeError("PHOTONS bring-up report unexpectedly has publication active")
+    if _require_bool(
+        payload.get("race_engine_active"),
+        "PHOTONS.REPORT.race_engine_active",
+    ) is not False:
+        raise RuntimeError("PHOTONS bring-up report unexpectedly has race engine active")
+    if _require_int(payload.get("laser_gate_level"), "PHOTONS.REPORT.laser_gate_level") != 1:
+        raise RuntimeError("PHOTONS bring-up report says active-low laser gate is not inhibited")
+    if _require_int(payload.get("ld_on_level"), "PHOTONS.REPORT.ld_on_level") != 0:
+        raise RuntimeError("PHOTONS bring-up report says coarse laser source is not inhibited")
+    _require_u32(payload.get("interrupt_irq_count"), "PHOTONS.REPORT.interrupt_irq_count")
+    _require_u32(
+        payload.get("interrupt_callback_count"),
+        "PHOTONS.REPORT.interrupt_callback_count",
+    )
+    _require_u32(
+        payload.get("interrupt_inactive_edge_count"),
+        "PHOTONS.REPORT.interrupt_inactive_edge_count",
+    )
     return copy.deepcopy(payload)
 
 
@@ -5024,6 +5347,12 @@ def _live_fragment_recovery_witness(
     recovery = _require_dict(
         instrument.get("recovery"), "PHOTONS_FRAGMENT.photons.recovery"
     )
+    race = _require_dict(
+        instrument.get("race"), "PHOTONS_FRAGMENT.photons.race"
+    )
+    race_engine_active = _require_bool(
+        race.get("active"), "PHOTONS_FRAGMENT.photons.race.active"
+    )
 
     baseline_fs = _require_int(
         stats.get("lap_baseline_fs"),
@@ -5120,6 +5449,7 @@ def _live_fragment_recovery_witness(
         "producer_recovery_generation": int(recovery_generation),
         "recovery_restored": bool(recovery.get("restored")),
         "recovery_proof_committed": bool(recovery.get("proof_committed")),
+        "race_engine_active": bool(race_engine_active),
         "fresh_physical_ancestry": True,
     }
 
@@ -5202,14 +5532,18 @@ def _recovery_proof_matches(
         )
 
     if mode == "LIVE_PRODUCER_ADOPT":
+        # PHOTONS_FRAGMENT is the instrument heartbeat, not evidence that a race
+        # occurred. A healthy descendant must advance publication/update chronology,
+        # while cumulative scientific N/T and custody may lawfully remain unchanged
+        # for arbitrarily many zero-race seconds.
         return (
             reset_count == int(expected["reset_count"])
             and sequence > int(expected["sequence"])
             and update_count > int(expected["update_count"])
-            and lap_count > int(expected["lap_count"])
-            and total_ns > int(expected["total_lap_gnss_ns"])
-            and custody_laps > int(expected["custody_lap_count"])
-            and custody_total > int(expected["custody_total_lap_gnss_ns"])
+            and lap_count >= int(expected["lap_count"])
+            and total_ns >= int(expected["total_lap_gnss_ns"])
+            and custody_laps >= int(expected["custody_lap_count"])
+            and custody_total >= int(expected["custody_total_lap_gnss_ns"])
         )
 
     if mode == "COLD_START":
@@ -5218,14 +5552,14 @@ def _recovery_proof_matches(
             generation = _require_int(recovery.get("generation"), "cold proof generation")
         except Exception:
             return False
+        # The first durable row of an empty cold-start epoch is allowed to contain
+        # zero races. Structural validation has already proved N/T and custody
+        # accounting; durability proof requires fresh ancestry plus advancing
+        # heartbeat chronology, not a manufactured optical observation.
         return (
             not restored
             and generation == int(expected["generation"])
             and update_count >= 1
-            and lap_count >= 1
-            and total_ns >= 1
-            and custody_laps >= 1
-            and custody_total >= 1
         )
 
     raise RuntimeError(f"unknown PHOTONS recovery proof mode {mode!r}")
@@ -5855,6 +6189,16 @@ def _startup_held_restore(
             args=commit_args,
             accepted_statuses={"recovery_committed"},
         )
+        if _require_bool(
+            commit.get("publication_started"),
+            "PHOTONS.RECOVERY_COMMIT.publication_started",
+        ) is not True:
+            raise RuntimeError("PHOTONS RECOVERY_COMMIT did not start the heartbeat publisher")
+        if _require_bool(
+            commit.get("race_engine_active"),
+            "PHOTONS.RECOVERY_COMMIT.race_engine_active",
+        ) is not False:
+            raise RuntimeError("PHOTONS RECOVERY_COMMIT unexpectedly started the race engine")
     except Exception:
         _best_effort_recovery_abort()
         raise
@@ -5971,11 +6315,11 @@ def _startup_cold_start(
         raise RuntimeError("cold PHOTONS start was requested despite durable LANTERN rows")
     if isinstance(migration, dict):
         if active_master is not None:
-            raise RuntimeError("real-race source migration requires the legacy LANTERN campaign STOPPED")
+            raise RuntimeError("PHOTONS cold-start epoch cutover requires LANTERN STOPPED")
         if migration.get("to_source") != "PD200T_REAL_RACE":
-            raise RuntimeError("unsupported PHOTONS source-epoch migration target")
+            raise RuntimeError("unsupported PHOTONS cold-start epoch target")
         if int(migration.get("historical_detail_rows_preserved") or 0) != int(rows_seen):
-            raise RuntimeError("PHOTONS source-epoch migration row accounting changed")
+            raise RuntimeError("PHOTONS cold-start epoch row accounting changed")
 
     generation = _new_recovery_generation()
     _rehydrate_pi_campaign(
@@ -5998,6 +6342,16 @@ def _startup_cold_start(
         args={"generation": generation},
         accepted_statuses={"recovery_cold_start_committed"},
     )
+    if _require_bool(
+        cold.get("publication_started"),
+        "PHOTONS.RECOVERY_COLD_START.publication_started",
+    ) is not True:
+        raise RuntimeError("PHOTONS RECOVERY_COLD_START did not start the heartbeat publisher")
+    if _require_bool(
+        cold.get("race_engine_active"),
+        "PHOTONS.RECOVERY_COLD_START.race_engine_active",
+    ) is not False:
+        raise RuntimeError("PHOTONS RECOVERY_COLD_START unexpectedly started the race engine")
     if _runtime_recovery_hold.is_set():
         _runtime_recovery_hold.clear()
         logging.info(
@@ -6031,7 +6385,7 @@ def _startup_cold_start(
 def _startup_adopt_live_producer(
     *,
     active_master: Optional[Dict[str, Any]],
-    source: Dict[str, Any],
+    source: Optional[Dict[str, Any]],
     live_witness: Dict[str, Any],
     transport_generation: int,
     skipped: List[Dict[str, Any]],
@@ -6112,7 +6466,10 @@ def _startup_adopt_live_producer(
         "generation": recovery_generation,
         "producer_recovery_generation": producer_generation,
         "transport_generation": int(transport_generation),
-        "source_detail_id": int(source["db_detail_id"]),
+        "source_detail_id": (
+            int(source["db_detail_id"]) if isinstance(source, dict) else None
+        ),
+        "durable_resurrection_source_available": isinstance(source, dict),
         "source_rows_scanned": rows_scanned,
         "damaged_rows_skipped": copy.deepcopy(skipped),
         "ingress_rows_drained": 0,
@@ -6174,9 +6531,11 @@ def _perform_phase5_recovery(
             else False
         )
         require_active_campaign = active_master is not None and active_detail_present
-        snapshot, skipped, rows_scanned = _load_newest_recoverable_photons_state(
-            active_master=active_master,
-            require_active_campaign=require_active_campaign,
+        snapshot, skipped, rows_scanned, empty_heartbeat_epoch = (
+            _load_newest_recovery_or_empty_heartbeat(
+                active_master=active_master,
+                require_active_campaign=require_active_campaign,
+            )
         )
 
         # Exact historical cardinality is irrelevant when the newest authoritative
@@ -6187,18 +6546,24 @@ def _perform_phase5_recovery(
         total_detail_count: Optional[int] = None
         real_race_detail_count: Optional[int] = None
         if snapshot is None:
-            if _current_real_race_has_details():
+            if empty_heartbeat_epoch is None and _current_real_race_has_details():
                 raise RuntimeError(
                     "durable PD200T_REAL_RACE history exists but no row satisfies the recovery court: "
                     f"rows_scanned={rows_scanned} skipped={skipped!r}"
                 )
             total_detail_count = _count_current_lantern_details()
+            if empty_heartbeat_epoch is not None:
+                empty_heartbeat_epoch["historical_detail_rows_preserved"] = int(
+                    total_detail_count
+                )
             active_detail_count = (
                 _count_lantern_campaign_details(active_master["campaign"])
                 if active_master is not None
                 else 0
             )
-            real_race_detail_count = 0
+            real_race_detail_count = (
+                1 if empty_heartbeat_epoch is not None else 0
+            )
         desired_state = (
             _project_photons_recovery_snapshot(
                 snapshot, datetime.now(timezone.utc)
@@ -6213,7 +6578,11 @@ def _perform_phase5_recovery(
         )
         source_epoch_migration: Optional[Dict[str, Any]] = None
         legacy_source_migration_required = False
-        if snapshot is None and int(total_detail_count or 0) != 0:
+        if (
+            snapshot is None
+            and empty_heartbeat_epoch is None
+            and int(total_detail_count or 0) != 0
+        ):
             if active_master is not None:
                 raise RuntimeError(
                     "legacy LANTERN campaign is still active during PD200T_REAL_RACE source "
@@ -6235,8 +6604,7 @@ def _perform_phase5_recovery(
         # authorize zero-RPC reuse.  Newborn PHOTONS is intentionally silent, so a
         # bounded timeout simply falls through to the existing firmware court.
         if (
-            source is not None
-            and transport_generation is not None
+            transport_generation is not None
             and survival_ingress_barrier_monotonic is not None
         ):
             live_fragment, live_age_s, live_received_utc = (
@@ -6273,7 +6641,15 @@ def _perform_phase5_recovery(
                             "total_detail_count": total_detail_count,
                             "real_race_detail_count": real_race_detail_count,
                             "source_epoch_migration": None,
-                            "source_detail_id": int(snapshot.source_detail_id),
+                            "source_detail_id": (
+                                int(snapshot.source_detail_id)
+                                if snapshot is not None
+                                else (
+                                    int(empty_heartbeat_epoch["detail_id"])
+                                    if empty_heartbeat_epoch is not None
+                                    else None
+                                )
+                            ),
                             "desired_state_schema": (
                                 desired_state.get("schema")
                                 if isinstance(desired_state, dict)
@@ -6284,13 +6660,17 @@ def _perform_phase5_recovery(
                                 if isinstance(desired_state, dict)
                                 else None
                             ),
-                            "source_welford_grand_ratio_diagnostic": copy.deepcopy(
-                                source.get("welford_grand_ratio_diagnostic")
+                            "source_welford_grand_ratio_diagnostic": (
+                                copy.deepcopy(source.get("welford_grand_ratio_diagnostic"))
+                                if isinstance(source, dict)
+                                else None
                             ),
                             "damaged_rows_skipped": copy.deepcopy(skipped),
                             "rows_scanned": rows_scanned,
                             "teensy_publication_started": True,
-                            "teensy_race_engine_active": True,
+                            "teensy_race_engine_active": bool(
+                                live_witness.get("race_engine_active")
+                            ),
                             "survival_witness_source": "PHOTONS_FRAGMENT",
                             "survival_witness_received_at_utc": live_received_utc,
                             "survival_witness_age_s": (
@@ -6371,6 +6751,7 @@ def _perform_phase5_recovery(
             "total_detail_count": total_detail_count,
             "real_race_detail_count": real_race_detail_count,
             "source_epoch_migration": copy.deepcopy(source_epoch_migration),
+            "empty_heartbeat_epoch": copy.deepcopy(empty_heartbeat_epoch),
             "source_detail_id": (
                 int(snapshot.source_detail_id) if snapshot is not None else None
             ),
@@ -6425,7 +6806,11 @@ def _perform_phase5_recovery(
             return _startup_cold_start(
                 active_master=active_master,
                 rows_seen=int(total_detail_count or 0),
-                source_epoch_migration=source_epoch_migration,
+                source_epoch_migration=(
+                    source_epoch_migration
+                    if source_epoch_migration is not None
+                    else empty_heartbeat_epoch
+                ),
             )
         literal_history = _literal_recovery_history_from_source(source)
         return _startup_held_restore(
@@ -7358,9 +7743,13 @@ def _runtime_reconcile_teensy_generation(previous_generation: int,
             if active_master is not None
             else False
         )
-        snapshot, _skipped, _rows_scanned = _load_newest_recoverable_photons_state(
-            active_master=active_master,
-            require_active_campaign=bool(active_master is not None and active_detail_present),
+        snapshot, _skipped, _rows_scanned, _empty_heartbeat_epoch = (
+            _load_newest_recovery_or_empty_heartbeat(
+                active_master=active_master,
+                require_active_campaign=bool(
+                    active_master is not None and active_detail_present
+                ),
+            )
         )
         source = snapshot.restore_source() if snapshot is not None else None
         live_fragment, live_age_s, live_received_utc = (
@@ -7369,7 +7758,7 @@ def _runtime_reconcile_teensy_generation(previous_generation: int,
             )
         )
         live_witness = None
-        if live_fragment is not None and source is not None:
+        if live_fragment is not None:
             try:
                 live_witness = _live_fragment_recovery_witness(
                     live_fragment,
@@ -10185,6 +10574,131 @@ COMMANDS = {
 # Entrypoint
 # ---------------------------------------------------------------------
 
+def _startup_activate_detector_for_heartbeat(
+    bringup: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Make only the already-proved safe PD200T detector lane live."""
+    if _require_bool(
+        bringup.get("interrupt_active"),
+        "PHOTONS commissioning bringup.interrupt_active",
+    ):
+        return {
+            "changed": False,
+            "status": "detector_already_active",
+            "interrupt_subscribed": True,
+            "interrupt_active": True,
+            "laser_gate_level": 1,
+            "ld_on_level": 0,
+            "publication_started": False,
+            "race_engine_active": False,
+        }
+
+    response = send_command(
+        machine="TEENSY",
+        subsystem=SUBSYSTEM,
+        command="DETECTOR_ACTIVATE",
+    )
+    payload = response.get("payload") if isinstance(response, dict) else None
+    if (
+        not isinstance(response, dict)
+        or not response.get("success")
+        or not isinstance(payload, dict)
+        or payload.get("status") != "detector_activated"
+    ):
+        raise RuntimeError(
+            f"Teensy PHOTONS.DETECTOR_ACTIVATE failed during heartbeat cutover: {response!r}"
+        )
+    if (
+        _require_bool(
+            payload.get("interrupt_subscribed"),
+            "PHOTONS.DETECTOR_ACTIVATE.interrupt_subscribed",
+        ) is not True
+        or _require_bool(
+            payload.get("interrupt_active"),
+            "PHOTONS.DETECTOR_ACTIVATE.interrupt_active",
+        ) is not True
+        or _require_int(
+            payload.get("laser_gate_level"),
+            "PHOTONS.DETECTOR_ACTIVATE.laser_gate_level",
+        ) != 1
+        or _require_int(
+            payload.get("ld_on_level"),
+            "PHOTONS.DETECTOR_ACTIVATE.ld_on_level",
+        ) != 0
+        or _require_bool(
+            payload.get("publication_started"),
+            "PHOTONS.DETECTOR_ACTIVATE.publication_started",
+        ) is not False
+        or _require_bool(
+            payload.get("race_engine_active"),
+            "PHOTONS.DETECTOR_ACTIVATE.race_engine_active",
+        ) is not False
+    ):
+        raise RuntimeError(
+            "PHOTONS detector activation violated the commissioning safety envelope"
+        )
+    return {"changed": True, **copy.deepcopy(payload)}
+
+
+def _startup_commissioning_empty_heartbeat_cutover(
+    *,
+    attempt_generation: int,
+    failure: Exception,
+    bringup: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Cut only the known invalid pre-heartbeat ancestry into a new empty epoch."""
+    failure_text = str(failure)
+    if "canonical PHOTONS statistics are invalid" not in failure_text:
+        return None
+
+    active_master = _load_active_lantern_master()
+    if active_master is not None:
+        logging.warning(
+            "🧪 [photons/startup] commissioning heartbeat cutover refused because "
+            "LANTERN campaign '%s' is active; preserving the explicit hold",
+            active_master.get("campaign"),
+        )
+        return None
+
+    historical_rows = _count_current_lantern_details()
+    detector = _startup_activate_detector_for_heartbeat(bringup)
+    _configure_teensy_lap_baseline()
+
+    current_generation = _runtime_teensy_rpc_generation()
+    if current_generation != int(attempt_generation):
+        raise RuntimeError(
+            "Teensy transport generation changed during PHOTONS commissioning "
+            f"heartbeat cutover: expected={attempt_generation} observed={current_generation}"
+        )
+
+    migration = {
+        "schema": "PHOTONS_COMMISSIONING_EMPTY_HEARTBEAT_CUTOVER_V1",
+        "from_source": "UNRECOVERABLE_PD200T_REAL_RACE_HISTORY",
+        "to_source": "PD200T_REAL_RACE",
+        "historical_detail_rows_preserved": int(historical_rows),
+        "producer_action": "COLD_START_EMPTY_HEARTBEAT_EPOCH",
+        "blocked_recovery_error": failure_text,
+    }
+    logging.warning(
+        "🫀 [photons/startup] safe commissioning producer has no active LANTERN; "
+        "preserving %d historical PHOTONS row(s), activating detector=%s, and "
+        "cold-starting a new 1 Hz empty-heartbeat epoch with race engine held",
+        int(historical_rows),
+        bool(detector.get("changed")),
+    )
+    result = _startup_cold_start(
+        active_master=None,
+        rows_seen=int(historical_rows),
+        source_epoch_migration=migration,
+    )
+    result["commissioning_heartbeat_cutover"] = {
+        "detector": copy.deepcopy(detector),
+        "historical_detail_rows_preserved": int(historical_rows),
+        "blocked_recovery_error": failure_text,
+    }
+    return result
+
+
 def _startup_phase5_recovery_with_generation_retry() -> Tuple[Dict[str, Any], int]:
     """Run Phase 5 against one proved Teensy transport generation at a time.
 
@@ -10217,6 +10731,41 @@ def _startup_phase5_recovery_with_generation_retry() -> Tuple[Dict[str, Any], in
                 current_generation is not None
                 and int(current_generation) == int(attempt_generation)
             ):
+                # During bounded optical bring-up the firmware deliberately keeps
+                # publication and the race engine stopped. An old durable science
+                # row may therefore fail the production recovery court while the
+                # live producer is still in an explicitly safe commissioning state.
+                # Preserve the recovery failure as testimony, but do not misclassify
+                # that intentional hold as a subsystem HARD_FAILURE.
+                bringup = _fetch_teensy_bringup_report()
+                if bringup is not None:
+                    cutover = _startup_commissioning_empty_heartbeat_cutover(
+                        attempt_generation=int(attempt_generation),
+                        failure=exc,
+                        bringup=bringup,
+                    )
+                    if cutover is not None:
+                        return cutover, int(attempt_generation)
+
+                    _campaign_control_ready.clear()
+                    _runtime_recovery_hold.clear()
+                    _clear_recovery_proof_custody()
+                    result = {
+                        "mode": "COMMISSIONING_HOLD",
+                        "producer_mutated": False,
+                        "transport_generation": int(attempt_generation),
+                        "blocked_recovery_error": str(exc),
+                        "bringup_report": copy.deepcopy(bringup),
+                    }
+                    _recovery_status_set("COMMISSIONING_HOLD", **result)
+                    logging.warning(
+                        "🧪 [photons/startup] explicit PHOTONS bring-up hold is active "
+                        "on transport generation=%d; preserving Phase-5 recovery failure "
+                        "without latching HARD_FAILURE: %s",
+                        int(attempt_generation),
+                        exc,
+                    )
+                    return result, int(attempt_generation)
                 raise
 
             _campaign_control_ready.clear()
@@ -10332,30 +10881,50 @@ def run() -> None:
             source="PHOTONS_PHASE5_RECOVERY",
         )
     else:
-        # START/STOP/baseline/maintenance control opens only after an advancing
-        # post-restart row has crossed the complete ordered persistence transaction
-        # on the same transport generation that was classified.
-        _campaign_control_ready.set()
-        _set_operational_state(
-            OPERATIONAL_STATE_RUNNING,
-            reason="phase5_recovery_complete",
-            source="RUN",
-        )
-        proof = recovery.get("proof") if isinstance(recovery.get("proof"), dict) else {}
-        _start_runtime_teensy_generation_monitor(initial_generation)
-        logging.info(
-            "✅ [photons] startup recovery complete: mode=%s producer_mutated=%s; "
-            "source detail=%s update=%s -> durable proof update=%s; "
-            "Better-Buckets history=%s%s; campaign_restored=%s",
-            recovery.get("mode") or "unknown",
-            recovery["producer_mutated"],
-            recovery.get("source_detail_id") or "none",
-            recovery.get("source_update_count") or "n/a",
-            proof.get("update_count") or "n/a",
-            recovery.get("ppb_history_scope") or "not applicable",
-            " (truncated)" if recovery.get("ppb_history_truncated") else "",
-            bool(recovery.get("campaign_restored_in_commit")),
-        )
+        if recovery.get("mode") == "COMMISSIONING_HOLD":
+            # Bring-up is a deliberate non-operational lifecycle: keep the Pi service
+            # alive and observable, but do not open campaign mutation or start the
+            # production producer-lifetime monitor while PHOTONS_FRAGMENT is
+            # intentionally held. The matching firmware now decouples the 1 Hz
+            # publisher from race production; this fallback remains only for a held
+            # state whose durable history is not provably an empty heartbeat epoch.
+            _campaign_control_ready.clear()
+            _set_operational_state(
+                OPERATIONAL_STATE_RECOVERING,
+                reason="commissioning_hold",
+                source="PHOTONS_BRINGUP_REPORT_V2",
+                details=copy.deepcopy(recovery),
+            )
+            logging.warning(
+                "🧪 [photons] commissioning hold admitted without HARD_FAILURE: "
+                "publication=false race_engine=false detector_active=%s gate=HIGH LD_ON=LOW",
+                bool((recovery.get("bringup_report") or {}).get("interrupt_active")),
+            )
+        else:
+            # START/STOP/baseline/maintenance control opens only after an advancing
+            # post-restart row has crossed the complete ordered persistence transaction
+            # on the same transport generation that was classified.
+            _campaign_control_ready.set()
+            _set_operational_state(
+                OPERATIONAL_STATE_RUNNING,
+                reason="phase5_recovery_complete",
+                source="RUN",
+            )
+            proof = recovery.get("proof") if isinstance(recovery.get("proof"), dict) else {}
+            _start_runtime_teensy_generation_monitor(initial_generation)
+            logging.info(
+                "✅ [photons] startup recovery complete: mode=%s producer_mutated=%s; "
+                "source detail=%s update=%s -> durable proof update=%s; "
+                "Better-Buckets history=%s%s; campaign_restored=%s",
+                recovery.get("mode") or "unknown",
+                recovery["producer_mutated"],
+                recovery.get("source_detail_id") or "none",
+                recovery.get("source_update_count") or "n/a",
+                proof.get("update_count") or "n/a",
+                recovery.get("ppb_history_scope") or "not applicable",
+                " (truncated)" if recovery.get("ppb_history_truncated") else "",
+                bool(recovery.get("campaign_restored_in_commit")),
+            )
 
     logging.info(
         "🏁 [photons] entering main loop operational_state=%s",

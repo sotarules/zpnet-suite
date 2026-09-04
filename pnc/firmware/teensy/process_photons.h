@@ -20,8 +20,11 @@
 //     ownership classes may never nest; illegal overlap is a system-integrity
 //     fault rather than a recoverable busy condition.
 //
-// PHOTONS_FRAGMENT is the canonical once-per-second optical instrument handoff.
-// Physical testimony and interpreted statistics remain separate: each completed
+// PHOTONS_FRAGMENT is the canonical once-per-second optical instrument heartbeat.
+// It remains lawful and continuous when the race engine is inactive or a second
+// contains zero races; race absence is testimony, while fragment silence is a
+// producer-health event. Physical testimony and interpreted statistics remain
+// separate: each completed
 // single-pass race preserves its raw DWT endpoints beside the GNSS-projected
 // estimated flight interval, science-admission testimony, Welford sufficient
 // state, and recovery totals.
@@ -459,7 +462,9 @@ struct photons_fragment_snapshot_t {
 
   // Real single-pass race telemetry. Lifetime counters are boot-local physical
   // testimony; the one-fragment Welford is derived only from completed projected
-  // races in this exact PHOTONS_FRAGMENT.
+  // races in this exact PHOTONS_FRAGMENT. The publisher heartbeat is independent
+  // of this producer lifecycle, so active=false with zero race counters is lawful.
+  bool race_engine_active = false;
   uint32_t race_cadence_hz = 0;
   uint64_t race_pulse_ns = 0;
   uint64_t race_cadence_tick_count_total = 0;
@@ -523,7 +528,8 @@ struct photons_fragment_snapshot_t {
 
 // Initialize PHOTONS runtime state and subscribe to the process_interrupt
 // PHOTODIODE lane. After the recovery verdict, PHOTONS starts the 1 Hz fragment
-// publisher and the real 1 kHz single-pass race cadence.
+// heartbeat. The real race producer is a separate lifecycle and remains held
+// until an explicit later commissioning transition starts it.
 // Must run after process_interrupt_init() and timepop_init().
 void process_photons_init(void);
 

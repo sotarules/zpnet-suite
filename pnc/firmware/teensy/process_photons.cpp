@@ -3298,6 +3298,7 @@ static Payload& photons_fragment_payload(
                  f.projected_laps_this_fragment);
 
   race.add("schema", "PHOTONS_RACE_V1");
+  race.add("active", f.race_engine_active);
   race.add("cadence_hz", f.race_cadence_hz);
   race.add("cadence_ns", PHOTONS_RACE_CADENCE_NS);
   race.add("pulse_ns", f.race_pulse_ns);
@@ -3733,6 +3734,12 @@ static void photons_fragment_tick(
 
   const photons_race_runtime_t race = g_photons_race;
 
+  // Publication is the PHOTONS heartbeat; race production is an independent
+  // lifecycle. Freeze that distinction into the immutable fragment so a zero-race
+  // second is explicit testimony rather than ambiguous silence.
+  const bool race_engine_active =
+      race.cadence_timer != TIMEPOP_INVALID_HANDLE;
+
   // This complete foreground-owned value is the publication custody boundary.
   // Keep the large canonical object in a dedicated RAM2 build slot rather than
   // placing ~1.7 KiB on MSP. This callback is the slot's sole owner; it completes
@@ -3755,6 +3762,7 @@ static void photons_fragment_tick(
   fragment.raw_lap_count = g_raw_cycles_state.completed_lap_count;
   fragment.projected_laps_this_fragment = drain.projected_laps;
 
+  fragment.race_engine_active = race_engine_active;
   fragment.race_cadence_hz = PHOTONS_RACE_CADENCE_HZ;
   fragment.race_pulse_ns = PHOTONS_RACE_PULSE_NS;
   fragment.race_cadence_tick_count_total = race.cadence_tick_count;
@@ -4053,13 +4061,14 @@ static void photons_recovery_clear_physical_ancestry(void) {
 }
 
 
-static void photons_start_publication(void) {
+static void photons_start_fragment_publisher(void) {
   if (!g_standard_lap_configured || g_lap_baseline_fs == 0ULL ||
       g_photons_recovery.publication_started ||
       g_fragment_timer != TIMEPOP_INVALID_HANDLE ||
       !g_photons_ppb_previous_endpoint_valid ||
       !g_interrupt_started ||
-      !g_interrupt_ancestry.valid) {
+      !g_interrupt_ancestry.valid ||
+      g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE) {
     __builtin_trap();
   }
 
@@ -4071,13 +4080,10 @@ static void photons_start_publication(void) {
       "PHOTONS_FRAGMENT");
   if (g_fragment_timer == TIMEPOP_INVALID_HANDLE) __builtin_trap();
 
+  // PHOTONS_FRAGMENT is the always-on instrument heartbeat. A lawful recovery
+  // verdict starts publication only; race production remains independently held.
+  // Zero races in a second are therefore explicit canonical testimony, not silence.
   g_photons_recovery.publication_started = true;
-  // A commissioning PULSE may have been armed before recovery/publication. It
-  // has no authority to consume an edge once the recurring race engine starts.
-  g_pulse_armed_sequence = 0U;
-  photons_memory_barrier();
-  g_last_pulse_launch = photons_pulse_launch_state_t{};
-  photons_race_start();
 }
 
 
@@ -4199,7 +4205,9 @@ FLASHMEM void process_photons_init(void) {
   // The fragment publisher and real race cadence are intentionally not started
   // here. SET_LAP_BASELINE_NS installs the current operator reference. A later
   // RECOVERY_COMMIT or RECOVERY_COLD_START establishes the statistical origin,
-  // clears boot-local physical ancestry, and starts both timers exactly once.
+  // clears boot-local physical ancestry, and starts the 1 Hz PHOTONS_FRAGMENT
+  // heartbeat exactly once. Race production remains separately held until an
+  // explicit later commissioning step starts it.
   g_initialized = true;
 }
 
@@ -5110,7 +5118,7 @@ static FLASHMEM Payload cmd_recovery_commit(const Payload& args) {
 
   photons_recovery_protocol_clear(false);
   photons_recovery_clear_physical_ancestry();
-  photons_start_publication();
+  photons_start_fragment_publisher();
 
   Payload p;
   p.add("status", "recovery_committed");
@@ -5123,6 +5131,7 @@ static FLASHMEM Payload cmd_recovery_commit(const Payload& args) {
   p.add("campaign_active", campaign_active);
   if (campaign_active) p.add("campaign", campaign_name);
   p.add("publication_started", true);
+  p.add("race_engine_active", false);
   p.add("fresh_physical_ancestry", true);
   p.add("pending_seed_restored", false);
   p.add("raw_lap_ring_restored", false);
@@ -5184,12 +5193,13 @@ static FLASHMEM Payload cmd_recovery_cold_start(const Payload& args) {
   g_photons_recovery.cold_start_count++;
 
   photons_recovery_clear_physical_ancestry();
-  photons_start_publication();
+  photons_start_fragment_publisher();
 
   Payload p;
   p.add("status", "recovery_cold_start_committed");
   p.add("generation", generation);
   p.add("publication_started", true);
+  p.add("race_engine_active", false);
   p.add("restored", false);
   p.add("fresh_physical_ancestry", true);
   return p;
