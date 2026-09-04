@@ -1664,7 +1664,8 @@ static void payload_contract_record(
     uint32_t expected1,
     uint32_t observed1,
     uint32_t before_fingerprint,
-    uint32_t after_fingerprint) {
+    uint32_t after_fingerprint,
+    bool capture_prefix = true) {
     if (g_payload_contract_suppression_depth != 0U) {
         g_payload_contract_event_incidents_suppressed++;
         return;
@@ -1716,7 +1717,11 @@ static void payload_contract_record(
 
     payload_contract_event_t pending{};
     pending.incident = incident;
-    payload_contract_capture_prefix(operation_id, self, &pending);
+    // Prefix capture is convenience testimony, never authority. A state-failure
+    // recorder is forbidden from re-entering the object that inspection rejected.
+    if (capture_prefix) {
+        payload_contract_capture_prefix(operation_id, self, &pending);
+    }
 
     const uint32_t saved = critical_enter();
     if (!payload_contract_incident_valid(
@@ -1724,10 +1729,11 @@ static void payload_contract_record(
         g_payload_contract_first_this_boot = incident;
     }
     if (g_payload_contract_pending_count < PAYLOAD_CONTRACT_PENDING_ENTRIES) {
-        g_payload_contract_pending[g_payload_contract_pending_head] = pending;
+        const uint32_t pending_slot =
+            g_payload_contract_pending_head % PAYLOAD_CONTRACT_PENDING_ENTRIES;
+        g_payload_contract_pending[pending_slot] = pending;
         g_payload_contract_pending_head =
-            (g_payload_contract_pending_head + 1U) %
-            PAYLOAD_CONTRACT_PENDING_ENTRIES;
+            (pending_slot + 1U) % PAYLOAD_CONTRACT_PENDING_ENTRIES;
         g_payload_contract_pending_count++;
     } else {
         g_payload_contract_pending_overflow++;
@@ -3607,6 +3613,12 @@ static bool json_array_locate(const char* json,
 struct payload_contract_state_t {
     bool valid = false;
     payload_contract_reason_t reason = payload_contract_reason_t::NONE;
+    // Detached stamp testimony. Once inspection rejects the object, every failure
+    // path must use these scalars and never dereference the rejected object again.
+    uint32_t contract_generation = 0U;
+    uint32_t contract_generation_guard = 0U;
+    uint32_t contract_fingerprint = 0U;
+    uint32_t contract_fingerprint_guard = 0U;
     uint32_t entry_index = 0xFFFFFFFFUL;
     uint32_t capacity = 0U;
     uint32_t count = 0U;
@@ -4006,21 +4018,21 @@ static void payload_contract_record_state_failure(
     uint32_t operation_id,
     const void* self,
     const payload_contract_state_t& state,
-    uint32_t generation,
     uint32_t before_fingerprint) {
     payload_contract_record(phase,
                             state.reason,
                             operation_id,
                             self,
                             nullptr,
-                            generation,
+                            state.contract_generation,
                             state.entry_index,
                             state.key_off,
                             state.val_off,
                             state.key_len,
                             state.val_len,
                             before_fingerprint,
-                            state.structural_fingerprint);
+                            state.structural_fingerprint,
+                            false);
 }
 
 static void payload_contract_record_postcondition(
@@ -4160,6 +4172,17 @@ uint32_t Payload::_json_hash_unchecked() const {
 bool Payload::_contract_inspect(payload_contract_state_t* out) const {
     if (!out) return false;
     *out = payload_contract_state_t{};
+
+    // Prove the control-block address before the first member load. This court
+    // must survive even when upstream ownership passes a damaged object pointer.
+    if (!payload_contract_span_readable_pure(this, sizeof(Payload))) {
+        out->reason = payload_contract_reason_t::STORAGE_UNREADABLE;
+        return false;
+    }
+    out->contract_generation = _contract_generation;
+    out->contract_generation_guard = _contract_generation_guard;
+    out->contract_fingerprint = _contract_fingerprint;
+    out->contract_fingerprint_guard = _contract_fingerprint_guard;
 
     if (!_storage_mode_guard_ok()) {
         out->reason = payload_contract_reason_t::STORAGE_MODE_GUARD;
@@ -4391,15 +4414,14 @@ bool Payload::_contract_begin(uint32_t operation_id,
     g_payload_contract_checks++;
     payload_contract_boot_latch();
 
-    const bool prior_stamp_valid =
-        (_contract_generation ^ _contract_generation_guard) ==
-            0xFFFFFFFFUL &&
-        (_contract_fingerprint ^ _contract_fingerprint_guard) ==
-            0xFFFFFFFFUL &&
-        _contract_generation != 0U;
-
     payload_contract_state_t state{};
     if (!_contract_inspect(&state)) {
+        const bool prior_stamp_valid =
+            (state.contract_generation ^ state.contract_generation_guard) ==
+                0xFFFFFFFFUL &&
+            (state.contract_fingerprint ^ state.contract_fingerprint_guard) ==
+                0xFFFFFFFFUL &&
+            state.contract_generation != 0U;
         payload_contract_record_state_failure(
             prior_stamp_valid
                 ? payload_contract_phase_t::OBSERVED_DRIFT
@@ -4407,16 +4429,14 @@ bool Payload::_contract_begin(uint32_t operation_id,
             operation_id,
             this,
             state,
-            _contract_generation,
-            _contract_fingerprint);
+            state.contract_fingerprint);
         return false;
     }
-
-    if ((_contract_generation ^ _contract_generation_guard) !=
+    if ((state.contract_generation ^ state.contract_generation_guard) !=
             0xFFFFFFFFUL ||
-        (_contract_fingerprint ^ _contract_fingerprint_guard) !=
+        (state.contract_fingerprint ^ state.contract_fingerprint_guard) !=
             0xFFFFFFFFUL ||
-        _contract_generation == 0U) {
+        state.contract_generation == 0U) {
         payload_stamp_trace_record(
             payload_stamp_trace_stage_t::STAMP_FAILURE,
             operation_id,
@@ -4429,18 +4449,18 @@ bool Payload::_contract_begin(uint32_t operation_id,
                                 operation_id,
                                 this,
                                 nullptr,
-                                _contract_generation,
+                                state.contract_generation,
                                 0xFFFFFFFFUL,
-                                ~_contract_generation,
-                                _contract_generation_guard,
-                                ~_contract_fingerprint,
-                                _contract_fingerprint_guard,
-                                _contract_fingerprint,
+                                ~state.contract_generation,
+                                state.contract_generation_guard,
+                                ~state.contract_fingerprint,
+                                state.contract_fingerprint_guard,
+                                state.contract_fingerprint,
                                 state.structural_fingerprint);
         return false;
     }
 
-    if (state.structural_fingerprint != _contract_fingerprint) {
+    if (state.structural_fingerprint != state.contract_fingerprint) {
         payload_stamp_trace_record(
             payload_stamp_trace_stage_t::STAMP_FAILURE,
             operation_id,
@@ -4453,13 +4473,13 @@ bool Payload::_contract_begin(uint32_t operation_id,
                                 operation_id,
                                 this,
                                 nullptr,
-                                _contract_generation,
+                                state.contract_generation,
                                 0xFFFFFFFFUL,
-                                _contract_fingerprint,
+                                state.contract_fingerprint,
                                 state.structural_fingerprint,
                                 state.semantic_fingerprint,
                                 state.count,
-                                _contract_fingerprint,
+                                state.contract_fingerprint,
                                 state.structural_fingerprint);
         return false;
     }
@@ -4471,12 +4491,12 @@ bool Payload::_contract_begin(uint32_t operation_id,
 bool Payload::contract_valid() const {
     payload_contract_state_t state{};
     if (!_contract_inspect(&state)) return false;
-    return (_contract_generation ^ _contract_generation_guard) ==
+    return (state.contract_generation ^ state.contract_generation_guard) ==
                0xFFFFFFFFUL &&
-           (_contract_fingerprint ^ _contract_fingerprint_guard) ==
+           (state.contract_fingerprint ^ state.contract_fingerprint_guard) ==
                0xFFFFFFFFUL &&
-           _contract_generation != 0U &&
-           state.structural_fingerprint == _contract_fingerprint;
+           state.contract_generation != 0U &&
+           state.structural_fingerprint == state.contract_fingerprint;
 }
 
 bool Payload::_contract_finish_preserve(
@@ -4490,7 +4510,6 @@ bool Payload::_contract_finish_preserve(
             operation_id,
             this,
             after,
-            _contract_generation,
             before.structural_fingerprint);
         return false;
     }
@@ -4533,7 +4552,6 @@ bool Payload::_contract_finish_add(
             operation_id,
             this,
             after,
-            _contract_generation,
             before.structural_fingerprint);
         return false;
     }
@@ -4611,7 +4629,6 @@ bool Payload::_contract_finish_clear(
             operation_id,
             this,
             after,
-            _contract_generation,
             before.structural_fingerprint);
         return false;
     }
@@ -4640,7 +4657,6 @@ bool Payload::_contract_finish_copy(
             operation_id,
             this,
             after,
-            _contract_generation,
             before.structural_fingerprint);
         return false;
     }
@@ -4671,7 +4687,6 @@ bool Payload::_contract_abort(uint32_t operation_id,
             operation_id,
             this,
             after,
-            _contract_generation,
             before.structural_fingerprint);
         return false;
     }
@@ -4700,6 +4715,15 @@ uint32_t PayloadArray::_json_hash_unchecked() const {
 bool PayloadArray::_contract_inspect(payload_contract_state_t* out) const {
     if (!out) return false;
     *out = payload_contract_state_t{};
+
+    if (!payload_contract_span_readable_pure(this, sizeof(PayloadArray))) {
+        out->reason = payload_contract_reason_t::STORAGE_UNREADABLE;
+        return false;
+    }
+    out->contract_generation = _contract_generation;
+    out->contract_generation_guard = _contract_generation_guard;
+    out->contract_fingerprint = _contract_fingerprint;
+    out->contract_fingerprint_guard = _contract_fingerprint_guard;
 
     if (!_heap_guard_ok()) {
         out->reason = payload_contract_reason_t::HEAP_GUARD;
@@ -4793,15 +4817,14 @@ bool PayloadArray::_contract_begin(uint32_t operation_id,
     g_payload_contract_checks++;
     payload_contract_boot_latch();
 
-    const bool prior_stamp_valid =
-        (_contract_generation ^ _contract_generation_guard) ==
-            0xFFFFFFFFUL &&
-        (_contract_fingerprint ^ _contract_fingerprint_guard) ==
-            0xFFFFFFFFUL &&
-        _contract_generation != 0U;
-
     payload_contract_state_t state{};
     if (!_contract_inspect(&state)) {
+        const bool prior_stamp_valid =
+            (state.contract_generation ^ state.contract_generation_guard) ==
+                0xFFFFFFFFUL &&
+            (state.contract_fingerprint ^ state.contract_fingerprint_guard) ==
+                0xFFFFFFFFUL &&
+            state.contract_generation != 0U;
         payload_contract_record_state_failure(
             prior_stamp_valid
                 ? payload_contract_phase_t::OBSERVED_DRIFT
@@ -4809,43 +4832,42 @@ bool PayloadArray::_contract_begin(uint32_t operation_id,
             operation_id,
             this,
             state,
-            _contract_generation,
-            _contract_fingerprint);
+            state.contract_fingerprint);
         return false;
     }
-    if ((_contract_generation ^ _contract_generation_guard) !=
+    if ((state.contract_generation ^ state.contract_generation_guard) !=
             0xFFFFFFFFUL ||
-        (_contract_fingerprint ^ _contract_fingerprint_guard) !=
+        (state.contract_fingerprint ^ state.contract_fingerprint_guard) !=
             0xFFFFFFFFUL ||
-        _contract_generation == 0U) {
+        state.contract_generation == 0U) {
         payload_contract_record(payload_contract_phase_t::OBSERVED_DRIFT,
                                 payload_contract_reason_t::STAMP_GUARD,
                                 operation_id,
                                 this,
                                 nullptr,
-                                _contract_generation,
+                                state.contract_generation,
                                 0xFFFFFFFFUL,
-                                ~_contract_generation,
-                                _contract_generation_guard,
-                                ~_contract_fingerprint,
-                                _contract_fingerprint_guard,
-                                _contract_fingerprint,
+                                ~state.contract_generation,
+                                state.contract_generation_guard,
+                                ~state.contract_fingerprint,
+                                state.contract_fingerprint_guard,
+                                state.contract_fingerprint,
                                 state.structural_fingerprint);
         return false;
     }
-    if (state.structural_fingerprint != _contract_fingerprint) {
+    if (state.structural_fingerprint != state.contract_fingerprint) {
         payload_contract_record(payload_contract_phase_t::OBSERVED_DRIFT,
                                 payload_contract_reason_t::STAMP_MISMATCH,
                                 operation_id,
                                 this,
                                 nullptr,
-                                _contract_generation,
+                                state.contract_generation,
                                 0xFFFFFFFFUL,
-                                _contract_fingerprint,
+                                state.contract_fingerprint,
                                 state.structural_fingerprint,
                                 state.semantic_fingerprint,
                                 state.element_count,
-                                _contract_fingerprint,
+                                state.contract_fingerprint,
                                 state.structural_fingerprint);
         return false;
     }
@@ -4856,12 +4878,12 @@ bool PayloadArray::_contract_begin(uint32_t operation_id,
 bool PayloadArray::contract_valid() const {
     payload_contract_state_t state{};
     if (!_contract_inspect(&state)) return false;
-    return (_contract_generation ^ _contract_generation_guard) ==
+    return (state.contract_generation ^ state.contract_generation_guard) ==
                0xFFFFFFFFUL &&
-           (_contract_fingerprint ^ _contract_fingerprint_guard) ==
+           (state.contract_fingerprint ^ state.contract_fingerprint_guard) ==
                0xFFFFFFFFUL &&
-           _contract_generation != 0U &&
-           state.structural_fingerprint == _contract_fingerprint;
+           state.contract_generation != 0U &&
+           state.structural_fingerprint == state.contract_fingerprint;
 }
 
 bool PayloadArray::_contract_finish_preserve(
@@ -4875,7 +4897,6 @@ bool PayloadArray::_contract_finish_preserve(
             operation_id,
             this,
             after,
-            _contract_generation,
             before.structural_fingerprint);
         return false;
     }
@@ -4911,7 +4932,6 @@ bool PayloadArray::_contract_finish_add(
             operation_id,
             this,
             after,
-            _contract_generation,
             before.structural_fingerprint);
         return false;
     }
@@ -4976,7 +4996,6 @@ bool PayloadArray::_contract_finish_clear(
             operation_id,
             this,
             after,
-            _contract_generation,
             before.structural_fingerprint);
         return false;
     }
@@ -5005,7 +5024,6 @@ bool PayloadArray::_contract_finish_copy(
             operation_id,
             this,
             after,
-            _contract_generation,
             before.structural_fingerprint);
         return false;
     }
@@ -5037,7 +5055,6 @@ bool PayloadArray::_contract_abort(
             operation_id,
             this,
             after,
-            _contract_generation,
             before.structural_fingerprint);
         return false;
     }
@@ -5094,8 +5111,8 @@ Payload::Payload()
             PAYLOAD_OP_CTOR,
             this,
             state,
-            0U,
             0U);
+        _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, PAYLOAD_OP_CTOR);
     }
     if (payload_stamp_trace_is_ocram_object(this)) {
         payload_stamp_trace_record(
@@ -5175,7 +5192,6 @@ Payload::Payload(StorageMode mode, void* storage, size_t capacity)
             PAYLOAD_OP_FIXED_BIND,
             this,
             state,
-            0U,
             0U);
         _fatal(PAYLOAD_ERR_FIXED_STORAGE,
                PAYLOAD_OP_FIXED_BIND,
@@ -5221,7 +5237,16 @@ Payload::Payload(Payload&& other) noexcept
                                  &g_payload_handler_ctx_ctor);
     payload_flight_note(PAYLOAD_OP_CTOR, this, 0U);
     payload_contract_state_t empty{};
-    if (_contract_inspect(&empty)) _contract_accept(empty);
+    if (!_contract_inspect(&empty)) {
+        payload_contract_record_state_failure(
+            payload_contract_phase_t::POST_INVARIANT,
+            PAYLOAD_OP_CTOR,
+            this,
+            empty,
+            0U);
+        _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, PAYLOAD_OP_CTOR);
+    }
+    _contract_accept(empty);
     _move_from(other);
     if (payload_stamp_trace_is_ocram_object(this)) {
         payload_stamp_trace_record(
@@ -5289,7 +5314,16 @@ Payload::Payload(const Payload& other)
                                  &g_payload_handler_ctx_ctor);
     payload_flight_note(PAYLOAD_OP_CTOR, this, 0U);
     payload_contract_state_t empty{};
-    if (_contract_inspect(&empty)) _contract_accept(empty);
+    if (!_contract_inspect(&empty)) {
+        payload_contract_record_state_failure(
+            payload_contract_phase_t::POST_INVARIANT,
+            PAYLOAD_OP_CTOR,
+            this,
+            empty,
+            0U);
+        _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, PAYLOAD_OP_CTOR);
+    }
+    _contract_accept(empty);
     if (!_copy_from(other)) {
         payload_note_error(PAYLOAD_ERR_COPY_ALLOC_FAIL,
                            PAYLOAD_OP_COPY_CTOR,
@@ -5511,8 +5545,8 @@ void Payload::_reset_empty() {
             PAYLOAD_OP_CLEAR,
             this,
             state,
-            _contract_generation,
-            _contract_fingerprint);
+            state.contract_fingerprint);
+        _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, PAYLOAD_OP_CLEAR);
     }
 }
 
@@ -5786,31 +5820,24 @@ size_t Payload::_append_required_bytes(size_t key_len,
 [[noreturn]] void Payload::_fatal(uint32_t fallback_error_code,
                                    uint32_t fallback_operation_id,
                                    size_t requested_bytes) const {
-    payload_stamp_trace_record(
-        payload_stamp_trace_stage_t::FATAL_ENTER,
-        fallback_operation_id,
-        this,
-        (uint32_t)(uintptr_t)__builtin_return_address(0),
-        0U,
-        g_payload_contract_next_sequence);
-
-    uint32_t capacity = 0U;
-    if (_heap_guard_ok()) {
-        const size_t observed = _capacity();
-        capacity = observed > UINT32_MAX ? UINT32_MAX : (uint32_t)observed;
-    }
-    const uint32_t count = _count_guard_ok() ? (uint32_t)_count : UINT32_MAX;
-    uint32_t data_used = 0U;
-    if (_data_begin_guard_ok() && capacity != 0U && _data_begin <= capacity) {
-        data_used = capacity - (uint32_t)_data_begin;
+    payload_contract_state_t state{};
+    const bool inspectable = _contract_inspect(&state);
+    if (inspectable) {
+        payload_stamp_trace_record(
+            payload_stamp_trace_stage_t::FATAL_ENTER,
+            fallback_operation_id,
+            this,
+            (uint32_t)(uintptr_t)__builtin_return_address(0),
+            state.structural_fingerprint,
+            g_payload_contract_next_sequence);
     }
     payload_fatal_stop(fallback_error_code,
                        fallback_operation_id,
                        this,
                        requested_bytes,
-                       capacity,
-                       count,
-                       data_used);
+                       inspectable ? state.capacity : 0U,
+                       inspectable ? state.count : UINT32_MAX,
+                       inspectable ? state.data_used : 0U);
 }
 
 
@@ -7978,8 +8005,7 @@ bool Payload::parseJSON(const uint8_t* data, size_t len) {
                 PAYLOAD_OP_PARSEJSON_DATA,
                 &parsed,
                 parsed_state,
-                parsed._contract_generation,
-                parsed._contract_fingerprint);
+                parsed_state.contract_fingerprint);
             return false;
         }
         const uint32_t expected_semantic =
@@ -8201,8 +8227,7 @@ bool Payload::parseJSON(const uint8_t* data, size_t len) {
                     PAYLOAD_OP_PARSEJSON_DATA,
                     &parsed,
                     parsed_state,
-                    parsed._contract_generation,
-                    parsed._contract_fingerprint);
+                    parsed_state.contract_fingerprint);
                 (void)clear();
                 return false;
             }
@@ -8546,7 +8571,16 @@ PayloadArray::PayloadArray()
     _inline_storage[1] = ']';
     _inline_storage[2] = '\0';
     payload_contract_state_t state{};
-    if (_contract_inspect(&state)) _contract_accept(state);
+    if (!_contract_inspect(&state)) {
+        payload_contract_record_state_failure(
+            payload_contract_phase_t::POST_INVARIANT,
+            PAYLOAD_OP_CTOR,
+            this,
+            state,
+            0U);
+        _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, PAYLOAD_OP_CTOR);
+    }
+    _contract_accept(state);
 }
 
 PayloadArray::~PayloadArray() {
@@ -8567,7 +8601,16 @@ PayloadArray::PayloadArray(const PayloadArray& other)
     _inline_storage[1] = ']';
     _inline_storage[2] = '\0';
     payload_contract_state_t empty{};
-    if (_contract_inspect(&empty)) _contract_accept(empty);
+    if (!_contract_inspect(&empty)) {
+        payload_contract_record_state_failure(
+            payload_contract_phase_t::POST_INVARIANT,
+            PAYLOAD_OP_CTOR,
+            this,
+            empty,
+            0U);
+        _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, PAYLOAD_OP_CTOR);
+    }
+    _contract_accept(empty);
     (void)_copy_from(other);
 }
 
@@ -8623,7 +8666,16 @@ PayloadArray::PayloadArray(PayloadArray&& other) noexcept
     _inline_storage[1] = ']';
     _inline_storage[2] = '\0';
     payload_contract_state_t empty{};
-    if (_contract_inspect(&empty)) _contract_accept(empty);
+    if (!_contract_inspect(&empty)) {
+        payload_contract_record_state_failure(
+            payload_contract_phase_t::POST_INVARIANT,
+            PAYLOAD_OP_CTOR,
+            this,
+            empty,
+            0U);
+        _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, PAYLOAD_OP_CTOR);
+    }
+    _contract_accept(empty);
     _move_from(other);
 }
 
@@ -8779,7 +8831,17 @@ void PayloadArray::_release_storage() {
         _inline_storage[0] = '[';
         _inline_storage[1] = ']';
         payload_contract_state_t state{};
-        if (_contract_inspect(&state)) _contract_accept(state);
+        if (!_contract_inspect(&state)) {
+            payload_contract_record_state_failure(
+                payload_contract_phase_t::POST_INVARIANT,
+                PAYLOAD_OP_ARRAY_RELEASE_STORAGE_GUARD,
+                this,
+                state,
+                state.contract_fingerprint);
+            _fatal(PAYLOAD_ERR_STORAGE_CORRUPT,
+                   PAYLOAD_OP_ARRAY_RELEASE_STORAGE_GUARD);
+        }
+        _contract_accept(state);
         return;
     }
     if (_heap_block) {
@@ -8806,7 +8868,17 @@ void PayloadArray::_release_storage() {
     _inline_storage[0] = '[';
     _inline_storage[1] = ']';
     payload_contract_state_t state{};
-    if (_contract_inspect(&state)) _contract_accept(state);
+    if (!_contract_inspect(&state)) {
+        payload_contract_record_state_failure(
+            payload_contract_phase_t::POST_INVARIANT,
+            PAYLOAD_OP_ARRAY_RELEASE_STORAGE,
+            this,
+            state,
+            state.contract_fingerprint);
+        _fatal(PAYLOAD_ERR_STORAGE_CORRUPT,
+               PAYLOAD_OP_ARRAY_RELEASE_STORAGE);
+    }
+    _contract_accept(state);
 }
 
 
@@ -8917,21 +8989,15 @@ bool PayloadArray::_copy_from(const PayloadArray& other) {
 [[noreturn]] void PayloadArray::_fatal(uint32_t fallback_error_code,
                                         uint32_t fallback_operation_id,
                                         size_t requested_bytes) const {
-    uint32_t capacity = 0U;
-    if (_heap_guard_ok()) {
-        const size_t observed = _capacity();
-        capacity = observed > UINT32_MAX ? UINT32_MAX : (uint32_t)observed;
-    }
-    const uint32_t count = _length_guard_ok() ? (uint32_t)_length : UINT32_MAX;
-    const uint32_t data_used =
-        _length_guard_ok() ? (uint32_t)_length : 0U;
+    payload_contract_state_t state{};
+    const bool inspectable = _contract_inspect(&state);
     payload_fatal_stop(fallback_error_code,
                        fallback_operation_id,
                        this,
                        requested_bytes,
-                       capacity,
-                       count,
-                       data_used);
+                       inspectable ? state.capacity : 0U,
+                       inspectable ? state.count : UINT32_MAX,
+                       inspectable ? state.data_used : 0U);
 }
 
 
