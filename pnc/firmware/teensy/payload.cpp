@@ -3759,6 +3759,70 @@ struct payload_contract_prefix_writer_t {
     }
 };
 
+struct payload_entry_access_t {
+    static inline Payload::Entry load(const uint8_t* storage, size_t index) {
+        Payload::Entry entry{};
+        memcpy(&entry,
+               storage + index * sizeof(Payload::Entry),
+               sizeof(entry));
+        return entry;
+    }
+
+    static inline void store(uint8_t* storage,
+                      size_t index,
+                      const Payload::Entry& entry) {
+        memcpy(storage + index * sizeof(Payload::Entry),
+               &entry,
+               sizeof(entry));
+    }
+
+    static bool find(const Payload& object,
+                     const char* key,
+                     size_t key_len,
+                     Payload::Entry& out,
+                     size_t* out_index) {
+        if (!key && key_len != 0U) return false;
+        if (!object._layout_ok(PAYLOAD_OP_FIND_LAYOUT)) return false;
+
+        payload_contract_state_t observed{};
+        if (!object._contract_begin(PAYLOAD_OP_FIND_LAYOUT, &observed)) {
+            return false;
+        }
+
+        const uint8_t* storage = object._storage();
+        for (size_t i = 0U; i < object._count; ++i) {
+            const Payload::Entry entry = load(storage, i);
+            if ((size_t)entry.key_len == key_len &&
+                (key_len == 0U ||
+                 memcmp(storage + entry.key_off, key, key_len) == 0)) {
+                out = entry;
+                if (out_index) *out_index = i;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static bool find(const Payload& object,
+                     const char* key,
+                     Payload::Entry& out,
+                     size_t* out_index) {
+        if (!key) return false;
+        size_t key_len = 0U;
+        if (!payload_cstr_len_checked(key,
+                                      Payload::ARENA_MAX,
+                                      PAYLOAD_OP_FIND_KEY,
+                                      &key_len,
+                                      false)) {
+            payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER,
+                               PAYLOAD_OP_FIND_KEY,
+                               &object);
+            return false;
+        }
+        return find(object, key, key_len, out, out_index);
+    }
+};
+
 struct payload_contract_prefix_access_t {
     static bool capture(const Payload& object,
                         char* out,
@@ -3775,11 +3839,11 @@ struct payload_contract_prefix_access_t {
 
         payload_contract_prefix_writer_t writer(out, capacity);
         bool complete = writer.append_char('{');
-        const Payload::Entry* entries = object._entries();
         const uint8_t* storage = object._storage();
 
         for (size_t i = 0U; complete && i < object._count; ++i) {
-            const Payload::Entry& entry = entries[i];
+            const Payload::Entry entry =
+                payload_entry_access_t::load(storage, i);
             if (i != 0U) complete = writer.append_char(',');
             if (complete) complete = writer.append_char('"');
             if (complete) {
@@ -4110,13 +4174,12 @@ static uint32_t payload_contract_hash_escaped(uint32_t hash,
 }
 
 uint32_t Payload::_contract_semantic_hash(size_t entry_limit) const {
-    const Entry* entries = _entries();
     const uint8_t* storage = _storage();
     const size_t bounded = entry_limit < _count ? entry_limit : _count;
     uint32_t hash = payload_contract_hash_u32(PAYLOAD_CONTRACT_HASH_SEED,
                                               (uint32_t)bounded);
     for (size_t i = 0U; i < bounded; ++i) {
-        const Entry& entry = entries[i];
+        const Entry entry = payload_entry_access_t::load(storage, i);
         hash = payload_contract_hash_u32(hash, entry.kind);
         hash = payload_contract_hash_u32(hash, entry.key_len);
         hash = payload_contract_hash_bytes(hash,
@@ -4131,13 +4194,12 @@ uint32_t Payload::_contract_semantic_hash(size_t entry_limit) const {
 }
 
 uint32_t Payload::_json_hash_unchecked() const {
-    const Entry* entries = _entries();
     const uint8_t* storage = _storage();
     uint32_t hash = payload_contract_hash_u32(
         PAYLOAD_CONTRACT_HASH_SEED, (uint32_t)_json_size());
     hash = payload_contract_hash_byte(hash, '{');
     for (size_t i = 0U; i < _count; ++i) {
-        const Entry& entry = entries[i];
+        const Entry entry = payload_entry_access_t::load(storage, i);
         if (i != 0U) hash = payload_contract_hash_byte(hash, ',');
         hash = payload_contract_hash_byte(hash, '"');
         hash = payload_contract_hash_escaped(
@@ -4256,10 +4318,9 @@ bool Payload::_contract_inspect(payload_contract_state_t* out) const {
         return false;
     }
 
-    const Entry* entries = reinterpret_cast<const Entry*>(storage);
     size_t expected_upper = capacity;
     for (size_t i = 0U; i < _count; ++i) {
-        const Entry& entry = entries[i];
+        const Entry entry = payload_entry_access_t::load(storage, i);
         out->entry_index = (uint32_t)i;
         out->key_off = entry.key_off;
         out->key_len = entry.key_len;
@@ -4580,8 +4641,8 @@ bool Payload::_contract_finish_add(
         return false;
     }
 
-    const Entry& entry = _entries()[before.count];
     const uint8_t* storage = _storage();
+    const Entry entry = payload_entry_access_t::load(storage, before.count);
     const uint32_t key_hash = payload_contract_span_hash(
         storage + entry.key_off, entry.key_len);
     const uint32_t value_hash = payload_contract_span_hash(
@@ -5477,14 +5538,6 @@ size_t Payload::_data_used() const {
     return capacity - _data_begin;
 }
 
-Payload::Entry* Payload::_entries() {
-    return reinterpret_cast<Entry*>(_storage());
-}
-
-const Payload::Entry* Payload::_entries() const {
-    return reinterpret_cast<const Entry*>(_storage());
-}
-
 void Payload::_reset_empty() {
     const bool preserve_fixed =
         _fixed_mode() && _heap_guard_ok() && _heap_block == nullptr &&
@@ -5755,12 +5808,13 @@ bool Payload::_copy_from(const Payload& other) {
         memcpy(target,
                source_storage,
                (size_t)other._count * sizeof(Entry));
-        Entry* entries = reinterpret_cast<Entry*>(target);
         for (size_t i = 0U; i < other._count; ++i) {
-            entries[i].key_off =
-                (uint16_t)((int32_t)entries[i].key_off + shift);
-            entries[i].val_off =
-                (uint16_t)((int32_t)entries[i].val_off + shift);
+            Entry entry = payload_entry_access_t::load(target, i);
+            entry.key_off =
+                (uint16_t)((int32_t)entry.key_off + shift);
+            entry.val_off =
+                (uint16_t)((int32_t)entry.val_off + shift);
+            payload_entry_access_t::store(target, i, entry);
         }
     }
     if (source_data_used != 0U) {
@@ -6040,11 +6094,10 @@ bool Payload::_layout_ok(uint32_t operation_id) const {
 
     const size_t capacity = _capacity();
     const uint8_t* storage = _storage();
-    const Entry* entries = _entries();
     size_t expected_upper = capacity;
 
     for (size_t i = 0; i < _count; ++i) {
-        const Entry& e = entries[i];
+        const Entry e = payload_entry_access_t::load(storage, i);
         if (!_entry_ok(e, i, operation_id)) return false;
 
         const size_t key_end = (size_t)e.key_off + (size_t)e.key_len;
@@ -6092,32 +6145,6 @@ bool Payload::_layout_ok(uint32_t operation_id) const {
         return false;
     }
     return true;
-}
-
-const Payload::Entry* Payload::_find(const char* key, size_t key_len) const {
-    if (!_layout_ok(PAYLOAD_OP_FIND_LAYOUT)) return nullptr;
-    payload_contract_state_t observed{};
-    if (!_contract_begin(PAYLOAD_OP_FIND_LAYOUT, &observed)) return nullptr;
-    const Entry* entries = _entries();
-    const uint8_t* storage = _storage();
-    for (size_t i = 0; i < _count; ++i) {
-        const Entry& e = entries[i];
-        if ((size_t)e.key_len == key_len &&
-            (key_len == 0U || memcmp(storage + e.key_off, key, key_len) == 0)) {
-            return &entries[i];
-        }
-    }
-    return nullptr;
-}
-
-const Payload::Entry* Payload::_find(const char* key) const {
-    if (!key) return nullptr;
-    size_t key_len = 0;
-    if (!payload_cstr_len_checked(key, ARENA_MAX, PAYLOAD_OP_FIND_KEY, &key_len, false)) {
-        payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, PAYLOAD_OP_FIND_KEY, this);
-        return nullptr;
-    }
-    return _find(key, key_len);
 }
 
 const char* Payload::_value_ptr(const Entry& e) const {
@@ -6206,12 +6233,13 @@ bool Payload::_ensure_room(size_t additional_entries,
                     storage + old_data_begin,
                     data_used);
         }
-        Entry* entries = reinterpret_cast<Entry*>(storage);
         for (size_t i = 0U; i < _count; ++i) {
-            entries[i].key_off =
-                (uint16_t)((int32_t)entries[i].key_off + shift);
-            entries[i].val_off =
-                (uint16_t)((int32_t)entries[i].val_off + shift);
+            Entry entry = payload_entry_access_t::load(storage, i);
+            entry.key_off =
+                (uint16_t)((int32_t)entry.key_off + shift);
+            entry.val_off =
+                (uint16_t)((int32_t)entry.val_off + shift);
+            payload_entry_access_t::store(storage, i, entry);
         }
         _set_data_begin(new_data_begin);
         payload_note_heap_delta((int32_t)new_capacity -
@@ -6236,12 +6264,13 @@ bool Payload::_ensure_room(size_t additional_entries,
             memcpy(new_storage,
                    old_storage,
                    (size_t)_count * sizeof(Entry));
-            Entry* copied_entries = reinterpret_cast<Entry*>(new_storage);
             for (size_t i = 0U; i < _count; ++i) {
-                copied_entries[i].key_off =
-                    (uint16_t)((int32_t)copied_entries[i].key_off + shift);
-                copied_entries[i].val_off =
-                    (uint16_t)((int32_t)copied_entries[i].val_off + shift);
+                Entry entry = payload_entry_access_t::load(new_storage, i);
+                entry.key_off =
+                    (uint16_t)((int32_t)entry.key_off + shift);
+                entry.val_off =
+                    (uint16_t)((int32_t)entry.val_off + shift);
+                payload_entry_access_t::store(new_storage, i, entry);
             }
         }
         if (data_used != 0U) {
@@ -6616,9 +6645,9 @@ bool Payload::_append_value(const char* key,
         return false;
     }
 
-    // Re-derive once more with all maskable interrupts blocked.  No function
-    // call occurs between these final coordinates and the authoritative entry,
-    // count, data-begin, and complement writes.
+    // Re-derive once more with all maskable interrupts blocked.  Directory
+    // publication crosses the byte-store boundary only through one fixed-size
+    // copy from a real local Entry value; metadata follows in the same court.
     const uint32_t saved_primask = payload_commit_irq_lock();
     const uint32_t commit_coordinates = fresh_coordinates();
     const uint16_t commit_val_off = (uint16_t)commit_coordinates;
@@ -6645,14 +6674,15 @@ bool Payload::_append_value(const char* key,
         return false;
     }
 
-    Entry* const entries = reinterpret_cast<Entry*>(storage);
-    Entry& committed = entries[_count];
-    committed.key_off = commit_key_off;
-    committed.key_len = (uint16_t)key_len;
-    committed.val_off = commit_val_off;
-    committed.val_len = (uint16_t)value_len;
-    committed.kind = (uint8_t)kind;
-    committed.reserved = 0U;
+    const Entry committed = {
+        commit_key_off,
+        (uint16_t)key_len,
+        commit_val_off,
+        (uint16_t)value_len,
+        (uint8_t)kind,
+        0U,
+    };
+    payload_entry_access_t::store(storage, _count, committed);
     _data_begin = commit_key_off;
     _data_begin_guard = (uint16_t)~commit_key_off;
     const uint16_t committed_count = (uint16_t)(_count + 1U);
@@ -6990,14 +7020,15 @@ bool Payload::_append_value_writer(const char* key,
         return false;
     }
 
-    Entry* const entries = reinterpret_cast<Entry*>(storage);
-    Entry& committed = entries[_count];
-    committed.key_off = commit_key_off;
-    committed.key_len = (uint16_t)key_len;
-    committed.val_off = commit_val_off;
-    committed.val_len = (uint16_t)value_len;
-    committed.kind = (uint8_t)kind;
-    committed.reserved = 0U;
+    const Entry committed = {
+        commit_key_off,
+        (uint16_t)key_len,
+        commit_val_off,
+        (uint16_t)value_len,
+        (uint8_t)kind,
+        0U,
+    };
+    payload_entry_access_t::store(storage, _count, committed);
     _data_begin = commit_key_off;
     _data_begin_guard = (uint16_t)~commit_key_off;
     const uint16_t committed_count = (uint16_t)(_count + 1U);
@@ -7740,11 +7771,10 @@ size_t Payload::_json_size() const {
     if (!_contract_begin(PAYLOAD_OP_JSON_SIZE, &observed)) return 0;
 
     size_t total = 2U;  // {}
-    const Entry* entries = _entries();
     const uint8_t* storage = _storage();
 
     for (size_t i = 0; i < _count; ++i) {
-        const Entry& e = entries[i];
+        const Entry e = payload_entry_access_t::load(storage, i);
         const char* value =
             reinterpret_cast<const char*>(storage + e.val_off);
         uint32_t semantic_reason = PAYLOAD_SEMANTIC_FAIL_NONE;
@@ -7855,10 +7885,9 @@ size_t Payload::_write_json_unchecked(char* buf) const {
     char* out = buf;
     *out++ = '{';
 
-    const Entry* entries = _entries();
     const uint8_t* storage = _storage();
     for (size_t i = 0; i < _count; ++i) {
-        const Entry& e = entries[i];
+        const Entry e = payload_entry_access_t::load(storage, i);
         if (i != 0) *out++ = ',';
         *out++ = '"';
         out += json_write_escaped(out,
@@ -8173,7 +8202,7 @@ bool Payload::parseJSON(const uint8_t* data, size_t len) {
         entry.kind = kind_code;
         entry.reserved = 0U;
 
-        parsed._entries()[parsed._count] = entry;
+        payload_entry_access_t::store(storage, parsed._count, entry);
         parsed._set_data_begin(key_off);
         parsed._set_count((uint16_t)(parsed._count + 1U));
 
@@ -8268,15 +8297,18 @@ bool Payload::parseJSON(const uint8_t* data, size_t len) {
 // ============================================================================
 
 bool Payload::has(const char* key) const {
-    return _find(key) != nullptr;
+    Entry entry{};
+    return payload_entry_access_t::find(*this, key, entry, nullptr);
 }
 
 const char* Payload::getString(const char* key) const {
-    const Entry* e = _find(key);
-    if (!e) return nullptr;
-    const ValueKind kind = (ValueKind)e->kind;
+    Entry entry{};
+    if (!payload_entry_access_t::find(*this, key, entry, nullptr)) {
+        return nullptr;
+    }
+    const ValueKind kind = (ValueKind)entry.kind;
     if (kind == ValueKind::OBJECT || kind == ValueKind::ARRAY) return nullptr;
-    return _value_ptr(*e);
+    return _value_ptr(entry);
 }
 
 static bool payload_parse_unsigned_decimal(const char* value,
@@ -8334,16 +8366,20 @@ static bool payload_parse_int32_decimal(const char* value,
 }
 
 bool Payload::tryGetBool(const char* key, bool& out) const {
-    const Entry* e = _find(key);
-    if (!e || !_entry_ok(*e, (size_t)(e - _entries()), PAYLOAD_OP_TRY_BOOL)) return false;
-    const ValueKind kind = (ValueKind)e->kind;
+    Entry entry{};
+    size_t index = 0U;
+    if (!payload_entry_access_t::find(*this, key, entry, &index) ||
+        !_entry_ok(entry, index, PAYLOAD_OP_TRY_BOOL)) {
+        return false;
+    }
+    const ValueKind kind = (ValueKind)entry.kind;
     if (kind != ValueKind::BOOLEAN && kind != ValueKind::STRING) return false;
-    const char* value = _value_ptr(*e);
-    if (e->val_len == 4U && memcmp(value, "true", 4U) == 0) {
+    const char* value = _value_ptr(entry);
+    if (entry.val_len == 4U && memcmp(value, "true", 4U) == 0) {
         out = true;
         return true;
     }
-    if (e->val_len == 5U && memcmp(value, "false", 5U) == 0) {
+    if (entry.val_len == 5U && memcmp(value, "false", 5U) == 0) {
         out = false;
         return true;
     }
@@ -8351,28 +8387,36 @@ bool Payload::tryGetBool(const char* key, bool& out) const {
 }
 
 bool Payload::tryGetInt(const char* key, int32_t& out) const {
-    const Entry* e = _find(key);
-    if (!e || !_entry_ok(*e, (size_t)(e - _entries()), PAYLOAD_OP_TRY_INT)) return false;
-    const ValueKind kind = (ValueKind)e->kind;
+    Entry entry{};
+    size_t index = 0U;
+    if (!payload_entry_access_t::find(*this, key, entry, &index) ||
+        !_entry_ok(entry, index, PAYLOAD_OP_TRY_INT)) {
+        return false;
+    }
+    const ValueKind kind = (ValueKind)entry.kind;
     if (kind != ValueKind::NUMBER && kind != ValueKind::STRING) return false;
 
-    const char* value = _value_ptr(*e);
-    if (!json_number_token_valid(value, e->val_len)) return false;
-    return payload_parse_int32_decimal(value, e->val_len, &out);
+    const char* value = _value_ptr(entry);
+    if (!json_number_token_valid(value, entry.val_len)) return false;
+    return payload_parse_int32_decimal(value, entry.val_len, &out);
 }
 
 bool Payload::tryGetUInt(const char* key, uint32_t& out) const {
-    const Entry* e = _find(key);
-    if (!e || !_entry_ok(*e, (size_t)(e - _entries()), PAYLOAD_OP_TRY_UINT)) return false;
-    const ValueKind kind = (ValueKind)e->kind;
+    Entry entry{};
+    size_t index = 0U;
+    if (!payload_entry_access_t::find(*this, key, entry, &index) ||
+        !_entry_ok(entry, index, PAYLOAD_OP_TRY_UINT)) {
+        return false;
+    }
+    const ValueKind kind = (ValueKind)entry.kind;
     if (kind != ValueKind::NUMBER && kind != ValueKind::STRING) return false;
 
-    const char* value = _value_ptr(*e);
-    if (!json_number_token_valid(value, e->val_len)) return false;
+    const char* value = _value_ptr(entry);
+    if (!json_number_token_valid(value, entry.val_len)) return false;
 
     uint64_t parsed = 0ULL;
     if (!payload_parse_unsigned_decimal(value,
-                                        e->val_len,
+                                        entry.val_len,
                                         (uint64_t)UINT32_MAX,
                                         &parsed)) {
         return false;
@@ -8382,15 +8426,19 @@ bool Payload::tryGetUInt(const char* key, uint32_t& out) const {
 }
 
 bool Payload::tryGetUInt64(const char* key, uint64_t& out) const {
-    const Entry* e = _find(key);
-    if (!e || !_entry_ok(*e, (size_t)(e - _entries()), PAYLOAD_OP_TRY_UINT64)) return false;
-    const ValueKind kind = (ValueKind)e->kind;
+    Entry entry{};
+    size_t index = 0U;
+    if (!payload_entry_access_t::find(*this, key, entry, &index) ||
+        !_entry_ok(entry, index, PAYLOAD_OP_TRY_UINT64)) {
+        return false;
+    }
+    const ValueKind kind = (ValueKind)entry.kind;
     if (kind != ValueKind::NUMBER && kind != ValueKind::STRING) return false;
 
-    const char* value = _value_ptr(*e);
-    if (!json_number_token_valid(value, e->val_len)) return false;
+    const char* value = _value_ptr(entry);
+    if (!json_number_token_valid(value, entry.val_len)) return false;
     return payload_parse_unsigned_decimal(value,
-                                          e->val_len,
+                                          entry.val_len,
                                           UINT64_MAX,
                                           &out);
 }
@@ -8417,35 +8465,48 @@ uint64_t Payload::getUInt64(const char* key, uint64_t default_value) const {
 
 Payload Payload::getPayload(const char* key) const {
     Payload result;
-    const Entry* e = _find(key);
-    if (!e || (ValueKind)e->kind != ValueKind::OBJECT) return result;
-    if (!_entry_ok(*e, (size_t)(e - _entries()), PAYLOAD_OP_GETPAYLOAD)) return result;
-    result.parseJSON(reinterpret_cast<const uint8_t*>(_value_ptr(*e)), e->val_len);
+    Entry entry{};
+    size_t index = 0U;
+    if (!payload_entry_access_t::find(*this, key, entry, &index) ||
+        (ValueKind)entry.kind != ValueKind::OBJECT ||
+        !_entry_ok(entry, index, PAYLOAD_OP_GETPAYLOAD)) {
+        return result;
+    }
+    result.parseJSON(reinterpret_cast<const uint8_t*>(_value_ptr(entry)),
+                     entry.val_len);
     return result;
 }
 
 PayloadArray Payload::getArray(const char* key) const {
     PayloadArray result;
-    const Entry* e = _find(key);
-    if (!e || (ValueKind)e->kind != ValueKind::ARRAY) return result;
-    if (!_entry_ok(*e, (size_t)(e - _entries()), PAYLOAD_OP_GETARRAY)) return result;
-    result.parseJSON(_value_ptr(*e));
+    Entry entry{};
+    size_t index = 0U;
+    if (!payload_entry_access_t::find(*this, key, entry, &index) ||
+        (ValueKind)entry.kind != ValueKind::ARRAY ||
+        !_entry_ok(entry, index, PAYLOAD_OP_GETARRAY)) {
+        return result;
+    }
+    result.parseJSON(_value_ptr(entry));
     return result;
 }
 
 bool Payload::hasArray(const char* key) const {
-    const Entry* e = _find(key);
-    return e && (ValueKind)e->kind == ValueKind::ARRAY &&
-           _entry_ok(*e, (size_t)(e - _entries()), PAYLOAD_OP_HASARRAY);
+    Entry entry{};
+    size_t index = 0U;
+    return payload_entry_access_t::find(*this, key, entry, &index) &&
+           (ValueKind)entry.kind == ValueKind::ARRAY &&
+           _entry_ok(entry, index, PAYLOAD_OP_HASARRAY);
 }
 
 PayloadArrayView Payload::getArrayView(const char* key) const {
-    const Entry* e = _find(key);
-    if (!e || (ValueKind)e->kind != ValueKind::ARRAY ||
-        !_entry_ok(*e, (size_t)(e - _entries()), PAYLOAD_OP_GETARRAYVIEW)) {
+    Entry entry{};
+    size_t index = 0U;
+    if (!payload_entry_access_t::find(*this, key, entry, &index) ||
+        (ValueKind)entry.kind != ValueKind::ARRAY ||
+        !_entry_ok(entry, index, PAYLOAD_OP_GETARRAYVIEW)) {
         return PayloadArrayView();
     }
-    return PayloadArrayView(_value_ptr(*e), e->val_len);
+    return PayloadArrayView(_value_ptr(entry), entry.val_len);
 }
 
 // ============================================================================
@@ -8479,10 +8540,9 @@ void Payload::debug_dump(const char* tag) const {
     debug_log("payload", line);
 
     if (!_self_ok(PAYLOAD_OP_DEBUG_DUMP)) return;
-    const Entry* entries = _entries();
     const uint8_t* storage = _storage();
     for (size_t i = 0; i < _count; ++i) {
-        const Entry& e = entries[i];
+        const Entry e = payload_entry_access_t::load(storage, i);
         if (!_entry_ok(e, i, PAYLOAD_OP_DEBUG_DUMP_ENTRY)) break;
 
         char key[80];

@@ -774,6 +774,7 @@ struct fixed_decimal_t;
 
 struct payload_contract_state_t;
 struct payload_contract_prefix_access_t;
+struct payload_entry_access_t;
 
 class Payload;
 class PayloadArray;
@@ -937,6 +938,7 @@ public:
 private:
     friend void payload_get_info(payload_info_t* out);
     friend struct payload_contract_prefix_access_t;
+    friend struct payload_entry_access_t;
     friend struct payload_stamp_trace_access_t;
     friend class PayloadArray;
 
@@ -957,6 +959,22 @@ private:
         uint8_t  kind;
         uint8_t  reserved;
     };
+
+    // Entry is a value record, never an object fabricated inside the byte store.
+    // Directory publication and observation cross that boundary with fixed-size
+    // memcpy only, so changing Entry to a non-trivial type is forbidden.
+    static_assert(std::is_trivially_copyable<Entry>::value,
+                  "Payload::Entry must remain trivially copyable");
+    static_assert(std::is_standard_layout<Entry>::value,
+                  "Payload::Entry must remain standard-layout");
+    static_assert(sizeof(Entry) == 10U &&
+                  offsetof(Entry, key_off) == 0U &&
+                  offsetof(Entry, key_len) == 2U &&
+                  offsetof(Entry, val_off) == 4U &&
+                  offsetof(Entry, val_len) == 6U &&
+                  offsetof(Entry, kind) == 8U &&
+                  offsetof(Entry, reserved) == 9U,
+                  "Payload::Entry byte schema changed");
 
     static constexpr size_t INLINE_STORAGE = 256;
     static constexpr size_t STORAGE_MAX =
@@ -1011,9 +1029,6 @@ private:
     size_t _capacity() const;
     size_t _data_used() const;
 
-    Entry* _entries();
-    const Entry* _entries() const;
-
     void _reset_empty();
     void _release_storage();
     void _move_from(Payload& other);
@@ -1051,9 +1066,6 @@ private:
     void _contract_accept(const payload_contract_state_t& state);
     uint32_t _contract_semantic_hash(size_t entry_limit) const;
     uint32_t _json_hash_unchecked() const;
-
-    const Entry* _find(const char* key, size_t key_len) const;
-    const Entry* _find(const char* key) const;
 
     bool _ensure_room(size_t additional_entries,
                       size_t additional_data,
