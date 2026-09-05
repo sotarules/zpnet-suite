@@ -31,10 +31,11 @@
 //
 // Real single-pass race engine:
 //   • one recurring 1 kHz TimePop cadence owns one race attempt per tick;
-//   • Step 4 keeps that producer held while optical authority migrates from the
-//     legacy LD_ON pulse path to the active-low SDM gate;
+//   • Step 4 keeps that producer held and establishes permanent split authority:
+//     LD_ON owns only the coarse MP5491 source while the active-low SDM gate
+//     remains HIGH/inhibited;
 //   • the dormant LD_ON falling-edge launch surrogate must not be activated in
-//     this baseline and will be replaced by the gate-timed path in a later step;
+//     this checkpoint and will be replaced by gate-timed launch in Step 5;
 //   • process_interrupt owns the first-instruction DWT coordinate of every
 //     physical PD200T pin-34 RISING edge; PHOTONS admits only the first eligible
 //     edge for the armed race and ignores later comparator chatter for race science;
@@ -50,11 +51,10 @@
 //
 // Commands:
 //   • INIT                — reinitialize PHOTONS-owned optical hardware; active-low gate
-//                           closes first; the Step-4 boot coarse-source switch is currently
-//                           neutralized, so LD_ON remains LOW after MP5491 configuration
+//                           closes first and LD_ON is forced LOW after MP5491 configuration
 //   • DETECTOR_ACTIVATE   — commissioning-only activation of the already-subscribed PD200T
-//                           interrupt lane; gate remains closed, LD_ON follows the Step-4
-//                           boot switch (currently LOW), and no race/publisher starts
+//                           interrupt lane; gate remains HIGH, LD_ON remains LOW, and no
+//                           race/publisher starts
 //   • SET_LAP_BASELINE_NS — install/change the operator-authored lap reference with
 //                           six fractional ns digits (1 fs); Better-Buckets are
 //                           re-referenced in place without changing physical custody
@@ -62,9 +62,9 @@
 //   • START               — start a LANTERN campaign, or hot-cut an active campaign to a new name
 //   • FLASH_CUT           — explicit hot campaign boundary preserving the always-on instrument epoch
 //   • STOP                — request campaign closure; the next published campaign fragment is final
-//   • REPORT              — compact operational/device report for laser, PD200T pin 38/A14
-//                           PD OUT voltage, pin 34 comparator interrupt custody/blocker
-//                           forensics, publication identity, and hardware commissioning
+//   • REPORT              — compact operational/device report including Step-4 coarse-source
+//                           state, active-low gate inhibit, MP5491 ID1 current setting, laser
+//                           monitor, PD200T pin 38/A14 telemetry, and pin-34 interrupt custody
 //   • PULSE               — Step-4 transition hold: rejected until Step 5 moves manual
 //                           pulse authorship from LD_ON to the active-low SDM gate
 //   • REPORT_PULSE        — minimal latest manual-shot commissioning report
@@ -82,11 +82,10 @@
 //   • REPORT_RECOVERY     — report staging, restored source, and physical-ancestry testimony
 //   • INJECT_PROBLEM      — retained command identity; synthetic injection is unavailable
 //                           after retirement of the emulator
-//   • ON                  — with the Step-4 boot switch neutralized, enable LD_ON only after
-//                           re-proving the active-low SDM gate HIGH/closed; if the boot switch
-//                           is later enabled, ON resumes opening the gate with LD_ON already HIGH
-//   • OFF                 — while the Step-4 boot switch is neutralized, close the gate and
-//                           return LD_ON LOW; if later enabled, close the gate and leave LD_ON HIGH
+//   • ON                  — Step-4 coarse-source enable only: re-prove the active-low SDM
+//                           gate HIGH/closed, then assert LD_ON HIGH; never opens the gate
+//   • OFF                 — Step-4 fail-safe shutdown: drive gate HIGH first, then LD_ON LOW,
+//                           and prove both physical levels before returning
 // ============================================================================
 
 // Cumulative ISR-authored optical-edge state from PD200T TTL pin 34.

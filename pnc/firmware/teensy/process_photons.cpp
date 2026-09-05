@@ -122,12 +122,6 @@ static constexpr uint8_t PHOTONS_LASER_ID1_CURRENT_LSB = 0x00;
 static constexpr float PHOTONS_LASER_EMIT_THRESHOLD_V = 0.75f;
 static constexpr uint64_t PHOTONS_PULSE_DEFAULT_NS = 1000ULL;
 
-// Step-4 commissioning kill switch.  False is the harmless bisect baseline:
-// PHOTONS configures the MP5491 but leaves LD_ON LOW after initialization.
-// Turning this true is the single deliberate step that reintroduces the boot-time
-// coarse-source enable behind the already-closed active-low SDM gate.
-static constexpr bool PHOTONS_STEP4_COARSE_SOURCE_BOOT_ENABLED = false;
-
 // Interim real-race geometry. One 1 ms cell contains one 91 us LD_ON pulse
 // followed by a long quiet receive/recovery interval. The actual LD_ON falling
 // edge is the temporary launch surrogate until the fast-switch daughterboard
@@ -2068,10 +2062,10 @@ static float photons_adc_voltage(uint16_t raw) {
 }
 
 // Optical authority is intentionally split.  The SDM/LANTERN gate is active-low.
-// LD_ON is the slower MP5491 coarse-source enable.  The current bisect baseline
-// keeps LD_ON LOW at boot; the first incremental commissioning step may raise it
-// explicitly while the gate remains physically re-proved closed.  Hard inhibit
-// always closes the gate first and removes the coarse source second.
+// LD_ON is the slower MP5491 coarse-source enable. Step 4 makes that separation
+// permanent: boot/INIT leave both layers inhibited; ON may raise only LD_ON after
+// re-proving the gate HIGH/closed; OFF closes the gate first and removes LD_ON
+// second. No Step-4 control is allowed to drive the gate LOW.
 static void photons_laser_hard_inhibit(void) {
   digitalWrite(LASER_GATE_PIN, HIGH);
   digitalWrite(LD_ON_PIN, LOW);
@@ -2081,8 +2075,12 @@ static void photons_laser_gate_close(void) {
   digitalWrite(LASER_GATE_PIN, HIGH);
 }
 
-static int photons_step4_expected_ld_on_level(void) {
-  return PHOTONS_STEP4_COARSE_SOURCE_BOOT_ENABLED ? HIGH : LOW;
+static void photons_laser_coarse_source_disable(void) {
+  photons_laser_hard_inhibit();
+  if (digitalRead(LASER_GATE_PIN) != HIGH ||
+      digitalRead(LD_ON_PIN) != LOW) {
+    __builtin_trap();
+  }
 }
 
 static void photons_laser_coarse_source_enable_behind_closed_gate(void) {
@@ -2371,14 +2369,14 @@ static void photons_race_start(void) {
 
 static void photons_laser_initialize_hardware(void) {
   // Take runtime custody from the early-boot safety boundary without ever
-  // authoring an emitting intermediate state.  Preload gate HIGH / LD_ON LOW
+  // authoring an emitting intermediate state. Preload gate HIGH / LD_ON LOW
   // before driving either pin and keep that hard inhibit through MP5491 setup.
-  // Only after configuration completes do we raise the coarse source behind a
-  // physically re-proved closed active-low SDM gate.
+  // Step 4 deliberately does not energize the coarse source at boot or INIT;
+  // only an explicit ON command may do that later behind the closed gate.
   photons_laser_hard_inhibit();
   pinMode(LASER_GATE_PIN, OUTPUT);
   pinMode(LD_ON_PIN, OUTPUT);
-  photons_laser_hard_inhibit();
+  photons_laser_coarse_source_disable();
 
   pinMode(LASER_MONITOR_PIN, INPUT);
   pinMode(PHOTODIODE_ANALOG_PIN, INPUT);
@@ -2400,15 +2398,9 @@ static void photons_laser_initialize_hardware(void) {
       MP5491_REG_ID1_LSB,
       (lsb & ~0x03U) | PHOTONS_LASER_ID1_CURRENT_LSB);
 
-  // Step-4 bisect baseline: keep the new coarse-source path present but inert.
-  // With the switch false, return from PHOTONS init in the previously proven
-  // gate-HIGH / LD_ON-LOW envelope.  Flipping this one constant later re-enables
-  // the exact boot-time behavior currently under suspicion.
-  if (PHOTONS_STEP4_COARSE_SOURCE_BOOT_ENABLED) {
-    photons_laser_coarse_source_enable_behind_closed_gate();
-  } else {
-    photons_laser_hard_inhibit();
-  }
+  // Re-establish and prove the permanent Step-4 idle state after every MP5491
+  // configuration transaction. No initialization path may leave LD_ON asserted.
+  photons_laser_coarse_source_disable();
 }
 
 static photons_device_snapshot_t photons_device_snapshot(void) {
@@ -5835,9 +5827,11 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
       __builtin_trap();
     }
 
+    const photons_device_snapshot_t device = photons_device_snapshot();
+
     Payload p;
     p.add("report", "PHOTONS");
-    p.add("schema", "PHOTONS_BRINGUP_REPORT_V2");
+    p.add("schema", "PHOTONS_BRINGUP_REPORT_V3");
     p.add("initialized", g_initialized);
     p.add("publication_started", false);
     p.add("interrupt_subscribed", interrupt_diag.subscribed);
@@ -5847,8 +5841,18 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
     p.add("interrupt_inactive_edge_count", interrupt_diag.inactive_edge_count);
     p.add("laser_gate_level", digitalRead(LASER_GATE_PIN));
     p.add("ld_on_level", digitalRead(LD_ON_PIN));
-    p.add("coarse_source_boot_enabled",
-          PHOTONS_STEP4_COARSE_SOURCE_BOOT_ENABLED);
+    p.add("coarse_source_enabled", device.laser_enabled);
+    // Compatibility testimony: Step 4 permanently forbids boot-time coarse enable.
+    p.add("coarse_source_boot_enabled", false);
+    p.add("gate_active_low", true);
+    p.add("gate_inhibited", digitalRead(LASER_GATE_PIN) == HIGH);
+    p.add("laser_id1_raw", device.laser_id1_raw);
+    p.add("laser_id1_current_ma",
+          toFixedDecimal(device.laser_id1_current_ma, 3));
+    p.add("laser_monitor_v", toFixedDecimal(device.laser_monitor_v, 6));
+    p.add("laser_emitting", device.laser_emitting);
+    p.add("photodiode_analog_v",
+          toFixedDecimal(device.photodiode_analog_v, 6));
     p.add("race_engine_active",
           g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE);
     return p;
@@ -5966,10 +5970,15 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
         toFixedDecimal(device.photodiode_analog_v, 6));
   p.add("laser_gate_level", digitalRead(LASER_GATE_PIN));
   p.add("ld_on_level", digitalRead(LD_ON_PIN));
-  p.add("coarse_source_boot_enabled",
-        PHOTONS_STEP4_COARSE_SOURCE_BOOT_ENABLED);
+  p.add("coarse_source_enabled", device.laser_enabled);
+  p.add("coarse_source_boot_enabled", false);
   p.add("gate_active_low", true);
+  p.add("gate_inhibited", digitalRead(LASER_GATE_PIN) == HIGH);
+  p.add("laser_id1_raw", device.laser_id1_raw);
+  p.add("laser_id1_current_ma",
+        toFixedDecimal(device.laser_id1_current_ma, 3));
   p.add("laser_monitor_v", toFixedDecimal(device.laser_monitor_v, 6));
+  p.add("laser_emitting", device.laser_emitting);
   return p;
 }
 
@@ -6036,9 +6045,9 @@ static FLASHMEM Payload cmd_detector_activate(const Payload& /*args*/) {
     return p;
   }
 
-  // Detector commissioning never changes the selected Step-4 coarse-source
-  // baseline.  The active-low SDM gate remains HIGH and LD_ON must match the
-  // compile-time bisect switch. No detector activation may open the gate.
+  // Detector commissioning remains the Step-3 boundary: it may activate only
+  // the PD200T lane. It re-proves the active-low gate HIGH and requires the
+  // coarse source to remain LOW; coarse-source authority belongs only to ON/OFF.
   photons_laser_gate_close();
 
   if (!g_initialized || !g_subscription_ok) __builtin_trap();
@@ -6059,9 +6068,8 @@ static FLASHMEM Payload cmd_detector_activate(const Payload& /*args*/) {
       !interrupt_diag.subscribed || !interrupt_diag.active) {
     __builtin_trap();
   }
-  const int expected_ld_on_level = photons_step4_expected_ld_on_level();
   if (digitalRead(LASER_GATE_PIN) != HIGH ||
-      digitalRead(LD_ON_PIN) != expected_ld_on_level ||
+      digitalRead(LD_ON_PIN) != LOW ||
       g_photons_recovery.publication_started ||
       g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE) {
     photons_laser_hard_inhibit();
@@ -6073,9 +6081,9 @@ static FLASHMEM Payload cmd_detector_activate(const Payload& /*args*/) {
   p.add("interrupt_subscribed", true);
   p.add("interrupt_active", true);
   p.add("laser_gate_level", HIGH);
-  p.add("ld_on_level", expected_ld_on_level);
-  p.add("coarse_source_boot_enabled",
-        PHOTONS_STEP4_COARSE_SOURCE_BOOT_ENABLED);
+  p.add("ld_on_level", LOW);
+  p.add("coarse_source_enabled", false);
+  p.add("coarse_source_boot_enabled", false);
   p.add("publication_started", false);
   p.add("race_engine_active", false);
   return p;
@@ -6236,37 +6244,29 @@ static FLASHMEM Payload cmd_on(const Payload& /*args*/) {
     p.add("status", "on_rejected_race_engine_active");
     return p;
   }
-  if (!PHOTONS_STEP4_COARSE_SOURCE_BOOT_ENABLED) {
-    // First post-baseline commissioning increment: energize only the slow
-    // MP5491 coarse source.  The active-low SDM gate must remain HIGH/closed,
-    // so this command cannot intentionally author optical emission.
-    photons_laser_coarse_source_enable_behind_closed_gate();
-    Payload p;
-    p.add("status", "coarse_source_enabled_gate_closed");
-    p.add("laser_gate_level", HIGH);
-    p.add("ld_on_level", HIGH);
-    p.add("coarse_source_boot_enabled", false);
-    p.add("gate_active_low", true);
-    return p;
-  }
-  if (digitalRead(LD_ON_PIN) != HIGH) {
-    photons_laser_hard_inhibit();
-    __builtin_trap();
-  }
 
-  // Active-low SDM gate: logical ON means opening pin 35 by driving it LOW.
-  digitalWrite(LASER_GATE_PIN, LOW);
-  if (digitalRead(LASER_GATE_PIN) != LOW ||
-      digitalRead(LD_ON_PIN) != HIGH) {
+  // Step 4 defines ON permanently as coarse-source enable only. The helper
+  // re-proves the active-low SDM gate HIGH before and after asserting LD_ON.
+  photons_laser_coarse_source_enable_behind_closed_gate();
+  const photons_device_snapshot_t device = photons_device_snapshot();
+  if (!device.laser_enabled || digitalRead(LASER_GATE_PIN) != HIGH) {
     photons_laser_hard_inhibit();
     __builtin_trap();
   }
 
   Payload p;
-  p.add("status", "laser_gate_open");
-  p.add("laser_gate_level", LOW);
+  p.add("status", "coarse_source_enabled_gate_closed");
+  p.add("laser_gate_level", HIGH);
   p.add("ld_on_level", HIGH);
+  p.add("coarse_source_enabled", true);
+  p.add("coarse_source_boot_enabled", false);
   p.add("gate_active_low", true);
+  p.add("gate_inhibited", true);
+  p.add("laser_id1_raw", device.laser_id1_raw);
+  p.add("laser_id1_current_ma",
+        toFixedDecimal(device.laser_id1_current_ma, 3));
+  p.add("laser_monitor_v", toFixedDecimal(device.laser_monitor_v, 6));
+  p.add("laser_emitting", device.laser_emitting);
   return p;
 }
 
@@ -6279,35 +6279,27 @@ static FLASHMEM Payload cmd_off(const Payload& /*args*/) {
     return p;
   }
 
-  if (!PHOTONS_STEP4_COARSE_SOURCE_BOOT_ENABLED) {
-    photons_laser_hard_inhibit();
-    Payload p;
-    p.add("status", "laser_hard_inhibited_step4_coarse_source_boot_disabled");
-    p.add("laser_gate_level", HIGH);
-    p.add("ld_on_level", LOW);
-    p.add("coarse_source_boot_enabled", false);
-    return p;
-  }
-
-  // Active-low SDM gate: logical OFF closes pin 35 while leaving the slower
-  // MP5491 coarse source continuously enabled behind it.
-  photons_laser_gate_close();
-  if (digitalRead(LASER_GATE_PIN) != HIGH) {
-    photons_laser_hard_inhibit();
-    __builtin_trap();
-  }
-  if (digitalRead(LD_ON_PIN) != HIGH) {
-    // The gate is already closed. Preserve that safe state, then fail loudly
-    // because normal Step-4 operation has lost its coarse-source invariant.
-    photons_laser_hard_inhibit();
+  // Step 4 defines OFF as the asymmetric fail-safe transaction: close the gate
+  // first, then remove the slower coarse source, and prove both physical levels.
+  photons_laser_coarse_source_disable();
+  const photons_device_snapshot_t device = photons_device_snapshot();
+  if (device.laser_enabled || digitalRead(LASER_GATE_PIN) != HIGH) {
     __builtin_trap();
   }
 
   Payload p;
-  p.add("status", "laser_gate_closed");
+  p.add("status", "coarse_source_disabled_gate_closed");
   p.add("laser_gate_level", HIGH);
-  p.add("ld_on_level", HIGH);
+  p.add("ld_on_level", LOW);
+  p.add("coarse_source_enabled", false);
+  p.add("coarse_source_boot_enabled", false);
   p.add("gate_active_low", true);
+  p.add("gate_inhibited", true);
+  p.add("laser_id1_raw", device.laser_id1_raw);
+  p.add("laser_id1_current_ma",
+        toFixedDecimal(device.laser_id1_current_ma, 3));
+  p.add("laser_monitor_v", toFixedDecimal(device.laser_monitor_v, 6));
+  p.add("laser_emitting", device.laser_emitting);
   return p;
 }
 
