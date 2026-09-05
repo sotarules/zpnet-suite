@@ -12,7 +12,7 @@
 // lineage_id carries immutable event/transaction identity across custody layers.
 //
 // Live rings remain in ordinary RAM1.  Fault capture freezes all committed live
-// entries into one retained RAM2 set before Teensyduino performs its reboot.
+// entries into the crash generation's retained RAM2 set before reboot.
 // Reporting may merge rings by DWT, but the per-context rings are the testimony.
 
 static constexpr uint32_t EXECUTION_TRACE_ENTRIES_PER_CONTEXT = 8U;
@@ -156,17 +156,26 @@ void execution_trace_record(execution_trace_context_t context,
                             uint32_t object,
                             uint32_t aux);
 
-void execution_trace_get_metadata(execution_trace_metadata_t* out);
+// generation=0 selects the latest committed trace. Exact missing generations
+// return no retained evidence; they never fall back to another fault's trace.
+void execution_trace_get_metadata(execution_trace_metadata_t* out,
+                                  uint32_t generation = 0U);
+uint32_t execution_trace_retained_bytes(void);
 bool execution_trace_snapshot_context(
     bool retained,
     execution_trace_context_t context,
-    execution_trace_context_snapshot_t* out);
+    execution_trace_context_snapshot_t* out,
+    uint32_t generation = 0U);
 
 void execution_trace_snapshot(execution_trace_snapshot_t* out);
 void execution_trace_clear_retained(void);
 
 extern "C" void execution_trace_capture_fault(uint32_t fault_dwt,
                                                uint32_t crash_sequence);
+// The crash recorder owns slot selection, keeping raw-only crashes from making
+// the trace archive independently rotate or overwrite the pinned first slot.
+extern "C" void execution_trace_capture_fault_generation(
+    uint32_t fault_dwt, uint32_t crash_sequence, uint32_t slot);
 
 #define ZPNET_EXECUTION_TRACE(context, stage, kind, phase, lineage_id,        \
                               subject_index, identity, target, related_target, \

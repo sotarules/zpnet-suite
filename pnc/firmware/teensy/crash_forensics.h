@@ -18,6 +18,9 @@
 
 static constexpr uint32_t CRASH_FORENSICS_SCHEMA_VERSION = 3U;
 static constexpr uint32_t CRASH_FORENSICS_CORE_SCHEMA_VERSION = 2U;
+// Slot 0 preserves the first fault until CRASH_CLEAR; slot 1 holds the latest
+// subsequent fault. Generation identifiers are capture sequences, not slots.
+static constexpr uint32_t CRASH_FORENSICS_GENERATION_CAPACITY = 2U;
 static constexpr size_t CRASH_FORENSICS_NVIC_WORDS = 5U;
 static constexpr size_t CRASH_FORENSICS_MPU_REGIONS = 16U;
 static constexpr size_t CRASH_FORENSICS_FP_FRAME_WORDS = 18U;
@@ -309,9 +312,17 @@ static_assert((sizeof(crash_forensics_record_t) % 32U) == 0U,
 void crash_forensics_install(void);
 bool crash_forensics_installed(void);
 
-void crash_forensics_get_status(crash_forensics_status_t* out);
-const crash_forensics_core_record_t* crash_forensics_core_record(void);
-const crash_forensics_record_t* crash_forensics_record(void);
+// generation=0 selects latest. An unavailable nonzero sequence never falls back.
+uint32_t crash_forensics_generation_at(uint32_t slot);
+uint32_t crash_forensics_latest_generation(void);
+size_t crash_forensics_retained_bytes(void);
+void crash_forensics_get_status(crash_forensics_status_t* out,
+                                uint32_t generation = 0U);
+const crash_forensics_core_record_t* crash_forensics_core_record(
+    uint32_t generation = 0U);
+const crash_forensics_record_t* crash_forensics_record(
+    uint32_t generation = 0U);
+// Explicitly releases both retained generations. No automatic boot-time clear.
 void crash_forensics_clear(void);
 
 const char* crash_forensics_exception_name(uint32_t exception_number);
@@ -348,7 +359,8 @@ struct crash_raw_entry_record_t {
 static_assert((sizeof(crash_raw_entry_record_t) % 32U) == 0U,
               "Raw entry record must occupy complete Cortex-M7 cache lines");
 
-const crash_raw_entry_record_t* crash_forensics_raw_entry_record(void);
+const crash_raw_entry_record_t* crash_forensics_raw_entry_record(
+    uint32_t generation = 0U);
 
 // ============================================================================
 // Retained deferred-dispatch breadcrumb

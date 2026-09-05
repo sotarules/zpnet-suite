@@ -6,6 +6,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 // ============================================================================
 // Core linkage and retained storage
@@ -24,10 +25,18 @@ volatile uint32_t g_crash_forensics_capture_active = 0U;
 alignas(8) uint32_t g_crash_forensics_emergency_stack[512];
 }
 
-alignas(32) static crash_forensics_core_record_t
-    g_crash_forensics_core_record DMAMEM;
-alignas(32) static crash_forensics_record_t g_crash_forensics_record DMAMEM;
-alignas(32) static crash_raw_entry_record_t g_crash_raw_entry_record DMAMEM;
+struct alignas(32) crash_generation_t {
+    crash_raw_entry_record_t raw;
+    crash_forensics_core_record_t core;
+    crash_forensics_record_t extended;
+};
+static crash_generation_t
+    g_crash_generations[CRASH_FORENSICS_GENERATION_CAPACITY] DMAMEM;
+static_assert(sizeof(g_crash_generations) == 4288U,
+              "Two crash generations must remain within 4288 bytes");
+// Only the terminal fault capture writes this selector. Reports select locally
+// by sequence and never change capture ownership or copy a complete generation.
+static uint32_t g_crash_capture_slot = 0U;
 alignas(32) static crash_dispatch_breadcrumb_t
     g_crash_dispatch_breadcrumb_live[2] DMAMEM;
 alignas(32) static crash_dispatch_breadcrumb_t
@@ -734,7 +743,8 @@ static bool core_record_crc_valid(
 
 static void core_record_publish_stage(
     crash_forensics_capture_stage_t stage) {
-    crash_forensics_core_record_t& record = g_crash_forensics_core_record;
+    crash_forensics_core_record_t& record =
+        g_crash_generations[g_crash_capture_slot].core;
     const uint32_t value = static_cast<uint32_t>(stage);
 
     // Invalidate the pair first.  A fault during the update leaves the core
@@ -752,7 +762,8 @@ static void core_record_publish_stage(
 static void capture_core_record_from_entry(
     const crash_forensics_entry_context_t* entry,
     uint32_t sequence) {
-    crash_forensics_core_record_t& record = g_crash_forensics_core_record;
+    crash_forensics_core_record_t& record =
+        g_crash_generations[g_crash_capture_slot].core;
     // Raw entry is already durable.  Persistently invalidate the prior core
     // header before replacement so a deeper capture fault cannot resurrect an
     // older CRC-valid core record from RAM2 after the dirty cache is lost.
@@ -920,14 +931,14 @@ static bool crash_sequence_newer(uint32_t candidate, uint32_t current) {
            (current == 0U || (int32_t)(candidate - current) > 0);
 }
 
-static uint32_t coherent_prior_sequence(void) {
+static uint32_t crash_generation_sequence(const crash_generation_t& generation) {
     uint32_t newest = 0U;
 
-    if (core_record_crc_valid(g_crash_forensics_core_record)) {
-        newest = g_crash_forensics_core_record.capture_sequence;
+    if (core_record_crc_valid(generation.core)) {
+        newest = generation.core.capture_sequence;
     }
 
-    const crash_forensics_record_t& record = g_crash_forensics_record;
+    const crash_forensics_record_t& record = generation.extended;
     const bool extended_valid =
         record.magic == CRASH_FORENSICS_MAGIC &&
         record.magic_inv == ~CRASH_FORENSICS_MAGIC &&
@@ -941,12 +952,36 @@ static uint32_t coherent_prior_sequence(void) {
         newest = record.capture_sequence;
     }
 
-    if (crash_raw_entry_valid(g_crash_raw_entry_record) &&
-        crash_sequence_newer(g_crash_raw_entry_record.sequence, newest)) {
-        newest = g_crash_raw_entry_record.sequence;
+    if (crash_raw_entry_valid(generation.raw) &&
+        crash_sequence_newer(generation.raw.sequence, newest)) {
+        newest = generation.raw.sequence;
     }
 
     return newest;
+}
+
+uint32_t crash_forensics_generation_at(uint32_t slot) {
+    return slot < CRASH_FORENSICS_GENERATION_CAPACITY
+        ? crash_generation_sequence(g_crash_generations[slot]) : 0U;
+}
+
+uint32_t crash_forensics_latest_generation(void) {
+    const uint32_t latest = crash_forensics_generation_at(1U);
+    return latest != 0U ? latest : crash_forensics_generation_at(0U);
+}
+
+size_t crash_forensics_retained_bytes(void) {
+    return sizeof(g_crash_generations);
+}
+
+static const crash_generation_t* crash_find_generation(uint32_t sequence) {
+    if (sequence == 0U) sequence = crash_forensics_latest_generation();
+    if (sequence == 0U) return nullptr;
+    for (uint32_t slot = 0U; slot < CRASH_FORENSICS_GENERATION_CAPACITY; ++slot) {
+        if (crash_forensics_generation_at(slot) == sequence)
+            return &g_crash_generations[slot];
+    }
+    return nullptr;
 }
 
 static void crash_raw_entry_publish_stage(
@@ -965,7 +1000,7 @@ static void crash_raw_entry_publish_stage(
 static void capture_raw_entry_witness(
     const crash_forensics_entry_context_t* entry,
     uint32_t sequence) {
-    crash_raw_entry_record_t& r = g_crash_raw_entry_record;
+    crash_raw_entry_record_t& r = g_crash_generations[g_crash_capture_slot].raw;
 
     // Persistently retire the previous raw witness before constructing this
     // one.  Otherwise a fault before the final cache flush can reboot with the
@@ -1042,14 +1077,23 @@ extern "C" void crash_forensics_capture_from_entry(
     // layers.  Include any surviving raw-only capture when choosing the next
     // sequence so a failed deeper capture can never make an older structured
     // record look contemporaneous with a newer fault.
-    uint32_t sequence = coherent_prior_sequence() + 1U;
+    uint32_t sequence = crash_forensics_latest_generation() + 1U;
     if (sequence == 0U) sequence = 1U;
+    const uint32_t first_sequence = crash_forensics_generation_at(0U);
+    // The first slot can outlive a complete counter cycle. Do not reuse its
+    // identity while it is still pinned.
+    if (sequence == first_sequence) {
+        ++sequence;
+        if (sequence == 0U) sequence = 1U;
+    }
+    g_crash_capture_slot = first_sequence != 0U ? 1U : 0U;
 
     // First durable act: preserve scalar entry state, then the untouched
     // architectural stack image as a second-stage best effort.
     capture_raw_entry_witness(entry, sequence);
 
-    crash_forensics_record_t& record = g_crash_forensics_record;
+    crash_forensics_record_t& record =
+        g_crash_generations[g_crash_capture_slot].extended;
 
     // Phase 1: commit the small, direct-read core record before any MPU walk,
     // executable-window inspection, or extended stack capture can fault.
@@ -1058,7 +1102,8 @@ extern "C" void crash_forensics_capture_from_entry(
     // Freeze every execution-context notebook immediately after the durable
     // core record.  DWT and crash sequence bind the retained trace set to this
     // exact fault without asking any recorder to infer cross-context ordering.
-    execution_trace_capture_fault(reg32(REG_DWT_CYCCNT), sequence);
+    execution_trace_capture_fault_generation(
+        reg32(REG_DWT_CYCCNT), sequence, g_crash_capture_slot);
 
     core_record_publish_stage(CRASH_FORENSICS_STAGE_EXTENDED_BEGIN);
 
@@ -2107,16 +2152,21 @@ FLASHMEM bool crash_forensics_installed(void) {
                crash_forensics_fault_entry;
 }
 
-FLASHMEM void crash_forensics_get_status(crash_forensics_status_t* out) {
+FLASHMEM void crash_forensics_get_status(crash_forensics_status_t* out,
+                                        uint32_t generation) {
     if (!out) return;
 
     *out = crash_forensics_status_t{};
     out->installed = crash_forensics_installed();
+    const crash_generation_t* selected = crash_find_generation(generation);
+    if (!selected) return;
+    const uint32_t sequence = crash_generation_sequence(*selected);
 
     const crash_forensics_core_record_t& core =
-        g_crash_forensics_core_record;
+        selected->core;
     out->core_stored_crc = core.crc32;
     out->core_present =
+        core.capture_sequence == sequence &&
         core.magic == CRASH_FORENSICS_CORE_MAGIC &&
         core.magic_inv == ~CRASH_FORENSICS_CORE_MAGIC;
     if (out->core_present) {
@@ -2128,9 +2178,10 @@ FLASHMEM void crash_forensics_get_status(crash_forensics_status_t* out) {
         }
     }
 
-    const crash_forensics_record_t& record = g_crash_forensics_record;
+    const crash_forensics_record_t& record = selected->extended;
     out->stored_crc = record.crc32;
     out->extended_present =
+        record.capture_sequence == sequence &&
         record.magic == CRASH_FORENSICS_MAGIC &&
         record.magic_inv == ~CRASH_FORENSICS_MAGIC;
     if (out->extended_present) {
@@ -2145,45 +2196,43 @@ FLASHMEM void crash_forensics_get_status(crash_forensics_status_t* out) {
         }
     }
 
-    out->present = out->core_present || out->extended_present;
+    out->present = out->core_present || out->extended_present ||
+        (crash_raw_entry_valid(selected->raw) && selected->raw.sequence == sequence);
 }
 
 FLASHMEM const crash_raw_entry_record_t*
-crash_forensics_raw_entry_record(void) {
-    return crash_raw_entry_valid(g_crash_raw_entry_record)
-        ? &g_crash_raw_entry_record : nullptr;
+crash_forensics_raw_entry_record(uint32_t generation) {
+    const crash_generation_t* selected = crash_find_generation(generation);
+    return selected && crash_raw_entry_valid(selected->raw) &&
+        selected->raw.sequence == crash_generation_sequence(*selected)
+        ? &selected->raw : nullptr;
 }
 
 FLASHMEM const crash_forensics_core_record_t*
-crash_forensics_core_record(void) {
+crash_forensics_core_record(uint32_t generation) {
     crash_forensics_status_t status{};
-    crash_forensics_get_status(&status);
+    crash_forensics_get_status(&status, generation);
     return status.core_crc_valid
-        ? &g_crash_forensics_core_record
+        ? &crash_find_generation(generation)->core
         : nullptr;
 }
 
-FLASHMEM const crash_forensics_record_t* crash_forensics_record(void) {
+FLASHMEM const crash_forensics_record_t* crash_forensics_record(uint32_t generation) {
     crash_forensics_status_t status{};
-    crash_forensics_get_status(&status);
-    return status.crc_valid ? &g_crash_forensics_record : nullptr;
+    crash_forensics_get_status(&status, generation);
+    return status.crc_valid ? &crash_find_generation(generation)->extended : nullptr;
 }
 
 FLASHMEM void crash_forensics_clear(void) {
     const uint32_t saved_primask = read_primask();
     disable_interrupts();
-    zero_core_record(g_crash_forensics_core_record);
-    zero_record(g_crash_forensics_record);
-    memset((void*)&g_crash_raw_entry_record, 0, sizeof(g_crash_raw_entry_record));
+    // Release the paired trace archive before sequences can restart at one.
+    execution_trace_clear_retained();
+    memset((void*)g_crash_generations, 0, sizeof(g_crash_generations));
     crash_dispatch_breadcrumb_zero(
         g_crash_dispatch_breadcrumb_retained);
     crash_barrier();
-    arm_dcache_flush_delete(&g_crash_forensics_core_record,
-                            sizeof(g_crash_forensics_core_record));
-    arm_dcache_flush_delete(&g_crash_forensics_record,
-                            sizeof(g_crash_forensics_record));
-    arm_dcache_flush_delete(&g_crash_raw_entry_record,
-                            sizeof(g_crash_raw_entry_record));
+    arm_dcache_flush_delete(g_crash_generations, sizeof(g_crash_generations));
     crash_dispatch_breadcrumb_flush(
         g_crash_dispatch_breadcrumb_retained);
     crash_barrier();

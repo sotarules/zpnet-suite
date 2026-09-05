@@ -443,7 +443,8 @@ static FLASHMEM Payload system_features_tree_payload(void) {
 //     before chaining into Teensyduino's core handler.
 //   • Teensyduino remains responsible for its standard CrashReport, USB grace,
 //     and automatic reboot.
-//   • The ZPNet retained record is immutable after reboot until CRASH_CLEAR.
+//   • The first ZPNet crash generation remains pinned until CRASH_CLEAR;
+//     the second slot holds the latest subsequent fault.
 //   • CrashReport.printTo() remains explicit because it clears the core record.
 //
 // Important Teensyduino behavior: CrashReport.printTo() clears the underlying
@@ -456,6 +457,56 @@ static FLASHMEM void system_crash_add_hex32(Payload& payload,
                                    const char* key,
                                    uint32_t value) {
   payload.add_fmt(key, "0x%08lX", (unsigned long)value);
+}
+
+// Resolve once per foreground RPC. No global reporting selector can be changed
+// underneath a response, and exact missing generations never select latest.
+static bool system_crash_generation_parse(const Payload& args,
+                                           uint32_t* generation) {
+  *generation = crash_forensics_latest_generation();
+  if (!args.has("generation")) return true;
+  const char* text = args.getString("generation");
+  if (text && strcmp(text, "latest") == 0) return true;
+  if (text && strcmp(text, "first") == 0) {
+    *generation = crash_forensics_generation_at(0U);
+    return *generation != 0U;
+  }
+  uint32_t value = 0U;
+  if (text) {
+    if (!*text) return false;
+    for (const char* c = text; *c; ++c) {
+      if (*c < '0' || *c > '9') return false;
+      const uint32_t digit = (uint32_t)(*c - '0');
+      if (value > (UINT32_MAX - digit) / 10U) return false;
+      value = value * 10U + digit;
+    }
+  } else {
+    value = args.getUInt("generation");
+  }
+  if (value == 0U) return false;
+  for (uint32_t slot = 0U; slot < CRASH_FORENSICS_GENERATION_CAPACITY; ++slot) {
+    if (crash_forensics_generation_at(slot) == value) {
+      *generation = value;
+      return true;
+    }
+  }
+  return false;
+}
+
+static FLASHMEM Payload system_crash_generation_error(void) {
+  Payload out;
+  out.add("error", "generation must be first, latest, or an available capture sequence");
+  return out;
+}
+
+static void system_crash_generation_metadata(Payload& out, uint32_t generation) {
+  out.add("generation", generation);
+  out.add("generation_capacity", CRASH_FORENSICS_GENERATION_CAPACITY);
+  out.add("first_generation", crash_forensics_generation_at(0U));
+  out.add("latest_generation", crash_forensics_latest_generation());
+  out.add("retention_policy", "FIRST_AND_LATEST_UNTIL_CRASH_CLEAR");
+  out.add("crash_retained_bytes", (uint32_t)crash_forensics_retained_bytes());
+  out.add("execution_trace_retained_bytes", execution_trace_retained_bytes());
 }
 
 static FLASHMEM Payload system_crash_word_window_payload(uint32_t base,
@@ -634,12 +685,15 @@ static FLASHMEM Payload system_rx_dispatch_breadcrumb_payload(
   system_crash_add_hex32(out, "lr", b.lr); return out;
 }
 
-static FLASHMEM Payload system_crash_forensics_payload(void) {
+static FLASHMEM Payload system_crash_forensics_payload(uint32_t generation = 0U) {
+  if (generation == 0U) generation = crash_forensics_latest_generation();
   crash_forensics_status_t status{};
-  crash_forensics_get_status(&status);
+  crash_forensics_get_status(&status, generation);
 
   Payload out;
   out.add("schema", "ZPNET_CRASH_FORENSICS_V4");
+  system_crash_generation_metadata(out, generation);
+  out.add("rx_dispatch_scope", "LIVE_AND_RETAINED_NOT_GENERATION_ARCHIVED");
   out.add("installed_now", status.installed);
   out.add("present", status.present);
 
@@ -657,7 +711,7 @@ static FLASHMEM Payload system_crash_forensics_payload(void) {
   system_crash_add_hex32(out, "stored_crc", status.stored_crc);
   system_crash_add_hex32(out, "computed_crc", status.computed_crc);
 
-  const crash_raw_entry_record_t* raw_entry = crash_forensics_raw_entry_record();
+  const crash_raw_entry_record_t* raw_entry = crash_forensics_raw_entry_record(generation);
   out.add("raw_entry_present", raw_entry != nullptr);
   if (raw_entry) out.add_object("raw_entry", system_raw_fault_entry_payload(*raw_entry));
 
@@ -673,13 +727,13 @@ static FLASHMEM Payload system_crash_forensics_payload(void) {
   out.add_object("rx_dispatch_breadcrumb", rx_breadcrumb);
 
   const crash_forensics_core_record_t* core =
-      crash_forensics_core_record();
+      crash_forensics_core_record(generation);
   if (core) {
     out.add_object("core",
                    system_crash_core_forensics_payload(*core));
   }
 
-  const crash_forensics_record_t* record = crash_forensics_record();
+  const crash_forensics_record_t* record = crash_forensics_record(generation);
   if (!record) return out;
 
   system_crash_add_hex32(out, "magic", record->magic);
@@ -1442,12 +1496,13 @@ static FLASHMEM Payload system_crash_policy_live_payload(void) {
   return out;
 }
 
-static FLASHMEM Payload system_crash_policy_payload(void) {
+static FLASHMEM Payload system_crash_policy_payload(uint32_t generation) {
   crash_forensics_status_t status{};
-  crash_forensics_get_status(&status);
+  crash_forensics_get_status(&status, generation);
 
   Payload out;
   out.add("schema", "ZPNET_CRASH_POLICY_V2");
+  system_crash_generation_metadata(out, generation);
   out.add("architecture", "ARMV7M_CORTEX_M7");
   out.add("frame_source_rule", "EXC_RETURN[2]: 0=MSP 1=PSP");
   out.add("return_mode_rule", "EXC_RETURN[3]: 0=HANDLER 1=THREAD");
@@ -1465,7 +1520,7 @@ static FLASHMEM Payload system_crash_policy_payload(void) {
   retained.add("extended_crc_valid", status.crc_valid);
 
   const crash_forensics_core_record_t* core =
-      crash_forensics_core_record();
+      crash_forensics_core_record(generation);
   if (core) {
     retained.add_object(
         "core",
@@ -1474,7 +1529,7 @@ static FLASHMEM Payload system_crash_policy_payload(void) {
   }
 
   const crash_forensics_record_t* extended =
-      crash_forensics_record();
+      crash_forensics_record(generation);
   if (extended) {
     retained.add_object(
         "extended",
@@ -1903,6 +1958,15 @@ static FLASHMEM Payload system_execution_trace_payload(
     return error;
   }
 
+  if (live_bank && args.has("generation")) {
+    Payload error;
+    error.add("error", "generation selects retained evidence; omit it for bank=live");
+    return error;
+  }
+  uint32_t generation = 0U;
+  if (!system_crash_generation_parse(args, &generation))
+    return system_crash_generation_error();
+
   execution_trace_context_t requested_context =
       execution_trace_context_t::NONE;
   bool all_contexts = false;
@@ -1937,10 +2001,14 @@ static FLASHMEM Payload system_execution_trace_payload(
   // Snapshot only the notebook this RPC will render.  The old SYSTEM scratch
   // duplicated all eight live/retained notebooks permanently in RAM2.
   execution_trace_metadata_t metadata{};
-  execution_trace_get_metadata(&metadata);
+  if (generation != 0U) execution_trace_get_metadata(&metadata, generation);
   execution_trace_context_snapshot_t context{};
-  (void)execution_trace_snapshot_context(
-      !live_bank, requested_context, &context);
+  if (live_bank || generation != 0U) {
+    (void)execution_trace_snapshot_context(
+        !live_bank, requested_context, &context, generation);
+  } else {
+    context.context = (uint32_t)requested_context;
+  }
 
   Payload out;
   out.add("schema", legacy_timepop_schema
@@ -1951,6 +2019,7 @@ static FLASHMEM Payload system_execution_trace_payload(
   out.add("entry_encoding", legacy_timepop_schema
       ? "TIMEPOP_COMPAT_V1" : "RAW_SCALAR_V1");
   out.add("bank", live_bank ? "live" : "retained");
+  system_crash_generation_metadata(out, generation);
   out.add("context",
           execution_trace_context_name((uint32_t)requested_context));
   out.add("context_count", EXECUTION_TRACE_CONTEXT_COUNT);
@@ -1973,9 +2042,10 @@ static FLASHMEM Payload system_execution_trace_payload(
   return out;
 }
 
-static FLASHMEM Payload system_execution_trace_summary_payload(void) {
+static FLASHMEM Payload system_execution_trace_summary_payload(uint32_t generation = 0U) {
+  if (generation == 0U) generation = crash_forensics_latest_generation();
   execution_trace_metadata_t metadata{};
-  execution_trace_get_metadata(&metadata);
+  if (generation != 0U) execution_trace_get_metadata(&metadata, generation);
 
   Payload out;
   out.add("schema", "ZPNET_EXECUTION_TRACE_SUMMARY_V2");
@@ -1990,7 +2060,10 @@ static FLASHMEM Payload system_execution_trace_summary_payload(void) {
         (execution_trace_context_t)(
             (uint32_t)execution_trace_context_t::PRIORITY0 + i);
     execution_trace_context_snapshot_t context{};
-    (void)execution_trace_snapshot_context(true, context_id, &context);
+    if (generation != 0U)
+      (void)execution_trace_snapshot_context(true, context_id, &context, generation);
+    else
+      context.context = (uint32_t)context_id;
 
     Payload item;
     item.add("context_id", context.context);
@@ -2874,13 +2947,15 @@ static FLASHMEM Payload system_dispatch_breadcrumb_payload(void) {
   return p;
 }
 
-static FLASHMEM Payload system_crash_report_payload(void) {
+static FLASHMEM Payload system_crash_report_payload(uint32_t generation) {
   // CRASH_INFO is an index, not a black-box dump.  Keep it comfortably below
   // the transport Payload ceiling regardless of how much retained evidence the
   // focused recorders hold.
   Payload p;
   p.reserve(4096U);
   p.add("schema", "ZPNET_CRASH_INDEX_V1");
+  system_crash_generation_metadata(p, generation);
+  p.add("unarchived_diagnostics_scope", "CRASHREPORT_AND_PAYLOAD_ARE_NOT_GENERATION_SELECTED");
   p.add("core_fault_present_now", (bool)CrashReport);
   p.add("captured", g_system_crash_report_captured);
   p.add("captured_core_fault_present", g_system_crash_report_core_fault_present);
@@ -2892,7 +2967,7 @@ static FLASHMEM Payload system_crash_report_payload(void) {
         g_system_crash_report_alloc_fail_count);
 
   crash_forensics_status_t status{};
-  crash_forensics_get_status(&status);
+  crash_forensics_get_status(&status, generation);
   {
     // Keep the child arena alive only through add_object().  Crash interrogation
     // must not accumulate serialized child Payload arenas while later forensic
@@ -2905,7 +2980,7 @@ static FLASHMEM Payload system_crash_report_payload(void) {
     processor.add("extended_present", status.extended_present);
     processor.add("extended_header_valid", status.header_valid);
     processor.add("extended_crc_valid", status.crc_valid);
-    const crash_raw_entry_record_t* raw_entry = crash_forensics_raw_entry_record();
+    const crash_raw_entry_record_t* raw_entry = crash_forensics_raw_entry_record(generation);
     processor.add("raw_entry_present", raw_entry != nullptr);
     if (raw_entry) {
       processor.add("raw_capture_sequence", raw_entry->sequence);
@@ -2915,7 +2990,7 @@ static FLASHMEM Payload system_crash_report_payload(void) {
       system_crash_add_hex32(processor, "raw_hfsr", raw_entry->hfsr);
     }
 
-    const crash_forensics_core_record_t* core = crash_forensics_core_record();
+    const crash_forensics_core_record_t* core = crash_forensics_core_record(generation);
     const bool matches_raw =
         raw_entry && core && raw_entry->sequence == core->capture_sequence;
     const bool stale_against_raw =
@@ -2954,6 +3029,7 @@ static FLASHMEM Payload system_crash_report_payload(void) {
     Payload detail;
     detail.add("crash_report_text", "SYSTEM.CRASH_REPORT_TEXT");
     detail.add("raw_fault_entry", "SYSTEM.RAW_FAULT_ENTRY");
+    detail.add("crash_record", "SYSTEM.CRASH_RECORD");
     detail.add("crash_policy", "SYSTEM.CRASH_POLICY");
     detail.add("execution_trace", "SYSTEM.EXECUTION_TRACE");
     detail.add("stack_watch", "SYSTEM.STACK_WATCH");
@@ -4354,11 +4430,70 @@ static FLASHMEM Payload cmd_payload_contract_info(const Payload& /*args*/) {
 // ------------------------------------------------------------
 // RAW_FAULT_ENTRY — earliest independently committed exception witness
 // ------------------------------------------------------------
-static FLASHMEM Payload cmd_raw_fault_entry(const Payload& /*args*/) {
-  const crash_raw_entry_record_t* raw = crash_forensics_raw_entry_record();
+static FLASHMEM Payload cmd_raw_fault_entry(const Payload& args) {
+  uint32_t generation = 0U;
+  if (!system_crash_generation_parse(args, &generation))
+    return system_crash_generation_error();
+  const crash_raw_entry_record_t* raw = crash_forensics_raw_entry_record(generation);
   Payload out;
+  system_crash_generation_metadata(out, generation);
   out.add("present", raw != nullptr);
   if (raw) out.add_object("raw_entry", system_raw_fault_entry_payload(*raw));
+  return out;
+}
+
+// Full archived structures remain accessible in small scalar pages. Never build
+// the complete raw+core+extended corpus as one nested Payload response.
+static FLASHMEM Payload cmd_crash_record(const Payload& args) {
+  uint32_t generation = 0U;
+  if (!system_crash_generation_parse(args, &generation))
+    return system_crash_generation_error();
+  const char* name = args.getString("record");
+  const void* record = nullptr;
+  size_t bytes = 0U;
+  if (!name || strcmp(name, "core") == 0) {
+    name = "core";
+    record = crash_forensics_core_record(generation);
+    bytes = sizeof(crash_forensics_core_record_t);
+  } else if (strcmp(name, "raw") == 0) {
+    record = crash_forensics_raw_entry_record(generation);
+    bytes = sizeof(crash_raw_entry_record_t);
+  } else if (strcmp(name, "extended") == 0) {
+    record = crash_forensics_record(generation);
+    bytes = sizeof(crash_forensics_record_t);
+  } else {
+    Payload error;
+    error.add("error", "record must be raw, core, or extended");
+    return error;
+  }
+  const uint32_t offset = args.has("offset") ? args.getUInt("offset") : 0U;
+  uint32_t count = args.has("count") ? args.getUInt("count") : 8U;
+  if (count > 8U) count = 8U;
+  const uint32_t total = record ? (uint32_t)(bytes / sizeof(uint32_t)) : 0U;
+  const uint32_t available = offset < total ? total - offset : 0U;
+  if (count > available) count = available;
+
+  Payload out;
+  out.add("schema", "ZPNET_CRASH_RECORD_WORDS_V1");
+  system_crash_generation_metadata(out, generation);
+  out.add("record", name);
+  out.add("present", record != nullptr);
+  out.add("record_size", (uint32_t)bytes);
+  out.add("total_words", total);
+  out.add("offset_words", offset);
+  out.add("returned_count", count);
+  out.add("has_more", count < available);
+  PayloadArray words;
+  for (uint32_t i = 0U; i < count; ++i) {
+    uint32_t value;
+    memcpy(&value, static_cast<const unsigned char*>(record) +
+        (size_t)(offset + i) * sizeof(value), sizeof(value));
+    Payload word;
+    word.add("index", offset + i);
+    system_crash_add_hex32(word, "value", value);
+    words.add(word);
+  }
+  out.add_array("words", words);
   return out;
 }
 
@@ -4380,15 +4515,23 @@ static FLASHMEM Payload cmd_dispatch_breadcrumb(const Payload& /*args*/) {
 // ------------------------------------------------------------
 // CRASH_INFO — core CrashReport plus retained structured exception evidence
 // ------------------------------------------------------------
-static FLASHMEM Payload cmd_crash_info(const Payload& /*args*/) {
+static FLASHMEM Payload cmd_crash_info(const Payload& args) {
+  uint32_t generation = 0U;
+  if (!system_crash_generation_parse(args, &generation))
+    return system_crash_generation_error();
   system_crash_report_capture_once();
-  return system_crash_report_payload();
+  return system_crash_report_payload(generation);
 }
 
 // ------------------------------------------------------------
 // CRASH_REPORT_TEXT — focused cached Teensyduino CrashReport text
 // ------------------------------------------------------------
-static FLASHMEM Payload cmd_crash_report_text(const Payload& /*args*/) {
+static FLASHMEM Payload cmd_crash_report_text(const Payload& args) {
+  if (args.has("generation")) {
+    Payload error;
+    error.add("error", "CrashReport text is not generation archived; use RAW_FAULT_ENTRY or CRASH_POLICY");
+    return error;
+  }
   system_crash_report_capture_once();
   return system_crash_report_text_payload();
 }
@@ -4396,8 +4539,11 @@ static FLASHMEM Payload cmd_crash_report_text(const Payload& /*args*/) {
 // ------------------------------------------------------------
 // CRASH_POLICY — live exception/FPU policy and retained-frame consistency
 // ------------------------------------------------------------
-static FLASHMEM Payload cmd_crash_policy(const Payload& /*args*/) {
-  return system_crash_policy_payload();
+static FLASHMEM Payload cmd_crash_policy(const Payload& args) {
+  uint32_t generation = 0U;
+  if (!system_crash_generation_parse(args, &generation))
+    return system_crash_generation_error();
+  return system_crash_policy_payload(generation);
 }
 
 // ------------------------------------------------------------
@@ -4420,7 +4566,7 @@ static FLASHMEM Payload cmd_crash_clear(const Payload& /*args*/) {
   memset((void*)&g_runtime_ledger_retained, 0,
          sizeof(g_runtime_ledger_retained));
 
-  execution_trace_clear_retained();
+  // crash_forensics_clear() already cleared the paired execution-trace archive.
   payload_fatal_record_clear();
   payload_clear_retained_stamp_trace();
   payload_clear_retained_append_trace();
@@ -4477,6 +4623,7 @@ static const process_command_entry_t SYSTEM_COMMANDS[] = {
   { "CRASH_INFO",       cmd_crash_info       },
   { "CRASH_REPORT_TEXT", cmd_crash_report_text },
   { "RAW_FAULT_ENTRY",  cmd_raw_fault_entry  },
+  { "CRASH_RECORD",     cmd_crash_record     },
   { "CRASH_POLICY",     cmd_crash_policy     },
   { "STACK_WATCH",      cmd_stack_watch      },
   { "STACK_TRIPWIRE",   cmd_stack_tripwire   },

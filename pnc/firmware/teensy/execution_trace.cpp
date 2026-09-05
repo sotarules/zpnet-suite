@@ -1,4 +1,5 @@
 #include "execution_trace.h"
+#include "crash_forensics.h"
 
 #include <Arduino.h>
 #include "imxrt.h"
@@ -59,7 +60,9 @@ static execution_trace_bank_t
     (uint32_t)execution_trace_context_t::FOREGROUND, 0U, {0U, 0U, 0U}, {} },
 };
 alignas(32) static execution_trace_retained_set_t
-    g_execution_trace_retained DMAMEM;
+    g_execution_trace_retained[CRASH_FORENSICS_GENERATION_CAPACITY] DMAMEM;
+static_assert(sizeof(g_execution_trace_retained) == 4416U,
+              "Two complete trace generations must remain within 4416 bytes");
 
 // ============================================================================
 // Tiny primitives
@@ -107,14 +110,35 @@ static execution_trace_bank_t* execution_trace_live_bank(
   return execution_trace_bank_valid(bank, context) ? &bank : nullptr;
 }
 
-static bool execution_trace_retained_valid(void) {
-  return g_execution_trace_retained.magic == EXECUTION_TRACE_SET_MAGIC &&
-         (g_execution_trace_retained.magic ^
-          g_execution_trace_retained.magic_inv) == 0xFFFFFFFFUL &&
-         g_execution_trace_retained.schema_version ==
+static bool execution_trace_retained_valid(
+    const execution_trace_retained_set_t& retained) {
+  return retained.magic == EXECUTION_TRACE_SET_MAGIC &&
+         (retained.magic ^ retained.magic_inv) == 0xFFFFFFFFUL &&
+         retained.crash_sequence != 0U &&
+         retained.schema_version ==
              EXECUTION_TRACE_SCHEMA_VERSION &&
-         g_execution_trace_retained.context_count ==
+         retained.context_count ==
              EXECUTION_TRACE_CONTEXT_COUNT;
+}
+
+static const execution_trace_retained_set_t* execution_trace_find_generation(
+    uint32_t generation) {
+  const execution_trace_retained_set_t* newest = nullptr;
+  for (const auto& retained : g_execution_trace_retained) {
+    if (!execution_trace_retained_valid(retained)) continue;
+    if (generation != 0U) {
+      if (retained.crash_sequence == generation) return &retained;
+    } else {
+      // Slot 1 is latest by ownership. The pinned first slot can survive a
+      // complete sequence wrap, so a signed age comparison is not sufficient.
+      newest = &retained;
+    }
+  }
+  return newest;
+}
+
+uint32_t execution_trace_retained_bytes(void) {
+  return sizeof(g_execution_trace_retained);
 }
 
 // ============================================================================
@@ -218,24 +242,27 @@ static void execution_trace_snapshot_bank(
   }
 }
 
-void execution_trace_get_metadata(execution_trace_metadata_t* out) {
+void execution_trace_get_metadata(execution_trace_metadata_t* out,
+                                  uint32_t generation) {
   if (!out) return;
   memset((void*)out, 0, sizeof(*out));
 
-  out->retained_valid = execution_trace_retained_valid();
+  const auto* retained = execution_trace_find_generation(generation);
+  out->retained_valid = retained != nullptr;
   if (!out->retained_valid) return;
 
   out->fault_captured =
-      (g_execution_trace_retained.flags &
+      (retained->flags &
        EXECUTION_TRACE_FLAG_FAULT_CAPTURED) != 0U;
-  out->fault_dwt = g_execution_trace_retained.fault_dwt;
-  out->crash_sequence = g_execution_trace_retained.crash_sequence;
+  out->fault_dwt = retained->fault_dwt;
+  out->crash_sequence = retained->crash_sequence;
 }
 
 bool execution_trace_snapshot_context(
     bool retained,
     execution_trace_context_t context,
-    execution_trace_context_snapshot_t* out) {
+    execution_trace_context_snapshot_t* out,
+    uint32_t generation) {
   if (!out) return false;
   memset((void*)out, 0, sizeof(*out));
   out->context = (uint32_t)context;
@@ -244,9 +271,10 @@ bool execution_trace_snapshot_context(
   if (index < 0) return false;
 
   if (retained) {
-    if (!execution_trace_retained_valid()) return false;
+    const auto* selected = execution_trace_find_generation(generation);
+    if (!selected) return false;
     execution_trace_snapshot_bank(
-        g_execution_trace_retained.banks[index], context, out);
+        selected->banks[index], context, out);
     return out->valid;
   }
 
@@ -270,7 +298,8 @@ void execution_trace_snapshot(execution_trace_snapshot_t* out) {
     }
   }
 
-  out->retained_valid = execution_trace_retained_valid();
+  const auto* retained = execution_trace_find_generation(0U);
+  out->retained_valid = retained != nullptr;
   if (!out->retained_valid) {
     for (uint32_t i = 0U; i < EXECUTION_TRACE_CONTEXT_COUNT; ++i) {
       out->retained[i].context =
@@ -280,16 +309,16 @@ void execution_trace_snapshot(execution_trace_snapshot_t* out) {
   }
 
   out->fault_captured =
-      (g_execution_trace_retained.flags &
+      (retained->flags &
        EXECUTION_TRACE_FLAG_FAULT_CAPTURED) != 0U;
-  out->fault_dwt = g_execution_trace_retained.fault_dwt;
-  out->crash_sequence = g_execution_trace_retained.crash_sequence;
+  out->fault_dwt = retained->fault_dwt;
+  out->crash_sequence = retained->crash_sequence;
 
   for (uint32_t i = 0U; i < EXECUTION_TRACE_CONTEXT_COUNT; ++i) {
     const execution_trace_context_t context =
         (execution_trace_context_t)(
             (uint32_t)execution_trace_context_t::PRIORITY0 + i);
-    execution_trace_snapshot_bank(g_execution_trace_retained.banks[i],
+    execution_trace_snapshot_bank(retained->banks[i],
                                   context,
                                   &out->retained[i]);
   }
@@ -311,7 +340,15 @@ const char* execution_trace_context_name(uint32_t context) {
 
 extern "C" void execution_trace_capture_fault(uint32_t fault_dwt,
                                                uint32_t crash_sequence) {
-  execution_trace_retained_set_t& retained = g_execution_trace_retained;
+  // Compatibility callers obey the same pinned-first policy.
+  const uint32_t slot = execution_trace_retained_valid(
+      g_execution_trace_retained[0]) ? 1U : 0U;
+  execution_trace_capture_fault_generation(fault_dwt, crash_sequence, slot);
+}
+
+extern "C" void execution_trace_capture_fault_generation(
+    uint32_t fault_dwt, uint32_t crash_sequence, uint32_t slot) {
+  execution_trace_retained_set_t& retained = g_execution_trace_retained[slot];
 
   // Persistently invalidate the previous retained publication before replacing
   // it.  A nested failure during this best-effort copy must not resurrect the
@@ -341,6 +378,9 @@ extern "C" void execution_trace_capture_fault(uint32_t fault_dwt,
     destination[i] = source[i];
   }
 
+  // Make the body durable while the publication header is still invalid.
+  arm_dcache_flush_delete(&retained, sizeof(retained));
+  __asm__ volatile("dsb\nisb" ::: "memory");
   retained.magic_inv = ~EXECUTION_TRACE_SET_MAGIC;
   execution_trace_dmb();
   retained.magic = EXECUTION_TRACE_SET_MAGIC;  // commit last

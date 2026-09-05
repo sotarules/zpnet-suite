@@ -51,8 +51,8 @@
  *       - floating-point environmental telemetry is intentionally excluded
  *   • EXECUTION_TRACE — return bounded causal breadcrumbs from independent
  *     PRIORITY0, PRIORITY16, PRIORITY32, and FOREGROUND notebooks.  Each live
- *     ring runs in RAM1; fault entry freezes all committed notebooks into one
- *     retained RAM2 set.  DWT is the shared timing ruler and lineage_id carries
+ *     ring runs in RAM1; fault entry freezes all committed notebooks into its
+ *     retained RAM2 crash generation. DWT is the shared timing ruler and lineage_id carries
  *     event identity across custody layers.  One RPC reports exactly one context;
  *     context=all is deliberately rejected to prevent forensic document
  *     amplification.  Accepts bank=retained|live,
@@ -64,6 +64,21 @@
  *     notebook using TimePop-oriented field aliases
  *   • CRASH_INFO — return a bounded crash index and focused drill-down command
  *     names; it never embeds the full retained black-box corpus
+ *   • CRASH_INFO, RAW_FAULT_ENTRY, CRASH_POLICY, CRASH_RECORD, and retained
+ *     EXECUTION_TRACE / TIMEPOP_DISPATCH_INFO accept generation=first|latest|N.
+ *     N is an exact capture sequence, not an array index. Default is latest;
+ *     an unavailable explicit generation returns an error without fallback.
+ *     Two generations retain the first fault and the latest subsequent fault
+ *     until CRASH_CLEAR. Intermediate subsequent faults are replaced.
+ *     Core/raw/extended storage totals 4288 bytes; trace storage totals 4416
+ *     bytes in RAM2. This adds 4352 retained bytes and a 4-byte RAM1 selector.
+ *     Retention covers warm reboot of the same image, not power loss/reflash.
+ *   • CRASH_RECORD — bounded raw/core/extended structure word pages:
+ *     record=raw|core|extended (default core), offset=N words, count=0..8
+ *     (default 8, larger requests capped). Fields retain the header-defined ABI.
+ *     No complete crash corpus is serialized into one response.
+ *     Cached Teensyduino text and other subsystem flight recorders are not
+ *     generation archived; CRASH_REPORT_TEXT rejects a generation argument.
  *   • CRASH_REPORT_TEXT — return only the cached Teensyduino CrashReport text
  *   • RAW_FAULT_ENTRY — return only the earliest retained exception witness
  *   • CRASH_POLICY — return live CPU/FPU exception policy plus a compact
