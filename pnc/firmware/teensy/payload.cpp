@@ -1162,7 +1162,7 @@ static void* payload_guarded_malloc(size_t total,
                                     uint32_t op_id,
                                     const void* self) {
     payload_note_handler_context(op_id, self, &g_payload_handler_ctx_alloc);
-    if (!payload_allocator_claim(op_id, self)) return nullptr;
+    if (!payload_allocator_claim(op_id, self)) __builtin_trap();
     void* raw = malloc(total);
     payload_allocator_release();
     return raw;
@@ -1173,7 +1173,7 @@ static void* payload_guarded_realloc(void* block,
                                      uint32_t op_id,
                                      const void* self) {
     payload_note_handler_context(op_id, self, &g_payload_handler_ctx_alloc);
-    if (!payload_allocator_claim(op_id, self)) return nullptr;
+    if (!payload_allocator_claim(op_id, self)) __builtin_trap();
     void* raw = realloc(block, total);
     payload_allocator_release();
     return raw;
@@ -1183,11 +1183,7 @@ static bool payload_guarded_free(void* block,
                                  uint32_t op_id,
                                  const void* self) {
     payload_note_handler_context(op_id, self, &g_payload_handler_ctx_free);
-    if (!payload_allocator_claim(op_id, self)) {
-        // Leaking one block is preferable to entering a heap operation whose
-        // ownership is already held by the preempted context.
-        return false;
-    }
+    if (!payload_allocator_claim(op_id, self)) __builtin_trap();
     free(block);
     payload_allocator_release();
     return true;
@@ -1336,7 +1332,8 @@ static FLASHMEM void payload_stamp_trace_record(
     const Payload* self,
     uint32_t caller_lr,
     uint32_t structural_fingerprint,
-    uint32_t contract_incident_sequence) {
+    uint32_t contract_incident_sequence,
+    bool capture_object_state = true) {
     if (!self) return;
     payload_stamp_trace_boot_latch();
 
@@ -1366,7 +1363,9 @@ static FLASHMEM void payload_stamp_trace_record(
     entry.msp = payload_read_msp();
     entry.dwt_cyccnt = payload_read_dwt();
     entry.ipsr = payload_read_ipsr();
-    payload_stamp_trace_access_t::capture(*self, &entry);
+    if (capture_object_state) {
+        payload_stamp_trace_access_t::capture(*self, &entry);
+    }
     entry.structural_fingerprint = structural_fingerprint;
     entry.contract_incident_sequence = contract_incident_sequence;
 
@@ -1664,7 +1663,8 @@ static void payload_contract_record(
     uint32_t expected1,
     uint32_t observed1,
     uint32_t before_fingerprint,
-    uint32_t after_fingerprint) {
+    uint32_t after_fingerprint,
+    bool capture_prefix = true) {
     if (g_payload_contract_suppression_depth != 0U) {
         g_payload_contract_event_incidents_suppressed++;
         return;
@@ -1716,7 +1716,9 @@ static void payload_contract_record(
 
     payload_contract_event_t pending{};
     pending.incident = incident;
-    payload_contract_capture_prefix(operation_id, self, &pending);
+    if (capture_prefix) {
+        payload_contract_capture_prefix(operation_id, self, &pending);
+    }
 
     const uint32_t saved = critical_enter();
     if (!payload_contract_incident_valid(
@@ -2015,7 +2017,8 @@ static void payload_contract_note_error(uint32_t code,
                             0U,
                             0U,
                             0U,
-                            0U);
+                            0U,
+                            false);
 }
 
 static void payload_contract_note_integrity(uint32_t operation_id,
@@ -2035,7 +2038,8 @@ static void payload_contract_note_integrity(uint32_t operation_id,
                             0U,
                             0U,
                             0U,
-                            0U);
+                            0U,
+                            false);
 }
 
 #if 0  // Phase 2 retired: Payload Append Trace and Payload Flight history.
@@ -3895,7 +3899,7 @@ static void payload_contract_capture_prefix(
     bool captured = false;
     switch (payload_contract_prefix_kind_for_operation(operation_id)) {
         case payload_contract_prefix_kind_t::PAYLOAD:
-            if (payload_contract_span_readable_pure(self, sizeof(Payload))) {
+            if (payload_fixed_storage_span_writable(self, sizeof(Payload))) {
                 captured = payload_contract_prefix_access_t::capture(
                     *reinterpret_cast<const Payload*>(self),
                     event->payload_prefix,
@@ -3906,7 +3910,7 @@ static void payload_contract_capture_prefix(
             break;
 
         case payload_contract_prefix_kind_t::ARRAY:
-            if (payload_contract_span_readable_pure(
+            if (payload_fixed_storage_span_writable(
                     self, sizeof(PayloadArray))) {
                 captured = payload_contract_prefix_access_t::capture(
                     *reinterpret_cast<const PayloadArray*>(self),
@@ -4020,7 +4024,8 @@ static void payload_contract_record_state_failure(
                             state.key_len,
                             state.val_len,
                             before_fingerprint,
-                            state.structural_fingerprint);
+                            state.structural_fingerprint,
+                            false);
 }
 
 static void payload_contract_record_postcondition(
@@ -5096,6 +5101,9 @@ Payload::Payload()
             state,
             0U,
             0U);
+        _fatal(PAYLOAD_ERR_STORAGE_CORRUPT,
+               PAYLOAD_OP_CTOR,
+               INLINE_STORAGE);
     }
     if (payload_stamp_trace_is_ocram_object(this)) {
         payload_stamp_trace_record(
@@ -5792,17 +5800,36 @@ size_t Payload::_append_required_bytes(size_t key_len,
         this,
         (uint32_t)(uintptr_t)__builtin_return_address(0),
         0U,
-        g_payload_contract_next_sequence);
+        g_payload_contract_next_sequence,
+        false);
 
+    // Terminal evidence must not chase object-owned pointers.  A rejected
+    // Payload may still contribute bounded scalar testimony only when its
+    // complete object span is ordinary writable RAM.
     uint32_t capacity = 0U;
-    if (_heap_guard_ok()) {
-        const size_t observed = _capacity();
-        capacity = observed > UINT32_MAX ? UINT32_MAX : (uint32_t)observed;
-    }
-    const uint32_t count = _count_guard_ok() ? (uint32_t)_count : UINT32_MAX;
+    uint32_t count = UINT32_MAX;
     uint32_t data_used = 0U;
-    if (_data_begin_guard_ok() && capacity != 0U && _data_begin <= capacity) {
-        data_used = capacity - (uint32_t)_data_begin;
+    if (payload_fixed_storage_span_writable(this, sizeof(Payload))) {
+        const bool mode_ok = _storage_mode_guard_ok();
+        const bool heap_ok = _heap_guard_ok();
+        const bool fixed_pointer_ok = _fixed_storage_guard_ok();
+        const bool fixed_capacity_ok = _fixed_capacity_guard_ok();
+        if (mode_ok && heap_ok && fixed_pointer_ok && fixed_capacity_ok) {
+            if (_fixed_mode()) {
+                if (_heap_block == nullptr && _fixed_storage != nullptr &&
+                    _fixed_capacity >= INLINE_STORAGE &&
+                    _fixed_capacity <= STORAGE_MAX) {
+                    capacity = _fixed_capacity;
+                }
+            } else if (_heap_block == nullptr && _fixed_storage == nullptr &&
+                       _fixed_capacity == 0U) {
+                capacity = INLINE_STORAGE;
+            }
+        }
+        if (_count_guard_ok()) count = (uint32_t)_count;
+        if (_data_begin_guard_ok() && capacity != 0U && _data_begin <= capacity) {
+            data_used = capacity - (uint32_t)_data_begin;
+        }
     }
     payload_fatal_stop(fallback_error_code,
                        fallback_operation_id,
@@ -5821,7 +5848,8 @@ void Payload::clear() {
         this,
         (uint32_t)(uintptr_t)__builtin_return_address(0),
         0U,
-        g_payload_contract_next_sequence);
+        g_payload_contract_next_sequence,
+        false);
 
     payload_contract_state_t before{};
     if (!_contract_begin(PAYLOAD_OP_CLEAR, &before)) {
@@ -8546,7 +8574,20 @@ PayloadArray::PayloadArray()
     _inline_storage[1] = ']';
     _inline_storage[2] = '\0';
     payload_contract_state_t state{};
-    if (_contract_inspect(&state)) _contract_accept(state);
+    if (_contract_inspect(&state)) {
+        _contract_accept(state);
+    } else {
+        payload_contract_record_state_failure(
+            payload_contract_phase_t::POST_INVARIANT,
+            PAYLOAD_OP_CTOR,
+            this,
+            state,
+            0U,
+            0U);
+        _fatal(PAYLOAD_ERR_STORAGE_CORRUPT,
+               PAYLOAD_OP_CTOR,
+               INLINE_STORAGE);
+    }
 }
 
 PayloadArray::~PayloadArray() {
@@ -8918,13 +8959,17 @@ bool PayloadArray::_copy_from(const PayloadArray& other) {
                                         uint32_t fallback_operation_id,
                                         size_t requested_bytes) const {
     uint32_t capacity = 0U;
-    if (_heap_guard_ok()) {
-        const size_t observed = _capacity();
-        capacity = observed > UINT32_MAX ? UINT32_MAX : (uint32_t)observed;
+    uint32_t count = UINT32_MAX;
+    uint32_t data_used = 0U;
+    if (payload_fixed_storage_span_writable(this, sizeof(PayloadArray))) {
+        if (_heap_guard_ok() && _heap_block == nullptr) {
+            capacity = INLINE_STORAGE;
+        }
+        if (_length_guard_ok()) {
+            count = (uint32_t)_length;
+            data_used = (uint32_t)_length;
+        }
     }
-    const uint32_t count = _length_guard_ok() ? (uint32_t)_length : UINT32_MAX;
-    const uint32_t data_used =
-        _length_guard_ok() ? (uint32_t)_length : 0U;
     payload_fatal_stop(fallback_error_code,
                        fallback_operation_id,
                        this,
