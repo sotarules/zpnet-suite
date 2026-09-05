@@ -32,8 +32,8 @@
       values cross the construction boundary as integer-only fixed_decimal_t
       objects; floating read accessors are intentionally retired.
     • Invalid fixed-decimal objects are represented as JSON null, never omitted.
-    • Failed add/copy operations leave the prior semantic document unchanged,
-      except for the documented invalid-number-to-null compatibility fallback.
+    • A failed construction or copy/move contract is terminal. No rollback or
+      continued use of an object rejected by a contract is promised.
     • parseJSON() is a replacement operation and clears on invalid input, matching
       the established command-ingress contract.
     • Nested objects and arrays are written directly; no temporary JSON heap
@@ -48,6 +48,9 @@
       fixed stores are bound by guarded pointer, capacity, and storage-mode state.
     • Corruption handling is fail-closed and quiet: no magic-number trap, stack
       walk, logging recursion, or diagnostic Payload construction.
+    • Payload and PayloadArray require one foreground owner. Cross-context
+      producers must hand off complete values using the system's standard SPSC
+      mechanism; these classes do not provide whole-object synchronization.
 
   Compatibility:
 
@@ -68,10 +71,9 @@
 //
 // Payload never constructs an event from inside a mutator or integrity court.
 // A failure is reduced to a fixed scalar incident and placed in the retained
-// RAM2 transcript.  For thread-mode failures, the pending-event copy also gets
-// a bounded, allocation-free serialization prefix when the operation identifies
-// the object type and the current structure is safely inspectable.  SYSTEM later
-// constructs one best-effort PAYLOAD_CONTRACT_ANOMALY event in serialized
+// RAM2 transcript. Failure recording never re-inspects or serializes the rejected
+// object. Legacy pending-event prefix fields remain present and zero. SYSTEM later
+// constructs one best-effort PAYLOAD_CONTRACT_ANOMALY event from scalar evidence in
 // foreground context while incident recursion is suppressed.
 
 #define PAYLOAD_CONTRACT_INCIDENT_ENTRIES 16U
@@ -158,6 +160,7 @@ struct payload_contract_incident_t {
 
 struct payload_contract_event_t {
   payload_contract_incident_t incident;
+  // Retained for compatibility; failure recording leaves all prefix fields zero.
   uint32_t payload_prefix_valid;
   uint32_t payload_prefix_length;
   uint32_t payload_prefix_truncated;
@@ -228,7 +231,7 @@ struct payload_fatal_record_t {
   uint32_t last_error_count;
   uint32_t last_error_object_ptr;
   uint32_t object_ptr;
-  uint32_t requested_bytes;
+  uint32_t requested_bytes; // Zero when no detached attempted size was captured.
   uint32_t capacity;
   uint32_t count;
   uint32_t data_used;
@@ -773,7 +776,6 @@ void payload_clear_retained_heap_resize_trace();
 struct fixed_decimal_t;
 
 struct payload_contract_state_t;
-struct payload_contract_prefix_access_t;
 struct payload_entry_access_t;
 
 class Payload;
@@ -937,7 +939,6 @@ public:
 
 private:
     friend void payload_get_info(payload_info_t* out);
-    friend struct payload_contract_prefix_access_t;
     friend struct payload_entry_access_t;
     friend struct payload_stamp_trace_access_t;
     friend class PayloadArray;
@@ -1033,8 +1034,6 @@ private:
     void _release_storage();
     void _move_from(Payload& other);
     bool _copy_from(const Payload& other);
-    size_t _append_required_bytes(size_t key_len,
-                                  size_t value_len) const;
     [[noreturn]] void _fatal(uint32_t fallback_error_code,
                              uint32_t fallback_operation_id,
                              size_t requested_bytes = 0U) const;
@@ -1116,7 +1115,6 @@ public:
     bool contract_valid() const;
 
 private:
-    friend struct payload_contract_prefix_access_t;
     friend class Payload;
 
     static constexpr size_t INLINE_STORAGE = 256;

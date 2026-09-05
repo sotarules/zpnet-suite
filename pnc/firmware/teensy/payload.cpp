@@ -1546,11 +1546,10 @@ void payload_fatal_record_clear(void) {
 
 // ---- Retained design-by-contract incident recorder -------------------------
 //
-// The retained transcript remains fixed scalar evidence.  After that record is
-// committed, a thread-mode failure may also capture one bounded, allocation-free
-// serialization prefix into the pending-event copy.  Handler-context failures
-// skip the extra traversal.  No contract path constructs a diagnostic Payload or
-// calls the event bus; SYSTEM consumes the queue in serialized foreground.
+// Every contract failure is reduced to scalars already captured at detection.
+// Recording never re-inspects the rejected object or serializes a JSON prefix.
+// The pending-event prefix fields remain zero for report-schema compatibility.
+// SYSTEM consumes the scalar event in serialized foreground.
 
 static constexpr uint32_t PAYLOAD_CONTRACT_MAGIC = 0x50444331UL;  // 'PDC1'
 static constexpr uint32_t PAYLOAD_CONTRACT_SCHEMA_VERSION = 1U;
@@ -1574,11 +1573,6 @@ static volatile uint32_t g_payload_contract_pending_head = 0U;
 static volatile uint32_t g_payload_contract_pending_tail = 0U;
 static volatile uint32_t g_payload_contract_pending_count = 0U;
 static payload_contract_incident_t g_payload_contract_first_this_boot;
-
-static void payload_contract_capture_prefix(
-    uint32_t operation_id,
-    const void* self,
-    payload_contract_event_t* event);
 
 static inline void payload_contract_dmb(void) {
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
@@ -1663,8 +1657,7 @@ static void payload_contract_record(
     uint32_t expected1,
     uint32_t observed1,
     uint32_t before_fingerprint,
-    uint32_t after_fingerprint,
-    bool capture_prefix = true) {
+    uint32_t after_fingerprint) {
     if (g_payload_contract_suppression_depth != 0U) {
         g_payload_contract_event_incidents_suppressed++;
         return;
@@ -1716,9 +1709,6 @@ static void payload_contract_record(
 
     payload_contract_event_t pending{};
     pending.incident = incident;
-    if (capture_prefix) {
-        payload_contract_capture_prefix(operation_id, self, &pending);
-    }
 
     const uint32_t saved = critical_enter();
     if (!payload_contract_incident_valid(
@@ -2017,8 +2007,7 @@ static void payload_contract_note_error(uint32_t code,
                             0U,
                             0U,
                             0U,
-                            0U,
-                            false);
+                            0U);
 }
 
 static void payload_contract_note_integrity(uint32_t operation_id,
@@ -2038,8 +2027,7 @@ static void payload_contract_note_integrity(uint32_t operation_id,
                             0U,
                             0U,
                             0U,
-                            0U,
-                            false);
+                            0U);
 }
 
 #if 0  // Phase 2 retired: Payload Append Trace and Payload Flight history.
@@ -3629,136 +3617,6 @@ struct payload_contract_state_t {
 static bool payload_contract_span_readable_pure(const void* ptr,
                                                   size_t len);
 
-struct payload_contract_prefix_writer_t {
-    char* out;
-    size_t capacity;
-    size_t length;
-    bool truncated;
-
-    payload_contract_prefix_writer_t(char* buffer, size_t buffer_capacity)
-        : out(buffer),
-          capacity(buffer_capacity),
-          length(0U),
-          truncated(false) {
-        if (out && capacity != 0U) out[0] = '\0';
-    }
-
-    bool append_char(char ch) {
-        if (!out || capacity == 0U || length + 1U >= capacity) {
-            truncated = true;
-            return false;
-        }
-        out[length++] = ch;
-        out[length] = '\0';
-        return true;
-    }
-
-    bool append_atomic(const char* text, size_t text_length) {
-        if ((!text && text_length != 0U) ||
-            !out ||
-            capacity == 0U ||
-            text_length > capacity - 1U - length) {
-            truncated = true;
-            return false;
-        }
-        if (text_length != 0U) {
-            memcpy(out + length, text, text_length);
-            length += text_length;
-            out[length] = '\0';
-        }
-        return true;
-    }
-
-    bool append_span(const char* text, size_t text_length) {
-        if (!text && text_length != 0U) {
-            truncated = true;
-            return false;
-        }
-        size_t i = 0U;
-        while (i < text_length) {
-            const uint8_t ch = (uint8_t)text[i];
-            if (ch < 0x80U) {
-                if (!append_char((char)ch)) return false;
-                ++i;
-                continue;
-            }
-
-            size_t sequence_length = 0U;
-            if (!json_validate_utf8_sequence(
-                    reinterpret_cast<const uint8_t*>(text),
-                    text_length,
-                    i,
-                    &sequence_length) ||
-                !append_atomic(text + i, sequence_length)) {
-                truncated = true;
-                return false;
-            }
-            i += sequence_length;
-        }
-        return true;
-    }
-
-    bool append_escaped(const char* text, size_t text_length) {
-        if (!text && text_length != 0U) {
-            truncated = true;
-            return false;
-        }
-        for (size_t i = 0U; i < text_length; ++i) {
-            const uint8_t ch = (uint8_t)text[i];
-            switch (ch) {
-                case '"':
-                    if (!append_span("\\\"", 2U)) return false;
-                    break;
-                case '\\':
-                    if (!append_span("\\\\", 2U)) return false;
-                    break;
-                case '\b':
-                    if (!append_span("\\b", 2U)) return false;
-                    break;
-                case '\f':
-                    if (!append_span("\\f", 2U)) return false;
-                    break;
-                case '\n':
-                    if (!append_span("\\n", 2U)) return false;
-                    break;
-                case '\r':
-                    if (!append_span("\\r", 2U)) return false;
-                    break;
-                case '\t':
-                    if (!append_span("\\t", 2U)) return false;
-                    break;
-                default:
-                    if (ch < 0x20U) {
-                        const char escaped[6] = {
-                            '\\', 'u', '0', '0',
-                            json_hex_digit((uint8_t)(ch >> 4)),
-                            json_hex_digit((uint8_t)(ch & 0x0FU)),
-                        };
-                        if (!append_span(escaped, sizeof(escaped))) {
-                            return false;
-                        }
-                    } else if (ch < 0x80U) {
-                        if (!append_char((char)ch)) return false;
-                    } else {
-                        size_t sequence_length = 0U;
-                        if (!json_validate_utf8_sequence(
-                                reinterpret_cast<const uint8_t*>(text),
-                                text_length,
-                                i,
-                                &sequence_length) ||
-                            !append_atomic(text + i, sequence_length)) {
-                            truncated = true;
-                            return false;
-                        }
-                        i += sequence_length - 1U;
-                    }
-                    break;
-            }
-        }
-        return true;
-    }
-};
-
 struct payload_entry_access_t {
     static inline Payload::Entry load(const uint8_t* storage, size_t index) {
         Payload::Entry entry{};
@@ -3822,181 +3680,6 @@ struct payload_entry_access_t {
         return find(object, key, key_len, out, out_index);
     }
 };
-
-struct payload_contract_prefix_access_t {
-    static bool capture(const Payload& object,
-                        char* out,
-                        size_t capacity,
-                        uint32_t* out_length,
-                        uint32_t* out_truncated) {
-        if (out_length) *out_length = 0U;
-        if (out_truncated) *out_truncated = 0U;
-        if (!out || capacity == 0U) return false;
-        out[0] = '\0';
-
-        payload_contract_state_t state{};
-        if (!object._contract_inspect(&state)) return false;
-
-        payload_contract_prefix_writer_t writer(out, capacity);
-        bool complete = writer.append_char('{');
-        const uint8_t* storage = object._storage();
-
-        for (size_t i = 0U; complete && i < object._count; ++i) {
-            const Payload::Entry entry =
-                payload_entry_access_t::load(storage, i);
-            if (i != 0U) complete = writer.append_char(',');
-            if (complete) complete = writer.append_char('"');
-            if (complete) {
-                complete = writer.append_escaped(
-                    reinterpret_cast<const char*>(storage + entry.key_off),
-                    entry.key_len);
-            }
-            if (complete) complete = writer.append_span("\":", 2U);
-
-            if (complete &&
-                (Payload::ValueKind)entry.kind ==
-                    Payload::ValueKind::STRING) {
-                complete = writer.append_char('"');
-                if (complete) {
-                    complete = writer.append_escaped(
-                        reinterpret_cast<const char*>(
-                            storage + entry.val_off),
-                        entry.val_len);
-                }
-                if (complete) complete = writer.append_char('"');
-            } else if (complete) {
-                complete = writer.append_span(
-                    reinterpret_cast<const char*>(
-                        storage + entry.val_off),
-                    entry.val_len);
-            }
-        }
-        if (complete) complete = writer.append_char('}');
-
-        if (out_length) *out_length = (uint32_t)writer.length;
-        if (out_truncated) {
-            *out_truncated =
-                (!complete || writer.truncated) ? 1U : 0U;
-        }
-        return true;
-    }
-
-    static bool capture(const PayloadArray& object,
-                        char* out,
-                        size_t capacity,
-                        uint32_t* out_length,
-                        uint32_t* out_truncated) {
-        if (out_length) *out_length = 0U;
-        if (out_truncated) *out_truncated = 0U;
-        if (!out || capacity == 0U) return false;
-        out[0] = '\0';
-
-        payload_contract_state_t state{};
-        if (!object._contract_inspect(&state)) return false;
-
-        payload_contract_prefix_writer_t writer(out, capacity);
-        const bool complete =
-            writer.append_span(object._data(), (size_t)object._length);
-        if (out_length) *out_length = (uint32_t)writer.length;
-        if (out_truncated) {
-            *out_truncated =
-                (!complete || writer.truncated) ? 1U : 0U;
-        }
-        return true;
-    }
-};
-
-enum class payload_contract_prefix_kind_t : uint32_t {
-    NONE = 0U,
-    PAYLOAD = 1U,
-    ARRAY = 2U,
-};
-
-static payload_contract_prefix_kind_t
-payload_contract_prefix_kind_for_operation(uint32_t operation_id) {
-    switch (operation_id) {
-        case PAYLOAD_OP_ARRAY_ADD_WRITE:
-        case PAYLOAD_OP_ARRAY_ALLOC:
-        case PAYLOAD_OP_ARRAY_CAPACITY:
-        case PAYLOAD_OP_ARRAY_PARSE:
-        case PAYLOAD_OP_ARRAY_PARSE_INVALID:
-        case PAYLOAD_OP_ARRAY_RELEASE_STORAGE:
-        case PAYLOAD_OP_ARRAY_RELEASE_STORAGE_GUARD:
-            return payload_contract_prefix_kind_t::ARRAY;
-
-        // These operation IDs are shared by Payload and PayloadArray, or belong
-        // to a view rather than an owning object.  Do not guess the layout.
-        case PAYLOAD_OP_NONE:
-        case PAYLOAD_OP_CLEAR:
-        case PAYLOAD_OP_COPY_ASSIGN:
-        case PAYLOAD_OP_COPY_ASSIGN_SOURCE:
-        case PAYLOAD_OP_COPY_FROM:
-        case PAYLOAD_OP_HEAP_BLOCK:
-        case PAYLOAD_OP_JSON_SIZE:
-        case PAYLOAD_OP_MOVE_ASSIGN_SOURCE:
-        case PAYLOAD_OP_MOVE_FROM:
-        case PAYLOAD_OP_ARRAY_VIEW_GET:
-        case PAYLOAD_OP_ARRAY_VIEW_SIZE:
-        case PAYLOAD_OP_ARRAY_VIEW_VALID:
-            return payload_contract_prefix_kind_t::NONE;
-
-        default:
-            return payload_contract_prefix_kind_t::PAYLOAD;
-    }
-}
-
-static void payload_contract_capture_prefix(
-    uint32_t operation_id,
-    const void* self,
-    payload_contract_event_t* event) {
-    if (!event) return;
-
-    event->payload_prefix_valid = 0U;
-    event->payload_prefix_length = 0U;
-    event->payload_prefix_truncated = 0U;
-    event->payload_prefix[0] = '\0';
-
-    // Handler-context contract recording must remain fixed-cost and avoid a
-    // second whole-object traversal.  Foreground failures get the richer clue.
-    if (!self || event->incident.ipsr != 0U) return;
-
-    bool captured = false;
-    switch (payload_contract_prefix_kind_for_operation(operation_id)) {
-        case payload_contract_prefix_kind_t::PAYLOAD:
-            if (payload_fixed_storage_span_writable(self, sizeof(Payload))) {
-                captured = payload_contract_prefix_access_t::capture(
-                    *reinterpret_cast<const Payload*>(self),
-                    event->payload_prefix,
-                    sizeof(event->payload_prefix),
-                    &event->payload_prefix_length,
-                    &event->payload_prefix_truncated);
-            }
-            break;
-
-        case payload_contract_prefix_kind_t::ARRAY:
-            if (payload_fixed_storage_span_writable(
-                    self, sizeof(PayloadArray))) {
-                captured = payload_contract_prefix_access_t::capture(
-                    *reinterpret_cast<const PayloadArray*>(self),
-                    event->payload_prefix,
-                    sizeof(event->payload_prefix),
-                    &event->payload_prefix_length,
-                    &event->payload_prefix_truncated);
-            }
-            break;
-
-        default:
-            break;
-    }
-
-    if (captured) {
-        event->payload_prefix_valid = 1U;
-    } else {
-        event->payload_prefix_length = 0U;
-        event->payload_prefix_truncated = 0U;
-        event->payload_prefix[0] = '\0';
-    }
-}
 
 static constexpr uint32_t PAYLOAD_CONTRACT_HASH_SEED = 0x811C9DC5UL;
 static constexpr uint32_t PAYLOAD_CONTRACT_HASH_PRIME = 0x01000193UL;
@@ -4088,8 +3771,7 @@ static void payload_contract_record_state_failure(
                             state.key_len,
                             state.val_len,
                             before_fingerprint,
-                            state.structural_fingerprint,
-                            false);
+                            state.structural_fingerprint);
 }
 
 static void payload_contract_record_postcondition(
@@ -5290,7 +4972,14 @@ Payload::Payload(Payload&& other) noexcept
                                  &g_payload_handler_ctx_ctor);
     payload_flight_note(PAYLOAD_OP_CTOR, this, 0U);
     payload_contract_state_t empty{};
-    if (_contract_inspect(&empty)) _contract_accept(empty);
+    if (!_contract_inspect(&empty)) {
+        payload_contract_record_state_failure(
+            payload_contract_phase_t::POST_INVARIANT,
+            PAYLOAD_OP_CTOR, this, empty, 0U, 0U);
+        _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, PAYLOAD_OP_CTOR,
+               INLINE_STORAGE);
+    }
+    _contract_accept(empty);
     _move_from(other);
     if (payload_stamp_trace_is_ocram_object(this)) {
         payload_stamp_trace_record(
@@ -5308,7 +4997,9 @@ Payload& Payload::operator=(Payload&& other) noexcept {
 
     payload_contract_state_t before{};
     payload_contract_state_t source{};
-    if (!_contract_begin(PAYLOAD_OP_MOVE_FROM, &before)) return *this;
+    if (!_contract_begin(PAYLOAD_OP_MOVE_FROM, &before)) {
+        _fatal(PAYLOAD_ERR_INTEGRITY, PAYLOAD_OP_MOVE_FROM);
+    }
     if (!other._contract_begin(PAYLOAD_OP_MOVE_ASSIGN_SOURCE, &source)) {
         payload_contract_record(payload_contract_phase_t::PRECONDITION,
                                 payload_contract_reason_t::SOURCE_INVALID,
@@ -5323,15 +5014,15 @@ Payload& Payload::operator=(Payload&& other) noexcept {
                                 0U,
                                 before.structural_fingerprint,
                                 0U);
-        return *this;
+        _fatal(PAYLOAD_ERR_INVALID_CHILD, PAYLOAD_OP_MOVE_ASSIGN_SOURCE);
     }
 
     const uint32_t expected_semantic = source.semantic_fingerprint;
     _release_storage();
     _move_from(other);
-    (void)_contract_finish_copy(PAYLOAD_OP_MOVE_FROM,
-                                before,
-                                expected_semantic);
+    if (!_contract_finish_copy(PAYLOAD_OP_MOVE_FROM, before, expected_semantic)) {
+        _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, PAYLOAD_OP_MOVE_FROM);
+    }
     return *this;
 }
 
@@ -5358,11 +5049,16 @@ Payload::Payload(const Payload& other)
                                  &g_payload_handler_ctx_ctor);
     payload_flight_note(PAYLOAD_OP_CTOR, this, 0U);
     payload_contract_state_t empty{};
-    if (_contract_inspect(&empty)) _contract_accept(empty);
+    if (!_contract_inspect(&empty)) {
+        payload_contract_record_state_failure(
+            payload_contract_phase_t::POST_INVARIANT,
+            PAYLOAD_OP_CTOR, this, empty, 0U, 0U);
+        _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, PAYLOAD_OP_CTOR,
+               INLINE_STORAGE);
+    }
+    _contract_accept(empty);
     if (!_copy_from(other)) {
-        payload_note_error(PAYLOAD_ERR_COPY_ALLOC_FAIL,
-                           PAYLOAD_OP_COPY_CTOR,
-                           this);
+        _fatal(PAYLOAD_ERR_COPY_ALLOC_FAIL, PAYLOAD_OP_COPY_CTOR);
     }
     if (payload_stamp_trace_is_ocram_object(this)) {
         payload_stamp_trace_record(
@@ -5380,7 +5076,9 @@ Payload& Payload::operator=(const Payload& other) {
 
     payload_contract_state_t before{};
     payload_contract_state_t source{};
-    if (!_contract_begin(PAYLOAD_OP_COPY_ASSIGN, &before)) return *this;
+    if (!_contract_begin(PAYLOAD_OP_COPY_ASSIGN, &before)) {
+        _fatal(PAYLOAD_ERR_INTEGRITY, PAYLOAD_OP_COPY_ASSIGN);
+    }
     if (!other._contract_begin(PAYLOAD_OP_COPY_ASSIGN_SOURCE, &source)) {
         payload_contract_record(payload_contract_phase_t::PRECONDITION,
                                 payload_contract_reason_t::SOURCE_INVALID,
@@ -5395,24 +5093,20 @@ Payload& Payload::operator=(const Payload& other) {
                                 0U,
                                 before.structural_fingerprint,
                                 0U);
-        return *this;
+        _fatal(PAYLOAD_ERR_INVALID_CHILD, PAYLOAD_OP_COPY_ASSIGN_SOURCE);
     }
 
     Payload temp;
     if (!temp._copy_from(other)) {
-        payload_note_error(PAYLOAD_ERR_COPY_ALLOC_FAIL,
-                           PAYLOAD_OP_COPY_ASSIGN,
-                           this);
-        (void)_contract_abort(PAYLOAD_OP_COPY_ASSIGN, before);
-        return *this;
+        _fatal(PAYLOAD_ERR_COPY_ALLOC_FAIL, PAYLOAD_OP_COPY_ASSIGN);
     }
 
     const uint32_t expected_semantic = source.semantic_fingerprint;
     _release_storage();
     _move_from(temp);
-    (void)_contract_finish_copy(PAYLOAD_OP_COPY_ASSIGN,
-                                before,
-                                expected_semantic);
+    if (!_contract_finish_copy(PAYLOAD_OP_COPY_ASSIGN, before, expected_semantic)) {
+        _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, PAYLOAD_OP_COPY_ASSIGN);
+    }
     return *this;
 }
 
@@ -5539,12 +5233,24 @@ size_t Payload::_data_used() const {
 }
 
 void Payload::_reset_empty() {
+    // Reset is used after a lawful transfer or release. It must not repair a
+    // damaged storage identity and let the caller continue as if it were valid.
+    if (!_storage_mode_guard_ok() || !_heap_guard_ok() ||
+        !_fixed_storage_guard_ok() || !_fixed_capacity_guard_ok() ||
+        (!_fixed_mode() &&
+         (_fixed_storage != nullptr || _fixed_capacity != 0U))) {
+        _fatal(PAYLOAD_ERR_INTEGRITY, PAYLOAD_OP_RELEASE_STORAGE_GUARD);
+    }
     const bool preserve_fixed =
         _fixed_mode() && _heap_guard_ok() && _heap_block == nullptr &&
         _fixed_storage_guard_ok() && _fixed_capacity_guard_ok() &&
         _fixed_storage && _fixed_capacity >= INLINE_STORAGE &&
         _fixed_capacity <= STORAGE_MAX &&
         payload_fixed_storage_span_writable(_fixed_storage, _fixed_capacity);
+
+    if (_fixed_mode() && !preserve_fixed) {
+        _fatal(PAYLOAD_ERR_FIXED_STORAGE, PAYLOAD_OP_RELEASE_STORAGE_GUARD);
+    }
 
     _set_heap_block(nullptr);
     _set_count(0U);
@@ -5554,9 +5260,7 @@ void Payload::_reset_empty() {
         memset(_fixed_storage, 0, _fixed_capacity);
         _set_data_begin(_fixed_capacity);
     } else {
-        // A damaged storage-policy identity is never dereferenced in an attempt
-        // to recover it. Collapse only the local object back to canonical dynamic
-        // empty state; the preceding court remains the authoritative evidence.
+        // Dynamic ownership has been released or transferred by the caller.
         _set_storage_mode(StorageMode::DYNAMIC);
         _set_fixed_storage(nullptr);
         _set_fixed_capacity(0U);
@@ -5574,6 +5278,7 @@ void Payload::_reset_empty() {
             state,
             _contract_generation,
             _contract_fingerprint);
+        _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, PAYLOAD_OP_CLEAR);
     }
 }
 
@@ -5584,18 +5289,19 @@ void Payload::_release_storage() {
         payload_note_integrity(PAYLOAD_SELF_OK_ENTRIES_SPAN_UNREADABLE,
                                PAYLOAD_OP_RELEASE_STORAGE_GUARD,
                                this);
-        _reset_empty();
-        return;
+        _fatal(PAYLOAD_ERR_INTEGRITY, PAYLOAD_OP_RELEASE_STORAGE_GUARD);
     }
     if (_fixed_mode()) {
         // FIXED storage is caller-owned and dedicated to this object's lifetime.
         // Release means semantic reset only: never free, resize, or transfer it.
         if (_heap_block != nullptr || !_fixed_storage ||
+            _fixed_capacity < INLINE_STORAGE || _fixed_capacity > STORAGE_MAX ||
             !payload_fixed_storage_span_writable(_fixed_storage,
                                                 _fixed_capacity)) {
             payload_note_integrity(PAYLOAD_SELF_OK_ENTRIES_SPAN_UNREADABLE,
                                    PAYLOAD_OP_RELEASE_STORAGE_GUARD,
                                    this);
+            _fatal(PAYLOAD_ERR_FIXED_STORAGE, PAYLOAD_OP_RELEASE_STORAGE_GUARD);
         }
         _reset_empty();
         return;
@@ -5604,8 +5310,7 @@ void Payload::_release_storage() {
         payload_note_integrity(PAYLOAD_SELF_OK_INLINE_CAP_MISMATCH,
                                PAYLOAD_OP_RELEASE_STORAGE_GUARD,
                                this);
-        _reset_empty();
-        return;
+        _fatal(PAYLOAD_ERR_INTEGRITY, PAYLOAD_OP_RELEASE_STORAGE_GUARD);
     }
     if (_heap_block) {
         const size_t capacity =
@@ -5617,10 +5322,9 @@ void Payload::_release_storage() {
                 payload_note_heap_delta(-(int32_t)capacity);
             }
         } else {
-            // Fail closed. A questionable pointer is leaked rather than passed
-            // to free(); this is the only safe destructor policy after header
-            // corruption.
+            // Stop before freeing or normalizing rejected storage.
             payload_note_integrity(PAYLOAD_SELF_OK_ENTRIES_SPAN_UNREADABLE, PAYLOAD_OP_RELEASE_STORAGE, this);
+            _fatal(PAYLOAD_ERR_INTEGRITY, PAYLOAD_OP_RELEASE_STORAGE);
         }
     }
     _reset_empty();
@@ -5629,7 +5333,9 @@ void Payload::_release_storage() {
 void Payload::_move_from(Payload& other) {
     payload_contract_state_t before{};
     payload_contract_state_t source{};
-    if (!_contract_begin(PAYLOAD_OP_MOVE_FROM, &before)) return;
+    if (!_contract_begin(PAYLOAD_OP_MOVE_FROM, &before)) {
+        _fatal(PAYLOAD_ERR_INTEGRITY, PAYLOAD_OP_MOVE_FROM);
+    }
     if (!other._contract_begin(PAYLOAD_OP_MOVE_FROM, &source)) {
         payload_contract_record(payload_contract_phase_t::PRECONDITION,
                                 payload_contract_reason_t::SOURCE_INVALID,
@@ -5644,7 +5350,7 @@ void Payload::_move_from(Payload& other) {
                                 0U,
                                 before.structural_fingerprint,
                                 0U);
-        return;
+        _fatal(PAYLOAD_ERR_INVALID_CHILD, PAYLOAD_OP_MOVE_FROM);
     }
 
     const uint32_t expected_semantic = source.semantic_fingerprint;
@@ -5654,7 +5360,9 @@ void Payload::_move_from(Payload& other) {
     // policy and then empty the source. Only dynamic->dynamic may transfer a
     // heap block and rebind its owner cookie.
     if (_fixed_mode() || other._fixed_mode()) {
-        if (!_copy_from(other)) return;
+        if (!_copy_from(other)) {
+            _fatal(PAYLOAD_ERR_COPY_ALLOC_FAIL, PAYLOAD_OP_MOVE_FROM);
+        }
         if (other._fixed_mode()) {
             other.clear();
         } else {
@@ -5679,6 +5387,7 @@ void Payload::_move_from(Payload& other) {
                 source_after.data_used,
                 before.structural_fingerprint,
                 source_after.structural_fingerprint);
+            _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, PAYLOAD_OP_MOVE_FROM);
         }
         return;
     }
@@ -5689,10 +5398,7 @@ void Payload::_move_from(Payload& other) {
                                        this,
                                        INLINE_STORAGE + 1U,
                                        STORAGE_MAX)) {
-            payload_note_error(PAYLOAD_ERR_STORAGE_CORRUPT,
-                               PAYLOAD_OP_MOVE_FROM,
-                               this);
-            return;
+            _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, PAYLOAD_OP_MOVE_FROM);
         }
         _set_heap_block(other._heap_block);
         _set_count(other._count);
@@ -5709,7 +5415,7 @@ void Payload::_move_from(Payload& other) {
     if (!_contract_finish_copy(PAYLOAD_OP_MOVE_FROM,
                                before,
                                expected_semantic)) {
-        return;
+        _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, PAYLOAD_OP_MOVE_FROM);
     }
 
     payload_contract_state_t source_after{};
@@ -5730,6 +5436,7 @@ void Payload::_move_from(Payload& other) {
             source_after.data_used,
             before.structural_fingerprint,
             source_after.structural_fingerprint);
+        _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, PAYLOAD_OP_MOVE_FROM);
     }
 }
 
@@ -5828,20 +5535,6 @@ bool Payload::_copy_from(const Payload& other) {
     return _contract_finish_copy(PAYLOAD_OP_COPY_FROM,
                                  before,
                                  source.semantic_fingerprint);
-}
-
-
-size_t Payload::_append_required_bytes(size_t key_len,
-                                       size_t value_len) const {
-    if (!_count_guard_ok() || !_data_begin_guard_ok()) return 0U;
-    const size_t data_used = _data_used();
-    const size_t new_count = (size_t)_count + 1U;
-    const size_t additional_data = key_len + 1U + value_len + 1U;
-    if (new_count > MAX_ENTRIES ||
-        additional_data > ARENA_MAX - data_used) {
-        return 0U;
-    }
-    return new_count * sizeof(Entry) + data_used + additional_data;
 }
 
 
@@ -6466,7 +6159,6 @@ bool Payload::_append_value(const char* key,
                                     key_alias, value_alias,
                                     key_offset, value_offset,
                                     shift, 0U, 0U);
-        _contract_abort(PAYLOAD_OP_APPEND_VALUE, before);
         return false;
     }
 
@@ -6515,7 +6207,6 @@ bool Payload::_append_value(const char* key,
         payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER,
                            PAYLOAD_OP_APPEND_FINAL_VALUE_SPAN,
                            this);
-        _contract_abort(PAYLOAD_OP_APPEND_VALUE, before);
         return false;
     }
     if (key_len != 0U &&
@@ -6537,7 +6228,6 @@ bool Payload::_append_value(const char* key,
         payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER,
                            PAYLOAD_OP_APPEND_FINAL_KEY_SPAN,
                            this);
-        _contract_abort(PAYLOAD_OP_APPEND_VALUE, before);
         return false;
     }
 
@@ -6556,7 +6246,6 @@ bool Payload::_append_value(const char* key,
             0U,
             before.structural_fingerprint,
             _contract_fingerprint);
-        _contract_abort(PAYLOAD_OP_APPEND_VALUE, before);
         return false;
     }
 
@@ -6641,7 +6330,6 @@ bool Payload::_append_value(const char* key,
             (uint32_t)verified_value_end,
             before.structural_fingerprint,
             _contract_fingerprint);
-        _contract_abort(PAYLOAD_OP_APPEND_VALUE, before);
         return false;
     }
 
@@ -6670,7 +6358,6 @@ bool Payload::_append_value(const char* key,
             commit_val_off,
             before.structural_fingerprint,
             _contract_fingerprint);
-        _contract_abort(PAYLOAD_OP_APPEND_VALUE, before);
         return false;
     }
 
@@ -6824,7 +6511,6 @@ bool Payload::_append_value_writer(const char* key,
     const size_t additional_data = key_len + 1U + value_len + 1U;
     int32_t shift = 0;
     if (!_ensure_room(1U, additional_data, &shift)) {
-        _contract_abort(PAYLOAD_OP_APPEND_WRITER, before);
         return false;
     }
 
@@ -6844,7 +6530,6 @@ bool Payload::_append_value_writer(const char* key,
         payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER,
                            PAYLOAD_OP_APPEND_FINAL_KEY_SPAN,
                            this);
-        _contract_abort(PAYLOAD_OP_APPEND_WRITER, before);
         return false;
     }
 
@@ -6854,14 +6539,33 @@ bool Payload::_append_value_writer(const char* key,
     const bool child_still_valid = object_value
         ? object_value->contract_valid()
         : array_value->contract_valid();
+    if (!child_still_valid) {
+        payload_contract_record(payload_contract_phase_t::PRECONDITION,
+                                payload_contract_reason_t::SOURCE_INVALID,
+                                PAYLOAD_OP_APPEND_WRITER,
+                                this,
+                                object_value
+                                    ? static_cast<const void*>(object_value)
+                                    : static_cast<const void*>(array_value),
+                                _contract_generation,
+                                0xFFFFFFFFUL,
+                                1U, 0U, 0U, 0U,
+                                before.structural_fingerprint,
+                                _contract_fingerprint);
+        _fatal(PAYLOAD_ERR_INVALID_CHILD, PAYLOAD_OP_APPEND_WRITER,
+               value_len);
+    }
     const size_t child_size_now = object_value
         ? object_value->_json_size()
         : array_value->_json_size();
+    if (child_size_now == 0U) {
+        _fatal(PAYLOAD_ERR_INVALID_CHILD, PAYLOAD_OP_APPEND_WRITER_LENGTH,
+               value_len);
+    }
     const uint32_t child_hash_now = object_value
         ? object_value->_json_hash_unchecked()
         : array_value->_json_hash_unchecked();
-    if (!child_still_valid ||
-        child_size_now != value_len ||
+    if (child_size_now != value_len ||
         child_hash_now != expected_value_hash) {
         payload_contract_record(payload_contract_phase_t::PRECONDITION,
                                 payload_contract_reason_t::SOURCE_INVALID,
@@ -6878,7 +6582,6 @@ bool Payload::_append_value_writer(const char* key,
                                 (uint32_t)child_size_now,
                                 before.structural_fingerprint,
                                 _contract_fingerprint);
-        _contract_abort(PAYLOAD_OP_APPEND_WRITER, before);
         return false;
     }
 
@@ -6897,7 +6600,6 @@ bool Payload::_append_value_writer(const char* key,
             0U,
             before.structural_fingerprint,
             _contract_fingerprint);
-        _contract_abort(PAYLOAD_OP_APPEND_WRITER, before);
         return false;
     }
 
@@ -6926,7 +6628,6 @@ bool Payload::_append_value_writer(const char* key,
         payload_note_error(PAYLOAD_ERR_SERIALIZE_OVERFLOW,
                            PAYLOAD_OP_APPEND_WRITER_WRITE,
                            this);
-        _contract_abort(PAYLOAD_OP_APPEND_WRITER, before);
         return false;
     }
     {
@@ -6988,7 +6689,6 @@ bool Payload::_append_value_writer(const char* key,
             (uint32_t)verified_value_end,
             before.structural_fingerprint,
             _contract_fingerprint);
-        _contract_abort(PAYLOAD_OP_APPEND_WRITER, before);
         return false;
     }
 
@@ -7016,7 +6716,6 @@ bool Payload::_append_value_writer(const char* key,
             commit_val_off,
             before.structural_fingerprint,
             _contract_fingerprint);
-        _contract_abort(PAYLOAD_OP_APPEND_WRITER, before);
         return false;
     }
 
@@ -7395,6 +7094,8 @@ static bool payload_format_uses_floating_conversion(const char* fmt,
 // ============================================================================
 // Semantic construction
 // ============================================================================
+// A failed append terminates without re-reading its object to reconstruct an
+// attempted size. Fatal requested_bytes is zero when no detached size exists.
 
 void Payload::add(const char* key, int32_t value) {
     size_t key_len = 0;
@@ -7415,7 +7116,7 @@ void Payload::add(const char* key, int32_t value) {
     }
     if (!_append_value(key ? key : "", key_len, text, len, ValueKind::NUMBER)) {
         _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, PAYLOAD_OP_ADD_I32,
-               _append_required_bytes(key_len, len));
+               0U);
     }
 }
 
@@ -7438,7 +7139,7 @@ void Payload::add(const char* key, uint32_t value) {
     }
     if (!_append_value(key ? key : "", key_len, text, len, ValueKind::NUMBER)) {
         _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, PAYLOAD_OP_ADD_U32,
-               _append_required_bytes(key_len, len));
+               0U);
     }
 }
 
@@ -7461,7 +7162,7 @@ void Payload::add(const char* key, int64_t value) {
     }
     if (!_append_value(key ? key : "", key_len, text, len, ValueKind::NUMBER)) {
         _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, PAYLOAD_OP_ADD_I64,
-               _append_required_bytes(key_len, len));
+               0U);
     }
 }
 
@@ -7484,7 +7185,7 @@ void Payload::add(const char* key, uint64_t value) {
     }
     if (!_append_value(key ? key : "", key_len, text, len, ValueKind::NUMBER)) {
         _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, PAYLOAD_OP_ADD_U64,
-               _append_required_bytes(key_len, len));
+               0U);
     }
 }
 
@@ -7510,7 +7211,7 @@ void Payload::add(const char* key, const char* value) {
     if (!_append_value(key ? key : "", key_len,
                        value, value_len, ValueKind::STRING)) {
         _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, PAYLOAD_OP_ADD_CSTR_VALUE,
-               _append_required_bytes(key_len, value_len));
+               0U);
     }
 }
 
@@ -7529,7 +7230,7 @@ void Payload::add(const char* key, bool value) {
     if (!_append_value(key ? key : "", key_len,
                        text, value ? 4U : 5U, ValueKind::BOOLEAN)) {
         _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, PAYLOAD_OP_ADD_BOOL_KEY,
-               _append_required_bytes(key_len, value ? 4U : 5U));
+               0U);
     }
 }
 
@@ -7578,7 +7279,7 @@ void Payload::add(const char* key, const fixed_decimal_t& value) {
         }
         g_payload_numeric_null_insert_fail++;
         _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, operation_id,
-               _append_required_bytes(key_len, 4U));
+               0U);
     };
 
     if (!value.valid()) {
@@ -7632,7 +7333,7 @@ void Payload::add(const char* key, const fixed_decimal_t& value) {
                        len,
                        ValueKind::NUMBER)) {
         _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, operation_id,
-               _append_required_bytes(key_len, len));
+               0U);
     }
 }
 
@@ -7674,7 +7375,7 @@ void Payload::add_fmt(const char* key, const char* fmt, ...) {
     if (!_append_value(key ? key : "", key_len,
                        text, value_len, ValueKind::STRING)) {
         _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, PAYLOAD_OP_ADD_FMT,
-               _append_required_bytes(key_len, value_len));
+               0U);
     }
 }
 
@@ -7698,7 +7399,7 @@ void Payload::add_object(const char* key, const Payload& obj) {
     if (!_append_value_writer(key ? key : "", key_len,
                               value_len, ValueKind::OBJECT, &obj, nullptr)) {
         _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, PAYLOAD_OP_ADD_OBJECT_VALUE,
-               _append_required_bytes(key_len, value_len));
+               0U);
     }
 }
 
@@ -7722,7 +7423,7 @@ void Payload::add_array(const char* key, const PayloadArray& arr) {
     if (!_append_value_writer(key ? key : "", key_len,
                               value_len, ValueKind::ARRAY, nullptr, &arr)) {
         _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, PAYLOAD_OP_ADD_ARRAY_VALUE,
-               _append_required_bytes(key_len, value_len));
+               0U);
     }
 }
 
@@ -7756,8 +7457,7 @@ void Payload::add_raw_object(const char* key, const char* raw_json_object) {
                        span.end - span.begin,
                        ValueKind::OBJECT)) {
         _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, PAYLOAD_OP_ADD_RAW_VALUE,
-               _append_required_bytes(key_len,
-                                      span.end - span.begin));
+               0U);
     }
 }
 
@@ -8668,8 +8368,17 @@ PayloadArray::PayloadArray(const PayloadArray& other)
     _inline_storage[1] = ']';
     _inline_storage[2] = '\0';
     payload_contract_state_t empty{};
-    if (_contract_inspect(&empty)) _contract_accept(empty);
-    (void)_copy_from(other);
+    if (!_contract_inspect(&empty)) {
+        payload_contract_record_state_failure(
+            payload_contract_phase_t::POST_INVARIANT,
+            PAYLOAD_OP_CTOR, this, empty, 0U, 0U);
+        _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, PAYLOAD_OP_CTOR,
+               INLINE_STORAGE);
+    }
+    _contract_accept(empty);
+    if (!_copy_from(other)) {
+        _fatal(PAYLOAD_ERR_COPY_ALLOC_FAIL, PAYLOAD_OP_COPY_CTOR);
+    }
 }
 
 PayloadArray& PayloadArray::operator=(const PayloadArray& other) {
@@ -8677,7 +8386,9 @@ PayloadArray& PayloadArray::operator=(const PayloadArray& other) {
 
     payload_contract_state_t before{};
     payload_contract_state_t source{};
-    if (!_contract_begin(PAYLOAD_OP_COPY_ASSIGN, &before)) return *this;
+    if (!_contract_begin(PAYLOAD_OP_COPY_ASSIGN, &before)) {
+        _fatal(PAYLOAD_ERR_INTEGRITY, PAYLOAD_OP_COPY_ASSIGN);
+    }
     if (!other._contract_begin(PAYLOAD_OP_COPY_ASSIGN_SOURCE, &source)) {
         payload_contract_record(payload_contract_phase_t::PRECONDITION,
                                 payload_contract_reason_t::SOURCE_INVALID,
@@ -8692,21 +8403,20 @@ PayloadArray& PayloadArray::operator=(const PayloadArray& other) {
                                 0U,
                                 before.structural_fingerprint,
                                 0U);
-        return *this;
+        _fatal(PAYLOAD_ERR_INVALID_CHILD, PAYLOAD_OP_COPY_ASSIGN_SOURCE);
     }
 
     PayloadArray temp;
     if (!temp._copy_from(other)) {
-        (void)_contract_abort(PAYLOAD_OP_COPY_ASSIGN, before);
-        return *this;
+        _fatal(PAYLOAD_ERR_COPY_ALLOC_FAIL, PAYLOAD_OP_COPY_ASSIGN);
     }
 
     const uint32_t expected_hash = source.semantic_fingerprint;
     _release_storage();
     _move_from(temp);
-    (void)_contract_finish_copy(PAYLOAD_OP_COPY_ASSIGN,
-                                before,
-                                expected_hash);
+    if (!_contract_finish_copy(PAYLOAD_OP_COPY_ASSIGN, before, expected_hash)) {
+        _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, PAYLOAD_OP_COPY_ASSIGN);
+    }
     return *this;
 }
 
@@ -8724,7 +8434,14 @@ PayloadArray::PayloadArray(PayloadArray&& other) noexcept
     _inline_storage[1] = ']';
     _inline_storage[2] = '\0';
     payload_contract_state_t empty{};
-    if (_contract_inspect(&empty)) _contract_accept(empty);
+    if (!_contract_inspect(&empty)) {
+        payload_contract_record_state_failure(
+            payload_contract_phase_t::POST_INVARIANT,
+            PAYLOAD_OP_CTOR, this, empty, 0U, 0U);
+        _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, PAYLOAD_OP_CTOR,
+               INLINE_STORAGE);
+    }
+    _contract_accept(empty);
     _move_from(other);
 }
 
@@ -8733,7 +8450,9 @@ PayloadArray& PayloadArray::operator=(PayloadArray&& other) noexcept {
 
     payload_contract_state_t before{};
     payload_contract_state_t source{};
-    if (!_contract_begin(PAYLOAD_OP_MOVE_FROM, &before)) return *this;
+    if (!_contract_begin(PAYLOAD_OP_MOVE_FROM, &before)) {
+        _fatal(PAYLOAD_ERR_INTEGRITY, PAYLOAD_OP_MOVE_FROM);
+    }
     if (!other._contract_begin(PAYLOAD_OP_MOVE_ASSIGN_SOURCE, &source)) {
         payload_contract_record(payload_contract_phase_t::PRECONDITION,
                                 payload_contract_reason_t::SOURCE_INVALID,
@@ -8748,15 +8467,15 @@ PayloadArray& PayloadArray::operator=(PayloadArray&& other) noexcept {
                                 0U,
                                 before.structural_fingerprint,
                                 0U);
-        return *this;
+        _fatal(PAYLOAD_ERR_INVALID_CHILD, PAYLOAD_OP_MOVE_ASSIGN_SOURCE);
     }
 
     const uint32_t expected_hash = source.semantic_fingerprint;
     _release_storage();
     _move_from(other);
-    (void)_contract_finish_copy(PAYLOAD_OP_MOVE_FROM,
-                                before,
-                                expected_hash);
+    if (!_contract_finish_copy(PAYLOAD_OP_MOVE_FROM, before, expected_hash)) {
+        _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, PAYLOAD_OP_MOVE_FROM);
+    }
     return *this;
 }
 
@@ -8874,14 +8593,7 @@ void PayloadArray::_release_storage() {
         payload_note_integrity(PAYLOAD_SELF_OK_ENTRIES_SPAN_UNREADABLE,
                                PAYLOAD_OP_ARRAY_RELEASE_STORAGE_GUARD,
                                this);
-        _set_heap_block(nullptr);
-        _set_length(2U);
-        memset(_inline_storage, 0, sizeof(_inline_storage));
-        _inline_storage[0] = '[';
-        _inline_storage[1] = ']';
-        payload_contract_state_t state{};
-        if (_contract_inspect(&state)) _contract_accept(state);
-        return;
+        _fatal(PAYLOAD_ERR_INTEGRITY, PAYLOAD_OP_ARRAY_RELEASE_STORAGE_GUARD);
     }
     if (_heap_block) {
         const size_t capacity =
@@ -8899,6 +8611,7 @@ void PayloadArray::_release_storage() {
             payload_note_integrity(PAYLOAD_SELF_OK_ENTRIES_SPAN_UNREADABLE,
                                    PAYLOAD_OP_ARRAY_RELEASE_STORAGE,
                                    this);
+            _fatal(PAYLOAD_ERR_INTEGRITY, PAYLOAD_OP_ARRAY_RELEASE_STORAGE);
         }
     }
     _set_heap_block(nullptr);
@@ -8907,14 +8620,23 @@ void PayloadArray::_release_storage() {
     _inline_storage[0] = '[';
     _inline_storage[1] = ']';
     payload_contract_state_t state{};
-    if (_contract_inspect(&state)) _contract_accept(state);
+    if (!_contract_inspect(&state)) {
+        payload_contract_record_state_failure(
+            payload_contract_phase_t::POST_INVARIANT,
+            PAYLOAD_OP_ARRAY_RELEASE_STORAGE, this, state,
+            _contract_generation, _contract_fingerprint);
+        _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, PAYLOAD_OP_ARRAY_RELEASE_STORAGE);
+    }
+    _contract_accept(state);
 }
 
 
 void PayloadArray::_move_from(PayloadArray& other) {
     payload_contract_state_t before{};
     payload_contract_state_t source{};
-    if (!_contract_begin(PAYLOAD_OP_MOVE_FROM, &before)) return;
+    if (!_contract_begin(PAYLOAD_OP_MOVE_FROM, &before)) {
+        _fatal(PAYLOAD_ERR_INTEGRITY, PAYLOAD_OP_MOVE_FROM);
+    }
     if (!other._contract_begin(PAYLOAD_OP_MOVE_FROM, &source)) {
         payload_contract_record(payload_contract_phase_t::PRECONDITION,
                                 payload_contract_reason_t::SOURCE_INVALID,
@@ -8929,7 +8651,7 @@ void PayloadArray::_move_from(PayloadArray& other) {
                                 0U,
                                 before.structural_fingerprint,
                                 0U);
-        return;
+        _fatal(PAYLOAD_ERR_INVALID_CHILD, PAYLOAD_OP_MOVE_FROM);
     }
 
     const uint32_t expected_hash = source.semantic_fingerprint;
@@ -8939,10 +8661,7 @@ void PayloadArray::_move_from(PayloadArray& other) {
                                        this,
                                        INLINE_STORAGE + 1U,
                                        STORAGE_MAX)) {
-            payload_note_error(PAYLOAD_ERR_STORAGE_CORRUPT,
-                               PAYLOAD_OP_MOVE_FROM,
-                               this);
-            return;
+            _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, PAYLOAD_OP_MOVE_FROM);
         }
         _set_heap_block(other._heap_block);
         _set_length(other._length);
@@ -8958,7 +8677,7 @@ void PayloadArray::_move_from(PayloadArray& other) {
     if (!_contract_finish_copy(PAYLOAD_OP_MOVE_FROM,
                                before,
                                expected_hash)) {
-        return;
+        _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, PAYLOAD_OP_MOVE_FROM);
     }
 
     payload_contract_state_t source_after{};
@@ -8979,6 +8698,7 @@ void PayloadArray::_move_from(PayloadArray& other) {
             source_after.count,
             before.structural_fingerprint,
             source_after.structural_fingerprint);
+        _fatal(PAYLOAD_ERR_STORAGE_CORRUPT, PAYLOAD_OP_MOVE_FROM);
     }
 }
 
@@ -9120,15 +8840,30 @@ void PayloadArray::add(const Payload& obj) {
                new_length);
     }
     if (!_ensure_capacity(new_length + 1U)) {
-        _contract_abort(PAYLOAD_OP_ARRAY_ADD_WRITE, before);
         _fatal(PAYLOAD_ERR_ARENA_ALLOC_FAIL,
                PAYLOAD_OP_ARRAY_ADD_WRITE,
                new_length + 1U);
     }
 
-    if (!obj.contract_valid() ||
-        obj._json_size() != object_size ||
-        obj._json_hash_unchecked() != object_hash) {
+    if (!obj.contract_valid()) {
+        payload_contract_record(payload_contract_phase_t::PRECONDITION,
+                                payload_contract_reason_t::SOURCE_INVALID,
+                                PAYLOAD_OP_ARRAY_ADD_WRITE,
+                                this, &obj, _contract_generation,
+                                before.element_count,
+                                1U, 0U, 0U, 0U,
+                                before.structural_fingerprint,
+                                _contract_fingerprint);
+        _fatal(PAYLOAD_ERR_INVALID_CHILD, PAYLOAD_OP_ARRAY_ADD_WRITE,
+               object_size);
+    }
+    const size_t object_size_now = obj._json_size();
+    if (object_size_now == 0U) {
+        _fatal(PAYLOAD_ERR_INVALID_CHILD, PAYLOAD_OP_ARRAY_ADD_WRITE,
+               object_size);
+    }
+    const uint32_t object_hash_now = obj._json_hash_unchecked();
+    if (object_size_now != object_size || object_hash_now != object_hash) {
         payload_contract_record(payload_contract_phase_t::PRECONDITION,
                                 payload_contract_reason_t::SOURCE_INVALID,
                                 PAYLOAD_OP_ARRAY_ADD_WRITE,
@@ -9137,12 +8872,11 @@ void PayloadArray::add(const Payload& obj) {
                                 _contract_generation,
                                 before.element_count,
                                 object_hash,
-                                obj._json_hash_unchecked(),
+                                object_hash_now,
                                 (uint32_t)object_size,
-                                (uint32_t)obj._json_size(),
+                                (uint32_t)object_size_now,
                                 before.structural_fingerprint,
                                 _contract_fingerprint);
-        _contract_abort(PAYLOAD_OP_ARRAY_ADD_WRITE, before);
         _fatal(PAYLOAD_ERR_INVALID_CHILD, PAYLOAD_OP_ARRAY_ADD_WRITE,
                object_size);
     }
@@ -9158,7 +8892,6 @@ void PayloadArray::add(const Payload& obj) {
         payload_note_error(PAYLOAD_ERR_SERIALIZE_OVERFLOW,
                            PAYLOAD_OP_ARRAY_ADD_WRITE,
                            this);
-        _contract_abort(PAYLOAD_OP_ARRAY_ADD_WRITE, before);
         _fatal(PAYLOAD_ERR_SERIALIZE_OVERFLOW,
                PAYLOAD_OP_ARRAY_ADD_WRITE,
                object_size);
