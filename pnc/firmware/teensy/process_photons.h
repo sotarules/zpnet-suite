@@ -32,10 +32,10 @@
 // Real single-pass race engine:
 //   • one recurring 1 kHz TimePop cadence owns one race attempt per tick;
 //   • Step 4 keeps that producer held and establishes permanent split authority:
-//     LD_ON owns only the coarse MP5491 source while the active-low SDM gate
-//     remains HIGH/inhibited;
+//     LD_ON owns only the coarse MP5491 source. The active-low SDM gate remains
+//     HIGH/inhibited except during an explicit manual ON or PULSE;
 //   • the dormant LD_ON falling-edge launch surrogate must not be activated in
-//     this checkpoint and will be replaced by gate-timed launch in Step 5;
+//     this checkpoint; manual gate pulses do not enable the recurring race engine;
 //   • process_interrupt owns the first-instruction DWT coordinate of every
 //     physical PD200T pin-34 RISING edge; PHOTONS admits only the first eligible
 //     edge for the armed race and ignores later comparator chatter for race science;
@@ -65,9 +65,26 @@
 //   • REPORT              — compact operational/device report including Step-4 coarse-source
 //                           state, active-low gate inhibit, MP5491 ID1 current setting, laser
 //                           monitor, PD200T pin 38/A14 telemetry, and pin-34 interrupt custody
-//   • PULSE               — Step-4 transition hold: rejected until Step 5 moves manual
-//                           pulse authorship from LD_ON to the active-low SDM gate
-//   • REPORT_PULSE        — minimal latest manual-shot commissioning report
+//   • PULSE [ns=N]        — one active-low SDM gate pulse; requires LD_ON first and
+//                           leaves LD_ON HIGH, gate HIGH afterward. Default: 1000 ns.
+//                           A continuously open gate is rejected; issue OFF first.
+//                           N is any positive uint64 integer; no policy duration cap.
+//                           Uses F_CPU_ACTUAL and DWT polling with interrupts enabled;
+//                           foreground remains occupied until gate closure. Long waits
+//                           accumulate unsigned deltas across DWT wraps. An IRQ gap
+//                           of a full DWT revolution cannot be recovered from DWT alone.
+//                           Requested width is approximate; loop/write/IRQ latency may
+//                           extend the physical LOW interval. Measure it with the scope.
+//                           Output: LASER_GATE_PIN 35. Detector input remains pin 34,
+//                           read through process_interrupt's authoritative GPIO2 accessor.
+//   • REPORT_PULSE        — latest manual-shot raw evidence (PHOTONS_PULSE_REPORT_V3):
+//                           requested ns, target whole seconds + fractional cycles,
+//                           CPU/DWT rate, write-bracketing start/end DWT and first
+//                           observed detector edge after arming. pulse_wall_cycles is
+//                           modulo 2^32, not a long-duration elapsed-time measurement.
+//                           No GNSS lock is required; flight_time_valid remains false.
+//                           Raw edges are not proof of optical return. Each accepted
+//                           shot replaces the prior report; rejections preserve it.
 //   • REPORT_PHOTONS      — compact always-on instrument + current CAMP report
 //   • REPORT_STATS        — detailed statistical/court/Better-Buckets report
 //   • STATS_RESET         — reset the always-on statistical epoch without changing CAMP custody
@@ -82,10 +99,18 @@
 //   • REPORT_RECOVERY     — report staging, restored source, and physical-ancestry testimony
 //   • INJECT_PROBLEM      — retained command identity; synthetic injection is unavailable
 //                           after retirement of the emulator
-//   • ON                  — Step-4 coarse-source enable only: re-prove the active-low SDM
-//                           gate HIGH/closed, then assert LD_ON HIGH; never opens the gate
-//   • OFF                 — Step-4 fail-safe shutdown: drive gate HIGH first, then LD_ON LOW,
-//                           and prove both physical levels before returning
+//   • LD_ON               — coarse-source preparation: gate HIGH/closed, then LD_ON HIGH;
+//                           repeated calls also close the gate before enabling the source
+//   • LD_OFF              — full shutdown: gate HIGH first, then LD_ON LOW; prove both
+//                           physical levels before returning
+//   • ON                  — continuous gate opening: requires LD_ON HIGH, writes gate LOW,
+//                           leaves LD_ON unchanged and returns immediately (no busy-wait)
+//   • OFF                 — gate closure only: writes gate HIGH and leaves LD_ON unchanged
+//                           whether the source is enabled or disabled
+//                           All four controls cancel a pending manual receive arm without
+//                           erasing its already-captured testimony. No race is started.
+//                           Continuous emission is not time-limited: explicitly OFF or
+//                           LD_OFF afterward, with the optical path enclosed throughout.
 // ============================================================================
 
 // Cumulative ISR-authored optical-edge state from PD200T TTL pin 34.
@@ -173,7 +198,7 @@ struct photons_fragment_raw_cycles_snapshot_t {
 // Projection testimony for the most recently accepted lap plus lifetime
 // admission counters. PHOTONS consumes a cached immutable PPS/VCLOCK anchor.
 // Ordinary detector ISR work never calls TIME/CLOCKS or performs Payload/statistical
-// work; the explicitly armed one-shot PULSE path projects its first return edge once.
+// work; the explicitly armed one-shot PULSE path retains its first edge as raw testimony.
 struct photons_fragment_projection_snapshot_t {
   bool anchor_cache_valid = false;
   uint32_t anchor_pps_count = 0;

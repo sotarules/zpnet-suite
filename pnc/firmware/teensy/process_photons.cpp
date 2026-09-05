@@ -2063,9 +2063,10 @@ static float photons_adc_voltage(uint16_t raw) {
 
 // Optical authority is intentionally split.  The SDM/LANTERN gate is active-low.
 // LD_ON is the slower MP5491 coarse-source enable. Step 4 makes that separation
-// permanent: boot/INIT leave both layers inhibited; ON may raise only LD_ON after
-// re-proving the gate HIGH/closed; OFF closes the gate first and removes LD_ON
-// second. No Step-4 control is allowed to drive the gate LOW.
+// permanent: boot/INIT leave both layers inhibited; LD_ON raises the source
+// enable only after closing the gate; LD_OFF closes the gate before removing
+// source enable. ON/OFF now open/close only the gate, with ON requiring the
+// source already enabled. PULSE requires a closed gate and enabled source.
 static void photons_laser_hard_inhibit(void) {
   digitalWrite(LASER_GATE_PIN, HIGH);
   digitalWrite(LD_ON_PIN, LOW);
@@ -2372,7 +2373,7 @@ static void photons_laser_initialize_hardware(void) {
   // authoring an emitting intermediate state. Preload gate HIGH / LD_ON LOW
   // before driving either pin and keep that hard inhibit through MP5491 setup.
   // Step 4 deliberately does not energize the coarse source at boot or INIT;
-  // only an explicit ON command may do that later behind the closed gate.
+  // only an explicit LD_ON command may do that later behind the closed gate.
   photons_laser_hard_inhibit();
   pinMode(LASER_GATE_PIN, OUTPUT);
   pinMode(LD_ON_PIN, OUTPUT);
@@ -2512,18 +2513,67 @@ static timepop_handle_t g_fragment_timer = TIMEPOP_INVALID_HANDLE;
 //
 // Foreground owns launch authorship. process_interrupt owns the pin-34
 // first-instruction DWT coordinate. PHOTONS admits only the first comparator
-// RISING edge after a PULSE arm. The ISR stores only scalar edge facts; any
-// GNSS projection is deferred to foreground reporting. Each new PULSE replaces
-// the prior one-shot report state.
+// RISING edge after a PULSE arm. The ISR stores only scalar edge facts; manual
+// reports preserve those raw coordinates without late GNSS reprojection.
+// Each new PULSE replaces the prior one-shot report state.
 //
+// Split seconds from fractional cycles so every positive uint64_t ns request
+// is representable, even when its total cycle count would exceed uint64_t.
+struct photons_pulse_width_t {
+  uint64_t whole_seconds = 0ULL;
+  uint32_t tail_cycles = 0U;
+};
+
+static photons_pulse_width_t photons_pulse_width(
+    uint64_t requested_ns, uint32_t dwt_cycles_per_second) {
+  photons_pulse_width_t width{};
+  width.whole_seconds = requested_ns / PHOTONS_NS_PER_SECOND;
+  const uint64_t remainder_ns = requested_ns % PHOTONS_NS_PER_SECOND;
+  // Round upward to the next DWT cycle. This product cannot overflow uint64_t:
+  // remainder_ns < 1e9 and the cycle rate is uint32_t.
+  width.tail_cycles = (uint32_t)(
+      (remainder_ns * (uint64_t)dwt_cycles_per_second +
+       PHOTONS_NS_PER_SECOND - 1ULL) / PHOTONS_NS_PER_SECOND);
+  if (width.tail_cycles == dwt_cycles_per_second) {
+    width.whole_seconds++;
+    width.tail_cycles = 0U;
+  }
+  return width;
+}
+
+// Long requests count successive unsigned DWT deltas across counter wraps.
+// Interrupt time counts toward the wait; an interruption spanning a complete
+// 32-bit DWT revolution is inherently unobservable and extends the pulse.
+// This intentionally blocks foreground dispatch, without yield or IRQ masking.
+static void photons_pulse_wait_long(
+    const photons_pulse_width_t& width,
+    uint32_t dwt_cycles_per_second,
+    uint32_t previous_dwt) {
+  uint64_t seconds_left = width.whole_seconds;
+  uint64_t fractional_cycles = 0ULL;
+  do {
+    const uint32_t now = ARM_DWT_CYCCNT;
+    fractional_cycles += (uint32_t)(now - previous_dwt);
+    previous_dwt = now;
+    if (fractional_cycles >= dwt_cycles_per_second) {
+      const uint64_t elapsed_seconds =
+          fractional_cycles / dwt_cycles_per_second;
+      if (elapsed_seconds > seconds_left) return;
+      seconds_left -= elapsed_seconds;
+      fractional_cycles %= dwt_cycles_per_second;
+    }
+  } while (seconds_left != 0ULL || fractional_cycles < width.tail_cycles);
+}
+
 struct photons_pulse_launch_state_t {
   bool     valid = false;
   uint32_t sequence = 0U;
   uint64_t requested_ns = 0ULL;
-  uint32_t target_high_cycles = 0U;
+  photons_pulse_width_t target{};
+  uint32_t dwt_cycles_per_second = 0U;
   uint32_t start_dwt = 0U;
-  bool     start_gnss_valid = false;
-  uint64_t start_gnss_ns = 0ULL;
+  uint32_t end_dwt = 0U;
+  // Raw write-bracketing interval, modulo 2^32; not a long-duration clock.
   uint32_t pulse_wall_cycles = 0U;
   uint32_t callback_count_start = 0U;
 };
@@ -5995,7 +6045,7 @@ static FLASHMEM Payload cmd_report_pulse(const Payload& /*args*/) {
   Payload p;
   photons_prepare_operational_report(p);
   p.add("report", "PHOTONS_PULSE");
-  p.add("schema", "PHOTONS_PULSE_REPORT_V2");
+  p.add("schema", "PHOTONS_PULSE_REPORT_V3");
   p.add("race_engine_active",
         g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE);
   p.add("interrupt_callback_count", interrupt_diag.callback_count);
@@ -6006,7 +6056,14 @@ static FLASHMEM Payload cmd_report_pulse(const Payload& /*args*/) {
 
   p.add("pulse_sequence", pulse_launch.sequence);
   p.add("pulse_requested_ns", pulse_launch.requested_ns);
+  p.add("pulse_target_whole_seconds", pulse_launch.target.whole_seconds);
+  p.add("pulse_target_tail_cycles", pulse_launch.target.tail_cycles);
+  p.add("pulse_dwt_cycles_per_second", pulse_launch.dwt_cycles_per_second);
+  p.add("pulse_start_dwt", pulse_launch.start_dwt);
+  p.add("pulse_end_dwt", pulse_launch.end_dwt);
   p.add("pulse_wall_cycles", pulse_launch.pulse_wall_cycles);
+  p.add("pulse_wall_cycles_semantics", "WRITE_BRACKET_MODULO_2_32");
+  p.add("pulse_launch_surrogate", "GATE_LOW_WRITE");
   const bool finish_seen =
       pulse_receive.seen &&
       pulse_receive.pulse_sequence == pulse_launch.sequence;
@@ -6016,21 +6073,16 @@ static FLASHMEM Payload cmd_report_pulse(const Payload& /*args*/) {
         interrupt_diag.callback_count - pulse_launch.callback_count_start);
   p.add("receive_seen", finish_seen);
 
-  uint64_t finish_gnss_ns = 0ULL;
-  const bool finish_gnss_valid =
-      finish_seen &&
-      time_clock_ns_at_dwt(time_clock_id_t::GNSS,
-                           pulse_receive.finish_dwt,
-                           &finish_gnss_ns);
-  const bool flight_time_valid =
-      pulse_launch.start_gnss_valid &&
-      finish_gnss_valid &&
-      finish_gnss_ns >= pulse_launch.start_gnss_ns;
-  p.add("flight_time_valid", flight_time_valid);
-  if (flight_time_valid) {
-    p.add("flight_time_gnss_ns",
-          finish_gnss_ns - pulse_launch.start_gnss_ns);
+  if (finish_seen) {
+    p.add("receive_edge_sequence", pulse_receive.edge_sequence);
+    p.add("receive_pps_sequence", pulse_receive.pps_sequence);
+    p.add("receive_dwt", pulse_receive.finish_dwt);
   }
+  // An arbitrarily late REPORT cannot project a retained 32-bit coordinate
+  // through the current GNSS anchor without risking a false wrap attribution.
+  // This manual scope command reports raw evidence, not race flight science.
+  p.add("flight_time_valid", false);
+  p.add("timing_semantics", "RAW_DWT_SCOPE_COMMISSIONING");
   return p;
 }
 
@@ -6106,70 +6158,60 @@ static FLASHMEM Payload cmd_pulse(const Payload& args) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
 
-  // Step 4 retires LD_ON as a pulse author. Keep the existing Step-5 machinery
-  // intact but unreachable until pulse timing is converted to the active-low SDM
-  // gate. This prevents two simultaneous optical authorities during bring-up.
-  static constexpr bool PHOTONS_STEP4_SDM_PULSE_READY = false;
-  if (!PHOTONS_STEP4_SDM_PULSE_READY) {
-    Payload p;
-    p.add("status", "pulse_rejected_step4_gate_transition");
-    p.add("error",
-          "PULSE is unavailable until Step 5 moves pulse authorship to the SDM gate");
-    p.add("laser_gate_level", digitalRead(LASER_GATE_PIN));
-    p.add("ld_on_level", digitalRead(LD_ON_PIN));
-    return p;
-  }
   if (g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE) {
     Payload p;
     p.add("status", "pulse_rejected_race_engine_active");
     return p;
   }
 
-  if (digitalRead(LD_ON_PIN) != LOW) {
+  // LD_ON owns source preparation. PULSE never cycles LD_ON during a normal shot.
+  if (!g_initialized) __builtin_trap();
+  if (digitalRead(LASER_GATE_PIN) != HIGH) {
+    // Continuous ON is now a legal state, not an output-integrity violation.
     Payload p;
-    p.add("status", "pulse_rejected_laser_not_inhibited");
+    p.add("status", "pulse_rejected_gate_open");
+    p.add("error", "Run PHOTONS.OFF before PULSE");
+    return p;
+  }
+  if (digitalRead(LD_ON_PIN) != HIGH) {
+    Payload p;
+    p.add("status", "pulse_rejected_source_disabled");
+    p.add("error", "Run PHOTONS.LD_ON before PULSE");
     return p;
   }
 
-  if (digitalRead(PHOTODIODE_EDGE_PIN) != LOW) {
+  // process_interrupt owns pin 34's GPIO2 remap and its ambient-level read.
+  if (interrupt_photodiode_level_high()) {
     Payload p;
     p.add("status", "pulse_rejected_detector_not_quiet");
     return p;
   }
 
-  // Manual PULSE remains a commissioning command. It requires the live GNSS/DWT
-  // ruler for width conversion and report projection but performs no ADC work
-  // inside the commanded HIGH interval.
-  time_clock_projection_t projection_preflight{};
-  if (!time_clock_projection(time_clock_id_t::GNSS,
-                             &projection_preflight)) {
-    Payload p;
-    p.add("status", "pulse_rejected_gnss_projection_unavailable");
-    return p;
-  }
-
   uint64_t requested_ns = PHOTONS_PULSE_DEFAULT_NS;
-  if (args.has("ns") && !args.tryGetUInt64("ns", requested_ns)) {
+  if ((args.has("ns") && !args.tryGetUInt64("ns", requested_ns)) ||
+      requested_ns == 0ULL) {
     Payload p;
     p.add("status", "pulse_rejected_ns_invalid");
+    p.add("error", "ns must be a positive uint64 integer");
     return p;
   }
 
-  uint32_t target_high_cycles = 0U;
-  if (!photons_ns_to_dwt_cycles(
-          requested_ns,
-          projection_preflight.dwt_cycles_per_second,
-          target_high_cycles)) {
-    Payload p;
-    p.add("status", "pulse_rejected_ns_out_of_range");
-    p.add("requested_ns", requested_ns);
-    return p;
-  }
+  // Ballpark scope timing uses the current CPU/DWT rate; GNSS lock is not a
+  // prerequisite. All conversion is complete before opening the active-low gate.
+  const uint32_t dwt_cycles_per_second = F_CPU_ACTUAL;
+  if (dwt_cycles_per_second == 0U) __builtin_trap();
+  const photons_pulse_width_t width =
+      photons_pulse_width(requested_ns, dwt_cycles_per_second);
 
   interrupt_photodiode_diag_t interrupt_before{};
   if (!interrupt_photodiode_snapshot(&interrupt_before)) {
     Payload p;
     p.add("status", "pulse_rejected_interrupt_snapshot_unavailable");
+    return p;
+  }
+  if (!interrupt_before.subscribed || !interrupt_before.active) {
+    Payload p;
+    p.add("status", "pulse_rejected_detector_inactive");
     return p;
   }
 
@@ -6195,26 +6237,33 @@ static FLASHMEM Payload cmd_pulse(const Payload& args) {
   photons_memory_barrier();
 
   const uint32_t start_dwt = ARM_DWT_CYCCNT;
-  digitalWriteFast(LD_ON_PIN, HIGH);
-  const uint32_t high_start = ARM_DWT_CYCCNT;
-  while ((uint32_t)(ARM_DWT_CYCCNT - high_start) < target_high_cycles) {
+  digitalWriteFast(LASER_GATE_PIN, LOW);
+  const uint32_t low_start = ARM_DWT_CYCCNT;
+  if (width.whole_seconds == 0ULL) {
+    // Keep the usual 20-100 ns path to a 32-bit DWT poll. IRQs stay enabled;
+    // loop/write overhead and interruptions may extend the physical LOW time.
+    while ((uint32_t)(ARM_DWT_CYCCNT - low_start) < width.tail_cycles) {
+    }
+  } else {
+    photons_pulse_wait_long(width, dwt_cycles_per_second, low_start);
   }
-  digitalWriteFast(LD_ON_PIN, LOW);
-  const uint32_t pulse_wall_cycles = ARM_DWT_CYCCNT - start_dwt;
-
-  uint64_t start_gnss_ns = 0ULL;
-  const bool start_gnss_valid =
-      time_clock_ns_at_dwt(time_clock_id_t::GNSS,
-                           start_dwt,
-                           &start_gnss_ns);
+  digitalWriteFast(LASER_GATE_PIN, HIGH);
+  const uint32_t end_dwt = ARM_DWT_CYCCNT;
+  const uint32_t pulse_wall_cycles = end_dwt - start_dwt;
+  // Close before any report construction or further foreground work. A broken
+  // output invariant removes the source as well before entering forensics.
+  if (digitalRead(LASER_GATE_PIN) != HIGH ||
+      digitalRead(LD_ON_PIN) != HIGH) {
+    photons_laser_hard_inhibit();
+    __builtin_trap();
+  }
 
   g_last_pulse_launch.sequence = pulse_sequence;
   g_last_pulse_launch.requested_ns = requested_ns;
-  g_last_pulse_launch.target_high_cycles = target_high_cycles;
+  g_last_pulse_launch.target = width;
+  g_last_pulse_launch.dwt_cycles_per_second = dwt_cycles_per_second;
   g_last_pulse_launch.start_dwt = start_dwt;
-  g_last_pulse_launch.start_gnss_valid = start_gnss_valid;
-  g_last_pulse_launch.start_gnss_ns =
-      start_gnss_valid ? start_gnss_ns : 0ULL;
+  g_last_pulse_launch.end_dwt = end_dwt;
   g_last_pulse_launch.pulse_wall_cycles = pulse_wall_cycles;
   g_last_pulse_launch.callback_count_start = interrupt_before.callback_count;
   photons_memory_barrier();
@@ -6224,11 +6273,16 @@ static FLASHMEM Payload cmd_pulse(const Payload& args) {
   p.add("status", "pulse_fired");
   p.add("pulse_sequence", pulse_sequence);
   p.add("pulse_requested_ns", requested_ns);
-  p.add("pulse_target_high_cycles", target_high_cycles);
+  p.add("pulse_target_whole_seconds", width.whole_seconds);
+  p.add("pulse_target_tail_cycles", width.tail_cycles);
+  p.add("pulse_dwt_cycles_per_second", dwt_cycles_per_second);
   p.add("pulse_wall_cycles", pulse_wall_cycles);
+  p.add("pulse_wall_cycles_semantics", "WRITE_BRACKET_MODULO_2_32");
   p.add("pulse_start_dwt", start_dwt);
-  p.add("pulse_start_gnss_valid", start_gnss_valid);
-  if (start_gnss_valid) p.add("pulse_start_gnss_ns", start_gnss_ns);
+  p.add("pulse_end_dwt", end_dwt);
+  p.add("pulse_launch_surrogate", "GATE_LOW_WRITE");
+  p.add("laser_gate_level", HIGH);
+  p.add("ld_on_level", HIGH);
   p.add("previous_receive_pending", previous_receive_pending);
   if (previous_receive_pending) {
     p.add("overwritten_pending_sequence", previous_armed_sequence);
@@ -6236,17 +6290,18 @@ static FLASHMEM Payload cmd_pulse(const Payload& args) {
   return p;
 }
 
-static FLASHMEM Payload cmd_on(const Payload& /*args*/) {
+static FLASHMEM Payload cmd_ld_on(const Payload& /*args*/) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
   if (g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE) {
     Payload p;
-    p.add("status", "on_rejected_race_engine_active");
+    p.add("status", "ld_on_rejected_race_engine_active");
     return p;
   }
 
-  // Step 4 defines ON permanently as coarse-source enable only. The helper
-  // re-proves the active-low SDM gate HIGH before and after asserting LD_ON.
+  // Source preparation always closes the gate, including repeated LD_ON calls.
+  g_pulse_armed_sequence = 0U;
+  photons_memory_barrier();
   photons_laser_coarse_source_enable_behind_closed_gate();
   const photons_device_snapshot_t device = photons_device_snapshot();
   if (!device.laser_enabled || digitalRead(LASER_GATE_PIN) != HIGH) {
@@ -6270,17 +6325,18 @@ static FLASHMEM Payload cmd_on(const Payload& /*args*/) {
   return p;
 }
 
-static FLASHMEM Payload cmd_off(const Payload& /*args*/) {
+static FLASHMEM Payload cmd_ld_off(const Payload& /*args*/) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
   if (g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE) {
     Payload p;
-    p.add("status", "off_rejected_race_engine_active");
+    p.add("status", "ld_off_rejected_race_engine_active");
     return p;
   }
 
-  // Step 4 defines OFF as the asymmetric fail-safe transaction: close the gate
-  // first, then remove the slower coarse source, and prove both physical levels.
+  // Full shutdown: close the gate first, then remove coarse-source enable.
+  g_pulse_armed_sequence = 0U;
+  photons_memory_barrier();
   photons_laser_coarse_source_disable();
   const photons_device_snapshot_t device = photons_device_snapshot();
   if (device.laser_enabled || digitalRead(LASER_GATE_PIN) != HIGH) {
@@ -6300,6 +6356,72 @@ static FLASHMEM Payload cmd_off(const Payload& /*args*/) {
         toFixedDecimal(device.laser_id1_current_ma, 3));
   p.add("laser_monitor_v", toFixedDecimal(device.laser_monitor_v, 6));
   p.add("laser_emitting", device.laser_emitting);
+  return p;
+}
+
+static FLASHMEM Payload cmd_on(const Payload& /*args*/) {
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::COMMAND);
+  if (g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE) {
+    Payload p;
+    p.add("status", "on_rejected_race_engine_active");
+    return p;
+  }
+  if (!g_initialized) __builtin_trap();
+  if (digitalRead(LD_ON_PIN) != HIGH) {
+    Payload p;
+    p.add("status", "on_rejected_source_disabled");
+    p.add("error", "Run PHOTONS.LD_ON before ON");
+    return p;
+  }
+
+  // Continuous gate opening returns foreground control immediately. No receive
+  // arm is created, and an unanswered manual shot must not claim an ON edge.
+  g_pulse_armed_sequence = 0U;
+  photons_memory_barrier();
+  digitalWrite(LASER_GATE_PIN, LOW);
+  if (digitalRead(LASER_GATE_PIN) != LOW ||
+      digitalRead(LD_ON_PIN) != HIGH) {
+    photons_laser_hard_inhibit();
+    __builtin_trap();
+  }
+
+  Payload p;
+  p.add("status", "gate_open");
+  p.add("laser_gate_level", LOW);
+  p.add("ld_on_level", HIGH);
+  p.add("coarse_source_enabled", true);
+  p.add("gate_active_low", true);
+  p.add("gate_inhibited", false);
+  return p;
+}
+
+static FLASHMEM Payload cmd_off(const Payload& /*args*/) {
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::COMMAND);
+  if (g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE) {
+    Payload p;
+    p.add("status", "off_rejected_race_engine_active");
+    return p;
+  }
+  if (!g_initialized) __builtin_trap();
+  const int source_level = digitalRead(LD_ON_PIN);
+  g_pulse_armed_sequence = 0U;
+  photons_memory_barrier();
+  photons_laser_gate_close();
+  if (digitalRead(LASER_GATE_PIN) != HIGH ||
+      digitalRead(LD_ON_PIN) != source_level) {
+    photons_laser_hard_inhibit();
+    __builtin_trap();
+  }
+
+  Payload p;
+  p.add("status", "gate_closed");
+  p.add("laser_gate_level", HIGH);
+  p.add("ld_on_level", source_level);
+  p.add("coarse_source_enabled", source_level == HIGH);
+  p.add("gate_active_low", true);
+  p.add("gate_inhibited", true);
   return p;
 }
 
@@ -6331,6 +6453,8 @@ static const process_command_entry_t PHOTONS_COMMANDS[] = {
   { "REPORT_RECOVERY",     cmd_report_recovery     },
   { "INJECT_PROBLEM",      cmd_inject_problem      },
   { "PULSE",               cmd_pulse               },
+  { "LD_ON",               cmd_ld_on               },
+  { "LD_OFF",              cmd_ld_off              },
   { "ON",                  cmd_on                  },
   { "OFF",                 cmd_off                 },
   { nullptr, nullptr }

@@ -10650,11 +10650,11 @@ def _startup_activate_detector_for_heartbeat(
     # Firmware DETECTOR_ACTIVATE requires LD_ON LOW. Do not issue a command that
     # would trap, and do not turn the coarse source off as a recovery side effect.
     # The existing commissioning-hold path keeps this state observable until the
-    # operator explicitly issues PHOTONS.OFF and retries startup.
+    # operator explicitly issues PHOTONS.LD_OFF and retries startup.
     if bringup["coarse_source_enabled"]:
         raise RuntimeError(
             "PHOTONS detector activation requires coarse source OFF; "
-            "issue PHOTONS.OFF before retrying startup"
+            "issue PHOTONS.LD_OFF before retrying startup"
         )
 
     response = send_command(
@@ -10726,7 +10726,7 @@ def _startup_commissioning_empty_heartbeat_cutover(
     if bringup["coarse_source_enabled"] and not bringup["interrupt_active"]:
         logging.warning(
             "[photons/startup] empty-heartbeat cutover held: detector activation "
-            "requires explicit PHOTONS.OFF before retrying startup"
+            "requires explicit PHOTONS.LD_OFF before retrying startup"
         )
         return None
 
