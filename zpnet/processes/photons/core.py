@@ -1987,11 +1987,11 @@ def _ppb_checkpoint_snapshot_locked(runtime: Dict[str, Any]) -> Dict[str, Any]:
     current_sequence = int(runtime.get("current_sequence") or 0)
     current = copy.deepcopy(runtime.get("current") or _ppb_zero_endpoint())
 
-    complete = bool(
+    # Complete producer history establishes custody even before the first race.
+    # Recoverable science additionally requires a measured cumulative population.
+    history_complete = bool(
         not runtime.get("rolling_custody_lost")
         and current_sequence > 0
-        and int(current.get("lap_count") or 0) > 0
-        and int(current.get("total_lap_gnss_ns") or 0) > 0
         and runtime.get("origin_valid")
         and len(second_history) == expected_second
         and len(minute_history) == expected_minute
@@ -2003,9 +2003,20 @@ def _ppb_checkpoint_snapshot_locked(runtime: Dict[str, Any]) -> Dict[str, Any]:
         and _ppb_minute_key(int(minute_history[-1]["sequence"]))
         == int(runtime.get("last_minute_key") or 0)
     )
+    complete = bool(
+        history_complete
+        and int(current.get("lap_count") or 0) > 0
+        and int(current.get("total_lap_gnss_ns") or 0) > 0
+    )
 
     if complete:
         status = "RECOVERABLE"
+    elif (
+        history_complete
+        and int(current.get("lap_count") or 0) == 0
+        and int(current.get("total_lap_gnss_ns") or 0) == 0
+    ):
+        status = "WAITING_FOR_FIRST_RACE"
     elif runtime.get("rolling_custody_lost"):
         status = "ROLLING_CUSTODY_LOST"
     elif runtime.get("last_gap"):
@@ -2298,7 +2309,11 @@ def _ppb_checkpoint_ingest(stats: Dict[str, Any]) -> Dict[str, Any]:
             runtime["status_reason"] = "COMPLETE_PRODUCER_RING_CUSTODY"
             _ppb_checkpoint_recoverable_rows += 1
         else:
-            runtime["status_reason"] = "WAITING_FOR_UNSEEN_PRODUCER_HISTORY"
+            runtime["status_reason"] = (
+                "WAITING_FOR_FIRST_RACE"
+                if snapshot["status"] == "WAITING_FOR_FIRST_RACE"
+                else "WAITING_FOR_UNSEEN_PRODUCER_HISTORY"
+            )
             _ppb_checkpoint_warming_rows += 1
         _ppb_checkpoint_rows_verified += 1
         return _ppb_checkpoint_snapshot_locked(runtime)
@@ -2982,7 +2997,9 @@ def _literal_recovery_history_from_source(source: Dict[str, Any]) -> Dict[str, A
         )
 
     checkpoint_status = str(saved.get("status") or "")
-    complete = bool(saved.get("recoverable"))
+    # A complete beacon ring has no science yet, but needs no suffix promotion
+    # and must not be reported as truncated merely for having zero population.
+    complete = bool(saved.get("recoverable")) or checkpoint_status == "WAITING_FOR_FIRST_RACE"
     if not complete and checkpoint_status not in {
         "WARMING_AFTER_OBSERVATION_GAP",
         "WARMING_FOR_COMPLETE_FIRMWARE_HISTORY",
@@ -5014,12 +5031,22 @@ def _refresh_ppb_checkpoint_from_live_photons() -> Dict[str, Any]:
                         "proved PHOTONS export ring geometry disagrees with Pi live testimony"
                     )
 
+                # Empty beacon rings are real history, but do not yet contain
+                # science to recover. The normalizer still proves ring custody;
+                # zero population alone must never excuse incomplete history.
+                waiting_for_first_race = (
+                    int(meta["current"]["lap_count"]) == 0
+                    and int(meta["current"]["total_lap_gnss_ns"]) == 0
+                )
                 candidate = {
                     "schema": PHOTONS_PPB_PI_CHECKPOINT_SCHEMA,
                     "source_schema": PHOTONS_PPB_FIRMWARE_DELTA_SCHEMA,
                     "valid": True,
-                    "recoverable": True,
-                    "status": "RECOVERABLE",
+                    "recoverable": not waiting_for_first_race,
+                    "status": (
+                        "WAITING_FOR_FIRST_RACE"
+                        if waiting_for_first_race else "RECOVERABLE"
+                    ),
                     "status_reason": "FULL_RING_REACQUIRED_FROM_LIVE_PHOTONS",
                     "reset_count": int(meta["reset_count"]),
                     "update_count": int(meta["update_count"]),
@@ -5044,9 +5071,12 @@ def _refresh_ppb_checkpoint_from_live_photons() -> Dict[str, Any]:
                     "proof_checks": 0,
                 }
                 normalized = _normalize_saved_ppb_checkpoint(candidate)
-                if not normalized.get("recoverable"):
+                if (
+                    not normalized.get("recoverable")
+                    and normalized.get("status") != "WAITING_FOR_FIRST_RACE"
+                ):
                     raise RuntimeError(
-                        "proved PHOTONS full-ring export did not form a recoverable checkpoint"
+                        "proved PHOTONS full-ring export did not establish complete ring custody"
                     )
                 refreshed = _restore_ppb_checkpoint_runtime(
                     normalized,
@@ -5061,6 +5091,8 @@ def _refresh_ppb_checkpoint_from_live_photons() -> Dict[str, Any]:
 
         result = {
             "refreshed": True,
+            "recoverable": bool(refreshed["recoverable"]),
+            "status": str(refreshed["status"]),
             "basis": "TEENSY_PHOTONS_FULL_RING_EXPORT",
             "reset_count": int(meta["reset_count"]),
             "update_count": int(meta["update_count"]),
@@ -5129,6 +5161,24 @@ def _ppb_checkpoint_reacquire_loop() -> None:
             if not _hard_failure_active():
                 _ppb_checkpoint_reacquire_requested.set()
                 time.sleep(PHOTONS_STATE_RETRY_S)
+            continue
+
+        if result.get("status") == "WAITING_FOR_FIRST_RACE":
+            # There is no scientific checkpoint to wait for yet. Keep the exact
+            # in-memory beacon history; ordinary ingestion/persistence will carry
+            # the first measured population when it arrives. Do not clear a newer
+            # request or count this as a durable scientific recovery.
+            with _ppb_checkpoint_lock:
+                _ppb_checkpoint_reacquire_last_result = copy.deepcopy(result)
+                _ppb_checkpoint_reacquire_last_failure = None
+            logging.info(
+                "📡 [photons/ppb] complete beacon history reacquired; waiting for "
+                "first race: reset=%d update=%d second=%d minute=%d",
+                int(result["reset_count"]),
+                int(result["update_count"]),
+                int(result["second_count"]),
+                int(result["minute_count"]),
+            )
             continue
 
         # The in-memory ring is repaired first.  Do not call that repair durable
