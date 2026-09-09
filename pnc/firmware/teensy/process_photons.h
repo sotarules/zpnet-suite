@@ -567,9 +567,3 @@ void process_photons_init(void);
 // Register the PHOTONS process command surface.
 void process_photons_register(void);
 
-// Foreground/test accessors.  They return coherent snapshots without changing
-// PHOTONS state.  The toy accessors are retained temporarily for compatibility;
-// new consumers should use photons_fragment_snapshot().
-bool photons_toy_capture_snapshot(photons_toy_capture_t* out);
-bool photons_toy_fragment_snapshot(photons_toy_fragment_t* out);
-bool photons_fragment_snapshot(photons_fragment_snapshot_t* out);
