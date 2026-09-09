@@ -70,20 +70,6 @@ static void ensure_static_routes(void) {
   g_routes_ready = true;
 }
 
-bool pubsub_routes_ready(void) {
-  ensure_static_routes();
-  return true;
-}
-
-// ================================================================
-// Accessors
-// ================================================================
-
-const Payload* pubsub_get_subscriptions() {
-  ensure_static_routes();
-  return &g_routes;
-}
-
 // ================================================================
 // Ingress: publications arriving from Pi (DATA PLANE ONLY)
 // ================================================================

@@ -79,8 +79,6 @@ set(ZPNET_SOURCES
     util.cpp
     teensy.ino
     time.cpp
-    ad5693r.cpp
-
 )
 
 set(ZPNET_HEADERS

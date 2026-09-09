@@ -171,16 +171,8 @@ bool system_feature_set(const char* subsystem,
                         system_feature_status_t status,
                         const char* detail = nullptr);
 
-bool system_feature_set_str(const char* subsystem,
-                            const char* feature,
-                            const char* status,
-                            const char* detail = nullptr);
-
 bool system_feature_has(const char* subsystem,
                         const char* feature);
 
 const char* system_feature_get_status(const char* subsystem,
                                       const char* feature);
-
-bool system_feature_is_nominal(const char* subsystem,
-                               const char* feature);

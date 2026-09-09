@@ -144,21 +144,6 @@ static_assert(PHOTONS_NS_PER_SECOND / PHOTONS_RACE_CADENCE_NS ==
 // No synthetic detector edges or synthetic lap intervals remain.
 // ============================================================================
 
-struct photons_race_launch_slot_t {
-  bool     valid = false;
-  uint32_t sequence = 0U;
-  uint32_t ld_on_start_dwt = 0U;
-  bool     launch_surrogate_valid = false;
-  uint32_t launch_surrogate_dwt = 0U;
-  uint32_t target_high_cycles = 0U;
-  uint32_t cadence_cell_cycles = 0U;
-  uint32_t pulse_wall_cycles = 0U;
-
-  bool     anchor_valid = false;
-  uint32_t anchor_dwt_at_pps_vclock = 0U;
-  uint32_t anchor_dwt_cycles_per_second = 0U;
-  uint32_t anchor_pps_count = 0U;
-};
 
 struct photons_race_receive_value_t {
   bool     seen = false;
@@ -188,7 +173,6 @@ struct photons_race_runtime_t {
 };
 
 static photons_race_runtime_t g_photons_race{};
-static photons_race_launch_slot_t g_photons_race_launch{};
 
 // Cross-context race custody is intentionally asymmetric:
 //   * foreground is the sole writer of g_race_armed_sequence; the detector
@@ -200,10 +184,6 @@ static photons_race_launch_slot_t g_photons_race_launch{};
 static photons_race_receive_state_t g_photons_race_receive{};
 static volatile uint32_t g_race_armed_sequence = 0U;
 
-static void photons_race_cadence_tick(
-    timepop_ctx_t* ctx,
-    timepop_diag_t* diag,
-    void* user_data);
 
 struct photons_device_snapshot_t {
   bool     laser_enabled = false;
@@ -1479,22 +1459,6 @@ static bool photons_projection_anchor_snapshot(
 }
 
 
-static bool photons_raw_lap_enqueue(const photons_raw_lap_record_t& record) {
-  photons_foreground_owner_assert(photons_foreground_owner_t::RACE_CADENCE);
-  const uint32_t write = g_raw_lap_ring_write;
-  const uint32_t next = (write + 1U) & PHOTONS_LAP_RING_MASK;
-
-  if (next == g_raw_lap_ring_read) {
-    g_raw_lap_ring_overflow_count++;
-    g_raw_lap_ring_data_loss = true;
-    return false;
-  }
-
-  g_raw_lap_ring[write] = record;
-  photons_memory_barrier();
-  g_raw_lap_ring_write = next;
-  return true;
-}
 
 static bool photons_project_raw_lap(
     const photons_raw_lap_record_t& record,
@@ -2099,36 +2063,6 @@ static void photons_laser_coarse_source_enable_behind_closed_gate(void) {
 }
 
 
-static bool photons_ns_to_dwt_cycles(uint64_t requested_ns,
-                                     uint32_t dwt_cycles_per_second,
-                                     uint32_t& out_cycles) {
-  out_cycles = 0U;
-  if (requested_ns == 0ULL || dwt_cycles_per_second == 0U) return false;
-
-  const uint64_t whole_seconds = requested_ns / PHOTONS_NS_PER_SECOND;
-  const uint64_t remainder_ns = requested_ns % PHOTONS_NS_PER_SECOND;
-  if (whole_seconds > UINT64_MAX / (uint64_t)dwt_cycles_per_second) {
-    return false;
-  }
-
-  const uint64_t whole_cycles =
-      whole_seconds * (uint64_t)dwt_cycles_per_second;
-  const uint64_t remainder_cycles =
-      (remainder_ns * (uint64_t)dwt_cycles_per_second +
-       PHOTONS_NS_PER_SECOND / 2ULL) /
-      PHOTONS_NS_PER_SECOND;
-
-  if (whole_cycles > (uint64_t)UINT32_MAX ||
-      remainder_cycles > (uint64_t)UINT32_MAX ||
-      whole_cycles > (uint64_t)UINT32_MAX - remainder_cycles) {
-    return false;
-  }
-
-  const uint64_t total_cycles = whole_cycles + remainder_cycles;
-  if (total_cycles == 0ULL) return false;
-  out_cycles = (uint32_t)total_cycles;
-  return true;
-}
 
 static void photons_race_receive_isr_publish(
     const photons_race_receive_value_t& value) {
@@ -2139,24 +2073,6 @@ static void photons_race_receive_isr_publish(
   g_photons_race_receive.generation++;
 }
 
-static bool photons_race_receive_snapshot(
-    photons_race_receive_value_t& out) {
-  for (;;) {
-    const uint32_t before = g_photons_race_receive.generation;
-    if (before & 1U) continue;
-
-    photons_memory_barrier();
-    const photons_race_receive_value_t snapshot =
-        g_photons_race_receive.value;
-    photons_memory_barrier();
-
-    const uint32_t after = g_photons_race_receive.generation;
-    if (before == after && !(after & 1U)) {
-      out = snapshot;
-      return true;
-    }
-  }
-}
 
 static void photons_race_observe_edge(
     const interrupt_photodiode_edge_t& edge) {
@@ -2181,155 +2097,7 @@ static void photons_race_observe_edge(
   photons_race_receive_isr_publish(value);
 }
 
-static void photons_race_finalize_previous(void) {
-  photons_foreground_owner_assert(photons_foreground_owner_t::RACE_CADENCE);
-  if (!g_photons_race_launch.valid) return;
 
-  // The cadence boundary is the explicit receive timeout. Close the arm before
-  // examining the latch so a late edge cannot bleed into the next race.
-  g_race_armed_sequence = 0U;
-  photons_memory_barrier();
-
-  photons_race_receive_value_t receive{};
-  (void)photons_race_receive_snapshot(receive);
-  const photons_race_launch_slot_t launch = g_photons_race_launch;
-
-  if (!launch.launch_surrogate_valid || !launch.anchor_valid ||
-      launch.anchor_dwt_cycles_per_second == 0U ||
-      launch.anchor_pps_count == 0U) {
-    __builtin_trap();
-  }
-
-  const bool receive_matches_launch =
-      receive.seen && receive.race_sequence == launch.sequence;
-  if (!receive_matches_launch) {
-    // The ISR-owned mailbox may lawfully retain testimony from an older race.
-    // Sequence identity, not destructive clearing, decides whether this launch
-    // actually received an edge.
-    g_photons_race.missed_count++;
-  } else {
-    // Every valid interim flight endpoint must occur after the actual LD_ON LOW
-    // surrogate. At a 1 ms cadence the signed DWT difference is unambiguous even
-    // across a 32-bit DWT wrap. An early receive is evidence, not a measurement.
-    const uint32_t elapsed_from_cell_start =
-        receive.finish_dwt - launch.ld_on_start_dwt;
-    const int32_t signed_cycles =
-        (int32_t)(receive.finish_dwt - launch.launch_surrogate_dwt);
-    if (signed_cycles <= 0 ||
-        elapsed_from_cell_start > launch.cadence_cell_cycles) {
-      // Either the first edge preceded the actual LD_ON-low surrogate or a
-      // delayed foreground cadence left the receive arm open beyond its 1 ms
-      // cell. Preserve the injury as invalid endpoint testimony; never let it
-      // enter the flight Welford.
-      g_photons_race.invalid_endpoint_count++;
-    } else {
-      photons_raw_lap_record_t record{};
-      record.start_dwt = launch.launch_surrogate_dwt;
-      record.end_dwt = receive.finish_dwt;
-      record.raw_cycles = (uint32_t)signed_cycles;
-      record.pps_sequence = receive.pps_sequence;
-      record.anchor_valid = true;
-      record.anchor_dwt_at_pps_vclock =
-          launch.anchor_dwt_at_pps_vclock;
-      record.anchor_dwt_cycles_per_second =
-          launch.anchor_dwt_cycles_per_second;
-      record.anchor_pps_count = launch.anchor_pps_count;
-
-      if (photons_raw_lap_enqueue(record)) {
-        g_photons_race.completed_count++;
-      } else {
-        g_photons_race.enqueue_failure_count++;
-      }
-    }
-  }
-
-  g_photons_race_launch = photons_race_launch_slot_t{};
-}
-
-static void photons_race_cadence_tick(
-    timepop_ctx_t* /*ctx*/,
-    timepop_diag_t* /*diag*/,
-    void* /*user_data*/) {
-  const photons_foreground_custody_t custody(
-      photons_foreground_owner_t::RACE_CADENCE);
-  g_photons_race.cadence_tick_count++;
-  photons_race_finalize_previous();
-
-  if (digitalRead(LD_ON_PIN) != LOW) {
-    // PHOTONS exclusively owns LD_ON while the race engine is live. Inhibit
-    // first for optical safety, then fail loudly on the ownership violation.
-    photons_laser_hard_inhibit();
-    __builtin_trap();
-  }
-
-  if (digitalRead(PHOTODIODE_EDGE_PIN) != LOW) {
-    g_photons_race.skipped_not_quiet_count++;
-    return;
-  }
-
-  photons_projection_anchor_value_t anchor{};
-  if (!photons_projection_anchor_snapshot(anchor) || !anchor.valid ||
-      anchor.dwt_cycles_per_second == 0U || anchor.pps_count == 0U) {
-    g_photons_race.skipped_projection_count++;
-    return;
-  }
-
-  uint32_t target_high_cycles = 0U;
-  uint32_t cadence_cell_cycles = 0U;
-  if (!photons_ns_to_dwt_cycles(
-          PHOTONS_RACE_PULSE_NS,
-          anchor.dwt_cycles_per_second,
-          target_high_cycles) ||
-      !photons_ns_to_dwt_cycles(
-          PHOTONS_RACE_CADENCE_NS,
-          anchor.dwt_cycles_per_second,
-          cadence_cell_cycles) ||
-      target_high_cycles >= cadence_cell_cycles) {
-    __builtin_trap();
-  }
-
-  g_photons_race.sequence++;
-  if (g_photons_race.sequence == 0U) g_photons_race.sequence++;
-  const uint32_t race_sequence = g_photons_race.sequence;
-
-  photons_race_launch_slot_t launch{};
-  launch.valid = true;
-  launch.sequence = race_sequence;
-  launch.target_high_cycles = target_high_cycles;
-  launch.cadence_cell_cycles = cadence_cell_cycles;
-  launch.anchor_valid = true;
-  launch.anchor_dwt_at_pps_vclock = anchor.dwt_at_pps_vclock;
-  launch.anchor_dwt_cycles_per_second = anchor.dwt_cycles_per_second;
-  launch.anchor_pps_count = anchor.pps_count;
-
-  // Publish all launch facts the foreground owns before opening the receive arm.
-  // The ISR never reads this structure, but this ordering makes the ownership
-  // boundary explicit and prevents future refactors from creating a half-launch.
-  launch.ld_on_start_dwt = ARM_DWT_CYCCNT;
-  g_photons_race_launch = launch;
-  photons_memory_barrier();
-  g_race_armed_sequence = race_sequence;
-  photons_memory_barrier();
-
-  digitalWriteFast(LD_ON_PIN, HIGH);
-  const uint32_t high_start = ARM_DWT_CYCCNT;
-  while ((uint32_t)(ARM_DWT_CYCCNT - high_start) < target_high_cycles) {
-  }
-  digitalWriteFast(LD_ON_PIN, LOW);
-  const uint32_t ld_on_low_dwt = ARM_DWT_CYCCNT;
-
-  g_photons_race_launch.launch_surrogate_dwt = ld_on_low_dwt;
-  g_photons_race_launch.pulse_wall_cycles =
-      ld_on_low_dwt - g_photons_race_launch.ld_on_start_dwt;
-  if (g_photons_race_launch.pulse_wall_cycles >= cadence_cell_cycles) {
-    // LD_ON is already LOW here. A pulse transaction that consumes the whole
-    // cell is a scheduler/timing invariant failure, not a usable optical race.
-    __builtin_trap();
-  }
-  photons_memory_barrier();
-  g_photons_race_launch.launch_surrogate_valid = true;
-  g_photons_race.attempt_count++;
-}
 
 static void photons_race_prepare(void) {
   // Resetting a live TimePop producer would orphan its scheduled callback while
@@ -2343,30 +2111,9 @@ static void photons_race_prepare(void) {
   photons_memory_barrier();
   g_photons_race = photons_race_runtime_t{};
   g_photons_race.sequence = preserved_sequence;
-  g_photons_race_launch = photons_race_launch_slot_t{};
   g_photons_race.initialized = true;
 }
 
-static void photons_race_start(void) {
-  if (!g_photons_race.initialized ||
-      g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE) {
-    __builtin_trap();
-  }
-  if (digitalRead(LD_ON_PIN) != LOW) {
-    photons_laser_hard_inhibit();
-    __builtin_trap();
-  }
-
-  g_photons_race.cadence_timer = timepop_arm(
-      PHOTONS_RACE_CADENCE_NS,
-      true,
-      photons_race_cadence_tick,
-      nullptr,
-      "PHOTONS_RACE_1KHZ");
-  if (g_photons_race.cadence_timer == TIMEPOP_INVALID_HANDLE) {
-    __builtin_trap();
-  }
-}
 
 static void photons_laser_initialize_hardware(void) {
   // Take runtime custody from the early-boot safety boundary without ever
@@ -2720,7 +2467,7 @@ static void photons_on_photodiode_edge(
 // Coherent toy snapshots
 // ============================================================================
 
-bool photons_toy_capture_snapshot(photons_toy_capture_t* out) {
+static bool photons_toy_capture_snapshot(photons_toy_capture_t* out) {
   if (!out) return false;
 
   for (;;) {
@@ -2763,21 +2510,7 @@ static void photons_last_fragment_reset(void) {
 }
 
 
-bool photons_toy_fragment_snapshot(photons_toy_fragment_t* out) {
-  if (!out) return false;
-  for (;;) {
-    const uint32_t before = g_last_fragment_generation;
-    if (before & 1U) continue;
-    photons_memory_barrier();
-    *out = g_last_fragment;
-    photons_memory_barrier();
-    const uint32_t after = g_last_fragment_generation;
-    if (before == after && !(after & 1U)) return true;
-  }
-}
-
-
-bool photons_fragment_snapshot(photons_fragment_snapshot_t* out) {
+static bool photons_fragment_snapshot(photons_fragment_snapshot_t* out) {
   if (!out) return false;
   for (;;) {
     const uint32_t before = g_last_fragment_generation;

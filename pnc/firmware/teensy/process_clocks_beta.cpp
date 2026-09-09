@@ -2483,7 +2483,6 @@ static uint32_t g_clocks_restore_commit_count = 0U;
 static uint32_t g_clocks_restore_failure_count = 0U;
 static uint32_t g_campaign_restore_count = 0U;
 static uint32_t g_campaign_restore_failure_count = 0U;
-static uint32_t g_campaign_restore_ignored_live_count = 0U;
 
 // Better-Buckets restore is a recovery-only staging transaction. Pi CLOCKS
 // supplies Alpha-authored endpoints from its durable synthetic checkpoint in
@@ -3269,27 +3268,6 @@ static int64_t g_campaign_public_ocxo2_measured_offset = 0;
 static int64_t g_campaign_public_counterledger_ocxo1_offset = 0;
 static int64_t g_campaign_public_counterledger_ocxo2_offset = 0;
 
-// Canonical OCXO residual rendering.  Delta Cycles is now the authority:
-// each OCXO observed one-second DWT interval is compared against the exact
-// same-row PPS/VCLOCK one-second DWT interval.  The
-// public pps_residual object remains a compatibility rendering of the
-// canonical Delta result:
-//
-//   delta:         fast = ref_gnss_cycles - ocxo_observed_cycles
-//   pps_residual:  gnss_interval = 1e9, clock_interval = 1e9 - fast_ns
-//
-// Projected-GNSS residuals remain preserved under science.traditional_*
-// for courtroom/report comparison only.
-struct pps_interval_residuals_t {
-  bool     ocxo1_valid = false;
-  bool     ocxo2_valid = false;
-  uint32_t public_count = 0;
-  uint64_t gnss_interval_ns = 0;
-  uint64_t ocxo1_interval_ns = 0;
-  uint64_t ocxo2_interval_ns = 0;
-  int64_t  ocxo1_fast_residual_ns = 0;
-  int64_t  ocxo2_fast_residual_ns = 0;
-};
 
 // Delta science totals.  Canonical one-second residuals remain physical
 // interval sums: for a fast clock the one-second period is shorter, so
@@ -3866,7 +3844,6 @@ static void ocxo_science_totals_reset(void) {
 // as a dormant report/compatibility surface and should stay zero in proof-driven
 // recovery.
 static uint32_t g_science_residual_quarantine_remaining = 0;
-static uint32_t g_science_residual_quarantine_begin_count = 0;
 static uint32_t g_science_residual_quarantine_consumed_count = 0;
 static uint32_t g_science_residual_quarantine_last_public_count = 0;
 
@@ -4057,28 +4034,6 @@ static void pps_interval_residuals_reset(void) {
   g_science_residual_quarantine_remaining = 0;
 }
 
-static void pps_interval_residuals_begin_recover_quarantine(uint32_t rows) {
-  pps_interval_residuals_reset();
-  g_science_residual_quarantine_remaining = rows;
-  g_science_residual_quarantine_begin_count++;
-}
-
-static uint64_t science_render_legacy_clock_interval_ns(
-    const clock_science_row_t& row) {
-  if (!row.valid) return 0ULL;
-
-  if (clocks_ocxo_counterledger_mode()) {
-    // CounterLedger mode changes public clockface authority, not this row's
-    // canonical one-second residual.  The row is still the Delta rendering.
-    return row.clock_interval_ns;
-  }
-
-  // Traditional Delta rendering: positive fast means the physical clock period
-  // was shorter than the GNSS reference second.
-  const int64_t rendered =
-      (int64_t)CLOCKS_BETA_NS_PER_SECOND - row.fast_residual_ns;
-  return (rendered > 0) ? (uint64_t)rendered : 0ULL;
-}
 
 static uint64_t science_render_public_clock_ns(
     uint64_t public_gnss_ns,
@@ -4105,31 +4060,6 @@ static uint64_t science_render_public_clock_ns(
   return (public_gnss_ns >= sub) ? (public_gnss_ns - sub) : 0ULL;
 }
 
-static pps_interval_residuals_t pps_interval_residuals_update(
-    uint32_t public_count,
-    const clock_science_row_t& ocxo1_science,
-    const clock_science_row_t& ocxo2_science) {
-  pps_interval_residuals_t r{};
-  r.public_count = public_count;
-
-  r.gnss_interval_ns = CLOCKS_BETA_NS_PER_SECOND;
-
-  if (ocxo1_science.valid) {
-    r.ocxo1_valid = true;
-    r.ocxo1_interval_ns =
-        science_render_legacy_clock_interval_ns(ocxo1_science);
-    r.ocxo1_fast_residual_ns = ocxo1_science.fast_residual_ns;
-  }
-
-  if (ocxo2_science.valid) {
-    r.ocxo2_valid = true;
-    r.ocxo2_interval_ns =
-        science_render_legacy_clock_interval_ns(ocxo2_science);
-    r.ocxo2_fast_residual_ns = ocxo2_science.fast_residual_ns;
-  }
-
-  return r;
-}
 
 static uint64_t current_raw_gnss_ns(void) {
   // At the selected PPS/VCLOCK edge, GNSS time is identity, not discovery.
@@ -9088,10 +9018,6 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
 
   g_delta_previous_vclock_reference = delta_reference_this_row;
 
-  const pps_interval_residuals_t pps_residuals =
-      pps_interval_residuals_update(public_count,
-                                    ocxo1_science,
-                                    ocxo2_science);
 
   // Preserve the pre-publication court as compact evidence. Every structurally
   // coherent candidate becomes a durable campaign row; this court decides only

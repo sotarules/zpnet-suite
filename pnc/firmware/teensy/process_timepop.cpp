@@ -1551,14 +1551,12 @@ static void timepop_apply_dispatch_mutations(const char* context) {
     uint32_t result_slot = TIMEPOP_DISPATCH_TRACE_NO_SLOT;
     timepop_callback_t result_slot_callback = nullptr;
     void* result_slot_user_data = m.user_data;
-    const char* result_slot_name = mutation_name;
     if (h != TIMEPOP_INVALID_HANDLE) {
       for (uint32_t i = 0U; i < MAX_SLOTS; ++i) {
         if (!slots[i].active || slots[i].handle != h) continue;
         result_slot = i;
         result_slot_callback = slots[i].callback;
         result_slot_user_data = slots[i].user_data;
-        result_slot_name = slots[i].name;
         break;
       }
     }
@@ -1575,7 +1573,7 @@ static void timepop_apply_dispatch_mutations(const char* context) {
         m.callback,
         result_slot_callback,
         result_slot_user_data,
-        result_slot_name,
+        nullptr,
         result_aux);
   }
 
@@ -3048,7 +3046,6 @@ static void timepop_process_ch2_event_foreground(
 
     const timepop_callback_t callback = slots[i].callback;
     void* const callback_user_data = slots[i].user_data;
-    const char* const callback_name = timepop_name_or_null(slots[i].name);
     const timepop_handle_t callback_handle = slots[i].handle;
 
     TIMEPOP_DISPATCH_TRACE(
@@ -3059,7 +3056,7 @@ static void timepop_process_ch2_event_foreground(
         callback,
         slots[i].callback,
         callback_user_data,
-        callback_name,
+        nullptr,
         slots[i].deadline);
 
     timepop_ctx_t ctx;
@@ -3076,7 +3073,7 @@ static void timepop_process_ch2_event_foreground(
         callback,
         slots[i].callback,
         callback_user_data,
-        callback_name,
+        nullptr,
         timepop_dispatch_trace_slot_flags(slots[i]));
 
     callback(&ctx, &diag, callback_user_data);
@@ -3089,7 +3086,7 @@ static void timepop_process_ch2_event_foreground(
         callback,
         slots[i].callback,
         callback_user_data,
-        callback_name,
+        nullptr,
         timepop_dispatch_trace_slot_flags(slots[i]));
 
     slots[i].isr_callback_fired = true;
@@ -3239,7 +3236,6 @@ static void dispatch_deferred_phase(deferred_slot_t* slots_buf,
     }
 
     if (!callback || handle == TIMEPOP_INVALID_HANDLE) continue;
-    const char* const name = timepop_name_or_null(slots_buf[i].dispatch_name);
 
     TIMEPOP_DISPATCH_TRACE(
         timepop_dispatch_trace_stage_t::DEFERRED_SELECTED,
@@ -3249,7 +3245,7 @@ static void dispatch_deferred_phase(deferred_slot_t* slots_buf,
         callback,
         slots_buf[i].callback,
         user_data,
-        name,
+        nullptr,
         generation);
 
     timepop_ctx_t ctx;
@@ -3263,7 +3259,7 @@ static void dispatch_deferred_phase(deferred_slot_t* slots_buf,
         callback,
         slots_buf[i].callback,
         user_data,
-        name,
+        nullptr,
         generation);
 
     const uint32_t start = ARM_DWT_CYCCNT;
@@ -3278,7 +3274,7 @@ static void dispatch_deferred_phase(deferred_slot_t* slots_buf,
         callback,
         slots_buf[i].callback,
         user_data,
-        name,
+        nullptr,
         end - start);
 
     diag_dispatch_callbacks++;
