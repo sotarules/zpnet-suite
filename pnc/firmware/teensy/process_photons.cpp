@@ -2504,7 +2504,7 @@ static void photons_last_fragment_reset(void) {
   g_last_fragment_generation++;
   photons_memory_barrier();
   g_last_fragment = photons_toy_fragment_t{};
-  memset(&g_last_photons_fragment, 0, sizeof(g_last_photons_fragment));
+  g_last_photons_fragment = photons_fragment_snapshot_t{};
   photons_memory_barrier();
   g_last_fragment_generation++;
 }
@@ -2725,6 +2725,18 @@ static FLASHMEM void photons_fragment_root_initialize_runtime(void) {
   photons_memory_barrier();
 }
 
+// The root body is declared as byte storage.  Preserve that type identity even
+// for diagnostic cache-line testimony: assemble words from bytes rather than
+// manufacturing uint32_t objects over the same storage with a pointer cast.
+static inline uint32_t photons_load_u32_le_volatile(
+    const volatile uint8_t* bytes) {
+  if (!bytes) __builtin_trap();
+  return (uint32_t)bytes[0] |
+      ((uint32_t)bytes[1] << 8) |
+      ((uint32_t)bytes[2] << 16) |
+      ((uint32_t)bytes[3] << 24);
+}
+
 static FLASHMEM void photons_fragment_root_snapshot_capture(
     uint32_t fragment_sequence,
     photons_fragment_root_snapshot_t* out) {
@@ -2736,9 +2748,9 @@ static FLASHMEM void photons_fragment_root_snapshot_capture(
 
   bool guard_recorded = false;
   for (size_t i = 0U; i < PHOTONS_FRAGMENT_ROOT_GUARD_WORDS; ++i) {
-    const uint32_t observed =
-        *reinterpret_cast<volatile const uint32_t*>(
-            &g_photons_fragment_root_region.guard_before[i]);
+    const volatile uint32_t* const guard =
+        &g_photons_fragment_root_region.guard_before[i];
+    const uint32_t observed = *guard;
     if (observed == PHOTONS_FRAGMENT_ROOT_GUARD_BEFORE) continue;
     out->guard_failure_mask |= 1U << 0;
     if (!guard_recorded) {
@@ -2749,9 +2761,9 @@ static FLASHMEM void photons_fragment_root_snapshot_capture(
     }
   }
   for (size_t i = 0U; i < PHOTONS_FRAGMENT_ROOT_GUARD_WORDS; ++i) {
-    const uint32_t observed =
-        *reinterpret_cast<volatile const uint32_t*>(
-            &g_photons_fragment_root_region.guard_after[i]);
+    const volatile uint32_t* const guard =
+        &g_photons_fragment_root_region.guard_after[i];
+    const uint32_t observed = *guard;
     if (observed == PHOTONS_FRAGMENT_ROOT_GUARD_AFTER) continue;
     out->guard_failure_mask |= 1U << 1;
     if (!guard_recorded) {
@@ -2762,9 +2774,8 @@ static FLASHMEM void photons_fragment_root_snapshot_capture(
     }
   }
 
-  volatile const uint8_t* const storage =
-      reinterpret_cast<volatile const uint8_t*>(
-          g_photons_fragment_root_region.storage);
+  const volatile uint8_t* const storage =
+      g_photons_fragment_root_region.storage;
   uint32_t whole_hash = PHOTONS_FRAGMENT_ROOT_HASH_OFFSET;
   for (size_t sector = 0U;
        sector < PHOTONS_FRAGMENT_ROOT_SECTOR_COUNT;
@@ -2782,16 +2793,16 @@ static FLASHMEM void photons_fragment_root_snapshot_capture(
   }
   out->hash = whole_hash;
 
-  volatile const uint32_t* const first =
-      reinterpret_cast<volatile const uint32_t*>(
-          g_photons_fragment_root_region.storage);
-  volatile const uint32_t* const last =
-      reinterpret_cast<volatile const uint32_t*>(
-          g_photons_fragment_root_region.storage +
-          PHOTONS_FRAGMENT_ROOT_CAPACITY - PHOTONS_RAM2_CACHE_LINE_BYTES);
+  const volatile uint8_t* const first = storage;
+  const volatile uint8_t* const last =
+      storage + PHOTONS_FRAGMENT_ROOT_CAPACITY -
+      PHOTONS_RAM2_CACHE_LINE_BYTES;
   for (size_t i = 0U; i < PHOTONS_FRAGMENT_ROOT_GUARD_WORDS; ++i) {
-    out->first_line[i] = first[i];
-    out->last_line[i] = last[i];
+    const size_t byte_offset = i * sizeof(uint32_t);
+    out->first_line[i] =
+        photons_load_u32_le_volatile(first + byte_offset);
+    out->last_line[i] =
+        photons_load_u32_le_volatile(last + byte_offset);
   }
 }
 
@@ -3561,7 +3572,7 @@ static void photons_fragment_tick(
   // From the first Payload mutation onward, the serializer may read only this
   // frozen value plus constants/pure formatting helpers.
   photons_fragment_snapshot_t& fragment = g_photons_fragment_build;
-  memset(&fragment, 0, sizeof(fragment));
+  fragment = photons_fragment_snapshot_t{};
   fragment.snapshot_ok = true;
   fragment.sequence = ++g_fragment_sequence;
   fragment.publish_count = g_publish_count + 1U;
@@ -3923,8 +3934,8 @@ FLASHMEM void process_photons_init(void) {
   g_photons_live = photons_live_state_t{};
   g_last_fragment_generation = 0U;
   photons_last_fragment_reset();
-  memset(&g_photons_fragment_build, 0, sizeof(g_photons_fragment_build));
-  memset(&g_photons_report_snapshot, 0, sizeof(g_photons_report_snapshot));
+  g_photons_fragment_build = photons_fragment_snapshot_t{};
+  g_photons_report_snapshot = photons_fragment_snapshot_t{};
   g_fragment_sequence = 0U;
   g_publish_count = 0U;
   g_publish_reject_count = 0U;

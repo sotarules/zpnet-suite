@@ -6361,6 +6361,32 @@ bool Payload::_append_value(const char* key,
         return false;
     }
 
+    // Candidate bytes are still non-authoritative here.  While PRIMASK is
+    // already held for publication, prove that writing the candidate key/value
+    // did not alter the semantic prefix that existed at mutation entry.  This
+    // closes the exact failure seen in retained testimony: a structurally valid
+    // append must never promote a candidate after earlier entries have changed.
+    const uint32_t precommit_prefix_hash =
+        _contract_semantic_hash(before.count);
+    if (precommit_prefix_hash != before.semantic_fingerprint) {
+        payload_commit_irq_unlock(saved_primask);
+        payload_contract_record(
+            payload_contract_phase_t::MUTATION_FAILURE,
+            payload_contract_reason_t::EXPECTED_SEMANTIC_PREFIX,
+            PAYLOAD_OP_APPEND_VALUE,
+            this,
+            nullptr,
+            _contract_generation,
+            before.count,
+            before.semantic_fingerprint,
+            precommit_prefix_hash,
+            verified_key_off,
+            verified_val_off,
+            before.structural_fingerprint,
+            _contract_fingerprint);
+        return false;
+    }
+
     const Entry committed = {
         commit_key_off,
         (uint16_t)key_len,
