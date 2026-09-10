@@ -3762,11 +3762,10 @@ def _finalize_recovery_clocks_custody(
                     raise RuntimeError(
                         "classified recovery checkpoint owner is not CLOCKS restore authority"
                     )
-                recovery_config_detail_id = int(routed_row["id"])
-                _write_clocks_recovery_config(
+                recovery_config_detail_id = _write_clocks_recovery_config(
                     cur,
                     routed_checkpoint,
-                    source_detail_id=recovery_config_detail_id,
+                    source_detail_id=int(routed_row["id"]),
                 )
         transaction_s = time.monotonic() - transaction_started
 
@@ -3797,7 +3796,10 @@ def _finalize_recovery_clocks_custody(
             "rows_promoted": promoted,
             "rows_superseded": superseded,
             "recovery_config_detail_id": recovery_config_detail_id,
-            "recovery_config_update_count": _as_int(routed_checkpoint.get("update_count")),
+            "recovery_config_update_count": (
+                _as_int(routed_checkpoint.get("update_count"))
+                if recovery_config_detail_id is not None else None
+            ),
             "timing": {
                 "barrier_wait_s": round(float(barrier_wait_s), 6),
                 "boundary_select_s": round(float(boundary_select_s), 6),
@@ -5928,12 +5930,23 @@ def _restore_ppb_checkpoint_runtime(
 
 def _write_clocks_recovery_config(
     cur: Any, checkpoint: Dict[str, Any], *, source_detail_id: int
-) -> None:
-    """Persist the literal CLOCKS recovery image and its exact durable owner."""
+) -> Optional[int]:
+    """Promote a complete literal image; return its newly published owner id.
+
+    An observation gap can leave Pi's live ring copy incomplete while Alpha and
+    ordinary CLOCKS persistence remain lawful. That warming copy must not replace
+    the last complete resurrection image. Retain that image AND its exact owner;
+    never attach old rings to a newer row's statistics or campaign state.
+
+    None means this observation did not advance the recovery singleton. Existing
+    lineage cutoffs and campaign identity courts still govern the retained pair.
+    """
     detail_id = int(source_detail_id)
     if detail_id <= 0:
         raise ValueError("CLOCKS recovery source_detail_id must be positive")
     normalized = _normalize_saved_ppb_checkpoint(checkpoint)
+    if not normalized["recoverable"]:
+        return None
     normalized["durable_source_detail_id"] = detail_id
     encoded = json.dumps(normalized, separators=(",", ":"), ensure_ascii=False)
     cur.execute(
@@ -5953,6 +5966,7 @@ def _write_clocks_recovery_config(
             raise RuntimeError(
                 f"config.{CLOCKS_RECOVERY_CONFIG_KEY} insert did not create exactly one row"
             )
+    return detail_id
 
 
 def _read_clocks_recovery_config() -> Optional[Dict[str, Any]]:
@@ -6506,6 +6520,8 @@ def _legacy_clocks_recovery_checkpoint() -> Optional[Dict[str, Any]]:
         if _clocks_gnss_raw_payload(state) is None:
             continue
         normalized = _normalize_saved_ppb_checkpoint(checkpoint)
+        if not normalized["recoverable"]:
+            continue
         source_detail_id = int(row["id"])
         with open_db() as conn:
             _write_clocks_recovery_config(
@@ -9237,12 +9253,14 @@ def _finalize_live_recovery_custody_without_campaign(
                         raise RuntimeError(
                             "live-producer checkpoint owner is not CLOCKS restore authority"
                         )
-                    recovery_config_detail_id = int(routed_row["id"])
-                    recovery_config_update_count = int(routed_update)
-                    _write_clocks_recovery_config(
+                    recovery_config_detail_id = _write_clocks_recovery_config(
                         cur,
                         routed_checkpoint,
-                        source_detail_id=recovery_config_detail_id,
+                        source_detail_id=int(routed_row["id"]),
+                    )
+                    recovery_config_update_count = (
+                        int(routed_update)
+                        if recovery_config_detail_id is not None else None
                     )
                     classification = "LIVE_PRODUCER_ADOPT_CONTINUITY"
 
