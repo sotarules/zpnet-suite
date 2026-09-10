@@ -6333,43 +6333,15 @@ bool Payload::_append_value(const char* key,
         return false;
     }
 
-    // Re-derive once more with all maskable interrupts blocked.  Directory
-    // publication crosses the byte-store boundary only through one fixed-size
-    // copy from a real local Entry value; metadata follows in the same court.
-    const uint32_t saved_primask = payload_commit_irq_lock();
-    const uint32_t commit_coordinates = fresh_coordinates();
-    const uint16_t commit_val_off = (uint16_t)commit_coordinates;
-    const uint16_t commit_key_off =
-        (uint16_t)(commit_coordinates >> 16);
-    if (commit_key_off != verified_key_off ||
-        commit_val_off != verified_val_off) {
-        payload_commit_irq_unlock(saved_primask);
-        payload_contract_record(
-            payload_contract_phase_t::OBSERVED_DRIFT,
-            payload_contract_reason_t::EXPECTED_NEW_ENTRY,
-            PAYLOAD_OP_APPEND_VALUE,
-            this,
-            nullptr,
-            _contract_generation,
-            before.count,
-            verified_key_off,
-            commit_key_off,
-            verified_val_off,
-            commit_val_off,
-            before.structural_fingerprint,
-            _contract_fingerprint);
-        return false;
-    }
-
-    // Candidate bytes are still non-authoritative here.  While PRIMASK is
-    // already held for publication, prove that writing the candidate key/value
-    // did not alter the semantic prefix that existed at mutation entry.  This
-    // closes the exact failure seen in retained testimony: a structurally valid
-    // append must never promote a candidate after earlier entries have changed.
+    // Candidate bytes are still non-authoritative here.  Protect the semantic
+    // prefix proof with the existing BASEPRI science-preserving court: lower
+    // priority firmware cannot interleave between proof and publication, while
+    // Priority-0 CLOCKS captures remain sovereign during the variable-cost hash.
+    const uint32_t saved_basepri = critical_enter();
     const uint32_t precommit_prefix_hash =
         _contract_semantic_hash(before.count);
     if (precommit_prefix_hash != before.semantic_fingerprint) {
-        payload_commit_irq_unlock(saved_primask);
+        critical_exit(saved_basepri);
         payload_contract_record(
             payload_contract_phase_t::MUTATION_FAILURE,
             payload_contract_reason_t::EXPECTED_SEMANTIC_PREFIX,
@@ -6382,6 +6354,36 @@ bool Payload::_append_value(const char* key,
             precommit_prefix_hash,
             verified_key_off,
             verified_val_off,
+            before.structural_fingerprint,
+            _contract_fingerprint);
+        return false;
+    }
+
+    // Final publication is the only PRIMASK region.  It is intentionally tiny
+    // and fixed-cost: re-prove coordinates, publish one Entry value, then publish
+    // the redundant metadata/guards.  BASEPRI remains held across this boundary
+    // so lower-priority work cannot invalidate the just-proved prefix.
+    const uint32_t saved_primask = payload_commit_irq_lock();
+    const uint32_t commit_coordinates = fresh_coordinates();
+    const uint16_t commit_val_off = (uint16_t)commit_coordinates;
+    const uint16_t commit_key_off =
+        (uint16_t)(commit_coordinates >> 16);
+    if (commit_key_off != verified_key_off ||
+        commit_val_off != verified_val_off) {
+        payload_commit_irq_unlock(saved_primask);
+        critical_exit(saved_basepri);
+        payload_contract_record(
+            payload_contract_phase_t::OBSERVED_DRIFT,
+            payload_contract_reason_t::EXPECTED_NEW_ENTRY,
+            PAYLOAD_OP_APPEND_VALUE,
+            this,
+            nullptr,
+            _contract_generation,
+            before.count,
+            verified_key_off,
+            commit_key_off,
+            verified_val_off,
+            commit_val_off,
             before.structural_fingerprint,
             _contract_fingerprint);
         return false;
@@ -6402,6 +6404,7 @@ bool Payload::_append_value(const char* key,
     _count = committed_count;
     _count_guard = (uint16_t)~committed_count;
     payload_commit_irq_unlock(saved_primask);
+    critical_exit(saved_basepri);
 
     if (!_contract_finish_add(PAYLOAD_OP_APPEND_VALUE,
                               before,
