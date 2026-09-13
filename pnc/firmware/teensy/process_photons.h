@@ -16,9 +16,10 @@
 //     DWT-at-edge custody.
 //   • PHOTONS consumes those edge facts and publishes PHOTONS_FRAGMENT.
 //   • all non-ISR PHOTONS mutation has one foreground owner at a time: the
-//     1 kHz race cadence, 1 Hz fragment transaction, or one RPC command. These
-//     ownership classes may never nest; illegal overlap is a system-integrity
-//     fault rather than a recoverable busy condition.
+//     1 kHz race cadence, 1 Hz fragment transaction, one RPC command, or the
+//     commissioning WAVE edge callback. These ownership classes may never nest;
+//     illegal overlap is a system-integrity fault rather than a recoverable busy
+//     condition.
 //
 // PHOTONS_FRAGMENT is the canonical once-per-second optical instrument heartbeat.
 // It remains lawful and continuous when the race engine is inactive or a second
@@ -65,6 +66,10 @@
 //   • REPORT              — compact operational/device report including Step-4 coarse-source
 //                           state, active-low gate inhibit, MP5491 ID1 current setting, laser
 //                           monitor, PD200T pin 38/A14 telemetry, and pin-34 interrupt custody
+//   • WAVEON ns=N         — commissioning square wave on LASER_GATE_PIN 35 using a
+//                           recurring TimePop callback. N is the full HIGH+LOW cycle;
+//                           each half-cycle is N/2 for a 50/50 duty cycle.
+//   • WAVEOFF             — cancel the commissioning wave and force pin 35 LOW.
 //   • PULSE [ns=N]        — one active-low SDM gate pulse; requires LD_ON first and
 //                           leaves LD_ON HIGH, gate HIGH afterward. Default: 1000 ns.
 //                           A continuously open gate is rejected; issue OFF first.

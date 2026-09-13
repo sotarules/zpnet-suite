@@ -217,7 +217,8 @@ static inline void photons_memory_barrier(void) {
 //   * FRAGMENT owns drain -> snapshot -> Payload render -> synchronous publish
 //     -> post-publish commit as one indivisible foreground transaction;
 //   * COMMAND owns every PHOTONS RPC handler from entry through returned Payload
-//     construction.
+//     construction;
+//   * WAVE owns each commissioning square-wave edge callback.
 //
 // ISR code never touches this owner.  Its only cross-context communication is
 // through the dedicated one-writer arm scalars / generation mailboxes below.
@@ -226,6 +227,7 @@ enum class photons_foreground_owner_t : uint8_t {
   RACE_CADENCE = 1U,
   FRAGMENT = 2U,
   COMMAND = 3U,
+  WAVE = 4U,
 };
 
 // The ownership court must be stronger than the scheduler assumption it is
@@ -2031,12 +2033,47 @@ static float photons_adc_voltage(uint16_t raw) {
 // enable only after closing the gate; LD_OFF closes the gate before removing
 // source enable. ON/OFF now open/close only the gate, with ON requiring the
 // source already enabled. PULSE requires a closed gate and enabled source.
+
+// Commissioning square wave for the new buffered DRV200 modulation path.  The
+// TimePop handle is the sole running-state authority; no parallel validity flag
+// exists.  WAVEON owns pin 35 until WAVEOFF or another gate-control operation
+// explicitly cancels the recurring timer.
+static timepop_handle_t g_photons_wave_timer = TIMEPOP_INVALID_HANDLE;
+static uint64_t g_photons_wave_cycle_ns = 0ULL;
+static uint64_t g_photons_wave_half_cycle_ns = 0ULL;
+static int g_photons_wave_level = LOW;
+
+static void photons_wave_tick(
+    timepop_ctx_t* ctx,
+    timepop_diag_t* /*diag*/,
+    void* /*user_data*/) {
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::WAVE);
+  if (!ctx || g_photons_wave_timer == TIMEPOP_INVALID_HANDLE ||
+      ctx->handle != g_photons_wave_timer) {
+    __builtin_trap();
+  }
+
+  g_photons_wave_level = (g_photons_wave_level == LOW) ? HIGH : LOW;
+  digitalWriteFast(LASER_GATE_PIN, g_photons_wave_level);
+}
+
+static void photons_wave_cancel(void) {
+  if (g_photons_wave_timer == TIMEPOP_INVALID_HANDLE) return;
+  const timepop_handle_t handle = g_photons_wave_timer;
+  if (!timepop_cancel(handle)) __builtin_trap();
+  g_photons_wave_timer = TIMEPOP_INVALID_HANDLE;
+  g_photons_wave_cycle_ns = 0ULL;
+  g_photons_wave_half_cycle_ns = 0ULL;
+}
 static void photons_laser_hard_inhibit(void) {
+  photons_wave_cancel();
   digitalWrite(LASER_GATE_PIN, HIGH);
   digitalWrite(LD_ON_PIN, LOW);
 }
 
 static void photons_laser_gate_close(void) {
+  photons_wave_cancel();
   digitalWrite(LASER_GATE_PIN, HIGH);
 }
 
@@ -5898,6 +5935,84 @@ static FLASHMEM Payload cmd_init(const Payload& /*args*/) {
   return ok_payload();
 }
 
+static FLASHMEM Payload cmd_wave_on(const Payload& args) {
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::COMMAND);
+
+  if (g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE) {
+    Payload p;
+    p.add("status", "wave_on_rejected_race_engine_active");
+    return p;
+  }
+
+  uint64_t requested_cycle_ns = 0ULL;
+  if (!args.has("ns") || !args.tryGetUInt64("ns", requested_cycle_ns) ||
+      requested_cycle_ns < 2ULL) {
+    Payload p;
+    p.add("status", "wave_on_rejected_ns_invalid");
+    p.add("error", "ns must be a full-cycle uint64 integer >= 2");
+    return p;
+  }
+
+  const uint64_t half_cycle_ns = requested_cycle_ns / 2ULL;
+  photons_wave_cancel();
+  g_pulse_armed_sequence = 0U;
+  photons_memory_barrier();
+
+  // Establish the first HIGH half-cycle immediately.  TimePop owns every later
+  // edge on the recurring half-cycle grid.
+  g_photons_wave_level = HIGH;
+  digitalWriteFast(LASER_GATE_PIN, HIGH);
+
+  g_photons_wave_cycle_ns = requested_cycle_ns;
+  g_photons_wave_half_cycle_ns = half_cycle_ns;
+  g_photons_wave_timer = timepop_arm(
+      half_cycle_ns,
+      true,
+      photons_wave_tick,
+      nullptr,
+      "PHOTONS_WAVE");
+  if (g_photons_wave_timer == TIMEPOP_INVALID_HANDLE) {
+    g_photons_wave_cycle_ns = 0ULL;
+    g_photons_wave_half_cycle_ns = 0ULL;
+    g_photons_wave_level = LOW;
+    digitalWriteFast(LASER_GATE_PIN, LOW);
+    Payload p;
+    p.add("status", "wave_on_rejected_timer_unavailable");
+    return p;
+  }
+
+  Payload p;
+  p.add("status", "wave_started");
+  p.add("cycle_ns", requested_cycle_ns);
+  p.add("half_cycle_ns", half_cycle_ns);
+  p.add("duty_percent", (uint32_t)50U);
+  p.add("output_pin", (uint32_t)LASER_GATE_PIN);
+  p.add("output_level", HIGH);
+  return p;
+}
+
+static FLASHMEM Payload cmd_wave_off(const Payload& /*args*/) {
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::COMMAND);
+
+  const uint64_t previous_cycle_ns = g_photons_wave_cycle_ns;
+  const uint64_t previous_half_cycle_ns = g_photons_wave_half_cycle_ns;
+  const bool was_running = g_photons_wave_timer != TIMEPOP_INVALID_HANDLE;
+  photons_wave_cancel();
+  g_photons_wave_level = LOW;
+  digitalWriteFast(LASER_GATE_PIN, LOW);
+
+  Payload p;
+  p.add("status", "wave_stopped");
+  p.add("was_running", was_running);
+  p.add("previous_cycle_ns", previous_cycle_ns);
+  p.add("previous_half_cycle_ns", previous_half_cycle_ns);
+  p.add("output_pin", (uint32_t)LASER_GATE_PIN);
+  p.add("output_level", LOW);
+  return p;
+}
+
 static FLASHMEM Payload cmd_pulse(const Payload& args) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
@@ -5905,6 +6020,12 @@ static FLASHMEM Payload cmd_pulse(const Payload& args) {
   if (g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE) {
     Payload p;
     p.add("status", "pulse_rejected_race_engine_active");
+    return p;
+  }
+  if (g_photons_wave_timer != TIMEPOP_INVALID_HANDLE) {
+    Payload p;
+    p.add("status", "pulse_rejected_wave_active");
+    p.add("error", "Run PHOTONS.WAVEOFF before PULSE");
     return p;
   }
 
@@ -6111,6 +6232,12 @@ static FLASHMEM Payload cmd_on(const Payload& /*args*/) {
     p.add("status", "on_rejected_race_engine_active");
     return p;
   }
+  if (g_photons_wave_timer != TIMEPOP_INVALID_HANDLE) {
+    Payload p;
+    p.add("status", "on_rejected_wave_active");
+    p.add("error", "Run PHOTONS.WAVEOFF before ON");
+    return p;
+  }
   if (!g_initialized) __builtin_trap();
   if (digitalRead(LD_ON_PIN) != HIGH) {
     Payload p;
@@ -6196,6 +6323,8 @@ static const process_command_entry_t PHOTONS_COMMANDS[] = {
   { "RECOVERY_PROOF_ACK",  cmd_recovery_proof_ack  },
   { "REPORT_RECOVERY",     cmd_report_recovery     },
   { "INJECT_PROBLEM",      cmd_inject_problem      },
+  { "WAVEON",              cmd_wave_on             },
+  { "WAVEOFF",             cmd_wave_off            },
   { "PULSE",               cmd_pulse               },
   { "LD_ON",               cmd_ld_on               },
   { "LD_OFF",              cmd_ld_off              },
