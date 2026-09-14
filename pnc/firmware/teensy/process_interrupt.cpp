@@ -6172,8 +6172,12 @@ bool interrupt_stop(interrupt_subscriber_kind_t kind) {
 }
 
 void interrupt_request_pps_rebootstrap(void) {
+  // Publish the request and grid invalidation together with respect to the
+  // Priority-32 continuation. Priority-0 physical capture remains enabled.
+  const uint32_t prior = interrupt_priority0_guard_enter();
   g_pps_rebootstrap_pending = true;
   g_vclock_lane.one_second_grid_valid = false;
+  interrupt_priority0_guard_exit(prior);
 }
 
 bool interrupt_pps_rebootstrap_pending(void) {

@@ -207,12 +207,7 @@ static bool crash_dispatch_breadcrumb_valid(
 
 static void crash_dispatch_breadcrumb_zero(
     crash_dispatch_breadcrumb_t& breadcrumb) {
-    uint32_t* words = reinterpret_cast<uint32_t*>(&breadcrumb);
-    for (size_t i = 0U;
-         i < sizeof(breadcrumb) / sizeof(uint32_t);
-         ++i) {
-        words[i] = 0U;
-    }
+    breadcrumb = crash_dispatch_breadcrumb_t{};
 }
 
 static void crash_dispatch_breadcrumb_flush(
@@ -254,25 +249,35 @@ static void crash_dispatch_breadcrumb_boot_latch(void) {
     }
 }
 
-static void zero_record(crash_forensics_record_t& record) {
-    uint32_t* words = reinterpret_cast<uint32_t*>(&record);
-    for (size_t i = 0; i < sizeof(record) / sizeof(uint32_t); ++i) {
-        words[i] = 0U;
+static void crash_zero_bytes(void* object, size_t byte_count) {
+    // Clear the object representation without inventing a uint32_t array.
+    // Volatile byte stores keep this fault path independent of a library call
+    // or a record-sized temporary on the emergency stack.
+    volatile unsigned char* const bytes =
+        static_cast<volatile unsigned char*>(object);
+    for (size_t i = 0U; i < byte_count; ++i) {
+        bytes[i] = 0U;
     }
+}
+
+static void zero_record(crash_forensics_record_t& record) {
+    crash_zero_bytes(&record, sizeof(record));
 }
 
 static void zero_core_record(crash_forensics_core_record_t& record) {
-    uint32_t* words = reinterpret_cast<uint32_t*>(&record);
-    for (size_t i = 0; i < sizeof(record) / sizeof(uint32_t); ++i) {
-        words[i] = 0U;
-    }
+    crash_zero_bytes(&record, sizeof(record));
 }
 
-static uint32_t crash_crc32_words(const uint32_t* p,
-                                  const uint32_t* end) {
+static uint32_t crash_crc32_words(const void* object, size_t word_count) {
+    const unsigned char* const bytes =
+        static_cast<const unsigned char*>(object);
     uint32_t crc = 0xFFFFFFFFUL;
-    while (p < end) {
-        crc ^= *p++;
+    for (size_t i = 0U; i < word_count; ++i) {
+        // Preserve the retained native-word CRC exactly. Transfer each word
+        // into a real uint32_t object before interpreting its value.
+        uint32_t word;
+        memcpy(&word, bytes + i * sizeof(word), sizeof(word));
+        crc ^= word;
         for (uint32_t bit = 0; bit < 32U; ++bit) {
             crc = (crc >> 1) ^ ((crc & 1U) ? 0xEDB88320UL : 0U);
         }
@@ -282,21 +287,21 @@ static uint32_t crash_crc32_words(const uint32_t* p,
 
 static uint32_t core_record_crc32(
     const crash_forensics_core_record_t& record) {
-    const uint32_t* const begin =
-        reinterpret_cast<const uint32_t*>(&record);
-    const uint32_t* const end = reinterpret_cast<const uint32_t*>(
-        reinterpret_cast<const uint8_t*>(&record) +
-        offsetof(crash_forensics_core_record_t, crc32));
-    return crash_crc32_words(begin, end);
+    static_assert(offsetof(crash_forensics_core_record_t, crc32) %
+                      sizeof(uint32_t) == 0U,
+                  "Core crash CRC must cover complete words");
+    return crash_crc32_words(
+        &record,
+        offsetof(crash_forensics_core_record_t, crc32) / sizeof(uint32_t));
 }
 
 static uint32_t record_crc32(const crash_forensics_record_t& record) {
-    const uint32_t* const begin =
-        reinterpret_cast<const uint32_t*>(&record);
-    const uint32_t* const end = reinterpret_cast<const uint32_t*>(
-        reinterpret_cast<const uint8_t*>(&record) +
-        offsetof(crash_forensics_record_t, crc32));
-    return crash_crc32_words(begin, end);
+    static_assert(offsetof(crash_forensics_record_t, crc32) %
+                      sizeof(uint32_t) == 0U,
+                  "Extended crash CRC must cover complete words");
+    return crash_crc32_words(
+        &record,
+        offsetof(crash_forensics_record_t, crc32) / sizeof(uint32_t));
 }
 
 static bool range_contains(uintptr_t begin,

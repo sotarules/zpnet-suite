@@ -2905,7 +2905,9 @@ struct clocks_stack_witness_t {
   uint32_t min_campaign_seconds;
 };
 
-static volatile clocks_stack_witness_t g_clocks_stack_witness DMAMEM = {};
+// Setup and foreground CLOCKS callbacks/commands own this typed witness.
+// No interrupt path reads or writes it.
+static clocks_stack_witness_t g_clocks_stack_witness DMAMEM = {};
 
 static inline uint32_t clocks_stack_witness_sp(void) {
   uint32_t sp = 0;
@@ -2972,14 +2974,13 @@ static FLASHMEM bool clocks_stack_witness_storage_safe(void) {
 static FLASHMEM void clocks_stack_witness_reset(void) {
   if (!clocks_stack_witness_storage_safe()) return;
 
-  clocks_stack_witness_t* w =
-      (clocks_stack_witness_t*)&g_clocks_stack_witness;
+  clocks_stack_witness_t& w = g_clocks_stack_witness;
   const uint32_t prior_reset_count =
-      (w->magic == CLOCKS_STACK_WITNESS_MAGIC) ? w->reset_count : 0U;
-  memset(w, 0, sizeof(*w));
-  w->magic = CLOCKS_STACK_WITNESS_MAGIC;
-  w->reset_count = prior_reset_count + 1U;
-  w->min_sp = 0xFFFFFFFFUL;
+      (w.magic == CLOCKS_STACK_WITNESS_MAGIC) ? w.reset_count : 0U;
+  w = clocks_stack_witness_t{};
+  w.magic = CLOCKS_STACK_WITNESS_MAGIC;
+  w.reset_count = prior_reset_count + 1U;
+  w.min_sp = 0xFFFFFFFFUL;
 }
 
 static FLASHMEM bool clocks_stack_witness_ready(void) {
@@ -3018,17 +3019,16 @@ static FLASHMEM void clocks_stack_witness_note(uint32_t context) {
   if (!clocks_stack_witness_ready()) return;
 
   const uint32_t sp = clocks_stack_witness_sp();
-  clocks_stack_witness_t* w =
-      (clocks_stack_witness_t*)&g_clocks_stack_witness;
+  clocks_stack_witness_t& w = g_clocks_stack_witness;
 
-  w->record_count++;
-  w->last_sp = sp;
-  w->last_context = context;
-  w->last_campaign_seconds = (uint32_t)campaign_seconds;
-  if (sp != 0U && sp < w->min_sp) {
-    w->min_sp = sp;
-    w->min_context = context;
-    w->min_campaign_seconds = (uint32_t)campaign_seconds;
+  w.record_count++;
+  w.last_sp = sp;
+  w.last_context = context;
+  w.last_campaign_seconds = (uint32_t)campaign_seconds;
+  if (sp != 0U && sp < w.min_sp) {
+    w.min_sp = sp;
+    w.min_context = context;
+    w.min_campaign_seconds = (uint32_t)campaign_seconds;
   }
 }
 static inline void clocks_stack_witness_note_hot(uint32_t context) {
@@ -6852,12 +6852,10 @@ static FLASHMEM void clocks_beta_cold_diagnostics_init(void) {
   g_beta_ocxo2_counterledger_row =
       clocks_alpha_ocxo_counterledger_snapshot_t{};
 
-  clocks_stack_witness_t* stack_witness =
-      (clocks_stack_witness_t*)&g_clocks_stack_witness;
-  memset(stack_witness, 0, sizeof(*stack_witness));
-  stack_witness->magic = CLOCKS_STACK_WITNESS_MAGIC;
-  stack_witness->reset_count = 1U;
-  stack_witness->min_sp = UINT32_MAX;
+  g_clocks_stack_witness = clocks_stack_witness_t{};
+  g_clocks_stack_witness.magic = CLOCKS_STACK_WITNESS_MAGIC;
+  g_clocks_stack_witness.reset_count = 1U;
+  g_clocks_stack_witness.min_sp = UINT32_MAX;
 
   g_ocxo_science_totals_ocxo1 = ocxo_science_totals_t{};
   g_ocxo_science_totals_ocxo2 = ocxo_science_totals_t{};

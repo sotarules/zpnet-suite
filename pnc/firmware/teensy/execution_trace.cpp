@@ -366,15 +366,15 @@ extern "C" void execution_trace_capture_fault_generation(
   retained.flags = EXECUTION_TRACE_FLAG_FAULT_CAPTURED;
   retained.reserved = 0U;
 
-  volatile uint32_t* const destination =
-      reinterpret_cast<volatile uint32_t*>(retained.banks);
-  const volatile uint32_t* const source =
-      reinterpret_cast<const volatile uint32_t*>(g_execution_trace_live);
+  // Copy the representations of the typed bank arrays through byte access.
+  // Volatile preserves the fault-time transfer without a library call or a
+  // complete bank temporary on the emergency stack.
+  volatile unsigned char* const destination =
+      reinterpret_cast<volatile unsigned char*>(&retained.banks);
+  const volatile unsigned char* const source =
+      reinterpret_cast<const volatile unsigned char*>(&g_execution_trace_live);
   constexpr size_t bank_bytes = sizeof(retained.banks);
-  static_assert((bank_bytes % sizeof(uint32_t)) == 0U,
-                "Execution Trace banks must be word-copyable");
-  constexpr size_t bank_words = bank_bytes / sizeof(uint32_t);
-  for (size_t i = 0U; i < bank_words; ++i) {
+  for (size_t i = 0U; i < bank_bytes; ++i) {
     destination[i] = source[i];
   }
 
