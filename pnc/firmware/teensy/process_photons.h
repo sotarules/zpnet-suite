@@ -31,12 +31,11 @@
 // state, and recovery totals.
 //
 // Real single-pass race engine:
-//   • one recurring 1 kHz TimePop cadence owns one race attempt per tick;
-//   • Step 4 keeps that producer held and establishes permanent split authority:
-//     LD_ON owns only the coarse MP5491 source. The active-low SDM gate remains
-//     HIGH/inhibited except during an explicit manual ON or PULSE;
-//   • the dormant LD_ON falling-edge launch surrogate must not be activated in
-//     this checkpoint; manual gate pulses do not enable the recurring race engine;
+//   • one recurring 1 kHz TimePop cadence remains the intended race owner;
+//   • the producer is currently held while the source launch is migrated to the
+//     active-high DRV200 MOD path on Teensy pin 35;
+//   • pin 35 LOW is the idle modulation level; a physical launch will be authored
+//     by a HIGH transition/pulse after the race engine is explicitly re-enabled;
 //   • process_interrupt owns the first-instruction DWT coordinate of every
 //     physical PD200T pin-34 RISING edge; PHOTONS admits only the first eligible
 //     edge for the armed race and ignores later comparator chatter for race science;
@@ -46,16 +45,14 @@
 //     or unsafe/ambiguous endpoint instead of manufacturing a measurement;
 //   • the 1 Hz foreground drain projects completed races and advances both the
 //     canonical lifetime Welford and a one-fragment race Welford for metrics;
-//   • the launch-surrogate contract is intentionally replaceable: the future
-//     fast-switch daughterboard can supply a better launch edge without changing
-//     the downstream race/Welford/campaign/recovery architecture.
+//   • the launch-surrogate contract remains replaceable; the DRV200 migration must
+//     establish the final active-high launch edge before recurring races are enabled.
 //
 // Commands:
-//   • INIT                — reinitialize PHOTONS-owned optical hardware; active-low gate
-//                           closes first and LD_ON is forced LOW after MP5491 configuration
+//   • INIT                — reinitialize PHOTONS-owned optical I/O and force the
+//                           active-high DRV200 MOD command LOW/idle
 //   • DETECTOR_ACTIVATE   — commissioning-only activation of the already-subscribed PD200T
-//                           interrupt lane; gate remains HIGH, LD_ON remains LOW, and no
-//                           race/publisher starts
+//                           interrupt lane; MOD remains LOW and no race/publisher starts
 //   • SET_LAP_BASELINE_NS — install/change the operator-authored lap reference with
 //                           six fractional ns digits (1 fs); Better-Buckets are
 //                           re-referenced in place without changing physical custody
@@ -63,24 +60,22 @@
 //   • START               — start a LANTERN campaign, or hot-cut an active campaign to a new name
 //   • FLASH_CUT           — explicit hot campaign boundary preserving the always-on instrument epoch
 //   • STOP                — request campaign closure; the next published campaign fragment is final
-//   • REPORT              — compact operational/device report including Step-4 coarse-source
-//                           state, active-low gate inhibit, MP5491 ID1 current setting, laser
-//                           monitor, PD200T pin 38/A14 telemetry, and pin-34 interrupt custody
-//   • WAVEON ns=N         — commissioning square wave on LASER_GATE_PIN 35 using a
+//   • REPORT              — compact operational/device report including active-high MOD state,
+//                           laser monitor, PD200T pin 38/A14 telemetry, and pin-34 interrupt custody
+//   • WAVEON ns=N         — commissioning square wave on LASER_MOD_PIN 35 using a
 //                           recurring TimePop callback. N is the full HIGH+LOW cycle;
 //                           each half-cycle is N/2 for a 50/50 duty cycle.
-//   • WAVEOFF             — cancel the commissioning wave and force pin 35 LOW.
-//   • PULSE [ns=N]        — one active-low SDM gate pulse; requires LD_ON first and
-//                           leaves LD_ON HIGH, gate HIGH afterward. Default: 1000 ns.
-//                           A continuously open gate is rejected; issue OFF first.
+//   • WAVEOFF             — cancel the commissioning wave and force pin 35 LOW/idle.
+//   • PULSE [ns=N]        — one active-high DRV200 MOD pulse. MOD must be LOW before
+//                           the shot and returns LOW afterward. Default: 1000 ns.
 //                           N is any positive uint64 integer; no policy duration cap.
 //                           Uses F_CPU_ACTUAL and DWT polling with interrupts enabled;
-//                           foreground remains occupied until gate closure. Long waits
+//                           foreground remains occupied until MOD returns LOW. Long waits
 //                           accumulate unsigned deltas across DWT wraps. An IRQ gap
 //                           of a full DWT revolution cannot be recovered from DWT alone.
 //                           Requested width is approximate; loop/write/IRQ latency may
-//                           extend the physical LOW interval. Measure it with the scope.
-//                           Output: LASER_GATE_PIN 35. Detector input remains pin 34,
+//                           extend the physical HIGH interval. Measure it with the scope.
+//                           Output: LASER_MOD_PIN 35. Detector input remains pin 34,
 //                           read through process_interrupt's authoritative GPIO2 accessor.
 //   • REPORT_PULSE        — latest manual-shot raw evidence (PHOTONS_PULSE_REPORT_V3):
 //                           requested ns, target whole seconds + fractional cycles,
@@ -104,18 +99,11 @@
 //   • REPORT_RECOVERY     — report staging, restored source, and physical-ancestry testimony
 //   • INJECT_PROBLEM      — retained command identity; synthetic injection is unavailable
 //                           after retirement of the emulator
-//   • LD_ON               — coarse-source preparation: gate HIGH/closed, then LD_ON HIGH;
-//                           repeated calls also close the gate before enabling the source
-//   • LD_OFF              — full shutdown: gate HIGH first, then LD_ON LOW; prove both
-//                           physical levels before returning
-//   • ON                  — continuous gate opening: requires LD_ON HIGH, writes gate LOW,
-//                           leaves LD_ON unchanged and returns immediately (no busy-wait)
-//   • OFF                 — gate closure only: writes gate HIGH and leaves LD_ON unchanged
-//                           whether the source is enabled or disabled
-//                           All four controls cancel a pending manual receive arm without
+//   • ON                  — force active-high DRV200 MOD HIGH continuously; this does not
+//                           control the DRV200 hardware switch or DC bias-current setting
+//   • OFF                 — cancel any commissioning wave and force DRV200 MOD LOW/idle
+//                           All direct MOD controls cancel a pending manual receive arm without
 //                           erasing its already-captured testimony. No race is started.
-//                           Continuous emission is not time-limited: explicitly OFF or
-//                           LD_OFF afterward, with the optical path enclosed throughout.
 // ============================================================================
 
 // Cumulative ISR-authored optical-edge state from PD200T TTL pin 34.

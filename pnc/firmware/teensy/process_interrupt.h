@@ -1330,8 +1330,9 @@ using pps_edge_dispatch_fn = void (*)(const pps_edge_snapshot_t& snap);
 // Earliest boot electrical-safety boundary.  Call before TimePop or interrupt
 // hardware initialization.  It establishes inactive levels for outputs whose
 // reset/input state can otherwise permit hardware activity that crowds out
-// later initialization.  This is temporary boot custody; subsystem runtime
-// ownership begins later.
+// later initialization.  The active-HIGH DRV200 modulation path is preloaded
+// LOW before output drive is enabled.  This is temporary boot custody; subsystem
+// runtime ownership begins later.
 void process_interrupt_init_safe_outputs(void);
 
 void process_interrupt_init_hardware(void);

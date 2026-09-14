@@ -82,7 +82,7 @@ LANTERN_REPORT_SCHEMA = "LANTERN_REPORT_V1"
 
 # Canonical Pi-side instrument schema and accepted firmware source schemas.
 PHOTONS_SCHEMA = "PHOTONS_V1"
-PHOTONS_BRINGUP_SCHEMA = "PHOTONS_BRINGUP_REPORT_V3"
+PHOTONS_BRINGUP_SCHEMA = "PHOTONS_BRINGUP_REPORT_V4"
 PHOTONS_FRAGMENT_SCHEMA = "PHOTONS_FRAGMENT_V1"
 PHOTONS_INSTRUMENT_SCHEMA = "PHOTONS_INSTRUMENT_V1"
 PHOTONS_SCIENCE_SCHEMA = "PHOTONS_SCIENCE_V2"
@@ -91,6 +91,8 @@ PHOTONS_RACE_SCHEMA = "PHOTONS_RACE_V1"
 PHOTONS_RACE_CADENCE_HZ = 1000
 PHOTONS_RACE_CADENCE_NS = 1_000_000
 PHOTONS_RACE_PULSE_NS = 91_000
+PHOTONS_RACE_LAUNCH_SURROGATE = "DRV200_MOD_HIGH_EDGE_PENDING"
+PHOTONS_EMPTY_HEARTBEAT_LEGACY_LAUNCH_SURROGATE = "LD_ON_FALLING_EDGE"
 PHOTONS_PPB_SEMANTICS = "LAP_BASELINE_NS_OFFSET_V1"
 
 PHOTONS_RECOVERY_SCHEMA_VERSION = 1
@@ -1116,7 +1118,7 @@ def _validate_photons_fragment(fragment: Payload) -> Tuple[int, int, Optional[in
             "PHOTONS race geometry changed unexpectedly: "
             f"cadence={cadence_hz}Hz/{cadence_ns}ns pulse={pulse_ns}ns"
         )
-    if race.get("launch_surrogate") != "LD_ON_FALLING_EDGE":
+    if race.get("launch_surrogate") != PHOTONS_RACE_LAUNCH_SURROGATE:
         raise ValueError(
             f"unsupported PHOTONS launch surrogate {race.get('launch_surrogate')!r}"
         )
@@ -3554,7 +3556,7 @@ def _canonical_recovery_state_from_row(
             f"durable={durable_race_geometry!r}"
         )
     if (
-        race.get("launch_surrogate") != "LD_ON_FALLING_EDGE"
+        race.get("launch_surrogate") != PHOTONS_RACE_LAUNCH_SURROGATE
         or race.get("flight_interpretation") != "ESTIMATED"
     ):
         raise ValueError("durable PHOTONS race launch/interpretation contract changed")
@@ -4089,7 +4091,10 @@ def _load_newest_empty_photons_heartbeat_state(
                 "empty-heartbeat PHOTONS.photons.race.pulse_ns",
                 minimum=1,
             ) != PHOTONS_RACE_PULSE_NS
-            or race.get("launch_surrogate") != "LD_ON_FALLING_EDGE"
+            or race.get("launch_surrogate") not in {
+                PHOTONS_RACE_LAUNCH_SURROGATE,
+                PHOTONS_EMPTY_HEARTBEAT_LEGACY_LAUNCH_SURROGATE,
+            }
             or race.get("flight_interpretation") != "ESTIMATED"
         ):
             return None
@@ -4603,31 +4608,26 @@ def _fetch_teensy_bringup_report() -> Optional[Dict[str, Any]]:
         "PHOTONS.REPORT.race_engine_active",
     ) is not False:
         raise RuntimeError("PHOTONS bring-up report unexpectedly has race engine active")
-    # V3 separates permanent boot policy from the current ON/OFF state. An
-    # explicit coarse-source ON remains lawful behind the closed gate, including
-    # across a Pi service restart. Reading this report grants no actuation authority.
+    # V4 describes the non-inverting TC4427 -> DRV200 modulation path. Firmware
+    # owns only modulation; external DRV200 bias is deliberately outside this court.
+    # Therefore startup safety is proved by active-HIGH semantics plus an idle LOW,
+    # not by the retired EV5491 coarse-source / active-low gate contract.
     if _require_bool(
-        payload.get("coarse_source_boot_enabled"),
-        "PHOTONS.REPORT.coarse_source_boot_enabled",
+        payload.get("laser_mod_active_high"),
+        "PHOTONS.REPORT.laser_mod_active_high",
+    ) is not True:
+        raise RuntimeError("PHOTONS bring-up report says DRV200 modulation is not active-HIGH")
+    if _require_int(
+        payload.get("laser_mod_level"),
+        "PHOTONS.REPORT.laser_mod_level",
+    ) != 0:
+        raise RuntimeError("PHOTONS bring-up report says DRV200 modulation is not idle LOW")
+    if _require_bool(
+        payload.get("laser_mod_active"),
+        "PHOTONS.REPORT.laser_mod_active",
     ) is not False:
-        raise RuntimeError("PHOTONS Step-4 boot policy must keep the coarse source off")
-    coarse_source_enabled = _require_bool(
-        payload.get("coarse_source_enabled"),
-        "PHOTONS.REPORT.coarse_source_enabled",
-    )
-    expected_ld_on_level = 1 if coarse_source_enabled else 0
-    if (
-        _require_bool(payload.get("gate_active_low"), "PHOTONS.REPORT.gate_active_low") is not True
-        or _require_bool(payload.get("gate_inhibited"), "PHOTONS.REPORT.gate_inhibited") is not True
-        or _require_bool(payload.get("laser_emitting"), "PHOTONS.REPORT.laser_emitting") is not False
-    ):
-        raise RuntimeError("PHOTONS bring-up report violates the Step-4 optical inhibit contract")
-    if _require_int(payload.get("laser_gate_level"), "PHOTONS.REPORT.laser_gate_level") != 1:
-        raise RuntimeError("PHOTONS bring-up report says active-low laser gate is not inhibited")
-    if _require_int(payload.get("ld_on_level"), "PHOTONS.REPORT.ld_on_level") != expected_ld_on_level:
-        raise RuntimeError(
-            "PHOTONS bring-up report LD_ON disagrees with the current coarse-source state"
-        )
+        raise RuntimeError("PHOTONS bring-up report says DRV200 modulation is active")
+    _require_bool(payload.get("laser_emitting"), "PHOTONS.REPORT.laser_emitting")
     _require_u32(payload.get("interrupt_irq_count"), "PHOTONS.REPORT.interrupt_irq_count")
     _require_u32(
         payload.get("interrupt_callback_count"),
@@ -4661,7 +4661,7 @@ def _fetch_teensy_photons_report() -> Dict[str, Any]:
         != PHOTONS_RACE_CADENCE_HZ
         or _require_int(payload.get("race_pulse_ns"), "PHOTONS.REPORT.race_pulse_ns", minimum=1)
         != PHOTONS_RACE_PULSE_NS
-        or payload.get("race_launch_surrogate") != "LD_ON_FALLING_EDGE"
+        or payload.get("race_launch_surrogate") != PHOTONS_RACE_LAUNCH_SURROGATE
     ):
         raise RuntimeError("Teensy PHOTONS real-race geometry does not match Pi contract")
     _require_bool(payload.get("race_engine_active"), "PHOTONS.REPORT.race_engine_active")
@@ -6806,12 +6806,11 @@ def _perform_phase5_recovery(
             detector_activation = _startup_activate_detector_for_heartbeat(bringup)
             logging.info(
                 "[photons/recovery] held producer detector prerequisite proved: "
-                "changed=%s active=%s gate=%s LD_ON=%s coarse_source_boot_enabled=%s",
+                "changed=%s active=%s laser_mod_level=%s active_high=%s",
                 bool(detector_activation.get("changed")),
                 bool(detector_activation.get("interrupt_active")),
-                detector_activation.get("laser_gate_level"),
-                detector_activation.get("ld_on_level"),
-                detector_activation.get("coarse_source_boot_enabled"),
+                detector_activation.get("laser_mod_level"),
+                detector_activation.get("laser_mod_active_high"),
             )
 
             # The read-only court plus explicit detector proof now establish the
@@ -10678,8 +10677,8 @@ def _startup_activate_detector_for_heartbeat(
     bringup: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Make only the already-proved safe PD200T detector lane live."""
-    # The caller has admitted the V3 report. Preserve an already-active detector
-    # and any explicitly commanded coarse-source state without another physical RPC.
+    # The caller has admitted the V4 modulation-idle report. Preserve an already-
+    # active detector without another physical RPC; DRV200 bias is not Pi custody.
     if _require_bool(
         bringup.get("interrupt_active"),
         "PHOTONS commissioning bringup.interrupt_active",
@@ -10689,23 +10688,11 @@ def _startup_activate_detector_for_heartbeat(
             "status": "detector_already_active",
             "interrupt_subscribed": True,
             "interrupt_active": True,
-            "laser_gate_level": bringup["laser_gate_level"],
-            "ld_on_level": bringup["ld_on_level"],
-            "coarse_source_enabled": bringup["coarse_source_enabled"],
-            "coarse_source_boot_enabled": False,
+            "laser_mod_level": bringup["laser_mod_level"],
+            "laser_mod_active_high": bringup["laser_mod_active_high"],
             "publication_started": False,
             "race_engine_active": False,
         }
-
-    # Firmware DETECTOR_ACTIVATE requires LD_ON LOW. Do not issue a command that
-    # would trap, and do not turn the coarse source off as a recovery side effect.
-    # The existing commissioning-hold path keeps this state observable until the
-    # operator explicitly issues PHOTONS.LD_OFF and retries startup.
-    if bringup["coarse_source_enabled"]:
-        raise RuntimeError(
-            "PHOTONS detector activation requires coarse source OFF; "
-            "issue PHOTONS.LD_OFF before retrying startup"
-        )
 
     response = send_command(
         machine="TEENSY",
@@ -10732,21 +10719,13 @@ def _startup_activate_detector_for_heartbeat(
             "PHOTONS.DETECTOR_ACTIVATE.interrupt_active",
         ) is not True
         or _require_int(
-            payload.get("laser_gate_level"),
-            "PHOTONS.DETECTOR_ACTIVATE.laser_gate_level",
-        ) != 1
-        or _require_int(
-            payload.get("ld_on_level"),
-            "PHOTONS.DETECTOR_ACTIVATE.ld_on_level",
+            payload.get("laser_mod_level"),
+            "PHOTONS.DETECTOR_ACTIVATE.laser_mod_level",
         ) != 0
         or _require_bool(
-            payload.get("coarse_source_enabled"),
-            "PHOTONS.DETECTOR_ACTIVATE.coarse_source_enabled",
-        ) is not False
-        or _require_bool(
-            payload.get("coarse_source_boot_enabled"),
-            "PHOTONS.DETECTOR_ACTIVATE.coarse_source_boot_enabled",
-        ) is not False
+            payload.get("laser_mod_active_high"),
+            "PHOTONS.DETECTOR_ACTIVATE.laser_mod_active_high",
+        ) is not True
         or _require_bool(
             payload.get("publication_started"),
             "PHOTONS.DETECTOR_ACTIVATE.publication_started",
@@ -10771,13 +10750,6 @@ def _startup_commissioning_empty_heartbeat_cutover(
     """Cut only the known invalid pre-heartbeat ancestry into a new empty epoch."""
     failure_text = str(failure)
     if "canonical PHOTONS statistics are invalid" not in failure_text:
-        return None
-
-    if bringup["coarse_source_enabled"] and not bringup["interrupt_active"]:
-        logging.warning(
-            "[photons/startup] empty-heartbeat cutover held: detector activation "
-            "requires explicit PHOTONS.LD_OFF before retrying startup"
-        )
         return None
 
     active_master = _load_active_lantern_master()
@@ -11026,11 +10998,11 @@ def run() -> None:
             )
             logging.warning(
                 "🧪 [photons] commissioning hold admitted without HARD_FAILURE: "
-                "publication=false race_engine=false detector_active=%s gate=HIGH "
-                "LD_ON=%s coarse_source_boot_enabled=%s",
+                "publication=false race_engine=false detector_active=%s "
+                "laser_mod_level=%s active_high=%s",
                 bool((recovery.get("bringup_report") or {}).get("interrupt_active")),
-                (recovery.get("bringup_report") or {}).get("ld_on_level"),
-                (recovery.get("bringup_report") or {}).get("coarse_source_boot_enabled"),
+                (recovery.get("bringup_report") or {}).get("laser_mod_level"),
+                (recovery.get("bringup_report") or {}).get("laser_mod_active_high"),
             )
         else:
             # START/STOP/baseline/maintenance control opens only after an advancing

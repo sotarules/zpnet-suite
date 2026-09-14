@@ -82,14 +82,14 @@ static const unsigned long GNSSDO_BAUD     = 38400;
 // --------------------------------------------------------------
 // Laser control pins
 // --------------------------------------------------------------
-static const int LD_ON_PIN          = 30;
+// Pin 30 was the EV5491 LD_ON/EN control. The EV5491 is retired and pin 30
+// is intentionally free; do not assign a firmware constant until it is reused.
 static const int LASER_MONITOR_PIN  = 20;
 
-// Active-low LANTERN SDM gate between EV5491 ID1 and laser LD+.
-// HIGH is the electrically safe/inhibited state; LOW permits ID1 current.
-// process_interrupt establishes HIGH during the earliest boot-safe-output
-// phase; PHOTONS will assume operational gate custody in a later change.
-static const int LASER_GATE_PIN     = 35;
+// Active-high DRV200 modulation command through the TC4427 MDM.
+// LOW is the safe/idle modulation level; HIGH applies positive modulation.
+// This pin does not enable/disable the DRV200 bias current or hardware switch.
+static const int LASER_MOD_PIN      = 35;
 
 // --------------------------------------------------------------
 // Koheron PD200T optical receiver

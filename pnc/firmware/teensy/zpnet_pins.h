@@ -101,10 +101,10 @@ GND           Black         GND                Battery branching ground         
 23            Green         DAC_VREF_OUT       AD5693R VREF (both)
 32            Orange        GNSS_PPS_RELAY     GPIO relay to Pi
 34            Coax          PHOTODIODE_INT     Koheron PD200T TTL out                Comparator timing / GPIO2[29] IRQ P48
-35            --            LASER_GATE         ZPNet SDM GATE                       Active-low: HIGH inhibits laser; LOW permits ID1 current
+35            Coax/pigtail  LASER_MOD          TC4427 MDM -> Koheron DRV200 MOD     Active-high: LOW idle; HIGH positive modulation
 38            Coax          PHOTODIODE_ANALOG_IN  Koheron PD200T PD OUT              Analog photodetector output / A14 ADC
 
-30            Green         LASER_EN           EV5491-C-00A EN pin
+30            --            FREE               --                                   Released 2026-09-13; EV5491 retired
 
 -------------------------------------------------------------------------------
 Timer hardware binding summary:
@@ -214,84 +214,78 @@ Notes:
 
 
 /*=============================================================================
- (5) LASER DIODE MODULE — FFIME LSDLD131
--------------------------------------------------------------------------------
+FFIME / presumed LSDLD131 — EXACT VARIANT UNVERIFIED
 
-Device:
-FFIME LSDLD131
-Wavelength: 1310 nm
-Optical power: ~3 mW
+Nominal wavelength: 1310 nm (working attribution; exact device identity unverified)
+Optical power: unknown; candidate LSDLD131 documentation specifies ~2 mW typ / 4 mW max
 Connector: FC/APC
-Driver: EV5491
+Driver: Koheron DRV200-A-40
 
-Pin numbering starts at the gold pin and proceeds clockwise.
+IMPORTANT:
+Numeric package-pin mapping is intentionally NOT asserted.
+The functional wire assignments below are based primarily on empirical testing.
 
-Pin #    Wire Color    Signal Name      Electrical / Voltage       Notes
----------------------------------------------------------------------------
-1        Blue          CASE_GND         Chassis / case             Parked
-2        Black         LD- / PD-        GND (EV5491 GND)           Common return
-3        Red           LD+              ~1.397 V                   ZPNet SDM output; switched EV5491 ID1
-4        White         PD+              ~0.918 V                   Monitored (laser on/off)
+Wire Color    Functional Signal     Current Connection     Evidence / Notes
+--------------------------------------------------------------------------------
+Blue          CASE                  Parked                 0 Ω to metal can; empirically proved
 
----------------------------------------------------------------------------
-Notes:
-• Case ground is intentionally parked and not bonded by default.
-• LD+ / LD- are driven exclusively by the EV5491 laser driver.
-• PD+ / PD- provide laser activity monitoring.
-• No pin on this device should ever be exposed to 5 V.
-• Optical output is active once LD+ is energized.
-=============================================================================*/
+Black         LD-                   DRV200 LD-             Laser cathode; floating from ZPNet GND
+
+Red           LD+ / likely PD-      DRV200 LD+             Laser anode empirically proved:
+                                                           original controller produced laser output;
+                                                           DRV200 V(LD+-LD-) ≈ +1.521 V.
+                                                           RED↔WHITE also forms separate diode junction,
+                                                           consistent with shared monitor-PD terminal.
+
+White         Monitor PD lead       Parked                 Likely PD+.
+                                                           RED→WHITE diode test ≈0.492 V;
+                                                           reverse direction OL.
+                                                           DO NOT connect directly to Teensy pin 20
+                                                           pending proper floating-domain interface.
+
+Observed physical clockwise wire order:
+BLUE → BLACK → RED → WHITE
+(view/orientation recorded separately; do not infer package pin numbers from this alone)
+
+DRV200 doctrine:
+- RED -> LD+
+- BLACK -> LD-
+- BLUE parked
+- WHITE parked
+- laser diode must remain floating from ZPNet/system ground
 
 /*=============================================================================
- (6) CONTROLLER MODULE — EV5491-C-00A LASER DRIVER (USED CONNECTIONS)
+ (6) OPTICAL SOURCE DRIVER — KOHERON DRV200-A-40 + TC4427 MDM
 -------------------------------------------------------------------------------
 
-Controller:
-EV5491-C-00A
-Function: Laser diode driver for FFIME LSDLD131
+Driver:
+Koheron DRV200-A-40
+Function: Floating laser-current driver with analog MOD input
 
-This table documents ONLY the connections that are actually used.
-Unused pins are intentionally omitted to reduce cognitive load.
+Interface module:
+TC4427 MDM with 220 ohm series output resistor
 
 -------------------------------------------------------------------------------
 Control / Signal Connections
 -------------------------------------------------------------------------------
 
-Signal     Wire Color    Connected To        Teensy Pin    Notes
+Signal       Source / Destination                         Notes
 ---------------------------------------------------------------------------
-EN         Green         Teensy GPIO         30            Laser enable
-ID1        Red           ZPNet SDM input      N/A           SDM switches ID1 path to laser LD+
-GND        Black         Laser diode GND     N/A           Common return
-
--------------------------------------------------------------------------------
-Power Connections
--------------------------------------------------------------------------------
-
-Terminal   Wire Color    Connected To        Rail           Notes
----------------------------------------------------------------------------
-VIN1       Purple        Backplane           +3V3           Primary supply
-VIN2       Purple        Backplane           +3V3           Secondary supply
-GND        Black         Backplane           GND            Power ground
-GND        —             —                   —              Unused
-
--------------------------------------------------------------------------------
-I2C Connections
--------------------------------------------------------------------------------
-
-Signal     Wire Color    Connected To        Rail           Notes
----------------------------------------------------------------------------
-SDA        Blue          Backplane           SDA1           Primary I2C data
-SCL        Yellow        Backplane           SCL1           Primary I2C clock
-GND        Black         Backplane           GND            I2C reference
+LASER_MOD    Teensy pin 35 -> MDM SMA IN                  Active-high logic command
+MDM OUT      MDM SMA OUT -> DRV200 MOD SMA                ~5 V unloaded; ~0.9 V into 50 ohm MOD input
+LD+          DRV200 LD+ -> laser red                      Floating laser anode drive
+LD-          DRV200 LD- -> laser black                    Floating laser return; never ZPNet GND
+IMON         DRV200 terminal                              100 mV per mA on A-40; commissioning telemetry
 
 -------------------------------------------------------------------------------
 Notes:
-• EN is the only controller signal driven by the Teensy.
-• ID1 feeds the ZPNet SDM; the SDM output drives the laser diode LD+ pin.
-• SDM GATE is Teensy pin 35 and is active-low: HIGH inhibits laser output.
-• All controller power is sourced from the +3V3 rail.
-• I2C is present for configuration/monitoring as supported.
-• Unused controller pins are intentionally left undocumented.
+• Pin 35 is no longer an active-low gate. LOW means zero added modulation; HIGH
+  applies positive DRV200 modulation through the non-inverting TC4427 MDM.
+• DRV200 bias current and the hardware ON/OFF switch are local driver controls;
+  Teensy pin 35 does not enable or remove the DC bias current.
+• The retired EV5491/MP5491 I2C controller and MOSFET daughterboard are removed.
+• Teensy pin 30 (former EV5491 EN / LD_ON) is free.
+• The DRV200 has no ZPNet I2C connection.
 =============================================================================*/
 
 /*=============================================================================

@@ -10,7 +10,6 @@
 #include "util.h"
 
 #include <Arduino.h>
-#include <Wire.h>
 #include <errno.h>
 #include <math.h>
 #include <stddef.h>
@@ -102,30 +101,17 @@ static constexpr uint32_t PHOTONS_RECOVERY_CHUNK_MAX_ENDPOINTS = 4U;
 // PHOTONS is the umbrella owner for photon-producing and photon-detecting
 // devices. process_interrupt still owns PD200T comparator edge custody.
 //
-// Laser driver: MP5491 / EV5491-C-00A
-//
-static constexpr uint8_t MP5491_ADDR = 0x66;
-
-static constexpr uint8_t MP5491_REG_CTL0    = 0x00;
-static constexpr uint8_t MP5491_REG_CTL1    = 0x01;
-static constexpr uint8_t MP5491_REG_ID1_MSB = 0x07;
-static constexpr uint8_t MP5491_REG_ID1_LSB = 0x08;
-
-static constexpr uint8_t MP5491_SYSEN_BIT  = 0x80;
-static constexpr uint8_t MP5491_ID_EN_BIT  = 0x80;
-static constexpr uint8_t MP5491_ID1_EN_BIT = 0x08;
-
-// Existing authoritative laser setting: ID1 = 20 mA, 0.25 mA / LSB.
-static constexpr uint8_t PHOTONS_LASER_ID1_CURRENT_MSB = 0x14;
-static constexpr uint8_t PHOTONS_LASER_ID1_CURRENT_LSB = 0x00;
+// Laser source: Koheron DRV200-A-40 driven through the TC4427 MDM.
+// Teensy owns only active-high MOD on pin 35 plus the historical monitor-PD
+// ADC on pin 20. DRV200 bias current and hardware enable are local controls.
 
 static constexpr float PHOTONS_LASER_EMIT_THRESHOLD_V = 0.75f;
 static constexpr uint64_t PHOTONS_PULSE_DEFAULT_NS = 1000ULL;
 
-// Interim real-race geometry. One 1 ms cell contains one 91 us LD_ON pulse
-// followed by a long quiet receive/recovery interval. The actual LD_ON falling
-// edge is the temporary launch surrogate until the fast-switch daughterboard
-// supplies a true fast optical launch edge.
+// Interim real-race geometry. One 1 ms cell is intended to contain one 91 us
+// active-high DRV200 MOD pulse followed by a long quiet receive/recovery interval.
+// The recurring race producer remains held until its launch edge is re-authored
+// and commissioned against the new optical source path.
 static constexpr uint64_t PHOTONS_RACE_CADENCE_NS = 1000000ULL;
 static constexpr uint32_t PHOTONS_RACE_CADENCE_HZ = 1000U;
 static constexpr uint64_t PHOTONS_RACE_PULSE_NS = 91000ULL;
@@ -186,9 +172,7 @@ static volatile uint32_t g_race_armed_sequence = 0U;
 
 
 struct photons_device_snapshot_t {
-  bool     laser_enabled = false;
-  uint16_t laser_id1_raw = 0;
-  float    laser_id1_current_ma = 0.0f;
+  int      laser_mod_level = LOW;
   uint16_t laser_monitor_raw = 0;
   float    laser_monitor_v = 0.0f;
   bool     laser_emitting = false;
@@ -2008,35 +1992,15 @@ static photons_fragment_drain_result_t photons_drain_raw_laps(void) {
 }
 
 
-static void photons_i2c_write(uint8_t reg, uint8_t val) {
-  Wire.beginTransmission(MP5491_ADDR);
-  Wire.write(reg);
-  Wire.write(val);
-  Wire.endTransmission();
-}
-
-static uint8_t photons_i2c_read(uint8_t reg) {
-  Wire.beginTransmission(MP5491_ADDR);
-  Wire.write(reg);
-  Wire.endTransmission(false);
-  Wire.requestFrom(MP5491_ADDR, (uint8_t)1);
-  return Wire.available() ? Wire.read() : 0xFF;
-}
-
 static float photons_adc_voltage(uint16_t raw) {
   return (raw / ADC_FS_COUNTS) * ADC_FS_VOLTS;
 }
 
-// Optical authority is intentionally split.  The SDM/LANTERN gate is active-low.
-// LD_ON is the slower MP5491 coarse-source enable. Step 4 makes that separation
-// permanent: boot/INIT leave both layers inhibited; LD_ON raises the source
-// enable only after closing the gate; LD_OFF closes the gate before removing
-// source enable. ON/OFF now open/close only the gate, with ON requiring the
-// source already enabled. PULSE requires a closed gate and enabled source.
-
-// Commissioning square wave for the new buffered DRV200 modulation path.  The
-// TimePop handle is the sole running-state authority; no parallel validity flag
-// exists.  WAVEON owns pin 35 until WAVEOFF or another gate-control operation
+// The retired EV5491 coarse-source and active-low MOSFET gate are gone. Pin 35
+// is now a single active-high DRV200 MOD command through the non-inverting
+// TC4427 MDM: LOW = zero added modulation, HIGH = positive modulation.
+//
+// Commissioning WAVE owns pin 35 until WAVEOFF or another direct MOD command
 // explicitly cancels the recurring timer.
 static timepop_handle_t g_photons_wave_timer = TIMEPOP_INVALID_HANDLE;
 static uint64_t g_photons_wave_cycle_ns = 0ULL;
@@ -2055,7 +2019,7 @@ static void photons_wave_tick(
   }
 
   g_photons_wave_level = (g_photons_wave_level == LOW) ? HIGH : LOW;
-  digitalWriteFast(LASER_GATE_PIN, g_photons_wave_level);
+  digitalWriteFast(LASER_MOD_PIN, g_photons_wave_level);
 }
 
 static void photons_wave_cancel(void) {
@@ -2066,40 +2030,12 @@ static void photons_wave_cancel(void) {
   g_photons_wave_cycle_ns = 0ULL;
   g_photons_wave_half_cycle_ns = 0ULL;
 }
-static void photons_laser_hard_inhibit(void) {
+
+static void photons_laser_mod_idle(void) {
   photons_wave_cancel();
-  digitalWrite(LASER_GATE_PIN, HIGH);
-  digitalWrite(LD_ON_PIN, LOW);
+  g_photons_wave_level = LOW;
+  digitalWriteFast(LASER_MOD_PIN, LOW);
 }
-
-static void photons_laser_gate_close(void) {
-  photons_wave_cancel();
-  digitalWrite(LASER_GATE_PIN, HIGH);
-}
-
-static void photons_laser_coarse_source_disable(void) {
-  photons_laser_hard_inhibit();
-  if (digitalRead(LASER_GATE_PIN) != HIGH ||
-      digitalRead(LD_ON_PIN) != LOW) {
-    __builtin_trap();
-  }
-}
-
-static void photons_laser_coarse_source_enable_behind_closed_gate(void) {
-  photons_laser_gate_close();
-  if (digitalRead(LASER_GATE_PIN) != HIGH) {
-    photons_laser_hard_inhibit();
-    __builtin_trap();
-  }
-  digitalWrite(LD_ON_PIN, HIGH);
-  if (digitalRead(LASER_GATE_PIN) != HIGH ||
-      digitalRead(LD_ON_PIN) != HIGH) {
-    photons_laser_hard_inhibit();
-    __builtin_trap();
-  }
-}
-
-
 
 static void photons_race_receive_isr_publish(
     const photons_race_receive_value_t& value) {
@@ -2153,51 +2089,24 @@ static void photons_race_prepare(void) {
 
 
 static void photons_laser_initialize_hardware(void) {
-  // Take runtime custody from the early-boot safety boundary without ever
-  // authoring an emitting intermediate state. Preload gate HIGH / LD_ON LOW
-  // before driving either pin and keep that hard inhibit through MP5491 setup.
-  // Step 4 deliberately does not energize the coarse source at boot or INIT;
-  // only an explicit LD_ON command may do that later behind the closed gate.
-  photons_laser_hard_inhibit();
-  pinMode(LASER_GATE_PIN, OUTPUT);
-  pinMode(LD_ON_PIN, OUTPUT);
-  photons_laser_coarse_source_disable();
+  // Runtime PHOTONS custody is active-high: preload LOW before enabling output
+  // drive, then prove the modulation line is idle. Earliest boot custody in
+  // process_interrupt.cpp establishes the same LOW/no-modulation invariant.
+  photons_wave_cancel();
+  g_photons_wave_level = LOW;
+  digitalWrite(LASER_MOD_PIN, LOW);
+  pinMode(LASER_MOD_PIN, OUTPUT);
+  if (digitalRead(LASER_MOD_PIN) != LOW) __builtin_trap();
 
   pinMode(LASER_MONITOR_PIN, INPUT);
   pinMode(PHOTODIODE_ANALOG_PIN, INPUT);
   analogReadResolution(12);
-
-  photons_i2c_write(MP5491_REG_CTL0, MP5491_SYSEN_BIT);
-
-  const uint8_t ctl1 = photons_i2c_read(MP5491_REG_CTL1);
-  photons_i2c_write(
-      MP5491_REG_CTL1,
-      MP5491_ID_EN_BIT | MP5491_ID1_EN_BIT | (ctl1 & 0x07));
-
-  photons_i2c_write(
-      MP5491_REG_ID1_MSB,
-      PHOTONS_LASER_ID1_CURRENT_MSB);
-
-  const uint8_t lsb = photons_i2c_read(MP5491_REG_ID1_LSB);
-  photons_i2c_write(
-      MP5491_REG_ID1_LSB,
-      (lsb & ~0x03U) | PHOTONS_LASER_ID1_CURRENT_LSB);
-
-  // Re-establish and prove the permanent Step-4 idle state after every MP5491
-  // configuration transaction. No initialization path may leave LD_ON asserted.
-  photons_laser_coarse_source_disable();
 }
 
 static photons_device_snapshot_t photons_device_snapshot(void) {
   photons_device_snapshot_t out{};
 
-  const uint8_t msb = photons_i2c_read(MP5491_REG_ID1_MSB);
-  const uint8_t lsb = photons_i2c_read(MP5491_REG_ID1_LSB);
-  out.laser_id1_raw = ((uint16_t)msb << 2) | (lsb & 0x03U);
-  out.laser_id1_current_ma = out.laser_id1_raw * 0.25f;
-
-  out.laser_enabled = digitalRead(LD_ON_PIN) == HIGH;
-
+  out.laser_mod_level = digitalRead(LASER_MOD_PIN);
   out.laser_monitor_raw = analogRead(LASER_MONITOR_PIN);
   out.laser_monitor_v = photons_adc_voltage(out.laser_monitor_raw);
   out.laser_emitting =
@@ -3164,7 +3073,7 @@ static Payload& photons_fragment_payload(
   race.add("cadence_hz", f.race_cadence_hz);
   race.add("cadence_ns", PHOTONS_RACE_CADENCE_NS);
   race.add("pulse_ns", f.race_pulse_ns);
-  race.add("launch_surrogate", "LD_ON_FALLING_EDGE");
+  race.add("launch_surrogate", "DRV200_MOD_HIGH_EDGE_PENDING");
   race.add("flight_interpretation", "ESTIMATED");
   race.add("cadence_tick_count_total", f.race_cadence_tick_count_total);
   race.add("cadence_ticks_this_fragment", f.race_cadence_ticks_this_fragment);
@@ -5411,7 +5320,7 @@ static FLASHMEM Payload cmd_report_photons(const Payload& /*args*/) {
         g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE);
   p.add("race_cadence_hz", PHOTONS_RACE_CADENCE_HZ);
   p.add("race_pulse_ns", PHOTONS_RACE_PULSE_NS);
-  p.add("race_launch_surrogate", "LD_ON_FALLING_EDGE");
+  p.add("race_launch_surrogate", "DRV200_MOD_HIGH_EDGE_PENDING");
   p.add("race_cadence_tick_count_total", canonical.race_cadence_tick_count_total);
   p.add("race_cadence_ticks_this_fragment", canonical.race_cadence_ticks_this_fragment);
   p.add("race_attempt_count_total", canonical.race_attempt_count_total);
@@ -5645,12 +5554,13 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
 
-  // Bring-up REPORT remains compact until publication begins. Step 3 may activate
-  // the detector while the laser is still doubly inhibited; that commissioning
-  // state must not fall through into the legacy broad-report serializer merely
-  // because pin-34 interrupt custody became live. Keep this path observational:
-  // it reports detector activity and the two optical inhibit pins without starting
-  // publication, race cadence, pulse generation, or any recovery transition.
+  // Bring-up REPORT remains compact until publication begins. The DRV200 path is
+  // active-HIGH modulation: LOW is the firmware-authored idle state. Step 3 may
+  // activate the detector while modulation remains idle; that commissioning state
+  // must not fall through into the broad-report serializer merely because pin-34
+  // interrupt custody became live. Keep this path observational: it reports
+  // detector activity and modulation state without starting publication, race
+  // cadence, pulse generation, or any recovery transition.
   if (!g_photons_recovery.publication_started) {
     interrupt_photodiode_diag_t interrupt_diag{};
     if (!interrupt_photodiode_snapshot(&interrupt_diag) ||
@@ -5662,7 +5572,7 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
 
     Payload p;
     p.add("report", "PHOTONS");
-    p.add("schema", "PHOTONS_BRINGUP_REPORT_V3");
+    p.add("schema", "PHOTONS_BRINGUP_REPORT_V4");
     p.add("initialized", g_initialized);
     p.add("publication_started", false);
     p.add("interrupt_subscribed", interrupt_diag.subscribed);
@@ -5670,16 +5580,9 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
     p.add("interrupt_irq_count", interrupt_diag.irq_count);
     p.add("interrupt_callback_count", interrupt_diag.callback_count);
     p.add("interrupt_inactive_edge_count", interrupt_diag.inactive_edge_count);
-    p.add("laser_gate_level", digitalRead(LASER_GATE_PIN));
-    p.add("ld_on_level", digitalRead(LD_ON_PIN));
-    p.add("coarse_source_enabled", device.laser_enabled);
-    // Compatibility testimony: Step 4 permanently forbids boot-time coarse enable.
-    p.add("coarse_source_boot_enabled", false);
-    p.add("gate_active_low", true);
-    p.add("gate_inhibited", digitalRead(LASER_GATE_PIN) == HIGH);
-    p.add("laser_id1_raw", device.laser_id1_raw);
-    p.add("laser_id1_current_ma",
-          toFixedDecimal(device.laser_id1_current_ma, 3));
+    p.add("laser_mod_level", device.laser_mod_level);
+    p.add("laser_mod_active_high", true);
+    p.add("laser_mod_active", device.laser_mod_level == HIGH);
     p.add("laser_monitor_v", toFixedDecimal(device.laser_monitor_v, 6));
     p.add("laser_emitting", device.laser_emitting);
     p.add("photodiode_analog_v",
@@ -5735,7 +5638,7 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
         g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE);
   p.add("race_cadence_hz", PHOTONS_RACE_CADENCE_HZ);
   p.add("race_pulse_ns", PHOTONS_RACE_PULSE_NS);
-  p.add("race_launch_surrogate", "LD_ON_FALLING_EDGE");
+  p.add("race_launch_surrogate", "DRV200_MOD_HIGH_EDGE_PENDING");
   p.add("race_cadence_tick_count_total", g_photons_race.cadence_tick_count);
   p.add("race_cadence_ticks_this_fragment", canonical.race_cadence_ticks_this_fragment);
   p.add("race_attempt_count_total", g_photons_race.attempt_count);
@@ -5799,15 +5702,9 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
   p.add("photodiode_edge_level", device.photodiode_edge_level);
   p.add("photodiode_analog_v",
         toFixedDecimal(device.photodiode_analog_v, 6));
-  p.add("laser_gate_level", digitalRead(LASER_GATE_PIN));
-  p.add("ld_on_level", digitalRead(LD_ON_PIN));
-  p.add("coarse_source_enabled", device.laser_enabled);
-  p.add("coarse_source_boot_enabled", false);
-  p.add("gate_active_low", true);
-  p.add("gate_inhibited", digitalRead(LASER_GATE_PIN) == HIGH);
-  p.add("laser_id1_raw", device.laser_id1_raw);
-  p.add("laser_id1_current_ma",
-        toFixedDecimal(device.laser_id1_current_ma, 3));
+  p.add("laser_mod_level", device.laser_mod_level);
+  p.add("laser_mod_active_high", true);
+  p.add("laser_mod_active", device.laser_mod_level == HIGH);
   p.add("laser_monitor_v", toFixedDecimal(device.laser_monitor_v, 6));
   p.add("laser_emitting", device.laser_emitting);
   return p;
@@ -5844,7 +5741,7 @@ static FLASHMEM Payload cmd_report_pulse(const Payload& /*args*/) {
   p.add("pulse_end_dwt", pulse_launch.end_dwt);
   p.add("pulse_wall_cycles", pulse_launch.pulse_wall_cycles);
   p.add("pulse_wall_cycles_semantics", "WRITE_BRACKET_MODULO_2_32");
-  p.add("pulse_launch_surrogate", "GATE_LOW_WRITE");
+  p.add("pulse_launch_surrogate", "MOD_HIGH_WRITE");
   const bool finish_seen =
       pulse_receive.seen &&
       pulse_receive.pulse_sequence == pulse_launch.sequence;
@@ -5878,10 +5775,9 @@ static FLASHMEM Payload cmd_detector_activate(const Payload& /*args*/) {
     return p;
   }
 
-  // Detector commissioning remains the Step-3 boundary: it may activate only
-  // the PD200T lane. It re-proves the active-low gate HIGH and requires the
-  // coarse source to remain LOW; coarse-source authority belongs only to ON/OFF.
-  photons_laser_gate_close();
+  // Detector commissioning may activate only the PD200T lane. Keep the new
+  // active-high DRV200 modulation command at its LOW/idle level.
+  photons_laser_mod_idle();
 
   if (!g_initialized || !g_subscription_ok) __builtin_trap();
 
@@ -5901,11 +5797,10 @@ static FLASHMEM Payload cmd_detector_activate(const Payload& /*args*/) {
       !interrupt_diag.subscribed || !interrupt_diag.active) {
     __builtin_trap();
   }
-  if (digitalRead(LASER_GATE_PIN) != HIGH ||
-      digitalRead(LD_ON_PIN) != LOW ||
+  if (digitalRead(LASER_MOD_PIN) != LOW ||
       g_photons_recovery.publication_started ||
       g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE) {
-    photons_laser_hard_inhibit();
+    photons_laser_mod_idle();
     __builtin_trap();
   }
 
@@ -5913,15 +5808,12 @@ static FLASHMEM Payload cmd_detector_activate(const Payload& /*args*/) {
   p.add("status", "detector_activated");
   p.add("interrupt_subscribed", true);
   p.add("interrupt_active", true);
-  p.add("laser_gate_level", HIGH);
-  p.add("ld_on_level", LOW);
-  p.add("coarse_source_enabled", false);
-  p.add("coarse_source_boot_enabled", false);
+  p.add("laser_mod_level", LOW);
+  p.add("laser_mod_active_high", true);
   p.add("publication_started", false);
   p.add("race_engine_active", false);
   return p;
 }
-
 
 static FLASHMEM Payload cmd_init(const Payload& /*args*/) {
   const photons_foreground_custody_t custody(
@@ -5962,7 +5854,7 @@ static FLASHMEM Payload cmd_wave_on(const Payload& args) {
   // Establish the first HIGH half-cycle immediately.  TimePop owns every later
   // edge on the recurring half-cycle grid.
   g_photons_wave_level = HIGH;
-  digitalWriteFast(LASER_GATE_PIN, HIGH);
+  digitalWriteFast(LASER_MOD_PIN, HIGH);
 
   g_photons_wave_cycle_ns = requested_cycle_ns;
   g_photons_wave_half_cycle_ns = half_cycle_ns;
@@ -5976,7 +5868,7 @@ static FLASHMEM Payload cmd_wave_on(const Payload& args) {
     g_photons_wave_cycle_ns = 0ULL;
     g_photons_wave_half_cycle_ns = 0ULL;
     g_photons_wave_level = LOW;
-    digitalWriteFast(LASER_GATE_PIN, LOW);
+    digitalWriteFast(LASER_MOD_PIN, LOW);
     Payload p;
     p.add("status", "wave_on_rejected_timer_unavailable");
     return p;
@@ -5987,7 +5879,7 @@ static FLASHMEM Payload cmd_wave_on(const Payload& args) {
   p.add("cycle_ns", requested_cycle_ns);
   p.add("half_cycle_ns", half_cycle_ns);
   p.add("duty_percent", (uint32_t)50U);
-  p.add("output_pin", (uint32_t)LASER_GATE_PIN);
+  p.add("output_pin", (uint32_t)LASER_MOD_PIN);
   p.add("output_level", HIGH);
   return p;
 }
@@ -6001,14 +5893,14 @@ static FLASHMEM Payload cmd_wave_off(const Payload& /*args*/) {
   const bool was_running = g_photons_wave_timer != TIMEPOP_INVALID_HANDLE;
   photons_wave_cancel();
   g_photons_wave_level = LOW;
-  digitalWriteFast(LASER_GATE_PIN, LOW);
+  digitalWriteFast(LASER_MOD_PIN, LOW);
 
   Payload p;
   p.add("status", "wave_stopped");
   p.add("was_running", was_running);
   p.add("previous_cycle_ns", previous_cycle_ns);
   p.add("previous_half_cycle_ns", previous_half_cycle_ns);
-  p.add("output_pin", (uint32_t)LASER_GATE_PIN);
+  p.add("output_pin", (uint32_t)LASER_MOD_PIN);
   p.add("output_level", LOW);
   return p;
 }
@@ -6029,19 +5921,12 @@ static FLASHMEM Payload cmd_pulse(const Payload& args) {
     return p;
   }
 
-  // LD_ON owns source preparation. PULSE never cycles LD_ON during a normal shot.
+  // Manual PULSE owns one active-high MOD excursion from the LOW/idle state.
   if (!g_initialized) __builtin_trap();
-  if (digitalRead(LASER_GATE_PIN) != HIGH) {
-    // Continuous ON is now a legal state, not an output-integrity violation.
+  if (digitalRead(LASER_MOD_PIN) != LOW) {
     Payload p;
-    p.add("status", "pulse_rejected_gate_open");
+    p.add("status", "pulse_rejected_mod_not_idle");
     p.add("error", "Run PHOTONS.OFF before PULSE");
-    return p;
-  }
-  if (digitalRead(LD_ON_PIN) != HIGH) {
-    Payload p;
-    p.add("status", "pulse_rejected_source_disabled");
-    p.add("error", "Run PHOTONS.LD_ON before PULSE");
     return p;
   }
 
@@ -6062,7 +5947,7 @@ static FLASHMEM Payload cmd_pulse(const Payload& args) {
   }
 
   // Ballpark scope timing uses the current CPU/DWT rate; GNSS lock is not a
-  // prerequisite. All conversion is complete before opening the active-low gate.
+  // prerequisite. All conversion is complete before driving active-high MOD.
   const uint32_t dwt_cycles_per_second = F_CPU_ACTUAL;
   if (dwt_cycles_per_second == 0U) __builtin_trap();
   const photons_pulse_width_t width =
@@ -6102,24 +5987,22 @@ static FLASHMEM Payload cmd_pulse(const Payload& args) {
   photons_memory_barrier();
 
   const uint32_t start_dwt = ARM_DWT_CYCCNT;
-  digitalWriteFast(LASER_GATE_PIN, LOW);
-  const uint32_t low_start = ARM_DWT_CYCCNT;
+  digitalWriteFast(LASER_MOD_PIN, HIGH);
+  const uint32_t high_start = ARM_DWT_CYCCNT;
   if (width.whole_seconds == 0ULL) {
     // Keep the usual 20-100 ns path to a 32-bit DWT poll. IRQs stay enabled;
-    // loop/write overhead and interruptions may extend the physical LOW time.
-    while ((uint32_t)(ARM_DWT_CYCCNT - low_start) < width.tail_cycles) {
+    // loop/write overhead and interruptions may extend the physical HIGH time.
+    while ((uint32_t)(ARM_DWT_CYCCNT - high_start) < width.tail_cycles) {
     }
   } else {
-    photons_pulse_wait_long(width, dwt_cycles_per_second, low_start);
+    photons_pulse_wait_long(width, dwt_cycles_per_second, high_start);
   }
-  digitalWriteFast(LASER_GATE_PIN, HIGH);
+  digitalWriteFast(LASER_MOD_PIN, LOW);
   const uint32_t end_dwt = ARM_DWT_CYCCNT;
   const uint32_t pulse_wall_cycles = end_dwt - start_dwt;
-  // Close before any report construction or further foreground work. A broken
-  // output invariant removes the source as well before entering forensics.
-  if (digitalRead(LASER_GATE_PIN) != HIGH ||
-      digitalRead(LD_ON_PIN) != HIGH) {
-    photons_laser_hard_inhibit();
+  // Return to LOW/idle before any report construction or further foreground work.
+  if (digitalRead(LASER_MOD_PIN) != LOW) {
+    photons_laser_mod_idle();
     __builtin_trap();
   }
 
@@ -6145,82 +6028,13 @@ static FLASHMEM Payload cmd_pulse(const Payload& args) {
   p.add("pulse_wall_cycles_semantics", "WRITE_BRACKET_MODULO_2_32");
   p.add("pulse_start_dwt", start_dwt);
   p.add("pulse_end_dwt", end_dwt);
-  p.add("pulse_launch_surrogate", "GATE_LOW_WRITE");
-  p.add("laser_gate_level", HIGH);
-  p.add("ld_on_level", HIGH);
+  p.add("pulse_launch_surrogate", "MOD_HIGH_WRITE");
+  p.add("laser_mod_level", LOW);
+  p.add("laser_mod_active_high", true);
   p.add("previous_receive_pending", previous_receive_pending);
   if (previous_receive_pending) {
     p.add("overwritten_pending_sequence", previous_armed_sequence);
   }
-  return p;
-}
-
-static FLASHMEM Payload cmd_ld_on(const Payload& /*args*/) {
-  const photons_foreground_custody_t custody(
-      photons_foreground_owner_t::COMMAND);
-  if (g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE) {
-    Payload p;
-    p.add("status", "ld_on_rejected_race_engine_active");
-    return p;
-  }
-
-  // Source preparation always closes the gate, including repeated LD_ON calls.
-  g_pulse_armed_sequence = 0U;
-  photons_memory_barrier();
-  photons_laser_coarse_source_enable_behind_closed_gate();
-  const photons_device_snapshot_t device = photons_device_snapshot();
-  if (!device.laser_enabled || digitalRead(LASER_GATE_PIN) != HIGH) {
-    photons_laser_hard_inhibit();
-    __builtin_trap();
-  }
-
-  Payload p;
-  p.add("status", "coarse_source_enabled_gate_closed");
-  p.add("laser_gate_level", HIGH);
-  p.add("ld_on_level", HIGH);
-  p.add("coarse_source_enabled", true);
-  p.add("coarse_source_boot_enabled", false);
-  p.add("gate_active_low", true);
-  p.add("gate_inhibited", true);
-  p.add("laser_id1_raw", device.laser_id1_raw);
-  p.add("laser_id1_current_ma",
-        toFixedDecimal(device.laser_id1_current_ma, 3));
-  p.add("laser_monitor_v", toFixedDecimal(device.laser_monitor_v, 6));
-  p.add("laser_emitting", device.laser_emitting);
-  return p;
-}
-
-static FLASHMEM Payload cmd_ld_off(const Payload& /*args*/) {
-  const photons_foreground_custody_t custody(
-      photons_foreground_owner_t::COMMAND);
-  if (g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE) {
-    Payload p;
-    p.add("status", "ld_off_rejected_race_engine_active");
-    return p;
-  }
-
-  // Full shutdown: close the gate first, then remove coarse-source enable.
-  g_pulse_armed_sequence = 0U;
-  photons_memory_barrier();
-  photons_laser_coarse_source_disable();
-  const photons_device_snapshot_t device = photons_device_snapshot();
-  if (device.laser_enabled || digitalRead(LASER_GATE_PIN) != HIGH) {
-    __builtin_trap();
-  }
-
-  Payload p;
-  p.add("status", "coarse_source_disabled_gate_closed");
-  p.add("laser_gate_level", HIGH);
-  p.add("ld_on_level", LOW);
-  p.add("coarse_source_enabled", false);
-  p.add("coarse_source_boot_enabled", false);
-  p.add("gate_active_low", true);
-  p.add("gate_inhibited", true);
-  p.add("laser_id1_raw", device.laser_id1_raw);
-  p.add("laser_id1_current_ma",
-        toFixedDecimal(device.laser_id1_current_ma, 3));
-  p.add("laser_monitor_v", toFixedDecimal(device.laser_monitor_v, 6));
-  p.add("laser_emitting", device.laser_emitting);
   return p;
 }
 
@@ -6239,31 +6053,21 @@ static FLASHMEM Payload cmd_on(const Payload& /*args*/) {
     return p;
   }
   if (!g_initialized) __builtin_trap();
-  if (digitalRead(LD_ON_PIN) != HIGH) {
-    Payload p;
-    p.add("status", "on_rejected_source_disabled");
-    p.add("error", "Run PHOTONS.LD_ON before ON");
-    return p;
-  }
 
-  // Continuous gate opening returns foreground control immediately. No receive
-  // arm is created, and an unanswered manual shot must not claim an ON edge.
   g_pulse_armed_sequence = 0U;
   photons_memory_barrier();
-  digitalWrite(LASER_GATE_PIN, LOW);
-  if (digitalRead(LASER_GATE_PIN) != LOW ||
-      digitalRead(LD_ON_PIN) != HIGH) {
-    photons_laser_hard_inhibit();
+  g_photons_wave_level = HIGH;
+  digitalWriteFast(LASER_MOD_PIN, HIGH);
+  if (digitalRead(LASER_MOD_PIN) != HIGH) {
+    photons_laser_mod_idle();
     __builtin_trap();
   }
 
   Payload p;
-  p.add("status", "gate_open");
-  p.add("laser_gate_level", LOW);
-  p.add("ld_on_level", HIGH);
-  p.add("coarse_source_enabled", true);
-  p.add("gate_active_low", true);
-  p.add("gate_inhibited", false);
+  p.add("status", "modulation_on");
+  p.add("laser_mod_level", HIGH);
+  p.add("laser_mod_active_high", true);
+  p.add("driver_bias_controlled_by_firmware", false);
   return p;
 }
 
@@ -6276,23 +6080,17 @@ static FLASHMEM Payload cmd_off(const Payload& /*args*/) {
     return p;
   }
   if (!g_initialized) __builtin_trap();
-  const int source_level = digitalRead(LD_ON_PIN);
+
   g_pulse_armed_sequence = 0U;
   photons_memory_barrier();
-  photons_laser_gate_close();
-  if (digitalRead(LASER_GATE_PIN) != HIGH ||
-      digitalRead(LD_ON_PIN) != source_level) {
-    photons_laser_hard_inhibit();
-    __builtin_trap();
-  }
+  photons_laser_mod_idle();
+  if (digitalRead(LASER_MOD_PIN) != LOW) __builtin_trap();
 
   Payload p;
-  p.add("status", "gate_closed");
-  p.add("laser_gate_level", HIGH);
-  p.add("ld_on_level", source_level);
-  p.add("coarse_source_enabled", source_level == HIGH);
-  p.add("gate_active_low", true);
-  p.add("gate_inhibited", true);
+  p.add("status", "modulation_off");
+  p.add("laser_mod_level", LOW);
+  p.add("laser_mod_active_high", true);
+  p.add("driver_bias_controlled_by_firmware", false);
   return p;
 }
 
@@ -6326,8 +6124,6 @@ static const process_command_entry_t PHOTONS_COMMANDS[] = {
   { "WAVEON",              cmd_wave_on             },
   { "WAVEOFF",             cmd_wave_off            },
   { "PULSE",               cmd_pulse               },
-  { "LD_ON",               cmd_ld_on               },
-  { "LD_OFF",              cmd_ld_off              },
   { "ON",                  cmd_on                  },
   { "OFF",                 cmd_off                 },
   { nullptr, nullptr }

@@ -6606,13 +6606,13 @@ FLASHMEM static void qtimer1_init_ch2_scheduler(void) {
 // or application subsystems can become active.  This is boot-only custody;
 // the owning subsystem assumes operational control later.
 //
-// LASER_GATE_PIN is the first active-low output in ZPNet: LOW permits the
-// LANTERN SDM to pass ID1 current to LD+, while HIGH inhibits the laser.
-// Preload HIGH while the pad is still an input, then enable output drive so
-// firmware never deliberately authors a LOW pulse during the mode transition.
+// LASER_MOD_PIN drives the non-inverting TC4427 MDM -> DRV200 MOD path.
+// LOW is the electrically idle/no-modulation state; HIGH adds modulation current.
+// Preload LOW while the pad is still an input, then enable output drive so
+// earliest boot custody never deliberately authors a positive MOD pulse.
 FLASHMEM void process_interrupt_init_safe_outputs(void) {
-  digitalWrite(LASER_GATE_PIN, HIGH);
-  pinMode(LASER_GATE_PIN, OUTPUT);
+  digitalWrite(LASER_MOD_PIN, LOW);
+  pinMode(LASER_MOD_PIN, OUTPUT);
 }
 
 FLASHMEM void process_interrupt_init_hardware(void) {
