@@ -4429,17 +4429,26 @@ def _timebase_silence_recovery(reason: str, details: Dict[str, Any]) -> None:
                     )
                     time.sleep(float(AUTO_RECOVERY_RETRY_DELAY_S))
                     continue
-                except Exception:
+                except Exception as exc:
                     if _hard_failure_active():
                         return
                     _diag["auto_recovery_failures"] = _diag.get("auto_recovery_failures", 0) + 1
                     logging.exception(
-                        "💥 [clocks] CLOCKS_FRAGMENT silence recovery failed — "
-                        "will retry after %.0fs",
-                        TEENSY_HEALTH_RETRY_S,
+                        "💥 [clocks] CLOCKS_FRAGMENT silence recovery failed unexpectedly — "
+                        "latching HARD_FAILURE without further producer commands"
                     )
-                    time.sleep(TEENSY_HEALTH_RETRY_S)
-                    continue
+                    _enter_hard_failure(
+                        "timebase_silence_recovery_unproved",
+                        {
+                            "error": str(exc),
+                            "exception_type": type(exc).__name__,
+                            "attempts": int(attempts),
+                            "trigger_reason": reason,
+                            "trigger_details": copy.deepcopy(details),
+                        },
+                        source="TIMEBASE_SILENCE_RECOVERY",
+                    )
+                    return
 
             time.sleep(TEENSY_HEALTH_RETRY_S)
     finally:
@@ -6836,14 +6845,16 @@ def _supersede_dead_producer_restore_rows(
     campaign_name: str,
     first_public_count: int,
 ) -> Dict[str, Any]:
-    """Mark pre-restore fresh-boot rows non-viable without deleting evidence.
+    """Exclude intervening rows that do not already carry restore exclusion.
 
     The first recovered campaign row has already passed through canonical CLOCKS
     persistence before the recovery processor signals it.  Every TEMPEST row
-    inserted after the durable recovery source but before that row belongs to
-    the superseded fresh-boot instrument and must never participate in a later
-    Holistic Restore replay. ``viable`` remains campaign-science semantics; the
-    explicit payload marker is the instrument-restore exclusion authority.
+    inserted after the durable recovery source but before that row must be
+    excluded from later Holistic Restore replay. Live recovery may already have
+    quarantined hours of surviving-producer observations in that interval.
+    Their explicit payload marker already denies restore authority: preserve
+    those rows, including their original science viability and custody evidence.
+    Only previously unclassified rows need the cold-bootstrap exclusion update.
     """
     base_detail_id = int(base_detail_id)
     first_public_count = int(first_public_count)
@@ -6886,6 +6897,7 @@ def _supersede_dead_producer_restore_rows(
                 WHERE campaign_type = %s
                   AND id > %s
                   AND id < %s
+                  AND NOT (payload @> '{"holistic_restore_superseded":true}'::jsonb)
                 """,
                 (
                     recovered_detail_id,
@@ -9460,6 +9472,49 @@ def _rearm_surviving_clocks_campaign(
 
 
 def _adopt_surviving_clocks_producer(
+    *,
+    snapshot_detail: Dict[str, Any],
+    active_campaign: Optional[Dict[str, Any]],
+    instrument_verdict: _HolisticInstrumentVerdict,
+) -> Dict[str, Any]:
+    """Keep every live-adoption failure outside firmware RECOVER cleanup."""
+    global _campaign_active
+
+    try:
+        return _adopt_surviving_clocks_producer_pi_state(
+            snapshot_detail=snapshot_detail,
+            active_campaign=active_campaign,
+            instrument_verdict=instrument_verdict,
+        )
+    except HardFailureRequired:
+        raise
+    except Exception as exc:
+        # Adoption did not open a firmware RECOVER/PPB_RESTORE transaction.
+        # Its failure therefore owns only Pi cleanup. RECOVER_ABORT would stop
+        # the surviving Beta that this path is expressly forbidden to mutate.
+        _campaign_active = False
+        _clear_sync_wait()
+        failure = {
+            "error": str(exc),
+            "exception_type": type(exc).__name__,
+            "campaign": active_campaign.get("campaign") if active_campaign else None,
+            "snapshot_detail_id": snapshot_detail.get("_db_detail_id"),
+        }
+        if isinstance(exc, RecoveryRetryableFailure):
+            failure["reason"] = exc.reason
+            failure["details"] = copy.deepcopy(exc.details)
+        logging.exception(
+            "💥 [clocks] surviving-producer adoption failed — preserving Teensy "
+            "state and latching Pi HARD_FAILURE"
+        )
+        _require_hard_failure(
+            "live_producer_adoption_unproved",
+            failure,
+            source="LIVE_PRODUCER_ADOPT",
+        )
+
+
+def _adopt_surviving_clocks_producer_pi_state(
     *,
     snapshot_detail: Dict[str, Any],
     active_campaign: Optional[Dict[str, Any]],
