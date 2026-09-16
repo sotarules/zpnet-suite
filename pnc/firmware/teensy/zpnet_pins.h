@@ -209,6 +209,10 @@ Notes:
   decisions.
 • MON is the blue-pot comparator-threshold monitor and is not connected to the
   Teensy in the current architecture.
+• Commissioned PD200T comparator threshold (2026-09-16): MON ≈0.950 V.
+• With the commissioned optical/driver settings, TTL OUT reliably responds to
+  PHOTONS pulses down through the original 20 ns command-width design target at
+  a 100 ms test interval.
 • PHOTODIODE_ANALOG_IN is telemetry only and is never a timing endpoint.
 =============================================================================*/
 
@@ -278,11 +282,28 @@ LD-          DRV200 LD- -> laser black                    Floating laser return;
 IMON         DRV200 terminal                              100 mV per mA on A-40; commissioning telemetry
 
 -------------------------------------------------------------------------------
+Commissioned DRV200 Settings (2026-09-16)
+-------------------------------------------------------------------------------
+DC bias        PHOTONS.OFF: IMON ≈0.897 V = 8.97 mA.
+Static ON      PHOTONS.ON:  IMON ≈1.066 V = 10.66 mA.
+MOD delta      ≈0.169 V IMON = 1.69 mA measured current increase.
+MODGAIN        M.  On DRV200-A-40 this is 2 mA/V.
+ILIM           L.  On DRV200-A-40 this limits current to 32 mA.
+               H would raise the limit to 48 mA; L is intentionally retained.
+VCC jumper     5 V.
+MOD drive      Measured HIGH ≈0.862 V at the loaded MOD input; LOW ≈0.008-0.010 V.
+               At MODGAIN=M, predicted HIGH current addition is ≈1.72 mA,
+               closely matching the measured ≈1.69 mA IMON delta.
+
+-------------------------------------------------------------------------------
 Notes:
 • Pin 35 is no longer an active-low gate. LOW means zero added modulation; HIGH
   applies positive DRV200 modulation through the non-inverting TC4427 MDM.
 • DRV200 bias current and the hardware ON/OFF switch are local driver controls;
   Teensy pin 35 does not enable or remove the DC bias current.
+• IMON is a DC/low-frequency monitor.  A sparse 20 ns WAVE pulse every 100 ms
+  does not materially change a DMM IMON reading; use static PHOTONS.ON/OFF when
+  verifying the modulation-current delta.
 • The retired EV5491/MP5491 I2C controller and MOSFET daughterboard are removed.
 • Teensy pin 30 (former EV5491 EN / LD_ON) is free.
 • The DRV200 has no ZPNet I2C connection.
