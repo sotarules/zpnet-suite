@@ -16,10 +16,19 @@
 //     DWT-at-edge custody.
 //   • PHOTONS consumes those edge facts and publishes PHOTONS_FRAGMENT.
 //   • all non-ISR PHOTONS mutation has one foreground owner at a time: the
-//     1 kHz race cadence, 1 Hz fragment transaction, one RPC command, or the
-//     commissioning WAVE pulse callback. These ownership classes may never nest;
+//     ordinary-loop service, deferred race relaunch, 1 Hz fragment transaction,
+//     one RPC command, or commissioning WAVE callback. These owners may never nest;
 //     illegal overlap is a system-integrity fault rather than a recoverable busy
 //     condition.
+//   • continuation alone writes each completed-race batch; foreground merges
+//     the immutable publication and acknowledges it before another launch.
+//     Only foreground writes/resets the separate fragment accumulator.
+//   • continuation alone writes the boot-lifetime histogram, including origin
+//     installation and seed replay. Foreground infers the origin from a completed
+//     immutable seed set and returns it through a one-shot SPSC handoff.
+//   • reports use producer-published typed snapshots. Foreground holds a slot
+//     until its next acquisition; producer cannot reuse that slot while held.
+//     Payload workspace is separate byte storage, never a snapshot overlay.
 //
 // PHOTONS_FRAGMENT is the canonical once-per-second optical instrument heartbeat.
 // It remains lawful and continuous when the race engine is inactive or a second
@@ -32,19 +41,23 @@
 //
 // LANTERN V1.0 autonomous race engine:
 //   • one 200 ns DRV200 MOD pulse primes the instrument; thereafter a real PD200T
-//     return ends race N and the Priority-32 continuation authors race N+1;
+//     return ends race N; foreground TimePop ALAP authors race N+1 after the
+//     minimum 2 us post-classification holdoff and completed-batch consumption;
 //   • the Priority-48 physical ISR captures only immutable DWT/arrival testimony;
 //     no laser write, GNSS projection, floating point, Payload work, or Welford
 //     mutation occurs in the detector ISR;
 //   • Priority-32 continuation performs only bounded physical continuation:
-//     finish previous raw flight, classify delay testimony, author MOD HIGH,
-//     capture the actual launch DWT, hold ~200 ns, return MOD LOW;
+//     finish the raw flight, classify delay testimony, update the live histogram,
+//     and publish its completed batch and any requested histogram snapshot;
+//   • foreground relaunch owns MOD HIGH, the actual launch DWT, the ~200 ns
+//     HIGH wait, and MOD LOW; scheduler mutation never occurs in continuation;
 //   • three mutually close clean flights establish the initial fast-path lineage;
 //     later long/right-tail flights and interrupt-delayed endpoints are rejected
 //     without moving the reference;
-//   • accepted/rejected flights accumulate integer sufficient statistics at race
-//     rate; 1 Hz foreground work performs GNSS scaling, Welford/statistics,
-//     operator-baseline residuals, Better-Buckets, and PHOTONS_FRAGMENT publication;
+//   • accepted/rejected integer sufficient statistics pass through an SPSC
+//     mailbox at race rate; 1 Hz foreground work performs GNSS scaling,
+//     Welford/statistics, operator-baseline residuals, Better-Buckets, and
+//     PHOTONS_FRAGMENT publication;
 //   • there is no recurring TimePop race cadence and no synthetic/emulated flight.
 //
 // Commands:
@@ -99,6 +112,13 @@
 //                           shot replaces the prior report; rejections preserve it.
 //   • REPORT_PHOTONS      — compact always-on instrument + current CAMP report
 //   • REPORT_STATS        — detailed statistical/court/Better-Buckets report
+//   • REPORT_HISTOGRAM    — boot-lifetime raw-cycle histogram: 64 one-cycle bins
+//                           per population, with midpoint inferred from 65 seeds.
+//                           Returns the latest completed SPSC snapshot and requests
+//                           a refresh; the 1 Hz fragment also requests refreshes.
+//                           A request is fulfilled on the next completed race.
+//                           Includes snapshot_sequence and raw snapshot_dwt;
+//                           campaigns and STATS_RESET preserve acquisition/bins.
 //   • STATS_RESET         — reset the always-on statistical epoch without changing CAMP custody
 //   • PPB_EXPORT_META     — read-only live Better-Buckets ring identity for Pi custody reacquisition
 //   • PPB_EXPORT_CHUNK    — page immutable live SECOND/MINUTE endpoints without freezing PHOTONS
@@ -601,8 +621,9 @@ struct photons_fragment_snapshot_t {
 // Must run after process_interrupt_init() and timepop_init().
 void process_photons_init(void);
 
-// Ordinary-loop bridge: queue a TimePop ALAP launch after the minimum
-// post-race holdoff. No scheduler mutation occurs in optical continuation.
+// Ordinary-loop foreground owner: infer a histogram origin from published seeds,
+// consume the completed-race batch, then queue a TimePop ALAP launch after the
+// minimum post-race holdoff. No scheduler mutation occurs in continuation.
 void process_photons_foreground_service(void);
 
 // Register the PHOTONS process command surface.

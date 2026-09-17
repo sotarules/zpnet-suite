@@ -172,7 +172,14 @@ struct photons_race_runtime_t {
 };
 
 static photons_race_runtime_t g_photons_race{};
+// Continuation alone writes this completed-race mailbox. A new launch is
+// forbidden until foreground has merged it and released its generation.
 static photons_race_batch_t g_photons_race_batch{};
+static uint32_t g_photons_race_batch_published = 0U; // continuation writer
+static uint32_t g_photons_race_batch_consumed = 0U;  // foreground writer
+static photons_race_batch_t g_photons_foreground_batch{};
+static_assert(__atomic_always_lock_free(sizeof(uint32_t), nullptr),
+              "PHOTONS handoff words must be lock-free");
 // Foreground-owned; optical continuation never mutates the scheduler.
 static timepop_handle_t g_photons_relaunch_handle = TIMEPOP_INVALID_HANDLE;
 
@@ -202,12 +209,14 @@ static inline void photons_memory_barrier(void) {
 // dispatch refactor must not make two PHOTONS mutation transactions legal.
 //
 // The owner court therefore makes the architectural rule executable:
-//   * RACE_CADENCE owns one complete 1 kHz launch/finalize transaction;
+//   * RACE_CADENCE owns one deferred race relaunch transaction;
 //   * FRAGMENT owns drain -> snapshot -> Payload render -> synchronous publish
 //     -> post-publish commit as one indivisible foreground transaction;
 //   * COMMAND owns every PHOTONS RPC handler from entry through returned Payload
 //     construction;
-//   * WAVE owns each commissioning pulse callback, including its HIGH wait.
+//   * WAVE owns each commissioning pulse callback, including its HIGH wait;
+//   * FOREGROUND_SERVICE owns completed-race consumption, histogram origin
+//     inference, and scheduling the next relaunch.
 //
 // ISR code never touches this owner.  Its only cross-context communication is
 // through the dedicated one-writer arm scalars / generation mailboxes below.
@@ -217,6 +226,7 @@ enum class photons_foreground_owner_t : uint8_t {
   FRAGMENT = 2U,
   COMMAND = 3U,
   WAVE = 4U,
+  FOREGROUND_SERVICE = 5U,
 };
 
 // The ownership court must be stronger than the scheduler assumption it is
@@ -1869,11 +1879,60 @@ static void photons_lap_science_projected_candidate(
 static inline uint32_t photons_priority32_guard_enter(void);
 static inline void photons_priority32_guard_exit(uint32_t prior);
 
+static void photons_batch_add_checked(uint64_t& total, uint64_t value) {
+  if (value > UINT64_MAX - total) __builtin_trap();
+  total += value;
+}
+
+// Exactly one unconsumed completion is possible: only foreground launches the
+// next race. Sequence subtraction is intentionally modulo 2^32, including wrap.
+static void photons_race_batch_consume(void) {
+  const uint32_t owner =
+      __atomic_load_n(&g_photons_foreground_owner, __ATOMIC_ACQUIRE);
+  if (owner != (uint32_t)photons_foreground_owner_t::FOREGROUND_SERVICE &&
+      owner != (uint32_t)photons_foreground_owner_t::FRAGMENT) {
+    __builtin_trap();
+  }
+  const uint32_t published =
+      __atomic_load_n(&g_photons_race_batch_published, __ATOMIC_ACQUIRE);
+  const uint32_t consumed =
+      __atomic_load_n(&g_photons_race_batch_consumed, __ATOMIC_RELAXED);
+  if (published == consumed) return;
+  if ((uint32_t)(published - consumed) != 1U) __builtin_trap();
+
+  const auto& source = g_photons_race_batch;
+  auto& total = g_photons_foreground_batch;
+  if (source.accepted_count != 0ULL) {
+    if (total.accepted_count == 0ULL ||
+        source.accepted_min_cycles < total.accepted_min_cycles)
+      total.accepted_min_cycles = source.accepted_min_cycles;
+    if (source.accepted_max_cycles > total.accepted_max_cycles)
+      total.accepted_max_cycles = source.accepted_max_cycles;
+  }
+  if (source.rejected_count != 0ULL) {
+    if (total.rejected_count == 0ULL ||
+        source.rejected_min_cycles < total.rejected_min_cycles)
+      total.rejected_min_cycles = source.rejected_min_cycles;
+    if (source.rejected_max_cycles > total.rejected_max_cycles)
+      total.rejected_max_cycles = source.rejected_max_cycles;
+  }
+  photons_batch_add_checked(total.accepted_count, source.accepted_count);
+  photons_batch_add_checked(total.accepted_sum_cycles, source.accepted_sum_cycles);
+  photons_batch_add_checked(total.accepted_sumsq_cycles, source.accepted_sumsq_cycles);
+  photons_batch_add_checked(total.rejected_count, source.rejected_count);
+  photons_batch_add_checked(total.rejected_sum_cycles, source.rejected_sum_cycles);
+  photons_batch_add_checked(total.rejected_sumsq_cycles, source.rejected_sumsq_cycles);
+  photons_batch_add_checked(total.rejected_isr_delay, source.rejected_isr_delay);
+  photons_batch_add_checked(total.rejected_excursion, source.rejected_excursion);
+  // Release only after the last read. The producer may now reuse its mailbox.
+  __atomic_store_n(&g_photons_race_batch_consumed, published, __ATOMIC_RELEASE);
+}
+
 static photons_race_batch_t photons_race_batch_take(void) {
-  const uint32_t prior = photons_priority32_guard_enter();
-  const photons_race_batch_t out = g_photons_race_batch;
-  g_photons_race_batch = photons_race_batch_t{};
-  photons_priority32_guard_exit(prior);
+  photons_foreground_owner_assert(photons_foreground_owner_t::FRAGMENT);
+  photons_race_batch_consume();
+  const photons_race_batch_t out = g_photons_foreground_batch;
+  g_photons_foreground_batch = photons_race_batch_t{};
   return out;
 }
 
@@ -2222,6 +2281,231 @@ static inline void photons_priority32_guard_exit(uint32_t prior) {
   __asm__ volatile ("msr basepri, %0" :: "r" (prior) : "memory");
 }
 
+// Always-on raw-cycle histogram. Its lifetime is the firmware boot, independent
+// of campaigns and STATS_RESET. Continuation is its ONLY writer, including the
+// origin commit and seed replay. Foreground receives immutable seeds, returns
+// the inferred origin, and reads separately published report snapshots.
+static constexpr uint32_t PHOTONS_HISTOGRAM_BINS = 64U;
+static constexpr uint32_t PHOTONS_HISTOGRAM_SEEDS = 65U;
+struct photons_histogram_population_t {
+  uint64_t bins[PHOTONS_HISTOGRAM_BINS]{};
+  uint64_t underflow = 0ULL;
+  uint64_t overflow = 0ULL;
+  uint64_t acquisition_unbinned = 0ULL;
+};
+struct photons_histogram_t {
+  uint32_t seed_count = 0U;
+  uint32_t seeds[PHOTONS_HISTOGRAM_SEEDS]{};
+  uint32_t origin_cycles = 0U; // zero denotes acquisition; lawful origin is positive
+  uint64_t warmup_returns = 0ULL;
+  photons_histogram_population_t unattributed{};
+  photons_histogram_population_t delayed{};
+};
+static photons_histogram_t g_photons_histogram{};
+
+// One-shot SPSC exchange. Once published, seeds are immutable for this boot.
+static uint32_t g_photons_histogram_seeds_published = 0U; // continuation writer
+static uint32_t g_photons_histogram_origin_request = 0U; // foreground writer
+
+struct photons_histogram_snapshot_t {
+  uint32_t seed_count = 0U;
+  uint32_t origin_cycles = 0U;
+  uint32_t sequence = 0U;
+  uint32_t dwt = 0U;
+  uint64_t warmup_returns = 0ULL;
+  photons_histogram_population_t unattributed{};
+  photons_histogram_population_t delayed{};
+};
+struct alignas(PHOTONS_RAM2_CACHE_LINE_BYTES) photons_histogram_slot_t {
+  photons_histogram_snapshot_t value{};
+};
+static photons_histogram_slot_t g_photons_histogram_slots[2] DMAMEM;
+static_assert(sizeof(g_photons_histogram_slots) == 2240U,
+              "Review the histogram snapshot RAM2 budget after layout changes");
+static uint32_t g_photons_histogram_snapshot_published = 0U; // producer writer
+static uint32_t g_photons_histogram_snapshot_consumed = 0U;  // consumer writer
+static uint32_t g_photons_histogram_snapshot_requested = 1U; // consumer writer
+
+// Dedicated byte stores belong only to COMMAND custody. Payload objects remain
+// ordinary scoped objects; no object storage is overlaid or reinterpreted.
+struct alignas(PHOTONS_RAM2_CACHE_LINE_BYTES) photons_histogram_report_store_t {
+  alignas(PHOTONS_RAM2_CACHE_LINE_BYTES) uint8_t root[6144];
+  alignas(PHOTONS_RAM2_CACHE_LINE_BYTES) uint8_t population[2048];
+  alignas(PHOTONS_RAM2_CACHE_LINE_BYTES) uint8_t bins[2304];
+};
+static photons_histogram_report_store_t g_photons_histogram_report_store DMAMEM;
+static_assert(sizeof(photons_histogram_report_store_t) == 10496U,
+              "Review the histogram report RAM2 budget after layout changes");
+
+static void photons_histogram_initialize_handoffs(void) {
+  // RAM2 is NOLOAD. Construct lawful empty snapshot values explicitly before
+  // registering the detector callback; only continuation writes slots afterward.
+  g_photons_histogram_slots[0].value = photons_histogram_snapshot_t{};
+  g_photons_histogram_slots[1].value = photons_histogram_snapshot_t{};
+}
+
+static void photons_histogram_publish_snapshot(void) {
+  const uint32_t published =
+      __atomic_load_n(&g_photons_histogram_snapshot_published, __ATOMIC_RELAXED);
+  const uint32_t requested =
+      __atomic_load_n(&g_photons_histogram_snapshot_requested, __ATOMIC_ACQUIRE);
+  if (requested == published) return;
+  if ((uint32_t)(requested - published) != 1U) __builtin_trap();
+  if (__atomic_load_n(&g_photons_histogram_snapshot_consumed, __ATOMIC_ACQUIRE) !=
+      published) return; // previous publication is still held by foreground
+
+  const uint32_t next = published + 1U;
+  auto& out = g_photons_histogram_slots[next & 1U].value;
+  out.seed_count = g_photons_histogram.seed_count;
+  out.origin_cycles = g_photons_histogram.origin_cycles;
+  out.sequence = next;
+  out.dwt = ARM_DWT_CYCCNT;
+  out.warmup_returns = g_photons_histogram.warmup_returns;
+  out.unattributed = g_photons_histogram.unattributed;
+  out.delayed = g_photons_histogram.delayed;
+  __atomic_store_n(&g_photons_histogram_snapshot_published, next, __ATOMIC_RELEASE);
+}
+
+static const photons_histogram_snapshot_t& photons_histogram_snapshot_acquire(void) {
+  const uint32_t owner =
+      __atomic_load_n(&g_photons_foreground_owner, __ATOMIC_ACQUIRE);
+  if (owner != (uint32_t)photons_foreground_owner_t::FRAGMENT &&
+      owner != (uint32_t)photons_foreground_owner_t::COMMAND) {
+    __builtin_trap();
+  }
+  const uint32_t published =
+      __atomic_load_n(&g_photons_histogram_snapshot_published, __ATOMIC_ACQUIRE);
+  const uint32_t consumed =
+      __atomic_load_n(&g_photons_histogram_snapshot_consumed, __ATOMIC_RELAXED);
+  if ((uint32_t)(published - consumed) > 1U) __builtin_trap();
+  // Release the PREVIOUS slot. Producer may fill the other slot, but cannot
+  // reuse this one until a later serialized foreground transaction advances
+  // consumed again. Never call acquire twice while retaining an earlier view.
+  __atomic_store_n(&g_photons_histogram_snapshot_consumed, published, __ATOMIC_RELEASE);
+  __atomic_store_n(&g_photons_histogram_snapshot_requested, published + 1U,
+                   __ATOMIC_RELEASE);
+  return g_photons_histogram_slots[published & 1U].value;
+}
+
+static void photons_histogram_increment(uint64_t& count) {
+  if (++count == 0ULL) __builtin_trap();
+}
+
+static void photons_histogram_bin(photons_histogram_population_t& population,
+                                  uint32_t raw_cycles) {
+  const uint32_t origin = g_photons_histogram.origin_cycles;
+  if (raw_cycles < origin) photons_histogram_increment(population.underflow);
+  else if (raw_cycles - origin >= PHOTONS_HISTOGRAM_BINS)
+    photons_histogram_increment(population.overflow);
+  else photons_histogram_increment(population.bins[raw_cycles - origin]);
+}
+
+static void photons_histogram_observe(uint32_t raw_cycles, bool delayed,
+                                      bool warmup) {
+  if (warmup) {
+    photons_histogram_increment(g_photons_histogram.warmup_returns);
+    return;
+  }
+  auto& population = delayed ? g_photons_histogram.delayed
+                             : g_photons_histogram.unattributed;
+  if (g_photons_histogram.origin_cycles != 0U) {
+    photons_histogram_bin(population, raw_cycles);
+  } else if (!delayed &&
+             g_photons_histogram.seed_count < PHOTONS_HISTOGRAM_SEEDS) {
+    g_photons_histogram.seeds[g_photons_histogram.seed_count++] = raw_cycles;
+    if (g_photons_histogram.seed_count == PHOTONS_HISTOGRAM_SEEDS)
+      __atomic_store_n(&g_photons_histogram_seeds_published, 1U, __ATOMIC_RELEASE);
+  } else {
+    photons_histogram_increment(population.acquisition_unbinned);
+  }
+}
+
+// One-time median inference happens in foreground, never in the edge callback.
+// Acquire the completed immutable seed buffer; return only the inferred origin.
+// Any returns while inference runs remain counted as acquisition_unbinned.
+static void photons_histogram_acquire(void) {
+  photons_foreground_owner_assert(photons_foreground_owner_t::FOREGROUND_SERVICE);
+  if (__atomic_load_n(&g_photons_histogram_origin_request, __ATOMIC_RELAXED) != 0U)
+    return;
+  if (__atomic_load_n(&g_photons_histogram_seeds_published, __ATOMIC_ACQUIRE) == 0U)
+    return;
+  uint32_t ordered[PHOTONS_HISTOGRAM_SEEDS];
+  for (uint32_t i = 0U; i < PHOTONS_HISTOGRAM_SEEDS; ++i)
+    ordered[i] = g_photons_histogram.seeds[i];
+  for (uint32_t i = 1U; i < PHOTONS_HISTOGRAM_SEEDS; ++i) {
+    const uint32_t value = ordered[i];
+    uint32_t j = i;
+    while (j != 0U && ordered[j - 1U] > value) {
+      ordered[j] = ordered[j - 1U]; --j;
+    }
+    ordered[j] = value;
+  }
+  const uint32_t midpoint = ordered[PHOTONS_HISTOGRAM_SEEDS / 2U];
+  if (midpoint <= 32U || midpoint > UINT32_MAX - 31U) __builtin_trap();
+  __atomic_store_n(&g_photons_histogram_origin_request, midpoint - 32U,
+                   __ATOMIC_RELEASE);
+}
+
+// Called only by continuation before observing its next completed race.
+static void photons_histogram_commit_origin(void) {
+  if (g_photons_histogram.origin_cycles != 0U) return;
+  const uint32_t origin =
+      __atomic_load_n(&g_photons_histogram_origin_request, __ATOMIC_ACQUIRE);
+  if (origin == 0U) return;
+  if (g_photons_histogram.seed_count != PHOTONS_HISTOGRAM_SEEDS ||
+      origin > UINT32_MAX - (PHOTONS_HISTOGRAM_BINS - 1U)) __builtin_trap();
+  g_photons_histogram.origin_cycles = origin;
+  for (uint32_t i = 0U; i < PHOTONS_HISTOGRAM_SEEDS; ++i)
+    photons_histogram_bin(g_photons_histogram.unattributed,
+                          g_photons_histogram.seeds[i]);
+}
+
+static void photons_histogram_payload_population(
+    Payload& parent, const char* name,
+    const photons_histogram_population_t& population) {
+  photons_foreground_owner_assert(photons_foreground_owner_t::COMMAND);
+  auto& store = g_photons_histogram_report_store;
+  Payload p(Payload::StorageMode::FIXED, store.population, sizeof(store.population));
+  p.add("underflow", population.underflow);
+  p.add("overflow", population.overflow);
+  p.add("acquisition_unbinned", population.acquisition_unbinned);
+  Payload bins(Payload::StorageMode::FIXED, store.bins, sizeof(store.bins));
+  for (uint32_t i = 0U; i < PHOTONS_HISTOGRAM_BINS; ++i) {
+    char key[8];
+    snprintf(key, sizeof(key), "b%02u", (unsigned)i);
+    bins.add(key, population.bins[i]);
+  }
+  p.add_object("bins", bins);
+  parent.add_object(name, p);
+}
+
+static FLASHMEM Payload cmd_report_histogram(const Payload& /*args*/) {
+  const photons_foreground_custody_t custody(photons_foreground_owner_t::COMMAND);
+  const auto& h = photons_histogram_snapshot_acquire();
+  auto& store = g_photons_histogram_report_store;
+  Payload p(Payload::StorageMode::FIXED, store.root, sizeof(store.root));
+  p.add("schema", "PHOTONS_HISTOGRAM_V1");
+  p.add("scope", "FIRMWARE_BOOT");
+  p.add("snapshot_policy", "LATEST_COMPLETED_SPSC_PUBLICATION");
+  p.add("snapshot_sequence", h.sequence);
+  p.add("snapshot_dwt", h.dwt);
+  p.add("state", h.origin_cycles == 0U ? "ACQUIRING" : "ACCUMULATING");
+  p.add("bin_width_cycles", 1U);
+  p.add("bin_count", PHOTONS_HISTOGRAM_BINS);
+  p.add("seed_target", PHOTONS_HISTOGRAM_SEEDS);
+  p.add("seed_count", h.seed_count);
+  p.add("warmup_returns", h.warmup_returns);
+  if (h.origin_cycles != 0U) {
+    p.add("origin_cycles", h.origin_cycles);
+    p.add("midpoint_cycles", h.origin_cycles + 32U);
+  }
+  photons_histogram_payload_population(p, "unattributed", h.unattributed);
+  photons_histogram_payload_population(p, "delayed", h.delayed);
+  // Copy to an owning response before COMMAND custody releases the workspace.
+  // Explicit copy construction prevents NRVO from returning a borrowed store.
+  return Payload(p);
+}
+
 static photons_race_runtime_t photons_race_runtime_snapshot(void) {
   const uint32_t prior = photons_priority32_guard_enter();
   const photons_race_runtime_t out = g_photons_race;
@@ -2262,9 +2546,10 @@ static void photons_race_batch_note(bool accepted, uint32_t raw_cycles) {
   uint64_t& sumsq = accepted ? b.accepted_sumsq_cycles : b.rejected_sumsq_cycles;
   uint32_t& minv = accepted ? b.accepted_min_cycles : b.rejected_min_cycles;
   uint32_t& maxv = accepted ? b.accepted_max_cycles : b.rejected_max_cycles;
-  count++; sum += raw_cycles;
-  sumsq += (uint64_t)raw_cycles * (uint64_t)raw_cycles;
-  if (minv == 0U || raw_cycles < minv) minv = raw_cycles;
+  if (count == 0ULL || raw_cycles < minv) minv = raw_cycles;
+  photons_batch_add_checked(count, 1ULL);
+  photons_batch_add_checked(sum, raw_cycles);
+  photons_batch_add_checked(sumsq, (uint64_t)raw_cycles * (uint64_t)raw_cycles);
   if (raw_cycles > maxv) maxv = raw_cycles;
 }
 
@@ -2341,9 +2626,20 @@ static void photons_race_observe_edge(
     g_photons_race.holdoff_edges++;
     return;
   }
+  const uint32_t published =
+      __atomic_load_n(&g_photons_race_batch_published, __ATOMIC_RELAXED);
+  if (__atomic_load_n(&g_photons_race_batch_consumed, __ATOMIC_ACQUIRE) !=
+      published) __builtin_trap();
+  // Producer alone clears its slot, after foreground has released it. Warmup
+  // and reference-acquisition returns also publish a (possibly empty) batch.
+  g_photons_race_batch = photons_race_batch_t{};
   g_photons_race.primed = false;
   const uint32_t raw_cycles = edge.dwt_at_edge - g_photons_race.launch_dwt;
   g_photons_race.completed_count++;
+  photons_histogram_commit_origin();
+  photons_histogram_observe(raw_cycles,
+      edge.interrupt_delay.valid && edge.interrupt_delay.delayed,
+      !g_photons_race.first_return_seen);
 
   if (!g_photons_race.first_return_seen) {
     g_photons_race.first_return_seen = true;
@@ -2372,13 +2668,22 @@ static void photons_race_observe_edge(
     }
   }
 
-  // End this race. Only foreground TimePop dispatch may launch its successor.
+  photons_histogram_publish_snapshot();
+  __atomic_store_n(&g_photons_race_batch_published, published + 1U,
+                   __ATOMIC_RELEASE);
+  // End this race. Only foreground TimePop dispatch may launch its successor,
+  // after consuming the immutable completed batch above.
   g_photons_race.holdoff_started_dwt = ARM_DWT_CYCCNT;
 }
 
 static void photons_race_relaunch(timepop_ctx_t* ctx,
                                   timepop_diag_t*, void*) {
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::RACE_CADENCE);
   if (!ctx || ctx->handle != g_photons_relaunch_handle) __builtin_trap();
+  if (__atomic_load_n(&g_photons_race_batch_published, __ATOMIC_ACQUIRE) !=
+      __atomic_load_n(&g_photons_race_batch_consumed, __ATOMIC_RELAXED))
+    __builtin_trap();
   g_photons_relaunch_handle = TIMEPOP_INVALID_HANDLE;
   const uint32_t prior = photons_priority32_guard_enter();
   if (!g_photons_race.active || g_photons_race.primed ||
@@ -2408,15 +2713,26 @@ static void photons_race_relaunch(timepop_ctx_t* ctx,
   g_photons_race.holdoff_launches++;
 }
 
-void process_photons_foreground_service(void) {
-  if (g_photons_relaunch_handle != TIMEPOP_INVALID_HANDLE) return;
+static bool photons_relaunch_ready(void* /*user_data*/) {
+  if (g_photons_relaunch_handle != TIMEPOP_INVALID_HANDLE) return false;
   const uint32_t prior = photons_priority32_guard_enter();
   const bool ready = g_photons_race.active && !g_photons_race.primed &&
       (uint32_t)(ARM_DWT_CYCCNT - g_photons_race.holdoff_started_dwt) >=
           g_photons_race.holdoff_cycles;
   photons_priority32_guard_exit(prior);
-  if (!ready) return;
-  // One bounded check per ordinary loop pass; no spin and no recurring poll slot.
+  return ready;
+}
+
+void process_photons_foreground_service(void) {
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::FOREGROUND_SERVICE);
+  photons_histogram_acquire();
+  if (!photons_relaunch_ready(nullptr)) return;
+  // Check completion BEFORE consumption: a return can preempt this service.
+  // Once ready is true, no new race can complete until this foreground domain
+  // launches it, so the mailbox cannot change underneath this transaction.
+  photons_race_batch_consume();
+  // TimePop idle yields when this same readiness predicate becomes true.
   // ALAP executes after timed clients and cannot be quarantined as a missed CH2
   // deadline. It remains queued until foreground dispatch services it.
   g_photons_relaunch_handle = timepop_arm_alap(
@@ -2425,7 +2741,12 @@ void process_photons_foreground_service(void) {
 }
 
 static void photons_race_prepare(void) {
-  if (g_photons_relaunch_handle != TIMEPOP_INVALID_HANDLE) __builtin_trap();
+  if (g_photons_race.active ||
+      g_photons_relaunch_handle != TIMEPOP_INVALID_HANDLE ||
+      __atomic_load_n(&g_photons_race_batch_published, __ATOMIC_ACQUIRE) !=
+          __atomic_load_n(&g_photons_race_batch_consumed, __ATOMIC_RELAXED)) {
+    __builtin_trap();
+  }
   const uint32_t preserved_sequence = g_photons_race.sequence;
   g_photons_race = photons_race_runtime_t{};
   g_photons_race.sequence = preserved_sequence;
@@ -2435,7 +2756,8 @@ static void photons_race_prepare(void) {
   g_photons_race.holdoff_cycles = (uint32_t)(
       ((uint64_t)cps * PHOTONS_RACE_HOLDOFF_NS + 999999999ULL) /
       1000000000ULL);
-  g_photons_race_batch = photons_race_batch_t{};
+  // No foreground reset of producer storage or publication generations.
+  g_photons_foreground_batch = photons_race_batch_t{};
 }
 
 static void photons_race_start_autonomous(void) {
@@ -2873,12 +3195,13 @@ static const photons_fragment_snapshot_t& photons_report_fragment_snapshot(void)
 
 // PHOTONS_FRAGMENT is a bounded, single-owner foreground serializer. Every
 // schema node that can exceed Payload's inline store is explicitly FIXED; the
-// few proven-inline leaves remain ordinary local Payloads.  RAM2 is used only
-// for the two large canonical byte stores.  Every Payload control block --
+// few proven-inline leaves remain ordinary local Payloads. Dedicated canonical
+// and nested byte stores live in cache-line-aligned RAM2. Every Payload control block --
 // pointer/capacity guards, mutation generation, and contract fingerprint -- lives
 // in ordinary RAM1 with its sole foreground owner.  A RAM2 backing-store injury
 // therefore cannot silently rewrite the ownership metadata that is meant to
-// detect it.  Bounded nested scratch is entirely RAM1.
+// detect it. Fixed-store constructors initialize each byte store before use;
+// RAM2 placement does not depend on NOLOAD storage being zero at boot.
 //
 // Capacity exhaustion is a schema-contract failure, not an invitation to grow:
 // Payload records FIXED_CAPACITY and fails hard.
@@ -2887,14 +3210,6 @@ static const photons_fragment_snapshot_t& photons_report_fragment_snapshot(void)
                 "PHOTONS RAM2 fixed store must fill cache lines");        \
   alignas(PHOTONS_RAM2_CACHE_LINE_BYTES)                                  \
   static uint8_t name##_storage[capacity] DMAMEM;                         \
-  static Payload name(                                                    \
-      Payload::StorageMode::FIXED,                                        \
-      name##_storage,                                                     \
-      sizeof(name##_storage))
-
-#define PHOTONS_FRAGMENT_FIXED_RAM1(name, capacity)                        \
-  alignas(Payload::FIXED_STORAGE_ALIGNMENT)                               \
-  static uint8_t name##_storage[capacity];                                \
   static Payload name(                                                    \
       Payload::StorageMode::FIXED,                                        \
       name##_storage,                                                     \
@@ -2950,23 +3265,22 @@ PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_instrument, 12288U);
 // PHOTONS_RACE object.  The old 1536-byte store was sized for the 25-field
 // cadence-era object. Include the holdoff and pending-successor witnesses plus
 // the nested flight_ns Welford. Keep explicit fixed custody with schema headroom.
-PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_race, 3072U);
-PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_raw_cycles, 1024U);
-PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_projection, 1024U);
-PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_science, 3072U);
-PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_science_accepted, 768U);
-PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_science_excluded, 768U);
-PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_science_reasons, 512U);
-PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_stats, 4096U);
-PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_welford, 512U);
-PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_ppb_buckets, 1024U);
-PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_ppb_checkpoint, 2048U);
-PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_campaign, 768U);
-PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_campaign_stats, 512U);
-PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_recovery, 1024U);
-PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_interrupt, 1280U);
+PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_race, 3072U);
+PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_raw_cycles, 1024U);
+PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_projection, 1024U);
+PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_science, 3072U);
+PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_science_accepted, 768U);
+PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_science_excluded, 768U);
+PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_science_reasons, 512U);
+PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_stats, 4096U);
+PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_welford, 512U);
+PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_ppb_buckets, 1024U);
+PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_ppb_checkpoint, 2048U);
+PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_campaign, 768U);
+PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_campaign_stats, 512U);
+PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_recovery, 1024U);
+PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_interrupt, 1280U);
 
-#undef PHOTONS_FRAGMENT_FIXED_RAM1
 #undef PHOTONS_FRAGMENT_FIXED_RAM2
 
 
@@ -3882,7 +4196,8 @@ static Payload& photons_fragment_payload(
 }
 
 
-static void photons_fragment_tick(
+// The 1 Hz publication transaction runs from flash; race/ISR paths stay in ITCM.
+static FLASHMEM void photons_fragment_tick(
     timepop_ctx_t* /*ctx*/,
     timepop_diag_t* /*diag*/,
     void* /*user_data*/) {
@@ -3895,6 +4210,10 @@ static void photons_fragment_tick(
 
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::FRAGMENT);
+
+  // Request a producer-owned snapshot at fragment cadence. Reports use the
+  // latest completed publication; neither caller copies the live histogram.
+  (void)photons_histogram_snapshot_acquire();
 
   // Refresh the PHOTONS-owned immutable copy for laps that will arrive after
   // this boundary.  Records already in the ring carry the anchor that was
@@ -4326,6 +4645,10 @@ static void photons_start_fragment_publisher(void) {
 FLASHMEM void process_photons_init(void) {
   if (g_initialized) return;
 
+  // Register once. TimePop only tests readiness; our foreground service arms
+  // ALAP after the holdoff, and the existing callback owns the actual launch.
+  timepop_register_foreground_ready(photons_relaunch_ready, nullptr);
+
   // Initialization runs before PHOTONS publishes any foreground work. Establish
   // the one foreground mutation domain explicitly before the ISR subscription
   // becomes live.
@@ -4333,6 +4656,7 @@ FLASHMEM void process_photons_init(void) {
                    (uint32_t)photons_foreground_owner_t::NONE,
                    __ATOMIC_RELEASE);
   photons_fragment_root_initialize_runtime();
+  photons_histogram_initialize_handoffs();
 
   // This is the only foreground initialization of ISR-owned live capture and it
   // occurs before the PHOTODIODE subscription exists. Step 2 deliberately binds
@@ -6588,6 +6912,7 @@ static FLASHMEM Payload cmd_off(const Payload& /*args*/) {
 // ============================================================================
 
 static const process_command_entry_t PHOTONS_COMMANDS[] = {
+  { "REPORT_HISTOGRAM",    cmd_report_histogram    },
   { "INIT",                cmd_init                },
   { "DETECTOR_ACTIVATE",   cmd_detector_activate   },
   { "SET_LAP_BASELINE_NS", cmd_set_lap_baseline_ns },

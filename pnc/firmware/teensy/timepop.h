@@ -59,6 +59,19 @@
 //
 // ============================================================================
 
+// Foreground idle readiness registry (maximum 8 lifetime registrations).
+// Register once during client initialization after timepop_init(), in foreground.
+// Predicates must be bounded, nonblocking and observational: no scheduler or
+// registry mutation, dispatch, or application work. Synchronize ISR-owned reads
+// within the predicate. True requests an idle exit, not a timed callback;
+// the ordinary foreground loop must service the client's ready work.
+// Callback/user_data pairs are unique; null callbacks, duplicates, capacity
+// exhaustion and registration from ISR/dispatch/predicate execution trap.
+// user_data must remain alive until reboot. No unregister operation is provided.
+typedef bool (*timepop_foreground_ready_fn)(void* user_data);
+void timepop_register_foreground_ready(timepop_foreground_ready_fn callback,
+                                       void* user_data);
+
 typedef uint32_t timepop_handle_t;
 static constexpr timepop_handle_t TIMEPOP_INVALID_HANDLE = 0;
 

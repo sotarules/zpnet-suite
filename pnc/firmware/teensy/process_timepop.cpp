@@ -1345,6 +1345,45 @@ static inline void timepop_idle_witness_note_wall_cycles(uint32_t now_dwt) {
   diag_idle_witness_wall_last_dwt = now_dwt;
 }
 
+// Foreground owns registration and evaluation. Entries live until reboot.
+static constexpr uint32_t MAX_FOREGROUND_READY_CLIENTS = 8U;
+struct timepop_foreground_ready_client_t {
+  timepop_foreground_ready_fn callback;
+  void* user_data;
+};
+static timepop_foreground_ready_client_t foreground_ready_clients[MAX_FOREGROUND_READY_CLIENTS]{};
+static uint32_t foreground_ready_count = 0U;
+static bool foreground_ready_evaluating = false;
+
+void timepop_register_foreground_ready(timepop_foreground_ready_fn callback,
+                                       void* user_data) {
+  if (timepop_current_ipsr() != 0U || dispatch_depth != 0U ||
+      foreground_ready_evaluating || !callback ||
+      foreground_ready_count == MAX_FOREGROUND_READY_CLIENTS) {
+    __builtin_trap();
+  }
+  for (uint32_t i = 0U; i < foreground_ready_count; ++i) {
+    if (foreground_ready_clients[i].callback == callback &&
+        foreground_ready_clients[i].user_data == user_data) __builtin_trap();
+  }
+  foreground_ready_clients[foreground_ready_count++] = {callback, user_data};
+}
+
+static bool timepop_foreground_client_ready(void) {
+  if (foreground_ready_evaluating) __builtin_trap();
+  foreground_ready_evaluating = true;
+  bool ready = false;
+  for (uint32_t i = 0U; i < foreground_ready_count; ++i) {
+    const auto& client = foreground_ready_clients[i];
+    if (client.callback(client.user_data)) {
+      ready = true;
+      break;
+    }
+  }
+  foreground_ready_evaluating = false;
+  return ready;
+}
+
 static void timepop_idle_witness_spin_until_pending(void) {
   if (!TIMEPOP_IDLE_DWT_WITNESS_ENABLED) return;
 
@@ -1361,7 +1400,10 @@ static void timepop_idle_witness_spin_until_pending(void) {
     // interrupt already happened before the read, pending is true and we do
     // not overwrite the last pre-interrupt shadow with a post-interrupt value.
     const uint32_t dwt = ARM_DWT_CYCCNT;
-    if (timepop_pending || process_interrupt_foreground_pending()) {
+    // Registered clients can become ready without a CH2 event or interrupt
+    // mailbox. Yield to the ordinary loop; predicates never service the work.
+    if (timepop_pending || process_interrupt_foreground_pending() ||
+        timepop_foreground_client_ready()) {
       // Thread mode has resumed.  Drop the running witness before any exit
       // accounting so an interrupt arriving during that bookkeeping cannot be
       // mistaken for exception tail-chaining from the prior SpinIdle sample.

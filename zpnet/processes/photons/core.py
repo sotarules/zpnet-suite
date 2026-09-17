@@ -9636,6 +9636,69 @@ def cmd_report_photons(_: Optional[dict]) -> Dict[str, Any]:
     return _combined_teensy_report("REPORT_PHOTONS", report_name="PHOTONS_SYSTEM_INSTRUMENT")
 
 
+def cmd_report_histogram(_: Optional[dict]) -> Dict[str, Any]:
+    """Read the always-on, boot-local histogram without resetting acquisition."""
+    response = _combined_teensy_report(
+        "REPORT_HISTOGRAM", report_name="PHOTONS_RAW_CYCLE_HISTOGRAM"
+    )
+    if not response["success"]:
+        return response
+    histogram = _require_dict(response["payload"]["teensy"], "histogram")
+    if histogram.get("schema") != "PHOTONS_HISTOGRAM_V1":
+        raise ValueError("unsupported PHOTONS histogram schema")
+    if histogram.get("scope") != "FIRMWARE_BOOT":
+        raise ValueError("unsupported PHOTONS histogram lifetime")
+    state = histogram.get("state")
+    if state not in ("ACQUIRING", "ACCUMULATING"):
+        raise ValueError("unknown PHOTONS histogram acquisition state")
+    if histogram.get("bin_count") != 64 or histogram.get("bin_width_cycles") != 1:
+        raise ValueError("PHOTONS histogram requires 64 one-cycle bins")
+    if histogram.get("seed_target") != 65:
+        raise ValueError("unexpected histogram seed target")
+    seeds = _require_int(histogram.get("seed_count"), "histogram.seed_count")
+    if seeds > 65:
+        raise ValueError("histogram seed count exceeds target")
+    warmup = _require_int(histogram.get("warmup_returns"), "histogram.warmup_returns")
+    origin = None
+    if state == "ACCUMULATING":
+        origin = _require_u32(histogram.get("origin_cycles"), "histogram.origin_cycles")
+        midpoint = _require_u32(histogram.get("midpoint_cycles"), "histogram.midpoint_cycles")
+        if seeds != 65 or origin == 0 or midpoint != origin + 32 or origin + 63 > 0xFFFFFFFF:
+            raise ValueError("inconsistent histogram acquisition coordinates")
+    elif "origin_cycles" in histogram or "midpoint_cycles" in histogram:
+        raise ValueError("histogram coordinates exist before acquisition")
+    accounted = warmup + (seeds if state == "ACQUIRING" else 0)
+    for name in ("unattributed", "delayed"):
+        population = _require_dict(histogram.get(name), f"histogram.{name}")
+        bins = _require_dict(population.get("bins"), f"histogram.{name}.bins")
+        if set(bins) != {f"b{i:02d}" for i in range(64)}:
+            raise ValueError(f"histogram.{name}: missing or extra buckets")
+        counts = [_require_int(bins[f"b{i:02d}"], f"histogram.{name}.b{i:02d}")
+                  for i in range(64)]
+        under = _require_int(population.get("underflow"), f"histogram.{name}.underflow")
+        over = _require_int(population.get("overflow"), f"histogram.{name}.overflow")
+        acquisition = _require_int(population.get("acquisition_unbinned"),
+                                   f"histogram.{name}.acquisition_unbinned")
+        binned = sum(counts)
+        if state == "ACQUIRING" and binned + under + over != 0:
+            raise ValueError("histogram buckets populated before acquisition")
+        classified = binned + under + over
+        population["classified_count"] = classified
+        population["total_count"] = classified + acquisition
+        population["in_window_count"] = binned
+        # Empty populations have no defined percentage; preserve that explicitly.
+        population["bucket_percent"] = {
+            f"b{i:02d}": (100.0 * count / classified if classified else None)
+            for i, count in enumerate(counts)
+        }
+        accounted += classified + acquisition
+    histogram["accounted_returns"] = accounted
+    histogram["bucket_coordinate_rule"] = "bNN = origin_cycles + NN (raw DWT cycles)"
+    histogram["percentage_denominator"] = "classified_count, including underflow and overflow"
+    histogram["persistence"] = "LIVE_TEENSY_RAM; cleared by firmware reboot; preserved by campaigns and stats_reset"
+    return response
+
+
 def cmd_report_stats(_: Optional[dict]) -> Dict[str, Any]:
     global _report_stats_requests
     with _state_lock:
@@ -10488,6 +10551,7 @@ COMMANDS = {
     "REPORT": cmd_report,
     "REPORT_PHOTONS": cmd_report_photons,
     "REPORT_STATS": cmd_report_stats,
+    "REPORT_HISTOGRAM": cmd_report_histogram,
     "REPORT_RECOVERY": cmd_report_recovery,
     "STATS_RESET": cmd_stats_reset,
     "REPAIR": cmd_repair,
@@ -10501,6 +10565,7 @@ COMMANDS = {
 }
 
 _HARD_FAILURE_READ_ONLY_COMMANDS = {
+    "REPORT_HISTOGRAM",
     "REPORT",
     "REPORT_PHOTONS",
     "REPORT_STATS",
