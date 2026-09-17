@@ -17,7 +17,7 @@
 //   • PHOTONS consumes those edge facts and publishes PHOTONS_FRAGMENT.
 //   • all non-ISR PHOTONS mutation has one foreground owner at a time: the
 //     1 kHz race cadence, 1 Hz fragment transaction, one RPC command, or the
-//     commissioning WAVE edge callback. These ownership classes may never nest;
+//     commissioning WAVE pulse callback. These ownership classes may never nest;
 //     illegal overlap is a system-integrity fault rather than a recoverable busy
 //     condition.
 //
@@ -30,23 +30,22 @@
 // estimated flight interval, science-admission testimony, Welford sufficient
 // state, and recovery totals.
 //
-// Real single-pass race engine:
-//   • one recurring 1 kHz TimePop cadence remains the intended race owner;
-//   • the producer is currently held while the source launch is migrated to the
-//     active-high DRV200 MOD path on Teensy pin 35;
-//   • pin 35 LOW is the idle modulation level; a physical launch will be authored
-//     by a HIGH transition/pulse after the race engine is explicitly re-enabled;
-//   • process_interrupt owns the first-instruction DWT coordinate of every
-//     physical PD200T pin-34 RISING edge; PHOTONS admits only the first eligible
-//     edge for the armed race and ignores later comparator chatter for race science;
-//   • no ADC polling, GNSS projection, floating point, Payload work, or Welford
-//     mutation occurs in the detector callback;
-//   • the next cadence finalizes the previous race, explicitly counting a miss
-//     or unsafe/ambiguous endpoint instead of manufacturing a measurement;
-//   • the 1 Hz foreground drain projects completed races and advances both the
-//     canonical lifetime Welford and a one-fragment race Welford for metrics;
-//   • the launch-surrogate contract remains replaceable; the DRV200 migration must
-//     establish the final active-high launch edge before recurring races are enabled.
+// LANTERN V1.0 autonomous race engine:
+//   • one 200 ns DRV200 MOD pulse primes the instrument; thereafter a real PD200T
+//     return ends race N and the Priority-32 continuation authors race N+1;
+//   • the Priority-48 physical ISR captures only immutable DWT/arrival testimony;
+//     no laser write, GNSS projection, floating point, Payload work, or Welford
+//     mutation occurs in the detector ISR;
+//   • Priority-32 continuation performs only bounded physical continuation:
+//     finish previous raw flight, classify delay testimony, author MOD HIGH,
+//     capture the actual launch DWT, hold ~200 ns, return MOD LOW;
+//   • three mutually close clean flights establish the initial fast-path lineage;
+//     later long/right-tail flights and interrupt-delayed endpoints are rejected
+//     without moving the reference;
+//   • accepted/rejected flights accumulate integer sufficient statistics at race
+//     rate; 1 Hz foreground work performs GNSS scaling, Welford/statistics,
+//     operator-baseline residuals, Better-Buckets, and PHOTONS_FRAGMENT publication;
+//   • there is no recurring TimePop race cadence and no synthetic/emulated flight.
 //
 // Commands:
 //   • INIT                — reinitialize PHOTONS-owned optical I/O and force the
@@ -62,9 +61,22 @@
 //   • STOP                — request campaign closure; the next published campaign fragment is final
 //   • REPORT              — compact operational/device report including active-high MOD state,
 //                           laser monitor, PD200T pin 38/A14 telemetry, and pin-34 interrupt custody
-//   • WAVEON ns=N         — commissioning square wave on LASER_MOD_PIN 35 using a
-//                           recurring TimePop callback. N is the full HIGH+LOW cycle;
-//                           each half-cycle is N/2 for a 50/50 duty cycle.
+//   • WAVEON interval=N width=W — commissioning pulse train on LASER_MOD_PIN 35.
+//                           Both parameters are required uint64 nanoseconds;
+//                           0 < W < N. The former ns/full-cycle argument is retired.
+//                           Example: interval=100000000 width=200 (10 Hz, ~200 ns HIGH).
+//                           First pulse fires immediately after the timer is armed.
+//                           TimePop owns recurring pulse-start cadence at interval N;
+//                           each pulse holds HIGH using F_CPU_ACTUAL/DWT polling,
+//                           then returns LOW before the command/callback returns.
+//                           No falling-edge TimePop event and no IRQ masking.
+//                           Width is approximate; GPIO/loop/IRQ latency may extend it.
+//                           Foreground is occupied during HIGH; long widths delay
+//                           commands and other callbacks. Long waits share PULSE's
+//                           DWT-wrap handling/limits. Cadence retains TimePop's timing
+//                           semantics; width < interval does not prove deadline fit.
+//                           No manual receive record or race science is authored.
+//                           Reply reports interval_ns, width_ns and output_level=LOW.
 //   • WAVEOFF             — cancel the commissioning wave and force pin 35 LOW/idle.
 //   • PULSE [ns=N]        — one active-high DRV200 MOD pulse. MOD must be LOW before
 //                           the shot and returns LOW afterward. Default: 1000 ns.
@@ -236,6 +248,7 @@ enum class photons_lap_science_exclusion_reason_t : uint16_t {
   PROJECTION_INVALID = 100,
   SEED_DISAGREEMENT = 200,
   RAW_CYCLE_EXCURSION = 300,
+  ISR_DELAY = 400,
 };
 
 
@@ -261,10 +274,12 @@ struct photons_lap_science_reason_counts_snapshot_t {
   uint64_t projection_invalid = 0;
   uint64_t seed_disagreement = 0;
   uint64_t raw_cycle_excursion = 0;
+  uint64_t isr_delay = 0;
 
   uint32_t projection_invalid_this_fragment = 0;
   uint32_t seed_disagreement_this_fragment = 0;
   uint32_t raw_cycle_excursion_this_fragment = 0;
+  uint32_t isr_delay_this_fragment = 0;
 };
 
 
@@ -278,7 +293,7 @@ struct photons_lap_science_snapshot_t {
   photons_lap_science_population_snapshot_t excluded{};
   photons_lap_science_reason_counts_snapshot_t exclusion_reasons{};
 
-  // Two agreeing projected laps establish the initial raw-cycle lineage.
+  // Three mutually close clean flights establish the initial raw-cycle lineage.
   bool predictor_valid = false;
   uint32_t predictor_cycles = 0;
   uint32_t gate_cycles = 0;
@@ -286,6 +301,7 @@ struct photons_lap_science_snapshot_t {
   uint32_t max_reject_streak = 0;
 
   bool seed_pending = false;
+  uint32_t seed_pending_count = 0;
   uint64_t seed_pending_candidate_index = 0;
   uint32_t seed_pending_raw_cycles = 0;
   uint64_t seed_pending_lap_gnss_ns = 0;
@@ -507,6 +523,22 @@ struct photons_fragment_snapshot_t {
   uint32_t race_invalid_endpoint_this_fragment = 0;
   uint64_t race_enqueue_failure_total = 0;
   uint32_t race_enqueue_failure_this_fragment = 0;
+
+  // LANTERN V1.0 return-driven rejection testimony.
+  uint64_t race_rejected_isr_delay_total = 0;
+  uint32_t race_rejected_isr_delay_this_fragment = 0;
+  uint64_t race_rejected_qtimer1_total = 0;
+  uint64_t race_rejected_ocxo1_total = 0;
+  uint64_t race_rejected_ocxo2_total = 0;
+  uint64_t race_rejected_pps_total = 0;
+  uint64_t race_rejected_continuation_total = 0;
+  uint64_t race_rejected_unknown_total = 0;
+  uint64_t race_rejected_excursion_total = 0;
+  uint32_t race_rejected_excursion_this_fragment = 0;
+  bool race_reference_valid = false;
+  uint32_t race_reference_cycles = 0;
+  uint32_t race_reference_gate_cycles = 0;
+  uint32_t race_seed_count = 0;
   photons_fragment_welford_snapshot_t race_flight_this_fragment{};
 
   photons_fragment_raw_cycles_snapshot_t raw_cycles{};

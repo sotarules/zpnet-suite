@@ -108,47 +108,36 @@ static constexpr uint32_t PHOTONS_RECOVERY_CHUNK_MAX_ENDPOINTS = 4U;
 static constexpr float PHOTONS_LASER_EMIT_THRESHOLD_V = 0.75f;
 static constexpr uint64_t PHOTONS_PULSE_DEFAULT_NS = 1000ULL;
 
-// Interim real-race geometry. One 1 ms cell is intended to contain one 91 us
-// active-high DRV200 MOD pulse followed by a long quiet receive/recovery interval.
-// The recurring race producer remains held until its launch edge is re-authored
-// and commissioned against the new optical source path.
-static constexpr uint64_t PHOTONS_RACE_CADENCE_NS = 1000000ULL;
-static constexpr uint32_t PHOTONS_RACE_CADENCE_HZ = 1000U;
-static constexpr uint64_t PHOTONS_RACE_PULSE_NS = 91000ULL;
-static_assert(PHOTONS_NS_PER_SECOND / PHOTONS_RACE_CADENCE_NS ==
-                  PHOTONS_RACE_CADENCE_HZ,
-              "PHOTONS race cadence constant mismatch");
+// LANTERN V1.0 physical geometry. No recurring race scheduler exists.
+static constexpr uint64_t PHOTONS_RACE_PULSE_NS = 200ULL;
+static constexpr uint64_t PHOTONS_RACE_CADENCE_NS = 0ULL;
+static constexpr uint32_t PHOTONS_RACE_CADENCE_HZ = 0U;
+static constexpr uint32_t PHOTONS_RACE_SEED_HISTORY = 8U;
+static constexpr uint32_t PHOTONS_RACE_SEED_QUORUM = 3U;
 
-
-// ============================================================================
-// Real single-pass race engine
-// ============================================================================
-//
-// TimePop owns the 1 kHz launch cadence. process_interrupt owns pin-34 DWT
-// custody. The PHOTODIODE callback only latches the first eligible receive edge;
-// the following cadence cell finalizes that race into the raw handoff ring.
-// No synthetic detector edges or synthetic lap intervals remain.
-// ============================================================================
-
-
-struct photons_race_receive_value_t {
-  bool     seen = false;
-  uint32_t race_sequence = 0U;
-  uint32_t edge_sequence = 0U;
-  uint32_t pps_sequence = 0U;
-  uint32_t finish_dwt = 0U;
-};
-
-struct photons_race_receive_state_t {
-  volatile uint32_t generation = 0U;
-  photons_race_receive_value_t value{};
+struct photons_race_batch_t {
+  uint64_t accepted_count = 0ULL;
+  uint64_t accepted_sum_cycles = 0ULL;
+  uint64_t accepted_sumsq_cycles = 0ULL;
+  uint32_t accepted_min_cycles = 0U;
+  uint32_t accepted_max_cycles = 0U;
+  uint64_t rejected_count = 0ULL;
+  uint64_t rejected_sum_cycles = 0ULL;
+  uint64_t rejected_sumsq_cycles = 0ULL;
+  uint32_t rejected_min_cycles = 0U;
+  uint32_t rejected_max_cycles = 0U;
+  uint64_t rejected_isr_delay = 0ULL;
+  uint64_t rejected_excursion = 0ULL;
 };
 
 struct photons_race_runtime_t {
   bool initialized = false;
-  timepop_handle_t cadence_timer = TIMEPOP_INVALID_HANDLE;
+  bool active = false;
+  bool primed = false;
+  bool first_return_seen = false;
+  uint32_t launch_dwt = 0U;
   uint32_t sequence = 0U;
-  uint64_t cadence_tick_count = 0ULL;
+  uint64_t cadence_tick_count = 0ULL; // retired wire compatibility
   uint64_t attempt_count = 0ULL;
   uint64_t completed_count = 0ULL;
   uint64_t missed_count = 0ULL;
@@ -156,20 +145,23 @@ struct photons_race_runtime_t {
   uint64_t skipped_projection_count = 0ULL;
   uint64_t invalid_endpoint_count = 0ULL;
   uint64_t enqueue_failure_count = 0ULL;
+  uint32_t seed_cycles[PHOTONS_RACE_SEED_HISTORY]{};
+  uint32_t seed_count = 0U;
+  bool reference_valid = false;
+  uint32_t reference_cycles = 0U;
+  uint32_t reference_gate_cycles = 0U;
+  uint64_t rejected_isr_delay_count = 0ULL;
+  uint64_t rejected_qtimer1_count = 0ULL;
+  uint64_t rejected_ocxo1_count = 0ULL;
+  uint64_t rejected_ocxo2_count = 0ULL;
+  uint64_t rejected_pps_count = 0ULL;
+  uint64_t rejected_continuation_count = 0ULL;
+  uint64_t rejected_unknown_count = 0ULL;
+  uint64_t rejected_excursion_count = 0ULL;
 };
 
 static photons_race_runtime_t g_photons_race{};
-
-// Cross-context race custody is intentionally asymmetric:
-//   * foreground is the sole writer of g_race_armed_sequence; the detector
-//     callback may only read it;
-//   * the detector callback is the sole writer of g_photons_race_receive;
-//     foreground may only take coherent snapshots.
-// Stale receive testimony is never cleared by foreground. Race sequence identity
-// is preserved across recovery so stale mailbox contents cannot alias a new race.
-static photons_race_receive_state_t g_photons_race_receive{};
-static volatile uint32_t g_race_armed_sequence = 0U;
-
+static photons_race_batch_t g_photons_race_batch{};
 
 struct photons_device_snapshot_t {
   int      laser_mod_level = LOW;
@@ -202,7 +194,7 @@ static inline void photons_memory_barrier(void) {
 //     -> post-publish commit as one indivisible foreground transaction;
 //   * COMMAND owns every PHOTONS RPC handler from entry through returned Payload
 //     construction;
-//   * WAVE owns each commissioning square-wave edge callback.
+//   * WAVE owns each commissioning pulse callback, including its HIGH wait.
 //
 // ISR code never touches this owner.  Its only cross-context communication is
 // through the dedicated one-writer arm scalars / generation mailboxes below.
@@ -510,6 +502,30 @@ static void photons_welford_update(photons_welford_state_t& w, double sample) {
   w.m2 += d1 * d2;
   if (sample < w.min_val) w.min_val = sample;
   if (sample > w.max_val) w.max_val = sample;
+}
+
+
+static void photons_welford_merge_batch(photons_welford_state_t& w,
+                                        uint64_t n,
+                                        double mean,
+                                        double m2,
+                                        double min_val,
+                                        double max_val) {
+  if (n == 0ULL) return;
+  if (w.n == 0ULL) {
+    w.n = n; w.mean = mean; w.m2 = m2;
+    w.min_val = min_val; w.max_val = max_val;
+    return;
+  }
+  const uint64_t old_n = w.n;
+  const uint64_t total_n = old_n + n;
+  const double delta = mean - w.mean;
+  w.mean += delta * ((double)n / (double)total_n);
+  w.m2 += m2 + delta * delta *
+      ((double)old_n * (double)n / (double)total_n);
+  w.n = total_n;
+  if (min_val < w.min_val) w.min_val = min_val;
+  if (max_val > w.max_val) w.max_val = max_val;
 }
 
 
@@ -1521,6 +1537,8 @@ static const char* photons_lap_science_reason_name(uint16_t code) {
       return "seed_disagreement";
     case photons_lap_science_exclusion_reason_t::RAW_CYCLE_EXCURSION:
       return "raw_cycle_excursion";
+    case photons_lap_science_exclusion_reason_t::ISR_DELAY:
+      return "isr_delay";
     default:
       return "none";
   }
@@ -1578,6 +1596,8 @@ static void photons_lap_science_note_last(
 
 static void photons_lap_science_refresh_seed_snapshot(void) {
   g_photons_lap_science_state.seed_pending = g_photons_lap_science_seed_pending.valid;
+  g_photons_lap_science_state.seed_pending_count =
+      g_photons_lap_science_seed_pending.valid ? 1U : 0U;
   g_photons_lap_science_state.seed_pending_candidate_index =
       g_photons_lap_science_seed_pending.valid
           ? g_photons_lap_science_seed_pending.candidate_index
@@ -1641,6 +1661,10 @@ static void photons_lap_science_count_exclusion_reason(
       g_photons_lap_science_state.exclusion_reasons.raw_cycle_excursion++;
       g_photons_lap_science_state.exclusion_reasons.raw_cycle_excursion_this_fragment++;
       return;
+    case photons_lap_science_exclusion_reason_t::ISR_DELAY:
+      g_photons_lap_science_state.exclusion_reasons.isr_delay++;
+      g_photons_lap_science_state.exclusion_reasons.isr_delay_this_fragment++;
+      return;
     case photons_lap_science_exclusion_reason_t::NONE:
     default:
       // Exclusion without an authored reason is a courtroom integrity failure.
@@ -1662,7 +1686,9 @@ static uint64_t photons_lap_science_excluded_count_from_reasons(
   if (UINT64_MAX - partial < reasons.raw_cycle_excursion) {
     __builtin_trap();
   }
-  return partial + reasons.raw_cycle_excursion;
+  const uint64_t partial2 = partial + reasons.raw_cycle_excursion;
+  if (UINT64_MAX - partial2 < reasons.isr_delay) __builtin_trap();
+  return partial2 + reasons.isr_delay;
 }
 
 
@@ -1671,7 +1697,8 @@ static uint32_t photons_lap_science_excluded_this_fragment_from_reasons(
   const uint64_t total =
       (uint64_t)reasons.projection_invalid_this_fragment +
       (uint64_t)reasons.seed_disagreement_this_fragment +
-      (uint64_t)reasons.raw_cycle_excursion_this_fragment;
+      (uint64_t)reasons.raw_cycle_excursion_this_fragment +
+      (uint64_t)reasons.isr_delay_this_fragment;
   if (total > (uint64_t)UINT32_MAX) __builtin_trap();
   return (uint32_t)total;
 }
@@ -1695,7 +1722,7 @@ static void photons_lap_science_validate_exclusion_ledger(
   }
   const uint64_t finalized_count =
       science.accepted.count + excluded_count;
-  const uint64_t pending_count = science.seed_pending ? 1ULL : 0ULL;
+  const uint64_t pending_count = (uint64_t)science.seed_pending_count;
   if (UINT64_MAX - finalized_count < pending_count ||
       science.candidate_count != finalized_count + pending_count) {
     __builtin_trap();
@@ -1826,6 +1853,27 @@ static void photons_lap_science_projected_candidate(
 }
 
 
+static inline uint32_t photons_priority32_guard_enter(void);
+static inline void photons_priority32_guard_exit(uint32_t prior);
+
+static photons_race_batch_t photons_race_batch_take(void) {
+  const uint32_t prior = photons_priority32_guard_enter();
+  const photons_race_batch_t out = g_photons_race_batch;
+  g_photons_race_batch = photons_race_batch_t{};
+  photons_priority32_guard_exit(prior);
+  return out;
+}
+
+static double photons_batch_m2(uint64_t n, uint64_t sum, uint64_t sumsq) {
+  if (n < 2ULL) return 0.0;
+  const double dsum = (double)sum;
+  double m2 = (double)sumsq - (dsum * dsum / (double)n);
+  if (m2 < 0.0 && m2 > -0.5) m2 = 0.0;
+  if (m2 < 0.0) __builtin_trap();
+  return m2;
+}
+
+
 struct photons_fragment_drain_result_t {
   uint32_t raw_laps = 0U;
   uint32_t projected_laps = 0U;
@@ -1846,6 +1894,114 @@ static photons_fragment_drain_result_t photons_drain_raw_laps(void) {
   g_photons_lap_science_state.exclusion_reasons.projection_invalid_this_fragment = 0U;
   g_photons_lap_science_state.exclusion_reasons.seed_disagreement_this_fragment = 0U;
   g_photons_lap_science_state.exclusion_reasons.raw_cycle_excursion_this_fragment = 0U;
+  g_photons_lap_science_state.exclusion_reasons.isr_delay_this_fragment = 0U;
+
+  const photons_race_batch_t race_batch = photons_race_batch_take();
+  const uint64_t race_finalized =
+      race_batch.accepted_count + race_batch.rejected_count;
+  if (race_finalized > (uint64_t)UINT32_MAX) __builtin_trap();
+
+  if (race_batch.accepted_count != 0ULL) {
+    const uint32_t cps = interrupt_dynamic_cps();
+    if (cps == 0U) __builtin_trap();
+    const double n = (double)race_batch.accepted_count;
+    const double mean_cycles = (double)race_batch.accepted_sum_cycles / n;
+    const double m2_cycles = photons_batch_m2(
+        race_batch.accepted_count,
+        race_batch.accepted_sum_cycles,
+        race_batch.accepted_sumsq_cycles);
+    const double ns_per_cycle =
+        (double)PHOTONS_NS_PER_SECOND / (double)cps;
+    const double mean_ns = mean_cycles * ns_per_cycle;
+    const double m2_ns = m2_cycles * ns_per_cycle * ns_per_cycle;
+
+    photons_welford_merge_batch(
+        g_accepted_raw_cycles_welford,
+        race_batch.accepted_count,
+        mean_cycles,
+        m2_cycles,
+        (double)race_batch.accepted_min_cycles,
+        (double)race_batch.accepted_max_cycles);
+    photons_welford_merge_batch(
+        g_lap_time_welford,
+        race_batch.accepted_count,
+        mean_ns,
+        m2_ns,
+        (double)race_batch.accepted_min_cycles * ns_per_cycle,
+        (double)race_batch.accepted_max_cycles * ns_per_cycle);
+    photons_welford_merge_batch(
+        result.projected_flight_welford,
+        race_batch.accepted_count,
+        mean_ns,
+        m2_ns,
+        (double)race_batch.accepted_min_cycles * ns_per_cycle,
+        (double)race_batch.accepted_max_cycles * ns_per_cycle);
+
+    const uint64_t accepted_ns = (uint64_t)(
+        ((long double)race_batch.accepted_sum_cycles *
+         (long double)PHOTONS_NS_PER_SECOND / (long double)cps) + 0.5L);
+    g_total_lap_gnss_ns += accepted_ns;
+    g_photons_custody_lap_count += race_batch.accepted_count;
+    g_photons_custody_total_lap_gnss_ns += accepted_ns;
+    g_photons_lap_science_state.accepted.count += race_batch.accepted_count;
+    g_photons_lap_science_state.accepted.count_this_fragment +=
+        (uint32_t)race_batch.accepted_count;
+  }
+
+  if (race_batch.rejected_count != 0ULL) {
+    const double n = (double)race_batch.rejected_count;
+    const double mean_cycles = (double)race_batch.rejected_sum_cycles / n;
+    const double m2_cycles = photons_batch_m2(
+        race_batch.rejected_count,
+        race_batch.rejected_sum_cycles,
+        race_batch.rejected_sumsq_cycles);
+    photons_welford_merge_batch(
+        g_excluded_raw_cycles_welford,
+        race_batch.rejected_count,
+        mean_cycles,
+        m2_cycles,
+        (double)race_batch.rejected_min_cycles,
+        (double)race_batch.rejected_max_cycles);
+    g_photons_lap_science_state.exclusion_reasons.isr_delay +=
+        race_batch.rejected_isr_delay;
+    g_photons_lap_science_state.exclusion_reasons.isr_delay_this_fragment +=
+        (uint32_t)race_batch.rejected_isr_delay;
+    g_photons_lap_science_state.exclusion_reasons.raw_cycle_excursion +=
+        race_batch.rejected_excursion;
+    g_photons_lap_science_state.exclusion_reasons.raw_cycle_excursion_this_fragment +=
+        (uint32_t)race_batch.rejected_excursion;
+  }
+
+  g_photons_lap_science_state.candidate_count += race_finalized;
+  g_photons_lap_science_state.candidates_this_fragment +=
+      (uint32_t)race_finalized;
+  g_raw_cycles_state.completed_lap_count += race_finalized;
+  // Autonomous raw exclusions never enter projection custody.  Only accepted
+  // flights are converted into projected flight-time statistics.
+  g_projection_state.attempt_count += race_batch.accepted_count;
+  g_projection_state.success_count += race_batch.accepted_count;
+  g_photons_lap_science_state.predictor_valid = g_photons_race.reference_valid;
+  g_photons_lap_science_state.predictor_cycles = g_photons_race.reference_cycles;
+  g_photons_lap_science_state.gate_cycles =
+      g_photons_race.reference_gate_cycles;
+  g_photons_lap_science_state.seed_pending = false;
+  g_photons_lap_science_state.seed_pending_count = 0U;
+
+  result.raw_laps += (uint32_t)race_finalized;
+  result.projected_laps += (uint32_t)race_batch.accepted_count;
+  result.total_cycles += race_batch.accepted_sum_cycles +
+                         race_batch.rejected_sum_cycles;
+  if (race_batch.accepted_min_cycles != 0U) result.min_cycles = race_batch.accepted_min_cycles;
+  if (race_batch.rejected_min_cycles != 0U &&
+      (result.min_cycles == 0U || race_batch.rejected_min_cycles < result.min_cycles)) {
+    result.min_cycles = race_batch.rejected_min_cycles;
+  }
+  if (race_batch.accepted_max_cycles > result.max_cycles) {
+    result.max_cycles = race_batch.accepted_max_cycles;
+  }
+  if (race_batch.rejected_max_cycles > result.max_cycles) {
+    result.max_cycles = race_batch.rejected_max_cycles;
+  }
 
   photons_memory_barrier();
   const uint32_t write_snapshot = g_raw_lap_ring_write;
@@ -2001,11 +2157,13 @@ static float photons_adc_voltage(uint16_t raw) {
 // TC4427 MDM: LOW = zero added modulation, HIGH = positive modulation.
 //
 // Commissioning WAVE owns pin 35 until WAVEOFF or another direct MOD command
-// explicitly cancels the recurring timer.
+// explicitly cancels the recurring timer. TimePop schedules pulse starts at the
+// requested interval; each callback holds HIGH with a DWT loop and returns LOW.
 static timepop_handle_t g_photons_wave_timer = TIMEPOP_INVALID_HANDLE;
-static uint64_t g_photons_wave_cycle_ns = 0ULL;
-static uint64_t g_photons_wave_half_cycle_ns = 0ULL;
-static int g_photons_wave_level = LOW;
+static uint64_t g_photons_wave_interval_ns = 0ULL;
+static uint64_t g_photons_wave_width_ns = 0ULL;
+
+static void photons_wave_emit_pulse(uint64_t requested_ns);
 
 static void photons_wave_tick(
     timepop_ctx_t* ctx,
@@ -2018,8 +2176,7 @@ static void photons_wave_tick(
     __builtin_trap();
   }
 
-  g_photons_wave_level = (g_photons_wave_level == LOW) ? HIGH : LOW;
-  digitalWriteFast(LASER_MOD_PIN, g_photons_wave_level);
+  photons_wave_emit_pulse(g_photons_wave_width_ns);
 }
 
 static void photons_wave_cancel(void) {
@@ -2027,64 +2184,177 @@ static void photons_wave_cancel(void) {
   const timepop_handle_t handle = g_photons_wave_timer;
   if (!timepop_cancel(handle)) __builtin_trap();
   g_photons_wave_timer = TIMEPOP_INVALID_HANDLE;
-  g_photons_wave_cycle_ns = 0ULL;
-  g_photons_wave_half_cycle_ns = 0ULL;
+  g_photons_wave_interval_ns = 0ULL;
+  g_photons_wave_width_ns = 0ULL;
 }
 
 static void photons_laser_mod_idle(void) {
   photons_wave_cancel();
-  g_photons_wave_level = LOW;
   digitalWriteFast(LASER_MOD_PIN, LOW);
 }
 
-static void photons_race_receive_isr_publish(
-    const photons_race_receive_value_t& value) {
-  g_photons_race_receive.generation++;
+static inline uint32_t photons_priority32_guard_enter(void) {
+  uint32_t prior = 0U;
+  __asm__ volatile ("mrs %0, basepri" : "=r" (prior) :: "memory");
+  const uint32_t mask_priority32 = 32U;
+  if (prior == 0U || prior > mask_priority32) {
+    __asm__ volatile ("msr basepri, %0" :: "r" (mask_priority32) : "memory");
+  }
   photons_memory_barrier();
-  g_photons_race_receive.value = value;
-  photons_memory_barrier();
-  g_photons_race_receive.generation++;
+  return prior;
 }
 
+static inline void photons_priority32_guard_exit(uint32_t prior) {
+  photons_memory_barrier();
+  __asm__ volatile ("msr basepri, %0" :: "r" (prior) : "memory");
+}
+
+static photons_race_runtime_t photons_race_runtime_snapshot(void) {
+  const uint32_t prior = photons_priority32_guard_enter();
+  const photons_race_runtime_t out = g_photons_race;
+  photons_priority32_guard_exit(prior);
+  return out;
+}
+
+static void photons_race_batch_note(bool accepted, uint32_t raw_cycles) {
+  photons_race_batch_t& b = g_photons_race_batch;
+  uint64_t& count = accepted ? b.accepted_count : b.rejected_count;
+  uint64_t& sum = accepted ? b.accepted_sum_cycles : b.rejected_sum_cycles;
+  uint64_t& sumsq = accepted ? b.accepted_sumsq_cycles : b.rejected_sumsq_cycles;
+  uint32_t& minv = accepted ? b.accepted_min_cycles : b.rejected_min_cycles;
+  uint32_t& maxv = accepted ? b.accepted_max_cycles : b.rejected_max_cycles;
+  count++; sum += raw_cycles;
+  sumsq += (uint64_t)raw_cycles * (uint64_t)raw_cycles;
+  if (minv == 0U || raw_cycles < minv) minv = raw_cycles;
+  if (raw_cycles > maxv) maxv = raw_cycles;
+}
+
+static void photons_race_note_delay(interrupt_delay_cause_t cause) {
+  g_photons_race.rejected_isr_delay_count++;
+  g_photons_race_batch.rejected_isr_delay++;
+  switch (cause) {
+    case interrupt_delay_cause_t::VCLOCK_TIMEPOP: g_photons_race.rejected_qtimer1_count++; break;
+    case interrupt_delay_cause_t::OCXO1: g_photons_race.rejected_ocxo1_count++; break;
+    case interrupt_delay_cause_t::OCXO2: g_photons_race.rejected_ocxo2_count++; break;
+    case interrupt_delay_cause_t::PPS: g_photons_race.rejected_pps_count++; break;
+    case interrupt_delay_cause_t::CONTINUATION: g_photons_race.rejected_continuation_count++; break;
+    default: g_photons_race.rejected_unknown_count++; break;
+  }
+}
+
+static bool photons_race_try_lock_reference(void) {
+  const uint32_t count = g_photons_race.seed_count;
+  if (count < PHOTONS_RACE_SEED_QUORUM) return false;
+  uint32_t ordered[PHOTONS_RACE_SEED_HISTORY]{};
+  for (uint32_t i = 0U; i < count; ++i) ordered[i] = g_photons_race.seed_cycles[i];
+  for (uint32_t i = 1U; i < count; ++i) {
+    const uint32_t value = ordered[i];
+    uint32_t j = i;
+    while (j > 0U && ordered[j - 1U] > value) {
+      ordered[j] = ordered[j - 1U]; --j;
+    }
+    ordered[j] = value;
+  }
+  for (uint32_t i = 0U; i + PHOTONS_RACE_SEED_QUORUM <= count; ++i) {
+    const uint32_t low = ordered[i];
+    const uint32_t high = ordered[i + PHOTONS_RACE_SEED_QUORUM - 1U];
+    const uint32_t gate = photons_lap_science_gate_cycles(low);
+    if ((uint64_t)(high - low) > (uint64_t)gate) continue;
+    g_photons_race.reference_cycles = ordered[i + 1U];
+    g_photons_race.reference_gate_cycles =
+        photons_lap_science_gate_cycles(g_photons_race.reference_cycles);
+    g_photons_race.reference_valid = true;
+    return true;
+  }
+  return false;
+}
+
+static void photons_race_seed_observe(uint32_t raw_cycles) {
+  if (g_photons_race.seed_count < PHOTONS_RACE_SEED_HISTORY) {
+    g_photons_race.seed_cycles[g_photons_race.seed_count++] = raw_cycles;
+  } else {
+    for (uint32_t i = 1U; i < PHOTONS_RACE_SEED_HISTORY; ++i) {
+      g_photons_race.seed_cycles[i - 1U] = g_photons_race.seed_cycles[i];
+    }
+    g_photons_race.seed_cycles[PHOTONS_RACE_SEED_HISTORY - 1U] = raw_cycles;
+  }
+  (void)photons_race_try_lock_reference();
+}
+
+static uint32_t photons_race_launch_200ns(void) {
+  if (digitalRead(LASER_MOD_PIN) != LOW) __builtin_trap();
+  const uint32_t cps = F_CPU_ACTUAL;
+  if (cps == 0U) __builtin_trap();
+  const uint32_t width_cycles = (uint32_t)(
+      ((uint64_t)cps * PHOTONS_RACE_PULSE_NS + 500000000ULL) / 1000000000ULL);
+  digitalWriteFast(LASER_MOD_PIN, HIGH);
+  const uint32_t launch_dwt = ARM_DWT_CYCCNT;
+  while ((uint32_t)(ARM_DWT_CYCCNT - launch_dwt) < width_cycles) {}
+  digitalWriteFast(LASER_MOD_PIN, LOW);
+  return launch_dwt;
+}
 
 static void photons_race_observe_edge(
     const interrupt_photodiode_edge_t& edge) {
-  const uint32_t race_sequence = g_race_armed_sequence;
-  if (race_sequence == 0U) return;
+  if (!g_photons_race.active || !g_photons_race.primed) return;
+  const uint32_t raw_cycles = edge.dwt_at_edge - g_photons_race.launch_dwt;
+  g_photons_race.completed_count++;
 
-  // Foreground owns the arm scalar. The detector callback never clears or
-  // rewrites foreground state. First-edge-wins is enforced entirely inside the
-  // ISR-owned mailbox: once this race sequence has been published, comparator
-  // chatter for the same arm is ignored.
-  if (g_photons_race_receive.value.seen &&
-      g_photons_race_receive.value.race_sequence == race_sequence) {
-    return;
+  if (!g_photons_race.first_return_seen) {
+    g_photons_race.first_return_seen = true;
+  } else if (edge.interrupt_delay.valid && edge.interrupt_delay.delayed) {
+    photons_race_batch_note(false, raw_cycles);
+    photons_race_note_delay(edge.interrupt_delay.delayed_by);
+  } else if (!g_photons_race.reference_valid) {
+    photons_race_seed_observe(raw_cycles);
+    if (g_photons_race.reference_valid) {
+      for (uint32_t i = 0U; i < g_photons_race.seed_count; ++i) {
+        const uint32_t seed = g_photons_race.seed_cycles[i];
+        if (photons_lap_science_abs_delta(seed, g_photons_race.reference_cycles) <=
+            (uint64_t)g_photons_race.reference_gate_cycles) {
+          photons_race_batch_note(true, seed);
+        }
+      }
+    }
+  } else {
+    const bool accepted =
+        photons_lap_science_abs_delta(raw_cycles, g_photons_race.reference_cycles) <=
+        (uint64_t)g_photons_race.reference_gate_cycles;
+    photons_race_batch_note(accepted, raw_cycles);
+    if (!accepted) {
+      g_photons_race.rejected_excursion_count++;
+      g_photons_race_batch.rejected_excursion++;
+    }
   }
 
-  photons_race_receive_value_t value{};
-  value.seen = true;
-  value.race_sequence = race_sequence;
-  value.edge_sequence = edge.sequence;
-  value.pps_sequence = edge.pps_sequence;
-  value.finish_dwt = edge.dwt_at_edge;
-  photons_race_receive_isr_publish(value);
+  g_photons_race.attempt_count++;
+  g_photons_race.sequence++;
+  if (g_photons_race.sequence == 0U) g_photons_race.sequence++;
+  g_photons_race.launch_dwt = photons_race_launch_200ns();
 }
 
-
-
 static void photons_race_prepare(void) {
-  // Resetting a live TimePop producer would orphan its scheduled callback while
-  // making foreground state claim it was stopped. That is an ownership failure.
-  if (g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE) __builtin_trap();
-
-  // Recovery may reset boot-local race counters, but it must not reuse a race
-  // identity that could still exist in the ISR-owned receive mailbox.
   const uint32_t preserved_sequence = g_photons_race.sequence;
-  g_race_armed_sequence = 0U;
-  photons_memory_barrier();
   g_photons_race = photons_race_runtime_t{};
   g_photons_race.sequence = preserved_sequence;
   g_photons_race.initialized = true;
+  g_photons_race_batch = photons_race_batch_t{};
+}
+
+static void photons_race_start_autonomous(void) {
+  interrupt_photodiode_diag_t interrupt_diag{};
+  if (!g_photons_race.initialized ||
+      !interrupt_photodiode_snapshot(&interrupt_diag) ||
+      !interrupt_diag.active) {
+    __builtin_trap();
+  }
+  if (g_photons_race.active) return;
+  photons_wave_cancel();
+  if (digitalRead(LASER_MOD_PIN) != LOW) __builtin_trap();
+  g_photons_race.active = true;
+  g_photons_race.primed = true;
+  g_photons_race.first_return_seen = false;
+  g_photons_race.launch_dwt = photons_race_launch_200ns();
 }
 
 
@@ -2093,7 +2363,6 @@ static void photons_laser_initialize_hardware(void) {
   // drive, then prove the modulation line is idle. Earliest boot custody in
   // process_interrupt.cpp establishes the same LOW/no-modulation invariant.
   photons_wave_cancel();
-  g_photons_wave_level = LOW;
   digitalWrite(LASER_MOD_PIN, LOW);
   pinMode(LASER_MOD_PIN, OUTPUT);
   if (digitalRead(LASER_MOD_PIN) != LOW) __builtin_trap();
@@ -2181,6 +2450,8 @@ static uint64_t g_last_fragment_race_skipped_not_quiet_count = 0ULL;
 static uint64_t g_last_fragment_race_skipped_projection_count = 0ULL;
 static uint64_t g_last_fragment_race_invalid_endpoint_count = 0ULL;
 static uint64_t g_last_fragment_race_enqueue_failure_count = 0ULL;
+static uint64_t g_last_fragment_race_rejected_isr_delay_count = 0ULL;
+static uint64_t g_last_fragment_race_rejected_excursion_count = 0ULL;
 
 // process_interrupt injury counters are boot-lifetime forensic testimony.
 // Fresh physical ancestry snapshots their origins; rolling custody judges only
@@ -2256,6 +2527,27 @@ static void photons_pulse_wait_long(
       fractional_cycles %= dwt_cycles_per_second;
     }
   } while (seconds_left != 0ULL || fractional_cycles < width.tail_cycles);
+}
+
+// WAVE uses the same approximate width conversion/wait as manual PULSE, but
+// does not arm a receive record or modify one-shot testimony. No TimePop call,
+// yield, Payload construction, or interrupt masking occurs while MOD is HIGH.
+static void photons_wave_emit_pulse(uint64_t requested_ns) {
+  const uint32_t dwt_cycles_per_second = F_CPU_ACTUAL;
+  if (requested_ns == 0ULL || dwt_cycles_per_second == 0U) __builtin_trap();
+  const photons_pulse_width_t width =
+      photons_pulse_width(requested_ns, dwt_cycles_per_second);
+
+  digitalWriteFast(LASER_MOD_PIN, HIGH);
+  const uint32_t high_start = ARM_DWT_CYCCNT;
+  if (width.whole_seconds == 0ULL) {
+    while ((uint32_t)(ARM_DWT_CYCCNT - high_start) < width.tail_cycles) {
+    }
+  } else {
+    photons_pulse_wait_long(width, dwt_cycles_per_second, high_start);
+  }
+  digitalWriteFast(LASER_MOD_PIN, LOW);
+  if (digitalRead(LASER_MOD_PIN) != LOW) __builtin_trap();
 }
 
 struct photons_pulse_launch_state_t {
@@ -2557,7 +2849,11 @@ static Payload g_photons_fragment_root(
     sizeof(g_photons_fragment_root_region.storage));
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_instrument, 12288U);
 
-PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_race, 1536U);
+// LANTERN V1.0 adds autonomous-race rejection/reference testimony to the
+// PHOTONS_RACE object.  The old 1536-byte store was sized for the 25-field
+// cadence-era object; V1.0 carries 39 scalar fields plus the nested flight_ns
+// Welford object.  Keep explicit fixed custody, but give that schema headroom.
+PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_race, 2560U);
 PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_raw_cycles, 1024U);
 PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_projection, 1024U);
 PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_science, 3072U);
@@ -3073,8 +3369,8 @@ static Payload& photons_fragment_payload(
   race.add("cadence_hz", f.race_cadence_hz);
   race.add("cadence_ns", PHOTONS_RACE_CADENCE_NS);
   race.add("pulse_ns", f.race_pulse_ns);
-  race.add("launch_surrogate", "DRV200_MOD_HIGH_EDGE_PENDING");
-  race.add("flight_interpretation", "ESTIMATED");
+  race.add("launch_surrogate", "DRV200_MOD_HIGH_EDGE_OBSERVED");
+  race.add("flight_interpretation", "OBSERVED_DWT_ENDPOINTS");
   race.add("cadence_tick_count_total", f.race_cadence_tick_count_total);
   race.add("cadence_ticks_this_fragment", f.race_cadence_ticks_this_fragment);
   race.add("attempt_count_total", f.race_attempt_count_total);
@@ -3101,6 +3397,22 @@ static Payload& photons_fragment_payload(
   race.add("enqueue_failure_total", f.race_enqueue_failure_total);
   race.add("enqueue_failure_this_fragment",
            f.race_enqueue_failure_this_fragment);
+  race.add("rejected_isr_delay_total", f.race_rejected_isr_delay_total);
+  race.add("rejected_isr_delay_this_fragment",
+           f.race_rejected_isr_delay_this_fragment);
+  race.add("rejected_qtimer1_total", f.race_rejected_qtimer1_total);
+  race.add("rejected_ocxo1_total", f.race_rejected_ocxo1_total);
+  race.add("rejected_ocxo2_total", f.race_rejected_ocxo2_total);
+  race.add("rejected_pps_total", f.race_rejected_pps_total);
+  race.add("rejected_continuation_total", f.race_rejected_continuation_total);
+  race.add("rejected_unknown_total", f.race_rejected_unknown_total);
+  race.add("rejected_excursion_total", f.race_rejected_excursion_total);
+  race.add("rejected_excursion_this_fragment",
+           f.race_rejected_excursion_this_fragment);
+  race.add("reference_valid", f.race_reference_valid);
+  race.add("reference_cycles", f.race_reference_cycles);
+  race.add("reference_gate_cycles", f.race_reference_gate_cycles);
+  race.add("seed_count", f.race_seed_count);
   photons_payload_add_welford(
       race, "flight_ns", f.race_flight_this_fragment);
   instrument.add_object("race", race);
@@ -3202,12 +3514,16 @@ static Payload& photons_fragment_payload(
               f.science.exclusion_reasons.seed_disagreement);
   reasons.add("raw_cycle_excursion",
               f.science.exclusion_reasons.raw_cycle_excursion);
+  reasons.add("isr_delay",
+              f.science.exclusion_reasons.isr_delay);
   reasons.add("projection_invalid_this_fragment",
               f.science.exclusion_reasons.projection_invalid_this_fragment);
   reasons.add("seed_disagreement_this_fragment",
               f.science.exclusion_reasons.seed_disagreement_this_fragment);
   reasons.add("raw_cycle_excursion_this_fragment",
               f.science.exclusion_reasons.raw_cycle_excursion_this_fragment);
+  reasons.add("isr_delay_this_fragment",
+              f.science.exclusion_reasons.isr_delay_this_fragment);
   science.add_object("exclusion_reasons", reasons);
   reasons.clear();
 
@@ -3219,6 +3535,7 @@ static Payload& photons_fragment_payload(
   science.add("reject_streak", f.science.reject_streak);
   science.add("max_reject_streak", f.science.max_reject_streak);
   science.add("seed_pending", f.science.seed_pending);
+  science.add("seed_pending_count", f.science.seed_pending_count);
   science.add("seed_pending_candidate_index",
               f.science.seed_pending_candidate_index);
   science.add("seed_pending_raw_cycles",
@@ -3503,13 +3820,13 @@ static void photons_fragment_tick(
   g_projection_state.anchor_dwt_cycles_per_second =
       current_anchor.dwt_cycles_per_second;
 
-  const photons_race_runtime_t race = g_photons_race;
+  const photons_race_runtime_t race = photons_race_runtime_snapshot();
 
   // Publication is the PHOTONS heartbeat; race production is an independent
   // lifecycle. Freeze that distinction into the immutable fragment so a zero-race
   // second is explicit testimony rather than ambiguous silence.
   const bool race_engine_active =
-      race.cadence_timer != TIMEPOP_INVALID_HANDLE;
+      race.active;
 
   // This complete foreground-owned value is the publication custody boundary.
   // Keep the large canonical object in a dedicated RAM2 build slot rather than
@@ -3568,6 +3885,24 @@ static void photons_fragment_tick(
   fragment.race_enqueue_failure_this_fragment = (uint32_t)(
       race.enqueue_failure_count -
       g_last_fragment_race_enqueue_failure_count);
+  fragment.race_rejected_isr_delay_total = race.rejected_isr_delay_count;
+  fragment.race_rejected_isr_delay_this_fragment = (uint32_t)(
+      race.rejected_isr_delay_count -
+      g_last_fragment_race_rejected_isr_delay_count);
+  fragment.race_rejected_qtimer1_total = race.rejected_qtimer1_count;
+  fragment.race_rejected_ocxo1_total = race.rejected_ocxo1_count;
+  fragment.race_rejected_ocxo2_total = race.rejected_ocxo2_count;
+  fragment.race_rejected_pps_total = race.rejected_pps_count;
+  fragment.race_rejected_continuation_total = race.rejected_continuation_count;
+  fragment.race_rejected_unknown_total = race.rejected_unknown_count;
+  fragment.race_rejected_excursion_total = race.rejected_excursion_count;
+  fragment.race_rejected_excursion_this_fragment = (uint32_t)(
+      race.rejected_excursion_count -
+      g_last_fragment_race_rejected_excursion_count);
+  fragment.race_reference_valid = race.reference_valid;
+  fragment.race_reference_cycles = race.reference_cycles;
+  fragment.race_reference_gate_cycles = race.reference_gate_cycles;
+  fragment.race_seed_count = race.seed_count;
   fragment.race_flight_this_fragment =
       photons_welford_snapshot(drain.projected_flight_welford);
 
@@ -3725,6 +4060,10 @@ static void photons_fragment_tick(
       fragment.race_invalid_endpoint_total;
   g_last_fragment_race_enqueue_failure_count =
       fragment.race_enqueue_failure_total;
+  g_last_fragment_race_rejected_isr_delay_count =
+      fragment.race_rejected_isr_delay_total;
+  g_last_fragment_race_rejected_excursion_count =
+      fragment.race_rejected_excursion_total;
 
   // Payload remains a renderer of this frozen value.  Keep the completed root
   // populated after publish: the next one-second root.clear() intentionally
@@ -3828,6 +4167,8 @@ static void photons_recovery_clear_physical_ancestry(void) {
   g_last_fragment_race_skipped_projection_count = 0ULL;
   g_last_fragment_race_invalid_endpoint_count = 0ULL;
   g_last_fragment_race_enqueue_failure_count = 0ULL;
+  g_last_fragment_race_rejected_isr_delay_count = 0ULL;
+  g_last_fragment_race_rejected_excursion_count = 0ULL;
   photons_last_fragment_reset();
 }
 
@@ -3839,7 +4180,7 @@ static void photons_start_fragment_publisher(void) {
       !g_photons_ppb_previous_endpoint_valid ||
       !g_interrupt_started ||
       !g_interrupt_ancestry.valid ||
-      g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE) {
+      g_photons_race.active) {
     __builtin_trap();
   }
 
@@ -3855,6 +4196,7 @@ static void photons_start_fragment_publisher(void) {
   // verdict starts publication only; race production remains independently held.
   // Zero races in a second are therefore explicit canonical testimony, not silence.
   g_photons_recovery.publication_started = true;
+  photons_race_start_autonomous();
 }
 
 
@@ -3894,14 +4236,13 @@ FLASHMEM void process_photons_init(void) {
   g_last_fragment_race_skipped_projection_count = 0ULL;
   g_last_fragment_race_invalid_endpoint_count = 0ULL;
   g_last_fragment_race_enqueue_failure_count = 0ULL;
+  g_last_fragment_race_rejected_isr_delay_count = 0ULL;
+  g_last_fragment_race_rejected_excursion_count = 0ULL;
 
   // Establish cross-context mailboxes before the PHOTODIODE subscription exists.
   // Subscription alone does not make the detector callback live. After a later
   // explicit activation, only the detector callback may mutate receive mailbox
   // contents; foreground owns only the arm/launch side of each handoff.
-  g_race_armed_sequence = 0U;
-  g_photons_race_receive.generation = 0U;
-  g_photons_race_receive.value = photons_race_receive_value_t{};
   g_pulse_armed_sequence = 0U;
   g_pulse_sequence = 0U;
   g_last_pulse_launch = photons_pulse_launch_state_t{};
@@ -4583,6 +4924,7 @@ static void photons_recovery_install_science_state(
     uint64_t projection_invalid,
     uint64_t seed_disagreement,
     uint64_t raw_cycle_excursion,
+    uint64_t isr_delay,
     const photons_welford_state_t& accepted_projected,
     const photons_welford_state_t& accepted_raw,
     const photons_welford_state_t& excluded_raw,
@@ -4591,6 +4933,7 @@ static void photons_recovery_install_science_state(
   recovery_reasons.projection_invalid = projection_invalid;
   recovery_reasons.seed_disagreement = seed_disagreement;
   recovery_reasons.raw_cycle_excursion = raw_cycle_excursion;
+  recovery_reasons.isr_delay = isr_delay;
   const uint64_t derived_excluded_count =
       photons_lap_science_excluded_count_from_reasons(recovery_reasons);
   if (excluded_count != derived_excluded_count ||
@@ -4606,23 +4949,30 @@ static void photons_recovery_install_science_state(
   g_raw_cycles_state.valid = candidate_count != 0ULL;
   g_raw_cycles_state.completed_lap_count = candidate_count;
 
+  // Restore the same projection custody used by the autonomous race path:
+  // raw exclusions contributed candidates, but never projection attempts.
+  const uint64_t preprojection_exclusions =
+      seed_disagreement + raw_cycle_excursion + isr_delay;
   g_projection_state = photons_fragment_projection_snapshot_t{};
-  g_projection_state.attempt_count = candidate_count;
+  g_projection_state.attempt_count = candidate_count - preprojection_exclusions;
   g_projection_state.reject_count = projection_invalid;
-  g_projection_state.success_count = candidate_count - projection_invalid;
+  g_projection_state.success_count =
+      g_projection_state.attempt_count - projection_invalid;
 
   g_photons_lap_science_state = photons_lap_science_snapshot_t{};
   g_photons_lap_science_state.valid = candidate_count != 0ULL;
   g_photons_lap_science_state.candidate_count = candidate_count;
   g_photons_lap_science_state.accepted.count = accepted_count;
   // excluded_count is recovery testimony only.  The installed producer derives
-  // its aggregate exclusion population from the three reason counters below.
+  // its aggregate exclusion population from the four reason counters below.
   g_photons_lap_science_state.exclusion_reasons.projection_invalid =
       projection_invalid;
   g_photons_lap_science_state.exclusion_reasons.seed_disagreement =
       seed_disagreement;
   g_photons_lap_science_state.exclusion_reasons.raw_cycle_excursion =
       raw_cycle_excursion;
+  g_photons_lap_science_state.exclusion_reasons.isr_delay =
+      isr_delay;
   g_photons_lap_science_state.accepted.raw_cycles =
       photons_welford_snapshot(accepted_raw);
   g_photons_lap_science_state.accepted.projected_lap_ns =
@@ -4682,6 +5032,7 @@ static FLASHMEM Payload cmd_recovery_commit(const Payload& args) {
   uint64_t projection_invalid = 0ULL;
   uint64_t seed_disagreement = 0ULL;
   uint64_t raw_cycle_excursion = 0ULL;
+  uint64_t isr_delay = 0ULL;
   uint32_t dropped_pending_seed_count = 0U;
   bool campaign_active = false;
 
@@ -4722,6 +5073,7 @@ static FLASHMEM Payload cmd_recovery_commit(const Payload& args) {
           args, "seed_disagreement", seed_disagreement) &&
       photons_recovery_get_u64(
           args, "raw_cycle_excursion", raw_cycle_excursion) &&
+      photons_recovery_get_u64(args, "isr_delay", isr_delay) &&
       photons_recovery_get_u32(
           args, "dropped_pending_seed_count", dropped_pending_seed_count) &&
       dropped_pending_seed_count <= 1U &&
@@ -4742,6 +5094,7 @@ static FLASHMEM Payload cmd_recovery_commit(const Payload& args) {
   recovery_reasons.projection_invalid = projection_invalid;
   recovery_reasons.seed_disagreement = seed_disagreement;
   recovery_reasons.raw_cycle_excursion = raw_cycle_excursion;
+  recovery_reasons.isr_delay = isr_delay;
   const uint64_t derived_excluded_count =
       photons_lap_science_excluded_count_from_reasons(recovery_reasons);
 
@@ -4841,6 +5194,7 @@ static FLASHMEM Payload cmd_recovery_commit(const Payload& args) {
       projection_invalid,
       seed_disagreement,
       raw_cycle_excursion,
+      isr_delay,
       accepted_projected,
       accepted_raw,
       excluded_raw,
@@ -5316,11 +5670,10 @@ static FLASHMEM Payload cmd_report_photons(const Payload& /*args*/) {
   p.add("stats_reset_count", canonical.stats.reset_count);
   p.add("stats_update_count", canonical.stats.update_count);
   p.add("stats_reset_pending", g_photons_stats_reset_pending);
-  p.add("race_engine_active",
-        g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE);
+  p.add("race_engine_active", canonical.race_engine_active);
   p.add("race_cadence_hz", PHOTONS_RACE_CADENCE_HZ);
   p.add("race_pulse_ns", PHOTONS_RACE_PULSE_NS);
-  p.add("race_launch_surrogate", "DRV200_MOD_HIGH_EDGE_PENDING");
+  p.add("race_launch_surrogate", "DRV200_MOD_HIGH_EDGE_OBSERVED");
   p.add("race_cadence_tick_count_total", canonical.race_cadence_tick_count_total);
   p.add("race_cadence_ticks_this_fragment", canonical.race_cadence_ticks_this_fragment);
   p.add("race_attempt_count_total", canonical.race_attempt_count_total);
@@ -5462,6 +5815,8 @@ static FLASHMEM Payload cmd_report_stats(const Payload& /*args*/) {
         canonical.science.exclusion_reasons.seed_disagreement);
   p.add("science_exclusion_raw_cycle_excursion",
         canonical.science.exclusion_reasons.raw_cycle_excursion);
+  p.add("science_exclusion_isr_delay",
+        canonical.science.exclusion_reasons.isr_delay);
   photons_payload_add_flat_ppb_bucket(p, "ppb_10_min",
                                       canonical.stats.ppb_buckets.minute_10);
   photons_payload_add_flat_ppb_bucket(p, "ppb_60_min",
@@ -5588,12 +5943,13 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
     p.add("photodiode_analog_v",
           toFixedDecimal(device.photodiode_analog_v, 6));
     p.add("race_engine_active",
-          g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE);
+          g_photons_race.active);
     return p;
   }
 
   const photons_fragment_snapshot_t& canonical =
       photons_report_fragment_snapshot();
+  const photons_race_runtime_t race = photons_race_runtime_snapshot();
 
   interrupt_photodiode_diag_t interrupt_diag{};
   (void)interrupt_photodiode_snapshot(&interrupt_diag);
@@ -5635,22 +5991,19 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
   p.add("fragment_sequence", canonical.sequence);
   p.add("fragment_valid", canonical.valid);
   p.add("race_engine_active",
-        g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE);
+        g_photons_race.active);
   p.add("race_cadence_hz", PHOTONS_RACE_CADENCE_HZ);
   p.add("race_pulse_ns", PHOTONS_RACE_PULSE_NS);
-  p.add("race_launch_surrogate", "DRV200_MOD_HIGH_EDGE_PENDING");
-  p.add("race_cadence_tick_count_total", g_photons_race.cadence_tick_count);
+  p.add("race_launch_surrogate", "DRV200_MOD_HIGH_EDGE_OBSERVED");
+  p.add("race_cadence_tick_count_total", race.cadence_tick_count);
   p.add("race_cadence_ticks_this_fragment", canonical.race_cadence_ticks_this_fragment);
-  p.add("race_attempt_count_total", g_photons_race.attempt_count);
-  p.add("race_completed_count_total", g_photons_race.completed_count);
-  p.add("race_missed_count_total", g_photons_race.missed_count);
-  p.add("race_skipped_not_quiet_total",
-        g_photons_race.skipped_not_quiet_count);
-  p.add("race_skipped_projection_total",
-        g_photons_race.skipped_projection_count);
-  p.add("race_invalid_endpoint_total",
-        g_photons_race.invalid_endpoint_count);
-  p.add("race_enqueue_failure_total", g_photons_race.enqueue_failure_count);
+  p.add("race_attempt_count_total", race.attempt_count);
+  p.add("race_completed_count_total", race.completed_count);
+  p.add("race_missed_count_total", race.missed_count);
+  p.add("race_skipped_not_quiet_total", race.skipped_not_quiet_count);
+  p.add("race_skipped_projection_total", race.skipped_projection_count);
+  p.add("race_invalid_endpoint_total", race.invalid_endpoint_count);
+  p.add("race_enqueue_failure_total", race.enqueue_failure_count);
   p.add("race_attempts_this_fragment", canonical.race_attempts_this_fragment);
   p.add("race_completed_this_fragment", canonical.race_completed_this_fragment);
   p.add("race_missed_this_fragment", canonical.race_missed_this_fragment);
@@ -5725,7 +6078,7 @@ static FLASHMEM Payload cmd_report_pulse(const Payload& /*args*/) {
   p.add("report", "PHOTONS_PULSE");
   p.add("schema", "PHOTONS_PULSE_REPORT_V3");
   p.add("race_engine_active",
-        g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE);
+        g_photons_race.active);
   p.add("interrupt_callback_count", interrupt_diag.callback_count);
   p.add("interrupt_callback_missing_count",
         interrupt_diag.callback_missing_count);
@@ -5769,7 +6122,7 @@ static FLASHMEM Payload cmd_detector_activate(const Payload& /*args*/) {
       photons_foreground_owner_t::COMMAND);
 
   if (g_photons_recovery.publication_started ||
-      g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE) {
+      g_photons_race.active) {
     Payload p;
     p.add("status", "detector_activate_rejected_instrument_running");
     return p;
@@ -5799,7 +6152,7 @@ static FLASHMEM Payload cmd_detector_activate(const Payload& /*args*/) {
   }
   if (digitalRead(LASER_MOD_PIN) != LOW ||
       g_photons_recovery.publication_started ||
-      g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE) {
+      g_photons_race.active) {
     photons_laser_mod_idle();
     __builtin_trap();
   }
@@ -5818,7 +6171,7 @@ static FLASHMEM Payload cmd_detector_activate(const Payload& /*args*/) {
 static FLASHMEM Payload cmd_init(const Payload& /*args*/) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
-  if (g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE) {
+  if (g_photons_race.active) {
     Payload p;
     p.add("status", "init_rejected_race_engine_active");
     return p;
@@ -5831,56 +6184,57 @@ static FLASHMEM Payload cmd_wave_on(const Payload& args) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
 
-  if (g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE) {
+  if (g_photons_race.active) {
     Payload p;
     p.add("status", "wave_on_rejected_race_engine_active");
     return p;
   }
 
-  uint64_t requested_cycle_ns = 0ULL;
-  if (!args.has("ns") || !args.tryGetUInt64("ns", requested_cycle_ns) ||
-      requested_cycle_ns < 2ULL) {
+  uint64_t interval_ns = 0ULL;
+  uint64_t width_ns = 0ULL;
+  if (args.has("ns") ||
+      !args.has("interval") || !args.tryGetUInt64("interval", interval_ns) ||
+      !args.has("width") || !args.tryGetUInt64("width", width_ns) ||
+      interval_ns == 0ULL || width_ns == 0ULL || width_ns >= interval_ns) {
     Payload p;
-    p.add("status", "wave_on_rejected_ns_invalid");
-    p.add("error", "ns must be a full-cycle uint64 integer >= 2");
+    p.add("status", "wave_on_rejected_timing_invalid");
+    p.add("error", "Use interval and width in ns: uint64 integers with 0 < width < interval; ns is retired");
     return p;
   }
+  if (!g_initialized) __builtin_trap();
 
-  const uint64_t half_cycle_ns = requested_cycle_ns / 2ULL;
-  photons_wave_cancel();
+  photons_laser_mod_idle();
   g_pulse_armed_sequence = 0U;
   photons_memory_barrier();
 
-  // Establish the first HIGH half-cycle immediately.  TimePop owns every later
-  // edge on the recurring half-cycle grid.
-  g_photons_wave_level = HIGH;
-  digitalWriteFast(LASER_MOD_PIN, HIGH);
-
-  g_photons_wave_cycle_ns = requested_cycle_ns;
-  g_photons_wave_half_cycle_ns = half_cycle_ns;
+  g_photons_wave_interval_ns = interval_ns;
+  g_photons_wave_width_ns = width_ns;
   g_photons_wave_timer = timepop_arm(
-      half_cycle_ns,
+      interval_ns,
       true,
       photons_wave_tick,
       nullptr,
       "PHOTONS_WAVE");
   if (g_photons_wave_timer == TIMEPOP_INVALID_HANDLE) {
-    g_photons_wave_cycle_ns = 0ULL;
-    g_photons_wave_half_cycle_ns = 0ULL;
-    g_photons_wave_level = LOW;
-    digitalWriteFast(LASER_MOD_PIN, LOW);
+    g_photons_wave_interval_ns = 0ULL;
+    g_photons_wave_width_ns = 0ULL;
     Payload p;
     p.add("status", "wave_on_rejected_timer_unavailable");
     return p;
   }
 
+  // Preserve the immediate first launch. Every later launch belongs to the
+  // recurring TimePop interval, never to a separately scheduled falling edge.
+  // Width is approximate: GPIO/loop overhead and IRQ service can extend HIGH.
+  photons_wave_emit_pulse(width_ns);
+
   Payload p;
   p.add("status", "wave_started");
-  p.add("cycle_ns", requested_cycle_ns);
-  p.add("half_cycle_ns", half_cycle_ns);
-  p.add("duty_percent", (uint32_t)50U);
+  p.add("interval_ns", interval_ns);
+  p.add("width_ns", width_ns);
+  p.add("timing_semantics", "TIMEPOP_INTERVAL_DWT_BUSY_WAIT_WIDTH");
   p.add("output_pin", (uint32_t)LASER_MOD_PIN);
-  p.add("output_level", HIGH);
+  p.add("output_level", LOW);
   return p;
 }
 
@@ -5888,18 +6242,16 @@ static FLASHMEM Payload cmd_wave_off(const Payload& /*args*/) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
 
-  const uint64_t previous_cycle_ns = g_photons_wave_cycle_ns;
-  const uint64_t previous_half_cycle_ns = g_photons_wave_half_cycle_ns;
+  const uint64_t previous_interval_ns = g_photons_wave_interval_ns;
+  const uint64_t previous_width_ns = g_photons_wave_width_ns;
   const bool was_running = g_photons_wave_timer != TIMEPOP_INVALID_HANDLE;
-  photons_wave_cancel();
-  g_photons_wave_level = LOW;
-  digitalWriteFast(LASER_MOD_PIN, LOW);
+  photons_laser_mod_idle();
 
   Payload p;
   p.add("status", "wave_stopped");
   p.add("was_running", was_running);
-  p.add("previous_cycle_ns", previous_cycle_ns);
-  p.add("previous_half_cycle_ns", previous_half_cycle_ns);
+  p.add("previous_interval_ns", previous_interval_ns);
+  p.add("previous_width_ns", previous_width_ns);
   p.add("output_pin", (uint32_t)LASER_MOD_PIN);
   p.add("output_level", LOW);
   return p;
@@ -5909,7 +6261,7 @@ static FLASHMEM Payload cmd_pulse(const Payload& args) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
 
-  if (g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE) {
+  if (g_photons_race.active) {
     Payload p;
     p.add("status", "pulse_rejected_race_engine_active");
     return p;
@@ -6041,7 +6393,7 @@ static FLASHMEM Payload cmd_pulse(const Payload& args) {
 static FLASHMEM Payload cmd_on(const Payload& /*args*/) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
-  if (g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE) {
+  if (g_photons_race.active) {
     Payload p;
     p.add("status", "on_rejected_race_engine_active");
     return p;
@@ -6056,7 +6408,6 @@ static FLASHMEM Payload cmd_on(const Payload& /*args*/) {
 
   g_pulse_armed_sequence = 0U;
   photons_memory_barrier();
-  g_photons_wave_level = HIGH;
   digitalWriteFast(LASER_MOD_PIN, HIGH);
   if (digitalRead(LASER_MOD_PIN) != HIGH) {
     photons_laser_mod_idle();
@@ -6074,7 +6425,7 @@ static FLASHMEM Payload cmd_on(const Payload& /*args*/) {
 static FLASHMEM Payload cmd_off(const Payload& /*args*/) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
-  if (g_photons_race.cadence_timer != TIMEPOP_INVALID_HANDLE) {
+  if (g_photons_race.active) {
     Payload p;
     p.add("status", "off_rejected_race_engine_active");
     return p;

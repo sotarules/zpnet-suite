@@ -88,10 +88,16 @@ PHOTONS_INSTRUMENT_SCHEMA = "PHOTONS_INSTRUMENT_V1"
 PHOTONS_SCIENCE_SCHEMA = "PHOTONS_SCIENCE_V2"
 PHOTONS_STATS_SCHEMA = "PHOTONS_INSTRUMENT_STATS_V1"
 PHOTONS_RACE_SCHEMA = "PHOTONS_RACE_V1"
-PHOTONS_RACE_CADENCE_HZ = 1000
-PHOTONS_RACE_CADENCE_NS = 1_000_000
-PHOTONS_RACE_PULSE_NS = 91_000
-PHOTONS_RACE_LAUNCH_SURROGATE = "DRV200_MOD_HIGH_EDGE_PENDING"
+# LANTERN V1.0 is return-driven, not cadence-driven: one observed PD return
+# immediately launches the next 200 ns pulse.  The cadence fields remain on the
+# V1 wire only as explicit retired-zero testimony.
+PHOTONS_RACE_CADENCE_HZ = 0
+PHOTONS_RACE_CADENCE_NS = 0
+PHOTONS_RACE_PULSE_NS = 200
+PHOTONS_RACE_LAUNCH_SURROGATE = "DRV200_MOD_HIGH_EDGE_OBSERVED"
+PHOTONS_RACE_FLIGHT_INTERPRETATION = "OBSERVED_DWT_ENDPOINTS"
+PHOTONS_RACE_SEED_HISTORY = 8
+PHOTONS_RACE_SEED_QUORUM = 3
 PHOTONS_EMPTY_HEARTBEAT_LEGACY_LAUNCH_SURROGATE = "LD_ON_FALLING_EDGE"
 PHOTONS_PPB_SEMANTICS = "LAP_BASELINE_NS_OFFSET_V1"
 
@@ -1106,8 +1112,8 @@ def _validate_photons_fragment(fragment: Payload) -> Tuple[int, int, Optional[in
         raise ValueError(f"unsupported PHOTONS race schema {race.get('schema')!r}")
     _require_bool(race.get("active"), "photons.race.active")
 
-    cadence_hz = _require_int(race.get("cadence_hz"), "photons.race.cadence_hz", minimum=1)
-    cadence_ns = _require_int(race.get("cadence_ns"), "photons.race.cadence_ns", minimum=1)
+    cadence_hz = _require_int(race.get("cadence_hz"), "photons.race.cadence_hz")
+    cadence_ns = _require_int(race.get("cadence_ns"), "photons.race.cadence_ns")
     pulse_ns = _require_int(race.get("pulse_ns"), "photons.race.pulse_ns", minimum=1)
     if (
         cadence_hz != PHOTONS_RACE_CADENCE_HZ
@@ -1115,14 +1121,14 @@ def _validate_photons_fragment(fragment: Payload) -> Tuple[int, int, Optional[in
         or pulse_ns != PHOTONS_RACE_PULSE_NS
     ):
         raise ValueError(
-            "PHOTONS race geometry changed unexpectedly: "
-            f"cadence={cadence_hz}Hz/{cadence_ns}ns pulse={pulse_ns}ns"
+            "PHOTONS autonomous-race geometry changed unexpectedly: "
+            f"retired_cadence={cadence_hz}Hz/{cadence_ns}ns pulse={pulse_ns}ns"
         )
     if race.get("launch_surrogate") != PHOTONS_RACE_LAUNCH_SURROGATE:
         raise ValueError(
             f"unsupported PHOTONS launch surrogate {race.get('launch_surrogate')!r}"
         )
-    if race.get("flight_interpretation") != "ESTIMATED":
+    if race.get("flight_interpretation") != PHOTONS_RACE_FLIGHT_INTERPRETATION:
         raise ValueError(
             f"unsupported PHOTONS flight interpretation {race.get('flight_interpretation')!r}"
         )
@@ -1176,111 +1182,162 @@ def _validate_photons_fragment(fragment: Payload) -> Tuple[int, int, Optional[in
     race_cadence_ticks_total = _require_int(
         race.get("cadence_tick_count_total"), "photons.race.cadence_tick_count_total"
     )
-    race_attempts_total = _require_int(
-        race.get("attempt_count_total"), "photons.race.attempt_count_total"
-    )
-    race_completed_total = _require_int(
-        race.get("completed_count_total"), "photons.race.completed_count_total"
-    )
-    race_missed_total = _require_int(
-        race.get("missed_count_total"), "photons.race.missed_count_total"
-    )
-    race_invalid_total = _require_int(
-        race.get("invalid_endpoint_total"), "photons.race.invalid_endpoint_total"
-    )
-    race_enqueue_failure_total = _require_int(
-        race.get("enqueue_failure_total"), "photons.race.enqueue_failure_total"
-    )
-    race_skipped_not_quiet_total = _require_int(
-        race.get("skipped_not_quiet_total"), "photons.race.skipped_not_quiet_total"
-    )
-    race_skipped_projection_total = _require_int(
-        race.get("skipped_projection_total"), "photons.race.skipped_projection_total"
-    )
-    # Forward-compatible rollout: old firmware omits this field and therefore
-    # contributes zero. New firmware makes producer backpressure explicit testimony.
-    race_skipped_backpressure_total = _require_int(
-        race.get("skipped_backpressure_total", 0),
-        "photons.race.skipped_backpressure_total",
-    )
-    if race_cadence_ticks_total != (
-        race_attempts_total
-        + race_skipped_not_quiet_total
-        + race_skipped_projection_total
-        + race_skipped_backpressure_total
-    ):
-        raise ValueError(
-            "PHOTONS race cadence accounting does not close: "
-            f"ticks={race_cadence_ticks_total} attempts={race_attempts_total} "
-            f"not_quiet={race_skipped_not_quiet_total} "
-            f"projection={race_skipped_projection_total} "
-            f"backpressure={race_skipped_backpressure_total}"
-        )
-
-    finalized_total = (
-        race_completed_total
-        + race_missed_total
-        + race_invalid_total
-        + race_enqueue_failure_total
-    )
-    if finalized_total > race_attempts_total or race_attempts_total - finalized_total > 1:
-        raise ValueError(
-            "PHOTONS race lifetime accounting does not close: "
-            f"attempts={race_attempts_total} completed={race_completed_total} "
-            f"missed={race_missed_total} invalid={race_invalid_total} "
-            f"enqueue_failure={race_enqueue_failure_total}"
-        )
-
     race_cadence_ticks_fragment = _require_int(
         race.get("cadence_ticks_this_fragment"), "photons.race.cadence_ticks_this_fragment"
+    )
+    race_attempts_total = _require_int(
+        race.get("attempt_count_total"), "photons.race.attempt_count_total"
     )
     race_attempts_fragment = _require_int(
         race.get("attempts_this_fragment"), "photons.race.attempts_this_fragment"
     )
+    race_completed_total = _require_int(
+        race.get("completed_count_total"), "photons.race.completed_count_total"
+    )
     race_completed_fragment = _require_int(
         race.get("completed_this_fragment"), "photons.race.completed_this_fragment"
     )
-    _require_int(race.get("missed_this_fragment"), "photons.race.missed_this_fragment")
-    race_skipped_not_quiet_fragment = _require_int(
-        race.get("skipped_not_quiet_this_fragment"),
-        "photons.race.skipped_not_quiet_this_fragment",
-    )
-    race_skipped_projection_fragment = _require_int(
-        race.get("skipped_projection_this_fragment"),
-        "photons.race.skipped_projection_this_fragment",
-    )
-    race_skipped_backpressure_fragment = _require_int(
-        race.get("skipped_backpressure_this_fragment", 0),
-        "photons.race.skipped_backpressure_this_fragment",
-    )
-    if race_cadence_ticks_fragment != (
-        race_attempts_fragment
-        + race_skipped_not_quiet_fragment
-        + race_skipped_projection_fragment
-        + race_skipped_backpressure_fragment
-    ):
+
+    # LANTERN V1.0 has no recurring scheduler.  These V1 fields are retained only
+    # so the wire shape remains explicit while downstream naming catches up.
+    retired_scheduler_fields = {
+        "cadence_tick_count_total": race_cadence_ticks_total,
+        "cadence_ticks_this_fragment": race_cadence_ticks_fragment,
+        "missed_count_total": _require_int(
+            race.get("missed_count_total"), "photons.race.missed_count_total"
+        ),
+        "missed_this_fragment": _require_int(
+            race.get("missed_this_fragment"), "photons.race.missed_this_fragment"
+        ),
+        "skipped_not_quiet_total": _require_int(
+            race.get("skipped_not_quiet_total"), "photons.race.skipped_not_quiet_total"
+        ),
+        "skipped_not_quiet_this_fragment": _require_int(
+            race.get("skipped_not_quiet_this_fragment"),
+            "photons.race.skipped_not_quiet_this_fragment",
+        ),
+        "skipped_projection_total": _require_int(
+            race.get("skipped_projection_total"), "photons.race.skipped_projection_total"
+        ),
+        "skipped_projection_this_fragment": _require_int(
+            race.get("skipped_projection_this_fragment"),
+            "photons.race.skipped_projection_this_fragment",
+        ),
+        "skipped_backpressure_total": _require_int(
+            race.get("skipped_backpressure_total"),
+            "photons.race.skipped_backpressure_total",
+        ),
+        "skipped_backpressure_this_fragment": _require_int(
+            race.get("skipped_backpressure_this_fragment"),
+            "photons.race.skipped_backpressure_this_fragment",
+        ),
+        "invalid_endpoint_total": _require_int(
+            race.get("invalid_endpoint_total"), "photons.race.invalid_endpoint_total"
+        ),
+        "invalid_endpoint_this_fragment": _require_int(
+            race.get("invalid_endpoint_this_fragment"),
+            "photons.race.invalid_endpoint_this_fragment",
+        ),
+        "enqueue_failure_total": _require_int(
+            race.get("enqueue_failure_total"), "photons.race.enqueue_failure_total"
+        ),
+        "enqueue_failure_this_fragment": _require_int(
+            race.get("enqueue_failure_this_fragment"),
+            "photons.race.enqueue_failure_this_fragment",
+        ),
+    }
+    nonzero_retired = {
+        key: value for key, value in retired_scheduler_fields.items() if value != 0
+    }
+    if nonzero_retired:
         raise ValueError(
-            "PHOTONS race fragment cadence accounting does not close: "
-            f"ticks={race_cadence_ticks_fragment} attempts={race_attempts_fragment} "
-            f"not_quiet={race_skipped_not_quiet_fragment} "
-            f"projection={race_skipped_projection_fragment} "
-            f"backpressure={race_skipped_backpressure_fragment}"
+            "PHOTONS autonomous race published nonzero retired scheduler testimony: "
+            f"{nonzero_retired!r}"
         )
-    _require_int(
-        race.get("invalid_endpoint_this_fragment"),
-        "photons.race.invalid_endpoint_this_fragment",
-    )
-    _require_int(
-        race.get("enqueue_failure_this_fragment"),
-        "photons.race.enqueue_failure_this_fragment",
-    )
-    if race_completed_fragment > race_attempts_fragment + 1:
-        # A race launched in the prior one-second fragment may lawfully complete
-        # in this one, so at most one completion can lead this fragment's attempts.
+
+    # Every observed return completes the currently armed race and immediately
+    # launches exactly one successor.  The first priming launch is intentionally
+    # outside both counters, so completed/attempt chronology closes one-for-one.
+    if race_completed_total != race_attempts_total:
         raise ValueError(
-            "PHOTONS race fragment completion/attempt geometry is impossible: "
-            f"attempts={race_attempts_fragment} completed={race_completed_fragment}"
+            "PHOTONS autonomous race lifetime return/relaunch accounting does not close: "
+            f"completed={race_completed_total} attempts={race_attempts_total}"
         )
+    if race_completed_fragment != race_attempts_fragment:
+        raise ValueError(
+            "PHOTONS autonomous race fragment return/relaunch accounting does not close: "
+            f"completed={race_completed_fragment} attempts={race_attempts_fragment}"
+        )
+
+    rejected_isr_delay_total = _require_int(
+        race.get("rejected_isr_delay_total"), "photons.race.rejected_isr_delay_total"
+    )
+    rejected_isr_delay_fragment = _require_int(
+        race.get("rejected_isr_delay_this_fragment"),
+        "photons.race.rejected_isr_delay_this_fragment",
+    )
+    rejected_delay_causes = {
+        "qtimer1": _require_int(
+            race.get("rejected_qtimer1_total"), "photons.race.rejected_qtimer1_total"
+        ),
+        "ocxo1": _require_int(
+            race.get("rejected_ocxo1_total"), "photons.race.rejected_ocxo1_total"
+        ),
+        "ocxo2": _require_int(
+            race.get("rejected_ocxo2_total"), "photons.race.rejected_ocxo2_total"
+        ),
+        "pps": _require_int(
+            race.get("rejected_pps_total"), "photons.race.rejected_pps_total"
+        ),
+        "continuation": _require_int(
+            race.get("rejected_continuation_total"),
+            "photons.race.rejected_continuation_total",
+        ),
+        "unknown": _require_int(
+            race.get("rejected_unknown_total"), "photons.race.rejected_unknown_total"
+        ),
+    }
+    if rejected_isr_delay_total != sum(rejected_delay_causes.values()):
+        raise ValueError(
+            "PHOTONS ISR-delay rejection cause ledger does not close: "
+            f"total={rejected_isr_delay_total} causes={rejected_delay_causes!r}"
+        )
+    if rejected_isr_delay_fragment > rejected_isr_delay_total:
+        raise ValueError("PHOTONS fragment ISR-delay rejection count exceeds lifetime count")
+
+    rejected_excursion_total = _require_int(
+        race.get("rejected_excursion_total"), "photons.race.rejected_excursion_total"
+    )
+    rejected_excursion_fragment = _require_int(
+        race.get("rejected_excursion_this_fragment"),
+        "photons.race.rejected_excursion_this_fragment",
+    )
+    if rejected_excursion_fragment > rejected_excursion_total:
+        raise ValueError("PHOTONS fragment excursion rejection count exceeds lifetime count")
+
+    reference_valid = _require_bool(
+        race.get("reference_valid"), "photons.race.reference_valid"
+    )
+    reference_cycles = _require_int(
+        race.get("reference_cycles"), "photons.race.reference_cycles"
+    )
+    reference_gate_cycles = _require_int(
+        race.get("reference_gate_cycles"), "photons.race.reference_gate_cycles"
+    )
+    seed_count = _require_int(race.get("seed_count"), "photons.race.seed_count")
+    if seed_count > PHOTONS_RACE_SEED_HISTORY:
+        raise ValueError(
+            f"PHOTONS race seed_count exceeds history capacity: {seed_count}"
+        )
+    if reference_valid:
+        if (
+            seed_count < PHOTONS_RACE_SEED_QUORUM
+            or reference_cycles <= 0
+            or reference_gate_cycles <= 0
+        ):
+            raise ValueError("PHOTONS locked race reference lacks seed/reference geometry")
+    elif reference_cycles != 0 or reference_gate_cycles != 0:
+        raise ValueError("PHOTONS unlocked race reference publishes nonzero geometry")
 
     race_flight = _validate_recovery_welford(
         race.get("flight_ns"), "photons.race.flight_ns"
@@ -1292,22 +1349,28 @@ def _validate_photons_fragment(fragment: Payload) -> Tuple[int, int, Optional[in
         instrument.get("projected_laps_this_fragment"),
         "photons.projected_laps_this_fragment",
     )
-    if race_completed_fragment != raw_laps_fragment:
+    accepted_fragment = _require_int(
+        accepted.get("count_this_fragment"), "photons.science.accepted.count_this_fragment"
+    )
+    excluded_fragment = _require_int(
+        excluded.get("count_this_fragment"), "photons.science.excluded.count_this_fragment"
+    )
+    if raw_laps_fragment != accepted_fragment + excluded_fragment:
         raise ValueError(
-            "PHOTONS completed-race/raw-ring mismatch: "
-            f"completed={race_completed_fragment} raw_laps={raw_laps_fragment}"
+            "PHOTONS autonomous race batch/raw accounting does not close: "
+            f"raw_laps={raw_laps_fragment} accepted={accepted_fragment} "
+            f"excluded={excluded_fragment}"
+        )
+    if projected_laps_fragment != accepted_fragment:
+        raise ValueError(
+            "PHOTONS autonomous race accepted/projection accounting does not close: "
+            f"projected={projected_laps_fragment} accepted={accepted_fragment}"
         )
     if int(race_flight["n"]) != projected_laps_fragment:
         raise ValueError(
             "PHOTONS race-flight/projection mismatch: "
             f"race_flight_n={race_flight['n']} projected={projected_laps_fragment}"
         )
-    if projected_laps_fragment > race_completed_fragment:
-        raise ValueError(
-            "PHOTONS projected race count exceeds physical completions: "
-            f"projected={projected_laps_fragment} completed={race_completed_fragment}"
-        )
-
     candidate_count = _require_int(
         science.get("candidate_count"), "photons.science.candidate_count"
     )
@@ -1414,10 +1477,16 @@ def _validate_photons_fragment(fragment: Payload) -> Tuple[int, int, Optional[in
             "PHOTONS projection accounting mismatch: "
             f"attempts={attempts} success={successes} reject={rejects}"
         )
-    if attempts != candidate_count:
+    preprojection_exclusions = (
+        lifetime_reason_counts.get("seed_disagreement", 0)
+        + lifetime_reason_counts.get("raw_cycle_excursion", 0)
+        + lifetime_reason_counts.get("isr_delay", 0)
+    )
+    if candidate_count != attempts + preprojection_exclusions:
         raise ValueError(
-            "PHOTONS candidate/projection mismatch: "
-            f"candidate_count={candidate_count} projection_attempts={attempts}"
+            "PHOTONS candidate/projection custody mismatch: "
+            f"candidate_count={candidate_count} projection_attempts={attempts} "
+            f"preprojection_exclusions={preprojection_exclusions}"
         )
     if rejects != projection_invalid:
         raise ValueError(
@@ -3528,7 +3597,7 @@ def _canonical_recovery_state_from_row(
 
     # Measurement-source migration is a hard scientific boundary.  Emulator-era
     # PHOTONS rows are valid historical evidence, but they may never be resurrected
-    # as ancestors of the physical 1 kHz race population.  The operator must make
+    # as ancestors of the physical autonomous return-driven race population.  The operator must make
     # the one-time STOP/CLEAR + producer reboot cut before this firmware generation.
     # Refuse legacy durable ancestry rather than silently mixing synthetic laps with
     # real optical flights.
@@ -3542,8 +3611,8 @@ def _canonical_recovery_state_from_row(
     if race.get("schema") != PHOTONS_RACE_SCHEMA:
         raise ValueError("durable PHOTONS race schema mismatch")
     durable_race_geometry = (
-        _require_int(race.get("cadence_hz"), "PHOTONS.photons.race.cadence_hz", minimum=1),
-        _require_int(race.get("cadence_ns"), "PHOTONS.photons.race.cadence_ns", minimum=1),
+        _require_int(race.get("cadence_hz"), "PHOTONS.photons.race.cadence_hz"),
+        _require_int(race.get("cadence_ns"), "PHOTONS.photons.race.cadence_ns"),
         _require_int(race.get("pulse_ns"), "PHOTONS.photons.race.pulse_ns", minimum=1),
     )
     if durable_race_geometry != (
@@ -3557,7 +3626,7 @@ def _canonical_recovery_state_from_row(
         )
     if (
         race.get("launch_surrogate") != PHOTONS_RACE_LAUNCH_SURROGATE
-        or race.get("flight_interpretation") != "ESTIMATED"
+        or race.get("flight_interpretation") != PHOTONS_RACE_FLIGHT_INTERPRETATION
     ):
         raise ValueError("durable PHOTONS race launch/interpretation contract changed")
 
@@ -3714,7 +3783,16 @@ def _canonical_recovery_state_from_row(
     raw_cycle_excursion = _require_int(
         reasons.get("raw_cycle_excursion"), "PHOTONS.reasons.raw_cycle_excursion"
     )
-    if projection_invalid + seed_disagreement + raw_cycle_excursion != excluded_count:
+    isr_delay = _require_int(
+        reasons.get("isr_delay"), "PHOTONS.reasons.isr_delay"
+    )
+    if (
+        projection_invalid
+        + seed_disagreement
+        + raw_cycle_excursion
+        + isr_delay
+        != excluded_count
+    ):
         raise ValueError("canonical PHOTONS exclusion reasons do not close")
 
     attempts = _require_int(
@@ -3726,8 +3804,11 @@ def _canonical_recovery_state_from_row(
     rejects = _require_int(
         projection.get("reject_count"), "PHOTONS.projection.reject_count"
     )
+    # Apply the same custody identities as live PHOTONS_FRAGMENT admission:
+    # raw exclusions never entered projection and cannot be projection successes.
+    preprojection_exclusions = seed_disagreement + raw_cycle_excursion + isr_delay
     if (
-        attempts != candidate_count
+        candidate_count != attempts + preprojection_exclusions
         or attempts != successes + rejects
         or rejects != projection_invalid
         or successes != accepted_count + excluded_projected["n"] + pending_count
@@ -3850,6 +3931,7 @@ def _canonical_recovery_state_from_row(
         "projection_invalid": projection_invalid,
         "seed_disagreement": seed_disagreement,
         "raw_cycle_excursion": raw_cycle_excursion,
+        "isr_delay": isr_delay,
         "dropped_pending_seed_count": pending_count,
         "campaign_active": campaign_restore is not None,
     }
@@ -4079,12 +4161,10 @@ def _load_newest_empty_photons_heartbeat_state(
             _require_int(
                 race.get("cadence_hz"),
                 "empty-heartbeat PHOTONS.photons.race.cadence_hz",
-                minimum=1,
             ) != PHOTONS_RACE_CADENCE_HZ
             or _require_int(
                 race.get("cadence_ns"),
                 "empty-heartbeat PHOTONS.photons.race.cadence_ns",
-                minimum=1,
             ) != PHOTONS_RACE_CADENCE_NS
             or _require_int(
                 race.get("pulse_ns"),
@@ -4095,7 +4175,7 @@ def _load_newest_empty_photons_heartbeat_state(
                 PHOTONS_RACE_LAUNCH_SURROGATE,
                 PHOTONS_EMPTY_HEARTBEAT_LEGACY_LAUNCH_SURROGATE,
             }
-            or race.get("flight_interpretation") != "ESTIMATED"
+            or race.get("flight_interpretation") != PHOTONS_RACE_FLIGHT_INTERPRETATION
         ):
             return None
 
@@ -4657,7 +4737,7 @@ def _fetch_teensy_photons_report() -> Dict[str, Any]:
             "PD200T_REAL_RACE firmware is required"
         )
     if (
-        _require_int(payload.get("race_cadence_hz"), "PHOTONS.REPORT.race_cadence_hz", minimum=1)
+        _require_int(payload.get("race_cadence_hz"), "PHOTONS.REPORT.race_cadence_hz")
         != PHOTONS_RACE_CADENCE_HZ
         or _require_int(payload.get("race_pulse_ns"), "PHOTONS.REPORT.race_pulse_ns", minimum=1)
         != PHOTONS_RACE_PULSE_NS
@@ -10747,9 +10827,24 @@ def _startup_commissioning_empty_heartbeat_cutover(
     failure: Exception,
     bringup: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
-    """Cut only the known invalid pre-heartbeat ancestry into a new empty epoch."""
+    """Cut known non-resurrectable commissioning ancestry into a new empty epoch."""
     failure_text = str(failure)
-    if "canonical PHOTONS statistics are invalid" not in failure_text:
+
+    # Commissioning cutovers are deliberately narrow.  Preserve arbitrary recovery
+    # contradictions as a hold, but recognize the two already-defined boundaries:
+    # pre-heartbeat invalid statistics and the exact retired 1 kHz / 91 us race
+    # geometry replaced by LANTERN V1.0's return-driven 200 ns race.
+    cutover_reason: Optional[str] = None
+    from_epoch = "UNRECOVERABLE_PD200T_REAL_RACE_HISTORY"
+    if "canonical PHOTONS statistics are invalid" in failure_text:
+        cutover_reason = "INVALID_PRE_HEARTBEAT_STATISTICS"
+    elif (
+        "durable PHOTONS race geometry does not match this firmware epoch: "
+        "durable=(1000, 1000000, 91000)"
+    ) in failure_text:
+        cutover_reason = "LANTERN_V1_RETURN_DRIVEN_RACE_EPOCH"
+        from_epoch = "PD200T_REAL_RACE_1KHZ_91US"
+    else:
         return None
 
     active_master = _load_active_lantern_master()
@@ -10774,8 +10869,9 @@ def _startup_commissioning_empty_heartbeat_cutover(
 
     migration = {
         "schema": "PHOTONS_COMMISSIONING_EMPTY_HEARTBEAT_CUTOVER_V1",
-        "from_source": "UNRECOVERABLE_PD200T_REAL_RACE_HISTORY",
+        "from_source": from_epoch,
         "to_source": "PD200T_REAL_RACE",
+        "cutover_reason": cutover_reason,
         "historical_detail_rows_preserved": int(historical_rows),
         "producer_action": "COLD_START_EMPTY_HEARTBEAT_EPOCH",
         "blocked_recovery_error": failure_text,

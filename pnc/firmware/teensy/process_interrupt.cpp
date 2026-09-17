@@ -30,10 +30,11 @@
 //     safe 16-bit compare-programming window;
 //   * raw ISR-entry DWT is converted once to the calibrated event coordinate;
 //   * every lawful OCXO compare authors one one-second event;
-//   * immutable CH2 and subscriber work is transferred to foreground-owned
-//     service without entering TimePop or invoking application behavior.
+//   * immutable CH2 and ordinary subscriber work is transferred to foreground;
+//   * the LANTERN PHOTODIODE edge alone may invoke its bounded optical continuation
+//     callback here after every other Priority-32 handoff item is drained.
 //
-// Foreground owns TimePop scheduling policy and all application callbacks.
+// Foreground owns TimePop scheduling policy and all non-optical application callbacks.
 //
 // There is no alternative endpoint estimator, repair candidate, FloorLine, or
 // alternative publication court in this module.  OCXO compare custody is 1 Hz;
@@ -526,6 +527,21 @@ struct photodiode_subscription_runtime_t {
 };
 
 static photodiode_subscription_runtime_t g_photodiode_subscription{};
+
+// LANTERN V1.0: the physical Priority-48 ISR authors one immutable optical edge
+// fact and pends the existing Priority-32 continuation.  The continuation invokes
+// the PHOTODIODE subscriber.  Because the next optical launch is authored only by
+// that continuation, one outstanding edge is sufficient; comparator chatter while
+// the first edge is in custody is counted and discarded rather than queued.
+struct photodiode_handoff_packet_t {
+  interrupt_photodiode_edge_t edge{};
+};
+
+static photodiode_handoff_packet_t g_photodiode_handoff_packet{};
+static volatile bool g_photodiode_handoff_pending = false;
+static volatile uint32_t g_photodiode_handoff_enqueue_count = 0U;
+static volatile uint32_t g_photodiode_handoff_dequeue_count = 0U;
+static volatile uint32_t g_photodiode_handoff_busy_drop_count = 0U;
 
 // Preserve raw first-instruction DWT until the dedicated PD200T GPIO entry
 // latency floor has been measured on the final interrupt vector.
@@ -4179,7 +4195,8 @@ static bool handoff_any_pending(void) {
          capture_ring_pending(g_ch2_capture_ring) != 0U ||
          capture_ring_pending(g_ocxo1_capture_ring) != 0U ||
          capture_ring_pending(g_ocxo2_capture_ring) != 0U ||
-         capture_ring_pending(g_pps_capture_ring) != 0U;
+         capture_ring_pending(g_pps_capture_ring) != 0U ||
+         g_photodiode_handoff_pending;
 }
 
 static void interrupt_handoff_request_isr(uint32_t request_dwt) {
@@ -4910,6 +4927,45 @@ static void recover_capture_overruns(void) {
   }
 }
 
+static bool process_photodiode_handoff_one(void) {
+  if (!g_photodiode_handoff_pending) return false;
+
+  const photodiode_handoff_packet_t packet = g_photodiode_handoff_packet;
+  dmb_barrier();
+  g_photodiode_handoff_pending = false;
+  g_photodiode_handoff_dequeue_count++;
+  dmb_barrier();
+
+  if (!g_photodiode_subscription.active) {
+    g_photodiode_subscription.diag.inactive_edge_count++;
+    return true;
+  }
+
+  const interrupt_photodiode_edge_fn callback =
+      g_photodiode_subscription.callback;
+  void* const user_data = g_photodiode_subscription.user_data;
+  if (!interrupt_callback_address_executable((uintptr_t)callback)) {
+    g_photodiode_subscription.diag.callback_missing_count++;
+    return true;
+  }
+
+  const uint32_t callback_start_dwt = ARM_DWT_CYCCNT;
+  g_photodiode_subscription.diag.callback_count++;
+  callback(packet.edge, g_photodiode_subscription.diag, user_data);
+  const uint32_t callback_cycles = ARM_DWT_CYCCNT - callback_start_dwt;
+  interrupt_photodiode_diag_t& diag = g_photodiode_subscription.diag;
+  diag.last_callback_wall_cycles = callback_cycles;
+  if (diag.min_callback_wall_cycles == 0U ||
+      callback_cycles < diag.min_callback_wall_cycles) {
+    diag.min_callback_wall_cycles = callback_cycles;
+  }
+  if (callback_cycles > diag.max_callback_wall_cycles) {
+    diag.max_callback_wall_cycles = callback_cycles;
+  }
+  return true;
+}
+
+
 static bool handoff_drain_one_oldest(void) {
   enum source_t : uint8_t {
     SRC_NONE,
@@ -5070,6 +5126,14 @@ static void interrupt_handoff_service_isr(void) {
   uint32_t drained = 0U;
   while (drained < INTERRUPT_HANDOFF_DRAIN_BUDGET &&
          handoff_drain_one_oldest()) {
+    ++drained;
+  }
+
+  // Optical continuation is deliberately last.  Its callback authors the next
+  // DRV200 pulse, so ordinary Priority-32 work must be complete before that launch;
+  // otherwise continuation itself would remain resident when the photon returns.
+  if (drained < INTERRUPT_HANDOFF_DRAIN_BUDGET &&
+      process_photodiode_handoff_one()) {
     ++drained;
   }
   recover_capture_overruns();
@@ -5830,27 +5894,17 @@ static void process_interrupt_photodiode_gpio_irq_observed(
     return;
   }
 
-  const interrupt_photodiode_edge_fn callback =
-      g_photodiode_subscription.callback;
-  void* const user_data =
-      g_photodiode_subscription.user_data;
-  if (!interrupt_callback_address_executable((uintptr_t)callback)) {
-    diag.callback_missing_count++;
+  if (g_photodiode_handoff_pending) {
+    g_photodiode_handoff_busy_drop_count++;
     return;
   }
 
-  const uint32_t callback_start_dwt = ARM_DWT_CYCCNT;
-  diag.callback_count++;
-  callback(edge, diag, user_data);
-  const uint32_t callback_cycles = ARM_DWT_CYCCNT - callback_start_dwt;
-  diag.last_callback_wall_cycles = callback_cycles;
-  if (diag.min_callback_wall_cycles == 0U ||
-      callback_cycles < diag.min_callback_wall_cycles) {
-    diag.min_callback_wall_cycles = callback_cycles;
-  }
-  if (callback_cycles > diag.max_callback_wall_cycles) {
-    diag.max_callback_wall_cycles = callback_cycles;
-  }
+  g_photodiode_handoff_packet.edge = edge;
+  dmb_barrier();
+  g_photodiode_handoff_pending = true;
+  g_photodiode_handoff_enqueue_count++;
+  dmb_barrier();
+  interrupt_handoff_request_isr(isr_entry_dwt_raw);
 }
 
 void process_interrupt_photodiode_gpio_irq(uint32_t isr_entry_dwt_raw) {
@@ -6730,6 +6784,11 @@ FLASHMEM void process_interrupt_init(void) {
   g_photodiode_subscription.diag.source_pin = (uint32_t)PHOTODIODE_EDGE_PIN;
   g_photodiode_subscription.diag.isr_entry_to_edge_correction_cycles =
       PHOTODIODE_ISR_ENTRY_TO_EDGE_CORRECTION_CYCLES;
+  g_photodiode_handoff_packet = photodiode_handoff_packet_t{};
+  g_photodiode_handoff_pending = false;
+  g_photodiode_handoff_enqueue_count = 0U;
+  g_photodiode_handoff_dequeue_count = 0U;
+  g_photodiode_handoff_busy_drop_count = 0U;
   g_interrupt_foreground_forensics =
       interrupt_foreground_forensic_runtime_t{};
   g_interrupt_foreground_forensic_live =

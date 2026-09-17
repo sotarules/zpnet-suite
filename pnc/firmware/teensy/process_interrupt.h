@@ -9,9 +9,9 @@
 // Execution tiers:
 //   Priority 0  — PPS, OCXO1, OCXO2 sovereign science capture
 //   Priority 16 — shared QTimer1 VCLOCK + TimePop CH2 capture
-//   Priority 32 — continuation/handoff and compare rearm
+//   Priority 32 — continuation/handoff, compare rearm, bounded LANTERN continuation
 //   Priority 48 — PHOTODIODE receive edge; expendable optical testimony
-//   Foreground  — TimePop policy and application callbacks
+//   Foreground  — TimePop policy and all non-optical application callbacks
 // ============================================================================
 
 #pragma once
@@ -1179,12 +1179,13 @@ interrupt_pps_edge_heartbeat_t interrupt_pps_edge_heartbeat(void);
 // High-rate photodiode edge subscription
 // ============================================================================
 //
-// The PD200T comparator is not an ordinary foreground subscriber.  Its edge
-// rate may approach hundreds of kHz, so its callback runs synchronously from
-// the physical pin-34 GPIO ISR after the first-instruction DWT capture.
-// The callback must remain bounded, allocation-free, and ISR-safe.  It may hand
-// the immutable edge fact to process_photons, but process_interrupt owns the
-// physical interrupt and capture coordinate.
+// The PD200T comparator is not an ordinary foreground subscriber.  The physical
+// pin-34 GPIO ISR captures the immutable first-instruction DWT/arrival testimony,
+// then transfers one outstanding optical edge to the existing Priority-32
+// continuation.  The PHOTODIODE callback runs from that continuation, never from
+// the Priority-48 physical ISR.  CLOCKS Priority 0/16 may preempt continuation;
+// PHOTODIODE can never delay CLOCKS.  process_interrupt owns the physical interrupt
+// and capture coordinate; process_photons owns optical race continuation.
 //
 // dwt_at_edge is the latency-adjusted physical-edge coordinate.  Until the
 // PD200T GPIO path has its own measured floor calibration, the correction is
