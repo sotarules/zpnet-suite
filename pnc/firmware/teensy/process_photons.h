@@ -541,6 +541,18 @@ struct photons_fragment_snapshot_t {
   uint32_t race_seed_count = 0;
   photons_fragment_welford_snapshot_t race_flight_this_fragment{};
 
+  // Post-race holdoff: elapsed DWT cycles from classification completion to
+  // actual relaunch. Counters share the boot-local race-runtime snapshot.
+  uint32_t race_pending_relaunch_count = 0;
+  uint32_t race_pending_relaunch_count_previous = 0;
+  uint32_t race_holdoff_ns = 0;
+  uint32_t race_holdoff_cycles = 0;
+  uint64_t race_holdoff_edges_total = 0;
+  uint64_t race_holdoff_launches_total = 0;
+  uint32_t race_holdoff_last_cycles = 0;
+  uint32_t race_holdoff_min_cycles = 0;
+  uint32_t race_holdoff_max_cycles = 0;
+
   photons_fragment_raw_cycles_snapshot_t raw_cycles{};
   photons_fragment_projection_snapshot_t projection{};
   photons_lap_science_snapshot_t science{};
@@ -588,6 +600,10 @@ struct photons_fragment_snapshot_t {
 // until an explicit later commissioning transition starts it.
 // Must run after process_interrupt_init() and timepop_init().
 void process_photons_init(void);
+
+// Ordinary-loop bridge: queue a TimePop ALAP launch after the minimum
+// post-race holdoff. No scheduler mutation occurs in optical continuation.
+void process_photons_foreground_service(void);
 
 // Register the PHOTONS process command surface.
 void process_photons_register(void);

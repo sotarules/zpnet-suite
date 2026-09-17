@@ -4,6 +4,7 @@
 #include <malloc.h>
 #include <string.h>
 #include <math.h>
+#include <stdio.h>
 
 #if defined(ARDUINO_TEENSY41)
 #include <ADC.h>
@@ -109,6 +110,48 @@ fixed_decimal_t toFixedDecimal(double value, int decimal_places) {
   out.whole = whole;
   out.fractional = fractional;
   out.negative = (negative && rounded_nonzero) ? 1U : 0U;
+  return out;
+}
+
+// Scientific conversion belongs outside Payload: its ABI remains integer-only.
+// A binary64 needs 17 significant decimal digits to survive a text round trip.
+fixed_decimal_t toScientificDecimal(double value) {
+  static_assert(sizeof(double) == sizeof(uint64_t), "binary64 double required");
+  if (!isfinite(value)) __builtin_trap();
+
+  fixed_decimal_t out;
+  out.whole = 0ULL;
+  out.fractional = 0ULL;
+  out.source_bits = 0ULL;
+  memcpy(&out.source_bits, &value, sizeof(value));
+  out.decimal_places = 0U;
+  out.negative = value < 0.0 ? 1U : 0U;
+  out.status = fixed_decimal_status_t::VALID;
+  out.exponent10 = 0;
+  if (value == 0.0) return out;
+
+  // Bounded conversion of the magnitude: d.dddddddddddddddd e +/- ddd.
+  // No float formatting, parsing, or arithmetic enters Payload itself.
+  char text[32];
+  const double magnitude = value < 0.0 ? -value : value;
+  const int length = snprintf(text, sizeof(text), "%.16e", magnitude);
+  if (length < 22 || length >= (int)sizeof(text) ||
+      text[1] != '.' || text[18] != 'e' ||
+      (text[19] != '+' && text[19] != '-')) __builtin_trap();
+  if (text[0] < '1' || text[0] > '9') __builtin_trap();
+  out.whole = (uint64_t)(text[0] - '0');
+  for (int i = 2; i < 18; ++i) {
+    if (text[i] < '0' || text[i] > '9') __builtin_trap();
+    out.whole = out.whole * 10ULL + (uint64_t)(text[i] - '0');
+  }
+  int exponent = 0;
+  for (int i = 20; i < length; ++i) {
+    if (text[i] < '0' || text[i] > '9') __builtin_trap();
+    exponent = exponent * 10 + (text[i] - '0');
+  }
+  if (text[19] == '-') exponent = -exponent;
+  if (exponent < -324 || exponent > 308) __builtin_trap();
+  out.exponent10 = (int16_t)(exponent - 16);
   return out;
 }
 

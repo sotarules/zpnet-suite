@@ -34,7 +34,8 @@
 //   * the LANTERN PHOTODIODE edge alone may invoke its bounded optical continuation
 //     callback here after every other Priority-32 handoff item is drained.
 //
-// Foreground owns TimePop scheduling policy and all non-optical application callbacks.
+// Foreground owns TimePop scheduling policy, optical relaunch, and ordinary
+// application callbacks.
 //
 // There is no alternative endpoint estimator, repair candidate, FloorLine, or
 // alternative publication court in this module.  OCXO compare custody is 1 Hz;
@@ -48,6 +49,7 @@
 
 #include "process_interrupt.h"
 #include "process_clocks.h"
+#include "process_photons.h"
 #include "process_system.h"
 #include "crash_forensics.h"
 #include "execution_trace.h"
@@ -5129,9 +5131,9 @@ static void interrupt_handoff_service_isr(void) {
     ++drained;
   }
 
-  // Optical continuation is deliberately last.  Its callback authors the next
-  // DRV200 pulse, so ordinary Priority-32 work must be complete before that launch;
-  // otherwise continuation itself would remain resident when the photon returns.
+  // Optical continuation is deliberately last. It closes the current race;
+  // PHOTONS defers the next DRV200 launch through foreground TimePop dispatch
+  // after the post-race holdoff. No scheduler mutation occurs in this tier.
   if (drained < INTERRUPT_HANDOFF_DRAIN_BUDGET &&
       process_photodiode_handoff_one()) {
     ++drained;
@@ -6365,6 +6367,9 @@ void process_interrupt_foreground_service(void) {
     clocks_fragment_pps_tick_from_interrupt(clocks_sequence);
   }
   interrupt_dispatch_foreground_service();
+  // The optical ISR only records completion. Let PHOTONS queue its next launch
+  // from this ordinary-loop bridge after its minimum settling interval.
+  process_photons_foreground_service();
   g_interrupt_foreground_forensic_live.subscriber_cycles =
       ARM_DWT_CYCCNT - phase_start;
 

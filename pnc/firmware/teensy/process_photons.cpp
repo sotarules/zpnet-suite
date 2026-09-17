@@ -110,6 +110,10 @@ static constexpr uint64_t PHOTONS_PULSE_DEFAULT_NS = 1000ULL;
 
 // LANTERN V1.0 physical geometry. No recurring race scheduler exists.
 static constexpr uint64_t PHOTONS_RACE_PULSE_NS = 200ULL;
+// Minimum settling time after classification, measured in nominal CPU cycles.
+// TimePop ALAP dispatch may extend this interval. No CH2 appointment is armed:
+// 2 us is inside TimePop's 6.4 us minimum hardware-arming lead.
+static constexpr uint32_t PHOTONS_RACE_HOLDOFF_NS = 2000U;
 static constexpr uint64_t PHOTONS_RACE_CADENCE_NS = 0ULL;
 static constexpr uint32_t PHOTONS_RACE_CADENCE_HZ = 0U;
 static constexpr uint32_t PHOTONS_RACE_SEED_HISTORY = 8U;
@@ -158,10 +162,19 @@ struct photons_race_runtime_t {
   uint64_t rejected_continuation_count = 0ULL;
   uint64_t rejected_unknown_count = 0ULL;
   uint64_t rejected_excursion_count = 0ULL;
+  uint32_t holdoff_started_dwt = 0U;
+  uint32_t holdoff_cycles = 0U;
+  uint64_t holdoff_edges = 0ULL;
+  uint64_t holdoff_launches = 0ULL;
+  uint32_t holdoff_last_cycles = 0U;
+  uint32_t holdoff_min_cycles = 0U;
+  uint32_t holdoff_max_cycles = 0U;
 };
 
 static photons_race_runtime_t g_photons_race{};
 static photons_race_batch_t g_photons_race_batch{};
+// Foreground-owned; optical continuation never mutates the scheduler.
+static timepop_handle_t g_photons_relaunch_handle = TIMEPOP_INVALID_HANDLE;
 
 struct photons_device_snapshot_t {
   int      laser_mod_level = LOW;
@@ -2216,6 +2229,32 @@ static photons_race_runtime_t photons_race_runtime_snapshot(void) {
   return out;
 }
 
+static uint32_t photons_race_pending_relaunch(
+    const photons_race_runtime_t& race) {
+  const uint32_t pending = race.active && !race.primed ? 1U : 0U;
+  if (race.attempt_count > race.completed_count ||
+      race.completed_count - race.attempt_count != pending ||
+      race.holdoff_launches != race.attempt_count) {
+    __builtin_trap();
+  }
+  return pending;
+}
+
+static void photons_race_snapshot_relaunch_accounting(
+    photons_fragment_snapshot_t& fragment,
+    const photons_race_runtime_t& race,
+    uint64_t previous_completed, uint64_t previous_attempts) {
+  if (previous_attempts > previous_completed ||
+      previous_completed - previous_attempts > 1ULL ||
+      previous_completed > race.completed_count ||
+      previous_attempts > race.attempt_count) {
+    __builtin_trap();
+  }
+  fragment.race_pending_relaunch_count = photons_race_pending_relaunch(race);
+  fragment.race_pending_relaunch_count_previous =
+      (uint32_t)(previous_completed - previous_attempts);
+}
+
 static void photons_race_batch_note(bool accepted, uint32_t raw_cycles) {
   photons_race_batch_t& b = g_photons_race_batch;
   uint64_t& count = accepted ? b.accepted_count : b.rejected_count;
@@ -2296,7 +2335,13 @@ static uint32_t photons_race_launch_200ns(void) {
 
 static void photons_race_observe_edge(
     const interrupt_photodiode_edge_t& edge) {
-  if (!g_photons_race.active || !g_photons_race.primed) return;
+  if (!g_photons_race.active) return;
+  if (!g_photons_race.primed) {
+    // No pulse is in flight: retain these edges as holdoff diagnostics, not laps.
+    g_photons_race.holdoff_edges++;
+    return;
+  }
+  g_photons_race.primed = false;
   const uint32_t raw_cycles = edge.dwt_at_edge - g_photons_race.launch_dwt;
   g_photons_race.completed_count++;
 
@@ -2327,17 +2372,69 @@ static void photons_race_observe_edge(
     }
   }
 
-  g_photons_race.attempt_count++;
+  // End this race. Only foreground TimePop dispatch may launch its successor.
+  g_photons_race.holdoff_started_dwt = ARM_DWT_CYCCNT;
+}
+
+static void photons_race_relaunch(timepop_ctx_t* ctx,
+                                  timepop_diag_t*, void*) {
+  if (!ctx || ctx->handle != g_photons_relaunch_handle) __builtin_trap();
+  g_photons_relaunch_handle = TIMEPOP_INVALID_HANDLE;
+  const uint32_t prior = photons_priority32_guard_enter();
+  if (!g_photons_race.active || g_photons_race.primed ||
+      (uint32_t)(ARM_DWT_CYCCNT - g_photons_race.holdoff_started_dwt) <
+          g_photons_race.holdoff_cycles) {
+    __builtin_trap();
+  }
   g_photons_race.sequence++;
   if (g_photons_race.sequence == 0U) g_photons_race.sequence++;
+  // Capture the physical launch here; deferred ctx fire time is not a launch.
   g_photons_race.launch_dwt = photons_race_launch_200ns();
+  const uint32_t elapsed =
+      g_photons_race.launch_dwt - g_photons_race.holdoff_started_dwt;
+  g_photons_race.attempt_count++;
+  g_photons_race.primed = true;
+  photons_priority32_guard_exit(prior);
+  // Foreground owns these diagnostics. A subsequent return may preempt them,
+  // but the local elapsed value already belongs to this completed holdoff.
+  g_photons_race.holdoff_last_cycles = elapsed;
+  if (g_photons_race.holdoff_launches == 0ULL ||
+      elapsed < g_photons_race.holdoff_min_cycles) {
+    g_photons_race.holdoff_min_cycles = elapsed;
+  }
+  if (elapsed > g_photons_race.holdoff_max_cycles) {
+    g_photons_race.holdoff_max_cycles = elapsed;
+  }
+  g_photons_race.holdoff_launches++;
+}
+
+void process_photons_foreground_service(void) {
+  if (g_photons_relaunch_handle != TIMEPOP_INVALID_HANDLE) return;
+  const uint32_t prior = photons_priority32_guard_enter();
+  const bool ready = g_photons_race.active && !g_photons_race.primed &&
+      (uint32_t)(ARM_DWT_CYCCNT - g_photons_race.holdoff_started_dwt) >=
+          g_photons_race.holdoff_cycles;
+  photons_priority32_guard_exit(prior);
+  if (!ready) return;
+  // One bounded check per ordinary loop pass; no spin and no recurring poll slot.
+  // ALAP executes after timed clients and cannot be quarantined as a missed CH2
+  // deadline. It remains queued until foreground dispatch services it.
+  g_photons_relaunch_handle = timepop_arm_alap(
+      photons_race_relaunch, nullptr, "PHOTONS_RELAUNCH");
+  if (g_photons_relaunch_handle == TIMEPOP_INVALID_HANDLE) __builtin_trap();
 }
 
 static void photons_race_prepare(void) {
+  if (g_photons_relaunch_handle != TIMEPOP_INVALID_HANDLE) __builtin_trap();
   const uint32_t preserved_sequence = g_photons_race.sequence;
   g_photons_race = photons_race_runtime_t{};
   g_photons_race.sequence = preserved_sequence;
   g_photons_race.initialized = true;
+  const uint32_t cps = F_CPU_ACTUAL;
+  if (cps == 0U) __builtin_trap();
+  g_photons_race.holdoff_cycles = (uint32_t)(
+      ((uint64_t)cps * PHOTONS_RACE_HOLDOFF_NS + 999999999ULL) /
+      1000000000ULL);
   g_photons_race_batch = photons_race_batch_t{};
 }
 
@@ -2851,9 +2948,9 @@ PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_instrument, 12288U);
 
 // LANTERN V1.0 adds autonomous-race rejection/reference testimony to the
 // PHOTONS_RACE object.  The old 1536-byte store was sized for the 25-field
-// cadence-era object; V1.0 carries 39 scalar fields plus the nested flight_ns
-// Welford object.  Keep explicit fixed custody, but give that schema headroom.
-PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_race, 2560U);
+// cadence-era object. Include the holdoff and pending-successor witnesses plus
+// the nested flight_ns Welford. Keep explicit fixed custody with schema headroom.
+PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_race, 3072U);
 PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_raw_cycles, 1024U);
 PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_projection, 1024U);
 PHOTONS_FRAGMENT_FIXED_RAM1(g_photons_fragment_science, 3072U);
@@ -3257,7 +3354,9 @@ static void photons_payload_add_welford(
   obj.clear();
   obj.add("n", w.n);
   obj.add("mean", toFixedDecimal(w.mean, 6));
-  obj.add("m2", toFixedDecimal(w.m2, 6));
+  // M2 grows with population and squared excursions; it is not bounded by
+  // the fixed-decimal whole-part limit. Preserve all binary64 recovery digits.
+  obj.add("m2", toScientificDecimal(w.m2));
   obj.add("stddev", toFixedDecimal(w.stddev, 6));
   obj.add("stderr", toFixedDecimal(w.stderr_value, 6));
   obj.add("min", toFixedDecimal(w.min, 6));
@@ -3365,6 +3464,9 @@ static Payload& photons_fragment_payload(
                  f.projected_laps_this_fragment);
 
   race.add("schema", "PHOTONS_RACE_V1");
+  race.add("accounting", "RETURN_HOLDOFF_V1");
+  race.add("pending_relaunch_count", f.race_pending_relaunch_count);
+  race.add("pending_relaunch_count_previous", f.race_pending_relaunch_count_previous);
   race.add("active", f.race_engine_active);
   race.add("cadence_hz", f.race_cadence_hz);
   race.add("cadence_ns", PHOTONS_RACE_CADENCE_NS);
@@ -3413,6 +3515,13 @@ static Payload& photons_fragment_payload(
   race.add("reference_cycles", f.race_reference_cycles);
   race.add("reference_gate_cycles", f.race_reference_gate_cycles);
   race.add("seed_count", f.race_seed_count);
+  race.add("holdoff_ns", f.race_holdoff_ns);
+  race.add("holdoff_cycles", f.race_holdoff_cycles);
+  race.add("holdoff_edges_total", f.race_holdoff_edges_total);
+  race.add("holdoff_launches_total", f.race_holdoff_launches_total);
+  race.add("holdoff_last_cycles", f.race_holdoff_last_cycles);
+  race.add("holdoff_min_cycles", f.race_holdoff_min_cycles);
+  race.add("holdoff_max_cycles", f.race_holdoff_max_cycles);
   photons_payload_add_welford(
       race, "flight_ns", f.race_flight_this_fragment);
   instrument.add_object("race", race);
@@ -3851,6 +3960,9 @@ static void photons_fragment_tick(
   fragment.projected_laps_this_fragment = drain.projected_laps;
 
   fragment.race_engine_active = race_engine_active;
+  photons_race_snapshot_relaunch_accounting(
+      fragment, race, g_last_fragment_race_completed_count,
+      g_last_fragment_race_attempt_count);
   fragment.race_cadence_hz = PHOTONS_RACE_CADENCE_HZ;
   fragment.race_pulse_ns = PHOTONS_RACE_PULSE_NS;
   fragment.race_cadence_tick_count_total = race.cadence_tick_count;
@@ -3903,6 +4015,13 @@ static void photons_fragment_tick(
   fragment.race_reference_cycles = race.reference_cycles;
   fragment.race_reference_gate_cycles = race.reference_gate_cycles;
   fragment.race_seed_count = race.seed_count;
+  fragment.race_holdoff_ns = PHOTONS_RACE_HOLDOFF_NS;
+  fragment.race_holdoff_cycles = race.holdoff_cycles;
+  fragment.race_holdoff_edges_total = race.holdoff_edges;
+  fragment.race_holdoff_launches_total = race.holdoff_launches;
+  fragment.race_holdoff_last_cycles = race.holdoff_last_cycles;
+  fragment.race_holdoff_min_cycles = race.holdoff_min_cycles;
+  fragment.race_holdoff_max_cycles = race.holdoff_max_cycles;
   fragment.race_flight_this_fragment =
       photons_welford_snapshot(drain.projected_flight_welford);
 
@@ -5671,6 +5790,16 @@ static FLASHMEM Payload cmd_report_photons(const Payload& /*args*/) {
   p.add("stats_update_count", canonical.stats.update_count);
   p.add("stats_reset_pending", g_photons_stats_reset_pending);
   p.add("race_engine_active", canonical.race_engine_active);
+  p.add("race_accounting", "RETURN_HOLDOFF_V1");
+  p.add("race_pending_relaunch_count", canonical.race_pending_relaunch_count);
+  p.add("race_pending_relaunch_count_previous", canonical.race_pending_relaunch_count_previous);
+  p.add("race_holdoff_ns", canonical.race_holdoff_ns);
+  p.add("race_holdoff_cycles", canonical.race_holdoff_cycles);
+  p.add("race_holdoff_edges_total", canonical.race_holdoff_edges_total);
+  p.add("race_holdoff_launches_total", canonical.race_holdoff_launches_total);
+  p.add("race_holdoff_last_cycles", canonical.race_holdoff_last_cycles);
+  p.add("race_holdoff_min_cycles", canonical.race_holdoff_min_cycles);
+  p.add("race_holdoff_max_cycles", canonical.race_holdoff_max_cycles);
   p.add("race_cadence_hz", PHOTONS_RACE_CADENCE_HZ);
   p.add("race_pulse_ns", PHOTONS_RACE_PULSE_NS);
   p.add("race_launch_surrogate", "DRV200_MOD_HIGH_EDGE_OBSERVED");
@@ -5798,7 +5927,7 @@ static FLASHMEM Payload cmd_report_stats(const Payload& /*args*/) {
   p.add("lap_welford_mean",
         toFixedDecimal(canonical.stats.lap_time_welford.mean, 6));
   p.add("lap_welford_m2",
-        toFixedDecimal(canonical.stats.lap_time_welford.m2, 6));
+        toScientificDecimal(canonical.stats.lap_time_welford.m2));
   p.add("lap_welford_stddev",
         toFixedDecimal(canonical.stats.lap_time_welford.stddev, 6));
   p.add("lap_welford_stderr",
@@ -5997,6 +6126,15 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
   p.add("race_launch_surrogate", "DRV200_MOD_HIGH_EDGE_OBSERVED");
   p.add("race_cadence_tick_count_total", race.cadence_tick_count);
   p.add("race_cadence_ticks_this_fragment", canonical.race_cadence_ticks_this_fragment);
+  p.add("race_accounting", "RETURN_HOLDOFF_V1");
+  p.add("race_pending_relaunch_count", photons_race_pending_relaunch(race));
+  p.add("race_holdoff_ns", PHOTONS_RACE_HOLDOFF_NS);
+  p.add("race_holdoff_cycles", race.holdoff_cycles);
+  p.add("race_holdoff_edges_total", race.holdoff_edges);
+  p.add("race_holdoff_launches_total", race.holdoff_launches);
+  p.add("race_holdoff_last_cycles", race.holdoff_last_cycles);
+  p.add("race_holdoff_min_cycles", race.holdoff_min_cycles);
+  p.add("race_holdoff_max_cycles", race.holdoff_max_cycles);
   p.add("race_attempt_count_total", race.attempt_count);
   p.add("race_completed_count_total", race.completed_count);
   p.add("race_missed_count_total", race.missed_count);

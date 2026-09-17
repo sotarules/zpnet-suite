@@ -4,8 +4,7 @@ ZPNet Metrics Readout Blocks — Generalized Campaign Detail Edition
 Data source:
   CLOCKS_V4 owns the clock operator view and PHOTONS_V1 owns the optical
   operator view.  Both are canonical always-on instruments with optional
-  campaign decoration. PHOTONS campaign baselines are campaign_master
-  relationships resolved on demand; CLOCKS comparisons use the campaign list.
+  campaign decoration. Campaign comparisons use the campaign lists.
   Metrics never waits for or reads TIMEBASE.
 
 Stats policy:
@@ -17,13 +16,12 @@ Stats policy:
   not estimate rolling windows from repaint history.  The live PHOTONS rolling
   tail retains actual PUBSUB publications in memory and subtracts adjacent
   snapshots only to recover one-second accepted-lap populations for display;
-  PostgreSQL is not in that live-tail path.  Durable campaign/baseline history
+  PostgreSQL is not in that live-tail path.  Durable campaign history
   remains a database read model.  This never synthesizes individual samples,
   changes admission, or feeds science back into PHOTONS.  PHOTONS CAMP is read
   verbatim from the Teensy-authored campaign.stats.ppb surface.  PHOTONS RES_NS
   is presentation math for the local accepted-lap mean minus LAP_BASELINE_NS,
-  rendered in the system-wide nanosecond coordinate to six fractional digits;
-  baseline campaign comparisons remain a separate BASE/NOW/DELTA surface.
+  rendered in the system-wide nanosecond coordinate to six fractional digits.
 
 Clock row doctrine:
   The dense operator table shows GNSS, VCLOCK, OCXO1, and OCXO2 only.
@@ -1940,16 +1938,11 @@ def _get_lantern_campaign_summaries() -> list[dict]:
                     master.campaign,
                     master.active,
                     master.payload,
-                    baseline.id AS baseline_campaign_id,
-                    baseline.campaign AS baseline_campaign,
                     first_detail.sequence AS first_sequence,
                     last_detail.sequence AS last_sequence,
                     prior_detail.payload AS prior_payload,
                     last_detail.payload AS last_payload
                 FROM campaign_master AS master
-                LEFT JOIN campaign_master AS baseline
-                  ON baseline.id = (master.payload ->> 'baseline_campaign_id')::bigint
-                 AND baseline.campaign_type = master.campaign_type
                 LEFT JOIN LATERAL (
                     SELECT d.id, d.sequence, d.payload
                     FROM campaign_detail AS d
@@ -2004,8 +1997,6 @@ def _get_lantern_campaign_summaries() -> list[dict]:
             "stop_after_sequence": _to_int(master_payload.get("stop_after_sequence")),
             "first_sequence": _to_int(row.get("first_sequence")),
             "last_sequence": _to_int(row.get("last_sequence")),
-            "baseline_campaign_id": _to_int(row.get("baseline_campaign_id")),
-            "baseline_campaign": row.get("baseline_campaign"),
             "stats": stats,
             "ppb_buckets": _photons_producer_ppb_buckets(last_payload),
             "campaign_ppb": _to_float(campaign_stats.get("ppb")),
@@ -2017,16 +2008,9 @@ def _get_lantern_campaign_summaries() -> list[dict]:
             "_last_payload": last_payload,
         })
 
-    by_id = {s["id"]: s for s in summaries if s.get("id") is not None}
     for summary in summaries:
-        base = by_id.get(summary.get("baseline_campaign_id"))
-        base_stats = base.get("stats") if isinstance(base, dict) else None
-        base_mean = base_stats.get("mean") if isinstance(base_stats, dict) else None
-        summary["baseline_mean_lap_ns"] = base_mean
-
         # RES_NS is the PHOTONS analogue of CLOCKS' immediate reference residual:
-        # campaign mean relative to LAP_BASELINE_NS. Baseline deltas
-        # remain a separate relationship and are never substituted here.
+        # campaign mean relative to LAP_BASELINE_NS.
         campaign_mean = summary.get("campaign_mean_lap_ns")
         lap_baseline_ns = summary.get("lap_baseline_ns")
         summary["residual_ns"] = (
@@ -2099,7 +2083,7 @@ def _photons_rolling_rows(live: dict, summaries: list[dict]) -> list[dict]:
             "ppb_total": producer_ppb.get("total"),
             "campaign_ppb": _to_float(producer_campaign_stats.get("ppb")),
             # Local one-second residual to the fixed metrological reference.
-            # This remains meaningful with or without a campaign or baseline.
+            # This remains meaningful with or without a campaign.
             "residual_ns": (
                 float(second_stats["mean"]) - float(lap_baseline_ns)
                 if second_stats.get("mean") is not None and lap_baseline_ns is not None
@@ -2147,21 +2131,17 @@ def photons_detail_readout() -> list[str]:
             else 0
         )
         campaign_name = str(campaign.get("campaign") or "?")
-        baseline_name = campaign.get("baseline_campaign") or (
-            active_summary.get("baseline_campaign") if isinstance(active_summary, dict) else None
-        )
         identity = (
             f"PHOTONS  CAMPAIGN: {campaign_name}"
             f"  LAP BASELINE: {lap_baseline_str}"
             f"  ELAPSED: {_seconds_to_hms(elapsed_s)}"
-            f"  BASELINE: {baseline_name or 'NONE'}"
             f"  RECOVERABLE: {recoverable_str}"
         )
     else:
         identity = (
             "PHOTONS  CAMPAIGN: STOPPED"
             f"  LAP BASELINE: {lap_baseline_str}"
-            "  INSTRUMENT: ALWAYS ON  BASELINE: NONE"
+            "  INSTRUMENT: ALWAYS ON"
             f"  RECOVERABLE: {recoverable_str}"
         )
 
@@ -2178,11 +2158,6 @@ def photons_detail_readout() -> list[str]:
     if current_stats is None:
         current_stats = _photons_instrument_stats(live)
 
-    baseline_mean = (
-        active_summary.get("baseline_mean_lap_ns")
-        if isinstance(active_summary, dict)
-        else None
-    )
     now_mean = current_stats.get("mean") if isinstance(current_stats, dict) else None
     current_ppb = _photons_producer_ppb_buckets(live)
     campaign_ppb = _to_float(_photons_producer_campaign_stats(live).get("ppb"))
@@ -2206,7 +2181,6 @@ def photons_detail_readout() -> list[str]:
     W_SD = 8
     W_SE = 8
     W_N = 7
-    W_BASE = 12
     G = " "
 
     lines.append(
@@ -2226,11 +2200,6 @@ def photons_detail_readout() -> list[str]:
     )
 
     if isinstance(current_stats, dict):
-        baseline_delta = (
-            float(now_mean) - float(baseline_mean)
-            if now_mean is not None and baseline_mean is not None
-            else None
-        )
         lines.append(
             f"{'LAP':<{W_NAME}}"
             f"{_fmt(now_mean, f'>{W_VALUE}.3f', W_VALUE)}{G}"
@@ -2242,19 +2211,6 @@ def photons_detail_readout() -> list[str]:
             f"{_fmt(current_stats.get('stderr'), f'>{W_SE}.3f', W_SE)}{G}"
             f"{_fmt(_to_int(current_stats.get('n')), f'>{W_N}d', W_N)}"
         )
-        if baseline_mean is not None and now_mean is not None:
-            lines.append(
-                f"{'BASELINE_NS':<12}{G}"
-                f"{'BASE':>{W_BASE}}{G}"
-                f"{'NOW':>{W_BASE}}{G}"
-                f"{'DELTA':>{W_BASE}}"
-            )
-            lines.append(
-                f"{'':<12}{G}"
-                f"{_fmt(baseline_mean, f'>{W_BASE}.3f', W_BASE)}{G}"
-                f"{_fmt(now_mean, f'>{W_BASE}.3f', W_BASE)}{G}"
-                f"{_fmt(baseline_delta, f'>+{W_BASE}.3f', W_BASE)}"
-            )
     else:
         lines.append("PHOTONS statistics unavailable")
 
@@ -2344,7 +2300,6 @@ def photons_campaigns_readout() -> list[str]:
     W_SD = 7
     W_SE = 7
     W_N = 7
-    W_BASELINE = 18
     G = " "
 
     lines.append(
@@ -2360,8 +2315,7 @@ def photons_campaigns_readout() -> list[str]:
         f"{'MEAN':>{W_MEAN}}{G}"
         f"{'SD':>{W_SD}}{G}"
         f"{'SE':>{W_SE}}{G}"
-        f"{'N':>{W_N}}{G}"
-        f"{'BASELINE':<{W_BASELINE}}"
+        f"{'N':>{W_N}}"
     )
 
     if not rows:
@@ -2380,10 +2334,6 @@ def photons_campaigns_readout() -> list[str]:
         ppb_values = tuple(producer_ppb.get(key) for key in PPB_BUCKET_KEYS) + (
             row.get("campaign_ppb"),
         )
-        baseline_name = str(row.get("baseline_campaign") or "---")
-        if len(baseline_name) > W_BASELINE:
-            baseline_name = baseline_name[:W_BASELINE - 1] + "~"
-
         lines.append(
             f"{campaign_cell}{G}"
             f"{_fmt(stats.get('mean'), f'>{W_VALUE}.3f', W_VALUE)}{G}"
@@ -2392,8 +2342,7 @@ def photons_campaigns_readout() -> list[str]:
             f"{_fmt(stats.get('mean'), f'>{W_MEAN}.3f', W_MEAN)}{G}"
             f"{_fmt(stats.get('stddev'), f'>{W_SD}.3f', W_SD)}{G}"
             f"{_fmt(stats.get('stderr'), f'>{W_SE}.3f', W_SE)}{G}"
-            f"{_fmt(_to_int(stats.get('n')), f'>{W_N}d', W_N)}{G}"
-            f"{baseline_name:<{W_BASELINE}}"
+            f"{_fmt(_to_int(stats.get('n')), f'>{W_N}d', W_N)}"
         )
 
     return lines

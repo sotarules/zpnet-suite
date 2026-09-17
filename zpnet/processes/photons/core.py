@@ -8,7 +8,7 @@ Campaign symmetry contract:
         -> firmware-authored LANTERN_FRAGMENT_V1 boundary + CAMP statistics
         -> PHOTONS_FRAGMENT_V1
         -> Pi structural/accounting court + SYSTEM context
-        -> Pi adds durable campaign ID/baseline provenance only
+        -> Pi adds durable campaign identity/provenance only
         -> canonical PHOTONS_V1
         -> ordered persistence + campaign_master read model
 
@@ -20,12 +20,11 @@ cumulative accepted-lap N/T at a published boundary and authors CAMP PPB from
 that origin against STANDARD_LAP_NS.
 
 The Pi does not recompute, smooth, repair, or re-adjudicate lap or CAMP science.
-It owns campaign_master identity, baseline relationships, restart policy, and
+It owns campaign_master identity, restart policy, and
 persistence.  Firmware owns the exact START/STOP measurement boundary.
 
-Baselines remain campaign-to-campaign relationships stored by campaign_master ID.
-No baseline statistics are copied into firmware and ``photons.baseline`` remains
-untouched.  Durable recovery restores aggregate sufficient state plus only the
+The configured lap baseline remains the optical residual reference.
+Durable recovery restores aggregate sufficient state plus only the
 bounded PPB endpoint history the Pi literally possesses.  A surviving producer is
 never repaired, replayed, or interrogated merely because the Pi restarted: current-
 session PHOTONS_FRAGMENT testimony proves monotonic descent, Pi restores only its
@@ -253,7 +252,6 @@ _startup_infrastructure_wait_seconds_last = 0.0
 _last_startup_infrastructure_wait: Optional[Dict[str, Any]] = None
 _campaign_start_count = 0
 _campaign_stop_count = 0
-_baseline_set_count = 0
 _stale_campaign_retire_count = 0
 _stats_reset_requests = 0
 _stats_reset_success = 0
@@ -1045,6 +1043,55 @@ def _wait_for_startup_infrastructure() -> Dict[str, Any]:
         time.sleep(STARTUP_INFRASTRUCTURE_POLL_S)
 
 
+def _validate_race_relaunch_accounting(race: Dict[str, Any], path: str) -> None:
+    """Prove physical successor launches, including a holdoff across a fragment."""
+    attempts = _require_int(race.get("attempt_count_total"), f"{path}.attempt_count_total")
+    completed = _require_int(race.get("completed_count_total"), f"{path}.completed_count_total")
+    attempts_fragment = _require_int(race.get("attempts_this_fragment"), f"{path}.attempts_this_fragment")
+    completed_fragment = _require_int(race.get("completed_this_fragment"), f"{path}.completed_this_fragment")
+    if attempts_fragment > attempts or completed_fragment > completed:
+        raise ValueError(f"{path}: fragment race counts exceed lifetime counts")
+
+    if "accounting" not in race:
+        # Historical immediate-relaunch producers had no pending successor.
+        # A partial new contract must not be mistaken for that historical shape.
+        if any(key.startswith("holdoff_") or key.startswith("pending_relaunch_") for key in race):
+            raise ValueError(f"{path}: holdoff testimony is missing its accounting contract")
+        if completed != attempts or completed_fragment != attempts_fragment:
+            raise ValueError(f"{path}: immediate return/relaunch accounting does not close")
+        return
+
+    if race["accounting"] != "RETURN_HOLDOFF_V1":
+        raise ValueError(f"{path}: unknown race accounting contract")
+    pending = _require_int(race.get("pending_relaunch_count"), f"{path}.pending_relaunch_count")
+    previous = _require_int(race.get("pending_relaunch_count_previous"), f"{path}.pending_relaunch_count_previous")
+    if pending > 1 or previous > 1:
+        raise ValueError(f"{path}: more than one successor is pending")
+    if completed != attempts + pending:
+        raise ValueError(f"{path}: lifetime return/relaunch/pending accounting does not close")
+    if previous + completed_fragment != attempts_fragment + pending:
+        raise ValueError(f"{path}: fragment return/relaunch/pending accounting does not close")
+    if pending and not _require_bool(race.get("active"), f"{path}.active"):
+        raise ValueError(f"{path}: inactive race engine has a pending successor")
+
+    _require_int(race.get("holdoff_ns"), f"{path}.holdoff_ns", minimum=1)
+    minimum_cycles = _require_u32(race.get("holdoff_cycles"), f"{path}.holdoff_cycles")
+    if minimum_cycles == 0:
+        raise ValueError(f"{path}: holdoff cycle threshold is zero")
+    launches = _require_int(race.get("holdoff_launches_total"), f"{path}.holdoff_launches_total")
+    _require_int(race.get("holdoff_edges_total"), f"{path}.holdoff_edges_total")
+    last = _require_u32(race.get("holdoff_last_cycles"), f"{path}.holdoff_last_cycles")
+    low = _require_u32(race.get("holdoff_min_cycles"), f"{path}.holdoff_min_cycles")
+    high = _require_u32(race.get("holdoff_max_cycles"), f"{path}.holdoff_max_cycles")
+    if launches != attempts:
+        raise ValueError(f"{path}: holdoff launch witness differs from physical successor count")
+    if launches == 0:
+        if (last, low, high) != (0, 0, 0):
+            raise ValueError(f"{path}: holdoff durations exist before the first successor")
+    elif not minimum_cycles <= low <= last <= high:
+        raise ValueError(f"{path}: observed holdoff violates its minimum or extrema")
+
+
 def _validate_photons_fragment(fragment: Payload) -> Tuple[int, int, Optional[int], Dict[str, Any]]:
     """Prove structural/accounting coherence without re-authoring optical science."""
     fragment = _require_dict(fragment, "PHOTONS_FRAGMENT")
@@ -1075,21 +1122,23 @@ def _validate_photons_fragment(fragment: Payload) -> Tuple[int, int, Optional[in
     reasons = _require_dict(
         science.get("exclusion_reasons"), "photons.science.exclusion_reasons"
     )
-    accepted_raw = _require_dict(
+    # Apply the same sufficient-state contract at live admission and recovery.
+    # A malformed accumulator must fail before it becomes durable ancestry.
+    accepted_raw = _validate_recovery_welford(
         accepted.get("raw_cycles"), "photons.science.accepted.raw_cycles"
     )
-    accepted_projected = _require_dict(
+    accepted_projected = _validate_recovery_welford(
         accepted.get("projected_lap_ns"),
         "photons.science.accepted.projected_lap_ns",
     )
-    excluded_raw = _require_dict(
+    excluded_raw = _validate_recovery_welford(
         excluded.get("raw_cycles"), "photons.science.excluded.raw_cycles"
     )
-    excluded_projected = _require_dict(
+    excluded_projected = _validate_recovery_welford(
         excluded.get("projected_lap_ns"),
         "photons.science.excluded.projected_lap_ns",
     )
-    stats_lap_time = _require_dict(stats.get("lap_time"), "photons.stats.lap_time")
+    stats_lap_time = _validate_recovery_welford(stats.get("lap_time"), "photons.stats.lap_time")
     recovery = _require_dict(instrument.get("recovery"), "photons.recovery")
 
     if science.get("schema") != PHOTONS_SCIENCE_SCHEMA:
@@ -1185,18 +1234,6 @@ def _validate_photons_fragment(fragment: Payload) -> Tuple[int, int, Optional[in
     race_cadence_ticks_fragment = _require_int(
         race.get("cadence_ticks_this_fragment"), "photons.race.cadence_ticks_this_fragment"
     )
-    race_attempts_total = _require_int(
-        race.get("attempt_count_total"), "photons.race.attempt_count_total"
-    )
-    race_attempts_fragment = _require_int(
-        race.get("attempts_this_fragment"), "photons.race.attempts_this_fragment"
-    )
-    race_completed_total = _require_int(
-        race.get("completed_count_total"), "photons.race.completed_count_total"
-    )
-    race_completed_fragment = _require_int(
-        race.get("completed_this_fragment"), "photons.race.completed_this_fragment"
-    )
 
     # LANTERN V1.0 has no recurring scheduler.  These V1 fields are retained only
     # so the wire shape remains explicit while downstream naming catches up.
@@ -1255,19 +1292,7 @@ def _validate_photons_fragment(fragment: Payload) -> Tuple[int, int, Optional[in
             f"{nonzero_retired!r}"
         )
 
-    # Every observed return completes the currently armed race and immediately
-    # launches exactly one successor.  The first priming launch is intentionally
-    # outside both counters, so completed/attempt chronology closes one-for-one.
-    if race_completed_total != race_attempts_total:
-        raise ValueError(
-            "PHOTONS autonomous race lifetime return/relaunch accounting does not close: "
-            f"completed={race_completed_total} attempts={race_attempts_total}"
-        )
-    if race_completed_fragment != race_attempts_fragment:
-        raise ValueError(
-            "PHOTONS autonomous race fragment return/relaunch accounting does not close: "
-            f"completed={race_completed_fragment} attempts={race_attempts_fragment}"
-        )
+    _validate_race_relaunch_accounting(race, "photons.race")
 
     rejected_isr_delay_total = _require_int(
         race.get("rejected_isr_delay_total"), "photons.race.rejected_isr_delay_total"
@@ -3474,13 +3499,8 @@ def _load_active_lantern_master() -> Optional[Dict[str, Any]]:
                 master.id,
                 master.campaign,
                 master.ts,
-                master.payload,
-                baseline.id AS baseline_campaign_id,
-                baseline.campaign AS baseline_campaign
+                master.payload
             FROM campaign_master AS master
-            LEFT JOIN campaign_master AS baseline
-              ON baseline.id = (master.payload ->> 'baseline_campaign_id')::bigint
-             AND baseline.campaign_type = master.campaign_type
             WHERE master.campaign_type = %s
               AND master.active = true
             ORDER BY master.ts DESC, master.id DESC
@@ -3510,10 +3530,6 @@ def _load_active_lantern_master() -> Optional[Dict[str, Any]]:
         "started_at": str(started_at),
         "master_payload": copy.deepcopy(payload),
     }
-    if row.get("baseline_campaign_id") is not None:
-        out["baseline_campaign_id"] = int(row["baseline_campaign_id"])
-    if row.get("baseline_campaign"):
-        out["baseline_campaign"] = str(row["baseline_campaign"])
     return out
 
 
@@ -3610,6 +3626,7 @@ def _canonical_recovery_state_from_row(
     race = _require_dict(instrument.get("race"), "PHOTONS.photons.race")
     if race.get("schema") != PHOTONS_RACE_SCHEMA:
         raise ValueError("durable PHOTONS race schema mismatch")
+    _validate_race_relaunch_accounting(race, "PHOTONS.photons.race")
     durable_race_geometry = (
         _require_int(race.get("cadence_hz"), "PHOTONS.photons.race.cadence_hz"),
         _require_int(race.get("cadence_ns"), "PHOTONS.photons.race.cadence_ns"),
@@ -4157,6 +4174,10 @@ def _load_newest_empty_photons_heartbeat_state(
         )
         if race.get("schema") != PHOTONS_RACE_SCHEMA:
             return None
+        if "accounting" in race or any(
+            key.startswith("holdoff_") or key.startswith("pending_relaunch_") for key in race
+        ):
+            _validate_race_relaunch_accounting(race, "empty-heartbeat PHOTONS.photons.race")
         if (
             _require_int(
                 race.get("cadence_hz"),
@@ -5396,10 +5417,6 @@ def _rehydrate_pi_campaign(
             "start_after_sequence": start_after,
             "firmware_public_count": public_count,
         }
-        if active_master.get("baseline_campaign_id") is not None:
-            window["baseline_campaign_id"] = int(active_master["baseline_campaign_id"])
-        if active_master.get("baseline_campaign"):
-            window["baseline_campaign"] = str(active_master["baseline_campaign"])
         if allow_first_public_count_splice:
             window["restart_public_count_splice_pending"] = True
         _active_campaign = window
@@ -6486,7 +6503,11 @@ def _startup_cold_start(
         allow_first_public_count_splice=False,
     )
     drained = _retire_fragment_queue_via_owner("COLD_START")
-    _arm_recovery_proof({"mode": "COLD_START", "generation": generation})
+    _arm_recovery_proof({
+        "mode": "COLD_START",
+        "generation": generation,
+        "source_epoch_migration": migration,
+    })
     _recovery_status_set(
         "COLD_STARTING",
         mode="COLD_START",
@@ -7041,12 +7062,6 @@ def _campaign_public_decoration(window: Dict[str, Any]) -> Dict[str, Any]:
     stop_after = window.get("stop_after_sequence")
     if stop_after is not None:
         out["stop_after_sequence"] = int(stop_after)
-    baseline_id = window.get("baseline_campaign_id")
-    baseline_name = window.get("baseline_campaign")
-    if baseline_id is not None:
-        out["baseline_campaign_id"] = int(baseline_id)
-    if baseline_name:
-        out["baseline_campaign"] = str(baseline_name)
     flash_cut_from = window.get("flash_cut_from")
     if flash_cut_from:
         out["flash_cut_from"] = str(flash_cut_from)
@@ -7181,57 +7196,6 @@ def _lantern_report_from_photons(photons: Payload) -> Dict[str, Any]:
     }
 
 
-def _baseline_relation_for_active_campaign() -> Optional[Dict[str, Any]]:
-    """Return the active LANTERN campaign and its referenced baseline, if any."""
-    with open_db(row_dict=True) as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT
-                current.id AS campaign_id,
-                current.campaign AS campaign,
-                baseline.id AS baseline_campaign_id,
-                baseline.campaign AS baseline_campaign,
-                baseline.payload AS baseline_payload
-            FROM campaign_master AS current
-            JOIN campaign_master AS baseline
-              ON baseline.id = (current.payload ->> 'baseline_campaign_id')::bigint
-             AND baseline.campaign_type = current.campaign_type
-            WHERE current.campaign_type = %s
-              AND current.active = true
-            ORDER BY current.ts DESC, current.id DESC
-            LIMIT 1
-            """,
-            (CAMPAIGN_TYPE_LANTERN,),
-        )
-        row = cur.fetchone()
-
-    if row is None:
-        return None
-
-    payload = row["baseline_payload"]
-    if isinstance(payload, str):
-        payload = json.loads(payload)
-    if not isinstance(payload, dict):
-        raise RuntimeError("baseline LANTERN campaign payload is not an object")
-
-    report = payload.get("report")
-    if not isinstance(report, dict) or not report:
-        raise RuntimeError(
-            f"Baseline campaign '{row['baseline_campaign']}' has no report"
-        )
-
-    return {
-        "campaign_id": int(row["campaign_id"]),
-        "campaign": row["campaign"],
-        "baseline_campaign_id": int(row["baseline_campaign_id"]),
-        "baseline_campaign": row["baseline_campaign"],
-        "baseline_report": report,
-        "baseline_started_at": payload.get("started_at"),
-        "baseline_stopped_at": payload.get("stopped_at"),
-    }
-
-
 def _persist_photons(
     photons: Payload, checkpoint: Dict[str, Any]
 ) -> int:
@@ -7259,6 +7223,25 @@ def _persist_photons(
         if campaign is not None
         else None
     )
+
+    photons_for_storage = photons
+    with _recovery_lock:
+        expected = copy.deepcopy(_recovery_proof_expected)
+        proof_already_durable = _recovery_proof_durable.is_set()
+    if (
+        expected is not None
+        and expected.get("mode") == "COLD_START"
+        and expected.get("source_epoch_migration") is not None
+        and not proof_already_durable
+        and _recovery_proof_matches(photons, expected)
+    ):
+        photons_for_storage = copy.deepcopy(photons)
+        photons_for_storage["epoch_cutover"] = {
+            "schema": "PHOTONS_EPOCH_CUTOVER_V1",
+            "generation": int(expected["generation"]),
+            "new_sequence": int(sequence),
+            "source_epoch_migration": copy.deepcopy(expected["source_epoch_migration"]),
+        }
 
     detail_id = 0
     with open_db(row_dict=True) as conn:
@@ -7290,7 +7273,7 @@ def _persist_photons(
                 CAMPAIGN_TYPE_LANTERN,
                 campaign_name or None,
                 True,
-                json.dumps(photons, separators=(",", ":")),
+                json.dumps(photons_for_storage, separators=(",", ":")),
                 sequence,
                 pps_count,
             ),
@@ -8763,27 +8746,6 @@ def cmd_delete(args: Optional[dict]) -> Dict[str, Any]:
             with open_db(row_dict=True) as conn:
                 cur = conn.cursor()
                 cur.execute(
-                    """
-                    SELECT DISTINCT ref.campaign
-                    FROM campaign_master AS target
-                    JOIN campaign_master AS ref
-                      ON (ref.payload ->> 'baseline_campaign_id')::bigint = target.id
-                    WHERE target.campaign_type = %s
-                      AND target.campaign = %s
-                    ORDER BY ref.campaign
-                    """,
-                    (CAMPAIGN_TYPE_LANTERN, campaign_name),
-                )
-                referenced_by = [str(row["campaign"]) for row in cur.fetchall()]
-                if referenced_by:
-                    return {
-                        "success": False,
-                        "message": (
-                            f"Campaign '{campaign_name}' is used as a baseline by: "
-                            + ", ".join(referenced_by)
-                        ),
-                    }
-                cur.execute(
                     "DELETE FROM campaign_detail WHERE campaign_type = %s AND campaign = %s",
                     (CAMPAIGN_TYPE_LANTERN, campaign_name),
                 )
@@ -9155,147 +9117,8 @@ def cmd_set_lap_baseline_ns(args: Optional[dict]) -> Dict[str, Any]:
     return {"success": True, "message": "OK", "payload": result}
 
 
-def cmd_set_baseline(args: Optional[dict]) -> Dict[str, Any]:
-    """Relate the active LANTERN campaign to another campaign by durable ID."""
-    global _baseline_set_count
-    global _last_campaign_transition
-
-    busy = _campaign_control_gate("SET_BASELINE")
-    if busy is not None:
-        return busy
-
-    baseline_name = str((args or {}).get("campaign") or "").strip()
-    if not baseline_name:
-        return {"success": False, "message": "SET_BASELINE requires 'campaign' argument"}
-
-    with _campaign_lock:
-        if _active_campaign is None:
-            return {
-                "success": False,
-                "message": "SET_BASELINE requires an active LANTERN campaign",
-            }
-
-        current = copy.deepcopy(_active_campaign)
-        try:
-            with open_db(row_dict=True) as conn:
-                cur = conn.cursor()
-                cur.execute(
-                    """
-                    SELECT id, campaign, active, payload
-                    FROM campaign_master
-                    WHERE campaign_type = %s
-                      AND campaign = %s
-                    ORDER BY ts DESC, id DESC
-                    LIMIT 1
-                    """,
-                    (CAMPAIGN_TYPE_LANTERN, baseline_name),
-                )
-                baseline = cur.fetchone()
-                if baseline is None:
-                    return {
-                        "success": False,
-                        "message": f"No LANTERN campaign named '{baseline_name}'",
-                    }
-                if int(baseline["id"]) == int(current["campaign_id"]):
-                    return {
-                        "success": False,
-                        "message": "A campaign cannot use itself as its baseline",
-                    }
-                if bool(baseline["active"]):
-                    return {
-                        "success": False,
-                        "message": "Baseline campaign must be stopped before it can be referenced",
-                    }
-
-                baseline_payload = baseline["payload"]
-                if isinstance(baseline_payload, str):
-                    baseline_payload = json.loads(baseline_payload)
-                baseline_report = (
-                    baseline_payload.get("report")
-                    if isinstance(baseline_payload, dict)
-                    else None
-                )
-                if not isinstance(baseline_report, dict) or not baseline_report:
-                    return {
-                        "success": False,
-                        "message": f"Campaign '{baseline_name}' has no persisted PHOTONS report",
-                    }
-
-                cur.execute(
-                    """
-                    UPDATE campaign_master
-                    SET payload = jsonb_set(
-                        payload,
-                        '{baseline_campaign_id}',
-                        to_jsonb(%s::bigint),
-                        true
-                    )
-                    WHERE id = %s
-                      AND campaign_type = %s
-                      AND active = true
-                    """,
-                    (
-                        int(baseline["id"]),
-                        int(current["campaign_id"]),
-                        CAMPAIGN_TYPE_LANTERN,
-                    ),
-                )
-                if cur.rowcount != 1:
-                    raise RuntimeError(
-                        "active LANTERN baseline relationship was not updated exactly once"
-                    )
-
-        except Exception as exc:
-            logging.exception("❌ [photons] SET_BASELINE failed")
-            return {"success": False, "message": str(exc)}
-
-        _active_campaign["baseline_campaign_id"] = int(baseline["id"])
-        _active_campaign["baseline_campaign"] = str(baseline["campaign"])
-
-    transition = {
-        "action": "SET_BASELINE",
-        "at_utc": _utc_now_z(),
-        "campaign": current["campaign"],
-        "campaign_id": int(current["campaign_id"]),
-        "baseline_campaign": str(baseline["campaign"]),
-        "baseline_campaign_id": int(baseline["id"]),
-    }
-    with _state_lock:
-        _baseline_set_count += 1
-        _last_campaign_transition = copy.deepcopy(transition)
-
-    logging.info(
-        "✅ [photons] LANTERN campaign '%s' baseline -> '%s'",
-        current["campaign"],
-        baseline["campaign"],
-    )
-    return {"success": True, "message": "OK", "payload": transition}
-
-
-def cmd_baseline_info(_: Optional[dict]) -> Dict[str, Any]:
-    """Return the active LANTERN campaign's baseline relationship."""
-    try:
-        relation = _baseline_relation_for_active_campaign()
-    except Exception as exc:
-        logging.exception("❌ [photons] BASELINE_INFO failed")
-        return {"success": False, "message": str(exc)}
-
-    if relation is None:
-        return {
-            "success": True,
-            "message": "OK",
-            "payload": {"baseline_set": False},
-        }
-
-    return {
-        "success": True,
-        "message": "OK",
-        "payload": {"baseline_set": True, **relation},
-    }
-
-
 def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
-    """List LANTERN campaign masters and baseline relationships."""
+    """List LANTERN campaign masters and optical recording summaries."""
     try:
         with open_db(row_dict=True) as conn:
             cur = conn.cursor()
@@ -9307,12 +9130,8 @@ def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
                     master.campaign,
                     master.active,
                     master.ts,
-                    master.payload,
-                    baseline.campaign AS baseline_campaign
+                    master.payload
                 FROM campaign_master AS master
-                LEFT JOIN campaign_master AS baseline
-                  ON baseline.id = (master.payload ->> 'baseline_campaign_id')::bigint
-                 AND baseline.campaign_type = master.campaign_type
                 WHERE master.campaign_type = %s
                 ORDER BY master.ts ASC, master.id ASC
                 """,
@@ -9344,7 +9163,6 @@ def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
                 "campaign_type": row["campaign_type"],
                 "campaign": row["campaign"],
                 "active": bool(row["active"]),
-                "baseline_campaign": row.get("baseline_campaign"),
                 "started_at": payload.get("started_at"),
                 "stopped_at": payload.get("stopped_at"),
                 "interrupted_at": payload.get("interrupted_at"),
@@ -10328,7 +10146,6 @@ def cmd_report(_: Optional[dict]) -> dict:
             "campaign_control_ready": _campaign_control_ready.is_set(),
             "campaign_start_count": _campaign_start_count,
             "campaign_stop_count": _campaign_stop_count,
-            "baseline_set_count": _baseline_set_count,
             "lap_baseline_set_count": _lap_baseline_set_count,
             "stale_campaign_retire_count": _stale_campaign_retire_count,
             "stats_reset_requests": _stats_reset_requests,
@@ -10679,8 +10496,6 @@ COMMANDS = {
     "TRUNCATE": cmd_truncate,
     "INJECT_PROBLEM": cmd_inject_problem,
     "SET_LAP_BASELINE_NS": cmd_set_lap_baseline_ns,
-    "SET_BASELINE": cmd_set_baseline,
-    "BASELINE_INFO": cmd_baseline_info,
     "LIST_CAMPAIGNS": cmd_list_campaigns,
     "PHOTONS_INFO": cmd_photons_info,
 }
@@ -10690,7 +10505,6 @@ _HARD_FAILURE_READ_ONLY_COMMANDS = {
     "REPORT_PHOTONS",
     "REPORT_STATS",
     "REPORT_RECOVERY",
-    "BASELINE_INFO",
     "LIST_CAMPAIGNS",
     "PHOTONS_INFO",
 }
@@ -10821,6 +10635,55 @@ def _startup_activate_detector_for_heartbeat(
     return {"changed": True, **copy.deepcopy(payload)}
 
 
+def _known_m2_publication_failure_cutover_source() -> Dict[str, Any]:
+    """Authorize only the operator-requested retirement of incident row 2164036.
+
+    This is a one-time epoch break, not reconstruction of the missing statistic.
+    A newer row or different evidence requires a separate recovery decision.
+    """
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, sequence, payload
+            FROM campaign_detail
+            WHERE campaign_type = %s
+              AND payload #>> '{photons,source}' = %s
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (CAMPAIGN_TYPE_LANTERN, "PD200T_REAL_RACE"),
+        )
+        row = cur.fetchone()
+    if row is None or int(row["id"]) != 2164036 or int(row["sequence"]) != 53668:
+        raise RuntimeError("one-time PHOTONS M2 cutover does not match newest incident row 2164036/53668")
+    payload = row["payload"]
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    payload = _require_dict(payload, "M2 cutover source payload")
+    instrument = _require_dict(payload.get("photons"), "M2 cutover source photons")
+    science = _require_dict(instrument.get("science"), "M2 cutover source science")
+    excluded = _require_dict(science.get("excluded"), "M2 cutover source excluded")
+    raw = _require_dict(excluded.get("raw_cycles"), "M2 cutover source raw_cycles")
+    if (
+        payload.get("schema") != PHOTONS_SCHEMA
+        or _require_int(excluded.get("count"), "M2 cutover excluded.count") != 185644232
+        or _require_int(raw.get("n"), "M2 cutover raw.n") != 185644232
+        or "m2" not in raw
+        or raw["m2"] is not None
+        or _require_float(raw.get("max"), "M2 cutover raw.max") != 2940389674.0
+    ):
+        raise RuntimeError("one-time PHOTONS M2 cutover source evidence differs from the reported incident")
+    return {
+        "source_detail_id": int(row["id"]),
+        "source_sequence": int(row["sequence"]),
+        "excluded_raw_cycles": copy.deepcopy(raw),
+        "authorization": "OPERATOR_REQUESTED_INCIDENT_2164036_EPOCH_RESTART",
+        "authorized_at_utc": _utc_now_z(),
+        "old_statistics_restored": False,
+    }
+
+
 def _startup_commissioning_empty_heartbeat_cutover(
     *,
     attempt_generation: int,
@@ -10831,10 +10694,11 @@ def _startup_commissioning_empty_heartbeat_cutover(
     failure_text = str(failure)
 
     # Commissioning cutovers are deliberately narrow.  Preserve arbitrary recovery
-    # contradictions as a hold, but recognize the two already-defined boundaries:
+    # contradictions as a hold, but recognize the already-defined boundaries:
     # pre-heartbeat invalid statistics and the exact retired 1 kHz / 91 us race
     # geometry replaced by LANTERN V1.0's return-driven 200 ns race.
     cutover_reason: Optional[str] = None
+    incident_source: Optional[Dict[str, Any]] = None
     from_epoch = "UNRECOVERABLE_PD200T_REAL_RACE_HISTORY"
     if "canonical PHOTONS statistics are invalid" in failure_text:
         cutover_reason = "INVALID_PRE_HEARTBEAT_STATISTICS"
@@ -10844,6 +10708,13 @@ def _startup_commissioning_empty_heartbeat_cutover(
     ) in failure_text:
         cutover_reason = "LANTERN_V1_RETURN_DRIVEN_RACE_EPOCH"
         from_epoch = "PD200T_REAL_RACE_1KHZ_91US"
+    elif (
+        "newest durable PHOTONS row failed recovery authority" in failure_text
+        and "PHOTONS.science.excluded.raw_cycles.m2 must be numeric; got None" in failure_text
+    ):
+        incident_source = _known_m2_publication_failure_cutover_source()
+        cutover_reason = "OPERATOR_AUTHORIZED_M2_PUBLICATION_RANGE_EPOCH_BREAK"
+        from_epoch = "PD200T_REAL_RACE_FIXED_DECIMAL_M2_INCIDENT_2164036"
     else:
         return None
 
@@ -10876,6 +10747,8 @@ def _startup_commissioning_empty_heartbeat_cutover(
         "producer_action": "COLD_START_EMPTY_HEARTBEAT_EPOCH",
         "blocked_recovery_error": failure_text,
     }
+    if incident_source is not None:
+        migration["incident_source"] = incident_source
     logging.warning(
         "🫀 [photons/startup] safe commissioning producer has no active LANTERN; "
         "preserving %d historical PHOTONS row(s), activating detector=%s, and "
@@ -11101,7 +10974,7 @@ def run() -> None:
                 (recovery.get("bringup_report") or {}).get("laser_mod_active_high"),
             )
         else:
-            # START/STOP/baseline/maintenance control opens only after an advancing
+            # START/STOP/lap-reference/maintenance control opens only after an advancing
             # post-restart row has crossed the complete ordered persistence transaction
             # on the same transport generation that was classified.
             _campaign_control_ready.set()

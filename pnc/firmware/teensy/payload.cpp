@@ -6950,7 +6950,7 @@ static bool payload_reconcile_signed_length(const char* text,
 
 
 // ============================================================================
-// Integer-only fixed-decimal rendering
+// Integer-only decimal rendering (fixed digits with optional power of ten)
 // ============================================================================
 //
 // Conversion from float/double happens in util.cpp and produces fixed_decimal_t.
@@ -6982,7 +6982,8 @@ static bool payload_format_fixed_decimal(const fixed_decimal_t& value,
 
     if (!value.valid() ||
         value.decimal_places > FIXED_DECIMAL_MAX_PLACES ||
-        value.negative > 1U) {
+        value.negative > 1U ||
+        value.exponent10 < -340 || value.exponent10 > 308) {
         return false;
     }
 
@@ -7006,7 +7007,21 @@ static bool payload_format_fixed_decimal(const fixed_decimal_t& value,
         value.decimal_places != 0U
             ? 1U + (size_t)value.decimal_places
             : 0U;
-    const size_t required = sign_chars + whole_digits + decimal_chars;
+    char reversed_exponent[3];
+    size_t exponent_digits = 0U;
+    if (value.exponent10 != 0) {
+        uint16_t magnitude = value.exponent10 < 0
+            ? (uint16_t)(-value.exponent10) : (uint16_t)value.exponent10;
+        do {
+            reversed_exponent[exponent_digits++] =
+                (char)('0' + magnitude % 10U);
+            magnitude /= 10U;
+        } while (magnitude != 0U);
+    }
+    const size_t exponent_chars =
+        exponent_digits != 0U ? 2U + exponent_digits : 0U;
+    const size_t required =
+        sign_chars + whole_digits + decimal_chars + exponent_chars;
     if (required + 1U > out_size) return false;
 
     size_t pos = 0U;
@@ -7024,6 +7039,14 @@ static bool payload_format_fixed_decimal(const fixed_decimal_t& value,
                 (uint8_t)((value.fractional / divisor) % 10ULL);
             out[pos++] = (char)('0' + digit);
             divisor /= 10ULL;
+        }
+    }
+
+    if (exponent_digits != 0U) {
+        out[pos++] = 'e';
+        out[pos++] = value.exponent10 < 0 ? '-' : '+';
+        while (exponent_digits != 0U) {
+            out[pos++] = reversed_exponent[--exponent_digits];
         }
     }
 

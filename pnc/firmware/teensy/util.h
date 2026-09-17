@@ -47,6 +47,7 @@ struct fixed_decimal_t {
   uint8_t decimal_places;
   uint8_t negative;
   fixed_decimal_status_t status;
+  int16_t exponent10 = 0;  // Decimal parts multiplied by 10^exponent10.
 
   bool valid() const {
     return status == fixed_decimal_status_t::VALID;
@@ -57,6 +58,12 @@ struct fixed_decimal_t {
 // The floating-point work occurs in the caller/util layer, before Payload is
 // entered.  Payload::add(const fixed_decimal_t&) performs only integer work.
 fixed_decimal_t toFixedDecimal(double value, int decimal_places);
+
+// Encode a finite double with 17 significant decimal digits for round-trip
+// recovery. The integer-only result uses whole as the significand, no
+// fractional places, and exponent10 as its power of ten. Invalid input or
+// conversion failure is fatal; no null or substitute statistic is produced.
+fixed_decimal_t toScientificDecimal(double value);
 
 const char* fixedDecimalStatusName(fixed_decimal_status_t status);
 
