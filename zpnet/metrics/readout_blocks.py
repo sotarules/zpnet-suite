@@ -4,9 +4,9 @@ ZPNet Metrics Readout Blocks — Generalized Campaign Detail Edition
 Data source:
   CLOCKS_V4 owns the clock operator view and PHOTONS_V1 owns the optical
   operator view.  Both are canonical always-on instruments with optional
-  campaign decoration. Baselines are campaign_master relationships resolved on
-  demand; they are not instrument state. Metrics never waits for or reads
-  TIMEBASE.
+  campaign decoration. PHOTONS campaign baselines are campaign_master
+  relationships resolved on demand; CLOCKS comparisons use the campaign list.
+  Metrics never waits for or reads TIMEBASE.
 
 Stats policy:
   CLOCKS statistics are read verbatim from the producer-authored instrument and
@@ -36,16 +36,19 @@ Clock row doctrine:
   TOTAL is the always-on population since boot or the last statistics reset.
   TOTAL owns the displayed Welford population and the legacy stats.<lane>.ppb
   fallback while producers migrate to ppb_buckets.
-  CAMP is the firmware-authored campaign population. BASE/NOW/DELTA compare
-  the referenced campaign CAMP result to the active campaign CAMP result.
+  CAMP is the firmware-authored campaign population. CAMP DAC MEAN is the
+  Pi-recorded campaign target population; it never resets the running servo.
+  CAMP VOLTS derives from that fractional mean at nominal 5 V / 65536 codes.
+  DAC N counts recorded eligible samples; DAC FROM identifies recording onset.
+  Legacy campaigns have no DAC recording; missing history is not backfilled.
   RES is the firmware-published residual for the prior PPS interval.
 
 Column layout (CLK rows):
   NAME   VALUE   10-MIN   60-MIN   8-HOUR   24-HOUR   TOTAL   CAMP   RES
-         MEAN   SD   SE   N   BASE   NOW   DELTA
+         MEAN   SD   SE   N
 
 Column layout (DAC rows):
-  NAME   DAC_VALUE_VOLTAGE   (blanks)   MEAN   SD   SE   N   BASE   NOW   DELTA
+  NAME   VALUE   VOUT   DITHER   MEAN   SD   SE   N
 
 Column layout (INT rows):
   NAME   END_GNSS_NS   DELTA_NS
@@ -254,21 +257,6 @@ def _get_pi_clocks_report() -> dict:
     report["published_at_utc"] = root.get("published_at_utc")
     return report
 
-def _get_clocks_baseline() -> dict | None:
-    """Return the active campaign's referenced baseline campaign read model."""
-    resp = send_command(
-        machine="PI",
-        subsystem="CLOCKS",
-        command="BASELINE_INFO",
-        retries=1,
-        retry_delay_s=0.0,
-    )
-    if not isinstance(resp, dict) or not resp.get("success"):
-        return None
-    payload = resp.get("payload")
-    if not isinstance(payload, dict) or not payload.get("baseline_set"):
-        return None
-    return payload
 
 def _seconds_to_hms(seconds) -> str:
     value = _to_int(seconds)
@@ -927,7 +915,47 @@ def _dac_timebase_dither_summary(r: dict, lane: str, dac_now=None) -> str:
         dac_now if dac_now is not None else _dac_value(r, lane)
     ) or (realization or "ON")
 
-def _dac_detail_lines(r: dict, baseline: dict | None) -> list[str]:
+def _get_campaign_dac_recording(campaign: str) -> dict | None:
+    """Read the durable Pi recorder, independent of the instrument's live totals."""
+    with open_db(row_dict=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT payload -> 'campaign_dac' AS campaign_dac "
+                "FROM campaign_master WHERE campaign_type = 'TEMPEST' AND campaign = %s",
+                (campaign,),
+            )
+            row = cur.fetchone()
+    if row is None:
+        raise RuntimeError(f"TEMPEST campaign master missing: {campaign}")
+    return row["campaign_dac"]
+
+
+def _campaign_dac_values(recording: dict | None, lane: str):
+    """Mean fractional target, nominal volts, N, and first recorded public count.
+
+    Absence denotes a historical campaign predating this recorder. N=0 denotes
+    an established recording with no admitted DAC samples. Neither invents a
+    mean from the instrument population or the latest actuator setting.
+    """
+    if recording is None:
+        return None, None, None, None
+    if recording["schema"] != "CAMPAIGN_DAC_V1":
+        raise ValueError("unsupported campaign DAC recording schema")
+    stats = recording[lane]
+    n = stats["n"]
+    first = recording["first_public_count"]
+    if type(n) is not int or n < 0 or type(first) is not int or first <= 0:
+        raise ValueError("invalid campaign DAC recording population")
+    if n == 0:
+        return None, None, 0, first
+    mean = stats["mean"]
+    if not math.isfinite(mean) or not DAC_MIN_CODE <= mean <= DAC_MAX_CODE:
+        raise ValueError("campaign DAC mean outside actuator bounds")
+    volts = mean * DAC_OUTPUT_FULL_SCALE_VOLTAGE / DAC_CODE_SCALE
+    return mean, volts, n, first
+
+
+def _dac_detail_lines(r: dict, campaign_dac: dict | None) -> list[str]:
     """Render DAC telemetry as a dedicated, spacious table.
 
     DAC rows no longer inherit the clock-table geometry. VALUE and VOUT are
@@ -944,9 +972,9 @@ def _dac_detail_lines(r: dict, baseline: dict | None) -> list[str]:
     W_SD = 8
     W_SE = 8
     W_N = 7
-    W_BASE = 10
-    W_NOW = 10
-    W_DELTA = 10
+    W_CAMP_MEAN = 13
+    W_CAMP_VOLTS = 13
+    W_CAMP_N = 9
     G = " "
 
     lines.append(
@@ -958,22 +986,15 @@ def _dac_detail_lines(r: dict, baseline: dict | None) -> list[str]:
         f"{'SD':>{W_SD}}{G}"
         f"{'SE':>{W_SE}}{G}"
         f"{'N':>{W_N}}{G}"
-        f"{'BASE':>{W_BASE}}{G}"
-        f"{'NOW':>{W_NOW}}{G}"
-        f"{'DELTA':>{W_DELTA}}"
+        f"{'CAMP DAC MEAN':>{W_CAMP_MEAN}}{G}"
+        f"{'CAMP VOLTS':>{W_CAMP_VOLTS}}{G}"
+        f"{'DAC N':>{W_CAMP_N}}"
     )
 
     for name, key in (("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")):
         dac_now = _dac_current_value(r, key)
         dac_voltage = _dac_current_voltage(r, key)
         dither_summary = _dac_timebase_dither_summary(r, key, dac_now)
-
-        baseline_report = (
-            baseline.get("baseline_report")
-            if isinstance(baseline, dict)
-            else None
-        )
-        base_dac = _campaign_dac_from_master_report(baseline_report, key)
 
         mean = _to_float(_welford_value(r, f"{key}_dac", "mean"))
         sd = _to_float(_welford_value(r, f"{key}_dac", "stddev"))
@@ -982,10 +1003,7 @@ def _dac_detail_lines(r: dict, baseline: dict | None) -> list[str]:
         if wn == 0:
             mean = sd = se = wn = None
 
-        delta = None
-        if base_dac is not None and dac_now is not None:
-            delta = float(dac_now) - float(base_dac)
-
+        camp_mean, camp_volts, camp_n, _ = _campaign_dac_values(campaign_dac, key)
         lines.append(
             f"{name:<{W_NAME}}"
             f"{_fmt(dac_now, f'>{W_VALUE}.3f', W_VALUE)}{G}"
@@ -995,9 +1013,9 @@ def _dac_detail_lines(r: dict, baseline: dict | None) -> list[str]:
             f"{_fmt(sd, f'>{W_SD}.3f', W_SD)}{G}"
             f"{_fmt(se, f'>{W_SE}.3f', W_SE)}{G}"
             f"{_fmt(wn, f'>{W_N}d', W_N)}{G}"
-            f"{_fmt(base_dac, f'>{W_BASE}.3f', W_BASE)}{G}"
-            f"{_fmt(dac_now, f'>{W_NOW}.3f', W_NOW)}{G}"
-            f"{_fmt(delta, f'>+{W_DELTA}.3f', W_DELTA)}"
+            f"{_fmt(camp_mean, f'>{W_CAMP_MEAN}.6f', W_CAMP_MEAN)}{G}"
+            f"{_fmt(camp_volts, f'>{W_CAMP_VOLTS}.9f', W_CAMP_VOLTS)}{G}"
+            f"{_fmt(camp_n, f'>{W_CAMP_N}d', W_CAMP_N)}"
         )
 
     return lines
@@ -1118,19 +1136,7 @@ def status_header() -> str:
     except Exception:
         return " STATUS: UNAVAILABLE"
 
-# ---------------------------------------------------------------------
-# Baseline comparison helper
-# ---------------------------------------------------------------------
 
-def _baseline_comp(base_val, now_val, width=9):
-    if base_val is not None and now_val is not None:
-        delta = float(now_val) - float(base_val)
-        return (
-            f"{_fmt(base_val, f'>{width}.3f', width)}"
-            f"{_fmt(now_val, f'>{width}.3f', width)}"
-            f"{_fmt(delta, f'>+{width}.3f', width)}"
-        )
-    return f"{'---':>{width}}{'---':>{width}}{'---':>{width}}"
 
 
 # ---------------------------------------------------------------------
@@ -1271,6 +1277,7 @@ def _get_campaign_rows() -> list[dict]:
                     master.campaign_type,
                     master.campaign,
                     master.active,
+                    master.payload -> 'campaign_dac' AS campaign_dac,
                     master.payload ? 'report' AS report_present,
                     (master.payload #>> '{report,science_eligible}')::boolean
                         AS viable,
@@ -1369,6 +1376,10 @@ def campaigns_readout() -> list[str]:
     W_SD = 7
     W_SE = 7
     W_N = 8
+    W_DAC_MEAN = 13
+    W_DAC_VOLTS = 13
+    W_DAC_N = 9
+    W_DAC_FROM = 9
     G = " "
 
     lines.append(
@@ -1385,7 +1396,11 @@ def campaigns_readout() -> list[str]:
         f"{'MEAN':>{W_MEAN}}"
         f"{'SD':>{W_SD}}"
         f"{'SE':>{W_SE}}"
-        f"{'N':>{W_N}}"
+        f"{'N':>{W_N}}{G}"
+        f"{'CAMP DAC MEAN':>{W_DAC_MEAN}}{G}"
+        f"{'CAMP VOLTS':>{W_DAC_VOLTS}}{G}"
+        f"{'DAC N':>{W_DAC_N}}{G}"
+        f"{'DAC FROM':>{W_DAC_FROM}}"
     )
 
     if not rows:
@@ -1421,6 +1436,9 @@ def campaigns_readout() -> list[str]:
             stderr = _to_float(row.get(f"{lane_key}_stderr"))
             n = _to_int(row.get(f"{lane_key}_n"))
 
+            dac_mean, dac_volts, dac_n, dac_from = _campaign_dac_values(
+                row.get("campaign_dac"), lane_key
+            )
             lines.append(
                 f"{campaign_cell}{G}"
                 f"{lane_name:<{W_DEV}}"
@@ -1430,12 +1448,17 @@ def campaigns_readout() -> list[str]:
                 f"{_fmt(mean, f'>{W_MEAN}.3f', W_MEAN)}"
                 f"{_fmt(stddev, f'>{W_SD}.3f', W_SD)}"
                 f"{_fmt(stderr, f'>{W_SE}.3f', W_SE)}"
-                f"{_fmt(n, f'>{W_N}d', W_N)}"
+                f"{_fmt(n, f'>{W_N}d', W_N)}{G}"
+                f"{_fmt(dac_mean, f'>{W_DAC_MEAN}.6f', W_DAC_MEAN)}{G}"
+                f"{_fmt(dac_volts, f'>{W_DAC_VOLTS}.9f', W_DAC_VOLTS)}{G}"
+                f"{_fmt(dac_n, f'>{W_DAC_N}d', W_DAC_N)}{G}"
+                f"{_fmt(dac_from, f'>{W_DAC_FROM}d', W_DAC_FROM)}"
             )
 
         if row_index != len(rows) - 1:
             lines.append("")
 
+    lines.extend(["", "DAC FROM: first recorded campaign public count; --- means no DAC recording."])
     return lines
 
 
@@ -1474,18 +1497,8 @@ def _campaign_ppb(r: dict, lane: str):
     return _to_float(_path_get(campaign, f"stats.ppb.{lane}", None))
 
 
-def _campaign_ppb_from_master_report(master_report: dict, lane: str):
-    """Read one CAMP PPB value from campaign_master.payload.report."""
-    if not isinstance(master_report, dict):
-        return None
-    if lane == "gnss_raw":
-        return _to_float(_path_get(master_report, "extra_clocks.gnss_raw_ppb", None))
-    return _to_float(_path_get(master_report, f"fragment.stats.ppb.{lane}", None))
 
 
-def _campaign_dac_from_master_report(master_report: dict, lane: str):
-    """Read the latest DAC target carried by a campaign master report."""
-    return _to_float(_path_get(master_report, f"clocks.control.{lane}.target_code", None))
 
 def _monitor_count(r: dict) -> int:
     value = _to_int(_field(r, "stats.ocxo1.welford.n", default=None))
@@ -1518,16 +1531,7 @@ def clocks_combined_readout() -> list[str]:
 
     servo_state = _servo_state(r)
 
-    baseline = _get_clocks_baseline()
-    baseline_report = (
-        baseline.get("baseline_report")
-        if isinstance(baseline, dict)
-        else None
-    )
-    baseline_campaign = baseline.get("baseline_campaign") if baseline else None
-
     servo_str = servo_state
-    baseline_str = f"BASELINE: {baseline_campaign}" if baseline_campaign else "BASELINE: NONE"
     recoverable_str = _recoverable_status(CLOCKS_RECOVERY_CONFIG_KEY)
 
     if state == "STARTED" or r.get("campaign_present"):
@@ -1537,7 +1541,6 @@ def clocks_combined_readout() -> list[str]:
     lines.append(
         identity
         + f"    SERVO: {servo_str}"
-        + f"    {baseline_str}"
         + f"    RECOVERABLE: {recoverable_str}"
     )
     lines.append("")
@@ -1551,10 +1554,6 @@ def clocks_combined_readout() -> list[str]:
     W_SD    = 7
     W_SE    = 7
     W_N     = 7
-    W_BASE  = 9
-    W_NOW   = 9
-    W_DELTA = 9
-
     # ── CLK header ──
     lines.append(
         f"{'CLK':<{W_NAME}}"
@@ -1570,42 +1569,25 @@ def clocks_combined_readout() -> list[str]:
         f"{'SD':>{W_SD}}"
         f"{'SE':>{W_SE}}"
         f"{'N':>{W_N}}"
-        f" "
-        f"{'BASE':>{W_BASE}}"
-        f"{'NOW':>{W_NOW}}"
-        f"{'DELTA':>{W_DELTA}}"
     )
 
     # ── GNSS (reference nanosecond clock) ──
     gnss_ns = _clockface_value(r, "gnss")
-    gnss_campaign_ppb = _campaign_ppb(r, "gnss")
     gnss_res = _to_int(_field(r, "gnss.second_residual_ns", "gnss_residual_ns")) or 0
-    gnss_baseline_comp = _baseline_comp(
-        _campaign_ppb_from_master_report(baseline_report, "gnss"),
-        gnss_campaign_ppb,
-        W_BASE,
-    )
     lines.append(
         f"{'GNSS':<{W_NAME}}"
         f"{_comma_int(gnss_ns, W_VALUE)}"
         f"{_ppb_cols_fragment(r, 'gnss', W_PPB_BUCKET)}"
         f"{_sign_int(gnss_res, W_RES)}"
         f"{_welford_cols_fragment(r, 'gnss', W_MEAN, W_SD, W_SE, W_N)}"
-        f" {gnss_baseline_comp}"
     )
 
     # ── VCLOCK (GNSS-disciplined nanosecond clock) ──
     vclock_ns  = _clockface_value(r, "vclock")
-    vclock_campaign_ppb = _campaign_ppb(r, "vclock")
     vclock_res = _vclock_residual_ns(r)
 
     if vclock_res is None:
         vclock_res = 0
-    vclock_baseline_comp = _baseline_comp(
-        _campaign_ppb_from_master_report(baseline_report, "vclock"),
-        vclock_campaign_ppb,
-        W_BASE,
-    )
 
     lines.append(
         f"{'VCLOCK':<{W_NAME}}"
@@ -1613,26 +1595,18 @@ def clocks_combined_readout() -> list[str]:
         f"{_ppb_cols_fragment(r, 'vclock', W_PPB_BUCKET)}"
         f"{_sign_int(vclock_res, W_RES)}"
         f"{_welford_cols_fragment_or_zero(r, 'vclock', W_MEAN, W_SD, W_SE, W_N)}"
-        f" {vclock_baseline_comp}"
     )
 
     # ── OCXO1, OCXO2 (nanosecond clocks) ──
     for name, key in [("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
         ocxo_ns = _clockface_value(r, key)
-        campaign_ppb = _campaign_ppb(r, key)
         res          = _ocxo_residual_ns(r, key)
-        campaign_baseline_comp = _baseline_comp(
-            _campaign_ppb_from_master_report(baseline_report, key),
-            campaign_ppb,
-            W_BASE,
-        )
         lines.append(
             f"{name:<{W_NAME}}"
             f"{_comma_int(ocxo_ns, W_VALUE)}"
             f"{_ppb_cols_fragment(r, key, W_PPB_BUCKET)}"
             f"{_sign_int(res, W_RES)}"
             f"{_welford_cols_fragment(r, key, W_MEAN, W_SD, W_SE, W_N)}"
-            f" {campaign_baseline_comp}"
         )
 
     # GN_RAW and DWT remain available in CLOCKS and focused reports, but are
@@ -1640,7 +1614,15 @@ def clocks_combined_readout() -> list[str]:
 
     # ── DAC detail ──
     lines.append("")
-    lines.extend(_dac_detail_lines(r, baseline))
+    campaign_dac = (
+        _get_campaign_dac_recording(campaign) if r.get("campaign_present") else None
+    )
+    lines.extend(_dac_detail_lines(r, campaign_dac))
+    if campaign_dac is not None:
+        lines.append(
+            f"DAC CAMP: observed targets since campaign public count "
+            f"{campaign_dac['first_public_count']}; gaps are not reconstructed."
+        )
 
     lines.append("")
 

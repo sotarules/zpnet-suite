@@ -2059,7 +2059,7 @@ def _dac_process_completed_row(
     teensy_clocks: Dict[str, Any],
     campaign: Optional[Dict[str, Any]],
     sequence: int,
-) -> None:
+) -> Optional[Dict[str, Any]]:
     global _dac_control_second
     global _dac_stats_reset_count, _dac_stats_update_count
     global _dac_stats_last_sequence, _dac_stats_reset_fence_count
@@ -2160,10 +2160,22 @@ def _dac_process_completed_row(
             _dac_control_second = int(update_count)
             for lane in _dac_lanes.values():
                 lane.welford.update(lane.target_code)
+            # Same locked pre-decision targets as the always-on Welfords.
+            # This is a Pi observation, not a reconstructed PPS-time voltage.
+            observation = {
+                "schema": "DAC_OBSERVATION_V1",
+                "sequence": int(sequence),
+                "reset_count": int(reset_count),
+                "update_count": int(update_count),
+                "servo_mode": _dac_servo_mode,
+                "dither_enabled": bool(_dac_dither_operator_enabled),
+                "ocxo1": float(_dac_lanes["ocxo1"].target_code),
+                "ocxo2": float(_dac_lanes["ocxo2"].target_code),
+            }
             mode = _dac_servo_mode
 
     if mode == "OFF":
-        return
+        return observation
 
     for lane_name, lane in _dac_lanes.items():
         inputs = _dac_servo_inputs(teensy_clocks, campaign, lane_name)
@@ -2206,6 +2218,8 @@ def _dac_process_completed_row(
                 deadband_ppb=SERVO_10_MIN_DEADBAND_PPB,
                 use_soft_landing=False,
             )
+
+    return observation
 
 
 def _dac_control_lane_snapshot(lane: _DacLaneState) -> Dict[str, Any]:
@@ -10328,6 +10342,141 @@ def _tempest_adjudication(detail: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+class _CampaignDacIntegrityError(RuntimeError):
+    """Contradictory DAC recording custody; never restart the population silently."""
+
+
+def _campaign_dac_advance(
+    previous: Optional[Dict[str, Any]],
+    observation: Optional[Dict[str, Any]],
+    *,
+    campaign: str,
+    detail_id: int,
+    sequence: int,
+    public_count: int,
+    science_eligible: bool,
+) -> Dict[str, Any]:
+    """Advance a passive recording of admitted Pi target observations.
+
+    This population survives producer-statistics rollback: it describes actual
+    recorded DAC observations, not replayed or projected firmware seconds.
+    Missing observations stay missing; first_public_count exposes mid-campaign
+    installation. The current target is never substituted for missing evidence.
+    """
+    try:
+        if previous is None:
+            state = {
+                "schema": "CAMPAIGN_DAC_V1",
+                "campaign": campaign,
+                "first_public_count": public_count,
+                "first_detail_id": detail_id,
+                "last_detail_id": 0,
+                "observations": 0,
+                "excluded_observations": 0,
+                "unsampled_observations": 0,
+                "ocxo1": _DacWelford().snapshot(),
+                "ocxo2": _DacWelford().snapshot(),
+            }
+        else:
+            state = copy.deepcopy(previous)
+        if state["schema"] != "CAMPAIGN_DAC_V1" or state["campaign"] != campaign:
+            raise ValueError("DAC recording schema/campaign mismatch")
+        if detail_id <= state["last_detail_id"]:
+            raise ValueError("DAC recording detail identity did not advance")
+        if min(detail_id, sequence, public_count) <= 0:
+            raise ValueError("DAC recording has a nonpositive observation identity")
+        lanes = {}
+        for name in ("ocxo1", "ocxo2"):
+            w = state[name]
+            if type(w["n"]) is not int or w["n"] < 0:
+                raise ValueError("DAC recording has an invalid population")
+            if not all(math.isfinite(w[k]) for k in ("mean", "m2", "min", "max")):
+                raise ValueError("DAC recording contains nonfinite statistics")
+            if w["m2"] < 0 or (w["n"] and not w["min"] <= w["mean"] <= w["max"]):
+                raise ValueError("DAC recording statistics contradict their bounds")
+            lanes[name] = _DacWelford(w["n"], w["mean"], w["m2"], w["min"], w["max"])
+        if lanes["ocxo1"].n != lanes["ocxo2"].n:
+            raise ValueError("DAC recording lane populations disagree")
+        if state["observations"] != (lanes["ocxo1"].n + state["excluded_observations"]
+                                     + state["unsampled_observations"]):
+            raise ValueError("DAC recording observation accounting disagrees")
+        if observation is not None:
+            if observation["schema"] != "DAC_OBSERVATION_V1" or observation["sequence"] != sequence:
+                raise ValueError("DAC sample belongs to another observation")
+            for name in lanes:
+                value = observation[name]
+                if not math.isfinite(value) or not 0.0 <= value <= AD5693R_SAFE_MAX_HW_CODE:
+                    raise ValueError("DAC sample is outside actuator bounds")
+        if observation is None:
+            state["unsampled_observations"] += 1
+        elif not science_eligible:
+            state["excluded_observations"] += 1
+        else:
+            for name, accumulator in lanes.items():
+                accumulator.update(observation[name])
+                state[name] = accumulator.snapshot()
+        state["observations"] += 1
+        state["last_detail_id"] = detail_id
+        state["last_sequence"] = sequence
+        state["last_public_count"] = public_count
+        state["last_observation"] = copy.deepcopy(observation)
+        state["last_science_eligible"] = science_eligible
+        return state
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise _CampaignDacIntegrityError(str(exc)) from exc
+
+
+def _record_campaign_dac(
+    cur: Any, *, campaign: str, detail_id: int, state: Dict[str, Any],
+    public_count: int, science_eligible: bool,
+) -> Dict[str, Any]:
+    """Commit recorder state and its per-detail receipt in the caller's transaction.
+
+    The master lock serializes updates. A committed retry reuses its receipt;
+    a transaction rollback changes neither population nor receipt. No in-memory
+    accumulator needs resurrection after Pi or Teensy restart.
+    """
+    cur.execute(
+        "SELECT id, payload FROM campaign_master "
+        "WHERE campaign_type = %s AND campaign = %s FOR UPDATE",
+        (CAMPAIGN_TYPE_TEMPEST, campaign),
+    )
+    master = cur.fetchone()
+    if master is None:
+        raise _CampaignDacIntegrityError("DAC recording has no campaign master")
+    previous = master["payload"].get("campaign_dac")
+    sample = state["clocks"]["dac_observation"]
+    if previous is not None and previous["last_detail_id"] == detail_id:
+        if (previous["last_observation"] != sample
+                or previous["last_science_eligible"] != science_eligible
+                or previous["last_sequence"] != state["sequence"]
+                or previous["last_public_count"] != public_count):
+            raise _CampaignDacIntegrityError("committed DAC observation changed on retry")
+        recording = previous
+    else:
+        recording = _campaign_dac_advance(
+            previous, sample, campaign=campaign, detail_id=detail_id,
+            sequence=state["sequence"], public_count=public_count,
+            science_eligible=science_eligible,
+        )
+    encoded = json.dumps(recording)
+    cur.execute(
+        "UPDATE campaign_detail SET payload = "
+        "jsonb_set(payload, '{campaign_dac}', %s::jsonb, true) WHERE id = %s",
+        (encoded, detail_id),
+    )
+    if cur.rowcount != 1:
+        raise _CampaignDacIntegrityError("DAC receipt did not update exactly one detail")
+    cur.execute(
+        "UPDATE campaign_master SET payload = "
+        "jsonb_set(payload, '{campaign_dac}', %s::jsonb, true) WHERE id = %s",
+        (encoded, master["id"]),
+    )
+    if cur.rowcount != 1:
+        raise _CampaignDacIntegrityError("DAC recording did not update exactly one master")
+    return recording
+
+
 def _attach_tempest_to_state_detail(detail: Dict[str, Any]) -> None:
     """Attach Pi adjudication to the already-persisted same-sequence V4 campaign.
 
@@ -10346,7 +10495,7 @@ def _attach_tempest_to_state_detail(detail: Dict[str, Any]) -> None:
     adjudication = _tempest_adjudication(detail)
 
     # campaign_master is an intentional read model and retains the latest accepted
-    # campaign report. Baseline comparisons reference another master row by ID.
+    # campaign report.
     report = dict(detail)
     report["campaign_type"] = CAMPAIGN_TYPE_TEMPEST
     report["campaign_state"] = "STARTED"
@@ -10380,7 +10529,7 @@ def _attach_tempest_to_state_detail(detail: Dict[str, Any]) -> None:
                         ORDER BY id DESC
                         LIMIT 1
                     )
-                    RETURNING id
+                    RETURNING id, payload
                     """,
                     (
                         viable,
@@ -10392,6 +10541,11 @@ def _attach_tempest_to_state_detail(detail: Dict[str, Any]) -> None:
                 )
                 attached = cur.fetchone()
                 if attached is not None:
+                    report["campaign_dac"] = _record_campaign_dac(
+                        cur, campaign=campaign, detail_id=int(attached["id"]),
+                        state=attached["payload"], public_count=int(public_count),
+                        science_eligible=viable,
+                    )
                     cur.execute(
                         """
                         UPDATE campaign_master
@@ -10415,6 +10569,11 @@ def _attach_tempest_to_state_detail(detail: Dict[str, Any]) -> None:
                     "success": True,
                 }
                 return
+        except (_CampaignDacIntegrityError, KeyError, TypeError, ValueError) as exc:
+            _require_hard_failure(
+                "campaign_dac_integrity", {"campaign": campaign, "error": str(exc)},
+                source="CAMPAIGN_DAC",
+            )
         except Exception as exc:
             last_error = exc
 
@@ -13565,8 +13724,9 @@ def _build_canonical_clocks_state(
     # A pre-classification newborn row is still a lawful physical observation, but
     # allowing it to reset DAC chronology or replace the literal Better-Buckets
     # image would let an unclassified lifetime rewrite resurrection authority.
+    dac_observation = None
     if mutate_alpha_custody:
-        _dac_process_completed_row(
+        dac_observation = _dac_process_completed_row(
             teensy_clocks,
             clocks_fragment.get("campaign"),
             sequence,
@@ -13583,6 +13743,7 @@ def _build_canonical_clocks_state(
     # DAC/control is Pi-authored.  Keep the established canonical JSON shape so
     # front-end consumers do not care that CLOCKS_FRAGMENT stopped carrying it.
     clocks["control"] = _dac_control_snapshot()
+    clocks["dac_observation"] = dac_observation
     ppb_restore_checkpoint: Optional[Dict[str, Any]] = None
     stats = clocks.get("stats")
     if isinstance(stats, dict):
@@ -17638,210 +17799,6 @@ def _restore_active_campaign_state(
 
 
 # ---------------------------------------------------------------------
-# BASELINE — campaign-to-campaign relationship
-# ---------------------------------------------------------------------
-
-
-def _baseline_relation_for_active_campaign() -> Optional[Dict[str, Any]]:
-    """Return the active campaign and its referenced baseline campaign, if any."""
-    with open_db(row_dict=True) as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT
-                current.campaign AS campaign,
-                baseline.campaign AS baseline_campaign,
-                baseline.payload AS baseline_payload
-            FROM campaign_master AS current
-            JOIN campaign_master AS baseline
-              ON baseline.id = (current.payload ->> 'baseline_campaign_id')::bigint
-             AND baseline.campaign_type = current.campaign_type
-            WHERE current.campaign_type = %s
-              AND current.active = true
-            ORDER BY current.ts DESC, current.id DESC
-            LIMIT 1
-            """,
-            (CAMPAIGN_TYPE_TEMPEST,),
-        )
-        row = cur.fetchone()
-
-    if row is None:
-        return None
-
-    payload = row["baseline_payload"]
-    if isinstance(payload, str):
-        payload = json.loads(payload)
-    if not isinstance(payload, dict):
-        raise RuntimeError("baseline campaign payload is not an object")
-
-    report = payload.get("report")
-    if not isinstance(report, dict) or not report:
-        raise RuntimeError(
-            f"Baseline campaign '{row['baseline_campaign']}' has no report"
-        )
-
-    return {
-        "campaign": row["campaign"],
-        "baseline_campaign": row["baseline_campaign"],
-        "baseline_report": report,
-        "baseline_location": payload.get("location"),
-        "baseline_started_at": payload.get("started_at"),
-    }
-
-
-def _remove_legacy_baseline_config(cur) -> None:
-    """Remove retired copied-baseline fields while preserving other SYSTEM config."""
-    cur.execute(
-        """
-        UPDATE config
-        SET payload = payload
-            - 'baseline_id'
-            - 'baseline_ppb'
-            - 'baseline_tau'
-            - 'baseline_dac'
-            - 'baseline_dac_mean'
-            - 'baseline_dac_stats'
-            - 'baseline_campaign_type'
-            - 'baseline_campaign'
-            - 'baseline_pps_vclock_n'
-            - 'baseline_pps_n'
-        WHERE config_key = 'SYSTEM'
-        """
-    )
-
-
-def cmd_set_baseline(args: Optional[dict]) -> Dict[str, Any]:
-    """Relate the active campaign to another campaign selected by name."""
-    if not args or not str(args.get("campaign") or "").strip():
-        return {"success": False, "message": "SET_BASELINE requires 'campaign' argument"}
-
-    baseline_name = str(args["campaign"]).strip()
-
-    try:
-        with open_db(row_dict=True) as conn:
-            cur = conn.cursor()
-            cur.execute(
-                """
-                SELECT id, campaign
-                FROM campaign_master
-                WHERE campaign_type = %s
-                  AND active = true
-                ORDER BY ts DESC, id DESC
-                LIMIT 1
-                """,
-                (CAMPAIGN_TYPE_TEMPEST,),
-            )
-            current = cur.fetchone()
-            if current is None:
-                return {
-                    "success": False,
-                    "message": "SET_BASELINE requires an active campaign",
-                }
-
-            cur.execute(
-                """
-                SELECT id, campaign, payload
-                FROM campaign_master
-                WHERE campaign_type = %s
-                  AND campaign = %s
-                ORDER BY ts DESC, id DESC
-                LIMIT 1
-                """,
-                (CAMPAIGN_TYPE_TEMPEST, baseline_name),
-            )
-            baseline = cur.fetchone()
-            if baseline is None:
-                return {
-                    "success": False,
-                    "message": f"No campaign named '{baseline_name}'",
-                }
-
-            if int(baseline["id"]) == int(current["id"]):
-                return {
-                    "success": False,
-                    "message": "A campaign cannot use itself as its baseline",
-                }
-
-            baseline_payload = baseline["payload"]
-            if isinstance(baseline_payload, str):
-                baseline_payload = json.loads(baseline_payload)
-            baseline_report = (
-                baseline_payload.get("report")
-                if isinstance(baseline_payload, dict)
-                else None
-            )
-            if not isinstance(baseline_report, dict) or not baseline_report:
-                return {
-                    "success": False,
-                    "message": f"Campaign '{baseline['campaign']}' has no report",
-                }
-
-            cur.execute(
-                """
-                UPDATE campaign_master
-                SET payload = jsonb_set(
-                    payload,
-                    '{baseline_campaign_id}',
-                    to_jsonb(%s::bigint),
-                    true
-                )
-                WHERE id = %s
-                """,
-                (int(baseline["id"]), int(current["id"])),
-            )
-            if cur.rowcount != 1:
-                raise RuntimeError("active campaign baseline relationship was not updated")
-
-            _remove_legacy_baseline_config(cur)
-
-    except Exception as exc:
-        logging.exception("❌ [clocks] failed to establish campaign baseline relationship")
-        return {"success": False, "message": str(exc)}
-
-    logging.info(
-        "✅ [clocks] campaign '%s' baseline -> '%s'",
-        current["campaign"],
-        baseline["campaign"],
-    )
-    return {
-        "success": True,
-        "message": "OK",
-        "payload": {
-            "campaign": current["campaign"],
-            "baseline_campaign": baseline["campaign"],
-        },
-    }
-
-
-def cmd_baseline_info(_: Optional[dict]) -> Dict[str, Any]:
-    """Return the active campaign's baseline relationship and referenced report."""
-    try:
-        relation = _baseline_relation_for_active_campaign()
-    except Exception as exc:
-        logging.exception("❌ [clocks] BASELINE_INFO failed")
-        return {"success": False, "message": str(exc)}
-
-    if relation is None:
-        return {
-            "success": True,
-            "message": "OK",
-            "payload": {"baseline_set": False},
-        }
-
-    return {
-        "success": True,
-        "message": "OK",
-        "payload": {
-            "baseline_set": True,
-            **relation,
-        },
-    }
-
-
-
-
-
-# ---------------------------------------------------------------------
 # Feature-status preflight gate
 # ---------------------------------------------------------------------
 
@@ -18632,28 +18589,6 @@ def cmd_delete(args: Optional[dict]) -> Dict[str, Any]:
         delete_started = time.monotonic()
         with open_db(row_dict=True) as conn:
             cur = conn.cursor()
-            cur.execute(
-                """
-                SELECT DISTINCT ref.campaign
-                FROM campaign_master AS target
-                JOIN campaign_master AS ref
-                  ON (ref.payload ->> 'baseline_campaign_id')::bigint = target.id
-                WHERE target.campaign_type = %s
-                  AND target.campaign = %s
-                ORDER BY ref.campaign
-                """,
-                (CAMPAIGN_TYPE_TEMPEST, campaign_name),
-            )
-            referenced_by = [str(row["campaign"]) for row in cur.fetchall()]
-            if referenced_by:
-                return {
-                    "success": False,
-                    "message": (
-                        f"Campaign '{campaign_name}' is used as a baseline by: "
-                        + ", ".join(referenced_by)
-                    ),
-                }
-
             # Operator DELETE is an explicitly requested maintenance transaction.
             # Large historical campaigns may legitimately exceed the ordinary
             # interactive statement timeout; keep the override transaction-local.
@@ -18831,7 +18766,7 @@ def cmd_truncate(args: Optional[dict]) -> Dict[str, Any]:
 
 
 def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
-    """List TEMPEST campaigns with each campaign's baseline relationship by name."""
+    """List TEMPEST campaigns and their recorded state."""
     try:
         with open_db(row_dict=True) as conn:
             cur = conn.cursor()
@@ -18842,12 +18777,8 @@ def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
                     master.campaign,
                     master.active,
                     master.ts,
-                    master.payload,
-                    baseline.campaign AS baseline_campaign
+                    master.payload
                 FROM campaign_master AS master
-                LEFT JOIN campaign_master AS baseline
-                  ON baseline.id = (master.payload ->> 'baseline_campaign_id')::bigint
-                 AND baseline.campaign_type = master.campaign_type
                 WHERE master.campaign_type = %s
                 ORDER BY master.ts ASC, master.id ASC
                 """,
@@ -18870,7 +18801,6 @@ def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
             "campaign_type": row["campaign_type"],
             "campaign": row["campaign"],
             "active": bool(row["active"]),
-            "baseline_campaign": row.get("baseline_campaign"),
             "started_at": payload.get("started_at"),
             "stopped_at": payload.get("stopped_at"),
             "resumed_at": payload.get("resumed_at"),
@@ -19184,8 +19114,6 @@ COMMANDS = {
     "DITHER_ENABLE": cmd_dither_enable,
     "DITHER_DISABLE": cmd_dither_disable,
     "DAC_INFO": cmd_dac_info,
-    "SET_BASELINE": cmd_set_baseline,
-    "BASELINE_INFO": cmd_baseline_info,
     "LIST_CAMPAIGNS": cmd_list_campaigns,
     "CLOCKS_INFO": cmd_clocks_info,
 }
@@ -19195,7 +19123,6 @@ _HARD_FAILURE_READ_ONLY_COMMANDS = {
     "REPORT_CLOCKS",
     "REPORT_STATS",
     "DAC_INFO",
-    "BASELINE_INFO",
     "LIST_CAMPAIGNS",
     "CLOCKS_INFO",
 }
