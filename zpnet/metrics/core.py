@@ -39,7 +39,9 @@ from dataclasses import dataclass
 from typing import Callable
 
 from zpnet.shared.logger import setup_logging
-from zpnet.metrics.readout_blocks import READOUTS, adjust_ocxo_dac, status_header
+from zpnet.metrics.readout_blocks import (
+    PHOTONS_UPDATED, READOUTS, adjust_ocxo_dac, status_header,
+)
 
 # ---------------------------------------------------------------------
 # Configuration
@@ -47,6 +49,7 @@ from zpnet.metrics.readout_blocks import READOUTS, adjust_ocxo_dac, status_heade
 
 REFRESH_INTERVAL_S = 1.0         # screen repaint cadence
 CYCLE_INTERVAL_S = 8.0           # auto-advance cadence (when unlocked)
+PHOTONS_KEY_POLL_S = 0.050       # keyboard polling; publications wake immediately
 
 DAC_KEY_HELP = (
     "O1 F9/F10/F11/F12=coarse-/fine-/fine+/coarse+  "
@@ -77,6 +80,18 @@ def _normalize_readout(entry) -> ReadoutSpec:
 def _page_step(body_height: int) -> int:
     """Move by almost one viewport so adjacent pages retain one context line."""
     return max(1, body_height - 1)
+
+
+def _photons_visible_lines(lines: list[str], body_height: int) -> list[str]:
+    """Keep the fixed headings and newest tail rows on shorter terminals."""
+    for index, line in enumerate(lines):
+        if line.lstrip().startswith("SEC "):
+            header_end = index + 1
+            row_count = body_height - header_end
+            if row_count > 0:
+                return lines[:header_end] + lines[header_end:][-row_count:]
+            break
+    return lines[:body_height]
 
 
 # ---------------------------------------------------------------------
@@ -172,7 +187,6 @@ def _main(stdscr: curses.window) -> None:
     curses.use_default_colors()
     stdscr.nodelay(True)             # non-blocking getch
     stdscr.keypad(True)               # decode function keys as curses.KEY_F(n)
-    stdscr.timeout(int(REFRESH_INTERVAL_S * 1000))
 
     # Green body, white title, and yellow warnings on black.
     curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
@@ -196,6 +210,7 @@ def _main(stdscr: curses.window) -> None:
     last_cycle_time = time.monotonic()
     last_control_message = ""
     last_control_time = 0.0
+    last_repaint_time = 0.0
 
     dac_key_bindings = _dac_key_bindings()
 
@@ -206,7 +221,16 @@ def _main(stdscr: curses.window) -> None:
         # -----------------------------------------------------
         # Input handling
         # -----------------------------------------------------
+        live_photons = readouts[readout_index].name == "PHOTONS"
+        stdscr.timeout(0 if live_photons else int(REFRESH_INTERVAL_S * 1000))
         key = _read_key(stdscr)
+
+        if (live_photons and key == -1 and not PHOTONS_UPDATED.is_set()
+                and time.monotonic() - last_repaint_time < REFRESH_INTERVAL_S):
+            # Sleep without holding up incoming publications. Recheck keyboard
+            # input at 50 ms intervals, but repaint only on arrival/key/timer.
+            PHOTONS_UPDATED.wait(PHOTONS_KEY_POLL_S)
+            continue
 
         if key == ord("q") or key == ord("Q"):
             break
@@ -257,6 +281,11 @@ def _main(stdscr: curses.window) -> None:
         readout = readouts[readout_index]
         readout_name = readout.name
 
+        if readout_name == "PHOTONS":
+            # Clear BEFORE taking the snapshot. An arrival during rendering
+            # stays signaled and causes another pass instead of being lost.
+            PHOTONS_UPDATED.clear()
+
         try:
             header = status_header()
         except Exception:
@@ -304,6 +333,8 @@ def _main(stdscr: curses.window) -> None:
         # Row 1 remains blank. Page names and horizontal rules are deliberately
         # absent; the body content identifies the active readout.
         visible_lines = lines[scroll_offset:scroll_offset + body_height]
+        if readout_name == "PHOTONS":
+            visible_lines = _photons_visible_lines(lines, body_height)
         for i, line in enumerate(visible_lines):
             row = 2 + i
             if row >= max_y - 2:
@@ -330,6 +361,7 @@ def _main(stdscr: curses.window) -> None:
             pass
 
         stdscr.refresh()
+        last_repaint_time = time.monotonic()
 
 
 # ---------------------------------------------------------------------

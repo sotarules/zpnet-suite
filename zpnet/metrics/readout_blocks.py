@@ -90,6 +90,7 @@ CLOCKS_RECOVERY_CONFIG_KEY = "CLOCKS_RECOVERY"
 PHOTONS_RECOVERY_CONFIG_KEY = "PHOTONS_RECOVERY"
 CAMPAIGN_TYPE_LANTERN = "LANTERN"
 PHOTONS_ROLLING_ROWS = 25
+PHOTONS_UPDATED = threading.Event()
 
 _LIVE_CACHE = create_pubsub_cache(CLOCKS_TOPIC)
 
@@ -172,6 +173,7 @@ class _RollingPubSubTap:
                             with self._lock:
                                 self._payloads.append(dict(payload))
                                 self._error = None
+                            PHOTONS_UPDATED.set()
             except Exception as exc:
                 with self._lock:
                     self._error = str(exc)
@@ -2031,11 +2033,8 @@ def _get_photons_rolling_payloads() -> list[dict]:
     return _PHOTONS_LIVE_TAP.history()
 
 
-def _photons_rolling_rows(live: dict, summaries: list[dict]) -> list[dict]:
+def _photons_rolling_rows(payloads: list[dict]) -> list[dict]:
     """Return oldest-to-newest one-second populations from the live PHOTONS tail."""
-    _ = live
-    _ = summaries
-    payloads = _get_photons_rolling_payloads()
     rows: list[dict] = []
 
     for before, current in zip(payloads, payloads[1:]):
@@ -2098,22 +2097,54 @@ def _photons_rolling_rows(live: dict, summaries: list[dict]) -> list[dict]:
     return rows[-PHOTONS_ROLLING_ROWS:]
 
 
-def photons_detail_readout() -> list[str]:
-    """Render the live optical detail plus a fixed-header 25-second rolling tail."""
-    live = _get_photons_snapshot()
-    if not isinstance(live, dict) or not live:
-        return ["PHOTONS: FEED UNAVAILABLE"]
+class _PhotonsReadModel:
+    """Refresh durable metadata without delaying the live publication display."""
 
-    try:
-        summaries = _get_lantern_campaign_summaries()
-    except Exception as exc:
-        summaries = []
-        campaign_error = str(exc)
-    else:
-        campaign_error = None
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._thread = None
+        self._snapshot = ([], None, "LOADING")
+
+    def get(self):
+        with self._lock:
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._refresh_loop,
+                    name="zpnet-metrics-photons-metadata",
+                    daemon=True,
+                )
+                self._thread.start()
+            return self._snapshot
+
+    def _refresh_loop(self):
+        while True:
+            try:
+                summaries = _get_lantern_campaign_summaries()
+                campaign_error = None
+            except Exception as exc:
+                summaries, campaign_error = [], str(exc)
+            try:
+                recoverable = _recoverable_status(PHOTONS_RECOVERY_CONFIG_KEY)
+            except Exception as exc:
+                recoverable = f"UNAVAILABLE: {exc}"
+            with self._lock:
+                self._snapshot = (summaries, campaign_error, recoverable)
+            PHOTONS_UPDATED.set()
+            time.sleep(1.0)
+
+
+_PHOTONS_READ_MODEL = _PhotonsReadModel()
+
+
+def photons_detail_readout() -> list[str]:
+    """Render one in-memory feed snapshot; durable metadata refreshes separately."""
+    payloads = _get_photons_rolling_payloads()
+    if not payloads:
+        return ["PHOTONS: FEED UNAVAILABLE"]
+    live = payloads[-1]
+    summaries, campaign_error, recoverable_str = _PHOTONS_READ_MODEL.get()
 
     campaign = live.get("campaign") if isinstance(live.get("campaign"), dict) else {}
-    recoverable_str = _recoverable_status(PHOTONS_RECOVERY_CONFIG_KEY)
     lap_baseline_ns = _photons_lap_baseline_ns(live)
     lap_baseline_str = (
         f"{lap_baseline_ns:.6f} ns" if lap_baseline_ns is not None else "---"
@@ -2163,7 +2194,7 @@ def photons_detail_readout() -> list[str]:
     campaign_ppb = _to_float(_photons_producer_campaign_stats(live).get("ppb"))
 
     try:
-        rolling = _photons_rolling_rows(live, summaries)
+        rolling = _photons_rolling_rows(payloads)
     except Exception:
         rolling = []
 
@@ -2250,7 +2281,7 @@ def photons_detail_readout() -> list[str]:
     )
 
     if not rolling:
-        history_count = len(_get_photons_rolling_payloads())
+        history_count = len(payloads)
         lines.append(
             f"WAITING FOR LIVE PHOTONS TAIL "
             f"({history_count}/2 publications needed for first one-second row)"
