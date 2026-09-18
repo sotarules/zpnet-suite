@@ -209,10 +209,59 @@ Notes:
   decisions.
 • MON is the blue-pot comparator-threshold monitor and is not connected to the
   Teensy in the current architecture.
-• Commissioned PD200T comparator threshold (2026-09-16): MON ≈0.950 V.
-• With the commissioned optical/driver settings, TTL OUT reliably responds to
-  PHOTONS pulses down through the original 20 ns command-width design target at
-  a 100 ms test interval.
+• Selected PD200T comparator threshold (2026-09-18): MON = 0.390 V.
+  This is the manually adjusted blue-pot MON voltage, not DRV200 MOD or IMON.
+  OTDR launch cable is installed; DRV200 settings were left unchanged.
+  The dangling male-to-male DuPont extension on the laser package monitor-PD
+  lead (PD+, distinct from PD200T PD OUT) was removed; that lead remains parked.
+• Calibration setup: autonomous photon races disabled through the Pi;
+  tc photons waveon interval=1000000 width=200 (200 ns command, 1 ms interval),
+  alternating with tc photons waveoff. WAVEOFF removes modulation, not DRV200
+  DC bias. TTL OUT and PD OUT were connected exclusively to scope CH1/CH2 via
+  1 m RG316 SMA-to-BNC cables, disconnected from Teensy during these tests.
+  Siglent SDS1202X-E: DC coupling, 1 MOhm inputs, 1X, Full bandwidth;
+  pulse checks used SINGLE captures with persistence off. PD OUT noise readings
+  below used CH2 at 100 mV/div. A 50-ohm cable is not a 50-ohm termination.
+
+2026-09-18 threshold observations -- OTDR launch cable installed:
+
+MON voltage    Observed behavior
+-------------------------------------------------------------------------------
+0.354 V        WAVEOFF: obvious borderline switching state.
+0.363 V        WAVEOFF: almost stable LOW, but occasional glitches.
+0.379 V        WAVEOFF: apparently solid LOW; WAVEON: no observed artifacts.
+0.390 V        WAVEON: no observed artifacts; selected and set operating value.
+0.400 V        WAVEON: no observed artifacts; approximately 200 ns HIGH plateau.
+0.420 V        WAVEON: no obvious artifacts, but trailing edge advanced and
+               plateau narrowed slightly; not selected.
+0.500 V        WAVEON: frequent leading-edge spikes and some downward plateau
+               "hair" after restoring the OTDR cable; not selected.
+
+• With OTDR installed, WAVEOFF PD OUT measured 340-364 mV (24 mV peak-to-peak).
+  These are observed scope extrema, not guaranteed limits or a drift rating.
+• Selection evidence: sampled clean pulses at 0.379, 0.390 and 0.400 V, above
+  the observed idle-glitch region. The requested extended idle/pulse soak at
+  0.390 V was not yet reported. This records the chosen setting, not proof of
+  long-term stability, minimum timing jitter, or performance after reconnecting
+  the Teensy. Recheck after changes to optical path, wiring, loading or bias.
+
+2026-09-18 comparison -- OTDR launch cable bypassed (not operating setup):
+
+• Idle TTL became barely LOW near MON = 0.480 V. At MON = 0.500 V, roughly ten
+  SINGLE pulse captures were clean and WAVEOFF remained LOW during observation.
+• WAVEOFF PD OUT measured 440-472 mV (32 mV peak-to-peak); restoring the OTDR
+  cable lowered the measured baseline. Do not transfer the short-path threshold
+  to the installed launch-cable configuration.
+• Removing the dangling laser monitor-PD extension coincided with a marked
+  reduction in observed noise. DRV200 power state at that moment is uncertain;
+  the exact coupling mechanism and causality were not established.
+
+Historical commissioning (2026-09-16; superseded threshold/configuration):
+
+• MON was approximately 0.950 V. Under those earlier optical/driver conditions,
+  TTL OUT responded to PHOTONS command widths down to 20 ns at 100 ms intervals.
+  The 2026-09-18 calibration above used 200 ns commands; it does not revalidate
+  the earlier 20 ns result at the newly selected threshold.
 • PHOTODIODE_ANALOG_IN is telemetry only and is never a timing endpoint.
 =============================================================================*/
 
