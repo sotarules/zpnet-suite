@@ -188,8 +188,6 @@ struct photons_device_snapshot_t {
   bool     laser_emitting = false;
 
   int      photodiode_edge_level = 0;
-  uint16_t photodiode_analog_raw = 0;
-  float    photodiode_analog_v = 0.0f;
 };
 
 // ============================================================================
@@ -2775,7 +2773,6 @@ static void photons_laser_initialize_hardware(void) {
   if (digitalRead(LASER_MOD_PIN) != LOW) __builtin_trap();
 
   pinMode(LASER_MONITOR_PIN, INPUT);
-  pinMode(PHOTODIODE_ANALOG_PIN, INPUT);
   analogReadResolution(12);
 }
 
@@ -2791,11 +2788,6 @@ static photons_device_snapshot_t photons_device_snapshot(void) {
   // Ambient pin level is diagnostic only. Timing evidence comes exclusively
   // from process_interrupt's PHOTODIODE edge capture.
   out.photodiode_edge_level = digitalRead(PHOTODIODE_EDGE_PIN);
-
-  // Pin 38/A14 is the real PD200T PD OUT commissioning telemetry. Timing
-  // authority remains the independent pin-34 comparator edge.
-  out.photodiode_analog_raw = analogRead(PHOTODIODE_ANALOG_PIN);
-  out.photodiode_analog_v = photons_adc_voltage(out.photodiode_analog_raw);
 
   return out;
 }
@@ -6382,8 +6374,6 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
     p.add("laser_mod_active", device.laser_mod_level == HIGH);
     p.add("laser_monitor_v", toFixedDecimal(device.laser_monitor_v, 6));
     p.add("laser_emitting", device.laser_emitting);
-    p.add("photodiode_analog_v",
-          toFixedDecimal(device.photodiode_analog_v, 6));
     p.add("race_engine_active",
           g_photons_race.active);
     return p;
@@ -6504,8 +6494,6 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
   p.add("interrupt_last_qtimer_pending_at_exit_mask",
         interrupt_diag.last_qtimer_pending_at_exit_mask);
   p.add("photodiode_edge_level", device.photodiode_edge_level);
-  p.add("photodiode_analog_v",
-        toFixedDecimal(device.photodiode_analog_v, 6));
   p.add("laser_mod_level", device.laser_mod_level);
   p.add("laser_mod_active_high", true);
   p.add("laser_mod_active", device.laser_mod_level == HIGH);

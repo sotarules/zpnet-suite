@@ -73,7 +73,7 @@
 //   • FLASH_CUT           — explicit hot campaign boundary preserving the always-on instrument epoch
 //   • STOP                — request campaign closure; the next published campaign fragment is final
 //   • REPORT              — compact operational/device report including active-high MOD state,
-//                           laser monitor, PD200T pin 38/A14 telemetry, and pin-34 interrupt custody
+//                           laser monitor and pin-34 interrupt custody; no PD OUT ADC telemetry
 //   • WAVEON interval=N width=W — commissioning pulse train on LASER_MOD_PIN 35.
 //                           Both parameters are required uint64 nanoseconds;
 //                           0 < W < N. The former ns/full-cycle argument is retired.

@@ -102,7 +102,7 @@ GND           Black         GND                Battery branching ground         
 32            Orange        GNSS_PPS_RELAY     GPIO relay to Pi
 34            Coax          PHOTODIODE_INT     Koheron PD200T TTL out                Comparator timing / GPIO2[29] IRQ P48
 35            Coax/pigtail  LASER_MOD          TC4427 MDM -> Koheron DRV200 MOD     Active-high: LOW idle; HIGH positive modulation
-38            Coax          PHOTODIODE_ANALOG_IN  Koheron PD200T PD OUT              Analog photodetector output / A14 ADC
+38            --            FREE               --                                   Released 2026-09-18; PD OUT cable removed
 
 30            --            FREE               --                                   Released 2026-09-13; EV5491 retired
 
@@ -194,7 +194,7 @@ Used outputs:
 Output / Signal      Teensy Pin    ZPNet Signal Name       Purpose
 ---------------------------------------------------------------------------
 TTL out              34            PHOTODIODE_INT          Comparator timing edge / GPIO IRQ
-PD OUT               38 / A14      PHOTODIODE_ANALOG_IN    Analog photodetector output / ADC
+PD OUT               --            --                      No Teensy connection; external scope diagnostics only
 
 Notes:
 • TTL out is the authoritative digital photodetector timing signal presented
@@ -203,10 +203,16 @@ Notes:
   pad to GPIO2[29] and services IRQ_GPIO2_16_31 at Priority 48, below the entire
   CLOCKS timing hierarchy.  If CLOCKS delays detector ISR entry, the optical
   endpoint retains that delay testimony and the corresponding race is expendable.
-• PD OUT is the analog photodetector waveform and is ADC-read on pin 38/A14.
-• During comparator-pot commissioning, pin 38/A14 shows received optical signal
-  amplitude while the independent pin 34 TTL interrupt count shows comparator
-  decisions.
+• PD OUT support retired 2026-09-18: the PD OUT-to-Teensy cable is removed,
+  pin 38/A14 is unassigned, and firmware no longer configures or ADC-reads that
+  pin or publishes photodiode_analog_v. TTL OUT on pin 34 remains the receiver
+  timing input. DRV200 laser-monitor telemetry is separate and retained.
+• Observed before removal: connecting PD OUT to the Teensy corrupted TTL OUT
+  on the scope and coincided with an interrupt storm/system unresponsiveness;
+  disconnecting PD OUT restored a clean TTL waveform. The electrical mechanism
+  was not established. Use an external scope for PD OUT diagnostics.
+• The calibration observations below are retained as scope-based history;
+  they do not imply a current PD OUT connection to the Teensy.
 • MON is the blue-pot comparator-threshold monitor and is not connected to the
   Teensy in the current architecture.
 • Selected PD200T comparator threshold (2026-09-18): MON = 0.390 V.
@@ -262,7 +268,6 @@ Historical commissioning (2026-09-16; superseded threshold/configuration):
   TTL OUT responded to PHOTONS command widths down to 20 ns at 100 ms intervals.
   The 2026-09-18 calibration above used 200 ns commands; it does not revalidate
   the earlier 20 ns result at the newly selected threshold.
-• PHOTODIODE_ANALOG_IN is telemetry only and is never a timing endpoint.
 =============================================================================*/
 
 

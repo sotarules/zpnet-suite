@@ -107,18 +107,14 @@ static const int LASER_MOD_PIN      = 35;
 //   not assume stock digitalRead(34) follows the changed GPIO bank.
 //   This is the authoritative optical timing signal.
 //
-// PHOTODIODE_ANALOG_PIN:
-//   PD200T PD OUT analog photodetector waveform.
-//   Slow ADC telemetry on Teensy 4.1 A14 for optical-path commissioning.
-//   This is observed signal amplitude, not the comparator threshold and never
-//   a timing endpoint; pin 34 remains the sole optical timing declaration.
+// PD200T PD OUT is disconnected from the Teensy; pin 38/A14 is unassigned.
+// Receiver timing uses only TTL OUT on pin 34.
 //
 // PD200T MON is the comparator-threshold monitor from the blue threshold
 // potentiometer.  MON is not connected to the Teensy in the current hardware.
 //
 
 static const int PHOTODIODE_EDGE_PIN = 34;
-static const int PHOTODIODE_ANALOG_PIN = 38;  // Teensy 4.1 A14
 
 // --------------------------------------------------------------
 // GNSS timing pins
@@ -197,17 +193,6 @@ static const unsigned long GNSS_SILENCE_FLUSH_MS = 50;
 // PPS events are rate-limited to avoid serial flooding.
 //
 static const uint32_t PPS_EMIT_INTERVAL_MS = 10000;
-
-// --------------------------------------------------------------
-// PD200T analog photodetector telemetry
-// --------------------------------------------------------------
-//
-// PHOTODIODE_ANALOG_PIN carries PD OUT on A14.  It is slow ADC telemetry for
-// optical amplitude/commissioning only; authoritative timing is the independent
-// TTL comparator output on PHOTODIODE_EDGE_PIN.
-//
-// PD200T MON is not connected to the Teensy.
-//
 
 // --------------------------------------------------------------
 // ADC scaling assumptions:
