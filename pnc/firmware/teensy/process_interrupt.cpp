@@ -49,7 +49,6 @@
 
 #include "process_interrupt.h"
 #include "process_clocks.h"
-#include "process_photons.h"
 #include "process_system.h"
 #include "crash_forensics.h"
 #include "execution_trace.h"
@@ -6367,9 +6366,6 @@ void process_interrupt_foreground_service(void) {
     clocks_fragment_pps_tick_from_interrupt(clocks_sequence);
   }
   interrupt_dispatch_foreground_service();
-  // The optical ISR only records completion. Let PHOTONS queue its next launch
-  // from this ordinary-loop bridge after its minimum settling interval.
-  process_photons_foreground_service();
   g_interrupt_foreground_forensic_live.subscriber_cycles =
       ARM_DWT_CYCCNT - phase_start;
 

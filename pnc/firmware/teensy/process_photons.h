@@ -621,10 +621,10 @@ struct photons_fragment_snapshot_t {
 // Must run after process_interrupt_init() and timepop_init().
 void process_photons_init(void);
 
-// Ordinary-loop foreground owner: infer a histogram origin from published seeds,
-// consume the completed-race batch, then queue a TimePop ALAP launch after the
-// minimum post-race holdoff. No scheduler mutation occurs in continuation.
-void process_photons_foreground_service(void);
+// Initialization registers private readiness/service callbacks with TimePop.
+// After the minimum post-race holdoff, that foreground service infers the
+// histogram origin, consumes the completed batch, and launches the next race
+// under one owner. No per-race ALAP mailbox or public loop hook is required.
 
 // Register the PHOTONS process command surface.
 void process_photons_register(void);

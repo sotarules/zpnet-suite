@@ -1349,14 +1349,16 @@ static inline void timepop_idle_witness_note_wall_cycles(uint32_t now_dwt) {
 static constexpr uint32_t MAX_FOREGROUND_READY_CLIENTS = 8U;
 struct timepop_foreground_ready_client_t {
   timepop_foreground_ready_fn callback;
+  timepop_foreground_service_fn service;
   void* user_data;
 };
 static timepop_foreground_ready_client_t foreground_ready_clients[MAX_FOREGROUND_READY_CLIENTS]{};
 static uint32_t foreground_ready_count = 0U;
 static bool foreground_ready_evaluating = false;
 
-void timepop_register_foreground_ready(timepop_foreground_ready_fn callback,
-                                       void* user_data) {
+static void timepop_register_foreground_client(
+    timepop_foreground_ready_fn callback,
+    timepop_foreground_service_fn service, void* user_data) {
   if (timepop_current_ipsr() != 0U || dispatch_depth != 0U ||
       foreground_ready_evaluating || !callback ||
       foreground_ready_count == MAX_FOREGROUND_READY_CLIENTS) {
@@ -1366,7 +1368,20 @@ void timepop_register_foreground_ready(timepop_foreground_ready_fn callback,
     if (foreground_ready_clients[i].callback == callback &&
         foreground_ready_clients[i].user_data == user_data) __builtin_trap();
   }
-  foreground_ready_clients[foreground_ready_count++] = {callback, user_data};
+  foreground_ready_clients[foreground_ready_count++] = {callback, service, user_data};
+}
+
+void timepop_register_foreground_ready(timepop_foreground_ready_fn callback,
+                                       void* user_data) {
+  // Explicit wake-only registration retains the existing API contract.
+  timepop_register_foreground_client(callback, nullptr, user_data);
+}
+
+void timepop_register_foreground_service(timepop_foreground_ready_fn ready,
+                                         timepop_foreground_service_fn service,
+                                         void* user_data) {
+  if (!service) __builtin_trap();
+  timepop_register_foreground_client(ready, service, user_data);
 }
 
 static bool timepop_foreground_client_ready(void) {
@@ -1382,6 +1397,28 @@ static bool timepop_foreground_client_ready(void) {
   }
   foreground_ready_evaluating = false;
   return ready;
+}
+
+static bool timepop_service_foreground_clients(void) {
+  if (timepop_current_ipsr() != 0U || dispatch_depth != 0U ||
+      foreground_ready_evaluating || g_timepop_idle_witness_running) {
+    __builtin_trap();
+  }
+  foreground_ready_evaluating = true;
+  bool serviced = false;
+  for (uint32_t i = 0U; i < foreground_ready_count; ++i) {
+    // Yield newly arrived capture/scheduler work to the ordinary loop. Never
+    // mask an interrupt to make the check and service indivisible: a service
+    // is bounded foreground work and remains preemptible by CLOCKS throughout.
+    if (timepop_pending || process_interrupt_foreground_pending()) break;
+    const auto& client = foreground_ready_clients[i];
+    if (!client.service || !client.callback(client.user_data)) continue;
+    if (timepop_pending || process_interrupt_foreground_pending()) break;
+    client.service(client.user_data);
+    serviced = true;
+  }
+  foreground_ready_evaluating = false;
+  return serviced;
 }
 
 static void timepop_idle_witness_spin_until_pending(void) {
@@ -4513,13 +4550,21 @@ uint32_t timepop_cancel_by_name(const char* name) {
 // ============================================================================
 
 void timepop_dispatch(void) {
+  if (timepop_current_ipsr() != 0U || dispatch_depth != 0U ||
+      foreground_ready_evaluating) __builtin_trap();
+
+  // The high-rate registered-service path neither allocates a deferred slot
+  // nor enters the priority-16 mask used by ordinary scheduler mutations.
+  // An ISR arriving after this read is observed by the service/idle checks;
+  // this branch never clears its pending testimony.
+  if (!timepop_pending) {
+    if (!timepop_service_foreground_clients()) {
+      timepop_idle_witness_spin_until_pending();
+    }
+    return;
+  }
   {
     const uint32_t saved = critical_enter();
-    if (!timepop_pending) {
-      critical_exit(saved);
-      timepop_idle_witness_spin_until_pending();
-      return;
-    }
     timepop_pending = false;
     critical_exit(saved);
   }
@@ -4963,7 +5008,9 @@ void timepop_dispatch(void) {
       nullptr,
       timepop_pending ? 1U : 0U);
 
-  if (!timepop_pending) {
+  // Finish the ordinary scheduler transaction before servicing registered
+  // clients. Each gets at most one service per pass, after ASAP/timed/ALAP work.
+  if (!timepop_pending && !timepop_service_foreground_clients()) {
     timepop_idle_witness_spin_until_pending();
   }
 }

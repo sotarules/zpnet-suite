@@ -180,8 +180,6 @@ static uint32_t g_photons_race_batch_consumed = 0U;  // foreground writer
 static photons_race_batch_t g_photons_foreground_batch{};
 static_assert(__atomic_always_lock_free(sizeof(uint32_t), nullptr),
               "PHOTONS handoff words must be lock-free");
-// Foreground-owned; optical continuation never mutates the scheduler.
-static timepop_handle_t g_photons_relaunch_handle = TIMEPOP_INVALID_HANDLE;
 
 struct photons_device_snapshot_t {
   int      laser_mod_level = LOW;
@@ -209,20 +207,18 @@ static inline void photons_memory_barrier(void) {
 // dispatch refactor must not make two PHOTONS mutation transactions legal.
 //
 // The owner court therefore makes the architectural rule executable:
-//   * RACE_CADENCE owns one deferred race relaunch transaction;
 //   * FRAGMENT owns drain -> snapshot -> Payload render -> synchronous publish
 //     -> post-publish commit as one indivisible foreground transaction;
 //   * COMMAND owns every PHOTONS RPC handler from entry through returned Payload
 //     construction;
 //   * WAVE owns each commissioning pulse callback, including its HIGH wait;
 //   * FOREGROUND_SERVICE owns completed-race consumption, histogram origin
-//     inference, and scheduling the next relaunch.
+//     inference, and the next physical launch as one transaction.
 //
 // ISR code never touches this owner.  Its only cross-context communication is
 // through the dedicated one-writer arm scalars / generation mailboxes below.
 enum class photons_foreground_owner_t : uint8_t {
   NONE = 0U,
-  RACE_CADENCE = 1U,
   FRAGMENT = 2U,
   COMMAND = 3U,
   WAVE = 4U,
@@ -2676,15 +2672,11 @@ static void photons_race_observe_edge(
   g_photons_race.holdoff_started_dwt = ARM_DWT_CYCCNT;
 }
 
-static void photons_race_relaunch(timepop_ctx_t* ctx,
-                                  timepop_diag_t*, void*) {
-  const photons_foreground_custody_t custody(
-      photons_foreground_owner_t::RACE_CADENCE);
-  if (!ctx || ctx->handle != g_photons_relaunch_handle) __builtin_trap();
+static void photons_race_relaunch(void) {
+  photons_foreground_owner_assert(photons_foreground_owner_t::FOREGROUND_SERVICE);
   if (__atomic_load_n(&g_photons_race_batch_published, __ATOMIC_ACQUIRE) !=
       __atomic_load_n(&g_photons_race_batch_consumed, __ATOMIC_RELAXED))
     __builtin_trap();
-  g_photons_relaunch_handle = TIMEPOP_INVALID_HANDLE;
   const uint32_t prior = photons_priority32_guard_enter();
   if (!g_photons_race.active || g_photons_race.primed ||
       (uint32_t)(ARM_DWT_CYCCNT - g_photons_race.holdoff_started_dwt) <
@@ -2693,7 +2685,7 @@ static void photons_race_relaunch(timepop_ctx_t* ctx,
   }
   g_photons_race.sequence++;
   if (g_photons_race.sequence == 0U) g_photons_race.sequence++;
-  // Capture the physical launch here; deferred ctx fire time is not a launch.
+  // Capture the physical launch here; readiness time is not a launch timestamp.
   g_photons_race.launch_dwt = photons_race_launch_200ns();
   const uint32_t elapsed =
       g_photons_race.launch_dwt - g_photons_race.holdoff_started_dwt;
@@ -2714,7 +2706,6 @@ static void photons_race_relaunch(timepop_ctx_t* ctx,
 }
 
 static bool photons_relaunch_ready(void* /*user_data*/) {
-  if (g_photons_relaunch_handle != TIMEPOP_INVALID_HANDLE) return false;
   const uint32_t prior = photons_priority32_guard_enter();
   const bool ready = g_photons_race.active && !g_photons_race.primed &&
       (uint32_t)(ARM_DWT_CYCCNT - g_photons_race.holdoff_started_dwt) >=
@@ -2723,26 +2714,23 @@ static bool photons_relaunch_ready(void* /*user_data*/) {
   return ready;
 }
 
-void process_photons_foreground_service(void) {
+static void photons_foreground_service(void* /*user_data*/) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::FOREGROUND_SERVICE);
+  if (!photons_relaunch_ready(nullptr)) __builtin_trap();
   photons_histogram_acquire();
-  if (!photons_relaunch_ready(nullptr)) return;
   // Check completion BEFORE consumption: a return can preempt this service.
   // Once ready is true, no new race can complete until this foreground domain
   // launches it, so the mailbox cannot change underneath this transaction.
   photons_race_batch_consume();
-  // TimePop idle yields when this same readiness predicate becomes true.
-  // ALAP executes after timed clients and cannot be quarantined as a missed CH2
-  // deadline. It remains queued until foreground dispatch services it.
-  g_photons_relaunch_handle = timepop_arm_alap(
-      photons_race_relaunch, nullptr, "PHOTONS_RELAUNCH");
-  if (g_photons_relaunch_handle == TIMEPOP_INVALID_HANDLE) __builtin_trap();
+  // TimePop invokes this registered service after scheduled/deferred work.
+  // Consume and launch under the same foreground custody, with no per-race
+  // scheduler mutation and no priority-16 mask. CLOCKS may preempt the launch.
+  photons_race_relaunch();
 }
 
 static void photons_race_prepare(void) {
   if (g_photons_race.active ||
-      g_photons_relaunch_handle != TIMEPOP_INVALID_HANDLE ||
       __atomic_load_n(&g_photons_race_batch_published, __ATOMIC_ACQUIRE) !=
           __atomic_load_n(&g_photons_race_batch_consumed, __ATOMIC_RELAXED)) {
     __builtin_trap();
@@ -4645,9 +4633,10 @@ static void photons_start_fragment_publisher(void) {
 FLASHMEM void process_photons_init(void) {
   if (g_initialized) return;
 
-  // Register once. TimePop only tests readiness; our foreground service arms
-  // ALAP after the holdoff, and the existing callback owns the actual launch.
-  timepop_register_foreground_ready(photons_relaunch_ready, nullptr);
+  // Register once. TimePop yields idle at the holdoff boundary and services
+  // consumption/relaunch in foreground without allocating an ALAP mailbox.
+  timepop_register_foreground_service(
+      photons_relaunch_ready, photons_foreground_service, nullptr);
 
   // Initialization runs before PHOTONS publishes any foreground work. Establish
   // the one foreground mutation domain explicitly before the ISR subscription

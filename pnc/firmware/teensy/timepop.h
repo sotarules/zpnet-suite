@@ -59,18 +59,33 @@
 //
 // ============================================================================
 
-// Foreground idle readiness registry (maximum 8 lifetime registrations).
+// Foreground readiness/service registry (maximum 8 lifetime registrations).
 // Register once during client initialization after timepop_init(), in foreground.
 // Predicates must be bounded, nonblocking and observational: no scheduler or
 // registry mutation, dispatch, or application work. Synchronize ISR-owned reads
 // within the predicate. True requests an idle exit, not a timed callback;
 // the ordinary foreground loop must service the client's ready work.
 // Callback/user_data pairs are unique; null callbacks, duplicates, capacity
-// exhaustion and registration from ISR/dispatch/predicate execution trap.
+// exhaustion and registration from ISR/dispatch/predicate/service execution trap.
 // user_data must remain alive until reboot. No unregister operation is provided.
 typedef bool (*timepop_foreground_ready_fn)(void* user_data);
 void timepop_register_foreground_ready(timepop_foreground_ready_fn callback,
                                        void* user_data);
+
+// Register a foreground-owned work source without a per-service timer or ALAP
+// mailbox. Shares the registry above; the ready/user_data pair must be unique.
+// TimePop checks readiness and calls service at most once per dispatch pass,
+// after scheduled/deferred work, with the idle witness stopped. Pending TimePop
+// or interrupt-bridge work takes precedence; a new interrupt can still arrive
+// after the final check, so services must be bounded and promptly return.
+// Registry evaluation/service adds no interrupt mask. Clients synchronize their
+// own ISR state without blocking CLOCKS capture. Services must not recursively
+// dispatch or register clients. They may arm ordinary future TimePop work.
+// Both callbacks and user_data live until reboot; null callbacks trap.
+typedef void (*timepop_foreground_service_fn)(void* user_data);
+void timepop_register_foreground_service(timepop_foreground_ready_fn ready,
+                                         timepop_foreground_service_fn service,
+                                         void* user_data);
 
 typedef uint32_t timepop_handle_t;
 static constexpr timepop_handle_t TIMEPOP_INVALID_HANDLE = 0;
