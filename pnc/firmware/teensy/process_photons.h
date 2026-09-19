@@ -20,9 +20,17 @@
 //     one RPC command, or commissioning WAVE callback. These owners may never nest;
 //     illegal overlap is a system-integrity fault rather than a recoverable busy
 //     condition.
-//   • continuation alone writes each completed-race batch; foreground merges
-//     the immutable publication and acknowledges it before another launch.
+//   • foreground commits a complete launch record through an SPSC handoff;
+//     continuation alone owns live race state and the completed-race batch.
+//     Batch, reference metadata, counters and holdoff origin publish together.
+//     Foreground copies both batch and runtime before acknowledging the result;
+//     only then may it reuse launch storage. Publication generations may wrap.
 //     Only foreground writes/resets the separate fragment accumulator.
+//   • readiness and reports read completed handoffs, never live race fields.
+//     A fragment uses the runtime acquired at its batch-drain boundary; later
+//     ISR returns cannot change its reference or counters during construction.
+//     Runtime reports show the latest consumed completion plus the subsequent
+//     foreground launch; holdoff-edge totals advance with completed handoffs.
 //   • continuation alone writes the boot-lifetime histogram, including origin
 //     installation and seed replay. Foreground infers the origin from a completed
 //     immutable seed set and returns it through a one-shot SPSC handoff.
@@ -42,15 +50,18 @@
 // LANTERN V1.0 autonomous race engine:
 //   • one 200 ns DRV200 MOD pulse primes the instrument; thereafter a real PD200T
 //     return ends race N; foreground TimePop ALAP authors race N+1 after the
-//     minimum 2 us post-classification holdoff and completed-batch consumption;
+//     configured 1 ms post-classification holdoff and completed-batch consumption;
 //   • the Priority-48 physical ISR captures only immutable DWT/arrival testimony;
 //     no laser write, GNSS projection, floating point, Payload work, or Welford
 //     mutation occurs in the detector ISR;
 //   • Priority-32 continuation performs only bounded physical continuation:
 //     finish the raw flight, classify delay testimony, update the live histogram,
-//     and publish its completed batch and any requested histogram snapshot;
-//   • foreground relaunch owns MOD HIGH, the actual launch DWT, the ~200 ns
-//     HIGH wait, and MOD LOW; scheduler mutation never occurs in continuation;
+//     and publish its completed batch/runtime and any requested histogram snapshot;
+//   • foreground owns MOD HIGH, the actual launch DWT, the ~200 ns HIGH wait,
+//     and MOD LOW. First shot and relaunch share the existing Priority-32 pulse
+//     guard: Priority 0/16 remain live; Priority 32/48 resume after launch commit.
+//     Payload construction and runtime snapshot reads do not use that guard;
+//     scheduler mutation never occurs in continuation;
 //   • three mutually close clean flights establish the initial fast-path lineage;
 //     later long/right-tail flights and interrupt-delayed endpoints are rejected
 //     without moving the reference;
@@ -623,8 +634,8 @@ void process_photons_init(void);
 
 // Initialization registers private readiness/service callbacks with TimePop.
 // After the minimum post-race holdoff, that foreground service infers the
-// histogram origin, consumes the completed batch, and launches the next race
-// under one owner. No per-race ALAP mailbox or public loop hook is required.
+// histogram origin, consumes the completed batch/runtime, and commits the next
+// launch under one owner. No per-race ALAP mailbox or public loop hook is required.
 
 // Register the PHOTONS process command surface.
 void process_photons_register(void);

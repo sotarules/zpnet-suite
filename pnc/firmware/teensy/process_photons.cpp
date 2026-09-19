@@ -171,9 +171,25 @@ struct photons_race_runtime_t {
   uint32_t holdoff_max_cycles = 0U;
 };
 
-static photons_race_runtime_t g_photons_race{};
-// Continuation alone writes this completed-race mailbox. A new launch is
-// forbidden until foreground has merged it and released its generation.
+// Foreground publishes one complete launch; continuation publishes one complete
+// result. Neither producer reuses its slot until the reverse handoff completes.
+struct photons_race_launch_t {
+  uint32_t dwt = 0U;
+  uint32_t sequence = 0U;
+  uint32_t holdoff_cycles = 0U;
+  uint64_t attempt_count = 0ULL;
+  uint64_t holdoff_launches = 0ULL;
+  uint32_t holdoff_last_cycles = 0U;
+  uint32_t holdoff_min_cycles = 0U;
+  uint32_t holdoff_max_cycles = 0U;
+};
+static photons_race_launch_t g_photons_race_launch{}; // foreground writer
+static uint32_t g_photons_race_launch_published = 0U; // foreground writer
+static photons_race_runtime_t g_photons_race{}; // continuation writer
+static photons_race_runtime_t g_photons_race_completed{}; // immutable result
+static photons_race_runtime_t g_photons_race_foreground{}; // foreground writer
+// Batch and runtime share the same publication and acknowledgment. Reference
+// acquisition, counters and sufficient statistics therefore cross together.
 static photons_race_batch_t g_photons_race_batch{};
 static uint32_t g_photons_race_batch_published = 0U; // continuation writer
 static uint32_t g_photons_race_batch_consumed = 0U;  // foreground writer
@@ -1918,7 +1934,9 @@ static void photons_race_batch_consume(void) {
   photons_batch_add_checked(total.rejected_sumsq_cycles, source.rejected_sumsq_cycles);
   photons_batch_add_checked(total.rejected_isr_delay, source.rejected_isr_delay);
   photons_batch_add_checked(total.rejected_excursion, source.rejected_excursion);
-  // Release only after the last read. The producer may now reuse its mailbox.
+  g_photons_race_foreground = g_photons_race_completed;
+  // Release only after the last batch AND runtime read. Later holdoff edges
+  // mutate continuation state, never the completed publication above.
   __atomic_store_n(&g_photons_race_batch_consumed, published, __ATOMIC_RELEASE);
 }
 
@@ -2046,10 +2064,14 @@ static photons_fragment_drain_result_t photons_drain_raw_laps(void) {
   // flights are converted into projected flight-time statistics.
   g_projection_state.attempt_count += race_batch.accepted_count;
   g_projection_state.success_count += race_batch.accepted_count;
-  g_photons_lap_science_state.predictor_valid = g_photons_race.reference_valid;
-  g_photons_lap_science_state.predictor_cycles = g_photons_race.reference_cycles;
+  // batch_take() acquired the reference metadata with these exact completions.
+  // A later ISR return cannot alter this foreground-owned value.
+  g_photons_lap_science_state.predictor_valid =
+      g_photons_race_foreground.reference_valid;
+  g_photons_lap_science_state.predictor_cycles =
+      g_photons_race_foreground.reference_cycles;
   g_photons_lap_science_state.gate_cycles =
-      g_photons_race.reference_gate_cycles;
+      g_photons_race_foreground.reference_gate_cycles;
   g_photons_lap_science_state.seed_pending = false;
   g_photons_lap_science_state.seed_pending_count = 0U;
 
@@ -2501,10 +2523,16 @@ static FLASHMEM Payload cmd_report_histogram(const Payload& /*args*/) {
 }
 
 static photons_race_runtime_t photons_race_runtime_snapshot(void) {
-  const uint32_t prior = photons_priority32_guard_enter();
-  const photons_race_runtime_t out = g_photons_race;
-  photons_priority32_guard_exit(prior);
-  return out;
+  const uint32_t owner =
+      __atomic_load_n(&g_photons_foreground_owner, __ATOMIC_ACQUIRE);
+  if (owner != (uint32_t)photons_foreground_owner_t::FRAGMENT &&
+      owner != (uint32_t)photons_foreground_owner_t::COMMAND) {
+    __builtin_trap();
+  }
+  // Latest consumed completion plus foreground's subsequent launch, if any.
+  // Do not acquire a newer completion here: FRAGMENT already drained its batch
+  // and must report counters/reference metadata from that same boundary.
+  return g_photons_race_foreground;
 }
 
 static uint32_t photons_race_pending_relaunch(
@@ -2614,16 +2642,29 @@ static uint32_t photons_race_launch_200ns(void) {
 
 static void photons_race_observe_edge(
     const interrupt_photodiode_edge_t& edge) {
-  if (!g_photons_race.active) return;
-  if (!g_photons_race.primed) {
-    // No pulse is in flight: retain these edges as holdoff diagnostics, not laps.
-    g_photons_race.holdoff_edges++;
-    return;
-  }
+  const uint32_t launch =
+      __atomic_load_n(&g_photons_race_launch_published, __ATOMIC_ACQUIRE);
   const uint32_t published =
       __atomic_load_n(&g_photons_race_batch_published, __ATOMIC_RELAXED);
-  if (__atomic_load_n(&g_photons_race_batch_consumed, __ATOMIC_ACQUIRE) !=
-      published) __builtin_trap();
+  if (launch == published) {
+    // No committed pulse awaits a return. Only continuation owns this counter.
+    if (g_photons_race.active) g_photons_race.holdoff_edges++;
+    return;
+  }
+  if ((uint32_t)(launch - published) != 1U ||
+      __atomic_load_n(&g_photons_race_batch_consumed, __ATOMIC_ACQUIRE) !=
+          published) __builtin_trap();
+  const photons_race_launch_t& shot = g_photons_race_launch;
+  g_photons_race.initialized = true;
+  g_photons_race.active = true;
+  g_photons_race.launch_dwt = shot.dwt;
+  g_photons_race.sequence = shot.sequence;
+  g_photons_race.holdoff_cycles = shot.holdoff_cycles;
+  g_photons_race.attempt_count = shot.attempt_count;
+  g_photons_race.holdoff_launches = shot.holdoff_launches;
+  g_photons_race.holdoff_last_cycles = shot.holdoff_last_cycles;
+  g_photons_race.holdoff_min_cycles = shot.holdoff_min_cycles;
+  g_photons_race.holdoff_max_cycles = shot.holdoff_max_cycles;
   // Producer alone clears its slot, after foreground has released it. Warmup
   // and reference-acquisition returns also publish a (possibly empty) batch.
   g_photons_race_batch = photons_race_batch_t{};
@@ -2663,60 +2704,90 @@ static void photons_race_observe_edge(
   }
 
   photons_histogram_publish_snapshot();
-  __atomic_store_n(&g_photons_race_batch_published, published + 1U,
-                   __ATOMIC_RELEASE);
-  // End this race. Only foreground TimePop dispatch may launch its successor,
-  // after consuming the immutable completed batch above.
   g_photons_race.holdoff_started_dwt = ARM_DWT_CYCCNT;
+  g_photons_race_completed = g_photons_race;
+  // Publish last: the batch, reference, counters and holdoff origin are complete.
+  // This also acknowledges the launch record; foreground still must consume the
+  // result before it can publish the next launch, including generation wrap.
+  __atomic_store_n(&g_photons_race_batch_published, launch, __ATOMIC_RELEASE);
+}
+
+// The existing physical-pulse guard is shared by the first shot and relaunch.
+// Priority 0/16 remain live. Priority 32/48 resume only after MOD is LOW and the
+// complete launch is published, so even an immediately pending return has an
+// authored timestamp. No Payload or runtime snapshot is built under this guard.
+static void photons_race_launch_commit(bool first) {
+  photons_foreground_owner_assert(first
+      ? photons_foreground_owner_t::COMMAND
+      : photons_foreground_owner_t::FOREGROUND_SERVICE);
+  const uint32_t published =
+      __atomic_load_n(&g_photons_race_batch_published, __ATOMIC_ACQUIRE);
+  if (__atomic_load_n(&g_photons_race_batch_consumed, __ATOMIC_RELAXED) !=
+          published ||
+      __atomic_load_n(&g_photons_race_launch_published, __ATOMIC_RELAXED) !=
+          published) __builtin_trap();
+
+  photons_race_runtime_t& race = g_photons_race_foreground;
+  if (!race.initialized || race.primed || (first ? race.active : !race.active)) {
+    __builtin_trap();
+  }
+  if (!first &&
+      (uint32_t)(ARM_DWT_CYCCNT - race.holdoff_started_dwt) <
+          race.holdoff_cycles) __builtin_trap();
+
+  const uint32_t prior = photons_priority32_guard_enter();
+  race.launch_dwt = photons_race_launch_200ns();
+  if (!first) {
+    race.sequence++;
+    if (race.sequence == 0U) race.sequence++;
+    const uint32_t elapsed = race.launch_dwt - race.holdoff_started_dwt;
+    race.attempt_count++;
+    race.holdoff_last_cycles = elapsed;
+    if (race.holdoff_launches == 0ULL || elapsed < race.holdoff_min_cycles) {
+      race.holdoff_min_cycles = elapsed;
+    }
+    if (elapsed > race.holdoff_max_cycles) race.holdoff_max_cycles = elapsed;
+    race.holdoff_launches++;
+  }
+  race.active = true;
+  race.primed = true;
+
+  photons_race_launch_t& shot = g_photons_race_launch;
+  shot.dwt = race.launch_dwt;
+  shot.sequence = race.sequence;
+  shot.holdoff_cycles = race.holdoff_cycles;
+  shot.attempt_count = race.attempt_count;
+  shot.holdoff_launches = race.holdoff_launches;
+  shot.holdoff_last_cycles = race.holdoff_last_cycles;
+  shot.holdoff_min_cycles = race.holdoff_min_cycles;
+  shot.holdoff_max_cycles = race.holdoff_max_cycles;
+  __atomic_store_n(&g_photons_race_launch_published, published + 1U,
+                   __ATOMIC_RELEASE);
+  photons_priority32_guard_exit(prior);
 }
 
 static void photons_race_relaunch(void) {
   photons_foreground_owner_assert(photons_foreground_owner_t::FOREGROUND_SERVICE);
-  if (__atomic_load_n(&g_photons_race_batch_published, __ATOMIC_ACQUIRE) !=
-      __atomic_load_n(&g_photons_race_batch_consumed, __ATOMIC_RELAXED))
-    __builtin_trap();
-  const uint32_t prior = photons_priority32_guard_enter();
-  if (!g_photons_race.active || g_photons_race.primed ||
-      (uint32_t)(ARM_DWT_CYCCNT - g_photons_race.holdoff_started_dwt) <
-          g_photons_race.holdoff_cycles) {
-    __builtin_trap();
-  }
-  g_photons_race.sequence++;
-  if (g_photons_race.sequence == 0U) g_photons_race.sequence++;
-  // Capture the physical launch here; readiness time is not a launch timestamp.
-  g_photons_race.launch_dwt = photons_race_launch_200ns();
-  const uint32_t elapsed =
-      g_photons_race.launch_dwt - g_photons_race.holdoff_started_dwt;
-  g_photons_race.attempt_count++;
-  g_photons_race.primed = true;
-  photons_priority32_guard_exit(prior);
-  // Foreground owns these diagnostics. A subsequent return may preempt them,
-  // but the local elapsed value already belongs to this completed holdoff.
-  g_photons_race.holdoff_last_cycles = elapsed;
-  if (g_photons_race.holdoff_launches == 0ULL ||
-      elapsed < g_photons_race.holdoff_min_cycles) {
-    g_photons_race.holdoff_min_cycles = elapsed;
-  }
-  if (elapsed > g_photons_race.holdoff_max_cycles) {
-    g_photons_race.holdoff_max_cycles = elapsed;
-  }
-  g_photons_race.holdoff_launches++;
+  photons_race_launch_commit(false);
 }
 
 static bool photons_relaunch_ready(void* /*user_data*/) {
-  // TimePop polls this in foreground, including while a photon is in flight.
-  // Do not mask Priority-48 detector capture merely to ask whether work is ready.
-  // Refresh the ISR-owned fields before reading them. If continuation clears
-  // primed during this check, it finishes writing holdoff_started_dwt before
-  // foreground resumes. Seeing the old primed=true only defers one readiness
-  // check. Once primed=false is observed, neither it nor the holdoff origin can
-  // change again until this serialized foreground domain launches the next race.
-  photons_memory_barrier();
-  if (!g_photons_race.active || g_photons_race.primed) return false;
-  // Read the holdoff origin only AFTER observing the completed-race state.
-  photons_memory_barrier();
-  return (uint32_t)(ARM_DWT_CYCCNT - g_photons_race.holdoff_started_dwt) >=
-      g_photons_race.holdoff_cycles;
+  // Poll only the committed SPSC result, never continuation's mutable runtime.
+  // No other foreground owner can launch while TimePop evaluates readiness.
+  if (!g_photons_race_foreground.active) return false;
+  const uint32_t published =
+      __atomic_load_n(&g_photons_race_batch_published, __ATOMIC_ACQUIRE);
+  if (published !=
+      __atomic_load_n(&g_photons_race_launch_published, __ATOMIC_RELAXED)) {
+    return false;
+  }
+  const uint32_t consumed =
+      __atomic_load_n(&g_photons_race_batch_consumed, __ATOMIC_RELAXED);
+  if ((uint32_t)(published - consumed) > 1U) __builtin_trap();
+  const photons_race_runtime_t& race = published == consumed
+      ? g_photons_race_foreground : g_photons_race_completed;
+  return (uint32_t)(ARM_DWT_CYCCNT - race.holdoff_started_dwt) >=
+      race.holdoff_cycles;
 }
 
 static void photons_foreground_service(void* /*user_data*/) {
@@ -2735,38 +2806,36 @@ static void photons_foreground_service(void* /*user_data*/) {
 }
 
 static void photons_race_prepare(void) {
-  if (g_photons_race.active ||
-      __atomic_load_n(&g_photons_race_batch_published, __ATOMIC_ACQUIRE) !=
-          __atomic_load_n(&g_photons_race_batch_consumed, __ATOMIC_RELAXED)) {
-    __builtin_trap();
-  }
-  const uint32_t preserved_sequence = g_photons_race.sequence;
-  g_photons_race = photons_race_runtime_t{};
-  g_photons_race.sequence = preserved_sequence;
-  g_photons_race.initialized = true;
+  const uint32_t published =
+      __atomic_load_n(&g_photons_race_batch_published, __ATOMIC_ACQUIRE);
+  if (g_photons_race_foreground.active ||
+      published != __atomic_load_n(&g_photons_race_batch_consumed,
+                                    __ATOMIC_RELAXED) ||
+      published != __atomic_load_n(&g_photons_race_launch_published,
+                                    __ATOMIC_RELAXED)) __builtin_trap();
+  const uint32_t preserved_sequence = g_photons_race_foreground.sequence;
+  g_photons_race_foreground = photons_race_runtime_t{};
+  g_photons_race_foreground.sequence = preserved_sequence;
+  g_photons_race_foreground.initialized = true;
   const uint32_t cps = F_CPU_ACTUAL;
   if (cps == 0U) __builtin_trap();
-  g_photons_race.holdoff_cycles = (uint32_t)(
+  g_photons_race_foreground.holdoff_cycles = (uint32_t)(
       ((uint64_t)cps * PHOTONS_RACE_HOLDOFF_NS + 999999999ULL) /
       1000000000ULL);
-  // No foreground reset of producer storage or publication generations.
+  // No foreground reset of continuation storage or publication generations.
   g_photons_foreground_batch = photons_race_batch_t{};
 }
 
 static void photons_race_start_autonomous(void) {
   interrupt_photodiode_diag_t interrupt_diag{};
-  if (!g_photons_race.initialized ||
+  if (!g_photons_race_foreground.initialized ||
       !interrupt_photodiode_snapshot(&interrupt_diag) ||
       !interrupt_diag.active) {
     __builtin_trap();
   }
-  if (g_photons_race.active) return;
+  if (g_photons_race_foreground.active) return;
   photons_wave_cancel();
-  if (digitalRead(LASER_MOD_PIN) != LOW) __builtin_trap();
-  g_photons_race.active = true;
-  g_photons_race.primed = true;
-  g_photons_race.first_return_seen = false;
-  g_photons_race.launch_dwt = photons_race_launch_200ns();
+  photons_race_launch_commit(true);
 }
 
 
@@ -4605,7 +4674,7 @@ static void photons_start_fragment_publisher(void) {
       !g_photons_ppb_previous_endpoint_valid ||
       !g_interrupt_started ||
       !g_interrupt_ancestry.valid ||
-      g_photons_race.active) {
+      g_photons_race_foreground.active) {
     __builtin_trap();
   }
 
@@ -6382,7 +6451,7 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
     p.add("laser_monitor_v", toFixedDecimal(device.laser_monitor_v, 6));
     p.add("laser_emitting", device.laser_emitting);
     p.add("race_engine_active",
-          g_photons_race.active);
+          g_photons_race_foreground.active);
     return p;
   }
 
@@ -6430,7 +6499,7 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
   p.add("fragment_sequence", canonical.sequence);
   p.add("fragment_valid", canonical.valid);
   p.add("race_engine_active",
-        g_photons_race.active);
+        g_photons_race_foreground.active);
   p.add("race_cadence_hz", PHOTONS_RACE_CADENCE_HZ);
   p.add("race_pulse_ns", PHOTONS_RACE_PULSE_NS);
   p.add("race_launch_surrogate", "DRV200_MOD_HIGH_EDGE_OBSERVED");
@@ -6524,7 +6593,7 @@ static FLASHMEM Payload cmd_report_pulse(const Payload& /*args*/) {
   p.add("report", "PHOTONS_PULSE");
   p.add("schema", "PHOTONS_PULSE_REPORT_V3");
   p.add("race_engine_active",
-        g_photons_race.active);
+        g_photons_race_foreground.active);
   p.add("interrupt_callback_count", interrupt_diag.callback_count);
   p.add("interrupt_callback_missing_count",
         interrupt_diag.callback_missing_count);
@@ -6568,7 +6637,7 @@ static FLASHMEM Payload cmd_detector_activate(const Payload& /*args*/) {
       photons_foreground_owner_t::COMMAND);
 
   if (g_photons_recovery.publication_started ||
-      g_photons_race.active) {
+      g_photons_race_foreground.active) {
     Payload p;
     p.add("status", "detector_activate_rejected_instrument_running");
     return p;
@@ -6598,7 +6667,7 @@ static FLASHMEM Payload cmd_detector_activate(const Payload& /*args*/) {
   }
   if (digitalRead(LASER_MOD_PIN) != LOW ||
       g_photons_recovery.publication_started ||
-      g_photons_race.active) {
+      g_photons_race_foreground.active) {
     photons_laser_mod_idle();
     __builtin_trap();
   }
@@ -6617,7 +6686,7 @@ static FLASHMEM Payload cmd_detector_activate(const Payload& /*args*/) {
 static FLASHMEM Payload cmd_init(const Payload& /*args*/) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
-  if (g_photons_race.active) {
+  if (g_photons_race_foreground.active) {
     Payload p;
     p.add("status", "init_rejected_race_engine_active");
     return p;
@@ -6630,7 +6699,7 @@ static FLASHMEM Payload cmd_wave_on(const Payload& args) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
 
-  if (g_photons_race.active) {
+  if (g_photons_race_foreground.active) {
     Payload p;
     p.add("status", "wave_on_rejected_race_engine_active");
     return p;
@@ -6707,7 +6776,7 @@ static FLASHMEM Payload cmd_pulse(const Payload& args) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
 
-  if (g_photons_race.active) {
+  if (g_photons_race_foreground.active) {
     Payload p;
     p.add("status", "pulse_rejected_race_engine_active");
     return p;
@@ -6839,7 +6908,7 @@ static FLASHMEM Payload cmd_pulse(const Payload& args) {
 static FLASHMEM Payload cmd_on(const Payload& /*args*/) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
-  if (g_photons_race.active) {
+  if (g_photons_race_foreground.active) {
     Payload p;
     p.add("status", "on_rejected_race_engine_active");
     return p;
@@ -6871,7 +6940,7 @@ static FLASHMEM Payload cmd_on(const Payload& /*args*/) {
 static FLASHMEM Payload cmd_off(const Payload& /*args*/) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
-  if (g_photons_race.active) {
+  if (g_photons_race_foreground.active) {
     Payload p;
     p.add("status", "off_rejected_race_engine_active");
     return p;
