@@ -20,10 +20,10 @@
 //   • Deferred 1 Hz canonical publication after both post-PPS OCXO edges complete
 //   • Explicit operation ownership: Alpha/Beta science producers may continue
 //     across immutable SPSC handoffs, but every mutable writer domain and every
-//     Payload-construction transaction has exactly one owner. Priority 0 capture
-//     remains live while command/event Payload custody excludes the Priority 16
-//     TimePop/handoff tier; CLOCKS_FRAGMENT owns exact-sequence serialization,
-//     retry custody, and publication until its queue slot is released.
+//     Payload-construction transaction has exactly one foreground owner. Capture
+//     and continuation interrupts remain live during command/event construction;
+//     CLOCKS_FRAGMENT owns exact-sequence serialization, retry custody, and
+//     publication until its queue slot is released.
 //   • Continuous DWT-to-GNSS calibration (campaign-independent)
 //   • Static PPS/GPIO-based one-second prediction audit for VCLOCK and OCXO lanes
 //   • VCLOCK heartbeat and OCXO one-second compare consumption as observed
@@ -335,12 +335,14 @@ bool clocks_alpha_tau_snapshot(time_clock_id_t clock,
 // statistics, or instrument clockfaces.  Recovery consumes the same canonical
 // live state; there is no parallel restore-state mirror.
 //
-// clocks_fragment_snapshot_take() returns whether the typed handoff package was
-// constructed. live.snapshot_ok separately reports whether Alpha supplied a
-// coherent live instrument snapshot. If Beta has completed a public campaign
-// record for the requested sequence, that campaign-only record is consumed from
-// Beta's bounded SPSC handoff and copied into campaign.  A committed record is
-// immutable until the CLOCKS publisher releases its queue slot.
+// clocks_fragment_snapshot_take() requires FRAGMENT foreground custody and
+// returns whether the typed provisional package was constructed. live.snapshot_ok
+// separately reports whether Alpha supplied a coherent live instrument snapshot.
+// A matching Beta campaign record is copied without acknowledging consumption.
+// The publisher must accept the exact instrument/campaign observation and commit
+// it to its immutable publication queue before releasing Beta's source slot.
+// Rejection leaves that source record intact; transport retries use the committed
+// publication copy and do not consume the campaign handoff again.
 
 static constexpr size_t CLOCKS_FRAGMENT_CAMPAIGN_NAME_MAX = 64U;
 static constexpr size_t CLOCKS_FRAGMENT_STATE_NAME_MAX = 40U;

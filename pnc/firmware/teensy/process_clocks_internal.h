@@ -1617,8 +1617,8 @@ double welford_stderr(const welford_t& w);
 // completed-row campaign path must use separate snapshot/Payload scratch. Alpha
 // commits one complete clocks_instrument_stats_snapshot_t per writer transaction;
 // readers copy that value and never re-derive Better-Buckets from live rings. Report
-// construction keeps Priority 0 capture live and excludes only the Priority 16
-// TimePop/handoff tier until the response has been fully copied.
+// construction holds foreground Payload ownership until the response has been
+// fully copied; capture and continuation interrupts remain live throughout.
 
 struct clocks_instrument_ppb_value_snapshot_t {
   uint64_t sample_count = 0;

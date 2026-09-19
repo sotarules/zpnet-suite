@@ -1826,6 +1826,11 @@ static void clocks_fragment_publish_service_release_owner(void) {
   if (deferred) clocks_fragment_schedule_publish();
 }
 
+// Release Beta's record only after the complete observation has entered the
+// immutable publication queue; rejection leaves the source record in custody.
+static void clocks_fragment_campaign_snapshot_accept(
+    const clocks_fragment_publication_item_t& item);
+
 static void clocks_fragment_publish_service(timepop_ctx_t*,
                                                    timepop_diag_t*,
                                                    void* user_data) {
@@ -1980,6 +1985,7 @@ static void clocks_fragment_publish_service(timepop_ctx_t*,
   if (!retrying_snapshot) {
     clocks_fragment_features_snapshot_take(publication_item->features);
     clocks_fragment_publication_queue_commit_write();
+    clocks_fragment_campaign_snapshot_accept(*publication_item);
     publication_item = clocks_fragment_publication_queue_front();
     if (!publication_item || publication_item->sequence != sequence) {
       __builtin_trap();
@@ -2406,10 +2412,10 @@ static void clocks_fragment_watchdog_reset_publication_custody(void) {
 }
 
 // Command-report construction is a serialized foreground service.  The outer
-// COMMAND Payload custody keeps Priority-0 capture live while excluding the
-// Priority-16 TimePop/handoff tier for the complete command transaction.  This
-// report-local owner then proves that the reusable report scratch itself has one
-// writer.  The typed CLOCKS handoff uses separate immutable queue state.
+// COMMAND Payload custody asserts one foreground owner without masking capture
+// or continuation interrupts. This report-local owner additionally proves that
+// the reusable report scratch itself has one writer. The typed CLOCKS handoff
+// uses separate immutable queue state.
 static volatile uint32_t g_clocks_report_build_active = 0U;
 static uint32_t g_clocks_report_build_count = 0U;
 static uint32_t g_clocks_report_busy_reject_count = 0U;
@@ -6386,6 +6392,18 @@ static FLASHMEM void payload_add_visible_origin_summary(Payload& p) {
   p.add_object("visible_origin", visible_origin);
 }
 
+// These lifecycle fields describe one ISR-authored state. Acquire once, then
+// serialize foreground-owned values even if SmartZero completes between adds.
+static FLASHMEM void payload_add_recovery_smartzero_state(Payload& p) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::COMMAND);
+  interrupt_smartzero_snapshot_t& snapshot = g_beta_report_live_smartzero_scratch;
+  if (!interrupt_smartzero_live_snapshot(&snapshot)) __builtin_trap();
+  const bool running = snapshot.running && !snapshot.complete;
+  const bool complete = snapshot.complete;
+  p.add("recover_smartzero_running", running);
+  p.add("recover_smartzero_complete", complete);
+}
+
 static FLASHMEM void payload_add_smartzero_summary(Payload& p) {
   clocks_payload_owner_assert(clocks_payload_owner_t::COMMAND);
   interrupt_smartzero_snapshot_t& live = g_beta_report_live_smartzero_scratch;
@@ -6506,8 +6524,8 @@ static double campaign_total_ppb_from_tau(double tau) {
 }
 
 // Report-only serializer: reusable Payload control blocks live in RAM1. The outer
-// COMMAND custody excludes priority-16 TimePop/handoff entry for the complete
-// response transaction; typed CLOCKS snapshots use independent RAM2 value state.
+// COMMAND custody serializes foreground response construction without masking
+// interrupts; typed CLOCKS snapshots use independent RAM2 value state.
 static FLASHMEM void report_add_welford_object(Payload& parent,
                                                const char* key,
                                                const welford_t& w) {
@@ -8431,6 +8449,7 @@ static FLASHMEM void clocks_fragment_live_snapshot_fill(
 FLASHMEM bool clocks_fragment_snapshot_take(
     uint32_t completed_second_sequence,
     clocks_fragment_snapshot_t* out) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::FRAGMENT);
   if (!out) return false;
   *out = clocks_fragment_snapshot_t{};
   clocks_fragment_live_snapshot_fill(out->live);
@@ -8448,10 +8467,10 @@ FLASHMEM bool clocks_fragment_snapshot_take(
       clocks_fragment_campaign_queue_front();
   if (campaign_front &&
       campaign_front->completed_second_sequence == completed_second_sequence) {
+    // This copy is provisional: the publisher still has to accept the exact
+    // instrument row and commit the complete observation. Keep Beta's slot
+    // immutable and unacknowledged until that custody transfer is complete.
     out->campaign = *campaign_front;
-    clocks_fragment_campaign_queue_release();
-    g_clocks_fragment_campaign_record_take_count++;
-    clocks_fragment_campaign_record_ready_retry_cancel();
   } else if (campaign_front &&
              (int32_t)(completed_second_sequence -
                        campaign_front->completed_second_sequence) > 0) {
@@ -8466,6 +8485,29 @@ FLASHMEM bool clocks_fragment_snapshot_take(
   }
 
   return true;
+}
+
+static void clocks_fragment_campaign_snapshot_accept(
+    const clocks_fragment_publication_item_t& item) {
+  clocks_payload_owner_assert(clocks_payload_owner_t::FRAGMENT);
+  if (clocks_fragment_publication_queue_front() != &item ||
+      !item.clocks.live.snapshot_ok ||
+      !item.clocks.live.completed_row_coherent ||
+      item.clocks.live.completed_pps_sequence != item.sequence) {
+    __builtin_trap();
+  }
+  if (!item.clocks.campaign.present) return;
+
+  const clocks_fragment_campaign_snapshot_t* front =
+      clocks_fragment_campaign_queue_front();
+  if (!front || !front->present ||
+      front->completed_second_sequence != item.sequence ||
+      item.clocks.campaign.completed_second_sequence != item.sequence) {
+    __builtin_trap();
+  }
+  clocks_fragment_campaign_queue_release();
+  g_clocks_fragment_campaign_record_take_count++;
+  clocks_fragment_campaign_record_ready_retry_cancel();
 }
 
 // ============================================================================
@@ -10366,8 +10408,7 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
         clocks_campaign_recovery_lifecycle_active());
   p.add("recover_dead_producer_restore_epoch_ready",
         g_recover_lifecycle_dead_producer_restore_epoch_ready);
-  p.add("recover_smartzero_running", interrupt_smartzero_running());
-  p.add("recover_smartzero_complete", interrupt_smartzero_complete());
+  payload_add_recovery_smartzero_state(p);
   p.add("recover_epoch_ready",
         clocks_alpha_installed_smartzero_backing_epoch());
   p.add("restore_court_ready", recover_restore_court_ready_now());
@@ -10574,8 +10615,7 @@ static FLASHMEM Payload cmd_report_recovery(const Payload&) {
         g_recover_lifecycle_dead_producer_restore_ready_count);
   p.add("recover_dead_producer_restore_commit_count",
         g_recover_lifecycle_dead_producer_restore_commit_count);
-  p.add("recover_smartzero_running", interrupt_smartzero_running());
-  p.add("recover_smartzero_complete", interrupt_smartzero_complete());
+  payload_add_recovery_smartzero_state(p);
   p.add("recover_epoch_ready", clocks_alpha_installed_smartzero_backing_epoch());
   p.add("restore_court_ready", recover_restore_court_ready_now());
 
@@ -10804,7 +10844,7 @@ static FLASHMEM void report_add_common_metadata(
   p.add("epoch_ready", clocks_alpha_installed_smartzero_backing_epoch());
   p.add("epoch_sequence", clocks_alpha_epoch_sequence());
   p.add("report_priority0_capture_live", true);
-  p.add("report_priority16_excluded", true);
+  p.add("report_priority16_excluded", false);
   p.add("report_build_count", g_clocks_report_build_count);
   p.add("report_busy_reject_count", g_clocks_report_busy_reject_count);
   p.add("report_max_duration_cycles", g_clocks_report_max_duration_cycles);
@@ -10957,7 +10997,7 @@ static FLASHMEM Payload cmd_report_row_court(const Payload&) {
   p.add("campaign", campaign_name);
   p.add("campaign_seconds", campaign_seconds);
   p.add("report_priority0_capture_live", true);
-  p.add("report_priority16_excluded", true);
+  p.add("report_priority16_excluded", false);
   return p;
 }
 
@@ -10979,7 +11019,7 @@ static FLASHMEM Payload cmd_report_smartzero(const Payload&) {
   built.add("epoch_ready", clocks_alpha_installed_smartzero_backing_epoch());
   built.add("epoch_sequence", clocks_alpha_epoch_sequence());
   built.add("report_priority0_capture_live", true);
-  built.add("report_priority16_excluded", true);
+  built.add("report_priority16_excluded", false);
   payload_add_smartzero_summary(built);
 
   Payload response = built;
