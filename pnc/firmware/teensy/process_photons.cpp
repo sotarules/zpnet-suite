@@ -111,9 +111,9 @@ static constexpr uint64_t PHOTONS_PULSE_DEFAULT_NS = 1000ULL;
 // LANTERN V1.0 physical geometry. No recurring race scheduler exists.
 static constexpr uint64_t PHOTONS_RACE_PULSE_NS = 200ULL;
 // Minimum settling time after classification, measured in nominal CPU cycles.
-// TimePop ALAP dispatch may extend this interval. No CH2 appointment is armed:
-// 2 us is inside TimePop's 6.4 us minimum hardware-arming lead.
-static constexpr uint32_t PHOTONS_RACE_HOLDOFF_NS = 2000U;
+// TimePop ALAP dispatch may extend this interval; no CH2 appointment is armed.
+// Use a 1 ms holdoff to measure sensitivity to inter-race settling time.
+static constexpr uint32_t PHOTONS_RACE_HOLDOFF_NS = 1000000U;
 static constexpr uint64_t PHOTONS_RACE_CADENCE_NS = 0ULL;
 static constexpr uint32_t PHOTONS_RACE_CADENCE_HZ = 0U;
 static constexpr uint32_t PHOTONS_RACE_SEED_HISTORY = 8U;
@@ -2704,12 +2704,19 @@ static void photons_race_relaunch(void) {
 }
 
 static bool photons_relaunch_ready(void* /*user_data*/) {
-  const uint32_t prior = photons_priority32_guard_enter();
-  const bool ready = g_photons_race.active && !g_photons_race.primed &&
-      (uint32_t)(ARM_DWT_CYCCNT - g_photons_race.holdoff_started_dwt) >=
-          g_photons_race.holdoff_cycles;
-  photons_priority32_guard_exit(prior);
-  return ready;
+  // TimePop polls this in foreground, including while a photon is in flight.
+  // Do not mask Priority-48 detector capture merely to ask whether work is ready.
+  // Refresh the ISR-owned fields before reading them. If continuation clears
+  // primed during this check, it finishes writing holdoff_started_dwt before
+  // foreground resumes. Seeing the old primed=true only defers one readiness
+  // check. Once primed=false is observed, neither it nor the holdoff origin can
+  // change again until this serialized foreground domain launches the next race.
+  photons_memory_barrier();
+  if (!g_photons_race.active || g_photons_race.primed) return false;
+  // Read the holdoff origin only AFTER observing the completed-race state.
+  photons_memory_barrier();
+  return (uint32_t)(ARM_DWT_CYCCNT - g_photons_race.holdoff_started_dwt) >=
+      g_photons_race.holdoff_cycles;
 }
 
 static void photons_foreground_service(void* /*user_data*/) {
