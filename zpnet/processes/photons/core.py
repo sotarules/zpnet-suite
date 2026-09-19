@@ -87,11 +87,12 @@ PHOTONS_INSTRUMENT_SCHEMA = "PHOTONS_INSTRUMENT_V1"
 PHOTONS_SCIENCE_SCHEMA = "PHOTONS_SCIENCE_V2"
 PHOTONS_STATS_SCHEMA = "PHOTONS_INSTRUMENT_STATS_V1"
 PHOTONS_RACE_SCHEMA = "PHOTONS_RACE_V1"
-# LANTERN V1.0 is return-driven, not cadence-driven: one observed PD return
-# immediately launches the next 200 ns pulse.  The cadence fields remain on the
-# V1 wire only as explicit retired-zero testimony.
+# Historical return-driven rows retain their zero cadence geometry. New
+# TIMEPOP_CADENCE_V1 rows carry a configurable independent launch interval.
 PHOTONS_RACE_CADENCE_HZ = 0
 PHOTONS_RACE_CADENCE_NS = 0
+PHOTONS_CADENCE_MIN_NS = 10000
+PHOTONS_CADENCE_MAX_NS = 1000000000
 PHOTONS_RACE_PULSE_NS = 200
 PHOTONS_RACE_LAUNCH_SURROGATE = "DRV200_MOD_HIGH_EDGE_OBSERVED"
 PHOTONS_RACE_FLIGHT_INTERPRETATION = "OBSERVED_DWT_ENDPOINTS"
@@ -1043,14 +1044,57 @@ def _wait_for_startup_infrastructure() -> Dict[str, Any]:
         time.sleep(STARTUP_INFRASTRUCTURE_POLL_S)
 
 
+def _validate_race_geometry(race: Dict[str, Any], path: str) -> None:
+    hz = _require_int(race.get("cadence_hz"), f"{path}.cadence_hz")
+    ns = _require_int(race.get("cadence_ns"), f"{path}.cadence_ns")
+    pulse = _require_int(race.get("pulse_ns"), f"{path}.pulse_ns", minimum=1)
+    if pulse != PHOTONS_RACE_PULSE_NS:
+        raise ValueError(f"{path}: unexpected pulse width {pulse}")
+    if race.get("accounting") == "TIMEPOP_CADENCE_V1":
+        if not PHOTONS_CADENCE_MIN_NS <= ns <= PHOTONS_CADENCE_MAX_NS:
+            raise ValueError(f"{path}: cadence interval out of range: {ns}")
+        if hz != 1000000000 // ns:
+            raise ValueError(f"{path}: cadence Hz/ns disagree")
+    elif (hz, ns) != (PHOTONS_RACE_CADENCE_HZ, PHOTONS_RACE_CADENCE_NS):
+        raise ValueError(f"{path}: historical return-driven cadence must be zero")
+
+
 def _validate_race_relaunch_accounting(race: Dict[str, Any], path: str) -> None:
-    """Prove physical successor launches, including a holdoff across a fragment."""
+    """Prove accounting under the producer-authored historical or cadence contract."""
     attempts = _require_int(race.get("attempt_count_total"), f"{path}.attempt_count_total")
     completed = _require_int(race.get("completed_count_total"), f"{path}.completed_count_total")
     attempts_fragment = _require_int(race.get("attempts_this_fragment"), f"{path}.attempts_this_fragment")
     completed_fragment = _require_int(race.get("completed_this_fragment"), f"{path}.completed_this_fragment")
     if attempts_fragment > attempts or completed_fragment > completed:
         raise ValueError(f"{path}: fragment race counts exceed lifetime counts")
+
+    if race.get("accounting") == "TIMEPOP_CADENCE_V1":
+        _validate_race_geometry(race, path)
+        missed = _require_int(race.get("missed_count_total"), f"{path}.missed_count_total")
+        missed_fragment = _require_int(race.get("missed_this_fragment"), f"{path}.missed_this_fragment")
+        pending = _require_int(race.get("pending_return_count"), f"{path}.pending_return_count")
+        previous = _require_int(race.get("pending_return_count_previous"), f"{path}.pending_return_count_previous")
+        if pending > 1 or previous > 1 or missed_fragment > missed:
+            raise ValueError(f"{path}: impossible pending/missed counts")
+        if attempts != completed + missed + pending:
+            raise ValueError(f"{path}: lifetime launch/return/missed/pending accounting does not close")
+        if previous + attempts_fragment != completed_fragment + missed_fragment + pending:
+            raise ValueError(f"{path}: fragment launch/return/missed/pending accounting does not close")
+        if pending and not _require_bool(race.get("active"), f"{path}.active"):
+            raise ValueError(f"{path}: stopped cadence has a pending return")
+        ticks = _require_int(race.get("cadence_tick_count_total"), f"{path}.cadence_tick_count_total")
+        ticks_fragment = _require_int(race.get("cadence_ticks_this_fragment"), f"{path}.cadence_ticks_this_fragment")
+        if ticks != attempts or ticks_fragment != attempts_fragment:
+            raise ValueError(f"{path}: measured cadence launch counts disagree")
+        for field in (
+            "pending_relaunch_count", "pending_relaunch_count_previous",
+            "holdoff_ns", "holdoff_cycles", "holdoff_launches_total",
+            "holdoff_last_cycles", "holdoff_min_cycles", "holdoff_max_cycles",
+        ):
+            if _require_int(race.get(field), f"{path}.{field}") != 0:
+                raise ValueError(f"{path}: retired return-driven field {field} is nonzero")
+        _require_int(race.get("holdoff_edges_total"), f"{path}.holdoff_edges_total")
+        return
 
     if "accounting" not in race:
         # Historical immediate-relaunch producers had no pending successor.
@@ -1161,18 +1205,7 @@ def _validate_photons_fragment(fragment: Payload) -> Tuple[int, int, Optional[in
         raise ValueError(f"unsupported PHOTONS race schema {race.get('schema')!r}")
     _require_bool(race.get("active"), "photons.race.active")
 
-    cadence_hz = _require_int(race.get("cadence_hz"), "photons.race.cadence_hz")
-    cadence_ns = _require_int(race.get("cadence_ns"), "photons.race.cadence_ns")
-    pulse_ns = _require_int(race.get("pulse_ns"), "photons.race.pulse_ns", minimum=1)
-    if (
-        cadence_hz != PHOTONS_RACE_CADENCE_HZ
-        or cadence_ns != PHOTONS_RACE_CADENCE_NS
-        or pulse_ns != PHOTONS_RACE_PULSE_NS
-    ):
-        raise ValueError(
-            "PHOTONS autonomous-race geometry changed unexpectedly: "
-            f"retired_cadence={cadence_hz}Hz/{cadence_ns}ns pulse={pulse_ns}ns"
-        )
+    _validate_race_geometry(race, "photons.race")
     if race.get("launch_surrogate") != PHOTONS_RACE_LAUNCH_SURROGATE:
         raise ValueError(
             f"unsupported PHOTONS launch surrogate {race.get('launch_surrogate')!r}"
@@ -1235,8 +1268,8 @@ def _validate_photons_fragment(fragment: Payload) -> Tuple[int, int, Optional[in
         race.get("cadence_ticks_this_fragment"), "photons.race.cadence_ticks_this_fragment"
     )
 
-    # LANTERN V1.0 has no recurring scheduler.  These V1 fields are retained only
-    # so the wire shape remains explicit while downstream naming catches up.
+    # Historical rows have no scheduler activity. Cadence producers revive only
+    # launch ticks and missing-return counts; other retired fields remain zero.
     retired_scheduler_fields = {
         "cadence_tick_count_total": race_cadence_ticks_total,
         "cadence_ticks_this_fragment": race_cadence_ticks_fragment,
@@ -1283,6 +1316,12 @@ def _validate_photons_fragment(fragment: Payload) -> Tuple[int, int, Optional[in
             "photons.race.enqueue_failure_this_fragment",
         ),
     }
+    if race.get("accounting") == "TIMEPOP_CADENCE_V1":
+        for field in (
+            "cadence_tick_count_total", "cadence_ticks_this_fragment",
+            "missed_count_total", "missed_this_fragment",
+        ):
+            del retired_scheduler_fields[field]
     nonzero_retired = {
         key: value for key, value in retired_scheduler_fields.items() if value != 0
     }
@@ -3627,20 +3666,7 @@ def _canonical_recovery_state_from_row(
     if race.get("schema") != PHOTONS_RACE_SCHEMA:
         raise ValueError("durable PHOTONS race schema mismatch")
     _validate_race_relaunch_accounting(race, "PHOTONS.photons.race")
-    durable_race_geometry = (
-        _require_int(race.get("cadence_hz"), "PHOTONS.photons.race.cadence_hz"),
-        _require_int(race.get("cadence_ns"), "PHOTONS.photons.race.cadence_ns"),
-        _require_int(race.get("pulse_ns"), "PHOTONS.photons.race.pulse_ns", minimum=1),
-    )
-    if durable_race_geometry != (
-        PHOTONS_RACE_CADENCE_HZ,
-        PHOTONS_RACE_CADENCE_NS,
-        PHOTONS_RACE_PULSE_NS,
-    ):
-        raise ValueError(
-            "durable PHOTONS race geometry does not match this firmware epoch: "
-            f"durable={durable_race_geometry!r}"
-        )
+    _validate_race_geometry(race, "PHOTONS.photons.race")
     if (
         race.get("launch_surrogate") != PHOTONS_RACE_LAUNCH_SURROGATE
         or race.get("flight_interpretation") != PHOTONS_RACE_FLIGHT_INTERPRETATION
@@ -4178,21 +4204,9 @@ def _load_newest_empty_photons_heartbeat_state(
             key.startswith("holdoff_") or key.startswith("pending_relaunch_") for key in race
         ):
             _validate_race_relaunch_accounting(race, "empty-heartbeat PHOTONS.photons.race")
+        _validate_race_geometry(race, "empty-heartbeat PHOTONS.photons.race")
         if (
-            _require_int(
-                race.get("cadence_hz"),
-                "empty-heartbeat PHOTONS.photons.race.cadence_hz",
-            ) != PHOTONS_RACE_CADENCE_HZ
-            or _require_int(
-                race.get("cadence_ns"),
-                "empty-heartbeat PHOTONS.photons.race.cadence_ns",
-            ) != PHOTONS_RACE_CADENCE_NS
-            or _require_int(
-                race.get("pulse_ns"),
-                "empty-heartbeat PHOTONS.photons.race.pulse_ns",
-                minimum=1,
-            ) != PHOTONS_RACE_PULSE_NS
-            or race.get("launch_surrogate") not in {
+            race.get("launch_surrogate") not in {
                 PHOTONS_RACE_LAUNCH_SURROGATE,
                 PHOTONS_EMPTY_HEARTBEAT_LEGACY_LAUNCH_SURROGATE,
             }
@@ -4757,14 +4771,14 @@ def _fetch_teensy_photons_report() -> Dict[str, Any]:
             f"unsupported Teensy PHOTONS broad-report schema {payload.get('schema')!r}; "
             "PD200T_REAL_RACE firmware is required"
         )
-    if (
-        _require_int(payload.get("race_cadence_hz"), "PHOTONS.REPORT.race_cadence_hz")
-        != PHOTONS_RACE_CADENCE_HZ
-        or _require_int(payload.get("race_pulse_ns"), "PHOTONS.REPORT.race_pulse_ns", minimum=1)
-        != PHOTONS_RACE_PULSE_NS
-        or payload.get("race_launch_surrogate") != PHOTONS_RACE_LAUNCH_SURROGATE
-    ):
-        raise RuntimeError("Teensy PHOTONS real-race geometry does not match Pi contract")
+    _validate_race_geometry({
+        "accounting": payload.get("race_accounting"),
+        "cadence_hz": payload.get("race_cadence_hz"),
+        "cadence_ns": payload.get("race_cadence_ns", PHOTONS_RACE_CADENCE_NS),
+        "pulse_ns": payload.get("race_pulse_ns"),
+    }, "PHOTONS.REPORT")
+    if payload.get("race_launch_surrogate") != PHOTONS_RACE_LAUNCH_SURROGATE:
+        raise RuntimeError("Teensy PHOTONS launch surrogate does not match Pi contract")
     _require_bool(payload.get("race_engine_active"), "PHOTONS.REPORT.race_engine_active")
     if not _require_bool(
         payload.get("standard_lap_configured"),

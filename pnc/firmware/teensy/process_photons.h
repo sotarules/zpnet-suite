@@ -15,24 +15,28 @@
 //   • process_interrupt owns PD200T comparator edge capture and immutable
 //     DWT-at-edge custody.
 //   • PHOTONS consumes those edge facts and publishes PHOTONS_FRAGMENT.
-//   • all non-ISR PHOTONS mutation has one foreground owner at a time: the
-//     ordinary-loop service, deferred race relaunch, 1 Hz fragment transaction,
+//   • PHOTONS processing is foreground-only. Raw edge capture belongs to
+//     process_interrupt; edge delivery runs as a bounded foreground service.
+//     Scheduling/statistics transactions have one foreground owner at a time:
+//     the cadence callback, 1 Hz fragment transaction,
 //     one RPC command, or commissioning WAVE callback. These owners may never nest;
 //     illegal overlap is a system-integrity fault rather than a recoverable busy
 //     condition.
 //   • foreground commits a complete launch record through an SPSC handoff;
-//     continuation alone owns live race state and the completed-race batch.
-//     Batch, reference metadata, counters and holdoff origin publish together.
+//     foreground edge service owns live race state and the completed-race batch.
+//     It may execute synchronously inside a boundary/fragment transaction; it
+//     never acquires another owner or mutates the active scheduling transaction.
+//     Batch, reference metadata and completion counters publish together.
 //     Foreground copies both batch and runtime before acknowledging the result;
 //     only then may it reuse launch storage. Publication generations may wrap.
 //     Only foreground writes/resets the separate fragment accumulator.
 //   • readiness and reports read completed handoffs, never live race fields.
 //     A fragment uses the runtime acquired at its batch-drain boundary; later
-//     ISR returns cannot change its reference or counters during construction.
+//     raw IRQ arrivals cannot change its reference or counters during construction.
 //     Runtime reports show the latest consumed completion plus the subsequent
-//     foreground launch; holdoff-edge totals advance with completed handoffs.
-//   • continuation alone writes the boot-lifetime histogram, including origin
-//     installation and seed replay. Foreground infers the origin from a completed
+//     foreground launch; out-of-window edge totals advance with completed handoffs.
+//   • foreground edge service writes the boot-lifetime histogram, including origin
+//     installation and seed replay. Cadence infers the origin from a completed
 //     immutable seed set and returns it through a one-shot SPSC handoff.
 //   • reports use producer-published typed snapshots. Foreground holds a slot
 //     until its next acquisition; producer cannot reuse that slot while held.
@@ -47,29 +51,23 @@
 // estimated flight interval, science-admission testimony, Welford sufficient
 // state, and recovery totals.
 //
-// LANTERN V1.0 autonomous race engine:
-//   • one 200 ns DRV200 MOD pulse primes the instrument; thereafter a real PD200T
-//     return ends race N; foreground TimePop ALAP authors race N+1 after the
-//     configured 1 ms post-classification holdoff and completed-batch consumption;
-//   • the Priority-48 physical ISR captures only immutable DWT/arrival testimony;
-//     no laser write, GNSS projection, floating point, Payload work, or Welford
-//     mutation occurs in the detector ISR;
-//   • Priority-32 continuation performs only bounded physical continuation:
-//     finish the raw flight, classify delay testimony, update the live histogram,
-//     and publish its completed batch/runtime and any requested histogram snapshot;
-//   • foreground owns MOD HIGH, the actual launch DWT, the ~200 ns HIGH wait,
-//     and MOD LOW. First shot and relaunch share the existing Priority-32 pulse
-//     guard: Priority 0/16 remain live; Priority 32/48 resume after launch commit.
-//     Payload construction and runtime snapshot reads do not use that guard;
-//     scheduler mutation never occurs in continuation;
-//   • three mutually close clean flights establish the initial fast-path lineage;
-//     later long/right-tail flights and interrupt-delayed endpoints are rejected
-//     without moving the reference;
-//   • accepted/rejected integer sufficient statistics pass through an SPSC
-//     mailbox at race rate; 1 Hz foreground work performs GNSS scaling,
-//     Welford/statistics, operator-baseline residuals, Better-Buckets, and
-//     PHOTONS_FRAGMENT publication;
-//   • there is no recurring TimePop race cadence and no synthetic/emulated flight.
+// Independent launch cadence:
+//   • initialization arms a recurring foreground TimePop timer (default 10 us);
+//     each callback emits a nominal 200 ns MOD pulse, regardless of PD arrivals;
+//   • measurement starts after recovery establishes statistical ancestry;
+//   • Priority 48 queues raw DWT/entry evidence; foreground classifies the first
+//     in-window return. No optical processing executes at Priority 32;
+//   • the next cadence callback or PHOTONS_STOP closes an unanswered shot as
+//     missed. Attempts = completed + missed + pending, with at most one pending;
+//   • each launch pauses ONLY the detector IRQ, drains all captured edges against
+//     the old shot, and clears uncaptured pending GPIO state. After the new launch
+//     record is published, detector capture resumes without clearing a new return.
+//     CLOCKS and Priority 32 remain live throughout. Raw queue overflow traps.
+//     The timestamp is sampled after MOD HIGH;
+//   • timer deadlines are scheduled cadence; actual GPIO timing includes
+//     foreground dispatch and interrupt latency. No catch-up pulse burst;
+//   • START/STOP retain campaign semantics. PHOTONS_START/PHOTONS_STOP control
+//     laser cadence independently; statistics and fragment publication continue.
 //
 // Commands:
 //   • INIT                — reinitialize PHOTONS-owned optical I/O and force the
@@ -83,6 +81,9 @@
 //   • START               — start a LANTERN campaign, or hot-cut an active campaign to a new name
 //   • FLASH_CUT           — explicit hot campaign boundary preserving the always-on instrument epoch
 //   • STOP                — request campaign closure; the next published campaign fragment is final
+//   • PHOTONS_START [interval=N] — run laser cadence; N is ns, 10000..1000000000.
+//                           Omitted interval preserves the current setting.
+//   • PHOTONS_STOP        — cancel cadence, close pending shot, force MOD LOW.
 //   • REPORT              — compact operational/device report including active-high MOD state,
 //                           laser monitor and pin-34 interrupt custody; no PD OUT ADC telemetry
 //   • WAVEON interval=N width=W — commissioning pulse train on LASER_MOD_PIN 35.
@@ -537,6 +538,9 @@ struct photons_fragment_snapshot_t {
   // of this producer lifecycle, so active=false with zero race counters is lawful.
   bool race_engine_active = false;
   uint32_t race_cadence_hz = 0;
+  uint64_t race_cadence_ns = 0;
+  uint32_t race_pending_return_count = 0;
+  uint32_t race_pending_return_count_previous = 0;
   uint64_t race_pulse_ns = 0;
   uint64_t race_cadence_tick_count_total = 0;
   uint32_t race_cadence_ticks_this_fragment = 0;
@@ -555,7 +559,7 @@ struct photons_fragment_snapshot_t {
   uint64_t race_enqueue_failure_total = 0;
   uint32_t race_enqueue_failure_this_fragment = 0;
 
-  // LANTERN V1.0 return-driven rejection testimony.
+  // Detector-return rejection testimony.
   uint64_t race_rejected_isr_delay_total = 0;
   uint32_t race_rejected_isr_delay_this_fragment = 0;
   uint64_t race_rejected_qtimer1_total = 0;
@@ -572,8 +576,8 @@ struct photons_fragment_snapshot_t {
   uint32_t race_seed_count = 0;
   photons_fragment_welford_snapshot_t race_flight_this_fragment{};
 
-  // Post-race holdoff: elapsed DWT cycles from classification completion to
-  // actual relaunch. Counters share the boot-local race-runtime snapshot.
+  // Retired holdoff fields remain zero except holdoff_edges_total, which counts
+  // arrivals outside an open receive window. No return schedules a launch.
   uint32_t race_pending_relaunch_count = 0;
   uint32_t race_pending_relaunch_count_previous = 0;
   uint32_t race_holdoff_ns = 0;
@@ -625,17 +629,10 @@ struct photons_fragment_snapshot_t {
   uint32_t interrupt_last_qtimer_pending_at_exit_mask = 0;
 };
 
-// Initialize PHOTONS runtime state and subscribe to the process_interrupt
-// PHOTODIODE lane. After the recovery verdict, PHOTONS starts the 1 Hz fragment
-// heartbeat. The real race producer is a separate lifecycle and remains held
-// until an explicit later commissioning transition starts it.
+// Initialize PHOTONS state, subscribe to the detector, and start laser cadence.
+// Recovery independently starts measurement and the 1 Hz fragment heartbeat.
 // Must run after process_interrupt_init() and timepop_init().
 void process_photons_init(void);
-
-// Initialization registers private readiness/service callbacks with TimePop.
-// After the minimum post-race holdoff, that foreground service infers the
-// histogram origin, consumes the completed batch/runtime, and commits the next
-// launch under one owner. No per-race ALAP mailbox or public loop hook is required.
 
 // Register the PHOTONS process command surface.
 void process_photons_register(void);

@@ -1295,7 +1295,7 @@ bool interrupt_photodiode_subscribe(
     const interrupt_photodiode_subscription_t& subscription);
 void interrupt_photodiode_unsubscribe(void);
 
-// Copies GPIO/continuation diagnostics under the existing Priority-0-preserving
+// Copies capture/foreground diagnostics under the existing Priority-0-preserving
 // guard. Foreground report construction uses the returned value after release.
 bool interrupt_photodiode_snapshot(interrupt_photodiode_diag_t* out);
 
@@ -1304,11 +1304,26 @@ bool interrupt_photodiode_snapshot(interrupt_photodiode_diag_t* out);
 // assume the stock digitalRead(34) metadata follows that runtime remap.
 bool interrupt_photodiode_level_high(void);
 
+// Subscriber callbacks run synchronously in foreground, never at Priority 32.
+// Drain only the raw records present at entry; new arrivals wait for the next
+// service pass. May be called by a serialized foreground acquisition/fragment
+// transaction. Recursive service or service from an ISR traps.
+void interrupt_photodiode_service_pending(void);
+
+// Paired foreground acquisition boundary. Begin disables ONLY the detector IRQ,
+// drains captured records against the old launch, and clears uncaptured GPIO
+// pending state. No captured record is discarded. Publish the new launch (or
+// finish STOP) before end re-enables the IRQ. End preserves edges that arrived
+// after begin's GPIO clear, including returns pending during the laser pulse.
+// CLOCKS and Priority 32 remain enabled. Nested/unpaired boundaries trap.
+void interrupt_photodiode_boundary_begin(void);
+void interrupt_photodiode_boundary_end(void);
+
 // Compatibility/synthetic custody boundary.  The installed physical pin-34 path
 // is GPIO2[29] on IRQ_GPIO2_16_31 at Priority 48 and enters through its dedicated
-// ISR, which attaches real entry-delay ancestry before invoking this custody
-// logic.  Direct callers supply only first-instruction DWT and therefore carry
-// UNKNOWN delay ancestry; this function never rereads DWT as event identity.
+// ISR, which queues immutable raw entry evidence for foreground classification.
+// Direct callers queue only first-instruction DWT and therefore carry UNKNOWN
+// delay ancestry; this function never rereads DWT as event identity.
 void process_interrupt_photodiode_gpio_irq(uint32_t isr_entry_dwt_raw);
 
 // event and diag are members of one immutable foreground-owned SPSC read slot.

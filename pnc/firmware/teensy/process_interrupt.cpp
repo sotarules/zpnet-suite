@@ -31,10 +31,10 @@
 //   * raw ISR-entry DWT is converted once to the calibrated event coordinate;
 //   * every lawful OCXO compare authors one one-second event;
 //   * immutable CH2 and ordinary subscriber work is transferred to foreground;
-//   * the LANTERN PHOTODIODE edge alone may invoke its bounded optical continuation
-//     callback here after every other Priority-32 handoff item is drained.
+//   * PHOTODIODE raw capture bypasses this tier entirely; its subscriber runs
+//     from a bounded foreground service or an acquisition-boundary drain.
 //
-// Foreground owns TimePop scheduling policy, optical relaunch, and ordinary
+// Foreground owns TimePop scheduling policy, optical processing/launch, and ordinary
 // application callbacks.
 //
 // There is no alternative endpoint estimator, repair candidate, FloorLine, or
@@ -529,20 +529,30 @@ struct photodiode_subscription_runtime_t {
 
 static photodiode_subscription_runtime_t g_photodiode_subscription{};
 
-// LANTERN V1.0: the physical Priority-48 ISR authors one immutable optical edge
-// fact and pends the existing Priority-32 continuation. The continuation invokes
-// the PHOTODIODE subscriber; foreground owns the next optical launch after the
-// completed-race handoff and holdoff. One outstanding edge is sufficient;
-// comparator chatter while that edge is in custody is counted and discarded.
-struct photodiode_handoff_packet_t {
-  interrupt_photodiode_edge_t edge{};
+// Priority 48 owns the raw producer; foreground alone consumes/classifies it.
+// A bounded SPSC ring preserves entry evidence across foreground latency.
+// No PHOTODIODE record enters the shared Priority-32 continuation.
+static constexpr uint32_t PHOTODIODE_RAW_CAPACITY = 64U;
+static_assert((PHOTODIODE_RAW_CAPACITY & (PHOTODIODE_RAW_CAPACITY - 1U)) == 0U,
+              "photodiode raw capacity must be a power of two");
+enum class photodiode_capture_kind_t : uint8_t { PHYSICAL, SYNTHETIC };
+struct photodiode_raw_packet_t {
+  uint32_t entry_dwt;
+  interrupt_arrival_capture_t arrival;
+  uint32_t pps_sequence;
+  uint32_t binding_generation;
+  uint32_t basepri;
+  uint32_t primask;
+  uint32_t ipsr;
+  photodiode_capture_kind_t kind;
 };
-
-static photodiode_handoff_packet_t g_photodiode_handoff_packet{};
-static volatile bool g_photodiode_handoff_pending = false;
-static volatile uint32_t g_photodiode_handoff_enqueue_count = 0U;
-static volatile uint32_t g_photodiode_handoff_dequeue_count = 0U;
-static volatile uint32_t g_photodiode_handoff_busy_drop_count = 0U;
+static photodiode_raw_packet_t g_photodiode_raw[PHOTODIODE_RAW_CAPACITY];
+static uint32_t g_photodiode_raw_head = 0U; // producer release-publishes
+static uint32_t g_photodiode_raw_tail = 0U; // consumer release-publishes
+static uint32_t g_photodiode_raw_overflow_count = 0U; // producer only
+static bool g_photodiode_service_running = false; // foreground only
+static bool g_photodiode_boundary_open = false; // foreground only
+static bool g_photodiode_service_registered = false; // lifetime registration
 
 // Preserve raw first-instruction DWT until the dedicated PD200T GPIO entry
 // latency floor has been measured on the final interrupt vector.
@@ -4089,6 +4099,43 @@ static bool photodiode_gpio2_route_readback_all_match(void) {
           INTERRUPT_PRIORITY_PHOTODIODE;
 }
 
+// Foreground-only counters; boundary clears never impersonate detector callbacks.
+static uint32_t g_photodiode_boundary_packet_discard_count = 0U;
+static uint32_t g_photodiode_boundary_gpio_clear_count = 0U;
+
+void interrupt_photodiode_boundary_begin(void) {
+  if (interrupt_ipsr() != 0U || interrupt_basepri() != 0U ||
+      interrupt_primask() != 0U || g_photodiode_boundary_open ||
+      g_photodiode_service_running ||
+      !interrupt_nvic_enabled((uint32_t)PHOTODIODE_IRQ)) __builtin_trap();
+  NVIC_DISABLE_IRQ(PHOTODIODE_IRQ);
+  __asm__ volatile ("dsb" ::: "memory");
+  __asm__ volatile ("isb" ::: "memory");
+  g_photodiode_boundary_open = true;
+  // The producer is stopped, so this finite drain consumes EVERY captured edge
+  // under the old shot before PHOTONS may close it or replace its launch DWT.
+  // Classification/callbacks execute with all CLOCKS/continuation IRQs enabled.
+  interrupt_photodiode_service_pending();
+  if (__atomic_load_n(&g_photodiode_raw_head, __ATOMIC_ACQUIRE) !=
+      __atomic_load_n(&g_photodiode_raw_tail, __ATOMIC_RELAXED)) __builtin_trap();
+  if ((GPIO2_ISR & PHOTODIODE_GPIO2_MASK) != 0U)
+    g_photodiode_boundary_gpio_clear_count++;
+  GPIO2_ISR = PHOTODIODE_GPIO2_MASK;
+  interrupt_nvic_icpr_word((uint32_t)PHOTODIODE_IRQ) =
+      interrupt_nvic_irq_mask((uint32_t)PHOTODIODE_IRQ);
+  __asm__ volatile ("dsb" ::: "memory");
+}
+
+void interrupt_photodiode_boundary_end(void) {
+  if (interrupt_ipsr() != 0U || !g_photodiode_boundary_open ||
+      g_photodiode_service_running) __builtin_trap();
+  g_photodiode_boundary_open = false;
+  // Do not clear pending here: a return may have arrived after the launch while
+  // a CLOCKS interrupt delayed foreground. Its GPIO pending state belongs to it.
+  dmb_barrier();
+  NVIC_ENABLE_IRQ(PHOTODIODE_IRQ);
+}
+
 bool interrupt_photodiode_level_high(void) {
   return (GPIO2_PSR & PHOTODIODE_GPIO2_MASK) != 0U;
 }
@@ -4202,8 +4249,7 @@ static bool handoff_any_pending(void) {
          capture_ring_pending(g_ch2_capture_ring) != 0U ||
          capture_ring_pending(g_ocxo1_capture_ring) != 0U ||
          capture_ring_pending(g_ocxo2_capture_ring) != 0U ||
-         capture_ring_pending(g_pps_capture_ring) != 0U ||
-         g_photodiode_handoff_pending;
+         capture_ring_pending(g_pps_capture_ring) != 0U;
 }
 
 static void interrupt_handoff_request_isr(uint32_t request_dwt) {
@@ -4935,46 +4981,6 @@ static void recover_capture_overruns(void) {
   }
 }
 
-static bool process_photodiode_handoff_one(void) {
-  if (!g_photodiode_handoff_pending) return false;
-  dmb_barrier();
-
-  const photodiode_handoff_packet_t packet = g_photodiode_handoff_packet;
-  dmb_barrier();
-  g_photodiode_handoff_pending = false;
-  g_photodiode_handoff_dequeue_count++;
-  dmb_barrier();
-
-  if (!g_photodiode_subscription.active) {
-    g_photodiode_subscription.diag.inactive_edge_count++;
-    return true;
-  }
-
-  const interrupt_photodiode_edge_fn callback =
-      g_photodiode_subscription.callback;
-  void* const user_data = g_photodiode_subscription.user_data;
-  if (!interrupt_callback_address_executable((uintptr_t)callback)) {
-    g_photodiode_subscription.diag.callback_missing_count++;
-    return true;
-  }
-
-  const uint32_t callback_start_dwt = ARM_DWT_CYCCNT;
-  g_photodiode_subscription.diag.callback_count++;
-  callback(packet.edge, g_photodiode_subscription.diag, user_data);
-  const uint32_t callback_cycles = ARM_DWT_CYCCNT - callback_start_dwt;
-  interrupt_photodiode_diag_t& diag = g_photodiode_subscription.diag;
-  diag.last_callback_wall_cycles = callback_cycles;
-  if (diag.min_callback_wall_cycles == 0U ||
-      callback_cycles < diag.min_callback_wall_cycles) {
-    diag.min_callback_wall_cycles = callback_cycles;
-  }
-  if (callback_cycles > diag.max_callback_wall_cycles) {
-    diag.max_callback_wall_cycles = callback_cycles;
-  }
-  return true;
-}
-
-
 static bool handoff_drain_one_oldest(void) {
   enum source_t : uint8_t {
     SRC_NONE,
@@ -5152,13 +5158,7 @@ static void interrupt_handoff_service_isr(void) {
     ++drained;
   }
 
-  // Optical continuation is deliberately last. It closes the current race;
-  // PHOTONS defers the next DRV200 launch through foreground TimePop dispatch
-  // after the post-race holdoff. No scheduler mutation occurs in this tier.
-  if (drained < INTERRUPT_HANDOFF_DRAIN_BUDGET &&
-      process_photodiode_handoff_one()) {
-    ++drained;
-  }
+  // Optical capture is serviced independently in foreground.
   recover_capture_overruns();
   if (handoff_any_pending()) {
     g_interrupt_handoff.drain_budget_exhausted_count++;
@@ -5547,53 +5547,58 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
       interrupt_execution_source_t::PPS, isr_entry_dwt_raw, arrival);
 }
 
-static void process_interrupt_photodiode_gpio_irq_observed(
-    uint32_t isr_entry_dwt_raw,
-    const interrupt_arrival_observation_t* arrival);
+static void photodiode_raw_push(uint32_t entry_dwt,
+                                const interrupt_arrival_capture_t& arrival,
+                                photodiode_capture_kind_t kind) {
+  // This producer is the physical ISR, or an explicitly serialized synthetic
+  // injection. Inactive external edges need no queue or application processing.
+  g_photodiode_subscription.diag.irq_count++;
+  if (!g_photodiode_subscription.active) {
+    g_photodiode_subscription.diag.inactive_edge_count++;
+    return;
+  }
+  const uint32_t head = __atomic_load_n(&g_photodiode_raw_head, __ATOMIC_RELAXED);
+  const uint32_t tail = __atomic_load_n(&g_photodiode_raw_tail, __ATOMIC_ACQUIRE);
+  if ((uint32_t)(head - tail) >= PHOTODIODE_RAW_CAPACITY) {
+    g_photodiode_raw_overflow_count++;
+    __builtin_trap(); // loss of captured evidence is a system integrity failure
+  }
+  auto& packet = g_photodiode_raw[head & (PHOTODIODE_RAW_CAPACITY - 1U)];
+  packet.entry_dwt = entry_dwt;
+  packet.arrival = arrival;
+  packet.pps_sequence = g_last_pps_witness_valid ? g_last_pps_witness.sequence : 0U;
+  packet.binding_generation = g_photodiode_subscription.binding_generation;
+  packet.basepri = interrupt_basepri();
+  packet.primask = interrupt_primask();
+  packet.ipsr = interrupt_ipsr();
+  packet.kind = kind;
+  __atomic_store_n(&g_photodiode_raw_head, head + 1U, __ATOMIC_RELEASE);
+}
 
 static void photodiode_gpio2_isr(void) {
-  // Dedicated GPIO2[29] Priority-48 entry.  Capture DWT before defusing the
-  // peripheral flag.  If a higher CLOCKS tier held the CPU while this edge was
-  // pending, its predecessor latch is consumed here and attached to the optical
-  // endpoint; no clock endpoint can ever wait behind this ISR.
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;
   const interrupt_arrival_capture_t arrival_capture =
-      interrupt_delay_capture_entry_fast(
-          interrupt_execution_source_t::PHOTODIODE);
+      interrupt_delay_capture_entry_fast(interrupt_execution_source_t::PHOTODIODE);
   interrupt_isr_diag_enter(
       g_interrupt_priority_runtime.photodiode, isr_entry_dwt_raw);
-
   const uint32_t status =
       GPIO2_ISR & GPIO2_IMR & PHOTODIODE_GPIO2_HIGH_HALF_MASK;
   if ((status & PHOTODIODE_GPIO2_MASK) == 0U ||
       (status & (PHOTODIODE_GPIO2_HIGH_HALF_MASK &
-                 ~PHOTODIODE_GPIO2_MASK)) != 0U) {
-    __builtin_trap();
-  }
+                 ~PHOTODIODE_GPIO2_MASK)) != 0U) __builtin_trap();
   GPIO2_ISR = PHOTODIODE_GPIO2_MASK;
   dmb_barrier();
-
-  const interrupt_arrival_observation_t arrival =
-      interrupt_delay_classify_entry(
-          interrupt_execution_source_t::PHOTODIODE,
-          isr_entry_dwt_raw,
-          arrival_capture);
-  process_interrupt_photodiode_gpio_irq_observed(
-      isr_entry_dwt_raw, &arrival);
-
+  photodiode_raw_push(isr_entry_dwt_raw, arrival_capture,
+                      photodiode_capture_kind_t::PHYSICAL);
   const bool preempted_after_entry =
       g_interrupt_priority_runtime.photodiode.preempted_during_current_entry;
   interrupt_isr_diag_exit(
       g_interrupt_priority_runtime.photodiode, isr_entry_dwt_raw);
-  interrupt_photodiode_diag_t& diag = g_photodiode_subscription.diag;
-  diag.last_isr_wall_cycles =
-      g_interrupt_priority_runtime.photodiode.last_wall_cycles;
-  if (diag.last_isr_wall_cycles > diag.max_isr_wall_cycles) {
+  auto& diag = g_photodiode_subscription.diag;
+  diag.last_isr_wall_cycles = g_interrupt_priority_runtime.photodiode.last_wall_cycles;
+  if (diag.last_isr_wall_cycles > diag.max_isr_wall_cycles)
     diag.max_isr_wall_cycles = diag.last_isr_wall_cycles;
-  }
-  if (preempted_after_entry) {
-    diag.preempted_after_entry_count++;
-  }
+  if (preempted_after_entry) diag.preempted_after_entry_count++;
 }
 
 static void pps_gpio_isr(void) {
@@ -5784,6 +5789,15 @@ uint32_t interrupt_recover_publication_custody_reset_count(void) {
 // High-rate PD200T comparator subscription
 // ============================================================================
 
+static bool photodiode_foreground_ready(void*) {
+  return __atomic_load_n(&g_photodiode_raw_head, __ATOMIC_ACQUIRE) !=
+      __atomic_load_n(&g_photodiode_raw_tail, __ATOMIC_RELAXED);
+}
+
+static void photodiode_foreground_service(void*) {
+  interrupt_photodiode_service_pending();
+}
+
 bool interrupt_photodiode_subscribe(
     const interrupt_photodiode_subscription_t& subscription) {
   if (!g_interrupt_runtime_ready || !subscription.on_edge ||
@@ -5791,6 +5805,12 @@ bool interrupt_photodiode_subscribe(
     return false;
   }
 
+  if (interrupt_ipsr() != 0U) __builtin_trap();
+  if (!g_photodiode_service_registered) {
+    timepop_register_foreground_service(
+        photodiode_foreground_ready, photodiode_foreground_service, nullptr);
+    g_photodiode_service_registered = true;
+  }
   const uint32_t prior = interrupt_priority0_guard_enter();
   g_photodiode_subscription.binding_generation++;
   if (g_photodiode_subscription.binding_generation == 0U) {
@@ -5829,27 +5849,28 @@ bool interrupt_photodiode_snapshot(interrupt_photodiode_diag_t* out) {
   return true;
 }
 
-static void process_interrupt_photodiode_gpio_irq_observed(
-    uint32_t isr_entry_dwt_raw,
-    const interrupt_arrival_observation_t* arrival) {
+static void photodiode_deliver_raw(const photodiode_raw_packet_t& packet) {
+  const uint32_t isr_entry_dwt_raw = packet.entry_dwt;
+  const interrupt_arrival_observation_t classified =
+      packet.kind == photodiode_capture_kind_t::PHYSICAL
+          ? interrupt_delay_classify_entry(interrupt_execution_source_t::PHOTODIODE,
+                                           packet.entry_dwt, packet.arrival)
+          : interrupt_arrival_observation_t{};
   interrupt_photodiode_diag_t& diag = g_photodiode_subscription.diag;
   diag.kind = PHOTODIODE_DESCRIPTOR.kind;
   diag.provider = PHOTODIODE_DESCRIPTOR.provider;
   diag.lane = PHOTODIODE_DESCRIPTOR.lane;
   diag.subscribed = g_photodiode_subscription.subscribed;
   diag.active = g_photodiode_subscription.active;
-  diag.irq_count++;
   diag.source_pin = (uint32_t)PHOTODIODE_EDGE_PIN;
   diag.last_isr_entry_dwt_raw = isr_entry_dwt_raw;
   diag.isr_entry_to_edge_correction_cycles =
       PHOTODIODE_ISR_ENTRY_TO_EDGE_CORRECTION_CYCLES;
-  diag.last_isr_entry_basepri = interrupt_basepri();
-  diag.last_isr_entry_primask = interrupt_primask();
-  diag.last_isr_entry_ipsr = interrupt_ipsr();
+  diag.last_isr_entry_basepri = packet.basepri;
+  diag.last_isr_entry_primask = packet.primask;
+  diag.last_isr_entry_ipsr = packet.ipsr;
 
-  const interrupt_delay_forensics_t endpoint_delay = arrival
-      ? arrival->delay
-      : interrupt_delay_forensics_t{};
+  const interrupt_delay_forensics_t endpoint_delay = classified.delay;
   diag.last_entry_delay_valid = endpoint_delay.valid;
   diag.last_entry_delay_verdict = endpoint_delay.verdict;
   diag.last_entry_delayed_by = endpoint_delay.delayed_by;
@@ -5891,8 +5912,7 @@ static void process_interrupt_photodiode_gpio_irq_observed(
             (uint32_t)(-PHOTODIODE_ISR_ENTRY_TO_EDGE_CORRECTION_CYCLES)
       : isr_entry_dwt_raw +
             (uint32_t)PHOTODIODE_ISR_ENTRY_TO_EDGE_CORRECTION_CYCLES;
-  edge.pps_sequence =
-      g_last_pps_witness_valid ? g_last_pps_witness.sequence : 0U;
+  edge.pps_sequence = packet.pps_sequence;
   edge.interrupt_delay = endpoint_delay;
 
   diag.last_sequence = edge.sequence;
@@ -5912,28 +5932,51 @@ static void process_interrupt_photodiode_gpio_irq_observed(
   }
   g_photodiode_subscription.previous_dwt_at_edge = edge.dwt_at_edge;
 
-  if (!g_photodiode_subscription.active) {
+  // A subscription generation change invalidates delivery, never rebinds old
+  // evidence to a new callback. Preserve the discard explicitly in diagnostics.
+  if (!g_photodiode_subscription.active ||
+      packet.binding_generation != g_photodiode_subscription.binding_generation) {
+    const uint32_t prior = interrupt_priority0_guard_enter();
     diag.inactive_edge_count++;
+    interrupt_priority0_guard_exit(prior);
     return;
   }
+  const interrupt_photodiode_edge_fn callback = g_photodiode_subscription.callback;
+  if (!interrupt_callback_address_executable((uintptr_t)callback)) __builtin_trap();
+  const uint32_t callback_start_dwt = ARM_DWT_CYCCNT;
+  diag.callback_count++;
+  callback(edge, diag, g_photodiode_subscription.user_data);
+  const uint32_t callback_cycles = ARM_DWT_CYCCNT - callback_start_dwt;
+  diag.last_callback_wall_cycles = callback_cycles;
+  if (diag.min_callback_wall_cycles == 0U || callback_cycles < diag.min_callback_wall_cycles)
+    diag.min_callback_wall_cycles = callback_cycles;
+  if (callback_cycles > diag.max_callback_wall_cycles)
+    diag.max_callback_wall_cycles = callback_cycles;
+}
 
-  if (g_photodiode_handoff_pending) {
-    g_photodiode_handoff_busy_drop_count++;
-    return;
+void interrupt_photodiode_service_pending(void) {
+  if (interrupt_ipsr() != 0U || interrupt_basepri() != 0U ||
+      interrupt_primask() != 0U || g_photodiode_service_running) __builtin_trap();
+  g_photodiode_service_running = true;
+  const uint32_t stop = __atomic_load_n(&g_photodiode_raw_head, __ATOMIC_ACQUIRE);
+  uint32_t tail = __atomic_load_n(&g_photodiode_raw_tail, __ATOMIC_RELAXED);
+  if ((uint32_t)(stop - tail) > PHOTODIODE_RAW_CAPACITY) __builtin_trap();
+  // Fixed entry snapshot: a busy detector cannot make this service unbounded.
+  while (tail != stop) {
+    const photodiode_raw_packet_t packet =
+        g_photodiode_raw[tail & (PHOTODIODE_RAW_CAPACITY - 1U)];
+    __atomic_store_n(&g_photodiode_raw_tail, ++tail, __ATOMIC_RELEASE);
+    photodiode_deliver_raw(packet);
   }
-
-  g_photodiode_handoff_packet.edge = edge;
-  dmb_barrier();
-  g_photodiode_handoff_pending = true;
-  g_photodiode_handoff_enqueue_count++;
-  dmb_barrier();
-  interrupt_handoff_request_isr(isr_entry_dwt_raw);
+  g_photodiode_service_running = false;
 }
 
 void process_interrupt_photodiode_gpio_irq(uint32_t isr_entry_dwt_raw) {
-  // Deterministic synthetic-edge tests may call this custody boundary directly.
-  // They have no physical IRQ-entry ancestry, so delay testimony remains UNKNOWN.
-  process_interrupt_photodiode_gpio_irq_observed(isr_entry_dwt_raw, nullptr);
+  // Test injection must serialize with the sole physical producer.
+  const uint32_t prior = interrupt_priority0_guard_enter();
+  photodiode_raw_push(isr_entry_dwt_raw, interrupt_arrival_capture_t{},
+                      photodiode_capture_kind_t::SYNTHETIC);
+  interrupt_priority0_guard_exit(prior);
 }
 
 // ============================================================================
@@ -6807,11 +6850,11 @@ FLASHMEM void process_interrupt_init(void) {
   g_photodiode_subscription.diag.source_pin = (uint32_t)PHOTODIODE_EDGE_PIN;
   g_photodiode_subscription.diag.isr_entry_to_edge_correction_cycles =
       PHOTODIODE_ISR_ENTRY_TO_EDGE_CORRECTION_CYCLES;
-  g_photodiode_handoff_packet = photodiode_handoff_packet_t{};
-  g_photodiode_handoff_pending = false;
-  g_photodiode_handoff_enqueue_count = 0U;
-  g_photodiode_handoff_dequeue_count = 0U;
-  g_photodiode_handoff_busy_drop_count = 0U;
+  g_photodiode_raw_head = 0U;
+  g_photodiode_raw_tail = 0U;
+  g_photodiode_raw_overflow_count = 0U;
+  g_photodiode_service_running = false;
+  g_photodiode_boundary_open = false;
   g_interrupt_foreground_forensics =
       interrupt_foreground_forensic_runtime_t{};
   g_interrupt_foreground_forensic_live =
@@ -7128,6 +7171,8 @@ static FLASHMEM void add_photodiode_report(Payload& payload,
   add_u32("callback_count", diag.callback_count);
   add_u32("callback_missing_count", diag.callback_missing_count);
   add_u32("inactive_edge_count", diag.inactive_edge_count);
+  add_u32("boundary_packet_discard_count", g_photodiode_boundary_packet_discard_count);
+  add_u32("boundary_gpio_clear_count", g_photodiode_boundary_gpio_clear_count);
   add_u32("last_sequence", diag.last_sequence);
   add_u32("last_pps_sequence", diag.last_pps_sequence);
   add_u32("last_isr_entry_dwt_raw", diag.last_isr_entry_dwt_raw);
@@ -7188,7 +7233,14 @@ static FLASHMEM void add_photodiode_report(Payload& payload,
            photodiode_gpio2_route_readback_all_match());
   add_bool("physical_level_high", interrupt_photodiode_level_high());
   add_string("delay_direction", "CLOCKS_CAN_DELAY_PHOTODIODE_ONLY");
-  add_string("dispatch_class", "SYNCHRONOUS_LOW_PRIORITY_ISR_SAFE_CALLBACK");
+  add_string("dispatch_class", "RAW_CAPTURE_TO_FOREGROUND");
+  add_u32("raw_queue_capacity", PHOTODIODE_RAW_CAPACITY);
+  const uint32_t head = __atomic_load_n(&g_photodiode_raw_head, __ATOMIC_ACQUIRE);
+  const uint32_t tail = __atomic_load_n(&g_photodiode_raw_tail, __ATOMIC_RELAXED);
+  add_u32("raw_queue_enqueued", head);
+  add_u32("raw_queue_dequeued", tail);
+  add_u32("raw_queue_pending", head - tail);
+  add_u32("raw_queue_overflow_count", g_photodiode_raw_overflow_count);
 }
 
 static FLASHMEM Payload cmd_report_photodiode(const Payload&) {
