@@ -1295,8 +1295,8 @@ bool interrupt_photodiode_subscribe(
     const interrupt_photodiode_subscription_t& subscription);
 void interrupt_photodiode_unsubscribe(void);
 
-// Coherent enough for foreground reporting: the photodiode callback updates this
-// scalar diagnostic surface monotonically from its single GPIO source.
+// Copies GPIO/continuation diagnostics under the existing Priority-0-preserving
+// guard. Foreground report construction uses the returned value after release.
 bool interrupt_photodiode_snapshot(interrupt_photodiode_diag_t* out);
 
 // Authoritative ambient level for the remapped detector pin.  Pin 34 is moved
@@ -1459,6 +1459,10 @@ bool interrupt_clock_snapshot(interrupt_subscriber_kind_t kind,
 uint32_t interrupt_clock32_from_ns(uint64_t ns);
 bool     interrupt_clock32_zero_from_ns(interrupt_subscriber_kind_t kind,
                                         uint64_t ns);
+// VCLOCK compatibility request: foreground is the sole producer; continuation
+// consumes the immutable value at a heartbeat. A second request before that
+// handoff completes is an integrity violation. OCXO calls remain compatibility
+// no-ops; their epochs use the explicit grid-rephase transaction instead.
 bool     interrupt_clock32_request_zero_from_ns(interrupt_subscriber_kind_t kind,
                                                 uint64_t ns);
 

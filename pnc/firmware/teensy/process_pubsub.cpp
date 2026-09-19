@@ -50,26 +50,6 @@ static constexpr pubsub_static_route_t STATIC_ROUTES[] = {
 static constexpr size_t STATIC_ROUTE_COUNT =
     sizeof(STATIC_ROUTES) / sizeof(STATIC_ROUTES[0]);
 
-static Payload g_routes;
-static bool g_routes_ready = false;
-
-static void ensure_static_routes(void) {
-  if (g_routes_ready) return;
-
-  PayloadArray routes;
-  for (size_t i = 0; i < STATIC_ROUTE_COUNT; i++) {
-    Payload edge;
-    edge.add("machine", STATIC_ROUTES[i].machine);
-    edge.add("subsystem", STATIC_ROUTES[i].subsystem);
-    edge.add("topic", STATIC_ROUTES[i].topic);
-    routes.add(edge);
-  }
-
-  g_routes.clear();
-  g_routes.add_array("routes", routes);
-  g_routes_ready = true;
-}
-
 // ================================================================
 // Ingress: publications arriving from Pi (DATA PLANE ONLY)
 // ================================================================
@@ -99,7 +79,6 @@ void process_pubsub_fanout(
   const Payload& payload
 ) {
   if (!topic || !*topic) return;
-  ensure_static_routes();
 
   // The canonical route graph above currently contains no TEENSY recipients.
   // Keep this entry point because publish() and Pi-origin data-plane ingress are
@@ -144,8 +123,21 @@ static Payload cmd_publish(const Payload& args) {
 // REPORT — expose execution truth (Cartesian edge list)
 // ------------------------------------------------------------
 static Payload cmd_report(const Payload&) {
-  ensure_static_routes();
-  return g_routes;
+  // The constant table is the only persistent route authority. Each report
+  // owns its complete construction; registration and fan-out need no Payload
+  // cache or lazy initialization shared with this command.
+  PayloadArray routes;
+  for (size_t i = 0; i < STATIC_ROUTE_COUNT; i++) {
+    Payload edge;
+    edge.add("machine", STATIC_ROUTES[i].machine);
+    edge.add("subsystem", STATIC_ROUTES[i].subsystem);
+    edge.add("topic", STATIC_ROUTES[i].topic);
+    routes.add(edge);
+  }
+
+  Payload out;
+  out.add_array("routes", routes);
+  return out;
 }
 
 // ================================================================
@@ -164,6 +156,5 @@ static const process_vtable_t PUBSUB_PROCESS = {
 };
 
 void process_pubsub_register(void) {
-  ensure_static_routes();
   process_register("PUBSUB", &PUBSUB_PROCESS);
 }

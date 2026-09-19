@@ -530,10 +530,10 @@ struct photodiode_subscription_runtime_t {
 static photodiode_subscription_runtime_t g_photodiode_subscription{};
 
 // LANTERN V1.0: the physical Priority-48 ISR authors one immutable optical edge
-// fact and pends the existing Priority-32 continuation.  The continuation invokes
-// the PHOTODIODE subscriber.  Because the next optical launch is authored only by
-// that continuation, one outstanding edge is sufficient; comparator chatter while
-// the first edge is in custody is counted and discarded rather than queued.
+// fact and pends the existing Priority-32 continuation. The continuation invokes
+// the PHOTODIODE subscriber; foreground owns the next optical launch after the
+// completed-race handoff and holdoff. One outstanding edge is sufficient;
+// comparator chatter while that edge is in custody is counted and discarded.
 struct photodiode_handoff_packet_t {
   interrupt_photodiode_edge_t edge{};
 };
@@ -622,7 +622,7 @@ static void synthetic_clock_birth(synthetic_clock32_t& clock,
   clock.current_counter32 = (uint32_t)hardware16;
   clock.current_ns = (uint64_t)hardware16 * 100ULL;
   clock.hardware16 = hardware16;
-  clock.pending_zero = false;
+  __atomic_store_n(&clock.pending_zero, false, __ATOMIC_RELEASE);
 }
 
 static void synthetic_clock_zero(synthetic_clock32_t& clock, uint64_t ns) {
@@ -633,7 +633,7 @@ static void synthetic_clock_zero(synthetic_clock32_t& clock, uint64_t ns) {
   clock.current_ns = ns;
   clock.hardware16 = (uint16_t)clock.current_counter32;
   clock.zero_count++;
-  clock.pending_zero = false;
+  __atomic_store_n(&clock.pending_zero, false, __ATOMIC_RELEASE);
 }
 
 static void vclock_anchor_hardware(uint32_t counter32, uint16_t hardware16) {
@@ -2389,10 +2389,16 @@ bool interrupt_clock32_zero_from_ns(interrupt_subscriber_kind_t kind,
 bool interrupt_clock32_request_zero_from_ns(interrupt_subscriber_kind_t kind,
                                             uint64_t ns) {
   if (kind == interrupt_subscriber_kind_t::VCLOCK) {
-    g_vclock_clock32.pending_zero = true;
+    // Foreground owns this request slot until release publication. Continuation
+    // owns it afterward; a second request may not overwrite an unconsumed value.
+    if (interrupt_ipsr() != 0U ||
+        __atomic_load_n(&g_vclock_clock32.pending_zero, __ATOMIC_ACQUIRE)) {
+      __builtin_trap();
+    }
     g_vclock_clock32.pending_zero_ns = ns;
     g_vclock_clock32.pending_zero_counter32 = clock32_from_ns(ns);
     g_vclock_clock32.pending_zero_count++;
+    __atomic_store_n(&g_vclock_clock32.pending_zero, true, __ATOMIC_RELEASE);
     return true;
   }
   // OCXO epoch changes are coherent foreground transactions, never deferred
@@ -2427,7 +2433,7 @@ void interrupt_ocxo_logical_grid_epoch(uint32_t ocxo1_epoch_counter32,
     clock.current_counter32 = install.epoch;
     clock.current_ns = (uint64_t)install.epoch * 100ULL;
     clock.hardware16 = hardware16;
-    clock.pending_zero = false;
+    __atomic_store_n(&clock.pending_zero, false, __ATOMIC_RELEASE);
     ocxo_reset_target_grid(lane, clock);
     lane.previous_event_valid = false;
     lane.previous_event_counter32 = 0U;
@@ -4571,9 +4577,10 @@ static void process_vclock_packet(const vclock_capture_packet_t& packet) {
   g_vclock_lane.last_dwt_at_edge = dwt_at_edge;
 
   uint32_t next = captured_target + VCLOCK_INTERVAL_COUNTS;
-  if (g_vclock_clock32.pending_zero) {
+  if (__atomic_load_n(&g_vclock_clock32.pending_zero, __ATOMIC_ACQUIRE)) {
     const uint64_t ns = g_vclock_clock32.pending_zero_ns;
-    g_vclock_clock32.pending_zero = false;
+    // synthetic_clock_zero acknowledges only after copying the request into
+    // the installed clock. Foreground cannot preempt this continuation.
     synthetic_clock_zero(g_vclock_clock32, ns);
     g_vclock_clock32.hardware_low16_at_zero = target_low16;
     vclock_anchor_hardware(g_vclock_clock32.zero_counter32, target_low16);
@@ -4930,6 +4937,7 @@ static void recover_capture_overruns(void) {
 
 static bool process_photodiode_handoff_one(void) {
   if (!g_photodiode_handoff_pending) return false;
+  dmb_barrier();
 
   const photodiode_handoff_packet_t packet = g_photodiode_handoff_packet;
   dmb_barrier();
@@ -4976,32 +4984,46 @@ static bool handoff_drain_one_oldest(void) {
     SRC_OCXO2,
     SRC_PPS,
   };
+  // All five ring producers preempt this consumer. Fix the eligible capture
+  // boundary before scanning: an ISR may populate an already-inspected ring
+  // and then a later ring, but neither new packet may overtake that first one.
+  // Higher-priority producers finish publication before this consumer resumes.
+  const uint32_t captured_through =
+      __atomic_load_n(&g_interrupt_capture_sequence, __ATOMIC_ACQUIRE);
   source_t source = SRC_NONE;
-  uint32_t best = UINT32_MAX;
+  uint32_t best = 0U;
   uint32_t sequence = 0U;
 
+  // Serial-number comparisons include UINT32_MAX and zero across wrap. Pending
+  // captures must be serviced within half the 32-bit sequence space.
+
   if (capture_ring_peek_sequence(g_vclock_capture_ring, sequence) &&
-      sequence < best) {
+      (int32_t)(sequence - captured_through) <= 0 &&
+      (source == SRC_NONE || (int32_t)(sequence - best) < 0)) {
     best = sequence;
     source = SRC_VCLOCK;
   }
   if (capture_ring_peek_sequence(g_ch2_capture_ring, sequence) &&
-      sequence < best) {
+      (int32_t)(sequence - captured_through) <= 0 &&
+      (source == SRC_NONE || (int32_t)(sequence - best) < 0)) {
     best = sequence;
     source = SRC_CH2;
   }
   if (capture_ring_peek_sequence(g_ocxo1_capture_ring, sequence) &&
-      sequence < best) {
+      (int32_t)(sequence - captured_through) <= 0 &&
+      (source == SRC_NONE || (int32_t)(sequence - best) < 0)) {
     best = sequence;
     source = SRC_OCXO1;
   }
   if (capture_ring_peek_sequence(g_ocxo2_capture_ring, sequence) &&
-      sequence < best) {
+      (int32_t)(sequence - captured_through) <= 0 &&
+      (source == SRC_NONE || (int32_t)(sequence - best) < 0)) {
     best = sequence;
     source = SRC_OCXO2;
   }
   if (capture_ring_peek_sequence(g_pps_capture_ring, sequence) &&
-      sequence < best) {
+      (int32_t)(sequence - captured_through) <= 0 &&
+      (source == SRC_NONE || (int32_t)(sequence - best) < 0)) {
     best = sequence;
     source = SRC_PPS;
   }
