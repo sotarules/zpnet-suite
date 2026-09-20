@@ -7711,6 +7711,21 @@ def _state_loop() -> None:
                         rejection.get("schema") or "unknown",
                         rejection.get("reason") or "structural/accounting court failure",
                     )
+                    # Rejected testimony never reaches Postgres. Preserve its
+                    # received values and types without coercion or repair.
+                    # Chunk the representation to avoid oversized journal lines;
+                    # concatenate parts in order to recover the full fragment.
+                    raw_fragment = repr(fragment)
+                    chunk_size = 1024
+                    part_count = (len(raw_fragment) + chunk_size - 1) // chunk_size
+                    for offset in range(0, len(raw_fragment), chunk_size):
+                        logging.error(
+                            "[photons/rejected-fragment] sequence=%s part=%d/%d raw=%s",
+                            rejection.get("sequence"),
+                            offset // chunk_size + 1,
+                            part_count,
+                            raw_fragment[offset:offset + chunk_size],
+                        )
                     continue
 
                 with _state_lock:
@@ -8869,135 +8884,6 @@ def cmd_truncate(_: Optional[dict]) -> Dict[str, Any]:
         int(ingress_drained),
         int(persist_drained),
         bool(result["server_truncate_success"]),
-    )
-    return {"success": True, "message": "OK", "payload": result}
-
-
-def cmd_set_lap_baseline_ns(args: Optional[dict]) -> Dict[str, Any]:
-    """Persist and realize one operator-authored LAP_BASELINE_NS reference."""
-    global _lap_baseline_ns
-    global _lap_baseline_fs
-    global _standard_lap_ns
-    global _standard_lap_ps
-    global _teensy_standard_configured
-    global _lap_baseline_set_count
-    global _last_maintenance
-
-    busy = _campaign_control_gate("SET_LAP_BASELINE_NS")
-    if busy is not None:
-        return busy
-
-    raw = (args or {}).get("ns")
-    if raw is None:
-        raw = (args or {}).get("lap_baseline_ns")
-    if raw is None:
-        return {"success": False, "message": "SET_LAP_BASELINE_NS requires ns=<nanoseconds>"}
-    try:
-        baseline_text, baseline_fs = _normalize_lap_baseline_ns(
-            raw, path="SET_LAP_BASELINE_NS.ns"
-        )
-        standard_text, standard_ps = _compat_standard_from_baseline_fs(baseline_fs)
-    except Exception as exc:
-        return {"success": False, "message": str(exc)}
-
-    requested_at = _utc_now_z()
-    with _maintenance_lock:
-        # Persist desired reference first. If transport realization is interrupted,
-        # the next PHOTONS process start converges the Teensy from config.PHOTONS.
-        try:
-            with open_db() as conn:
-                cur = conn.cursor()
-                cur.execute(
-                    """
-                    UPDATE config
-                    SET payload = payload || jsonb_build_object(
-                        'lap_baseline_ns', %s::text,
-                        'lap_baseline_fs', %s::bigint,
-                        'lap_baseline_source', 'OPERATOR',
-                        'lap_baseline_updated_at_utc', %s::text
-                    )
-                    WHERE config_key = 'PHOTONS'
-                    """,
-                    (baseline_text, baseline_fs, requested_at),
-                )
-                if cur.rowcount != 1:
-                    raise RuntimeError("config.PHOTONS LAP_BASELINE_NS update did not affect exactly one row")
-        except Exception as exc:
-            logging.exception("❌ [photons] SET_LAP_BASELINE_NS persistence failed")
-            return {"success": False, "message": str(exc)}
-
-        try:
-            response = send_command(
-                machine="TEENSY",
-                subsystem=SUBSYSTEM,
-                command="SET_LAP_BASELINE_NS",
-                args={"lap_baseline_ns": baseline_text},
-            )
-            payload = response.get("payload") if isinstance(response, dict) else None
-            if (
-                not isinstance(response, dict)
-                or not response.get("success")
-                or not isinstance(payload, dict)
-                or payload.get("status") != "lap_baseline_set"
-            ):
-                raise RuntimeError(f"Teensy PHOTONS.SET_LAP_BASELINE_NS rejected: {response!r}")
-            echoed_fs = _require_int(
-                payload.get("lap_baseline_fs"),
-                "PHOTONS.SET_LAP_BASELINE_NS.payload.lap_baseline_fs",
-                minimum=1,
-            )
-            if echoed_fs != baseline_fs:
-                raise RuntimeError(
-                    f"Teensy LAP_BASELINE_NS echo mismatch: requested_fs={baseline_fs} echoed_fs={echoed_fs}"
-                )
-        except Exception as exc:
-            failure = {
-                "action": "SET_LAP_BASELINE_NS",
-                "requested_at_utc": requested_at,
-                "success": False,
-                "config_persisted": True,
-                "producer_realized": False,
-                "lap_baseline_ns": baseline_text,
-                "lap_baseline_fs": baseline_fs,
-                "error": str(exc),
-                "recovery_action": "retry command or restart PHOTONS to converge from config.PHOTONS",
-            }
-            with _state_lock:
-                _last_maintenance = copy.deepcopy(failure)
-            logging.exception("⚠️ [photons] LAP_BASELINE_NS persisted but Teensy realization failed")
-            return {"success": False, "message": str(exc), "payload": failure}
-
-        previous_text = _lap_baseline_ns
-        previous_fs = _lap_baseline_fs
-        _lap_baseline_ns = baseline_text
-        _lap_baseline_fs = baseline_fs
-        _standard_lap_ns = standard_text
-        _standard_lap_ps = standard_ps
-        _teensy_standard_configured = True
-
-    result = {
-        "action": "SET_LAP_BASELINE_NS",
-        "requested_at_utc": requested_at,
-        "success": True,
-        "changed": previous_fs != baseline_fs,
-        "previous_lap_baseline_ns": previous_text,
-        "previous_lap_baseline_fs": previous_fs,
-        "lap_baseline_ns": baseline_text,
-        "lap_baseline_fs": baseline_fs,
-        "config_key": "PHOTONS",
-        "config_field": "lap_baseline_ns",
-        "producer_realized": True,
-        "physical_measurement_unchanged": True,
-        "welford_preserved": True,
-        "better_buckets_history_preserved": True,
-        "effect": "REFERENCE_ONLY_NEXT_FRAGMENT_RECOMPUTES_PPB_AND_RESIDUALS",
-    }
-    with _state_lock:
-        _lap_baseline_set_count += 1
-        _last_maintenance = copy.deepcopy(result)
-    logging.warning(
-        "📐 [photons] LAP_BASELINE_NS %s -> %s ns (%d fs); physical N/T and Better-Buckets custody preserved",
-        previous_text or "UNSET", baseline_text, baseline_fs,
     )
     return {"success": True, "message": "OK", "payload": result}
 

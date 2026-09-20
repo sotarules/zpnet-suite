@@ -110,8 +110,11 @@ static constexpr uint64_t PHOTONS_PULSE_DEFAULT_NS = 1000ULL;
 
 // Laser cadence is independent of detector arrivals and campaign recording.
 static constexpr uint64_t PHOTONS_RACE_PULSE_NS = 200ULL;
-static constexpr uint64_t PHOTONS_CADENCE_DEFAULT_NS = 10000ULL;
+
+static constexpr uint64_t PHOTONS_CADENCE_MIN_NS = 10000ULL;
+static constexpr uint64_t PHOTONS_CADENCE_DEFAULT_NS = 1000000ULL;
 static constexpr uint64_t PHOTONS_CADENCE_MAX_NS = 1000000000ULL;
+
 static constexpr uint32_t PHOTONS_RACE_HOLDOFF_NS = 0U; // retired wire field
 static timepop_handle_t g_photons_cadence_timer = TIMEPOP_INVALID_HANDLE;
 static uint64_t g_photons_cadence_ns = PHOTONS_CADENCE_DEFAULT_NS;
@@ -6704,7 +6707,7 @@ static FLASHMEM Payload cmd_photons_start(const Payload& args) {
   const photons_foreground_custody_t custody(photons_foreground_owner_t::COMMAND);
   uint64_t interval_ns = g_photons_cadence_ns;
   if ((args.has("interval") && !args.tryGetUInt64("interval", interval_ns)) ||
-      interval_ns < PHOTONS_CADENCE_DEFAULT_NS || interval_ns > PHOTONS_CADENCE_MAX_NS) {
+      interval_ns < PHOTONS_CADENCE_MIN_NS || interval_ns > PHOTONS_CADENCE_MAX_NS) {
     Payload p;
     p.add("status", "photons_start_rejected_interval");
     p.add("error", "interval must be integer nanoseconds in 10000..1000000000");

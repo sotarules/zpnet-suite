@@ -1884,6 +1884,63 @@ def _photons_instrument_stats(payload: dict | None) -> dict | None:
     }
 
 
+def _photons_fragment_stats(payload: dict | None) -> dict:
+    """Return the producer-authored statistics and counts for one cadence cell."""
+    root = _json_object(payload)
+    instrument = root.get("photons")
+    if not isinstance(instrument, dict):
+        raise ValueError("PHOTONS_FRAGMENT.photons is required")
+
+    race = instrument.get("race")
+    if not isinstance(race, dict):
+        raise ValueError("PHOTONS_FRAGMENT.photons.race is required")
+    if race.get("accounting") != "TIMEPOP_CADENCE_V1":
+        raise ValueError(
+            f"unsupported PHOTONS race accounting {race.get('accounting')!r}"
+        )
+
+    flight = race.get("flight_ns")
+    if not isinstance(flight, dict):
+        raise ValueError("PHOTONS_FRAGMENT.photons.race.flight_ns is required")
+
+    science = instrument.get("science")
+    if not isinstance(science, dict):
+        raise ValueError("PHOTONS_FRAGMENT.photons.science is required")
+    accepted = science.get("accepted")
+    excluded = science.get("excluded")
+    if not isinstance(accepted, dict) or not isinstance(excluded, dict):
+        raise ValueError("PHOTONS_FRAGMENT science counts are required")
+
+    values = {
+        "n": _to_int(flight.get("n")),
+        "mean": _to_float(flight.get("mean")),
+        "m2": _to_float(flight.get("m2")),
+        "stddev": _to_float(flight.get("stddev")),
+        "stderr": _to_float(flight.get("stderr")),
+        "accepted": _to_int(accepted.get("count_this_fragment")),
+        "excluded": _to_int(excluded.get("count_this_fragment")),
+        "missed": _to_int(race.get("missed_this_fragment")),
+    }
+    missing = [name for name, value in values.items() if value is None]
+    if missing:
+        raise ValueError(
+            "PHOTONS_FRAGMENT cadence testimony is missing " + ", ".join(missing)
+        )
+
+    projected = _to_int(instrument.get("projected_laps_this_fragment"))
+    if projected is None:
+        raise ValueError(
+            "PHOTONS_FRAGMENT.photons.projected_laps_this_fragment is required"
+        )
+    if values["n"] != projected:
+        raise ValueError(
+            "PHOTONS_FRAGMENT flight population disagrees with projected laps: "
+            f"flight_n={values['n']} projected={projected}"
+        )
+
+    return values
+
+
 def _photons_producer_ppb_buckets(payload: dict | None) -> dict[str, float | None]:
     """Return producer-authored PHOTONS PPB values without recomputation."""
     root = _json_object(payload)
@@ -2034,24 +2091,13 @@ def _get_photons_rolling_payloads() -> list[dict]:
 
 
 def _photons_rolling_rows(payloads: list[dict]) -> list[dict]:
-    """Return oldest-to-newest one-second populations from the live PHOTONS tail."""
+    """Return producer-authored cadence-cell populations from the live PHOTONS tail."""
     rows: list[dict] = []
 
-    for before, current in zip(payloads, payloads[1:]):
-        second_stats = _photons_population_delta(before, current)
-        if second_stats is None:
-            continue
+    for current in payloads:
+        second_stats = _photons_fragment_stats(current)
 
         instrument = current.get("photons") if isinstance(current.get("photons"), dict) else {}
-        science = instrument.get("science") if isinstance(instrument.get("science"), dict) else {}
-        accepted = science.get("accepted") if isinstance(science.get("accepted"), dict) else {}
-        excluded = science.get("excluded") if isinstance(science.get("excluded"), dict) else {}
-        accepted_this = _to_int(accepted.get("count_this_fragment"))
-        excluded_this = _to_int(excluded.get("count_this_fragment"))
-        if accepted_this is None:
-            accepted_this = _to_int(second_stats.get("accepted"))
-        if excluded_this is None:
-            excluded_this = _to_int(second_stats.get("excluded"))
 
         sequence = _to_int(current.get("sequence"))
         campaign = current.get("campaign") if isinstance(current.get("campaign"), dict) else {}
@@ -2073,8 +2119,9 @@ def _photons_rolling_rows(payloads: list[dict]) -> list[dict]:
             "campaign_id": campaign_id,
             "campaign": campaign.get("campaign"),
             "value_ns": second_stats.get("mean"),
-            "accepted": accepted_this,
-            "excluded": excluded_this,
+            "accepted": second_stats.get("accepted"),
+            "excluded": second_stats.get("excluded"),
+            "missed": second_stats.get("missed"),
             "ppb_10_min": producer_ppb.get("10_min"),
             "ppb_60_min": producer_ppb.get("60_min"),
             "ppb_8_hour": producer_ppb.get("8_hour"),
@@ -2142,17 +2189,13 @@ def photons_detail_readout() -> list[str]:
     if not payloads:
         return ["PHOTONS: FEED UNAVAILABLE"]
     live = payloads[-1]
-    summaries, campaign_error, recoverable_str = _PHOTONS_READ_MODEL.get()
+    _, campaign_error, recoverable_str = _PHOTONS_READ_MODEL.get()
 
     campaign = live.get("campaign") if isinstance(live.get("campaign"), dict) else {}
     lap_baseline_ns = _photons_lap_baseline_ns(live)
     lap_baseline_str = (
         f"{lap_baseline_ns:.6f} ns" if lap_baseline_ns is not None else "---"
     )
-    campaign_id = _to_int(campaign.get("campaign_id"))
-    summary_by_id = {s.get("id"): s for s in summaries}
-    active_summary = summary_by_id.get(campaign_id)
-
     if campaign:
         start_after = _to_int(campaign.get("start_after_sequence"))
         sequence = _to_int(live.get("sequence"))
@@ -2181,22 +2224,14 @@ def photons_detail_readout() -> list[str]:
         lines.append(f"LANTERN READ MODEL: UNAVAILABLE: {campaign_error}")
     lines.append("")
 
-    # Current campaign-local sufficient state when a campaign exists; otherwise
-    # show the authoritative always-on instrument Welford.
-    current_stats = None
-    if isinstance(active_summary, dict) and active_summary.get("_prior_payload"):
-        current_stats = _photons_population_delta(active_summary.get("_prior_payload"), live)
-    if current_stats is None:
-        current_stats = _photons_instrument_stats(live)
-
-    now_mean = current_stats.get("mean") if isinstance(current_stats, dict) else None
+    # The current cadence cell is the only population whose distribution is
+    # directly published under the launch/return contract now in force.
+    current_stats = _photons_fragment_stats(live)
+    now_mean = current_stats.get("mean")
     current_ppb = _photons_producer_ppb_buckets(live)
     campaign_ppb = _to_float(_photons_producer_campaign_stats(live).get("ppb"))
 
-    try:
-        rolling = _photons_rolling_rows(payloads)
-    except Exception:
-        rolling = []
+    rolling = _photons_rolling_rows(payloads)
 
     current_residual_ns = (
         float(now_mean) - float(lap_baseline_ns)
@@ -2230,30 +2265,28 @@ def photons_detail_readout() -> list[str]:
         f"{'N':>{W_N}}"
     )
 
-    if isinstance(current_stats, dict):
-        lines.append(
-            f"{'LAP':<{W_NAME}}"
-            f"{_fmt(now_mean, f'>{W_VALUE}.3f', W_VALUE)}{G}"
-            f"{G.join(_fmt(current_ppb.get(key), f'>{W_PPB}.3f', W_PPB) for key in PPB_BUCKET_KEYS)}{G}"
-            f"{_fmt(campaign_ppb, f'>{W_PPB}.3f', W_PPB)}{G}"
-            f"{_fmt(current_residual_ns, f'>+{W_RES}.6f', W_RES)}{G}"
-            f"{_fmt(current_stats.get('mean'), f'>{W_MEAN}.3f', W_MEAN)}{G}"
-            f"{_fmt(current_stats.get('stddev'), f'>{W_SD}.3f', W_SD)}{G}"
-            f"{_fmt(current_stats.get('stderr'), f'>{W_SE}.3f', W_SE)}{G}"
-            f"{_fmt(_to_int(current_stats.get('n')), f'>{W_N}d', W_N)}"
-        )
-    else:
-        lines.append("PHOTONS statistics unavailable")
+    lines.append(
+        f"{'LAP':<{W_NAME}}"
+        f"{_fmt(now_mean, f'>{W_VALUE}.3f', W_VALUE)}{G}"
+        f"{G.join(_fmt(current_ppb.get(key), f'>{W_PPB}.3f', W_PPB) for key in PPB_BUCKET_KEYS)}{G}"
+        f"{_fmt(campaign_ppb, f'>{W_PPB}.3f', W_PPB)}{G}"
+        f"{_fmt(current_residual_ns, f'>+{W_RES}.6f', W_RES)}{G}"
+        f"{_fmt(current_stats.get('mean'), f'>{W_MEAN}.3f', W_MEAN)}{G}"
+        f"{_fmt(current_stats.get('stddev'), f'>{W_SD}.3f', W_SD)}{G}"
+        f"{_fmt(current_stats.get('stderr'), f'>{W_SE}.3f', W_SE)}{G}"
+        f"{_fmt(_to_int(current_stats.get('n')), f'>{W_N}d', W_N)}"
+    )
 
     lines.append("")
     lines.append(
-        f"LIVE {PHOTONS_ROLLING_ROWS}-SECOND ACCEPTED-LAP TAIL  "
+        f"LIVE {PHOTONS_ROLLING_ROWS}-SECOND CADENCE-FLIGHT TAIL  "
         "(PUBSUB; newest at bottom)"
     )
 
     W_SEC = 6
     W_ACC = 6
     W_EXCL = 5
+    W_MISSED = 6
     W_ROLL_VALUE = 12
     W_ROLL_MEAN = 12
     W_ROLL_SD = 8
@@ -2267,6 +2300,7 @@ def photons_detail_readout() -> list[str]:
         f"{'LAP_NS':>{W_ROLL_VALUE}}{G}"
         f"{'ACCEPT':>{W_ACC}}{G}"
         f"{'EXCL':>{W_EXCL}}{G}"
+        f"{'MISSED':>{W_MISSED}}{G}"
         f"{'10-MIN':>{W_PPB}}{G}"
         f"{'60-MIN':>{W_PPB}}{G}"
         f"{'8-HOUR':>{W_PPB}}{G}"
@@ -2284,7 +2318,7 @@ def photons_detail_readout() -> list[str]:
         history_count = len(payloads)
         lines.append(
             f"WAITING FOR LIVE PHOTONS TAIL "
-            f"({history_count}/2 publications needed for first one-second row)"
+            f"({history_count}/1 publications needed for first cadence row)"
         )
         return lines
 
@@ -2302,6 +2336,7 @@ def photons_detail_readout() -> list[str]:
             f"{_fmt(row.get('value_ns'), f'>{W_ROLL_VALUE}.3f', W_ROLL_VALUE)}{G}"
             f"{_fmt(_to_int(row.get('accepted')), f'>{W_ACC}d', W_ACC)}{G}"
             f"{_fmt(_to_int(row.get('excluded')), f'>{W_EXCL}d', W_EXCL)}{G}"
+            f"{_fmt(_to_int(row.get('missed')), f'>{W_MISSED}d', W_MISSED)}{G}"
             f"{G.join(_fmt(v, f'>{W_PPB}.3f', W_PPB) for v in ppb_values)}{G}"
             f"{_fmt(row.get('residual_ns'), f'>+{W_RES}.6f', W_RES)}{G}"
             f"{_fmt(row.get('mean'), f'>{W_ROLL_MEAN}.3f', W_ROLL_MEAN)}{G}"
