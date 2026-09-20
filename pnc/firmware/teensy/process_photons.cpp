@@ -112,7 +112,7 @@ static constexpr uint64_t PHOTONS_PULSE_DEFAULT_NS = 1000ULL;
 static constexpr uint64_t PHOTONS_RACE_PULSE_NS = 200ULL;
 
 static constexpr uint64_t PHOTONS_CADENCE_MIN_NS = 10000ULL;
-static constexpr uint64_t PHOTONS_CADENCE_DEFAULT_NS = 500000ULL;
+static constexpr uint64_t PHOTONS_CADENCE_DEFAULT_NS = 10000ULL;
 static constexpr uint64_t PHOTONS_CADENCE_MAX_NS = 1000000000ULL;
 
 static constexpr uint32_t PHOTONS_RACE_HOLDOFF_NS = 0U; // retired wire field
