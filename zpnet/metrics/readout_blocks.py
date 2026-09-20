@@ -2278,10 +2278,6 @@ def photons_detail_readout() -> list[str]:
     )
 
     lines.append("")
-    lines.append(
-        f"LIVE {PHOTONS_ROLLING_ROWS}-SECOND CADENCE-FLIGHT TAIL  "
-        "(PUBSUB; newest at bottom)"
-    )
 
     W_SEC = 6
     W_ACC = 6

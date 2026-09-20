@@ -52,20 +52,25 @@
 // state, and recovery totals.
 //
 // Independent launch cadence:
-//   • initialization arms a recurring foreground TimePop timer (default 10 us);
-//     each callback emits a nominal 200 ns MOD pulse, regardless of PD arrivals;
+//   • initialization registers a TimePop foreground service (default 1 ms);
+//     each due service emits a nominal 200 ns MOD pulse, regardless of PD arrivals;
+//     the next deadline is one configured interval after the actual launch DWT,
+//     using the existing F_CPU_ACTUAL conversion to DWT cycles. START establishes
+//     the first origin; late service emits one pulse and starts a fresh interval;
 //   • measurement starts after recovery establishes statistical ancestry;
 //   • Priority 48 queues raw DWT/entry evidence; foreground classifies the first
 //     in-window return. No optical processing executes at Priority 32;
-//   • the next cadence callback or PHOTONS_STOP closes an unanswered shot as
+//   • the next cadence service or PHOTONS_STOP closes an unanswered shot as
 //     missed. Attempts = completed + missed + pending, with at most one pending;
 //   • each launch pauses ONLY the detector IRQ, drains all captured edges against
 //     the old shot, and clears uncaptured pending GPIO state. After the new launch
 //     record is published, detector capture resumes without clearing a new return.
 //     CLOCKS and Priority 32 remain live throughout. Raw queue overflow traps.
 //     The timestamp is sampled after MOD HIGH;
-//   • timer deadlines are scheduled cadence; actual GPIO timing includes
-//     foreground dispatch and interrupt latency. No catch-up pulse burst;
+//   • readiness is polled by TimePop, including while idle; no recurring grid
+//     or cancellable one-shot appointment owns the next launch. Actual GPIO
+//     timing still includes foreground service and interrupt latency. No catch-up
+//     pulse burst. The legacy grid-deferral counter remains zero;
 //   • START/STOP retain campaign semantics. PHOTONS_START/PHOTONS_STOP control
 //     laser cadence independently; statistics and fragment publication continue.
 //

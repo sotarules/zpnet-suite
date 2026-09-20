@@ -112,17 +112,18 @@ static constexpr uint64_t PHOTONS_PULSE_DEFAULT_NS = 1000ULL;
 static constexpr uint64_t PHOTONS_RACE_PULSE_NS = 200ULL;
 
 static constexpr uint64_t PHOTONS_CADENCE_MIN_NS = 10000ULL;
-static constexpr uint64_t PHOTONS_CADENCE_DEFAULT_NS = 1000000ULL;
+static constexpr uint64_t PHOTONS_CADENCE_DEFAULT_NS = 500000ULL;
 static constexpr uint64_t PHOTONS_CADENCE_MAX_NS = 1000000000ULL;
 
 static constexpr uint32_t PHOTONS_RACE_HOLDOFF_NS = 0U; // retired wire field
-static timepop_handle_t g_photons_cadence_timer = TIMEPOP_INVALID_HANDLE;
+static bool g_photons_cadence_running = false;
 static uint64_t g_photons_cadence_ns = PHOTONS_CADENCE_DEFAULT_NS;
 static uint32_t g_photons_cadence_cycles = 0U;
 static uint32_t g_photons_cadence_last_dwt = 0U;
 static uint64_t g_photons_cadence_launches_since_start = 0ULL;
 static uint64_t g_photons_laser_launch_count = 0ULL;
-static uint64_t g_photons_cadence_deferred_count = 0ULL;
+// Retired grid-spacing deferrals: retained for report compatibility.
+static constexpr uint64_t g_photons_cadence_deferred_count = 0ULL;
 
 static constexpr uint32_t PHOTONS_RACE_SEED_HISTORY = 8U;
 static constexpr uint32_t PHOTONS_RACE_SEED_QUORUM = 3U;
@@ -2739,21 +2740,21 @@ static void photons_race_close_window(void) {
   (void)photons_race_pending_return(race);
 }
 
-static void photons_cadence_tick(
-    timepop_ctx_t* ctx, timepop_diag_t*, void*) {
+static bool photons_cadence_ready(void*) {
+  // TIMEPOP checks this in SpinIdle and before foreground service. Unsigned
+  // subtraction crosses DWT wrap without moving the deadline onto a timer grid.
+  return g_photons_cadence_running &&
+      (uint32_t)(ARM_DWT_CYCCNT - g_photons_cadence_last_dwt) >=
+          g_photons_cadence_cycles;
+}
+
+static void photons_cadence_service(void*) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::FOREGROUND_SERVICE);
-  if (!ctx || ctx->handle != g_photons_cadence_timer ||
-      g_photons_cadence_timer == TIMEPOP_INVALID_HANDLE) __builtin_trap();
+  if (!photons_cadence_ready(nullptr)) __builtin_trap();
 
-  // Dispatch may be late. Never compress two actual launches into one receive
-  // window to catch up with a timer grid; expose deferred callbacks explicitly.
-  if (g_photons_cadence_launches_since_start != 0ULL &&
-      (uint32_t)(ARM_DWT_CYCCNT - g_photons_cadence_last_dwt) <
-          g_photons_cadence_cycles) {
-    g_photons_cadence_deferred_count++;
-    return;
-  }
+  // Service one due launch, however late. The actual MOD-high timestamp below
+  // becomes the next deadline's origin: no grid skip and no catch-up burst.
   photons_histogram_acquire();
   interrupt_photodiode_boundary_begin();
   photons_race_close_window();
@@ -2788,10 +2789,7 @@ static void photons_cadence_tick(
 }
 
 static void photons_cadence_stop(void) {
-  if (g_photons_cadence_timer != TIMEPOP_INVALID_HANDLE) {
-    if (!timepop_cancel(g_photons_cadence_timer)) __builtin_trap();
-    g_photons_cadence_timer = TIMEPOP_INVALID_HANDLE;
-  }
+  g_photons_cadence_running = false;
   interrupt_photodiode_boundary_begin();
   photons_race_close_window();
   g_photons_race_foreground.active = false;
@@ -2800,7 +2798,7 @@ static void photons_cadence_stop(void) {
 }
 
 static void photons_cadence_start(void) {
-  if (g_photons_cadence_timer != TIMEPOP_INVALID_HANDLE) __builtin_trap();
+  if (g_photons_cadence_running) __builtin_trap();
   const uint32_t cps = F_CPU_ACTUAL;
   if (cps == 0U) __builtin_trap();
   const uint64_t cycles =
@@ -2810,9 +2808,10 @@ static void photons_cadence_start(void) {
   g_photons_cadence_launches_since_start = 0ULL;
   photons_laser_mod_idle();
   g_photons_race_foreground.active = g_photons_recovery.publication_started;
-  g_photons_cadence_timer = timepop_arm(
-      g_photons_cadence_ns, true, photons_cadence_tick, nullptr, "PHOTONS_CADENCE");
-  if (g_photons_cadence_timer == TIMEPOP_INVALID_HANDLE) __builtin_trap();
+  // The first launch is due one interval after START. Subsequent origins are
+  // captured by photons_race_launch_200ns(), never the scheduled service time.
+  g_photons_cadence_last_dwt = ARM_DWT_CYCCNT;
+  g_photons_cadence_running = true;
 }
 
 static void photons_race_prepare(void) {
@@ -2838,7 +2837,7 @@ static void photons_race_start_autonomous(void) {
   }
   // Recovery admits measurement; it never overrides an operator's laser stop.
   g_photons_race_foreground.active =
-      g_photons_cadence_timer != TIMEPOP_INVALID_HANDLE;
+      g_photons_cadence_running;
 }
 
 
@@ -4697,7 +4696,7 @@ static void photons_start_fragment_publisher(void) {
       "PHOTONS_FRAGMENT");
   if (g_fragment_timer == TIMEPOP_INVALID_HANDLE) __builtin_trap();
 
-  // Recovery starts measurement/publication. The laser timer already exists
+  // Recovery starts measurement/publication. Laser cadence is already running
   // unless the operator stopped it; recovery must preserve that choice.
   g_photons_recovery.publication_started = true;
   photons_race_start_autonomous();
@@ -4821,6 +4820,8 @@ FLASHMEM void process_photons_init(void) {
 
   // Laser cadence starts at initialization, independently of the recovery
   // verdict. Recovery later enables measurement and the 1 Hz fragment heartbeat.
+  timepop_register_foreground_service(
+      photons_cadence_ready, photons_cadence_service, nullptr);
   g_initialized = true;
   photons_cadence_start();
 }
@@ -6695,7 +6696,8 @@ static FLASHMEM Payload cmd_detector_activate(const Payload& /*args*/) {
 }
 
 static void photons_cadence_report(Payload& p) {
-  p.add("laser_cadence_running", g_photons_cadence_timer != TIMEPOP_INVALID_HANDLE);
+  p.add("laser_cadence_running", g_photons_cadence_running);
+  p.add("laser_cadence_scheduling", "ACTUAL_LAUNCH_DWT");
   p.add("laser_cadence_ns", g_photons_cadence_ns);
   p.add("laser_pulse_ns", PHOTONS_RACE_PULSE_NS);
   p.add("laser_launch_count_total", g_photons_laser_launch_count);
@@ -6714,7 +6716,7 @@ static FLASHMEM Payload cmd_photons_start(const Payload& args) {
     return p;
   }
   if (!g_initialized) __builtin_trap();
-  if (g_photons_cadence_timer == TIMEPOP_INVALID_HANDLE ||
+  if (!g_photons_cadence_running ||
       interval_ns != g_photons_cadence_ns) {
     photons_cadence_stop();
     g_pulse_armed_sequence = 0U;
@@ -6743,7 +6745,7 @@ static FLASHMEM Payload cmd_photons_stop(const Payload&) {
 static FLASHMEM Payload cmd_init(const Payload& /*args*/) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
-  if (g_photons_cadence_timer != TIMEPOP_INVALID_HANDLE) {
+  if (g_photons_cadence_running) {
     Payload p;
     p.add("status", "init_rejected_race_engine_active");
     return p;
@@ -6756,7 +6758,7 @@ static FLASHMEM Payload cmd_wave_on(const Payload& args) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
 
-  if (g_photons_cadence_timer != TIMEPOP_INVALID_HANDLE) {
+  if (g_photons_cadence_running) {
     Payload p;
     p.add("status", "wave_on_rejected_race_engine_active");
     return p;
@@ -6814,7 +6816,7 @@ static FLASHMEM Payload cmd_wave_off(const Payload& /*args*/) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
 
-  if (g_photons_cadence_timer != TIMEPOP_INVALID_HANDLE) {
+  if (g_photons_cadence_running) {
     Payload p;
     p.add("status", "wave_off_rejected_cadence_running");
     p.add("error", "Use PHOTONS_STOP to stop laser cadence");
@@ -6840,7 +6842,7 @@ static FLASHMEM Payload cmd_pulse(const Payload& args) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
 
-  if (g_photons_cadence_timer != TIMEPOP_INVALID_HANDLE) {
+  if (g_photons_cadence_running) {
     Payload p;
     p.add("status", "pulse_rejected_race_engine_active");
     return p;
@@ -6974,7 +6976,7 @@ static FLASHMEM Payload cmd_pulse(const Payload& args) {
 static FLASHMEM Payload cmd_on(const Payload& /*args*/) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
-  if (g_photons_cadence_timer != TIMEPOP_INVALID_HANDLE) {
+  if (g_photons_cadence_running) {
     Payload p;
     p.add("status", "on_rejected_race_engine_active");
     return p;
@@ -7006,7 +7008,7 @@ static FLASHMEM Payload cmd_on(const Payload& /*args*/) {
 static FLASHMEM Payload cmd_off(const Payload& /*args*/) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
-  if (g_photons_cadence_timer != TIMEPOP_INVALID_HANDLE) {
+  if (g_photons_cadence_running) {
     Payload p;
     p.add("status", "off_rejected_race_engine_active");
     return p;
