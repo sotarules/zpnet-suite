@@ -16,14 +16,14 @@ The Teensy remains the optical-science authority and runs continuously.
 START/STOP never start or stop physical PHOTONS measurement and never reset the
 always-on Welford/Better-Buckets population.  As in CLOCKS, START only tells the
 firmware which recording lifecycle is beginning; firmware snapshots its own
-cumulative accepted-lap N/T at a published boundary and authors CAMP PPB from
-that origin against STANDARD_LAP_NS.
+cumulative accepted-lap N/T at a published boundary and authors the CAMP mean
+lap duration from that origin. Welford measures scatter of accepted lap times.
 
 The Pi does not recompute, smooth, repair, or re-adjudicate lap or CAMP science.
 It owns campaign_master identity, restart policy, and
 persistence.  Firmware owns the exact START/STOP measurement boundary.
 
-The configured lap baseline remains the optical residual reference.
+Lap means and scatter use nanoseconds directly, without a configured reference.
 Durable recovery restores aggregate sufficient state plus only the
 bounded PPB endpoint history the Pi literally possesses.  A surviving producer is
 never repaired, replayed, or interrogated merely because the Pi restarted: current-
@@ -47,7 +47,6 @@ import queue
 import threading
 import time
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
 from zpnet.processes.processes import (
@@ -99,7 +98,8 @@ PHOTONS_RACE_FLIGHT_INTERPRETATION = "OBSERVED_DWT_ENDPOINTS"
 PHOTONS_RACE_SEED_HISTORY = 8
 PHOTONS_RACE_SEED_QUORUM = 3
 PHOTONS_EMPTY_HEARTBEAT_LEGACY_LAUNCH_SURROGATE = "LD_ON_FALLING_EDGE"
-PHOTONS_PPB_SEMANTICS = "LAP_BASELINE_NS_OFFSET_V1"
+PHOTONS_LAP_SEMANTICS = "MEAN_LAP_NS_V1"
+PHOTONS_LEGACY_PPB_SEMANTICS = "LAP_BASELINE_NS_OFFSET_V1"
 
 PHOTONS_RECOVERY_SCHEMA_VERSION = 1
 PHOTONS_RECOVERY_CHUNK_MAX_ENDPOINTS = 4
@@ -115,7 +115,7 @@ PHOTONS_RECOVERY_VERIFY_TOLERANCE = 1.0e-6
 # accumulated Welford mean are mathematically equivalent but do not share the
 # same floating-point path.  A large divergence is worth surfacing to the
 # operator, but it must never silently choose an older durable ancestor.
-PHOTONS_WELFORD_GRAND_RATIO_DIAGNOSTIC_PPB = 0.1
+PHOTONS_WELFORD_GRAND_RATIO_DIAGNOSTIC_NS = 0.1
 
 # CLOCKS-parity checkpoint testimony. Firmware publishes one compact delta/proof
 # per second; Pi PHOTONS persists the literal bounded recovery custody it actually
@@ -356,14 +356,6 @@ _repair_success = 0
 _repair_failures = 0
 _last_repair: Optional[Dict[str, Any]] = None
 
-_lap_baseline_ns: Optional[str] = None
-_lap_baseline_fs: Optional[int] = None
-# Deprecated whole-picosecond compatibility mirror retained for recovery/report
-# interoperability with already-durable PHOTONS rows.
-_standard_lap_ns: Optional[str] = None
-_standard_lap_ps: Optional[int] = None
-_teensy_standard_configured = False
-_lap_baseline_set_count = 0
 
 
 # ---------------------------------------------------------------------
@@ -563,161 +555,20 @@ def _welford_equivalent(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
 
 
 def _welford_grand_ratio_diagnostic(
-    *,
-    welford_mean_ns: float,
-    ratio_mean_ns: float,
-    lap_baseline_fs: int,
+    *, welford_mean_ns: float, ratio_mean_ns: float,
 ) -> Dict[str, Any]:
     """Quantify Welford-vs-N/T drift without granting it custody authority."""
-    lap_baseline_ns = float(lap_baseline_fs) / 1_000_000.0
-    if lap_baseline_ns <= 0.0:
-        raise ValueError("PHOTONS Welford/grand-ratio diagnostic has nonpositive lap baseline")
     delta_ns = float(welford_mean_ns) - float(ratio_mean_ns)
-    delta_ppb = delta_ns
     return {
         "schema": "PHOTONS_WELFORD_GRAND_RATIO_DIAGNOSTIC_V1",
         "welford_mean_ns": float(welford_mean_ns),
         "grand_ratio_mean_ns": float(ratio_mean_ns),
-        "delta_ns": float(delta_ns),
-        "abs_delta_ns": abs(float(delta_ns)),
-        "delta_ppb": float(delta_ppb),
-        "abs_delta_ppb": abs(float(delta_ppb)),
-        "diagnostic_limit_ppb": float(PHOTONS_WELFORD_GRAND_RATIO_DIAGNOSTIC_PPB),
-        "notable": abs(float(delta_ppb)) > PHOTONS_WELFORD_GRAND_RATIO_DIAGNOSTIC_PPB,
+        "delta_ns": delta_ns,
+        "abs_delta_ns": abs(delta_ns),
+        "diagnostic_limit_ns": float(PHOTONS_WELFORD_GRAND_RATIO_DIAGNOSTIC_NS),
+        "notable": abs(delta_ns) > PHOTONS_WELFORD_GRAND_RATIO_DIAGNOSTIC_NS,
         "recovery_authority_effect": "NONE_DIAGNOSTIC_ONLY",
     }
-
-
-def _normalize_lap_baseline_ns(raw: Any, *, path: str) -> Tuple[str, int]:
-    try:
-        value = Decimal(str(raw))
-    except (InvalidOperation, ValueError) as exc:
-        raise ValueError(f"{path} is not decimal: {raw!r}") from exc
-    if not value.is_finite() or value <= 0:
-        raise ValueError(f"{path} must be finite and > 0; got {raw!r}")
-    quantum = Decimal("0.000001")
-    normalized = value.quantize(quantum)
-    if normalized != value:
-        raise ValueError(f"{path} may have at most six decimal places; got {raw!r}")
-    text = format(normalized, ".6f")
-    fs = int(normalized * 1_000_000)
-    if fs <= 0:
-        raise ValueError(f"{path} resolved to nonpositive femtoseconds")
-    return text, fs
-
-
-def _compat_standard_from_baseline_fs(lap_baseline_fs: int) -> Tuple[str, int]:
-    ps = int(lap_baseline_fs) // 1000 + (1 if int(lap_baseline_fs) % 1000 >= 500 else 0)
-    if ps <= 0:
-        raise ValueError("PHOTONS LAP_BASELINE_NS cannot be represented by compatibility ps mirror")
-    return format(Decimal(ps) / Decimal(1000), ".3f"), ps
-
-
-def _load_lap_baseline_ns() -> Tuple[str, int, str, int]:
-    """Load config.PHOTONS LAP_BASELINE_NS, explicitly migrating the legacy standard once."""
-    with open_db(row_dict=True) as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT payload FROM config WHERE config_key = 'PHOTONS'")
-        row = cur.fetchone()
-        if row is None:
-            raise RuntimeError("config.PHOTONS row is required")
-        payload = row.get("payload")
-        if isinstance(payload, str):
-            payload = json.loads(payload)
-        payload = _require_dict(payload, "config.PHOTONS.payload")
-        raw = payload.get("lap_baseline_ns")
-        migrated = False
-        if raw is None:
-            raw = payload.get("standard_lap_ns")
-            if raw is None:
-                raise RuntimeError("config.PHOTONS.lap_baseline_ns is required")
-            migrated = True
-        baseline_text, baseline_fs = _normalize_lap_baseline_ns(
-            raw, path=("config.PHOTONS.standard_lap_ns" if migrated else "config.PHOTONS.lap_baseline_ns")
-        )
-        if migrated:
-            cur.execute(
-                """
-                UPDATE config
-                SET payload = payload || jsonb_build_object(
-                    'lap_baseline_ns', %s::text,
-                    'lap_baseline_fs', %s::bigint,
-                    'lap_baseline_source', 'LEGACY_STANDARD_LAP_NS_MIGRATION',
-                    'lap_baseline_updated_at_utc', %s::text
-                )
-                WHERE config_key = 'PHOTONS'
-                """,
-                (baseline_text, baseline_fs, _utc_now_z()),
-            )
-            if cur.rowcount != 1:
-                raise RuntimeError("config.PHOTONS legacy baseline migration did not update exactly one row")
-    if migrated:
-        logging.warning(
-            "📐 [photons] migrated legacy config.PHOTONS.standard_lap_ns=%s to LAP_BASELINE_NS=%s",
-            raw, baseline_text,
-        )
-    standard_text, standard_ps = _compat_standard_from_baseline_fs(baseline_fs)
-    return baseline_text, baseline_fs, standard_text, standard_ps
-
-
-def _load_local_lap_baseline() -> Tuple[str, int, str, int]:
-    """Load config.PHOTONS reference into Pi custody without touching the Teensy."""
-    global _lap_baseline_ns
-    global _lap_baseline_fs
-    global _standard_lap_ns
-    global _standard_lap_ps
-
-    baseline_text, baseline_fs, standard_text, standard_ps = _load_lap_baseline_ns()
-    _lap_baseline_ns = baseline_text
-    _lap_baseline_fs = baseline_fs
-    _standard_lap_ns = standard_text
-    _standard_lap_ps = standard_ps
-    return baseline_text, baseline_fs, standard_text, standard_ps
-
-
-def _confirm_live_teensy_lap_baseline(report: Dict[str, Any]) -> None:
-    """Adopt already-proved live baseline custody without issuing a Teensy command."""
-    global _teensy_standard_configured
-
-    if not report.get("publication_started"):
-        raise RuntimeError("PHOTONS live-baseline adoption requires a publishing producer")
-    if not report.get("standard_lap_configured"):
-        raise RuntimeError(
-            "live Teensy PHOTONS producer is publishing without LAP_BASELINE_NS"
-        )
-    # _fetch_teensy_recovery_report() has already proved equality with the
-    # Pi-local config value whenever the firmware says the baseline is configured.
-    _teensy_standard_configured = True
-
-
-def _configure_teensy_lap_baseline() -> None:
-    """Install config.PHOTONS reference on a held producer that requires restore."""
-    global _teensy_standard_configured
-
-    baseline_text, baseline_fs, _standard_text, _standard_ps = _load_local_lap_baseline()
-    response = send_command(
-        machine="TEENSY",
-        subsystem=SUBSYSTEM,
-        command="SET_LAP_BASELINE_NS",
-        args={"lap_baseline_ns": baseline_text},
-    )
-    payload = response.get("payload") if isinstance(response, dict) else None
-    if not isinstance(response, dict) or not response.get("success") or not isinstance(payload, dict):
-        raise RuntimeError(f"Teensy PHOTONS.SET_LAP_BASELINE_NS failed: {response!r}")
-    if payload.get("lap_baseline_configured") is not True:
-        raise RuntimeError(f"Teensy did not confirm LAP_BASELINE_NS installation: {payload!r}")
-    echoed_fs = _require_int(
-        payload.get("lap_baseline_fs"), "PHOTONS.SET_LAP_BASELINE_NS.payload.lap_baseline_fs", minimum=1
-    )
-    if echoed_fs != baseline_fs:
-        raise RuntimeError(
-            f"Teensy LAP_BASELINE_NS echo mismatch: configured_fs={baseline_fs} echoed_fs={echoed_fs}"
-        )
-    _teensy_standard_configured = True
-    logging.info(
-        "✅ [photons] installed LAP_BASELINE_NS=%s ns (%d fs) on Teensy",
-        baseline_text, baseline_fs,
-    )
 
 
 def _request_teensy_campaign_command(
@@ -848,8 +699,8 @@ def _validate_firmware_campaign(
     if lap_count == 0:
         if total_ns != 0:
             raise ValueError("zero-lap PHOTONS campaign has nonzero total_lap_gnss_ns")
-        if stats.get("sample_count") is not None or stats.get("ppb") is not None:
-            raise ValueError("zero-lap PHOTONS campaign must not publish PPB testimony")
+        if stats.get("sample_count") is not None or stats.get("mean_lap_ns") is not None:
+            raise ValueError("zero-lap PHOTONS campaign must not publish lap mean testimony")
     else:
         if total_ns == 0:
             raise ValueError("nonempty PHOTONS campaign has zero total_lap_gnss_ns")
@@ -863,8 +714,11 @@ def _validate_firmware_campaign(
                 "PHOTONS campaign sample-count mismatch: "
                 f"lap_count={lap_count} sample_count={sample_count}"
             )
-        if stats.get("mean_lap_ns") is None or stats.get("ppb") is None:
-            raise ValueError("nonempty PHOTONS campaign is missing mean_lap_ns/ppb")
+        mean_lap_ns = _require_float(
+            stats.get("mean_lap_ns"), "PHOTONS_FRAGMENT.campaign.stats.mean_lap_ns"
+        )
+        if abs(mean_lap_ns - total_ns / lap_count) > PHOTONS_RECOVERY_VERIFY_TOLERANCE:
+            raise ValueError("PHOTONS campaign mean does not close with N/T")
 
     return copy.deepcopy(campaign)
 
@@ -1189,9 +1043,9 @@ def _validate_photons_fragment(fragment: Payload) -> Tuple[int, int, Optional[in
         raise ValueError(f"unsupported PHOTONS science schema {science.get('schema')!r}")
     if stats.get("schema") != PHOTONS_STATS_SCHEMA:
         raise ValueError(f"unsupported PHOTONS stats schema {stats.get('schema')!r}")
-    if stats.get("ppb_semantics") != PHOTONS_PPB_SEMANTICS:
+    if stats.get("lap_semantics") != PHOTONS_LAP_SEMANTICS:
         raise ValueError(
-            f"unsupported PHOTONS PPB semantics {stats.get('ppb_semantics')!r}"
+            f"unsupported PHOTONS lap semantics {stats.get('lap_semantics')!r}"
         )
 
     # Real-race transport court.  The recurring 1 kHz source is physical testimony,
@@ -1748,23 +1602,17 @@ def _ppb_endpoints_equal(a: Any, b: Any) -> bool:
         return False
 
 
-def _ppb_value_from_endpoints(
-    current: Dict[str, Any], anchor: Dict[str, Any], lap_baseline_fs: int
+def _lap_value_from_endpoints(
+    current: Dict[str, Any], anchor: Dict[str, Any]
 ) -> Dict[str, Any]:
     lap_count = int(current["lap_count"]) - int(anchor["lap_count"])
     total_ns = int(current["total_lap_gnss_ns"]) - int(anchor["total_lap_gnss_ns"])
-    if lap_count <= 0 or total_ns <= 0 or lap_baseline_fs <= 0:
+    if int(current["sequence"]) <= int(anchor["sequence"]) or lap_count <= 0 or total_ns <= 0:
         raise ValueError(
-            "Better-Buckets proof has nonpositive endpoint population/reference: "
-            f"lap_count={lap_count} total_ns={total_ns} lap_baseline_fs={lap_baseline_fs}"
+            "Better-Buckets proof has invalid endpoint chronology/population: "
+            f"lap_count={lap_count} total_ns={total_ns}"
         )
-    mean_fs = (float(total_ns) * 1_000_000.0) / float(lap_count)
-    residual_ns = (mean_fs - float(lap_baseline_fs)) / 1_000_000.0
-    return {
-        "sample_count": lap_count,
-        "ppb": residual_ns,
-        "residual_ns": residual_ns,
-    }
+    return {"sample_count": lap_count, "mean_lap_ns": total_ns / lap_count}
 
 
 def _validate_firmware_ppb_checkpoint_delta(stats: Dict[str, Any]) -> Dict[str, Any]:
@@ -1780,9 +1628,9 @@ def _validate_firmware_ppb_checkpoint_delta(stats: Dict[str, Any]) -> Dict[str, 
             f"{raw.get('schema')!r}"
         )
 
-    if stats.get("ppb_semantics") != PHOTONS_PPB_SEMANTICS:
+    if stats.get("lap_semantics") != PHOTONS_LAP_SEMANTICS:
         raise ValueError(
-            f"unsupported PHOTONS Better-Buckets semantics {stats.get('ppb_semantics')!r}"
+            f"unsupported PHOTONS Better-Buckets semantics {stats.get('lap_semantics')!r}"
         )
 
     reset_count = _require_int(stats.get("reset_count"), "photons.stats.reset_count")
@@ -1800,9 +1648,6 @@ def _validate_firmware_ppb_checkpoint_delta(stats: Dict[str, Any]) -> Dict[str, 
     interval_advanced = _require_bool(
         stats.get("rolling_ppb_interval_advanced"),
         "photons.stats.rolling_ppb_interval_advanced",
-    )
-    lap_baseline_fs = _require_int(
-        stats.get("lap_baseline_fs"), "photons.stats.lap_baseline_fs", minimum=1
     )
     stats_lap_count = _require_int(
         stats.get("lap_count"), "photons.stats.lap_count"
@@ -1851,7 +1696,7 @@ def _validate_firmware_ppb_checkpoint_delta(stats: Dict[str, Any]) -> Dict[str, 
 
     proof: Dict[str, Any] = {}
     proof_checks = 0
-    buckets = _require_dict(stats.get("ppb_buckets"), "photons.stats.ppb_buckets")
+    buckets = _require_dict(stats.get("lap_buckets"), "photons.stats.lap_buckets")
     windows = (
         ("10_min", PHOTONS_RECOVERY_10_MIN_SECONDS),
         ("60_min", PHOTONS_RECOVERY_60_MIN_SECONDS),
@@ -1972,53 +1817,37 @@ def _validate_firmware_ppb_checkpoint_delta(stats: Dict[str, Any]) -> Dict[str, 
         anchor = _ppb_endpoint_from_payload(
             node.get("anchor"), path=f"rolling_ppb_checkpoint.{key}.anchor"
         )
-        computed = _ppb_value_from_endpoints(current, anchor, lap_baseline_fs)
+        computed = _lap_value_from_endpoints(current, anchor)
         if computed["sample_count"] != sample_count:
             raise ValueError(
                 f"PHOTONS {key} proof N mismatch: "
                 f"published={sample_count} endpoint={computed['sample_count']}"
             )
-        recorded = _require_dict(recorded, f"photons.stats.ppb_buckets.{key}")
+        recorded = _require_dict(recorded, f"photons.stats.lap_buckets.{key}")
         recorded_n = _require_int(
             recorded.get("sample_count"),
-            f"photons.stats.ppb_buckets.{key}.sample_count",
+            f"photons.stats.lap_buckets.{key}.sample_count",
             minimum=1,
         )
-        recorded_ppb = _require_float(
-            recorded.get("ppb"), f"photons.stats.ppb_buckets.{key}.ppb"
-        )
-        recorded_residual_ns = _require_float(
-            recorded.get("residual_ns"), f"photons.stats.ppb_buckets.{key}.residual_ns"
+        recorded_mean = _require_float(
+            recorded.get("mean_lap_ns"), f"photons.stats.lap_buckets.{key}.mean_lap_ns"
         )
         if recorded_n != sample_count:
+            raise ValueError(f"PHOTONS {key} bucket/proof N mismatch")
+        delta_ns = computed["mean_lap_ns"] - recorded_mean
+        if abs(delta_ns) > PHOTONS_RECOVERY_VERIFY_TOLERANCE:
             raise ValueError(
-                f"PHOTONS {key} bucket/proof N mismatch: "
-                f"bucket={recorded_n} proof={sample_count}"
-            )
-        delta_ppb = float(computed["ppb"]) - recorded_ppb
-        delta_residual_ns = float(computed["residual_ns"]) - recorded_residual_ns
-        if abs(delta_ppb) > PHOTONS_RECOVERY_VERIFY_TOLERANCE:
-            raise ValueError(
-                "PHOTONS Better-Buckets row-local proof mismatch: "
-                f"window={key} computed={computed['ppb']:.9f} "
-                f"recorded={recorded_ppb:.9f} delta={delta_ppb:.9f}"
-            )
-        if abs(delta_residual_ns) > 0.000001:
-            raise ValueError(
-                "PHOTONS Better-Buckets residual proof mismatch: "
-                f"window={key} computed={computed['residual_ns']:.6f} "
-                f"recorded={recorded_residual_ns:.6f} delta={delta_residual_ns:.6f}"
+                "PHOTONS Better-Buckets row-local mean proof mismatch: "
+                f"window={key} computed={computed['mean_lap_ns']:.9f} "
+                f"recorded={recorded_mean:.9f} delta={delta_ns:.9f}"
             )
         proof[key] = {
             "valid": True,
             "sample_count": sample_count,
             "anchor": anchor,
-            "computed_ppb": round(float(computed["ppb"]), 9),
-            "recorded_ppb": round(recorded_ppb, 9),
-            "delta_ppb": round(delta_ppb, 9),
-            "recorded_residual_ns": round(recorded_residual_ns, 6),
-            "computed_residual_ns": round(float(computed["residual_ns"]), 6),
-            "delta_residual_ns": round(delta_residual_ns, 6),
+            "computed_mean_lap_ns": round(computed["mean_lap_ns"], 9),
+            "recorded_mean_lap_ns": round(recorded_mean, 9),
+            "delta_ns": round(delta_ns, 9),
         }
         proof_checks += 1
 
@@ -2027,7 +1856,6 @@ def _validate_firmware_ppb_checkpoint_delta(stats: Dict[str, Any]) -> Dict[str, 
         "valid": True,
         "reset_count": reset_count,
         "update_count": update_count,
-        "lap_baseline_fs": lap_baseline_fs,
         "rolling_sequence": rolling_sequence,
         "second_count": second_count,
         "minute_count": minute_count,
@@ -2053,7 +1881,6 @@ def _ppb_checkpoint_delta_signature(delta: Dict[str, Any]) -> str:
             "valid",
             "reset_count",
             "update_count",
-            "lap_baseline_fs",
             "rolling_sequence",
             "second_count",
             "minute_count",
@@ -3715,18 +3542,6 @@ def _canonical_recovery_state_from_row(
             ):
                 raise ValueError(f"durable PHOTONS row illegally restored {field}")
 
-    standard_lap_ps = _require_int(
-        stats.get("standard_lap_ps"), "PHOTONS.photons.stats.standard_lap_ps", minimum=1
-    )
-    # The operator reference is not physical ancestry. Legacy durable rows may
-    # predate femtosecond baseline testimony; their whole-ps mirror remains enough
-    # to verify their own historical PPB while recovery restores only raw N/T.
-    source_lap_baseline_fs = (
-        _require_int(stats.get("lap_baseline_fs"), "PHOTONS.photons.stats.lap_baseline_fs", minimum=1)
-        if stats.get("lap_baseline_fs") is not None
-        else standard_lap_ps * 1000
-    )
-
     reset_count = _require_int(
         stats.get("reset_count"), "PHOTONS.photons.stats.reset_count"
     )
@@ -3801,7 +3616,6 @@ def _canonical_recovery_state_from_row(
     welford_grand_ratio = _welford_grand_ratio_diagnostic(
         welford_mean_ns=float(accepted_projected["mean"]),
         ratio_mean_ns=ratio_mean,
-        lap_baseline_fs=source_lap_baseline_fs,
     )
 
     seed_pending = _require_bool(
@@ -3870,33 +3684,57 @@ def _canonical_recovery_state_from_row(
     if not endpoint_admitted or current_sequence != update_count:
         raise ValueError("canonical PHOTONS row is not a lawful PPB endpoint")
 
-    total_bucket = _require_dict(
-        _require_dict(stats.get("ppb_buckets"), "PHOTONS.stats.ppb_buckets").get("total"),
-        "PHOTONS.stats.ppb_buckets.total",
-    )
-    total_bucket_n = _require_int(
-        total_bucket.get("sample_count"), "PHOTONS.stats.ppb_buckets.total.sample_count"
-    )
-    total_bucket_ppb = _require_float(
-        total_bucket.get("ppb"), "PHOTONS.stats.ppb_buckets.total.ppb"
-    )
-    source_ppb_semantics = stats.get("ppb_semantics")
-    if source_ppb_semantics is None:
-        # Pre-normalization durable rows used conventional fractional-lap PPB.
-        # Their N/T and endpoint rings remain valid physical custody, so prove
-        # the historical derived value under its own semantics and then restore
-        # only the baseline-independent sufficient state.
-        expected_total_ppb = (
-            ((ratio_mean * 1_000_000.0) / float(source_lap_baseline_fs)) - 1.0
-        ) * 1.0e9
-    elif source_ppb_semantics == PHOTONS_PPB_SEMANTICS:
-        expected_total_ppb = ratio_mean - (float(source_lap_baseline_fs) / 1_000_000.0)
-    else:
-        raise ValueError(
-            f"unsupported durable PHOTONS PPB semantics {source_ppb_semantics!r}"
+    if stats.get("lap_semantics") == PHOTONS_LAP_SEMANTICS:
+        total_bucket = _require_dict(
+            _require_dict(stats.get("lap_buckets"), "PHOTONS.stats.lap_buckets").get("total"),
+            "PHOTONS.stats.lap_buckets.total",
         )
-    if total_bucket_n != lap_count or abs(total_bucket_ppb - expected_total_ppb) > PHOTONS_RECOVERY_VERIFY_TOLERANCE:
-        raise ValueError("canonical PHOTONS TOTAL PPB does not close")
+        total_bucket_n = _require_int(total_bucket.get("sample_count"), "TOTAL.sample_count")
+        total_mean = _require_float(total_bucket.get("mean_lap_ns"), "TOTAL.mean_lap_ns")
+        if total_bucket_n != lap_count or abs(total_mean - ratio_mean) > PHOTONS_RECOVERY_VERIFY_TOLERANCE:
+            raise ValueError("canonical PHOTONS TOTAL mean does not close with N/T")
+    elif stats.get("lap_semantics") is not None:
+        raise ValueError(f"unsupported durable PHOTONS lap semantics {stats.get('lap_semantics')!r}")
+    else:
+        standard_lap_ps = _require_int(
+            stats.get("standard_lap_ps"), "PHOTONS.photons.stats.standard_lap_ps", minimum=1
+        )
+        # The operator reference is not physical ancestry. Legacy durable rows may
+        # predate femtosecond baseline testimony; their whole-ps mirror remains enough
+        # to verify their own historical PPB while recovery restores only raw N/T.
+        source_lap_baseline_fs = (
+            _require_int(stats.get("lap_baseline_fs"), "PHOTONS.photons.stats.lap_baseline_fs", minimum=1)
+            if stats.get("lap_baseline_fs") is not None
+            else standard_lap_ps * 1000
+        )
+
+        total_bucket = _require_dict(
+            _require_dict(stats.get("ppb_buckets"), "PHOTONS.stats.ppb_buckets").get("total"),
+            "PHOTONS.stats.ppb_buckets.total",
+        )
+        total_bucket_n = _require_int(
+            total_bucket.get("sample_count"), "PHOTONS.stats.ppb_buckets.total.sample_count"
+        )
+        total_bucket_ppb = _require_float(
+            total_bucket.get("ppb"), "PHOTONS.stats.ppb_buckets.total.ppb"
+        )
+        source_ppb_semantics = stats.get("ppb_semantics")
+        if source_ppb_semantics is None:
+            # Pre-normalization durable rows used conventional fractional-lap PPB.
+            # Their N/T and endpoint rings remain valid physical custody, so prove
+            # the historical derived value under its own semantics and then restore
+            # only the baseline-independent sufficient state.
+            expected_total_ppb = (
+                ((ratio_mean * 1_000_000.0) / float(source_lap_baseline_fs)) - 1.0
+            ) * 1.0e9
+        elif source_ppb_semantics == PHOTONS_LEGACY_PPB_SEMANTICS:
+            expected_total_ppb = ratio_mean - (float(source_lap_baseline_fs) / 1_000_000.0)
+        else:
+            raise ValueError(
+                f"unsupported durable PHOTONS PPB semantics {source_ppb_semantics!r}"
+            )
+        if total_bucket_n != lap_count or abs(total_bucket_ppb - expected_total_ppb) > PHOTONS_RECOVERY_VERIFY_TOLERANCE:
+            raise ValueError("canonical PHOTONS TOTAL PPB does not close")
 
     campaign_restore: Optional[Dict[str, Any]] = None
     campaign = state.get("campaign")
@@ -3964,7 +3802,6 @@ def _canonical_recovery_state_from_row(
         "source_publish_count": publish_count,
         "source_reset_count": reset_count,
         "source_update_count": update_count,
-        "standard_lap_ps": int(_standard_lap_ps or 0),
         "stats_lap_count": lap_count,
         "stats_total_lap_gnss_ns": total_ns,
         "custody_lap_count": custody_lap_count,
@@ -4459,13 +4296,13 @@ def _load_newest_recoverable_photons_state(
         log = logging.warning if diagnostic.get("notable") else logging.info
         log(
             "%s [photons/recovery] selected newest durable source id=%d update=%d "
-            "Welford/grand-ratio drift=%.9f ppb limit=%.6f ppb; "
+            "Welford/grand-ratio drift=%.9f ns limit=%.6f ns; "
             "diagnostic only, authority unchanged",
             "⚠️" if diagnostic.get("notable") else "🧮",
             int(snapshot.source_detail_id),
             int(snapshot.prepared_restore["update_count"]),
-            float(diagnostic.get("delta_ppb") or 0.0),
-            float(diagnostic.get("diagnostic_limit_ppb") or 0.0),
+            float(diagnostic.get("delta_ns") or 0.0),
+            float(diagnostic.get("diagnostic_limit_ns") or 0.0),
         )
     return snapshot, [], 1
 
@@ -4579,9 +4416,7 @@ def _send_teensy_recovery_command(
     return copy.deepcopy(payload)
 
 
-def _fetch_teensy_recovery_report(
-    *, require_baseline: bool = True
-) -> Dict[str, Any]:
+def _fetch_teensy_recovery_report() -> Dict[str, Any]:
     response = send_command(
         machine="TEENSY",
         subsystem=SUBSYSTEM,
@@ -4605,32 +4440,8 @@ def _fetch_teensy_recovery_report(
         payload.get("publication_started"),
         "PHOTONS.REPORT_RECOVERY.publication_started",
     )
-    baseline_configured = _require_bool(
-        payload.get("standard_lap_configured"),
-        "PHOTONS.REPORT_RECOVERY.standard_lap_configured",
-    )
-    if require_baseline and not baseline_configured:
-        raise RuntimeError("Teensy PHOTONS recovery report lacks STANDARD_LAP_NS")
-    baseline_fs = _require_int(
-        payload.get("lap_baseline_fs"),
-        "PHOTONS.REPORT_RECOVERY.lap_baseline_fs",
-    )
-    if baseline_configured:
-        if baseline_fs <= 0:
-            raise RuntimeError("Teensy PHOTONS recovery report has invalid LAP_BASELINE_NS")
-        if (
-            _lap_baseline_fs is not None
-            and baseline_fs != int(_lap_baseline_fs)
-            and (require_baseline or publication_started)
-        ):
-            raise RuntimeError(
-                "live/configured Teensy PHOTONS LAP_BASELINE_NS mismatch during recovery: "
-                f"teensy_fs={baseline_fs} config_fs={_lap_baseline_fs}"
-            )
-    elif baseline_fs != 0:
-        raise RuntimeError(
-            "Teensy PHOTONS recovery report publishes LAP_BASELINE_NS before configuration"
-        )
+    if payload.get("lap_semantics") != PHOTONS_LAP_SEMANTICS:
+        raise RuntimeError("Teensy PHOTONS recovery requires MEAN_LAP_NS_V1 firmware")
     for field in (
         "staging_active",
         "restored",
@@ -4780,16 +4591,8 @@ def _fetch_teensy_photons_report() -> Dict[str, Any]:
     if payload.get("race_launch_surrogate") != PHOTONS_RACE_LAUNCH_SURROGATE:
         raise RuntimeError("Teensy PHOTONS launch surrogate does not match Pi contract")
     _require_bool(payload.get("race_engine_active"), "PHOTONS.REPORT.race_engine_active")
-    if not _require_bool(
-        payload.get("standard_lap_configured"),
-        "PHOTONS.REPORT.standard_lap_configured",
-    ):
-        raise RuntimeError("Teensy PHOTONS broad report lacks STANDARD_LAP_NS")
-    baseline_fs = _require_int(
-        payload.get("lap_baseline_fs"), "PHOTONS.REPORT.lap_baseline_fs", minimum=1
-    )
-    if _lap_baseline_fs is None or baseline_fs != int(_lap_baseline_fs):
-        raise RuntimeError("Teensy PHOTONS broad-report LAP_BASELINE_NS mismatch")
+    if payload.get("lap_semantics") != PHOTONS_LAP_SEMANTICS:
+        raise RuntimeError("Teensy PHOTONS report requires MEAN_LAP_NS_V1 firmware")
     return copy.deepcopy(payload)
 
 
@@ -4852,16 +4655,8 @@ def _fetch_teensy_ppb_export_meta() -> Dict[str, Any]:
             payload.get(key), f"PHOTONS.PPB_EXPORT_META.{key}"
         )
 
-    lap_baseline_fs = _require_int(
-        payload.get("lap_baseline_fs"),
-        "PHOTONS.PPB_EXPORT_META.lap_baseline_fs",
-        minimum=1,
-    )
-    if _lap_baseline_fs is None or lap_baseline_fs != int(_lap_baseline_fs):
-        raise RuntimeError(
-            "PHOTONS Better-Buckets export LAP_BASELINE_NS disagrees with config: "
-            f"teensy_fs={lap_baseline_fs} config_fs={_lap_baseline_fs}"
-        )
+    if payload.get("lap_semantics") != PHOTONS_LAP_SEMANTICS:
+        raise RuntimeError("Teensy PHOTONS endpoint export requires MEAN_LAP_NS_V1 firmware")
     if meta["update_count"] <= 0 or meta["current_sequence"] != meta["update_count"]:
         raise RuntimeError("PHOTONS Better-Buckets export current chronology is invalid")
     if not (0 < meta["second_count"] <= PHOTONS_RECOVERY_SECOND_CAPACITY):
@@ -5542,17 +5337,6 @@ def _live_fragment_recovery_witness(
         race.get("active"), "PHOTONS_FRAGMENT.photons.race.active"
     )
 
-    baseline_fs = _require_int(
-        stats.get("lap_baseline_fs"),
-        "PHOTONS_FRAGMENT.photons.stats.lap_baseline_fs",
-        minimum=1,
-    )
-    if _lap_baseline_fs is None or int(baseline_fs) != int(_lap_baseline_fs):
-        raise RuntimeError(
-            "current-session PHOTONS_FRAGMENT LAP_BASELINE_NS disagrees with config: "
-            f"fragment_fs={baseline_fs} config_fs={_lap_baseline_fs}"
-        )
-
     report_like = {
         "fragment_sequence": int(sequence),
         "publish_count": int(publish_count),
@@ -5979,8 +5763,6 @@ def _mark_active_campaign_recovered(
         )
         if cur.rowcount != 1:
             raise RuntimeError("active LANTERN recovery metadata did not update exactly once")
-
-
 
 
 def _adopt_live_lantern_state(
@@ -6701,11 +6483,8 @@ def _perform_phase5_recovery(
         _recovery_attempt_count += 1
     _recovery_status_set("CLASSIFYING")
     try:
-        # CLOCKS parity: first establish the expected operator reference in Pi
-        # custody, then classify the producer using read-only testimony. A live
-        # producer must never receive restore/reference mutation merely because
-        # the Pi process restarted.
-        _load_local_lap_baseline()
+        # Classify the producer using read-only testimony. A live producer must
+        # never receive a restore mutation merely because the Pi restarted.
         empty_domain = _retire_orphaned_photons_recovery_config_if_domain_empty()
         if empty_domain.get("domain_empty"):
             logging.warning(
@@ -6898,13 +6677,11 @@ def _perform_phase5_recovery(
         # existing REPORT_RECOVERY path now classifies only the held/newborn,
         # pending-proof, or otherwise ambiguous cases.
         detector_activation: Optional[Dict[str, Any]] = None
-        report = _fetch_teensy_recovery_report(require_baseline=False)
-        if report["publication_started"]:
-            _confirm_live_teensy_lap_baseline(report)
-        else:
+        report = _fetch_teensy_recovery_report()
+        if not report["publication_started"]:
             if report["staging_active"]:
                 _best_effort_recovery_abort()
-                report = _fetch_teensy_recovery_report(require_baseline=False)
+                report = _fetch_teensy_recovery_report()
             if report["staging_active"]:
                 raise RuntimeError("Teensy PHOTONS recovery staging remains active")
 
@@ -6929,10 +6706,9 @@ def _perform_phase5_recovery(
             )
 
             # The read-only court plus explicit detector proof now establish the
-            # held-producer prerequisite envelope. Only this branch may install
-            # the reference needed by RECOVERY_BEGIN or RECOVERY_COLD_START.
-            _configure_teensy_lap_baseline()
-            report = _fetch_teensy_recovery_report(require_baseline=True)
+            # held-producer prerequisite envelope for RECOVERY_BEGIN or
+            # RECOVERY_COLD_START. Refresh testimony after detector activation.
+            report = _fetch_teensy_recovery_report()
 
         if report["staging_active"]:
             raise RuntimeError("Teensy PHOTONS recovery staging remains active")
@@ -8002,7 +7778,7 @@ def _runtime_reconcile_teensy_generation(previous_generation: int,
 
         # The stream did not prove a healthy survivor.  REPORT_RECOVERY is now a
         # fallback court for the newborn/held or otherwise ambiguous case only.
-        report = _fetch_teensy_recovery_report(require_baseline=False)
+        report = _fetch_teensy_recovery_report()
         if bool(report.get("publication_started")) and live_fragment is None:
             # No canonical row was observed in the bounded window, but firmware says
             # publication survived. Preserve the prior non-mutating behavior rather
@@ -8030,7 +7806,7 @@ def _runtime_reconcile_teensy_generation(previous_generation: int,
             return
 
         # A newborn Teensy is intentionally silent: firmware publication remains
-        # held until this Pi supplies baseline + one explicit recovery verdict.
+        # held until this Pi supplies one explicit recovery verdict.
         # Retire any queued prefix that never crossed the canonical/durable court.
         retired = _retire_fragment_queue_via_owner("AMBIENT_PRODUCER_RESURRECTION")
         with _state_lock:
@@ -8888,135 +8664,6 @@ def cmd_truncate(_: Optional[dict]) -> Dict[str, Any]:
     return {"success": True, "message": "OK", "payload": result}
 
 
-def cmd_set_lap_baseline_ns(args: Optional[dict]) -> Dict[str, Any]:
-    """Persist and realize one operator-authored LAP_BASELINE_NS reference."""
-    global _lap_baseline_ns
-    global _lap_baseline_fs
-    global _standard_lap_ns
-    global _standard_lap_ps
-    global _teensy_standard_configured
-    global _lap_baseline_set_count
-    global _last_maintenance
-
-    busy = _campaign_control_gate("SET_LAP_BASELINE_NS")
-    if busy is not None:
-        return busy
-
-    raw = (args or {}).get("ns")
-    if raw is None:
-        raw = (args or {}).get("lap_baseline_ns")
-    if raw is None:
-        return {"success": False, "message": "SET_LAP_BASELINE_NS requires ns=<nanoseconds>"}
-    try:
-        baseline_text, baseline_fs = _normalize_lap_baseline_ns(
-            raw, path="SET_LAP_BASELINE_NS.ns"
-        )
-        standard_text, standard_ps = _compat_standard_from_baseline_fs(baseline_fs)
-    except Exception as exc:
-        return {"success": False, "message": str(exc)}
-
-    requested_at = _utc_now_z()
-    with _maintenance_lock:
-        # Persist desired reference first. If transport realization is interrupted,
-        # the next PHOTONS process start converges the Teensy from config.PHOTONS.
-        try:
-            with open_db() as conn:
-                cur = conn.cursor()
-                cur.execute(
-                    """
-                    UPDATE config
-                    SET payload = payload || jsonb_build_object(
-                        'lap_baseline_ns', %s::text,
-                        'lap_baseline_fs', %s::bigint,
-                        'lap_baseline_source', 'OPERATOR',
-                        'lap_baseline_updated_at_utc', %s::text
-                    )
-                    WHERE config_key = 'PHOTONS'
-                    """,
-                    (baseline_text, baseline_fs, requested_at),
-                )
-                if cur.rowcount != 1:
-                    raise RuntimeError("config.PHOTONS LAP_BASELINE_NS update did not affect exactly one row")
-        except Exception as exc:
-            logging.exception("❌ [photons] SET_LAP_BASELINE_NS persistence failed")
-            return {"success": False, "message": str(exc)}
-
-        try:
-            response = send_command(
-                machine="TEENSY",
-                subsystem=SUBSYSTEM,
-                command="SET_LAP_BASELINE_NS",
-                args={"lap_baseline_ns": baseline_text},
-            )
-            payload = response.get("payload") if isinstance(response, dict) else None
-            if (
-                not isinstance(response, dict)
-                or not response.get("success")
-                or not isinstance(payload, dict)
-                or payload.get("status") != "lap_baseline_set"
-            ):
-                raise RuntimeError(f"Teensy PHOTONS.SET_LAP_BASELINE_NS rejected: {response!r}")
-            echoed_fs = _require_int(
-                payload.get("lap_baseline_fs"),
-                "PHOTONS.SET_LAP_BASELINE_NS.payload.lap_baseline_fs",
-                minimum=1,
-            )
-            if echoed_fs != baseline_fs:
-                raise RuntimeError(
-                    f"Teensy LAP_BASELINE_NS echo mismatch: requested_fs={baseline_fs} echoed_fs={echoed_fs}"
-                )
-        except Exception as exc:
-            failure = {
-                "action": "SET_LAP_BASELINE_NS",
-                "requested_at_utc": requested_at,
-                "success": False,
-                "config_persisted": True,
-                "producer_realized": False,
-                "lap_baseline_ns": baseline_text,
-                "lap_baseline_fs": baseline_fs,
-                "error": str(exc),
-                "recovery_action": "retry command or restart PHOTONS to converge from config.PHOTONS",
-            }
-            with _state_lock:
-                _last_maintenance = copy.deepcopy(failure)
-            logging.exception("⚠️ [photons] LAP_BASELINE_NS persisted but Teensy realization failed")
-            return {"success": False, "message": str(exc), "payload": failure}
-
-        previous_text = _lap_baseline_ns
-        previous_fs = _lap_baseline_fs
-        _lap_baseline_ns = baseline_text
-        _lap_baseline_fs = baseline_fs
-        _standard_lap_ns = standard_text
-        _standard_lap_ps = standard_ps
-        _teensy_standard_configured = True
-
-    result = {
-        "action": "SET_LAP_BASELINE_NS",
-        "requested_at_utc": requested_at,
-        "success": True,
-        "changed": previous_fs != baseline_fs,
-        "previous_lap_baseline_ns": previous_text,
-        "previous_lap_baseline_fs": previous_fs,
-        "lap_baseline_ns": baseline_text,
-        "lap_baseline_fs": baseline_fs,
-        "config_key": "PHOTONS",
-        "config_field": "lap_baseline_ns",
-        "producer_realized": True,
-        "physical_measurement_unchanged": True,
-        "welford_preserved": True,
-        "better_buckets_history_preserved": True,
-        "effect": "REFERENCE_ONLY_NEXT_FRAGMENT_RECOMPUTES_PPB_AND_RESIDUALS",
-    }
-    with _state_lock:
-        _lap_baseline_set_count += 1
-        _last_maintenance = copy.deepcopy(result)
-    logging.warning(
-        "📐 [photons] LAP_BASELINE_NS %s -> %s ns (%d fs); physical N/T and Better-Buckets custody preserved",
-        previous_text or "UNSET", baseline_text, baseline_fs,
-    )
-    return {"success": True, "message": "OK", "payload": result}
-
-
 def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
     """List LANTERN campaign masters and optical recording summaries."""
     try:
@@ -9137,16 +8784,6 @@ def _stats_epoch_snapshot_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
             "PHOTONS.photons.stats.update_count",
             minimum=1,
         ),
-        "lap_baseline_fs": _require_int(
-            stats.get("lap_baseline_fs"),
-            "PHOTONS.photons.stats.lap_baseline_fs",
-            minimum=1,
-        ),
-        "standard_lap_ps": _require_int(
-            stats.get("standard_lap_ps"),
-            "PHOTONS.photons.stats.standard_lap_ps",
-            minimum=1,
-        ),
         "lap_count": _require_int(
             stats.get("lap_count"), "PHOTONS.photons.stats.lap_count"
         ),
@@ -9197,10 +8834,6 @@ def _stats_reset_birth_court(
         raise ValueError(
             "PHOTONS physical publication chronology did not advance across STATS_RESET"
         )
-    if snapshot["lap_baseline_fs"] != int(before["lap_baseline_fs"]):
-        raise ValueError("PHOTONS STATS_RESET changed LAP_BASELINE_NS")
-    if snapshot["standard_lap_ps"] != int(before["standard_lap_ps"]):
-        raise ValueError("PHOTONS STATS_RESET changed compatibility standard_lap_ps")
     if snapshot["custody_lap_count"] < int(before["custody_lap_count"]):
         raise ValueError("PHOTONS STATS_RESET regressed monotonic accepted-lap custody")
     if snapshot["custody_total_lap_gnss_ns"] < int(
@@ -9338,7 +8971,6 @@ def _stats_reset_birth_court(
         welford_grand_ratio = _welford_grand_ratio_diagnostic(
             welford_mean_ns=float(lap_welford["mean"]),
             ratio_mean_ns=ratio_mean,
-            lap_baseline_fs=int(snapshot["lap_baseline_fs"]),
         )
 
     current_sequence = _require_int(
@@ -9355,37 +8987,34 @@ def _stats_reset_birth_court(
             "PHOTONS STATS_RESET birth did not establish Better-Buckets endpoint 1"
         )
 
-    buckets = _require_dict(stats.get("ppb_buckets"), "PHOTONS.stats.ppb_buckets")
+    buckets = _require_dict(stats.get("lap_buckets"), "PHOTONS.stats.lap_buckets")
     if lap_count == 0:
         if any(isinstance(buckets.get(name), dict) for name in PPB_BUCKET_NAMES):
-            raise ValueError("PHOTONS STATS_RESET empty birth published nonempty PPB bucket")
+            raise ValueError("PHOTONS STATS_RESET empty birth published nonempty lap bucket")
         bucket_proof: Dict[str, Any] = {}
     else:
         bucket_proof = {}
-        reference_ppb: Optional[float] = None
         for name in PPB_BUCKET_NAMES:
             bucket = _require_dict(
-                buckets.get(name), f"PHOTONS.stats.ppb_buckets.{name}"
+                buckets.get(name), f"PHOTONS.stats.lap_buckets.{name}"
             )
             bucket_n = _require_int(
                 bucket.get("sample_count"),
-                f"PHOTONS.stats.ppb_buckets.{name}.sample_count",
+                f"PHOTONS.stats.lap_buckets.{name}.sample_count",
                 minimum=1,
             )
-            bucket_ppb = _require_float(
-                bucket.get("ppb"), f"PHOTONS.stats.ppb_buckets.{name}.ppb"
+            bucket_mean = _require_float(
+                bucket.get("mean_lap_ns"), f"PHOTONS.stats.lap_buckets.{name}.mean_lap_ns"
             )
             if bucket_n != lap_count:
                 raise ValueError(
                     f"PHOTONS STATS_RESET birth {name} N={bucket_n} != lap_count={lap_count}"
                 )
-            if reference_ppb is None:
-                reference_ppb = bucket_ppb
-            elif abs(bucket_ppb - reference_ppb) > PHOTONS_RECOVERY_VERIFY_TOLERANCE:
+            if abs(bucket_mean - ratio_mean) > PHOTONS_RECOVERY_VERIFY_TOLERANCE:
                 raise ValueError(
                     "PHOTONS STATS_RESET birth Better-Buckets do not share epoch origin"
                 )
-            bucket_proof[name] = {"sample_count": bucket_n, "ppb": bucket_ppb}
+            bucket_proof[name] = {"sample_count": bucket_n, "mean_lap_ns": bucket_mean}
 
     return {
         **snapshot,
@@ -9397,7 +9026,7 @@ def _stats_reset_birth_court(
         "projection_reject_count": rejects,
         "reason_counts": reason_counts,
         "welford_grand_ratio_diagnostic": copy.deepcopy(welford_grand_ratio),
-        "ppb_buckets": bucket_proof,
+        "lap_buckets": bucket_proof,
         "custody_lap_delta_from_before": (
             int(snapshot["custody_lap_count"]) - int(before["custody_lap_count"])
         ),
@@ -9467,11 +9096,6 @@ def _pi_report_surface() -> Dict[str, Any]:
             "rows_persisted": _rows_persisted,
             "ingress_queue_depth": _fragment_queue.qsize(),
             "persist_queue_depth": _persist_queue.qsize(),
-            "lap_baseline_ns": _lap_baseline_ns,
-            "lap_baseline_fs": _lap_baseline_fs,
-            "standard_lap_ns": _standard_lap_ns,
-            "standard_lap_ps": _standard_lap_ps,
-            "teensy_standard_configured": _teensy_standard_configured,
             "latest_sequence": latest.get("sequence") if isinstance(latest, dict) else None,
             "operational_state": _operational_state_snapshot(),
             "hard_failure_entries": _hard_failure_entries,
@@ -9850,10 +9474,6 @@ def _note_stats_reset_persisted(photons: Dict[str, Any], detail_id: int) -> None
                 )
             if after["sequence"] < durable_birth["sequence"]:
                 raise RuntimeError("latest PHOTONS physical sequence regressed behind durable row 1")
-            if after["lap_baseline_fs"] != before["lap_baseline_fs"]:
-                raise RuntimeError("latest PHOTONS LAP_BASELINE_NS changed across STATS_RESET")
-            if after["standard_lap_ps"] != before["standard_lap_ps"]:
-                raise RuntimeError("latest PHOTONS compatibility standard_lap_ps changed across STATS_RESET")
             if after["campaign"] != before.get("campaign"):
                 raise RuntimeError("latest PHOTONS LANTERN identity/origin changed across STATS_RESET")
             if after["custody_lap_count"] < durable_birth["custody_lap_count"]:
@@ -9902,7 +9522,6 @@ def _note_stats_reset_persisted(photons: Dict[str, Any], detail_id: int) -> None
             "physical_measurement_unchanged": True,
             "physical_sequence_preserved": True,
             "monotonic_custody_preserved": True,
-            "standard_lap_preserved": True,
             "first_durable_update_count": 1,
         }
         _stats_reset_pending = None
@@ -10027,11 +9646,6 @@ def cmd_photons_info(_: Optional[dict]) -> Dict[str, Any]:
             "instrument_always_on": True,
             "teensy_science_authority": True,
             "pi_campaign_lifecycle_authority": True,
-            "lap_baseline_ns": _lap_baseline_ns,
-            "lap_baseline_fs": _lap_baseline_fs,
-            "standard_lap_ns": _standard_lap_ns,
-            "standard_lap_ps": _standard_lap_ps,
-            "teensy_standard_configured": _teensy_standard_configured,
             "state_worker_started": _state_worker_started.is_set(),
             "persistence_worker_started": _persistence_worker_started.is_set(),
             "campaign_control_ready": _campaign_control_ready.is_set(),
@@ -10048,7 +9662,6 @@ def cmd_photons_info(_: Optional[dict]) -> Dict[str, Any]:
             "stats_reset_success": _stats_reset_success,
             "stats_reset_failures": _stats_reset_failures,
             "stats_reset_in_progress": _stats_reset_in_progress.is_set(),
-            "lap_baseline_set_count": _lap_baseline_set_count,
             "report_photons_requests": _report_photons_requests,
             "report_stats_requests": _report_stats_requests,
             "clear_count": _clear_count,
@@ -10109,7 +9722,6 @@ def cmd_report(_: Optional[dict]) -> dict:
             "campaign_control_ready": _campaign_control_ready.is_set(),
             "campaign_start_count": _campaign_start_count,
             "campaign_stop_count": _campaign_stop_count,
-            "lap_baseline_set_count": _lap_baseline_set_count,
             "stale_campaign_retire_count": _stale_campaign_retire_count,
             "stats_reset_requests": _stats_reset_requests,
             "stats_reset_success": _stats_reset_success,
@@ -10134,11 +9746,6 @@ def cmd_report(_: Optional[dict]) -> dict:
                 "success_count": _repair_success,
                 "failure_count": _repair_failures,
             },
-            "lap_baseline_ns": _lap_baseline_ns,
-            "lap_baseline_fs": _lap_baseline_fs,
-            "standard_lap_ns": _standard_lap_ns,
-            "standard_lap_ps": _standard_lap_ps,
-            "teensy_standard_configured": _teensy_standard_configured,
             "latest_fragment": copy.deepcopy(_latest_fragment),
             "latest_photons": copy.deepcopy(_latest_photons),
         }
@@ -10243,10 +9850,7 @@ def _repair_worker(*, trigger_state: Dict[str, Any], record: Dict[str, Any]) -> 
 
         _clear_recovery_proof_custody()
         _runtime_recovery_hold.clear()
-        _load_local_lap_baseline()
-        report = _fetch_teensy_recovery_report(require_baseline=False)
-        if report.get("publication_started"):
-            _confirm_live_teensy_lap_baseline(report)
+        report = _fetch_teensy_recovery_report()
         record["producer_publication_started"] = bool(report.get("publication_started"))
 
         repaired_by = None
@@ -10459,7 +10063,6 @@ COMMANDS = {
     "DELETE": cmd_delete,
     "TRUNCATE": cmd_truncate,
     "INJECT_PROBLEM": cmd_inject_problem,
-    "SET_LAP_BASELINE_NS": cmd_set_lap_baseline_ns,
     "LIST_CAMPAIGNS": cmd_list_campaigns,
     "PHOTONS_INFO": cmd_photons_info,
 }
@@ -10694,7 +10297,6 @@ def _startup_commissioning_empty_heartbeat_cutover(
 
     historical_rows = _count_current_lantern_details()
     detector = _startup_activate_detector_for_heartbeat(bringup)
-    _configure_teensy_lap_baseline()
 
     current_generation = _runtime_teensy_rpc_generation()
     if current_generation != int(attempt_generation):
@@ -10740,7 +10342,7 @@ def _startup_phase5_recovery_with_generation_retry() -> Tuple[Dict[str, Any], in
     A generation change is infrastructure invalidation, not a PHOTONS scientific
     contradiction. Discard only process-local proof expectation, wait for the
     replacement RPC lease, and classify again. Surviving producers are read-only;
-    baseline installation belongs only to the held/newborn restore branch. Any
+    aggregate installation belongs only to the held/newborn restore branch. Any
     failure while the same generation remains proved is still terminal.
     """
     while True:
@@ -10939,7 +10541,7 @@ def run() -> None:
                 (recovery.get("bringup_report") or {}).get("laser_mod_active_high"),
             )
         else:
-            # START/STOP/lap-reference/maintenance control opens only after an advancing
+            # START/STOP/maintenance control opens only after an advancing
             # post-restart row has crossed the complete ordered persistence transaction
             # on the same transport generation that was classified.
             _campaign_control_ready.set()

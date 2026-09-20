@@ -85,7 +85,7 @@ def _page_step(body_height: int) -> int:
 def _photons_visible_lines(lines: list[str], body_height: int) -> list[str]:
     """Keep the fixed headings and newest tail rows on shorter terminals."""
     for index, line in enumerate(lines):
-        if line.lstrip().startswith("SEC "):
+        if line.split() == ["SEC", "LAP", "ACCEPT", "EXCL", "MISSED", "SD", "SE"]:
             header_end = index + 1
             row_count = body_height - header_end
             if row_count > 0:

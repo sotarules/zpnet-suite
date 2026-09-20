@@ -52,7 +52,7 @@
 // state, and recovery totals.
 //
 // Independent launch cadence:
-//   • initialization registers a TimePop foreground service (default 1 ms);
+//   • initialization registers a TimePop foreground service (default 10 us);
 //     each due service emits a nominal 200 ns MOD pulse, regardless of PD arrivals;
 //     the next deadline is one configured interval after the actual launch DWT,
 //     using the existing F_CPU_ACTUAL conversion to DWT cycles. START establishes
@@ -79,10 +79,6 @@
 //                           active-high DRV200 MOD command LOW/idle
 //   • DETECTOR_ACTIVATE   — commissioning-only activation of the already-subscribed PD200T
 //                           interrupt lane; MOD remains LOW and no race/publisher starts
-//   • SET_LAP_BASELINE_NS — install/change the operator-authored lap reference with
-//                           six fractional ns digits (1 fs); Better-Buckets are
-//                           re-referenced in place without changing physical custody
-//   • SET_STANDARD_LAP_NS — legacy startup-compatible 3-decimal alias
 //   • START               — start a LANTERN campaign, or hot-cut an active campaign to a new name
 //   • FLASH_CUT           — explicit hot campaign boundary preserving the always-on instrument epoch
 //   • STOP                — request campaign closure; the next published campaign fragment is final
@@ -358,25 +354,24 @@ struct photons_lap_science_snapshot_t {
 };
 
 
-// One PHOTONS PPB population.  sample_count is accepted projected laps, not
-// elapsed seconds.  A zero sample_count means that bucket is scientifically
-// unavailable and must not be presented as a zero-PPB observation.
-struct photons_fragment_ppb_value_snapshot_t {
+// One accepted-flight population. A zero sample_count means no measured mean;
+// the serializer omits that bucket rather than publishing a zero lap duration.
+struct photons_fragment_lap_value_snapshot_t {
   uint64_t sample_count = 0;
-  double ppb = 0.0;
-  double residual_ns = 0.0;
+  double mean_lap_ns = 0.0;
 };
 
 
-// Instrument-owned rolling/lifetime PPB populations.  LANTERN CAMP PPB is a
-// separate firmware-authored campaign population below, matching CLOCKS' split
-// between always-on instrument buckets and campaign-relative statistics.
-struct photons_fragment_ppb_buckets_snapshot_t {
-  photons_fragment_ppb_value_snapshot_t minute_10{};
-  photons_fragment_ppb_value_snapshot_t minute_60{};
-  photons_fragment_ppb_value_snapshot_t hour_8{};
-  photons_fragment_ppb_value_snapshot_t hour_24{};
-  photons_fragment_ppb_value_snapshot_t total{};
+// Instrument-owned rolling/lifetime mean lap durations in nanoseconds.
+// LANTERN is a separate accepted-flight population, independent of these windows.
+// Existing PPB-named checkpoint types below retain the count/time recovery wire
+// protocol only; they carry no lap baseline or residual statistics.
+struct photons_fragment_lap_buckets_snapshot_t {
+  photons_fragment_lap_value_snapshot_t minute_10{};
+  photons_fragment_lap_value_snapshot_t minute_60{};
+  photons_fragment_lap_value_snapshot_t hour_8{};
+  photons_fragment_lap_value_snapshot_t hour_24{};
+  photons_fragment_lap_value_snapshot_t total{};
 };
 
 
@@ -429,10 +424,6 @@ struct photons_fragment_stats_snapshot_t {
   bool valid = false;
   uint32_t reset_count = 0;
   uint32_t update_count = 0;
-  // Exact operator-authored reference. standard_lap_ps remains a deprecated
-  // whole-picosecond compatibility mirror; all reference arithmetic uses fs.
-  uint64_t lap_baseline_fs = 0;
-  uint64_t standard_lap_ps = 0;
   uint64_t lap_count = 0;
   uint64_t total_lap_gnss_ns = 0;
 
@@ -444,7 +435,7 @@ struct photons_fragment_stats_snapshot_t {
 
   double mean_lap_ns = 0.0;
   photons_fragment_welford_snapshot_t lap_time_welford{};
-  photons_fragment_ppb_buckets_snapshot_t ppb_buckets{};
+  photons_fragment_lap_buckets_snapshot_t lap_buckets{};
 
   // Recovery-only Better-Buckets witnesses.  update_count is the logical
   // rolling chronology; current_sequence identifies the latest lawful endpoint.
@@ -458,7 +449,7 @@ struct photons_fragment_stats_snapshot_t {
 
 
 // Firmware-authored LANTERN campaign measurement.  Pi owns campaign lifecycle,
-// durable identity, and baseline relationships; PHOTONS owns the exact recording
+// and durable identity; PHOTONS owns the exact recording
 // boundary and CAMP statistics.  Campaign N/T is based on monotonic custody
 // totals that survive STATS_RESET, while the always-on statistical N/T above may
 // begin a fresh epoch.  Thus campaign transitions and statistics resets are
@@ -473,18 +464,6 @@ struct photons_fragment_campaign_snapshot_t {
   uint64_t lap_count = 0;
   uint64_t total_lap_gnss_ns = 0;
   double mean_lap_ns = 0.0;
-  photons_fragment_ppb_value_snapshot_t ppb{};
-};
-
-
-// Operator-authored instrument reference. This is deliberately independent of
-// campaign-to-campaign baseline provenance: it is simply the scalar zero used to
-// express the current accepted-population mean as a residual.
-struct photons_fragment_baseline_snapshot_t {
-  bool present = false;
-  bool residual_valid = false;
-  double baseline_mean_lap_ns = 0.0;
-  double mean_residual_ns = 0.0;
 };
 
 
@@ -519,7 +498,7 @@ struct photons_fragment_recovery_snapshot_t {
 // Canonical once-per-second PHOTONS handoff.  The always-on instrument subtree
 // remains authoritative and campaign-independent.  Optional campaign testimony
 // is a recording-relative sibling authored by firmware, matching CLOCKS_FRAGMENT:
-// Pi may add durable campaign ID/baseline provenance but never recomputes CAMP.
+// Pi may add durable campaign identity but never recomputes CAMP mean duration.
 struct photons_fragment_snapshot_t {
   bool snapshot_ok = false;
   bool valid = false;
@@ -598,7 +577,6 @@ struct photons_fragment_snapshot_t {
   photons_lap_science_snapshot_t science{};
   photons_fragment_stats_snapshot_t stats{};
   photons_fragment_campaign_snapshot_t campaign{};
-  photons_fragment_baseline_snapshot_t baseline{};
   photons_fragment_recovery_snapshot_t recovery{};
 
   // Snapshot of process_interrupt's PHOTODIODE lane testimony. Lifetime

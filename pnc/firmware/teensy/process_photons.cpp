@@ -422,16 +422,9 @@ static uint32_t g_photons_stats_reset_commit_count = 0U;
 static uint64_t g_photons_custody_lap_count = 0ULL;
 static uint64_t g_photons_custody_total_lap_gnss_ns = 0ULL;
 
-// Operator-authored lap reference. The exact authority is integer femtoseconds;
-// standard_lap_ps remains only a deprecated whole-ps compatibility mirror.
-// Re-referencing does not mutate physical N/T, Welford, or Better-Buckets custody.
-static bool g_standard_lap_configured = false;
-static uint64_t g_lap_baseline_fs = 0ULL;
-static uint64_t g_standard_lap_ps = 0ULL;
-
 // LANTERN lifecycle mirrors CLOCKS Beta conceptually: Pi owns the campaign
 // lifecycle/name, while Teensy snapshots its own already-running cumulative
-// accepted-lap state at a published fragment boundary and authors CAMP PPB.
+// accepted-lap state at a published fragment boundary and authors CAMP mean lap duration.
 enum class photons_campaign_state_t : uint8_t {
   STOPPED = 0,
   START_PENDING,
@@ -457,7 +450,7 @@ static uint32_t g_photons_flash_cut_commit_count = 0U;
 static uint32_t g_photons_flash_cut_reject_count = 0U;
 
 // Recovery is a boot-local transaction.  A rebooted Teensy remains held after
-// STANDARD_LAP_NS installation until the Pi either commits durable state or
+// initialization until the Pi either commits durable state or
 // explicitly declares a cold start.  A Pi-only restart sees publication_started
 // and reattaches without touching healthy live state.
 struct photons_recovery_protocol_t {
@@ -816,43 +809,16 @@ static bool photons_recovery_stage_endpoint(bool minute_history,
 }
 
 
-static double photons_observed_mean_fs(uint64_t total_lap_gnss_ns,
-                                       uint64_t lap_count) {
+static double photons_mean_lap_ns_from_population(
+    uint64_t total_lap_gnss_ns, uint64_t lap_count) {
   if (lap_count == 0ULL || total_lap_gnss_ns == 0ULL) __builtin_trap();
-
-  // Divide first so TOTAL remains numerically well behaved after years of
-  // accumulation. The quotient/remainder form avoids multiplying the lifetime
-  // nanosecond numerator by 1,000,000 in uint64_t.
   const uint64_t whole_ns = total_lap_gnss_ns / lap_count;
   const uint64_t remainder_ns = total_lap_gnss_ns % lap_count;
-  return (double)whole_ns * 1000000.0 +
-      ((double)remainder_ns * 1000000.0) / (double)lap_count;
+  return (double)whole_ns + (double)remainder_ns / (double)lap_count;
 }
 
 
-
-
-static double photons_residual_ns_from_population(
-    uint64_t total_lap_gnss_ns, uint64_t lap_count) {
-  if (!g_standard_lap_configured || g_lap_baseline_fs == 0ULL) {
-    __builtin_trap();
-  }
-  const double observed_mean_fs =
-      photons_observed_mean_fs(total_lap_gnss_ns, lap_count);
-  return (observed_mean_fs - (double)g_lap_baseline_fs) / 1000000.0;
-}
-
-
-static double photons_ppb_from_population(uint64_t total_lap_gnss_ns,
-                                          uint64_t lap_count) {
-  // PHOTONS uses the system-wide nanosecond coordinate: one nanosecond of
-  // mean baseline residual is one displayed PPB. The name is retained for
-  // Better-Buckets symmetry with CLOCKS; there is no fractional-lap scaling.
-  return photons_residual_ns_from_population(total_lap_gnss_ns, lap_count);
-}
-
-
-static photons_fragment_ppb_value_snapshot_t photons_ppb_bucket_between(
+static photons_fragment_lap_value_snapshot_t photons_ppb_bucket_between(
     const photons_ppb_endpoint_t& anchor,
     const photons_ppb_endpoint_t& current) {
   if (current.sequence <= anchor.sequence ||
@@ -866,14 +832,13 @@ static photons_fragment_ppb_value_snapshot_t photons_ppb_bucket_between(
       current.total_lap_gnss_ns - anchor.total_lap_gnss_ns;
   if (lap_count == 0ULL) {
     if (total_ns != 0ULL) __builtin_trap();
-    return photons_fragment_ppb_value_snapshot_t{};
+    return photons_fragment_lap_value_snapshot_t{};
   }
   if (total_ns == 0ULL) __builtin_trap();
 
-  photons_fragment_ppb_value_snapshot_t out{};
+  photons_fragment_lap_value_snapshot_t out{};
   out.sample_count = lap_count;
-  out.ppb = photons_ppb_from_population(total_ns, lap_count);
-  out.residual_ns = photons_residual_ns_from_population(total_ns, lap_count);
+  out.mean_lap_ns = photons_mean_lap_ns_from_population(total_ns, lap_count);
   return out;
 }
 
@@ -960,7 +925,7 @@ static photons_fragment_ppb_window_proof_snapshot_t photons_ppb_window_proof(
     return out;
   }
 
-  const photons_fragment_ppb_value_snapshot_t value =
+  const photons_fragment_lap_value_snapshot_t value =
       photons_ppb_bucket_between(anchor, current);
   if (value.sample_count == 0ULL) return out;
 
@@ -1108,7 +1073,7 @@ static void photons_ppb_windows_note_endpoint(uint32_t sequence,
 
 
 template <size_t N>
-static photons_fragment_ppb_value_snapshot_t photons_ppb_window_snapshot(
+static photons_fragment_lap_value_snapshot_t photons_ppb_window_snapshot(
     const photons_ppb_endpoint_t (&ring)[N],
     uint32_t head,
     uint32_t count,
@@ -1123,14 +1088,14 @@ static photons_fragment_ppb_value_snapshot_t photons_ppb_window_snapshot(
   if (!photons_ppb_ring_find_anchor(
           ring, head, count, target_sequence, current.sequence,
           minute_history, anchor)) {
-    return photons_fragment_ppb_value_snapshot_t{};
+    return photons_fragment_lap_value_snapshot_t{};
   }
   return photons_ppb_bucket_between(anchor, current);
 }
 
 
-static photons_fragment_ppb_buckets_snapshot_t photons_ppb_buckets_snapshot(void) {
-  photons_fragment_ppb_buckets_snapshot_t out{};
+static photons_fragment_lap_buckets_snapshot_t photons_ppb_buckets_snapshot(void) {
+  photons_fragment_lap_buckets_snapshot_t out{};
   if (!g_photons_ppb_endpoint_admitted ||
       !g_photons_ppb_previous_endpoint_valid) {
     return out;
@@ -1174,9 +1139,7 @@ static photons_fragment_ppb_buckets_snapshot_t photons_ppb_buckets_snapshot(void
 
   if (current.lap_count != 0ULL) {
     out.total.sample_count = current.lap_count;
-    out.total.ppb = photons_ppb_from_population(
-        current.total_lap_gnss_ns, current.lap_count);
-    out.total.residual_ns = photons_residual_ns_from_population(
+    out.total.mean_lap_ns = photons_mean_lap_ns_from_population(
         current.total_lap_gnss_ns, current.lap_count);
   } else if (current.total_lap_gnss_ns != 0ULL) {
     __builtin_trap();
@@ -1243,13 +1206,8 @@ static photons_fragment_campaign_snapshot_t photons_campaign_snapshot(
   }
   if (out.total_lap_gnss_ns == 0ULL) __builtin_trap();
 
-  out.mean_lap_ns =
-      (double)out.total_lap_gnss_ns / (double)out.lap_count;
-  out.ppb.sample_count = out.lap_count;
-  out.ppb.ppb =
-      photons_ppb_from_population(out.total_lap_gnss_ns, out.lap_count);
-  out.ppb.residual_ns =
-      photons_residual_ns_from_population(out.total_lap_gnss_ns, out.lap_count);
+  out.mean_lap_ns = photons_mean_lap_ns_from_population(
+      out.total_lap_gnss_ns, out.lap_count);
   return out;
 }
 
@@ -1335,8 +1293,6 @@ static void photons_campaign_commit_after_publish(
 
 
 static void photons_instrument_statistics_reset_commit(void) {
-  if (!g_standard_lap_configured || g_lap_baseline_fs == 0ULL) __builtin_trap();
-
   photons_welford_reset(g_lap_time_welford);
   photons_welford_reset(g_accepted_raw_cycles_welford);
   photons_welford_reset(g_excluded_raw_cycles_welford);
@@ -3742,16 +3698,15 @@ static void photons_payload_add_welford(
 }
 
 
-static void photons_payload_add_ppb_value(
+static void photons_payload_add_lap_value(
     Payload& parent,
     const char* name,
-    const photons_fragment_ppb_value_snapshot_t& value) {
+    const photons_fragment_lap_value_snapshot_t& value) {
   if (value.sample_count == 0ULL) return;
 
   Payload obj;
   obj.add("sample_count", value.sample_count);
-  obj.add("ppb", toFixedDecimal(value.ppb, 6));
-  obj.add("residual_ns", toFixedDecimal(value.residual_ns, 6));
+  obj.add("mean_lap_ns", toFixedDecimal(value.mean_lap_ns, 6));
   parent.add_object(name, obj);
 }
 
@@ -3799,7 +3754,6 @@ static Payload& photons_fragment_payload(
   Payload& ppb_checkpoint = g_photons_fragment_ppb_checkpoint;
   Payload& campaign = g_photons_fragment_campaign;
   Payload& campaign_stats = g_photons_fragment_campaign_stats;
-  Payload baseline;
   Payload& recovery = g_photons_fragment_recovery;
   Payload& interrupt = g_photons_fragment_interrupt;
 
@@ -4059,17 +4013,10 @@ static Payload& photons_fragment_payload(
   science.clear();
 
   stats.add("schema", "PHOTONS_INSTRUMENT_STATS_V1");
-  stats.add("ppb_semantics", "LAP_BASELINE_NS_OFFSET_V1");
+  stats.add("lap_semantics", "MEAN_LAP_NS_V1");
   stats.add("valid", f.stats.valid);
   stats.add("reset_count", f.stats.reset_count);
   stats.add("update_count", f.stats.update_count);
-  stats.add("lap_baseline_fs", f.stats.lap_baseline_fs);
-  stats.add("lap_baseline_ns",
-            toFixedDecimal((double)f.stats.lap_baseline_fs / 1000000.0, 6));
-  // Deprecated compatibility mirror; reference arithmetic never uses this field.
-  stats.add("standard_lap_ps", f.stats.standard_lap_ps);
-  stats.add("standard_lap_ns",
-            toFixedDecimal((double)f.stats.standard_lap_ps / 1000.0, 3));
   stats.add("custody_lap_count", f.stats.custody_lap_count);
   stats.add("custody_total_lap_gnss_ns",
             f.stats.custody_total_lap_gnss_ns);
@@ -4081,17 +4028,17 @@ static Payload& photons_fragment_payload(
   photons_payload_add_welford(
       stats, "lap_time", f.stats.lap_time_welford);
 
-  photons_payload_add_ppb_value(
-      ppb_buckets, "10_min", f.stats.ppb_buckets.minute_10);
-  photons_payload_add_ppb_value(
-      ppb_buckets, "60_min", f.stats.ppb_buckets.minute_60);
-  photons_payload_add_ppb_value(
-      ppb_buckets, "8_hour", f.stats.ppb_buckets.hour_8);
-  photons_payload_add_ppb_value(
-      ppb_buckets, "24_hour", f.stats.ppb_buckets.hour_24);
-  photons_payload_add_ppb_value(
-      ppb_buckets, "total", f.stats.ppb_buckets.total);
-  stats.add_object("ppb_buckets", ppb_buckets);
+  photons_payload_add_lap_value(
+      ppb_buckets, "10_min", f.stats.lap_buckets.minute_10);
+  photons_payload_add_lap_value(
+      ppb_buckets, "60_min", f.stats.lap_buckets.minute_60);
+  photons_payload_add_lap_value(
+      ppb_buckets, "8_hour", f.stats.lap_buckets.hour_8);
+  photons_payload_add_lap_value(
+      ppb_buckets, "24_hour", f.stats.lap_buckets.hour_24);
+  photons_payload_add_lap_value(
+      ppb_buckets, "total", f.stats.lap_buckets.total);
+  stats.add_object("lap_buckets", ppb_buckets);
   ppb_buckets.clear();
 
   stats.add("rolling_ppb_current_sequence",
@@ -4142,17 +4089,6 @@ static Payload& photons_fragment_payload(
   instrument.add_object("stats", stats);
   stats.clear();
 
-  baseline.add("present", f.baseline.present);
-  baseline.add("residual_valid", f.baseline.residual_valid);
-  if (f.baseline.present) {
-    baseline.add("baseline_mean_lap_ns",
-                 toFixedDecimal(f.baseline.baseline_mean_lap_ns, 6));
-  }
-  if (f.baseline.residual_valid) {
-    baseline.add("mean_residual_ns",
-                 toFixedDecimal(f.baseline.mean_residual_ns, 6));
-  }
-  instrument.add_object("baseline", baseline);
 
   recovery.add("restored", f.recovery.restored);
   recovery.add("proof_pending", f.recovery.proof_pending);
@@ -4245,10 +4181,7 @@ static Payload& photons_fragment_payload(
       campaign_stats.add("race_count", f.campaign.lap_count);
       campaign_stats.add("mean_flight_ns",
                          toFixedDecimal(f.campaign.mean_lap_ns, 6));
-      campaign_stats.add("sample_count", f.campaign.ppb.sample_count);
-      campaign_stats.add("ppb", toFixedDecimal(f.campaign.ppb.ppb, 6));
-      campaign_stats.add("residual_ns",
-                         toFixedDecimal(f.campaign.ppb.residual_ns, 6));
+      campaign_stats.add("sample_count", f.campaign.lap_count);
     }
     campaign.add_object("stats", campaign_stats);
     campaign_stats.clear();
@@ -4266,11 +4199,8 @@ static FLASHMEM void photons_fragment_tick(
     timepop_diag_t* /*diag*/,
     void* /*user_data*/) {
 
-  // PHOTONS_FRAGMENT is ready-to-eat testimony.  Until the Pi supplies the
-  // required standard lap, PHOTONS has no authority to publish interpreted
-  // optical statistics.
-  if (!g_standard_lap_configured || g_lap_baseline_fs == 0ULL ||
-      !g_photons_recovery.publication_started) return;
+  // Recovery establishes statistical ancestry before publication begins.
+  if (!g_photons_recovery.publication_started) return;
 
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::FRAGMENT);
@@ -4419,8 +4349,6 @@ static FLASHMEM void photons_fragment_tick(
 
   fragment.stats.reset_count = g_photons_stats_reset_count;
   fragment.stats.update_count = ++g_photons_stats_update_count;
-  fragment.stats.lap_baseline_fs = g_lap_baseline_fs;
-  fragment.stats.standard_lap_ps = g_standard_lap_ps;
   fragment.stats.lap_count = g_lap_time_welford.n;
   fragment.stats.total_lap_gnss_ns = g_total_lap_gnss_ns;
   fragment.stats.custody_lap_count = g_photons_custody_lap_count;
@@ -4451,7 +4379,7 @@ static FLASHMEM void photons_fragment_tick(
       ppb_endpoint_admitted,
       fragment.stats.lap_count,
       fragment.stats.total_lap_gnss_ns);
-  fragment.stats.ppb_buckets = photons_ppb_buckets_snapshot();
+  fragment.stats.lap_buckets = photons_ppb_buckets_snapshot();
   fragment.stats.rolling_ppb_current_sequence =
       g_photons_ppb_current_sequence;
   fragment.stats.rolling_ppb_endpoint_admitted =
@@ -4467,22 +4395,6 @@ static FLASHMEM void photons_fragment_tick(
   // origin, exactly like CLOCKS campaign offsets.
   fragment.campaign = photons_campaign_snapshot(fragment.sequence);
 
-  // LAP_BASELINE_NS is an operator-authored coordinate reference, independent
-  // of campaign-to-campaign baseline provenance. Re-reference the current exact
-  // accepted N/T without mutating any physical/statistical custody.
-  fragment.baseline = photons_fragment_baseline_snapshot_t{};
-  fragment.baseline.present =
-      g_standard_lap_configured && g_lap_baseline_fs != 0ULL;
-  if (fragment.baseline.present) {
-    fragment.baseline.baseline_mean_lap_ns =
-        (double)g_lap_baseline_fs / 1000000.0;
-    if (fragment.stats.lap_count != 0ULL) {
-      fragment.baseline.residual_valid = true;
-      fragment.baseline.mean_residual_ns =
-          photons_residual_ns_from_population(
-              fragment.stats.total_lap_gnss_ns, fragment.stats.lap_count);
-    }
-  }
   fragment.recovery = photons_recovery_snapshot();
 
   fragment.interrupt_subscribed = interrupt_diag.subscribed;
@@ -4678,8 +4590,7 @@ static void photons_recovery_clear_physical_ancestry(void) {
 
 
 static void photons_start_fragment_publisher(void) {
-  if (!g_standard_lap_configured || g_lap_baseline_fs == 0ULL ||
-      g_photons_recovery.publication_started ||
+  if (g_photons_recovery.publication_started ||
       g_fragment_timer != TIMEPOP_INVALID_HANDLE ||
       !g_photons_ppb_previous_endpoint_valid ||
       !g_interrupt_started ||
@@ -4757,9 +4668,6 @@ FLASHMEM void process_photons_init(void) {
   g_fragment_timer = TIMEPOP_INVALID_HANDLE;
   g_photons_recovery_protocol = photons_recovery_protocol_t{};
   g_photons_recovery = photons_recovery_runtime_t{};
-  g_standard_lap_configured = false;
-  g_lap_baseline_fs = 0ULL;
-  g_standard_lap_ps = 0ULL;
   g_photons_campaign_state = photons_campaign_state_t::STOPPED;
   g_photons_campaign_name[0] = '\0';
   g_photons_campaign_origin_lap_count = 0ULL;
@@ -4830,159 +4738,6 @@ FLASHMEM void process_photons_init(void) {
 // Commands
 // ============================================================================
 
-// Parse the operator-authored LAP_BASELINE_NS exactly into integer femtoseconds.
-// One or more integer digits, '.', and exactly six fractional digits are required.
-static bool photons_parse_lap_baseline_ns(const char* text,
-                                          uint64_t& lap_baseline_fs) {
-  lap_baseline_fs = 0ULL;
-  if (!text || !*text) return false;
-
-  const char* p = text;
-  uint64_t whole_ns = 0ULL;
-  uint32_t integer_digits = 0U;
-  while (*p >= '0' && *p <= '9') {
-    const uint32_t digit = (uint32_t)(*p - '0');
-    if (whole_ns > (UINT64_MAX - (uint64_t)digit) / 10ULL) return false;
-    whole_ns = whole_ns * 10ULL + (uint64_t)digit;
-    integer_digits++;
-    p++;
-  }
-  if (integer_digits == 0U || *p != '.') return false;
-  p++;
-
-  uint32_t fractional_fs = 0U;
-  for (uint32_t i = 0U; i < 6U; i++) {
-    if (*p < '0' || *p > '9') return false;
-    fractional_fs = fractional_fs * 10U + (uint32_t)(*p - '0');
-    p++;
-  }
-  if (*p != '\0') return false;
-  if (whole_ns > (UINT64_MAX - (uint64_t)fractional_fs) / 1000000ULL) {
-    return false;
-  }
-
-  lap_baseline_fs = whole_ns * 1000000ULL + (uint64_t)fractional_fs;
-  return lap_baseline_fs != 0ULL;
-}
-
-
-static void photons_install_lap_baseline_fs(uint64_t requested_fs) {
-  if (requested_fs == 0ULL) __builtin_trap();
-  g_lap_baseline_fs = requested_fs;
-  // Deprecated compatibility mirror only. Round to the nearest whole ps.
-  g_standard_lap_ps = requested_fs / 1000ULL +
-      ((requested_fs % 1000ULL) >= 500ULL ? 1ULL : 0ULL);
-  if (g_standard_lap_ps == 0ULL) __builtin_trap();
-  photons_memory_barrier();
-  g_standard_lap_configured = true;
-}
-
-
-static FLASHMEM Payload cmd_set_lap_baseline_ns(const Payload& args) {
-  const photons_foreground_custody_t custody(
-      photons_foreground_owner_t::COMMAND);
-  const char* text = args.getString("lap_baseline_ns");
-  uint64_t requested_fs = 0ULL;
-  if (!photons_parse_lap_baseline_ns(text, requested_fs)) {
-    Payload err;
-    err.add("status", "lap_baseline_rejected_contract");
-    err.add("error",
-            "LAP_BASELINE_NS must be positive fixed decimal with exactly six fractional digits");
-    return err;
-  }
-  if (g_photons_recovery_protocol.active || g_photons_recovery.proof_pending ||
-      g_photons_stats_reset_pending) {
-    Payload err;
-    err.add("status", "lap_baseline_rejected_transition");
-    err.add("error", "PHOTONS recovery/statistics transition owns the reference boundary");
-    return err;
-  }
-
-  const bool was_configured = g_standard_lap_configured;
-  const uint64_t previous_fs = g_lap_baseline_fs;
-  const bool changed = !was_configured || requested_fs != previous_fs;
-  if (changed) photons_install_lap_baseline_fs(requested_fs);
-
-  Payload p;
-  p.add("status", "lap_baseline_set");
-  p.add("changed", changed);
-  p.add("lap_baseline_configured", g_standard_lap_configured);
-  p.add("lap_baseline_fs", g_lap_baseline_fs);
-  p.add("lap_baseline_ns",
-        toFixedDecimal((double)g_lap_baseline_fs / 1000000.0, 6));
-  p.add("previous_lap_baseline_fs", was_configured ? previous_fs : 0ULL);
-  p.add("publication_started", g_photons_recovery.publication_started);
-  p.add("measurement_history_preserved", true);
-  p.add("better_buckets_history_preserved", true);
-  p.add("campaign_state", photons_campaign_state_name(g_photons_campaign_state));
-  return p;
-}
-
-
-// Legacy 3-decimal startup alias. It may establish the reference on a newborn
-// producer, but it may not overwrite an exact six-decimal baseline.
-static bool photons_parse_standard_lap_ns(const char* text,
-                                          uint64_t& standard_lap_ps) {
-  standard_lap_ps = 0ULL;
-  if (!text || !*text) return false;
-
-  const char* p = text;
-  uint64_t whole_ns = 0ULL;
-  uint32_t integer_digits = 0U;
-  while (*p >= '0' && *p <= '9') {
-    const uint32_t digit = (uint32_t)(*p - '0');
-    if (whole_ns > (UINT64_MAX - (uint64_t)digit) / 10ULL) return false;
-    whole_ns = whole_ns * 10ULL + (uint64_t)digit;
-    integer_digits++;
-    p++;
-  }
-  if (integer_digits == 0U || *p != '.') return false;
-  p++;
-
-  uint32_t fractional_ps = 0U;
-  for (uint32_t i = 0U; i < 3U; i++) {
-    if (*p < '0' || *p > '9') return false;
-    fractional_ps = fractional_ps * 10U + (uint32_t)(*p - '0');
-    p++;
-  }
-  if (*p != '\0') return false;
-  if (whole_ns > (UINT64_MAX - (uint64_t)fractional_ps) / 1000ULL) return false;
-  standard_lap_ps = whole_ns * 1000ULL + (uint64_t)fractional_ps;
-  return standard_lap_ps != 0ULL;
-}
-
-
-static FLASHMEM Payload cmd_set_standard_lap_ns(const Payload& args) {
-  const photons_foreground_custody_t custody(
-      photons_foreground_owner_t::COMMAND);
-  const char* text = args.getString("standard_lap_ns");
-  uint64_t requested_ps = 0ULL;
-  if (!photons_parse_standard_lap_ns(text, requested_ps) ||
-      requested_ps > UINT64_MAX / 1000ULL) {
-    __builtin_trap();
-  }
-  const uint64_t requested_fs = requested_ps * 1000ULL;
-
-  if (g_standard_lap_configured) {
-    if (requested_fs != g_lap_baseline_fs) __builtin_trap();
-  } else {
-    photons_install_lap_baseline_fs(requested_fs);
-  }
-
-  Payload p;
-  p.add("standard_lap_configured", true);
-  p.add("publication_started", g_photons_recovery.publication_started);
-  p.add("recovery_verdict_required", !g_photons_recovery.publication_started);
-  p.add("standard_lap_ps", g_standard_lap_ps);
-  p.add("standard_lap_ns",
-        toFixedDecimal((double)g_standard_lap_ps / 1000.0, 3));
-  p.add("lap_baseline_fs", g_lap_baseline_fs);
-  p.add("lap_baseline_ns",
-        toFixedDecimal((double)g_lap_baseline_fs / 1000000.0, 6));
-  return p;
-}
-
-
 static bool photons_recovery_get_u32(const Payload& args,
                                      const char* key,
                                      uint32_t& out) {
@@ -5041,6 +4796,7 @@ static FLASHMEM Payload cmd_ppb_export_meta(const Payload& /*args*/) {
   const photons_ppb_endpoint_t current = g_photons_ppb_previous_endpoint;
   const photons_ppb_endpoint_t origin{};
   Payload p;
+  p.add("lap_semantics", "MEAN_LAP_NS_V1");
   p.add("status", "ppb_export_ready");
   p.add("schema", "PHOTONS_PPB_FULL_RING_EXPORT_V1");
   p.add("read_only", true);
@@ -5063,10 +4819,6 @@ static FLASHMEM Payload cmd_ppb_export_meta(const Payload& /*args*/) {
       g_photons_ppb_minutes_count));
   p.add("last_minute_key", g_photons_ppb_last_minute_key);
   p.add("origin_valid", true);
-  p.add("lap_baseline_fs", g_lap_baseline_fs);
-  p.add("lap_baseline_ns",
-        toFixedDecimal((double)g_lap_baseline_fs / 1000000.0, 6));
-  p.add("standard_lap_ps", g_standard_lap_ps);
   p.add("chunk_max_endpoints", PHOTONS_RECOVERY_CHUNK_MAX_ENDPOINTS);
   photons_ppb_export_add_endpoint(p, "current", current);
   photons_ppb_export_add_endpoint(p, "origin", origin);
@@ -5213,11 +4965,6 @@ static Payload photons_recovery_reject(const char* status,
 static FLASHMEM Payload cmd_recovery_begin(const Payload& args) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
-  if (!g_standard_lap_configured || g_lap_baseline_fs == 0ULL) {
-    return photons_recovery_reject(
-        "recovery_begin_rejected_standard_missing",
-        "LAP_BASELINE_NS must be installed before recovery");
-  }
   if (g_photons_recovery.publication_started) {
     return photons_recovery_reject(
         "recovery_begin_rejected_live",
@@ -5525,7 +5272,6 @@ static FLASHMEM Payload cmd_recovery_commit(const Payload& args) {
   uint32_t source_publish_count = 0U;
   uint32_t source_reset_count = 0U;
   uint32_t source_update_count = 0U;
-  uint64_t standard_lap_ps = 0ULL;
   uint64_t stats_lap_count = 0ULL;
   uint64_t stats_total_ns = 0ULL;
   uint64_t custody_lap_count = 0ULL;
@@ -5559,8 +5305,6 @@ static FLASHMEM Payload cmd_recovery_commit(const Payload& args) {
       photons_recovery_get_u32(
           args, "source_update_count", source_update_count) &&
       source_update_count != 0U &&
-      photons_recovery_get_u64(args, "standard_lap_ps", standard_lap_ps) &&
-      standard_lap_ps == g_standard_lap_ps &&
       photons_recovery_get_u64(args, "stats_lap_count", stats_lap_count) &&
       photons_recovery_get_u64(
           args, "stats_total_lap_gnss_ns", stats_total_ns) &&
@@ -5771,11 +5515,6 @@ static FLASHMEM Payload cmd_recovery_commit(const Payload& args) {
 static FLASHMEM Payload cmd_recovery_cold_start(const Payload& args) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
-  if (!g_standard_lap_configured || g_lap_baseline_fs == 0ULL) {
-    return photons_recovery_reject(
-        "recovery_cold_start_rejected_standard_missing",
-        "LAP_BASELINE_NS must be installed before cold start");
-  }
   if (g_photons_recovery.publication_started ||
       g_photons_recovery_protocol.active) {
     return photons_recovery_reject(
@@ -5896,14 +5635,10 @@ static FLASHMEM Payload cmd_report_recovery(const Payload& /*args*/) {
       photons_foreground_owner_t::COMMAND);
   Payload p;
   photons_prepare_operational_report(p);
+  p.add("lap_semantics", "MEAN_LAP_NS_V1");
   p.add("report", "PHOTONS_RECOVERY");
   p.add("schema", "PHOTONS_RECOVERY_REPORT_V1");
   p.add("restore_schema_version", PHOTONS_RECOVERY_SCHEMA_VERSION);
-  p.add("standard_lap_configured", g_standard_lap_configured);
-  p.add("lap_baseline_fs", g_lap_baseline_fs);
-  p.add("lap_baseline_ns",
-        toFixedDecimal((double)g_lap_baseline_fs / 1000000.0, 6));
-  p.add("standard_lap_ps", g_standard_lap_ps);
   p.add("publication_started", g_photons_recovery.publication_started);
   p.add("staging_active", g_photons_recovery_protocol.active);
   p.add("staging_generation", g_photons_recovery_protocol.generation);
@@ -6121,18 +5856,16 @@ static FLASHMEM Payload cmd_stop(const Payload& /*args*/) {
 }
 
 
-static void photons_payload_add_flat_ppb_bucket(
+static void photons_payload_add_flat_lap_bucket(
     Payload& p,
     const char* prefix,
-    const photons_fragment_ppb_value_snapshot_t& value) {
+    const photons_fragment_lap_value_snapshot_t& value) {
   char key[48];
   snprintf(key, sizeof(key), "%s_n", prefix);
   p.add(key, value.sample_count);
   if (value.sample_count != 0ULL) {
-    snprintf(key, sizeof(key), "%s_ppb", prefix);
-    p.add(key, toFixedDecimal(value.ppb, 6));
-    snprintf(key, sizeof(key), "%s_residual_ns", prefix);
-    p.add(key, toFixedDecimal(value.residual_ns, 6));
+    snprintf(key, sizeof(key), "%s_mean_lap_ns", prefix);
+    p.add(key, toFixedDecimal(value.mean_lap_ns, 6));
   }
 }
 
@@ -6150,7 +5883,7 @@ static FLASHMEM Payload cmd_report_photons(const Payload& /*args*/) {
   photons_prepare_operational_report(p);
   p.add("report", "PHOTONS_INSTRUMENT");
   p.add("schema", "PHOTONS_INSTRUMENT_REPORT_V1");
-  p.add("ppb_semantics", "LAP_BASELINE_NS_OFFSET_V1");
+  p.add("lap_semantics", "MEAN_LAP_NS_V1");
   p.add("instrument_always_on", true);
   p.add("instrument_owner", "TEENSY.PHOTONS");
   p.add("publication_started", g_photons_recovery.publication_started);
@@ -6160,16 +5893,6 @@ static FLASHMEM Payload cmd_report_photons(const Payload& /*args*/) {
   p.add("recovery_generation", g_photons_recovery.generation);
   p.add("snapshot_ok", canonical.snapshot_ok);
   p.add("valid", canonical.valid);
-  p.add("standard_lap_configured", g_standard_lap_configured);
-  p.add("lap_baseline_configured", g_standard_lap_configured);
-  if (g_standard_lap_configured) {
-    p.add("lap_baseline_fs", g_lap_baseline_fs);
-    p.add("lap_baseline_ns",
-          toFixedDecimal((double)g_lap_baseline_fs / 1000000.0, 6));
-    p.add("standard_lap_ps", g_standard_lap_ps);
-    p.add("standard_lap_ns",
-          toFixedDecimal((double)g_standard_lap_ps / 1000.0, 3));
-  }
   p.add("stats_reset_count", canonical.stats.reset_count);
   p.add("stats_update_count", canonical.stats.update_count);
   p.add("stats_reset_pending", g_photons_stats_reset_pending);
@@ -6228,22 +5951,16 @@ static FLASHMEM Payload cmd_report_photons(const Payload& /*args*/) {
   p.add("lap_count", canonical.stats.lap_count);
   p.add("total_lap_gnss_ns", canonical.stats.total_lap_gnss_ns);
   p.add("mean_lap_ns", toFixedDecimal(canonical.stats.mean_lap_ns, 6));
-  p.add("lap_baseline_ns",
-        toFixedDecimal((double)canonical.stats.lap_baseline_fs / 1000000.0, 6));
-  if (canonical.baseline.residual_valid) {
-    p.add("mean_residual_ns",
-          toFixedDecimal(canonical.baseline.mean_residual_ns, 6));
-  }
-  photons_payload_add_flat_ppb_bucket(p, "ppb_10_min",
-                                      canonical.stats.ppb_buckets.minute_10);
-  photons_payload_add_flat_ppb_bucket(p, "ppb_60_min",
-                                      canonical.stats.ppb_buckets.minute_60);
-  photons_payload_add_flat_ppb_bucket(p, "ppb_8_hour",
-                                      canonical.stats.ppb_buckets.hour_8);
-  photons_payload_add_flat_ppb_bucket(p, "ppb_24_hour",
-                                      canonical.stats.ppb_buckets.hour_24);
-  photons_payload_add_flat_ppb_bucket(p, "ppb_total",
-                                      canonical.stats.ppb_buckets.total);
+  photons_payload_add_flat_lap_bucket(p, "lap_10_min",
+                                      canonical.stats.lap_buckets.minute_10);
+  photons_payload_add_flat_lap_bucket(p, "lap_60_min",
+                                      canonical.stats.lap_buckets.minute_60);
+  photons_payload_add_flat_lap_bucket(p, "lap_8_hour",
+                                      canonical.stats.lap_buckets.hour_8);
+  photons_payload_add_flat_lap_bucket(p, "lap_24_hour",
+                                      canonical.stats.lap_buckets.hour_24);
+  photons_payload_add_flat_lap_bucket(p, "lap_total",
+                                      canonical.stats.lap_buckets.total);
   p.add("campaign_state", photons_campaign_state_name(g_photons_campaign_state));
   if (g_photons_campaign_name[0]) p.add("campaign", g_photons_campaign_name);
   p.add("campaign_public_count", g_photons_campaign_public_count);
@@ -6251,16 +5968,13 @@ static FLASHMEM Payload cmd_report_photons(const Payload& /*args*/) {
         canonical.stats.reset_count == g_photons_stats_reset_count);
   if (canonical.campaign.present &&
       !strcmp(canonical.campaign.campaign, g_photons_campaign_name) &&
-      canonical.campaign.ppb.sample_count != 0ULL) {
+      canonical.campaign.lap_count != 0ULL) {
     p.add("campaign_race_count", canonical.campaign.lap_count);
     p.add("campaign_mean_flight_ns",
           toFixedDecimal(canonical.campaign.mean_lap_ns, 6));
     p.add("campaign_lap_count", canonical.campaign.lap_count);
     p.add("campaign_mean_lap_ns",
           toFixedDecimal(canonical.campaign.mean_lap_ns, 6));
-    p.add("campaign_ppb", toFixedDecimal(canonical.campaign.ppb.ppb, 6));
-    p.add("campaign_residual_ns",
-          toFixedDecimal(canonical.campaign.ppb.residual_ns, 6));
   }
   p.add("custody_lap_count", g_photons_custody_lap_count);
   p.add("custody_total_lap_gnss_ns", g_photons_custody_total_lap_gnss_ns);
@@ -6279,7 +5993,7 @@ static FLASHMEM Payload cmd_report_stats(const Payload& /*args*/) {
   photons_prepare_operational_report(p);
   p.add("report", "PHOTONS_STATS");
   p.add("schema", "PHOTONS_INSTRUMENT_STATS_REPORT_V1");
-  p.add("ppb_semantics", "LAP_BASELINE_NS_OFFSET_V1");
+  p.add("lap_semantics", "MEAN_LAP_NS_V1");
   p.add("publication_started", g_photons_recovery.publication_started);
   p.add("recovery_restored", g_photons_recovery.restored);
   p.add("recovery_proof_pending", g_photons_recovery.proof_pending);
@@ -6303,13 +6017,6 @@ static FLASHMEM Payload cmd_report_stats(const Payload& /*args*/) {
   p.add("race_count", canonical.stats.lap_count);
   p.add("mean_flight_ns", toFixedDecimal(canonical.stats.mean_lap_ns, 6));
   p.add("mean_lap_ns", toFixedDecimal(canonical.stats.mean_lap_ns, 6));
-  p.add("lap_baseline_fs", canonical.stats.lap_baseline_fs);
-  p.add("lap_baseline_ns",
-        toFixedDecimal((double)canonical.stats.lap_baseline_fs / 1000000.0, 6));
-  if (canonical.baseline.residual_valid) {
-    p.add("mean_residual_ns",
-          toFixedDecimal(canonical.baseline.mean_residual_ns, 6));
-  }
   p.add("lap_welford_n", canonical.stats.lap_time_welford.n);
   p.add("lap_welford_mean",
         toFixedDecimal(canonical.stats.lap_time_welford.mean, 6));
@@ -6333,16 +6040,16 @@ static FLASHMEM Payload cmd_report_stats(const Payload& /*args*/) {
         canonical.science.exclusion_reasons.raw_cycle_excursion);
   p.add("science_exclusion_isr_delay",
         canonical.science.exclusion_reasons.isr_delay);
-  photons_payload_add_flat_ppb_bucket(p, "ppb_10_min",
-                                      canonical.stats.ppb_buckets.minute_10);
-  photons_payload_add_flat_ppb_bucket(p, "ppb_60_min",
-                                      canonical.stats.ppb_buckets.minute_60);
-  photons_payload_add_flat_ppb_bucket(p, "ppb_8_hour",
-                                      canonical.stats.ppb_buckets.hour_8);
-  photons_payload_add_flat_ppb_bucket(p, "ppb_24_hour",
-                                      canonical.stats.ppb_buckets.hour_24);
-  photons_payload_add_flat_ppb_bucket(p, "ppb_total",
-                                      canonical.stats.ppb_buckets.total);
+  photons_payload_add_flat_lap_bucket(p, "lap_10_min",
+                                      canonical.stats.lap_buckets.minute_10);
+  photons_payload_add_flat_lap_bucket(p, "lap_60_min",
+                                      canonical.stats.lap_buckets.minute_60);
+  photons_payload_add_flat_lap_bucket(p, "lap_8_hour",
+                                      canonical.stats.lap_buckets.hour_8);
+  photons_payload_add_flat_lap_bucket(p, "lap_24_hour",
+                                      canonical.stats.lap_buckets.hour_24);
+  photons_payload_add_flat_lap_bucket(p, "lap_total",
+                                      canonical.stats.lap_buckets.total);
   p.add("rolling_ppb_current_sequence",
         canonical.stats.rolling_ppb_current_sequence);
   p.add("rolling_ppb_endpoint_admitted",
@@ -6360,11 +6067,6 @@ static FLASHMEM Payload cmd_report_stats(const Payload& /*args*/) {
     p.add("campaign_public_count", canonical.campaign.public_count);
     p.add("campaign_lap_count", canonical.campaign.lap_count);
     p.add("campaign_total_lap_gnss_ns", canonical.campaign.total_lap_gnss_ns);
-    if (canonical.campaign.ppb.sample_count != 0ULL) {
-        p.add("campaign_ppb", toFixedDecimal(canonical.campaign.ppb.ppb, 6));
-      p.add("campaign_residual_ns",
-            toFixedDecimal(canonical.campaign.ppb.residual_ns, 6));
-    }
   }
   return p;
 }
@@ -6403,8 +6105,6 @@ static FLASHMEM Payload cmd_stats_reset(const Payload& /*args*/) {
   p.add("boundary", "AFTER_NEXT_SUCCESSFULLY_PUBLISHED_FRAGMENT");
   p.add("campaign_changed", false);
   p.add("custody_preserved", true);
-  p.add("standard_lap_preserved", true);
-  p.add("lap_baseline_preserved", true);
   p.add("next_report", "REPORT_STATS");
   return p;
 }
@@ -6482,17 +6182,9 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
   p.add("report", "PHOTONS");
   photons_cadence_report(p);
   p.add("schema", "PHOTONS_REPORT_V3");
-  p.add("ppb_semantics", "LAP_BASELINE_NS_OFFSET_V1");
+  p.add("lap_semantics", "MEAN_LAP_NS_V1");
   p.add("initialized", g_initialized);
   p.add("publication_started", g_photons_recovery.publication_started);
-  p.add("standard_lap_configured", g_standard_lap_configured);
-  p.add("lap_baseline_configured", g_standard_lap_configured);
-  if (g_standard_lap_configured) {
-    p.add("lap_baseline_fs", g_lap_baseline_fs);
-    p.add("lap_baseline_ns",
-          toFixedDecimal((double)g_lap_baseline_fs / 1000000.0, 6));
-    p.add("standard_lap_ps", g_standard_lap_ps);
-  }
   p.add("recovery_restored", g_photons_recovery.restored);
   p.add("recovery_proof_pending", g_photons_recovery.proof_pending);
   p.add("recovery_proof_committed", g_photons_recovery.proof_committed);
@@ -7036,8 +6728,6 @@ static const process_command_entry_t PHOTONS_COMMANDS[] = {
   { "REPORT_HISTOGRAM",    cmd_report_histogram    },
   { "INIT",                cmd_init                },
   { "DETECTOR_ACTIVATE",   cmd_detector_activate   },
-  { "SET_LAP_BASELINE_NS", cmd_set_lap_baseline_ns },
-  { "SET_STANDARD_LAP_NS", cmd_set_standard_lap_ns },
   { "START",               cmd_start               },
   { "PHOTONS_START",       cmd_photons_start       },
   { "PHOTONS_STOP",        cmd_photons_stop        },
