@@ -532,7 +532,7 @@ static photodiode_subscription_runtime_t g_photodiode_subscription{};
 // Priority 48 owns the raw producer; foreground alone consumes/classifies it.
 // A bounded SPSC ring preserves entry evidence across foreground latency.
 // No PHOTODIODE record enters the shared Priority-32 continuation.
-static constexpr uint32_t PHOTODIODE_RAW_CAPACITY = 64U;
+static constexpr uint32_t PHOTODIODE_RAW_CAPACITY = 256U;
 static_assert((PHOTODIODE_RAW_CAPACITY & (PHOTODIODE_RAW_CAPACITY - 1U)) == 0U,
               "photodiode raw capacity must be a power of two");
 enum class photodiode_capture_kind_t : uint8_t { PHYSICAL, SYNTHETIC };
@@ -5583,13 +5583,17 @@ static void photodiode_gpio2_isr(void) {
       g_interrupt_priority_runtime.photodiode, isr_entry_dwt_raw);
   const uint32_t status =
       GPIO2_ISR & GPIO2_IMR & PHOTODIODE_GPIO2_HIGH_HALF_MASK;
-  if ((status & PHOTODIODE_GPIO2_MASK) == 0U ||
-      (status & (PHOTODIODE_GPIO2_HIGH_HALF_MASK &
+  if ((status & (PHOTODIODE_GPIO2_HIGH_HALF_MASK &
                  ~PHOTODIODE_GPIO2_MASK)) != 0U) __builtin_trap();
-  GPIO2_ISR = PHOTODIODE_GPIO2_MASK;
-  dmb_barrier();
-  photodiode_raw_push(isr_entry_dwt_raw, arrival_capture,
-                      photodiode_capture_kind_t::PHYSICAL);
+  // NVIC delivery can outlive GPIO status cleared at an acquisition boundary.
+  // An empty entry carries no edge: leave GPIO untouched and complete the ISR
+  // bookkeeping below. A later edge remains pending for its own capture.
+  if ((status & PHOTODIODE_GPIO2_MASK) != 0U) {
+    GPIO2_ISR = PHOTODIODE_GPIO2_MASK;
+    dmb_barrier();
+    photodiode_raw_push(isr_entry_dwt_raw, arrival_capture,
+                        photodiode_capture_kind_t::PHYSICAL);
+  }
   const bool preempted_after_entry =
       g_interrupt_priority_runtime.photodiode.preempted_during_current_entry;
   interrupt_isr_diag_exit(
