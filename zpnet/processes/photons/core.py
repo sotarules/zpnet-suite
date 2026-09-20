@@ -913,6 +913,49 @@ def _validate_race_geometry(race: Dict[str, Any], path: str) -> None:
         raise ValueError(f"{path}: historical return-driven cadence must be zero")
 
 
+def _validate_race_capture_gate(race: Dict[str, Any], path: str) -> None:
+    """Validate rejected-edge testimony separately from flight accounting."""
+    fields = ("spurious_count_total", "spurious_this_fragment")
+    reasons = ("early", "duplicate", "late", "unarmed")
+    reason_fields = tuple(f"spurious_{reason}_{suffix}" for reason in reasons
+                          for suffix in ("count_total", "this_fragment"))
+    bounds = ("capture_min_ns", "capture_max_ns",
+              "capture_min_cycles", "capture_max_cycles")
+    if "capture_gate" not in race:
+        if any(field in race for field in fields + reason_fields + bounds):
+            raise ValueError(f"{path}: spurious counts are missing their capture gate contract")
+        return  # Historical rows predate capture gating; do not invent zeroes.
+    if race["capture_gate"] not in ("TOTAL_MEAN_6SD_V1", "EXPLICIT_WINDOW_V1"):
+        raise ValueError(f"{path}: unknown capture gate contract")
+    total = _require_int(race.get(fields[0]), f"{path}.{fields[0]}")
+    fragment = _require_int(race.get(fields[1]), f"{path}.{fields[1]}")
+    if total > 0xFFFFFFFFFFFFFFFF or fragment > total:
+        raise ValueError(f"{path}: impossible spurious edge counts")
+    if race["capture_gate"] == "EXPLICIT_WINDOW_V1":
+        low_ns, high_ns, low_cycles, high_cycles = (
+            _require_int(race.get(field), f"{path}.{field}", minimum=1)
+            for field in bounds)
+        if not (low_ns < high_ns <= 0xFFFFFFFF and
+                low_cycles <= high_cycles <= 0x7FFFFFFF):
+            raise ValueError(f"{path}: impossible acquisition window bounds")
+        reason_total = reason_fragment = 0
+        for reason in reasons:
+            total_key = f"spurious_{reason}_count_total"
+            fragment_key = f"spurious_{reason}_this_fragment"
+            rt = _require_int(race.get(total_key), f"{path}.{total_key}")
+            rf = _require_int(race.get(fragment_key), f"{path}.{fragment_key}")
+            if rt > 0xFFFFFFFFFFFFFFFF or rf > rt:
+                raise ValueError(f"{path}: impossible {reason} edge counts")
+            reason_total += rt
+            reason_fragment += rf
+        if (reason_total, reason_fragment) != (total, fragment):
+            raise ValueError(f"{path}: spurious reason counts do not close")
+    elif any(field in race for field in reason_fields + bounds):
+        raise ValueError(f"{path}: explicit window fields under a historical gate contract")
+    # A shot can reject many edges and still complete or be MISSED. These counts
+    # never enter attempts = completed + missed + pending or the flight Welford.
+
+
 def _validate_race_relaunch_accounting(race: Dict[str, Any], path: str) -> None:
     """Prove accounting under the producer-authored historical or cadence contract."""
     attempts = _require_int(race.get("attempt_count_total"), f"{path}.attempt_count_total")
@@ -1185,6 +1228,7 @@ def _validate_photons_fragment(fragment: Payload) -> Tuple[int, int, Optional[in
             f"{nonzero_retired!r}"
         )
 
+    _validate_race_capture_gate(race, "photons.race")
     _validate_race_relaunch_accounting(race, "photons.race")
 
     rejected_isr_delay_total = _require_int(

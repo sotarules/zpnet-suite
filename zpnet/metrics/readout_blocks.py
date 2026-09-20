@@ -1960,6 +1960,54 @@ def _photons_fragment_stats(payload: dict | None) -> dict:
             f"flight_n={values['n']} projected={projected}"
         )
 
+    # SPURIOUS counts edges, independently of completed or MISSED flights.
+    # Historical rows have no gate testimony; display unavailable, never zero.
+    values["spurious"] = None
+    reasons = ("early", "duplicate", "late", "unarmed")
+    values.update({reason: None for reason in reasons})
+    spurious_fields = ("spurious_count_total", "spurious_this_fragment")
+    reason_fields = tuple(f"spurious_{reason}_{suffix}" for reason in reasons
+                          for suffix in ("count_total", "this_fragment"))
+    bounds = ("capture_min_ns", "capture_max_ns",
+              "capture_min_cycles", "capture_max_cycles")
+    if "capture_gate" in race:
+        if race["capture_gate"] not in ("TOTAL_MEAN_6SD_V1", "EXPLICIT_WINDOW_V1"):
+            raise ValueError("PHOTONS_FRAGMENT has an unknown capture gate contract")
+        total, count = (race.get(field) for field in spurious_fields)
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0
+               for value in (total, count)):
+            raise ValueError("PHOTONS_FRAGMENT spurious counts must be nonnegative integers")
+        if total > 0xFFFFFFFFFFFFFFFF or count > total:
+            raise ValueError("PHOTONS_FRAGMENT has impossible spurious edge counts")
+        values["spurious"] = count
+        if race["capture_gate"] == "EXPLICIT_WINDOW_V1":
+            window = tuple(race.get(field) for field in bounds)
+            if any(isinstance(v, bool) or not isinstance(v, int) or v < 1
+                   for v in window):
+                raise ValueError("PHOTONS_FRAGMENT acquisition bounds must be positive integers")
+            low_ns, high_ns, low_cycles, high_cycles = window
+            if not (low_ns < high_ns <= 0xFFFFFFFF and
+                    low_cycles <= high_cycles <= 0x7FFFFFFF):
+                raise ValueError("PHOTONS_FRAGMENT has impossible acquisition bounds")
+            reason_total = reason_count = 0
+            for reason in reasons:
+                rt = race.get(f"spurious_{reason}_count_total")
+                rf = race.get(f"spurious_{reason}_this_fragment")
+                if any(isinstance(v, bool) or not isinstance(v, int) or v < 0
+                       for v in (rt, rf)):
+                    raise ValueError("PHOTONS_FRAGMENT spurious reasons must be nonnegative integers")
+                if rt > 0xFFFFFFFFFFFFFFFF or rf > rt:
+                    raise ValueError("PHOTONS_FRAGMENT has impossible spurious reason counts")
+                values[reason] = rf
+                reason_total += rt
+                reason_count += rf
+            if (reason_total, reason_count) != (total, count):
+                raise ValueError("PHOTONS_FRAGMENT spurious reason counts do not close")
+        elif any(field in race for field in reason_fields + bounds):
+            raise ValueError("PHOTONS_FRAGMENT explicit fields have a historical gate contract")
+    elif any(field in race for field in spurious_fields + reason_fields + bounds):
+        raise ValueError("PHOTONS_FRAGMENT spurious counts lack a capture gate contract")
+
     return values
 
 
@@ -2193,6 +2241,11 @@ def _photons_rolling_rows(payloads: list[dict]) -> list[dict]:
             "accepted": stats["accepted"],
             "excluded": stats["excluded"],
             "missed": stats["missed"],
+            "spurious": stats["spurious"],
+            "early": stats["early"],
+            "duplicate": stats["duplicate"],
+            "late": stats["late"],
+            "unarmed": stats["unarmed"],
             "stddev": stats["stddev"] if n >= 2 else None,
             "stderr": stats["stderr"] if n >= 2 else None,
         })
@@ -2268,13 +2321,19 @@ def photons_detail_readout() -> list[str]:
         lines.append("CAMPAIGN SD/SE: UNAVAILABLE (exact campaign population not retained)")
     lines.extend(["", _photons_summary_header(bool(campaign)),
                   _photons_summary_line(summary, bool(campaign), summary["mean"]), "",
-                  f"{'SEC':>8} {'LAP':>12} {'ACCEPT':>8} {'EXCL':>7} {'MISSED':>7} {'SD':>10} {'SE':>10}"])
+                  f"{'SEC':>8} {'LAP':>12} {'ACCEPT':>8} {'EXCL':>7} {'MISSED':>7} {'SPURIOUS':>8}"
+                  f" {'EARLY':>6} {'DUP':>6} {'LATE':>6} {'UNARM':>6} {'SD':>10} {'SE':>10}"])
     for row in _photons_rolling_rows(payloads):
         lines.append(
             _fmt(row["second"], '>8d', 8) + " " + _fmt(row["mean"], '>12.6f', 12)
             + " " + _fmt(row["accepted"], '>8d', 8)
             + " " + _fmt(row["excluded"], '>7d', 7)
             + " " + _fmt(row["missed"], '>7d', 7)
+            + " " + _fmt(row["spurious"], '>8d', 8)
+            + " " + _fmt(row["early"], '>6d', 6)
+            + " " + _fmt(row["duplicate"], '>6d', 6)
+            + " " + _fmt(row["late"], '>6d', 6)
+            + " " + _fmt(row["unarmed"], '>6d', 6)
             + " " + _fmt(row["stddev"], '>10.6f', 10)
             + " " + _fmt(row["stderr"], '>10.6f', 10))
     return lines

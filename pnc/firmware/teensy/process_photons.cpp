@@ -570,6 +570,50 @@ static double photons_welford_stddev(const photons_welford_state_t& w) {
   return (w.n >= 2ULL) ? sqrt(w.m2 / (double)(w.n - 1ULL)) : 0.0;
 }
 
+// Acquisition policy, independent of the selected science population. The
+// observed ~5.09 us return has a broad interval for capture; delayed candidates
+// still reach the existing foreground exclusion court. Change these explicit
+// bounds to commission a different optical path, never by resetting statistics.
+static constexpr uint32_t PHOTONS_RECEIVE_MIN_NS = 4000U;
+static constexpr uint32_t PHOTONS_RECEIVE_MAX_NS = 10000U;
+static constexpr uint32_t PHOTONS_RECEIVE_MAX_CYCLES = 0x7FFFFFFFU;
+static_assert(0U < PHOTONS_RECEIVE_MIN_NS &&
+              PHOTONS_RECEIVE_MIN_NS < PHOTONS_RECEIVE_MAX_NS,
+              "PHOTONS acquisition bounds must be ordered and positive");
+struct photons_receive_window_t {
+  uint32_t minimum_cycles = 1U;
+  uint32_t maximum_cycles = PHOTONS_RECEIVE_MAX_CYCLES;
+};
+static photons_receive_window_t g_photons_receive_window{};
+
+static void photons_receive_window_initialize(void) {
+  const uint32_t cps = F_CPU_ACTUAL;
+  if (cps == 0U) __builtin_trap();
+  const uint64_t minimum = ((uint64_t)cps * PHOTONS_RECEIVE_MIN_NS +
+      PHOTONS_NS_PER_SECOND - 1ULL) / PHOTONS_NS_PER_SECOND;
+  const uint64_t maximum =
+      (uint64_t)cps * PHOTONS_RECEIVE_MAX_NS / PHOTONS_NS_PER_SECOND;
+  if (minimum == 0ULL || minimum > maximum ||
+      maximum > PHOTONS_RECEIVE_MAX_CYCLES) __builtin_trap();
+  g_photons_receive_window = {(uint32_t)minimum, (uint32_t)maximum};
+}
+
+static uint32_t photons_receive_upper_cycles(uint32_t shot_maximum_cycles) {
+  return g_photons_receive_window.maximum_cycles < shot_maximum_cycles
+      ? g_photons_receive_window.maximum_cycles : shot_maximum_cycles;
+}
+
+static void photons_arm_receive_window(uint32_t launch_dwt,
+                                        uint32_t shot_maximum_cycles) {
+  const uint32_t upper = photons_receive_upper_cycles(shot_maximum_cycles);
+  // A configured cadence shorter than the acquisition interval cannot admit a return.
+  // Leave this shot's permit closed; ordinary closure will account it as MISSED.
+  if (g_photons_receive_window.minimum_cycles <= upper) {
+    interrupt_photodiode_arm_window(launch_dwt,
+        g_photons_receive_window.minimum_cycles, upper);
+  }
+}
+
 
 static double photons_welford_stderr(const photons_welford_state_t& w) {
   return (w.n >= 2ULL)
@@ -2253,7 +2297,9 @@ static void photons_wave_cancel(void) {
 
 static void photons_laser_mod_idle(void) {
   photons_wave_cancel();
+  interrupt_photodiode_boundary_begin();
   digitalWriteFast(LASER_MOD_PIN, LOW);
+  interrupt_photodiode_boundary_end(); // no arm: stopped output has no receive permit
 }
 
 // Always-on raw-cycle histogram. Its lifetime is the firmware boot, independent
@@ -2741,6 +2787,7 @@ static void photons_cadence_service(void*) {
     __atomic_store_n(&g_photons_race_launch_published, published + 1U,
                      __ATOMIC_RELEASE);
   }
+  photons_arm_receive_window(launch_dwt, g_photons_cadence_cycles - 1U);
   interrupt_photodiode_boundary_end();
 }
 
@@ -2879,6 +2926,11 @@ static uint64_t g_last_fragment_race_cadence_tick_count = 0ULL;
 static uint64_t g_last_fragment_race_attempt_count = 0ULL;
 static uint64_t g_last_fragment_race_completed_count = 0ULL;
 static uint64_t g_last_fragment_race_missed_count = 0ULL;
+static uint64_t g_last_fragment_spurious_count = 0ULL;
+static uint64_t g_last_fragment_spurious_early_count = 0ULL;
+static uint64_t g_last_fragment_spurious_duplicate_count = 0ULL;
+static uint64_t g_last_fragment_spurious_late_count = 0ULL;
+static uint64_t g_last_fragment_spurious_unarmed_count = 0ULL;
 static uint64_t g_last_fragment_race_skipped_not_quiet_count = 0ULL;
 static uint64_t g_last_fragment_race_skipped_projection_count = 0ULL;
 static uint64_t g_last_fragment_race_invalid_endpoint_count = 0ULL;
@@ -2962,17 +3014,20 @@ static void photons_pulse_wait_long(
   } while (seconds_left != 0ULL || fractional_cycles < width.tail_cycles);
 }
 
-// WAVE uses the same approximate width conversion/wait as manual PULSE, but
-// does not arm a receive record or modify one-shot testimony. No TimePop call,
-// yield, Payload construction, or interrupt masking occurs while MOD is HIGH.
+// WAVE uses manual PULSE's approximate width without modifying its report.
+// Each physical launch gets one acquisition permit. The detector-only boundary
+// is released immediately after the HIGH timestamp, including for long pulses.
 static void photons_wave_emit_pulse(uint64_t requested_ns) {
   const uint32_t dwt_cycles_per_second = F_CPU_ACTUAL;
   if (requested_ns == 0ULL || dwt_cycles_per_second == 0U) __builtin_trap();
   const photons_pulse_width_t width =
       photons_pulse_width(requested_ns, dwt_cycles_per_second);
 
+  interrupt_photodiode_boundary_begin();
   digitalWriteFast(LASER_MOD_PIN, HIGH);
   const uint32_t high_start = ARM_DWT_CYCCNT;
+  photons_arm_receive_window(high_start, PHOTONS_RECEIVE_MAX_CYCLES);
+  interrupt_photodiode_boundary_end();
   if (width.whole_seconds == 0ULL) {
     while ((uint32_t)(ARM_DWT_CYCCNT - high_start) < width.tail_cycles) {
     }
@@ -3283,7 +3338,8 @@ PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_instrument, 12288U);
 // PHOTONS_RACE object.  The old 1536-byte store was sized for the 25-field
 // cadence-era object. Include cadence and pending-return witnesses plus
 // the nested flight_ns Welford. Keep explicit fixed custody with schema headroom.
-PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_race, 3328U);
+// Explicit acquisition bounds and four uint64 rejection reasons (total/delta).
+PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_race, 4096U);
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_raw_cycles, 1024U);
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_projection, 1024U);
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_science, 3072U);
@@ -3737,6 +3793,48 @@ static void photons_payload_add_ppb_window_proof(
 }
 
 
+// Serialize only frozen fragment values; ISR-owned counters never reach Payload.
+static void photons_payload_add_capture_gate(
+    Payload& p, const photons_fragment_snapshot_t& f, const char* prefix) {
+  char key[80];
+  auto add = [&](const char* name, uint64_t value) {
+    snprintf(key, sizeof(key), "%s%s", prefix, name);
+    p.add(key, value);
+  };
+  snprintf(key, sizeof(key), "%scapture_gate", prefix);
+  p.add(key, "EXPLICIT_WINDOW_V1");
+  add("capture_min_ns", f.race_capture_min_ns);
+  add("capture_max_ns", f.race_capture_max_ns);
+  add("capture_min_cycles", f.race_capture_min_cycles);
+  add("capture_max_cycles", f.race_capture_max_cycles);
+  add("spurious_count_total", f.race_spurious_count_total);
+  add("spurious_this_fragment", f.race_spurious_this_fragment);
+  add("spurious_early_count_total", f.race_spurious_early_count_total);
+  add("spurious_early_this_fragment", f.race_spurious_early_this_fragment);
+  add("spurious_duplicate_count_total", f.race_spurious_duplicate_count_total);
+  add("spurious_duplicate_this_fragment", f.race_spurious_duplicate_this_fragment);
+  add("spurious_late_count_total", f.race_spurious_late_count_total);
+  add("spurious_late_this_fragment", f.race_spurious_late_this_fragment);
+  add("spurious_unarmed_count_total", f.race_spurious_unarmed_count_total);
+  add("spurious_unarmed_this_fragment", f.race_spurious_unarmed_this_fragment);
+}
+
+// REPORT also exposes current totals from its own guarded diagnostic copy.
+static void photons_payload_add_capture_totals(
+    Payload& p, const interrupt_photodiode_diag_t& diag) {
+  p.add("race_capture_gate", "EXPLICIT_WINDOW_V1");
+  p.add("race_capture_min_ns", PHOTONS_RECEIVE_MIN_NS);
+  p.add("race_capture_max_ns", PHOTONS_RECEIVE_MAX_NS);
+  p.add("race_capture_min_cycles", g_photons_receive_window.minimum_cycles);
+  p.add("race_capture_max_cycles", photons_receive_upper_cycles(
+      g_photons_cadence_running ? g_photons_cadence_cycles - 1U : PHOTONS_RECEIVE_MAX_CYCLES));
+  p.add("race_spurious_count_total", diag.spurious_count);
+  p.add("race_spurious_early_count_total", diag.spurious_early_count);
+  p.add("race_spurious_duplicate_count_total", diag.spurious_duplicate_count);
+  p.add("race_spurious_late_count_total", diag.spurious_late_count);
+  p.add("race_spurious_unarmed_count_total", diag.spurious_unarmed_count);
+}
+
 static Payload& photons_fragment_payload(
     const photons_fragment_snapshot_t& f) {
   photons_foreground_owner_assert(photons_foreground_owner_t::FRAGMENT);
@@ -3813,6 +3911,7 @@ static Payload& photons_fragment_payload(
   race.add("completed_this_fragment", f.race_completed_this_fragment);
   race.add("missed_count_total", f.race_missed_count_total);
   race.add("missed_this_fragment", f.race_missed_this_fragment);
+  photons_payload_add_capture_gate(race, f, "");
   race.add("skipped_not_quiet_total", f.race_skipped_not_quiet_total);
   race.add("skipped_not_quiet_this_fragment",
            f.race_skipped_not_quiet_this_fragment);
@@ -4293,6 +4392,33 @@ static FLASHMEM void photons_fragment_tick(
   fragment.race_missed_count_total = race.missed_count;
   fragment.race_missed_this_fragment = (uint32_t)(
       race.missed_count - g_last_fragment_race_missed_count);
+  fragment.race_spurious_count_total = interrupt_diag.spurious_count;
+  if (interrupt_diag.spurious_count < g_last_fragment_spurious_count) __builtin_trap();
+  fragment.race_spurious_this_fragment =
+      interrupt_diag.spurious_count - g_last_fragment_spurious_count;
+  auto freeze_reason = [](uint64_t value, uint64_t previous,
+                          uint64_t& total, uint64_t& delta) {
+    if (value < previous) __builtin_trap();
+    total = value;
+    delta = value - previous;
+  };
+  freeze_reason(interrupt_diag.spurious_early_count, g_last_fragment_spurious_early_count,
+      fragment.race_spurious_early_count_total, fragment.race_spurious_early_this_fragment);
+  freeze_reason(interrupt_diag.spurious_duplicate_count, g_last_fragment_spurious_duplicate_count,
+      fragment.race_spurious_duplicate_count_total, fragment.race_spurious_duplicate_this_fragment);
+  freeze_reason(interrupt_diag.spurious_late_count, g_last_fragment_spurious_late_count,
+      fragment.race_spurious_late_count_total, fragment.race_spurious_late_this_fragment);
+  freeze_reason(interrupt_diag.spurious_unarmed_count, g_last_fragment_spurious_unarmed_count,
+      fragment.race_spurious_unarmed_count_total, fragment.race_spurious_unarmed_this_fragment);
+  if (fragment.race_spurious_count_total !=
+      fragment.race_spurious_early_count_total + fragment.race_spurious_duplicate_count_total +
+      fragment.race_spurious_late_count_total + fragment.race_spurious_unarmed_count_total)
+    __builtin_trap();
+  fragment.race_capture_min_ns = PHOTONS_RECEIVE_MIN_NS;
+  fragment.race_capture_max_ns = PHOTONS_RECEIVE_MAX_NS;
+  fragment.race_capture_min_cycles = g_photons_receive_window.minimum_cycles;
+  fragment.race_capture_max_cycles =
+      photons_receive_upper_cycles(g_photons_cadence_cycles - 1U);
   fragment.race_skipped_not_quiet_total =
       race.skipped_not_quiet_count;
   fragment.race_skipped_not_quiet_this_fragment = (uint32_t)(
@@ -4468,6 +4594,11 @@ static FLASHMEM void photons_fragment_tick(
   g_last_fragment_race_attempt_count = fragment.race_attempt_count_total;
   g_last_fragment_race_completed_count = fragment.race_completed_count_total;
   g_last_fragment_race_missed_count = fragment.race_missed_count_total;
+  g_last_fragment_spurious_count = fragment.race_spurious_count_total;
+  g_last_fragment_spurious_early_count = fragment.race_spurious_early_count_total;
+  g_last_fragment_spurious_duplicate_count = fragment.race_spurious_duplicate_count_total;
+  g_last_fragment_spurious_late_count = fragment.race_spurious_late_count_total;
+  g_last_fragment_spurious_unarmed_count = fragment.race_spurious_unarmed_count_total;
   g_last_fragment_race_skipped_not_quiet_count =
       fragment.race_skipped_not_quiet_total;
   g_last_fragment_race_skipped_projection_count =
@@ -4636,6 +4767,12 @@ FLASHMEM void process_photons_init(void) {
   // activation occurs, only the detector callback may mutate g_photons_live.
   g_photons_live = photons_live_state_t{};
   g_last_fragment_generation = 0U;
+  g_last_fragment_spurious_count = 0ULL;
+  g_last_fragment_spurious_early_count = 0ULL;
+  g_last_fragment_spurious_duplicate_count = 0ULL;
+  g_last_fragment_spurious_late_count = 0ULL;
+  g_last_fragment_spurious_unarmed_count = 0ULL;
+  photons_receive_window_initialize();
   photons_last_fragment_reset();
   g_photons_fragment_build = photons_fragment_snapshot_t{};
   g_photons_report_snapshot = photons_fragment_snapshot_t{};
@@ -5898,6 +6035,7 @@ static FLASHMEM Payload cmd_report_photons(const Payload& /*args*/) {
   p.add("stats_reset_pending", g_photons_stats_reset_pending);
   p.add("race_engine_active", canonical.race_engine_active);
   p.add("race_accounting", "TIMEPOP_CADENCE_V1");
+  photons_payload_add_capture_gate(p, canonical, "race_");
   p.add("race_pending_return_count", canonical.race_pending_return_count);
   p.add("race_pending_return_count_previous", canonical.race_pending_return_count_previous);
   p.add("race_pending_relaunch_count", canonical.race_pending_relaunch_count);
@@ -6152,6 +6290,7 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
     p.add("interrupt_subscribed", interrupt_diag.subscribed);
     p.add("interrupt_active", interrupt_diag.active);
     p.add("interrupt_irq_count", interrupt_diag.irq_count);
+    photons_payload_add_capture_totals(p, interrupt_diag);
     p.add("interrupt_callback_count", interrupt_diag.callback_count);
     p.add("interrupt_inactive_edge_count", interrupt_diag.inactive_edge_count);
     p.add("laser_mod_level", device.laser_mod_level);
@@ -6221,6 +6360,7 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
   p.add("race_attempt_count_total", race.attempt_count);
   p.add("race_completed_count_total", race.completed_count);
   p.add("race_missed_count_total", race.missed_count);
+  photons_payload_add_capture_totals(p, interrupt_diag);
   p.add("race_skipped_not_quiet_total", race.skipped_not_quiet_count);
   p.add("race_skipped_projection_total", race.skipped_projection_count);
   p.add("race_invalid_endpoint_total", race.invalid_endpoint_count);
@@ -6228,6 +6368,11 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
   p.add("race_attempts_this_fragment", canonical.race_attempts_this_fragment);
   p.add("race_completed_this_fragment", canonical.race_completed_this_fragment);
   p.add("race_missed_this_fragment", canonical.race_missed_this_fragment);
+  p.add("race_spurious_this_fragment", canonical.race_spurious_this_fragment);
+  p.add("race_spurious_early_this_fragment", canonical.race_spurious_early_this_fragment);
+  p.add("race_spurious_duplicate_this_fragment", canonical.race_spurious_duplicate_this_fragment);
+  p.add("race_spurious_late_this_fragment", canonical.race_spurious_late_this_fragment);
+  p.add("race_spurious_unarmed_this_fragment", canonical.race_spurious_unarmed_this_fragment);
   p.add("race_flight_n_this_fragment", canonical.race_flight_this_fragment.n);
   if (canonical.race_flight_this_fragment.n != 0ULL) {
     p.add("race_flight_mean_ns_this_fragment",
@@ -6615,6 +6760,7 @@ static FLASHMEM Payload cmd_pulse(const Payload& args) {
   const uint32_t start_dwt = ARM_DWT_CYCCNT;
   digitalWriteFast(LASER_MOD_PIN, HIGH);
   const uint32_t high_start = ARM_DWT_CYCCNT;
+  photons_arm_receive_window(high_start, PHOTONS_RECEIVE_MAX_CYCLES);
   interrupt_photodiode_boundary_end();
   if (width.whole_seconds == 0ULL) {
     // Keep the usual 20-100 ns path to a 32-bit DWT poll. IRQs stay enabled;
@@ -6681,9 +6827,13 @@ static FLASHMEM Payload cmd_on(const Payload& /*args*/) {
   }
   if (!g_initialized) __builtin_trap();
 
+  // Continuous ON is not a flight request. Drain the old manual return and
+  // withdraw its permit before replacing the launch identity.
+  interrupt_photodiode_boundary_begin();
   g_pulse_armed_sequence = 0U;
   photons_memory_barrier();
   digitalWriteFast(LASER_MOD_PIN, HIGH);
+  interrupt_photodiode_boundary_end();
   if (digitalRead(LASER_MOD_PIN) != HIGH) {
     photons_laser_mod_idle();
     __builtin_trap();

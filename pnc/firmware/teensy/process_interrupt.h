@@ -1221,6 +1221,17 @@ struct interrupt_photodiode_diag_t {
   uint32_t callback_missing_count = 0;
   uint32_t inactive_edge_count = 0;
 
+  // ISR-owned boot-lifetime edge counts. SPURIOUS is exactly the sum of EARLY,
+  // DUPLICATE (in-window after a winner), LATE, and UNARMED (no launch window).
+  // These describe observed ISR timestamps, not a diagnosis of electrical noise.
+  // Rejected edges never occupy raw queue slots. Snapshot all 64-bit values
+  // together through interrupt_photodiode_snapshot(), never by live reference.
+  uint64_t spurious_count = 0;
+  uint64_t spurious_early_count = 0;
+  uint64_t spurious_duplicate_count = 0;
+  uint64_t spurious_late_count = 0;
+  uint64_t spurious_unarmed_count = 0;
+
   uint32_t source_pin = 0;
   uint32_t last_sequence = 0;
   uint32_t last_pps_sequence = 0;
@@ -1312,12 +1323,25 @@ void interrupt_photodiode_service_pending(void);
 
 // Paired foreground acquisition boundary. Begin disables ONLY the detector IRQ,
 // drains captured records against the old launch, and clears uncaptured GPIO
-// pending state. No captured record is discarded. Publish the new launch (or
-// finish STOP) before end re-enables the IRQ. End preserves edges that arrived
+// pending state, and withdraws the preceding capture permit. No captured record
+// is discarded. Publish the new launch and arm its window (or leave it closed
+// for STOP) before end re-enables the IRQ. End preserves edges that arrived
 // after begin's GPIO clear, including returns pending during the laser pulse.
 // CLOCKS and Priority 32 remain enabled. Nested/unpaired boundaries trap.
 void interrupt_photodiode_boundary_begin(void);
 void interrupt_photodiode_boundary_end(void);
+
+// One candidate per launch, admitted BEFORE raw-queue publication. Foreground
+// may arm only inside the existing detector boundary, after old packets drain.
+// Bounds are inclusive elapsed DWT cycles: 0 < minimum <= maximum < 2^31.
+// Foreground publishes the immutable launch/window; the ISR alone acknowledges
+// a consumed permit. EARLY leaves the permit open; the first in-window edge
+// consumes it. Further in-window edges are DUPLICATE; edges after expiry are
+// LATE even after a winner. The next boundary withdraws the old window; edges
+// without an armed window are UNARMED. Timing rejection never rewrites science.
+void interrupt_photodiode_arm_window(uint32_t launch_dwt,
+                                     uint32_t minimum_cycles,
+                                     uint32_t maximum_cycles);
 
 // Compatibility/synthetic custody boundary.  The installed physical pin-34 path
 // is GPIO2[29] on IRQ_GPIO2_16_31 at Priority 48 and enters through its dedicated

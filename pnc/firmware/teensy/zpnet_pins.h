@@ -215,7 +215,7 @@ Notes:
   they do not imply a current PD OUT connection to the Teensy.
 • MON is the blue-pot comparator-threshold monitor and is not connected to the
   Teensy in the current architecture.
-• Selected PD200T comparator threshold (2026-09-18): MON = 0.390 V.
+• Selected PD200T comparator threshold (2026-09-20): MON = 0.407 V.
   This is the manually adjusted blue-pot MON voltage, not DRV200 MOD or IMON.
   OTDR launch cable is installed; DRV200 settings were left unchanged.
   The dangling male-to-male DuPont extension on the laser package monitor-PD
@@ -236,7 +236,7 @@ MON voltage    Observed behavior
 0.354 V        WAVEOFF: obvious borderline switching state.
 0.363 V        WAVEOFF: almost stable LOW, but occasional glitches.
 0.379 V        WAVEOFF: apparently solid LOW; WAVEON: no observed artifacts.
-0.390 V        WAVEON: no observed artifacts; selected and set operating value.
+0.390 V        WAVEON: no observed artifacts
 0.400 V        WAVEON: no observed artifacts; approximately 200 ns HIGH plateau.
 0.420 V        WAVEON: no obvious artifacts, but trailing edge advanced and
                plateau narrowed slightly; not selected.

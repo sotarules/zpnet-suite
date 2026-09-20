@@ -58,8 +58,14 @@
 //     using the existing F_CPU_ACTUAL conversion to DWT cycles. START establishes
 //     the first origin; late service emits one pulse and starts a fresh interval;
 //   • measurement starts after recovery establishes statistical ancestry;
-//   • Priority 48 queues raw DWT/entry evidence; foreground classifies the first
-//     in-window return. No optical processing executes at Priority 32;
+//   • foreground publishes an explicit 4000-10000 ns acquisition window at each
+//     launch, clipped before the cadence deadline. Bounds use the nominal DWT
+//     clock, independently of statistics/reset/recovery; science retains GNSS
+//     projection and delay classification after capture;
+//   • Priority 48 admits at most one in-window raw candidate per launch. Other
+//     active-detector hits increment SPURIOUS (EARLY/DUPLICATE/LATE/UNARMED)
+//     before queueing; foreground retains
+//     science/delay classification. No optical processing executes at Priority 32;
 //   • the next cadence service or PHOTONS_STOP closes an unanswered shot as
 //     missed. Attempts = completed + missed + pending, with at most one pending;
 //   • each launch pauses ONLY the detector IRQ, drains all captured edges against
@@ -500,6 +506,10 @@ struct photons_fragment_recovery_snapshot_t {
 // is a recording-relative sibling authored by firmware, matching CLOCKS_FRAGMENT:
 // Pi may add durable campaign identity but never recomputes CAMP mean duration.
 struct photons_fragment_snapshot_t {
+  // SPURIOUS is a count of active-detector arrivals rejected before raw queue
+  // admission, not a count of flights. One flight may have spurious arrivals
+  // and still complete or be MISSED. Totals are boot-lifetime ISR testimony;
+  // each fragment freezes a coherent snapshot and the delta since its predecessor.
   bool snapshot_ok = false;
   bool valid = false;
   uint32_t sequence = 0;
@@ -534,6 +544,21 @@ struct photons_fragment_snapshot_t {
   uint32_t race_completed_this_fragment = 0;
   uint64_t race_missed_count_total = 0;
   uint32_t race_missed_this_fragment = 0;
+  uint64_t race_spurious_count_total = 0;
+  uint64_t race_spurious_this_fragment = 0;
+  uint64_t race_spurious_early_count_total = 0;
+  uint64_t race_spurious_early_this_fragment = 0;
+  uint64_t race_spurious_duplicate_count_total = 0;
+  uint64_t race_spurious_duplicate_this_fragment = 0;
+  uint64_t race_spurious_late_count_total = 0;
+  uint64_t race_spurious_late_this_fragment = 0;
+  uint64_t race_spurious_unarmed_count_total = 0;
+  uint64_t race_spurious_unarmed_this_fragment = 0;
+  // Nominal bounds plus effective inclusive cycle limits after cadence clipping.
+  uint32_t race_capture_min_ns = 0;
+  uint32_t race_capture_max_ns = 0;
+  uint32_t race_capture_min_cycles = 0;
+  uint32_t race_capture_max_cycles = 0;
   uint64_t race_skipped_not_quiet_total = 0;
   uint32_t race_skipped_not_quiet_this_fragment = 0;
   uint64_t race_skipped_projection_total = 0;
