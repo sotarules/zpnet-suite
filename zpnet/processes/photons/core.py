@@ -8983,9 +8983,9 @@ def _stats_reset_birth_court(
     rejects = _require_int(
         projection.get("reject_count"), "PHOTONS.projection.reject_count"
     )
-    if completed_laps != candidate_count or attempts != candidate_count:
+    if completed_laps != candidate_count:
         raise ValueError(
-            "PHOTONS STATS_RESET birth raw/projection populations do not start at epoch origin"
+            "PHOTONS STATS_RESET birth raw population does not start at epoch origin"
         )
     if attempts != successes + rejects:
         raise ValueError("PHOTONS STATS_RESET birth projection accounting does not close")
@@ -9002,6 +9002,22 @@ def _stats_reset_birth_court(
     if rejects != reason_counts.get("projection_invalid", 0):
         raise ValueError(
             "PHOTONS STATS_RESET birth projection rejects disagree with reason custody"
+        )
+
+    # Match live admission and canonical recovery: raw exclusions never
+    # entered projection, including in the first row of a new stats epoch.
+    preprojection_exclusions = (
+        reason_counts["seed_disagreement"]
+        + reason_counts["raw_cycle_excursion"]
+        + reason_counts["isr_delay"]
+    )
+    if candidate_count != attempts + preprojection_exclusions:
+        raise ValueError(
+            "PHOTONS STATS_RESET birth candidate/projection custody does not close"
+        )
+    if successes != accepted_count + excluded_projected["n"] + pending_count:
+        raise ValueError(
+            "PHOTONS STATS_RESET birth projected populations do not close"
         )
 
     welford_grand_ratio: Optional[Dict[str, Any]] = None
