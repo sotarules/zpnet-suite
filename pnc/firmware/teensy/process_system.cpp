@@ -1669,6 +1669,37 @@ static FLASHMEM Payload system_payload_flight_payload(bool retained_only) {
 // Payload fatal construction court — retained reporting surface
 // ================================================================
 
+static FLASHMEM Payload system_payload_fatal_evidence_payload(void) {
+  payload_fatal_evidence_info_t evidence{};
+  payload_get_fatal_evidence_info(&evidence);
+  payload_fatal_record_t fatal{};
+  const bool fatal_present = payload_fatal_record_get(&fatal);
+
+  const char* state = "CORRUPT";
+  switch (evidence.state) {
+    case payload_fatal_evidence_state_t::NONE: state = "NONE"; break;
+    case payload_fatal_evidence_state_t::INCOMPLETE: state = "INCOMPLETE"; break;
+    case payload_fatal_evidence_state_t::CORRUPT: break;
+    case payload_fatal_evidence_state_t::COMMITTED: state = "COMMITTED"; break;
+  }
+  Payload out;
+  out.add("schema", "ZPNET_PAYLOAD_FATAL_EVIDENCE_V1");
+  out.add("state", state);
+  out.add("retention_policy", "LATEST_PAYLOAD_FATAL_UNTIL_CRASH_CLEAR");
+  out.add("integrity", "CRC32_METADATA_AND_BOTH_BANKS");
+  if (evidence.state != payload_fatal_evidence_state_t::COMMITTED) return out;
+  out.add("fatal_sequence", evidence.fatal_sequence);
+  system_crash_add_hex32(out, "fatal_dwt", evidence.fatal_dwt);
+  system_crash_add_hex32(out, "fatal_object", evidence.fatal_object);
+  out.add("fatal_operation_id", evidence.fatal_operation);
+  out.add("matches_payload_fatal",
+          fatal_present && evidence.fatal_sequence == fatal.sequence &&
+          evidence.fatal_dwt == fatal.dwt_cyccnt &&
+          evidence.fatal_object == fatal.object_ptr &&
+          evidence.fatal_operation == fatal.operation_id);
+  return out;
+}
+
 static FLASHMEM Payload system_payload_fatal_payload(void) {
   payload_fatal_record_t fatal{};
   const bool valid = payload_fatal_record_get(&fatal);
@@ -1676,6 +1707,7 @@ static FLASHMEM Payload system_payload_fatal_payload(void) {
   Payload out;
   out.add("schema", "ZPNET_PAYLOAD_FATAL_V1");
   out.add("valid", valid);
+  out.add_object("retained_evidence", system_payload_fatal_evidence_payload());
   if (!valid) return out;
 
   out.add("schema_version", fatal.schema_version);
@@ -1780,6 +1812,9 @@ static FLASHMEM Payload system_payload_stamp_trace_payload(
   out.add("schema", "ZPNET_PAYLOAD_STAMP_TRACE_V2");
   out.add("entry_encoding", "RAW_SCALAR_V1");
   out.add("bank", live_bank ? "live" : "retained");
+  if (!live_bank) {
+    out.add_object("retained_evidence", system_payload_fatal_evidence_payload());
+  }
   out.add("valid", bank.valid != 0U);
   out.add("capacity", PAYLOAD_STAMP_TRACE_ENTRIES);
   out.add("available_count", bank.count);
@@ -2114,10 +2149,11 @@ static FLASHMEM Payload system_payload_contract_info_payload(void) {
   payload_contract_get_info(&info);
 
   Payload out;
-  // This report appends three nested incident documents.  Acquire its final
-  // response arena before any child Payload exists so add_object() never has to
+  // This report appends three incident documents and fatal association metadata.
+  // Acquire its final response arena before any child Payload exists so
+  // add_object() never has to
   // grow the parent under peak forensic-construction heap pressure.
-  out.reserve(4096U);
+  out.reserve(6144U);
   out.add("schema", "ZPNET_PAYLOAD_CONTRACT_V1");
   out.add("checks", info.checks);
   out.add("successful_mutations", info.successful_mutations);
@@ -2143,6 +2179,7 @@ static FLASHMEM Payload system_payload_contract_info_payload(void) {
   out.add_object("latest_retained",
                  system_payload_contract_incident_payload(
                      info.latest_retained));
+  out.add_object("retained_evidence", system_payload_fatal_evidence_payload());
   return out;
 }
 
@@ -2152,6 +2189,7 @@ static FLASHMEM Payload system_payload_contract_summary_payload(void) {
 
   Payload out;
   out.add("schema", "ZPNET_PAYLOAD_CONTRACT_SUMMARY_V1");
+  out.add_object("retained_evidence", system_payload_fatal_evidence_payload());
   out.add("incidents", info.incidents);
   out.add("pending_events", info.pending_events);
   out.add("post_invariant_failures", info.post_invariant_failures);
@@ -4071,11 +4109,10 @@ static FLASHMEM Payload cmd_crash_clear(const Payload& /*args*/) {
          sizeof(g_runtime_ledger_retained));
 
   // crash_forensics_clear() already cleared the paired execution-trace archive.
+  payload_clear_retained_fatal_evidence();
   payload_fatal_record_clear();
-  payload_clear_retained_stamp_trace();
   payload_clear_retained_append_trace();
   payload_clear_retained_heap_resize_trace();
-  payload_contract_clear_retained();
   crash_stack_watch_clear_retained();
   crash_stack_tripwire_clear_retained();
 
@@ -4087,6 +4124,7 @@ static FLASHMEM Payload cmd_crash_clear(const Payload& /*args*/) {
   resp.add("execution_trace_cleared", true);
   resp.add("timepop_dispatch_trace_cleared", true);
   resp.add("payload_fatal_cleared", true);
+  resp.add("payload_fatal_evidence_cleared", true);
   resp.add("payload_stamp_trace_cleared", true);
   resp.add("payload_append_trace_cleared", true);
   resp.add("payload_heap_resize_trace_cleared", true);

@@ -1238,6 +1238,9 @@ bool payload_shared_heap_free(void* block) {
 static constexpr uint32_t PAYLOAD_STAMP_TRACE_MAGIC = 0x50535431UL;  // 'PST1'
 static constexpr uint32_t PAYLOAD_STAMP_TRACE_SCHEMA_VERSION = 1U;
 
+static bool payload_fatal_evidence_ready(void);
+static void payload_capture_fatal_evidence(void);
+
 struct payload_stamp_trace_bank_t {
     uint32_t magic;
     uint32_t magic_inv;
@@ -1313,16 +1316,8 @@ static FLASHMEM void payload_stamp_trace_boot_latch() {
     if (g_payload_stamp_trace_boot_latched) return;
     g_payload_stamp_trace_boot_latched = true;
 
-    // RAM2 is NOLOAD. Preserve the previous boot's final live ring before
-    // initializing this boot's live bank.
-    if (payload_stamp_trace_bank_valid(g_payload_stamp_trace_live)) {
-        g_payload_stamp_trace_retained = g_payload_stamp_trace_live;
-    } else {
-        memset((void*)&g_payload_stamp_trace_retained, 0,
-               sizeof(g_payload_stamp_trace_retained));
-    }
-    payload_retained_flush(&g_payload_stamp_trace_retained,
-                           sizeof(g_payload_stamp_trace_retained));
+    // Only fatal capture owns the retained bank. A recovery boot must not
+    // replace fatal evidence with its own startup clears.
     payload_stamp_trace_initialize_live();
 }
 
@@ -1421,16 +1416,15 @@ FLASHMEM void payload_get_stamp_trace(payload_stamp_trace_snapshot_t* out) {
     payload_stamp_trace_boot_latch();
     memset(out, 0, sizeof(*out));
     payload_stamp_trace_snapshot_bank(g_payload_stamp_trace_live, &out->live);
-    payload_stamp_trace_snapshot_bank(g_payload_stamp_trace_retained,
-                                      &out->retained);
+    if (payload_fatal_evidence_ready()) {
+        payload_stamp_trace_snapshot_bank(g_payload_stamp_trace_retained,
+                                          &out->retained);
+    }
 }
 
 FLASHMEM void payload_clear_retained_stamp_trace(void) {
-    payload_stamp_trace_boot_latch();
-    memset((void*)&g_payload_stamp_trace_retained, 0,
-           sizeof(g_payload_stamp_trace_retained));
-    payload_retained_flush(&g_payload_stamp_trace_retained,
-                           sizeof(g_payload_stamp_trace_retained));
+    // Compatibility entry point: the two banks now have one integrity seal.
+    payload_clear_retained_fatal_evidence();
 }
 
 FLASHMEM const char* payload_stamp_trace_stage_name(uint32_t stage) {
@@ -1485,6 +1479,9 @@ void payload_fatal_record_clear(void) {
                                             uint32_t capacity,
                                             uint32_t count,
                                             uint32_t data_used) {
+    // Freeze the scalar recorder sources through capture, including Priority-0
+    // IRQs. Restore the caller's mask before the existing emergency USB path.
+    const uint32_t saved_primask = payload_commit_irq_lock();
     uint32_t sequence = 1U;
     if (payload_fatal_record_valid(g_payload_fatal_record)) {
         sequence = g_payload_fatal_record.sequence + 1U;
@@ -1522,6 +1519,9 @@ void payload_fatal_record_clear(void) {
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     payload_retained_flush(&g_payload_fatal_record,
                            sizeof(g_payload_fatal_record));
+
+    payload_capture_fatal_evidence();
+    payload_commit_irq_unlock(saved_primask);
 
     // Serial/USB work from exception context is not a trustworthy recovery
     // operation.  The retained court still survives that path; ordinary
@@ -1608,15 +1608,132 @@ static void payload_contract_boot_latch(void) {
     if (g_payload_contract_boot_latched) return;
     g_payload_contract_boot_latched = true;
 
-    if (payload_contract_bank_valid(g_payload_contract_live)) {
-        g_payload_contract_retained = g_payload_contract_live;
-    } else {
-        memset((void*)&g_payload_contract_retained, 0,
-               sizeof(g_payload_contract_retained));
+    // Retained banks are written together at fatal time, never at boot.
+    payload_contract_initialize_live();
+}
+
+// One cache-line seal binds the existing two retained banks to a Payload fatal.
+// No additional trace banks, Payload construction, heap use, or object traversal.
+static constexpr uint32_t PAYLOAD_EVIDENCE_MAGIC = 0x50455631UL;
+static constexpr uint32_t PAYLOAD_EVIDENCE_WRITING = 0x50455752UL;
+struct payload_fatal_evidence_seal_t {
+    uint32_t magic;
+    uint32_t magic_inv;
+    uint32_t schema_version;
+    uint32_t fatal_sequence;
+    uint32_t fatal_dwt;
+    uint32_t fatal_object;
+    uint32_t fatal_operation;
+    uint32_t crc32;
+};
+static_assert(sizeof(payload_fatal_evidence_seal_t) == 32U,
+              "Fatal evidence seal must occupy one cache line");
+alignas(32) static payload_fatal_evidence_seal_t
+    g_payload_fatal_evidence_seal PAYLOAD_RETAINED_MEM;
+
+static uint32_t payload_evidence_crc32_update(uint32_t crc,
+                                             const void* data, size_t bytes) {
+    const uint8_t* cursor = static_cast<const uint8_t*>(data);
+    while (bytes-- != 0U) {
+        crc ^= *cursor++;
+        for (uint32_t bit = 0U; bit < 8U; ++bit) {
+            crc = (crc >> 1U) ^ ((0U - (crc & 1U)) & 0xEDB88320UL);
+        }
     }
+    return crc;
+}
+
+static uint32_t payload_fatal_evidence_crc32(void) {
+    uint32_t crc = payload_evidence_crc32_update(
+        0xFFFFFFFFUL, &g_payload_fatal_evidence_seal.schema_version,
+        offsetof(payload_fatal_evidence_seal_t, crc32) -
+            offsetof(payload_fatal_evidence_seal_t, schema_version));
+    crc = payload_evidence_crc32_update(
+        crc, &g_payload_stamp_trace_retained,
+        sizeof(g_payload_stamp_trace_retained));
+    crc = payload_evidence_crc32_update(
+        crc, &g_payload_contract_retained, sizeof(g_payload_contract_retained));
+    return ~crc;
+}
+
+void payload_get_fatal_evidence_info(payload_fatal_evidence_info_t* out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    const payload_fatal_evidence_seal_t& seal = g_payload_fatal_evidence_seal;
+    if (seal.magic == 0U && seal.magic_inv == 0U) return;
+    out->state = payload_fatal_evidence_state_t::CORRUPT;
+    if ((seal.magic ^ seal.magic_inv) != 0xFFFFFFFFUL) return;
+    if (seal.magic == PAYLOAD_EVIDENCE_WRITING) {
+        out->state = payload_fatal_evidence_state_t::INCOMPLETE;
+        return;
+    }
+    if (seal.magic != PAYLOAD_EVIDENCE_MAGIC || seal.schema_version != 1U ||
+        seal.fatal_sequence == 0U ||
+        !payload_stamp_trace_bank_valid(g_payload_stamp_trace_retained) ||
+        !payload_contract_bank_valid(g_payload_contract_retained) ||
+        seal.crc32 != payload_fatal_evidence_crc32()) return;
+    out->state = payload_fatal_evidence_state_t::COMMITTED;
+    out->fatal_sequence = seal.fatal_sequence;
+    out->fatal_dwt = seal.fatal_dwt;
+    out->fatal_object = seal.fatal_object;
+    out->fatal_operation = seal.fatal_operation;
+}
+
+static bool payload_fatal_evidence_ready(void) {
+    payload_fatal_evidence_info_t info{};
+    payload_get_fatal_evidence_info(&info);
+    return info.state == payload_fatal_evidence_state_t::COMMITTED;
+}
+
+// Called with PRIMASK held by payload_fatal_stop, before USB can fault/reenter.
+static void payload_capture_fatal_evidence(void) {
+    payload_stamp_trace_boot_latch();
+    payload_contract_boot_latch();
+    g_payload_fatal_evidence_seal.magic = PAYLOAD_EVIDENCE_WRITING;
+    g_payload_fatal_evidence_seal.magic_inv = ~PAYLOAD_EVIDENCE_WRITING;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    payload_retained_flush(&g_payload_fatal_evidence_seal,
+                           sizeof(g_payload_fatal_evidence_seal));
+
+    g_payload_stamp_trace_retained = g_payload_stamp_trace_live;
+    g_payload_contract_retained = g_payload_contract_live;
+    payload_retained_flush(&g_payload_stamp_trace_retained,
+                           sizeof(g_payload_stamp_trace_retained));
     payload_retained_flush(&g_payload_contract_retained,
                            sizeof(g_payload_contract_retained));
-    payload_contract_initialize_live();
+    g_payload_fatal_evidence_seal.schema_version = 1U;
+    g_payload_fatal_evidence_seal.fatal_sequence = g_payload_fatal_record.sequence;
+    g_payload_fatal_evidence_seal.fatal_dwt = g_payload_fatal_record.dwt_cyccnt;
+    g_payload_fatal_evidence_seal.fatal_object = g_payload_fatal_record.object_ptr;
+    g_payload_fatal_evidence_seal.fatal_operation =
+        g_payload_fatal_record.operation_id;
+    g_payload_fatal_evidence_seal.crc32 = payload_fatal_evidence_crc32();
+    payload_retained_flush(&g_payload_fatal_evidence_seal,
+                           sizeof(g_payload_fatal_evidence_seal));
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    g_payload_fatal_evidence_seal.magic_inv = ~PAYLOAD_EVIDENCE_MAGIC;
+    g_payload_fatal_evidence_seal.magic = PAYLOAD_EVIDENCE_MAGIC;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    payload_retained_flush(&g_payload_fatal_evidence_seal,
+                           sizeof(g_payload_fatal_evidence_seal));
+}
+
+void payload_clear_retained_fatal_evidence(void) {
+    const uint32_t saved_primask = payload_commit_irq_lock();
+    // Invalidate the seal first so a reset during clear cannot expose a pair
+    // containing one old bank and one cleared bank.
+    memset(&g_payload_fatal_evidence_seal, 0,
+           sizeof(g_payload_fatal_evidence_seal));
+    payload_retained_flush(&g_payload_fatal_evidence_seal,
+                           sizeof(g_payload_fatal_evidence_seal));
+    memset(&g_payload_stamp_trace_retained, 0,
+           sizeof(g_payload_stamp_trace_retained));
+    memset(&g_payload_contract_retained, 0, sizeof(g_payload_contract_retained));
+    payload_retained_flush(&g_payload_stamp_trace_retained,
+                           sizeof(g_payload_stamp_trace_retained));
+    payload_retained_flush(&g_payload_contract_retained,
+                           sizeof(g_payload_contract_retained));
+    payload_commit_irq_unlock(saved_primask);
 }
 
 static void payload_contract_increment_phase(uint32_t phase) {
@@ -1809,8 +1926,10 @@ FLASHMEM void payload_contract_get_snapshot(payload_contract_snapshot_t* out) {
     payload_contract_boot_latch();
     memset(out, 0, sizeof(*out));
     payload_contract_snapshot_bank(g_payload_contract_live, &out->live);
-    payload_contract_snapshot_bank(g_payload_contract_retained,
-                                   &out->retained);
+    if (payload_fatal_evidence_ready()) {
+        payload_contract_snapshot_bank(g_payload_contract_retained,
+                                       &out->retained);
+    }
 }
 
 FLASHMEM void payload_contract_get_info(payload_contract_info_t* out) {
@@ -1841,8 +1960,10 @@ FLASHMEM void payload_contract_get_info(payload_contract_info_t* out) {
     }
     (void)payload_contract_latest_incident(
         g_payload_contract_live, &out->latest_this_boot);
-    (void)payload_contract_latest_incident(
-        g_payload_contract_retained, &out->latest_retained);
+    if (payload_fatal_evidence_ready()) {
+        (void)payload_contract_latest_incident(
+            g_payload_contract_retained, &out->latest_retained);
+    }
 }
 
 bool payload_contract_event_peek(payload_contract_event_t* out) {
@@ -1882,10 +2003,8 @@ void payload_contract_event_end(bool emitted) {
 }
 
 void payload_contract_clear_retained(void) {
-    memset((void*)&g_payload_contract_retained, 0,
-           sizeof(g_payload_contract_retained));
-    payload_retained_flush(&g_payload_contract_retained,
-                           sizeof(g_payload_contract_retained));
+    // Compatibility entry point: clearing either member releases the pair.
+    payload_clear_retained_fatal_evidence();
 }
 
 FLASHMEM const char* payload_contract_phase_name(uint32_t phase) {

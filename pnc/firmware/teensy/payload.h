@@ -245,6 +245,28 @@ struct payload_fatal_record_t {
 bool payload_fatal_record_get(payload_fatal_record_t* out);
 void payload_fatal_record_clear(void);
 
+// The existing retained contract and stamp banks form one fatal-time snapshot.
+// Boot does not replace it. A newer Payload fatal replaces it; crash_clear
+// releases it. Integrity covers both banks and their fatal association.
+enum class payload_fatal_evidence_state_t : uint32_t {
+  NONE       = 0,
+  INCOMPLETE = 1,
+  CORRUPT    = 2,
+  COMMITTED  = 3,
+};
+
+struct payload_fatal_evidence_info_t {
+  payload_fatal_evidence_state_t state;
+  uint32_t fatal_sequence;
+  uint32_t fatal_dwt;
+  uint32_t fatal_object;
+  uint32_t fatal_operation;
+};
+
+void payload_get_fatal_evidence_info(payload_fatal_evidence_info_t* out);
+// Clears both retained banks as a pair; leaves live recording untouched.
+void payload_clear_retained_fatal_evidence(void);
+
 // ============================================================================
 // Payload contract-stamp lifecycle recorder (retained, scalar-only)
 // ============================================================================
