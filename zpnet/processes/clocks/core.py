@@ -12907,6 +12907,31 @@ def _recovery_timebase_from_clocks_state(
         "gnss_raw_welford_max": _first_float(welford.get("max"), 0.0) or 0.0,
     }
 
+    # Campaign GNSS_RAW has its own admitted population and reference clock.
+    # Preserve its exact pair from this row's Pi adjudication; the always-on
+    # instrument totals above must never be substituted for campaign totals.
+    # Unadjudicated rows have no saved campaign pair and retain the existing
+    # recovery projection policy for absent campaign evidence.
+    if "adjudication" in campaign:
+        adjudication = campaign["adjudication"]
+        if not isinstance(adjudication, dict):
+            raise ValueError("CLOCKS recovery campaign adjudication is not an object")
+        if (adjudication.get("sequence") != source_sequence
+                or adjudication.get("public_count") != public_count):
+            raise ValueError("CLOCKS recovery campaign adjudication boundary mismatch")
+        saved_extra = adjudication["extra_clocks"]
+        if not isinstance(saved_extra, dict):
+            raise ValueError("CLOCKS recovery campaign extra_clocks is not an object")
+        raw_ns = saved_extra["gnss_raw_ns"]
+        raw_ref_ns = saved_extra["gnss_raw_ref_ns"]
+        if (type(raw_ns) is not int or type(raw_ref_ns) is not int
+                or raw_ns < 0 or raw_ref_ns < 0
+                or raw_ref_ns % NS_PER_SECOND != 0
+                or (raw_ns == 0) != (raw_ref_ns == 0)):
+            raise ValueError("CLOCKS recovery campaign GNSS_RAW pair is malformed")
+        extra_clocks["gnss_raw_ns"] = raw_ns
+        extra_clocks["gnss_raw_ref_ns"] = raw_ref_ns
+
     return {
         "schema": "TIMEBASE_V4",
         "campaign_type": CAMPAIGN_TYPE_TEMPEST,
