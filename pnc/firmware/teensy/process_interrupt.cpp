@@ -932,6 +932,8 @@ interrupt_dispatch_write_acquire(
   const uint32_t write = queue.write_sequence;
   dmb_barrier();
   const uint32_t read = queue.read_sequence;
+  // Acquire foreground's release before reusing its former slot.
+  dmb_barrier();
   const uint32_t depth = write - read;
   if (depth > INTERRUPT_SUBSCRIBER_DISPATCH_QUEUE_CAPACITY) {
     __builtin_trap();
@@ -2276,10 +2278,13 @@ ocxo_start_one_second_service(const ocxo_binding_t& binding) {
   ocxo_lane_t& lane = *binding.lane;
   synthetic_clock32_t& clock = *binding.clock32;
   if (!lane.initialized) return false;
+  // Foreground start/rephase and Priority-32 tending share this writer state.
+  const uint32_t prior = interrupt_priority0_guard_enter();
   lane.active = true;
   if (!clock.zeroed) synthetic_clock_birth(clock, ocxo_counter_now(lane));
   if (!lane.target_grid_valid) ocxo_reset_target_grid(lane, clock);
   ocxo_tend_and_arm(binding);
+  interrupt_priority0_guard_exit(prior);
   interrupt_features_note_ocxo_custody();
   // A target one OCXO second away is intentionally not armed yet; VCLOCK
   // extends low-word lineage and tends it into the safe 16-bit arm window.
@@ -2289,8 +2294,10 @@ ocxo_start_one_second_service(const ocxo_binding_t& binding) {
 static __attribute__((always_inline)) inline void
 ocxo_stop_one_second_service(const ocxo_binding_t& binding) {
   ocxo_lane_t& lane = *binding.lane;
+  const uint32_t prior = interrupt_priority0_guard_enter();
   lane.active = false;
   if (lane.initialized) ocxo_disable_compare(lane);
+  interrupt_priority0_guard_exit(prior);
 }
 
 static __attribute__((noinline, noclone))
@@ -2506,7 +2513,12 @@ bool interrupt_clock_snapshot(interrupt_subscriber_kind_t kind,
 }
 
 uint32_t interrupt_qtimer1_counter32_now(void) {
-  return vclock_synthetic_from_hardware_low16(qtimer1_ch0_counter_now());
+  // Keep the hardware sample and its continuation-owned anchor in one read.
+  const uint32_t prior = interrupt_priority0_guard_enter();
+  const uint32_t counter32 =
+      vclock_synthetic_from_hardware_low16(qtimer1_ch0_counter_now());
+  interrupt_priority0_guard_exit(prior);
+  return counter32;
 }
 
 uint16_t interrupt_qtimer2_ch0_counter_now(void) {
@@ -2609,7 +2621,7 @@ uint16_t interrupt_qtimer1_ch1_csctrl_now(void) {
 }
 
 uint32_t interrupt_vclock_counter32_observe_ambient(void) {
-  return vclock_synthetic_from_hardware_low16(qtimer1_ch0_counter_now());
+  return interrupt_qtimer1_counter32_now();
 }
 
 static void qtimer1_ch2_defer_arm_locked(uint32_t target_counter32) {
@@ -4198,7 +4210,10 @@ static bool capture_ring_push_isr(
     T packet) {
   const uint32_t head = ring.head;
   dmb_barrier();
-  if (head - ring.tail >= N) {
+  const uint32_t tail = ring.tail;
+  // Acquire continuation's release before reusing its former slot.
+  dmb_barrier();
+  if (head - tail >= N) {
     // The overrun count is the one anomaly fact that cannot be reconstructed
     // after a packet fails to enter custody.  Recovery itself runs at Priority 32.
     diag.overrun_count++;
@@ -6027,9 +6042,13 @@ static void photodiode_deliver_raw(const photodiode_raw_packet_t& packet) {
   }
   const interrupt_photodiode_edge_fn callback = g_photodiode_subscription.callback;
   if (!interrupt_callback_address_executable((uintptr_t)callback)) __builtin_trap();
-  const uint32_t callback_start_dwt = ARM_DWT_CYCCNT;
   diag.callback_count++;
-  callback(edge, diag, g_photodiode_subscription.user_data);
+  // The ISR still updates the live diagnostic counters. Transfer a coherent
+  // value to this foreground callback; never lend it the producer's store.
+  interrupt_photodiode_diag_t callback_diag{};
+  (void)interrupt_photodiode_snapshot(&callback_diag);
+  const uint32_t callback_start_dwt = ARM_DWT_CYCCNT;
+  callback(edge, callback_diag, g_photodiode_subscription.user_data);
   const uint32_t callback_cycles = ARM_DWT_CYCCNT - callback_start_dwt;
   diag.last_callback_wall_cycles = callback_cycles;
   if (diag.min_callback_wall_cycles == 0U || callback_cycles < diag.min_callback_wall_cycles)

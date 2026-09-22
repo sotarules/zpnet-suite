@@ -9,9 +9,9 @@
 // Execution tiers:
 //   Priority 0  — PPS, OCXO1, OCXO2 sovereign science capture
 //   Priority 16 — shared QTimer1 VCLOCK + TimePop CH2 capture
-//   Priority 32 — continuation/handoff, compare rearm, bounded LANTERN continuation
+//   Priority 32 — CLOCKS continuation/handoff and compare rearm
 //   Priority 48 — PHOTODIODE receive edge; expendable optical testimony
-//   Foreground  — TimePop policy and all non-optical application callbacks
+//   Foreground  — TimePop policy and all application callbacks, including PHOTONS
 // ============================================================================
 
 #pragma once
@@ -1181,11 +1181,11 @@ interrupt_pps_edge_heartbeat_t interrupt_pps_edge_heartbeat(void);
 //
 // The PD200T comparator is not an ordinary foreground subscriber.  The physical
 // pin-34 GPIO ISR captures the immutable first-instruction DWT/arrival testimony,
-// then transfers one outstanding optical edge to the existing Priority-32
-// continuation.  The PHOTODIODE callback runs from that continuation, never from
-// the Priority-48 physical ISR.  CLOCKS Priority 0/16 may preempt continuation;
-// PHOTODIODE can never delay CLOCKS.  process_interrupt owns the physical interrupt
-// and capture coordinate; process_photons owns optical race continuation.
+// then release-publishes accepted edges to a bounded raw SPSC ring. Foreground
+// copies each packet before releasing its slot and invokes the PHOTODIODE
+// callback synchronously. Optical callbacks never run at Priority 32 or 48;
+// CLOCKS capture/continuation may preempt them. process_interrupt owns the
+// physical interrupt and capture coordinate; process_photons owns optical races.
 //
 // dwt_at_edge is the latency-adjusted physical-edge coordinate.  Until the
 // PD200T GPIO path has its own measured floor calibration, the correction is
@@ -1292,6 +1292,10 @@ struct interrupt_photodiode_diag_t {
   uint32_t last_qtimer_pending_at_exit_mask = 0;
 };
 
+// Both arguments are foreground-owned values stable until this call returns.
+// Diagnostics are a coherent delivery-time snapshot, not a live ISR reference
+// or a reconstruction of every counter at the earlier physical capture time.
+// The snapshot guard is released before callback entry. Do not retain references.
 using interrupt_photodiode_edge_fn =
     void (*)(const interrupt_photodiode_edge_t& edge,
              const interrupt_photodiode_diag_t& diag,
@@ -1476,6 +1480,7 @@ uint16_t interrupt_qtimer1_ch1_counter_now(void);
 uint16_t interrupt_qtimer1_ch1_comp1_now(void);
 uint16_t interrupt_qtimer1_ch1_csctrl_now(void);
 
+// Same guarded foreground observation as interrupt_qtimer1_counter32_now().
 uint32_t interrupt_vclock_counter32_observe_ambient(void);
 
 // Request the next TimePop CH2 deadline.  process_interrupt separates requested,
@@ -1514,6 +1519,10 @@ void process_interrupt_gpio6789_irq  (uint32_t isr_entry_dwt_raw);
 uint16_t interrupt_qtimer2_ch0_counter_now(void);
 uint16_t interrupt_qtimer3_ch0_counter_now(void);
 uint16_t interrupt_qtimer3_ch3_counter_now(void);
+// Foreground observation: sample hardware and project from the current anchor
+// under the Priority-0-preserving guard, restoring the caller's prior mask.
+// This does not grant a higher-priority ISR permission to read an interrupted
+// continuation writer's partly updated anchor; capture ISRs retain raw facts.
 uint32_t interrupt_qtimer1_counter32_now (void);
 
 uint32_t interrupt_dynamic_cps(void);

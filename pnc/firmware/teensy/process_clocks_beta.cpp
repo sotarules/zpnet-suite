@@ -686,6 +686,8 @@ clocks_fragment_campaign_queue_acquire_write(void) {
   const uint32_t write = g_clocks_fragment_campaign_queue_write;
   clocks_fragment_campaign_queue_barrier();
   const uint32_t read = g_clocks_fragment_campaign_queue_read;
+  // Acquire the consumer's release before reusing its former slot.
+  clocks_fragment_campaign_queue_barrier();
   if ((write - read) >= CLOCKS_FRAGMENT_CAMPAIGN_QUEUE_CAPACITY) {
     return nullptr;
   }
@@ -709,6 +711,8 @@ clocks_fragment_campaign_queue_front(void) {
   const uint32_t read = g_clocks_fragment_campaign_queue_read;
   clocks_fragment_campaign_queue_barrier();
   const uint32_t write = g_clocks_fragment_campaign_queue_write;
+  // Acquire the producer's commit before reading the published slot.
+  clocks_fragment_campaign_queue_barrier();
   if (read == write) return nullptr;
   return &g_clocks_fragment_campaign_queue[
       read % CLOCKS_FRAGMENT_CAMPAIGN_QUEUE_CAPACITY];
@@ -979,6 +983,8 @@ clocks_fragment_publication_queue_acquire_write(void) {
   const uint32_t write = g_clocks_fragment_publication_queue_write;
   clocks_fragment_publication_queue_barrier();
   const uint32_t read = g_clocks_fragment_publication_queue_read;
+  // Acquire the consumer's release before reusing its former slot.
+  clocks_fragment_publication_queue_barrier();
   if ((write - read) >= CLOCKS_FRAGMENT_PUBLICATION_QUEUE_CAPACITY) {
     __builtin_trap();
   }
@@ -1002,6 +1008,8 @@ clocks_fragment_publication_queue_front(void) {
   const uint32_t read = g_clocks_fragment_publication_queue_read;
   clocks_fragment_publication_queue_barrier();
   const uint32_t write = g_clocks_fragment_publication_queue_write;
+  // Acquire the producer's commit before reading the published slot.
+  clocks_fragment_publication_queue_barrier();
   if (read == write) return nullptr;
   return &g_clocks_fragment_publication_queue[
       read % CLOCKS_FRAGMENT_PUBLICATION_QUEUE_CAPACITY];
