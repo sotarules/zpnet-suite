@@ -363,7 +363,8 @@ struct deferred_slot_t {
 // directly mutate the active timed-slot table or reprogram CH2 while TimePop
 // is walking callback state. Such requests are copied into this fixed,
 // allocation-free mutation queue and applied at explicit dispatch barriers
-// immediately after the current callback returns.
+// after the current callback returns. The CH2 critical-callback pass holds all
+// mutations until its same-event callbacks and recurring rearms are complete.
 //
 // Deferred ASAP/ALAP arming remains immediate in foreground because those lanes
 // are fixed mailboxes, not timed slots, and do not call schedule_next().
@@ -3217,6 +3218,10 @@ static void timepop_process_ch2_event_foreground(
     phantom_count++;
   }
 
+  // All critical callbacks and rearms for this captured event are complete.
+  // Keep their arm/cancel requests queued until here: applying between callbacks
+  // could reuse an index still named by expired_this_pass for another client.
+  timepop_apply_dispatch_mutations("after_ch2_callbacks");
   diag_schedule_next_calls_from_other++;
   schedule_next();
 }
@@ -3231,7 +3236,8 @@ void timepop_accept_ch2_event_foreground(
     diag_ch2_handler_last_ipsr = ipsr;
     return;
   }
-  if (dispatch_depth != 0U || dispatch_applying_mutations) {
+  if (dispatch_depth != 0U || dispatch_applying_mutations ||
+      foreground_ready_evaluating) {
     diag_ch2_reentry_reject_count++;
     return;
   }
@@ -3243,7 +3249,12 @@ void timepop_accept_ch2_event_foreground(
   diag_ch2_direct_last_event_dwt = event.dwt_at_event;
 
   const uint32_t body_start = ARM_DWT_CYCCNT;
+  // CH2 ingress invokes client callbacks too. Claim the same foreground
+  // transaction as ordinary dispatch so callbacks cannot recursively dispatch
+  // or mutate the slot table that this captured event still owns.
+  timepop_dispatch_enter(timepop_dispatch_phase_t::TIMED);
   timepop_process_ch2_event_foreground(event, diag);
+  timepop_dispatch_leave();
   const uint32_t body_cycles = ARM_DWT_CYCCNT - body_start;
   diag_ch2_direct_body_cycles_last = body_cycles;
   if (body_cycles > diag_ch2_direct_body_cycles_max) {
@@ -3258,7 +3269,8 @@ void timepop_ch2_capture_lost_foreground(void) {
     diag_ch2_handler_last_ipsr = ipsr;
     return;
   }
-  if (dispatch_depth != 0U || dispatch_applying_mutations) {
+  if (dispatch_depth != 0U || dispatch_applying_mutations ||
+      foreground_ready_evaluating) {
     diag_ch2_reentry_reject_count++;
     return;
   }

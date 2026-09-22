@@ -110,6 +110,12 @@
 //   foreground CH2 scheduler pass before schedule_next() selects the next compare.
 //   The legacy ISR API names remain source-compatible but no callback executes
 //   in Priority 0, Priority 16, or Priority 32.
+//   The complete CH2 foreground pass holds dispatch ownership. Critical callback
+//   arm/cancel requests use the ordinary mutation queue and commit after all
+//   critical callbacks and recurring rearms for that captured event, before the
+//   final schedule_next(). Cancelling/replacing a same-event peer therefore does
+//   not suppress its already-captured critical callback. Recursive dispatch and
+//   CH2 ingress from another active dispatch or foreground service are prohibited.
 //
 //   Timed slots may also carry a service priority. Lower numeric priority runs
 //   first when multiple timed slots share one exact CH2 fire fact. Priority
