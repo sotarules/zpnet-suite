@@ -1041,27 +1041,31 @@ static bool timepop_should_queue_dispatch_mutation(void) {
   return dispatch_depth != 0 && !dispatch_applying_mutations;
 }
 
+// These ownership helpers run only in foreground and never call a client or
+// yield. Interrupt capture does not write dispatch_depth or dispatch_phase.
+// Preserve compiler ordering at the ownership boundaries without masking
+// Priority-16 VCLOCK. Queue mutations and timer hardware retain their guards.
 static void timepop_dispatch_enter(timepop_dispatch_phase_t phase) {
-  const uint32_t saved = critical_enter();
+  __asm volatile("" ::: "memory");
   dispatch_depth++;
   if (dispatch_depth > diag_dispatch_depth_max) {
     diag_dispatch_depth_max = dispatch_depth;
   }
   dispatch_phase = phase;
-  critical_exit(saved);
+  __asm volatile("" ::: "memory");
 }
 
 static void timepop_dispatch_set_phase(timepop_dispatch_phase_t phase) {
-  const uint32_t saved = critical_enter();
+  __asm volatile("" ::: "memory");
   dispatch_phase = phase;
-  critical_exit(saved);
+  __asm volatile("" ::: "memory");
 }
 
 static void timepop_dispatch_leave(void) {
-  const uint32_t saved = critical_enter();
+  __asm volatile("" ::: "memory");
   if (dispatch_depth != 0) dispatch_depth--;
   if (dispatch_depth == 0) dispatch_phase = timepop_dispatch_phase_t::IDLE;
-  critical_exit(saved);
+  __asm volatile("" ::: "memory");
 }
 
 
