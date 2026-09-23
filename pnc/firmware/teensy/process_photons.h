@@ -138,6 +138,19 @@
 //                           A request is fulfilled on the next completed race.
 //                           Includes snapshot_sequence and raw snapshot_dwt;
 //                           campaigns and STATS_RESET preserve acquisition/bins.
+//   • REPORT_ENVELOPE     — alpha lower-envelope estimate for accepted autonomous races:
+//                           per-fragment ranks 1%-10%, 128 one-cycle bins, latest
+//                           completed histogram and eight recent fragment summaries.
+//                           At least 1000 accepted races required; censored ranks
+//                           have no estimate. Bin origin follows prior batch mean.
+//                           Fractional COUNT weights do not interpolate within bins;
+//                           a band inside one bin remains quantized with zero
+//                           selected spread, not zero measurement uncertainty.
+//                           Canonical LAP/SD, science admission and campaign sums
+//                           retain their meanings. instrument.envelope carries
+//                           the same compact testimony in every fragment.
+//                           History resets with physical recovery; STATS_RESET,
+//                           campaigns and cadence stop/start preserve ancestry.
 //   • STATS_RESET         — reset the always-on statistical epoch without changing CAMP custody
 //   • PPB_EXPORT_META     — read-only live Better-Buckets ring identity for Pi custody reacquisition
 //   • PPB_EXPORT_CHUNK    — page immutable live SECOND/MINUTE endpoints without freezing PHOTONS
@@ -210,6 +223,30 @@ struct photons_fragment_welford_snapshot_t {
   double stderr_value = 0.0;
   double min = 0.0;
   double max = 0.0;
+};
+
+
+// Alpha lower-envelope testimony for one autonomous accepted-race fragment.
+// The estimate is the weighted mean of ranks 1%-10%, using actual integer DWT
+// values and fractional COUNT weights at the two rank boundaries. Its selected
+// SD describes the trimmed distribution, not uncertainty of the estimator.
+// No recovered/campaign aggregate is replaced by this experimental statistic.
+struct photons_envelope_snapshot_t {
+  uint32_t sequence = 0;
+  uint32_t dwt_cycles_per_second = 0;
+  uint64_t accepted_count = 0;
+  uint32_t origin_cycles = 0;
+  uint64_t underflow = 0;
+  uint64_t overflow = 0;
+  double accepted_mean_cycles = 0.0;
+  double accepted_sd_cycles = 0.0;
+  double selected_mean_cycles = 0.0;
+  double selected_sd_cycles = 0.0;
+  uint32_t selected_first_cycles = 0;
+  uint32_t selected_last_cycles = 0;
+  uint32_t selected_bins = 0;
+  uint32_t in_range_mode_cycles = 0;
+  uint32_t in_range_mode_count = 0;
 };
 
 
@@ -544,6 +581,11 @@ struct photons_fragment_snapshot_t {
   uint32_t race_completed_this_fragment = 0;
   uint64_t race_missed_count_total = 0;
   uint32_t race_missed_this_fragment = 0;
+  // Captured acquisition rejects outside science EXCL; missed subset below.
+  uint64_t race_rejected_launch_timing_total = 0;
+  uint64_t race_rejected_launch_timing_this_fragment = 0;
+  uint64_t race_missed_launch_timing_total = 0;
+  uint64_t race_missed_launch_timing_this_fragment = 0;
   uint64_t race_spurious_count_total = 0;
   uint64_t race_spurious_this_fragment = 0;
   uint64_t race_spurious_early_count_total = 0;
@@ -584,6 +626,7 @@ struct photons_fragment_snapshot_t {
   uint32_t race_reference_gate_cycles = 0;
   uint32_t race_seed_count = 0;
   photons_fragment_welford_snapshot_t race_flight_this_fragment{};
+  photons_envelope_snapshot_t envelope{};
 
   // Retired holdoff fields remain zero except holdoff_edges_total, which counts
   // arrivals outside an open receive window. No return schedules a launch.

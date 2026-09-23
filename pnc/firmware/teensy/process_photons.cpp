@@ -154,6 +154,9 @@ struct photons_race_runtime_t {
   uint64_t attempt_count = 0ULL;
   uint64_t completed_count = 0ULL;
   uint64_t missed_count = 0ULL;
+  // Acquisition rejects are outside the durable science EXCL ledger.
+  uint64_t rejected_launch_timing_count = 0ULL; // captured returns
+  uint64_t missed_launch_timing_count = 0ULL;   // subset of missed_count
   uint64_t skipped_not_quiet_count = 0ULL;
   uint64_t skipped_projection_count = 0ULL;
   uint64_t invalid_endpoint_count = 0ULL;
@@ -184,6 +187,7 @@ struct photons_race_runtime_t {
 // result. Neither producer reuses its slot until the reverse handoff completes.
 struct photons_race_launch_t {
   uint32_t dwt = 0U;
+  uint32_t launch_bracket_cycles = 0U;
   uint32_t window_cycles = 0U;
   uint32_t sequence = 0U;
   uint32_t holdoff_cycles = 0U;
@@ -604,13 +608,16 @@ static uint32_t photons_receive_upper_cycles(uint32_t shot_maximum_cycles) {
 }
 
 static void photons_arm_receive_window(uint32_t launch_dwt,
-                                        uint32_t shot_maximum_cycles) {
+                                        uint32_t shot_maximum_cycles,
+                                        uint32_t before_mod_high_dwt,
+                                        interrupt_photodiode_launch_kind_t launch_kind) {
   const uint32_t upper = photons_receive_upper_cycles(shot_maximum_cycles);
   // A configured cadence shorter than the acquisition interval cannot admit a return.
   // Leave this shot's permit closed; ordinary closure will account it as MISSED.
   if (g_photons_receive_window.minimum_cycles <= upper) {
     interrupt_photodiode_arm_window(launch_dwt,
-        g_photons_receive_window.minimum_cycles, upper);
+        g_photons_receive_window.minimum_cycles, upper,
+        before_mod_high_dwt, launch_kind);
   }
 }
 
@@ -1949,11 +1956,13 @@ static void photons_race_batch_consume(void) {
   const uint64_t attempts = g_photons_race_foreground.attempt_count;
   const uint64_t ticks = g_photons_race_foreground.cadence_tick_count;
   const uint64_t missed = g_photons_race_foreground.missed_count;
+  const uint64_t missed_launch = g_photons_race_foreground.missed_launch_timing_count;
   g_photons_race_foreground = g_photons_race_completed;
   g_photons_race_foreground.active = active;
   g_photons_race_foreground.attempt_count = attempts;
   g_photons_race_foreground.cadence_tick_count = ticks;
   g_photons_race_foreground.missed_count = missed;
+  g_photons_race_foreground.missed_launch_timing_count = missed_launch;
   // Release only after the last batch AND runtime read. Later holdoff edges
   // mutate edge-service state, never the completed publication above.
   __atomic_store_n(&g_photons_race_batch_consumed, published, __ATOMIC_RELEASE);
@@ -1974,6 +1983,158 @@ static double photons_batch_m2(uint64_t n, uint64_t sum, uint64_t sumsq) {
   if (m2 < 0.0 && m2 > -0.5) m2 = 0.0;
   if (m2 < 0.0) __builtin_trap();
   return m2;
+}
+
+
+// Alpha lower envelope has independent foreground-only custody. Never put this
+// histogram in the per-race SPSC batch: that batch is copied at flight cadence.
+// Counting is O(1) per accepted race; selection/recentering occurs only at 1 Hz.
+static constexpr uint32_t PHOTONS_ENVELOPE_BINS = 128U;
+static constexpr uint32_t PHOTONS_ENVELOPE_HISTORY = 8U;
+static constexpr uint32_t PHOTONS_ENVELOPE_LOW_PERCENT = 1U;
+static constexpr uint32_t PHOTONS_ENVELOPE_HIGH_PERCENT = 10U;
+static constexpr uint32_t PHOTONS_ENVELOPE_MIN_COUNT = 1000U;
+static_assert(0U < PHOTONS_ENVELOPE_LOW_PERCENT &&
+              PHOTONS_ENVELOPE_LOW_PERCENT < PHOTONS_ENVELOPE_HIGH_PERCENT &&
+              PHOTONS_ENVELOPE_HIGH_PERCENT <= 100U,
+              "Envelope rank interval must be ordered within (0,100]");
+
+struct photons_envelope_histogram_t {
+  uint32_t bins[PHOTONS_ENVELOPE_BINS]{};
+  uint32_t origin_cycles = 0U;
+  uint64_t count = 0ULL;
+  uint64_t underflow = 0ULL;
+  uint64_t overflow = 0ULL;
+};
+struct alignas(PHOTONS_RAM2_CACHE_LINE_BYTES) photons_envelope_store_t {
+  photons_envelope_histogram_t live{};
+  photons_envelope_histogram_t latest_histogram{};
+  photons_envelope_snapshot_t latest{};
+  photons_envelope_snapshot_t history[PHOTONS_ENVELOPE_HISTORY]{};
+  uint32_t history_next = 0U;
+  uint32_t history_count = 0U;
+  uint32_t next_center_cycles = 0U;
+};
+static photons_envelope_store_t g_photons_envelope DMAMEM;
+static_assert(sizeof(photons_envelope_store_t) <= 2304U,
+              "Review the envelope typed RAM2 budget after layout changes");
+
+static void photons_envelope_reset(void) {
+  // RAM2 is NOLOAD. Also called whenever physical recovery discards a batch.
+  g_photons_envelope = photons_envelope_store_t{};
+}
+
+static void photons_envelope_observe(uint32_t raw_cycles,
+                                     uint32_t reference_cycles) {
+  auto& e = g_photons_envelope;
+  auto& h = e.live;
+  if (h.count == 0ULL) {
+    const uint32_t center = e.next_center_cycles != 0U
+        ? e.next_center_cycles : reference_cycles;
+    if (center == 0U) __builtin_trap();
+    h.origin_cycles = center > PHOTONS_ENVELOPE_BINS / 2U
+        ? center - PHOTONS_ENVELOPE_BINS / 2U : 0U;
+  }
+  // Same fragment count bound as photons_drain_raw_laps(). No bin may wrap.
+  if (h.count == UINT32_MAX) __builtin_trap();
+  ++h.count;
+  if (raw_cycles < h.origin_cycles) ++h.underflow;
+  else if (raw_cycles - h.origin_cycles >= PHOTONS_ENVELOPE_BINS) ++h.overflow;
+  else ++h.bins[raw_cycles - h.origin_cycles];
+}
+
+static const char* photons_envelope_state(const photons_envelope_snapshot_t& s) {
+  if (s.accepted_count == 0ULL) return "NO_SAMPLES";
+  if (s.accepted_count < PHOTONS_ENVELOPE_MIN_COUNT) return "LOW_SUPPORT";
+  // Include unseen tails in rank positions. Never renormalize to in-range N.
+  if (100ULL * s.underflow > PHOTONS_ENVELOPE_LOW_PERCENT * s.accepted_count ||
+      100ULL * (s.accepted_count - s.overflow) <
+          PHOTONS_ENVELOPE_HIGH_PERCENT * s.accepted_count) return "CENSORED";
+  return "ESTIMATED";
+}
+
+static uint64_t photons_envelope_bin_weight(uint64_t before, uint32_t count,
+                                            uint64_t low, uint64_t high) {
+  const uint64_t begin = 100ULL * before;
+  const uint64_t end = 100ULL * (before + count);
+  const uint64_t left = begin > low ? begin : low;
+  const uint64_t right = end < high ? end : high;
+  return right > left ? right - left : 0ULL;
+}
+
+static void photons_envelope_estimate(const photons_envelope_histogram_t& h,
+                                      photons_envelope_snapshot_t& out) {
+  const uint64_t low = PHOTONS_ENVELOPE_LOW_PERCENT * h.count;
+  const uint64_t high = PHOTONS_ENVELOPE_HIGH_PERCENT * h.count;
+  uint64_t before = h.underflow;
+  uint64_t weight = 0ULL;
+  double sum = 0.0;
+  for (uint32_t i = 0U; i < PHOTONS_ENVELOPE_BINS; ++i) {
+    const uint64_t w = photons_envelope_bin_weight(before, h.bins[i], low, high);
+    before += h.bins[i];
+    if (w == 0ULL) continue;
+    if (out.selected_bins == 0U) out.selected_first_cycles = h.origin_cycles + i;
+    out.selected_last_cycles = h.origin_cycles + i;
+    ++out.selected_bins;
+    weight += w;
+    sum += (double)w * (double)i;
+  }
+  if (weight != high - low || weight == 0ULL) __builtin_trap();
+  const double mean_offset = sum / (double)weight;
+  // Second pass about a small centered value avoids subtracting large squares.
+  double m2 = 0.0;
+  before = h.underflow;
+  for (uint32_t i = 0U; i < PHOTONS_ENVELOPE_BINS; ++i) {
+    const uint64_t w = photons_envelope_bin_weight(before, h.bins[i], low, high);
+    before += h.bins[i];
+    const double delta = (double)i - mean_offset;
+    m2 += (double)w * delta * delta;
+  }
+  out.selected_mean_cycles = (double)h.origin_cycles + mean_offset;
+  // Descriptive weighted population SD, deliberately no selected SD/sqrt(N).
+  out.selected_sd_cycles = sqrt(m2 / (double)weight);
+}
+
+static FLASHMEM void photons_envelope_finish(const photons_race_batch_t& batch,
+                                             uint32_t cps, uint32_t sequence) {
+  photons_foreground_owner_assert(photons_foreground_owner_t::FRAGMENT);
+  auto& e = g_photons_envelope;
+  if (e.live.count != batch.accepted_count) __builtin_trap();
+  e.latest_histogram = e.live;
+  e.live = photons_envelope_histogram_t{};
+  const auto& h = e.latest_histogram;
+  auto& s = e.latest;
+  s = photons_envelope_snapshot_t{};
+  s.sequence = sequence;
+  s.dwt_cycles_per_second = cps;
+  s.accepted_count = h.count;
+  s.origin_cycles = h.origin_cycles;
+  s.underflow = h.underflow;
+  s.overflow = h.overflow;
+  uint64_t accounted = h.underflow + h.overflow;
+  for (uint32_t i = 0U; i < PHOTONS_ENVELOPE_BINS; ++i) {
+    accounted += h.bins[i];
+    if (h.bins[i] > s.in_range_mode_count) {
+      s.in_range_mode_count = h.bins[i];
+      s.in_range_mode_cycles = h.origin_cycles + i;
+    }
+  }
+  if (accounted != h.count) __builtin_trap();
+  if (h.count != 0ULL) {
+    if (cps == 0U) __builtin_trap();
+    s.accepted_mean_cycles = (double)batch.accepted_sum_cycles / (double)h.count;
+    s.accepted_sd_cycles = h.count > 1ULL ? sqrt(photons_batch_m2(
+        h.count, batch.accepted_sum_cycles, batch.accepted_sumsq_cycles) /
+        (double)(h.count - 1ULL)) : 0.0;
+    // Recentering uses the full accepted batch, even if the selected ranks were
+    // censored. A clipped window therefore reacquires without a firmware reboot.
+    e.next_center_cycles = (uint32_t)(s.accepted_mean_cycles + 0.5);
+  }
+  if (!strcmp(photons_envelope_state(s), "ESTIMATED"))
+    photons_envelope_estimate(h, s);
+  e.history[e.history_next] = s;
+  e.history_next = (e.history_next + 1U) % PHOTONS_ENVELOPE_HISTORY;
+  if (e.history_count < PHOTONS_ENVELOPE_HISTORY) ++e.history_count;
 }
 
 
@@ -2004,8 +2165,12 @@ static photons_fragment_drain_result_t photons_drain_raw_laps(void) {
       race_batch.accepted_count + race_batch.rejected_count;
   if (race_finalized > (uint64_t)UINT32_MAX) __builtin_trap();
 
+  const uint32_t race_cps = race_batch.accepted_count != 0ULL
+      ? interrupt_dynamic_cps() : 0U;
+  photons_envelope_finish(race_batch, race_cps, g_fragment_sequence + 1U);
+
   if (race_batch.accepted_count != 0ULL) {
-    const uint32_t cps = interrupt_dynamic_cps();
+    const uint32_t cps = race_cps;
     if (cps == 0U) __builtin_trap();
     const double n = (double)race_batch.accepted_count;
     const double mean_cycles = (double)race_batch.accepted_sum_cycles / n;
@@ -2319,6 +2484,7 @@ struct photons_histogram_t {
   uint32_t seeds[PHOTONS_HISTOGRAM_SEEDS]{};
   uint32_t origin_cycles = 0U; // zero denotes acquisition; lawful origin is positive
   uint64_t warmup_returns = 0ULL;
+  uint64_t launch_timing_rejected_returns = 0ULL;
   photons_histogram_population_t unattributed{};
   photons_histogram_population_t delayed{};
 };
@@ -2334,6 +2500,7 @@ struct photons_histogram_snapshot_t {
   uint32_t sequence = 0U;
   uint32_t dwt = 0U;
   uint64_t warmup_returns = 0ULL;
+  uint64_t launch_timing_rejected_returns = 0ULL;
   photons_histogram_population_t unattributed{};
   photons_histogram_population_t delayed{};
 };
@@ -2350,12 +2517,13 @@ static uint32_t g_photons_histogram_snapshot_requested = 1U; // consumer writer
 // Dedicated byte stores belong only to COMMAND custody. Payload objects remain
 // ordinary scoped objects; no object storage is overlaid or reinterpreted.
 struct alignas(PHOTONS_RAM2_CACHE_LINE_BYTES) photons_histogram_report_store_t {
-  alignas(PHOTONS_RAM2_CACHE_LINE_BYTES) uint8_t root[6144];
+  // Shared by histogram and envelope RPCs under exclusive COMMAND custody.
+  alignas(PHOTONS_RAM2_CACHE_LINE_BYTES) uint8_t root[16384];
   alignas(PHOTONS_RAM2_CACHE_LINE_BYTES) uint8_t population[2048];
-  alignas(PHOTONS_RAM2_CACHE_LINE_BYTES) uint8_t bins[2304];
+  alignas(PHOTONS_RAM2_CACHE_LINE_BYTES) uint8_t bins[4096];
 };
 static photons_histogram_report_store_t g_photons_histogram_report_store DMAMEM;
-static_assert(sizeof(photons_histogram_report_store_t) == 10496U,
+static_assert(sizeof(photons_histogram_report_store_t) == 22528U,
               "Review the histogram report RAM2 budget after layout changes");
 
 static void photons_histogram_initialize_handoffs(void) {
@@ -2382,6 +2550,7 @@ static void photons_histogram_publish_snapshot(void) {
   out.sequence = next;
   out.dwt = ARM_DWT_CYCCNT;
   out.warmup_returns = g_photons_histogram.warmup_returns;
+  out.launch_timing_rejected_returns = g_photons_histogram.launch_timing_rejected_returns;
   out.unattributed = g_photons_histogram.unattributed;
   out.delayed = g_photons_histogram.delayed;
   __atomic_store_n(&g_photons_histogram_snapshot_published, next, __ATOMIC_RELEASE);
@@ -2516,6 +2685,9 @@ static FLASHMEM Payload cmd_report_histogram(const Payload& /*args*/) {
   p.add("seed_target", PHOTONS_HISTOGRAM_SEEDS);
   p.add("seed_count", h.seed_count);
   p.add("warmup_returns", h.warmup_returns);
+  p.add("launch_timing_rejected_returns", h.launch_timing_rejected_returns);
+  p.add("launch_bracket_max_cycles", INTERRUPT_PHOTODIODE_LAUNCH_BRACKET_MAX_CYCLES);
+  p.add("launch_timing_policy", "REJECTED_RETURNS_OUTSIDE_BINS_AND_SEEDS");
   if (h.origin_cycles != 0U) {
     p.add("origin_cycles", h.origin_cycles);
     p.add("midpoint_cycles", h.origin_cycles + 32U);
@@ -2567,6 +2739,7 @@ static void photons_race_snapshot_cadence_accounting(
 }
 
 static void photons_race_batch_note(bool accepted, uint32_t raw_cycles) {
+  if (accepted) photons_envelope_observe(raw_cycles, g_photons_race.reference_cycles);
   photons_race_batch_t& b = g_photons_race_batch;
   uint64_t& count = accepted ? b.accepted_count : b.rejected_count;
   uint64_t& sum = accepted ? b.accepted_sum_cycles : b.rejected_sum_cycles;
@@ -2632,16 +2805,19 @@ static void photons_race_seed_observe(uint32_t raw_cycles) {
   (void)photons_race_try_lock_reference();
 }
 
-static uint32_t photons_race_launch_200ns(void) {
+static uint32_t photons_race_launch_200ns(uint32_t& before_mod_high_dwt) {
   if (digitalRead(LASER_MOD_PIN) != LOW) __builtin_trap();
   const uint32_t cps = F_CPU_ACTUAL;
   if (cps == 0U) __builtin_trap();
   const uint32_t width_cycles = (uint32_t)(
       ((uint64_t)cps * PHOTONS_RACE_PULSE_NS + 500000000ULL) / 1000000000ULL);
+  // One additional DWT read; keep MOD HIGH and the science timestamp adjacent.
+  const uint32_t before_high = ARM_DWT_CYCCNT;
   digitalWriteFast(LASER_MOD_PIN, HIGH);
   const uint32_t launch_dwt = ARM_DWT_CYCCNT;
   while ((uint32_t)(ARM_DWT_CYCCNT - launch_dwt) < width_cycles) {}
   digitalWriteFast(LASER_MOD_PIN, LOW);
+  before_mod_high_dwt = before_high;
   return launch_dwt;
 }
 
@@ -2682,12 +2858,23 @@ static void photons_race_observe_edge(
   g_photons_race.primed = false;
   const uint32_t raw_cycles = edge.dwt_at_edge - g_photons_race.launch_dwt;
   g_photons_race.completed_count++;
-  photons_histogram_commit_origin();
-  photons_histogram_observe(raw_cycles,
-      edge.interrupt_delay.valid && edge.interrupt_delay.delayed,
-      !g_photons_race.first_return_seen);
+  // A long write bracket does not locate the interruption on either side of
+  // MOD HIGH. Never correct the flight by adding/subtracting that span. Keep
+  // this captured attempt complete, but reject it before warmup, either seed
+  // learner, science, or the envelope can consume its uncertain start.
+  const bool launch_stretched = shot.launch_bracket_cycles >
+      INTERRUPT_PHOTODIODE_LAUNCH_BRACKET_MAX_CYCLES;
+  if (!launch_stretched) {
+    photons_histogram_commit_origin();
+    photons_histogram_observe(raw_cycles,
+        edge.interrupt_delay.valid && edge.interrupt_delay.delayed,
+        !g_photons_race.first_return_seen);
+  }
 
-  if (!g_photons_race.first_return_seen) {
+  if (launch_stretched) {
+    g_photons_race.rejected_launch_timing_count++;
+    photons_histogram_increment(g_photons_histogram.launch_timing_rejected_returns);
+  } else if (!g_photons_race.first_return_seen) {
     g_photons_race.first_return_seen = true;
   } else if (edge.interrupt_delay.valid && edge.interrupt_delay.delayed) {
     photons_race_batch_note(false, raw_cycles);
@@ -2736,6 +2923,11 @@ static void photons_race_close_window(void) {
   if (launch != published) {
     if ((uint32_t)(launch - published) != 1U || !race.primed) __builtin_trap();
     race.missed_count++;
+    // EARLY/LATE/no-edge shots still have launch testimony. This is a subset
+    // of MISSED, not a fabricated completed flight or a science exclusion.
+    if (g_photons_race_launch.launch_bracket_cycles >
+        INTERRUPT_PHOTODIODE_LAUNCH_BRACKET_MAX_CYCLES)
+      race.missed_launch_timing_count++;
     race.primed = false;
     __atomic_store_n(&g_photons_race_launch_published, published, __ATOMIC_RELEASE);
   }
@@ -2761,7 +2953,8 @@ static void photons_cadence_service(void*) {
   interrupt_photodiode_boundary_begin();
   photons_race_close_window();
   auto& race = g_photons_race_foreground;
-  const uint32_t launch_dwt = photons_race_launch_200ns();
+  uint32_t before_mod_high_dwt;
+  const uint32_t launch_dwt = photons_race_launch_200ns(before_mod_high_dwt);
   g_photons_cadence_last_dwt = launch_dwt;
   g_photons_cadence_launches_since_start++;
   g_photons_laser_launch_count++;
@@ -2779,6 +2972,7 @@ static void photons_cadence_service(void*) {
     auto& shot = g_photons_race_launch;
     shot = photons_race_launch_t{};
     shot.dwt = launch_dwt;
+    shot.launch_bracket_cycles = launch_dwt - before_mod_high_dwt;
     shot.window_cycles = g_photons_cadence_cycles;
     shot.sequence = race.sequence;
     shot.attempt_count = race.attempt_count;
@@ -2787,7 +2981,8 @@ static void photons_cadence_service(void*) {
     __atomic_store_n(&g_photons_race_launch_published, published + 1U,
                      __ATOMIC_RELEASE);
   }
-  photons_arm_receive_window(launch_dwt, g_photons_cadence_cycles - 1U);
+  photons_arm_receive_window(launch_dwt, g_photons_cadence_cycles - 1U,
+      before_mod_high_dwt, interrupt_photodiode_launch_kind_t::CADENCE);
   interrupt_photodiode_boundary_end();
 }
 
@@ -2830,6 +3025,7 @@ static void photons_race_prepare(void) {
   g_photons_race_foreground.sequence = preserved_sequence;
   g_photons_race_foreground.initialized = true;
   g_photons_foreground_batch = photons_race_batch_t{};
+  photons_envelope_reset();
 }
 
 static void photons_race_start_autonomous(void) {
@@ -2926,6 +3122,8 @@ static uint64_t g_last_fragment_race_cadence_tick_count = 0ULL;
 static uint64_t g_last_fragment_race_attempt_count = 0ULL;
 static uint64_t g_last_fragment_race_completed_count = 0ULL;
 static uint64_t g_last_fragment_race_missed_count = 0ULL;
+static uint64_t g_last_fragment_race_rejected_launch_timing_count = 0ULL;
+static uint64_t g_last_fragment_race_missed_launch_timing_count = 0ULL;
 static uint64_t g_last_fragment_spurious_count = 0ULL;
 static uint64_t g_last_fragment_spurious_early_count = 0ULL;
 static uint64_t g_last_fragment_spurious_duplicate_count = 0ULL;
@@ -3024,9 +3222,11 @@ static void photons_wave_emit_pulse(uint64_t requested_ns) {
       photons_pulse_width(requested_ns, dwt_cycles_per_second);
 
   interrupt_photodiode_boundary_begin();
+  const uint32_t before_mod_high_dwt = ARM_DWT_CYCCNT;
   digitalWriteFast(LASER_MOD_PIN, HIGH);
   const uint32_t high_start = ARM_DWT_CYCCNT;
-  photons_arm_receive_window(high_start, PHOTONS_RECEIVE_MAX_CYCLES);
+  photons_arm_receive_window(high_start, PHOTONS_RECEIVE_MAX_CYCLES,
+      before_mod_high_dwt, interrupt_photodiode_launch_kind_t::WAVE);
   interrupt_photodiode_boundary_end();
   if (width.whole_seconds == 0ULL) {
     while ((uint32_t)(ARM_DWT_CYCCNT - high_start) < width.tail_cycles) {
@@ -3288,7 +3488,8 @@ static const photons_fragment_snapshot_t& photons_report_fragment_snapshot(void)
       name##_storage,                                                     \
       sizeof(name##_storage))
 
-static constexpr size_t PHOTONS_FRAGMENT_ROOT_CAPACITY = 13312U;
+// Reserve 2 KiB for the new nested envelope testimony and its framing.
+static constexpr size_t PHOTONS_FRAGMENT_ROOT_CAPACITY = 15360U;
 static constexpr size_t PHOTONS_FRAGMENT_ROOT_GUARD_WORDS =
     PHOTONS_RAM2_CACHE_LINE_BYTES / sizeof(uint32_t);
 static constexpr size_t PHOTONS_FRAGMENT_ROOT_SECTOR_BYTES = 1024U;
@@ -3332,7 +3533,8 @@ static Payload g_photons_fragment_root(
     Payload::StorageMode::FIXED,
     g_photons_fragment_root_region.storage,
     sizeof(g_photons_fragment_root_region.storage));
-PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_instrument, 12288U);
+PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_instrument, 14336U);
+PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_envelope, 2048U);
 
 // LANTERN V1.0 adds autonomous-race rejection/reference testimony to the
 // PHOTONS_RACE object.  The old 1536-byte store was sized for the 25-field
@@ -3819,6 +4021,26 @@ static void photons_payload_add_capture_gate(
   add("spurious_unarmed_this_fragment", f.race_spurious_unarmed_this_fragment);
 }
 
+// These are acquisition outcomes, not another durable science reason. A
+// stretched return completes an attempt but never enters EXCL or ACCEPT; a
+// stretched shot without a captured return remains in MISSED. Totals have the
+// same physical-ancestry scope as the other race counters.
+static void photons_payload_add_launch_timing(
+    Payload& p, const photons_fragment_snapshot_t& f, const char* prefix) {
+  char key[80];
+  auto add = [&](const char* name, uint64_t value) {
+    snprintf(key, sizeof(key), "%s%s", prefix, name);
+    p.add(key, value);
+  };
+  snprintf(key, sizeof(key), "%slaunch_timing_policy", prefix);
+  p.add(key, "ACQUISITION_REJECT_BEFORE_SCIENCE");
+  add("launch_bracket_max_cycles", INTERRUPT_PHOTODIODE_LAUNCH_BRACKET_MAX_CYCLES);
+  add("rejected_launch_timing_total", f.race_rejected_launch_timing_total);
+  add("rejected_launch_timing_this_fragment", f.race_rejected_launch_timing_this_fragment);
+  add("missed_launch_timing_total", f.race_missed_launch_timing_total);
+  add("missed_launch_timing_this_fragment", f.race_missed_launch_timing_this_fragment);
+}
+
 // REPORT also exposes current totals from its own guarded diagnostic copy.
 static void photons_payload_add_capture_totals(
     Payload& p, const interrupt_photodiode_diag_t& diag) {
@@ -3834,6 +4056,88 @@ static void photons_payload_add_capture_totals(
   p.add("race_spurious_late_count_total", diag.spurious_late_count);
   p.add("race_spurious_unarmed_count_total", diag.spurious_unarmed_count);
 }
+
+static void photons_payload_add_envelope(Payload& parent, const char* name,
+                                         const photons_envelope_snapshot_t& s) {
+  Payload& p = g_photons_fragment_envelope;
+  p.clear();
+  p.add("algorithm", "LOWER_RANK_BAND_V1_ALPHA");
+  p.add("population", "AUTONOMOUS_SCIENCE_ACCEPTED");
+  p.add("state", photons_envelope_state(s));
+  p.add("sequence", s.sequence);
+  p.add("accepted_count", s.accepted_count);
+  p.add("rank_low_pct", PHOTONS_ENVELOPE_LOW_PERCENT);
+  p.add("rank_high_pct", PHOTONS_ENVELOPE_HIGH_PERCENT);
+  p.add("minimum_count", PHOTONS_ENVELOPE_MIN_COUNT);
+  p.add("origin_cycles", s.origin_cycles);
+  p.add("underflow", s.underflow);
+  p.add("overflow", s.overflow);
+  p.add("dwt_cycles_per_second", s.dwt_cycles_per_second);
+  if (s.in_range_mode_count != 0U) {
+    p.add("in_range_mode_cycles", s.in_range_mode_cycles);
+    p.add("in_range_mode_count", s.in_range_mode_count);
+  }
+  if (s.accepted_count != 0ULL) {
+    const double scale = (double)PHOTONS_NS_PER_SECOND / s.dwt_cycles_per_second;
+    p.add("accepted_mean_cycles", toFixedDecimal(s.accepted_mean_cycles, 9));
+    p.add("accepted_sd_cycles", toFixedDecimal(s.accepted_sd_cycles, 9));
+    p.add("accepted_mean_ns", toFixedDecimal(s.accepted_mean_cycles * scale, 9));
+    p.add("accepted_sd_ns", toFixedDecimal(s.accepted_sd_cycles * scale, 9));
+    if (!strcmp(photons_envelope_state(s), "ESTIMATED")) {
+      p.add("selected_weight_n", toFixedDecimal((double)s.accepted_count *
+          (PHOTONS_ENVELOPE_HIGH_PERCENT - PHOTONS_ENVELOPE_LOW_PERCENT) / 100.0, 2));
+      p.add("selected_bins", s.selected_bins);
+      p.add("selected_first_cycles", s.selected_first_cycles);
+      p.add("selected_last_cycles", s.selected_last_cycles);
+      p.add("mean_cycles", toFixedDecimal(s.selected_mean_cycles, 9));
+      p.add("mean_ns", toFixedDecimal(s.selected_mean_cycles * scale, 9));
+      p.add("selected_population_sd_cycles", toFixedDecimal(s.selected_sd_cycles, 9));
+      p.add("selected_population_sd_ns", toFixedDecimal(s.selected_sd_cycles * scale, 9));
+      p.add("mean_minus_envelope_ns", toFixedDecimal(
+          (s.accepted_mean_cycles - s.selected_mean_cycles) * scale, 9));
+    }
+  }
+  parent.add_object(name, p);
+  p.clear();
+}
+
+static FLASHMEM Payload cmd_report_envelope(const Payload& /*args*/) {
+  const photons_foreground_custody_t custody(photons_foreground_owner_t::COMMAND);
+  // Read only the completed fragment, never the accumulating live histogram.
+  // Reports do not drain races, reset windows, or alter the estimator.
+  const auto& e = g_photons_envelope;
+  auto& store = g_photons_histogram_report_store;
+  Payload p(Payload::StorageMode::FIXED, store.root, sizeof(store.root));
+  p.add("schema", "PHOTONS_ENVELOPE_REPORT_V1");
+  p.add("scope", "LATEST_COMPLETED_FRAGMENT");
+  p.add("nominal_fragment_period_ns", PHOTONS_FRAGMENT_PERIOD_NS);
+  p.add("bin_count", PHOTONS_ENVELOPE_BINS);
+  p.add("bin_width_cycles", 1U);
+  p.add("bin_semantics", "origin_cycles + bin_index; integer observations");
+  p.add("weight_semantics", "fractional counts at rank boundaries; no within-bin interpolation");
+  p.add("sd_semantics", "selected population spread; not estimator uncertainty");
+  p.add("history_order", "OLDEST_TO_NEWEST; recent_0 onward");
+  p.add("history_scope", "PHYSICAL_ANCESTRY; survives STATS_RESET and campaigns");
+  p.add("history_count", e.history_count);
+  photons_payload_add_envelope(p, "latest", e.latest);
+  Payload bins(Payload::StorageMode::FIXED, store.bins, sizeof(store.bins));
+  for (uint32_t i = 0U; i < PHOTONS_ENVELOPE_BINS; ++i) {
+    char key[8];
+    snprintf(key, sizeof(key), "b%02u", (unsigned)i);
+    bins.add(key, e.latest_histogram.bins[i]);
+  }
+  p.add_object("accepted_bins", bins);
+  const uint32_t oldest = (e.history_next + PHOTONS_ENVELOPE_HISTORY -
+                           e.history_count) % PHOTONS_ENVELOPE_HISTORY;
+  for (uint32_t i = 0U; i < e.history_count; ++i) {
+    char key[24];
+    snprintf(key, sizeof(key), "recent_%u", (unsigned)i);
+    photons_payload_add_envelope(p, key,
+        e.history[(oldest + i) % PHOTONS_ENVELOPE_HISTORY]);
+  }
+  return Payload(p); // owning copy before COMMAND releases shared byte stores
+}
+
 
 static Payload& photons_fragment_payload(
     const photons_fragment_snapshot_t& f) {
@@ -3912,6 +4216,7 @@ static Payload& photons_fragment_payload(
   race.add("missed_count_total", f.race_missed_count_total);
   race.add("missed_this_fragment", f.race_missed_this_fragment);
   photons_payload_add_capture_gate(race, f, "");
+  photons_payload_add_launch_timing(race, f, "");
   race.add("skipped_not_quiet_total", f.race_skipped_not_quiet_total);
   race.add("skipped_not_quiet_this_fragment",
            f.race_skipped_not_quiet_this_fragment);
@@ -3957,6 +4262,7 @@ static Payload& photons_fragment_payload(
       race, "flight_ns", f.race_flight_this_fragment);
   instrument.add_object("race", race);
   race.clear();
+  photons_payload_add_envelope(instrument, "envelope", f.envelope);
 
   raw.add("valid", f.raw_cycles.valid);
   raw.add("completed_lap_count", f.raw_cycles.completed_lap_count);
@@ -4402,6 +4708,16 @@ static FLASHMEM void photons_fragment_tick(
     total = value;
     delta = value - previous;
   };
+  freeze_reason(race.rejected_launch_timing_count,
+      g_last_fragment_race_rejected_launch_timing_count,
+      fragment.race_rejected_launch_timing_total,
+      fragment.race_rejected_launch_timing_this_fragment);
+  freeze_reason(race.missed_launch_timing_count,
+      g_last_fragment_race_missed_launch_timing_count,
+      fragment.race_missed_launch_timing_total,
+      fragment.race_missed_launch_timing_this_fragment);
+  if (race.rejected_launch_timing_count > race.completed_count ||
+      race.missed_launch_timing_count > race.missed_count) __builtin_trap();
   freeze_reason(interrupt_diag.spurious_early_count, g_last_fragment_spurious_early_count,
       fragment.race_spurious_early_count_total, fragment.race_spurious_early_this_fragment);
   freeze_reason(interrupt_diag.spurious_duplicate_count, g_last_fragment_spurious_duplicate_count,
@@ -4465,6 +4781,8 @@ static FLASHMEM void photons_fragment_tick(
   fragment.race_holdoff_max_cycles = race.holdoff_max_cycles;
   fragment.race_flight_this_fragment =
       photons_welford_snapshot(drain.projected_flight_welford);
+
+  fragment.envelope = g_photons_envelope.latest;
 
   fragment.raw_cycles = g_raw_cycles_state;
   fragment.projection = g_projection_state;
@@ -4594,6 +4912,8 @@ static FLASHMEM void photons_fragment_tick(
   g_last_fragment_race_attempt_count = fragment.race_attempt_count_total;
   g_last_fragment_race_completed_count = fragment.race_completed_count_total;
   g_last_fragment_race_missed_count = fragment.race_missed_count_total;
+  g_last_fragment_race_rejected_launch_timing_count = fragment.race_rejected_launch_timing_total;
+  g_last_fragment_race_missed_launch_timing_count = fragment.race_missed_launch_timing_total;
   g_last_fragment_spurious_count = fragment.race_spurious_count_total;
   g_last_fragment_spurious_early_count = fragment.race_spurious_early_count_total;
   g_last_fragment_spurious_duplicate_count = fragment.race_spurious_duplicate_count_total;
@@ -4710,6 +5030,8 @@ static void photons_recovery_clear_physical_ancestry(void) {
   g_last_fragment_race_attempt_count = 0ULL;
   g_last_fragment_race_completed_count = 0ULL;
   g_last_fragment_race_missed_count = 0ULL;
+  g_last_fragment_race_rejected_launch_timing_count = 0ULL;
+  g_last_fragment_race_missed_launch_timing_count = 0ULL;
   g_last_fragment_race_skipped_not_quiet_count = 0ULL;
   g_last_fragment_race_skipped_projection_count = 0ULL;
   g_last_fragment_race_invalid_endpoint_count = 0ULL;
@@ -4784,6 +5106,8 @@ FLASHMEM void process_photons_init(void) {
   g_last_fragment_race_attempt_count = 0ULL;
   g_last_fragment_race_completed_count = 0ULL;
   g_last_fragment_race_missed_count = 0ULL;
+  g_last_fragment_race_rejected_launch_timing_count = 0ULL;
+  g_last_fragment_race_missed_launch_timing_count = 0ULL;
   g_last_fragment_race_skipped_not_quiet_count = 0ULL;
   g_last_fragment_race_skipped_projection_count = 0ULL;
   g_last_fragment_race_invalid_endpoint_count = 0ULL;
@@ -6036,6 +6360,7 @@ static FLASHMEM Payload cmd_report_photons(const Payload& /*args*/) {
   p.add("race_engine_active", canonical.race_engine_active);
   p.add("race_accounting", "TIMEPOP_CADENCE_V1");
   photons_payload_add_capture_gate(p, canonical, "race_");
+  photons_payload_add_launch_timing(p, canonical, "race_");
   p.add("race_pending_return_count", canonical.race_pending_return_count);
   p.add("race_pending_return_count_previous", canonical.race_pending_return_count_previous);
   p.add("race_pending_relaunch_count", canonical.race_pending_relaunch_count);
@@ -6760,7 +7085,8 @@ static FLASHMEM Payload cmd_pulse(const Payload& args) {
   const uint32_t start_dwt = ARM_DWT_CYCCNT;
   digitalWriteFast(LASER_MOD_PIN, HIGH);
   const uint32_t high_start = ARM_DWT_CYCCNT;
-  photons_arm_receive_window(high_start, PHOTONS_RECEIVE_MAX_CYCLES);
+  photons_arm_receive_window(high_start, PHOTONS_RECEIVE_MAX_CYCLES,
+      start_dwt, interrupt_photodiode_launch_kind_t::PULSE);
   interrupt_photodiode_boundary_end();
   if (width.whole_seconds == 0ULL) {
     // Keep the usual 20-100 ns path to a 32-bit DWT poll. IRQs stay enabled;
@@ -6876,6 +7202,7 @@ static FLASHMEM Payload cmd_off(const Payload& /*args*/) {
 
 static const process_command_entry_t PHOTONS_COMMANDS[] = {
   { "REPORT_HISTOGRAM",    cmd_report_histogram    },
+  { "REPORT_ENVELOPE",     cmd_report_envelope     },
   { "INIT",                cmd_init                },
   { "DETECTOR_ACTIVATE",   cmd_detector_activate   },
   { "START",               cmd_start               },

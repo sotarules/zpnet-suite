@@ -1343,9 +1343,23 @@ void interrupt_photodiode_boundary_end(void);
 // consumes it. Further in-window edges are DUPLICATE; edges after expiry are
 // LATE even after a winner. The next boundary withdraws the old window; edges
 // without an armed window are UNARMED. Timing rejection never rewrites science.
+// The pre-write sample brackets MOD HIGH with the original launch timestamp.
+// It is a launch-quality witness, not a corrected optical launch coordinate.
+// The provisional budget admits the observed three-cycle normal bracket with
+// margin. It is not an optical timing precision or an ISR-duration estimate.
+static constexpr uint32_t INTERRUPT_PHOTODIODE_LAUNCH_BRACKET_MAX_CYCLES = 8U;
+
+enum class interrupt_photodiode_launch_kind_t : uint8_t {
+  CADENCE,
+  WAVE,
+  PULSE,
+};
+
 void interrupt_photodiode_arm_window(uint32_t launch_dwt,
                                      uint32_t minimum_cycles,
-                                     uint32_t maximum_cycles);
+                                     uint32_t maximum_cycles,
+                                     uint32_t before_mod_high_dwt,
+                                     interrupt_photodiode_launch_kind_t launch_kind);
 
 // Compatibility/synthetic custody boundary.  The installed physical pin-34 path
 // is GPIO2[29] on IRQ_GPIO2_16_31 at Priority 48 and enters through its dedicated

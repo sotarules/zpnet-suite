@@ -563,6 +563,9 @@ struct photodiode_window_t {
   uint32_t launch_dwt;
   uint32_t minimum_cycles;
   uint32_t maximum_cycles;
+  uint32_t before_mod_high_dwt;
+  interrupt_photodiode_launch_kind_t launch_kind;
+  uint64_t trace_sequence;
 };
 static photodiode_window_t g_photodiode_window{};
 static uint32_t g_photodiode_window_published = 0U; // foreground only
@@ -571,9 +574,96 @@ enum class photodiode_window_outcome_t : uint8_t { CAPTURED, EXPIRED };
 static photodiode_window_outcome_t g_photodiode_window_outcome =
     photodiode_window_outcome_t::EXPIRED; // ISR only; meaningful after acknowledgment
 
+// The ISR accumulates evidence only for the current receive window. A count
+// owns its associated coordinates, including legitimate zero/wrapped DWTs.
+// Capture evidence is separate from the admission outcome: a LATE edge may
+// mark that outcome EXPIRED even after a successful candidate was captured.
+struct photodiode_early_window_t {
+  uint32_t early_count;
+  uint32_t first_entry_dwt;
+  uint32_t last_entry_dwt;
+  uint32_t first_irq_count;
+  interrupt_arrival_capture_t first_arrival;
+  photodiode_capture_kind_t first_kind;
+  uint32_t captured_count;
+  uint32_t captured_entry_dwt;
+};
+static photodiode_early_window_t g_photodiode_early_window{};
+
+static constexpr uint32_t PHOTODIODE_EARLY_TRACE_CAPACITY = 8U;
+struct photodiode_early_record_t {
+  photodiode_window_t window;
+  photodiode_early_window_t edges;
+  uint32_t closed_dwt;
+};
+struct photodiode_early_trace_t {
+  uint64_t armed_windows;
+  uint64_t recorded_windows;
+  uint64_t recorded_early_edges;
+  uint64_t windows_with_capture;
+  uint32_t launch_bracket_min_cycles;
+  uint32_t launch_bracket_max_cycles;
+  photodiode_early_record_t records[PHOTODIODE_EARLY_TRACE_CAPACITY];
+};
+// Only foreground writes this completed-record ring. Reporting never reads the
+// ISR's live accumulator, so it needs no new interrupt mask or retry protocol.
+static photodiode_early_trace_t g_photodiode_early_trace{};
+
+static constexpr uint32_t PHOTODIODE_LAUNCH_TRACE_CAPACITY = 8U;
+struct photodiode_launch_trace_t {
+  uint64_t bracket_bins[INTERRUPT_PHOTODIODE_LAUNCH_BRACKET_MAX_CYCLES + 1U];
+  uint64_t over_limit_armed_windows;
+  uint64_t closed_windows;
+  uint64_t windows_with_early;
+  uint64_t windows_with_capture;
+  photodiode_early_record_t records[PHOTODIODE_LAUNCH_TRACE_CAPACITY];
+};
+// Foreground owns both the bracket distribution and completed stretched-launch
+// records. No new work is added to CLOCKS or detector interrupt entry.
+static photodiode_launch_trace_t g_photodiode_launch_trace{};
+
+static void photodiode_early_trace_close_window(void) {
+  const auto& edges = g_photodiode_early_window;
+  const auto& window = g_photodiode_window;
+  const bool stretched = window.maximum_cycles != 0U &&
+      (uint32_t)(window.launch_dwt - window.before_mod_high_dwt) >
+          INTERRUPT_PHOTODIODE_LAUNCH_BRACKET_MAX_CYCLES;
+  if (edges.early_count != 0U || stretched) {
+    if (interrupt_ipsr() != 0U) __builtin_trap();
+    const uint32_t closed_dwt = ARM_DWT_CYCCNT;
+    if (stretched) {
+      auto& trace = g_photodiode_launch_trace;
+      auto& record = trace.records[trace.closed_windows %
+                                   PHOTODIODE_LAUNCH_TRACE_CAPACITY];
+      record.window = window;
+      record.edges = edges;
+      record.closed_dwt = closed_dwt;
+      trace.closed_windows++;
+      trace.windows_with_early += edges.early_count != 0U ? 1ULL : 0ULL;
+      trace.windows_with_capture += edges.captured_count;
+    }
+    if (edges.early_count != 0U) {
+      auto& trace = g_photodiode_early_trace;
+      auto& record = trace.records[trace.recorded_windows %
+                                   PHOTODIODE_EARLY_TRACE_CAPACITY];
+      record.window = window;
+      record.edges = edges;
+      record.closed_dwt = closed_dwt;
+      trace.recorded_windows++;
+      trace.recorded_early_edges += edges.early_count;
+      trace.windows_with_capture += edges.captured_count;
+    }
+  }
+  // Do not memset the arrival transcript at every launch. The first EARLY
+  // edge assigns it completely; captured_count owns captured_entry_dwt.
+  g_photodiode_early_window.early_count = 0U;
+  g_photodiode_early_window.captured_count = 0U;
+}
+
 // Caller excludes the detector producer through its acquisition boundary or
 // existing subscription-lifecycle guard. Withdrawal never edits ISR custody.
 static void photodiode_window_withdraw(void) {
+  photodiode_early_trace_close_window();
   const uint32_t consumed =
       __atomic_load_n(&g_photodiode_window_consumed, __ATOMIC_ACQUIRE);
   g_photodiode_window = photodiode_window_t{};
@@ -4167,7 +4257,9 @@ void interrupt_photodiode_boundary_begin(void) {
 
 void interrupt_photodiode_arm_window(uint32_t launch_dwt,
                                      uint32_t minimum_cycles,
-                                     uint32_t maximum_cycles) {
+                                     uint32_t maximum_cycles,
+                                     uint32_t before_mod_high_dwt,
+                                     interrupt_photodiode_launch_kind_t launch_kind) {
   if (interrupt_ipsr() != 0U || !g_photodiode_boundary_open ||
       interrupt_nvic_enabled((uint32_t)PHOTODIODE_IRQ) ||
       minimum_cycles == 0U || minimum_cycles > maximum_cycles ||
@@ -4176,7 +4268,21 @@ void interrupt_photodiode_arm_window(uint32_t launch_dwt,
       __atomic_load_n(&g_photodiode_window_consumed, __ATOMIC_ACQUIRE);
   if (__atomic_load_n(&g_photodiode_window_published, __ATOMIC_RELAXED) !=
       consumed) __builtin_trap();
-  g_photodiode_window = {launch_dwt, minimum_cycles, maximum_cycles};
+  auto& trace = g_photodiode_early_trace;
+  const uint32_t bracket_cycles = launch_dwt - before_mod_high_dwt;
+  const uint64_t sequence = ++trace.armed_windows;
+  if (sequence == 1ULL || bracket_cycles < trace.launch_bracket_min_cycles)
+    trace.launch_bracket_min_cycles = bracket_cycles;
+  if (bracket_cycles > trace.launch_bracket_max_cycles)
+    trace.launch_bracket_max_cycles = bracket_cycles;
+  if (bracket_cycles <= INTERRUPT_PHOTODIODE_LAUNCH_BRACKET_MAX_CYCLES)
+    g_photodiode_launch_trace.bracket_bins[bracket_cycles]++;
+  else
+    g_photodiode_launch_trace.over_limit_armed_windows++;
+  // The admission generation can repeat after a miss; the independent arm
+  // sequence identifies every window, including CADENCE/WAVE/manual PULSE.
+  g_photodiode_window = {launch_dwt, minimum_cycles, maximum_cycles,
+                         before_mod_high_dwt, launch_kind, sequence};
   __atomic_store_n(&g_photodiode_window_published, consumed + 1U,
                    __ATOMIC_RELEASE);
 }
@@ -5639,6 +5745,14 @@ static void photodiode_raw_push(uint32_t entry_dwt,
   if (elapsed < g_photodiode_window.minimum_cycles) {
     g_photodiode_subscription.diag.spurious_count++;
     g_photodiode_subscription.diag.spurious_early_count++;
+    auto& early = g_photodiode_early_window;
+    if (early.early_count++ == 0U) {
+      early.first_entry_dwt = entry_dwt;
+      early.first_irq_count = g_photodiode_subscription.diag.irq_count;
+      early.first_arrival = arrival;
+      early.first_kind = kind;
+    }
+    early.last_entry_dwt = entry_dwt;
     return; // early interference must not steal the real return
   }
   if (published == consumed) {
@@ -5648,6 +5762,8 @@ static void photodiode_raw_push(uint32_t entry_dwt,
   }
   // Claim before raw publication. Classification order above distinguishes
   // additional in-window edges from late edges without admitting either.
+  g_photodiode_early_window.captured_entry_dwt = entry_dwt;
+  g_photodiode_early_window.captured_count = 1U;
   g_photodiode_window_outcome = photodiode_window_outcome_t::CAPTURED;
   __atomic_store_n(&g_photodiode_window_consumed, published, __ATOMIC_RELEASE);
   const uint32_t head = __atomic_load_n(&g_photodiode_raw_head, __ATOMIC_RELAXED);
@@ -6960,6 +7076,9 @@ FLASHMEM void process_interrupt_init(void) {
   g_photodiode_window_published = 0U;
   g_photodiode_window_consumed = 0U;
   g_photodiode_window_outcome = photodiode_window_outcome_t::EXPIRED;
+  g_photodiode_early_window = photodiode_early_window_t{};
+  g_photodiode_early_trace = photodiode_early_trace_t{};
+  g_photodiode_launch_trace = photodiode_launch_trace_t{};
   g_photodiode_raw_overflow_count = 0U;
   g_photodiode_service_running = false;
   g_photodiode_boundary_open = false;
@@ -7361,10 +7480,141 @@ static FLASHMEM void add_photodiode_report(Payload& payload,
   add_u32("raw_queue_overflow_count", g_photodiode_raw_overflow_count);
 }
 
+// One reusable record serializer, confined to this foreground command. Keep
+// trace expansion out of the other reports that reuse add_photodiode_report().
+alignas(uint32_t) static DMAMEM char g_photodiode_early_report_record[2048];
+
+static FLASHMEM const char* photodiode_launch_kind_str(
+    interrupt_photodiode_launch_kind_t kind) {
+  switch (kind) {
+    case interrupt_photodiode_launch_kind_t::CADENCE: return "CADENCE";
+    case interrupt_photodiode_launch_kind_t::WAVE: return "WAVE";
+    case interrupt_photodiode_launch_kind_t::PULSE: return "PULSE";
+  }
+  __builtin_trap();
+}
+
+static FLASHMEM void add_photodiode_trace_record(
+    Payload& payload, const char* key, const photodiode_early_record_t& r) {
+  Payload record(Payload::StorageMode::FIXED, g_photodiode_early_report_record,
+                 sizeof(g_photodiode_early_report_record));
+  const auto& w = r.window;
+  const auto& e = r.edges;
+  record.add("window_sequence", w.trace_sequence);
+  record.add("launch_kind", photodiode_launch_kind_str(w.launch_kind));
+  record.add("before_mod_high_dwt", w.before_mod_high_dwt);
+  record.add("launch_dwt", w.launch_dwt);
+  // This span includes possible interruption BEFORE MOD HIGH as well as
+  // after it. Never treat it as a measured optical offset or subtract it.
+  record.add("launch_bracket_cycles", (uint32_t)(w.launch_dwt - w.before_mod_high_dwt));
+  record.add("minimum_cycles", w.minimum_cycles);
+  record.add("maximum_cycles", w.maximum_cycles);
+  record.add("early_count", e.early_count);
+  if (e.early_count != 0U) {
+    record.add("capture_kind", e.first_kind == photodiode_capture_kind_t::PHYSICAL
+        ? "PHYSICAL" : "SYNTHETIC");
+    record.add("first_early_irq_count", e.first_irq_count);
+    record.add("first_early_entry_dwt", e.first_entry_dwt);
+    record.add("last_early_entry_dwt", e.last_entry_dwt);
+    record.add("first_early_elapsed_cycles", (uint32_t)(e.first_entry_dwt - w.launch_dwt));
+    record.add("last_early_elapsed_cycles", (uint32_t)(e.last_entry_dwt - w.launch_dwt));
+    // Only the first EARLY edge owns this raw arrival witness. Running the
+    // classifier here would change its learned baseline during reporting.
+    const auto& a = e.first_arrival;
+    record.add("first_arrival_blocker", interrupt_execution_source_str(a.blocker));
+    record.add("first_arrival_blocker_exit_dwt", a.blocker_exit_dwt);
+    record.add("first_arrival_blocker_wall_cycles", a.blocker_wall_cycles);
+    record.add("first_arrival_pending_at_blocker_entry", a.target_pending_at_blocker_entry);
+    record.add("first_arrival_pending_mask", a.pending_mask_at_entry);
+    record.add("first_arrival_lower_active_mask", a.lower_context_active_mask);
+    record.add("first_arrival_spinidle_running", a.spinidle_running);
+    record.add("first_arrival_spinidle_shadow_dwt", a.spinidle_shadow_dwt);
+  }
+  record.add("captured_count", e.captured_count);
+  record.add("window_result", e.captured_count != 0U ? "CAPTURED" : "CLOSED_WITHOUT_CAPTURE");
+  if (e.captured_count != 0U) {
+    record.add("captured_entry_dwt", e.captured_entry_dwt);
+    record.add("captured_elapsed_cycles", (uint32_t)(e.captured_entry_dwt - w.launch_dwt));
+  }
+  record.add("closed_dwt", r.closed_dwt);
+  payload.add_object(key, record);
+}
+
+static FLASHMEM void add_photodiode_early_trace(Payload& payload) {
+  if (interrupt_ipsr() != 0U) __builtin_trap();
+  const auto& trace = g_photodiode_early_trace;
+  const uint32_t retained = trace.recorded_windows < PHOTODIODE_EARLY_TRACE_CAPACITY
+      ? (uint32_t)trace.recorded_windows : PHOTODIODE_EARLY_TRACE_CAPACITY;
+  payload.add("photodiode_early_trace_schema", "PHOTODIODE_EARLY_TRACE_V1");
+  payload.add("photodiode_early_trace_scope", "FIRMWARE_BOOT");
+  payload.add("photodiode_early_trace_policy", "FIRST_AND_LAST_EARLY_PER_CLOSED_WINDOW");
+  payload.add("photodiode_early_trace_order", "OLDEST_TO_NEWEST");
+  payload.add("photodiode_early_trace_bracket", "PRE_MOD_WRITE_DWT_TO_LAUNCH_DWT");
+  payload.add("photodiode_early_trace_arrival", "FIRST_EARLY_ISR_ENTRY_NOT_LAUNCH_ANCESTRY");
+  payload.add("photodiode_early_trace_nominal_cps", (uint32_t)F_CPU_ACTUAL);
+  payload.add("photodiode_early_trace_capacity", PHOTODIODE_EARLY_TRACE_CAPACITY);
+  payload.add("photodiode_early_trace_armed_windows", trace.armed_windows);
+  payload.add("photodiode_early_trace_recorded_windows", trace.recorded_windows);
+  payload.add("photodiode_early_trace_recorded_edges", trace.recorded_early_edges);
+  payload.add("photodiode_early_trace_windows_with_capture", trace.windows_with_capture);
+  payload.add("photodiode_early_trace_windows_without_capture",
+              trace.recorded_windows - trace.windows_with_capture);
+  payload.add("photodiode_early_trace_retained", retained);
+  payload.add("photodiode_early_trace_overwritten", trace.recorded_windows - retained);
+  if (trace.armed_windows != 0ULL) {
+    payload.add("photodiode_launch_bracket_min_cycles", trace.launch_bracket_min_cycles);
+    payload.add("photodiode_launch_bracket_max_cycles", trace.launch_bracket_max_cycles);
+  }
+
+  for (uint32_t i = 0U; i < retained; ++i) {
+    const uint64_t index = trace.recorded_windows - retained + i;
+    const auto& r = trace.records[index % PHOTODIODE_EARLY_TRACE_CAPACITY];
+    char key[32];
+    snprintf(key, sizeof(key), "photodiode_early_r%02u", (unsigned)i);
+    add_photodiode_trace_record(payload, key, r);
+  }
+}
+
+static FLASHMEM void add_photodiode_launch_trace(Payload& payload) {
+  const auto& trace = g_photodiode_launch_trace;
+  const uint32_t retained = trace.closed_windows < PHOTODIODE_LAUNCH_TRACE_CAPACITY
+      ? (uint32_t)trace.closed_windows : PHOTODIODE_LAUNCH_TRACE_CAPACITY;
+  payload.add("photodiode_launch_trace_schema", "PHOTODIODE_LAUNCH_TRACE_V1");
+  payload.add("photodiode_launch_trace_scope", "FIRMWARE_BOOT_ARMED_WINDOWS");
+  payload.add("photodiode_launch_trace_policy", "CLOSED_WINDOWS_WITH_BRACKET_OVER_LIMIT");
+  payload.add("photodiode_launch_trace_capture", "DETECTOR_CAPTURE_NOT_SCIENCE_ACCEPTANCE");
+  payload.add("photodiode_launch_trace_order", "OLDEST_TO_NEWEST");
+  payload.add("photodiode_launch_bracket_limit_cycles",
+              INTERRUPT_PHOTODIODE_LAUNCH_BRACKET_MAX_CYCLES);
+  payload.add("photodiode_launch_trace_capacity", PHOTODIODE_LAUNCH_TRACE_CAPACITY);
+  payload.add("photodiode_launch_bracket_over_limit_windows", trace.over_limit_armed_windows);
+  payload.add("photodiode_launch_trace_closed_windows", trace.closed_windows);
+  payload.add("photodiode_launch_trace_windows_with_early", trace.windows_with_early);
+  payload.add("photodiode_launch_trace_windows_with_capture", trace.windows_with_capture);
+  payload.add("photodiode_launch_trace_windows_without_capture",
+              trace.closed_windows - trace.windows_with_capture);
+  payload.add("photodiode_launch_trace_retained", retained);
+  payload.add("photodiode_launch_trace_overwritten", trace.closed_windows - retained);
+  for (uint32_t i = 0U; i <= INTERRUPT_PHOTODIODE_LAUNCH_BRACKET_MAX_CYCLES; ++i) {
+    char key[40];
+    snprintf(key, sizeof(key), "photodiode_launch_bracket_c%02u", (unsigned)i);
+    payload.add(key, trace.bracket_bins[i]);
+  }
+  for (uint32_t i = 0U; i < retained; ++i) {
+    const uint64_t index = trace.closed_windows - retained + i;
+    const auto& r = trace.records[index % PHOTODIODE_LAUNCH_TRACE_CAPACITY];
+    char key[32];
+    snprintf(key, sizeof(key), "photodiode_launch_r%02u", (unsigned)i);
+    add_photodiode_trace_record(payload, key, r);
+  }
+}
+
 static FLASHMEM Payload cmd_report_photodiode(const Payload&) {
   Payload payload;
   payload.add("report", "INTERRUPT_PHOTODIODE");
   add_photodiode_report(payload, "photodiode");
+  add_photodiode_early_trace(payload);
+  add_photodiode_launch_trace(payload);
   return payload;
 }
 
