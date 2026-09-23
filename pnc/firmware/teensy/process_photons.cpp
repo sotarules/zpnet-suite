@@ -1988,7 +1988,8 @@ static double photons_batch_m2(uint64_t n, uint64_t sum, uint64_t sumsq) {
 
 // Alpha lower envelope has independent foreground-only custody. Never put this
 // histogram in the per-race SPSC batch: that batch is copied at flight cadence.
-// Counting is O(1) per accepted race; selection/recentering occurs only at 1 Hz.
+// Counting is O(1) per provisional accepted race. The core gate finalizes that
+// population before the envelope is evaluated; both scans run only at 1 Hz.
 static constexpr uint32_t PHOTONS_ENVELOPE_BINS = 128U;
 static constexpr uint32_t PHOTONS_ENVELOPE_HISTORY = 8U;
 static constexpr uint32_t PHOTONS_ENVELOPE_LOW_PERCENT = 1U;
@@ -2005,6 +2006,8 @@ struct photons_envelope_histogram_t {
   uint64_t count = 0ULL;
   uint64_t underflow = 0ULL;
   uint64_t overflow = 0ULL;
+  uint32_t underflow_max_cycles = 0U; // meaningful only with underflow count
+  uint32_t overflow_min_cycles = 0U;  // meaningful only with overflow count
 };
 struct alignas(PHOTONS_RAM2_CACHE_LINE_BYTES) photons_envelope_store_t {
   photons_envelope_histogram_t live{};
@@ -2038,9 +2041,15 @@ static void photons_envelope_observe(uint32_t raw_cycles,
   // Same fragment count bound as photons_drain_raw_laps(). No bin may wrap.
   if (h.count == UINT32_MAX) __builtin_trap();
   ++h.count;
-  if (raw_cycles < h.origin_cycles) ++h.underflow;
-  else if (raw_cycles - h.origin_cycles >= PHOTONS_ENVELOPE_BINS) ++h.overflow;
-  else ++h.bins[raw_cycles - h.origin_cycles];
+  if (raw_cycles < h.origin_cycles) {
+    if (h.underflow++ == 0ULL || raw_cycles > h.underflow_max_cycles)
+      h.underflow_max_cycles = raw_cycles;
+  } else if (raw_cycles - h.origin_cycles >= PHOTONS_ENVELOPE_BINS) {
+    if (h.overflow++ == 0ULL || raw_cycles < h.overflow_min_cycles)
+      h.overflow_min_cycles = raw_cycles;
+  } else {
+    ++h.bins[raw_cycles - h.origin_cycles];
+  }
 }
 
 static const char* photons_envelope_state(const photons_envelope_snapshot_t& s) {
@@ -2093,6 +2102,228 @@ static void photons_envelope_estimate(const photons_envelope_histogram_t& h,
   out.selected_mean_cycles = (double)h.origin_cycles + mean_offset;
   // Descriptive weighted population SD, deliberately no selected SD/sqrt(N).
   out.selected_sd_cycles = sqrt(m2 / (double)weight);
+}
+
+// Select a generous central population from this fragment alone. The radius
+// follows the observed width; the eight-cycle floor tolerates cycle quantization.
+// No previous fragment supplies a target value or contributes to the result.
+static constexpr uint32_t PHOTONS_CORE_HISTORY = 8U;
+static constexpr uint32_t PHOTONS_CORE_MIN_COUNT = 1000U;
+static constexpr uint32_t PHOTONS_CORE_MIN_RADIUS_CYCLES = 8U;
+static constexpr uint32_t PHOTONS_CORE_MAD_MULTIPLIER = 6U;
+static constexpr uint32_t PHOTONS_CORE_MIN_RETAINED_PERCENT = 95U;
+static_assert(PHOTONS_CORE_MIN_RETAINED_PERCENT <= 100U,
+              "Core retained percentage must not exceed the whole population");
+
+struct alignas(PHOTONS_RAM2_CACHE_LINE_BYTES) photons_core_store_t {
+  photons_envelope_histogram_t latest_input_histogram{};
+  photons_core_snapshot_t latest{};
+  photons_core_snapshot_t history[PHOTONS_CORE_HISTORY]{};
+  uint64_t rejection_total = 0ULL;
+  uint32_t history_next = 0U;
+  uint32_t history_count = 0U;
+};
+static photons_core_store_t g_photons_core DMAMEM;
+static_assert(sizeof(photons_core_store_t) <= 2304U,
+              "Review the core typed RAM2 budget after layout changes");
+
+static void photons_core_reset(void) {
+  // RAM2 is NOLOAD; reset with the physical race ancestry, not STATS_RESET.
+  g_photons_core = photons_core_store_t{};
+}
+
+static const char* photons_core_state_name(photons_core_state_t state) {
+  switch (state) {
+    case photons_core_state_t::NO_SAMPLES: return "NO_SAMPLES";
+    case photons_core_state_t::LOW_SUPPORT: return "LOW_SUPPORT";
+    case photons_core_state_t::CENSORED: return "CENSORED";
+    case photons_core_state_t::BROAD_POPULATION: return "BROAD_POPULATION";
+    case photons_core_state_t::FILTERED: return "FILTERED";
+  }
+  __builtin_trap();
+}
+
+static uint64_t photons_core_multiply_checked(uint64_t left, uint64_t right) {
+  if (right != 0ULL && left > UINT64_MAX / right) __builtin_trap();
+  return left * right;
+}
+
+// The full-population rank includes censored tails. Once the final gate fits
+// completely inside the window, every unseen tail lies farther away than MAD;
+// ignoring its unknown coordinates during the shell scan cannot change MAD.
+static FLASHMEM photons_core_state_t photons_core_select(
+    photons_race_batch_t& batch,
+    photons_envelope_histogram_t& h,
+    photons_core_snapshot_t& out) {
+  if (h.count == 0ULL) return photons_core_state_t::NO_SAMPLES;
+  if (h.count < PHOTONS_CORE_MIN_COUNT)
+    return photons_core_state_t::LOW_SUPPORT;
+
+  const uint64_t rank = (h.count + 1ULL) / 2ULL;
+  if (h.underflow >= rank || h.count - h.overflow < rank)
+    return photons_core_state_t::CENSORED;
+  uint64_t cumulative = h.underflow;
+  uint32_t median_bin = 0U;
+  for (; median_bin < PHOTONS_ENVELOPE_BINS; ++median_bin) {
+    cumulative += h.bins[median_bin];
+    if (cumulative >= rank) break;
+  }
+  if (median_bin == PHOTONS_ENVELOPE_BINS) __builtin_trap();
+  out.median_cycles = h.origin_cycles + median_bin;
+
+  uint32_t mad = 0U;
+  cumulative = h.bins[median_bin];
+  while (cumulative < rank && mad + 1U < PHOTONS_ENVELOPE_BINS) {
+    ++mad;
+    if (median_bin >= mad) cumulative += h.bins[median_bin - mad];
+    if (mad < PHOTONS_ENVELOPE_BINS - median_bin)
+      cumulative += h.bins[median_bin + mad];
+  }
+  if (cumulative < rank) return photons_core_state_t::CENSORED;
+  out.mad_cycles = mad;
+  const uint32_t scaled_mad = PHOTONS_CORE_MAD_MULTIPLIER * mad;
+  const uint32_t radius = scaled_mad > PHOTONS_CORE_MIN_RADIUS_CYCLES
+      ? scaled_mad : PHOTONS_CORE_MIN_RADIUS_CYCLES;
+  out.radius_cycles = radius;
+  // Both endpoint coordinates and every admitted observation are known. A real
+  // shift beyond this window passes through and recenters via envelope_finish.
+  if (median_bin < radius ||
+      radius >= PHOTONS_ENVELOPE_BINS - median_bin)
+    return photons_core_state_t::CENSORED;
+  const uint32_t first_bin = median_bin - radius;
+  const uint32_t last_bin = median_bin + radius;
+  out.gate_low_cycles = h.origin_cycles + first_bin;
+  out.gate_high_cycles = h.origin_cycles + last_bin;
+
+  uint64_t kept_count = 0ULL;
+  uint64_t kept_sum = 0ULL;
+  uint64_t kept_sumsq = 0ULL;
+  uint32_t kept_min = 0U;
+  uint32_t kept_max = 0U;
+  for (uint32_t i = first_bin; i <= last_bin; ++i) {
+    const uint32_t count = h.bins[i];
+    if (count == 0U) continue;
+    const uint32_t value = h.origin_cycles + i;
+    if (kept_count == 0ULL) kept_min = value;
+    kept_max = value;
+    photons_batch_add_checked(kept_count, count);
+    photons_batch_add_checked(kept_sum,
+        photons_core_multiply_checked(count, value));
+    photons_batch_add_checked(kept_sumsq,
+        photons_core_multiply_checked(count, (uint64_t)value * value));
+  }
+  if (kept_count == 0ULL || kept_count > batch.accepted_count ||
+      kept_sum > batch.accepted_sum_cycles ||
+      kept_sumsq > batch.accepted_sumsq_cycles) __builtin_trap();
+  // This phase removes sparse tails only. A broader/multimodal population is
+  // evidence to report, not permission to choose whichever cluster looks best.
+  if (100ULL * kept_count <
+      PHOTONS_CORE_MIN_RETAINED_PERCENT * h.count)
+    return photons_core_state_t::BROAD_POPULATION;
+
+  const uint64_t removed_count = batch.accepted_count - kept_count;
+  const uint64_t removed_sum = batch.accepted_sum_cycles - kept_sum;
+  const uint64_t removed_sumsq = batch.accepted_sumsq_cycles - kept_sumsq;
+  uint64_t early = h.underflow;
+  uint64_t late = h.overflow;
+  uint32_t removed_min = UINT32_MAX;
+  uint32_t removed_max = 0U;
+  if (h.underflow != 0ULL) {
+    removed_min = batch.accepted_min_cycles;
+    removed_max = h.underflow_max_cycles;
+  }
+  if (h.overflow != 0ULL) {
+    if (h.overflow_min_cycles < removed_min)
+      removed_min = h.overflow_min_cycles;
+    if (batch.accepted_max_cycles > removed_max)
+      removed_max = batch.accepted_max_cycles;
+  }
+  for (uint32_t i = 0U; i < PHOTONS_ENVELOPE_BINS; ++i) {
+    if (i >= first_bin && i <= last_bin) continue;
+    const uint32_t count = h.bins[i];
+    if (count == 0U) continue;
+    const uint32_t value = h.origin_cycles + i;
+    if (value < removed_min) removed_min = value;
+    if (value > removed_max) removed_max = value;
+    if (i < first_bin) early += count;
+    else late += count;
+  }
+  if (early + late != removed_count) __builtin_trap();
+  if (removed_count != 0ULL) {
+    if (batch.rejected_count == 0ULL || removed_min < batch.rejected_min_cycles)
+      batch.rejected_min_cycles = removed_min;
+    if (removed_max > batch.rejected_max_cycles)
+      batch.rejected_max_cycles = removed_max;
+    photons_batch_add_checked(batch.rejected_count, removed_count);
+    photons_batch_add_checked(batch.rejected_sum_cycles, removed_sum);
+    photons_batch_add_checked(batch.rejected_sumsq_cycles, removed_sumsq);
+    photons_batch_add_checked(batch.rejected_excursion, removed_count);
+    photons_batch_add_checked(g_photons_core.rejection_total, removed_count);
+    out.rejected_min_cycles = removed_min;
+    out.rejected_max_cycles = removed_max;
+    out.rejected_mean_cycles = (double)removed_sum / (double)removed_count;
+  } else if (removed_sum != 0ULL || removed_sumsq != 0ULL) {
+    __builtin_trap();
+  }
+
+  batch.accepted_count = kept_count;
+  batch.accepted_sum_cycles = kept_sum;
+  batch.accepted_sumsq_cycles = kept_sumsq;
+  batch.accepted_min_cycles = kept_min;
+  batch.accepted_max_cycles = kept_max;
+  out.retained_count = kept_count;
+  out.rejected_early_count = early;
+  out.rejected_late_count = late;
+  out.retained_mean_cycles = (double)kept_sum / (double)kept_count;
+  out.retained_sd_cycles = kept_count > 1ULL ? sqrt(photons_batch_m2(
+      kept_count, kept_sum, kept_sumsq) / (double)(kept_count - 1ULL)) : 0.0;
+  // The envelope and canonical batch now describe exactly the same population.
+  // The untouched preselection histogram lives in latest_input_histogram.
+  for (uint32_t i = 0U; i < PHOTONS_ENVELOPE_BINS; ++i)
+    if (i < first_bin || i > last_bin) h.bins[i] = 0U;
+  h.count = kept_count;
+  h.underflow = 0ULL;
+  h.overflow = 0ULL;
+  h.underflow_max_cycles = 0U;
+  h.overflow_min_cycles = 0U;
+  return photons_core_state_t::FILTERED;
+}
+
+static FLASHMEM void photons_core_finish(photons_race_batch_t& batch,
+                                         uint32_t cps, uint32_t sequence) {
+  photons_foreground_owner_assert(photons_foreground_owner_t::FRAGMENT);
+  auto& c = g_photons_core;
+  auto& h = g_photons_envelope.live;
+  if (h.count != batch.accepted_count || h.count > UINT32_MAX)
+    __builtin_trap();
+  uint64_t histogram_count = h.underflow + h.overflow;
+  for (uint32_t i = 0U; i < PHOTONS_ENVELOPE_BINS; ++i)
+    histogram_count += h.bins[i];
+  if (histogram_count != h.count) __builtin_trap();
+  c.latest_input_histogram = h;
+  auto& s = c.latest;
+  s = photons_core_snapshot_t{};
+  s.sequence = sequence;
+  s.dwt_cycles_per_second = cps;
+  s.input_count = batch.accepted_count;
+  s.retained_count = batch.accepted_count;
+  if (batch.accepted_count != 0ULL) {
+    if (cps == 0U) __builtin_trap();
+    s.input_mean_cycles = (double)batch.accepted_sum_cycles /
+                          (double)batch.accepted_count;
+    s.input_sd_cycles = batch.accepted_count > 1ULL ? sqrt(photons_batch_m2(
+        batch.accepted_count, batch.accepted_sum_cycles,
+        batch.accepted_sumsq_cycles) / (double)(batch.accepted_count - 1ULL)) : 0.0;
+    s.retained_mean_cycles = s.input_mean_cycles;
+    s.retained_sd_cycles = s.input_sd_cycles;
+  }
+  s.state = photons_core_select(batch, h, s);
+  s.rejected_count_total = c.rejection_total;
+  if (s.input_count != s.retained_count + s.rejected_early_count +
+                       s.rejected_late_count) __builtin_trap();
+  c.history[c.history_next] = s;
+  c.history_next = (c.history_next + 1U) % PHOTONS_CORE_HISTORY;
+  if (c.history_count < PHOTONS_CORE_HISTORY) ++c.history_count;
 }
 
 static FLASHMEM void photons_envelope_finish(const photons_race_batch_t& batch,
@@ -2160,13 +2391,16 @@ static photons_fragment_drain_result_t photons_drain_raw_laps(void) {
   g_photons_lap_science_state.exclusion_reasons.raw_cycle_excursion_this_fragment = 0U;
   g_photons_lap_science_state.exclusion_reasons.isr_delay_this_fragment = 0U;
 
-  const photons_race_batch_t race_batch = photons_race_batch_take();
+  photons_race_batch_t race_batch = photons_race_batch_take();
   const uint64_t race_finalized =
       race_batch.accepted_count + race_batch.rejected_count;
   if (race_finalized > (uint64_t)UINT32_MAX) __builtin_trap();
 
   const uint32_t race_cps = race_batch.accepted_count != 0ULL
       ? interrupt_dynamic_cps() : 0U;
+  // Finalize exact science membership before any Welford, numerator, count,
+  // bucket, or campaign sees this batch. No averaging across seconds occurs.
+  photons_core_finish(race_batch, race_cps, g_fragment_sequence + 1U);
   photons_envelope_finish(race_batch, race_cps, g_fragment_sequence + 1U);
 
   if (race_batch.accepted_count != 0ULL) {
@@ -3026,6 +3260,7 @@ static void photons_race_prepare(void) {
   g_photons_race_foreground.initialized = true;
   g_photons_foreground_batch = photons_race_batch_t{};
   photons_envelope_reset();
+  photons_core_reset();
 }
 
 static void photons_race_start_autonomous(void) {
@@ -3535,6 +3770,7 @@ static Payload g_photons_fragment_root(
     sizeof(g_photons_fragment_root_region.storage));
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_instrument, 14336U);
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_envelope, 2048U);
+PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_core, 2048U);
 
 // LANTERN V1.0 adds autonomous-race rejection/reference testimony to the
 // PHOTONS_RACE object.  The old 1536-byte store was sized for the 25-field
@@ -4057,6 +4293,112 @@ static void photons_payload_add_capture_totals(
   p.add("race_spurious_unarmed_count_total", diag.spurious_unarmed_count);
 }
 
+// Render the same completed selection that fed canonical science. Counts own
+// their moments; no missing fragment is represented by a fabricated zero mean.
+static void photons_payload_add_core(Payload& parent, const char* name,
+                                     const photons_core_snapshot_t& s) {
+  Payload& p = g_photons_fragment_core;
+  p.clear();
+  p.add("algorithm", "FRAGMENT_MEDIAN_MAD_CORE_V1");
+  p.add("population", "AUTONOMOUS_RACES_AFTER_LAUNCH_AND_ARRIVAL_GATES");
+  p.add("state", photons_core_state_name(s.state));
+  p.add("sequence", s.sequence);
+  p.add("dwt_cycles_per_second", s.dwt_cycles_per_second);
+  p.add("input_count", s.input_count);
+  p.add("retained_count", s.retained_count);
+  p.add("rejected_early_count", s.rejected_early_count);
+  p.add("rejected_late_count", s.rejected_late_count);
+  p.add("rejected_count_total", s.rejected_count_total);
+  p.add("exclusion_reason", "raw_cycle_excursion");
+  p.add("minimum_count", PHOTONS_CORE_MIN_COUNT);
+  p.add("minimum_radius_cycles", PHOTONS_CORE_MIN_RADIUS_CYCLES);
+  p.add("mad_multiplier", PHOTONS_CORE_MAD_MULTIPLIER);
+  p.add("minimum_retained_pct", PHOTONS_CORE_MIN_RETAINED_PERCENT);
+  if (s.state == photons_core_state_t::FILTERED ||
+      s.state == photons_core_state_t::BROAD_POPULATION) {
+    p.add("median_cycles", s.median_cycles);
+    p.add("mad_cycles", s.mad_cycles);
+    p.add("radius_cycles", s.radius_cycles);
+    p.add("gate_low_cycles", s.gate_low_cycles);
+    p.add("gate_high_cycles", s.gate_high_cycles);
+  }
+  if (s.input_count != 0ULL) {
+    if (s.dwt_cycles_per_second == 0U) __builtin_trap();
+    const double scale = (double)PHOTONS_NS_PER_SECOND / s.dwt_cycles_per_second;
+    p.add("input_mean_cycles", toFixedDecimal(s.input_mean_cycles, 9));
+    p.add("input_mean_ns", toFixedDecimal(s.input_mean_cycles * scale, 9));
+    p.add("input_population_sd_ns", toFixedDecimal(s.input_sd_cycles * scale, 9));
+    p.add("retained_mean_cycles", toFixedDecimal(s.retained_mean_cycles, 9));
+    p.add("retained_mean_ns", toFixedDecimal(s.retained_mean_cycles * scale, 9));
+    p.add("retained_population_sd_ns", toFixedDecimal(s.retained_sd_cycles * scale, 9));
+    p.add("mean_change_ns", toFixedDecimal(
+        (s.retained_mean_cycles - s.input_mean_cycles) * scale, 9));
+    if (s.rejected_early_count + s.rejected_late_count != 0ULL) {
+      p.add("rejected_min_cycles", s.rejected_min_cycles);
+      p.add("rejected_max_cycles", s.rejected_max_cycles);
+      p.add("rejected_mean_cycles", toFixedDecimal(s.rejected_mean_cycles, 9));
+    }
+  }
+  parent.add_object(name, p);
+  p.clear();
+}
+
+static FLASHMEM Payload cmd_report_core(const Payload& /*args*/) {
+  const photons_foreground_custody_t custody(photons_foreground_owner_t::COMMAND);
+  const auto& c = g_photons_core;
+  const auto& h = c.latest_input_histogram;
+  auto& store = g_photons_histogram_report_store;
+  Payload p(Payload::StorageMode::FIXED, store.root, sizeof(store.root));
+  p.add("schema", "PHOTONS_CORE_REPORT_V1");
+  p.add("scope", "LATEST_COMPLETED_FRAGMENT");
+  p.add("canonical_policy", "RETAINED_RACES_FEED_LAP_AND_ALL_SCIENCE_AGGREGATES");
+  p.add("unfiltered_states", "NO_SAMPLES;LOW_SUPPORT;CENSORED;BROAD_POPULATION");
+  p.add("history_scope", "PHYSICAL_ANCESTRY; survives STATS_RESET and campaigns");
+  p.add("history_order", "OLDEST_TO_NEWEST; recent_0 onward");
+  p.add("history_count", c.history_count);
+  p.add("bin_count", PHOTONS_ENVELOPE_BINS);
+  p.add("bin_width_cycles", 1U);
+  p.add("input_histogram_origin_cycles", h.origin_cycles);
+  p.add("input_histogram_underflow", h.underflow);
+  p.add("input_histogram_overflow", h.overflow);
+  photons_payload_add_core(p, "latest", c.latest);
+  Payload bins(Payload::StorageMode::FIXED, store.bins, sizeof(store.bins));
+  for (uint32_t i = 0U; i < PHOTONS_ENVELOPE_BINS; ++i) {
+    char key[8];
+    snprintf(key, sizeof(key), "b%02u", (unsigned)i);
+    bins.add(key, h.bins[i]);
+  }
+  p.add_object("input_bins", bins);
+
+  photons_welford_state_t input_means{};
+  photons_welford_state_t retained_means{};
+  uint32_t filtered_fragments = 0U;
+  const uint32_t oldest = (c.history_next + PHOTONS_CORE_HISTORY -
+                           c.history_count) % PHOTONS_CORE_HISTORY;
+  for (uint32_t i = 0U; i < c.history_count; ++i) {
+    const auto& s = c.history[(oldest + i) % PHOTONS_CORE_HISTORY];
+    char key[24];
+    snprintf(key, sizeof(key), "recent_%u", (unsigned)i);
+    photons_payload_add_core(p, key, s);
+    if (s.state == photons_core_state_t::FILTERED) ++filtered_fragments;
+    if (s.input_count == 0ULL) continue;
+    const double scale = (double)PHOTONS_NS_PER_SECOND / s.dwt_cycles_per_second;
+    photons_welford_update(input_means, s.input_mean_cycles * scale);
+    photons_welford_update(retained_means, s.retained_mean_cycles * scale);
+  }
+  p.add("history_filtered_fragments", filtered_fragments);
+  p.add("history_compared_fragments", input_means.n);
+  // These two SDs answer repeatability between seconds, independently of the
+  // within-population SDs above. Both use the same nonempty fragment sequence.
+  if (input_means.n >= 2ULL) {
+    p.add("input_between_fragment_mean_sd_ns",
+          toFixedDecimal(photons_welford_stddev(input_means), 9));
+    p.add("retained_between_fragment_mean_sd_ns",
+          toFixedDecimal(photons_welford_stddev(retained_means), 9));
+  }
+  return Payload(p);
+}
+
 static void photons_payload_add_envelope(Payload& parent, const char* name,
                                          const photons_envelope_snapshot_t& s) {
   Payload& p = g_photons_fragment_envelope;
@@ -4263,6 +4605,7 @@ static Payload& photons_fragment_payload(
   instrument.add_object("race", race);
   race.clear();
   photons_payload_add_envelope(instrument, "envelope", f.envelope);
+  photons_payload_add_core(instrument, "core", f.core);
 
   raw.add("valid", f.raw_cycles.valid);
   raw.add("completed_lap_count", f.raw_cycles.completed_lap_count);
@@ -4764,9 +5107,18 @@ static FLASHMEM void photons_fragment_tick(
   fragment.race_rejected_pps_total = race.rejected_pps_count;
   fragment.race_rejected_continuation_total = race.rejected_continuation_count;
   fragment.race_rejected_unknown_total = race.rejected_unknown_count;
+  // Edge service owns coarse-reference rejects; the fragment owns core-tail
+  // rejects. Combine their totals here without rewriting completion custody.
   fragment.race_rejected_excursion_total = race.rejected_excursion_count;
+  photons_batch_add_checked(fragment.race_rejected_excursion_total,
+                            g_photons_core.rejection_total);
+  if (fragment.race_rejected_excursion_total <
+      g_last_fragment_race_rejected_excursion_count ||
+      fragment.race_rejected_excursion_total -
+          g_last_fragment_race_rejected_excursion_count > UINT32_MAX)
+    __builtin_trap();
   fragment.race_rejected_excursion_this_fragment = (uint32_t)(
-      race.rejected_excursion_count -
+      fragment.race_rejected_excursion_total -
       g_last_fragment_race_rejected_excursion_count);
   fragment.race_reference_valid = race.reference_valid;
   fragment.race_reference_cycles = race.reference_cycles;
@@ -4783,6 +5135,7 @@ static FLASHMEM void photons_fragment_tick(
       photons_welford_snapshot(drain.projected_flight_welford);
 
   fragment.envelope = g_photons_envelope.latest;
+  fragment.core = g_photons_core.latest;
 
   fragment.raw_cycles = g_raw_cycles_state;
   fragment.projection = g_projection_state;
@@ -6361,6 +6714,7 @@ static FLASHMEM Payload cmd_report_photons(const Payload& /*args*/) {
   p.add("race_accounting", "TIMEPOP_CADENCE_V1");
   photons_payload_add_capture_gate(p, canonical, "race_");
   photons_payload_add_launch_timing(p, canonical, "race_");
+  photons_payload_add_core(p, "core", canonical.core);
   p.add("race_pending_return_count", canonical.race_pending_return_count);
   p.add("race_pending_return_count_previous", canonical.race_pending_return_count_previous);
   p.add("race_pending_relaunch_count", canonical.race_pending_relaunch_count);
@@ -7203,6 +7557,7 @@ static FLASHMEM Payload cmd_off(const Payload& /*args*/) {
 static const process_command_entry_t PHOTONS_COMMANDS[] = {
   { "REPORT_HISTOGRAM",    cmd_report_histogram    },
   { "REPORT_ENVELOPE",     cmd_report_envelope     },
+  { "REPORT_CORE",         cmd_report_core         },
   { "INIT",                cmd_init                },
   { "DETECTOR_ACTIVATE",   cmd_detector_activate   },
   { "START",               cmd_start               },

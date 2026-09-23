@@ -138,6 +138,8 @@
 //                           A request is fulfilled on the next completed race.
 //                           Includes snapshot_sequence and raw snapshot_dwt;
 //                           campaigns and STATS_RESET preserve acquisition/bins.
+//   • REPORT_CORE         — canonical fragment-local median/MAD admission, raw versus
+//                           retained means, input histogram, and eight-fragment repeatability.
 //   • REPORT_ENVELOPE     — alpha lower-envelope estimate for accepted autonomous races:
 //                           per-fragment ranks 1%-10%, 128 one-cycle bins, latest
 //                           completed histogram and eight recent fragment summaries.
@@ -225,6 +227,39 @@ struct photons_fragment_welford_snapshot_t {
   double max = 0.0;
 };
 
+
+// Fragment-local robust selection has no validity flag. The outcome names why
+// the current fragment was filtered or passed through unchanged.
+enum class photons_core_state_t : uint8_t {
+  NO_SAMPLES,
+  LOW_SUPPORT,
+  CENSORED,
+  BROAD_POPULATION,
+  FILTERED
+};
+
+struct photons_core_snapshot_t {
+  photons_core_state_t state = photons_core_state_t::NO_SAMPLES;
+  uint32_t sequence = 0U;
+  uint32_t dwt_cycles_per_second = 0U;
+  uint64_t input_count = 0ULL;
+  uint64_t retained_count = 0ULL;
+  uint64_t rejected_early_count = 0ULL;
+  uint64_t rejected_late_count = 0ULL;
+  uint64_t rejected_count_total = 0ULL;
+  uint32_t median_cycles = 0U;
+  uint32_t mad_cycles = 0U;
+  uint32_t radius_cycles = 0U;
+  uint32_t gate_low_cycles = 0U;
+  uint32_t gate_high_cycles = 0U;
+  double input_mean_cycles = 0.0;
+  double input_sd_cycles = 0.0;
+  double retained_mean_cycles = 0.0;
+  double retained_sd_cycles = 0.0;
+  uint32_t rejected_min_cycles = 0U;
+  uint32_t rejected_max_cycles = 0U;
+  double rejected_mean_cycles = 0.0;
+};
 
 // Alpha lower-envelope testimony for one autonomous accepted-race fragment.
 // The estimate is the weighted mean of ranks 1%-10%, using actual integer DWT
@@ -627,6 +662,7 @@ struct photons_fragment_snapshot_t {
   uint32_t race_seed_count = 0;
   photons_fragment_welford_snapshot_t race_flight_this_fragment{};
   photons_envelope_snapshot_t envelope{};
+  photons_core_snapshot_t core{};
 
   // Retired holdoff fields remain zero except holdoff_edges_total, which counts
   // arrivals outside an open receive window. No return schedules a launch.
