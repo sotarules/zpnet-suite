@@ -1086,7 +1086,7 @@ def _build_environment_status_once() -> dict:
         return {
             "sensor_address": "0x76",
             "sensor_present": True,
-            "temperature_c": round(temp_c, 2),
+            "temperature_c": temp_c,
             "pressure_hpa": round(pressure_hpa, 2),
             "humidity_pct": round(humidity_pct, 2),
             "altitude_m": round(altitude_m, 1),
