@@ -1,6 +1,7 @@
 #include "payload.h"
 #include "util.h"
 #include "debug.h"
+#include "crash_forensics.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -3160,12 +3161,147 @@ struct json_cursor_t {
     size_t pos;
 };
 
-static void json_skip_ws(json_cursor_t& c) {
-    while (c.pos < c.len) {
-        const uint8_t ch = c.data[c.pos];
-        if (ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r') break;
-        ++c.pos;
-    }
+static_assert(sizeof(void*) == 4U && sizeof(size_t) == 4U &&
+              sizeof(json_cursor_t) == 12U &&
+              offsetof(json_cursor_t, data) == 0U &&
+              offsetof(json_cursor_t, len) == 4U &&
+              offsetof(json_cursor_t, pos) == 8U,
+              "json_skip_ws assembly requires the 32-bit cursor ABI");
+
+// Diagnostic build: own the exact PUSH/POP boundary instead of guessing where
+// the compiler saved LR. No calls, allocation, logging or interrupt masking.
+// The scanner recognizes exactly space, tab, LF and CR, as before. Even the
+// empty-input path now has the same explicit 12-byte frame and return check.
+//
+// This single live witness requires foreground parsing. UDF #203 rejects
+// handler entry before it can overwrite a suspended foreground witness.
+// UDF #201 means the saved LR
+// differs; UDF #202 means the independent expected-LR/complement pair differs.
+// The check never repairs a slot. There remains an interrupt window between
+// checking it and POP; RETURN_READY is a last observation, not proof of return.
+__attribute__((naked, noinline, noclone, used))
+static void json_skip_ws(json_cursor_t&) {
+    __asm__ volatile(
+        ".syntax unified\n"
+        "mrs ip, ipsr\n"
+        "cmp ip, #0\n"
+        "bne 9f\n"
+        "push {r4, r5, lr}\n"
+        "movw r1, #:lower16:g_crash_json_ws_live\n"
+        "movt r1, #:upper16:g_crash_json_ws_live\n"
+        "movs r2, #1\n"                  // WRITING_ENTRY
+        "str r2, [r1, #4]\n"
+        "str lr, [r1, #8]\n"
+        "mvn.w r2, lr\n"
+        "str r2, [r1, #12]\n"
+        "ldr r2, [r1, #0]\n"
+        "adds r2, #1\n"
+        "str r2, [r1, #0]\n"
+        "add r2, sp, #8\n"
+        "str r2, [r1, #28]\n"           // Actual saved-LR address
+        "add r2, sp, #12\n"
+        "str r2, [r1, #32]\n"
+        "str ip, [r1, #40]\n"
+        "movw r2, #0x1004\n"
+        "movt r2, #0xe000\n"            // DWT_CYCCNT
+        "ldr r2, [r2]\n"
+        "str r2, [r1, #48]\n"
+        "str r0, [r1, #56]\n"
+        "ldr r2, [r0, #0]\n"
+        "str r2, [r1, #60]\n"
+        "ldr r2, [r0, #4]\n"
+        "str r2, [r1, #64]\n"
+        "ldr r2, [r0, #8]\n"
+        "str r2, [r1, #68]\n"
+        "movs r2, #0\n"
+        "str r2, [r1, #16]\n"
+        "str r2, [r1, #20]\n"
+        "str r2, [r1, #24]\n"
+        "str r2, [r1, #36]\n"
+        "str r2, [r1, #44]\n"
+        "str r2, [r1, #52]\n"
+        "str r2, [r1, #72]\n"
+        "dmb\n"
+        "movs r2, #2\n"                  // SCANNING
+        "str r2, [r1, #4]\n"
+
+        // Preserve the original scanner's byte classification and bounds.
+        "ldrd r3, r1, [r0, #4]\n"        // len, pos
+        "cmp r3, r1\n"
+        "bls 2f\n"
+        "subs r1, #1\n"
+        "ldr r4, [r0]\n"
+        "add.w lr, r3, #-1\n"
+        "movw r5, #0xffec\n"
+        "movt r5, #0xff7f\n"
+        "add r1, r4\n"
+        "add lr, r4\n"
+        "1:\n"
+        "mov r2, r1\n"
+        "ldrb r3, [r1, #1]!\n"
+        "subs r3, #9\n"
+        "adds r2, #2\n"
+        "uxtb r3, r3\n"
+        "subs r2, r2, r4\n"
+        "cmp r3, #23\n"
+        "asr.w ip, r5, r3\n"
+        "bhi 2f\n"
+        "tst.w ip, #1\n"
+        "bne 2f\n"
+        "cmp r1, lr\n"
+        "str r2, [r0, #8]\n"
+        "bne 1b\n"
+
+        "2:\n"
+        "movw r4, #:lower16:g_crash_json_ws_live\n"
+        "movt r4, #:upper16:g_crash_json_ws_live\n"
+        "movs r1, #3\n"                  // WRITING_EXIT
+        "str r1, [r4, #4]\n"
+        "mov r1, sp\n"
+        "str r1, [r4, #36]\n"
+        "mrs r1, ipsr\n"
+        "str r1, [r4, #44]\n"
+        "movw r1, #0x1004\n"
+        "movt r1, #0xe000\n"
+        "ldr r1, [r1]\n"
+        "str r1, [r4, #52]\n"
+        "ldr r1, [r0, #8]\n"
+        "str r1, [r4, #72]\n"
+        "ldr r2, [r4, #8]\n"
+        "ldr r3, [r4, #12]\n"
+        "eors r3, r2\n"
+        "mvns r3, r3\n"
+        "str r3, [r4, #24]\n"           // Zero iff shadow pair agrees
+        "ldr r1, [sp, #8]\n"            // Read the slot POP will consume
+        "str r1, [r4, #16]\n"
+        "eors r1, r2\n"
+        "str r1, [r4, #20]\n"
+        "cmp r3, #0\n"
+        "bne 8f\n"
+        "cmp r1, #0\n"
+        "bne 7f\n"
+        "movs r1, #4\n"                  // RETURN_READY
+        "dmb\n"
+        "str r1, [r4, #4]\n"
+        "pop {r4, r5, pc}\n"
+        "7:\n"
+        "movs r1, #5\n"                  // RETURN_MISMATCH
+        "dmb\n"
+        "str r1, [r4, #4]\n"
+        "dsb\n"
+        "udf #201\n"
+        "b 7b\n"
+        "8:\n"
+        "movs r1, #6\n"                  // SHADOW_MISMATCH
+        "dmb\n"
+        "str r1, [r4, #4]\n"
+        "dsb\n"
+        "udf #202\n"
+        "b 8b\n"
+        "9:\n"
+        "udf #203\n"
+        "b 9b\n"
+    );
 }
 
 static int json_hex_value(uint8_t c) {

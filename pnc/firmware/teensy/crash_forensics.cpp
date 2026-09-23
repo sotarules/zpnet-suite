@@ -23,6 +23,9 @@ void crash_forensics_fault_entry(void);
 // Ordinary BSS: cleared by startup before startup_late_hook() installs us.
 volatile uint32_t g_crash_forensics_capture_active = 0U;
 alignas(8) uint32_t g_crash_forensics_emergency_stack[512];
+// Referenced by basic assembly: retain the unmangled symbol through LTO.
+alignas(4) volatile crash_json_ws_live_t g_crash_json_ws_live
+    __attribute__((used, externally_visible)) = {};
 }
 
 struct alignas(32) crash_generation_t {
@@ -37,6 +40,11 @@ static_assert(sizeof(g_crash_generations) == 4288U,
 // Only the terminal fault capture writes this selector. Reports select locally
 // by sequence and never change capture ownership or copy a complete generation.
 static uint32_t g_crash_capture_slot = 0U;
+// Independent cache lines and envelope; do not change crash_generation_t.
+alignas(32) static crash_json_ws_record_t
+    g_crash_json_ws_retained[CRASH_FORENSICS_GENERATION_CAPACITY] DMAMEM;
+static_assert(sizeof(g_crash_json_ws_retained) == 256U,
+              "JSON return witnesses must remain within 256 RAM2 bytes");
 alignas(32) static crash_dispatch_breadcrumb_t
     g_crash_dispatch_breadcrumb_live[2] DMAMEM;
 alignas(32) static crash_dispatch_breadcrumb_t
@@ -283,6 +291,106 @@ static uint32_t crash_crc32_words(const void* object, size_t word_count) {
         }
     }
     return crc;
+}
+
+static constexpr uint32_t CRASH_JSON_WS_MAGIC = 0x4A575352UL; // "JWSR"
+static constexpr uint32_t CRASH_JSON_WS_COMMITTED = 0x4A57434DUL; // "JWCM"
+static constexpr uint32_t CRASH_JSON_WS_SCHEMA = 1U;
+
+static uint32_t crash_json_ws_crc(const crash_json_ws_record_t& record) {
+    return crash_crc32_words(&record,
+        offsetof(crash_json_ws_record_t, crc32) / sizeof(uint32_t));
+}
+
+static bool crash_json_ws_header(const crash_json_ws_record_t& record) {
+    return record.magic == CRASH_JSON_WS_MAGIC &&
+        record.magic_inv == ~CRASH_JSON_WS_MAGIC &&
+        record.schema_version == CRASH_JSON_WS_SCHEMA &&
+        record.record_size == sizeof(record) &&
+        record.capture_sequence != 0U &&
+        record.committed == CRASH_JSON_WS_COMMITTED &&
+        record.committed_inv == ~CRASH_JSON_WS_COMMITTED;
+}
+
+static void capture_json_ws_witness(uint32_t sequence) {
+    crash_json_ws_record_t& record = g_crash_json_ws_retained[g_crash_capture_slot];
+    // Retire the previous envelope in backing RAM before replacing its body.
+    record.magic = 0U;
+    record.magic_inv = 0U;
+    record.committed = 0U;
+    record.committed_inv = 0U;
+    crash_barrier();
+    arm_dcache_flush_delete(&record, sizeof(record));
+    crash_barrier();
+    crash_zero_bytes(&record, sizeof(record));
+    record.magic = CRASH_JSON_WS_MAGIC;
+    record.magic_inv = ~CRASH_JSON_WS_MAGIC;
+    record.schema_version = CRASH_JSON_WS_SCHEMA;
+    record.record_size = sizeof(record);
+    record.capture_sequence = sequence;
+    record.fault_dwt = reg32(REG_DWT_CYCCNT);
+    record.fault_ipsr = read_ipsr();
+
+    // Copy scalars only. Never read the saved cursor, data, SP or return-slot
+    // addresses: exception stacking may already have overwritten that stack.
+    record.live.call_sequence = g_crash_json_ws_live.call_sequence;
+    record.live.stage = g_crash_json_ws_live.stage;
+    record.live.expected_lr = g_crash_json_ws_live.expected_lr;
+    record.live.expected_lr_inv = g_crash_json_ws_live.expected_lr_inv;
+    record.live.observed_lr = g_crash_json_ws_live.observed_lr;
+    record.live.return_xor = g_crash_json_ws_live.return_xor;
+    record.live.shadow_xor = g_crash_json_ws_live.shadow_xor;
+    record.live.return_slot = g_crash_json_ws_live.return_slot;
+    record.live.entry_sp = g_crash_json_ws_live.entry_sp;
+    record.live.checked_sp = g_crash_json_ws_live.checked_sp;
+    record.live.entry_ipsr = g_crash_json_ws_live.entry_ipsr;
+    record.live.checked_ipsr = g_crash_json_ws_live.checked_ipsr;
+    record.live.entry_dwt = g_crash_json_ws_live.entry_dwt;
+    record.live.checked_dwt = g_crash_json_ws_live.checked_dwt;
+    record.live.cursor = g_crash_json_ws_live.cursor;
+    record.live.data = g_crash_json_ws_live.data;
+    record.live.length = g_crash_json_ws_live.length;
+    record.live.entry_pos = g_crash_json_ws_live.entry_pos;
+    record.live.checked_pos = g_crash_json_ws_live.checked_pos;
+
+    record.crc32 = crash_json_ws_crc(record);
+    crash_barrier();
+    arm_dcache_flush_delete(&record, sizeof(record));
+    crash_barrier();
+    record.committed = CRASH_JSON_WS_COMMITTED;
+    record.committed_inv = ~CRASH_JSON_WS_COMMITTED;
+    crash_barrier();
+    arm_dcache_flush_delete(&record, sizeof(record));
+    crash_barrier();
+}
+
+FLASHMEM crash_json_ws_state_t crash_json_ws_snapshot(
+    crash_json_ws_record_t* out, uint32_t generation) {
+    if (!out) return CRASH_JSON_WS_ABSENT;
+    memset(out, 0, sizeof(*out));
+    const crash_json_ws_record_t* selected = nullptr;
+    const crash_json_ws_record_t* damaged = nullptr;
+    for (const auto& record : g_crash_json_ws_retained) {
+        if (generation != 0U && record.capture_sequence != generation) continue;
+        if (!crash_json_ws_header(record)) {
+            if (record.magic != 0U || record.capture_sequence != 0U ||
+                record.committed != 0U) damaged = &record;
+            continue;
+        }
+        if (!selected ||
+            (record.capture_sequence != selected->capture_sequence &&
+             (record.capture_sequence - selected->capture_sequence) < 0x80000000UL)) {
+            selected = &record;
+        }
+    }
+    if (!selected) {
+        if (!damaged) return CRASH_JSON_WS_ABSENT;
+        *out = *damaged;
+        return CRASH_JSON_WS_HEADER_INVALID;
+    }
+    *out = *selected;
+    return crash_json_ws_crc(*out) == out->crc32
+        ? CRASH_JSON_WS_AVAILABLE : CRASH_JSON_WS_CRC_MISMATCH;
 }
 
 static uint32_t core_record_crc32(
@@ -1096,6 +1204,9 @@ extern "C" void crash_forensics_capture_from_entry(
     // First durable act: preserve scalar entry state, then the untouched
     // architectural stack image as a second-stage best effort.
     capture_raw_entry_witness(entry, sequence);
+
+    // Independent early evidence survives a failed core/extended envelope.
+    capture_json_ws_witness(sequence);
 
     crash_forensics_record_t& record =
         g_crash_generations[g_crash_capture_slot].extended;
@@ -2234,10 +2345,12 @@ FLASHMEM void crash_forensics_clear(void) {
     // Release the paired trace archive before sequences can restart at one.
     execution_trace_clear_retained();
     memset((void*)g_crash_generations, 0, sizeof(g_crash_generations));
+    memset(g_crash_json_ws_retained, 0, sizeof(g_crash_json_ws_retained));
     crash_dispatch_breadcrumb_zero(
         g_crash_dispatch_breadcrumb_retained);
     crash_barrier();
     arm_dcache_flush_delete(g_crash_generations, sizeof(g_crash_generations));
+    arm_dcache_flush_delete(g_crash_json_ws_retained, sizeof(g_crash_json_ws_retained));
     crash_dispatch_breadcrumb_flush(
         g_crash_dispatch_breadcrumb_retained);
     crash_barrier();

@@ -2573,6 +2573,7 @@ static FLASHMEM Payload system_crash_report_payload(uint32_t generation) {
     Payload detail;
     detail.add("crash_report_text", "SYSTEM.CRASH_REPORT_TEXT");
     detail.add("raw_fault_entry", "SYSTEM.RAW_FAULT_ENTRY");
+    detail.add("json_ws_return", "SYSTEM.JSON_WS_RETURN");
     detail.add("crash_record", "SYSTEM.CRASH_RECORD");
     detail.add("crash_policy", "SYSTEM.CRASH_POLICY");
     detail.add("execution_trace", "SYSTEM.EXECUTION_TRACE");
@@ -4042,6 +4043,121 @@ static FLASHMEM Payload cmd_crash_record(const Payload& args) {
 // ------------------------------------------------------------
 // STACK_WATCH / STACK_TRIPWIRE / DISPATCH_BREADCRUMB — focused witnesses
 // ------------------------------------------------------------
+static FLASHMEM const char* system_json_ws_stage_name(uint32_t stage) {
+  switch (stage) {
+    case CRASH_JSON_WS_NONE: return "NONE";
+    case CRASH_JSON_WS_WRITING_ENTRY: return "WRITING_ENTRY";
+    case CRASH_JSON_WS_SCANNING: return "SCANNING";
+    case CRASH_JSON_WS_WRITING_EXIT: return "WRITING_EXIT";
+    case CRASH_JSON_WS_RETURN_READY: return "RETURN_READY";
+    case CRASH_JSON_WS_RETURN_MISMATCH: return "RETURN_MISMATCH";
+    case CRASH_JSON_WS_SHADOW_MISMATCH: return "SHADOW_MISMATCH";
+    default: return "UNKNOWN";
+  }
+}
+
+static FLASHMEM Payload system_json_ws_return_payload(uint32_t generation) {
+  // Snapshot the frozen record before constructing any Payload. Reporting may
+  // itself parse JSON, but it cannot replace the crash-bound retained witness.
+  crash_json_ws_record_t record{};
+  const crash_json_ws_state_t state = crash_json_ws_snapshot(&record, generation);
+  Payload p;
+  p.reserve(2048U);
+  p.add("schema", "ZPNET_JSON_WS_RETURN_V1");
+  const uint32_t selected_generation = generation != 0U ? generation :
+      (state == CRASH_JSON_WS_AVAILABLE || state == CRASH_JSON_WS_CRC_MISMATCH)
+          ? record.capture_sequence : 0U;
+  system_crash_generation_metadata(p, selected_generation);
+  p.add("selection", generation == 0U
+      ? "NEWEST_SEALED_JSON_WITNESS" : "EXACT_CAPTURE_SEQUENCE");
+  p.add("retained_bytes", (uint32_t)(sizeof(record) * CRASH_FORENSICS_GENERATION_CAPACITY));
+  p.add("live_bytes", (uint32_t)sizeof(record.live));
+  p.add("state", state == CRASH_JSON_WS_AVAILABLE ? "AVAILABLE" :
+                 state == CRASH_JSON_WS_HEADER_INVALID ? "HEADER_INVALID" :
+                 state == CRASH_JSON_WS_CRC_MISMATCH ? "CRC_MISMATCH" : "ABSENT");
+  if (state == CRASH_JSON_WS_ABSENT) return p;
+
+  // On an envelope failure these are untrusted raw fields, still useful for
+  // diagnosing retention. Do not relabel a bad header as a CRC mismatch.
+  p.add("capture_sequence", record.capture_sequence);
+  p.add("schema_version", record.schema_version);
+  p.add("record_size", record.record_size);
+  system_crash_add_hex32(p, "magic", record.magic);
+  system_crash_add_hex32(p, "magic_inv", record.magic_inv);
+  system_crash_add_hex32(p, "crc32", record.crc32);
+  system_crash_add_hex32(p, "committed", record.committed);
+  system_crash_add_hex32(p, "committed_inv", record.committed_inv);
+  system_crash_add_hex32(p, "fault_dwt", record.fault_dwt);
+  p.add("fault_ipsr", record.fault_ipsr);
+
+  const crash_json_ws_live_t& w = record.live;
+  Payload fields;
+  fields.add("call_sequence", w.call_sequence);
+  fields.add("stage_id", w.stage);
+  fields.add("stage", system_json_ws_stage_name(w.stage));
+  system_crash_add_hex32(fields, "expected_lr", w.expected_lr);
+  system_crash_add_hex32(fields, "expected_lr_inv", w.expected_lr_inv);
+  system_crash_add_hex32(fields, "observed_lr", w.observed_lr);
+  system_crash_add_hex32(fields, "return_xor", w.return_xor);
+  system_crash_add_hex32(fields, "shadow_xor", w.shadow_xor);
+  system_crash_add_hex32(fields, "return_slot", w.return_slot);
+  system_crash_add_hex32(fields, "entry_sp", w.entry_sp);
+  system_crash_add_hex32(fields, "checked_sp", w.checked_sp);
+  fields.add("entry_ipsr", w.entry_ipsr);
+  fields.add("checked_ipsr", w.checked_ipsr);
+  system_crash_add_hex32(fields, "entry_dwt", w.entry_dwt);
+  system_crash_add_hex32(fields, "checked_dwt", w.checked_dwt);
+  system_crash_add_hex32(fields, "cursor", w.cursor);
+  system_crash_add_hex32(fields, "data", w.data);
+  fields.add("length", w.length);
+  fields.add("entry_pos", w.entry_pos);
+  fields.add("checked_pos", w.checked_pos);
+  p.add_object("captured_fields", fields);
+  return p;
+}
+
+static bool system_json_ws_generation_parse(const Payload& args,
+                                            uint32_t* generation) {
+  *generation = 0U;
+  if (!args.has("generation")) return true;
+  const char* text = args.getString("generation");
+  if (text && strcmp(text, "latest") == 0) return true;
+  if (text && strcmp(text, "first") == 0) {
+    *generation = crash_forensics_generation_at(0U);
+    return *generation != 0U;
+  }
+  uint32_t value = 0U;
+  if (text) {
+    if (!*text) return false;
+    for (const char* c = text; *c; ++c) {
+      if (*c < '0' || *c > '9') return false;
+      const uint32_t digit = (uint32_t)(*c - '0');
+      if (value > (UINT32_MAX - digit) / 10U) return false;
+      value = value * 10U + digit;
+    }
+  } else {
+    value = args.getUInt("generation");
+  }
+  if (value == 0U) return false;
+  // Exact JSON witnesses remain addressable even if the main crash archive
+  // lost that generation's identity. The snapshot reports ABSENT if missing.
+  *generation = value;
+  return true;
+}
+
+static FLASHMEM Payload cmd_json_ws_return(const Payload& args) {
+  uint32_t generation = 0U;
+  if (!system_json_ws_generation_parse(args, &generation)) {
+    Payload error;
+    error.add("error", "generation must be latest, an available first, or a nonzero uint32 capture sequence");
+    return error;
+  }
+  // Latest means newest independently sealed JSON witness. Response metadata
+  // names its actual generation; use an exact sequence to inspect a damaged
+  // envelope without falling back to an older sealed witness.
+  return system_json_ws_return_payload(generation);
+}
+
 static FLASHMEM Payload cmd_stack_watch(const Payload& /*args*/) {
   return system_stack_watch_payload();
 }
@@ -4119,6 +4235,7 @@ static FLASHMEM Payload cmd_crash_clear(const Payload& /*args*/) {
   Payload resp = ok_payload();
   resp.add("crash_report_cleared", true);
   resp.add("crash_forensics_cleared", true);
+  resp.add("json_ws_return_cleared", true);
   resp.add("dispatch_breadcrumb_retained_cleared", true);
   resp.add("runtime_ledger_cleared", true);
   resp.add("execution_trace_cleared", true);
@@ -4165,6 +4282,7 @@ static const process_command_entry_t SYSTEM_COMMANDS[] = {
   { "CRASH_INFO",       cmd_crash_info       },
   { "CRASH_REPORT_TEXT", cmd_crash_report_text },
   { "RAW_FAULT_ENTRY",  cmd_raw_fault_entry  },
+  { "JSON_WS_RETURN",   cmd_json_ws_return   },
   { "CRASH_RECORD",     cmd_crash_record     },
   { "CRASH_POLICY",     cmd_crash_policy     },
   { "STACK_WATCH",      cmd_stack_watch      },

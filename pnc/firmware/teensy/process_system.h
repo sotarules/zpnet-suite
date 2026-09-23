@@ -81,6 +81,21 @@
  *     generation archived; CRASH_REPORT_TEXT rejects a generation argument.
  *   • CRASH_REPORT_TEXT — return only the cached Teensyduino CrashReport text
  *   • RAW_FAULT_ENTRY — return only the earliest retained exception witness
+ *   • JSON_WS_RETURN — return the independently sealed json_skip_ws return
+ *     witness, captured after raw fault entry and before the core recorder.
+ *     Default/latest selects the newest sealed JSON witness and reports its
+ *     actual generation; this can differ from the main crash archive's latest.
+ *     generation=N addresses that exact witness without requiring a surviving
+ *     raw/core identity. Missing N returns ABSENT, never a different generation.
+ *     Use the exact fault sequence to inspect an invalid newer envelope rather
+ *     than selecting an older sealed witness. first uses the main archive's
+ *     pinned first identity and errors if that identity is unavailable.
+ *     HEADER_INVALID and CRC_MISMATCH are distinct; fields in either state are
+ *     untrusted. Writing stages may be partial. RETURN_READY proves only the
+ *     pre-POP comparison, not that the return completed. UDF #201 reports a
+ *     saved-LR mismatch, #202 a shadow/complement mismatch, #203 handler entry.
+ *     Two independent 128-byte RAM2 slots add 256 retained bytes; the live
+ *     scalar witness adds 76 RAM1 bytes. CRASH_CLEAR clears both retained slots.
  *   • CRASH_POLICY — return live CPU/FPU exception policy plus a compact
  *     consistency analysis of retained core and extended exception frames
  *   • CRASH_TEST — acknowledge and then deliberately fault from foreground

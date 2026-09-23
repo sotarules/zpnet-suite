@@ -30,6 +30,102 @@ static constexpr size_t CRASH_FORENSICS_OTHER_STACK_WORDS = 16U;
 static constexpr size_t CRASH_FORENSICS_PC_WINDOW_WORDS = 24U;
 static constexpr size_t CRASH_FORENSICS_LR_WINDOW_WORDS = 24U;
 
+// Independent json_skip_ws return witness. This is diagnostic evidence, not a
+// recovery mechanism. The live scalar record is in DTCM; fault capture copies it
+// into separately sealed RAM2 slots before attempting the main core record.
+// Writing stages may contain fields from two calls. RETURN_READY means only
+// that the slot matched at the check; it does not prove the POP completed.
+enum crash_json_ws_stage_t : uint32_t {
+    CRASH_JSON_WS_NONE = 0U,
+    CRASH_JSON_WS_WRITING_ENTRY = 1U,
+    CRASH_JSON_WS_SCANNING = 2U,
+    CRASH_JSON_WS_WRITING_EXIT = 3U,
+    CRASH_JSON_WS_RETURN_READY = 4U,
+    CRASH_JSON_WS_RETURN_MISMATCH = 5U,
+    CRASH_JSON_WS_SHADOW_MISMATCH = 6U,
+};
+
+struct crash_json_ws_live_t {
+    uint32_t call_sequence;
+    uint32_t stage;
+    uint32_t expected_lr;
+    uint32_t expected_lr_inv;
+    uint32_t observed_lr;
+    uint32_t return_xor;
+    uint32_t shadow_xor;
+    uint32_t return_slot;
+    uint32_t entry_sp;       // Before PUSH {r4,r5,lr}.
+    uint32_t checked_sp;     // With that 12-byte frame still on the stack.
+    uint32_t entry_ipsr;
+    uint32_t checked_ipsr;
+    uint32_t entry_dwt;
+    uint32_t checked_dwt;
+    uint32_t cursor;
+    uint32_t data;
+    uint32_t length;
+    uint32_t entry_pos;
+    uint32_t checked_pos;
+};
+
+// These offsets are the contract with the basic assembly in payload.cpp.
+static_assert(sizeof(crash_json_ws_live_t) == 76U, "JSON witness size drifted");
+static_assert(offsetof(crash_json_ws_live_t, call_sequence) == 0U, "JSON witness offset");
+static_assert(offsetof(crash_json_ws_live_t, stage) == 4U, "JSON witness offset");
+static_assert(offsetof(crash_json_ws_live_t, expected_lr) == 8U, "JSON witness offset");
+static_assert(offsetof(crash_json_ws_live_t, expected_lr_inv) == 12U, "JSON witness offset");
+static_assert(offsetof(crash_json_ws_live_t, observed_lr) == 16U, "JSON witness offset");
+static_assert(offsetof(crash_json_ws_live_t, return_xor) == 20U, "JSON witness offset");
+static_assert(offsetof(crash_json_ws_live_t, shadow_xor) == 24U, "JSON witness offset");
+static_assert(offsetof(crash_json_ws_live_t, return_slot) == 28U, "JSON witness offset");
+static_assert(offsetof(crash_json_ws_live_t, entry_sp) == 32U, "JSON witness offset");
+static_assert(offsetof(crash_json_ws_live_t, checked_sp) == 36U, "JSON witness offset");
+static_assert(offsetof(crash_json_ws_live_t, entry_ipsr) == 40U, "JSON witness offset");
+static_assert(offsetof(crash_json_ws_live_t, checked_ipsr) == 44U, "JSON witness offset");
+static_assert(offsetof(crash_json_ws_live_t, entry_dwt) == 48U, "JSON witness offset");
+static_assert(offsetof(crash_json_ws_live_t, checked_dwt) == 52U, "JSON witness offset");
+static_assert(offsetof(crash_json_ws_live_t, cursor) == 56U, "JSON witness offset");
+static_assert(offsetof(crash_json_ws_live_t, data) == 60U, "JSON witness offset");
+static_assert(offsetof(crash_json_ws_live_t, length) == 64U, "JSON witness offset");
+static_assert(offsetof(crash_json_ws_live_t, entry_pos) == 68U, "JSON witness offset");
+static_assert(offsetof(crash_json_ws_live_t, checked_pos) == 72U, "JSON witness offset");
+static_assert(CRASH_JSON_WS_WRITING_ENTRY == 1U && CRASH_JSON_WS_SCANNING == 2U &&
+              CRASH_JSON_WS_WRITING_EXIT == 3U && CRASH_JSON_WS_RETURN_READY == 4U &&
+              CRASH_JSON_WS_RETURN_MISMATCH == 5U && CRASH_JSON_WS_SHADOW_MISMATCH == 6U,
+              "JSON witness assembly stage values drifted");
+
+extern "C" volatile crash_json_ws_live_t g_crash_json_ws_live;
+
+struct crash_json_ws_record_t {
+    uint32_t magic;
+    uint32_t magic_inv;
+    uint32_t schema_version;
+    uint32_t record_size;
+    uint32_t capture_sequence;
+    uint32_t fault_dwt;
+    uint32_t fault_ipsr;
+    uint32_t reserved;
+    crash_json_ws_live_t live;
+    uint32_t crc32;
+    uint32_t committed;
+    uint32_t committed_inv;
+    uint32_t reserved_tail[2];
+};
+static_assert(sizeof(crash_json_ws_record_t) == 128U, "JSON retained record size drifted");
+static_assert(offsetof(crash_json_ws_record_t, crc32) == 108U, "JSON retained CRC offset");
+
+enum crash_json_ws_state_t : uint32_t {
+    CRASH_JSON_WS_ABSENT = 0U,
+    CRASH_JSON_WS_HEADER_INVALID = 1U,
+    CRASH_JSON_WS_CRC_MISMATCH = 2U,
+    CRASH_JSON_WS_AVAILABLE = 3U,
+};
+
+// No saved pointer is dereferenced. Generation zero selects the newest sealed
+// JSON witness independently of the core envelope. A CRC protects retention,
+// not the truth of the pre-fault live fields or the completion of the return.
+crash_json_ws_state_t crash_json_ws_snapshot(crash_json_ws_record_t* out,
+                                             uint32_t generation = 0U);
+
 enum crash_forensics_frame_source_t : uint32_t {
     CRASH_FORENSICS_FRAME_NONE = 0U,
     CRASH_FORENSICS_FRAME_MSP = 1U,
