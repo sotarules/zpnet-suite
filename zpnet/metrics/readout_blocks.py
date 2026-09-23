@@ -1106,6 +1106,8 @@ def status_header() -> str:
         s = _get_system_snapshot()
         net = s.get("network", {}).get("network_status", "?")
         pi_health = s.get("pi", {}).get("health_state", "?")
+        temp_c = s.get("environment", {}).get("temperature_c")
+        temperature = "?" if temp_c is None else f"{temp_c:.1f}°C"
         features = s.get("features") if isinstance(s.get("features"), dict) else {}
         teensy_health = _feature_subtree_health(features, "TEENSY")
         try:
@@ -1129,6 +1131,7 @@ def status_header() -> str:
         return (
             f" NET: {net}"
             f"  BAT: {bat_v}"
+            f"  TEMP: {temperature}"
             f"  PI: {pi_health}"
             f"  TEENSY: {teensy_health}"
             f"  GNSS: {gnss_lock}"
@@ -1618,12 +1621,6 @@ def clocks_combined_readout() -> list[str]:
         _get_campaign_dac_recording(campaign) if r.get("campaign_present") else None
     )
     lines.extend(_dac_detail_lines(r, campaign_dac))
-    if campaign_dac is not None:
-        lines.append(
-            f"DAC CAMP: observed targets since campaign public count "
-            f"{campaign_dac['first_public_count']}; gaps are not reconstructed."
-        )
-
     lines.append("")
 
     # ── Time ──
