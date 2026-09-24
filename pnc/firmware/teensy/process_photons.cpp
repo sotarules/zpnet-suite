@@ -4171,7 +4171,7 @@ static FLASHMEM void photons_fragment_root_add_report(Payload& parent) {
 }
 
 
-static void photons_payload_add_welford(
+static FLASHMEM void photons_payload_add_welford(
     Payload& parent,
     const char* name,
     const photons_fragment_welford_snapshot_t& w) {
@@ -4232,7 +4232,7 @@ static void photons_payload_add_ppb_window_proof(
 
 
 // Serialize only frozen fragment values; ISR-owned counters never reach Payload.
-static void photons_payload_add_capture_gate(
+static FLASHMEM void photons_payload_add_capture_gate(
     Payload& p, const photons_fragment_snapshot_t& f, const char* prefix) {
   char key[80];
   auto add = [&](const char* name, uint64_t value) {
@@ -4261,7 +4261,7 @@ static void photons_payload_add_capture_gate(
 // stretched return completes an attempt but never enters EXCL or ACCEPT; a
 // stretched shot without a captured return remains in MISSED. Totals have the
 // same physical-ancestry scope as the other race counters.
-static void photons_payload_add_launch_timing(
+static FLASHMEM void photons_payload_add_launch_timing(
     Payload& p, const photons_fragment_snapshot_t& f, const char* prefix) {
   char key[80];
   auto add = [&](const char* name, uint64_t value) {
@@ -4278,7 +4278,7 @@ static void photons_payload_add_launch_timing(
 }
 
 // REPORT also exposes current totals from its own guarded diagnostic copy.
-static void photons_payload_add_capture_totals(
+static FLASHMEM void photons_payload_add_capture_totals(
     Payload& p, const interrupt_photodiode_diag_t& diag) {
   p.add("race_capture_gate", "EXPLICIT_WINDOW_V1");
   p.add("race_capture_min_ns", PHOTONS_RECEIVE_MIN_NS);
@@ -4295,7 +4295,7 @@ static void photons_payload_add_capture_totals(
 
 // Render the same completed selection that fed canonical science. Counts own
 // their moments; no missing fragment is represented by a fabricated zero mean.
-static void photons_payload_add_core(Payload& parent, const char* name,
+static FLASHMEM void photons_payload_add_core(Payload& parent, const char* name,
                                      const photons_core_snapshot_t& s) {
   Payload& p = g_photons_fragment_core;
   p.clear();
@@ -4399,7 +4399,7 @@ static FLASHMEM Payload cmd_report_core(const Payload& /*args*/) {
   return Payload(p);
 }
 
-static void photons_payload_add_envelope(Payload& parent, const char* name,
+static FLASHMEM void photons_payload_add_envelope(Payload& parent, const char* name,
                                          const photons_envelope_snapshot_t& s) {
   Payload& p = g_photons_fragment_envelope;
   p.clear();
