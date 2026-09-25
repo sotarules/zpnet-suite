@@ -4171,7 +4171,7 @@ static FLASHMEM void photons_fragment_root_add_report(Payload& parent) {
 }
 
 
-static void photons_payload_add_welford(
+static FLASHMEM void photons_payload_add_welford(
     Payload& parent,
     const char* name,
     const photons_fragment_welford_snapshot_t& w) {

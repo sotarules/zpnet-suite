@@ -89,6 +89,7 @@
 #include "config.h"
 #include "timepop.h"
 #include "process_timepop.h"
+#include "process_interrupt.h"
 
 #include "publish.h"
 
@@ -2642,6 +2643,99 @@ static inline void ch2_arm_compare(uint32_t target_counter32) {
 }
 
 // ============================================================================
+// Passive transport-deadline witness (boot-lifetime, foreground-owned)
+// ============================================================================
+//
+// A recurring 2 ms transport service must not acquire a seconds-long future
+// deadline. Observe only slots that schedule_next() has already accepted as
+// future, AFTER quarantine/rearm. No timer, callback, or policy is changed.
+// Keep the first record through report reads, slot reuse and epoch changes.
+// Ordinary RAM only: a CPU reset/power loss clears this experiment's evidence.
+static constexpr uint32_t TRANSPORT_WITNESS_PERIOD_TICKS = 20000U;
+static constexpr uint32_t TRANSPORT_WITNESS_LEAD_TICKS = ONE_HZ_TICKS;
+
+struct timepop_transport_future_record_t {
+  timepop_slot_t slot{};  // Copy owned name/state; never dereference saved pointers.
+  time_anchor_snapshot_t anchor{};
+  interrupt_clock_snapshot_t clocks[3]{};  // VCLOCK, OCXO1, OCXO2; NOT simultaneous.
+  uint32_t clock_snapshot_mask = 0U;       // successful reads: bits 0, 1, 2
+  uint32_t slot_index = 0U;
+  uint32_t scheduler_now = 0U;
+  uint32_t scheduler_dwt = 0U;
+  uint32_t forward_ticks = 0U;
+  uint32_t capture_begin_dwt = 0U;
+  uint32_t capture_end_dwt = 0U;
+  uint32_t uptime_ms = 0U;
+  uint32_t epoch_change_count = 0U;
+  uint32_t epoch_sequence = 0U;
+  uint32_t schedule_calls = 0U;
+  uint32_t ch2_foreground_calls = 0U;
+  uint32_t dispatch_calls = 0U;
+  uint32_t dispatch_callbacks = 0U;
+  uint32_t missed_deadlines = 0U;
+};
+
+struct timepop_transport_future_witness_t {
+  uint32_t checks[2]{};             // RX, TX; modulo-32 observer liveness counters
+  uint32_t max_forward_ticks[2]{};
+  bool captured = false;
+  timepop_transport_future_record_t first{};
+};
+
+static timepop_transport_future_witness_t g_transport_future{};
+static_assert(sizeof(g_transport_future) <= 640U,
+              "transport witness must remain a small fixed RAM record");
+
+static FLASHMEM void timepop_capture_transport_future(
+    uint32_t slot_index, uint32_t now, uint32_t scheduler_dwt,
+    uint32_t forward_ticks) {
+  auto& r = g_transport_future.first;
+  r.capture_begin_dwt = ARM_DWT_CYCCNT;
+  r.uptime_ms = millis();
+  r.slot = slots[slot_index];
+  r.slot_index = slot_index;
+  r.scheduler_now = now;
+  r.scheduler_dwt = scheduler_dwt;
+  r.forward_ticks = forward_ticks;
+  r.epoch_change_count = diag_epoch_change_count;
+  r.epoch_sequence = diag_epoch_last_sequence;
+  r.schedule_calls = diag_schedule_next_calls_total;
+  r.ch2_foreground_calls = diag_ch2_direct_call_count;
+  r.dispatch_calls = diag_dispatch_calls;
+  r.dispatch_callbacks = diag_dispatch_callbacks;
+  r.missed_deadlines = diag_missed_deadline_slots;
+  // This is the anchor OBSERVED at the scheduling decision, not a claim that
+  // it is the historical basis of last_arm. Bypass the diagnostic wrapper so
+  // the capture does not replace TimePop's existing last-anchor testimony.
+  r.anchor = time_anchor_snapshot();
+  if (interrupt_clock_snapshot(interrupt_subscriber_kind_t::VCLOCK, &r.clocks[0]))
+    r.clock_snapshot_mask |= 1U;
+  if (interrupt_clock_snapshot(interrupt_subscriber_kind_t::OCXO1, &r.clocks[1]))
+    r.clock_snapshot_mask |= 2U;
+  if (interrupt_clock_snapshot(interrupt_subscriber_kind_t::OCXO2, &r.clocks[2]))
+    r.clock_snapshot_mask |= 4U;
+  r.capture_end_dwt = ARM_DWT_CYCCNT;
+  g_transport_future.captured = true;
+}
+
+static inline void timepop_note_transport_future(
+    uint32_t slot_index, uint32_t now, uint32_t scheduler_dwt,
+    uint32_t forward_ticks) {
+  const timepop_slot_t& slot = slots[slot_index];
+  if (!slot.recurring || slot.period_ticks != TRANSPORT_WITNESS_PERIOD_TICKS)
+    return;
+  uint32_t lane;
+  if (strcmp(slot.name, "TRANSPORT_RX") == 0) lane = 0U;
+  else if (strcmp(slot.name, "TRANSPORT_TX") == 0) lane = 1U;
+  else return;
+  g_transport_future.checks[lane]++;
+  if (forward_ticks > g_transport_future.max_forward_ticks[lane])
+    g_transport_future.max_forward_ticks[lane] = forward_ticks;
+  if (!g_transport_future.captured && forward_ticks > TRANSPORT_WITNESS_LEAD_TICKS)
+    timepop_capture_transport_future(slot_index, now, scheduler_dwt, forward_ticks);
+}
+
+// ============================================================================
 // schedule_next
 // ============================================================================
 //
@@ -2757,6 +2851,8 @@ static void schedule_next(void) {
         post_distance < SCHEDULE_MIN_ARM_LEAD_TICKS) {
       continue;
     }
+
+    timepop_note_transport_future(i, now, scheduler_dwt, post_distance);
 
     if (!found || (post_distance < (soonest - now))) {
       soonest = slots[i].deadline;
@@ -5233,6 +5329,9 @@ bool timepop_idle_witness_snapshot(timepop_idle_witness_snapshot_t* out) {
 
 static FLASHMEM Payload cmd_report(const Payload&) {
   Payload out;
+  out.add("transport_future_captured", g_transport_future.captured);
+  out.add("transport_future_rx_checks", g_transport_future.checks[0]);
+  out.add("transport_future_tx_checks", g_transport_future.checks[1]);
 
   out.add("isr_fires",         isr_fire_count);
   out.add("isr_count",         diag_isr_count);
@@ -5716,7 +5815,96 @@ static FLASHMEM Payload cmd_slots(const Payload&) {
   return out;
 }
 
+// Compact on-demand report: do not add this full record to periodic REPORT or
+// SLOTS payloads. Reporting never clears/rearms the latch. The saved slot name
+// is owned, so later cancellation/reuse cannot change the first testimony.
+static FLASHMEM Payload cmd_rollover(const Payload&) {
+  const time_anchor_snapshot_t anchor_now = time_anchor_snapshot();
+  const uint32_t vclock_now = vclock_count();
+  const uint32_t dwt_now = ARM_DWT_CYCCNT;
+  Payload out;
+  out.add("schema", "TIMEPOP_TRANSPORT_FUTURE_V1");
+  out.add("retention", "FIRST_UNTIL_CPU_RESET");
+  out.add("witness_bytes", (uint32_t)sizeof(g_transport_future));
+  out.add("period_ticks", TRANSPORT_WITNESS_PERIOD_TICKS);
+  out.add("threshold_ticks", TRANSPORT_WITNESS_LEAD_TICKS);
+  out.add("captured", g_transport_future.captured);
+  out.add("rx_checks", g_transport_future.checks[0]);
+  out.add("tx_checks", g_transport_future.checks[1]);
+  out.add("rx_max_forward_ticks", g_transport_future.max_forward_ticks[0]);
+  out.add("tx_max_forward_ticks", g_transport_future.max_forward_ticks[1]);
+  out.add("schedule_calls_now", (uint32_t)diag_schedule_next_calls_total);
+  out.add("ch2_foreground_calls_now", (uint32_t)diag_ch2_direct_call_count);
+  out.add("epoch_change_count_now", (uint32_t)diag_epoch_change_count);
+  out.add("epoch_sequence_now", (uint32_t)diag_epoch_last_sequence);
+  out.add("vclock_now", vclock_now);
+  out.add("dwt_now", dwt_now);
+  out.add("uptime_ms_now", millis());
+  out.add("anchor_ok_now", anchor_now.ok);
+  out.add("anchor_valid_now", anchor_now.valid);
+  out.add("anchor_pps_count_now", anchor_now.pps_count);
+  out.add("anchor_vclock_now", anchor_now.qtimer_at_pps);
+  out.add("anchor_dwt_now", anchor_now.dwt_at_pps);
+  out.add("anchor_cps_now", anchor_now.dwt_cycles_per_s);
+  if (!g_transport_future.captured) return out;
+
+  const auto& r = g_transport_future.first;
+  const auto& s = r.slot;
+  out.add("first_slot", r.slot_index);
+  out.add("first_handle", s.handle);
+  out.add("first_name", s.name);
+  out.add("first_period_ns", s.period_ns);
+  out.add("first_period_ticks", s.period_ticks);
+  out.add("first_deadline", s.deadline);
+  out.add("first_scheduler_now", r.scheduler_now);
+  out.add("first_scheduler_dwt", r.scheduler_dwt);
+  out.add("first_forward_ticks", r.forward_ticks);
+  out.add("first_target_gnss_ns", s.target_gnss_ns);
+  out.add("first_is_absolute", s.is_absolute);
+  out.add("first_recurrence_mode", (uint32_t)s.recurrence_mode);
+  out.add("first_base_fixed", s.recurring_base_fixed);
+  out.add("first_base_counter32_fixed", s.recurring_base_counter32_fixed);
+  out.add("first_base_counter32", s.recurring_base_counter32);
+  out.add("first_next_index", s.recurring_next_index);
+  out.add("first_base_gnss_ns", s.recurring_base_gnss_ns);
+  out.add("first_last_arm_source", arm_source_str(s.last_arm_source));
+  out.add("first_last_arm_now", s.last_arm_now);
+  out.add("first_last_arm_had_now", s.last_arm_had_now);
+  out.add("first_last_arm_deadline", s.last_arm_deadline);
+  out.add("first_last_arm_delta_ticks", s.last_arm_delta_ticks);
+  out.add("first_last_arm_target_gnss_ns", s.last_arm_target_gnss_ns);
+  out.add("first_last_arm_dwt", s.last_arm_dwt);
+  out.add("first_rearmed_count", s.recurring_rearmed_count);
+  out.add("first_skipped_intervals", s.recurring_last_skipped_intervals);
+  out.add("first_capture_begin_dwt", r.capture_begin_dwt);
+  out.add("first_capture_end_dwt", r.capture_end_dwt);
+  out.add("first_capture_span_cycles", r.capture_end_dwt - r.capture_begin_dwt);
+  out.add("first_uptime_ms", r.uptime_ms);
+  out.add("first_epoch_change_count", r.epoch_change_count);
+  out.add("first_epoch_sequence", r.epoch_sequence);
+  out.add("first_schedule_calls", r.schedule_calls);
+  out.add("first_ch2_foreground_calls", r.ch2_foreground_calls);
+  out.add("first_dispatch_calls", r.dispatch_calls);
+  out.add("first_dispatch_callbacks", r.dispatch_callbacks);
+  out.add("first_missed_deadlines", r.missed_deadlines);
+  out.add("first_anchor_ok", r.anchor.ok);
+  out.add("first_anchor_valid", r.anchor.valid);
+  out.add("first_anchor_pps_count", r.anchor.pps_count);
+  out.add("first_anchor_vclock", r.anchor.qtimer_at_pps);
+  out.add("first_anchor_dwt", r.anchor.dwt_at_pps);
+  out.add("first_anchor_cps", r.anchor.dwt_cycles_per_s);
+  out.add("first_clock_snapshot_mask", r.clock_snapshot_mask);
+  out.add("first_vclock_counter32", r.clocks[0].counter32);
+  out.add("first_vclock_hardware16", (uint32_t)r.clocks[0].hardware16);
+  out.add("first_ocxo1_counter32", r.clocks[1].counter32);
+  out.add("first_ocxo1_hardware16", (uint32_t)r.clocks[1].hardware16);
+  out.add("first_ocxo2_counter32", r.clocks[2].counter32);
+  out.add("first_ocxo2_hardware16", (uint32_t)r.clocks[2].hardware16);
+  return out;
+}
+
 static const process_command_entry_t TIMEPOP_COMMANDS[] = {
+  { "ROLLOVER",               cmd_rollover               },
   { "REPORT",                 cmd_report                 },
   { "SLOTS",                  cmd_slots                  },
   { nullptr,                  nullptr                    }
