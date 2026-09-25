@@ -1366,8 +1366,6 @@ void interrupt_photodiode_arm_window(uint32_t launch_dwt,
 // ISR, which queues immutable raw entry evidence for foreground classification.
 // Direct callers queue only first-instruction DWT and therefore carry UNKNOWN
 // delay ancestry; this function never rereads DWT as event identity.
-// Foreground only: the implementation serializes this synthetic producer with
-// the physical photodiode ISR. Calling from any ISR is an integrity violation.
 void process_interrupt_photodiode_gpio_irq(uint32_t isr_entry_dwt_raw);
 
 // event and diag are members of one immutable foreground-owned SPSC read slot.
@@ -1530,9 +1528,6 @@ uint16_t interrupt_qtimer1_ch2_counter_now(void);
 uint16_t interrupt_qtimer1_ch2_comp1_now(void);
 uint16_t interrupt_qtimer1_ch2_csctrl_now(void);
 
-// Compatibility PPS entry: call only from the actual IRQ_GPIO6789 handler.
-// Foreground or other-ISR injection is an integrity violation. The entry point
-// accounts for its ISR work so foreground report snapshots detect preemption.
 void process_interrupt_gpio6789_irq  (uint32_t isr_entry_dwt_raw);
 
 uint16_t interrupt_qtimer2_ch0_counter_now(void);

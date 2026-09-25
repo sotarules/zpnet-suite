@@ -3479,17 +3479,12 @@ static interrupt_delay_blocker_latch_t g_delay_latch_qtimer1{};
 static interrupt_delay_blocker_latch_t g_delay_latch_ocxo1{};
 static interrupt_delay_blocker_latch_t g_delay_latch_ocxo2{};
 static interrupt_delay_blocker_latch_t g_delay_latch_pps{};
-// Unlike the other targets, PHOTODIODE can be blocked by nested Priority
-// 0/16/32 writers. Each source owns one slot; a sequence counter alone cannot
-// serialize their writes to a shared record.
-static constexpr uint32_t PHOTODIODE_BLOCKER_COUNT = 5U;
-static interrupt_delay_blocker_latch_t
-    g_delay_latch_photodiode[PHOTODIODE_BLOCKER_COUNT]{};
+static interrupt_delay_blocker_latch_t g_delay_latch_photodiode{};
 static uint32_t g_delay_seen_qtimer1_token = 0U;
 static uint32_t g_delay_seen_ocxo1_token = 0U;
 static uint32_t g_delay_seen_ocxo2_token = 0U;
 static uint32_t g_delay_seen_pps_token = 0U;
-static uint32_t g_delay_seen_photodiode_token[PHOTODIODE_BLOCKER_COUNT]{};
+static uint32_t g_delay_seen_photodiode_token = 0U;
 
 static interrupt_delay_forensics_t g_pps_interrupt_delay{};
 static interrupt_arrival_capture_t g_pps_arrival_capture{};
@@ -3506,14 +3501,12 @@ static void interrupt_delay_runtime_reset(void) {
   g_delay_latch_ocxo1 = interrupt_delay_blocker_latch_t{};
   g_delay_latch_ocxo2 = interrupt_delay_blocker_latch_t{};
   g_delay_latch_pps = interrupt_delay_blocker_latch_t{};
-  for (uint32_t i = 0U; i < PHOTODIODE_BLOCKER_COUNT; ++i) {
-    g_delay_latch_photodiode[i] = interrupt_delay_blocker_latch_t{};
-    g_delay_seen_photodiode_token[i] = 0U;
-  }
+  g_delay_latch_photodiode = interrupt_delay_blocker_latch_t{};
   g_delay_seen_qtimer1_token = 0U;
   g_delay_seen_ocxo1_token = 0U;
   g_delay_seen_ocxo2_token = 0U;
   g_delay_seen_pps_token = 0U;
+  g_delay_seen_photodiode_token = 0U;
   g_pps_interrupt_delay = interrupt_delay_forensics_t{};
   g_pps_arrival_capture = interrupt_arrival_capture_t{};
   g_pps_arrival_entry_dwt = 0U;
@@ -3660,8 +3653,7 @@ static uint32_t interrupt_delay_lower_active_mask(
 }
 
 static interrupt_delay_blocker_latch_t* interrupt_delay_latch_for(
-    interrupt_execution_source_t target,
-    interrupt_execution_source_t blocker = interrupt_execution_source_t::NONE) {
+    interrupt_execution_source_t target) {
   switch (target) {
     case interrupt_execution_source_t::QTIMER1:
       return &g_delay_latch_qtimer1;
@@ -3672,20 +3664,7 @@ static interrupt_delay_blocker_latch_t* interrupt_delay_latch_for(
     case interrupt_execution_source_t::PPS:
       return &g_delay_latch_pps;
     case interrupt_execution_source_t::PHOTODIODE:
-      switch (blocker) {
-        case interrupt_execution_source_t::QTIMER1:
-          return &g_delay_latch_photodiode[0];
-        case interrupt_execution_source_t::OCXO1:
-          return &g_delay_latch_photodiode[1];
-        case interrupt_execution_source_t::OCXO2:
-          return &g_delay_latch_photodiode[2];
-        case interrupt_execution_source_t::PPS:
-          return &g_delay_latch_photodiode[3];
-        case interrupt_execution_source_t::CONTINUATION:
-          return &g_delay_latch_photodiode[4];
-        default:
-          __builtin_trap();
-      }
+      return &g_delay_latch_photodiode;
     default:
       return nullptr;
   }
@@ -3702,6 +3681,8 @@ static uint32_t* interrupt_delay_seen_token_for(
       return &g_delay_seen_ocxo2_token;
     case interrupt_execution_source_t::PPS:
       return &g_delay_seen_pps_token;
+    case interrupt_execution_source_t::PHOTODIODE:
+      return &g_delay_seen_photodiode_token;
     default:
       return nullptr;
   }
@@ -3755,8 +3736,7 @@ static void interrupt_delay_publish_blocker(
   // latch and claim that the current active invocation was serialized.
   if (interrupt_delay_source_active(target)) return;
 
-  interrupt_delay_blocker_latch_t* latch =
-      interrupt_delay_latch_for(target, blocker);
+  interrupt_delay_blocker_latch_t* latch = interrupt_delay_latch_for(target);
   if (!latch) return;
   uint32_t token = latch->publish_token + 1U;
   if (token == 0U) token = 1U;
@@ -3773,8 +3753,7 @@ static void interrupt_delay_publish_blocker(
 }
 
 static interrupt_arrival_capture_t interrupt_delay_capture_entry_fast(
-    interrupt_execution_source_t source,
-    uint32_t entry_dwt) {
+    interrupt_execution_source_t source) {
   // Assign every scalar explicitly: this path is the first handful of
   // instructions in the ISR and must not invite compiler-generated memset.
   interrupt_arrival_capture_t capture;
@@ -3788,16 +3767,9 @@ static interrupt_arrival_capture_t interrupt_delay_capture_entry_fast(
   capture.lower_context_active_mask =
       interrupt_delay_lower_active_mask(source);
 
-  const bool photodiode = source == interrupt_execution_source_t::PHOTODIODE;
-  const uint32_t slot_count = photodiode ? PHOTODIODE_BLOCKER_COUNT : 1U;
-  uint32_t nearest_gap = UINT32_MAX;
-  for (uint32_t slot = 0U; slot < slot_count; ++slot) {
-    interrupt_delay_blocker_latch_t* latch = photodiode
-        ? &g_delay_latch_photodiode[slot] : interrupt_delay_latch_for(source);
-    uint32_t* seen_token = photodiode
-        ? &g_delay_seen_photodiode_token[slot]
-        : interrupt_delay_seen_token_for(source);
-    if (!latch || !seen_token) continue;
+  interrupt_delay_blocker_latch_t* latch = interrupt_delay_latch_for(source);
+  uint32_t* seen_token = interrupt_delay_seen_token_for(source);
+  if (latch && seen_token) {
     for (uint32_t attempt = 0U; attempt < 3U; ++attempt) {
       const uint32_t seq1 = latch->seq;
       if ((seq1 & 1U) != 0U) continue;
@@ -3815,16 +3787,6 @@ static interrupt_arrival_capture_t interrupt_delay_capture_entry_fast(
         // from becoming spuriously "recent" when 32-bit DWT later wraps.
         if (token != 0U && token != *seen_token) {
           *seen_token = token;
-          // Retire every observed token, including losing/old candidates.
-          // Compare against first-instruction entry, not a later DWT read:
-          // a publisher preempting this scan is not a pre-entry blocker.
-          const uint32_t gap = entry_dwt - blocker_exit_dwt;
-          if (photodiode &&
-              (gap > INTERRUPT_DELAY_TAILCHAIN_MAX_GAP_CYCLES ||
-               gap >= nearest_gap)) {
-            break;
-          }
-          nearest_gap = gap;
           capture.blocker = blocker;
           capture.blocker_exit_dwt =
               blocker == interrupt_execution_source_t::NONE
@@ -5303,7 +5265,7 @@ static void interrupt_handoff_service_isr(void) {
   const uint32_t entry_dwt = ARM_DWT_CYCCNT;
   const interrupt_arrival_capture_t arrival =
       interrupt_delay_capture_entry_fast(
-          interrupt_execution_source_t::CONTINUATION, entry_dwt);
+          interrupt_execution_source_t::CONTINUATION);
   interrupt_isr_diag_enter(
       g_interrupt_priority_runtime.continuation, entry_dwt);
   interrupt_note_photodiode_preemption();
@@ -5532,7 +5494,7 @@ static void qtimer1_isr(void) {
       g_interrupt_priority_runtime.qtimer1, isr_entry_dwt_raw);
   const interrupt_arrival_capture_t arrival =
       interrupt_delay_capture_entry_fast(
-          interrupt_execution_source_t::QTIMER1, isr_entry_dwt_raw);
+          interrupt_execution_source_t::QTIMER1);
   interrupt_note_photodiode_preemption();
   if (g_interrupt_priority_runtime.continuation.active) {
     g_interrupt_priority_runtime.qtimer1_preempted_continuation_count++;
@@ -5651,7 +5613,7 @@ static void qtimer2_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;
   const interrupt_arrival_capture_t arrival =
       interrupt_delay_capture_entry_fast(
-          interrupt_execution_source_t::OCXO1, isr_entry_dwt_raw);
+          interrupt_execution_source_t::OCXO1);
   interrupt_isr_diag_enter(
       g_interrupt_priority_runtime.qtimer2, isr_entry_dwt_raw);
   interrupt_note_science_preemption(
@@ -5677,7 +5639,7 @@ static void qtimer3_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;
   const interrupt_arrival_capture_t arrival =
       interrupt_delay_capture_entry_fast(
-          interrupt_execution_source_t::OCXO2, isr_entry_dwt_raw);
+          interrupt_execution_source_t::OCXO2);
   interrupt_isr_diag_enter(
       g_interrupt_priority_runtime.qtimer3, isr_entry_dwt_raw);
   interrupt_note_science_preemption(
@@ -5741,18 +5703,10 @@ static void process_interrupt_gpio6789_irq(
 }
 
 void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
-  // A second execution domain would turn the physical PPS ring into MPSC.
-  if (interrupt_ipsr() != (uint32_t)IRQ_GPIO6789 + 16U) __builtin_trap();
   const interrupt_arrival_capture_t arrival =
       interrupt_delay_capture_entry_fast(
-          interrupt_execution_source_t::PPS, isr_entry_dwt_raw);
-  interrupt_isr_diag_enter(
-      g_interrupt_priority_runtime.pps, isr_entry_dwt_raw);
-  interrupt_note_science_preemption(
-      g_interrupt_priority_runtime.pps_preempted_qtimer1_count);
+          interrupt_execution_source_t::PPS);
   process_interrupt_gpio6789_irq(isr_entry_dwt_raw, arrival);
-  interrupt_isr_diag_exit(
-      g_interrupt_priority_runtime.pps, isr_entry_dwt_raw);
   interrupt_delay_note_isr_exit(
       interrupt_execution_source_t::PPS, isr_entry_dwt_raw, arrival);
 }
@@ -5833,8 +5787,7 @@ static void photodiode_raw_push(uint32_t entry_dwt,
 static void photodiode_gpio2_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;
   const interrupt_arrival_capture_t arrival_capture =
-      interrupt_delay_capture_entry_fast(
-          interrupt_execution_source_t::PHOTODIODE, isr_entry_dwt_raw);
+      interrupt_delay_capture_entry_fast(interrupt_execution_source_t::PHOTODIODE);
   interrupt_isr_diag_enter(
       g_interrupt_priority_runtime.photodiode, isr_entry_dwt_raw);
   const uint32_t status =
@@ -5865,7 +5818,7 @@ static void pps_gpio_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;
   const interrupt_arrival_capture_t arrival =
       interrupt_delay_capture_entry_fast(
-          interrupt_execution_source_t::PPS, isr_entry_dwt_raw);
+          interrupt_execution_source_t::PPS);
   interrupt_isr_diag_enter(
       g_interrupt_priority_runtime.pps, isr_entry_dwt_raw);
   interrupt_note_science_preemption(
@@ -6238,8 +6191,6 @@ void interrupt_photodiode_service_pending(void) {
 }
 
 void process_interrupt_photodiode_gpio_irq(uint32_t isr_entry_dwt_raw) {
-  // BASEPRI cannot serialize an ISR that already preempted the real producer.
-  if (interrupt_ipsr() != 0U) __builtin_trap();
   // Test injection must serialize with the sole physical producer.
   const uint32_t prior = interrupt_priority0_guard_enter();
   photodiode_raw_push(isr_entry_dwt_raw, interrupt_arrival_capture_t{},
@@ -7230,96 +7181,33 @@ void process_interrupt_enable_irqs(void) {
 // Lean observed-only reports
 // ============================================================================
 
-struct interrupt_report_epoch_t {
-  uint32_t entries[6];
-};
-
-static interrupt_report_epoch_t interrupt_report_epoch(void) {
-  return {{
-      g_interrupt_priority_runtime.qtimer1.entry_count,
-      g_interrupt_priority_runtime.qtimer2.entry_count,
-      g_interrupt_priority_runtime.qtimer3.entry_count,
-      g_interrupt_priority_runtime.pps.entry_count,
-      g_interrupt_priority_runtime.continuation.entry_count,
-      g_interrupt_priority_runtime.photodiode.entry_count}};
-}
-
-// Foreground cannot run until a preempting ISR has returned. The six existing
-// entry counters therefore witness every installed writer across this bounded
-// copy, including spurious/empty interrupts that publish no capture packet.
-// Keep all formatting, Payload work and callbacks outside the copy. No IRQ
-// masking or new work in Priority 0 is needed. Hardware flags remain sampled
-// observations: the peripheral can change them without executing an ISR.
-template <typename Copy>
-static void interrupt_report_snapshot(Copy copy) {
-  if (interrupt_ipsr() != 0U) __builtin_trap();
-  for (;;) {
-    const interrupt_report_epoch_t before = interrupt_report_epoch();
-    dmb_barrier();
-    copy();
-    dmb_barrier();
-    const interrupt_report_epoch_t after = interrupt_report_epoch();
-    bool unchanged = true;
-    for (uint32_t i = 0U; i < 6U; ++i) {
-      if (before.entries[i] != after.entries[i]) unchanged = false;
-    }
-    if (unchanged) return;
-  }
-}
-
 static FLASHMEM void add_runtime_summary(Payload& payload,
                                          const char* prefix,
                                          const interrupt_subscriber_runtime_t* rt) {
-  struct {
-    bool subscribed;
-    bool active;
-    uint32_t event_count;
-    uint32_t dispatch_count;
-    uint32_t busy_drop_count;
-    uint32_t queue_depth;
-    uint32_t arm_fail_count;
-  } snapshot{};
-  interrupt_report_snapshot([&]() {
-    snapshot.subscribed = rt ? rt->subscribed : false;
-    snapshot.active = rt ? rt->active : false;
-    snapshot.event_count = rt ? rt->event_count : 0U;
-    snapshot.dispatch_count = rt ? rt->dispatch_count : 0U;
-    snapshot.busy_drop_count = rt ? rt->dispatch_busy_drop_count : 0U;
-    snapshot.queue_depth = rt ? interrupt_dispatch_queue_depth(*rt) : 0U;
-    snapshot.arm_fail_count = rt ? rt->dispatch_arm_fail_count : 0U;
-  });
   char key[64];
   snprintf(key, sizeof(key), "%s_subscribed", prefix);
-  payload.add(key, snapshot.subscribed);
+  payload.add(key, rt ? rt->subscribed : false);
   snprintf(key, sizeof(key), "%s_active", prefix);
-  payload.add(key, snapshot.active);
+  payload.add(key, rt ? rt->active : false);
   snprintf(key, sizeof(key), "%s_event_count", prefix);
-  payload.add(key, snapshot.event_count);
+  payload.add(key, rt ? rt->event_count : 0U);
   snprintf(key, sizeof(key), "%s_dispatch_count", prefix);
-  payload.add(key, snapshot.dispatch_count);
+  payload.add(key, rt ? rt->dispatch_count : 0U);
   snprintf(key, sizeof(key), "%s_dispatch_busy_drop_count", prefix);
-  payload.add(key, snapshot.busy_drop_count);
+  payload.add(key, rt ? rt->dispatch_busy_drop_count : 0U);
   snprintf(key, sizeof(key), "%s_dispatch_queue_depth", prefix);
-  payload.add(key, snapshot.queue_depth);
+  payload.add(key, rt ? interrupt_dispatch_queue_depth(*rt) : 0U);
   snprintf(key, sizeof(key), "%s_dispatch_queue_capacity", prefix);
   payload.add(key, INTERRUPT_SUBSCRIBER_DISPATCH_QUEUE_CAPACITY);
   snprintf(key, sizeof(key), "%s_dispatch_arm_fail_count", prefix);
-  payload.add(key, snapshot.arm_fail_count);
+  payload.add(key, rt ? rt->dispatch_arm_fail_count : 0U);
 }
 
 static FLASHMEM void add_ocxo_lane_report(Payload& payload,
                                           const char* prefix,
                                           const ocxo_binding_t& ctx) {
-  ocxo_lane_t lane{};
-  uint32_t clock32 = 0U;
-  uint16_t hardware16 = 0U;
-  bool binding_identity_exact = false;
-  interrupt_report_snapshot([&]() {
-    lane = *ctx.lane;
-    clock32 = ctx.clock32->current_counter32;
-    hardware16 = ctx.clock32->hardware16;
-    binding_identity_exact = ocxo_static_binding_exact(ctx.kind);
-  });
+  const ocxo_lane_t& lane = *ctx.lane;
+  const synthetic_clock32_t& clock = *ctx.clock32;
   char key[80];
   auto add_bool = [&](const char* suffix, bool value) {
     snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
@@ -7341,8 +7229,8 @@ static FLASHMEM void add_ocxo_lane_report(Payload& payload,
   add_bool("capture_pending", (bool)lane.capture_pending);
   add_u32("capture_pending_target_counter32",
           lane.capture_pending_target_counter32);
-  add_u32("clock32", clock32);
-  add_u32("hardware16", (uint32_t)hardware16);
+  add_u32("clock32", clock.current_counter32);
+  add_u32("hardware16", (uint32_t)clock.hardware16);
   add_u32("grid_epoch_counter32", lane.grid_epoch_counter32);
   add_u32("next_target_counter32", lane.next_target_counter32);
   add_u32("armed_target_counter32", lane.armed_target_counter32);
@@ -7379,7 +7267,7 @@ static FLASHMEM void add_ocxo_lane_report(Payload& payload,
   add_u32("binding_identity_failure_count",
           lane.binding_identity_failure_count);
   add_bool("binding_identity_exact",
-           binding_identity_exact);
+           ocxo_static_binding_exact(ctx.kind));
   add_u32("capture_pending_set_count", lane.capture_pending_set_count);
   add_u32("capture_pending_clear_count", lane.capture_pending_clear_count);
   add_u32("capture_pending_tend_skip_count",
@@ -7436,27 +7324,14 @@ static FLASHMEM void add_ocxo_lane_report(Payload& payload,
           lane.counter_delta_violation_count);
 }
 
-struct interrupt_irq_report_snapshot_t {
-  uint32_t priority;
-  bool enabled;
-  bool pending;
-  bool active;
-};
-
-static interrupt_irq_report_snapshot_t interrupt_irq_report_snapshot(uint32_t irq) {
-  return {interrupt_nvic_priority_read(irq), interrupt_nvic_enabled(irq),
-          interrupt_nvic_pending(irq), interrupt_nvic_active(irq)};
-}
-
 static FLASHMEM void add_irq_priority_report(
     Payload& payload,
     const char* prefix,
     uint32_t irq,
     uint32_t requested_priority,
-    const interrupt_isr_runtime_diag_t& diag,
-    const interrupt_irq_report_snapshot_t& hardware) {
+    const interrupt_isr_runtime_diag_t& diag) {
   char key[80];
-  const uint32_t observed_priority = hardware.priority;
+  const uint32_t observed_priority = interrupt_nvic_priority_read(irq);
 
   auto add_u32 = [&](const char* suffix, uint32_t value) {
     snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
@@ -7471,9 +7346,9 @@ static FLASHMEM void add_irq_priority_report(
   add_u32("requested_priority", requested_priority);
   add_u32("observed_priority", observed_priority);
   add_bool("priority_match", observed_priority == requested_priority);
-  add_bool("enabled", hardware.enabled);
-  add_bool("pending", hardware.pending);
-  add_bool("active", hardware.active);
+  add_bool("enabled", interrupt_nvic_enabled(irq));
+  add_bool("pending", interrupt_nvic_pending(irq));
+  add_bool("active", interrupt_nvic_active(irq));
   add_u32("entry_count", (uint32_t)diag.entry_count);
   add_u32("last_wall_cycles", (uint32_t)diag.last_wall_cycles);
   add_u32("max_wall_cycles", (uint32_t)diag.max_wall_cycles);
@@ -7744,101 +7619,75 @@ static FLASHMEM Payload cmd_report_photodiode(const Payload&) {
 }
 
 static FLASHMEM Payload cmd_report_priorities(const Payload&) {
-  struct {
-    interrupt_priority_runtime_t runtime;
-    interrupt_irq_report_snapshot_t hardware[6];
-    uint32_t ipsr;
-    uint32_t basepri;
-    uint32_t primask;
-    bool live_readback_all_match;
-    bool photodiode_route_match;
-    bool photodiode_irq_installed;
-  } snapshot{};
-  interrupt_report_snapshot([&]() {
-    snapshot.runtime = g_interrupt_priority_runtime;
-    snapshot.hardware[0] = interrupt_irq_report_snapshot((uint32_t)IRQ_QTIMER1);
-    snapshot.hardware[1] = interrupt_irq_report_snapshot((uint32_t)IRQ_QTIMER2);
-    snapshot.hardware[2] = interrupt_irq_report_snapshot((uint32_t)IRQ_QTIMER3);
-    snapshot.hardware[3] = interrupt_irq_report_snapshot((uint32_t)IRQ_GPIO6789);
-    snapshot.hardware[4] = interrupt_irq_report_snapshot(INTERRUPT_HANDOFF_IRQ_NUMBER);
-    snapshot.hardware[5] = interrupt_irq_report_snapshot((uint32_t)PHOTODIODE_IRQ);
-    snapshot.ipsr = interrupt_ipsr();
-    snapshot.basepri = interrupt_basepri();
-    snapshot.primask = interrupt_primask();
-    snapshot.live_readback_all_match = interrupt_priority_readback_all_match();
-    snapshot.photodiode_route_match = photodiode_gpio2_route_readback_all_match();
-    snapshot.photodiode_irq_installed = g_photodiode_physical_irq_installed;
-  });
-  const interrupt_priority_runtime_t& runtime = snapshot.runtime;
   Payload payload;
   payload.add("report", "INTERRUPT_PRIORITIES");
   payload.add("topology",
               "P0_SCIENCE__P16_QTIMER1__P32_CONTINUATION__P48_PHOTODIODE__FOREGROUND");
   payload.add("basepri_mask_threshold",
               INTERRUPT_PRIORITY0_PRESERVING_BASEPRI);
-  payload.add("current_ipsr", snapshot.ipsr);
-  payload.add("current_basepri", snapshot.basepri);
-  payload.add("current_primask", snapshot.primask);
+  payload.add("current_ipsr", interrupt_ipsr());
+  payload.add("current_basepri", interrupt_basepri());
+  payload.add("current_primask", interrupt_primask());
   payload.add("verify_count",
-              (uint32_t)runtime.verify_count);
+              (uint32_t)g_interrupt_priority_runtime.verify_count);
   payload.add("verify_mismatch_count",
-              (uint32_t)runtime.verify_mismatch_count);
+              (uint32_t)g_interrupt_priority_runtime.verify_mismatch_count);
   payload.add("last_verify_all_match",
-              (bool)runtime.last_verify_all_match);
+              (bool)g_interrupt_priority_runtime.last_verify_all_match);
   payload.add("live_readback_all_match",
-              snapshot.live_readback_all_match);
+              interrupt_priority_readback_all_match());
 
   add_irq_priority_report(
       payload, "qtimer1", (uint32_t)IRQ_QTIMER1,
       INTERRUPT_PRIORITY_VCLOCK_TIMEPOP,
-      runtime.qtimer1, snapshot.hardware[0]);
+      g_interrupt_priority_runtime.qtimer1);
   add_irq_priority_report(
       payload, "ocxo1", (uint32_t)IRQ_QTIMER2,
       INTERRUPT_PRIORITY_SCIENCE,
-      runtime.qtimer2, snapshot.hardware[1]);
+      g_interrupt_priority_runtime.qtimer2);
   add_irq_priority_report(
       payload, "ocxo2", (uint32_t)IRQ_QTIMER3,
       INTERRUPT_PRIORITY_SCIENCE,
-      runtime.qtimer3, snapshot.hardware[2]);
+      g_interrupt_priority_runtime.qtimer3);
   add_irq_priority_report(
       payload, "pps", (uint32_t)IRQ_GPIO6789,
       INTERRUPT_PRIORITY_SCIENCE,
-      runtime.pps, snapshot.hardware[3]);
+      g_interrupt_priority_runtime.pps);
   payload.add("photodiode_kind", "PHOTODIODE");
   payload.add("photodiode_provider", "GPIO2");
   payload.add("photodiode_lane", "GPIO_PHOTODIODE_EDGE");
   payload.add("photodiode_physical_irq_installed",
-              snapshot.photodiode_irq_installed);
+              g_photodiode_physical_irq_installed);
   payload.add("photodiode_shared_gpio6789_vector_with_pps", false);
   payload.add("photodiode_independent_priority_ready", true);
   payload.add("photodiode_execution_priority", INTERRUPT_PRIORITY_PHOTODIODE);
   payload.add("photodiode_delay_blocker_traced", false);
   payload.add("photodiode_delay_target_traced", true);
   payload.add("photodiode_gpio2_route_readback_all_match",
-              snapshot.photodiode_route_match);
+              photodiode_gpio2_route_readback_all_match());
   add_irq_priority_report(
       payload, "continuation", INTERRUPT_HANDOFF_IRQ_NUMBER,
       INTERRUPT_PRIORITY_CONTINUATION,
-      runtime.continuation, snapshot.hardware[4]);
+      g_interrupt_priority_runtime.continuation);
   add_irq_priority_report(
       payload, "photodiode", (uint32_t)PHOTODIODE_IRQ,
       INTERRUPT_PRIORITY_PHOTODIODE,
-      runtime.photodiode, snapshot.hardware[5]);
+      g_interrupt_priority_runtime.photodiode);
 
   payload.add("qtimer1_preempted_continuation_count",
-              (uint32_t)runtime
+              (uint32_t)g_interrupt_priority_runtime
                   .qtimer1_preempted_continuation_count);
   payload.add("ocxo1_preempted_qtimer1_count",
-              (uint32_t)runtime
+              (uint32_t)g_interrupt_priority_runtime
                   .ocxo1_preempted_qtimer1_count);
   payload.add("ocxo2_preempted_qtimer1_count",
-              (uint32_t)runtime
+              (uint32_t)g_interrupt_priority_runtime
                   .ocxo2_preempted_qtimer1_count);
   payload.add("pps_preempted_qtimer1_count",
-              (uint32_t)runtime
+              (uint32_t)g_interrupt_priority_runtime
                   .pps_preempted_qtimer1_count);
   payload.add("science_preempted_continuation_count",
-              (uint32_t)runtime
+              (uint32_t)g_interrupt_priority_runtime
                   .science_preempted_continuation_count);
   payload.add("vclock_dwt_capture_class", "PRIORITY16_OBSERVED");
   payload.add("ocxo_dwt_capture_class", "PRIORITY0_SOVEREIGN");
@@ -8109,189 +7958,113 @@ static FLASHMEM void add_handoff_source(
 }
 
 static FLASHMEM Payload cmd_report_handoff(const Payload&) {
-  // One completed value spans handoff, all five sources, and CH2 custody.
-  struct {
-    decltype(g_interrupt_handoff) interrupt_handoff;
-    decltype(g_vclock_capture_overrun_rearm_request_count) vclock_capture_overrun_rearm_request_count;
-    decltype(g_vclock_capture_overrun_rearm_complete_count) vclock_capture_overrun_rearm_complete_count;
-    decltype(g_ocxo1_capture_overrun_recovery_count) ocxo1_capture_overrun_recovery_count;
-    decltype(g_ocxo2_capture_overrun_recovery_count) ocxo2_capture_overrun_recovery_count;
-    decltype(g_timepop_foreground_diag) timepop_foreground_diag;
-    decltype(g_qtimer1_ch2_compare_armed) qtimer1_ch2_compare_armed;
-    decltype(g_qtimer1_ch2_armed_target_counter32) qtimer1_ch2_armed_target_counter32;
-    decltype(g_qtimer1_ch2_armed_target_low16) qtimer1_ch2_armed_target_low16;
-    decltype(g_qtimer1_ch2_last_requested_target_counter32) qtimer1_ch2_last_requested_target_counter32;
-    decltype(g_qtimer1_ch2_request_count) qtimer1_ch2_request_count;
-    decltype(g_qtimer1_ch2_physical_arm_count) qtimer1_ch2_physical_arm_count;
-    decltype(g_qtimer1_ch2_physical_reprogram_count) qtimer1_ch2_physical_reprogram_count;
-    decltype(g_qtimer1_ch2_fact_outstanding) qtimer1_ch2_fact_outstanding;
-    decltype(g_qtimer1_ch2_deferred_arm_valid) qtimer1_ch2_deferred_arm_valid;
-    decltype(g_qtimer1_ch2_deferred_arm_target_counter32) qtimer1_ch2_deferred_arm_target_counter32;
-    decltype(g_qtimer1_ch2_deferred_arm_count) qtimer1_ch2_deferred_arm_count;
-    decltype(g_qtimer1_ch2_deferred_arm_replace_count) qtimer1_ch2_deferred_arm_replace_count;
-    decltype(g_qtimer1_ch2_release_arm_count) qtimer1_ch2_release_arm_count;
-    decltype(g_qtimer1_ch2_release_without_arm_count) qtimer1_ch2_release_without_arm_count;
-    decltype(g_qtimer1_ch2_valid_capture_count) qtimer1_ch2_valid_capture_count;
-    decltype(g_qtimer1_ch2_rejected_flag_count) qtimer1_ch2_rejected_flag_count;
-    decltype(g_qtimer1_ch2_flag_while_disabled_count) qtimer1_ch2_flag_while_disabled_count;
-    decltype(g_qtimer1_ch2_flag_while_unarmed_count) qtimer1_ch2_flag_while_unarmed_count;
-    decltype(g_qtimer1_ch2_flag_while_outstanding_count) qtimer1_ch2_flag_while_outstanding_count;
-    decltype(g_qtimer1_ch2_target_mismatch_count) qtimer1_ch2_target_mismatch_count;
-    decltype(g_qtimer1_ch2_unexpected_capture_count) qtimer1_ch2_unexpected_capture_count;
-    decltype(g_handoff_vclock) handoff_vclock;
-    decltype(g_handoff_ch2) handoff_ch2;
-    decltype(g_handoff_ocxo1) handoff_ocxo1;
-    decltype(g_handoff_ocxo2) handoff_ocxo2;
-    decltype(g_handoff_pps) handoff_pps;
-    uint32_t observed_priority;
-    uint32_t ch2_csctrl;
-    uint32_t ch2_comp1;
-  } snapshot{};
-  interrupt_report_snapshot([&]() {
-    snapshot.interrupt_handoff = g_interrupt_handoff;
-    snapshot.vclock_capture_overrun_rearm_request_count = g_vclock_capture_overrun_rearm_request_count;
-    snapshot.vclock_capture_overrun_rearm_complete_count = g_vclock_capture_overrun_rearm_complete_count;
-    snapshot.ocxo1_capture_overrun_recovery_count = g_ocxo1_capture_overrun_recovery_count;
-    snapshot.ocxo2_capture_overrun_recovery_count = g_ocxo2_capture_overrun_recovery_count;
-    snapshot.timepop_foreground_diag = g_timepop_foreground_diag;
-    snapshot.qtimer1_ch2_compare_armed = g_qtimer1_ch2_compare_armed;
-    snapshot.qtimer1_ch2_armed_target_counter32 = g_qtimer1_ch2_armed_target_counter32;
-    snapshot.qtimer1_ch2_armed_target_low16 = g_qtimer1_ch2_armed_target_low16;
-    snapshot.qtimer1_ch2_last_requested_target_counter32 = g_qtimer1_ch2_last_requested_target_counter32;
-    snapshot.qtimer1_ch2_request_count = g_qtimer1_ch2_request_count;
-    snapshot.qtimer1_ch2_physical_arm_count = g_qtimer1_ch2_physical_arm_count;
-    snapshot.qtimer1_ch2_physical_reprogram_count = g_qtimer1_ch2_physical_reprogram_count;
-    snapshot.qtimer1_ch2_fact_outstanding = g_qtimer1_ch2_fact_outstanding;
-    snapshot.qtimer1_ch2_deferred_arm_valid = g_qtimer1_ch2_deferred_arm_valid;
-    snapshot.qtimer1_ch2_deferred_arm_target_counter32 = g_qtimer1_ch2_deferred_arm_target_counter32;
-    snapshot.qtimer1_ch2_deferred_arm_count = g_qtimer1_ch2_deferred_arm_count;
-    snapshot.qtimer1_ch2_deferred_arm_replace_count = g_qtimer1_ch2_deferred_arm_replace_count;
-    snapshot.qtimer1_ch2_release_arm_count = g_qtimer1_ch2_release_arm_count;
-    snapshot.qtimer1_ch2_release_without_arm_count = g_qtimer1_ch2_release_without_arm_count;
-    snapshot.qtimer1_ch2_valid_capture_count = g_qtimer1_ch2_valid_capture_count;
-    snapshot.qtimer1_ch2_rejected_flag_count = g_qtimer1_ch2_rejected_flag_count;
-    snapshot.qtimer1_ch2_flag_while_disabled_count = g_qtimer1_ch2_flag_while_disabled_count;
-    snapshot.qtimer1_ch2_flag_while_unarmed_count = g_qtimer1_ch2_flag_while_unarmed_count;
-    snapshot.qtimer1_ch2_flag_while_outstanding_count = g_qtimer1_ch2_flag_while_outstanding_count;
-    snapshot.qtimer1_ch2_target_mismatch_count = g_qtimer1_ch2_target_mismatch_count;
-    snapshot.qtimer1_ch2_unexpected_capture_count = g_qtimer1_ch2_unexpected_capture_count;
-    snapshot.handoff_vclock = g_handoff_vclock;
-    snapshot.handoff_ch2 = g_handoff_ch2;
-    snapshot.handoff_ocxo1 = g_handoff_ocxo1;
-    snapshot.handoff_ocxo2 = g_handoff_ocxo2;
-    snapshot.handoff_pps = g_handoff_pps;
-    snapshot.observed_priority =
-        interrupt_nvic_priority_read(INTERRUPT_HANDOFF_IRQ_NUMBER);
-    snapshot.ch2_csctrl = IMXRT_TMR1.CH[QTIMER1_TIMEPOP_CH].CSCTRL;
-    snapshot.ch2_comp1 = IMXRT_TMR1.CH[QTIMER1_TIMEPOP_CH].COMP1;
-  });
   Payload payload;
   payload.add("report", "INTERRUPT_HANDOFF");
   payload.add("entry_latency_measurement", "FIRST_REQUEST_TO_ENTRY");
   payload.add("source_latency_measurement", "CAPTURE_TO_DEQUEUE");
   payload.add("execution_priority", INTERRUPT_PRIORITY_CONTINUATION);
   payload.add("observed_priority",
-              snapshot.observed_priority);
+              interrupt_nvic_priority_read(INTERRUPT_HANDOFF_IRQ_NUMBER));
   payload.add("priority_match",
-              snapshot.observed_priority ==
+              interrupt_nvic_priority_read(INTERRUPT_HANDOFF_IRQ_NUMBER) ==
                   INTERRUPT_PRIORITY_CONTINUATION);
-  payload.add("configured", (bool)snapshot.interrupt_handoff.configured);
-  payload.add("request_count", (uint32_t)snapshot.interrupt_handoff.request_count);
-  payload.add("entry_count", (uint32_t)snapshot.interrupt_handoff.entry_count);
-  payload.add("exit_count", (uint32_t)snapshot.interrupt_handoff.exit_count);
-  payload.add("reentry_count", (uint32_t)snapshot.interrupt_handoff.reentry_count);
-  payload.add("repend_count", (uint32_t)snapshot.interrupt_handoff.repend_count);
+  payload.add("configured", (bool)g_interrupt_handoff.configured);
+  payload.add("request_count", (uint32_t)g_interrupt_handoff.request_count);
+  payload.add("entry_count", (uint32_t)g_interrupt_handoff.entry_count);
+  payload.add("exit_count", (uint32_t)g_interrupt_handoff.exit_count);
+  payload.add("reentry_count", (uint32_t)g_interrupt_handoff.reentry_count);
+  payload.add("repend_count", (uint32_t)g_interrupt_handoff.repend_count);
   payload.add("drain_budget_exhausted_count",
-              (uint32_t)snapshot.interrupt_handoff.drain_budget_exhausted_count);
+              (uint32_t)g_interrupt_handoff.drain_budget_exhausted_count);
   payload.add("latency_invalid_count",
-              (uint32_t)snapshot.interrupt_handoff.latency_invalid_count);
+              (uint32_t)g_interrupt_handoff.latency_invalid_count);
   payload.add("last_latency_cycles",
-              (uint32_t)snapshot.interrupt_handoff.last_latency_cycles);
+              (uint32_t)g_interrupt_handoff.last_latency_cycles);
   payload.add("min_latency_cycles",
-              snapshot.interrupt_handoff.min_latency_cycles != UINT32_MAX
-                  ? (uint32_t)snapshot.interrupt_handoff.min_latency_cycles
+              g_interrupt_handoff.min_latency_cycles != UINT32_MAX
+                  ? (uint32_t)g_interrupt_handoff.min_latency_cycles
                   : 0U);
   payload.add("max_latency_cycles",
-              (uint32_t)snapshot.interrupt_handoff.max_latency_cycles);
+              (uint32_t)g_interrupt_handoff.max_latency_cycles);
   payload.add("vclock_overrun_rearm_requests",
-              (uint32_t)snapshot.vclock_capture_overrun_rearm_request_count);
+              (uint32_t)g_vclock_capture_overrun_rearm_request_count);
   payload.add("vclock_overrun_rearm_completed",
-              snapshot.vclock_capture_overrun_rearm_complete_count);
+              g_vclock_capture_overrun_rearm_complete_count);
   payload.add("ocxo1_overrun_recovery_completed",
-              snapshot.ocxo1_capture_overrun_recovery_count);
+              g_ocxo1_capture_overrun_recovery_count);
   payload.add("ocxo2_overrun_recovery_completed",
-              snapshot.ocxo2_capture_overrun_recovery_count);
+              g_ocxo2_capture_overrun_recovery_count);
   payload.add("timepop_foreground_enqueue_count",
-              (uint32_t)snapshot.timepop_foreground_diag.enqueue_count);
+              (uint32_t)g_timepop_foreground_diag.enqueue_count);
   payload.add("timepop_foreground_dequeue_count",
-              (uint32_t)snapshot.timepop_foreground_diag.dequeue_count);
+              (uint32_t)g_timepop_foreground_diag.dequeue_count);
   payload.add("timepop_foreground_service_count",
-              (uint32_t)snapshot.timepop_foreground_diag.service_count);
+              (uint32_t)g_timepop_foreground_diag.service_count);
   payload.add("timepop_foreground_overrun_count",
-              (uint32_t)snapshot.timepop_foreground_diag.overrun_count);
+              (uint32_t)g_timepop_foreground_diag.overrun_count);
   payload.add("timepop_foreground_high_water",
-              (uint32_t)snapshot.timepop_foreground_diag.high_water);
+              (uint32_t)g_timepop_foreground_diag.high_water);
   payload.add("timepop_foreground_handler_reject_count",
-              (uint32_t)snapshot.timepop_foreground_diag.handler_reject_count);
+              (uint32_t)g_timepop_foreground_diag.handler_reject_count);
   payload.add("timepop_foreground_handler_last_ipsr",
-              (uint32_t)snapshot.timepop_foreground_diag.handler_last_ipsr);
+              (uint32_t)g_timepop_foreground_diag.handler_last_ipsr);
   payload.add("timepop_foreground_scheduler_recover_count",
-              (uint32_t)snapshot.timepop_foreground_diag.scheduler_recover_count);
+              (uint32_t)g_timepop_foreground_diag.scheduler_recover_count);
   const uint32_t ch2_csctrl_snapshot =
-      snapshot.ch2_csctrl;
+      IMXRT_TMR1.CH[QTIMER1_TIMEPOP_CH].CSCTRL;
   payload.add("ch2_hw_tcf1",
               (bool)((ch2_csctrl_snapshot & TMR_CSCTRL_TCF1) != 0U));
   payload.add("ch2_hw_tcf1en",
               (bool)((ch2_csctrl_snapshot & TMR_CSCTRL_TCF1EN) != 0U));
   payload.add("ch2_hw_comp1",
-              (uint32_t)snapshot.ch2_comp1);
+              (uint32_t)IMXRT_TMR1.CH[QTIMER1_TIMEPOP_CH].COMP1);
   payload.add("ch2_compare_armed",
-              (bool)snapshot.qtimer1_ch2_compare_armed);
+              (bool)g_qtimer1_ch2_compare_armed);
   payload.add("ch2_armed_target_counter32",
-              (uint32_t)snapshot.qtimer1_ch2_armed_target_counter32);
+              (uint32_t)g_qtimer1_ch2_armed_target_counter32);
   payload.add("ch2_armed_target_low16",
-              (uint32_t)snapshot.qtimer1_ch2_armed_target_low16);
+              (uint32_t)g_qtimer1_ch2_armed_target_low16);
   payload.add("ch2_last_requested_target_counter32",
-              (uint32_t)snapshot.qtimer1_ch2_last_requested_target_counter32);
+              (uint32_t)g_qtimer1_ch2_last_requested_target_counter32);
   payload.add("ch2_request_count",
-              (uint32_t)snapshot.qtimer1_ch2_request_count);
+              (uint32_t)g_qtimer1_ch2_request_count);
   payload.add("ch2_physical_arm_count",
-              (uint32_t)snapshot.qtimer1_ch2_physical_arm_count);
+              (uint32_t)g_qtimer1_ch2_physical_arm_count);
   payload.add("ch2_physical_reprogram_count",
-              (uint32_t)snapshot.qtimer1_ch2_physical_reprogram_count);
+              (uint32_t)g_qtimer1_ch2_physical_reprogram_count);
   payload.add("ch2_fact_outstanding",
-              (bool)snapshot.qtimer1_ch2_fact_outstanding);
+              (bool)g_qtimer1_ch2_fact_outstanding);
   payload.add("ch2_deferred_arm_valid",
-              (bool)snapshot.qtimer1_ch2_deferred_arm_valid);
+              (bool)g_qtimer1_ch2_deferred_arm_valid);
   payload.add("ch2_deferred_arm_target_counter32",
-              (uint32_t)snapshot.qtimer1_ch2_deferred_arm_target_counter32);
+              (uint32_t)g_qtimer1_ch2_deferred_arm_target_counter32);
   payload.add("ch2_deferred_arm_count",
-              (uint32_t)snapshot.qtimer1_ch2_deferred_arm_count);
+              (uint32_t)g_qtimer1_ch2_deferred_arm_count);
   payload.add("ch2_deferred_arm_replace_count",
-              (uint32_t)snapshot.qtimer1_ch2_deferred_arm_replace_count);
+              (uint32_t)g_qtimer1_ch2_deferred_arm_replace_count);
   payload.add("ch2_release_arm_count",
-              (uint32_t)snapshot.qtimer1_ch2_release_arm_count);
+              (uint32_t)g_qtimer1_ch2_release_arm_count);
   payload.add("ch2_release_without_arm_count",
-              (uint32_t)snapshot.qtimer1_ch2_release_without_arm_count);
+              (uint32_t)g_qtimer1_ch2_release_without_arm_count);
   payload.add("ch2_valid_capture_count",
-              (uint32_t)snapshot.qtimer1_ch2_valid_capture_count);
+              (uint32_t)g_qtimer1_ch2_valid_capture_count);
   payload.add("ch2_rejected_flag_count",
-              (uint32_t)snapshot.qtimer1_ch2_rejected_flag_count);
+              (uint32_t)g_qtimer1_ch2_rejected_flag_count);
   payload.add("ch2_flag_while_disabled_count",
-              (uint32_t)snapshot.qtimer1_ch2_flag_while_disabled_count);
+              (uint32_t)g_qtimer1_ch2_flag_while_disabled_count);
   payload.add("ch2_flag_while_unarmed_count",
-              (uint32_t)snapshot.qtimer1_ch2_flag_while_unarmed_count);
+              (uint32_t)g_qtimer1_ch2_flag_while_unarmed_count);
   payload.add("ch2_flag_while_outstanding_count",
-              (uint32_t)snapshot.qtimer1_ch2_flag_while_outstanding_count);
+              (uint32_t)g_qtimer1_ch2_flag_while_outstanding_count);
   payload.add("ch2_target_mismatch_count",
-              (uint32_t)snapshot.qtimer1_ch2_target_mismatch_count);
+              (uint32_t)g_qtimer1_ch2_target_mismatch_count);
   payload.add("ch2_unexpected_capture_count",
-              (uint32_t)snapshot.qtimer1_ch2_unexpected_capture_count);
-  add_handoff_source(payload, "vclock", snapshot.handoff_vclock);
-  add_handoff_source(payload, "ch2", snapshot.handoff_ch2);
-  add_handoff_source(payload, "ocxo1", snapshot.handoff_ocxo1);
-  add_handoff_source(payload, "ocxo2", snapshot.handoff_ocxo2);
-  add_handoff_source(payload, "pps", snapshot.handoff_pps);
+              (uint32_t)g_qtimer1_ch2_unexpected_capture_count);
+  add_handoff_source(payload, "vclock", g_handoff_vclock);
+  add_handoff_source(payload, "ch2", g_handoff_ch2);
+  add_handoff_source(payload, "ocxo1", g_handoff_ocxo1);
+  add_handoff_source(payload, "ocxo2", g_handoff_ocxo2);
+  add_handoff_source(payload, "pps", g_handoff_pps);
   return payload;
 }
 

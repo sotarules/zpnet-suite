@@ -1038,9 +1038,6 @@ static void timepop_idle_witness_spin_until_pending(void);
 // ============================================================================
 
 static bool timepop_should_queue_dispatch_mutation(void) {
-  // Both queued and immediate scheduling mutations belong to foreground.
-  // BASEPRI critical sections do not exclude Priority-0 interrupt callers.
-  if (timepop_current_ipsr() != 0U) __builtin_trap();
   return dispatch_depth != 0 && !dispatch_applying_mutations;
 }
 
@@ -3427,7 +3424,6 @@ static timepop_handle_t arm_deferred(deferred_slot_t* slots_buf,
                                      timepop_callback_t callback,
                                      void* user_data,
                                      const char* name) {
-  if (timepop_current_ipsr() != 0U) __builtin_trap();
   if (!callback) return TIMEPOP_INVALID_HANDLE;
 
   char owned_name[MAX_TIMEPOP_NAME + 1] = {};
@@ -3442,9 +3438,10 @@ static timepop_handle_t arm_deferred(deferred_slot_t* slots_buf,
 
   const uint32_t saved = critical_enter();
 
-  // Deferred callbacks are foreground-owned mailboxes, not timed slots.
-  // Named replacement stays within the deferred lanes and never calls
-  // schedule_next().
+  // Deferred callbacks are intentionally not timed slots.  Arming ASAP/ALAP
+  // from ISR context must not mutate the timed slot table and must not call
+  // schedule_next().  Named replacement is therefore restricted to the
+  // dedicated deferred lanes.
   if (owned_name_ptr && other_slots_buf && other_max_slots > 0) {
     const uint32_t cancelled =
         deferred_cancel_pending_by_name_unlocked(other_slots_buf,
@@ -5045,7 +5042,6 @@ void timepop_dispatch(void) {
 // cancelled because their old-epoch target cannot be interpreted safely.
 
 void timepop_epoch_changed(uint32_t epoch_sequence) {
-  if (timepop_current_ipsr() != 0U) __builtin_trap();
   const uint32_t saved = critical_enter();
 
   const time_anchor_snapshot_t epoch_anchor =
