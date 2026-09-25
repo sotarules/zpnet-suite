@@ -1107,7 +1107,7 @@ def status_header() -> str:
         net = s.get("network", {}).get("network_status", "?")
         pi_health = s.get("pi", {}).get("health_state", "?")
         temp_c = s.get("environment", {}).get("temperature_c")
-        temperature = "?" if temp_c is None else f"{temp_c:.1f}°C"
+        temperature = "?" if temp_c is None else f"{temp_c:.4f}°C"
         features = s.get("features") if isinstance(s.get("features"), dict) else {}
         teensy_health = _feature_subtree_health(features, "TEENSY")
         try:
