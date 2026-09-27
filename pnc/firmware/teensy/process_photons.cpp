@@ -3240,7 +3240,7 @@ static void photons_cadence_start(void) {
   g_photons_cadence_launches_since_start = 0ULL;
   photons_laser_mod_idle();
   g_photons_race_foreground.active = g_photons_recovery.publication_started;
-  // The first launch is due one interval after START. Subsequent origins are
+  // The first launch is due one interval after ENABLE. Subsequent origins are
   // captured by photons_race_launch_200ns(), never the scheduled service time.
   g_photons_cadence_last_dwt = ARM_DWT_CYCCNT;
   g_photons_cadence_running = true;
@@ -3386,6 +3386,7 @@ static photons_interrupt_ancestry_t g_interrupt_ancestry{};
 static bool g_initialized = false;
 static bool g_subscription_ok = false;
 static bool g_interrupt_started = false;
+static bool g_photons_enabled = false;
 
 static timepop_handle_t g_fragment_timer = TIMEPOP_INVALID_HANDLE;
 
@@ -3571,6 +3572,9 @@ static void photons_on_photodiode_edge(
   uint32_t ipsr = 0U;
   __asm__ volatile ("mrs %0, ipsr" : "=r" (ipsr) :: "memory");
   if (ipsr != 0U) __builtin_trap();
+  // A packet captured before DISABLE may still be waiting in process_interrupt's
+  // foreground queue. The subsystem boundary wins over that stale residue.
+  if (!g_photons_enabled) return;
   // Serialized foreground service, including synchronous boundary drains inside
   // an existing PHOTONS transaction. Never acquire a second foreground owner.
   photons_race_observe_edge(edge);
@@ -4947,6 +4951,10 @@ static FLASHMEM void photons_fragment_tick(
     timepop_diag_t* /*diag*/,
     void* /*user_data*/) {
 
+  // ENABLE/DISABLE is the subsystem boundary. A stale selected callback must
+  // never resurrect publication after DISABLE.
+  if (!g_photons_enabled) return;
+
   // Recovery establishes statistical ancestry before publication begins.
   if (!g_photons_recovery.publication_started) return;
 
@@ -5396,7 +5404,8 @@ static void photons_recovery_clear_physical_ancestry(void) {
 
 
 static void photons_start_fragment_publisher(void) {
-  if (g_photons_recovery.publication_started ||
+  if (!g_photons_enabled ||
+      g_photons_recovery.publication_started ||
       g_fragment_timer != TIMEPOP_INVALID_HANDLE ||
       !g_photons_ppb_previous_endpoint_valid ||
       !g_interrupt_started ||
@@ -5530,22 +5539,17 @@ FLASHMEM void process_photons_init(void) {
   subscription.user_data = nullptr;
 
   g_subscription_ok = interrupt_photodiode_subscribe(subscription);
-  // Step 2 separates callback identity from hardware activation. The physical
-  // PHOTODIODE lane remains inactive until a later commissioning step explicitly
-  // starts it; ordinary ZPNet operation therefore cannot enter PHOTONS ISR work.
+  // Binding the callback is safe at boot, but ENABLE is the only authority that
+  // may activate the PHOTODIODE lane or optical cadence.
   g_interrupt_started = false;
+  g_photons_enabled = false;
 
-  // Prime the PHOTONS-owned projection cache before the race engine begins. TIME
-  // may still be initializing; invalidity is preserved and early cadence cells
-  // are skipped rather than projected through an invented ruler.
-  photons_projection_anchor_refresh();
-
-  // Laser cadence starts at initialization, independently of the recovery
-  // verdict. Recovery later enables measurement and the 1 Hz fragment heartbeat.
+  // Register the dormant cadence service so ENABLE needs no new scheduler
+  // topology. cadence_ready() remains false while cadence_running is false.
   timepop_register_foreground_service(
       photons_cadence_ready, photons_cadence_service, nullptr);
   g_initialized = true;
-  photons_cadence_start();
+  photons_laser_mod_idle();
 }
 
 // ============================================================================
@@ -5769,6 +5773,7 @@ static Payload photons_recovery_reject(const char* status,
   Payload p;
   p.add("status", status ? status : "recovery_rejected");
   p.add("error", error ? error : "recovery command rejected");
+  p.add("enabled", g_photons_enabled);
   p.add("publication_started", g_photons_recovery.publication_started);
   p.add("staging_active", g_photons_recovery_protocol.active);
   p.add("generation", g_photons_recovery.generation);
@@ -5776,9 +5781,22 @@ static Payload photons_recovery_reject(const char* status,
 }
 
 
+static Payload photons_disabled_reject(const char* command) {
+  Payload p;
+  p.add("status", "subsystem_disabled");
+  p.add("error", "PHOTONS is DISABLED; issue ENABLE first");
+  p.add("command", command ? command : "");
+  p.add("enabled", false);
+  p.add("publication_started", false);
+  p.add("race_engine_active", false);
+  return p;
+}
+
+
 static FLASHMEM Payload cmd_recovery_begin(const Payload& args) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
+  if (!g_photons_enabled) return photons_disabled_reject("RECOVERY_BEGIN");
   if (g_photons_recovery.publication_started) {
     return photons_recovery_reject(
         "recovery_begin_rejected_live",
@@ -6061,6 +6079,7 @@ static void photons_recovery_install_science_state(
 static FLASHMEM Payload cmd_recovery_commit(const Payload& args) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
+  if (!g_photons_enabled) return photons_disabled_reject("RECOVERY_COMMIT");
   photons_recovery_protocol_t& protocol = g_photons_recovery_protocol;
   if (!protocol.active || g_photons_recovery.publication_started) {
     return photons_recovery_reject(
@@ -6329,6 +6348,7 @@ static FLASHMEM Payload cmd_recovery_commit(const Payload& args) {
 static FLASHMEM Payload cmd_recovery_cold_start(const Payload& args) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
+  if (!g_photons_enabled) return photons_disabled_reject("RECOVERY_COLD_START");
   if (g_photons_recovery.publication_started ||
       g_photons_recovery_protocol.active) {
     return photons_recovery_reject(
@@ -6390,6 +6410,7 @@ static FLASHMEM Payload cmd_recovery_cold_start(const Payload& args) {
 static FLASHMEM Payload cmd_recovery_proof_ack(const Payload& args) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
+  if (!g_photons_enabled) return photons_disabled_reject("RECOVERY_PROOF_ACK");
   uint32_t generation = 0U;
   uint32_t sequence = 0U;
   uint32_t update_count = 0U;
@@ -6453,6 +6474,7 @@ static FLASHMEM Payload cmd_report_recovery(const Payload& /*args*/) {
   p.add("report", "PHOTONS_RECOVERY");
   p.add("schema", "PHOTONS_RECOVERY_REPORT_V1");
   p.add("restore_schema_version", PHOTONS_RECOVERY_SCHEMA_VERSION);
+  p.add("enabled", g_photons_enabled);
   p.add("publication_started", g_photons_recovery.publication_started);
   p.add("staging_active", g_photons_recovery_protocol.active);
   p.add("staging_generation", g_photons_recovery_protocol.generation);
@@ -6516,6 +6538,7 @@ static FLASHMEM Payload cmd_report_recovery(const Payload& /*args*/) {
 
 
 static FLASHMEM Payload photons_flash_cut_command_body(const Payload& args) {
+  if (!g_photons_enabled) return photons_disabled_reject("FLASH_CUT");
   if (!g_photons_recovery.publication_started ||
       g_photons_recovery.proof_pending) {
     return photons_recovery_reject(
@@ -6564,7 +6587,8 @@ static FLASHMEM Payload photons_flash_cut_command_body(const Payload& args) {
   p.add("campaign", g_photons_flash_cut_campaign_name);
   p.add("boundary_contract",
         "NEXT_SUCCESSFULLY_PUBLISHED_OLD_CAMPAIGN_FRAGMENT_IS_FINAL_AND_NEW_PRIVATE_ORIGIN");
-  p.add("instrument_always_on", true);
+  p.add("instrument_always_on", false);
+  p.add("enabled", true);
   p.add("statistics_preserved", true);
   return p;
 }
@@ -6580,6 +6604,7 @@ static FLASHMEM Payload cmd_flash_cut(const Payload& args) {
 static FLASHMEM Payload cmd_start(const Payload& args) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
+  if (!g_photons_enabled) return photons_disabled_reject("START");
   if (!g_photons_recovery.publication_started ||
       g_photons_recovery.proof_pending) {
     return photons_recovery_reject(
@@ -6625,6 +6650,7 @@ static FLASHMEM Payload cmd_start(const Payload& args) {
 static FLASHMEM Payload cmd_stop(const Payload& /*args*/) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
+  if (!g_photons_enabled) return photons_disabled_reject("STOP");
   if (!g_photons_recovery.publication_started ||
       g_photons_recovery.proof_pending) {
     return photons_recovery_reject(
@@ -6687,6 +6713,26 @@ static void photons_payload_add_flat_lap_bucket(
 static FLASHMEM Payload cmd_report_photons(const Payload& /*args*/) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
+
+  // DISABLED has no canonical completed fragment by definition. Keep the
+  // detailed command read-only and bounded instead of reaching into stale
+  // fragment state.
+  if (!g_photons_enabled) {
+    Payload p;
+    p.add("report", "PHOTONS_INSTRUMENT");
+    p.add("schema", "PHOTONS_INSTRUMENT_REPORT_V1");
+    p.add("lap_semantics", "MEAN_LAP_NS_V1");
+    p.add("instrument_always_on", false);
+    p.add("instrument_owner", "TEENSY.PHOTONS");
+    p.add("enabled", false);
+    p.add("publication_started", false);
+    p.add("race_engine_active", false);
+    p.add("laser_cadence_running", false);
+    p.add("campaign_state", photons_campaign_state_name(g_photons_campaign_state));
+    if (g_photons_campaign_name[0]) p.add("campaign", g_photons_campaign_name);
+    return p;
+  }
+
   // Both the canonical publisher and command dispatcher are foreground-owned;
   // use the immutable last-completed value directly instead of placing another
   // ~1.7 KiB copy on MSP.
@@ -6698,8 +6744,9 @@ static FLASHMEM Payload cmd_report_photons(const Payload& /*args*/) {
   p.add("report", "PHOTONS_INSTRUMENT");
   p.add("schema", "PHOTONS_INSTRUMENT_REPORT_V1");
   p.add("lap_semantics", "MEAN_LAP_NS_V1");
-  p.add("instrument_always_on", true);
+  p.add("instrument_always_on", false);
   p.add("instrument_owner", "TEENSY.PHOTONS");
+  p.add("enabled", true);
   p.add("publication_started", g_photons_recovery.publication_started);
   p.add("recovery_restored", g_photons_recovery.restored);
   p.add("recovery_proof_pending", g_photons_recovery.proof_pending);
@@ -6965,6 +7012,7 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
     photons_cadence_report(p);
     p.add("schema", "PHOTONS_BRINGUP_REPORT_V4");
     p.add("initialized", g_initialized);
+    p.add("enabled", g_photons_enabled);
     p.add("publication_started", false);
     p.add("interrupt_subscribed", interrupt_diag.subscribed);
     p.add("interrupt_active", interrupt_diag.active);
@@ -7002,6 +7050,7 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
   p.add("schema", "PHOTONS_REPORT_V3");
   p.add("lap_semantics", "MEAN_LAP_NS_V1");
   p.add("initialized", g_initialized);
+  p.add("enabled", g_photons_enabled);
   p.add("publication_started", g_photons_recovery.publication_started);
   p.add("recovery_restored", g_photons_recovery.restored);
   p.add("recovery_proof_pending", g_photons_recovery.proof_pending);
@@ -7164,6 +7213,7 @@ static FLASHMEM Payload cmd_detector_activate(const Payload& /*args*/) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
 
+  if (!g_photons_enabled) return photons_disabled_reject("DETECTOR_ACTIVATE");
   if (g_photons_recovery.publication_started ||
       g_photons_race_foreground.active) {
     Payload p;
@@ -7221,40 +7271,142 @@ static void photons_cadence_report(Payload& p) {
   p.add("laser_timing", "TIMEPOP_FOREGROUND_ACTUAL_DWT_AT_MOD_HIGH");
 }
 
-static FLASHMEM Payload cmd_photons_start(const Payload& args) {
-  const photons_foreground_custody_t custody(photons_foreground_owner_t::COMMAND);
+static FLASHMEM Payload cmd_enable(const Payload& args) {
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::COMMAND);
+
   uint64_t interval_ns = g_photons_cadence_ns;
   if ((args.has("interval") && !args.tryGetUInt64("interval", interval_ns)) ||
-      interval_ns < PHOTONS_CADENCE_MIN_NS || interval_ns > PHOTONS_CADENCE_MAX_NS) {
+      interval_ns < PHOTONS_CADENCE_MIN_NS ||
+      interval_ns > PHOTONS_CADENCE_MAX_NS) {
     Payload p;
-    p.add("status", "photons_start_rejected_interval");
+    p.add("status", "enable_rejected_interval");
     p.add("error", "interval must be integer nanoseconds in 10000..1000000000");
     return p;
   }
-  if (!g_initialized) __builtin_trap();
-  if (!g_photons_cadence_running ||
-      interval_ns != g_photons_cadence_ns) {
-    photons_cadence_stop();
-    g_pulse_armed_sequence = 0U;
-    photons_memory_barrier();
-    g_photons_cadence_ns = interval_ns;
-    photons_cadence_start();
+  if (!g_initialized || !g_subscription_ok) __builtin_trap();
+
+  if (g_photons_enabled) {
+    Payload p;
+    p.add("status", "already_enabled");
+    p.add("enabled", true);
+    photons_cadence_report(p);
+    p.add("interrupt_active", g_interrupt_started);
+    p.add("publication_started", g_photons_recovery.publication_started);
+    p.add("race_engine_active", g_photons_race_foreground.active);
+    return p;
   }
+
+  if (g_photons_recovery.publication_started ||
+      g_fragment_timer != TIMEPOP_INVALID_HANDLE ||
+      g_photons_race_foreground.active) {
+    __builtin_trap();
+  }
+
+  photons_laser_mod_idle();
+  g_pulse_armed_sequence = 0U;
+  photons_memory_barrier();
+  g_photons_cadence_ns = interval_ns;
+
+  if (!interrupt_start(interrupt_subscriber_kind_t::PHOTODIODE)) {
+    __builtin_trap();
+  }
+  interrupt_photodiode_diag_t interrupt_diag{};
+  if (!interrupt_photodiode_snapshot(&interrupt_diag) ||
+      !interrupt_diag.subscribed || !interrupt_diag.active) {
+    __builtin_trap();
+  }
+  g_interrupt_started = true;
+
+  // ENABLE admits physical acquisition. The Pi recovery court remains the sole
+  // authority that may start the 1 Hz publisher and statistical lineage.
+  g_photons_enabled = true;
+  photons_memory_barrier();
+  photons_projection_anchor_refresh();
+  photons_cadence_start();
+
   Payload p;
-  p.add("status", "photons_started");
+  p.add("status", "enabled");
+  p.add("enabled", true);
   photons_cadence_report(p);
+  p.add("interrupt_active", true);
+  p.add("publication_started", false);
+  p.add("race_engine_active", false);
+  p.add("recovery_required", true);
   return p;
 }
 
-static FLASHMEM Payload cmd_photons_stop(const Payload&) {
-  const photons_foreground_custody_t custody(photons_foreground_owner_t::COMMAND);
+
+static FLASHMEM Payload cmd_disable(const Payload&) {
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::COMMAND);
+
+  if (g_photons_campaign_state == photons_campaign_state_t::START_PENDING ||
+      g_photons_campaign_state == photons_campaign_state_t::STOP_PENDING ||
+      g_photons_campaign_state == photons_campaign_state_t::FLASH_CUT_PENDING) {
+    Payload p;
+    p.add("status", "disable_rejected_campaign_boundary_pending");
+    p.add("enabled", g_photons_enabled);
+    p.add("campaign_state", photons_campaign_state_name(g_photons_campaign_state));
+    p.add("error", "wait for the pending campaign boundary before DISABLE");
+    return p;
+  }
+
+  const bool was_enabled = g_photons_enabled;
+  const bool was_publication_started = g_photons_recovery.publication_started;
+  const bool was_race_engine_active = g_photons_race_foreground.active;
+  const bool was_interrupt_active = g_interrupt_started;
+
+  // Publish the system-level denial first. Any stale foreground callback that
+  // survives cancellation becomes a no-op at its entry gate.
+  g_photons_enabled = false;
+  photons_memory_barrier();
+
   photons_cadence_stop();
-  // Stop also cancels commissioning WAVE and leaves the modulation line LOW.
   photons_laser_mod_idle();
+
+  if (g_fragment_timer != TIMEPOP_INVALID_HANDLE) {
+    if (!timepop_cancel(g_fragment_timer)) __builtin_trap();
+    g_fragment_timer = TIMEPOP_INVALID_HANDLE;
+  }
+
+  g_photons_recovery.publication_started = false;
+  g_photons_recovery.proof_pending = false;
+  g_photons_recovery.proof_advanced_published = false;
+  photons_recovery_protocol_clear(false);
+
+  g_interrupt_ancestry = photons_interrupt_ancestry_t{};
+  if (g_interrupt_started) {
+    if (!interrupt_stop(interrupt_subscriber_kind_t::PHOTODIODE)) {
+      __builtin_trap();
+    }
+    g_interrupt_started = false;
+  }
+
+  g_pulse_armed_sequence = 0U;
+  photons_memory_barrier();
+  if (digitalRead(LASER_MOD_PIN) != LOW ||
+      g_photons_cadence_running ||
+      g_photons_race_foreground.active ||
+      g_photons_recovery.publication_started ||
+      g_fragment_timer != TIMEPOP_INVALID_HANDLE ||
+      g_interrupt_started) {
+    __builtin_trap();
+  }
+
   Payload p;
-  p.add("status", "photons_stopped");
-  photons_cadence_report(p);
-  p.add("laser_mod_level", (uint32_t)digitalRead(LASER_MOD_PIN));
+  p.add("status", was_enabled ? "disabled" : "already_disabled");
+  p.add("enabled", false);
+  p.add("was_publication_started", was_publication_started);
+  p.add("was_race_engine_active", was_race_engine_active);
+  p.add("was_interrupt_active", was_interrupt_active);
+  p.add("publication_started", false);
+  p.add("race_engine_active", false);
+  p.add("interrupt_active", false);
+  p.add("laser_mod_level", LOW);
+  p.add("statistics_preserved", true);
+  p.add("campaign_state_preserved", true);
+  p.add("campaign_state", photons_campaign_state_name(g_photons_campaign_state));
   return p;
 }
 
@@ -7274,6 +7426,7 @@ static FLASHMEM Payload cmd_wave_on(const Payload& args) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
 
+  if (!g_photons_enabled) return photons_disabled_reject("WAVEON");
   if (g_photons_cadence_running) {
     Payload p;
     p.add("status", "wave_on_rejected_race_engine_active");
@@ -7335,7 +7488,7 @@ static FLASHMEM Payload cmd_wave_off(const Payload& /*args*/) {
   if (g_photons_cadence_running) {
     Payload p;
     p.add("status", "wave_off_rejected_cadence_running");
-    p.add("error", "Use PHOTONS_STOP to stop laser cadence");
+    p.add("error", "Use DISABLE to defeat PHOTONS cadence");
     return p;
   }
 
@@ -7358,6 +7511,7 @@ static FLASHMEM Payload cmd_pulse(const Payload& args) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
 
+  if (!g_photons_enabled) return photons_disabled_reject("PULSE");
   if (g_photons_cadence_running) {
     Payload p;
     p.add("status", "pulse_rejected_race_engine_active");
@@ -7494,6 +7648,7 @@ static FLASHMEM Payload cmd_pulse(const Payload& args) {
 static FLASHMEM Payload cmd_on(const Payload& /*args*/) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
+  if (!g_photons_enabled) return photons_disabled_reject("ON");
   if (g_photons_cadence_running) {
     Payload p;
     p.add("status", "on_rejected_race_engine_active");
@@ -7560,9 +7715,9 @@ static const process_command_entry_t PHOTONS_COMMANDS[] = {
   { "REPORT_CORE",         cmd_report_core         },
   { "INIT",                cmd_init                },
   { "DETECTOR_ACTIVATE",   cmd_detector_activate   },
+  { "ENABLE",              cmd_enable              },
+  { "DISABLE",             cmd_disable             },
   { "START",               cmd_start               },
-  { "PHOTONS_START",       cmd_photons_start       },
-  { "PHOTONS_STOP",        cmd_photons_stop        },
   { "FLASH_CUT",           cmd_flash_cut           },
   { "STOP",                cmd_stop                },
   { "REPORT",              cmd_report              },

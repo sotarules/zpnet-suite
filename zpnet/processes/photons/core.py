@@ -193,6 +193,9 @@ SYSTEM_CONTEXT_FIELDS = (
 _state_lock = threading.Lock()
 _campaign_lock = threading.Lock()
 _recovery_lock = threading.RLock()
+_subsystem_lifecycle_lock = threading.RLock()
+_subsystem_lifecycle_known = threading.Event()
+_subsystem_enabled = threading.Event()
 # Serialize worker publication/persistence with destructive maintenance commands.
 # PHOTONS is only 1 Hz, so this intentionally favors an exact maintenance boundary
 # over parallelism that could let a pre-CLEAR campaign row reappear afterward.
@@ -244,6 +247,7 @@ _fragments_processed = 0
 _photons_published = 0
 _rows_persisted = 0
 _fragments_rejected = 0
+_disabled_ingress_dropped = 0
 _ingress_queue_depth_max = 0
 _persist_queue_depth_max = 0
 _system_report_retry_count = 0
@@ -325,6 +329,7 @@ _ppb_checkpoint_reacquire_last_failure: Optional[Dict[str, Any]] = None
 
 OPERATIONAL_STATE_SCHEMA = "PI_SUBSYSTEM_OPERATIONAL_STATE_V1"
 OPERATIONAL_STATE_STARTING = "STARTING"
+OPERATIONAL_STATE_DISABLED = "DISABLED"
 OPERATIONAL_STATE_RECOVERING = "RECOVERING"
 OPERATIONAL_STATE_RUNNING = "RUNNING"
 OPERATIONAL_STATE_HARD_FAILURE = "HARD_FAILURE"
@@ -379,6 +384,13 @@ def _repair_active() -> bool:
     return _repair_event.is_set()
 
 
+def _subsystem_lifecycle_surface() -> Dict[str, Any]:
+    return {
+        "known": _subsystem_lifecycle_known.is_set(),
+        "enabled": _subsystem_enabled.is_set(),
+    }
+
+
 def _set_operational_state(
     state: str,
     *,
@@ -392,6 +404,7 @@ def _set_operational_state(
     normalized = str(state or "").strip().upper()
     if normalized not in {
         OPERATIONAL_STATE_STARTING,
+        OPERATIONAL_STATE_DISABLED,
         OPERATIONAL_STATE_RECOVERING,
         OPERATIONAL_STATE_RUNNING,
         OPERATIONAL_STATE_HARD_FAILURE,
@@ -569,6 +582,35 @@ def _welford_grand_ratio_diagnostic(
         "notable": abs(delta_ns) > PHOTONS_WELFORD_GRAND_RATIO_DIAGNOSTIC_NS,
         "recovery_authority_effect": "NONE_DIAGNOSTIC_ONLY",
     }
+
+
+def _request_teensy_subsystem_command(
+    command: str,
+    *,
+    accepted_statuses: set[str],
+    args: Optional[dict] = None,
+) -> Dict[str, Any]:
+    """Delegate ENABLE/DISABLE to the firmware and require its physical verdict."""
+    kwargs: Dict[str, Any] = {
+        "machine": "TEENSY",
+        "subsystem": SUBSYSTEM,
+        "command": command,
+    }
+    if args:
+        kwargs["args"] = copy.deepcopy(args)
+    response = send_command(**kwargs)
+    payload = response.get("payload") if isinstance(response, dict) else None
+    status = str(payload.get("status") or "") if isinstance(payload, dict) else ""
+    if (
+        not isinstance(response, dict)
+        or not response.get("success")
+        or not isinstance(payload, dict)
+        or status not in accepted_statuses
+    ):
+        raise RuntimeError(
+            f"Teensy PHOTONS.{command} rejected: status={status!r} response={response!r}"
+        )
+    return copy.deepcopy(payload)
 
 
 def _request_teensy_campaign_command(
@@ -4480,6 +4522,10 @@ def _fetch_teensy_recovery_report() -> Dict[str, Any]:
         "PHOTONS.REPORT_RECOVERY.restore_schema_version",
     ) != PHOTONS_RECOVERY_SCHEMA_VERSION:
         raise RuntimeError("Teensy PHOTONS recovery schema version mismatch")
+    _require_bool(
+        payload.get("enabled"),
+        "PHOTONS.REPORT_RECOVERY.enabled",
+    )
     publication_started = _require_bool(
         payload.get("publication_started"),
         "PHOTONS.REPORT_RECOVERY.publication_started",
@@ -5091,6 +5137,9 @@ def _ppb_checkpoint_reacquire_loop() -> None:
 
     while True:
         _ppb_checkpoint_reacquire_requested.wait()
+        if _subsystem_lifecycle_known.is_set() and not _subsystem_enabled.is_set():
+            _ppb_checkpoint_reacquire_requested.clear()
+            continue
 
         # Clear before beginning, not after success.  If another observation gap
         # occurs while this export is in flight, that newer request remains set
@@ -5112,7 +5161,13 @@ def _ppb_checkpoint_reacquire_loop() -> None:
             logging.exception(
                 "⚠️ [photons/ppb] live Better-Buckets reacquisition failed; retrying"
             )
-            if not _hard_failure_active():
+            if (
+                not _hard_failure_active()
+                and not (
+                    _subsystem_lifecycle_known.is_set()
+                    and not _subsystem_enabled.is_set()
+                )
+            ):
                 _ppb_checkpoint_reacquire_requested.set()
                 time.sleep(PHOTONS_STATE_RETRY_S)
             continue
@@ -5145,7 +5200,13 @@ def _ppb_checkpoint_reacquire_loop() -> None:
         repaired_update = int(result["update_count"])
         durable_checkpoint: Optional[Dict[str, Any]] = None
         superseded = False
-        while not _hard_failure_active():
+        while (
+            not _hard_failure_active()
+            and not (
+                _subsystem_lifecycle_known.is_set()
+                and not _subsystem_enabled.is_set()
+            )
+        ):
             if _ppb_checkpoint_reacquire_requested.is_set():
                 superseded = True
                 break
@@ -7340,6 +7401,15 @@ def on_photons_fragment(fragment: Payload) -> None:
     global _fragments_received
     global _fragments_queued
     global _hard_failure_ingress_dropped
+    global _disabled_ingress_dropped
+
+    # Before lifecycle classification, preserve a possibly surviving producer's
+    # prefix. Once DISABLED is authoritative, any fragment is stale testimony
+    # and must not provoke Pi recovery or persistence.
+    if _subsystem_lifecycle_known.is_set() and not _subsystem_enabled.is_set():
+        with _state_lock:
+            _disabled_ingress_dropped += 1
+        return
 
     if _hard_failure_active() and not _repair_active():
         with _state_lock:
@@ -7920,6 +7990,20 @@ def _runtime_teensy_generation_monitor_loop() -> None:
         if _hard_failure_active():
             time.sleep(PHOTONS_RUNTIME_RECOVERY_POLL_S)
             continue
+
+        # DISABLE is an operator-authored lifecycle boundary, not an outage.
+        # Keep the transport generation baseline current, but never launch
+        # ambient producer recovery while PHOTONS is deliberately defeated.
+        if _subsystem_lifecycle_known.is_set() and not _subsystem_enabled.is_set():
+            try:
+                observed = _runtime_teensy_rpc_generation()
+            except Exception:
+                observed = None
+            if observed is not None:
+                _runtime_recovery_generation = int(observed)
+            time.sleep(PHOTONS_RUNTIME_RECOVERY_POLL_S)
+            continue
+
         try:
             observed = _runtime_teensy_rpc_generation()
         except Exception:
@@ -8016,12 +8100,251 @@ def _campaign_control_gate(command: str) -> Optional[Dict[str, Any]]:
             "message": f"{command} unavailable while PHOTONS is latched in HARD_FAILURE",
             "payload": {"operational_state": _operational_state_snapshot()},
         }
+    if _subsystem_lifecycle_known.is_set() and not _subsystem_enabled.is_set():
+        return {
+            "success": False,
+            "message": f"{command} unavailable while PHOTONS is DISABLED",
+            "payload": {"subsystem": _subsystem_lifecycle_surface()},
+        }
     if _campaign_control_ready.is_set():
         return None
     return {
         "success": False,
         "message": f"{command} unavailable while LANTERN startup classification is in progress",
     }
+
+
+def cmd_enable(args: Optional[dict]) -> Dict[str, Any]:
+    """Admit PHOTONS physically, then complete the existing durable recovery court."""
+    with _subsystem_lifecycle_lock:
+        if _hard_failure_active():
+            return {
+                "success": False,
+                "message": "PHOTONS ENABLE refused while subsystem is latched in HARD_FAILURE",
+                "payload": {"operational_state": _operational_state_snapshot()},
+            }
+
+        _wait_for_startup_infrastructure()
+        try:
+            report = _fetch_teensy_recovery_report()
+        except Exception as exc:
+            return {"success": False, "message": f"PHOTONS ENABLE preflight failed: {exc}"}
+
+        if (
+            bool(report.get("enabled"))
+            and _subsystem_enabled.is_set()
+            and _operational_state_snapshot().get("state") == OPERATIONAL_STATE_RUNNING
+            and _campaign_control_ready.is_set()
+        ):
+            return {
+                "success": True,
+                "message": "PHOTONS is already ENABLED",
+                "payload": {
+                    "status": "already_enabled",
+                    "subsystem": _subsystem_lifecycle_surface(),
+                    "operational_state": _operational_state_snapshot(),
+                },
+            }
+
+        try:
+            firmware_enable = (
+                {"status": "already_enabled", **copy.deepcopy(report)}
+                if bool(report.get("enabled"))
+                else _request_teensy_subsystem_command(
+                    "ENABLE",
+                    accepted_statuses={"enabled", "already_enabled"},
+                    args=copy.deepcopy(args or {}),
+                )
+            )
+        except Exception as exc:
+            return {"success": False, "message": f"PHOTONS ENABLE failed: {exc}"}
+
+        _subsystem_lifecycle_known.set()
+        _subsystem_enabled.set()
+        _campaign_control_ready.clear()
+        _runtime_recovery_hold.set()
+        _ppb_checkpoint_reacquire_requested.clear()
+        _clear_recovery_proof_custody()
+        _set_operational_state(
+            OPERATIONAL_STATE_RECOVERING,
+            reason="operator_enable",
+            source="PHOTONS.ENABLE",
+            details={"firmware": copy.deepcopy(firmware_enable)},
+        )
+
+        try:
+            # A previous DISABLE may have interrupted Pi cleanup after firmware
+            # was already quiescent. Retire stale process-local rows before the
+            # recovery court can admit new producer testimony.
+            _enter_maintenance_queue_hold("ENABLE")
+            try:
+                _retire_fragment_queue_via_owner("ENABLE_CUTOVER")
+                _retire_persist_queue_via_owner("ENABLE_CUTOVER")
+            finally:
+                _leave_maintenance_queue_hold()
+
+            _runtime_recovery_hold.clear()
+            recovery, initial_generation = _startup_phase5_recovery_with_generation_retry()
+            if recovery.get("mode") == "COMMISSIONING_HOLD":
+                raise RuntimeError(
+                    "PHOTONS recovery remained in COMMISSIONING_HOLD after ENABLE"
+                )
+        except Exception as exc:
+            # Fail closed. ENABLE never leaves a half-admitted optical producer.
+            try:
+                _request_teensy_subsystem_command(
+                    "DISABLE", accepted_statuses={"disabled", "already_disabled"}
+                )
+            except Exception:
+                logging.exception(
+                    "⚠️ [photons] ENABLE rollback could not prove Teensy DISABLE"
+                )
+            _subsystem_enabled.clear()
+            _subsystem_lifecycle_known.set()
+            _campaign_control_ready.clear()
+            _runtime_recovery_hold.set()
+            _clear_recovery_proof_custody()
+            _recovery_status_set("DISABLED", reason="enable_failed", error=str(exc))
+            _set_operational_state(
+                OPERATIONAL_STATE_DISABLED,
+                reason="enable_failed_closed",
+                source="PHOTONS.ENABLE",
+                details={"error": str(exc)},
+            )
+            return {
+                "success": False,
+                "message": f"PHOTONS ENABLE failed closed: {exc}",
+                "payload": {
+                    "status": "disabled",
+                    "subsystem": _subsystem_lifecycle_surface(),
+                    "operational_state": _operational_state_snapshot(),
+                },
+            }
+
+        _campaign_control_ready.set()
+        _runtime_recovery_hold.clear()
+        _set_operational_state(
+            OPERATIONAL_STATE_RUNNING,
+            reason="operator_enable_complete",
+            source="PHOTONS.ENABLE",
+        )
+        _start_runtime_teensy_generation_monitor(initial_generation)
+        return {
+            "success": True,
+            "message": "PHOTONS ENABLED",
+            "payload": {
+                "status": "enabled",
+                "firmware": copy.deepcopy(firmware_enable),
+                "recovery": copy.deepcopy(recovery),
+                "subsystem": _subsystem_lifecycle_surface(),
+                "operational_state": _operational_state_snapshot(),
+            },
+        }
+
+
+def cmd_disable(_: Optional[dict]) -> Dict[str, Any]:
+    """Defeat PHOTONS without pretending the system-level boundary is campaign STOP."""
+    with _subsystem_lifecycle_lock:
+        if _repair_active():
+            return {
+                "success": False,
+                "message": "PHOTONS DISABLE refused while REPAIR owns producer recovery",
+            }
+        if not _hard_failure_active():
+            with _campaign_lock:
+                start_boundary_pending = (
+                    _active_campaign is not None
+                    and _active_campaign.get("start_after_sequence") is None
+                )
+                if start_boundary_pending or _closing_campaigns:
+                    return {
+                        "success": False,
+                        "message": (
+                            "PHOTONS DISABLE refused while a campaign boundary is pending; "
+                            "wait for the START/STOP/flash-cut boundary to settle"
+                        ),
+                    }
+
+        prior_hold = _runtime_recovery_hold.is_set()
+        prior_campaign_ready = _campaign_control_ready.is_set()
+        _campaign_control_ready.clear()
+        _runtime_recovery_hold.set()
+
+        _enter_maintenance_queue_hold("DISABLE")
+        try:
+            try:
+                firmware = _request_teensy_subsystem_command(
+                    "DISABLE", accepted_statuses={"disabled", "already_disabled"}
+                )
+            except Exception as exc:
+                if not prior_hold:
+                    _runtime_recovery_hold.clear()
+                if prior_campaign_ready:
+                    _campaign_control_ready.set()
+                return {"success": False, "message": f"PHOTONS DISABLE failed: {exc}"}
+
+            # Firmware acceptance is the subsystem cutover.  Publish that fact
+            # to the Pi before administrative queue cleanup so a cleanup error
+            # can never resurrect ambient recovery against a physically disabled
+            # producer.
+            _subsystem_enabled.clear()
+            _subsystem_lifecycle_known.set()
+            _campaign_control_ready.clear()
+            _runtime_recovery_hold.set()
+            _ppb_checkpoint_reacquire_requested.clear()
+            _clear_recovery_proof_custody()
+
+            ingress_retired = 0
+            persistence_retired = 0
+            retirement_error: Optional[str] = None
+            try:
+                ingress_retired = _retire_fragment_queue_via_owner("DISABLE")
+                persistence_retired = _retire_persist_queue_via_owner("DISABLE")
+            except Exception as exc:
+                retirement_error = str(exc)
+                logging.exception(
+                    "⚠️ [photons] DISABLE completed in firmware but Pi queue retirement failed"
+                )
+        finally:
+            _leave_maintenance_queue_hold()
+
+        _recovery_status_set(
+            "DISABLED",
+            reason="operator_disable",
+            fragment_ingress_retired=int(ingress_retired),
+            pending_persistence_retired=int(persistence_retired),
+            queue_retirement_error=retirement_error,
+        )
+        _set_operational_state(
+            OPERATIONAL_STATE_DISABLED,
+            reason="operator_disable",
+            source="PHOTONS.DISABLE",
+            details={
+                "firmware": copy.deepcopy(firmware),
+                "fragment_ingress_retired": int(ingress_retired),
+                "pending_persistence_retired": int(persistence_retired),
+                "queue_retirement_error": retirement_error,
+                "campaign_state_preserved": True,
+            },
+        )
+        return {
+            "success": True,
+            "message": (
+                "PHOTONS DISABLED"
+                if retirement_error is None
+                else "PHOTONS DISABLED; Pi queue cleanup reported a warning"
+            ),
+            "payload": {
+                "status": "disabled",
+                "firmware": copy.deepcopy(firmware),
+                "fragment_ingress_retired": int(ingress_retired),
+                "pending_persistence_retired": int(persistence_retired),
+                "queue_retirement_error": retirement_error,
+                "campaign_state_preserved": True,
+                "subsystem": _subsystem_lifecycle_surface(),
+                "operational_state": _operational_state_snapshot(),
+            },
+        }
 
 
 def cmd_start(args: Optional[dict]) -> dict:
@@ -9149,9 +9472,11 @@ def _pi_report_surface() -> Dict[str, Any]:
     with _state_lock:
         latest = copy.deepcopy(_latest_photons)
         state = {
+            "subsystem": _subsystem_lifecycle_surface(),
             "fragments_received": _fragments_received,
             "fragments_processed": _fragments_processed,
             "fragments_rejected": _fragments_rejected,
+            "disabled_ingress_dropped": _disabled_ingress_dropped,
             "photons_published": _photons_published,
             "rows_persisted": _rows_persisted,
             "ingress_queue_depth": _fragment_queue.qsize(),
@@ -9217,7 +9542,14 @@ def cmd_report_photons(_: Optional[dict]) -> Dict[str, Any]:
     global _report_photons_requests
     with _state_lock:
         _report_photons_requests += 1
-    return _combined_teensy_report("REPORT_PHOTONS", report_name="PHOTONS_SYSTEM_INSTRUMENT")
+    teensy_command = (
+        "REPORT"
+        if _subsystem_lifecycle_known.is_set() and not _subsystem_enabled.is_set()
+        else "REPORT_PHOTONS"
+    )
+    return _combined_teensy_report(
+        teensy_command, report_name="PHOTONS_SYSTEM_INSTRUMENT"
+    )
 
 
 def cmd_report_histogram(_: Optional[dict]) -> Dict[str, Any]:
@@ -9703,7 +10035,8 @@ def cmd_photons_info(_: Optional[dict]) -> Dict[str, Any]:
         payload = {
             "schema": "PHOTONS_INFO_V1",
             "operational_state": _operational_state_snapshot(),
-            "instrument_always_on": True,
+            "subsystem": _subsystem_lifecycle_surface(),
+            "instrument_always_on": False,
             "teensy_science_authority": True,
             "pi_campaign_lifecycle_authority": True,
             "state_worker_started": _state_worker_started.is_set(),
@@ -9715,6 +10048,7 @@ def cmd_photons_info(_: Optional[dict]) -> Dict[str, Any]:
             "fragments_received": _fragments_received,
             "fragments_processed": _fragments_processed,
             "fragments_rejected": _fragments_rejected,
+            "disabled_ingress_dropped": _disabled_ingress_dropped,
             "rows_persisted": _rows_persisted,
             "ingress_queue_depth": _fragment_queue.qsize(),
             "persist_queue_depth": _persist_queue.qsize(),
@@ -9762,10 +10096,12 @@ def cmd_report(_: Optional[dict]) -> dict:
         payload = {
             "schema": "PHOTONS_REPORT_V5",
             "operational_state": _operational_state_snapshot(),
+            "subsystem": _subsystem_lifecycle_surface(),
             "fragments_received": _fragments_received,
             "fragments_queued": _fragments_queued,
             "fragments_processed": _fragments_processed,
             "fragments_rejected": _fragments_rejected,
+            "disabled_ingress_dropped": _disabled_ingress_dropped,
             "photons_published": _photons_published,
             "rows_persisted": _rows_persisted,
             "ingress_queue_depth": _fragment_queue.qsize(),
@@ -10022,6 +10358,16 @@ def cmd_repair(_: Optional[dict]) -> Dict[str, Any]:
 
     state = _operational_state_snapshot()
     state_name = str(state.get("state") or "").strip().upper()
+    if _subsystem_lifecycle_known.is_set() and not _subsystem_enabled.is_set():
+        return {
+            "success": True,
+            "message": "PHOTONS is deliberately DISABLED; no repair attempted",
+            "payload": {
+                "action": "NO_ACTION_DISABLED",
+                "operational_state": state,
+                "subsystem": _subsystem_lifecycle_surface(),
+            },
+        }
     if (
         state_name == OPERATIONAL_STATE_RUNNING
         and _campaign_control_ready.is_set()
@@ -10109,6 +10455,8 @@ def cmd_repair(_: Optional[dict]) -> Dict[str, Any]:
 
 
 COMMANDS = {
+    "ENABLE": cmd_enable,
+    "DISABLE": cmd_disable,
     "START": cmd_start,
     "FLASH_CUT": cmd_flash_cut,
     "STOP": cmd_stop,
@@ -10171,7 +10519,7 @@ def _hard_failure_guard_command(
         if (
             _hard_failure_active()
             and command not in _HARD_FAILURE_READ_ONLY_COMMANDS
-            and command != "REPAIR"
+            and command not in {"REPAIR", "DISABLE"}
         ):
             return {
                 "success": False,
@@ -10534,6 +10882,8 @@ def run() -> None:
     _startup_live_adopt_custody_active.clear()
     _ppb_checkpoint_reacquire_requested.clear()
     _runtime_recovery_hold.clear()
+    _subsystem_lifecycle_known.clear()
+    _subsystem_enabled.clear()
 
     logging.info(
         "[photons] starting canonical PHOTONS_V1 with Phase-3 literal durable recovery, "
@@ -10557,7 +10907,51 @@ def run() -> None:
     # are forbidden until SYSTEM proves both application planes NOMINAL.
     _wait_for_startup_infrastructure()
 
-    # Configuration is necessary but no longer sufficient to begin publication.
+    # ENABLE/DISABLE is a system-level authority boundary. A normal Teensy boot
+    # initializes PHOTONS disabled; the Pi mirrors that state and must not
+    # reinterpret intentional silence as a failed producer that needs repair.
+    try:
+        lifecycle_report = _fetch_teensy_recovery_report()
+    except Exception as exc:
+        _enter_hard_failure(
+            "startup_lifecycle_preflight_failed",
+            {"error": str(exc)},
+            source="PHOTONS_LIFECYCLE",
+        )
+        logging.info(
+            "🏁 [photons] entering main loop operational_state=%s",
+            _operational_state_snapshot().get("state"),
+        )
+        while True:
+            time.sleep(3600)
+
+    _subsystem_lifecycle_known.set()
+    if not bool(lifecycle_report.get("enabled")):
+        _subsystem_enabled.clear()
+        _campaign_control_ready.clear()
+        _runtime_recovery_hold.set()
+        _recovery_status_set("DISABLED", reason="firmware_boot_default")
+        _set_operational_state(
+            OPERATIONAL_STATE_DISABLED,
+            reason="firmware_boot_default",
+            source="RUN",
+            details={"firmware": copy.deepcopy(lifecycle_report)},
+        )
+        logging.info(
+            "⏹️ [photons] firmware is DISABLED; suppressing startup recovery "
+            "until explicit PHOTONS.ENABLE"
+        )
+        logging.info(
+            "🏁 [photons] entering main loop operational_state=%s",
+            _operational_state_snapshot().get("state"),
+        )
+        while True:
+            time.sleep(3600)
+
+    _subsystem_enabled.set()
+
+    # An already-enabled Teensy (for example after a Pi-only service restart)
+    # retains the existing Phase-5 continuity court.
     # Firmware remains held until the Pi delivers one explicit recovery verdict:
     # aggregate restore (with complete rings or an exact literal suffix), live
     # reattachment, or scientifically empty cold start.

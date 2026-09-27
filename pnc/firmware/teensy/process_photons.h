@@ -66,7 +66,7 @@
 //     active-detector hits increment SPURIOUS (EARLY/DUPLICATE/LATE/UNARMED)
 //     before queueing; foreground retains
 //     science/delay classification. No optical processing executes at Priority 32;
-//   • the next cadence service or PHOTONS_STOP closes an unanswered shot as
+//   • the next cadence service or DISABLE closes an unanswered shot as
 //     missed. Attempts = completed + missed + pending, with at most one pending;
 //   • each launch pauses ONLY the detector IRQ, drains all captured edges against
 //     the old shot, and clears uncaptured pending GPIO state. After the new launch
@@ -77,20 +77,22 @@
 //     or cancellable one-shot appointment owns the next launch. Actual GPIO
 //     timing still includes foreground service and interrupt latency. No catch-up
 //     pulse burst. The legacy grid-deferral counter remains zero;
-//   • START/STOP retain campaign semantics. PHOTONS_START/PHOTONS_STOP control
-//     laser cadence independently; statistics and fragment publication continue.
+//   • START/STOP retain campaign semantics. ENABLE/DISABLE own the subsystem
+//     lifecycle: disabled means MOD LOW, no detector acquisition, no races,
+//     no statistical advancement and no PHOTONS_FRAGMENT publication.
 //
 // Commands:
 //   • INIT                — reinitialize PHOTONS-owned optical I/O and force the
 //                           active-high DRV200 MOD command LOW/idle
 //   • DETECTOR_ACTIVATE   — commissioning-only activation of the already-subscribed PD200T
-//                           interrupt lane; MOD remains LOW and no race/publisher starts
+//                           interrupt lane; requires the subsystem to be ENABLED
+//   • ENABLE [interval=N] — admit detector + laser cadence; Pi recovery then
+//                           establishes statistical ancestry and 1 Hz publication
+//   • DISABLE             — quiesce detector, laser, races and fragment publication;
+//                           preserve established campaign/statistical history
 //   • START               — start a LANTERN campaign, or hot-cut an active campaign to a new name
-//   • FLASH_CUT           — explicit hot campaign boundary preserving the always-on instrument epoch
+//   • FLASH_CUT           — explicit hot campaign boundary preserving the enabled instrument epoch
 //   • STOP                — request campaign closure; the next published campaign fragment is final
-//   • PHOTONS_START [interval=N] — run laser cadence; N is ns, 10000..1000000000.
-//                           Omitted interval preserves the current setting.
-//   • PHOTONS_STOP        — cancel cadence, close pending shot, force MOD LOW.
 //   • REPORT              — compact operational/device report including active-high MOD state,
 //                           laser monitor and pin-34 interrupt custody; no PD OUT ADC telemetry
 //   • WAVEON interval=N width=W — commissioning pulse train on LASER_MOD_PIN 35.
@@ -716,8 +718,9 @@ struct photons_fragment_snapshot_t {
   uint32_t interrupt_last_qtimer_pending_at_exit_mask = 0;
 };
 
-// Initialize PHOTONS state, subscribe to the detector, and start laser cadence.
-// Recovery independently starts measurement and the 1 Hz fragment heartbeat.
+// Initialize PHOTONS into its safe DISABLED state. The detector callback is bound
+// but inactive, laser modulation is LOW, cadence/races are stopped, and no
+// PHOTONS_FRAGMENT can be produced until the explicit ENABLE command.
 // Must run after process_interrupt_init() and timepop_init().
 void process_photons_init(void);
 
