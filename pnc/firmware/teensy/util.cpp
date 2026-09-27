@@ -5,6 +5,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdio.h>
+#include <errno.h>
 
 #if defined(ARDUINO_TEENSY41)
 #include <ADC.h>
@@ -239,6 +240,31 @@ float readVrefVolts() {
 #else
   return 0.0f;
 #endif
+}
+
+// --------------------------------------------------------------
+// Reserve Teensy CrashReport's retained RAM from heap growth
+// --------------------------------------------------------------
+extern "C" {
+
+extern char *__brkval;
+extern unsigned long _heap_end;
+
+void *_sbrk(int incr) {
+  char *prev = __brkval;
+  char *limit = reinterpret_cast<char *>(&_heap_end) - 128;
+
+  if (incr != 0) {
+    if (prev + incr > limit) {
+      errno = ENOMEM;
+      return reinterpret_cast<void *>(-1);
+    }
+    __brkval = prev + incr;
+  }
+
+  return prev;
+}
+
 }
 
 // --------------------------------------------------------------
