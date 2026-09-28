@@ -1,3 +1,4 @@
+#include "integer_only.h"
 // teensy.cpp — ZPNet Runtime
 //
 // Extended Cortex-M fault capture is installed before global constructors and
@@ -45,7 +46,7 @@
 //
 // THERMAL NOTE:
 //    1.008 GHz + heatsink = safe continuous operation.
-//    CPU temperature is monitored via SYSTEM.REPORT (tempmonGetTemp).
+//    CPU temperature is monitored via SYSTEM.REPORT (integer-only cpuTempC).
 //
 // DWT NS CONVERSION NOTE:
 //    At 600 MHz: 1 cycle = 5/3 ns (exact)

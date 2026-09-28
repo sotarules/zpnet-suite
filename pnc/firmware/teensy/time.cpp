@@ -1,3 +1,4 @@
+#include "integer_only.h"
 #include "time.h"
 #include "process_clocks.h"
 

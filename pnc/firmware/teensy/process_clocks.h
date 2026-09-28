@@ -1,5 +1,6 @@
 #pragma once
 
+#include "double.h"
 #include <stdint.h>
 #include <stddef.h>
 #include "process.h"
@@ -295,20 +296,20 @@ struct clocks_alpha_tau_snapshot_t {
   // intentionally not exposed.
   uint64_t cumulative_reference_ns = 0;
   uint64_t cumulative_clock_ns = 0;
-  double   cumulative_clock_ns_exact = 0.0;
-  double   mean_x = 0.0;
-  double   mean_y = 0.0;
-  double   sxx = 0.0;
-  double   sxy = 0.0;
-  double   syy = 0.0;
-  double   interval_m2_ppb = 0.0;
+  Double   cumulative_clock_ns_exact = 0_D;
+  Double   mean_x = 0_D;
+  Double   mean_y = 0_D;
+  Double   sxx = 0_D;
+  Double   sxy = 0_D;
+  Double   syy = 0_D;
+  Double   interval_m2_ppb = 0_D;
 
-  double   tau = 1.0;
-  double   ppb = 0.0;
-  double   stderr_ppb = 0.0;
-  double   interval_mean_ppb = 0.0;
-  double   interval_stddev_ppb = 0.0;
-  double   interval_stderr_ppb = 0.0;
+  Double   tau = 1_D;
+  Double   ppb = 0_D;
+  Double   stderr_ppb = 0_D;
+  Double   interval_mean_ppb = 0_D;
+  Double   interval_stddev_ppb = 0_D;
+  Double   interval_stderr_ppb = 0_D;
   int64_t  intercept_ns = 0;
 };
 #endif
@@ -353,12 +354,12 @@ static constexpr size_t CLOCKS_FRAGMENT_STATE_NAME_MAX = 40U;
 
 struct clocks_fragment_welford_snapshot_t {
   uint64_t n = 0;
-  double mean = 0.0;
-  double m2 = 0.0;
-  double stddev = 0.0;
-  double stderr_value = 0.0;
-  double min = 0.0;
-  double max = 0.0;
+  Double mean = 0_D;
+  Double m2 = 0_D;
+  Double stddev = 0_D;
+  Double stderr_value = 0_D;
+  Double min = 0_D;
+  Double max = 0_D;
 };
 
 // Stable Alpha TAU sufficient state required for exact resurrection.  Transient
@@ -378,21 +379,21 @@ struct clocks_fragment_tau_recovery_snapshot_t {
 
   uint64_t cumulative_reference_ns = 0;
   uint64_t cumulative_clock_ns = 0;
-  double cumulative_clock_ns_exact = 0.0;
+  Double cumulative_clock_ns_exact = 0_D;
 
-  double mean_x = 0.0;
-  double mean_y = 0.0;
-  double sxx = 0.0;
-  double sxy = 0.0;
-  double syy = 0.0;
+  Double mean_x = 0_D;
+  Double mean_y = 0_D;
+  Double sxx = 0_D;
+  Double sxy = 0_D;
+  Double syy = 0_D;
 
-  double interval_mean_ppb = 0.0;
-  double interval_m2_ppb = 0.0;
+  Double interval_mean_ppb = 0_D;
+  Double interval_m2_ppb = 0_D;
 };
 
 struct clocks_fragment_ppb_value_snapshot_t {
   uint64_t sample_count = 0;
-  double ppb = 0.0;
+  Double ppb = 0_D;
 };
 
 // Instrument-owned PPB populations only. Campaign PPB is intentionally absent;
@@ -410,7 +411,7 @@ struct clocks_fragment_ppb_buckets_snapshot_t {
 // to maintain a larger synthetic recovery checkpoint but may not re-author them.
 struct clocks_fragment_ppb_endpoint_snapshot_t {
   uint64_t reference_ns = 0ULL;
-  double dwt_error_cycles = 0.0;
+  Double dwt_error_cycles = 0_D;
   int64_t ocxo1_error_ns = 0LL;
   int64_t ocxo2_error_ns = 0LL;
   uint32_t rolling_sequence = 0U;
@@ -448,8 +449,8 @@ struct clocks_fragment_ppb_checkpoint_delta_snapshot_t {
 struct clocks_fragment_stats_clock_snapshot_t {
   clocks_fragment_welford_snapshot_t welford{};
   bool frequency_present = false;
-  double tau = 1.0;
-  double ppb = 0.0;
+  Double tau = 1_D;
+  Double ppb = 0_D;
   clocks_fragment_ppb_buckets_snapshot_t ppb_buckets{};
 };
 
@@ -536,10 +537,10 @@ struct clocks_fragment_clock_candidate_t {
   uint32_t last_public_count = 0;
   uint32_t interval_count = 0;
   uint64_t ns = 0;
-  double fractional_ns = 0.0;
+  Double fractional_ns = 0_D;
   bool residual_available = false;
   int64_t residual_ns = 0;
-  double residual_ns_exact = 0.0;
+  Double residual_ns_exact = 0_D;
 };
 
 struct clocks_fragment_clock_candidates_snapshot_t {
@@ -549,7 +550,7 @@ struct clocks_fragment_clock_candidates_snapshot_t {
   bool comparable = false;
   int64_t delta_cycles_minus_phaseledger_ns = 0;
   bool residuals_comparable = false;
-  double delta_cycles_minus_phaseledger_residual_ns_exact = 0.0;
+  Double delta_cycles_minus_phaseledger_residual_ns_exact = 0_D;
 };
 
 struct clocks_fragment_science_snapshot_t {
@@ -559,7 +560,7 @@ struct clocks_fragment_science_snapshot_t {
   uint64_t gnss_interval_ns = 0;
   uint64_t clock_interval_ns = 0;
   int64_t fast_residual_ns = 0;
-  double fast_residual_ns_exact = 0.0;
+  Double fast_residual_ns_exact = 0_D;
   bool delta_raw_valid = false;
   uint32_t delta_raw_reference_interval_cycles = 0;
   uint32_t delta_raw_clock_interval_cycles = 0;

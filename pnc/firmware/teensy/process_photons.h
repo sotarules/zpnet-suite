@@ -1,5 +1,6 @@
 #pragma once
 
+#include "double.h"
 #include <stdint.h>
 
 // ============================================================================
@@ -221,12 +222,12 @@ struct photons_toy_fragment_t {
 // stddev/stderr are derived convenience values carried in each fragment.
 struct photons_fragment_welford_snapshot_t {
   uint64_t n = 0;
-  double mean = 0.0;
-  double m2 = 0.0;
-  double stddev = 0.0;
-  double stderr_value = 0.0;
-  double min = 0.0;
-  double max = 0.0;
+  Double mean = 0_D;
+  Double m2 = 0_D;
+  Double stddev = 0_D;
+  Double stderr_value = 0_D;
+  Double min = 0_D;
+  Double max = 0_D;
 };
 
 
@@ -254,13 +255,13 @@ struct photons_core_snapshot_t {
   uint32_t radius_cycles = 0U;
   uint32_t gate_low_cycles = 0U;
   uint32_t gate_high_cycles = 0U;
-  double input_mean_cycles = 0.0;
-  double input_sd_cycles = 0.0;
-  double retained_mean_cycles = 0.0;
-  double retained_sd_cycles = 0.0;
+  Double input_mean_cycles = 0_D;
+  Double input_sd_cycles = 0_D;
+  Double retained_mean_cycles = 0_D;
+  Double retained_sd_cycles = 0_D;
   uint32_t rejected_min_cycles = 0U;
   uint32_t rejected_max_cycles = 0U;
-  double rejected_mean_cycles = 0.0;
+  Double rejected_mean_cycles = 0_D;
 };
 
 // Alpha lower-envelope testimony for one autonomous accepted-race fragment.
@@ -275,10 +276,10 @@ struct photons_envelope_snapshot_t {
   uint32_t origin_cycles = 0;
   uint64_t underflow = 0;
   uint64_t overflow = 0;
-  double accepted_mean_cycles = 0.0;
-  double accepted_sd_cycles = 0.0;
-  double selected_mean_cycles = 0.0;
-  double selected_sd_cycles = 0.0;
+  Double accepted_mean_cycles = 0_D;
+  Double accepted_sd_cycles = 0_D;
+  Double selected_mean_cycles = 0_D;
+  Double selected_sd_cycles = 0_D;
   uint32_t selected_first_cycles = 0;
   uint32_t selected_last_cycles = 0;
   uint32_t selected_bins = 0;
@@ -303,13 +304,13 @@ struct photons_fragment_raw_cycles_snapshot_t {
 
   uint32_t laps_this_fragment = 0;
   uint64_t total_cycles_this_fragment = 0;
-  double mean_cycles_this_fragment = 0.0;
+  Double mean_cycles_this_fragment = 0_D;
   uint32_t min_cycles_this_fragment = 0;
   uint32_t max_cycles_this_fragment = 0;
 
   bool previous_fragment_mean_valid = false;
-  double previous_fragment_mean_cycles = 0.0;
-  double fragment_mean_residual_cycles = 0.0;
+  Double previous_fragment_mean_cycles = 0_D;
+  Double fragment_mean_residual_cycles = 0_D;
 };
 
 
@@ -438,7 +439,7 @@ struct photons_lap_science_snapshot_t {
 // the serializer omits that bucket rather than publishing a zero lap duration.
 struct photons_fragment_lap_value_snapshot_t {
   uint64_t sample_count = 0;
-  double mean_lap_ns = 0.0;
+  Double mean_lap_ns = 0_D;
 };
 
 
@@ -513,7 +514,7 @@ struct photons_fragment_stats_snapshot_t {
   uint64_t custody_lap_count = 0;
   uint64_t custody_total_lap_gnss_ns = 0;
 
-  double mean_lap_ns = 0.0;
+  Double mean_lap_ns = 0_D;
   photons_fragment_welford_snapshot_t lap_time_welford{};
   photons_fragment_lap_buckets_snapshot_t lap_buckets{};
 
@@ -543,7 +544,7 @@ struct photons_fragment_campaign_snapshot_t {
   uint32_t public_count = 0;
   uint64_t lap_count = 0;
   uint64_t total_lap_gnss_ns = 0;
-  double mean_lap_ns = 0.0;
+  Double mean_lap_ns = 0_D;
 };
 
 

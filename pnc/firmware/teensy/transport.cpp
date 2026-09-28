@@ -1,3 +1,4 @@
+#include "integer_only.h"
 // transport.cpp — ZPNet Transport (Teensy, USB CDC serial only)
 // ----------------------------------------------------------------
 //

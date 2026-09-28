@@ -1,5 +1,6 @@
 #pragma once
 
+#include "double.h"
 #include <Arduino.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -30,8 +31,7 @@ void debug_log(const char* name, int32_t value);
 void debug_log(const char* name, uint32_t value);
 void debug_log(const char* name, int64_t value);
 void debug_log(const char* name, uint64_t value);
-void debug_log(const char* name, float value);
-void debug_log(const char* name, double value);
+void debug_log(const char* name, Double value);
 void debug_log(const char* name, bool value);
 void debug_log(const char* name, const void* ptr);
 

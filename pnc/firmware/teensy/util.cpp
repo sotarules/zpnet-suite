@@ -1,3 +1,5 @@
+#include "integer_only.h"
+#include "double.h"
 #include "util.h"
 #include "debug.h"
 #include "payload.h"
@@ -10,162 +12,6 @@
 #if defined(ARDUINO_TEENSY41)
 #include <ADC.h>
 #endif
-
-// ============================================================================
-// Fixed-decimal publication boundary
-// ============================================================================
-
-static constexpr uint64_t FIXED_DECIMAL_MAX_WHOLE =
-    9000000000000000000ULL;
-
-fixed_decimal_t toFixedDecimal(double value, int decimal_places) {
-  fixed_decimal_t out;
-  out.whole = 0ULL;
-  out.fractional = 0ULL;
-  out.source_bits = 0ULL;
-  memcpy(&out.source_bits, &value, sizeof(value));
-  out.decimal_places = 0U;
-  out.negative = 0U;
-  out.status = fixed_decimal_status_t::VALID;
-
-  if (decimal_places < 0) decimal_places = 0;
-  if (decimal_places > (int)FIXED_DECIMAL_MAX_PLACES) {
-    decimal_places = (int)FIXED_DECIMAL_MAX_PLACES;
-  }
-  out.decimal_places = (uint8_t)decimal_places;
-
-  if (value != value) {
-    out.status = fixed_decimal_status_t::NAN_VALUE;
-    return out;
-  }
-  if (isinf(value)) {
-    out.status = signbit(value)
-        ? fixed_decimal_status_t::NEGATIVE_INFINITY
-        : fixed_decimal_status_t::POSITIVE_INFINITY;
-    return out;
-  }
-
-  const bool negative = value < 0.0;
-  const double magnitude = negative ? -value : value;
-  if (magnitude > (double)FIXED_DECIMAL_MAX_WHOLE) {
-    out.status = fixed_decimal_status_t::OUT_OF_RANGE;
-    return out;
-  }
-
-  uint64_t whole = (uint64_t)magnitude;
-  double fraction = magnitude - (double)whole;
-  if (fraction < 0.0) fraction = 0.0;
-  if (fraction >= 1.0) fraction = 0.9999999999999999;
-
-  // Every digit that will be read is written by the loop.  Deliberately avoid
-  // aggregate zero-initialization so this conversion helper cannot grow a
-  // compiler-generated memset of its own.
-  uint8_t fractional_digits[FIXED_DECIMAL_MAX_PLACES];
-  uint8_t guard_digit = 0U;
-
-  for (uint32_t i = 0U; i <= out.decimal_places; ++i) {
-    const double scaled = fraction * 10.0;
-    int digit = (int)scaled;
-    if (digit < 0) digit = 0;
-    if (digit > 9) digit = 9;
-
-    fraction = scaled - (double)digit;
-    if (fraction < 0.0) fraction = 0.0;
-    if (fraction > 1.0) fraction = 1.0;
-
-    if (i < out.decimal_places) {
-      fractional_digits[i] = (uint8_t)digit;
-    } else {
-      guard_digit = (uint8_t)digit;
-    }
-  }
-
-  if (guard_digit >= 5U) {
-    bool carry = true;
-    for (uint32_t i = out.decimal_places; i != 0U && carry; --i) {
-      uint8_t& digit = fractional_digits[i - 1U];
-      if (digit == 9U) {
-        digit = 0U;
-      } else {
-        ++digit;
-        carry = false;
-      }
-    }
-    if (carry) {
-      ++whole;
-    }
-  }
-
-  if (whole > FIXED_DECIMAL_MAX_WHOLE) {
-    out.status = fixed_decimal_status_t::OUT_OF_RANGE;
-    return out;
-  }
-
-  uint64_t fractional = 0ULL;
-  bool rounded_nonzero = whole != 0ULL;
-  for (uint32_t i = 0U; i < out.decimal_places; ++i) {
-    fractional = fractional * 10ULL + fractional_digits[i];
-    if (fractional_digits[i] != 0U) rounded_nonzero = true;
-  }
-
-  out.whole = whole;
-  out.fractional = fractional;
-  out.negative = (negative && rounded_nonzero) ? 1U : 0U;
-  return out;
-}
-
-// Scientific conversion belongs outside Payload: its ABI remains integer-only.
-// A binary64 needs 17 significant decimal digits to survive a text round trip.
-fixed_decimal_t toScientificDecimal(double value) {
-  static_assert(sizeof(double) == sizeof(uint64_t), "binary64 double required");
-  if (!isfinite(value)) __builtin_trap();
-
-  fixed_decimal_t out;
-  out.whole = 0ULL;
-  out.fractional = 0ULL;
-  out.source_bits = 0ULL;
-  memcpy(&out.source_bits, &value, sizeof(value));
-  out.decimal_places = 0U;
-  out.negative = value < 0.0 ? 1U : 0U;
-  out.status = fixed_decimal_status_t::VALID;
-  out.exponent10 = 0;
-  if (value == 0.0) return out;
-
-  // Bounded conversion of the magnitude: d.dddddddddddddddd e +/- ddd.
-  // No float formatting, parsing, or arithmetic enters Payload itself.
-  char text[32];
-  const double magnitude = value < 0.0 ? -value : value;
-  const int length = snprintf(text, sizeof(text), "%.16e", magnitude);
-  if (length < 22 || length >= (int)sizeof(text) ||
-      text[1] != '.' || text[18] != 'e' ||
-      (text[19] != '+' && text[19] != '-')) __builtin_trap();
-  if (text[0] < '1' || text[0] > '9') __builtin_trap();
-  out.whole = (uint64_t)(text[0] - '0');
-  for (int i = 2; i < 18; ++i) {
-    if (text[i] < '0' || text[i] > '9') __builtin_trap();
-    out.whole = out.whole * 10ULL + (uint64_t)(text[i] - '0');
-  }
-  int exponent = 0;
-  for (int i = 20; i < length; ++i) {
-    if (text[i] < '0' || text[i] > '9') __builtin_trap();
-    exponent = exponent * 10 + (text[i] - '0');
-  }
-  if (text[19] == '-') exponent = -exponent;
-  if (exponent < -324 || exponent > 308) __builtin_trap();
-  out.exponent10 = (int16_t)(exponent - 16);
-  return out;
-}
-
-const char* fixedDecimalStatusName(fixed_decimal_status_t status) {
-  switch (status) {
-    case fixed_decimal_status_t::VALID: return "VALID";
-    case fixed_decimal_status_t::NAN_VALUE: return "NAN";
-    case fixed_decimal_status_t::POSITIVE_INFINITY: return "POSITIVE_INFINITY";
-    case fixed_decimal_status_t::NEGATIVE_INFINITY: return "NEGATIVE_INFINITY";
-    case fixed_decimal_status_t::OUT_OF_RANGE: return "OUT_OF_RANGE";
-    default: return "UNKNOWN";
-  }
-}
 
 // --------------------------------------------------------------
 // Safe string copy
@@ -212,18 +58,27 @@ String jsonEscape(const char* s) {
 // --------------------------------------------------------------
 // CPU temperature
 // --------------------------------------------------------------
-float cpuTempC() {
+Double cpuTempC() {
 #if defined(ARDUINO_TEENSY41)
-  return tempmonGetTemp();
+  // Read the same OTP calibration and sensor code as the Teensy core, but
+  // perform the conversion here without entering its FP implementation.
+  const uint32_t calibration = HW_OCOTP_ANA1;
+  const int32_t hot_c = calibration & 0xffU;
+  const int32_t hot_count = (calibration >> 8) & 0xfffU;
+  const int32_t room_count = (calibration >> 20) & 0xfffU;
+  while (!(TEMPMON_TEMPSENSE0 & 4U)) {}
+  const int32_t measured = (TEMPMON_TEMPSENSE0 >> 8) & 0xfffU;
+  return Double(hot_c) - Double(measured - hot_count) *
+      Double(hot_c - 25) / Double(room_count - hot_count);
 #else
-  return 0.0f;
+  return 0_D;
 #endif
 }
 
 // --------------------------------------------------------------
 // Internal voltage reference
 // --------------------------------------------------------------
-float readVrefVolts() {
+Double readVrefVolts() {
 #if defined(ARDUINO_TEENSY41)
   static ADC* adc = new ADC();
 
@@ -231,14 +86,14 @@ float readVrefVolts() {
   adc->adc0->setResolution(12);
 
   uint16_t raw = adc->adc0->analogRead(ADC_INTERNAL_SOURCE::VREFSH);
-  if (raw == 0) return 0.0f;
+  if (raw == 0) return 0_D;
 
-  const float VREF_INTERNAL = 1.2f;
-  const float ADC_MAX = 4095.0f;
+  const Double VREF_INTERNAL = 1.2_D;
+  const Double ADC_MAX = 4095_D;
 
   return VREF_INTERNAL / (raw / ADC_MAX);
 #else
-  return 0.0f;
+  return 0_D;
 #endif
 }
 
@@ -252,7 +107,8 @@ extern unsigned long _heap_end;
 
 void *_sbrk(int incr) {
   char *prev = __brkval;
-  char *limit = reinterpret_cast<char *>(&_heap_end) - 128;
+  char *limit = reinterpret_cast<char *>(
+      reinterpret_cast<uintptr_t>(&_heap_end) - uintptr_t{128});
 
   if (incr != 0) {
     if (prev + incr > limit) {

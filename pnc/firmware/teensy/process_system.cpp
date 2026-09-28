@@ -1,3 +1,4 @@
+#include "integer_only.h"
 // =============================================================
 // FILE: process_system.cpp
 // =============================================================
@@ -70,7 +71,6 @@ enum class system_crash_test_type_t : uint8_t {
 };
 
 static bool system_crash_test_pending = false;
-static bool system_crash_test_touch_fp = false;
 static system_crash_test_type_t system_crash_test_type =
     system_crash_test_type_t::NONE;
 static uint32_t system_crash_test_deadline_dwt = 0U;
@@ -2139,6 +2139,20 @@ static FLASHMEM Payload system_payload_contract_incident_payload(
                          incident.before_fingerprint);
   system_crash_add_hex32(out, "after_fingerprint",
                          incident.after_fingerprint);
+  if (incident.reason == (uint32_t)payload_contract_reason_t::PACKED_LAYOUT &&
+      incident.related_ptr != 0U && incident.entry_index != 0xFFFFFFFFUL) {
+    // Failed inspection has no after-fingerprint. That slot retains the
+    // packing boundary instead; the four original slots retain entry geometry.
+    out.add("packed_evidence_encoding", "ENTRY_GEOMETRY_AND_UPPER_V1");
+    system_crash_add_hex32(out, "inspected_storage", incident.related_ptr);
+    out.add("packed_expected_upper", incident.after_fingerprint);
+    out.add("key_offset", incident.expected0);
+    out.add("key_length", incident.expected1);
+    out.add("value_offset", incident.observed0);
+    out.add("value_length", incident.observed1);
+    out.add("key_end_plus_terminator", incident.expected0 + incident.expected1 + 1U);
+    out.add("value_end_plus_terminator", incident.observed0 + incident.observed1 + 1U);
+  }
   system_crash_add_hex32(out, "dwt", incident.dwt_cyccnt);
   out.add("ipsr", incident.ipsr);
   return out;
@@ -2627,17 +2641,6 @@ static FLASHMEM void enter_bootloader_cb(timepop_ctx_t*, timepop_diag_t*, void*)
   system_enter_quiescence();
 }
 
-static __attribute__((noinline)) void system_crash_test_activate_fp(void) {
-  // Volatile arithmetic guarantees real floating-point work in this build.
-  // With automatic FP context preservation enabled, this deliberately makes
-  // the upcoming exception eligible for an EXTENDED_FP hardware frame.
-  volatile float lhs = 1.25f;
-  volatile float rhs = 2.5f;
-  volatile float result = lhs * rhs + 0.5f;
-  (void)result;
-  __asm__ volatile("dsb\nisb" ::: "memory");
-}
-
 static __attribute__((noreturn, noinline))
 void system_crash_test_udf_now(void) {
   __asm__ volatile("udf #0" ::: "memory");
@@ -2682,14 +2685,10 @@ void system_reboot_service(void) {
   if (system_crash_test_pending &&
       (int32_t)(now - system_crash_test_deadline_dwt) >= 0) {
     const system_crash_test_type_t type = system_crash_test_type;
-    const bool touch_fp = system_crash_test_touch_fp;
 
     // Retire the pending command before crossing the intentional fault boundary.
     system_crash_test_pending = false;
     system_crash_test_type = system_crash_test_type_t::NONE;
-    system_crash_test_touch_fp = false;
-
-    if (touch_fp) system_crash_test_activate_fp();
 
     switch (type) {
       case system_crash_test_type_t::UDF:
@@ -3777,9 +3776,9 @@ static FLASHMEM Payload cmd_crash_test(const Payload& args) {
   }
 
   const uint32_t fp_value = args.has("fp") ? args.getUInt("fp") : 0U;
-  if (fp_value > 1U) {
+  if (fp_value != 0U) {
     Payload err;
-    err.add("error", "fp must be 0 or 1");
+    err.add("error", "fp=1 is unavailable in integer-only firmware");
     return err;
   }
 
@@ -3801,7 +3800,6 @@ static FLASHMEM Payload cmd_crash_test(const Payload& args) {
 
   const uint32_t delay_cycles = F_CPU_ACTUAL / 4U;  // 250 ms
   system_crash_test_type = type;
-  system_crash_test_touch_fp = fp_value != 0U;
   system_crash_test_deadline_dwt = ARM_DWT_CYCCNT + delay_cycles;
   system_crash_test_pending = true;
 
@@ -3810,7 +3808,7 @@ static FLASHMEM Payload cmd_crash_test(const Payload& args) {
   resp.add("type", type == system_crash_test_type_t::UDF
                        ? "UDF" : "IACCVIOL");
   resp.add("delay_ms", CRASH_TEST_DELAY_MS);
-  resp.add("fp_touch_requested", system_crash_test_touch_fp);
+  resp.add("fp_touch_requested", false);
   resp.add("fp_zero_guarantees_basic_frame", false);
   resp.add("retained_evidence_cleared", false);
   if (type == system_crash_test_type_t::IACCVIOL) {

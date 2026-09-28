@@ -25,6 +25,14 @@ TEENSY_LOADER = teensy_loader_cli
 USB_MODE = serial
 BOARD    = teensy:avr:teensy41:usb=$(USB_MODE)
 
+# Suppress historical ARM parameter-passing notes for Double.
+# Keep all other compiler diagnostics enabled.
+# Teensy uses build.flags.cpp, not compiler.cpp.extra_flags.
+# Preserve the platform's C++ defaults and append the targeted suppression.
+CXX_FLAGS = -std=gnu++17 -fno-exceptions -fpermissive -fno-rtti \
+            -fno-threadsafe-statics -felide-constructors -Wno-error=narrowing \
+            -Wno-psabi
+
 # -------------------------------------------------------------
 # Targets
 # -------------------------------------------------------------
@@ -37,8 +45,9 @@ all: build
 
 build:
 	@echo "🔧 Building Teensy 4.1 (cold-boot compatible)..."
-	$(ARDUINO_CLI) compile \
+	$(ARDUINO_CLI) compile --clean \
 	  --fqbn $(BOARD) \
+	  --build-property "build.flags.cpp=$(CXX_FLAGS)" \
 	  . \
 	  --output-dir ./build
 

@@ -47,11 +47,11 @@
 //   suffix set:
 //
 //     <prefix>_welford_n        - uint64 sample count
-//     <prefix>_welford_mean     - double, in the semantic unit of the signal
-//     <prefix>_welford_stddev   - double, same unit
-//     <prefix>_welford_stderr   - double, same unit (= stddev / sqrt(n))
-//     <prefix>_welford_min      - double, same unit
-//     <prefix>_welford_max      - double, same unit
+//     <prefix>_welford_mean     - Double, in the semantic unit of the signal
+//     <prefix>_welford_stddev   - Double, same unit
+//     <prefix>_welford_stderr   - Double, same unit (= stddev / sqrt(n))
+//     <prefix>_welford_min      - Double, same unit
+//     <prefix>_welford_max      - Double, same unit
 //
 //   Published Welford prefixes (five total):
 //
@@ -105,6 +105,7 @@
 
 #pragma once
 
+#include "double.h"
 #include "config.h"
 #include "payload.h"
 #include "time.h"
@@ -546,15 +547,15 @@ struct clocks_alpha_ocxo_counterledger_snapshot_t {
   uint64_t block_ticks = 0;
   uint64_t block_ns = 0;
   int64_t  block_fast_residual_sum_ns = 0;
-  double   block_mean_fast_residual_ns = 0.0;
-  double   block_tau = 1.0;
-  double   block_ppb = 0.0;
+  Double   block_mean_fast_residual_ns = 0_D;
+  Double   block_tau = 1_D;
+  Double   block_ppb = 0_D;
   bool     block_phase_valid = false;
   uint64_t block_ns_with_phase = 0;
   int64_t  block_fast_residual_sum_ns_with_phase = 0;
-  double   block_mean_fast_residual_ns_with_phase = 0.0;
-  double   block_tau_with_phase = 1.0;
-  double   block_ppb_with_phase = 0.0;
+  Double   block_mean_fast_residual_ns_with_phase = 0_D;
+  Double   block_tau_with_phase = 1_D;
+  Double   block_ppb_with_phase = 0_D;
 
   bool     completed_block_valid = false;
   uint32_t completed_block_count = 0;
@@ -564,15 +565,15 @@ struct clocks_alpha_ocxo_counterledger_snapshot_t {
   uint64_t completed_block_ticks = 0;
   uint64_t completed_block_ns = 0;
   int64_t  completed_block_fast_residual_sum_ns = 0;
-  double   completed_block_mean_fast_residual_ns = 0.0;
-  double   completed_block_tau = 1.0;
-  double   completed_block_ppb = 0.0;
+  Double   completed_block_mean_fast_residual_ns = 0_D;
+  Double   completed_block_tau = 1_D;
+  Double   completed_block_ppb = 0_D;
   bool     completed_block_phase_valid = false;
   uint64_t completed_block_ns_with_phase = 0;
   int64_t  completed_block_fast_residual_sum_ns_with_phase = 0;
-  double   completed_block_mean_fast_residual_ns_with_phase = 0.0;
-  double   completed_block_tau_with_phase = 1.0;
-  double   completed_block_ppb_with_phase = 0.0;
+  Double   completed_block_mean_fast_residual_ns_with_phase = 0_D;
+  Double   completed_block_tau_with_phase = 1_D;
+  Double   completed_block_ppb_with_phase = 0_D;
 
   uint32_t block_gap_reset_count = 0;
 };
@@ -1587,10 +1588,10 @@ extern uint64_t recover_ocxo2_ns;
 
 struct welford_t {
   uint64_t n;
-  double   mean;
-  double   m2;
-  double   min_val;
-  double   max_val;
+  Double   mean;
+  Double   m2;
+  Double   min_val;
+  Double   max_val;
 };
 
 extern welford_t welford_gnss;
@@ -1601,10 +1602,10 @@ extern welford_t welford_ocxo2;
 extern welford_t welford_pps_witness;
 
 void   welford_reset(welford_t& w);
-void   welford_update(welford_t& w, double sample);
+void   welford_update(welford_t& w, Double sample);
 bool   welford_restore(welford_t& w, const welford_t& state);
-double welford_stddev(const welford_t& w);
-double welford_stderr(const welford_t& w);
+Double welford_stddev(const welford_t& w);
+Double welford_stderr(const welford_t& w);
 
 // ============================================================================
 // Alpha always-on instrument statistics snapshot
@@ -1622,7 +1623,7 @@ double welford_stderr(const welford_t& w);
 
 struct clocks_instrument_ppb_value_snapshot_t {
   uint64_t sample_count = 0;
-  double ppb = 0.0;
+  Double ppb = 0_D;
 };
 
 // Alpha owns only the always-on populations. Beta decorates the public handoff
@@ -1641,7 +1642,7 @@ struct clocks_instrument_ppb_buckets_snapshot_t {
 // species prevents the stenographer from re-authoring rolling state.
 struct clocks_alpha_ppb_cumulative_endpoint_snapshot_t {
   uint64_t reference_ns = 0ULL;
-  double   dwt_error_cycles = 0.0;
+  Double   dwt_error_cycles = 0_D;
   int64_t  ocxo1_error_ns = 0LL;
   int64_t  ocxo2_error_ns = 0LL;
   uint32_t rolling_sequence = 0;
@@ -1686,9 +1687,9 @@ struct clocks_instrument_frequency_snapshot_t {
   bool     valid = false;
   uint64_t sample_count = 0;
   uint64_t interval_count = 0;
-  double   tau = 1.0;
-  double   ppb = 0.0;
-  double   stderr_ppb = 0.0;
+  Double   tau = 1_D;
+  Double   ppb = 0_D;
+  Double   stderr_ppb = 0_D;
   clocks_instrument_ppb_buckets_snapshot_t ppb_buckets{};
 };
 

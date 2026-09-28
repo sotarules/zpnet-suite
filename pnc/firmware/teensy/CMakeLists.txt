@@ -61,6 +61,7 @@ set(ZPNET_SOURCES
     bootloader.cpp
     build_fingerprint.cpp
     debug.cpp
+    double.cpp
     memory_info.cpp
     payload.cpp
     process.cpp
@@ -85,6 +86,8 @@ set(ZPNET_HEADERS
     bootloader.h
     config.h
     debug.h
+    double.h
+    integer_only.h
     memory_info.h
     payload.h
     process.h

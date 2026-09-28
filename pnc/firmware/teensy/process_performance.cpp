@@ -1,3 +1,4 @@
+#include "integer_only.h"
 #include "process_performance.h"
 
 #include "payload.h"

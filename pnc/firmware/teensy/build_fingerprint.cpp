@@ -26,6 +26,7 @@ const char ZPNET_BUILD_FINGERPRINT[] =
   "ZPNET_BUILD{"
   "TRANSPORT=SERIAL;"
   "USB=CDC;"
+  "REAL=DECIMAL16;"
   "}";
 
 } // extern "C"

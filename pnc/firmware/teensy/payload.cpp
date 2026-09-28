@@ -1,3 +1,4 @@
+#include "integer_only.h"
 #include "payload.h"
 #include "util.h"
 #include "debug.h"
@@ -765,8 +766,8 @@ static void payload_note_numeric_reject(uint32_t reason,
                             key_len);
 
     // Retained telemetry field names remain source-compatible with the former
-    // floating-point API.  util.cpp captures the source IEEE-754 bits before
-    // Payload receives this integer-only admission object.
+    // floating-point API. Double now supplies its integer decimal encoding
+    // as source evidence; these bits are no longer an IEEE binary64 value.
     g_payload_last_numeric_reject_value_bits = source_value_bits;
     g_payload_last_numeric_reject_precision = precision;
     g_payload_last_numeric_reject_format_return = format_return;
@@ -3862,6 +3863,8 @@ struct payload_contract_state_t {
     uint32_t structural_fingerprint = 0U;
     uint32_t semantic_fingerprint = 0U;
     uint32_t element_count = 0U;
+    const void* inspected_storage = nullptr;
+    uint32_t packed_expected_upper = 0U;
     uint32_t key_off = 0U;
     uint32_t key_len = 0U;
     uint32_t val_off = 0U;
@@ -4018,7 +4021,7 @@ static void payload_contract_record_state_failure(
                             state.reason,
                             operation_id,
                             self,
-                            nullptr,
+                            state.inspected_storage,
                             generation,
                             state.entry_index,
                             state.key_off,
@@ -4026,7 +4029,9 @@ static void payload_contract_record_state_failure(
                             state.key_len,
                             state.val_len,
                             before_fingerprint,
-                            state.structural_fingerprint);
+                            state.reason == payload_contract_reason_t::PACKED_LAYOUT
+                                ? state.packed_expected_upper
+                                : state.structural_fingerprint);
 }
 
 static void payload_contract_record_postcondition(
@@ -4227,6 +4232,7 @@ bool Payload::_contract_inspect(payload_contract_state_t* out) const {
         }
     }
 
+    out->inspected_storage = storage;
     out->capacity = capacity;
     out->count = _count;
     out->data_begin = _data_begin;
@@ -4257,6 +4263,7 @@ bool Payload::_contract_inspect(payload_contract_state_t* out) const {
 
     size_t expected_upper = capacity;
     for (size_t i = 0U; i < _count; ++i) {
+        out->packed_expected_upper = (uint32_t)expected_upper;
         const Entry entry = payload_entry_access_t::load(storage, i);
         out->entry_index = (uint32_t)i;
         out->key_off = entry.key_off;
@@ -4347,6 +4354,8 @@ bool Payload::_contract_inspect(payload_contract_state_t* out) const {
     }
 
     if (expected_upper != _data_begin) {
+        out->entry_index = 0xFFFFFFFFUL;
+        out->packed_expected_upper = (uint32_t)expected_upper;
         out->reason = payload_contract_reason_t::PACKED_LAYOUT;
         return false;
     }
@@ -5851,7 +5860,7 @@ void Payload::clear() {
         (uint32_t)(uintptr_t)__builtin_return_address(0),
         0U,
         g_payload_contract_next_sequence,
-        false);
+        true);
 
     payload_contract_state_t before{};
     if (!_contract_begin(PAYLOAD_OP_CLEAR, &before)) {
@@ -7208,7 +7217,7 @@ static bool payload_reconcile_signed_length(const char* text,
 // Integer-only decimal rendering (fixed digits with optional power of ten)
 // ============================================================================
 //
-// Conversion from float/double happens in util.cpp and produces fixed_decimal_t.
+// Double owns integer-only conversion into fixed_decimal_t.
 // From this boundary onward Payload operates only on integer decimal parts.
 
 static bool payload_format_fixed_decimal(const fixed_decimal_t& value,
@@ -7238,7 +7247,7 @@ static bool payload_format_fixed_decimal(const fixed_decimal_t& value,
     if (!value.valid() ||
         value.decimal_places > FIXED_DECIMAL_MAX_PLACES ||
         value.negative > 1U ||
-        value.exponent10 < -340 || value.exponent10 > 308) {
+        value.exponent10 < -398 || value.exponent10 > 384) {
         return false;
     }
 

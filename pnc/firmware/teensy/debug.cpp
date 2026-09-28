@@ -1,3 +1,4 @@
+#include "integer_only.h"
 // debug.cpp
 //
 // ZPNet Debug Facility (Teensy side)
@@ -22,6 +23,7 @@
 //   • No SysTick dependency.
 //
 
+#include "double.h"
 #include "debug.h"
 #include "transport.h"
 #include "payload.h"
@@ -180,15 +182,7 @@ void debug_log(const char* name, uint64_t v) {
   transport_send(TRAFFIC_DEBUG, out);
 }
 
-void debug_log(const char* name, float v) {
-  if (!name || !*name) return;
-  Payload out;
-  out.add("name", name);
-  out.add("value", toFixedDecimal((double)v, 6));
-  transport_send(TRAFFIC_DEBUG, out);
-}
-
-void debug_log(const char* name, double v) {
+void debug_log(const char* name, Double v) {
   if (!name || !*name) return;
   Payload out;
   out.add("name", name);

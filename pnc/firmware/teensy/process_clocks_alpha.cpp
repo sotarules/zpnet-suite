@@ -1,3 +1,4 @@
+#include "integer_only.h"
 // ============================================================================
 // process_clocks_alpha.cpp — Always-On Physics Layer
 // ============================================================================
@@ -22,6 +23,7 @@
 // measurements.
 // ============================================================================
 
+#include "double.h"
 #include "process_clocks_internal.h"
 #include "process_clocks.h"
 #include "process_interrupt.h"
@@ -1460,17 +1462,17 @@ welford_t welford_pps_witness  = {};
 
 void welford_reset(welford_t& w) {
   w.n       = 0;
-  w.mean    = 0.0;
-  w.m2      = 0.0;
-  w.min_val = 1e30;
-  w.max_val = -1e30;
+  w.mean    = 0_D;
+  w.m2      = 0_D;
+  w.min_val = 1e30_D;
+  w.max_val = -1e30_D;
 }
 
-void welford_update(welford_t& w, double sample) {
+void welford_update(welford_t& w, Double sample) {
   w.n++;
-  const double d1 = sample - w.mean;
-  w.mean += d1 / (double)w.n;
-  const double d2 = sample - w.mean;
+  const Double d1 = sample - w.mean;
+  w.mean += d1 / (Double)w.n;
+  const Double d2 = sample - w.mean;
   w.m2 += d1 * d2;
   if (sample < w.min_val) w.min_val = sample;
   if (sample > w.max_val) w.max_val = sample;
@@ -1481,7 +1483,7 @@ static bool welford_restore_state_valid(const welford_t& state) {
       !isfinite(state.min_val) || !isfinite(state.max_val)) {
     return false;
   }
-  if (state.m2 < 0.0) return false;
+  if (state.m2 < 0_D) return false;
   if (state.n == 0ULL) return true;
   return state.min_val <= state.max_val &&
          state.mean >= state.min_val &&
@@ -1498,13 +1500,13 @@ bool welford_restore(welford_t& w, const welford_t& state) {
   return true;
 }
 
-double welford_stddev(const welford_t& w) {
-  return (w.n >= 2) ? sqrt(w.m2 / (double)(w.n - 1)) : 0.0;
+Double welford_stddev(const welford_t& w) {
+  return (w.n >= 2) ? sqrt(w.m2 / (Double)(w.n - 1)) : 0_D;
 }
 
-double welford_stderr(const welford_t& w) {
-  if (w.n < 2) return 0.0;
-  return welford_stddev(w) / sqrt((double)w.n);
+Double welford_stderr(const welford_t& w) {
+  if (w.n < 2) return 0_D;
+  return welford_stddev(w) / sqrt((Double)w.n);
 }
 
 // ============================================================================
@@ -1536,20 +1538,20 @@ struct alpha_tau_estimator_t {
   // from campaign/epoch clockface intercepts.
   uint64_t cumulative_reference_ns = 0;
   uint64_t cumulative_clock_ns = 0;
-  double   cumulative_clock_ns_exact = 0.0;
+  Double   cumulative_clock_ns_exact = 0_D;
 
-  double   mean_x = 0.0;
-  double   mean_y = 0.0;
-  double   sxx = 0.0;
-  double   sxy = 0.0;
-  double   syy = 0.0;
+  Double   mean_x = 0_D;
+  Double   mean_y = 0_D;
+  Double   sxx = 0_D;
+  Double   sxy = 0_D;
+  Double   syy = 0_D;
 
-  double   interval_mean_ppb = 0.0;
-  double   interval_m2_ppb = 0.0;
+  Double   interval_mean_ppb = 0_D;
+  Double   interval_m2_ppb = 0_D;
 
-  double   tau = 1.0;
-  double   ppb = 0.0;
-  double   stderr_ppb = 0.0;
+  Double   tau = 1_D;
+  Double   ppb = 0_D;
+  Double   stderr_ppb = 0_D;
   int64_t  intercept_ns = 0;
 };
 
@@ -1606,37 +1608,37 @@ static void alpha_tau_reset_all(void) {
 static void alpha_tau_recompute(alpha_tau_estimator_t& s) {
   if (s.interval_count != 0U &&
       s.cumulative_reference_ns != 0ULL &&
-      s.cumulative_clock_ns_exact > 0.0) {
+      s.cumulative_clock_ns_exact > 0_D) {
     // TAU is the frequency ratio, not the period ratio.  A physically fast
     // clock has a shorter measured interval and therefore tau > 1.
-    s.tau = (double)s.cumulative_reference_ns /
+    s.tau = (Double)s.cumulative_reference_ns /
             s.cumulative_clock_ns_exact;
-    s.ppb = (s.tau - 1.0) * 1.0e9;
+    s.ppb = (s.tau - 1_D) * 1.0e9_D;
     if (s.interval_count >= 2U) {
-      const double stddev = sqrt(
-          s.interval_m2_ppb / (double)(s.interval_count - 1U));
-      s.stderr_ppb = stddev / sqrt((double)s.interval_count);
+      const Double stddev = sqrt(
+          s.interval_m2_ppb / (Double)(s.interval_count - 1U));
+      s.stderr_ppb = stddev / sqrt((Double)s.interval_count);
     } else {
-      s.stderr_ppb = 0.0;
+      s.stderr_ppb = 0_D;
     }
     s.valid = true;
     s.intercept_ns = 0;
   } else {
     s.valid = false;
-    s.tau = 1.0;
-    s.ppb = 0.0;
-    s.stderr_ppb = 0.0;
+    s.tau = 1_D;
+    s.ppb = 0_D;
+    s.stderr_ppb = 0_D;
     s.intercept_ns = 0;
   }
 }
 
 static void alpha_tau_interval_update(alpha_tau_estimator_t& s,
-                                      double interval_ppb) {
+                                      Double interval_ppb) {
   s.interval_count++;
-  const double n = (double)s.interval_count;
-  const double d1 = interval_ppb - s.interval_mean_ppb;
+  const Double n = (Double)s.interval_count;
+  const Double d1 = interval_ppb - s.interval_mean_ppb;
   s.interval_mean_ppb += d1 / n;
-  const double d2 = interval_ppb - s.interval_mean_ppb;
+  const Double d2 = interval_ppb - s.interval_mean_ppb;
   s.interval_m2_ppb += d1 * d2;
 }
 
@@ -1650,10 +1652,8 @@ static bool alpha_instrument_interval_plausible(uint32_t cycles) {
          cycles <= ALPHA_INSTRUMENT_INTERVAL_MAX_CYCLES;
 }
 
-static int64_t alpha_round_double_to_i64(double value) {
-  return value >= 0.0
-      ? (int64_t)(value + 0.5)
-      : (int64_t)(value - 0.5);
+static int64_t alpha_round_double_to_i64(Double value) {
+  return value.roundedInteger();
 }
 
 static void alpha_tau_note_delta_interval(time_clock_id_t clock,
@@ -1686,21 +1686,21 @@ static void alpha_tau_note_delta_interval(time_clock_id_t clock,
     return;
   }
 
-  const double clock_interval_ns_exact =
-      ((double)clock_cycles * (double)NS_PER_SECOND_U64) /
-      (double)reference_cycles;
-  if (!(clock_interval_ns_exact > 0.0)) {
+  const Double clock_interval_ns_exact =
+      ((Double)clock_cycles * (Double)NS_PER_SECOND_U64) /
+      (Double)reference_cycles;
+  if (!(clock_interval_ns_exact > 0_D)) {
     s->reject_count++;
     clocks_alpha_dmb();
     s->seq++;
     return;
   }
 
-  const double interval_tau =
-      (double)reference_cycles / (double)clock_cycles;
-  const double interval_ppb = (interval_tau - 1.0) * 1.0e9;
-  const double fast_residual_ns =
-      (double)NS_PER_SECOND_U64 - clock_interval_ns_exact;
+  const Double interval_tau =
+      (Double)reference_cycles / (Double)clock_cycles;
+  const Double interval_ppb = (interval_tau - 1_D) * 1.0e9_D;
+  const Double fast_residual_ns =
+      (Double)NS_PER_SECOND_U64 - clock_interval_ns_exact;
 
   s->last_interval_pps_sequence = pps_sequence;
   s->last_fast_residual_ns = alpha_round_double_to_i64(fast_residual_ns);
@@ -1709,23 +1709,23 @@ static void alpha_tau_note_delta_interval(time_clock_id_t clock,
   s->cumulative_reference_ns += NS_PER_SECOND_U64;
   s->cumulative_clock_ns_exact += clock_interval_ns_exact;
   s->cumulative_clock_ns +=
-      (uint64_t)(clock_interval_ns_exact + 0.5);
+      (uint64_t)(clock_interval_ns_exact + 0.5_D);
   alpha_tau_recompute(*s);
 
   clocks_alpha_dmb();
   s->seq++;
 }
 
-static double alpha_tau_interval_stddev(const alpha_tau_estimator_t& s) {
+static Double alpha_tau_interval_stddev(const alpha_tau_estimator_t& s) {
   return (s.interval_count >= 2U)
-      ? sqrt(s.interval_m2_ppb / (double)(s.interval_count - 1U))
-      : 0.0;
+      ? sqrt(s.interval_m2_ppb / (Double)(s.interval_count - 1U))
+      : 0_D;
 }
 
-static double alpha_tau_interval_stderr(const alpha_tau_estimator_t& s) {
+static Double alpha_tau_interval_stderr(const alpha_tau_estimator_t& s) {
   return (s.interval_count >= 2U)
-      ? alpha_tau_interval_stddev(s) / sqrt((double)s.interval_count)
-      : 0.0;
+      ? alpha_tau_interval_stddev(s) / sqrt((Double)s.interval_count)
+      : 0_D;
 }
 
 FLASHMEM bool clocks_alpha_ocxo_tau_snapshot(time_clock_id_t clock,
@@ -1795,10 +1795,10 @@ static bool alpha_tau_restore_state_valid(
       !isfinite(state.interval_m2_ppb)) {
     return false;
   }
-  if (state.interval_m2_ppb < 0.0) return false;
+  if (state.interval_m2_ppb < 0_D) return false;
   if (state.interval_count == 0U) return true;
   return state.cumulative_reference_ns != 0ULL &&
-         state.cumulative_clock_ns_exact > 0.0;
+         state.cumulative_clock_ns_exact > 0_D;
 }
 
 bool clocks_alpha_ocxo_tau_restore(
@@ -1948,7 +1948,7 @@ struct alpha_ppb_raw_endpoint_t {
 
 struct alpha_ppb_cumulative_endpoint_t {
   uint64_t reference_ns = 0ULL;
-  double dwt_error_cycles = 0.0;
+  Double dwt_error_cycles = 0_D;
   int64_t ocxo1_error_ns = 0LL;
   int64_t ocxo2_error_ns = 0LL;
   uint32_t rolling_sequence = 0U;
@@ -2260,11 +2260,11 @@ static void alpha_ppb_windows_note_endpoint(uint32_t rolling_sequence,
     const uint64_t ocxo2_delta =
         raw.ocxo2_ns - g_alpha_ppb_previous_raw.ocxo2_ns;
 
-    const double expected_dwt_delta =
-        ((double)reference_delta * (double)DWT_EXPECTED_PER_PPS) /
-        (double)NS_PER_SECOND_U64;
+    const Double expected_dwt_delta =
+        ((Double)reference_delta * (Double)DWT_EXPECTED_PER_PPS) /
+        (Double)NS_PER_SECOND_U64;
     next.reference_ns += reference_delta;
-    next.dwt_error_cycles += (double)dwt_delta - expected_dwt_delta;
+    next.dwt_error_cycles += (Double)dwt_delta - expected_dwt_delta;
     next.ocxo1_error_ns +=
         alpha_ppb_signed_delta(ocxo1_delta, reference_delta);
     next.ocxo2_error_ns +=
@@ -2559,30 +2559,30 @@ static clocks_instrument_ppb_value_snapshot_t alpha_ppb_value_from_proof(
   out.sample_count = interval_count;
   switch (lane) {
     case alpha_ppb_lane_t::DWT: {
-      const double expected_cycles =
-          ((double)reference_ns * (double)DWT_EXPECTED_PER_PPS) /
-          (double)NS_PER_SECOND_U64;
-      if (expected_cycles <= 0.0) __builtin_trap();
-      const double error_cycles =
+      const Double expected_cycles =
+          ((Double)reference_ns * (Double)DWT_EXPECTED_PER_PPS) /
+          (Double)NS_PER_SECOND_U64;
+      if (expected_cycles <= 0_D) __builtin_trap();
+      const Double error_cycles =
           current.dwt_error_cycles - proof.anchor.dwt_error_cycles;
-      out.ppb = error_cycles * 1.0e9 / expected_cycles;
+      out.ppb = error_cycles * 1.0e9_D / expected_cycles;
       break;
     }
     case alpha_ppb_lane_t::VCLOCK:
       // VCLOCK is the GNSS-disciplined reference identity.  Its independent
       // one-second cycle residual remains visible through Welford/raw_cycles.
-      out.ppb = 0.0;
+      out.ppb = 0_D;
       break;
     case alpha_ppb_lane_t::OCXO1: {
       const int64_t error_ns =
           current.ocxo1_error_ns - proof.anchor.ocxo1_error_ns;
-      out.ppb = (double)error_ns * 1.0e9 / (double)reference_ns;
+      out.ppb = (Double)error_ns * 1.0e9_D / (Double)reference_ns;
       break;
     }
     case alpha_ppb_lane_t::OCXO2: {
       const int64_t error_ns =
           current.ocxo2_error_ns - proof.anchor.ocxo2_error_ns;
-      out.ppb = (double)error_ns * 1.0e9 / (double)reference_ns;
+      out.ppb = (Double)error_ns * 1.0e9_D / (Double)reference_ns;
       break;
     }
   }
@@ -2628,8 +2628,8 @@ alpha_frequency_from_welford(const welford_t& w) {
   f.valid = w.n != 0ULL;
   f.sample_count = w.n;
   f.interval_count = w.n;
-  f.ppb = f.valid ? w.mean : 0.0;
-  f.tau = 1.0 + f.ppb / 1.0e9;
+  f.ppb = f.valid ? w.mean : 0_D;
+  f.tau = 1_D + f.ppb / 1.0e9_D;
   f.stderr_ppb = welford_stderr(w);
   return f;
 }
@@ -2640,9 +2640,9 @@ alpha_frequency_from_tau(const clocks_alpha_tau_snapshot_t& tau) {
   f.valid = tau.valid;
   f.sample_count = tau.sample_count;
   f.interval_count = tau.interval_count;
-  f.tau = tau.valid ? tau.tau : 1.0;
-  f.ppb = tau.valid ? tau.ppb : 0.0;
-  f.stderr_ppb = tau.valid ? tau.stderr_ppb : 0.0;
+  f.tau = tau.valid ? tau.tau : 1_D;
+  f.ppb = tau.valid ? tau.ppb : 0_D;
+  f.stderr_ppb = tau.valid ? tau.stderr_ppb : 0_D;
   return f;
 }
 
@@ -2745,16 +2745,16 @@ void clocks_alpha_instrument_stats_reset(void) {
   alpha_instrument_stats_writer_commit();
 }
 
-static double alpha_instrument_delta_fast_ns(uint32_t reference_cycles,
+static Double alpha_instrument_delta_fast_ns(uint32_t reference_cycles,
                                              uint32_t clock_cycles) {
-  if (reference_cycles == 0U || clock_cycles == 0U) return 0.0;
+  if (reference_cycles == 0U || clock_cycles == 0U) return 0_D;
 
   // Match Beta's canonical Delta Cycles conversion exactly: the same-row
   // selected PPS/VCLOCK interval is both the subtraction reference and the
   // cycles-per-second denominator.
-  return ((double)((int64_t)reference_cycles - (int64_t)clock_cycles) *
-          (double)NS_PER_SECOND_U64) /
-         (double)reference_cycles;
+  return ((Double)((int64_t)reference_cycles - (int64_t)clock_cycles) *
+          (Double)NS_PER_SECOND_U64) /
+         (Double)reference_cycles;
 }
 
 static void alpha_instrument_stats_note_completed_row(
@@ -2784,16 +2784,16 @@ static void alpha_instrument_stats_note_completed_row(
   if (science_eligible) {
     // GNSS is the exact reference clock. Give it a real Welford population of
     // admitted zero-residual samples; PPS count remains a timeline identity.
-    welford_update(welford_gnss, 0.0);
+    welford_update(welford_gnss, 0_D);
 
     if (g_dwt_calibration_valid && cps != 0U) {
-      const double expected = (double)DWT_EXPECTED_PER_PPS;
-      const double dwt_ppb = ((double)cps - expected) / expected * 1.0e9;
+      const Double expected = (Double)DWT_EXPECTED_PER_PPS;
+      const Double dwt_ppb = ((Double)cps - expected) / expected * 1.0e9_D;
       welford_update(welford_dwt, dwt_ppb);
     }
 
     if (reference_valid && alpha_instrument_interval_plausible(vclock_cycles)) {
-      const double vclock_ppb =
+      const Double vclock_ppb =
           alpha_instrument_delta_fast_ns(reference_cycles, vclock_cycles);
       welford_update(welford_vclock, vclock_ppb);
     } else {
@@ -2827,10 +2827,10 @@ static void alpha_instrument_stats_note_completed_row(
     }
 
     if (reference_valid && cps != 0U) {
-      const double pps_phase_ns =
-          ((double)g_pps_vclock_phase_cycles *
-           (double)NS_PER_SECOND_U64) /
-          (double)cps;
+      const Double pps_phase_ns =
+          ((Double)g_pps_vclock_phase_cycles *
+           (Double)NS_PER_SECOND_U64) /
+          (Double)cps;
       welford_update(welford_pps_witness, pps_phase_ns);
     }
 
@@ -3372,25 +3372,25 @@ static void alpha_counterledger_add_block_interval(
   }
 }
 
-static double alpha_counterledger_block_mean_ns(int64_t residual_sum_ns,
+static Double alpha_counterledger_block_mean_ns(int64_t residual_sum_ns,
                                                 uint32_t interval_count) {
   return interval_count
-      ? ((double)residual_sum_ns / (double)interval_count)
-      : 0.0;
+      ? ((Double)residual_sum_ns / (Double)interval_count)
+      : 0_D;
 }
 
-static double alpha_counterledger_block_tau(uint64_t block_ns,
+static Double alpha_counterledger_block_tau(uint64_t block_ns,
                                             uint32_t interval_count) {
-  if (interval_count == 0U) return 1.0;
-  const double reference_ns =
-      (double)interval_count * (double)NS_PER_SECOND_U64;
-  return reference_ns != 0.0 ? ((double)block_ns / reference_ns) : 1.0;
+  if (interval_count == 0U) return 1_D;
+  const Double reference_ns =
+      (Double)interval_count * (Double)NS_PER_SECOND_U64;
+  return reference_ns != 0_D ? ((Double)block_ns / reference_ns) : 1_D;
 }
 
-static double alpha_counterledger_block_ppb(uint64_t block_ns,
+static Double alpha_counterledger_block_ppb(uint64_t block_ns,
                                             uint32_t interval_count) {
-  const double tau = alpha_counterledger_block_tau(block_ns, interval_count);
-  return (tau - 1.0) * 1.0e9;
+  const Double tau = alpha_counterledger_block_tau(block_ns, interval_count);
+  return (tau - 1_D) * 1.0e9_D;
 }
 
 static uint64_t alpha_phaseledger_refined_ns(
@@ -5634,15 +5634,15 @@ bool clocks_alpha_ocxo_counterledger_snapshot(
       ? alpha_counterledger_block_mean_ns(
             s->block_fast_residual_sum_ns_with_phase,
             s->block_interval_count)
-      : 0.0;
+      : 0_D;
   out->block_tau_with_phase = out->block_phase_valid
       ? alpha_counterledger_block_tau(s->block_ns_with_phase,
                                       s->block_interval_count)
-      : 1.0;
+      : 1_D;
   out->block_ppb_with_phase = out->block_phase_valid
       ? alpha_counterledger_block_ppb(s->block_ns_with_phase,
                                       s->block_interval_count)
-      : 0.0;
+      : 0_D;
 
   out->completed_block_valid = s->completed_block_valid;
   out->completed_block_count = s->completed_block_count;
@@ -5676,15 +5676,15 @@ bool clocks_alpha_ocxo_counterledger_snapshot(
           ? alpha_counterledger_block_mean_ns(
                 s->completed_block_fast_residual_sum_ns_with_phase,
                 s->completed_block_interval_count)
-          : 0.0;
+          : 0_D;
   out->completed_block_tau_with_phase = out->completed_block_phase_valid
       ? alpha_counterledger_block_tau(s->completed_block_ns_with_phase,
                                       s->completed_block_interval_count)
-      : 1.0;
+      : 1_D;
   out->completed_block_ppb_with_phase = out->completed_block_phase_valid
       ? alpha_counterledger_block_ppb(s->completed_block_ns_with_phase,
                                       s->completed_block_interval_count)
-      : 0.0;
+      : 0_D;
   out->block_gap_reset_count = s->block_gap_reset_count;
   return out->valid;
 }

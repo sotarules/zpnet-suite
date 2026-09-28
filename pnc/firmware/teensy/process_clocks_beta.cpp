@@ -1,3 +1,4 @@
+#include "integer_only.h"
 // ============================================================================
 // process_clocks_beta.cpp — Campaign Layer
 // ============================================================================
@@ -37,7 +38,7 @@
 // Unified Welford:
 //
 //   welford_t standardizes every published statistical accumulator.  One
-//   struct, one API, double-valued samples (supports ppb + ns + LSB
+//   struct, one API, Double-valued samples (supports ppb + ns + LSB
 //   with the same type).  Global instances named welford_<what>:
 //   welford_dwt, welford_vclock, welford_ocxo1, welford_ocxo2,
 //   welford_pps_witness.
@@ -55,6 +56,7 @@
 //
 // ============================================================================
 
+#include "double.h"
 #include "process_clocks_internal.h"
 #include "process_clocks.h"
 #include "process_interrupt.h"
@@ -1022,14 +1024,15 @@ static void clocks_fragment_publication_queue_release(void) {
   clocks_fragment_publication_item_t& item =
       g_clocks_fragment_publication_queue[
           read % CLOCKS_FRAGMENT_PUBLICATION_QUEUE_CAPACITY];
-  memset(&item, 0, sizeof(item));
+  item = clocks_fragment_publication_item_t{};
   clocks_fragment_publication_queue_barrier();
   g_clocks_fragment_publication_queue_read = read + 1U;
 }
 
 static void clocks_fragment_publication_queue_reset(void) {
-  memset(g_clocks_fragment_publication_queue, 0,
-         sizeof(g_clocks_fragment_publication_queue));
+  for (auto& item : g_clocks_fragment_publication_queue) {
+    item = clocks_fragment_publication_item_t{};
+  }
   g_clocks_fragment_publication_queue_read = 0U;
   g_clocks_fragment_publication_queue_write = 0U;
   clocks_fragment_publication_queue_barrier();
@@ -1935,7 +1938,7 @@ static void clocks_fragment_publish_service(timepop_ctx_t*,
     }
 
     publication_item = clocks_fragment_publication_queue_acquire_write();
-    memset(publication_item, 0, sizeof(*publication_item));
+    *publication_item = clocks_fragment_publication_item_t{};
     publication_item->sequence = sequence;
     clocks_snapshot_ok = clocks_fragment_snapshot_take(
         sequence, &publication_item->clocks);
@@ -1961,7 +1964,7 @@ static void clocks_fragment_publish_service(timepop_ctx_t*,
     }
     g_clocks_fragment_publication_pending_sequence = sequence;
     g_clocks_fragment_publication_pending = true;
-    memset(publication_item, 0, sizeof(*publication_item));
+    *publication_item = clocks_fragment_publication_item_t{};
     clocks_fragment_publish_service_release_owner();
     return;
   }
@@ -1985,7 +1988,7 @@ static void clocks_fragment_publish_service(timepop_ctx_t*,
     }
     g_clocks_fragment_publication_pending_sequence = sequence;
     g_clocks_fragment_publication_pending = true;
-    memset(publication_item, 0, sizeof(*publication_item));
+    *publication_item = clocks_fragment_publication_item_t{};
     clocks_fragment_publish_service_release_owner();
     return;
   }
@@ -2569,18 +2572,11 @@ static bool restore_get_i64(const Payload& args, const char* key,
 }
 
 static bool restore_get_double(const Payload& args, const char* key,
-                               double& out, bool required = true) {
+                               Double& out, bool required = true) {
   if (!args.has(key)) return !required;
   const char* token = args.getString(key);
   if (!token || !*token) return false;
-  errno = 0;
-  char* end = nullptr;
-  const double parsed = strtod(token, &end);
-  if (errno == ERANGE || !end || *end != '\0' || !isfinite(parsed)) {
-    return false;
-  }
-  out = parsed;
-  return true;
+  return Double::tryParse(token, out);
 }
 
 static bool restore_get_bool(const Payload& args, const char* key,
@@ -2604,7 +2600,7 @@ static bool restore_parse_welford(const Payload& args,
   snprintf(key, sizeof(key), "%s_max", prefix);
   if (!restore_get_double(args, key, out.max_val)) return false;
   return out.n == 0ULL ||
-         (isfinite(out.mean) && isfinite(out.m2) && out.m2 >= 0.0 &&
+         (isfinite(out.mean) && isfinite(out.m2) && out.m2 >= 0_D &&
           isfinite(out.min_val) && isfinite(out.max_val) &&
           out.min_val <= out.max_val);
 }
@@ -2666,7 +2662,7 @@ static bool restore_parse_tau(const Payload& args,
          isfinite(out.mean_x) && isfinite(out.mean_y) &&
          isfinite(out.sxx) && isfinite(out.sxy) && isfinite(out.syy) &&
          isfinite(out.interval_mean_ppb) &&
-         isfinite(out.interval_m2_ppb) && out.interval_m2_ppb >= 0.0;
+         isfinite(out.interval_m2_ppb) && out.interval_m2_ppb >= 0_D;
 }
 
 static bool clocks_recovery_state_from_args(
@@ -3327,16 +3323,16 @@ struct ocxo_science_totals_t {
   uint32_t sample_count = 0;
   uint64_t clock_interval_total_ns = 0;
   uint64_t gnss_interval_total_ns = 0;
-  double   clock_interval_total_ns_exact = 0.0;
-  double   gnss_interval_total_ns_exact = 0.0;
+  Double   clock_interval_total_ns_exact = 0_D;
+  Double   gnss_interval_total_ns_exact = 0_D;
 
   // Preserved traditional projected-GNSS residual totals.  These remain
   // courtroom/comparison evidence only after Delta Cycles becomes canonical.
   uint32_t traditional_sample_count = 0;
   uint64_t traditional_clock_interval_total_ns = 0;
   uint64_t traditional_gnss_interval_total_ns = 0;
-  double   traditional_clock_interval_total_ns_exact = 0.0;
-  double   traditional_gnss_interval_total_ns_exact = 0.0;
+  Double   traditional_clock_interval_total_ns_exact = 0_D;
+  Double   traditional_gnss_interval_total_ns_exact = 0_D;
 };
 
 static ocxo_science_totals_t g_ocxo_science_totals_ocxo1 DMAMEM = {};
@@ -3344,7 +3340,7 @@ static ocxo_science_totals_t g_ocxo_science_totals_ocxo2 DMAMEM = {};
 
 // Defined below the candidate implementation.
 static bool delta_raw_interval_cycles_plausible(uint32_t cycles);
-static int64_t beta_round_double_to_i64(double value);
+static int64_t beta_round_double_to_i64(Double value);
 
 // Campaign-scoped Delta-Cycles shadow clocks.  The canonical public OCXO
 // clockface remains CounterLedger + PhaseLedger.  The independent Delta clock
@@ -3366,7 +3362,7 @@ struct delta_clock_candidate_state_t {
   uint32_t last_public_count = 0;
   uint32_t interval_count = 0;
   uint64_t ns = 0;
-  double fractional_ns = 0.0;
+  Double fractional_ns = 0_D;
 
   bool geometry_valid = false;
   uint32_t geometry_target_dwt = 0;
@@ -3375,7 +3371,7 @@ struct delta_clock_candidate_state_t {
 
   bool last_residual_available = false;
   int64_t last_residual_ns = 0;
-  double last_residual_ns_exact = 0.0;
+  Double last_residual_ns_exact = 0_D;
 };
 
 static delta_clock_candidate_state_t
@@ -3491,8 +3487,8 @@ struct clock_science_row_t : clocks_fragment_science_snapshot_t {
   int64_t  delta_raw_residual_cycles = 0;
   int64_t  delta_raw_residual_ns = 0;
   int64_t  delta_raw_fast_residual_ns = 0;
-  double   delta_raw_residual_ns_exact = 0.0;
-  double   delta_raw_fast_residual_ns_exact = 0.0;
+  Double   delta_raw_residual_ns_exact = 0_D;
+  Double   delta_raw_fast_residual_ns_exact = 0_D;
   int64_t  delta_raw_fast_minus_traditional_ns = 0;
 
   // Traditional projected-GNSS residual surface preserved for reports.
@@ -3502,42 +3498,42 @@ struct clock_science_row_t : clocks_fragment_science_snapshot_t {
   uint64_t traditional_gnss_interval_ns = 0;
   uint64_t traditional_clock_interval_ns = 0;
   int64_t  traditional_fast_residual_ns = 0;
-  double   traditional_gnss_interval_ns_exact = 0.0;
-  double   traditional_clock_interval_ns_exact = 0.0;
-  double   traditional_fast_residual_ns_exact = 0.0;
-  double   traditional_tau_1s = 1.0;
-  double   traditional_ppb_1s = 0.0;
+  Double   traditional_gnss_interval_ns_exact = 0_D;
+  Double   traditional_clock_interval_ns_exact = 0_D;
+  Double   traditional_fast_residual_ns_exact = 0_D;
+  Double   traditional_tau_1s = 1_D;
+  Double   traditional_ppb_1s = 0_D;
 
   bool     traditional_total_valid = false;
   uint32_t traditional_total_sample_count = 0;
   uint64_t traditional_total_clock_interval_ns = 0;
   uint64_t traditional_total_gnss_interval_ns = 0;
   int64_t  traditional_total_fast_residual_ns = 0;
-  double   traditional_total_clock_interval_ns_exact = 0.0;
-  double   traditional_total_gnss_interval_ns_exact = 0.0;
-  double   traditional_total_fast_residual_ns_exact = 0.0;
-  double   traditional_total_tau = 1.0;
-  double   traditional_total_ppb = 0.0;
+  Double   traditional_total_clock_interval_ns_exact = 0_D;
+  Double   traditional_total_gnss_interval_ns_exact = 0_D;
+  Double   traditional_total_fast_residual_ns_exact = 0_D;
+  Double   traditional_total_tau = 1_D;
+  Double   traditional_total_ppb = 0_D;
 
   int64_t  prior_edge_gnss_ns = 0;
   int64_t  current_edge_gnss_ns = 0;
-  double   prior_edge_gnss_ns_exact = 0.0;
-  double   current_edge_gnss_ns_exact = 0.0;
-  double   gnss_interval_ns_exact = 0.0;
-  double   clock_interval_ns_exact = 0.0;
-  double   tau_1s = 1.0;
-  double   ppb_1s = 0.0;
+  Double   prior_edge_gnss_ns_exact = 0_D;
+  Double   current_edge_gnss_ns_exact = 0_D;
+  Double   gnss_interval_ns_exact = 0_D;
+  Double   clock_interval_ns_exact = 0_D;
+  Double   tau_1s = 1_D;
+  Double   ppb_1s = 0_D;
 
   bool     total_valid = false;
   uint32_t total_sample_count = 0;
   uint64_t total_clock_interval_ns = 0;
   uint64_t total_gnss_interval_ns = 0;
   int64_t  total_fast_residual_ns = 0;
-  double   total_clock_interval_ns_exact = 0.0;
-  double   total_gnss_interval_ns_exact = 0.0;
-  double   total_fast_residual_ns_exact = 0.0;
-  double   total_tau = 1.0;
-  double   total_ppb = 0.0;
+  Double   total_clock_interval_ns_exact = 0_D;
+  Double   total_gnss_interval_ns_exact = 0_D;
+  Double   total_fast_residual_ns_exact = 0_D;
+  Double   total_tau = 1_D;
+  Double   total_ppb = 0_D;
 
   // Alpha-owned always-on PhaseLedger TAU snapshot. These fields remain
   // side-channel frequency evidence.  Panel-facing campaign TAU/PPB is the
@@ -3548,11 +3544,11 @@ struct clock_science_row_t : clocks_fragment_science_snapshot_t {
   uint32_t alpha_tau_interval_count = 0;
   uint32_t alpha_tau_last_pps_sequence = 0;
   uint32_t alpha_tau_last_interval_pps_sequence = 0;
-  double   alpha_tau = 1.0;
-  double   alpha_tau_ppb = 0.0;
-  double   alpha_tau_stderr_ppb = 0.0;
-  double   alpha_tau_interval_mean_ppb = 0.0;
-  double   alpha_tau_interval_stderr_ppb = 0.0;
+  Double   alpha_tau = 1_D;
+  Double   alpha_tau_ppb = 0_D;
+  Double   alpha_tau_stderr_ppb = 0_D;
+  Double   alpha_tau_interval_mean_ppb = 0_D;
+  Double   alpha_tau_interval_stderr_ppb = 0_D;
   int64_t  alpha_tau_intercept_ns = 0;
   int64_t  alpha_tau_detrended_fast_residual_ns = 0;
 };
@@ -3602,7 +3598,7 @@ static void delta_clock_candidate_fail(
   state.geometry_valid = false;
   state.last_residual_available = false;
   state.last_residual_ns = 0;
-  state.last_residual_ns_exact = 0.0;
+  state.last_residual_ns_exact = 0_D;
   state.status = status;
   state.last_public_count = public_count;
 }
@@ -3624,14 +3620,14 @@ static bool delta_clock_candidate_reanchor(
   // independently.  RECOVER and FLASH_CUT may have no lawful pre-boundary
   // bracket; their first public row becomes an explicit splice anchor.
   state.ns = phaseledger_ns;
-  state.fractional_ns = 0.0;
+  state.fractional_ns = 0_D;
   state.last_public_count = public_count;
   state.interval_count = public_count >= state.start_public_count
       ? public_count - state.start_public_count
       : 0U;
   state.last_residual_available = false;
   state.last_residual_ns = 0;
-  state.last_residual_ns_exact = 0.0;
+  state.last_residual_ns_exact = 0_D;
   state.status = clocks_fragment_clock_candidate_status_t::SEEDED;
   return true;
 }
@@ -3737,20 +3733,20 @@ static void delta_clock_candidate_advance(
   // The VCLOCK window straddles the common OCXO boundary.  Convert each DWT
   // piece with the OCXO interval that actually contains it, then add the two
   // elapsed OCXO-nanosecond pieces.  This is the endpoint-aligned Delta clock.
-  const double previous_tail_ns =
-      ((double)CLOCKS_BETA_NS_PER_SECOND *
-       (double)previous_tail_cycles) /
-      (double)state.geometry_interval_cycles;
-  const double current_head_ns =
-      ((double)CLOCKS_BETA_NS_PER_SECOND *
-       (double)current_head_cycles) /
-      (double)current_interval_cycles;
-  const double exact_increment_ns = previous_tail_ns + current_head_ns;
-  const double increment_with_carry =
+  const Double previous_tail_ns =
+      ((Double)CLOCKS_BETA_NS_PER_SECOND *
+       (Double)previous_tail_cycles) /
+      (Double)state.geometry_interval_cycles;
+  const Double current_head_ns =
+      ((Double)CLOCKS_BETA_NS_PER_SECOND *
+       (Double)current_head_cycles) /
+      (Double)current_interval_cycles;
+  const Double exact_increment_ns = previous_tail_ns + current_head_ns;
+  const Double increment_with_carry =
       state.fractional_ns + exact_increment_ns;
   if (!isfinite(exact_increment_ns) || !isfinite(increment_with_carry) ||
-      increment_with_carry > (double)INT64_MAX ||
-      increment_with_carry < 1.0) {
+      increment_with_carry > (Double)INT64_MAX ||
+      increment_with_carry < 1_D) {
     delta_clock_candidate_fail(
         state,
         clocks_fragment_clock_candidate_status_t::ARITHMETIC_FAILURE,
@@ -3770,12 +3766,12 @@ static void delta_clock_candidate_advance(
 
   state.ns += (uint64_t)increment_ns;
   state.fractional_ns =
-      increment_with_carry - (double)increment_ns;
+      increment_with_carry - (Double)increment_ns;
   state.last_public_count = public_count;
   state.interval_count++;
   state.last_residual_available = true;
   state.last_residual_ns_exact =
-      exact_increment_ns - (double)CLOCKS_BETA_NS_PER_SECOND;
+      exact_increment_ns - (Double)CLOCKS_BETA_NS_PER_SECOND;
   state.last_residual_ns =
       beta_round_double_to_i64(state.last_residual_ns_exact);
   state.status = clocks_fragment_clock_candidate_status_t::ADVANCED;
@@ -4189,10 +4185,8 @@ static int64_t campaign_recover_signed_delta_u64(uint64_t lhs, uint64_t rhs) {
       : ((rhs - lhs) > (uint64_t)INT64_MAX ? -INT64_MAX : -(int64_t)(rhs - lhs));
 }
 
-static int64_t campaign_recover_round_double_to_i64(double value) {
-  return (value >= 0.0)
-      ? (int64_t)(value + 0.5)
-      : (int64_t)(value - 0.5);
+static int64_t campaign_recover_round_double_to_i64(Double value) {
+  return value.roundedInteger();
 }
 
 static uint64_t campaign_recover_project_ocxo_to_public_gnss(
@@ -4208,9 +4202,9 @@ static uint64_t campaign_recover_project_ocxo_to_public_gnss(
   // so scaling the offset avoids uint64 overflow and keeps ns precision.
   const int64_t recovered_offset_ns =
       campaign_recover_signed_delta_u64(recovered_ocxo_ns, recover_gnss_ns);
-  const double scale = (double)public_gnss_ns / (double)recover_gnss_ns;
+  const Double scale = (Double)public_gnss_ns / (Double)recover_gnss_ns;
   const int64_t projected_offset_ns =
-      campaign_recover_round_double_to_i64((double)recovered_offset_ns * scale);
+      campaign_recover_round_double_to_i64((Double)recovered_offset_ns * scale);
   return campaign_public_from_offset(public_gnss_ns, projected_offset_ns);
 }
 
@@ -5453,17 +5447,17 @@ static FLASHMEM void ocxo_science_row_suppress_for_recover_hold(clock_science_ro
   row.gnss_interval_ns = CLOCKS_BETA_NS_PER_SECOND;
   row.clock_interval_ns = 0ULL;
   row.fast_residual_ns = 0LL;
-  row.gnss_interval_ns_exact = (double)CLOCKS_BETA_NS_PER_SECOND;
-  row.clock_interval_ns_exact = 0.0;
-  row.fast_residual_ns_exact = 0.0;
-  row.tau_1s = 1.0;
-  row.ppb_1s = 0.0;
+  row.gnss_interval_ns_exact = (Double)CLOCKS_BETA_NS_PER_SECOND;
+  row.clock_interval_ns_exact = 0_D;
+  row.fast_residual_ns_exact = 0_D;
+  row.tau_1s = 1_D;
+  row.ppb_1s = 0_D;
 
   row.total_valid = false;
-  row.total_tau = 1.0;
-  row.total_ppb = 0.0;
+  row.total_tau = 1_D;
+  row.total_ppb = 0_D;
   row.total_fast_residual_ns = 0LL;
-  row.total_fast_residual_ns_exact = 0.0;
+  row.total_fast_residual_ns_exact = 0_D;
 }
 
 static FLASHMEM void recover_proof_apply_degraded_science_hold(clock_science_row_t& row) {
@@ -6011,9 +6005,9 @@ static FLASHMEM bool clocks_payload_validate_double_token(
 
     court.magnitude10 = magnitude10;
 
-    // Keep libc away from range-error paths.  These limits are deliberately
-    // conservative for recovery science fields: legitimate Welford values
-    // are nowhere near IEEE double overflow or subnormal-underflow territory.
+    // Preserve the existing recovery admission limits. The following parser
+    // now constructs Double directly; no libc floating-point conversion
+    // occurs. Legitimate Welford values remain well within these limits.
     if (magnitude10 > 307) {
       court.reason = CLOCKS_PAYLOAD_NUMERIC_DOUBLE_OVERFLOW_RISK;
       return false;
@@ -6059,7 +6053,7 @@ static FLASHMEM clocks_payload_checked_status_t clocks_payload_try_get_double_ch
     const char* path,
     const char* lane,
     const char* field,
-    double& out) {
+    Double& out) {
   const char* token = nullptr;
   size_t token_len = 0;
   const clocks_payload_checked_status_t fetched =
@@ -6074,18 +6068,8 @@ static FLASHMEM clocks_payload_checked_status_t clocks_payload_try_get_double_ch
     return CLOCKS_PAYLOAD_FIELD_INVALID;
   }
 
-  errno = 0;
-  char* end = nullptr;
-  out = strtod(token, &end);
-  if (errno == ERANGE ||
-      !end || end != token + token_len || *end != '\0') {
+  if (!Double::tryParse(token, out)) {
     court.reason = CLOCKS_PAYLOAD_NUMERIC_LIBC_PARSE_FAILED;
-    clocks_payload_numeric_emit_watchdog(payload, context, path, lane,
-                                         field, key, court);
-    return CLOCKS_PAYLOAD_FIELD_INVALID;
-  }
-  if (!isfinite(out)) {
-    court.reason = CLOCKS_PAYLOAD_NUMERIC_LIBC_NONFINITE;
     clocks_payload_numeric_emit_watchdog(payload, context, path, lane,
                                          field, key, court);
     return CLOCKS_PAYLOAD_FIELD_INVALID;
@@ -6515,20 +6499,20 @@ static FLASHMEM void prediction_snapshot_for_clock(
 //
 // The publication path uses the compact helpers below.
 
-static FLASHMEM void payload_add_frequency_fields(Payload& obj, double ppb_value) {
-  const double tau_value = 1.0 + ppb_value / 1e9;
+static FLASHMEM void payload_add_frequency_fields(Payload& obj, Double ppb_value) {
+  const Double tau_value = 1_D + ppb_value / 1e9_D;
   obj.add("tau", toFixedDecimal(tau_value, 12));
   obj.add("ppb", toFixedDecimal(ppb_value, 3));
 }
 
-static double campaign_total_tau_from_ratio(uint64_t reference_value,
+static Double campaign_total_tau_from_ratio(uint64_t reference_value,
                                              uint64_t clock_value) {
-  if (reference_value == 0ULL) return 1.0;
-  return (double)clock_value / (double)reference_value;
+  if (reference_value == 0ULL) return 1_D;
+  return (Double)clock_value / (Double)reference_value;
 }
 
-static double campaign_total_ppb_from_tau(double tau) {
-  return (tau - 1.0) * 1.0e9;
+static Double campaign_total_ppb_from_tau(Double tau) {
+  return (tau - 1_D) * 1.0e9_D;
 }
 
 // Report-only serializer: reusable Payload control blocks live in RAM1. The outer
@@ -6544,8 +6528,8 @@ static FLASHMEM void report_add_welford_object(Payload& parent,
   obj.add("mean", toFixedDecimal(w.mean, 6));
   obj.add("stddev", toFixedDecimal(welford_stddev(w), 6));
   obj.add("stderr", toFixedDecimal(welford_stderr(w), 6));
-  obj.add("min", toFixedDecimal((w.n > 0) ? w.min_val : 0.0, 6));
-  obj.add("max", toFixedDecimal((w.n > 0) ? w.max_val : 0.0, 6));
+  obj.add("min", toFixedDecimal((w.n > 0) ? w.min_val : 0_D, 6));
+  obj.add("max", toFixedDecimal((w.n > 0) ? w.max_val : 0_D, 6));
   parent.add_object(key, obj);
   obj.clear();
 }
@@ -6554,7 +6538,7 @@ static FLASHMEM void report_add_stats_clock(Payload& parent,
                                              const char* key,
                                              const welford_t& w,
                                              bool include_frequency,
-                                             double ppb_value = 0.0) {
+                                             Double ppb_value = 0_D) {
   clocks_payload_owner_assert(clocks_payload_owner_t::COMMAND);
   Payload& obj = g_report_child_clock;
   obj.clear();
@@ -6581,7 +6565,7 @@ static FLASHMEM void report_add_stats_summary_from_snapshot(
   stats.add("last_pps_sequence", instrument.last_pps_sequence);
   stats.add("completed_row_coherent", instrument.completed_row_coherent);
 
-  report_add_stats_clock(stats, "gnss", instrument.gnss_welford, true, 0.0);
+  report_add_stats_clock(stats, "gnss", instrument.gnss_welford, true, 0_D);
   report_add_stats_clock(stats, "dwt", instrument.dwt_welford, true,
                          instrument.dwt_frequency.ppb);
   report_add_stats_clock(stats, "vclock", instrument.vclock_welford, true,
@@ -6633,20 +6617,20 @@ static FLASHMEM clocks_fragment_welford_snapshot_t clocks_fragment_welford_snaps
   out.m2 = w.m2;
   out.stddev = welford_stddev(w);
   out.stderr_value = welford_stderr(w);
-  out.min = (w.n > 0U) ? w.min_val : 0.0;
-  out.max = (w.n > 0U) ? w.max_val : 0.0;
+  out.min = (w.n > 0U) ? w.min_val : 0_D;
+  out.max = (w.n > 0U) ? w.max_val : 0_D;
   return out;
 }
 
 static FLASHMEM clocks_fragment_stats_clock_snapshot_t clocks_fragment_stats_clock(
     const welford_t& w,
     bool frequency_present,
-    double ppb) {
+    Double ppb) {
   clocks_fragment_stats_clock_snapshot_t out{};
   out.welford = clocks_fragment_welford_snapshot(w);
   out.frequency_present = frequency_present;
-  out.ppb = frequency_present ? ppb : 0.0;
-  out.tau = frequency_present ? (1.0 + ppb / 1.0e9) : 1.0;
+  out.ppb = frequency_present ? ppb : 0_D;
+  out.tau = frequency_present ? (1_D + ppb / 1.0e9_D) : 1_D;
   return out;
 }
 
@@ -6654,7 +6638,7 @@ static FLASHMEM clocks_fragment_ppb_value_snapshot_t clocks_fragment_ppb_value(
     const clocks_instrument_ppb_value_snapshot_t& source) {
   clocks_fragment_ppb_value_snapshot_t out{};
   out.sample_count = source.sample_count;
-  out.ppb = source.sample_count != 0ULL ? source.ppb : 0.0;
+  out.ppb = source.sample_count != 0ULL ? source.ppb : 0_D;
   return out;
 }
 
@@ -6672,16 +6656,16 @@ static FLASHMEM clocks_fragment_ppb_buckets_snapshot_t clocks_fragment_ppb_bucke
 static void clocks_fragment_campaign_ppb_set(
     clocks_fragment_ppb_value_snapshot_t& out,
     uint64_t sample_count,
-    double ppb) {
+    Double ppb) {
   out.sample_count = sample_count;
-  out.ppb = sample_count != 0ULL ? ppb : 0.0;
+  out.ppb = sample_count != 0ULL ? ppb : 0_D;
 }
 
-static double clocks_fragment_campaign_dwt_ppb(uint64_t gnss_ns,
+static Double clocks_fragment_campaign_dwt_ppb(uint64_t gnss_ns,
                                                uint64_t dwt_cycles) {
-  const double expected_cycles =
-      ((double)gnss_ns * (double)DWT_EXPECTED_PER_PPS) / 1.0e9;
-  return ((double)dwt_cycles / expected_cycles - 1.0) * 1.0e9;
+  const Double expected_cycles =
+      ((Double)gnss_ns * (Double)DWT_EXPECTED_PER_PPS) / 1.0e9_D;
+  return ((Double)dwt_cycles / expected_cycles - 1_D) * 1.0e9_D;
 }
 
 static void clocks_fragment_campaign_stats_snapshot(
@@ -6694,8 +6678,8 @@ static void clocks_fragment_campaign_stats_snapshot(
   stats = clocks_fragment_campaign_stats_snapshot_t{};
   if (sample_count == 0ULL || gnss_ns == 0ULL) return;
 
-  clocks_fragment_campaign_ppb_set(stats.gnss, sample_count, 0.0);
-  clocks_fragment_campaign_ppb_set(stats.vclock, sample_count, 0.0);
+  clocks_fragment_campaign_ppb_set(stats.gnss, sample_count, 0_D);
+  clocks_fragment_campaign_ppb_set(stats.vclock, sample_count, 0_D);
 
   if (dwt_cycles != 0ULL) {
     clocks_fragment_campaign_ppb_set(
@@ -6821,7 +6805,7 @@ static FLASHMEM void clocks_fragment_stats_snapshot_from_instrument(
       out.rolling_ppb_checkpoint, instrument.rolling_ppb_checkpoint);
   out.completed_row_coherent = instrument.completed_row_coherent;
 
-  out.gnss = clocks_fragment_stats_clock(instrument.gnss_welford, true, 0.0);
+  out.gnss = clocks_fragment_stats_clock(instrument.gnss_welford, true, 0_D);
   out.dwt = clocks_fragment_stats_clock(
       instrument.dwt_welford,
       instrument.dwt_frequency.valid,
@@ -6839,7 +6823,7 @@ static FLASHMEM void clocks_fragment_stats_snapshot_from_instrument(
       instrument.ocxo2_frequency.valid,
       instrument.ocxo2_frequency.ppb);
   out.pps_witness = clocks_fragment_stats_clock(
-      instrument.pps_witness_welford, false, 0.0);
+      instrument.pps_witness_welford, false, 0_D);
 
   out.dwt.ppb_buckets = clocks_fragment_ppb_buckets(
       instrument.dwt_frequency.ppb_buckets);
@@ -6851,7 +6835,7 @@ static FLASHMEM void clocks_fragment_stats_snapshot_from_instrument(
       instrument.ocxo2_frequency.ppb_buckets);
   if (instrument.gnss_welford.n != 0ULL) {
     out.gnss.ppb_buckets.total.sample_count = instrument.gnss_welford.n;
-    out.gnss.ppb_buckets.total.ppb = 0.0;
+    out.gnss.ppb_buckets.total.ppb = 0_D;
   }
   out.ocxo1_tau_state = clocks_fragment_tau_recovery_snapshot(
       instrument.ocxo1_tau_state);
@@ -7024,17 +7008,15 @@ static int64_t beta_signed_delta_u64(uint64_t lhs, uint64_t rhs) {
       : -beta_i64_from_u64_saturating(rhs - lhs);
 }
 
-static int64_t beta_round_double_to_i64(double value) {
-  return (value >= 0.0)
-      ? (int64_t)(value + 0.5)
-      : (int64_t)(value - 0.5);
+static int64_t beta_round_double_to_i64(Double value) {
+  return value.roundedInteger();
 }
 
-static double beta_dwt_cycles_to_gnss_ns_exact_signed(int64_t cycles,
+static Double beta_dwt_cycles_to_gnss_ns_exact_signed(int64_t cycles,
                                                        uint32_t cps) {
-  if (cps == 0U) return 0.0;
-  return ((double)cycles * (double)CLOCKS_BETA_NS_PER_SECOND) /
-         (double)cps;
+  if (cps == 0U) return 0_D;
+  return ((Double)cycles * (Double)CLOCKS_BETA_NS_PER_SECOND) /
+         (Double)cps;
 }
 
 static delta_residual_reference_t delta_residual_capture_vclock_reference(
@@ -7145,19 +7127,19 @@ static void ocxo_science_attach_totals(
   row.total_gnss_interval_ns = totals.gnss_interval_total_ns;
   row.total_clock_interval_ns_exact = totals.clock_interval_total_ns_exact;
   row.total_gnss_interval_ns_exact = totals.gnss_interval_total_ns_exact;
-  row.total_valid = totals.gnss_interval_total_ns_exact != 0.0 &&
-                    totals.clock_interval_total_ns_exact != 0.0;
+  row.total_valid = totals.gnss_interval_total_ns_exact != 0_D &&
+                    totals.clock_interval_total_ns_exact != 0_D;
   row.total_tau = row.total_valid
       ? (totals.gnss_interval_total_ns_exact /
          totals.clock_interval_total_ns_exact)
-      : 1.0;
+      : 1_D;
   row.total_ppb = row.total_valid
       ? campaign_total_ppb_from_tau(row.total_tau)
-      : 0.0;
+      : 0_D;
   row.total_fast_residual_ns_exact = row.total_valid
       ? (totals.gnss_interval_total_ns_exact -
          totals.clock_interval_total_ns_exact)
-      : 0.0;
+      : 0_D;
   row.total_fast_residual_ns = row.total_valid
       ? beta_round_double_to_i64(row.total_fast_residual_ns_exact)
       : 0LL;
@@ -7172,19 +7154,19 @@ static void ocxo_science_attach_totals(
   row.traditional_total_gnss_interval_ns_exact =
       totals.traditional_gnss_interval_total_ns_exact;
   row.traditional_total_valid =
-      totals.traditional_gnss_interval_total_ns_exact != 0.0 &&
-      totals.traditional_clock_interval_total_ns_exact != 0.0;
+      totals.traditional_gnss_interval_total_ns_exact != 0_D &&
+      totals.traditional_clock_interval_total_ns_exact != 0_D;
   row.traditional_total_tau = row.traditional_total_valid
       ? (totals.traditional_clock_interval_total_ns_exact /
          totals.traditional_gnss_interval_total_ns_exact)
-      : 1.0;
+      : 1_D;
   row.traditional_total_ppb = row.traditional_total_valid
       ? campaign_total_ppb_from_tau(row.traditional_total_tau)
-      : 0.0;
+      : 0_D;
   row.traditional_total_fast_residual_ns_exact = row.traditional_total_valid
       ? (totals.traditional_clock_interval_total_ns_exact -
          totals.traditional_gnss_interval_total_ns_exact)
-      : 0.0;
+      : 0_D;
   row.traditional_total_fast_residual_ns = row.traditional_total_valid
       ? beta_round_double_to_i64(row.traditional_total_fast_residual_ns_exact)
       : 0LL;
@@ -7197,19 +7179,19 @@ static void clock_science_apply_campaign_public_ratio(clock_science_row_t& row,
   row.total_sample_count = public_count;
   row.total_clock_interval_ns = public_clock_ns;
   row.total_gnss_interval_ns = public_gnss_ns;
-  row.total_clock_interval_ns_exact = (double)public_clock_ns;
-  row.total_gnss_interval_ns_exact = (double)public_gnss_ns;
+  row.total_clock_interval_ns_exact = (Double)public_clock_ns;
+  row.total_gnss_interval_ns_exact = (Double)public_gnss_ns;
   row.total_valid = public_gnss_ns != 0ULL && public_clock_ns != 0ULL;
 
   row.total_tau = row.total_valid
       ? campaign_total_tau_from_ratio(public_gnss_ns, public_clock_ns)
-      : 1.0;
+      : 1_D;
   row.total_ppb = row.total_valid
       ? campaign_total_ppb_from_tau(row.total_tau)
-      : 0.0;
+      : 0_D;
   row.total_fast_residual_ns_exact = row.total_valid
-      ? ((double)public_clock_ns - (double)public_gnss_ns)
-      : 0.0;
+      ? ((Double)public_clock_ns - (Double)public_gnss_ns)
+      : 0_D;
   row.total_fast_residual_ns = row.total_valid
       ? beta_signed_delta_u64(public_clock_ns, public_gnss_ns)
       : 0LL;
@@ -7224,15 +7206,15 @@ static void clock_science_apply_alpha_tau(clock_science_row_t& row,
   row.alpha_tau_interval_count = tau.interval_count;
   row.alpha_tau_last_pps_sequence = tau.last_pps_sequence;
   row.alpha_tau_last_interval_pps_sequence = tau.last_interval_pps_sequence;
-  row.alpha_tau = row.alpha_tau_valid ? tau.tau : 1.0;
-  row.alpha_tau_ppb = row.alpha_tau_valid ? tau.ppb : 0.0;
-  row.alpha_tau_stderr_ppb = row.alpha_tau_valid ? tau.stderr_ppb : 0.0;
+  row.alpha_tau = row.alpha_tau_valid ? tau.tau : 1_D;
+  row.alpha_tau_ppb = row.alpha_tau_valid ? tau.ppb : 0_D;
+  row.alpha_tau_stderr_ppb = row.alpha_tau_valid ? tau.stderr_ppb : 0_D;
   row.alpha_tau_interval_mean_ppb = row.alpha_tau_valid
       ? tau.interval_mean_ppb
-      : 0.0;
+      : 0_D;
   row.alpha_tau_interval_stderr_ppb = row.alpha_tau_valid
       ? tau.interval_stderr_ppb
-      : 0.0;
+      : 0_D;
   row.alpha_tau_intercept_ns = row.alpha_tau_valid ? tau.intercept_ns : 0;
 
   if (!row.alpha_tau_valid) return;
@@ -7383,15 +7365,15 @@ static void clock_science_build_ocxo(
     row.current_edge_gnss_ns =
         beta_i64_from_u64_saturating(public_gnss_ns) + current_delta_ns;
     row.current_edge_gnss_ns_exact =
-        (double)public_gnss_ns +
-        ((double)current_delta_cycles * (double)CLOCKS_BETA_NS_PER_SECOND) /
-            (double)row.projection_cps_cycles;
+        (Double)public_gnss_ns +
+        ((Double)current_delta_cycles * (Double)CLOCKS_BETA_NS_PER_SECOND) /
+            (Double)row.projection_cps_cycles;
 
     row.traditional_valid = true;
     row.traditional_gnss_interval_ns_exact =
-        ((double)row.clock_observed_interval_cycles *
-         (double)CLOCKS_BETA_NS_PER_SECOND) /
-        (double)row.projection_cps_cycles;
+        ((Double)row.clock_observed_interval_cycles *
+         (Double)CLOCKS_BETA_NS_PER_SECOND) /
+        (Double)row.projection_cps_cycles;
     row.traditional_gnss_interval_ns = beta_dwt_cycles_to_gnss_ns_rounded(
         (uint64_t)row.clock_observed_interval_cycles,
         row.projection_cps_cycles);
@@ -7404,14 +7386,14 @@ static void clock_science_build_ocxo(
 
     row.traditional_clock_interval_ns = CLOCKS_BETA_NS_PER_SECOND;
     row.traditional_clock_interval_ns_exact =
-        (double)CLOCKS_BETA_NS_PER_SECOND;
+        (Double)CLOCKS_BETA_NS_PER_SECOND;
     row.traditional_fast_residual_ns_exact =
         row.traditional_clock_interval_ns_exact -
         row.traditional_gnss_interval_ns_exact;
     row.traditional_fast_residual_ns =
         beta_round_double_to_i64(row.traditional_fast_residual_ns_exact);
-    row.traditional_tau_1s = (double)row.projection_cps_cycles /
-                             (double)row.clock_observed_interval_cycles;
+    row.traditional_tau_1s = (Double)row.projection_cps_cycles /
+                             (Double)row.clock_observed_interval_cycles;
     row.traditional_ppb_1s =
         campaign_total_ppb_from_tau(row.traditional_tau_1s);
 
@@ -7443,17 +7425,17 @@ static void clock_science_build_ocxo(
   }
 
   row.gnss_interval_ns = CLOCKS_BETA_NS_PER_SECOND;
-  row.gnss_interval_ns_exact = (double)CLOCKS_BETA_NS_PER_SECOND;
+  row.gnss_interval_ns_exact = (Double)CLOCKS_BETA_NS_PER_SECOND;
   row.fast_residual_ns_exact = row.delta_raw_fast_residual_ns_exact;
   row.fast_residual_ns = row.delta_raw_fast_residual_ns;
   row.clock_interval_ns_exact = row.gnss_interval_ns_exact -
                                 row.fast_residual_ns_exact;
-  row.clock_interval_ns = row.clock_interval_ns_exact > 0.0
+  row.clock_interval_ns = row.clock_interval_ns_exact > 0_D
       ? (uint64_t)beta_round_double_to_i64(row.clock_interval_ns_exact)
       : 0ULL;
-  row.tau_1s = (row.clock_interval_ns_exact > 0.0)
+  row.tau_1s = (row.clock_interval_ns_exact > 0_D)
       ? (row.gnss_interval_ns_exact / row.clock_interval_ns_exact)
-      : 1.0;
+      : 1_D;
   row.ppb_1s = campaign_total_ppb_from_tau(row.tau_1s);
 
   totals.sample_count++;
@@ -7995,7 +7977,7 @@ static FLASHMEM void clocks_fragment_clock_candidates_snapshot_from_row(
       ? phaseledger.refined_fast_residual_ns
       : 0LL;
   out.phaseledger.residual_ns_exact =
-      (double)out.phaseledger.residual_ns;
+      (Double)out.phaseledger.residual_ns;
 
   out.delta_cycles.available =
       delta_state.seeded && delta_state.continuity_valid &&
@@ -8018,7 +8000,7 @@ static FLASHMEM void clocks_fragment_clock_candidates_snapshot_from_row(
       : 0LL;
   out.delta_cycles.residual_ns_exact = out.delta_cycles.residual_available
       ? delta_state.last_residual_ns_exact
-      : 0.0;
+      : 0_D;
   (void)delta_row;
 
   out.comparable =
@@ -8033,7 +8015,7 @@ static FLASHMEM void clocks_fragment_clock_candidates_snapshot_from_row(
       out.residuals_comparable
           ? out.delta_cycles.residual_ns_exact -
                 out.phaseledger.residual_ns_exact
-          : 0.0;
+          : 0_D;
 }
 
 static FLASHMEM void clocks_fragment_science_snapshot_from_row(
@@ -9285,7 +9267,7 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
 static bool payload_try_get_double_alias(const Payload& args,
                                          const char* path,
                                          const char* lane,
-                                         double& out,
+                                         Double& out,
                                          const char* k1,
                                          const char* k2,
                                          const char* k3) {
@@ -10583,7 +10565,7 @@ static FLASHMEM Payload cmd_inject_problem(const Payload& args) {
     return err;
   }
 
-  double cycles_value = 1000.0;
+  Double cycles_value = 1000_D;
   if (args.has("cycles") || args.has("CYCLES") || args.has("magnitude")) {
     clocks_payload_numeric_integrity_reset();
     if (!payload_try_get_double_alias(args,
@@ -10599,8 +10581,8 @@ static FLASHMEM Payload cmd_inject_problem(const Payload& args) {
     }
   }
 
-  if (!isfinite(cycles_value) || cycles_value < 257.0 ||
-      cycles_value > 1000000.0) {
+  if (!isfinite(cycles_value) || cycles_value < 257_D ||
+      cycles_value > 1000000_D) {
     Payload err;
     err.add("error", "excursion cycles outside supported range");
     err.add("status", "inject_problem_rejected_cycles");

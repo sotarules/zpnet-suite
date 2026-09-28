@@ -1,5 +1,6 @@
 #pragma once
 
+#include "double.h"
 #include <cstdint>
 #include <cstddef>
 
@@ -197,8 +198,8 @@ static const uint32_t PPS_EMIT_INTERVAL_MS = 10000;
 // --------------------------------------------------------------
 // ADC scaling assumptions:
 // --------------------------------------------------------------
-static const float ADC_FS_VOLTS  = 3.3f;
-static const float ADC_FS_COUNTS = 4095.0f;
+static const Double ADC_FS_VOLTS  = 3.3_D;
+static const Double ADC_FS_COUNTS = 4095_D;
 
 // ============================================================================
 // Constants

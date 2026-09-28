@@ -1,3 +1,4 @@
+#include "integer_only.h"
 #include "execution_trace.h"
 #include "crash_forensics.h"
 

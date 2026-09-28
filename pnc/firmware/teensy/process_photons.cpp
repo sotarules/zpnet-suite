@@ -1,3 +1,5 @@
+#include "integer_only.h"
+#include "double.h"
 #include "process_photons.h"
 
 #include "config.h"
@@ -105,7 +107,7 @@ static constexpr uint32_t PHOTONS_RECOVERY_CHUNK_MAX_ENDPOINTS = 4U;
 // Teensy owns only active-high MOD on pin 35 plus the historical monitor-PD
 // ADC on pin 20. DRV200 bias current and hardware enable are local controls.
 
-static constexpr float PHOTONS_LASER_EMIT_THRESHOLD_V = 0.75f;
+static constexpr Double PHOTONS_LASER_EMIT_THRESHOLD_V = 0.75_D;
 static constexpr uint64_t PHOTONS_PULSE_DEFAULT_NS = 1000ULL;
 
 // Laser cadence is independent of detector arrivals and campaign recording.
@@ -214,7 +216,7 @@ static_assert(__atomic_always_lock_free(sizeof(uint32_t), nullptr),
 struct photons_device_snapshot_t {
   int      laser_mod_level = LOW;
   uint16_t laser_monitor_raw = 0;
-  float    laser_monitor_v = 0.0f;
+  Double    laser_monitor_v = 0_D;
   bool     laser_emitting = false;
 
   int      photodiode_edge_level = 0;
@@ -356,10 +358,10 @@ static_assert(
 
 struct photons_welford_state_t {
   uint64_t n = 0ULL;
-  double mean = 0.0;
-  double m2 = 0.0;
-  double min_val = 0.0;
-  double max_val = 0.0;
+  Double mean = 0_D;
+  Double m2 = 0_D;
+  Double min_val = 0_D;
+  Double max_val = 0_D;
 };
 
 
@@ -523,23 +525,23 @@ static bool g_photons_ppb_interval_advanced = false;
 static bool g_photons_ppb_last_minute_appended = false;
 
 static bool g_previous_fragment_mean_cycles_valid = false;
-static double g_previous_fragment_mean_cycles = 0.0;
+static Double g_previous_fragment_mean_cycles = 0_D;
 
 
 static void photons_welford_reset(photons_welford_state_t& w) {
   w.n = 0ULL;
-  w.mean = 0.0;
-  w.m2 = 0.0;
-  w.min_val = 1.0e300;
-  w.max_val = -1.0e300;
+  w.mean = 0_D;
+  w.m2 = 0_D;
+  w.min_val = 1.0e300_D;
+  w.max_val = -1.0e300_D;
 }
 
 
-static void photons_welford_update(photons_welford_state_t& w, double sample) {
+static void photons_welford_update(photons_welford_state_t& w, Double sample) {
   w.n++;
-  const double d1 = sample - w.mean;
-  w.mean += d1 / (double)w.n;
-  const double d2 = sample - w.mean;
+  const Double d1 = sample - w.mean;
+  w.mean += d1 / (Double)w.n;
+  const Double d2 = sample - w.mean;
   w.m2 += d1 * d2;
   if (sample < w.min_val) w.min_val = sample;
   if (sample > w.max_val) w.max_val = sample;
@@ -548,10 +550,10 @@ static void photons_welford_update(photons_welford_state_t& w, double sample) {
 
 static void photons_welford_merge_batch(photons_welford_state_t& w,
                                         uint64_t n,
-                                        double mean,
-                                        double m2,
-                                        double min_val,
-                                        double max_val) {
+                                        Double mean,
+                                        Double m2,
+                                        Double min_val,
+                                        Double max_val) {
   if (n == 0ULL) return;
   if (w.n == 0ULL) {
     w.n = n; w.mean = mean; w.m2 = m2;
@@ -560,18 +562,18 @@ static void photons_welford_merge_batch(photons_welford_state_t& w,
   }
   const uint64_t old_n = w.n;
   const uint64_t total_n = old_n + n;
-  const double delta = mean - w.mean;
-  w.mean += delta * ((double)n / (double)total_n);
+  const Double delta = mean - w.mean;
+  w.mean += delta * ((Double)n / (Double)total_n);
   w.m2 += m2 + delta * delta *
-      ((double)old_n * (double)n / (double)total_n);
+      ((Double)old_n * (Double)n / (Double)total_n);
   w.n = total_n;
   if (min_val < w.min_val) w.min_val = min_val;
   if (max_val > w.max_val) w.max_val = max_val;
 }
 
 
-static double photons_welford_stddev(const photons_welford_state_t& w) {
-  return (w.n >= 2ULL) ? sqrt(w.m2 / (double)(w.n - 1ULL)) : 0.0;
+static Double photons_welford_stddev(const photons_welford_state_t& w) {
+  return (w.n >= 2ULL) ? sqrt(w.m2 / (Double)(w.n - 1ULL)) : 0_D;
 }
 
 // Acquisition policy, independent of the selected science population. The
@@ -622,10 +624,10 @@ static void photons_arm_receive_window(uint32_t launch_dwt,
 }
 
 
-static double photons_welford_stderr(const photons_welford_state_t& w) {
+static Double photons_welford_stderr(const photons_welford_state_t& w) {
   return (w.n >= 2ULL)
-      ? photons_welford_stddev(w) / sqrt((double)w.n)
-      : 0.0;
+      ? photons_welford_stddev(w) / sqrt((Double)w.n)
+      : 0_D;
 }
 
 
@@ -637,8 +639,8 @@ static photons_fragment_welford_snapshot_t photons_welford_snapshot(
   out.m2 = w.m2;
   out.stddev = photons_welford_stddev(w);
   out.stderr_value = photons_welford_stderr(w);
-  out.min = (w.n != 0ULL) ? w.min_val : 0.0;
-  out.max = (w.n != 0ULL) ? w.max_val : 0.0;
+  out.min = (w.n != 0ULL) ? w.min_val : 0_D;
+  out.max = (w.n != 0ULL) ? w.max_val : 0_D;
   return out;
 }
 
@@ -860,12 +862,12 @@ static bool photons_recovery_stage_endpoint(bool minute_history,
 }
 
 
-static double photons_mean_lap_ns_from_population(
+static Double photons_mean_lap_ns_from_population(
     uint64_t total_lap_gnss_ns, uint64_t lap_count) {
   if (lap_count == 0ULL || total_lap_gnss_ns == 0ULL) __builtin_trap();
   const uint64_t whole_ns = total_lap_gnss_ns / lap_count;
   const uint64_t remainder_ns = total_lap_gnss_ns % lap_count;
-  return (double)whole_ns + (double)remainder_ns / (double)lap_count;
+  return (Double)whole_ns + (Double)remainder_ns / (Double)lap_count;
 }
 
 
@@ -1363,7 +1365,7 @@ static void photons_instrument_statistics_reset_commit(void) {
   g_raw_lap_ring_overflow_count = 0U;
   g_raw_lap_ring_data_loss = false;
   g_previous_fragment_mean_cycles_valid = false;
-  g_previous_fragment_mean_cycles = 0.0;
+  g_previous_fragment_mean_cycles = 0_D;
   g_photons_stats_reset_pending = false;
   g_photons_stats_reset_commit_count++;
 }
@@ -1674,10 +1676,10 @@ static void photons_lap_science_accept(
   g_photons_lap_science_state.reject_streak = 0U;
 
   photons_welford_update(
-      g_accepted_raw_cycles_welford, (double)candidate.raw_cycles);
+      g_accepted_raw_cycles_welford, (Double)candidate.raw_cycles);
   g_total_lap_gnss_ns += candidate.lap_gnss_ns;
   photons_welford_update(
-      g_lap_time_welford, (double)candidate.lap_gnss_ns);
+      g_lap_time_welford, (Double)candidate.lap_gnss_ns);
   g_photons_custody_lap_count++;
   g_photons_custody_total_lap_gnss_ns += candidate.lap_gnss_ns;
 
@@ -1805,10 +1807,10 @@ static void photons_lap_science_exclude(
   photons_lap_science_count_exclusion_reason(reason);
 
   photons_welford_update(
-      g_excluded_raw_cycles_welford, (double)candidate.raw_cycles);
+      g_excluded_raw_cycles_welford, (Double)candidate.raw_cycles);
   if (projection_valid) {
     photons_welford_update(
-        g_excluded_lap_time_welford, (double)candidate.lap_gnss_ns);
+        g_excluded_lap_time_welford, (Double)candidate.lap_gnss_ns);
   }
 
   g_photons_lap_science_state.reject_streak++;
@@ -1976,12 +1978,12 @@ static photons_race_batch_t photons_race_batch_take(void) {
   return out;
 }
 
-static double photons_batch_m2(uint64_t n, uint64_t sum, uint64_t sumsq) {
-  if (n < 2ULL) return 0.0;
-  const double dsum = (double)sum;
-  double m2 = (double)sumsq - (dsum * dsum / (double)n);
-  if (m2 < 0.0 && m2 > -0.5) m2 = 0.0;
-  if (m2 < 0.0) __builtin_trap();
+static Double photons_batch_m2(uint64_t n, uint64_t sum, uint64_t sumsq) {
+  if (n < 2ULL) return 0_D;
+  const Double dsum = (Double)sum;
+  Double m2 = (Double)sumsq - (dsum * dsum / (Double)n);
+  if (m2 < 0_D && m2 > -0.5_D) m2 = 0_D;
+  if (m2 < 0_D) __builtin_trap();
   return m2;
 }
 
@@ -2077,7 +2079,7 @@ static void photons_envelope_estimate(const photons_envelope_histogram_t& h,
   const uint64_t high = PHOTONS_ENVELOPE_HIGH_PERCENT * h.count;
   uint64_t before = h.underflow;
   uint64_t weight = 0ULL;
-  double sum = 0.0;
+  Double sum = 0_D;
   for (uint32_t i = 0U; i < PHOTONS_ENVELOPE_BINS; ++i) {
     const uint64_t w = photons_envelope_bin_weight(before, h.bins[i], low, high);
     before += h.bins[i];
@@ -2086,22 +2088,22 @@ static void photons_envelope_estimate(const photons_envelope_histogram_t& h,
     out.selected_last_cycles = h.origin_cycles + i;
     ++out.selected_bins;
     weight += w;
-    sum += (double)w * (double)i;
+    sum += (Double)w * (Double)i;
   }
   if (weight != high - low || weight == 0ULL) __builtin_trap();
-  const double mean_offset = sum / (double)weight;
+  const Double mean_offset = sum / (Double)weight;
   // Second pass about a small centered value avoids subtracting large squares.
-  double m2 = 0.0;
+  Double m2 = 0_D;
   before = h.underflow;
   for (uint32_t i = 0U; i < PHOTONS_ENVELOPE_BINS; ++i) {
     const uint64_t w = photons_envelope_bin_weight(before, h.bins[i], low, high);
     before += h.bins[i];
-    const double delta = (double)i - mean_offset;
-    m2 += (double)w * delta * delta;
+    const Double delta = (Double)i - mean_offset;
+    m2 += (Double)w * delta * delta;
   }
-  out.selected_mean_cycles = (double)h.origin_cycles + mean_offset;
+  out.selected_mean_cycles = (Double)h.origin_cycles + mean_offset;
   // Descriptive weighted population SD, deliberately no selected SD/sqrt(N).
-  out.selected_sd_cycles = sqrt(m2 / (double)weight);
+  out.selected_sd_cycles = sqrt(m2 / (Double)weight);
 }
 
 // Select a generous central population from this fragment alone. The radius
@@ -2261,7 +2263,7 @@ static FLASHMEM photons_core_state_t photons_core_select(
     photons_batch_add_checked(g_photons_core.rejection_total, removed_count);
     out.rejected_min_cycles = removed_min;
     out.rejected_max_cycles = removed_max;
-    out.rejected_mean_cycles = (double)removed_sum / (double)removed_count;
+    out.rejected_mean_cycles = (Double)removed_sum / (Double)removed_count;
   } else if (removed_sum != 0ULL || removed_sumsq != 0ULL) {
     __builtin_trap();
   }
@@ -2274,9 +2276,9 @@ static FLASHMEM photons_core_state_t photons_core_select(
   out.retained_count = kept_count;
   out.rejected_early_count = early;
   out.rejected_late_count = late;
-  out.retained_mean_cycles = (double)kept_sum / (double)kept_count;
+  out.retained_mean_cycles = (Double)kept_sum / (Double)kept_count;
   out.retained_sd_cycles = kept_count > 1ULL ? sqrt(photons_batch_m2(
-      kept_count, kept_sum, kept_sumsq) / (double)(kept_count - 1ULL)) : 0.0;
+      kept_count, kept_sum, kept_sumsq) / (Double)(kept_count - 1ULL)) : 0_D;
   // The envelope and canonical batch now describe exactly the same population.
   // The untouched preselection histogram lives in latest_input_histogram.
   for (uint32_t i = 0U; i < PHOTONS_ENVELOPE_BINS; ++i)
@@ -2309,11 +2311,11 @@ static FLASHMEM void photons_core_finish(photons_race_batch_t& batch,
   s.retained_count = batch.accepted_count;
   if (batch.accepted_count != 0ULL) {
     if (cps == 0U) __builtin_trap();
-    s.input_mean_cycles = (double)batch.accepted_sum_cycles /
-                          (double)batch.accepted_count;
+    s.input_mean_cycles = (Double)batch.accepted_sum_cycles /
+                          (Double)batch.accepted_count;
     s.input_sd_cycles = batch.accepted_count > 1ULL ? sqrt(photons_batch_m2(
         batch.accepted_count, batch.accepted_sum_cycles,
-        batch.accepted_sumsq_cycles) / (double)(batch.accepted_count - 1ULL)) : 0.0;
+        batch.accepted_sumsq_cycles) / (Double)(batch.accepted_count - 1ULL)) : 0_D;
     s.retained_mean_cycles = s.input_mean_cycles;
     s.retained_sd_cycles = s.input_sd_cycles;
   }
@@ -2353,13 +2355,13 @@ static FLASHMEM void photons_envelope_finish(const photons_race_batch_t& batch,
   if (accounted != h.count) __builtin_trap();
   if (h.count != 0ULL) {
     if (cps == 0U) __builtin_trap();
-    s.accepted_mean_cycles = (double)batch.accepted_sum_cycles / (double)h.count;
+    s.accepted_mean_cycles = (Double)batch.accepted_sum_cycles / (Double)h.count;
     s.accepted_sd_cycles = h.count > 1ULL ? sqrt(photons_batch_m2(
         h.count, batch.accepted_sum_cycles, batch.accepted_sumsq_cycles) /
-        (double)(h.count - 1ULL)) : 0.0;
+        (Double)(h.count - 1ULL)) : 0_D;
     // Recentering uses the full accepted batch, even if the selected ranks were
     // censored. A clipped window therefore reacquires without a firmware reboot.
-    e.next_center_cycles = (uint32_t)(s.accepted_mean_cycles + 0.5);
+    e.next_center_cycles = (uint32_t)(s.accepted_mean_cycles + 0.5_D);
   }
   if (!strcmp(photons_envelope_state(s), "ESTIMATED"))
     photons_envelope_estimate(h, s);
@@ -2406,42 +2408,42 @@ static photons_fragment_drain_result_t photons_drain_raw_laps(void) {
   if (race_batch.accepted_count != 0ULL) {
     const uint32_t cps = race_cps;
     if (cps == 0U) __builtin_trap();
-    const double n = (double)race_batch.accepted_count;
-    const double mean_cycles = (double)race_batch.accepted_sum_cycles / n;
-    const double m2_cycles = photons_batch_m2(
+    const Double n = (Double)race_batch.accepted_count;
+    const Double mean_cycles = (Double)race_batch.accepted_sum_cycles / n;
+    const Double m2_cycles = photons_batch_m2(
         race_batch.accepted_count,
         race_batch.accepted_sum_cycles,
         race_batch.accepted_sumsq_cycles);
-    const double ns_per_cycle =
-        (double)PHOTONS_NS_PER_SECOND / (double)cps;
-    const double mean_ns = mean_cycles * ns_per_cycle;
-    const double m2_ns = m2_cycles * ns_per_cycle * ns_per_cycle;
+    const Double ns_per_cycle =
+        (Double)PHOTONS_NS_PER_SECOND / (Double)cps;
+    const Double mean_ns = mean_cycles * ns_per_cycle;
+    const Double m2_ns = m2_cycles * ns_per_cycle * ns_per_cycle;
 
     photons_welford_merge_batch(
         g_accepted_raw_cycles_welford,
         race_batch.accepted_count,
         mean_cycles,
         m2_cycles,
-        (double)race_batch.accepted_min_cycles,
-        (double)race_batch.accepted_max_cycles);
+        (Double)race_batch.accepted_min_cycles,
+        (Double)race_batch.accepted_max_cycles);
     photons_welford_merge_batch(
         g_lap_time_welford,
         race_batch.accepted_count,
         mean_ns,
         m2_ns,
-        (double)race_batch.accepted_min_cycles * ns_per_cycle,
-        (double)race_batch.accepted_max_cycles * ns_per_cycle);
+        (Double)race_batch.accepted_min_cycles * ns_per_cycle,
+        (Double)race_batch.accepted_max_cycles * ns_per_cycle);
     photons_welford_merge_batch(
         result.projected_flight_welford,
         race_batch.accepted_count,
         mean_ns,
         m2_ns,
-        (double)race_batch.accepted_min_cycles * ns_per_cycle,
-        (double)race_batch.accepted_max_cycles * ns_per_cycle);
+        (Double)race_batch.accepted_min_cycles * ns_per_cycle,
+        (Double)race_batch.accepted_max_cycles * ns_per_cycle);
 
     const uint64_t accepted_ns = (uint64_t)(
-        ((long double)race_batch.accepted_sum_cycles *
-         (long double)PHOTONS_NS_PER_SECOND / (long double)cps) + 0.5L);
+        ((Double)race_batch.accepted_sum_cycles *
+         (Double)PHOTONS_NS_PER_SECOND / (Double)cps) + 0.5_D);
     g_total_lap_gnss_ns += accepted_ns;
     g_photons_custody_lap_count += race_batch.accepted_count;
     g_photons_custody_total_lap_gnss_ns += accepted_ns;
@@ -2451,9 +2453,9 @@ static photons_fragment_drain_result_t photons_drain_raw_laps(void) {
   }
 
   if (race_batch.rejected_count != 0ULL) {
-    const double n = (double)race_batch.rejected_count;
-    const double mean_cycles = (double)race_batch.rejected_sum_cycles / n;
-    const double m2_cycles = photons_batch_m2(
+    const Double n = (Double)race_batch.rejected_count;
+    const Double mean_cycles = (Double)race_batch.rejected_sum_cycles / n;
+    const Double m2_cycles = photons_batch_m2(
         race_batch.rejected_count,
         race_batch.rejected_sum_cycles,
         race_batch.rejected_sumsq_cycles);
@@ -2462,8 +2464,8 @@ static photons_fragment_drain_result_t photons_drain_raw_laps(void) {
         race_batch.rejected_count,
         mean_cycles,
         m2_cycles,
-        (double)race_batch.rejected_min_cycles,
-        (double)race_batch.rejected_max_cycles);
+        (Double)race_batch.rejected_min_cycles,
+        (Double)race_batch.rejected_max_cycles);
     g_photons_lap_science_state.exclusion_reasons.isr_delay +=
         race_batch.rejected_isr_delay;
     g_photons_lap_science_state.exclusion_reasons.isr_delay_this_fragment +=
@@ -2591,7 +2593,7 @@ static photons_fragment_drain_result_t photons_drain_raw_laps(void) {
     // Welford. The science court below independently decides whether it may
     // mutate the canonical lifetime population.
     photons_welford_update(
-        result.projected_flight_welford, (double)lap_gnss_ns);
+        result.projected_flight_welford, (Double)lap_gnss_ns);
 
     science_candidate.lap_gnss_ns = lap_gnss_ns;
     photons_lap_science_projected_candidate(science_candidate);
@@ -2606,8 +2608,8 @@ static photons_fragment_drain_result_t photons_drain_raw_laps(void) {
   g_raw_cycles_state.max_cycles_this_fragment = result.max_cycles;
   g_raw_cycles_state.mean_cycles_this_fragment =
       (result.raw_laps != 0U)
-          ? (double)result.total_cycles / (double)result.raw_laps
-          : 0.0;
+          ? (Double)result.total_cycles / (Double)result.raw_laps
+          : 0_D;
 
   g_raw_cycles_state.previous_fragment_mean_valid =
       g_previous_fragment_mean_cycles_valid;
@@ -2617,7 +2619,7 @@ static photons_fragment_drain_result_t photons_drain_raw_laps(void) {
       (result.raw_laps != 0U && g_previous_fragment_mean_cycles_valid)
           ? g_raw_cycles_state.mean_cycles_this_fragment -
                 g_previous_fragment_mean_cycles
-          : 0.0;
+          : 0_D;
 
   if (result.raw_laps != 0U) {
     g_previous_fragment_mean_cycles =
@@ -2654,7 +2656,7 @@ static photons_fragment_drain_result_t photons_drain_raw_laps(void) {
 }
 
 
-static float photons_adc_voltage(uint16_t raw) {
+static Double photons_adc_voltage(uint16_t raw) {
   return (raw / ADC_FS_COUNTS) * ADC_FS_VOLTS;
 }
 
@@ -3737,7 +3739,7 @@ static constexpr size_t PHOTONS_FRAGMENT_ROOT_SECTOR_COUNT =
 static constexpr uint32_t PHOTONS_FRAGMENT_ROOT_GUARD_BEFORE = 0x50524742UL; // 'PRGB'
 static constexpr uint32_t PHOTONS_FRAGMENT_ROOT_GUARD_AFTER  = 0x50524741UL; // 'PRGA'
 static constexpr uint32_t PHOTONS_FRAGMENT_ROOT_WITNESS_MAGIC = 0x50525731UL; // 'PRW1'
-static constexpr uint32_t PHOTONS_FRAGMENT_ROOT_WITNESS_SCHEMA_VERSION = 1U;
+static constexpr uint32_t PHOTONS_FRAGMENT_ROOT_WITNESS_SCHEMA_VERSION = 2U;
 static constexpr uint32_t PHOTONS_FRAGMENT_ROOT_HASH_OFFSET = 2166136261UL;
 static constexpr uint32_t PHOTONS_FRAGMENT_ROOT_HASH_PRIME = 16777619UL;
 
@@ -3806,6 +3808,7 @@ enum class photons_fragment_root_mismatch_stage_t : uint32_t {
   PUBLISH = 2U,
   POST_PUBLISH = 3U,
   QUIESCENT = 4U,
+  QUIESCENT_CONTRACT = 5U,
 };
 
 struct photons_fragment_root_snapshot_t {
@@ -3847,7 +3850,8 @@ photons_fragment_root_mismatch_record_t {
   uint32_t observed_first_line[PHOTONS_FRAGMENT_ROOT_GUARD_WORDS];
   uint32_t expected_last_line[PHOTONS_FRAGMENT_ROOT_GUARD_WORDS];
   uint32_t observed_last_line[PHOTONS_FRAGMENT_ROOT_GUARD_WORDS];
-  uint32_t reserved[5];
+  uint32_t expected_witness_available;
+  uint32_t reserved[4];
 };
 
 static_assert(sizeof(photons_fragment_root_mismatch_record_t) == 224U,
@@ -3869,6 +3873,7 @@ static FLASHMEM const char* photons_fragment_root_mismatch_stage_name(uint32_t s
     case photons_fragment_root_mismatch_stage_t::PUBLISH:      return "PUBLISH";
     case photons_fragment_root_mismatch_stage_t::POST_PUBLISH: return "POST_PUBLISH";
     case photons_fragment_root_mismatch_stage_t::QUIESCENT:    return "QUIESCENT";
+    case photons_fragment_root_mismatch_stage_t::QUIESCENT_CONTRACT: return "QUIESCENT_CONTRACT";
     default:                                                   return "NONE";
   }
 }
@@ -4006,6 +4011,7 @@ static FLASHMEM void photons_fragment_root_mismatch_commit(
   record.sequence = sequence;
   record.sequence_inv = ~sequence;
   record.stage = (uint32_t)stage;
+  record.expected_witness_available = expected.valid ? 1U : 0U;
   record.fragment_sequence = fragment_sequence;
   record.expected_fragment_sequence = expected.fragment_sequence;
   record.dwt = ARM_DWT_CYCCNT;
@@ -4104,6 +4110,13 @@ static FLASHMEM void photons_fragment_root_verify_quiescent(
           expected,
           observed);
     }
+    if (!g_photons_fragment_root.contract_valid()) {
+      photons_fragment_root_fail(
+          photons_fragment_root_mismatch_stage_t::QUIESCENT_CONTRACT,
+          next_fragment_sequence,
+          g_photons_fragment_root_quiescent,
+          observed);
+    }
     return;
   }
 
@@ -4117,6 +4130,16 @@ static FLASHMEM void photons_fragment_root_verify_quiescent(
       sector_mismatch != 0U) {
     photons_fragment_root_fail(
         photons_fragment_root_mismatch_stage_t::QUIESCENT,
+        next_fragment_sequence,
+        expected,
+        observed);
+  }
+
+  // A matching byte image is not proof of a semantically valid document.
+  // Retain the comparison before clear() performs its own independent check.
+  if (!g_photons_fragment_root.contract_valid()) {
+    photons_fragment_root_fail(
+        photons_fragment_root_mismatch_stage_t::QUIESCENT_CONTRACT,
         next_fragment_sequence,
         expected,
         observed);
@@ -4153,6 +4176,7 @@ static FLASHMEM void photons_fragment_root_add_report(Payload& parent) {
   if (mismatch_valid) {
     const photons_fragment_root_mismatch_record_t& mismatch =
         g_photons_fragment_root_mismatch_retained;
+    custody.add("retained_expected_witness_available", mismatch.expected_witness_available != 0U);
     custody.add("retained_mismatch_sequence", mismatch.sequence);
     custody.add("retained_mismatch_stage_id", mismatch.stage);
     custody.add("retained_mismatch_stage",
@@ -4328,7 +4352,7 @@ static void photons_payload_add_core(Payload& parent, const char* name,
   }
   if (s.input_count != 0ULL) {
     if (s.dwt_cycles_per_second == 0U) __builtin_trap();
-    const double scale = (double)PHOTONS_NS_PER_SECOND / s.dwt_cycles_per_second;
+    const Double scale = (Double)PHOTONS_NS_PER_SECOND / s.dwt_cycles_per_second;
     p.add("input_mean_cycles", toFixedDecimal(s.input_mean_cycles, 9));
     p.add("input_mean_ns", toFixedDecimal(s.input_mean_cycles * scale, 9));
     p.add("input_population_sd_ns", toFixedDecimal(s.input_sd_cycles * scale, 9));
@@ -4386,7 +4410,7 @@ static FLASHMEM Payload cmd_report_core(const Payload& /*args*/) {
     photons_payload_add_core(p, key, s);
     if (s.state == photons_core_state_t::FILTERED) ++filtered_fragments;
     if (s.input_count == 0ULL) continue;
-    const double scale = (double)PHOTONS_NS_PER_SECOND / s.dwt_cycles_per_second;
+    const Double scale = (Double)PHOTONS_NS_PER_SECOND / s.dwt_cycles_per_second;
     photons_welford_update(input_means, s.input_mean_cycles * scale);
     photons_welford_update(retained_means, s.retained_mean_cycles * scale);
   }
@@ -4424,14 +4448,14 @@ static void photons_payload_add_envelope(Payload& parent, const char* name,
     p.add("in_range_mode_count", s.in_range_mode_count);
   }
   if (s.accepted_count != 0ULL) {
-    const double scale = (double)PHOTONS_NS_PER_SECOND / s.dwt_cycles_per_second;
+    const Double scale = (Double)PHOTONS_NS_PER_SECOND / s.dwt_cycles_per_second;
     p.add("accepted_mean_cycles", toFixedDecimal(s.accepted_mean_cycles, 9));
     p.add("accepted_sd_cycles", toFixedDecimal(s.accepted_sd_cycles, 9));
     p.add("accepted_mean_ns", toFixedDecimal(s.accepted_mean_cycles * scale, 9));
     p.add("accepted_sd_ns", toFixedDecimal(s.accepted_sd_cycles * scale, 9));
     if (!strcmp(photons_envelope_state(s), "ESTIMATED")) {
-      p.add("selected_weight_n", toFixedDecimal((double)s.accepted_count *
-          (PHOTONS_ENVELOPE_HIGH_PERCENT - PHOTONS_ENVELOPE_LOW_PERCENT) / 100.0, 2));
+      p.add("selected_weight_n", toFixedDecimal((Double)s.accepted_count *
+          (PHOTONS_ENVELOPE_HIGH_PERCENT - PHOTONS_ENVELOPE_LOW_PERCENT) / 100_D, 2));
       p.add("selected_bins", s.selected_bins);
       p.add("selected_first_cycles", s.selected_first_cycles);
       p.add("selected_last_cycles", s.selected_last_cycles);
@@ -5161,9 +5185,9 @@ static FLASHMEM void photons_fragment_tick(
       g_photons_custody_total_lap_gnss_ns;
   fragment.stats.mean_lap_ns =
       (g_lap_time_welford.n != 0ULL)
-          ? (double)g_total_lap_gnss_ns /
-                (double)g_lap_time_welford.n
-          : 0.0;
+          ? (Double)g_total_lap_gnss_ns /
+                (Double)g_lap_time_welford.n
+          : 0_D;
   fragment.stats.lap_time_welford =
       photons_welford_snapshot(g_lap_time_welford);
   fragment.stats.valid =
@@ -5365,7 +5389,7 @@ static void photons_recovery_clear_physical_ancestry(void) {
   g_raw_lap_ring_data_loss = false;
   g_photons_lap_science_seed_pending = photons_lap_science_candidate_t{};
   g_previous_fragment_mean_cycles_valid = false;
-  g_previous_fragment_mean_cycles = 0.0;
+  g_previous_fragment_mean_cycles = 0_D;
 
   // g_photons_live is edge-service cumulative testimony. Recovery must never become
   // a second writer to its seqlock. Reclaim ancestry by draining foreground
@@ -5529,7 +5553,7 @@ FLASHMEM void process_photons_init(void) {
   g_photons_stats_update_count = 0U;
   photons_ppb_windows_clear_history();
   g_previous_fragment_mean_cycles_valid = false;
-  g_previous_fragment_mean_cycles = 0.0;
+  g_previous_fragment_mean_cycles = 0_D;
 
   photons_race_prepare();
   photons_laser_initialize_hardware();
@@ -5714,18 +5738,11 @@ static bool photons_recovery_get_bool(const Payload& args,
 
 static bool photons_recovery_get_double(const Payload& args,
                                         const char* key,
-                                        double& out) {
+                                        Double& out) {
   if (!args.has(key)) return false;
   const char* text = args.getString(key);
   if (!text || !*text) return false;
-  errno = 0;
-  char* end = nullptr;
-  const double parsed = strtod(text, &end);
-  if (errno == ERANGE || !end || *end != '\0' || !isfinite(parsed)) {
-    return false;
-  }
-  out = parsed;
-  return true;
+  return Double::tryParse(text, out);
 }
 
 
@@ -5734,10 +5751,10 @@ static bool photons_recovery_get_welford(const Payload& args,
                                          photons_welford_state_t& out) {
   char key[80];
   uint64_t n = 0ULL;
-  double mean = 0.0;
-  double m2 = 0.0;
-  double min_val = 0.0;
-  double max_val = 0.0;
+  Double mean = 0_D;
+  Double m2 = 0_D;
+  Double min_val = 0_D;
+  Double max_val = 0_D;
 
   snprintf(key, sizeof(key), "%s_n", prefix);
   if (!photons_recovery_get_u64(args, key, n)) return false;
@@ -5752,9 +5769,9 @@ static bool photons_recovery_get_welford(const Payload& args,
 
   if (n == 0ULL) {
     photons_welford_reset(out);
-    return mean == 0.0 && m2 == 0.0 && min_val == 0.0 && max_val == 0.0;
+    return mean == 0_D && m2 == 0_D && min_val == 0_D && max_val == 0_D;
   }
-  if (m2 < 0.0 || min_val > max_val || mean < min_val || mean > max_val) {
+  if (m2 < 0_D || min_val > max_val || mean < min_val || mean > max_val) {
     return false;
   }
 
@@ -6730,6 +6747,8 @@ static FLASHMEM Payload cmd_report_photons(const Payload& /*args*/) {
     p.add("laser_cadence_running", false);
     p.add("campaign_state", photons_campaign_state_name(g_photons_campaign_state));
     if (g_photons_campaign_name[0]) p.add("campaign", g_photons_campaign_name);
+    // Retained storage evidence must remain readable after a disabled reboot.
+    photons_fragment_root_add_report(p);
     return p;
   }
 
