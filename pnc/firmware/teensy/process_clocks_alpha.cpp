@@ -8892,6 +8892,8 @@ static void apply_ocxo_event(clock_state_t& clock,
 static void vclock_callback(const interrupt_event_t& event,
                             const interrupt_capture_diag_t* diag,
                             void*) {
+  if (!clocks_subsystem_enabled()) return;
+
   alpha_event_flow_note_callback(time_clock_id_t::VCLOCK, event, diag);
   clocks_capture_interrupt_diag(g_pps_witness_diag, diag);
   g_last_vclock_event_counter32_at_event = event.counter32_at_event;
@@ -8936,6 +8938,7 @@ static void vclock_callback(const interrupt_event_t& event,
 static void ocxo1_callback(const interrupt_event_t& event,
                            const interrupt_capture_diag_t* diag,
                            void*) {
+  if (!clocks_subsystem_enabled()) return;
   apply_ocxo_event(g_ocxo1_clock, g_ocxo1_measurement,
                    g_ocxo1_interrupt_diag, event, diag,
                    g_alpha_epoch_last_ocxo1_counter32,
@@ -8945,6 +8948,7 @@ static void ocxo1_callback(const interrupt_event_t& event,
 static void ocxo2_callback(const interrupt_event_t& event,
                            const interrupt_capture_diag_t* diag,
                            void*) {
+  if (!clocks_subsystem_enabled()) return;
   apply_ocxo_event(g_ocxo2_clock, g_ocxo2_measurement,
                    g_ocxo2_interrupt_diag, event, diag,
                    g_alpha_epoch_last_ocxo2_counter32,
@@ -9344,6 +9348,18 @@ static void update_pps_vclock_bridge_anchor(const pps_edge_snapshot_t& snap) {
 }
 
 static void pps_selector_callback(const pps_edge_snapshot_t& snap) {
+  // CLOCKS DISABLE leaves the system timing substrate alive. process_interrupt
+  // still authors PPS/VCLOCK identity and the physical counters continue to run,
+  // but Alpha/Beta science, SmartZero, Welfords and CLOCKS_FRAGMENT are quiescent.
+  if (!clocks_subsystem_enabled()) {
+    uint32_t cps = snap.vclock_edge_authority.dwt_cycles_per_second;
+    if (cps == 0U) cps = F_CPU_ACTUAL;
+    if (snap.snapshot_ok && snap.dwt_at_edge != 0U && cps != 0U) {
+      time_pps_vclock_update(snap.dwt_at_edge, cps, snap.counter32_at_edge);
+    }
+    return;
+  }
+
   g_alpha_latest_selector_reference_sequence = snap.sequence;
   g_alpha_latest_selector_reference_dwt = snap.dwt_at_edge;
 
@@ -9432,6 +9448,42 @@ static void pps_selector_callback(const pps_edge_snapshot_t& snap) {
 // Init
 // ============================================================================
 
+static volatile uint32_t g_clocks_subsystem_enabled = 0U;
+
+bool clocks_subsystem_enabled(void) {
+  return __atomic_load_n(&g_clocks_subsystem_enabled,
+                         __ATOMIC_ACQUIRE) != 0U;
+}
+
+bool clocks_subsystem_enable(void) {
+  uint32_t expected = 0U;
+  if (!__atomic_compare_exchange_n(&g_clocks_subsystem_enabled,
+                                   &expected,
+                                   1U,
+                                   false,
+                                   __ATOMIC_ACQ_REL,
+                                   __ATOMIC_ACQUIRE)) {
+    return true;  // idempotent
+  }
+
+  // Re-establish a fresh Alpha epoch only after explicit admission. The
+  // interrupt/timing substrate has remained live while CLOCKS was disabled.
+  interrupt_request_pps_rebootstrap();
+  if (!clocks_alpha_begin_smartzero_epoch("enable")) {
+    __atomic_store_n(&g_clocks_subsystem_enabled, 0U, __ATOMIC_RELEASE);
+    return false;
+  }
+  return true;
+}
+
+void clocks_subsystem_disable(void) {
+  // Withdraw science admission first so any later foreground callback becomes
+  // substrate-only before lifecycle scratch is retired by Beta.
+  __atomic_store_n(&g_clocks_subsystem_enabled, 0U, __ATOMIC_RELEASE);
+  interrupt_smartzero_abort();
+  alpha_completed_row_clear();
+}
+
 void process_clocks_init_hardware(void) {
   clocks_alpha_cold_diagnostics_init();
   dwt_enable();
@@ -9452,16 +9504,13 @@ void process_clocks_init(void) {
   time_init();
   clocks_beta_features_init();
 
-  // Startup epoch is installed locally by alpha from the first valid
-  // process_interrupt PPS/VCLOCK epoch capture packet.  Request a PPS
-  // rebootstrap so process_interrupt authors the first canonical PPS_VCLOCK
-  // edge and its epoch-ready capture packet.
-  interrupt_request_pps_rebootstrap();
+  __atomic_store_n(&g_clocks_subsystem_enabled, 0U, __ATOMIC_RELEASE);
 
   subscribe_clock(interrupt_subscriber_kind_t::VCLOCK, vclock_callback);
   subscribe_clock(interrupt_subscriber_kind_t::OCXO1, ocxo1_callback);
   subscribe_clock(interrupt_subscriber_kind_t::OCXO2, ocxo2_callback);
 
+  // Keep physical subscriptions connected while CLOCKS science boots disabled.
+  // Do not request a CLOCKS epoch until explicit ENABLE.
   interrupt_pps_edge_register_dispatch(pps_selector_callback);
-  (void)clocks_alpha_begin_smartzero_epoch("startup");
 }

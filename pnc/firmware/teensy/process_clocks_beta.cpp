@@ -9378,6 +9378,12 @@ static FLASHMEM Payload cmd_flash_cut(const Payload& args) {
 static FLASHMEM Payload cmd_start(const Payload& args) {
   const clocks_payload_custody_t payload_custody(
       clocks_payload_owner_t::COMMAND);
+  if (!clocks_subsystem_enabled()) {
+    Payload err;
+    err.add("error", "CLOCKS subsystem is disabled");
+    err.add("status", "start_rejected_subsystem_disabled");
+    return err;
+  }
   if (g_ppb_restore_protocol_active) {
     Payload err;
     err.add("error", "Better-Buckets restore is staged");
@@ -9454,6 +9460,94 @@ static FLASHMEM Payload cmd_start(const Payload& args) {
   p.add("epoch_owner", "CLOCKS_ALPHA");
   p.add("epoch_sequence", clocks_alpha_epoch_sequence());
   p.add("epoch_reason", clocks_alpha_epoch_last_reason());
+  return p;
+}
+
+static FLASHMEM Payload cmd_enable(const Payload&) {
+  const clocks_payload_custody_t payload_custody(
+      clocks_payload_owner_t::COMMAND);
+
+  if (clocks_subsystem_enabled()) {
+    Payload p;
+    p.add("status", "clocks_enabled");
+    p.add("enabled", true);
+    p.add("changed", false);
+    p.add("timing_substrate_alive", true);
+    return p;
+  }
+
+  if (campaign_state != clocks_campaign_state_t::STOPPED ||
+      request_start || request_stop || request_zero || request_recover ||
+      request_rearm || request_flash_cut ||
+      g_clocks_restore_requested || g_ppb_restore_protocol_active ||
+      clocks_campaign_recovery_lifecycle_active() ||
+      g_clocks_fragment_publication_service_active != 0U ||
+      clocks_epoch_pending()) {
+    Payload p;
+    p.add("status", "enable_rejected_lifecycle_busy");
+    p.add("enabled", false);
+    p.add("campaign_state", clocks_campaign_state_name(campaign_state));
+    p.add("epoch_pending", clocks_epoch_pending());
+    p.add("publisher_active",
+          g_clocks_fragment_publication_service_active != 0U);
+    return p;
+  }
+
+  const bool enabled = clocks_subsystem_enable();
+  Payload p;
+  p.add("status", enabled
+                      ? "clocks_enabled"
+                      : "enable_rejected_smartzero_start_failed");
+  p.add("enabled", enabled);
+  p.add("changed", enabled);
+  p.add("timing_substrate_alive", true);
+  p.add("smartzero_running", interrupt_smartzero_running());
+  return p;
+}
+
+static FLASHMEM Payload cmd_disable(const Payload&) {
+  const clocks_payload_custody_t payload_custody(
+      clocks_payload_owner_t::COMMAND);
+
+  if (!clocks_subsystem_enabled()) {
+    Payload p;
+    p.add("status", "clocks_disabled");
+    p.add("enabled", false);
+    p.add("changed", false);
+    p.add("timing_substrate_alive", true);
+    return p;
+  }
+
+  // DISABLE is intentionally quiescent-only. It is a diagnostic system
+  // boundary, not another asynchronous campaign/recovery teardown mechanism.
+  if (campaign_state != clocks_campaign_state_t::STOPPED ||
+      request_start || request_stop || request_zero || request_recover ||
+      request_rearm || request_flash_cut ||
+      g_clocks_restore_requested || g_ppb_restore_protocol_active ||
+      clocks_campaign_recovery_lifecycle_active() ||
+      g_clocks_fragment_publication_service_active != 0U ||
+      clocks_epoch_pending()) {
+    Payload p;
+    p.add("status", "disable_rejected_lifecycle_busy");
+    p.add("enabled", true);
+    p.add("campaign_state", clocks_campaign_state_name(campaign_state));
+    p.add("epoch_pending", clocks_epoch_pending());
+    p.add("publisher_active",
+          g_clocks_fragment_publication_service_active != 0U);
+    return p;
+  }
+
+  clocks_subsystem_disable();
+  clocks_fragment_recover_reset_publication_custody(false);
+
+  Payload p;
+  p.add("status", "clocks_disabled");
+  p.add("enabled", false);
+  p.add("changed", true);
+  p.add("timing_substrate_alive", true);
+  p.add("pps_vclock_preserved", true);
+  p.add("counter_services_preserved", true);
+  p.add("fragment_publication", false);
   return p;
 }
 
@@ -10587,6 +10681,7 @@ static FLASHMEM Payload cmd_report_recovery(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_RECOVERY");
   p.add("schema", "CLOCKS_RECOVERY_COMPACT_V2");
+  p.add("enabled", clocks_subsystem_enabled());
 
   p.add("campaign_state", clocks_campaign_state_name(campaign_state));
   p.add("campaign", campaign_name);
@@ -10837,7 +10932,9 @@ static FLASHMEM void report_add_common_metadata(
   clocks_payload_owner_assert(clocks_payload_owner_t::COMMAND);
   p.add("report", report);
   p.add("schema", schema);
-  p.add("instrument_always_on", true);
+  p.add("enabled", clocks_subsystem_enabled());
+  p.add("instrument_always_on", false);
+  p.add("timing_substrate_always_on", true);
   p.add("instrument_owner", "ALPHA");
   p.add("snapshot_ok", snapshot_ok);
   p.add("valid", g_beta_report_instrument_stats.valid);
@@ -11020,6 +11117,7 @@ static FLASHMEM Payload cmd_report_smartzero(const Payload&) {
   built.add("report", "CLOCKS_SMARTZERO");
   built.add("schema", "CLOCKS_SMARTZERO_REPORT_V1");
   built.add("read_only", true);
+  built.add("enabled", clocks_subsystem_enabled());
   built.add("campaign_state", clocks_campaign_state_name(campaign_state));
   built.add("campaign", campaign_name);
   built.add("campaign_seconds", campaign_seconds);
@@ -11140,6 +11238,8 @@ static FLASHMEM Payload cmd_stack_witness_reset(const Payload&) {
 // ============================================================================
 
 static const process_command_entry_t CLOCKS_COMMANDS[] = {
+  { "ENABLE",              cmd_enable              },
+  { "DISABLE",             cmd_disable             },
   { "START",               cmd_start               },
   { "REARM",               cmd_rearm               },
   { "FLASH_CUT",           cmd_flash_cut           },

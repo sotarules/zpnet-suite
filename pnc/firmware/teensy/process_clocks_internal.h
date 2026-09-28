@@ -1847,6 +1847,13 @@ extern volatile uint32_t watchdog_anomaly_trigger_dwt;
 // completed_pps_sequence.  Publication latency is deliberately irrelevant.
 void clocks_beta_pps(uint32_t completed_pps_sequence);
 void clocks_beta_features_init(void);
+
+// System-level CLOCKS lifecycle. The physical timing substrate remains live
+// while disabled; these functions gate Alpha/Beta science and publication.
+bool clocks_subsystem_enabled(void);
+bool clocks_subsystem_enable(void);
+void clocks_subsystem_disable(void);
+
 void clocks_watchdog_anomaly(const char* reason,
                              uint32_t detail0 = 0,
                              uint32_t detail1 = 0,

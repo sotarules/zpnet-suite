@@ -78,6 +78,7 @@ import logging
 import math
 import os
 import queue
+import sys
 import threading
 import subprocess
 import time
@@ -1566,7 +1567,7 @@ def _dac_control_loop() -> None:
     global _dac_next_frame_monotonic
     _dac_control_thread_started.set()
     while True:
-        if _hard_failure_active():
+        if _hard_failure_active() or not _clocks_subsystem_enabled.is_set():
             _dac_control_wakeup.wait(timeout=1.0)
             _dac_control_wakeup.clear()
             continue
@@ -2488,10 +2489,14 @@ def _gnss_raw_welford_reset() -> Dict[str, Any]:
 # ---------------------------------------------------------------------
 
 OPERATIONAL_STATE_SCHEMA = "PI_SUBSYSTEM_OPERATIONAL_STATE_V1"
+OPERATIONAL_STATE_DISABLED = "DISABLED"
 OPERATIONAL_STATE_STARTING = "STARTING"
 OPERATIONAL_STATE_RECOVERING = "RECOVERING"
 OPERATIONAL_STATE_RUNNING = "RUNNING"
 OPERATIONAL_STATE_HARD_FAILURE = "HARD_FAILURE"
+
+_clocks_subsystem_enabled = threading.Event()
+_clocks_enable_requested = threading.Event()
 
 _operational_state_lock = threading.Lock()
 _operational_state: Dict[str, Any] = {
@@ -2756,6 +2761,7 @@ def _set_operational_state(
 
     normalized = str(state or "").strip().upper()
     if normalized not in {
+        OPERATIONAL_STATE_DISABLED,
         OPERATIONAL_STATE_STARTING,
         OPERATIONAL_STATE_RECOVERING,
         OPERATIONAL_STATE_RUNNING,
@@ -4558,6 +4564,8 @@ def _timebase_silence_monitor_loop() -> None:
     while True:
         time.sleep(TIMEBASE_SILENCE_MONITOR_POLL_S)
         _diag["timebase_silence_checks"] += 1
+        if not _clocks_subsystem_enabled.is_set():
+            continue
 
         if _hard_failure_active():
             continue
@@ -13379,6 +13387,11 @@ def on_watchdog_anomaly(payload: Payload) -> None:
     startup reconciliation is complete it initiates ordinary auto-recovery;
     before that boundary the anomaly is retained as startup-owned evidence.
     """
+    if not _clocks_subsystem_enabled.is_set():
+        _diag["disabled_watchdog_anomalies_ignored"] = (
+            _diag.get("disabled_watchdog_anomalies_ignored", 0) + 1
+        )
+        return
     _diag["watchdog_anomalies_received"] += 1
 
     anomaly = dict(payload)
@@ -14786,6 +14799,12 @@ def _clocks_persistence_loop() -> None:
 
 def on_clocks_fragment(payload: Payload) -> None:
     """Queue every exact CLOCKS_FRAGMENT_V4 for canonical CLOCKS construction."""
+    if not _clocks_subsystem_enabled.is_set():
+        _diag["disabled_fragments_dropped"] = (
+            _diag.get("disabled_fragments_dropped", 0) + 1
+        )
+        return
+
     if _hard_failure_active() and not _hard_failure_stats_repair_active():
         _diag["hard_failure_ingress_dropped"] = (
             _diag.get("hard_failure_ingress_dropped", 0) + 1
@@ -18854,6 +18873,7 @@ def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
 
 def cmd_clocks_info(_: Optional[dict]) -> Dict[str, Any]:
     payload = {
+        "enabled": _clocks_subsystem_enabled.is_set(),
         "campaign_active": _campaign_active,
         "operational_state": _operational_state_snapshot(),
         "integrity_contract": {
@@ -19120,6 +19140,11 @@ def cmd_dac_info(_: Optional[dict] = None) -> Dict[str, Any]:
 
 
 COMMANDS = {
+    # Lifecycle handlers are defined later in this module. Late-bind them so
+    # command-table construction at import time does not depend on definition
+    # order; the names are resolved only when the command is actually invoked.
+    "ENABLE": lambda args=None: cmd_enable(args),
+    "DISABLE": lambda args=None: cmd_disable(args),
     "START": cmd_start,
     "STOP": cmd_stop,
     "RESUME": cmd_resume,
@@ -19150,6 +19175,9 @@ _HARD_FAILURE_READ_ONLY_COMMANDS = {
     "DAC_INFO",
     "LIST_CAMPAIGNS",
     "CLOCKS_INFO",
+}
+_DISABLED_ALLOWED_COMMANDS = _HARD_FAILURE_READ_ONLY_COMMANDS | {
+    "ENABLE", "DISABLE",
 }
 _HARD_FAILURE_OPERATOR_REPAIR_COMMANDS = {
     "REPAIR",
@@ -19201,9 +19229,163 @@ def _hard_failure_guard_command(
     return guarded
 
 
+def _disabled_guard_command(command: str, handler):
+    def guarded(args: Optional[dict]) -> Dict[str, Any]:
+        if (
+            not _clocks_subsystem_enabled.is_set()
+            and command not in _DISABLED_ALLOWED_COMMANDS
+        ):
+            return {
+                "success": False,
+                "message": f"CLOCKS.{command} refused: subsystem is DISABLED",
+                "payload": {
+                    "enabled": False,
+                    "operational_state": _operational_state_snapshot(),
+                },
+            }
+        return handler(args)
+    return guarded
+
+
+def _fetch_teensy_clocks_enabled() -> bool:
+    response = send_command(
+        machine="TEENSY",
+        subsystem="CLOCKS",
+        command="REPORT_CLOCKS",
+        retries=1,
+        retry_delay_s=0.0,
+    )
+    payload = response.get("payload") if isinstance(response, dict) else None
+    if (
+        not isinstance(response, dict)
+        or not response.get("success")
+        or not isinstance(payload, dict)
+        or not isinstance(payload.get("enabled"), bool)
+    ):
+        raise RuntimeError(
+            f"Teensy CLOCKS lifecycle testimony unavailable: {response!r}"
+        )
+    return bool(payload["enabled"])
+
+
+def cmd_enable(_: Optional[dict]) -> Dict[str, Any]:
+    if _clocks_subsystem_enabled.is_set():
+        return {
+            "success": True,
+            "message": "CLOCKS is already enabled",
+            "payload": {"enabled": True, "changed": False},
+        }
+
+    response = send_command(
+        machine="TEENSY",
+        subsystem="CLOCKS",
+        command="ENABLE",
+    )
+    payload = response.get("payload") if isinstance(response, dict) else None
+    status = str(payload.get("status") or "") if isinstance(payload, dict) else ""
+    if (
+        not isinstance(response, dict)
+        or not response.get("success")
+        or not isinstance(payload, dict)
+        or status != "clocks_enabled"
+        or payload.get("enabled") is not True
+    ):
+        return {
+            "success": False,
+            "message": f"Teensy CLOCKS.ENABLE rejected: {response!r}",
+            "payload": {"enabled": False, "teensy_response": response},
+        }
+
+    _clocks_subsystem_enabled.set()
+    _clocks_enable_requested.set()
+    _set_operational_state(
+        OPERATIONAL_STATE_STARTING,
+        reason="explicit_enable",
+        source="CLOCKS.ENABLE",
+    )
+    _dac_control_wakeup.set()
+    return {
+        "success": True,
+        "message": "CLOCKS enabled; startup reconciliation admitted",
+        "payload": {
+            "enabled": True,
+            "changed": bool(payload.get("changed")),
+            "teensy": copy.deepcopy(payload),
+        },
+    }
+
+
+def _reexec_after_disable() -> None:
+    # Re-enter the ordinary boot lifecycle after the command response has had
+    # time to leave the command socket. This retires Pi worker/recovery custody
+    # instead of inventing a second dynamic teardown path.
+    time.sleep(0.5)
+    os.execv(sys.executable, [sys.executable, *sys.argv])
+
+
+def cmd_disable(_: Optional[dict]) -> Dict[str, Any]:
+    response = send_command(
+        machine="TEENSY",
+        subsystem="CLOCKS",
+        command="DISABLE",
+    )
+    payload = response.get("payload") if isinstance(response, dict) else None
+    status = str(payload.get("status") or "") if isinstance(payload, dict) else ""
+    if (
+        not isinstance(response, dict)
+        or not response.get("success")
+        or not isinstance(payload, dict)
+        or status != "clocks_disabled"
+        or payload.get("enabled") is not False
+    ):
+        return {
+            "success": False,
+            "message": f"Teensy CLOCKS.DISABLE rejected: {response!r}",
+            "payload": {
+                "enabled": _clocks_subsystem_enabled.is_set(),
+                "teensy_response": response,
+            },
+        }
+
+    _clocks_subsystem_enabled.clear()
+    _clocks_enable_requested.clear()
+    _startup_control_ready.clear()
+    _clocks_persistence_enabled.clear()
+    _diag["startup_control_ready"] = False
+    _dac_set_dither_enabled(False)
+    _dac_set_servo_mode("OFF")
+    _set_operational_state(
+        OPERATIONAL_STATE_DISABLED,
+        reason="explicit_disable",
+        source="CLOCKS.DISABLE",
+        details={"timing_substrate_alive": True},
+    )
+    _dac_control_wakeup.set()
+
+    threading.Thread(
+        target=_reexec_after_disable,
+        daemon=True,
+        name="clocks-disable-reexec",
+    ).start()
+    return {
+        "success": True,
+        "message": "CLOCKS disabled",
+        "payload": {
+            "enabled": False,
+            "changed": bool(payload.get("changed")),
+            "timing_substrate_alive": True,
+            "pi_reexec_scheduled": True,
+            "teensy": copy.deepcopy(payload),
+        },
+    }
+
+
 COMMANDS = {
-    name: _hard_failure_guard_command(
-        name, _stats_reset_guard_command(name, handler)
+    name: _disabled_guard_command(
+        name,
+        _hard_failure_guard_command(
+            name, _stats_reset_guard_command(name, handler)
+        ),
     )
     for name, handler in COMMANDS.items()
 }
@@ -19235,6 +19417,8 @@ def run() -> None:
     _hard_failure_event.clear()
     _hard_failure_stats_repair_event.clear()
     _repair_request_in_progress.clear()
+    _clocks_subsystem_enabled.clear()
+    _clocks_enable_requested.clear()
     # From command-server exposure through the holistic finalizer there is exactly
     # one startup owner.  REPAIR requests may queue during this interval but may
     # not mutate lineage concurrently with it.
@@ -19278,6 +19462,37 @@ def run() -> None:
     # CLOCKS_FRAGMENT ingress open while waiting, but do not touch PostgreSQL or
     # issue Teensy RPC until those exact planes have been proved usable.
     _wait_for_startup_infrastructure()
+
+    # CLOCKS boots disabled at the firmware layer. Keep the Pi service and
+    # command socket alive, but do not seed/restore/start workers against
+    # deliberate CLOCKS_FRAGMENT silence. ENABLE wakes this same startup owner,
+    # which then runs the ordinary holistic reconciliation below.
+    firmware_enabled = _fetch_teensy_clocks_enabled()
+    if not firmware_enabled:
+        _clocks_subsystem_enabled.clear()
+        _startup_control_ready.clear()
+        _clocks_persistence_enabled.clear()
+        _diag["startup_control_ready"] = False
+        _startup_reconciliation_active.clear()
+        _set_operational_state(
+            OPERATIONAL_STATE_DISABLED,
+            reason="firmware_disabled",
+            source="RUN",
+            details={"timing_substrate_alive": True},
+        )
+        logging.info(
+            "⏹️ [clocks] firmware is DISABLED; PPS/VCLOCK/OCXO timing substrate "
+            "remains live while CLOCKS science/recovery waits for explicit CLOCKS.ENABLE"
+        )
+        _clocks_enable_requested.wait()
+        _startup_reconciliation_active.set()
+        _set_operational_state(
+            OPERATIONAL_STATE_STARTING,
+            reason="explicit_enable_startup",
+            source="RUN",
+        )
+    else:
+        _clocks_subsystem_enabled.set()
 
     # Resume the Pi-owned literal Better-Buckets checkpoint from the singleton
     # config.CLOCKS_RECOVERY image before queued live ingestion is consumed.
