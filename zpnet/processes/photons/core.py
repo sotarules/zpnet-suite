@@ -8153,7 +8153,7 @@ def cmd_enable(args: Optional[dict]) -> Dict[str, Any]:
                 else _request_teensy_subsystem_command(
                     "ENABLE",
                     accepted_statuses={"enabled", "already_enabled"},
-                    args=copy.deepcopy(args or {}),
+                    args={"interval": 100_000, **copy.deepcopy(args or {})},
                 )
             )
         except Exception as exc:
