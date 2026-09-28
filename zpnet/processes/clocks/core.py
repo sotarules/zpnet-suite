@@ -182,9 +182,9 @@ CAMPAIGN_DETAIL_ATTACH_POLL_S = 0.05
 # Teensy DWT conversion constants mirror pnc/firmware/teensy/config.h.
 # RECOVER still accepts a dwt_ns command argument, but current
 # TEMPEST_FRAGMENT_V1 publishes the DWT ledger in native cycles.
-DWT_NS_NUM = 125
-DWT_NS_DEN = 126
-DWT_EXPECTED_PER_PPS = 1_008_000_000
+DWT_NS_NUM = 5
+DWT_NS_DEN = 3
+DWT_EXPECTED_PER_PPS = 600_000_000
 
 GNSS_WAIT_LOG_INTERVAL = 60
 GNSS_RAW_INFO_MAX_AGE_S = 2.5
@@ -288,8 +288,13 @@ TIMEBASE_FINAL_COURT_VIOLATION_REASON = "tempest_final_court_violation"
 # recovery, DAC settling, or servo correction.  Debug10 PPS 574 had
 # clock=1 against a ~1,007,995,428-cycle reference; the broad plausibility
 # band is the corruption trap that blocks that class before DB write.
-TIMEBASE_FINAL_COURT_DWT_INTERVAL_MIN_CYCLES = 900_000_000
-TIMEBASE_FINAL_COURT_DWT_INTERVAL_MAX_CYCLES = 1_100_000_000
+# Preserve the existing relative plausibility band at the configured DWT rate.
+TIMEBASE_FINAL_COURT_DWT_INTERVAL_MIN_CYCLES = (
+    DWT_EXPECTED_PER_PPS * 900 // 1008
+)
+TIMEBASE_FINAL_COURT_DWT_INTERVAL_MAX_CYCLES = (
+    DWT_EXPECTED_PER_PPS * 1100 // 1008
+)
 # Non-fatal witness threshold only: records notable OCXO-vs-reference raw
 # offsets for diagnostics, but never blocks TIMEBASE persistence by itself.
 TIMEBASE_FINAL_COURT_DELTA_RAW_INTERVAL_GATE_CYCLES = 500

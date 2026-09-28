@@ -64,15 +64,33 @@ static constexpr uint32_t SMARTPOP_HZ       = 10000U; // 10 kHz
 static constexpr uint64_t NS_PER_SMART_TICK = NS_PER_SECOND / SMARTPOP_HZ; // 100,000 ns
 
 // --------------------------------------------------------------
-// DWT conversion (1008 MHz core clock)
+// DWT conversion (600 MHz clock-margin diagnostic trial)
 // --------------------------------------------------------------
 
-// Exact rational conversion: 1 DWT cycle = 125/126 ns
-static constexpr uint64_t DWT_NS_NUM = 125ULL;
-static constexpr uint64_t DWT_NS_DEN = 126ULL;
+// Exact rational conversion: 1 DWT cycle = 5/3 ns.
+static constexpr uint64_t DWT_NS_NUM = 5ULL;
+static constexpr uint64_t DWT_NS_DEN = 3ULL;
 
-// Expected DWT cycles per PPS second at 1008 MHz
-static constexpr uint32_t DWT_EXPECTED_PER_PPS = 1008000000U;
+// One nominal frequency drives both the boot clock and DWT conversions.
+// This trial tests processor timing margin; it is not a proven crash repair.
+static constexpr uint32_t DWT_EXPECTED_PER_PPS = 600000000U;
+static_assert((uint64_t)DWT_EXPECTED_PER_PPS * DWT_NS_NUM ==
+                  NS_PER_SECOND * DWT_NS_DEN,
+              "DWT conversion must match the configured core frequency");
+
+// Broad one-second plausibility limits shared by Alpha, Beta, and telemetry.
+// Preserve the original 900M..1100M band relative to its 1008 MHz nominal
+// rate. Pi CLOCKS uses the same ratios; changing the core rate changes every
+// interval court together. Widen before multiplying to avoid uint32 overflow.
+static constexpr uint32_t DWT_INTERVAL_MIN_CYCLES =
+    (uint32_t)((uint64_t)DWT_EXPECTED_PER_PPS * 900ULL / 1008ULL);
+static constexpr uint32_t DWT_INTERVAL_MAX_CYCLES =
+    (uint32_t)((uint64_t)DWT_EXPECTED_PER_PPS * 1100ULL / 1008ULL);
+static_assert(DWT_INTERVAL_MIN_CYCLES > 0U &&
+                  DWT_INTERVAL_MIN_CYCLES < DWT_EXPECTED_PER_PPS &&
+                  DWT_EXPECTED_PER_PPS < DWT_INTERVAL_MAX_CYCLES &&
+                  DWT_INTERVAL_MAX_CYCLES < 0xFFFFFFFFU,
+              "DWT interval limits must bracket one second and exclude sentinels");
 
 // --------------------------------------------------------------
 // Serial configuration
@@ -162,7 +180,7 @@ static constexpr uint32_t QTIMER1_CH0_MASK = 0xFFFF;
 //
 // Domain    Timer/Channel    Pin   Clock Source           Resolution
 // -------   ---------------  ---   --------------------   ----------
-// DWT       ARM_DWT_CYCCNT    —    CPU core (1008 MHz)    ~1 ns
+// DWT       ARM_DWT_CYCCNT    —    CPU core (600 MHz)     5/3 ns
 // GNSS      QTimer1 CH0       10   GF-8802 VCLOCK 10 MHz  100 ns
 // OCXO1     QTimer2 CH0       13   AOCJY1-A #1   10 MHz   100 ns
 // OCXO2     QTimer3 CH3       15   AOCJY1-A #2   10 MHz   100 ns

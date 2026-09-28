@@ -1642,14 +1642,9 @@ static void alpha_tau_interval_update(alpha_tau_estimator_t& s,
   s.interval_m2_ppb += d1 * d2;
 }
 
-static constexpr uint32_t ALPHA_INSTRUMENT_INTERVAL_MIN_CYCLES =
-    900000000UL;
-static constexpr uint32_t ALPHA_INSTRUMENT_INTERVAL_MAX_CYCLES =
-    1100000000UL;
-
 static bool alpha_instrument_interval_plausible(uint32_t cycles) {
-  return cycles >= ALPHA_INSTRUMENT_INTERVAL_MIN_CYCLES &&
-         cycles <= ALPHA_INSTRUMENT_INTERVAL_MAX_CYCLES;
+  return cycles >= DWT_INTERVAL_MIN_CYCLES &&
+         cycles <= DWT_INTERVAL_MAX_CYCLES;
 }
 
 static int64_t alpha_round_double_to_i64(Double value) {

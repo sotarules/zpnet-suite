@@ -130,10 +130,11 @@ static constexpr uint32_t HEARTBEAT_TICKS = 10000;
 static constexpr uint32_t PREDICT_MAX_QTIMER_ELAPSED = 15000000U;
 static constexpr uint32_t ONE_HZ_TICKS = 10000000U;
 // SpinIdle is a witness, not an owner of the main loop.  Bound each residence
-// to roughly 1 ms at 1.008 GHz so imperative transport_poll() can keep USB
+// to roughly 1 ms at the configured core frequency so transport_poll() keeps USB
 // commands and D0 heartbeat alive even when TimePop has no scheduled-context
 // work pending.
-static constexpr uint32_t TIMEPOP_IDLE_WITNESS_SPIN_BUDGET_CYCLES = 1008000U;
+static constexpr uint32_t TIMEPOP_IDLE_WITNESS_SPIN_BUDGET_CYCLES =
+    DWT_EXPECTED_PER_PPS / 1000U;
 static constexpr bool     TIMEPOP_SLOT_PRIORITY_ORDERING_ENABLED = true;
 static constexpr const char* WITNESS_SCHEDULER_NAME = "WITNESS_SCHEDULER";
 

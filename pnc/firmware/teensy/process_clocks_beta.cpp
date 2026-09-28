@@ -3301,8 +3301,6 @@ static constexpr uint64_t CLOCKS_BETA_NS_PER_SECOND = 1000000000ULL;
 // must remain evidence, but they must never publish with delta_raw_valid=true.
 // Keep the band deliberately broad: this is corruption/sentinel gating, not a
 // tight clock-quality gate.
-static constexpr uint32_t CLOCKS_DELTA_RAW_INTERVAL_MIN_CYCLES = 900000000UL;
-static constexpr uint32_t CLOCKS_DELTA_RAW_INTERVAL_MAX_CYCLES = 1100000000UL;
 static constexpr uint32_t CLOCKS_DELTA_RAW_INTERVAL_SENTINEL_U32 = 0xFFFFFFFFUL;
 
 static uint32_t g_delta_raw_interval_reject_count = 0;
@@ -3795,10 +3793,10 @@ static const char* delta_raw_interval_reject_reason(uint32_t cycles) {
   if (cycles == CLOCKS_DELTA_RAW_INTERVAL_SENTINEL_U32) {
     return "interval_sentinel_0xffffffff";
   }
-  if (cycles < CLOCKS_DELTA_RAW_INTERVAL_MIN_CYCLES) {
+  if (cycles < DWT_INTERVAL_MIN_CYCLES) {
     return "interval_below_plausible_min";
   }
-  if (cycles > CLOCKS_DELTA_RAW_INTERVAL_MAX_CYCLES) {
+  if (cycles > DWT_INTERVAL_MAX_CYCLES) {
     return "interval_above_plausible_max";
   }
   return "OK";
@@ -6598,8 +6596,8 @@ static FLASHMEM void report_add_stats_summary_from_snapshot(
 
   Payload& admission = g_report_child_admission;
   admission.clear();
-  admission.add("interval_min_cycles", 900000000UL);
-  admission.add("interval_max_cycles", 1100000000UL);
+  admission.add("interval_min_cycles", DWT_INTERVAL_MIN_CYCLES);
+  admission.add("interval_max_cycles", DWT_INTERVAL_MAX_CYCLES);
   admission.add("vclock_reject_count", instrument.vclock_interval_reject_count);
   admission.add("ocxo1_reject_count", instrument.ocxo1_interval_reject_count);
   admission.add("ocxo2_reject_count", instrument.ocxo2_interval_reject_count);

@@ -30,10 +30,11 @@
 // DWT CLOCK DETERMINISM CONFIGURATION
 // ============================================================================
 //
-// Goal: maximize DWT cycle counter stability for precision timing.
+// Goal: keep the DWT counter running at the configured core frequency.
 //
-// 1. Overclock to 1.008 GHz — ~1 ns per DWT tick, maximum resolution.
-//    The Teensy 4.1 (i.MX RT1062) supports this with adequate cooling.
+// 1. Run the 600 MHz diagnostic trial configured in config.h.
+//    This removes the 1.008 GHz overclock as a crash investigation variable.
+//    Adequate cooling alone does not establish timing margin at an overclock.
 //    set_arm_clock() reconfigures PLL1 and adjusts DCDC voltage.
 //
 // 2. Disable all ARM sleep modes — prevent core clock gating.
@@ -44,13 +45,12 @@
 //    All downstream code that uses F_CPU_ACTUAL will pick up the
 //    new frequency.
 //
-// THERMAL NOTE:
-//    1.008 GHz + heatsink = safe continuous operation.
-//    CPU temperature is monitored via SYSTEM.REPORT (integer-only cpuTempC).
+// CPU temperature is monitored via SYSTEM.REPORT (integer-only cpuTempC).
 //
 // DWT NS CONVERSION NOTE:
-//    At 600 MHz: 1 cycle = 5/3 ns (exact)
-//    At 1008 MHz: 1 cycle = 125/126 ns (exact rational, ~0.9921 ns)
+//    At 600 MHz: 1 cycle = 5/3 ns (exact).
+//    Frequency changes require a new instrument timing baseline; software
+//    conversion alone does not calibrate launch/capture latency.
 //
 // ============================================================================
 
@@ -60,9 +60,9 @@ extern "C" uint32_t set_arm_clock(uint32_t frequency);
 static void maximize_dwt_determinism(void) {
 
   // ----------------------------------------------------------
-  // 1. Overclock to 1.008 GHz
+  // 1. Apply the nominal frequency used by the DWT conversion constants
   // ----------------------------------------------------------
-  set_arm_clock(1008000000);
+  set_arm_clock(DWT_EXPECTED_PER_PPS);
 
   // ----------------------------------------------------------
   // 2. Disable ARM sleep modes
