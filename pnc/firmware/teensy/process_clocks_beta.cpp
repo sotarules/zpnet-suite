@@ -1352,7 +1352,9 @@ static void clocks_fragment_add_stats_clock(
   parent.add_object(key, value);
 }
 
-static void clocks_fragment_add_tau_state(
+// Foreground serialization belongs in flash so RAM1 banks remain available
+// for the stack. Payload storage retains its existing placement.
+static FLASHMEM void clocks_fragment_add_tau_state(
     Payload& parent,
     const char* key,
     const clocks_fragment_tau_recovery_snapshot_t& state) {
@@ -1491,7 +1493,7 @@ static void clocks_fragment_add_science(
   parent.add_object("science", value);
 }
 
-static Payload& clocks_fragment_clocks_payload(
+static FLASHMEM Payload& clocks_fragment_clocks_payload(
     const clocks_fragment_live_snapshot_t& snapshot) {
   clocks_payload_owner_assert(clocks_payload_owner_t::FRAGMENT);
   Payload& clocks = g_clocks_fragment_clocks_payload;
@@ -1588,7 +1590,7 @@ static void clocks_fragment_add_clock_candidates(
   parent.add_object("clock_candidates", candidates);
 }
 
-static void clocks_fragment_add_campaign_ocxo(
+static FLASHMEM void clocks_fragment_add_campaign_ocxo(
     Payload& parent,
     const char* key,
     const clocks_fragment_clock_candidates_snapshot_t& clock_candidates,
@@ -1625,7 +1627,7 @@ static void clocks_fragment_add_campaign_stats(
   parent.add_object("stats", stats);
 }
 
-static Payload& clocks_fragment_campaign_payload(
+static FLASHMEM Payload& clocks_fragment_campaign_payload(
     const clocks_fragment_campaign_snapshot_t& snapshot) {
   clocks_payload_owner_assert(clocks_payload_owner_t::FRAGMENT);
   Payload& campaign = g_clocks_fragment_campaign_payload;
@@ -1842,7 +1844,7 @@ static void clocks_fragment_publish_service_release_owner(void) {
 static void clocks_fragment_campaign_snapshot_accept(
     const clocks_fragment_publication_item_t& item);
 
-static void clocks_fragment_publish_service(timepop_ctx_t*,
+static FLASHMEM void clocks_fragment_publish_service(timepop_ctx_t*,
                                                    timepop_diag_t*,
                                                    void* user_data) {
   const uint32_t callback_generation = (uint32_t)(uintptr_t)user_data;

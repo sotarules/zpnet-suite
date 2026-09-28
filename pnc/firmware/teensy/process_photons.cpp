@@ -4333,7 +4333,9 @@ static void photons_payload_add_capture_totals(
 
 // Render the same completed selection that fed canonical science. Counts own
 // their moments; no missing fragment is represented by a fabricated zero mean.
-static void photons_payload_add_core(Payload& parent, const char* name,
+// These foreground renderers share the fragment/report callers' flash placement
+// to release RAM1 for the stack without relocating acquisition state.
+static FLASHMEM void photons_payload_add_core(Payload& parent, const char* name,
                                      const photons_core_snapshot_t& s) {
   Payload& p = g_photons_fragment_core;
   p.clear();
@@ -4437,7 +4439,7 @@ static FLASHMEM Payload cmd_report_core(const Payload& /*args*/) {
   return Payload(p);
 }
 
-static void photons_payload_add_envelope(Payload& parent, const char* name,
+static FLASHMEM void photons_payload_add_envelope(Payload& parent, const char* name,
                                          const photons_envelope_snapshot_t& s) {
   Payload& p = g_photons_fragment_envelope;
   p.clear();
