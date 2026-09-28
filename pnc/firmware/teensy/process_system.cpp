@@ -2768,13 +2768,19 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
   // CPU clock frequency — authoritative runtime value.
   // F_CPU_ACTUAL is updated by set_arm_clock() at boot.
   // This is the ACTUAL core clock, not the compile-time default.
+  p.add("cpu_freq_hz", (uint32_t)F_CPU_ACTUAL);
   p.add("cpu_freq_mhz", (uint32_t)(F_CPU_ACTUAL / 1000000UL));
 
-  // Deliberately omit CPU temperature and internal-reference voltage from
-  // periodic SYSTEM.REPORT.  Their acquisition APIs return floating point, and
-  // this report executes on the shared foreground/exception MSP stack under
-  // frequent timing interrupts.  Reintroduce them only through a focused,
-  // explicitly isolated integer telemetry surface.
+  // Arduino's unsigned millisecond tick wraps after approximately 49.7 days.
+  p.add("uptime_ms32", (uint32_t)millis());
+
+  // Teensy die temperature, distinct from Pi CPU and Pelican ambient readings.
+  // cpuTempC() reads TEMPMON using integer-backed Double arithmetic.
+  // fixed_decimal_t keeps publication free of native floating-point operations.
+  const fixed_decimal_t cpu_temperature = toFixedDecimal(cpuTempC(), 2);
+  p.add("cpu_temp_c", cpu_temperature);
+  p.add("cpu_temp_source", "ON_DIE_TEMPMON");
+
   // Heap availability
   // MULE: COMMENTED OUT for STABILITY
   //p.add("free_heap_bytes", freeHeapBytes());
@@ -2818,9 +2824,9 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
   // CPU work means non-spin foreground/ISR work.  True core occupancy is
   // intentionally near 100% because the idle DWT witness loop runs when idle.
   //
-  // Publish the already-computed millipercent scalars directly.  SYSTEM.REPORT
-  // must remain integer-only: no floating-point division, fixed_decimal_t
-  // structure return, temporary-reference binding, or numeric reformatting.
+  // Publish the already-computed millipercent scalars directly; CPU work
+  // percentages need no decimal conversion. Temperature above uses the
+  // integer-backed Double/fixed_decimal_t path, without native floating point.
   // The Pi SYSTEM process treats this Teensy payload as a transitive dictionary.
   p.add("cpu_usage_pct_milli", cpu_work_pct_milli);
   p.add("cpu_work_pct_milli", cpu_work_pct_milli);
