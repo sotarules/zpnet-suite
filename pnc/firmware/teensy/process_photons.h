@@ -66,7 +66,7 @@
 //     launch, clipped before the cadence deadline. Bounds use the nominal DWT
 //     clock, independently of statistics/reset/recovery; science retains GNSS
 //     projection and delay classification after capture;
-//   • Priority 48 admits at most one in-window raw candidate per launch. Other
+//   • Priority 0 admits at most one in-window raw candidate per launch. Other
 //     active-detector hits increment SPURIOUS (EARLY/DUPLICATE/LATE/UNARMED)
 //     before queueing; foreground retains
 //     science/delay classification. No optical processing executes at Priority 32;
@@ -642,6 +642,7 @@ struct photons_fragment_snapshot_t {
   uint32_t race_capture_max_ns = 0;
   uint32_t race_capture_min_cycles = 0;
   uint32_t race_capture_max_cycles = 0;
+  // Cadence opportunities suppressed by PPS/OCXO quiet guards; no pulse exists.
   uint64_t race_skipped_not_quiet_total = 0;
   uint32_t race_skipped_not_quiet_this_fragment = 0;
   uint64_t race_skipped_projection_total = 0;

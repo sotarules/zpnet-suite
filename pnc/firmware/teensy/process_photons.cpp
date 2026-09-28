@@ -121,11 +121,19 @@ static constexpr uint32_t PHOTONS_RACE_HOLDOFF_NS = 0U; // retired wire field
 static bool g_photons_cadence_running = false;
 static uint64_t g_photons_cadence_ns = PHOTONS_CADENCE_DEFAULT_NS;
 static uint32_t g_photons_cadence_cycles = 0U;
-static uint32_t g_photons_cadence_last_dwt = 0U;
+static uint32_t g_photons_race_pulse_cycles = 0U;
+// An actual launch normally anchors the next opportunity. A quiet-window skip
+// consumes one opportunity and anchors the next one at its admission check.
+static uint32_t g_photons_cadence_anchor_dwt = 0U;
 static uint64_t g_photons_cadence_launches_since_start = 0ULL;
 static uint64_t g_photons_laser_launch_count = 0ULL;
-// Retired grid-spacing deferrals: retained for report compatibility.
-static constexpr uint64_t g_photons_cadence_deferred_count = 0ULL;
+// Foreground-owned, boot-lifetime testimony. Overlapping clock guards count
+// once in deferred_count and once for each lane responsible for that skip.
+static uint64_t g_photons_cadence_deferred_count = 0ULL;
+static uint64_t g_photons_quiet_pps_count = 0ULL;
+static uint64_t g_photons_quiet_ocxo1_count = 0ULL;
+static uint64_t g_photons_quiet_ocxo2_count = 0ULL;
+static uint32_t g_photons_quiet_last_blocker_mask = 0U;
 
 static constexpr uint32_t PHOTONS_RACE_SEED_HISTORY = 8U;
 static constexpr uint32_t PHOTONS_RACE_SEED_QUORUM = 3U;
@@ -159,7 +167,7 @@ struct photons_race_runtime_t {
   // Acquisition rejects are outside the durable science EXCL ledger.
   uint64_t rejected_launch_timing_count = 0ULL; // captured returns
   uint64_t missed_launch_timing_count = 0ULL;   // subset of missed_count
-  uint64_t skipped_not_quiet_count = 0ULL;
+  uint64_t skipped_not_quiet_count = 0ULL; // guarded opportunities: no pulse/attempt
   uint64_t skipped_projection_count = 0ULL;
   uint64_t invalid_endpoint_count = 0ULL;
   uint64_t enqueue_failure_count = 0ULL;
@@ -1959,12 +1967,14 @@ static void photons_race_batch_consume(void) {
   const uint64_t ticks = g_photons_race_foreground.cadence_tick_count;
   const uint64_t missed = g_photons_race_foreground.missed_count;
   const uint64_t missed_launch = g_photons_race_foreground.missed_launch_timing_count;
+  const uint64_t skipped_not_quiet = g_photons_race_foreground.skipped_not_quiet_count;
   g_photons_race_foreground = g_photons_race_completed;
   g_photons_race_foreground.active = active;
   g_photons_race_foreground.attempt_count = attempts;
   g_photons_race_foreground.cadence_tick_count = ticks;
   g_photons_race_foreground.missed_count = missed;
   g_photons_race_foreground.missed_launch_timing_count = missed_launch;
+  g_photons_race_foreground.skipped_not_quiet_count = skipped_not_quiet;
   // Release only after the last batch AND runtime read. Later holdoff edges
   // mutate edge-service state, never the completed publication above.
   __atomic_store_n(&g_photons_race_batch_consumed, published, __ATOMIC_RELEASE);
@@ -3041,12 +3051,12 @@ static void photons_race_seed_observe(uint32_t raw_cycles) {
   (void)photons_race_try_lock_reference();
 }
 
+// Cadence service already admitted this complete acquisition and holds the
+// priority-0-preserving launch guard until the return receiver is armed.
+// Pulse width is prepared at ENABLE so no division follows quiet admission.
 static uint32_t photons_race_launch_200ns(uint32_t& before_mod_high_dwt) {
   if (digitalRead(LASER_MOD_PIN) != LOW) __builtin_trap();
-  const uint32_t cps = F_CPU_ACTUAL;
-  if (cps == 0U) __builtin_trap();
-  const uint32_t width_cycles = (uint32_t)(
-      ((uint64_t)cps * PHOTONS_RACE_PULSE_NS + 500000000ULL) / 1000000000ULL);
+  const uint32_t width_cycles = g_photons_race_pulse_cycles;
   // One additional DWT read; keep MOD HIGH and the science timestamp adjacent.
   const uint32_t before_high = ARM_DWT_CYCCNT;
   digitalWriteFast(LASER_MOD_PIN, HIGH);
@@ -3174,7 +3184,7 @@ static bool photons_cadence_ready(void*) {
   // TIMEPOP checks this in SpinIdle and before foreground service. Unsigned
   // subtraction crosses DWT wrap without moving the deadline onto a timer grid.
   return g_photons_cadence_running &&
-      (uint32_t)(ARM_DWT_CYCCNT - g_photons_cadence_last_dwt) >=
+      (uint32_t)(ARM_DWT_CYCCNT - g_photons_cadence_anchor_dwt) >=
           g_photons_cadence_cycles;
 }
 
@@ -3183,15 +3193,39 @@ static void photons_cadence_service(void*) {
       photons_foreground_owner_t::FOREGROUND_SERVICE);
   if (!photons_cadence_ready(nullptr)) __builtin_trap();
 
-  // Service one due launch, however late. The actual MOD-high timestamp below
-  // becomes the next deadline's origin: no grid skip and no catch-up burst.
+  // Service one due opportunity, however late. An admitted actual MOD-high or
+  // a rejected quiet-window opportunity anchors the next full interval. There
+  // is no catch-up burst when any of the three clock guards clears.
   photons_histogram_acquire();
   interrupt_photodiode_boundary_begin();
   photons_race_close_window();
   auto& race = g_photons_race_foreground;
+  // Complete the decision, physical launch, and receive arming as one bounded
+  // transaction. Priority-0 clocks remain live; lower-priority work cannot hold
+  // an already-returned detector edge pending beyond its admitted horizon.
+  const uint32_t prior_basepri = interrupt_photons_launch_guard_enter();
+  const uint32_t blockers = interrupt_photons_quiet_blockers(
+      photons_receive_upper_cycles(g_photons_cadence_cycles - 1U));
+  g_photons_quiet_last_blocker_mask = blockers;
+  if (blockers != 0U) {
+    interrupt_photons_launch_guard_exit(prior_basepri);
+    g_photons_cadence_anchor_dwt = ARM_DWT_CYCCNT;
+    g_photons_cadence_deferred_count++;
+    if ((blockers & INTERRUPT_DELAY_SOURCE_BIT_PPS) != 0U)
+      g_photons_quiet_pps_count++;
+    if ((blockers & INTERRUPT_DELAY_SOURCE_BIT_OCXO1) != 0U)
+      g_photons_quiet_ocxo1_count++;
+    if ((blockers & INTERRUPT_DELAY_SOURCE_BIT_OCXO2) != 0U)
+      g_photons_quiet_ocxo2_count++;
+    if (g_photons_recovery.publication_started) race.skipped_not_quiet_count++;
+    // The previous shot has been settled and its capture permit withdrawn.
+    // This opportunity emitted nothing: do not author an attempt or a miss.
+    interrupt_photodiode_boundary_end();
+    return;
+  }
   uint32_t before_mod_high_dwt;
   const uint32_t launch_dwt = photons_race_launch_200ns(before_mod_high_dwt);
-  g_photons_cadence_last_dwt = launch_dwt;
+  g_photons_cadence_anchor_dwt = launch_dwt;
   g_photons_cadence_launches_since_start++;
   g_photons_laser_launch_count++;
 
@@ -3220,6 +3254,7 @@ static void photons_cadence_service(void*) {
   photons_arm_receive_window(launch_dwt, g_photons_cadence_cycles - 1U,
       before_mod_high_dwt, interrupt_photodiode_launch_kind_t::CADENCE);
   interrupt_photodiode_boundary_end();
+  interrupt_photons_launch_guard_exit(prior_basepri);
 }
 
 static void photons_cadence_stop(void) {
@@ -3239,12 +3274,14 @@ static void photons_cadence_start(void) {
       ((uint64_t)cps * g_photons_cadence_ns + 999999999ULL) / 1000000000ULL;
   if (cycles == 0ULL || cycles >= 0x80000000ULL) __builtin_trap();
   g_photons_cadence_cycles = (uint32_t)cycles;
+  g_photons_race_pulse_cycles = (uint32_t)(
+      ((uint64_t)cps * PHOTONS_RACE_PULSE_NS + 500000000ULL) / 1000000000ULL);
   g_photons_cadence_launches_since_start = 0ULL;
   photons_laser_mod_idle();
   g_photons_race_foreground.active = g_photons_recovery.publication_started;
-  // The first launch is due one interval after ENABLE. Subsequent origins are
-  // captured by photons_race_launch_200ns(), never the scheduled service time.
-  g_photons_cadence_last_dwt = ARM_DWT_CYCCNT;
+  // The first opportunity is due one interval after ENABLE. Admitted launches
+  // use the actual MOD-high DWT; quiet skips consume a full cadence opportunity.
+  g_photons_cadence_anchor_dwt = ARM_DWT_CYCCNT;
   g_photons_cadence_running = true;
 }
 
@@ -7294,11 +7331,20 @@ static FLASHMEM Payload cmd_detector_activate(const Payload& /*args*/) {
 
 static void photons_cadence_report(Payload& p) {
   p.add("laser_cadence_running", g_photons_cadence_running);
-  p.add("laser_cadence_scheduling", "ACTUAL_LAUNCH_DWT");
+  p.add("laser_cadence_scheduling", "ACTUAL_LAUNCH_OR_QUIET_SKIP_DWT");
   p.add("laser_cadence_ns", g_photons_cadence_ns);
   p.add("laser_pulse_ns", PHOTONS_RACE_PULSE_NS);
   p.add("laser_launch_count_total", g_photons_laser_launch_count);
   p.add("laser_cadence_deferred_count", g_photons_cadence_deferred_count);
+  p.add("laser_cadence_deferred_policy", "QUIET_GUARD_NO_LAUNCH_NO_CATCHUP");
+  p.add("laser_quiet_guard_before_ns", INTERRUPT_PHOTONS_QUIET_GUARD_NS);
+  p.add("laser_quiet_guard_after_ns", INTERRUPT_PHOTONS_QUIET_GUARD_NS);
+  p.add("laser_quiet_launch_budget_ns", INTERRUPT_PHOTONS_QUIET_LAUNCH_BUDGET_NS);
+  p.add("laser_quiet_acquisition_max_ns", PHOTONS_RECEIVE_MAX_NS);
+  p.add("laser_quiet_last_blocker_mask", g_photons_quiet_last_blocker_mask);
+  p.add("laser_quiet_pps_skipped_count", g_photons_quiet_pps_count);
+  p.add("laser_quiet_ocxo1_skipped_count", g_photons_quiet_ocxo1_count);
+  p.add("laser_quiet_ocxo2_skipped_count", g_photons_quiet_ocxo2_count);
   p.add("laser_timing", "TIMEPOP_FOREGROUND_ACTUAL_DWT_AT_MOD_HIGH");
 }
 

@@ -5,19 +5,19 @@
 //
 // process_interrupt owns only executable custody and observed edge facts.
 //
-// Four execution tiers are deliberate and runtime-reportable:
+// Three interrupt tiers are deliberate and runtime-reportable:
 //
 // Priority 0 is the sovereign science-capture tier:
 //   * PPS GPIO, OCXO1, and OCXO2 capture ARM_DWT_CYCCNT before handler work;
 //   * these sparse one-second sources may preempt every lower execution tier;
 //   * each sparse source is minimally defused and a bounded scalar packet is enqueued.
 //
-// Priority 48 owns the expendable PHOTODIODE receive edge:
+// Priority 0 also owns the PHOTODIODE receive edge:
 //   * Teensy pin 34 is remapped from fast GPIO7[29] to ordinary GPIO2[29];
-//   * IRQ_GPIO2_16_31 is independently prioritizable below all CLOCKS tiers;
-//   * CLOCKS may delay a photon endpoint, but PHOTODIODE can never serialize a
-//     PPS/OCXO/QTimer1/continuation interrupt; delayed optical edges remain raw
-//     testimony and are eligible for PHOTONS-side race exclusion.
+//   * its dedicated vector shares science priority without sharing PPS dispatch;
+//   * foreground protects predicted one-second PPS/OCXO windows before launch;
+//   * unexpected equal-priority collisions remain attributed in both directions;
+//   * the ISR only captures/classifies admission and queues raw evidence.
 //
 // Priority 16 owns the shared QTimer1 capture vector:
 //   * native VCLOCK CH0 and TimePop CH2 necessarily share one NVIC priority;
@@ -94,7 +94,7 @@ void clocks_watchdog_anomaly_payload(const char* reason,
 static constexpr uint32_t INTERRUPT_PRIORITY_SCIENCE = 0U;
 static constexpr uint32_t INTERRUPT_PRIORITY_VCLOCK_TIMEPOP = 16U;
 static constexpr uint32_t INTERRUPT_PRIORITY_CONTINUATION = 32U;
-static constexpr uint32_t INTERRUPT_PRIORITY_PHOTODIODE = 48U;
+static constexpr uint32_t INTERRUPT_PRIORITY_PHOTODIODE = 0U;
 static constexpr uint32_t INTERRUPT_PRIORITY0_PRESERVING_BASEPRI =
     INTERRUPT_PRIORITY_VCLOCK_TIMEPOP;
 static constexpr uint32_t INTERRUPT_HANDOFF_IRQ_NUMBER = 71U;
@@ -119,9 +119,8 @@ static_assert(INTERRUPT_PRIORITY_SCIENCE <
                   INTERRUPT_PRIORITY_VCLOCK_TIMEPOP &&
               INTERRUPT_PRIORITY_VCLOCK_TIMEPOP <
                   INTERRUPT_PRIORITY_CONTINUATION &&
-              INTERRUPT_PRIORITY_CONTINUATION <
-                  INTERRUPT_PRIORITY_PHOTODIODE,
-              "interrupt tiers must remain ordered 0 < 16 < 32 < 48");
+              INTERRUPT_PRIORITY_PHOTODIODE == INTERRUPT_PRIORITY_SCIENCE,
+              "science and photodiode share 0, followed by 16 < 32");
 static_assert((INTERRUPT_PRIORITY_SCIENCE & 0x0FU) == 0U &&
               (INTERRUPT_PRIORITY_VCLOCK_TIMEPOP & 0x0FU) == 0U &&
               (INTERRUPT_PRIORITY_CONTINUATION & 0x0FU) == 0U &&
@@ -237,6 +236,7 @@ struct interrupt_priority_runtime_t {
   volatile uint32_t ocxo1_preempted_qtimer1_count = 0U;
   volatile uint32_t ocxo2_preempted_qtimer1_count = 0U;
   volatile uint32_t pps_preempted_qtimer1_count = 0U;
+  volatile uint32_t photodiode_preempted_qtimer1_count = 0U;
   volatile uint32_t science_preempted_continuation_count = 0U;
 
   volatile uint32_t verify_count = 0U;
@@ -312,12 +312,6 @@ static inline void interrupt_isr_diag_exit(
   diag.active = false;
 }
 
-static inline void interrupt_note_photodiode_preemption(void) {
-  if (!g_interrupt_priority_runtime.photodiode.active) return;
-  g_interrupt_priority_runtime.photodiode.preempted_during_current_entry = true;
-  g_interrupt_priority_runtime.photodiode.preempted_by_higher_tier_count++;
-}
-
 static inline void interrupt_note_science_preemption(
     volatile uint32_t& qtimer1_counter) {
   if (g_interrupt_priority_runtime.qtimer1.active) {
@@ -329,7 +323,6 @@ static inline void interrupt_note_science_preemption(
     g_interrupt_priority_runtime.science_preempted_continuation_count++;
     g_interrupt_priority_runtime.continuation.preempted_by_higher_tier_count++;
   }
-  interrupt_note_photodiode_preemption();
 }
 
 static inline uint32_t interrupt_priority0_guard_enter(void) {
@@ -530,7 +523,7 @@ struct photodiode_subscription_runtime_t {
 
 static photodiode_subscription_runtime_t g_photodiode_subscription{};
 
-// Priority 48 owns the raw producer; foreground alone consumes/classifies it.
+// Priority 0 owns the raw producer; foreground alone consumes/classifies it.
 // A bounded SPSC ring preserves entry evidence across foreground latency.
 // No PHOTODIODE record enters the shared Priority-32 continuation.
 static constexpr uint32_t PHOTODIODE_RAW_CAPACITY = 64U;
@@ -701,6 +694,144 @@ static uint32_t interrupt_vclock_cycles_per_second(void) {
 
 uint32_t interrupt_dynamic_cps(void) {
   return interrupt_vclock_cycles_per_second();
+}
+
+// Raw physical tick history belongs to each priority-0 producer. Forecasts are
+// launch scheduling only; no clock endpoint or science result is projected here.
+// Milliseconds are a coarse freshness witness: DWT alone wraps in about 4.26 s.
+struct photons_quiet_tick_t {
+  volatile uint32_t sequence = 0U;
+  volatile uint32_t last_dwt = 0U;
+  volatile uint32_t last_ms = 0U;
+  volatile uint32_t period_cycles = 0U;
+  volatile uint32_t period_ms = 0U;
+  volatile int32_t last_prediction_error_cycles = 0;
+  volatile uint32_t max_abs_prediction_error_cycles = 0U;
+  volatile uint32_t prediction_outside_guard_count = 0U;
+};
+struct photons_quiet_tick_snapshot_t {
+  uint32_t sequence;
+  uint32_t last_dwt;
+  uint32_t last_ms;
+  uint32_t period_cycles;
+  uint32_t period_ms;
+  int32_t last_prediction_error_cycles;
+  uint32_t max_abs_prediction_error_cycles;
+  uint32_t prediction_outside_guard_count;
+};
+static photons_quiet_tick_t g_photons_quiet_pps{};
+static photons_quiet_tick_t g_photons_quiet_ocxo1{};
+static photons_quiet_tick_t g_photons_quiet_ocxo2{};
+static uint32_t g_photons_quiet_guard_cycles = 0U;
+static uint32_t g_photons_quiet_launch_budget_cycles = 0U;
+
+static void photons_quiet_tick_observe(photons_quiet_tick_t& tick,
+                                      uint32_t entry_dwt) {
+  const uint32_t now_ms = millis();
+  const uint32_t sequence = tick.sequence;
+  if (sequence != 0U) {
+    if (sequence >= 2U && tick.period_ms >= 500U && tick.period_ms <= 1500U &&
+        (uint32_t)(now_ms - tick.last_ms) <= 1500U) {
+      const int32_t error = (int32_t)(entry_dwt - tick.last_dwt -
+                                     tick.period_cycles);
+      const uint32_t absolute_error = error < 0
+          ? 0U - (uint32_t)error : (uint32_t)error;
+      tick.last_prediction_error_cycles = error;
+      if (absolute_error > tick.max_abs_prediction_error_cycles)
+        tick.max_abs_prediction_error_cycles = absolute_error;
+      if (absolute_error > g_photons_quiet_guard_cycles)
+        tick.prediction_outside_guard_count++;
+    }
+    tick.period_cycles = entry_dwt - tick.last_dwt;
+    tick.period_ms = now_ms - tick.last_ms;
+  }
+  tick.last_dwt = entry_dwt;
+  tick.last_ms = now_ms;
+  dmb_barrier();
+  tick.sequence = sequence == UINT32_MAX ? 1U : sequence + 1U;
+}
+
+static photons_quiet_tick_snapshot_t photons_quiet_tick_snapshot(
+    const photons_quiet_tick_t& tick) {
+  photons_quiet_tick_snapshot_t out;
+  // Only foreground reads; it cannot suspend the priority-0 writer. A tick
+  // interrupting the copy completes its publication before foreground resumes.
+  do {
+    out.sequence = tick.sequence;
+    dmb_barrier();
+    out.last_dwt = tick.last_dwt;
+    out.last_ms = tick.last_ms;
+    out.period_cycles = tick.period_cycles;
+    out.period_ms = tick.period_ms;
+    out.last_prediction_error_cycles = tick.last_prediction_error_cycles;
+    out.max_abs_prediction_error_cycles = tick.max_abs_prediction_error_cycles;
+    out.prediction_outside_guard_count = tick.prediction_outside_guard_count;
+    dmb_barrier();
+  } while (out.sequence != tick.sequence);
+  return out;
+}
+
+static bool photons_quiet_tick_blocks(
+    const photons_quiet_tick_snapshot_t& tick,
+    uint32_t now_dwt, uint32_t now_ms, uint32_t acquisition_cycles,
+    uint32_t guard_cycles, uint32_t launch_budget_cycles) {
+  // Two successive physical one-second ticks establish a forecast. A missing
+  // tick keeps the lane closed until observation resumes; never wrap a missed
+  // prediction forward or mistake a later DWT revolution for a recent edge.
+  if (tick.sequence < 2U || tick.period_ms < 500U ||
+      tick.period_ms > 1500U || (uint32_t)(now_ms - tick.last_ms) > 1500U)
+    return true;
+  const uint32_t age = now_dwt - tick.last_dwt;
+  return age <= guard_cycles ||
+      (uint64_t)age + acquisition_cycles + guard_cycles +
+          launch_budget_cycles >= tick.period_cycles;
+}
+
+uint32_t interrupt_photons_launch_guard_enter(void) {
+  return interrupt_priority0_guard_enter();
+}
+
+void interrupt_photons_launch_guard_exit(uint32_t prior_basepri) {
+  interrupt_priority0_guard_exit(prior_basepri);
+}
+
+static uint32_t interrupt_delay_pending_mask(void);
+
+uint32_t interrupt_photons_quiet_blockers(uint32_t acquisition_cycles) {
+  const photons_quiet_tick_snapshot_t pps =
+      photons_quiet_tick_snapshot(g_photons_quiet_pps);
+  const photons_quiet_tick_snapshot_t ocxo1 =
+      photons_quiet_tick_snapshot(g_photons_quiet_ocxo1);
+  const photons_quiet_tick_snapshot_t ocxo2 =
+      photons_quiet_tick_snapshot(g_photons_quiet_ocxo2);
+  const uint32_t now_ms = millis();
+  const uint32_t now_dwt = ARM_DWT_CYCCNT;
+  uint32_t blockers = 0U;
+  if (photons_quiet_tick_blocks(pps, now_dwt, now_ms, acquisition_cycles,
+          g_photons_quiet_guard_cycles, g_photons_quiet_launch_budget_cycles))
+    blockers |= INTERRUPT_DELAY_SOURCE_BIT_PPS;
+  if (!OCXO1_DISABLED && photons_quiet_tick_blocks(ocxo1, now_dwt, now_ms,
+          acquisition_cycles, g_photons_quiet_guard_cycles,
+          g_photons_quiet_launch_budget_cycles))
+    blockers |= INTERRUPT_DELAY_SOURCE_BIT_OCXO1;
+  if (!OCXO2_DISABLED && photons_quiet_tick_blocks(ocxo2, now_dwt, now_ms,
+          acquisition_cycles, g_photons_quiet_guard_cycles,
+          g_photons_quiet_launch_budget_cycles))
+    blockers |= INTERRUPT_DELAY_SOURCE_BIT_OCXO2;
+  // A priority-0 tick may have interrupted the snapshots or this arithmetic.
+  // Retry on the next cadence opportunity with its newly published phase.
+  if (pps.sequence != g_photons_quiet_pps.sequence)
+    blockers |= INTERRUPT_DELAY_SOURCE_BIT_PPS;
+  if (ocxo1.sequence != g_photons_quiet_ocxo1.sequence)
+    blockers |= INTERRUPT_DELAY_SOURCE_BIT_OCXO1;
+  if (ocxo2.sequence != g_photons_quiet_ocxo2.sequence)
+    blockers |= INTERRUPT_DELAY_SOURCE_BIT_OCXO2;
+  constexpr uint32_t tick_mask = INTERRUPT_DELAY_SOURCE_BIT_PPS |
+      INTERRUPT_DELAY_SOURCE_BIT_OCXO1 | INTERRUPT_DELAY_SOURCE_BIT_OCXO2;
+  blockers |= interrupt_delay_pending_mask() & tick_mask;
+  if ((uint32_t)(ARM_DWT_CYCCNT - now_dwt) >
+      g_photons_quiet_launch_budget_cycles) blockers |= tick_mask;
+  return blockers;
 }
 
 // ============================================================================
@@ -3633,7 +3764,8 @@ static uint32_t interrupt_delay_lower_active_mask(
   uint32_t mask = 0U;
   if (source == interrupt_execution_source_t::OCXO1 ||
       source == interrupt_execution_source_t::OCXO2 ||
-      source == interrupt_execution_source_t::PPS) {
+      source == interrupt_execution_source_t::PPS ||
+      source == interrupt_execution_source_t::PHOTODIODE) {
     if (g_interrupt_priority_runtime.qtimer1.active) {
       mask |= INTERRUPT_DELAY_SOURCE_BIT_QTIMER1;
     }
@@ -3816,6 +3948,38 @@ static void interrupt_delay_note_isr_exit(
   const uint32_t exit_dwt = ARM_DWT_CYCCNT;
   const uint32_t blocker_wall_cycles = exit_dwt - entry_dwt;
 
+  if (source == interrupt_execution_source_t::PHOTODIODE) {
+    auto& diag = g_photodiode_subscription.diag;
+    uint32_t blocked = pending_mask_at_exit;
+    if (g_interrupt_priority_runtime.qtimer1.active)
+      blocked &= ~INTERRUPT_DELAY_SOURCE_BIT_QTIMER1;
+    if (g_interrupt_priority_runtime.qtimer2.active)
+      blocked &= ~INTERRUPT_DELAY_SOURCE_BIT_OCXO1;
+    if (g_interrupt_priority_runtime.qtimer3.active)
+      blocked &= ~INTERRUPT_DELAY_SOURCE_BIT_OCXO2;
+    if (g_interrupt_priority_runtime.pps.active)
+      blocked &= ~INTERRUPT_DELAY_SOURCE_BIT_PPS;
+    blocked &= INTERRUPT_DELAY_SOURCE_BIT_QTIMER1 |
+        INTERRUPT_DELAY_SOURCE_BIT_OCXO1 | INTERRUPT_DELAY_SOURCE_BIT_OCXO2 |
+        INTERRUPT_DELAY_SOURCE_BIT_PPS;
+    if (blocked != 0U) {
+      diag.blocker_trace_count++;
+      diag.blocked_qtimer1_count +=
+          (blocked & INTERRUPT_DELAY_SOURCE_BIT_QTIMER1) != 0U;
+      diag.blocked_ocxo1_count +=
+          (blocked & INTERRUPT_DELAY_SOURCE_BIT_OCXO1) != 0U;
+      diag.blocked_ocxo2_count +=
+          (blocked & INTERRUPT_DELAY_SOURCE_BIT_OCXO2) != 0U;
+      diag.blocked_pps_count +=
+          (blocked & INTERRUPT_DELAY_SOURCE_BIT_PPS) != 0U;
+      diag.last_blocker_wall_cycles = blocker_wall_cycles;
+      if (blocker_wall_cycles > diag.max_blocker_wall_cycles)
+        diag.max_blocker_wall_cycles = blocker_wall_cycles;
+      diag.last_qtimer_pending_at_entry_mask = arrival.pending_mask_at_entry;
+      diag.last_qtimer_pending_at_exit_mask = pending_mask_at_exit;
+    }
+  }
+
   interrupt_delay_publish_blocker(
       source, interrupt_execution_source_t::QTIMER1,
       exit_dwt, blocker_wall_cycles,
@@ -3838,10 +4002,8 @@ static void interrupt_delay_note_isr_exit(
       arrival.pending_mask_at_entry, pending_mask_at_exit);
 }
 
-// Legacy PHOTODIODE-as-blocker helper retired.  The dedicated GPIO2 vector is
-// Priority 48, below every CLOCKS tier.  A pending detector edge is now a delay
-// target recorded by interrupt_delay_note_isr_exit(); it never authors a
-// predecessor latch for QTimer/PPS/OCXO.
+// PHOTODIODE uses the same pending-at-exit attribution as its priority-0 peers.
+// Predicted quiet windows reduce collisions; they do not erase collision evidence.
 
 static void interrupt_delay_learn_spin_baseline(
     interrupt_delay_baseline_runtime_t& runtime,
@@ -4226,6 +4388,22 @@ static bool photodiode_gpio2_route_readback_all_match(void) {
       interrupt_nvic_enabled((uint32_t)PHOTODIODE_IRQ) &&
       interrupt_nvic_priority_read((uint32_t)PHOTODIODE_IRQ) ==
           INTERRUPT_PRIORITY_PHOTODIODE;
+}
+
+// BASEPRI cannot exclude priority 0. Preserve the detector's actual enable
+// state so a snapshot nested inside an acquisition boundary never reopens it.
+// PPS/OCXO and every other interrupt retain their existing mask state.
+static bool photodiode_guard_enter(void) {
+  const bool enabled = interrupt_nvic_enabled((uint32_t)PHOTODIODE_IRQ);
+  NVIC_DISABLE_IRQ(PHOTODIODE_IRQ);
+  __asm__ volatile ("dsb" ::: "memory");
+  __asm__ volatile ("isb" ::: "memory");
+  return enabled;
+}
+
+static void photodiode_guard_exit(bool enabled) {
+  dmb_barrier();
+  if (enabled) NVIC_ENABLE_IRQ(PHOTODIODE_IRQ);
 }
 
 // Foreground-only counters; boundary clears never impersonate detector callbacks.
@@ -5269,7 +5447,6 @@ static void interrupt_handoff_service_isr(void) {
           interrupt_execution_source_t::CONTINUATION);
   interrupt_isr_diag_enter(
       g_interrupt_priority_runtime.continuation, entry_dwt);
-  interrupt_note_photodiode_preemption();
   if (g_interrupt_handoff.running) {
     g_interrupt_handoff.reentry_count++;
     interrupt_handoff_request_isr(entry_dwt);
@@ -5496,7 +5673,6 @@ static void qtimer1_isr(void) {
   const interrupt_arrival_capture_t arrival =
       interrupt_delay_capture_entry_fast(
           interrupt_execution_source_t::QTIMER1);
-  interrupt_note_photodiode_preemption();
   if (g_interrupt_priority_runtime.continuation.active) {
     g_interrupt_priority_runtime.qtimer1_preempted_continuation_count++;
     g_interrupt_priority_runtime.continuation
@@ -5537,6 +5713,7 @@ static __attribute__((always_inline)) inline bool ocxo_capture_priority0(
     interrupt_capture_ring_t<ocxo_capture_packet_t,
                              HANDOFF_OCXO_RING_SIZE>& ring,
     interrupt_handoff_source_diag_t& handoff,
+    photons_quiet_tick_t& quiet_tick,
     uint32_t isr_entry_dwt_raw,
     const interrupt_arrival_capture_t& arrival) {
   const uint32_t csctrl = module.CH[CHANNEL].CSCTRL;
@@ -5565,6 +5742,7 @@ static __attribute__((always_inline)) inline bool ocxo_capture_priority0(
 
   qtimer_defuse_ocxo_priority0(module, CHANNEL);
   lane.compare_armed = false;
+  if (active) photons_quiet_tick_observe(quiet_tick, isr_entry_dwt_raw);
 
   // Every member is assigned explicitly; avoid a compiler-generated packet
   // memset in the sovereign Priority-0 capture path.
@@ -5624,6 +5802,7 @@ static void qtimer2_isr(void) {
           IMXRT_TMR2,
           g_ocxo1_capture_ring,
           g_handoff_ocxo1,
+          g_photons_quiet_ocxo1,
           isr_entry_dwt_raw,
           arrival)) {
     interrupt_handoff_request_isr(isr_entry_dwt_raw);
@@ -5650,6 +5829,7 @@ static void qtimer3_isr(void) {
           IMXRT_TMR3,
           g_ocxo2_capture_ring,
           g_handoff_ocxo2,
+          g_photons_quiet_ocxo2,
           isr_entry_dwt_raw,
           arrival)) {
     interrupt_handoff_request_isr(isr_entry_dwt_raw);
@@ -5791,6 +5971,8 @@ static void photodiode_gpio2_isr(void) {
       interrupt_delay_capture_entry_fast(interrupt_execution_source_t::PHOTODIODE);
   interrupt_isr_diag_enter(
       g_interrupt_priority_runtime.photodiode, isr_entry_dwt_raw);
+  interrupt_note_science_preemption(
+      g_interrupt_priority_runtime.photodiode_preempted_qtimer1_count);
   const uint32_t status =
       GPIO2_ISR & GPIO2_IMR & PHOTODIODE_GPIO2_HIGH_HALF_MASK;
   if ((status & (PHOTODIODE_GPIO2_HIGH_HALF_MASK &
@@ -5806,6 +5988,11 @@ static void photodiode_gpio2_isr(void) {
   }
   const bool preempted_after_entry =
       g_interrupt_priority_runtime.photodiode.preempted_during_current_entry;
+  interrupt_delay_note_isr_exit(
+      interrupt_execution_source_t::PHOTODIODE, isr_entry_dwt_raw,
+      arrival_capture);
+  // Include blocker attribution in residence telemetry; only these final scalar
+  // diagnostic stores and the exception return follow the wall-clock reading.
   interrupt_isr_diag_exit(
       g_interrupt_priority_runtime.photodiode, isr_entry_dwt_raw);
   auto& diag = g_photodiode_subscription.diag;
@@ -5825,6 +6012,7 @@ static void pps_gpio_isr(void) {
   interrupt_note_science_preemption(
       g_interrupt_priority_runtime.pps_preempted_qtimer1_count);
   process_interrupt_gpio6789_irq(isr_entry_dwt_raw, arrival);
+  photons_quiet_tick_observe(g_photons_quiet_pps, isr_entry_dwt_raw);
   interrupt_isr_diag_exit(
       g_interrupt_priority_runtime.pps, isr_entry_dwt_raw);
   // Pending-at-exit attribution must be the final ISR action so a peer edge
@@ -6025,7 +6213,7 @@ bool interrupt_photodiode_subscribe(
         photodiode_foreground_ready, photodiode_foreground_service, nullptr);
     g_photodiode_service_registered = true;
   }
-  const uint32_t prior = interrupt_priority0_guard_enter();
+  const bool prior = photodiode_guard_enter();
   g_photodiode_subscription.binding_generation++;
   if (g_photodiode_subscription.binding_generation == 0U) {
     g_photodiode_subscription.binding_generation = 1U;
@@ -6036,12 +6224,12 @@ bool interrupt_photodiode_subscribe(
   g_photodiode_subscription.diag.subscribed = true;
   dmb_barrier();
   g_photodiode_subscription.callback = subscription.on_edge;
-  interrupt_priority0_guard_exit(prior);
+  photodiode_guard_exit(prior);
   return true;
 }
 
 void interrupt_photodiode_unsubscribe(void) {
-  const uint32_t prior = interrupt_priority0_guard_enter();
+  const bool prior = photodiode_guard_enter();
   photodiode_window_withdraw();
   g_photodiode_subscription.callback = nullptr;
   dmb_barrier();
@@ -6054,14 +6242,14 @@ void interrupt_photodiode_unsubscribe(void) {
   if (g_photodiode_subscription.binding_generation == 0U) {
     g_photodiode_subscription.binding_generation = 1U;
   }
-  interrupt_priority0_guard_exit(prior);
+  photodiode_guard_exit(prior);
 }
 
 bool interrupt_photodiode_snapshot(interrupt_photodiode_diag_t* out) {
   if (!out) return false;
-  const uint32_t prior = interrupt_priority0_guard_enter();
+  const bool prior = photodiode_guard_enter();
   *out = g_photodiode_subscription.diag;
-  interrupt_priority0_guard_exit(prior);
+  photodiode_guard_exit(prior);
   return true;
 }
 
@@ -6152,9 +6340,9 @@ static void photodiode_deliver_raw(const photodiode_raw_packet_t& packet) {
   // evidence to a new callback. Preserve the discard explicitly in diagnostics.
   if (!g_photodiode_subscription.active ||
       packet.binding_generation != g_photodiode_subscription.binding_generation) {
-    const uint32_t prior = interrupt_priority0_guard_enter();
+    const bool prior = photodiode_guard_enter();
     diag.inactive_edge_count++;
-    interrupt_priority0_guard_exit(prior);
+    photodiode_guard_exit(prior);
     return;
   }
   const interrupt_photodiode_edge_fn callback = g_photodiode_subscription.callback;
@@ -6193,10 +6381,10 @@ void interrupt_photodiode_service_pending(void) {
 
 void process_interrupt_photodiode_gpio_irq(uint32_t isr_entry_dwt_raw) {
   // Test injection must serialize with the sole physical producer.
-  const uint32_t prior = interrupt_priority0_guard_enter();
+  const bool prior = photodiode_guard_enter();
   photodiode_raw_push(isr_entry_dwt_raw, interrupt_arrival_capture_t{},
                       photodiode_capture_kind_t::SYNTHETIC);
-  interrupt_priority0_guard_exit(prior);
+  photodiode_guard_exit(prior);
 }
 
 // ============================================================================
@@ -6222,14 +6410,14 @@ bool interrupt_subscribe(const interrupt_subscription_t& subscription) {
 
 bool interrupt_start(interrupt_subscriber_kind_t kind) {
   if (kind == interrupt_subscriber_kind_t::PHOTODIODE) {
-    const uint32_t prior = interrupt_priority0_guard_enter();
+    const bool prior = photodiode_guard_enter();
     const bool ready = g_photodiode_subscription.subscribed &&
         interrupt_callback_address_executable(
             (uintptr_t)g_photodiode_subscription.callback);
     g_photodiode_subscription.active = ready;
     g_photodiode_subscription.diag.active = ready;
     if (ready) g_photodiode_subscription.diag.start_count++;
-    interrupt_priority0_guard_exit(prior);
+    photodiode_guard_exit(prior);
     return ready;
   }
   interrupt_subscriber_runtime_t* rt = runtime_for(kind);
@@ -6331,6 +6519,7 @@ ocxo_rephase_quiesce(interrupt_capture_ring_t<T, N>& ring,
 
 static __attribute__((noinline, noclone))
 void ocxo1_rephase_quiesce_bound(void) {
+  g_photons_quiet_ocxo1 = photons_quiet_tick_t{};
   ocxo_rephase_quiesce(
       g_ocxo1_capture_ring,
       g_subscribers[INTERRUPT_SUBSCRIBER_INDEX_OCXO1],
@@ -6341,6 +6530,7 @@ void ocxo1_rephase_quiesce_bound(void) {
 
 static __attribute__((noinline, noclone))
 void ocxo2_rephase_quiesce_bound(void) {
+  g_photons_quiet_ocxo2 = photons_quiet_tick_t{};
   ocxo_rephase_quiesce(
       g_ocxo2_capture_ring,
       g_subscribers[INTERRUPT_SUBSCRIBER_INDEX_OCXO2],
@@ -6485,12 +6675,12 @@ bool interrupt_recover_rebootstrap_ocxo_service(
 
 bool interrupt_stop(interrupt_subscriber_kind_t kind) {
   if (kind == interrupt_subscriber_kind_t::PHOTODIODE) {
-    const uint32_t prior = interrupt_priority0_guard_enter();
+    const bool prior = photodiode_guard_enter();
     photodiode_window_withdraw();
     g_photodiode_subscription.active = false;
     g_photodiode_subscription.diag.active = false;
     g_photodiode_subscription.diag.stop_count++;
-    interrupt_priority0_guard_exit(prior);
+    photodiode_guard_exit(prior);
     return true;
   }
   interrupt_subscriber_runtime_t* rt = runtime_for(kind);
@@ -7047,6 +7237,15 @@ FLASHMEM void process_interrupt_init(void) {
   if (g_interrupt_runtime_ready) return;
   runtime_init_subscribers();
   interrupt_delay_runtime_reset();
+  g_photons_quiet_pps = photons_quiet_tick_t{};
+  g_photons_quiet_ocxo1 = photons_quiet_tick_t{};
+  g_photons_quiet_ocxo2 = photons_quiet_tick_t{};
+  g_photons_quiet_guard_cycles = (uint32_t)(
+      ((uint64_t)F_CPU_ACTUAL * INTERRUPT_PHOTONS_QUIET_GUARD_NS +
+       999999999ULL) / 1000000000ULL);
+  g_photons_quiet_launch_budget_cycles = (uint32_t)(
+      ((uint64_t)F_CPU_ACTUAL * INTERRUPT_PHOTONS_QUIET_LAUNCH_BUDGET_NS +
+       999999999ULL) / 1000000000ULL);
   g_interrupt_integrity = interrupt_integrity_snapshot_t{};
   g_store = snapshot_store_t{};
   g_epoch_capture = epoch_capture_store_t{};
@@ -7102,7 +7301,7 @@ static void photodiode_gpio2_configure_irq(void) {
 
   // No other ordinary GPIO2[16:31] interrupt source is lawful in this firmware.
   // Owning the vector exclusively lets pin 34 bypass Arduino's shared GPIO6789
-  // dispatch and receive a genuinely lower NVIC priority.
+  // dispatch while retaining independent acquisition-boundary custody.
   NVIC_DISABLE_IRQ(PHOTODIODE_IRQ);
   GPIO2_IMR &= ~PHOTODIODE_GPIO2_MASK;
   if ((GPIO2_IMR & PHOTODIODE_GPIO2_HIGH_HALF_MASK &
@@ -7172,7 +7371,7 @@ void process_interrupt_enable_irqs(void) {
   NVIC_SET_PRIORITY(IRQ_GPIO6789, INTERRUPT_PRIORITY_SCIENCE);
 
   // PHOTODIODE is intentionally routed away from that vector.  Its dedicated
-  // ordinary-GPIO2 path is expendable Priority 48: CLOCKS always wins.
+  // ordinary-GPIO2 path shares Priority 0; guarded launch scheduling protects ticks.
   photodiode_gpio2_configure_irq();
   g_interrupt_irqs_enabled = true;
   interrupt_priority_verify_live();
@@ -7448,12 +7647,12 @@ static FLASHMEM void add_photodiode_report(Payload& payload,
   add_u32("preempted_after_entry_count", diag.preempted_after_entry_count);
   add_u32("last_isr_wall_cycles", diag.last_isr_wall_cycles);
   add_u32("max_isr_wall_cycles", diag.max_isr_wall_cycles);
-  // Deprecated pre-priority-isolation blocker counters remain ABI-visible and
-  // should stay zero after boot under the Priority-48 architecture.
+  // Detector-attributed blocking is visible alongside delayed detector entry.
   add_u32("blocker_trace_count", diag.blocker_trace_count);
   add_u32("blocked_qtimer1_count", diag.blocked_qtimer1_count);
   add_u32("blocked_ocxo1_count", diag.blocked_ocxo1_count);
   add_u32("blocked_ocxo2_count", diag.blocked_ocxo2_count);
+  add_u32("blocked_pps_count", diag.blocked_pps_count);
   add_u32("last_blocker_wall_cycles", diag.last_blocker_wall_cycles);
   add_u32("max_blocker_wall_cycles", diag.max_blocker_wall_cycles);
   add_u32("last_qtimer_pending_at_entry_mask",
@@ -7470,7 +7669,7 @@ static FLASHMEM void add_photodiode_report(Payload& payload,
   add_bool("gpio2_route_readback_all_match",
            photodiode_gpio2_route_readback_all_match());
   add_bool("physical_level_high", interrupt_photodiode_level_high());
-  add_string("delay_direction", "CLOCKS_CAN_DELAY_PHOTODIODE_ONLY");
+  add_string("delay_direction", "PRIORITY0_PEERS_CAN_DELAY_EACH_OTHER");
   add_string("dispatch_class", "RAW_CAPTURE_TO_FOREGROUND");
   add_u32("raw_queue_capacity", PHOTODIODE_RAW_CAPACITY);
   const uint32_t head = __atomic_load_n(&g_photodiode_raw_head, __ATOMIC_ACQUIRE);
@@ -7623,7 +7822,7 @@ static FLASHMEM Payload cmd_report_priorities(const Payload&) {
   Payload payload;
   payload.add("report", "INTERRUPT_PRIORITIES");
   payload.add("topology",
-              "P0_SCIENCE__P16_QTIMER1__P32_CONTINUATION__P48_PHOTODIODE__FOREGROUND");
+              "P0_SCIENCE_AND_PHOTODIODE__P16_QTIMER1__P32_CONTINUATION__FOREGROUND");
   payload.add("basepri_mask_threshold",
               INTERRUPT_PRIORITY0_PRESERVING_BASEPRI);
   payload.add("current_ipsr", interrupt_ipsr());
@@ -7662,7 +7861,7 @@ static FLASHMEM Payload cmd_report_priorities(const Payload&) {
   payload.add("photodiode_shared_gpio6789_vector_with_pps", false);
   payload.add("photodiode_independent_priority_ready", true);
   payload.add("photodiode_execution_priority", INTERRUPT_PRIORITY_PHOTODIODE);
-  payload.add("photodiode_delay_blocker_traced", false);
+  payload.add("photodiode_delay_blocker_traced", true);
   payload.add("photodiode_delay_target_traced", true);
   payload.add("photodiode_gpio2_route_readback_all_match",
               photodiode_gpio2_route_readback_all_match());
@@ -7687,12 +7886,34 @@ static FLASHMEM Payload cmd_report_priorities(const Payload&) {
   payload.add("pps_preempted_qtimer1_count",
               (uint32_t)g_interrupt_priority_runtime
                   .pps_preempted_qtimer1_count);
+  payload.add("photodiode_preempted_qtimer1_count",
+              (uint32_t)g_interrupt_priority_runtime
+                  .photodiode_preempted_qtimer1_count);
   payload.add("science_preempted_continuation_count",
               (uint32_t)g_interrupt_priority_runtime
                   .science_preempted_continuation_count);
   payload.add("vclock_dwt_capture_class", "PRIORITY16_OBSERVED");
   payload.add("ocxo_dwt_capture_class", "PRIORITY0_SOVEREIGN");
   return payload;
+}
+
+static FLASHMEM void add_photons_quiet_tick_report(
+    Payload& payload, const char* lane, const photons_quiet_tick_t& source) {
+  const photons_quiet_tick_snapshot_t tick = photons_quiet_tick_snapshot(source);
+  char key[80];
+  auto add_u32 = [&](const char* suffix, uint32_t value) {
+    snprintf(key, sizeof(key), "photons_quiet_%s_%s", lane, suffix);
+    payload.add(key, value);
+  };
+  add_u32("sequence", tick.sequence);
+  add_u32("last_dwt", tick.last_dwt);
+  add_u32("last_ms", tick.last_ms);
+  add_u32("period_cycles", tick.period_cycles);
+  add_u32("period_ms", tick.period_ms);
+  snprintf(key, sizeof(key), "photons_quiet_%s_last_prediction_error_cycles", lane);
+  payload.add(key, tick.last_prediction_error_cycles);
+  add_u32("max_abs_prediction_error_cycles", tick.max_abs_prediction_error_cycles);
+  add_u32("prediction_outside_guard_count", tick.prediction_outside_guard_count);
 }
 
 static FLASHMEM Payload cmd_report_status(const Payload&) {
@@ -7708,15 +7929,23 @@ static FLASHMEM Payload cmd_report_status(const Payload&) {
   payload.add("ocxo_rollover_owner", "VCLOCK_HEARTBEAT");
   payload.add("ocxo_boundary_period_ticks", OCXO_ONE_SECOND_TICKS);
   payload.add("priority_topology",
-              "SCIENCE_0_QTIMER1_16_CONTINUATION_32_PHOTODIODE_48");
+              "SCIENCE_0_PHOTODIODE_0_QTIMER1_16_CONTINUATION_32");
   payload.add("priority0_science", INTERRUPT_PRIORITY_SCIENCE);
   payload.add("priority16_vclock_timepop",
               INTERRUPT_PRIORITY_VCLOCK_TIMEPOP);
   payload.add("priority32_continuation",
               INTERRUPT_PRIORITY_CONTINUATION);
-  payload.add("priority48_photodiode", INTERRUPT_PRIORITY_PHOTODIODE);
+  payload.add("priority0_photodiode", INTERRUPT_PRIORITY_PHOTODIODE);
   payload.add("basepri_science_guard",
               INTERRUPT_PRIORITY0_PRESERVING_BASEPRI);
+  payload.add("photons_quiet_guard_ns", INTERRUPT_PHOTONS_QUIET_GUARD_NS);
+  payload.add("photons_quiet_launch_budget_ns",
+              INTERRUPT_PHOTONS_QUIET_LAUNCH_BUDGET_NS);
+  payload.add("photons_quiet_guard_cycles", g_photons_quiet_guard_cycles);
+  payload.add("photons_quiet_forecast", "LAST_PHYSICAL_ONE_SECOND_INTERVAL");
+  add_photons_quiet_tick_report(payload, "pps", g_photons_quiet_pps);
+  add_photons_quiet_tick_report(payload, "ocxo1", g_photons_quiet_ocxo1);
+  add_photons_quiet_tick_report(payload, "ocxo2", g_photons_quiet_ocxo2);
   payload.add("priority_readback_all_match",
               interrupt_priority_readback_all_match());
   payload.add("hardware_ready", g_interrupt_hw_ready);

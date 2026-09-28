@@ -1207,8 +1207,9 @@ def _validate_photons_fragment(fragment: Payload) -> Tuple[int, int, Optional[in
         race.get("cadence_ticks_this_fragment"), "photons.race.cadence_ticks_this_fragment"
     )
 
-    # Historical rows have no scheduler activity. Cadence producers revive only
-    # launch ticks and missing-return counts; other retired fields remain zero.
+    # Cadence producers count launches, missing returns, and opportunities
+    # skipped to protect the PPS/OCXO quiet windows. A quiet skip is not a shot.
+    # Historical rows keep the retired scheduler fields at zero.
     retired_scheduler_fields = {
         "cadence_tick_count_total": race_cadence_ticks_total,
         "cadence_ticks_this_fragment": race_cadence_ticks_fragment,
@@ -1259,6 +1260,7 @@ def _validate_photons_fragment(fragment: Payload) -> Tuple[int, int, Optional[in
         for field in (
             "cadence_tick_count_total", "cadence_ticks_this_fragment",
             "missed_count_total", "missed_this_fragment",
+            "skipped_not_quiet_total", "skipped_not_quiet_this_fragment",
         ):
             del retired_scheduler_fields[field]
     nonzero_retired = {

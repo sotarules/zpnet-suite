@@ -7,10 +7,9 @@
 // one-second compare only after the target enters the safe programming window.
 //
 // Execution tiers:
-//   Priority 0  — PPS, OCXO1, OCXO2 sovereign science capture
+//   Priority 0  — PPS, OCXO1, OCXO2 and guarded PHOTODIODE capture
 //   Priority 16 — shared QTimer1 VCLOCK + TimePop CH2 capture
 //   Priority 32 — CLOCKS continuation/handoff and compare rearm
-//   Priority 48 — PHOTODIODE receive edge; expendable optical testimony
 //   Foreground  — TimePop policy and all application callbacks, including PHOTONS
 // ============================================================================
 
@@ -151,9 +150,8 @@ static constexpr uint32_t INTERRUPT_DELAY_SOURCE_BIT_OCXO1 = 1U << 1;
 static constexpr uint32_t INTERRUPT_DELAY_SOURCE_BIT_OCXO2 = 1U << 2;
 static constexpr uint32_t INTERRUPT_DELAY_SOURCE_BIT_PPS = 1U << 3;
 static constexpr uint32_t INTERRUPT_DELAY_SOURCE_BIT_CONTINUATION = 1U << 4;
-// Dedicated target identity for the Priority-48 PHOTODIODE GPIO2[29] source.
-// Higher CLOCKS tiers may publish this bit when the detector edge is physically
-// pending; PHOTODIODE itself is too low-priority to block any CLOCKS source.
+// Dedicated identity for the Priority-0 PHOTODIODE GPIO2[29] source. Equal
+// priority captures can serialize one another; pending-at-exit names the blocker.
 static constexpr uint32_t INTERRUPT_DELAY_SOURCE_BIT_PHOTODIODE = 1U << 5;
 
 // First-instruction testimony captured before handler work.  This is intentionally
@@ -1183,7 +1181,7 @@ interrupt_pps_edge_heartbeat_t interrupt_pps_edge_heartbeat(void);
 // pin-34 GPIO ISR captures the immutable first-instruction DWT/arrival testimony,
 // then release-publishes accepted edges to a bounded raw SPSC ring. Foreground
 // copies each packet before releasing its slot and invokes the PHOTODIODE
-// callback synchronously. Optical callbacks never run at Priority 32 or 48;
+// callback synchronously. Optical callbacks never run at interrupt priority;
 // CLOCKS capture/continuation may preempt them. process_interrupt owns the
 // physical interrupt and capture coordinate; process_photons owns optical races.
 //
@@ -1252,10 +1250,8 @@ struct interrupt_photodiode_diag_t {
   uint32_t last_isr_entry_primask = 0;
   uint32_t last_isr_entry_ipsr = 0;
 
-  // Priority-48 entry-delay testimony.  CLOCKS is authoritative: if a PPS,
-  // OCXO, QTimer1, or continuation ISR delays detector entry, preserve that
-  // cause so PHOTONS can discard the expendable optical race rather than let
-  // PHOTODIODE perturb or reinterpret any clock endpoint.
+  // Priority-0 entry-delay testimony. PPS/OCXO peers can serialize detector
+  // entry. QTimer1/continuation are lower-priority and can now be preempted.
   bool last_entry_delay_valid = false;
   interrupt_delay_verdict_t last_entry_delay_verdict =
       interrupt_delay_verdict_t::UNKNOWN;
@@ -1272,20 +1268,20 @@ struct interrupt_photodiode_diag_t {
   uint32_t delayed_by_continuation_count = 0;
   uint32_t delayed_by_unknown_count = 0;
 
-  // If a CLOCKS tier preempts after the detector ISR has already captured its
-  // first-instruction DWT, the endpoint itself was not delayed.  Count that
-  // separately so post-entry residence never becomes a false pathology label.
+  // Post-entry preemption is distinct from endpoint delay. With all capture
+  // sources at priority 0 this retained compatibility count remains zero.
   uint32_t preempted_after_entry_count = 0;
   uint32_t last_isr_wall_cycles = 0;
   uint32_t max_isr_wall_cycles = 0;
 
-  // Deprecated pre-isolation blocker testimony retained for source/wire
-  // compatibility.  Under the dedicated Priority-48 GPIO2 route these counters
-  // remain zero because PHOTODIODE can no longer serialize CLOCKS.
+  // Physical targets still pending at detector exit, excluding active targets
+  // the detector merely preempted. Quiet scheduling should prevent PPS/OCXO
+  // collisions; retain direct evidence when the prediction margin was exceeded.
   uint32_t blocker_trace_count = 0;
   uint32_t blocked_qtimer1_count = 0;
   uint32_t blocked_ocxo1_count = 0;
   uint32_t blocked_ocxo2_count = 0;
+  uint32_t blocked_pps_count = 0;
   uint32_t last_blocker_wall_cycles = 0;
   uint32_t max_blocker_wall_cycles = 0;
   uint32_t last_qtimer_pending_at_entry_mask = 0;
@@ -1310,8 +1306,8 @@ bool interrupt_photodiode_subscribe(
     const interrupt_photodiode_subscription_t& subscription);
 void interrupt_photodiode_unsubscribe(void);
 
-// Copies capture/foreground diagnostics under the existing Priority-0-preserving
-// guard. Foreground report construction uses the returned value after release.
+// Copies capture/foreground diagnostics with only the detector IRQ excluded.
+// Restores its prior enable state; PPS/OCXO capture remains enabled throughout.
 bool interrupt_photodiode_snapshot(interrupt_photodiode_diag_t* out);
 
 // Authoritative ambient level for the remapped detector pin.  Pin 34 is moved
@@ -1361,8 +1357,27 @@ void interrupt_photodiode_arm_window(uint32_t launch_dwt,
                                      uint32_t before_mod_high_dwt,
                                      interrupt_photodiode_launch_kind_t launch_kind);
 
+static constexpr uint32_t INTERRUPT_PHOTONS_QUIET_GUARD_NS = 5000U;
+static constexpr uint32_t INTERRUPT_PHOTONS_QUIET_LAUNCH_BUDGET_NS = 1000U;
+
+// Foreground-only, bounded decision-to-launch transaction. BASEPRI 16 excludes
+// lower-priority deferral but keeps priority-0 PPS/OCXO capture live. Detector
+// custody is separately held by boundary_begin(). Arm the new receive window
+// and boundary_end() before restoring BASEPRI, so lower-priority work cannot
+// strand a physical return behind the detector's temporary NVIC exclusion.
+// All old-capture drains/callbacks precede entry; report construction follows exit.
+uint32_t interrupt_photons_launch_guard_enter(void);
+void interrupt_photons_launch_guard_exit(uint32_t prior_basepri);
+
+// Zero admits a launch. Otherwise PPS/OCXO source bits identify protected lanes.
+// Forecast each next tick from its last measured physical interval, requiring
+// two observations; stale/untrained lanes stay closed. Protect the complete
+// receive horizon plus a bounded launch budget, and five microseconds either
+// side of each tick. The routine observes current DWT after coherent snapshots.
+uint32_t interrupt_photons_quiet_blockers(uint32_t acquisition_cycles);
+
 // Compatibility/synthetic custody boundary.  The installed physical pin-34 path
-// is GPIO2[29] on IRQ_GPIO2_16_31 at Priority 48 and enters through its dedicated
+// is GPIO2[29] on IRQ_GPIO2_16_31 at Priority 0 and enters through its dedicated
 // ISR, which queues immutable raw entry evidence for foreground classification.
 // Direct callers queue only first-instruction DWT and therefore carry UNKNOWN
 // delay ancestry; this function never rereads DWT as event identity.

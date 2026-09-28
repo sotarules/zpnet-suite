@@ -100,7 +100,7 @@ GND           Black         GND                Battery branching ground         
 
 23            Green         DAC_VREF_OUT       AD5693R VREF (both)
 32            Orange        GNSS_PPS_RELAY     GPIO relay to Pi
-34            Coax          PHOTODIODE_INT     Koheron PD200T TTL out                Comparator timing / GPIO2[29] IRQ P48
+34            Coax          PHOTODIODE_INT     Koheron PD200T TTL out                Comparator timing / GPIO2[29] IRQ P0
 35            Coax/pigtail  LASER_MOD          TC4427 MDM -> Koheron DRV200 MOD     Active-high: LOW idle; HIGH positive modulation
 38            --            FREE               --                                   Released 2026-09-18; PD OUT cable removed
 
@@ -119,12 +119,12 @@ Interrupt priority / GPIO routing summary:
   Priority 0   →  PPS GPIO, OCXO1, OCXO2 sovereign CLOCKS capture
   Priority 16  →  QTimer1 VCLOCK + TimePop shared vector
   Priority 32  →  process_interrupt continuation/handoff
-  Priority 48  →  PHOTODIODE_INT, pin 34 / GPIO2[29] / IRQ_GPIO2_16_31
+  Priority 0   →  PHOTODIODE_INT, pin 34 / GPIO2[29] / IRQ_GPIO2_16_31
 
   Pin 34 wiring does NOT change.  process_interrupt remaps GPIO_B1_13 internally
   from Teensy's fast GPIO7[29] alias to ordinary GPIO2[29] so the detector gets
-  an independently prioritizable vector below every CLOCKS tier.  CLOCKS may
-  delay PHOTODIODE; PHOTODIODE must never delay CLOCKS.
+  an independently controlled vector sharing Priority 0 with PPS/OCXO capture.
+  Guarded launches avoid predicted tick windows; unexpected collisions are traced.
 
 =============================================================================*/
 
@@ -200,9 +200,9 @@ Notes:
 • TTL out is the authoritative digital photodetector timing signal presented
   to process_interrupt for DWT-at-edge capture.
 • The physical TTL coax remains on Teensy pin 34.  process_interrupt remaps that
-  pad to GPIO2[29] and services IRQ_GPIO2_16_31 at Priority 48, below the entire
-  CLOCKS timing hierarchy.  If CLOCKS delays detector ISR entry, the optical
-  endpoint retains that delay testimony and the corresponding race is expendable.
+  pad to GPIO2[29] and services IRQ_GPIO2_16_31 at Priority 0 alongside the
+  PPS/OCXO sources. PHOTONS protects predicted +/-5 us tick windows before
+  launching; unexpected equal-priority serialization retains delay testimony.
 • PD OUT support retired 2026-09-18: the PD OUT-to-Teensy cable is removed,
   pin 38/A14 is unassigned, and firmware no longer configures or ADC-reads that
   pin or publishes photodiode_analog_v. TTL OUT on pin 34 remains the receiver

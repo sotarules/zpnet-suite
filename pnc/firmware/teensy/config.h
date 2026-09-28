@@ -103,7 +103,7 @@ static const int LASER_MOD_PIN      = 35;
 //   Fast digital photodetector timing edge owned by process_interrupt.
 //   Physical pin 34 / GPIO_B1_13 is remapped at runtime from the Teensy fast
 //   GPIO7[29] alias to ordinary GPIO2[29], then bound to IRQ_GPIO2_16_31 at
-//   expendable Priority 48 so every CLOCKS interrupt can preempt it.
+//   Priority 0, alongside PPS/OCXO capture, with predicted launch quiet windows.
 //   After that remap, process_interrupt's level accessor is authoritative; do
 //   not assume stock digitalRead(34) follows the changed GPIO bank.
 //   This is the authoritative optical timing signal.
@@ -172,13 +172,13 @@ static constexpr uint32_t QTIMER1_CH0_MASK = 0xFFFF;
 // may wake callbacks but must not author VCLOCK edge identity.
 //
 // Interrupt execution tiers:
-//   Priority 0  — PPS GPIO, OCXO1, OCXO2 science captures
+//   Priority 0  — PPS GPIO, OCXO1, OCXO2 and PHOTODIODE GPIO2[29] captures
 //   Priority 16 — shared QTimer1 vector: native VCLOCK CH0 + TimePop CH2
 //   Priority 32 — process_interrupt continuation/handoff
-//   Priority 48 — PHOTODIODE GPIO2[29] receive edge; expendable race testimony
 //   Foreground  — TimePop scheduling policy and application callbacks
 //
-// CLOCKS may delay PHOTODIODE; PHOTODIODE must never delay CLOCKS.
+// PHOTONS protects +/-5 us around predicted PPS/OCXO ticks before launching.
+// Equal-priority collisions remain measured and attributed in both directions.
 //
 
 // --------------------------------------------------------------
