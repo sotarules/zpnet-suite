@@ -3256,10 +3256,20 @@ static void photons_race_prepare(void) {
                                     __ATOMIC_RELAXED) ||
       published != __atomic_load_n(&g_photons_race_launch_published,
                                     __ATOMIC_RELAXED)) __builtin_trap();
+  // Boot runs before service registration; recovery holds COMMAND custody with
+  // publication stopped. Edge delivery is foreground-only and both handoffs
+  // are settled above, so no edge-service callback can interleave this reset.
+  // Start both owners and the completion snapshot in the same physical epoch:
+  // retaining producer counters/reference would republish pre-recovery state
+  // into the foreground's new attempts on the first completed return.
+  // Keep the launch sequence and handoff generations continuous.
   const uint32_t preserved_sequence = g_photons_race_foreground.sequence;
   g_photons_race_foreground = photons_race_runtime_t{};
   g_photons_race_foreground.sequence = preserved_sequence;
   g_photons_race_foreground.initialized = true;
+  g_photons_race = g_photons_race_foreground;
+  g_photons_race_completed = g_photons_race_foreground;
+  g_photons_race_batch = photons_race_batch_t{};
   g_photons_foreground_batch = photons_race_batch_t{};
   photons_envelope_reset();
   photons_core_reset();

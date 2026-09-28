@@ -31,6 +31,9 @@
 //     Foreground copies both batch and runtime before acknowledging the result;
 //     only then may it reuse launch storage. Publication generations may wrap.
 //     Only foreground writes/resets the separate fragment accumulator.
+//     At boot and recovery, prepare resets both runtime owners and the completed
+//     snapshot together, with no launch or result outstanding and no concurrent
+//     edge service. Handoff generations and the launch sequence remain continuous.
 //   • readiness and reports read completed handoffs, never live race fields.
 //     A fragment uses the runtime acquired at its batch-drain boundary; later
 //     raw IRQ arrivals cannot change its reference or counters during construction.
