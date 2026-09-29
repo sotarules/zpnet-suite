@@ -2291,9 +2291,9 @@ def photons_campaigns_readout() -> list[str]:
     except Exception as exc:
         return ["\0LANTERN_CAMPAIGNS:ERROR", f"LANTERN CAMPAIGNS: UNAVAILABLE: {exc}"]
     newest_identity = str(rows[0].get("id")) if rows else "EMPTY"
-    include_campaign = any(row.get("active") for row in rows)
+    # Every row owns a recorded campaign mean, regardless of its active state.
     lines = [f"\0LANTERN_CAMPAIGN:{newest_identity}",
-             f"{'CAMPAIGN':<14} " + _photons_summary_header(include_campaign)]
+             f"{'CAMPAIGN':<14} " + _photons_summary_header(True)]
     if not rows:
         return lines + ["", "NO LANTERN CAMPAIGNS"]
     for row_index, row in enumerate(rows):
@@ -2305,8 +2305,7 @@ def photons_campaigns_readout() -> list[str]:
         summary = {"seconds": row.get("seconds"), "mean": row.get("campaign_mean_lap_ns"),
                    "buckets": row.get("lap_buckets") or {}, "scatter": row.get("stats") or {}}
         lines.append(_campaign_cell(name, bool(row.get("active")), 14) + " "
-                     + _photons_summary_line(summary, include_campaign,
-                                             summary["mean"] if row.get("active") else None))
+                     + _photons_summary_line(summary, True, summary["mean"]))
         if row_index != len(rows) - 1:
             lines.append("")
     return lines
