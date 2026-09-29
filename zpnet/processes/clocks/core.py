@@ -15012,7 +15012,20 @@ def _process_loop() -> None:
                         f"res={sample.get('residual_cycles')}]"
                     )
 
-                logging.warning(
+                # Routine interval rejection and its following antecedent hold
+                # are recorded in the durable row and diagnostics above. Keep
+                # their per-second detail available at DEBUG; other firmware
+                # objections still deserve an operator-visible warning.
+                exclusion_log_level = (
+                    logging.DEBUG
+                    if firmware_exclusion["reason_name"] in {
+                        "alpha_cycle_excursion",
+                        "beta_antecedent_science_hold",
+                    }
+                    else logging.WARNING
+                )
+                logging.log(
+                    exclusion_log_level,
                     "🧪 [clocks] firmware science exclusion retained: "
                     "campaign=%s public_count=%d reason=%s raw_cycles=%s",
                     campaign,
