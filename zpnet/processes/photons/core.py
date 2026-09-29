@@ -6386,6 +6386,7 @@ def _startup_cold_start(
 ) -> Dict[str, Any]:
     """Create a fresh producer epoch without inventing continuity across sources."""
     global _recovery_cold_start_count
+    global _ppb_checkpoint_runtime
 
     migration = copy.deepcopy(source_epoch_migration)
     if rows_seen != 0 and not isinstance(migration, dict):
@@ -6406,6 +6407,10 @@ def _startup_cold_start(
         allow_first_public_count_splice=False,
     )
     drained = _retire_fragment_queue_via_owner("COLD_START")
+    # The authorized fresh epoch reuses reset/update identities from zero. Drop
+    # the previous epoch's Pi ledger before firmware can publish its first row.
+    with _ppb_checkpoint_lock:
+        _ppb_checkpoint_runtime = _ppb_checkpoint_new_runtime(reason="COLD_START")
     _arm_recovery_proof({
         "mode": "COLD_START",
         "generation": generation,
@@ -7900,6 +7905,41 @@ def _runtime_reconcile_teensy_generation(previous_generation: int,
         # The stream did not prove a healthy survivor.  REPORT_RECOVERY is now a
         # fallback court for the newborn/held or otherwise ambiguous case only.
         report = _fetch_teensy_recovery_report()
+        if not bool(report.get("enabled")):
+            # A reboot returns firmware to DISABLED.  Ambient recovery owns no
+            # operator ENABLE intent and must not mistake that physical boundary
+            # for an enabled producer awaiting detector activation and restore.
+            _subsystem_lifecycle_known.set()
+            _subsystem_enabled.clear()
+            _campaign_control_ready.clear()
+            _runtime_recovery_hold.set()
+            _ppb_checkpoint_reacquire_requested.clear()
+            _clear_recovery_proof_custody()
+            _runtime_recovery_generation = int(observed_generation)
+            with _state_lock:
+                _runtime_recovery_last = {
+                    "mode": "FIRMWARE_DISABLED",
+                    "previous_generation": int(previous_generation),
+                    "observed_generation": int(observed_generation),
+                    "persistence_barrier": copy.deepcopy(barrier),
+                    "producer_mutated": False,
+                    "completed_at_utc": _utc_now_z(),
+                }
+            _recovery_status_set(
+                "DISABLED", reason="firmware_disabled_after_transport_change"
+            )
+            _set_operational_state(
+                OPERATIONAL_STATE_DISABLED,
+                reason="firmware_disabled_after_transport_change",
+                source="RUNTIME_GENERATION_MONITOR",
+                details=copy.deepcopy(_runtime_recovery_last),
+            )
+            logging.info(
+                "⏹️ [photons/ambient restore] firmware is DISABLED on generation=%d; "
+                "waiting for explicit PHOTONS.ENABLE",
+                int(observed_generation),
+            )
+            return
         if bool(report.get("publication_started")) and live_fragment is None:
             # No canonical row was observed in the bounded window, but firmware says
             # publication survived. Preserve the prior non-mutating behavior rather
@@ -7984,19 +8024,16 @@ def _runtime_reconcile_teensy_generation(previous_generation: int,
         raise
 
 
-def _runtime_teensy_generation_monitor_loop() -> None:
-    """Reconcile every proved PUBSUB generation change without replaying RPC intent."""
+def _runtime_teensy_generation_monitor_step() -> None:
+    """Classify one transport observation under exclusive lifecycle ownership."""
     global _runtime_recovery_generation
 
-    _runtime_recovery_monitor_started.set()
-    logging.info(
-        "🚀 [photons] Teensy producer-lifetime monitor started generation=%d",
-        int(_runtime_recovery_generation),
-    )
-    while True:
+    # ENABLE/DISABLE own the same lock across their physical and durable cutover.
+    # Re-read both lifecycle and generation after acquiring it: an observation
+    # made before a waiting operator transition cannot authorize a second restore.
+    with _subsystem_lifecycle_lock:
         if _hard_failure_active():
-            time.sleep(PHOTONS_RUNTIME_RECOVERY_POLL_S)
-            continue
+            return
 
         # DISABLE is an operator-authored lifecycle boundary, not an outage.
         # Keep the transport generation baseline current, but never launch
@@ -8008,18 +8045,15 @@ def _runtime_teensy_generation_monitor_loop() -> None:
                 observed = None
             if observed is not None:
                 _runtime_recovery_generation = int(observed)
-            time.sleep(PHOTONS_RUNTIME_RECOVERY_POLL_S)
-            continue
+            return
 
         try:
             observed = _runtime_teensy_rpc_generation()
         except Exception:
             logging.exception("⚠️ [photons/ambient restore] runtime RPC-generation read failed")
-            time.sleep(PHOTONS_RUNTIME_RECOVERY_POLL_S)
-            continue
+            return
         if observed is None or observed == _runtime_recovery_generation:
-            time.sleep(PHOTONS_RUNTIME_RECOVERY_POLL_S)
-            continue
+            return
 
         previous = int(_runtime_recovery_generation)
         target = int(observed)
@@ -8041,8 +8075,7 @@ def _runtime_teensy_generation_monitor_loop() -> None:
                     target,
                     exc,
                 )
-                time.sleep(PHOTONS_RUNTIME_RECOVERY_POLL_S)
-                continue
+                return
             _enter_hard_failure(
                 "ambient_producer_recovery_failed",
                 {
@@ -8053,6 +8086,18 @@ def _runtime_teensy_generation_monitor_loop() -> None:
                 },
                 source="PHOTONS_RUNTIME_RECOVERY",
             )
+
+
+def _runtime_teensy_generation_monitor_loop() -> None:
+    """Reconcile proved PUBSUB generation changes without replaying RPC intent."""
+    _runtime_recovery_monitor_started.set()
+    logging.info(
+        "🚀 [photons] Teensy producer-lifetime monitor started generation=%d",
+        int(_runtime_recovery_generation),
+    )
+    while True:
+        _runtime_teensy_generation_monitor_step()
+        time.sleep(PHOTONS_RUNTIME_RECOVERY_POLL_S)
 
 
 def _start_runtime_teensy_generation_monitor(initial_generation: int) -> None:
@@ -8153,6 +8198,7 @@ def cmd_enable(args: Optional[dict]) -> Dict[str, Any]:
                 },
             }
 
+        enable_args = {"interval": 500_000, **copy.deepcopy(args or {})}
         try:
             firmware_enable = (
                 {"status": "already_enabled", **copy.deepcopy(report)}
@@ -8160,7 +8206,7 @@ def cmd_enable(args: Optional[dict]) -> Dict[str, Any]:
                 else _request_teensy_subsystem_command(
                     "ENABLE",
                     accepted_statuses={"enabled", "already_enabled"},
-                    args={"interval": 500_000, **copy.deepcopy(args or {})},
+                    args=enable_args,
                 )
             )
         except Exception as exc:
@@ -8191,7 +8237,9 @@ def cmd_enable(args: Optional[dict]) -> Dict[str, Any]:
                 _leave_maintenance_queue_hold()
 
             _runtime_recovery_hold.clear()
-            recovery, initial_generation = _startup_phase5_recovery_with_generation_retry()
+            recovery, initial_generation = _startup_phase5_recovery_with_generation_retry(
+                operator_enable_args=enable_args
+            )
             if recovery.get("mode") == "COMMISSIONING_HOLD":
                 raise RuntimeError(
                     "PHOTONS recovery remained in COMMISSIONING_HOLD after ENABLE"
@@ -10751,7 +10799,9 @@ def _startup_commissioning_empty_heartbeat_cutover(
     return result
 
 
-def _startup_phase5_recovery_with_generation_retry() -> Tuple[Dict[str, Any], int]:
+def _startup_phase5_recovery_with_generation_retry(
+    *, operator_enable_args: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, Any], int]:
     """Run Phase 5 against one proved Teensy transport generation at a time.
 
     A generation change is infrastructure invalidation, not a PHOTONS scientific
@@ -10773,6 +10823,17 @@ def _startup_phase5_recovery_with_generation_retry() -> Tuple[Dict[str, Any], in
             int(attempt_generation),
         )
         try:
+            if operator_enable_args is not None:
+                # Only an in-flight operator ENABLE owns physical admission on a
+                # replacement Teensy lifetime. Ordinary startup/live adoption must
+                # preserve disabled firmware and its zero-RPC survivor path.
+                lifecycle_report = _fetch_teensy_recovery_report()
+                if not bool(lifecycle_report.get("enabled")):
+                    _request_teensy_subsystem_command(
+                        "ENABLE",
+                        accepted_statuses={"enabled", "already_enabled"},
+                        args=copy.deepcopy(operator_enable_args),
+                    )
             recovery = _perform_phase5_recovery(
                 transport_generation=int(attempt_generation),
                 survival_ingress_barrier_monotonic=survival_barrier,

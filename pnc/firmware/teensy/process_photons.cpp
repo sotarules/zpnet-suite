@@ -6416,7 +6416,9 @@ static FLASHMEM Payload cmd_recovery_cold_start(const Payload& args) {
       photons_foreground_owner_t::COMMAND);
   if (!g_photons_enabled) return photons_disabled_reject("RECOVERY_COLD_START");
   if (g_photons_recovery.publication_started ||
-      g_photons_recovery_protocol.active) {
+      g_photons_recovery_protocol.active ||
+      g_fragment_timer != TIMEPOP_INVALID_HANDLE ||
+      g_photons_race_foreground.active) {
     return photons_recovery_reject(
         "recovery_cold_start_rejected_busy",
         "cold start requires a held instrument with no staged restore");
@@ -6434,11 +6436,38 @@ static FLASHMEM Payload cmd_recovery_cold_start(const Payload& args) {
         "recovery_cold_start_rejected_generation",
         "cold start requires a nonzero generation");
   }
-  if (g_lap_time_welford.n != 0ULL || g_total_lap_gnss_ns != 0ULL ||
-      g_photons_custody_lap_count != 0ULL ||
-      g_photons_custody_total_lap_gnss_ns != 0ULL) {
-    __builtin_trap();
-  }
+
+  // DISABLE stops physical acquisition but preserves the preceding statistical
+  // lineage for durable restore. After a database TRUNCATE the Pi instead owns
+  // an explicit cold-start verdict: establish a fresh durability epoch here,
+  // even when this Teensy has already measured laps during the same boot.
+  // Validation is complete and COMMAND custody excludes cadence/fragment work.
+  // Boot-lifetime diagnostics, capture counters, and handoff generations remain
+  // continuous; physical race ancestry is reset together below.
+  photons_welford_reset(g_lap_time_welford);
+  photons_welford_reset(g_accepted_raw_cycles_welford);
+  photons_welford_reset(g_excluded_raw_cycles_welford);
+  photons_welford_reset(g_excluded_lap_time_welford);
+  g_total_lap_gnss_ns = 0ULL;
+  g_photons_custody_lap_count = 0ULL;
+  g_photons_custody_total_lap_gnss_ns = 0ULL;
+  g_photons_stats_reset_count = 0U;
+  g_photons_stats_update_count = 0U;
+  g_photons_stats_reset_pending = false;
+  g_raw_cycles_state = photons_fragment_raw_cycles_snapshot_t{};
+  g_projection_state = photons_fragment_projection_snapshot_t{};
+  g_photons_lap_science_state = photons_lap_science_snapshot_t{};
+  g_fragment_sequence = 0U;
+  g_publish_count = 0U;
+  g_publish_reject_count = 0U;
+
+  g_photons_campaign_state = photons_campaign_state_t::STOPPED;
+  g_photons_campaign_name[0] = '\0';
+  g_photons_campaign_origin_lap_count = 0ULL;
+  g_photons_campaign_origin_total_lap_gnss_ns = 0ULL;
+  g_photons_campaign_start_after_sequence = 0U;
+  g_photons_campaign_public_count = 0U;
+  g_photons_flash_cut_campaign_name[0] = '\0';
 
   photons_ppb_windows_seed_origin();
   g_photons_recovery.restored = false;
