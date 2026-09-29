@@ -73,8 +73,6 @@ DAC_OUTPUT_FULL_SCALE_VOLTAGE = 5.0
 DAC_SAFE_MAX_OUTPUT_VOLTAGE = 3.3
 DAC_CODE_SCALE = 65536.0
 
-DAC_FINE_STEP = 1.0
-DAC_COARSE_STEP = 10.0
 DAC_MIN_CODE = 0.0
 DAC_MAX_CODE = float(
     int((DAC_SAFE_MAX_OUTPUT_VOLTAGE / DAC_OUTPUT_FULL_SCALE_VOLTAGE) * DAC_CODE_SCALE)
@@ -826,112 +824,6 @@ def _clamp_dac_code(value: float) -> float:
     return value
 
 
-def _manual_dac_current_value(lane: str) -> float:
-    """Fetch the live DAC value for keyboard nudging.
-
-    Read the Pi-owned target from the current canonical CLOCKS.clocks.control
-    surface.  Keyboard nudging never polls or commands the Teensy.
-    """
-    report = {}
-    try:
-        p = _get_pi_clocks_report()
-        report = p.get("report") if isinstance(p.get("report"), dict) else p
-    except Exception:
-        report = {}
-
-    current = _dac_current_value(report, lane)
-    if current is None:
-        raise RuntimeError(f"{lane.upper()} DAC value unavailable")
-
-    return float(current)
-
-
-def adjust_ocxo_dac(*, lane: str, direction: int, step_kind: str) -> dict:
-    """Apply one keyboard DAC nudge through the sole PI CLOCKS actuator owner.
-
-    The current target is read from canonical CLOCKS.control. Metrics computes
-    one bounded coarse/fine target and sends exactly one PI CLOCKS SET_DAC
-    command. The response payload is then authoritative for the accepted
-    target, current hardware code, voltage, realization mode, and write status;
-    no Teensy command/response path participates.
-    """
-    if lane not in ("ocxo1", "ocxo2"):
-        raise ValueError(f"unknown DAC lane: {lane!r}")
-    if direction not in (-1, 1):
-        raise ValueError(f"invalid DAC direction: {direction!r}")
-
-    coarse = "coarse" in str(step_kind).lower()
-    step = DAC_COARSE_STEP if coarse else DAC_FINE_STEP
-    old_value = _manual_dac_current_value(lane)
-    requested_value = _clamp_dac_code(old_value + float(direction) * step)
-
-    arg_name = "DAC1" if lane == "ocxo1" else "DAC2"
-    response_target_key = f"{lane}_dac"
-    response_hw_key = f"{lane}_dac_hw_code"
-    response_voltage_key = f"{lane}_dac_voltage"
-    response_write_key = f"{lane}_dac_last_write_ok"
-
-    resp = send_command(
-        machine="PI",
-        subsystem="CLOCKS",
-        command="SET_DAC",
-        args={arg_name: f"{requested_value:.6f}"},
-    )
-
-    if not isinstance(resp, dict):
-        raise RuntimeError("PI CLOCKS SET_DAC returned a malformed response")
-
-    ok = bool(resp.get("success"))
-    msg = str(resp.get("message") or ("OK" if ok else "FAILED"))
-    payload = resp.get("payload") if isinstance(resp.get("payload"), dict) else {}
-
-    accepted_value = _to_float(payload.get(response_target_key))
-    if accepted_value is None:
-        accepted_value = requested_value
-
-    hw_code = _to_int(payload.get(response_hw_key))
-    volts = _to_float(payload.get(response_voltage_key))
-    if volts is None:
-        volts = _dac_voltage(accepted_value)
-
-    write_ok = _to_bool(payload.get(response_write_key))
-    realization = str(payload.get("realization_mode") or "").upper()
-    owner = str(payload.get("owner") or "PI.CLOCKS")
-
-    voltage_text = f"{volts:.9f}V" if volts is not None else "---"
-    hw_text = f" hw={hw_code}" if hw_code is not None else ""
-    realization_text = f" {realization}" if realization else ""
-    prefix = "DAC" if ok else "DAC FAILED"
-
-    if ok:
-        result_text = (
-            f"{prefix}: {lane.upper()} {step_kind} "
-            f"{old_value:.3f} -> {accepted_value:.3f}"
-            f"{hw_text} {voltage_text}{realization_text} [{owner}]"
-        )
-    else:
-        result_text = (
-            f"{prefix}: {lane.upper()} {step_kind} "
-            f"requested {requested_value:.3f}; {owner}: {msg}"
-        )
-
-    return {
-        "success": ok,
-        "message": result_text,
-        "old_value": old_value,
-        "requested_value": requested_value,
-        "new_value": accepted_value,
-        "hw_code": hw_code,
-        "voltage": volts,
-        "write_ok": write_ok,
-        "realization_mode": realization or None,
-        "owner": owner,
-        "step": step,
-        "lane": lane,
-        "response": resp,
-    }
-
-
 def _dac_dither_summary_from_fractional_code(dac_code) -> str:
     """Format the two integer DAC codes used to realize a fractional code.
 
@@ -1518,7 +1410,6 @@ def campaigns_readout() -> list[str]:
         if row_index != len(rows) - 1:
             lines.append("")
 
-    lines.extend(["", "DAC FROM: first recorded campaign public count; --- means no DAC recording."])
     return lines
 
 
@@ -2163,7 +2054,7 @@ def _photons_summary_header(include_campaign: bool) -> str:
     labels = ["LAP", "10-MIN", "60-MIN", "8-HOUR", "24-HOUR", "TOTAL"]
     if include_campaign:
         labels.append("CAMP")
-    return (f"{'SEC':>8} " + " ".join(f"{label:>12}" for label in labels)
+    return (f"{'SEC':<8} " + " ".join(f"{label:>12}" for label in labels)
             + f" {'SD':>10} {'SE':>10}")
 
 
@@ -2172,7 +2063,7 @@ def _photons_summary_line(summary: dict, include_campaign: bool, campaign_mean=N
     if include_campaign:
         values.append(campaign_mean)
     scatter = summary.get("scatter") or {}
-    return (_fmt(summary.get("seconds"), '>8d', 8) + " "
+    return (_fmt(summary.get("seconds"), 'd', 0).ljust(8) + " "
             + " ".join(_fmt(value, '>12.6f', 12) for value in values)
             + " " + _fmt(scatter.get("stddev"), '>10.6f', 10)
             + " " + _fmt(scatter.get("stderr"), '>10.6f', 10))
@@ -2367,7 +2258,7 @@ def photons_detail_readout() -> list[str]:
     name = str(campaign.get("campaign") or "STOPPED")
     if campaign.get("final"):
         name += " [FINAL]"
-    lines = [f"PHOTONS  CAMPAIGN: {name}  UNITS: ns"
+    lines = [f"CAMPAIGN: {name}  UNITS: ns"
              f"  ELAPSED: {_seconds_to_hms(summary['seconds'])}  RECOVERABLE: {recoverable}"]
     if campaign_error:
         lines.append(f"LANTERN READ MODEL: UNAVAILABLE: {campaign_error}")
@@ -2375,11 +2266,11 @@ def photons_detail_readout() -> list[str]:
         lines.append("CAMPAIGN SD/SE: UNAVAILABLE (exact campaign population not retained)")
     lines.extend(["", _photons_summary_header(bool(campaign)),
                   _photons_summary_line(summary, bool(campaign), summary["mean"]), "",
-                  f"{'SEC':>8} {'LAP':>12} {'ACCEPT':>8} {'EXCL':>7} {'MISSED':>7} {'SPURIOUS':>8}"
+                  f"{'SEC':<8} {'LAP':>12} {'ACCEPT':>8} {'EXCL':>7} {'MISSED':>7} {'SPURIOUS':>8}"
                   f" {'EARLY':>6} {'DUP':>6} {'LATE':>6} {'UNARM':>6} {'SD':>10} {'SE':>10}"])
     for row in _photons_rolling_rows(payloads):
         lines.append(
-            _fmt(row["second"], '>8d', 8) + " " + _fmt(row["mean"], '>12.6f', 12)
+            _fmt(row["second"], 'd', 0).ljust(8) + " " + _fmt(row["mean"], '>12.6f', 12)
             + " " + _fmt(row["accepted"], '>8d', 8)
             + " " + _fmt(row["excluded"], '>7d', 7)
             + " " + _fmt(row["missed"], '>7d', 7)
@@ -2405,7 +2296,7 @@ def photons_campaigns_readout() -> list[str]:
              f"{'CAMPAIGN':<14} " + _photons_summary_header(include_campaign)]
     if not rows:
         return lines + ["", "NO LANTERN CAMPAIGNS"]
-    for row in rows:
+    for row_index, row in enumerate(rows):
         name = str(row.get("campaign") or "?")
         if row.get("campaign_mean_lap_ns") is None:
             name += " [WAIT]"
@@ -2416,8 +2307,8 @@ def photons_campaigns_readout() -> list[str]:
         lines.append(_campaign_cell(name, bool(row.get("active")), 14) + " "
                      + _photons_summary_line(summary, include_campaign,
                                              summary["mean"] if row.get("active") else None))
-    lines.extend(["", "UNITS: ns. Buckets: instrument windows at the campaign's last row.",
-                  "SD/SE: --- when population size or retained campaign ancestry is insufficient."])
+        if row_index != len(rows) - 1:
+            lines.append("")
     return lines
 
 
