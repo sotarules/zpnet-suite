@@ -19495,9 +19495,9 @@ def run() -> None:
     # issue Teensy RPC until those exact planes have been proved usable.
     _wait_for_startup_infrastructure()
 
-    # CLOCKS boots disabled at the firmware layer. Keep the Pi service and
-    # command socket alive, but do not seed/restore/start workers against
-    # deliberate CLOCKS_FRAGMENT silence. ENABLE wakes this same startup owner,
+    # Firmware boots enabled, but a Pi-only restart may find an explicit DISABLE.
+    # Keep the command socket alive without starting workers against deliberate
+    # CLOCKS_FRAGMENT silence. ENABLE wakes this same startup owner,
     # which then runs the ordinary holistic reconciliation below.
     firmware_enabled = _fetch_teensy_clocks_enabled()
     if not firmware_enabled:

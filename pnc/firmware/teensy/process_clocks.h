@@ -41,9 +41,9 @@
 //
 //   Phase 2: process_clocks_init()
 //     Initializes subscriptions and the always-live timing substrate after
-//     TimePop is available. CLOCKS science boots DISABLED: PPS/VCLOCK/OCXO
-//     counting remains live, while Alpha/Beta statistics and CLOCKS_FRAGMENT
-//     publication wait for explicit CLOCKS.ENABLE.
+//     TimePop is available. CLOCKS science boots ENABLED and requests its
+//     initial Alpha epoch through the ordinary ENABLE path. DISABLE/ENABLE
+//     remain available without stopping the PPS/VCLOCK/OCXO timing substrate.
 //     Must be called AFTER timepop_init().
 //
 // Completed campaign-row lifecycle:
@@ -119,7 +119,7 @@ void process_clocks_init_hardware(void);
 // -----------------------------------------------------------------------------
 
 /// Initialize CLOCKS subscriptions and the system timing substrate.
-/// CLOCKS science/publication remains disabled until explicit ENABLE.
+/// CLOCKS science boots enabled through the ordinary epoch-admission path.
 /// Must be called after timepop_init().
 void process_clocks_init(void);
 

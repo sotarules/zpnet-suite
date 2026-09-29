@@ -114,7 +114,7 @@ static constexpr uint64_t PHOTONS_PULSE_DEFAULT_NS = 1000ULL;
 static constexpr uint64_t PHOTONS_RACE_PULSE_NS = 200ULL;
 
 static constexpr uint64_t PHOTONS_CADENCE_MIN_NS = 10000ULL;
-static constexpr uint64_t PHOTONS_CADENCE_DEFAULT_NS = 10000ULL;
+static constexpr uint64_t PHOTONS_CADENCE_DEFAULT_NS = 500000ULL;
 static constexpr uint64_t PHOTONS_CADENCE_MAX_NS = 1000000000ULL;
 
 static constexpr uint32_t PHOTONS_RACE_HOLDOFF_NS = 0U; // retired wire field
@@ -5506,6 +5506,31 @@ static void photons_start_fragment_publisher(void) {
 // Initialization
 // ============================================================================
 
+static FLASHMEM void photons_enable_acquisition(uint64_t interval_ns) {
+  if (!g_initialized || !g_subscription_ok) __builtin_trap();
+  photons_laser_mod_idle();
+  g_pulse_armed_sequence = 0U;
+  photons_memory_barrier();
+  g_photons_cadence_ns = interval_ns;
+
+  if (!interrupt_start(interrupt_subscriber_kind_t::PHOTODIODE)) {
+    __builtin_trap();
+  }
+  interrupt_photodiode_diag_t interrupt_diag{};
+  if (!interrupt_photodiode_snapshot(&interrupt_diag) ||
+      !interrupt_diag.subscribed || !interrupt_diag.active) {
+    __builtin_trap();
+  }
+  g_interrupt_started = true;
+
+  // Boot and ENABLE admit physical acquisition. The Pi recovery court alone
+  // may start the 1 Hz publisher and statistical lineage.
+  g_photons_enabled = true;
+  photons_memory_barrier();
+  photons_projection_anchor_refresh();
+  photons_cadence_start();
+}
+
 FLASHMEM void process_photons_init(void) {
   if (g_initialized) return;
 
@@ -5520,8 +5545,8 @@ FLASHMEM void process_photons_init(void) {
 
   // This is the initialization of edge-service live capture and it
   // occurs before the PHOTODIODE subscription exists. Step 2 deliberately binds
-  // the callback without activating the detector lane; once a later explicit
-  // activation occurs, only the detector callback may mutate g_photons_live.
+  // the callback before activating the detector at the end of initialization.
+  // Once activated, only the detector callback may mutate g_photons_live.
   g_photons_live = photons_live_state_t{};
   g_last_fragment_generation = 0U;
   g_last_fragment_spurious_count = 0ULL;
@@ -5551,8 +5576,8 @@ FLASHMEM void process_photons_init(void) {
   g_last_fragment_race_rejected_excursion_count = 0ULL;
 
   // Establish cross-context mailboxes before the PHOTODIODE subscription exists.
-  // Subscription alone does not make the detector callback live. After a later
-  // explicit activation, only the detector callback may mutate receive mailbox
+  // Subscription alone does not make the detector callback live. After boot
+  // activation, only the detector callback may mutate receive mailbox
   // contents; foreground owns only the arm/launch side of each handoff.
   g_pulse_armed_sequence = 0U;
   g_pulse_sequence = 0U;
@@ -5612,17 +5637,15 @@ FLASHMEM void process_photons_init(void) {
   subscription.user_data = nullptr;
 
   g_subscription_ok = interrupt_photodiode_subscribe(subscription);
-  // Binding the callback is safe at boot, but ENABLE is the only authority that
-  // may activate the PHOTODIODE lane or optical cadence.
+  // Finish initialization before admitting physical acquisition below.
   g_interrupt_started = false;
   g_photons_enabled = false;
 
-  // Register the dormant cadence service so ENABLE needs no new scheduler
-  // topology. cadence_ready() remains false while cadence_running is false.
+  // Register the cadence service before boot admission; later ENABLE reuses it.
   timepop_register_foreground_service(
       photons_cadence_ready, photons_cadence_service, nullptr);
   g_initialized = true;
-  photons_laser_mod_idle();
+  photons_enable_acquisition(g_photons_cadence_ns);
 }
 
 // ============================================================================
@@ -7409,27 +7432,7 @@ static FLASHMEM Payload cmd_enable(const Payload& args) {
     __builtin_trap();
   }
 
-  photons_laser_mod_idle();
-  g_pulse_armed_sequence = 0U;
-  photons_memory_barrier();
-  g_photons_cadence_ns = interval_ns;
-
-  if (!interrupt_start(interrupt_subscriber_kind_t::PHOTODIODE)) {
-    __builtin_trap();
-  }
-  interrupt_photodiode_diag_t interrupt_diag{};
-  if (!interrupt_photodiode_snapshot(&interrupt_diag) ||
-      !interrupt_diag.subscribed || !interrupt_diag.active) {
-    __builtin_trap();
-  }
-  g_interrupt_started = true;
-
-  // ENABLE admits physical acquisition. The Pi recovery court remains the sole
-  // authority that may start the 1 Hz publisher and statistical lineage.
-  g_photons_enabled = true;
-  photons_memory_barrier();
-  photons_projection_anchor_refresh();
-  photons_cadence_start();
+  photons_enable_acquisition(interval_ns);
 
   Payload p;
   p.add("status", "enabled");

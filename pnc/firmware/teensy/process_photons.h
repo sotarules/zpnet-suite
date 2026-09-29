@@ -723,12 +723,11 @@ struct photons_fragment_snapshot_t {
   uint32_t interrupt_last_qtimer_pending_at_exit_mask = 0;
 };
 
-// Initialize PHOTONS into its safe DISABLED state. The detector callback is bound
-// but inactive, laser modulation is LOW, cadence/races are stopped, and no
-// PHOTONS_FRAGMENT can be produced until the explicit ENABLE command.
+// Initialize PHOTONS enabled with its detector and default acquisition cadence.
+// Publication and statistical lineage still wait for the Pi recovery verdict.
+// Explicit DISABLE/ENABLE remain available after initialization.
 // Must run after process_interrupt_init() and timepop_init().
 void process_photons_init(void);
 
 // Register the PHOTONS process command surface.
 void process_photons_register(void);
-

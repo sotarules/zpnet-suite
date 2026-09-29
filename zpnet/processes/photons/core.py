@@ -7906,8 +7906,8 @@ def _runtime_reconcile_teensy_generation(previous_generation: int,
         # fallback court for the newborn/held or otherwise ambiguous case only.
         report = _fetch_teensy_recovery_report()
         if not bool(report.get("enabled")):
-            # A reboot returns firmware to DISABLED.  Ambient recovery owns no
-            # operator ENABLE intent and must not mistake that physical boundary
+            # Honor an explicit DISABLE observed after a transport change.
+            # Ambient recovery must not override the operator or mistake silence
             # for an enabled producer awaiting detector activation and restore.
             _subsystem_lifecycle_known.set()
             _subsystem_enabled.clear()
@@ -10976,8 +10976,8 @@ def run() -> None:
     _wait_for_startup_infrastructure()
 
     # ENABLE/DISABLE is a system-level authority boundary. A normal Teensy boot
-    # initializes PHOTONS disabled; the Pi mirrors that state and must not
-    # reinterpret intentional silence as a failed producer that needs repair.
+    # initializes PHOTONS enabled; a Pi-only restart may find an explicit DISABLE.
+    # Mirror that state rather than treating intentional silence as a failure.
     try:
         lifecycle_report = _fetch_teensy_recovery_report()
     except Exception as exc:
@@ -10998,10 +10998,10 @@ def run() -> None:
         _subsystem_enabled.clear()
         _campaign_control_ready.clear()
         _runtime_recovery_hold.set()
-        _recovery_status_set("DISABLED", reason="firmware_boot_default")
+        _recovery_status_set("DISABLED", reason="firmware_disabled")
         _set_operational_state(
             OPERATIONAL_STATE_DISABLED,
-            reason="firmware_boot_default",
+            reason="firmware_disabled",
             source="RUN",
             details={"firmware": copy.deepcopy(lifecycle_report)},
         )

@@ -9518,7 +9518,8 @@ void process_clocks_init(void) {
   subscribe_clock(interrupt_subscriber_kind_t::OCXO1, ocxo1_callback);
   subscribe_clock(interrupt_subscriber_kind_t::OCXO2, ocxo2_callback);
 
-  // Keep physical subscriptions connected while CLOCKS science boots disabled.
-  // Do not request a CLOCKS epoch until explicit ENABLE.
+  // Boot uses the same epoch admission as an explicit ENABLE, after all
+  // physical subscriptions and PPS dispatch are connected.
   interrupt_pps_edge_register_dispatch(pps_selector_callback);
+  if (!clocks_subsystem_enable()) __builtin_trap();
 }
