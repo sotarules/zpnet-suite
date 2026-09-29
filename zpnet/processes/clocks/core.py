@@ -94,7 +94,7 @@ from zpnet.processes.processes import (
     send_command,
 )
 from zpnet.shared.constants import Payload
-from zpnet.shared.db import open_db
+from zpnet.shared.db import DatabaseContentionRetry, open_db
 from zpnet.shared.logger import setup_logging
 from zpnet.shared.util import blocking_features, system_time_z
 from zpnet.shared.events import create_event
@@ -10445,13 +10445,14 @@ def _record_campaign_dac(
 ) -> Dict[str, Any]:
     """Commit recorder state and its per-detail receipt in the caller's transaction.
 
-    The master lock serializes updates. A committed retry reuses its receipt;
+    The non-key master lock serializes payload updates while allowing detail
+    inserts to check their foreign key. A committed retry reuses its receipt;
     a transaction rollback changes neither population nor receipt. No in-memory
     accumulator needs resurrection after Pi or Teensy restart.
     """
     cur.execute(
         "SELECT id, payload FROM campaign_master "
-        "WHERE campaign_type = %s AND campaign = %s FOR UPDATE",
+        "WHERE campaign_type = %s AND campaign = %s FOR NO KEY UPDATE",
         (CAMPAIGN_TYPE_TEMPEST, campaign),
     )
     master = cur.fetchone()
@@ -10516,6 +10517,9 @@ def _attach_tempest_to_state_detail(detail: Dict[str, Any]) -> None:
     deadline = time.monotonic() + CAMPAIGN_DETAIL_ATTACH_TIMEOUT_S
     attempts = 0
     last_error: Optional[BaseException] = None
+    contention = DatabaseContentionRetry(
+        f"CLOCKS adjudication campaign={campaign} sequence={sequence}"
+    )
 
     while True:
         attempts += 1
@@ -10588,6 +10592,11 @@ def _attach_tempest_to_state_detail(detail: Dict[str, Any]) -> None:
                 source="CAMPAIGN_DAC",
             )
         except Exception as exc:
+            if contention.retry(exc):
+                # A lock timeout is not a missing detail. Keep this candidate
+                # in order and give the next transaction a fresh lookup budget.
+                deadline = time.monotonic() + CAMPAIGN_DETAIL_ATTACH_TIMEOUT_S
+                continue
             last_error = exc
 
         if time.monotonic() >= deadline:
@@ -14697,6 +14706,9 @@ def _clocks_persistence_loop() -> None:
             state_clocks["ephemeral"] = False
 
         failure_logged = False
+        contention = DatabaseContentionRetry(
+            f"CLOCKS persistence sequence={state.get('sequence')}"
+        )
         while True:
             try:
                 worker_sequence = _as_int(state.get("sequence"))
@@ -14740,12 +14752,14 @@ def _clocks_persistence_loop() -> None:
                     ):
                         _clocks_holistic_restore_proof_committed.set()
                 break
-            except Exception:
+            except Exception as exc:
                 if _hard_failure_active() and not _hard_failure_stats_repair_active():
                     _diag["hard_failure_persistence_dropped"] = (
                         _diag.get("hard_failure_persistence_dropped", 0) + 1
                     )
                     break
+                if contention.retry(exc):
+                    continue
                 if not failure_logged:
                     logging.exception(
                         "⚠️ [clocks] campaign_detail persistence failed for CLOCKS sequence=%s; retrying",

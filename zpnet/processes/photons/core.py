@@ -55,7 +55,7 @@ from zpnet.processes.processes import (
     server_setup,
 )
 from zpnet.shared.constants import Payload
-from zpnet.shared.db import open_db
+from zpnet.shared.db import DatabaseContentionRetry, open_db
 from zpnet.shared.logger import setup_logging
 
 
@@ -7679,6 +7679,9 @@ def _persistence_loop() -> None:
                     _hard_failure_persistence_dropped += 1
             else:
                 failure_logged = False
+                contention = DatabaseContentionRetry(
+                    f"PHOTONS persistence sequence={photons['sequence']}"
+                )
                 while True:
                     try:
                         detail_id = _persist_photons(photons, checkpoint)
@@ -7698,6 +7701,8 @@ def _persistence_loop() -> None:
                         with _state_lock:
                             _persistence_retry_count += 1
                             _last_persistence_failure = failure
+                        if contention.retry(exc):
+                            continue
                         if not failure_logged:
                             logging.exception(
                                 "⚠️ [photons] LANTERN campaign_detail persistence failed for PHOTONS sequence=%s; retrying",
