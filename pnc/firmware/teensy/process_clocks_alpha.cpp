@@ -4203,6 +4203,10 @@ struct alpha_static_prediction_store_t {
 };
 
 static alpha_static_prediction_store_t g_static_prediction_pps = {};
+// Protected by g_static_prediction_pps.seq and its writer custody. Keep this
+// physical PPS evidence with its interval; g_pps_witness_diag is also reused by
+// the VCLOCK callback and cannot supply an independent PPS delay snapshot.
+static interrupt_delay_forensics_t g_static_prediction_pps_interrupt_delay{};
 static alpha_static_prediction_store_t g_static_prediction_vclock = {};
 static alpha_static_prediction_store_t g_static_prediction_ocxo1 = {};
 static alpha_static_prediction_store_t g_static_prediction_ocxo2 = {};
@@ -4213,7 +4217,9 @@ static alpha_static_prediction_store_t* alpha_static_prediction_store(time_clock
       &g_static_prediction_ocxo1, &g_static_prediction_ocxo2);
 }
 
-static void alpha_static_prediction_reset_store(alpha_static_prediction_store_t& s) {
+static void alpha_static_prediction_reset_store(
+    alpha_static_prediction_store_t& s,
+    interrupt_delay_forensics_t* delay = nullptr) {
   const alpha_writer_custody_t writer_custody(s.writer_owner);
   s.seq++;
   clocks_alpha_dmb();
@@ -4224,13 +4230,15 @@ static void alpha_static_prediction_reset_store(alpha_static_prediction_store_t&
   s.static_prediction_cycles = 0;
   s.actual_cycles = 0;
   s.static_residual_cycles = 0;
+  if (delay) *delay = interrupt_delay_forensics_t{};
 
   clocks_alpha_dmb();
   s.seq++;
 }
 
 void clocks_static_prediction_reset_all(void) {
-  alpha_static_prediction_reset_store(g_static_prediction_pps);
+  alpha_static_prediction_reset_store(
+      g_static_prediction_pps, &g_static_prediction_pps_interrupt_delay);
   alpha_static_prediction_reset_store(g_static_prediction_vclock);
   alpha_static_prediction_reset_store(g_static_prediction_ocxo1);
   alpha_static_prediction_reset_store(g_static_prediction_ocxo2);
@@ -4274,7 +4282,9 @@ static void alpha_static_prediction_record(time_clock_id_t clock,
   clocks_feature_update_static_prediction();
 }
 
-static void alpha_static_prediction_record_pps(uint32_t actual_cycles) {
+static void alpha_static_prediction_record_pps(
+    uint32_t actual_cycles,
+    const interrupt_delay_forensics_t& delay) {
   if (actual_cycles == 0) return;
 
   alpha_static_prediction_store_t& s = g_static_prediction_pps;
@@ -4299,6 +4309,7 @@ static void alpha_static_prediction_record_pps(uint32_t actual_cycles) {
   // Keep impossible PPS intervals as raw testimony, never as the next static
   // predictor. A clean PPS interval reseeds; the following one becomes valid.
   s.last_actual_cycles = actual_plausible ? actual_cycles : 0U;
+  g_static_prediction_pps_interrupt_delay = delay;
 
   clocks_alpha_dmb();
   s.seq++;
@@ -4341,39 +4352,40 @@ bool clocks_static_prediction_snapshot(time_clock_id_t clock,
   return false;
 }
 
-static bool alpha_static_prediction_snapshot_store(const alpha_static_prediction_store_t& store,
-                                                   uint32_t clock_id,
-                                                   clocks_static_prediction_snapshot_t* out) {
+bool clocks_static_prediction_pps_snapshot(
+    clocks_static_prediction_snapshot_t* out,
+    interrupt_delay_forensics_t* delay) {
   if (!out) return false;
   *out = clocks_static_prediction_snapshot_t{};
+  if (delay) *delay = interrupt_delay_forensics_t{};
+  const alpha_static_prediction_store_t& store = g_static_prediction_pps;
 
   for (int attempt = 0; attempt < 4; attempt++) {
     const uint32_t seq1 = store.seq;
     clocks_alpha_dmb();
 
     clocks_static_prediction_snapshot_t local{};
-    local.clock_id = clock_id;
+    local.clock_id = 0U;
     local.valid = store.valid;
     local.completed_interval_count = store.completed_interval_count;
     local.static_prediction_cycles = store.static_prediction_cycles;
     local.actual_cycles = store.actual_cycles;
     local.static_residual_cycles = store.static_residual_cycles;
+    const interrupt_delay_forensics_t local_delay =
+        g_static_prediction_pps_interrupt_delay;
 
     clocks_alpha_dmb();
     const uint32_t seq2 = store.seq;
     if (seq1 == seq2 && (seq1 & 1u) == 0u) {
       local.snapshot_ok = true;
       *out = local;
+      if (delay) *delay = local_delay;
       return true;
     }
   }
 
   *out = clocks_static_prediction_snapshot_t{};
   return false;
-}
-
-bool clocks_static_prediction_pps_snapshot(clocks_static_prediction_snapshot_t* out) {
-  return alpha_static_prediction_snapshot_store(g_static_prediction_pps, 0U, out);
 }
 
 static void clocks_feature_update_static_prediction(void) {
@@ -8969,7 +8981,8 @@ static void publish_pps_witness_diag(const pps_edge_snapshot_t& snap) {
     g_dwt_cycles_between_pps_vclock = (uint32_t)g_pps_dwt_cycles_between_edges;
     g_dwt_calibration_valid = true;
 
-    alpha_static_prediction_record_pps((uint32_t)g_pps_dwt_cycles_between_edges);
+    alpha_static_prediction_record_pps(
+        (uint32_t)g_pps_dwt_cycles_between_edges, snap.interrupt_delay);
   } else {
     g_pps_dwt_cycles_between_edges = 0;
     g_pps_dwt_cycles_between_edges_valid = false;

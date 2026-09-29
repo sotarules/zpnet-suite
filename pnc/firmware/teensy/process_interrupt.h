@@ -104,8 +104,9 @@ enum class interrupt_event_status_t : uint8_t {
 };
 
 // Per-endpoint ISR service verdict.  The interrupt layer integrates SpinIdle,
-// predecessor/tail-chain, priority, and QTimer service evidence and exports the
-// conclusion rather than forcing downstream consumers to interpret registers.
+// predecessor/tail-chain and priority evidence. UNKNOWN means the entry evidence
+// cannot settle the question. A later QTimer read cannot prove an earlier entry
+// was delayed; its offset remains separately available as service telemetry.
 enum class interrupt_delay_verdict_t : uint8_t {
   UNKNOWN = 0,
   ON_TIME = 1,
@@ -119,7 +120,7 @@ enum class interrupt_delay_cause_t : uint8_t {
   OCXO2 = 3,
   PPS = 4,
   CONTINUATION = 5,
-  MASKING_OR_UNKNOWN_CPU = 6,
+  MASKING_OR_UNKNOWN_CPU = 6,  // Legacy wire value; no longer inferred from CNTR.
   MULTIPLE_ISR = 7,
   PHOTODIODE = 8,
   UNKNOWN = 255,

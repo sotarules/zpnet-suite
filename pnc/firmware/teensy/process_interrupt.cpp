@@ -42,10 +42,10 @@
 // alternative publication court in this module.  OCXO compare custody is 1 Hz;
 // ambient counter reads are rollover witnesses and never event truth.
 //
-// SpinIdle/predecessor/QTimer evidence is integrated into a parallel causal
-// verdict: whether an ISR endpoint was delayed, who delayed it, and the signed
-// delay contribution to the current interval.  The observed DWT endpoint is
-// never overwritten by that verdict.
+// SpinIdle/predecessor evidence supplies a parallel entry-delay verdict and,
+// where quantifiable, its contribution to the current interval. QTimer reads
+// remain independent service telemetry. The observed DWT endpoint is never
+// overwritten by a diagnostic verdict.
 // ============================================================================
 
 #include "process_interrupt.h"
@@ -3570,26 +3570,20 @@ static inline bool interrupt_nvic_active(uint32_t irq) {
 // SpinIdle supplies the last thread-mode DWT breadcrumb.  A small per-source
 // baseline learns the normal shadow-to-first-instruction age.  Per-target
 // pending-at-blocker-exit latches distinguish ordinary preemption from actual
-// equal/higher-priority serialization.  QTimer counter-vs-target lateness
-// is used as a second, quantized witness.  No result mutates the captured edge.
+// equal/higher-priority serialization.  QTimer counter-vs-target offsets remain
+// raw service telemetry: CNTR is read after the DWT endpoint, so variable work
+// between those reads cannot establish displacement of the earlier endpoint.
+// No result mutates the captured edge.
 
 static constexpr uint32_t INTERRUPT_DELAY_SPIN_BASELINE_MIN_SAMPLES = 3U;
 static constexpr uint32_t INTERRUPT_DELAY_SPIN_CANDIDATE_MAX_CYCLES = 256U;
 static constexpr uint32_t INTERRUPT_DELAY_SPIN_GUARD_CYCLES = 12U;
 static constexpr uint32_t INTERRUPT_DELAY_TAILCHAIN_MAX_GAP_CYCLES = 512U;
-static constexpr uint32_t INTERRUPT_DELAY_SERVICE_BASELINE_MIN_SAMPLES = 3U;
-static constexpr int32_t INTERRUPT_DELAY_SERVICE_NORMAL_JITTER_TICKS = 1;
-static constexpr int32_t INTERRUPT_DELAY_SERVICE_CANDIDATE_MIN_TICKS = -2;
-static constexpr int32_t INTERRUPT_DELAY_SERVICE_CANDIDATE_MAX_TICKS = 8;
 
 struct interrupt_delay_baseline_runtime_t {
   bool spin_valid = false;
   uint32_t spin_sample_count = 0U;
   uint32_t spin_baseline_cycles = 0U;
-
-  bool service_valid = false;
-  uint32_t service_sample_count = 0U;
-  int32_t service_baseline_ticks = 0;
 };
 
 struct interrupt_delay_blocker_latch_t {
@@ -3943,7 +3937,7 @@ static void interrupt_delay_note_isr_exit(
   // Read pending as late as practical.  A target already pending when this ISR
   // entered waited for the full blocker and may use SpinIdle as a fine ruler.
   // A target that appeared during the blocker is still attributed correctly,
-  // but compare-service evidence remains the duration authority.
+  // but its duration remains unquantified without a request-time witness.
   const uint32_t pending_mask_at_exit = interrupt_delay_pending_mask();
   const uint32_t exit_dwt = ARM_DWT_CYCCNT;
   const uint32_t blocker_wall_cycles = exit_dwt - entry_dwt;
@@ -4023,23 +4017,6 @@ static void interrupt_delay_learn_spin_baseline(
       INTERRUPT_DELAY_SPIN_BASELINE_MIN_SAMPLES;
 }
 
-static void interrupt_delay_learn_service_baseline(
-    interrupt_delay_baseline_runtime_t& runtime,
-    int32_t service_offset_ticks) {
-  if (service_offset_ticks < INTERRUPT_DELAY_SERVICE_CANDIDATE_MIN_TICKS ||
-      service_offset_ticks > INTERRUPT_DELAY_SERVICE_CANDIDATE_MAX_TICKS) {
-    return;
-  }
-
-  if (runtime.service_sample_count == 0U ||
-      service_offset_ticks < runtime.service_baseline_ticks) {
-    runtime.service_baseline_ticks = service_offset_ticks;
-  }
-  if (runtime.service_sample_count != UINT32_MAX) runtime.service_sample_count++;
-  runtime.service_valid = runtime.service_sample_count >=
-      INTERRUPT_DELAY_SERVICE_BASELINE_MIN_SAMPLES;
-}
-
 static interrupt_arrival_observation_t interrupt_delay_classify_entry(
     interrupt_execution_source_t source,
     uint32_t entry_dwt,
@@ -4101,7 +4078,8 @@ static interrupt_arrival_observation_t interrupt_delay_classify_entry(
     // for the blocker's full residence.  In that case the SpinIdle excess is a
     // fine-grained estimate of the endpoint displacement.  If the target became
     // pending later, SpinIdle still proves non-idle ancestry but overstates its
-    // actual wait; the QTimer classifier below must quantify that case.
+    // actual wait.  Keep that case unquantified rather than subtracting time
+    // that may have elapsed before the target requested service.
     if (blocker_recent && blocker_could_block &&
         capture.target_pending_at_blocker_entry) {
       out.delay.valid = true;
@@ -4119,8 +4097,9 @@ static interrupt_arrival_observation_t interrupt_delay_classify_entry(
 
   // Pending-at-exit proves this endpoint was serialized behind the named ISR,
   // even when the request arrived partway through the blocker and SpinIdle
-  // cannot tell us the exact wait.  Preserve that verdict and cause; compare-
-  // driven lanes will add a quantified duration below.
+  // cannot tell us the exact wait.  Preserve that verdict and cause without
+  // inventing a duration from a later counter read.  An unquantified endpoint
+  // deliberately breaks the explanatory interval/residual history.
   if (blocker_recent && blocker_could_block) {
     out.delay.valid = true;
     out.delay.verdict = interrupt_delay_verdict_t::DELAYED;
@@ -4148,101 +4127,6 @@ static interrupt_arrival_observation_t interrupt_delay_classify_entry(
     out.delay.uncertainty_cycles = INTERRUPT_DELAY_SPIN_GUARD_CYCLES;
   }
 
-  return out;
-}
-
-static uint32_t interrupt_delay_ticks_to_cycles(uint32_t ticks) {
-  const uint32_t cps = interrupt_vclock_cycles_per_second();
-  if (ticks == 0U || cps == 0U) return 0U;
-  return (uint32_t)(((uint64_t)ticks * (uint64_t)cps +
-                     (uint64_t)OCXO_ONE_SECOND_TICKS / 2ULL) /
-                    (uint64_t)OCXO_ONE_SECOND_TICKS);
-}
-
-static interrupt_arrival_observation_t interrupt_delay_classify_qtimer(
-    interrupt_execution_source_t source,
-    uint32_t entry_dwt,
-    const interrupt_arrival_capture_t& capture,
-    int32_t service_offset_ticks,
-    bool service_witness_contaminated = false) {
-  interrupt_arrival_observation_t out =
-      interrupt_delay_classify_entry(source, entry_dwt, capture);
-  interrupt_delay_baseline_runtime_t* runtime =
-      interrupt_delay_baseline_for(source);
-  if (!runtime) return out;
-
-  // A higher-priority ISR may preempt QTimer1 after the first-instruction DWT
-  // was already captured but before CNTR is read.  That makes the service-offset
-  // witness late without making the endpoint late.  Preserve the entry verdict
-  // and refuse both learning and adjudication from that contaminated witness.
-  if (service_witness_contaminated) return out;
-
-  // Learn the ordinary counter-vs-compare offset only from an independently
-  // clean SpinIdle verdict.  A delayed sample must never teach the delay ruler.
-  if (out.delay.valid &&
-      out.delay.verdict == interrupt_delay_verdict_t::ON_TIME &&
-      out.spinidle_shadow_valid &&
-      out.spinidle_excess_cycles <= INTERRUPT_DELAY_SPIN_GUARD_CYCLES) {
-    interrupt_delay_learn_service_baseline(*runtime, service_offset_ticks);
-  }
-  if (!runtime->service_valid) return out;
-
-  const int32_t service_extra_ticks =
-      service_offset_ticks - runtime->service_baseline_ticks;
-  const uint32_t one_tick_cycles = interrupt_delay_ticks_to_cycles(1U);
-
-  if (service_extra_ticks <= INTERRUPT_DELAY_SERVICE_NORMAL_JITTER_TICKS) {
-    // The hardware compare was serviced at its learned ordinary offset.  This
-    // outranks a long SpinIdle ancestry interval: the target may have become
-    // pending only at the blocker's final instruction and did not suffer a
-    // measurable endpoint displacement.
-    out.delay.valid = true;
-    out.delay.verdict = interrupt_delay_verdict_t::ON_TIME;
-    out.delay.delayed = false;
-    out.delay.delayed_by = interrupt_delay_cause_t::NONE;
-    out.delay.confidence = interrupt_delay_confidence_t::MEDIUM_CONFIDENCE;
-    out.delay.delay_cycles_valid = true;
-    out.delay.delay_cycles = 0U;
-    out.delay.uncertainty_cycles = one_tick_cycles;
-    return out;
-  }
-
-  const uint32_t service_delay_cycles =
-      interrupt_delay_ticks_to_cycles((uint32_t)service_extra_ticks);
-  const uint32_t agreement_gate = one_tick_cycles +
-      INTERRUPT_DELAY_SPIN_GUARD_CYCLES;
-  uint32_t selected_delay = service_delay_cycles;
-  uint32_t selected_uncertainty = agreement_gate;
-
-  // SpinIdle supplies sub-QTimer-tick precision only when the target was already
-  // pending at blocker entry (so the full blocker residence belongs to its wait)
-  // and the independent timer ruler agrees within one tick.
-  if (capture.target_pending_at_blocker_entry &&
-      out.spinidle_excess_cycles > INTERRUPT_DELAY_SPIN_GUARD_CYCLES) {
-    const uint32_t difference =
-        out.spinidle_excess_cycles >= service_delay_cycles
-            ? out.spinidle_excess_cycles - service_delay_cycles
-            : service_delay_cycles - out.spinidle_excess_cycles;
-    if (difference <= agreement_gate) {
-      selected_delay = out.spinidle_excess_cycles;
-      selected_uncertainty = INTERRUPT_DELAY_SPIN_GUARD_CYCLES;
-    }
-  }
-
-  out.delay.valid = true;
-  out.delay.verdict = interrupt_delay_verdict_t::DELAYED;
-  out.delay.delayed = true;
-  if (out.delay.delayed_by == interrupt_delay_cause_t::NONE ||
-      out.delay.delayed_by == interrupt_delay_cause_t::UNKNOWN) {
-    out.delay.delayed_by = interrupt_delay_cause_t::MASKING_OR_UNKNOWN_CPU;
-  }
-  if ((uint8_t)out.delay.confidence <
-      (uint8_t)interrupt_delay_confidence_t::MEDIUM_CONFIDENCE) {
-    out.delay.confidence = interrupt_delay_confidence_t::MEDIUM_CONFIDENCE;
-  }
-  out.delay.delay_cycles_valid = true;
-  out.delay.delay_cycles = selected_delay;
-  out.delay.uncertainty_cycles = selected_uncertainty;
   return out;
 }
 
@@ -4946,15 +4830,11 @@ static void process_vclock_packet(const vclock_capture_packet_t& packet) {
   const uint16_t target_low16 = packet.target_low16;
   const uint32_t service_counter32 =
       vclock_synthetic_from_hardware_low16(packet.service_low16);
-  const int32_t service_offset_ticks =
-      (int32_t)((int16_t)(uint16_t)(packet.service_low16 - target_low16));
   const interrupt_arrival_observation_t arrival =
-      interrupt_delay_classify_qtimer(
+      interrupt_delay_classify_entry(
           interrupt_execution_source_t::QTIMER1,
           packet.isr_entry_dwt_raw,
-          packet.arrival,
-          service_offset_ticks,
-          packet.preempted_after_entry);
+          packet.arrival);
   uint32_t event_target = captured_target;
 
   vclock_anchor_hardware(captured_target, target_low16);
@@ -5095,9 +4975,9 @@ static void process_ocxo_packet(const ocxo_binding_t& ctx,
   lane.last_isr_entry_dwt_raw = packet.isr_entry_dwt_raw;
   lane.last_ambient_low16 = packet.ambient_low16;
   lane.last_compare_low16 = packet.compare_low16;
-  // ISR service delay is the ambient counter displacement from the physical
-  // COMP1 that asserted the interrupt.  Software target intent is preserved
-  // separately in the lossless compare transcript.
+  // Counter displacement at the later CNTR read is service telemetry, not a
+  // measurement of delay at the first-instruction DWT endpoint.  Preserve the
+  // physical compare and software target separately in the compare transcript.
   lane.last_ambient_minus_target_ticks =
       (int32_t)((int16_t)(uint16_t)(packet.ambient_low16 -
                                     packet.compare_low16));
@@ -5106,11 +4986,10 @@ static void process_ocxo_packet(const ocxo_binding_t& ctx,
           ? interrupt_execution_source_t::OCXO1
           : interrupt_execution_source_t::OCXO2;
   const interrupt_arrival_observation_t arrival =
-      interrupt_delay_classify_qtimer(
+      interrupt_delay_classify_entry(
           delay_source,
           packet.isr_entry_dwt_raw,
-          packet.arrival,
-          lane.last_ambient_minus_target_ticks);
+          packet.arrival);
 
   // The semantic event identity is the target authored before the match.  The
   // ambient read is witness-only and cannot advance, reject, or replace it.

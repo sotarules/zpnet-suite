@@ -2452,6 +2452,8 @@ static clocks_instrument_stats_snapshot_t
     g_beta_clocks_fragment_instrument_stats DMAMEM = {};
 static clocks_static_prediction_snapshot_t
     g_beta_clocks_fragment_pps_prediction DMAMEM = {};
+static interrupt_delay_forensics_t
+    g_beta_clocks_fragment_pps_interrupt_delay DMAMEM = {};
 static clocks_static_prediction_snapshot_t
     g_beta_clocks_fragment_vclock_prediction DMAMEM = {};
 static clocks_static_prediction_snapshot_t
@@ -6472,9 +6474,10 @@ static FLASHMEM void payload_add_smartzero_summary(Payload& p) {
 
 
 static FLASHMEM void prediction_snapshot_for_pps(
-    clocks_static_prediction_snapshot_t& out) {
+    clocks_static_prediction_snapshot_t& out,
+    interrupt_delay_forensics_t* delay = nullptr) {
   out = clocks_static_prediction_snapshot_t{};
-  if (!clocks_static_prediction_pps_snapshot(&out)) {
+  if (!clocks_static_prediction_pps_snapshot(&out, delay)) {
     out = clocks_static_prediction_snapshot_t{};
   }
 }
@@ -8099,7 +8102,8 @@ static FLASHMEM void clocks_fragment_raw_cycles_snapshot(
     const clocks_alpha_lane_forensics_t& ocxo1_forensics,
     const clocks_alpha_lane_forensics_t& ocxo2_forensics) {
   out = clocks_fragment_raw_cycles_snapshot_t{};
-  clocks_fragment_raw_cycles_lane_snapshot(out.pps, pps, true, pps_delay);
+  clocks_fragment_raw_cycles_lane_snapshot(
+      out.pps, pps, pps.snapshot_ok, pps_delay);
   clocks_fragment_raw_cycles_lane_snapshot(
       out.vclock, vclock, vclock_forensics.snapshot_ok,
       vclock_forensics.interrupt_delay);
@@ -8359,7 +8363,9 @@ static bool clocks_try_finish_pending_smartzero(void) {
 
 
 static FLASHMEM void clocks_fragment_refresh_prediction_snapshots(void) {
-  prediction_snapshot_for_pps(g_beta_clocks_fragment_pps_prediction);
+  prediction_snapshot_for_pps(
+      g_beta_clocks_fragment_pps_prediction,
+      &g_beta_clocks_fragment_pps_interrupt_delay);
   prediction_snapshot_for_clock(
       time_clock_id_t::VCLOCK, g_beta_clocks_fragment_vclock_prediction);
   prediction_snapshot_for_clock(
@@ -8429,7 +8435,7 @@ static FLASHMEM void clocks_fragment_live_snapshot_fill(
       g_beta_clocks_fragment_vclock_prediction,
       g_beta_clocks_fragment_ocxo1_prediction,
       g_beta_clocks_fragment_ocxo2_prediction,
-      g_beta_clocks_fragment_vclock_forensics.interrupt_delay,
+      g_beta_clocks_fragment_pps_interrupt_delay,
       g_beta_clocks_fragment_vclock_forensics,
       g_beta_clocks_fragment_ocxo1_forensics,
       g_beta_clocks_fragment_ocxo2_forensics);

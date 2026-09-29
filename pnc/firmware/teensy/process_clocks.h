@@ -248,7 +248,11 @@ void clocks_static_prediction_reset_all(void);
 
 // Return value reports coherent snapshot acquisition only.  snapshot.valid
 // separately reports whether enough intervals exist for a scientific residual.
-bool clocks_static_prediction_pps_snapshot(clocks_static_prediction_snapshot_t* out);
+// The optional PPS delay belongs to the same physical endpoint as the interval.
+struct interrupt_delay_forensics_t;
+bool clocks_static_prediction_pps_snapshot(
+    clocks_static_prediction_snapshot_t* out,
+    interrupt_delay_forensics_t* delay = nullptr);
 bool clocks_static_prediction_snapshot(time_clock_id_t clock,
                                        clocks_static_prediction_snapshot_t* out);
 

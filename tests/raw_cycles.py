@@ -22,6 +22,14 @@ than collapsing them into one invented "correction":
 * dp      — adjacent-row change in p_err, ns.
 
 The adjacent-row deltas surrender across a durable campaign gap.
+The quiet NOTE value ``OK`` means this audit found no reportable anomaly; it
+does not turn an UNKNOWN interrupt-delay verdict into an ON_TIME claim.
+
+Absolute interval plausibility uses the selected nominal DWT/CPU rate, defaulting
+to the current 600 MHz build. For historical 1.008 GHz campaigns, pass
+``--cpu-hz 1008000000``. CLOCKS_V4 does not persist an independent nominal CPU
+rate, so the report never infers it from the measurements it is auditing.
+Residuals and their gates remain literal DWT cycles at either rate.
 """
 
 from __future__ import annotations
@@ -38,8 +46,7 @@ RAILS: Tuple[str, ...] = ("PPS", "VCLOCK", "OCXO1", "OCXO2")
 RAIL_KEYS = {name: name.lower() for name in RAILS}
 DEFAULT_GATE_CYCLES = 500
 EXPLANATION_GATE_CYCLES = 16
-PLAUSIBLE_MIN = 900_000_000
-PLAUSIBLE_MAX = 1_100_000_000
+DEFAULT_CPU_HZ = 600_000_000
 DEFAULT_BATCH_SIZE = 16
 CAMPAIGN_TYPE = "TEMPEST"
 PPS_COUNT_SQL = """
@@ -473,7 +480,19 @@ def build_row(
     )
 
 
-def row_note(row: AuditRow, selected: Sequence[str], gate: int) -> str:
+def plausible_cycle_bounds(cpu_hz: int) -> Tuple[int, int]:
+    # Match config.h's relative interval band. At the historical 1008 MHz rate
+    # this reproduces the original 900M..1100M limits exactly.
+    return cpu_hz * 900 // 1008, cpu_hz * 1100 // 1008
+
+
+def row_note(
+    row: AuditRow,
+    selected: Sequence[str],
+    gate: int,
+    *,
+    cpu_hz: int = DEFAULT_CPU_HZ,
+) -> str:
     if row.recovery_boundary:
         skipped = (row.count_delta - 1) if row.count_delta is not None else 0
         return f"RECOVER GAP ({skipped} skipped)"
@@ -495,11 +514,12 @@ def row_note(row: AuditRow, selected: Sequence[str], gate: int) -> str:
         if row.gnss.alarm != 0:
             notes.append(f"GNSS_ALARM=0x{row.gnss.alarm:X}")
 
+    plausible_min, plausible_max = plausible_cycle_bounds(cpu_hz)
     for name in selected:
         rail = row.rails[name]
         if rail.observed is None:
             notes.append(f"{name}:MISSING")
-        elif not PLAUSIBLE_MIN <= rail.observed <= PLAUSIBLE_MAX:
+        elif not plausible_min <= rail.observed <= plausible_max:
             notes.append(f"{name}:IMPLAUSIBLE")
         if rail.valid is False:
             notes.append(f"{name}:INVALID")
@@ -532,7 +552,7 @@ def row_note(row: AuditRow, selected: Sequence[str], gate: int) -> str:
         elif rail.delay_status not in {"ON_TIME", "UNKNOWN"}:
             notes.append(f"{name}:{rail.delay_status}")
 
-    return " | ".join(notes) if notes else "ON_TIME"
+    return " | ".join(notes) if notes else "OK"
 
 
 def fmt(value: Optional[int], width: int, signed: bool = False) -> str:
@@ -549,12 +569,12 @@ def fmt_float(value: Optional[float], width: int, decimals: int = 3) -> str:
     return f"{value:+{width}.{decimals}f}"
 
 
-def parse(argv: Sequence[str]) -> tuple[str, int, int, Optional[str], bool, int, int]:
+def parse(argv: Sequence[str]) -> tuple[str, int, int, Optional[str], bool, int, int, int]:
     if len(argv) < 2:
         raise SystemExit(
             "Usage: raw_cycles CAMPAIGN [limit] [clock] [--skip N] "
             "[--pathology-only] [--pathology-gate N] "
-            "[--batch-size N]"
+            "[--batch-size N] [--cpu-hz HZ (default: 600000000)]"
         )
     campaign = argv[1]
     limit = 0
@@ -563,6 +583,7 @@ def parse(argv: Sequence[str]) -> tuple[str, int, int, Optional[str], bool, int,
     pathology_only = False
     gate = DEFAULT_GATE_CYCLES
     batch_size = DEFAULT_BATCH_SIZE
+    cpu_hz = DEFAULT_CPU_HZ
     positional: list[str] = []
 
     idx = 2
@@ -572,7 +593,7 @@ def parse(argv: Sequence[str]) -> tuple[str, int, int, Optional[str], bool, int,
             pathology_only = True
             idx += 1
         elif arg in {"--skip", "--pathology-gate", "--clock", "--limit",
-                     "--batch-size"}:
+                     "--batch-size", "--cpu-hz"}:
             if idx + 1 >= len(argv):
                 raise SystemExit(f"{arg} requires a value")
             value = argv[idx + 1]
@@ -587,6 +608,8 @@ def parse(argv: Sequence[str]) -> tuple[str, int, int, Optional[str], bool, int,
                 limit = int(value)
             elif arg == "--batch-size":
                 batch_size = int(value)
+            elif arg == "--cpu-hz":
+                cpu_hz = int(value)
         elif "=" in arg and arg.startswith("--"):
             key, value = arg.split("=", 1)
             if key == "--skip":
@@ -599,6 +622,10 @@ def parse(argv: Sequence[str]) -> tuple[str, int, int, Optional[str], bool, int,
                 limit = int(value)
             elif key == "--batch-size":
                 batch_size = int(value)
+            elif key == "--cpu-hz":
+                cpu_hz = int(value)
+            else:
+                raise SystemExit(f"Unknown option: {key}")
             idx += 1
         elif arg in {"--align-ocxo", "--delay-pps-vclock", "--slip"}:
             idx += 1
@@ -616,16 +643,20 @@ def parse(argv: Sequence[str]) -> tuple[str, int, int, Optional[str], bool, int,
         raise SystemExit("skip/limit must be nonnegative; batch-size must be positive")
     if clock is not None and clock not in RAILS:
         raise SystemExit("clock must be PPS, VCLOCK, OCXO1, or OCXO2")
-    return campaign, limit, skip, clock, pathology_only, gate, batch_size
+    if cpu_hz <= 0:
+        raise SystemExit("cpu-hz must be positive")
+    return campaign, limit, skip, clock, pathology_only, gate, batch_size, cpu_hz
 
 
 def main(argv: Sequence[str]) -> None:
-    campaign, limit, skip, clock, pathology_only, gate, batch_size = parse(argv)
+    campaign, limit, skip, clock, pathology_only, gate, batch_size, cpu_hz = parse(argv)
     selected = (clock,) if clock else RAILS
+    plausible_min, plausible_max = plausible_cycle_bounds(cpu_hz)
 
     print(
         f"Campaign: {campaign}  view={clock or 'ALL'}  "
-        f"server_batch={batch_size}"
+        f"server_batch={batch_size}  cpu_hz={cpu_hz:,}  "
+        f"plausible_cycles={plausible_min:,}..{plausible_max:,}"
     )
     header = [
         f"{'pps':>7}",
@@ -665,8 +696,8 @@ def main(argv: Sequence[str]) -> None:
         previous_gnss = row.gnss
         processed += 1
 
-        note = row_note(row, selected, gate)
-        pathological = note != "ON_TIME"
+        note = row_note(row, selected, gate, cpu_hz=cpu_hz)
+        pathological = note != "OK"
         if pathology_only and not pathological:
             continue
 
