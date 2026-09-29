@@ -205,6 +205,7 @@ BME280_RETRY_COUNT = 3
 BME280_RETRY_DELAY_SEC = 0.05
 
 _BME280_CAL_CACHE: Optional[dict] = None
+_BME280_READ_LOCK = threading.Lock()
 _BME280_LAST_GOOD: Optional[dict] = None
 _BME280_READ_FAIL_COUNT = 0
 _BME280_CONSECUTIVE_FAIL_COUNT = 0
@@ -609,6 +610,7 @@ def get_ssid() -> str:
         ["iwgetid", "-r"],
         capture_output=True,
         text=True,
+        timeout=1.0,
     )
     return result.stdout.strip()
 
@@ -1125,6 +1127,12 @@ def _bme280_failure_payload(error: Exception, attempts: int) -> dict:
 
 
 def build_environment_status() -> dict:
+    # The slow platform poll and live metrics share calibration/retry state.
+    with _BME280_READ_LOCK:
+        return _build_environment_status_locked()
+
+
+def _build_environment_status_locked() -> dict:
     """
     Read environmental data from BME280.
 
@@ -1914,6 +1922,33 @@ def _location_context(gnss_payload: Dict[str, Any]) -> Dict[str, Any]:
 # ------------------------------------------------------------------
 
 
+def cmd_report_metrics(_: Optional[dict]) -> Dict:
+    """Fresh title-bar telemetry without network speed tests or DB access."""
+    try:
+        ssid = get_ssid()
+    except (OSError, subprocess.TimeoutExpired):
+        ssid = ""
+    try:
+        pi_temp = get_cpu_temp_c()
+    except (OSError, ValueError):
+        pi_temp = None
+    environment = build_environment_status()
+    gnss = build_gnss_status()
+    with _SYSTEM_LOCK:
+        power = copy.deepcopy(SYSTEM.get("power") or {})
+    return {
+        "success": True,
+        "message": "OK",
+        "payload": {
+            "network": {"ssid": ssid},
+            "pi": {"cpu_temp_c": pi_temp},
+            "environment": environment,
+            "gnss": gnss,
+            "power": power,
+        },
+    }
+
+
 def cmd_report(_: Optional[dict]) -> Dict:
     """Return current Pi platform context plus SYSTEM-owned location identity."""
     with _SYSTEM_LOCK:
@@ -2264,6 +2299,7 @@ def cmd_swap_battery(_: Optional[dict]) -> Dict:
 
 COMMANDS = {
     "REPORT": cmd_report,
+    "REPORT_METRICS": cmd_report_metrics,
     "SET_LOCATION": cmd_set_location,
     "CAPTURE_LOCATION": cmd_capture_location,
     "LOCATION_INFO": cmd_location_info,

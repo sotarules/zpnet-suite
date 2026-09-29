@@ -6,6 +6,8 @@ Data source:
   operator view.  Both are canonical always-on instruments with optional
   campaign decoration. Campaign comparisons use the campaign lists.
   Metrics never waits for or reads TIMEBASE.
+  The title bar polls Pi/Teensy SYSTEM separately so thermal telemetry keeps
+  updating even if an instrument stream stops.
 
 Stats policy:
   CLOCKS statistics are read verbatim from the producer-authored instrument and
@@ -93,6 +95,59 @@ PHOTONS_ROLLING_ROWS = 25
 PHOTONS_UPDATED = threading.Event()
 
 _LIVE_CACHE = create_pubsub_cache(CLOCKS_TOPIC)
+
+
+HEADER_POLL_INTERVAL_S = 2.0
+HEADER_MAX_AGE_S = 6.0
+
+
+class _HeaderTelemetry:
+    """One background RPC per source; repaint never waits for hardware."""
+
+    def __init__(self, machine: str, command: str):
+        self._machine = machine
+        self._command = command
+        self._lock = threading.Lock()
+        self._thread = None
+        self._payload = {}
+        self._sampled_at = 0.0
+
+    def get(self) -> dict:
+        with self._lock:
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._run,
+                    name=f"metrics-header-{self._machine.lower()}",
+                    daemon=True,
+                )
+                self._thread.start()
+            if time.monotonic() - self._sampled_at > HEADER_MAX_AGE_S:
+                return {}
+            return self._payload
+
+    def _run(self):
+        while True:
+            sampled_at = time.monotonic()
+            try:
+                response = send_command(
+                    machine=self._machine,
+                    subsystem="SYSTEM",
+                    command=self._command,
+                    retries=1,
+                )
+                if response.get("success") and isinstance(response.get("payload"), dict):
+                    with self._lock:
+                        self._payload = response["payload"]
+                        self._sampled_at = sampled_at
+            except Exception:
+                # An unavailable command plane must not freeze the UI. The
+                # previous reading expires rather than looking current forever.
+                pass
+            time.sleep(HEADER_POLL_INTERVAL_S)
+
+
+_HEADER_PI = _HeaderTelemetry("PI", "REPORT_METRICS")
+_HEADER_TEENSY = _HeaderTelemetry("TEENSY", "REPORT")
 
 
 class _RollingPubSubTap:
@@ -281,9 +336,7 @@ def _merge_missing(dst: dict, src: dict | None) -> dict:
 def _derive_gnss_lock_quality(g: dict) -> str:
     """Return binary GNSS/PPS readiness from zpnet-gnss receiver testimony.
 
-    The title bar is a readiness annunciator, not a signal-strength meter.
-    Satellite count and HDOP remain useful operator telemetry but must not make
-    the title oscillate while GF-8802 discipline/PPS state remains locked.
+    Satellite count and HDOP do not determine discipline/PPS readiness.
     """
     freq_mode = str(g.get("freq_mode_name") or "").upper()
     time_status = str(g.get("time_status") or "").upper()
@@ -1101,21 +1154,25 @@ def _feature_subtree_health(tree: dict, path: str) -> str:
 # Status header
 # ---------------------------------------------------------------------
 
+def _header_temperature(value, digits: int = 2) -> str:
+    temperature = _to_float(value)
+    if temperature is None or not math.isfinite(temperature):
+        return "?"
+    return f"{temperature:.{digits}f}°C"
+
+
 def status_header() -> str:
     try:
-        s = _get_system_snapshot()
-        net = s.get("network", {}).get("network_status", "?")
-        pi_health = s.get("pi", {}).get("health_state", "?")
-        temp_c = s.get("environment", {}).get("temperature_c")
-        temperature = "?" if temp_c is None else f"{temp_c:.4f}°C"
-        features = s.get("features") if isinstance(s.get("features"), dict) else {}
-        teensy_health = _feature_subtree_health(features, "TEENSY")
-        try:
-            clocks_report = _get_pi_clocks_report()
-        except Exception:
-            clocks_report = {}
-        gnss_status = _gnss_status(clocks_report, s)
-        gnss_lock = gnss_status.get("lock_quality", "?")
+        s = _HEADER_PI.get()
+        teensy = _HEADER_TEENSY.get()
+        net = s.get("network", {}).get("ssid") or "?"
+        pi_temperature = _header_temperature(s.get("pi", {}).get("cpu_temp_c"))
+        environment = s.get("environment", {})
+        temperature = _header_temperature(environment.get("temperature_c"), 4)
+        if environment.get("stale") or environment.get("read_ok") is False:
+            temperature = "?"
+        teensy_temperature = _header_temperature(teensy.get("cpu_temp_c"))
+        gnss_mode = _gnss_from_system_snapshot(s).get("pos_mode") or "?"
 
         bat_v = "?"
         power = s.get("power", {})
@@ -1131,10 +1188,10 @@ def status_header() -> str:
         return (
             f" NET: {net}"
             f"  BAT: {bat_v}"
-            f"  TEMP: {temperature}"
-            f"  PI: {pi_health}"
-            f"  TEENSY: {teensy_health}"
-            f"  GNSS: {gnss_lock}"
+            f"  BME280: {temperature}"
+            f"  PI: {pi_temperature}"
+            f"  TEENSY: {teensy_temperature}"
+            f"  GNSS: {gnss_mode}"
         )
     except Exception:
         return " STATUS: UNAVAILABLE"
