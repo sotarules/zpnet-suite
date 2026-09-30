@@ -103,9 +103,13 @@ def _main(stdscr: curses.window) -> None:
     stdscr.nodelay(True)             # non-blocking getch
     stdscr.keypad(True)              # decode navigation keys such as PGUP/PGDN
 
-    # Green body and white title on black.
-    curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
-    curses.init_pair(2, curses.COLOR_WHITE, curses.COLOR_BLACK)
+    # Green body and white title on the terminal's default background.
+    # Using curses.COLOR_BLACK here forces ANSI palette color 0, which is not
+    # necessarily the terminal's actual background (for example, GNOME Terminal
+    # may render it as a dark purple/navy).  Since use_default_colors() is active,
+    # -1 preserves the terminal's configured background exactly.
+    curses.init_pair(1, curses.COLOR_GREEN, -1)
+    curses.init_pair(2, curses.COLOR_WHITE, -1)
 
     COLOR_NORMAL = curses.color_pair(1)
     COLOR_HEADER = curses.color_pair(2) | curses.A_BOLD
