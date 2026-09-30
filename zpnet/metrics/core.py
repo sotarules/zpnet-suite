@@ -103,6 +103,11 @@ def _main(stdscr: curses.window) -> None:
     stdscr.nodelay(True)             # non-blocking getch
     stdscr.keypad(True)              # decode navigation keys such as PGUP/PGDN
 
+    # Metrics owns its phosphor colors explicitly rather than inheriting
+    # terminal palette definitions. curses RGB components use 0..1000.
+    curses.init_color(curses.COLOR_GREEN, 0, 1000, 0)          # #00FF00
+    curses.init_color(curses.COLOR_WHITE, 1000, 1000, 1000)   # #FFFFFF
+
     # Green body and white title on the terminal's default background.
     # Using curses.COLOR_BLACK here forces ANSI palette color 0, which is not
     # necessarily the terminal's actual background (for example, GNOME Terminal
