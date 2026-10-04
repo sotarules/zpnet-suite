@@ -1326,10 +1326,11 @@ void interrupt_photodiode_service_pending(void);
 // drains captured records against the old launch, and clears uncaptured GPIO
 // pending state, and withdraws the preceding capture permit. No captured record
 // is discarded. For a launch, capture_begin re-enables the IRQ BEFORE MOD HIGH;
-// raw timestamps may queue before the launch record/window is complete. Publish
+// one raw timestamp may queue before the launch record/window is complete. Publish
 // and arm that window before end allows foreground delivery. STOP can omit
-// capture_begin/arm. End preserves pending edges and enables the IRQ in either
-// case. No foreground service may run between capture_begin and end.
+// capture_begin/arm. End enables NVIC but never reopens the GPIO source gate;
+// only capture_begin opens it. No foreground service may run between
+// capture_begin and end. Masked pending status is cleared at the next launch.
 // CLOCKS and Priority 32 remain enabled. Nested/unpaired boundaries trap.
 void interrupt_photodiode_boundary_begin(void);
 void interrupt_photodiode_boundary_capture_begin(void);
@@ -1339,11 +1340,16 @@ void interrupt_photodiode_boundary_end(void);
 // may arm only inside the existing detector boundary, after old packets drain.
 // Bounds are inclusive elapsed DWT cycles: 0 < minimum <= maximum < 2^31.
 // Foreground alone owns the launch/window and acknowledges a consumed permit.
-// The ISR never reads partially assembled launch state. EARLY (including a
-// timestamp before the launch) leaves the permit open; the first in-window edge
-// consumes it. Further in-window edges are DUPLICATE; edges after expiry are
-// LATE even after a winner. The next boundary withdraws the old window; edges
-// without an armed window are UNARMED. Timing rejection never rewrites science.
+// The ISR never reads partially assembled launch state. It masks the GPIO
+// source after the first edge, bounding both queue use and interrupt load.
+// EARLY (including prelaunch) or LATE rejects that shot; an in-window first
+// edge consumes the permit. No second edge is selected to replace a rejection.
+// Extra edges while masked are not individually counted as SPURIOUS. Existing
+// reason fields describe captured edges only. Timing rejection never rewrites
+// science. The queue overflow integrity trap remains, but ordinary input bursts
+// cannot fill the queue: every rearm requires draining the preceding capture.
+static constexpr const char* INTERRUPT_PHOTODIODE_CAPTURE_POLICY =
+    "FIRST_EDGE_PER_LAUNCH_V1";
 // The pre-write sample brackets MOD HIGH with the original launch timestamp.
 // It is a launch-quality witness, not a corrected optical launch coordinate.
 // The provisional budget admits the observed three-cycle normal bracket with

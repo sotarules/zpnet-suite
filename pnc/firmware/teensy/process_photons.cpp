@@ -4325,6 +4325,8 @@ static void photons_payload_add_capture_gate(
   };
   snprintf(key, sizeof(key), "%scapture_gate", prefix);
   p.add(key, "EXPLICIT_WINDOW_V1");
+  snprintf(key, sizeof(key), "%scapture_policy", prefix);
+  p.add(key, INTERRUPT_PHOTODIODE_CAPTURE_POLICY);
   add("capture_min_ns", f.race_capture_min_ns);
   add("capture_max_ns", f.race_capture_max_ns);
   add("capture_min_cycles", f.race_capture_min_cycles);
@@ -4365,6 +4367,7 @@ static void photons_payload_add_launch_timing(
 static void photons_payload_add_capture_totals(
     Payload& p, const interrupt_photodiode_diag_t& diag) {
   p.add("race_capture_gate", "EXPLICIT_WINDOW_V1");
+  p.add("race_capture_policy", INTERRUPT_PHOTODIODE_CAPTURE_POLICY);
   p.add("race_capture_min_ns", PHOTONS_RECEIVE_MIN_NS);
   p.add("race_capture_max_ns", PHOTONS_RECEIVE_MAX_NS);
   p.add("race_capture_min_cycles", g_photons_receive_window.minimum_cycles);
@@ -6878,6 +6881,9 @@ static FLASHMEM Payload cmd_report_photons(const Payload& /*args*/) {
   p.add("enabled", true);
   p.add("publication_started", g_photons_recovery.publication_started);
   p.add("recovery_restored", g_photons_recovery.restored);
+  p.add("measurement_state", g_photons_recovery.publication_started
+      ? "RUNNING" : "ACQUISITION_ONLY_REQUIRES_PI_ENABLE");
+  p.add("statistics_scope", "LATEST_COMPLETED_FRAGMENT");
   p.add("recovery_proof_pending", g_photons_recovery.proof_pending);
   p.add("recovery_proof_committed", g_photons_recovery.proof_committed);
   p.add("recovery_generation", g_photons_recovery.generation);

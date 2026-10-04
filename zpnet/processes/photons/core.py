@@ -8188,6 +8188,9 @@ def cmd_enable(args: Optional[dict]) -> Dict[str, Any]:
 
         if (
             bool(report.get("enabled"))
+            and report["publication_started"] is True
+            and report["proof_committed"] is True
+            and report["proof_pending"] is False
             and _subsystem_enabled.is_set()
             and _operational_state_snapshot().get("state") == OPERATIONAL_STATE_RUNNING
             and _campaign_control_ready.is_set()

@@ -661,6 +661,10 @@ static void photodiode_early_trace_close_window(void) {
 // Caller excludes the detector producer through its acquisition boundary or
 // existing subscription-lifecycle guard. Withdrawal never edits ISR custody.
 static void photodiode_window_withdraw(void) {
+  // Source masking is separate from NVIC custody: no launch means no detector
+  // interrupt traffic, including during boot, STOP, or recovery/report work.
+  GPIO2_IMR &= ~PHOTODIODE_GPIO2_MASK;
+  __asm__ volatile ("dsb" ::: "memory");
   photodiode_early_trace_close_window();
   const uint32_t consumed =
       __atomic_load_n(&g_photodiode_window_consumed, __ATOMIC_ACQUIRE);
@@ -4271,7 +4275,9 @@ static bool photodiode_gpio2_route_readback_all_match(void) {
       (GPIO2_GDIR & PHOTODIODE_GPIO2_MASK) == 0U &&
       (GPIO2_EDGE_SEL & PHOTODIODE_GPIO2_MASK) == 0U &&
       icr == PHOTODIODE_GPIO_RISING_ICR &&
-      (GPIO2_IMR & PHOTODIODE_GPIO2_MASK) != 0U &&
+      // Pin 34's IMR bit is a one-shot acquisition gate, not route identity.
+      (GPIO2_IMR & PHOTODIODE_GPIO2_HIGH_HALF_MASK &
+       ~PHOTODIODE_GPIO2_MASK) == 0U &&
       (GPIO7_IMR & PHOTODIODE_GPIO2_MASK) == 0U &&
       interrupt_nvic_enabled((uint32_t)PHOTODIODE_IRQ) &&
       interrupt_nvic_priority_read((uint32_t)PHOTODIODE_IRQ) ==
@@ -4325,13 +4331,26 @@ void interrupt_photodiode_boundary_begin(void) {
 void interrupt_photodiode_boundary_capture_begin(void) {
   if (interrupt_ipsr() != 0U || interrupt_primask() != 0U ||
       !g_photodiode_boundary_open || g_photodiode_boundary_capturing ||
-      g_photodiode_service_running ||
+      g_photodiode_service_running || !g_photodiode_subscription.active ||
       interrupt_nvic_enabled((uint32_t)PHOTODIODE_IRQ)) __builtin_trap();
+  if ((GPIO2_IMR & PHOTODIODE_GPIO2_MASK) != 0U ||
+      __atomic_load_n(&g_photodiode_raw_head, __ATOMIC_ACQUIRE) !=
+      __atomic_load_n(&g_photodiode_raw_tail, __ATOMIC_RELAXED)) __builtin_trap();
+  // Masked GPIO status is a coalesced indication, never an exact edge count.
+  // Clear it immediately before opening the new launch's one-shot gate.
+  if ((GPIO2_ISR & PHOTODIODE_GPIO2_MASK) != 0U)
+    g_photodiode_boundary_gpio_clear_count++;
+  GPIO2_ISR = PHOTODIODE_GPIO2_MASK;
+  interrupt_nvic_icpr_word((uint32_t)PHOTODIODE_IRQ) =
+      interrupt_nvic_irq_mask((uint32_t)PHOTODIODE_IRQ);
+  __asm__ volatile ("dsb" ::: "memory");
   // Establish the prelaunch interval before enabling capture. Its edges must
   // not expire the new window merely because unsigned launch subtraction wraps.
   g_photodiode_capture_start_dwt = ARM_DWT_CYCCNT;
   g_photodiode_boundary_capturing = true;
   dmb_barrier();
+  GPIO2_IMR |= PHOTODIODE_GPIO2_MASK;
+  __asm__ volatile ("dsb" ::: "memory");
   NVIC_ENABLE_IRQ(PHOTODIODE_IRQ);
   __asm__ volatile ("dsb" ::: "memory");
   __asm__ volatile ("isb" ::: "memory");
@@ -4375,8 +4394,9 @@ void interrupt_photodiode_boundary_end(void) {
       g_photodiode_service_running) __builtin_trap();
   g_photodiode_boundary_open = false;
   g_photodiode_boundary_capturing = false;
-  // Do not clear pending here: a return may have arrived after the launch while
-  // a CLOCKS interrupt delayed foreground. Its GPIO pending state belongs to it.
+  // Re-enable NVIC custody without reopening the source gate. If a return has
+  // already been captured, IMR stays masked until the next launch. Otherwise
+  // preserve the still-armed source and any pending first return.
   dmb_barrier();
   NVIC_ENABLE_IRQ(PHOTODIODE_IRQ);
 }
@@ -5795,8 +5815,12 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
 static void photodiode_raw_push(uint32_t entry_dwt,
                                 const interrupt_arrival_capture_t& arrival,
                                 photodiode_capture_kind_t kind) {
-  // This producer is the physical ISR, or an explicitly serialized synthetic
-  // injection. Inactive external edges need no queue or application processing.
+  // Physical or serialized synthetic first edge. Close the source before any
+  // queue work: at most one raw packet can exist between acquisition boundaries,
+  // regardless of foreground delays or detector chatter. Keep the timestamp
+  // sampled at ISR entry; masking does not move the measurement coordinate.
+  GPIO2_IMR &= ~PHOTODIODE_GPIO2_MASK;
+  __asm__ volatile ("dsb" ::: "memory");
   g_photodiode_subscription.diag.irq_count++;
   if (!g_photodiode_subscription.active) {
     g_photodiode_subscription.diag.inactive_edge_count++;
@@ -6155,7 +6179,11 @@ static bool photodiode_admit_raw(const photodiode_raw_packet_t& packet) {
       early.first_kind = packet.kind;
     }
     early.last_entry_dwt = entry_dwt;
-    return false; // early interference must not steal the real return
+    // The physical first-edge gate is already closed. An early first edge
+    // rejects this launch; do not reopen into chatter or select a later edge.
+    g_photodiode_window_outcome = photodiode_window_outcome_t::EXPIRED;
+    __atomic_store_n(&g_photodiode_window_consumed, published, __ATOMIC_RELEASE);
+    return false;
   }
   if (published == consumed) {
     g_photodiode_subscription.diag.spurious_count++;
@@ -6301,8 +6329,10 @@ void interrupt_photodiode_service_pending(void) {
 void process_interrupt_photodiode_gpio_irq(uint32_t isr_entry_dwt_raw) {
   // Test injection must serialize with the sole physical producer.
   const bool prior = photodiode_guard_enter();
-  photodiode_raw_push(isr_entry_dwt_raw, interrupt_arrival_capture_t{},
-                      photodiode_capture_kind_t::SYNTHETIC);
+  if ((GPIO2_IMR & PHOTODIODE_GPIO2_MASK) != 0U) {
+    photodiode_raw_push(isr_entry_dwt_raw, interrupt_arrival_capture_t{},
+                        photodiode_capture_kind_t::SYNTHETIC);
+  }
   photodiode_guard_exit(prior);
 }
 
@@ -7249,8 +7279,8 @@ static void photodiode_gpio2_configure_irq(void) {
   NVIC_SET_PRIORITY(PHOTODIODE_IRQ, INTERRUPT_PRIORITY_PHOTODIODE);
   interrupt_nvic_icpr_word((uint32_t)PHOTODIODE_IRQ) =
       interrupt_nvic_irq_mask((uint32_t)PHOTODIODE_IRQ);
-  dmb_barrier();
-  GPIO2_IMR |= PHOTODIODE_GPIO2_MASK;
+  // Boot with the source masked. Only a launch boundary opens it, even while
+  // the subscription is active and the NVIC vector is enabled.
   dmb_barrier();
   NVIC_ENABLE_IRQ(PHOTODIODE_IRQ);
   g_photodiode_physical_irq_installed = true;
@@ -7508,6 +7538,10 @@ static FLASHMEM void add_photodiode_report(Payload& payload,
   };
 
   add_string("kind", interrupt_subscriber_kind_str(diag.kind));
+  add_string("capture_policy", INTERRUPT_PHOTODIODE_CAPTURE_POLICY);
+  add_bool("capture_source_armed", (GPIO2_IMR & PHOTODIODE_GPIO2_MASK) != 0U);
+  add_string("masked_edges", "NOT_INDIVIDUALLY_COUNTED");
+  add_string("boundary_gpio_clear_semantics", "COALESCED_PENDING_CLEARS_NOT_EDGE_COUNT");
   add_string("provider", interrupt_provider_kind_str(diag.provider));
   add_string("lane", interrupt_lane_str(diag.lane));
   add_bool("subscribed", diag.subscribed);

@@ -67,9 +67,10 @@
 //     launch, clipped before the cadence deadline. Bounds use the nominal DWT
 //     clock, independently of statistics/reset/recovery; science retains GNSS
 //     projection and delay classification after capture;
-//   • Priority 0 queues raw timestamps, including arrivals while MOD is HIGH.
-//     Foreground admits at most one in-window candidate per launch; other active
-//     hits increment SPURIOUS (EARLY/DUPLICATE/LATE/UNARMED). Science/delay
+//   • Priority 0 captures the first edge per launch, including while MOD is HIGH,
+//     then masks the detector GPIO source until the next launch. Foreground
+//     admits that edge only if in-window. An early/late first edge rejects the
+//     shot; additional masked edges are not individually counted. Science/delay
 //     classification also stays in foreground. No optical processing executes
 //     at Priority 32;
 //   • the next cadence service or DISABLE closes an unanswered shot as
