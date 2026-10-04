@@ -944,13 +944,17 @@ def _validate_race_geometry(race: Dict[str, Any], path: str) -> None:
     hz = _require_int(race.get("cadence_hz"), f"{path}.cadence_hz")
     ns = _require_int(race.get("cadence_ns"), f"{path}.cadence_ns")
     pulse = _require_int(race.get("pulse_ns"), f"{path}.pulse_ns", minimum=1)
-    if pulse != PHOTONS_RACE_PULSE_NS:
-        raise ValueError(f"{path}: unexpected pulse width {pulse}")
     if race.get("accounting") == "TIMEPOP_CADENCE_V1":
+        # Firmware reports its configured pulse; the Pi does not own a second
+        # copy of the commissioning setting. It must fit every legal cadence.
+        if pulse >= PHOTONS_CADENCE_MIN_NS:
+            raise ValueError(f"{path}: pulse width exceeds cadence budget: {pulse}")
         if not PHOTONS_CADENCE_MIN_NS <= ns <= PHOTONS_CADENCE_MAX_NS:
             raise ValueError(f"{path}: cadence interval out of range: {ns}")
         if hz != 1000000000 // ns:
             raise ValueError(f"{path}: cadence Hz/ns disagree")
+    elif pulse != PHOTONS_RACE_PULSE_NS:
+        raise ValueError(f"{path}: unexpected historical pulse width {pulse}")
     elif (hz, ns) != (PHOTONS_RACE_CADENCE_HZ, PHOTONS_RACE_CADENCE_NS):
         raise ValueError(f"{path}: historical return-driven cadence must be zero")
 

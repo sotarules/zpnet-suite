@@ -1325,18 +1325,22 @@ void interrupt_photodiode_service_pending(void);
 // Paired foreground acquisition boundary. Begin disables ONLY the detector IRQ,
 // drains captured records against the old launch, and clears uncaptured GPIO
 // pending state, and withdraws the preceding capture permit. No captured record
-// is discarded. Publish the new launch and arm its window (or leave it closed
-// for STOP) before end re-enables the IRQ. End preserves edges that arrived
-// after begin's GPIO clear, including returns pending during the laser pulse.
+// is discarded. For a launch, capture_begin re-enables the IRQ BEFORE MOD HIGH;
+// raw timestamps may queue before the launch record/window is complete. Publish
+// and arm that window before end allows foreground delivery. STOP can omit
+// capture_begin/arm. End preserves pending edges and enables the IRQ in either
+// case. No foreground service may run between capture_begin and end.
 // CLOCKS and Priority 32 remain enabled. Nested/unpaired boundaries trap.
 void interrupt_photodiode_boundary_begin(void);
+void interrupt_photodiode_boundary_capture_begin(void);
 void interrupt_photodiode_boundary_end(void);
 
-// One candidate per launch, admitted BEFORE raw-queue publication. Foreground
+// One candidate per launch, admitted in foreground AFTER raw capture. Foreground
 // may arm only inside the existing detector boundary, after old packets drain.
 // Bounds are inclusive elapsed DWT cycles: 0 < minimum <= maximum < 2^31.
-// Foreground publishes the immutable launch/window; the ISR alone acknowledges
-// a consumed permit. EARLY leaves the permit open; the first in-window edge
+// Foreground alone owns the launch/window and acknowledges a consumed permit.
+// The ISR never reads partially assembled launch state. EARLY (including a
+// timestamp before the launch) leaves the permit open; the first in-window edge
 // consumes it. Further in-window edges are DUPLICATE; edges after expiry are
 // LATE even after a winner. The next boundary withdraws the old window; edges
 // without an armed window are UNARMED. Timing rejection never rewrites science.
@@ -1363,9 +1367,9 @@ static constexpr uint32_t INTERRUPT_PHOTONS_QUIET_LAUNCH_BUDGET_NS = 1000U;
 
 // Foreground-only, bounded decision-to-launch transaction. BASEPRI 16 excludes
 // lower-priority deferral but keeps priority-0 PPS/OCXO capture live. Detector
-// custody is separately held by boundary_begin(). Arm the new receive window
-// and boundary_end() before restoring BASEPRI, so lower-priority work cannot
-// strand a physical return behind the detector's temporary NVIC exclusion.
+// capture is re-enabled by boundary_capture_begin() before MOD HIGH. Arm the
+// new receive window and boundary_end() before restoring BASEPRI; callbacks
+// wait until foreground service, after launch publication is complete.
 // All old-capture drains/callbacks precede entry; report construction follows exit.
 uint32_t interrupt_photons_launch_guard_enter(void);
 void interrupt_photons_launch_guard_exit(uint32_t prior_basepri);

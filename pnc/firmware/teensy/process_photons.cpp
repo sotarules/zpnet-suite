@@ -111,11 +111,15 @@ static constexpr Double PHOTONS_LASER_EMIT_THRESHOLD_V = 0.75_D;
 static constexpr uint64_t PHOTONS_PULSE_DEFAULT_NS = 1000ULL;
 
 // Laser cadence is independent of detector arrivals and campaign recording.
-static constexpr uint64_t PHOTONS_RACE_PULSE_NS = 200ULL;
+// Commissioning parameters live together in config.h. They describe the
+// electrical pulse and observed GPIO/ISR receive interval, not fiber length.
 
 static constexpr uint64_t PHOTONS_CADENCE_MIN_NS = 10000ULL;
 static constexpr uint64_t PHOTONS_CADENCE_DEFAULT_NS = 500000ULL;
 static constexpr uint64_t PHOTONS_CADENCE_MAX_NS = 1000000000ULL;
+static_assert(PHOTONS_RACE_PULSE_NS > 0ULL &&
+              PHOTONS_RACE_PULSE_NS < PHOTONS_CADENCE_MIN_NS,
+              "PHOTONS pulse must fit the minimum cadence interval");
 
 static constexpr uint32_t PHOTONS_RACE_HOLDOFF_NS = 0U; // retired wire field
 static bool g_photons_cadence_running = false;
@@ -584,12 +588,7 @@ static Double photons_welford_stddev(const photons_welford_state_t& w) {
   return (w.n >= 2ULL) ? sqrt(w.m2 / (Double)(w.n - 1ULL)) : 0_D;
 }
 
-// Acquisition policy, independent of the selected science population. The
-// observed ~5.09 us return has a broad interval for capture; delayed candidates
-// still reach the existing foreground exclusion court. Change these explicit
-// bounds to commission a different optical path, never by resetting statistics.
-static constexpr uint32_t PHOTONS_RECEIVE_MIN_NS = 4000U;
-static constexpr uint32_t PHOTONS_RECEIVE_MAX_NS = 10000U;
+// Acquisition bounds come from config.h, independently of science/reset.
 static constexpr uint32_t PHOTONS_RECEIVE_MAX_CYCLES = 0x7FFFFFFFU;
 static_assert(0U < PHOTONS_RECEIVE_MIN_NS &&
               PHOTONS_RECEIVE_MIN_NS < PHOTONS_RECEIVE_MAX_NS,
@@ -2877,8 +2876,10 @@ static void photons_histogram_acquire(void) {
     ordered[j] = value;
   }
   const uint32_t midpoint = ordered[PHOTONS_HISTOGRAM_SEEDS / 2U];
-  if (midpoint <= 32U || midpoint > UINT32_MAX - 31U) __builtin_trap();
-  __atomic_store_n(&g_photons_histogram_origin_request, midpoint - 32U,
+  if (midpoint == 0U || midpoint > UINT32_MAX - 31U) __builtin_trap();
+  // Zero is the acquisition sentinel; short-path seeds need a positive origin.
+  const uint32_t origin = midpoint > 32U ? midpoint - 32U : 1U;
+  __atomic_store_n(&g_photons_histogram_origin_request, origin,
                    __ATOMIC_RELEASE);
 }
 
@@ -3054,13 +3055,16 @@ static void photons_race_seed_observe(uint32_t raw_cycles) {
 // Cadence service already admitted this complete acquisition and holds the
 // priority-0-preserving launch guard until the return receiver is armed.
 // Pulse width is prepared at ENABLE so no division follows quiet admission.
-static uint32_t photons_race_launch_200ns(uint32_t& before_mod_high_dwt) {
+static uint32_t photons_race_launch_pulse(uint32_t& before_mod_high_dwt) {
   if (digitalRead(LASER_MOD_PIN) != LOW) __builtin_trap();
   const uint32_t width_cycles = g_photons_race_pulse_cycles;
   // One additional DWT read; keep MOD HIGH and the science timestamp adjacent.
+  interrupt_photodiode_boundary_capture_begin();
   const uint32_t before_high = ARM_DWT_CYCCNT;
   digitalWriteFast(LASER_MOD_PIN, HIGH);
   const uint32_t launch_dwt = ARM_DWT_CYCCNT;
+  // A short-path return may preempt this wait. Preserve the full configured
+  // pulse; ISR time may extend HIGH, but never becomes the return timestamp.
   while ((uint32_t)(ARM_DWT_CYCCNT - launch_dwt) < width_cycles) {}
   digitalWriteFast(LASER_MOD_PIN, LOW);
   before_mod_high_dwt = before_high;
@@ -3204,8 +3208,12 @@ static void photons_cadence_service(void*) {
   // transaction. Priority-0 clocks remain live; lower-priority work cannot hold
   // an already-returned detector edge pending beyond its admitted horizon.
   const uint32_t prior_basepri = interrupt_photons_launch_guard_enter();
+  const uint32_t receive_cycles =
+      photons_receive_upper_cycles(g_photons_cadence_cycles - 1U);
+  const uint32_t acquisition_cycles = receive_cycles > g_photons_race_pulse_cycles
+      ? receive_cycles : g_photons_race_pulse_cycles;
   const uint32_t blockers = interrupt_photons_quiet_blockers(
-      photons_receive_upper_cycles(g_photons_cadence_cycles - 1U));
+      acquisition_cycles);
   g_photons_quiet_last_blocker_mask = blockers;
   if (blockers != 0U) {
     interrupt_photons_launch_guard_exit(prior_basepri);
@@ -3224,7 +3232,7 @@ static void photons_cadence_service(void*) {
     return;
   }
   uint32_t before_mod_high_dwt;
-  const uint32_t launch_dwt = photons_race_launch_200ns(before_mod_high_dwt);
+  const uint32_t launch_dwt = photons_race_launch_pulse(before_mod_high_dwt);
   g_photons_cadence_anchor_dwt = launch_dwt;
   g_photons_cadence_launches_since_start++;
   g_photons_laser_launch_count++;
@@ -3275,7 +3283,7 @@ static void photons_cadence_start(void) {
   if (cycles == 0ULL || cycles >= 0x80000000ULL) __builtin_trap();
   g_photons_cadence_cycles = (uint32_t)cycles;
   g_photons_race_pulse_cycles = (uint32_t)(
-      ((uint64_t)cps * PHOTONS_RACE_PULSE_NS + 500000000ULL) / 1000000000ULL);
+      ((uint64_t)cps * PHOTONS_RACE_PULSE_NS + 999999999ULL) / 1000000000ULL);
   g_photons_cadence_launches_since_start = 0ULL;
   photons_laser_mod_idle();
   g_photons_race_foreground.active = g_photons_recovery.publication_started;
@@ -3499,7 +3507,7 @@ static void photons_pulse_wait_long(
 
 // WAVE uses manual PULSE's approximate width without modifying its report.
 // Each physical launch gets one acquisition permit. The detector-only boundary
-// is released immediately after the HIGH timestamp, including for long pulses.
+// enables capture BEFORE MOD HIGH, including for long pulses.
 static void photons_wave_emit_pulse(uint64_t requested_ns) {
   const uint32_t dwt_cycles_per_second = F_CPU_ACTUAL;
   if (requested_ns == 0ULL || dwt_cycles_per_second == 0U) __builtin_trap();
@@ -3507,6 +3515,7 @@ static void photons_wave_emit_pulse(uint64_t requested_ns) {
       photons_pulse_width(requested_ns, dwt_cycles_per_second);
 
   interrupt_photodiode_boundary_begin();
+  interrupt_photodiode_boundary_capture_begin();
   const uint32_t before_mod_high_dwt = ARM_DWT_CYCCNT;
   digitalWriteFast(LASER_MOD_PIN, HIGH);
   const uint32_t high_start = ARM_DWT_CYCCNT;
@@ -7678,7 +7687,7 @@ static FLASHMEM Payload cmd_pulse(const Payload& args) {
   }
 
   // Drain old captures before replacing the manual arm. Re-enable capture just
-  // after MOD HIGH, including for long commissioning pulses. Foreground delivery
+  // before MOD HIGH, including for long commissioning pulses. Foreground delivery
   // then observes this new arm; no old queued edge can impersonate its return.
   interrupt_photodiode_boundary_begin();
   const uint32_t previous_armed_sequence = g_pulse_armed_sequence;
@@ -7699,6 +7708,7 @@ static FLASHMEM Payload cmd_pulse(const Payload& args) {
   g_pulse_armed_sequence = pulse_sequence;
   photons_memory_barrier();
 
+  interrupt_photodiode_boundary_capture_begin();
   const uint32_t start_dwt = ARM_DWT_CYCCNT;
   digitalWriteFast(LASER_MOD_PIN, HIGH);
   const uint32_t high_start = ARM_DWT_CYCCNT;
@@ -7757,7 +7767,10 @@ static FLASHMEM Payload cmd_pulse(const Payload& args) {
 static FLASHMEM Payload cmd_on(const Payload& /*args*/) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
-  if (!g_photons_enabled) return photons_disabled_reject("ON");
+  // Explicit manual modulation is available after DISABLE has quiesced cadence.
+  // It does not enable detector delivery, publication, or statistical acquisition.
+  // Requiring ENABLE here made ON unreachable: ENABLE also starts cadence, and
+  // the running-cadence rejection below correctly excludes manual ownership.
   if (g_photons_cadence_running) {
     Payload p;
     p.add("status", "on_rejected_race_engine_active");

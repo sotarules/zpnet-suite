@@ -17,7 +17,7 @@
 //   * its dedicated vector shares science priority without sharing PPS dispatch;
 //   * foreground protects predicted one-second PPS/OCXO windows before launch;
 //   * unexpected equal-priority collisions remain attributed in both directions;
-//   * the ISR only captures/classifies admission and queues raw evidence.
+//   * the ISR only captures and queues raw evidence; foreground owns admission.
 //
 // Priority 16 owns the shared QTimer1 capture vector:
 //   * native VCLOCK CH0 and TimePop CH2 necessarily share one NVIC priority;
@@ -532,6 +532,7 @@ static_assert((PHOTODIODE_RAW_CAPACITY & (PHOTODIODE_RAW_CAPACITY - 1U)) == 0U,
 enum class photodiode_capture_kind_t : uint8_t { PHYSICAL, SYNTHETIC };
 struct photodiode_raw_packet_t {
   uint32_t entry_dwt;
+  uint32_t irq_count;
   interrupt_arrival_capture_t arrival;
   uint32_t pps_sequence;
   uint32_t binding_generation;
@@ -546,13 +547,15 @@ static uint32_t g_photodiode_raw_tail = 0U; // consumer release-publishes
 static uint32_t g_photodiode_raw_overflow_count = 0U; // producer only
 static bool g_photodiode_service_running = false; // foreground only
 static bool g_photodiode_boundary_open = false; // foreground only
+static bool g_photodiode_boundary_capturing = false; // foreground only
+static uint32_t g_photodiode_capture_start_dwt = 0U; // foreground only
 static bool g_photodiode_service_registered = false; // lifetime registration
 
-// Foreground publishes one immutable window while the detector IRQ is disabled.
-// The ISR alone acknowledges a candidate (or expires a late window). Equality
-// means admission is closed, but the window remains available for classifying
-// duplicate/late edges until foreground withdraws it. Zero maximum means no
-// launch window. Unsigned generations also work across wrap.
+// Window admission and its evidence are foreground-owned. The ISR only queues
+// immutable timestamps, including returns captured before launch publication.
+// The old queue drains before a window is replaced; service cannot run during
+// an incomplete launch. Equality means the permit is consumed; zero maximum
+// means unarmed. Generations also work across wrap.
 struct photodiode_window_t {
   uint32_t launch_dwt;
   uint32_t minimum_cycles;
@@ -560,15 +563,16 @@ struct photodiode_window_t {
   uint32_t before_mod_high_dwt;
   interrupt_photodiode_launch_kind_t launch_kind;
   uint64_t trace_sequence;
+  uint32_t capture_start_dwt;
 };
 static photodiode_window_t g_photodiode_window{};
 static uint32_t g_photodiode_window_published = 0U; // foreground only
-static uint32_t g_photodiode_window_consumed = 0U;  // ISR only
+static uint32_t g_photodiode_window_consumed = 0U;  // foreground only
 enum class photodiode_window_outcome_t : uint8_t { CAPTURED, EXPIRED };
 static photodiode_window_outcome_t g_photodiode_window_outcome =
-    photodiode_window_outcome_t::EXPIRED; // ISR only; meaningful after acknowledgment
+    photodiode_window_outcome_t::EXPIRED; // foreground only; meaningful after acknowledgment
 
-// The ISR accumulates evidence only for the current receive window. A count
+// Foreground accumulates evidence only for the current receive window. A count
 // owns its associated coordinates, including legitimate zero/wrapped DWTs.
 // Capture evidence is separate from the admission outcome: a LATE edge may
 // mark that outcome EXPIRED even after a successful candidate was captured.
@@ -4318,13 +4322,28 @@ void interrupt_photodiode_boundary_begin(void) {
   __asm__ volatile ("dsb" ::: "memory");
 }
 
+void interrupt_photodiode_boundary_capture_begin(void) {
+  if (interrupt_ipsr() != 0U || interrupt_primask() != 0U ||
+      !g_photodiode_boundary_open || g_photodiode_boundary_capturing ||
+      g_photodiode_service_running ||
+      interrupt_nvic_enabled((uint32_t)PHOTODIODE_IRQ)) __builtin_trap();
+  // Establish the prelaunch interval before enabling capture. Its edges must
+  // not expire the new window merely because unsigned launch subtraction wraps.
+  g_photodiode_capture_start_dwt = ARM_DWT_CYCCNT;
+  g_photodiode_boundary_capturing = true;
+  dmb_barrier();
+  NVIC_ENABLE_IRQ(PHOTODIODE_IRQ);
+  __asm__ volatile ("dsb" ::: "memory");
+  __asm__ volatile ("isb" ::: "memory");
+}
+
 void interrupt_photodiode_arm_window(uint32_t launch_dwt,
                                      uint32_t minimum_cycles,
                                      uint32_t maximum_cycles,
                                      uint32_t before_mod_high_dwt,
                                      interrupt_photodiode_launch_kind_t launch_kind) {
   if (interrupt_ipsr() != 0U || !g_photodiode_boundary_open ||
-      interrupt_nvic_enabled((uint32_t)PHOTODIODE_IRQ) ||
+      !g_photodiode_boundary_capturing ||
       minimum_cycles == 0U || minimum_cycles > maximum_cycles ||
       maximum_cycles >= 0x80000000U) __builtin_trap();
   const uint32_t consumed =
@@ -4345,7 +4364,8 @@ void interrupt_photodiode_arm_window(uint32_t launch_dwt,
   // The admission generation can repeat after a miss; the independent arm
   // sequence identifies every window, including CADENCE/WAVE/manual PULSE.
   g_photodiode_window = {launch_dwt, minimum_cycles, maximum_cycles,
-                         before_mod_high_dwt, launch_kind, sequence};
+                         before_mod_high_dwt, launch_kind, sequence,
+                         g_photodiode_capture_start_dwt};
   __atomic_store_n(&g_photodiode_window_published, consumed + 1U,
                    __ATOMIC_RELEASE);
 }
@@ -4354,6 +4374,7 @@ void interrupt_photodiode_boundary_end(void) {
   if (interrupt_ipsr() != 0U || !g_photodiode_boundary_open ||
       g_photodiode_service_running) __builtin_trap();
   g_photodiode_boundary_open = false;
+  g_photodiode_boundary_capturing = false;
   // Do not clear pending here: a return may have arrived after the launch while
   // a CLOCKS interrupt delayed foreground. Its GPIO pending state belongs to it.
   dmb_barrier();
@@ -5781,51 +5802,6 @@ static void photodiode_raw_push(uint32_t entry_dwt,
     g_photodiode_subscription.diag.inactive_edge_count++;
     return;
   }
-  const uint32_t published =
-      __atomic_load_n(&g_photodiode_window_published, __ATOMIC_ACQUIRE);
-  const uint32_t consumed =
-      __atomic_load_n(&g_photodiode_window_consumed, __ATOMIC_RELAXED);
-  if (g_photodiode_window.maximum_cycles == 0U) {
-    g_photodiode_subscription.diag.spurious_count++;
-    g_photodiode_subscription.diag.spurious_unarmed_count++;
-    return;
-  }
-  if ((uint32_t)(published - consumed) > 1U) __builtin_trap();
-  const uint32_t elapsed = entry_dwt - g_photodiode_window.launch_dwt;
-  if ((published == consumed && g_photodiode_window_outcome ==
-          photodiode_window_outcome_t::EXPIRED) ||
-      elapsed > g_photodiode_window.maximum_cycles) {
-    g_photodiode_subscription.diag.spurious_count++;
-    g_photodiode_subscription.diag.spurious_late_count++;
-    // Preserve expiry across later DWT revolutions, including after a winner.
-    g_photodiode_window_outcome = photodiode_window_outcome_t::EXPIRED;
-    __atomic_store_n(&g_photodiode_window_consumed, published, __ATOMIC_RELEASE);
-    return;
-  }
-  if (elapsed < g_photodiode_window.minimum_cycles) {
-    g_photodiode_subscription.diag.spurious_count++;
-    g_photodiode_subscription.diag.spurious_early_count++;
-    auto& early = g_photodiode_early_window;
-    if (early.early_count++ == 0U) {
-      early.first_entry_dwt = entry_dwt;
-      early.first_irq_count = g_photodiode_subscription.diag.irq_count;
-      early.first_arrival = arrival;
-      early.first_kind = kind;
-    }
-    early.last_entry_dwt = entry_dwt;
-    return; // early interference must not steal the real return
-  }
-  if (published == consumed) {
-    g_photodiode_subscription.diag.spurious_count++;
-    g_photodiode_subscription.diag.spurious_duplicate_count++;
-    return;
-  }
-  // Claim before raw publication. Classification order above distinguishes
-  // additional in-window edges from late edges without admitting either.
-  g_photodiode_early_window.captured_entry_dwt = entry_dwt;
-  g_photodiode_early_window.captured_count = 1U;
-  g_photodiode_window_outcome = photodiode_window_outcome_t::CAPTURED;
-  __atomic_store_n(&g_photodiode_window_consumed, published, __ATOMIC_RELEASE);
   const uint32_t head = __atomic_load_n(&g_photodiode_raw_head, __ATOMIC_RELAXED);
   const uint32_t tail = __atomic_load_n(&g_photodiode_raw_tail, __ATOMIC_ACQUIRE);
   if ((uint32_t)(head - tail) >= PHOTODIODE_RAW_CAPACITY) {
@@ -5834,6 +5810,7 @@ static void photodiode_raw_push(uint32_t entry_dwt,
   }
   auto& packet = g_photodiode_raw[head & (PHOTODIODE_RAW_CAPACITY - 1U)];
   packet.entry_dwt = entry_dwt;
+  packet.irq_count = g_photodiode_subscription.diag.irq_count;
   packet.arrival = arrival;
   packet.pps_sequence = g_last_pps_witness_valid ? g_last_pps_witness.sequence : 0U;
   packet.binding_generation = g_photodiode_subscription.binding_generation;
@@ -6132,6 +6109,68 @@ bool interrupt_photodiode_snapshot(interrupt_photodiode_diag_t* out) {
   return true;
 }
 
+static bool photodiode_admit_raw(const photodiode_raw_packet_t& packet) {
+  // Never let an old subscription's evidence consume a new launch permit.
+  if (!g_photodiode_subscription.active ||
+      packet.binding_generation != g_photodiode_subscription.binding_generation) {
+    const bool prior = photodiode_guard_enter();
+    g_photodiode_subscription.diag.inactive_edge_count++;
+    photodiode_guard_exit(prior);
+    return false;
+  }
+  const uint32_t entry_dwt = packet.entry_dwt;
+  const uint32_t published =
+      __atomic_load_n(&g_photodiode_window_published, __ATOMIC_ACQUIRE);
+  const uint32_t consumed =
+      __atomic_load_n(&g_photodiode_window_consumed, __ATOMIC_RELAXED);
+  if (g_photodiode_window.maximum_cycles == 0U) {
+    g_photodiode_subscription.diag.spurious_count++;
+    g_photodiode_subscription.diag.spurious_unarmed_count++;
+    return false;
+  }
+  if ((uint32_t)(published - consumed) > 1U) __builtin_trap();
+  const uint32_t elapsed = entry_dwt - g_photodiode_window.launch_dwt;
+  const bool prelaunch =
+      (uint32_t)(entry_dwt - g_photodiode_window.capture_start_dwt) <
+      (uint32_t)(g_photodiode_window.launch_dwt -
+                 g_photodiode_window.capture_start_dwt);
+  if ((published == consumed && g_photodiode_window_outcome ==
+          photodiode_window_outcome_t::EXPIRED) ||
+      (!prelaunch && elapsed > g_photodiode_window.maximum_cycles)) {
+    g_photodiode_subscription.diag.spurious_count++;
+    g_photodiode_subscription.diag.spurious_late_count++;
+    // Preserve expiry across later DWT revolutions, including after a winner.
+    g_photodiode_window_outcome = photodiode_window_outcome_t::EXPIRED;
+    __atomic_store_n(&g_photodiode_window_consumed, published, __ATOMIC_RELEASE);
+    return false;
+  }
+  if (prelaunch || elapsed < g_photodiode_window.minimum_cycles) {
+    g_photodiode_subscription.diag.spurious_count++;
+    g_photodiode_subscription.diag.spurious_early_count++;
+    auto& early = g_photodiode_early_window;
+    if (early.early_count++ == 0U) {
+      early.first_entry_dwt = entry_dwt;
+      early.first_irq_count = packet.irq_count;
+      early.first_arrival = packet.arrival;
+      early.first_kind = packet.kind;
+    }
+    early.last_entry_dwt = entry_dwt;
+    return false; // early interference must not steal the real return
+  }
+  if (published == consumed) {
+    g_photodiode_subscription.diag.spurious_count++;
+    g_photodiode_subscription.diag.spurious_duplicate_count++;
+    return false;
+  }
+  // Claim before callback delivery. Classification order above distinguishes
+  // additional in-window edges from late edges without admitting either.
+  g_photodiode_early_window.captured_entry_dwt = entry_dwt;
+  g_photodiode_early_window.captured_count = 1U;
+  g_photodiode_window_outcome = photodiode_window_outcome_t::CAPTURED;
+  __atomic_store_n(&g_photodiode_window_consumed, published, __ATOMIC_RELEASE);
+  return true;
+}
+
 static void photodiode_deliver_raw(const photodiode_raw_packet_t& packet) {
   const uint32_t isr_entry_dwt_raw = packet.entry_dwt;
   const interrupt_arrival_observation_t classified =
@@ -6243,7 +6282,8 @@ static void photodiode_deliver_raw(const photodiode_raw_packet_t& packet) {
 
 void interrupt_photodiode_service_pending(void) {
   if (interrupt_ipsr() != 0U || interrupt_basepri() != 0U ||
-      interrupt_primask() != 0U || g_photodiode_service_running) __builtin_trap();
+      interrupt_primask() != 0U || g_photodiode_service_running ||
+      g_photodiode_boundary_capturing) __builtin_trap();
   g_photodiode_service_running = true;
   const uint32_t stop = __atomic_load_n(&g_photodiode_raw_head, __ATOMIC_ACQUIRE);
   uint32_t tail = __atomic_load_n(&g_photodiode_raw_tail, __ATOMIC_RELAXED);
@@ -6253,7 +6293,7 @@ void interrupt_photodiode_service_pending(void) {
     const photodiode_raw_packet_t packet =
         g_photodiode_raw[tail & (PHOTODIODE_RAW_CAPACITY - 1U)];
     __atomic_store_n(&g_photodiode_raw_tail, ++tail, __ATOMIC_RELEASE);
-    photodiode_deliver_raw(packet);
+    if (photodiode_admit_raw(packet)) photodiode_deliver_raw(packet);
   }
   g_photodiode_service_running = false;
 }
@@ -7161,6 +7201,8 @@ FLASHMEM void process_interrupt_init(void) {
   g_photodiode_raw_overflow_count = 0U;
   g_photodiode_service_running = false;
   g_photodiode_boundary_open = false;
+  g_photodiode_boundary_capturing = false;
+  g_photodiode_capture_start_dwt = 0U;
   g_interrupt_foreground_forensics =
       interrupt_foreground_forensic_runtime_t{};
   g_interrupt_foreground_forensic_live =

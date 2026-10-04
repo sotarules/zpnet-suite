@@ -57,24 +57,27 @@
 //
 // Independent launch cadence:
 //   • initialization registers a TimePop foreground service (default 10 us);
-//     each due service emits a nominal 200 ns MOD pulse, regardless of PD arrivals;
+//     each due service emits the configured MOD pulse (default 200 ns), regardless
+//     of PD arrivals; software timing/interrupts may extend its HIGH duration;
 //     the next deadline is one configured interval after the actual launch DWT,
 //     using the existing F_CPU_ACTUAL conversion to DWT cycles. START establishes
 //     the first origin; late service emits one pulse and starts a fresh interval;
 //   • measurement starts after recovery establishes statistical ancestry;
-//   • foreground publishes an explicit 4000-10000 ns acquisition window at each
+//   • foreground publishes a configurable acquisition window (default 1-10000 ns) at each
 //     launch, clipped before the cadence deadline. Bounds use the nominal DWT
 //     clock, independently of statistics/reset/recovery; science retains GNSS
 //     projection and delay classification after capture;
-//   • Priority 0 admits at most one in-window raw candidate per launch. Other
-//     active-detector hits increment SPURIOUS (EARLY/DUPLICATE/LATE/UNARMED)
-//     before queueing; foreground retains
-//     science/delay classification. No optical processing executes at Priority 32;
+//   • Priority 0 queues raw timestamps, including arrivals while MOD is HIGH.
+//     Foreground admits at most one in-window candidate per launch; other active
+//     hits increment SPURIOUS (EARLY/DUPLICATE/LATE/UNARMED). Science/delay
+//     classification also stays in foreground. No optical processing executes
+//     at Priority 32;
 //   • the next cadence service or DISABLE closes an unanswered shot as
 //     missed. Attempts = completed + missed + pending, with at most one pending;
 //   • each launch pauses ONLY the detector IRQ, drains all captured edges against
-//     the old shot, and clears uncaptured pending GPIO state. After the new launch
-//     record is published, detector capture resumes without clearing a new return.
+//     the old shot, and clears uncaptured pending GPIO state. Capture resumes
+//     BEFORE MOD HIGH; foreground delivery waits until the new launch record
+//     and receive window are complete, without clearing a new return.
 //     CLOCKS and Priority 32 remain live throughout. Raw queue overflow traps.
 //     The timestamp is sampled after MOD HIGH;
 //   • readiness is polled by TimePop, including while idle; no recurring grid
@@ -173,6 +176,9 @@
 //                           after retirement of the emulator
 //   • ON                  — force active-high DRV200 MOD HIGH continuously; this does not
 //                           control the DRV200 hardware switch or DC bias-current setting
+//                           Run Pi PHOTONS.DISABLE first to stop cadence and recording.
+//                           Explicit ON is allowed while disabled; acquisition stays disabled.
+//                           OFF or another DISABLE returns MOD LOW before ENABLE resumes races.
 //   • OFF                 — cancel any commissioning wave and force DRV200 MOD LOW/idle
 //                           All direct MOD controls cancel a pending manual receive arm without
 //                           erasing its already-captured testimony. No race is started.

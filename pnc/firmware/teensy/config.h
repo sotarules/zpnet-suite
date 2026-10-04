@@ -24,6 +24,17 @@ static constexpr uint64_t NS_PER_MILLISECOND = 1000000ULL;
 static constexpr uint64_t NS_PER_MICROSECOND = 1000ULL;
 
 // --------------------------------------------------------------
+// PHOTONS optical-path commissioning (nanoseconds, not CPU cycles)
+// --------------------------------------------------------------
+// Capture stays enabled throughout the pulse for short and long fiber paths.
+// Receive bounds include detector/electronics/ISR latency; do not set the upper
+// bound to the calculated optical propagation alone. Defaults acquire both a
+// short patch cable and the ~1 km spool. All conversions use F_CPU_ACTUAL.
+static constexpr uint64_t PHOTONS_RACE_PULSE_NS = 200ULL;
+static constexpr uint32_t PHOTONS_RECEIVE_MIN_NS = 1U;
+static constexpr uint32_t PHOTONS_RECEIVE_MAX_NS = 10000U;
+
+// --------------------------------------------------------------
 // 10 MHz clock constants
 // --------------------------------------------------------------
 //
