@@ -1,77 +1,74 @@
-# =============================================================
-# ZPNet Teensy 4.1 — Build + Flash (Cold Ownership)
+# ZPNet Teensy 4.1 -- incremental builds, explicit 600 MHz default.
 #
-# PRINCIPLE:
-#   • Bootloader (HalfKay) must have cold ownership
-#   • Makefile does NOT attempt to enter bootloader
-#   • Flashing assumes HalfKay is already active
+#   make build                      Reuse compiler intermediates.
+#   make build CLEAN=1              Rebuild the selected configuration.
+#   make build MODE=diagnostic      Verbose compiler transcript; same flags.
+#   make build JOBS=4               Override Arduino CLI compile parallelism.
+#   make clean                      Remove local build outputs and caches.
 #
-# Flashing is correct ONLY after:
-#   • physical reset
-#   • external RESET_B control
-#   • button press
-#
-# =============================================================
+# Use flash-teensy for the complete build/archive/bootloader/service workflow.
+# Direct make flash assumes HalfKay already owns the device and the cluster
+# has been stopped. It does not manage services or archive the image.
 
-# -------------------------------------------------------------
-# Configuration
-# -------------------------------------------------------------
+.DEFAULT_GOAL := build
 
-NAME          = teensy
-ARDUINO_CLI   = ../../bin/arduino-cli
-TEENSY_LOADER = teensy_loader_cli
+NAME          := teensy
+ARDUINO_CLI   ?= ../../bin/arduino-cli
+TEENSY_LOADER ?= teensy_loader_cli
+CPU           ?= 600
+USB_MODE      := serial
+BOARD         := teensy:avr:teensy41:usb=$(USB_MODE),speed=$(CPU)
 
-# USB CDC serial is the only supported runtime transport.
-USB_MODE = serial
-BOARD    = teensy:avr:teensy41:usb=$(USB_MODE)
+MODE          ?= fast
+CLEAN         ?= 0
+# Empty leaves parallelism to the installed CLI; set only if it supports --jobs.
+JOBS          ?=
 
-# Suppress historical ARM parameter-passing notes for Double.
-# Keep all other compiler diagnostics enabled.
-# Teensy uses build.flags.cpp, not compiler.cpp.extra_flags.
-# Preserve the platform's C++ defaults and append the targeted suppression.
+# Separate intermediates from exported images. flash-teensy removes only the
+# exports, allowing the CLI to reuse compiled objects on subsequent builds.
+OUTPUT_DIR    := $(CURDIR)/build
+CACHE_DIR     := $(OUTPUT_DIR)/cache/$(CPU)-$(USB_MODE)
+
+# Preserve the supplied makefile's C++ flags and platform optimization defaults.
+# Debug symbols remain available in the archived ELF for fault-address lookup.
 CXX_FLAGS = -std=gnu++17 -fno-exceptions -fpermissive -fno-rtti \
             -fno-threadsafe-statics -felide-constructors -Wno-error=narrowing \
             -Wno-psabi
 
-# -------------------------------------------------------------
-# Targets
-# -------------------------------------------------------------
+ifeq ($(filter $(MODE),fast diagnostic),)
+$(error MODE must be fast or diagnostic)
+endif
+ifeq ($(filter $(CLEAN),0 1),)
+$(error CLEAN must be 0 or 1)
+endif
+ifneq ($(strip $(PROFILE)),)
+$(error PROFILE is retired; this makefile preserves the baseline compiler flags)
+endif
 
+COMPILE_OPTIONS = $(if $(filter 1,$(CLEAN)),--clean) \
+                  $(if $(filter diagnostic,$(MODE)),--verbose) \
+                  $(if $(strip $(JOBS)),--jobs $(JOBS))
+
+.PHONY: all build flash flash-only clean clobber
 all: build
 
-# -------------------------------------------------------------
-# Build
-# -------------------------------------------------------------
-
 build:
-	@echo "🔧 Building Teensy 4.1 (cold-boot compatible)..."
-	$(ARDUINO_CLI) compile --clean \
-	  --fqbn $(BOARD) \
+	@echo "Building Teensy 4.1: CPU=$(CPU) MHz MODE=$(MODE) CLEAN=$(CLEAN)"
+	"$(ARDUINO_CLI)" compile $(COMPILE_OPTIONS) \
+	  --fqbn "$(BOARD)" \
+	  --build-path "$(CACHE_DIR)" \
 	  --build-property "build.flags.cpp=$(CXX_FLAGS)" \
-	  . \
-	  --output-dir ./build
-
-# -------------------------------------------------------------
-# Flash (HalfKay must already own the machine)
-# -------------------------------------------------------------
+	  --output-dir "$(OUTPUT_DIR)" \
+	  .
 
 flash: build
-	@echo "🚀 Flashing Teensy 4.1 (HalfKay must already be active)..."
-	sudo $(TEENSY_LOADER) \
-	  -mmcu=TEENSY41 \
-	  -w \
-	  build/$(NAME).ino.hex
-	@echo "✅ Flash complete."
+	$(MAKE) flash-only
 
-# -------------------------------------------------------------
-# Housekeeping
-# -------------------------------------------------------------
+flash-only:
+	sudo "$(TEENSY_LOADER)" -mmcu=TEENSY41 -w "$(OUTPUT_DIR)/$(NAME).ino.hex"
 
 clean:
-	rm -rf build
+	rm -rf "$(OUTPUT_DIR)"
 
+# Deliberately scoped to this firmware; do not purge other Arduino projects.
 clobber: clean
-	@echo "🧹 Removing Arduino CLI build cache..."
-	rm -rf ~/.arduino15/packages/*/hardware/*/*/build
-
-.PHONY: all build flash clean clobber
