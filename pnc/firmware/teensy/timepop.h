@@ -47,6 +47,13 @@
 //      The callback receives the same shared fire facts as other same-deadline
 //      timed clients.
 //
+//   8. Recurring foreground service
+//        timepop_arm_recurring_service(period_gnss_ns, ...)
+//
+//      For polling/publication work that must still run if its appointment is
+//      missed. Overdue periods coalesce into one pending callback, followed by
+//      a future appointment. This API never supplies precision fire facts.
+//
 // TimePop owns:
 //   • timed slot scheduling
 //   • deferred ASAP/ALAP scheduled-context dispatch
@@ -108,7 +115,7 @@ typedef struct timepop_ctx_t {
 // ============================================================================
 //
 // Populated for timed callbacks and ISR callbacks.
-// Null for ASAP/ALAP scheduled-context dispatch.
+// Both ctx and diag are null for ASAP/ALAP and recurring service callbacks.
 //
 // The authoritative result is still timepop_ctx_t. These diagnostics expose
 // Spin-Dry / landing facts that are useful for instrumentation and later
@@ -144,6 +151,17 @@ typedef void (*timepop_callback_t)(
 timepop_handle_t timepop_arm(
   uint64_t            delay_gnss_ns,
   bool                recurring,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name
+);
+
+// Foreground only; callback receives nullptr for both ctx and diag, even when
+// CH2 captured the appointment exactly. Never dispatches early or replays missed
+// periods. Uses the phase grid when available, otherwise a relative period.
+// Existing cancellation, epoch rebasing and dispatch mutation rules apply.
+timepop_handle_t timepop_arm_recurring_service(
+  uint64_t            period_gnss_ns,
   timepop_callback_t  callback,
   void*               user_data,
   const char*         name

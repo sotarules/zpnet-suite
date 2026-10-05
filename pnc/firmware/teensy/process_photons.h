@@ -600,6 +600,11 @@ struct photons_fragment_snapshot_t {
   uint32_t sequence = 0;
   uint32_t publish_count = 0;
   uint64_t fragment_period_ns = 0;
+  // Actual foreground batch-cut interval, measured with boot uptime millis().
+  // Diagnostic only: never a lap-time ruler or a replacement for nominal period.
+  uint32_t fragment_elapsed_ms = 0;
+  // Rejections since init/recovery, excluding this fragment's publish attempt.
+  uint32_t publish_reject_count_before_fragment = 0;
 
   uint32_t edge_count_total = 0;
   uint32_t edges_this_fragment = 0;

@@ -3409,6 +3409,7 @@ static photons_fragment_snapshot_t g_photons_report_snapshot DMAMEM = {};
 
 static uint32_t g_publish_count = 0;
 static uint32_t g_publish_reject_count = 0;
+static uint32_t g_last_fragment_cut_ms = 0U;
 static uint32_t g_last_published_edge_count = 0;
 static uint64_t g_last_fragment_race_cadence_tick_count = 0ULL;
 static uint64_t g_last_fragment_race_attempt_count = 0ULL;
@@ -4616,6 +4617,11 @@ static Payload& photons_fragment_payload(
   instrument.add("snapshot_ok", f.snapshot_ok);
   instrument.add("valid", f.valid);
   instrument.add("fragment_period_ns", f.fragment_period_ns);
+  instrument.add("fragment_elapsed_ms", f.fragment_elapsed_ms);
+  // Frozen before this attempt; a rejection is visible in the next admitted
+  // fragment or immediately in REPORT/REPORT_PHOTONS/REPORT_RECOVERY.
+  instrument.add("publish_reject_count_before_fragment",
+                 f.publish_reject_count_before_fragment);
   instrument.add("source", "PD200T_REAL_RACE");
   instrument.add("edge_count_total", f.edge_count_total);
   instrument.add("edges_this_fragment", f.edges_this_fragment);
@@ -5070,6 +5076,11 @@ static FLASHMEM void photons_fragment_tick(
       interrupt_diag.inactive_edge_count -
       interrupt_ancestry.inactive_edge_origin;
 
+  // This is a foreground batch boundary, not the scheduled CH2 event time.
+  // Unsigned subtraction handles millis() rollover for ordinary batch spans.
+  const uint32_t fragment_cut_ms = millis();
+  const uint32_t fragment_elapsed_ms = fragment_cut_ms - g_last_fragment_cut_ms;
+  g_last_fragment_cut_ms = fragment_cut_ms;
   const photons_fragment_drain_result_t drain =
       photons_drain_raw_laps();
 
@@ -5104,6 +5115,8 @@ static FLASHMEM void photons_fragment_tick(
   fragment.sequence = ++g_fragment_sequence;
   fragment.publish_count = g_publish_count + 1U;
   fragment.fragment_period_ns = PHOTONS_FRAGMENT_PERIOD_NS;
+  fragment.fragment_elapsed_ms = fragment_elapsed_ms;
+  fragment.publish_reject_count_before_fragment = g_publish_reject_count;
 
   fragment.edge_count_total = capture.edge_count;
   fragment.edges_this_fragment =
@@ -5499,9 +5512,11 @@ static void photons_start_fragment_publisher(void) {
     __builtin_trap();
   }
 
-  g_fragment_timer = timepop_arm(
+  // Rebase on every publisher start so disabled/recovery time is not charged
+  // to the first batch. Rejected publications still advance the batch boundary.
+  g_last_fragment_cut_ms = millis();
+  g_fragment_timer = timepop_arm_recurring_service(
       PHOTONS_FRAGMENT_PERIOD_NS,
-      true,
       photons_fragment_tick,
       nullptr,
       "PHOTONS_FRAGMENT");
@@ -6646,6 +6661,7 @@ static FLASHMEM Payload cmd_report_recovery(const Payload& /*args*/) {
   p.add("in_flight_train_restored", false);
   p.add("fragment_sequence", g_fragment_sequence);
   p.add("publish_count", g_publish_count);
+  p.add("publish_reject_count", g_publish_reject_count);
   p.add("stats_reset_count", g_photons_stats_reset_count);
   p.add("stats_update_count", g_photons_stats_update_count);
   p.add("stats_lap_count", g_lap_time_welford.n);
@@ -6891,6 +6907,8 @@ static FLASHMEM Payload cmd_report_photons(const Payload& /*args*/) {
   p.add("valid", canonical.valid);
   p.add("stats_reset_count", canonical.stats.reset_count);
   p.add("stats_update_count", canonical.stats.update_count);
+  p.add("fragment_elapsed_ms", canonical.fragment_elapsed_ms);
+  p.add("publish_reject_count", g_publish_reject_count);
   p.add("stats_reset_pending", g_photons_stats_reset_pending);
   p.add("race_engine_active", canonical.race_engine_active);
   p.add("race_accounting", "TIMEPOP_CADENCE_V1");
@@ -7201,6 +7219,8 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
   p.add("campaign_public_count", g_photons_campaign_public_count);
 
   p.add("fragment_sequence", canonical.sequence);
+  p.add("fragment_elapsed_ms", canonical.fragment_elapsed_ms);
+  p.add("publish_reject_count", g_publish_reject_count);
   p.add("fragment_valid", canonical.valid);
   p.add("race_engine_active",
         g_photons_race_foreground.active);

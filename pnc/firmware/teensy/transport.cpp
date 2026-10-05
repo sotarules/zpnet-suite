@@ -1962,19 +1962,21 @@ void transport_init(void) {
   host_session_connected = false;
   host_session_tx_rewind_requested = false;
 
-  timepop_arm(
+  // Polling must survive a missed compare appointment. The existing bounded
+  // RX/TX quanta still run at most once per foreground dispatch pass.
+  const timepop_handle_t rx_timer = timepop_arm_recurring_service(
     TRANSPORT_SERVICE_PERIOD_NS,
-    true,
     transport_rx_timepop,
     nullptr,
     "TRANSPORT_RX"
   );
 
-  timepop_arm(
+  const timepop_handle_t tx_timer = timepop_arm_recurring_service(
     TRANSPORT_SERVICE_PERIOD_NS,
-    true,
     transport_tx_timepop,
     nullptr,
     "TRANSPORT_TX"
   );
+  if (rx_timer == TIMEPOP_INVALID_HANDLE ||
+      tx_timer == TIMEPOP_INVALID_HANDLE) __builtin_trap();
 }

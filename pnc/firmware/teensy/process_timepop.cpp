@@ -79,6 +79,8 @@
 //   Callback order is logical only; priority only orders callbacks after the
 //   shared physical fire facts have been captured for every exact-match slot.
 //   It must never re-author the physical timing facts.
+//   Opt-in recurring services are different: a missed appointment requests one
+//   foreground callback with null ctx/diag, without claiming a captured edge.
 //
 //   TimePop authors fire_gnss_ns from VCLOCK arithmetic using the event's
 //   process_interrupt-authored counter32 identity.  Any DWT-derived GNSS
@@ -239,6 +241,7 @@ struct timepop_slot_t {
   bool                expired;
   bool                recurring;
   bool                is_absolute;
+  bool                service_when_due; // scheduling policy, never fire authority
   timepop_recurrence_mode_t recurrence_mode;
 
 
@@ -302,6 +305,8 @@ struct timepop_slot_t {
   uint32_t            schedule_next_last_now;
   uint32_t            schedule_next_last_deadline;
   uint32_t            schedule_next_last_dwt;
+  uint32_t            service_late_count;
+  uint32_t            service_late_max_ticks;
 
   // IRQ scan diagnostics.  These tell whether a slot was actually visible and
   // expirable when CH2 scanned the timed slot table.  If a slot is later caught
@@ -436,6 +441,7 @@ struct timepop_dispatch_mutation_t {
   bool recurring = false;
   bool isr_callback = false;
   bool rearm_in_isr = false;
+  bool service_when_due = false;
   timepop_callback_t callback = nullptr;
   void* user_data = nullptr;
   char name[MAX_TIMEPOP_NAME + 1] = {};
@@ -996,7 +1002,8 @@ static timepop_handle_t arm_relative_slot_internal(uint64_t delay_gnss_ns,
                                                    bool isr_callback,
                                                    bool rearm_in_isr,
                                                    timepop_priority_t priority,
-                                                   timepop_handle_t forced_handle = TIMEPOP_INVALID_HANDLE);
+                                                   timepop_handle_t forced_handle = TIMEPOP_INVALID_HANDLE,
+                                                   bool service_when_due = false);
 
 static bool timepop_should_queue_dispatch_mutation(void);
 static timepop_handle_t queue_dispatch_relative_arm(uint64_t delay_gnss_ns,
@@ -1006,7 +1013,8 @@ static timepop_handle_t queue_dispatch_relative_arm(uint64_t delay_gnss_ns,
                                                     const char* name,
                                                     bool isr_callback,
                                                     bool rearm_in_isr,
-                                                    timepop_priority_t priority);
+                                                    timepop_priority_t priority,
+                                                    bool service_when_due = false);
 static timepop_handle_t queue_dispatch_absolute_arm(int64_t target_gnss_ns,
                                                     bool recurring,
                                                     uint64_t recurring_period_gnss_ns,
@@ -1240,9 +1248,11 @@ static timepop_handle_t queue_dispatch_relative_arm(uint64_t delay_gnss_ns,
                                                     const char* name,
                                                     bool isr_callback,
                                                     bool rearm_in_isr,
-                                                    timepop_priority_t priority) {
+                                                    timepop_priority_t priority,
+                                                    bool service_when_due) {
   if (!callback) return TIMEPOP_INVALID_HANDLE;
   if (rearm_in_isr && (!recurring || !isr_callback)) return TIMEPOP_INVALID_HANDLE;
+  if (service_when_due && (!recurring || isr_callback || rearm_in_isr)) __builtin_trap();
 
   timepop_dispatch_mutation_t m{};
   m.kind = timepop_dispatch_mutation_kind_t::ARM_RELATIVE;
@@ -1250,6 +1260,7 @@ static timepop_handle_t queue_dispatch_relative_arm(uint64_t delay_gnss_ns,
   m.recurring = recurring;
   m.isr_callback = isr_callback;
   m.rearm_in_isr = rearm_in_isr;
+  m.service_when_due = service_when_due;
   m.callback = callback;
   m.user_data = user_data;
   if (!dispatch_mutation_copy_name(m, name)) return TIMEPOP_INVALID_HANDLE;
@@ -1561,7 +1572,8 @@ static void timepop_apply_dispatch_mutations(const char* context) {
                                        m.isr_callback,
                                        m.rearm_in_isr,
                                        m.priority,
-                                       m.reserved_handle);
+                                       m.reserved_handle,
+                                       m.service_when_due);
         ok = (h == m.reserved_handle && h != TIMEPOP_INVALID_HANDLE);
         break;
 
@@ -2375,6 +2387,27 @@ static bool timepop_quarantine_missed_deadline(timepop_slot_t& slot,
   const uint32_t late_ticks = deadline_passed(old_deadline, now)
       ? deadline_lateness_ticks(old_deadline, now)
       : 0U;
+
+  if (slot.service_when_due) {
+    if (!slot.recurring || slot.isr_callback || slot.rearm_in_isr) __builtin_trap();
+    // A future appointment inside the compare-arm margin must not run early.
+    // Leave it intact; the scheduler heartbeat will discover it once due.
+    if (!deadline_reached_or_passed(old_deadline, now)) return true;
+
+    // Retain the work, not an invented physical edge. Normal foreground
+    // dispatch runs it once and authors a future appointment afterward.
+    slot.fire_vclock_raw = 0U;
+    slot.fire_dwt_cyccnt = 0U;
+    slot.fire_gnss_ns = -1;
+    slot.fire_capture_source = timepop_fire_capture_source_t::NONE;
+    slot.isr_callback_fired = false;
+    slot.expired = true;
+    slot.service_late_count++;
+    update_max_u32(slot.service_late_max_ticks, late_ticks);
+    expired_count++;
+    timepop_pending = true;
+    return true;
+  }
 
   // A too-close deadline is still in the future, but not far enough into the
   // future to arm safely.  Re-author recurring grids past the scheduler race
@@ -4065,10 +4098,12 @@ static timepop_handle_t arm_relative_slot_internal(
   bool                isr_callback,
   bool                rearm_in_isr,
   timepop_priority_t  priority,
-  timepop_handle_t    forced_handle
+  timepop_handle_t    forced_handle,
+  bool                service_when_due
 ) {
   if (!callback) return TIMEPOP_INVALID_HANDLE;
   if (rearm_in_isr && (!recurring || !isr_callback)) return TIMEPOP_INVALID_HANDLE;
+  if (service_when_due && (!recurring || isr_callback || rearm_in_isr)) __builtin_trap();
 
   char owned_name[MAX_TIMEPOP_NAME + 1] = {};
   if (!timepop_copy_name(owned_name, name)) {
@@ -4099,6 +4134,7 @@ static timepop_handle_t arm_relative_slot_internal(
     slots[i].expired      = false;
     slots[i].recurring    = recurring;
     slots[i].is_absolute  = false;
+    slots[i].service_when_due = service_when_due;
     slots[i].recurrence_mode = timepop_recurrence_mode_t::NONE;
     slots[i].handle       = h;
     slots[i].period_ns    = delay_gnss_ns;
@@ -4189,6 +4225,27 @@ timepop_handle_t timepop_arm(
                                    user_data,
                                    name,
                                    TIMEPOP_PRIORITY_DEFAULT);
+}
+
+timepop_handle_t timepop_arm_recurring_service(
+  uint64_t            period_gnss_ns,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name
+) {
+  if (timepop_current_ipsr() != 0U || foreground_ready_evaluating) __builtin_trap();
+  uint32_t period_ticks = 0U;
+  if (!period_ns_to_exact_ticks(period_gnss_ns, period_ticks)) {
+    return TIMEPOP_INVALID_HANDLE;
+  }
+  if (timepop_should_queue_dispatch_mutation()) {
+    return queue_dispatch_relative_arm(period_gnss_ns, true, callback, user_data,
+                                       name, false, false,
+                                       TIMEPOP_PRIORITY_DEFAULT, true);
+  }
+  return arm_relative_slot_internal(period_gnss_ns, true, callback, user_data,
+                                    name, false, false, TIMEPOP_PRIORITY_DEFAULT,
+                                    TIMEPOP_INVALID_HANDLE, true);
 }
 
 timepop_handle_t timepop_arm_with_priority(
@@ -4746,6 +4803,7 @@ void timepop_dispatch(void) {
     // manufacture a false SCHEDULE_NEXT expiry.  The slot remains expired until
     // its next appointment is fully authored below.
     const bool callback_already_ran = slots[i].isr_callback_fired;
+    const bool service_when_due = slots[i].service_when_due;
     const timepop_handle_t callback_handle = slots[i].handle;
     const timepop_callback_t callback = slots[i].callback;
     void* const callback_user_data = slots[i].user_data;
@@ -4769,16 +4827,17 @@ void timepop_dispatch(void) {
 
     if (!callback_already_ran) {
       // ── Timed scheduled-context callback ──
-      timepop_ctx_t ctx;
-      slot_build_ctx(slots[i], ctx);
-
-      timepop_diag_t diag;
-      slot_build_diag(slots[i], 0, diag);
+      timepop_ctx_t ctx{};
+      timepop_diag_t diag{};
+      if (!service_when_due) {
+        slot_build_ctx(slots[i], ctx);
+        slot_build_diag(slots[i], 0, diag);
+      }
 
       const uint32_t start = ARM_DWT_CYCCNT;
 
-      if (ctx.fire_dwt_cyccnt != 0) {
-        const uint32_t latency = start - ctx.fire_dwt_cyccnt;
+      if (slots[i].fire_dwt_cyccnt != 0) {
+        const uint32_t latency = start - slots[i].fire_dwt_cyccnt;
         diag_timed_dispatch_latency_count++;
         diag_timed_dispatch_latency_last_cycles = latency;
         diag_timed_dispatch_latency_cycles_sum += (uint64_t)latency;
@@ -4803,7 +4862,8 @@ void timepop_dispatch(void) {
       // If it is corrupt, the retained CALL_ENTER entry survives the resulting
       // instruction-access fault.  If return state is corrupt, CALL_RETURN is
       // absent even though the recorded callback target was executable.
-      callback(&ctx, &diag, callback_user_data);
+      callback(service_when_due ? nullptr : &ctx,
+               service_when_due ? nullptr : &diag, callback_user_data);
 
       const uint32_t end = ARM_DWT_CYCCNT;
       const uint32_t body_cycles = end - start;
@@ -4878,6 +4938,45 @@ void timepop_dispatch(void) {
           slots[i].user_data,
           slots[i].name,
           callback_handle);
+      continue;
+    }
+
+    // Services coalesce overdue work into this one callback. Always choose a
+    // future appointment; never replay the missed intervals. Anchor loss must
+    // not retire transport/publication while CLOCKS reacquires its epoch.
+    if (slots[i].service_when_due) {
+      timepop_slot_t& slot = slots[i];
+      if (!slot.recurring || slot.isr_callback || slot.rearm_in_isr ||
+          slot.period_ticks == 0U) __builtin_trap();
+      const uint32_t old_deadline = slot.deadline;
+      const bool phase_locked =
+          configure_phase_locked_recurring_slot(slot, slot.period_ns);
+      const uint32_t now = vclock_count();
+      const uint32_t skipped = deadline_passed(old_deadline, now)
+          ? (now - old_deadline) / slot.period_ticks : 0U;
+      slot.recurring_last_skipped_intervals = skipped;
+      slot.recurring_total_skipped_intervals += skipped;
+      if (!phase_locked || deadline_reached_or_passed(slot.deadline, now)) {
+        slot.deadline = now + slot.period_ticks;
+        slot.arm_vclock_raw = now;
+        slot.arm_delta_ticks = slot.period_ticks;
+        slot.is_absolute = false;
+        slot.recurrence_mode = timepop_recurrence_mode_t::RELATIVE;
+        slot.target_gnss_ns = -1;
+      }
+      slot.recurring_rearmed_count++;
+      slot.predicted_dwt = predict_dwt_at_deadline(
+          slot.deadline, slot.prediction_valid);
+      slot.expired = false;
+      record_slot_arm_diag(slot,
+                           slot.is_absolute
+                               ? timepop_arm_source_t::DISPATCH_PHASE_LOCKED_REARM
+                               : timepop_arm_source_t::DISPATCH_RELATIVE_REARM,
+                           true, now, slot.target_gnss_ns);
+      const uint32_t saved = critical_enter();
+      diag_schedule_next_calls_from_dispatch++;
+      schedule_next();
+      critical_exit(saved);
       continue;
     }
 
@@ -5717,6 +5816,10 @@ static FLASHMEM void add_timers_array(Payload& out) {
     entry.add("handle",    slots[i].handle);
     entry.add("name",      slots[i].name);
     entry.add("priority",  (uint32_t)slots[i].priority);
+    entry.add("deadline_policy", slots[i].service_when_due
+        ? "SERVICE_WHEN_DUE" : "EXACT_EVENT");
+    entry.add("service_late_count", slots[i].service_late_count);
+    entry.add("service_late_max_ticks", slots[i].service_late_max_ticks);
     entry.add("deadline",  slots[i].deadline);
     entry.add("expired",   slots[i].expired);
 
