@@ -6,6 +6,9 @@
 
 Prints the complete report to STDOUT; no files or database values are changed.
 Uses the same-message BME280 and one-second mean lap, never cumulative means.
+For normalized rows, reconstructs uncorrected LAP using the recorded firmware
+offset, and compares it with canonical LAP on the same observations. New models
+fit uncorrected LAP; they are replacement candidates, never a second correction.
 Models: constant, linear, quadratic, cubic. Model selection uses forward-only
 validation within the first 70%; the last 30% tests the frozen choice once.
 The default uses current temperature only. Optional lag uses past temperatures
@@ -30,7 +33,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 SCHEMA = "PHOTONS_V1"
 MIN_FIT = 3
-VERSION = "2026-10-05.1"
+VERSION = "2026-10-05.2"
 
 
 def utc(value: Any) -> float:
@@ -56,6 +59,12 @@ def integer(value: Any) -> int:
     return value
 
 
+def signed_integer(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not -2**31 <= value < 2**31:
+        raise ValueError(f"expected a signed 32-bit integer, got {value!r}")
+    return value
+
+
 @dataclass(frozen=True)
 class Sample:
     row_id: int
@@ -70,6 +79,11 @@ class Sample:
     update: Optional[int]
     generation: Optional[int]
     receipt: bool
+    canonical_ns: float
+    normalization_id: Optional[int] = None
+    correction_fs: int = 0
+    applied_temperature: Optional[float] = None
+    correction_age_ms: Optional[int] = None
     epoch: int = 0
     run: int = 0
 
@@ -108,6 +122,31 @@ def parse_sample(row_id: int, p: Dict[str, Any]) -> Tuple[Optional[Sample], str]
         raise ValueError("core diagnostic belongs to a different fragment")
     if core and integer(core["retained_count"]) != n:
         raise ValueError("core retained count does not match flight population")
+    stats = ph["stats"]
+    canonical_ns = number(flight["mean"])
+    normalization_id = None
+    correction_fs = 0
+    applied_temperature = correction_age_ms = None
+    policy = p.get("normalization")
+    fields = ("normalization_id", "normalization_correction_fs",
+              "normalization_temperature_micro_c", "normalization_update_age_ms")
+    # SQL emits nulls for absent legacy fields. Partial normalization testimony
+    # must fail loudly rather than silently treating corrected LAP as raw.
+    if policy is not None or any(stats.get(k) is not None for k in fields):
+        normalization_id = integer(stats["normalization_id"])
+        if not 0 < normalization_id < 2**32:
+            raise ValueError("normalized race population requires a nonzero uint32 calibration identity")
+        correction_fs = signed_integer(stats["normalization_correction_fs"])
+        applied_temperature = signed_integer(stats["normalization_temperature_micro_c"]) / 1_000_000
+        correction_age_ms = integer(stats["normalization_update_age_ms"])
+        if policy is not None:
+            if not isinstance(policy, dict) or policy.get("normalization_id") != normalization_id:
+                raise ValueError("normalization policy and firmware identity disagree")
+            if (policy.get("schema") != "PHOTONS_THERMAL_NORMALIZATION_V1" or
+                    policy.get("application") != "UNIFORM_OFFSET_AT_FRAGMENT_DRAIN"):
+                raise ValueError("unsupported normalization reconstruction contract")
+    # Undo exactly the applied offset; never recompute it from SYSTEM temperature.
+    uncorrected_ns = canonical_ns + correction_fs / 1_000_000
     # Per-second center/radius/state are data, not configuration changes.
     signature = json.dumps({
         "race": {k: race.get(k) for k in (
@@ -115,6 +154,7 @@ def parse_sample(row_id: int, p: Dict[str, Any]) -> Tuple[Optional[Sample], str]
             "launch_bracket_max_cycles", "flight_interpretation", "launch_timing_policy")},
         "core": {k: core.get(k) for k in (
             "algorithm", "minimum_count", "minimum_radius_cycles", "mad_multiplier", "minimum_retained_pct")},
+        "normalization": {"id": normalization_id, "policy": policy},
     }, sort_keys=True)
     projection = ph.get("projection") or {}
     pps = projection.get("anchor_pps_count")
@@ -123,11 +163,14 @@ def parse_sample(row_id: int, p: Dict[str, Any]) -> Tuple[Optional[Sample], str]
     return Sample(
         row_id=row_id, time=utc(p["published_at_utc"]), sequence=integer(p["sequence"]),
         reset=integer(ph["stats"]["reset_count"]), pps=None if pps is None else integer(pps),
-        temperature=number(env["temperature_c"]), lap_ns=number(flight["mean"]), races=n,
+        temperature=number(env["temperature_c"]), lap_ns=uncorrected_ns, races=n,
         signature=signature,
         update=None if update is None else integer(update),
         generation=None if generation is None else integer(generation),
         receipt=p.get("recovery_receipt") is not None,
+        canonical_ns=canonical_ns, normalization_id=normalization_id,
+        correction_fs=correction_fs, applied_temperature=applied_temperature,
+        correction_age_ms=correction_age_ms,
     ), "used"
 
 
@@ -142,13 +185,18 @@ def database_rows(args: argparse.Namespace) -> Iterable[Tuple[int, Dict[str, Any
             'sequence', payload -> 'sequence',
             'published_at_utc', payload -> 'published_at_utc',
             'environment', payload -> 'environment',
+            'normalization', payload -> 'normalization',
             'recovery_receipt', payload -> 'recovery_receipt',
             'photons', jsonb_build_object(
                 'snapshot_ok', payload #> '{photons,snapshot_ok}',
                 'fragment_period_ns', payload #> '{photons,fragment_period_ns}',
                 'stats', jsonb_build_object(
                     'reset_count', payload #> '{photons,stats,reset_count}',
-                    'update_count', payload #> '{photons,stats,update_count}'),
+                    'update_count', payload #> '{photons,stats,update_count}',
+                    'normalization_id', payload #> '{photons,stats,normalization_id}',
+                    'normalization_correction_fs', payload #> '{photons,stats,normalization_correction_fs}',
+                    'normalization_temperature_micro_c', payload #> '{photons,stats,normalization_temperature_micro_c}',
+                    'normalization_update_age_ms', payload #> '{photons,stats,normalization_update_age_ms}'),
                 'recovery', jsonb_build_object('generation', payload #> '{photons,recovery,generation}'),
                 'projection', jsonb_build_object('anchor_pps_count', payload #> '{photons,projection,anchor_pps_count}'),
                 'core', payload #> '{photons,core}',
@@ -239,12 +287,15 @@ def collect(rows: Iterable[Tuple[int, Dict[str, Any]]], args: argparse.Namespace
             same_generation = sample.generation == prev.generation
             repeated_receipt = not sample.receipt or prev.receipt
             if same_generation and repeated_receipt and identity == previous_identity:
-                if (sample.lap_ns, sample.races, sample.signature) != (prev.lap_ns, prev.races, prev.signature):
+                if (sample.lap_ns, sample.canonical_ns, sample.correction_fs,
+                    sample.applied_temperature, sample.correction_age_ms, sample.races, sample.signature) != (
+                    prev.lap_ns, prev.canonical_ns, prev.correction_fs,
+                    prev.applied_temperature, prev.correction_age_ms, prev.races, prev.signature):
                     raise ValueError(f"row {row_id}: repeated fragment has conflicting science/settings")
                 counts["duplicate_fragment"] += 1
                 continue
             if sample.signature != prev.signature:
-                changes.append("acquisition/core settings changed")
+                changes.append("acquisition/core settings or normalization policy changed")
             if (sample.sequence <= prev.sequence or
                     (sample.pps is not None and prev.pps is not None and sample.pps < prev.pps) or
                     (sample.update is not None and prev.update is not None and sample.update <= prev.update)):
@@ -269,6 +320,7 @@ def collect(rows: Iterable[Tuple[int, Dict[str, Any]]], args: argparse.Namespace
         samples.append(sample)
         prev = sample
         counts["used"] += 1
+        counts["reconstructed_uncorrected" if sample.normalization_id is not None else "original_uncorrected"] += 1
     return samples, counts, reasons
 
 
@@ -417,7 +469,8 @@ def formula(model, lag_seconds):
     print(f'  predicted_LAP_ns = {expression}')
     correction = ' '.join(f'{c:+.12g}*x'+(f'^{j}' if j>1 else '')
                           for j,c in enumerate(model.coefficients[1:],1)) or '0'
-    print(f'  normalized_LAP_ns = measured_LAP_ns - ({correction})')
+    print(f'  candidate_normalized_LAP_ns = uncorrected_LAP_ns - ({correction})')
+    print('  Apply this candidate to uncorrected LAP, never on top of an existing correction.')
     print(f'  Fitted temperature range: {model.low:.6f} .. {model.high:.6f} C')
     for j,c in enumerate(model.coefficients):
         print(f'    coefficient c{j} = {c:.12g} ns'+(f'/C^{j}' if j else ''))
@@ -466,6 +519,54 @@ def shape(points, x, residual, args):
     print('  Persistent residual shape or direction gaps suggest temperature alone is incomplete.')
 
 
+def deployed_comparison(samples, points, canonical_points):
+    """Describe the installed correction even when there is too little data to fit."""
+    print('\n  DEPLOYED NORMALIZATION (same observations; no refitting)')
+    print(f'  Firmware normalization_id: {samples[0].normalization_id}')
+    print('  uncorrected_LAP_ns = canonical_LAP_ns + recorded_correction_fs / 1,000,000')
+    print('  Reconstruction retains the stored LAP rounding; no current policy is imported.')
+    policy = json.loads(samples[0].signature)['normalization']['policy']
+    if policy is None:
+        print('  Policy document absent; reconstruction uses the recorded uniform firmware offset.')
+    elif policy.get('temperature_path') != ['environment', 'temperature_c']:
+        print('  Deployed sensor differs from BME280; new candidate fits still use BME280 only.')
+    corrections = [s.correction_fs/1_000_000 for s in samples]
+    applied = [s.applied_temperature for s in samples]
+    ages = [s.correction_age_ms for s in samples]
+    print(f'  Recorded correction range: {min(corrections):+.6f} .. {max(corrections):+.6f} ns')
+    print(f'  Applied sensor range: {min(applied):.6f} .. {max(applied):.6f} C')
+    print(f'  Correction refresh age: median={st.median(ages):.0f} ms; max={max(ages):,} ms (not physical sensor-reading age).')
+    if policy is not None and policy.get('temperature_path') == ['environment', 'temperature_c']:
+        print(f'  Max |applied BME280 - row SYSTEM BME280|: '
+              f'{max(abs(s.applied_temperature-s.temperature) for s in samples):.6f} C')
+    raw = [s.lap_ns for s in samples]
+    canonical = [s.canonical_ns for s in samples]
+    spread_header()
+    spread('uncorrected one-second', raw)
+    spread('deployed one-second', canonical)
+    if len(raw)>1:
+        print(f'  Deployed one-second SD reduction: {reduction(st.stdev(raw),st.stdev(canonical))}')
+    print(f'  Deployed one-second peak-to-peak reduction: '
+          f'{reduction(max(raw)-min(raw),max(canonical)-min(canonical))}')
+    if points:
+        spread('uncorrected block means', [p.lap_ns for p in points])
+        spread('deployed block means', [p.lap_ns for p in canonical_points])
+    temperatures = [s.temperature for s in samples]
+    print(f'  Descriptive BME280 correlation: uncorrected={fmt(pearson(temperatures,raw))}; '
+          f'deployed={fmt(pearson(temperatures,canonical))}')
+    print('  Descriptive comparison only; this does not establish calibration accuracy or causation.')
+    print('\n  DEPLOYED NORMALIZATION IN SIX CHRONOLOGICAL WINDOWS (all usable seconds)')
+    print('    UTC start                    N    mean_T_C  uncorrected_ns    deployed_ns  correction_ns')
+    for i in range(6):
+        window = samples[i*len(samples)//6:(i+1)*len(samples)//6]
+        if window:
+            print(f'    {stamp(window[0].time):25s} {len(window):5d} '
+                  f'{st.fmean(s.temperature for s in window):11.5f} '
+                  f'{st.fmean(s.lap_ns for s in window):15.6f} '
+                  f'{st.fmean(s.canonical_ns for s in window):14.6f} '
+                  f'{st.fmean(s.correction_fs/1_000_000 for s in window):14.6f}')
+
+
 def analyze(samples, reason, args):
     print(f'\nEPOCH {samples[0].epoch}: {reason}')
     print(f'  UTC {stamp(samples[0].time)} .. {stamp(samples[-1].time)}')
@@ -475,16 +576,21 @@ def analyze(samples, reason, args):
     print(f'  BME280 range: {min(temperatures):.6f} .. {max(temperatures):.6f} C')
     repeated = sum(a.run==b.run and a.temperature==b.temperature for a,b in zip(samples,samples[1:]))
     print(f'  Adjacent identical BME280 readings: {repeated:,} (cached snapshots are not new independent readings).')
+    deployed = samples[0].normalization_id is not None
+    print(f'  Canonical LAP: {"already normalized; model target reconstructed from recorded offsets" if deployed else "uncorrected legacy measurements"}.')
     spread_header()
-    spread('all raw one-second means', [s.lap_ns for s in samples])
-    print(f'  Raw lap range: {min(s.lap_ns for s in samples):.9f} .. {max(s.lap_ns for s in samples):.9f} ns')
+    spread('uncorrected one-second', [s.lap_ns for s in samples])
+    print(f'  Uncorrected lap range: {min(s.lap_ns for s in samples):.9f} .. {max(s.lap_ns for s in samples):.9f} ns')
     points, omitted = blocks(samples,args.bin_seconds)
+    canonical_points, _ = blocks([replace(s,lap_ns=s.canonical_ns) for s in samples],args.bin_seconds)
     print(f'  Complete {args.bin_seconds}-second blocks: {len(points):,}; seconds in incomplete blocks: {omitted:,}')
+    if deployed:
+        deployed_comparison(samples,points,canonical_points)
     if len(points)<60:
-        print('  Need at least 60 complete blocks for model selection plus a later test.')
-        print('  Use a smaller --bin-seconds if continuity breaks leave too few complete blocks.')
+        print('\n  MODEL SELECTION DEFERRED: need at least 60 complete blocks plus adequate later-test support.')
+        print('  Collect longer runs across thermal cycles; smaller blocks do not create independent sensor observations.')
         return
-    print(f'  Descriptive block correlations: T vs LAP {fmt(pearson([p.temperature for p in points], [p.lap_ns for p in points]))}; '
+    print(f'  Descriptive block correlations: T vs uncorrected LAP {fmt(pearson([p.temperature for p in points], [p.lap_ns for p in points]))}; '
           f'T vs time {fmt(pearson([p.temperature for p in points], [p.time for p in points]))}')
     lookup = {(p.run,p.index):p for p in points}
     steps = args.max_lag_seconds//args.bin_seconds
@@ -515,7 +621,7 @@ def analyze(samples, reason, args):
         return [lookup[(p.run,p.index-lag)].temperature for p in rows]
     def ys(rows):
         return [p.lap_ns for p in rows]
-    print('\n  MODEL SELECTION (first 70% only; three expanding forward folds)')
+    print('\n  MODEL SELECTION ON UNCORRECTED LAP (first 70% only; three expanding forward folds)')
     print(f'  Separation: >{embargo}s; final test: {len(test):,} blocks, not used to choose degree or lag.')
     for i,(train,val) in enumerate(folds,1):
         print(f'  Fold {i}: fit {len(train):,}, validate {len(val):,}; validation {stamp(val[0].time)} .. {stamp(val[-1].time)}')
@@ -553,7 +659,7 @@ def analyze(samples, reason, args):
     print(f'  FROZEN CHOICE: {name(degree,lag,args.bin_seconds)}')
     model = polynomial(xs(development,lag),ys(development),degree)
     assert model is not None
-    print('\n  FROZEN FORMULA (fitted on development only; no later-data recentering)')
+    print('\n  FROZEN CANDIDATE FORMULA (fitted on uncorrected development LAP only; no later-data recentering)')
     formula(model,lag*args.bin_seconds)
     tx, actual = xs(test,lag),ys(test)
     predictions = [model.predict(t) for t in tx]
@@ -578,8 +684,14 @@ def analyze(samples, reason, args):
             print(f'  {label}: {len(indices):,} blocks; formula RMSE {rmse([residual[i] for i in indices])*1000:.3f} ps; '
                   f'constant RMSE {rmse([baseline_errors[i] for i in indices])*1000:.3f} ps')
     spread_header()
-    spread('raw test block means',actual)
-    spread('normalized test blocks',normalized)
+    spread('uncorrected test blocks',actual)
+    spread('candidate test blocks',normalized)
+    if deployed:
+        canonical_lookup = {(p.run,p.index):p.lap_ns for p in canonical_points}
+        deployed_test = [canonical_lookup[(p.run,p.index)] for p in test]
+        spread('deployed test blocks',deployed_test)
+        print(f'  Deployed test SD reduction vs uncorrected: {reduction(st.stdev(actual),st.stdev(deployed_test))}')
+        print('  Candidate and deployed reference levels may differ; compare scatter, not absolute means.')
     print(f'  Test RMSE reduction vs constant: {reduction(rmse(baseline_errors),rmse(residual))}')
     print(f'  Test SD reduction: {reduction(st.stdev(actual),st.stdev(normalized))}')
     print(f'  Test peak-to-peak reduction: {reduction(max(actual)-min(actual),max(normalized)-min(normalized))}')
@@ -589,7 +701,7 @@ def analyze(samples, reason, args):
     # A block contains exactly width consecutive retained fragments in a run.
     if lag==0:
         selected = {(p.run,p.index) for p in test}
-        raw_seconds, corrected_seconds = [],[]
+        raw_seconds, corrected_seconds, deployed_seconds = [],[],[]
         ordinal = Counter()
         for s in samples:
             index = ordinal[s.run]//args.bin_seconds
@@ -597,15 +709,18 @@ def analyze(samples, reason, args):
             if (s.run,index) in selected:
                 raw_seconds.append(s.lap_ns)
                 corrected_seconds.append(s.lap_ns-model.correction(s.temperature))
+                deployed_seconds.append(s.canonical_ns)
         print('\n  SAME FINAL TEST, AT ONE-SECOND RESOLUTION (cached recorded temperature)')
         spread_header()
-        spread('raw one-second means',raw_seconds)
-        spread('normalized one-second',corrected_seconds)
+        spread('uncorrected one-second',raw_seconds)
+        spread('candidate one-second',corrected_seconds)
+        if deployed:
+            spread('deployed one-second',deployed_seconds)
         print('  Polynomial evaluated per second here; nonlinear averaging can differ from block evaluation.')
     else:
         print('  Lagged correction is evaluated at block resolution only; no interpolated one-second results.')
     print('\n  FINAL TEST IN SIX CHRONOLOGICAL WINDOWS')
-    print('    UTC start                    N    mean_T_C  raw_mean_ns  normalized_mean_ns  residual_mean_ps')
+    print('    UTC start                    N    mean_T_C  uncorrected_ns   candidate_mean_ns  residual_mean_ps')
     for i in range(6):
         indices = list(range(i*len(test)//6,(i+1)*len(test)//6))
         if indices:
@@ -668,7 +783,8 @@ def main(argv):
     print(f'Campaign: {args.campaign}; generated UTC: {datetime.now(timezone.utc).isoformat(timespec="seconds")}')
     print(f'Options: block={args.bin_seconds}s, max_degree={args.max_degree}, max_lag={args.max_lag_seconds}s, simplicity={args.simplicity_pct:g}%')
     print(f'Selection: start={args.start}, end={args.end}, skip={args.skip_seconds}s; source={args.input or "read-only database"}')
-    print('Predictor: environment.temperature_c (BME280); target: photons.race.flight_ns.mean (ns).')
+    print('Predictor: environment.temperature_c (BME280); target: uncorrected one-second LAP (ns).')
+    print('Legacy rows use photons.race.flight_ns.mean directly; normalized rows add back the recorded firmware correction.')
     print('Equal weight per usable second; no cumulative means; no rejection based on lap magnitude.')
     print('Loading campaign observations...',flush=True)
     rows = file_rows(args.input,args.campaign) if args.input else database_rows(args)
@@ -686,7 +802,9 @@ def main(argv):
     for epoch,observations in epochs.items():
         analyze(observations,reasons[epoch],args)
     print('\nREPORT NOTES')
-    print('  Epochs are fitted separately across recorded settings changes, resets and recovery.')
+    print('  Epochs are fitted separately across recorded settings/calibration changes, resets and recovery.')
+    print('  Deployed = stored canonical LAP; uncorrected = original legacy LAP or reconstructed pre-correction LAP.')
+    print('  Candidate formulas always fit uncorrected LAP and replace, rather than compound, the deployed correction.')
     print('  Blocks and lag history never cross continuity gaps. Unknown hardware changes need explicit time selection.')
     print('  All printed SDs describe one-second or block means, not individual-photon jitter or calibration uncertainty.')
     print('  Time-correlated observations and cached temperatures are not independent thermal experiments.')

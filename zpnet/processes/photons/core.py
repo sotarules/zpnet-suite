@@ -23,7 +23,8 @@ The Pi does not recompute, smooth, repair, or re-adjudicate lap or CAMP science.
 It owns campaign_master identity, restart policy, and
 persistence.  Firmware owns the exact START/STOP measurement boundary.
 
-Lap means and scatter use nanoseconds directly, without a configured reference.
+Lap means use thermally normalized nanoseconds. Pi supplies the configured
+temperature correction; firmware applies it before Welford/N/T accumulation.
 Durable recovery restores aggregate sufficient state plus only the
 bounded PPB endpoint history the Pi literally possesses.  A surviving producer is
 never repaired, replayed, or interrogated merely because the Pi restarted: current-
@@ -53,6 +54,9 @@ from zpnet.processes.processes import (
     publish,
     send_command,
     server_setup,
+)
+from zpnet.processes.photons.normalization import (
+    NORMALIZATION_ID, POLICY as NORMALIZATION_POLICY, command_args as normalization_args,
 )
 from zpnet.shared.constants import Payload
 from zpnet.shared.db import DatabaseContentionRetry, open_db
@@ -146,6 +150,7 @@ PHOTONS_PERSIST_RETRY_S = 0.25
 STARTUP_INFRASTRUCTURE_REQUIRED = (
     "PI.SYSTEM.POSTGRES",
     "PI.PUBSUB.TEENSY_RPC",
+    NORMALIZATION_POLICY["readiness_feature"],
 )
 STARTUP_INFRASTRUCTURE_POLL_S = 0.5
 STARTUP_INFRASTRUCTURE_QUIET_GRACE_S = 5.0
@@ -591,6 +596,8 @@ def _request_teensy_subsystem_command(
     args: Optional[dict] = None,
 ) -> Dict[str, Any]:
     """Delegate ENABLE/DISABLE to the firmware and require its physical verdict."""
+    if command == "ENABLE":
+        _send_normalization(_fetch_system_report())
     kwargs: Dict[str, Any] = {
         "machine": "TEENSY",
         "subsystem": SUBSYSTEM,
@@ -778,6 +785,88 @@ def _fetch_system_report() -> Dict[str, Any]:
     if not isinstance(response, dict) or not response.get("success") or not isinstance(payload, dict):
         raise RuntimeError(f"SYSTEM.REPORT unavailable: {response!r}")
     return copy.deepcopy(payload)
+
+
+def _send_normalization(system_context: Dict[str, Any]) -> None:
+    """Refresh the firmware's correction for subsequent foreground batch cuts.
+
+    This does not rewrite the already-received fragment. Its frozen correction
+    fields identify what it used, independently of the newer SYSTEM context.
+    """
+    args = normalization_args(system_context)
+    response = send_command(
+        machine="TEENSY", subsystem=SUBSYSTEM, command="SET_NORMALIZATION",
+        args=args, retries=1, retry_delay_s=0.0,
+    )
+    payload = response.get("payload") if isinstance(response, dict) else None
+    if (not isinstance(response, dict) or not response.get("success")
+            or not isinstance(payload, dict)
+            or payload.get("status") != "normalization_updated"
+            or any(payload.get(k) != v for k, v in args.items())):
+        raise RuntimeError(f"PHOTONS normalization update failed: {response!r}")
+
+
+def _normalization_epoch_migration() -> Optional[Dict[str, Any]]:
+    """Inspect only the newest source; never fall back to an older calibration."""
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, payload #> '{photons,stats,normalization_id}' AS normalization_id
+            FROM campaign_detail
+            WHERE campaign_type = %s AND payload #>> '{photons,source}' = %s
+            ORDER BY id DESC LIMIT 1
+        """, (CAMPAIGN_TYPE_LANTERN, "PD200T_REAL_RACE"))
+        row = cur.fetchone()
+    if row is None or row["normalization_id"] == NORMALIZATION_ID:
+        return None
+    return {
+        "schema": "PHOTONS_NORMALIZATION_EPOCH_MIGRATION_V1",
+        "from_normalization_id": row["normalization_id"],
+        "normalization_id": NORMALIZATION_ID,
+        "previous_detail_id": int(row["id"]),
+        "to_source": "PD200T_REAL_RACE",
+        "historical_detail_rows_preserved": _count_current_lantern_details(),
+        "producer_action": "COLD_START_NEW_CALIBRATION_EPOCH",
+    }
+
+
+def _close_lantern_for_normalization(active_master, migration) -> None:
+    """Close old calibration custody only after startup proves a held producer.
+
+    A reflashed producer cannot author the old campaign's final fragment. Record
+    its last durable boundary as interrupted; never fabricate a physical STOP.
+    """
+    campaign = str(active_master["campaign"])
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, ts FROM campaign_detail
+            WHERE campaign_type = %s AND campaign = %s
+            ORDER BY id DESC LIMIT 1
+        """, (CAMPAIGN_TYPE_LANTERN, campaign))
+        last = cur.fetchone()
+        closure = {
+            "stopped_at": last["ts"].isoformat() if last else active_master["started_at"],
+            "interrupted_at": _utc_now_z(),
+            "stop_reason": "NORMALIZATION_EPOCH_CUTOVER",
+            "stop_boundary_pending": False,
+            "stop_boundary_contract": "LAST_DURABLE_ROW_AFTER_PRODUCER_REBOOT",
+            "normalization_cutover": dict(
+                migration, last_campaign_detail_id=int(last["id"]) if last else None,
+            ),
+        }
+        cur.execute("""
+            UPDATE campaign_master
+            SET active = false, payload = payload || %s::jsonb
+            WHERE id = %s AND campaign_type = %s AND campaign = %s AND active = true
+        """, (json.dumps(closure), int(active_master["campaign_id"]),
+              CAMPAIGN_TYPE_LANTERN, campaign))
+        if cur.rowcount != 1:
+            raise RuntimeError("normalization cutover did not close exactly one active LANTERN master")
+    logging.warning(
+        "[photons/normalization] closed interrupted campaign '%s' at durable detail=%s; history preserved",
+        campaign, int(last["id"]) if last else None,
+    )
 
 
 def _read_startup_system_feature(name: str) -> Dict[str, Any]:
@@ -1132,6 +1221,8 @@ def _validate_photons_fragment(fragment: Payload) -> Tuple[int, int, Optional[in
         raise ValueError(f"unsupported PHOTONS science schema {science.get('schema')!r}")
     if stats.get("schema") != PHOTONS_STATS_SCHEMA:
         raise ValueError(f"unsupported PHOTONS stats schema {stats.get('schema')!r}")
+    if stats.get("normalization_id") != NORMALIZATION_ID:
+        raise ValueError("PHOTONS calibration identity does not match the configured policy")
     if stats.get("lap_semantics") != PHOTONS_LAP_SEMANTICS:
         raise ValueError(
             f"unsupported PHOTONS lap semantics {stats.get('lap_semantics')!r}"
@@ -1720,6 +1811,8 @@ def _validate_firmware_ppb_checkpoint_delta(stats: Dict[str, Any]) -> Dict[str, 
             f"{raw.get('schema')!r}"
         )
 
+    if stats.get("normalization_id") != NORMALIZATION_ID:
+        raise ValueError("PHOTONS calibration identity does not match the configured policy")
     if stats.get("lap_semantics") != PHOTONS_LAP_SEMANTICS:
         raise ValueError(
             f"unsupported PHOTONS Better-Buckets semantics {stats.get('lap_semantics')!r}"
@@ -3396,6 +3489,7 @@ def _make_photons(
     # Preserve the exact Teensy-owned instrument subtree.  Context enrichment
     # never reaches inside or re-authors firmware optical science.
     state["photons"] = copy.deepcopy(instrument)
+    state["normalization"] = dict(NORMALIZATION_POLICY, normalization_id=NORMALIZATION_ID)
     stats = _require_dict(instrument.get("stats"), "PHOTONS_FRAGMENT.photons.stats")
 
     # Fold the producer-authored Better-Buckets delta before publication. The
@@ -3566,6 +3660,8 @@ def _canonical_recovery_state_from_row(
     ) != sequence:
         raise ValueError("campaign_detail sequence does not match canonical payload")
     instrument = _require_dict(state.get("photons"), "PHOTONS.photons")
+    if instrument.get("stats", {}).get("normalization_id") != NORMALIZATION_ID:
+        raise ValueError("PHOTONS restore source belongs to a different calibration")
     if instrument.get("schema") != PHOTONS_INSTRUMENT_SCHEMA:
         raise ValueError("canonical PHOTONS instrument schema mismatch")
 
@@ -4481,6 +4577,9 @@ def _send_teensy_recovery_command(
     args: Optional[Dict[str, Any]] = None,
     accepted_statuses: set[str],
 ) -> Dict[str, Any]:
+    if command in {"RECOVERY_COMMIT", "RECOVERY_COLD_START"}:
+        _send_normalization(_fetch_system_report())
+        args = dict(args or {}, normalization_id=NORMALIZATION_ID)
     if args is None:
         response = send_command(
             machine="TEENSY",
@@ -4519,6 +4618,8 @@ def _fetch_teensy_recovery_report() -> Dict[str, Any]:
     payload = response.get("payload") if isinstance(response, dict) else None
     if not isinstance(response, dict) or not response.get("success") or not isinstance(payload, dict):
         raise RuntimeError(f"Teensy PHOTONS.REPORT_RECOVERY unavailable: {response!r}")
+    if payload.get("normalization_protocol") != 1:
+        raise RuntimeError("PHOTONS normalization requires the matching Teensy firmware")
     if payload.get("schema") != "PHOTONS_RECOVERY_REPORT_V1":
         raise RuntimeError(
             f"unsupported Teensy PHOTONS recovery schema {payload.get('schema')!r}"
@@ -6612,6 +6713,23 @@ def _perform_phase5_recovery(
             )
 
         active_master = _load_active_lantern_master()
+        migration = _normalization_epoch_migration()
+        if migration is not None:
+            report = _fetch_teensy_recovery_report()
+            if report["publication_started"] or report["staging_active"]:
+                raise RuntimeError("PHOTONS calibration cutover requires a freshly rebooted, held Teensy")
+            bringup = _fetch_teensy_bringup_report()
+            if bringup is None:
+                raise RuntimeError("PHOTONS calibration cutover lacks held-producer bringup testimony")
+            _startup_activate_detector_for_heartbeat(bringup)
+            if active_master is not None:
+                _close_lantern_for_normalization(active_master, migration)
+            logging.warning("[photons/normalization] new calibration epoch: %s", migration)
+            return _startup_cold_start(
+                active_master=None,
+                rows_seen=migration["historical_detail_rows_preserved"],
+                source_epoch_migration=migration,
+            )
         active_detail_present = (
             _lantern_campaign_has_details(active_master["campaign"])
             if active_master is not None
@@ -7491,6 +7609,7 @@ def _state_loop() -> None:
                         break
                     try:
                         system_context = _fetch_system_report()
+                        _send_normalization(system_context)
                         break
                     except Exception as exc:
                         failure = {
