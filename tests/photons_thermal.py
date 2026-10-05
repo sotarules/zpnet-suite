@@ -1,44 +1,22 @@
-"""Characterize BME280 temperature versus PHOTONS fragment mean flight time.
+"""Infer BME280 temperature compensation for one PHOTONS campaign.
 
-    zt photons_thermal Campaign1 Campaign2 Campaign3
-    zt photons_thermal Campaign1 --bin-seconds 60 --csv /tmp/thermal.csv
-    zt photons_thermal Campaign1 --max-lag-seconds 600
-    zt photons_thermal Campaign1 --input /tmp/photons.jsonl
+    zt photons_thermal Short2
+    zt photons_thermal Short2 --max-lag-seconds 600
+    python3 photons_thermal.py Short2 --input Short2.jsonl
 
-Reads only each named LANTERN campaign's PHOTONS_V1 rows. The paired facts are
-from the SAME message: environment.temperature_c and photons.race.flight_ns.mean.
-The latter is already nanoseconds for that one-second accepted population;
-cumulative campaign/instrument means are never regression inputs. Every usable
-second has equal weight, regardless of the number of flights within it.
+Prints the complete report to STDOUT; no files or database values are changed.
+Uses the same-message BME280 and one-second mean lap, never cumulative means.
+Models: constant, linear, quadratic, cubic. Model selection uses forward-only
+validation within the first 70%; the last 30% tests the frozen choice once.
+The default uses current temperature only. Optional lag uses past temperatures
+on complete, uninterrupted blocks. Positive lag means temperature BEFORE lap.
 
-Reports a linear candidate function, temperature-binned shape, warming/cooling
-agreement, a frozen later-data prediction, and cross-campaign prediction where
-recorded configurations and temperature ranges overlap. No normalization is
-installed and no stored data or live statistics are changed.
-
-Nonoverlapping time blocks reduce second-to-second noise. Blocks and optional
-lag alignment never cross gaps, resets, recovery, or recorded setting changes.
-Lag +N means temperature N seconds BEFORE the measured lap. Lag selection uses
-training data only. The later holdout is separated by the maximum tested lag
-plus one block; held-out outcomes never select the model. Default lag is zero.
-
-Stored BME280 snapshots may repeat: read_ok/stale describe sensor-read outcome,
-not precise sample age. Missing temperature/quality observations are counted
-and omitted, never filled in or assumed successful. A large row count is not
-a count of independent thermal experiments. No IID p-values or standard errors
-are claimed. A high R2 alone cannot distinguish heat from elapsed time or
-establish a deterministic law.
-
-Only the standard library and zpnet.shared.db are needed. main(argv) includes
-the program name, matching the existing zt runner. --input accepts PHOTONS JSON,
-a JSON array or JSONL, optionally prefixed with PHOTONS. --start/--end require a
-timezone. Unrecorded hardware/firmware changes must be separated by the operator.
+Standard library only, plus zpnet.shared.db when reading the database.
+main(argv) includes the program name, as required by the zt runner.
 """
-
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import math
 import statistics as st
@@ -52,8 +30,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 SCHEMA = "PHOTONS_V1"
 MIN_FIT = 3
-MIN_TRAIN = 8
-MIN_TEST = 4
+VERSION = "2026-10-05.1"
 
 
 def utc(value: Any) -> float:
@@ -342,340 +319,383 @@ def pearson(x: Sequence[float], y: Sequence[float]) -> Optional[float]:
     return max(-1.0, min(1.0, dot(a, b) / math.sqrt(xx * yy))) if xx > 1e-24 and yy > 1e-24 else None
 
 
-@dataclass(frozen=True)
-class Fit:
-    x0: float
-    t0: float
-    y0: float
-    beta: float
-    drift: float
-    r2: float
-    residual_sd_ns: float
-
-    def predict(self, x: float, t: float) -> float:
-        return self.y0 + self.beta * (x - self.x0) + self.drift * (t - self.t0)
-
-
-def fit(x: Sequence[float], y: Sequence[float], times: Optional[Sequence[float]] = None) -> Optional[Fit]:
-    if len(x) < MIN_FIT:
-        return None
-    xc, yc = centered(x), centered(y)
-    xx = dot(xc, xc)
-    if xx <= 1e-24:
-        return None
-    t0 = drift = 0.0
-    if times is None:
-        beta = dot(xc, yc) / xx
-        residual = [b - beta * a for a, b in zip(xc, yc)]
-    else:
-        tc = centered(times)
-        tt = dot(tc, tc)
-        if tt <= 1e-24:
-            return None
-        xt, yt = dot(xc, tc) / tt, dot(yc, tc) / tt
-        xr = [a - xt * t for a, t in zip(xc, tc)]
-        yr = [b - yt * t for b, t in zip(yc, tc)]
-        xr2 = dot(xr, xr)
-        # Temperature proportional to elapsed time cannot identify two slopes.
-        if xr2 <= 1e-10 * xx:
-            return None
-        beta = dot(xr, yr) / xr2
-        drift = yt - beta * xt
-        t0 = st.fmean(times)
-        residual = [b - beta * a - drift * t for a, b, t in zip(xc, yc, tc)]
-    yy = dot(yc, yc)
-    r2 = 1.0 - dot(residual, residual) / yy if yy > 1e-24 else 0.0
-    return Fit(st.fmean(x), t0, st.fmean(y), beta, drift, r2, st.stdev(residual))
-
-
-def detrended_r(x, y, t) -> Optional[float]:
-    tx, ty = fit(t, x), fit(t, y)
-    if tx is None or ty is None:
-        return None
-    xr = [v - tx.predict(s, 0) for v, s in zip(x, t)]
-    yr = [v - ty.predict(s, 0) for v, s in zip(y, t)]
-    if (dot(xr, xr) <= 1e-10 * dot(centered(x), centered(x)) or
-            dot(yr, yr) <= 1e-10 * dot(centered(y), centered(y))):
-        return None
-    return pearson(xr, yr)
-
-
 def fmt(v: Optional[float], digits: int = 4) -> str:
     return "n/a" if v is None else f"{v:.{digits}f}"
 
 
-def association(points: Sequence[Point]) -> Optional[Fit]:
-    x, y = [p.temperature for p in points], [p.lap_ns for p in points]
-    model = fit(x, y)
-    if model is None:
-        print("  Function unavailable: need at least three blocks with temperature variation.")
+@dataclass(frozen=True)
+class Polynomial:
+    reference: float
+    coefficients: Tuple[float, ...]  # powers of (temperature - reference), ns/C^k
+    low: float
+    high: float
+
+    def predict(self, temperature: float) -> float:
+        value = 0.0
+        for coefficient in reversed(self.coefficients):
+            value = value * (temperature - self.reference) + coefficient
+        return value
+
+    def correction(self, temperature: float) -> float:
+        return self.predict(temperature) - self.coefficients[0]
+
+
+def polynomial(x, y, degree):
+    """Small least squares fit, scaled and solved by reorthogonalized QR.
+
+    A rank-deficient temperature population cannot identify this degree; that
+    candidate is omitted explicitly rather than filled with guessed coefficients.
+    """
+    reference = st.fmean(x)
+    scale = max(abs(t-reference) for t in x)
+    if degree and scale < 1e-12:
         return None
-    print(f"  Candidate: LAP_ns = {model.y0:.9f} + ({model.beta:+.9f}) * (BME280_C - {model.x0:.6f})")
-    print(f"  Sensitivity {model.beta*1000:+.3f} ps/C; r={fmt(pearson(x,y))}; R2={model.r2:.4f}")
-    print(f"  Between-block LAP SD {st.stdev(y)*1000:.3f} ps -> fitted residual SD {model.residual_sd_ns*1000:.3f} ps")
-    times = [p.time-points[0].time for p in points]
-    controlled = fit(x, y, times)
-    print(f"  After removing a linear time trend: r={fmt(detrended_r(x,y,times))}; "
-          f"temperature slope={fmt(None if controlled is None else controlled.beta*1000,3)} ps/C")
-    if controlled is None:
-        print("  Temperature and elapsed time do not separately identify a thermal slope here.")
-    pairs = [(a,b) for a,b in zip(points,points[1:]) if a.run == b.run and b.index == a.index+1]
-    print(f"  Adjacent changes corr(delta T, delta LAP)={fmt(pearson([b.temperature-a.temperature for a,b in pairs], [b.lap_ns-a.lap_ns for a,b in pairs]))}")
-    return model
+    scale = scale or 1.0
+    z = [(t-reference)/scale for t in x]
+    columns = [[t**j for t in z] for j in range(degree+1)]
+    q = []
+    r = [[0.0]*(degree+1) for _ in range(degree+1)]
+    for j, column in enumerate(columns):
+        v = column[:]
+        for _ in range(2):
+            for i, basis in enumerate(q):
+                projection = dot(basis, v)
+                r[i][j] += projection
+                v = [a-projection*b for a,b in zip(v,basis)]
+        norm = math.sqrt(dot(v,v))
+        if norm < 1e-10*math.sqrt(len(x)):
+            return None
+        r[j][j] = norm
+        q.append([a/norm for a in v])
+    y0 = st.fmean(y)
+    rhs = [dot(basis, [v-y0 for v in y]) for basis in q]
+    coefficients = [0.0]*(degree+1)
+    for j in reversed(range(degree+1)):
+        coefficients[j] = (rhs[j]-math.fsum(r[j][k]*coefficients[k]
+                            for k in range(j+1,degree+1)))/r[j][j]
+    coefficients[0] += y0
+    coefficients = tuple(c/scale**j for j,c in enumerate(coefficients))
+    return Polynomial(reference, coefficients, min(x), max(x))
 
 
-def directions(points: Sequence[Point], threshold: float) -> Dict[Tuple[int, int], str]:
-    """Centered local temperature rate; never compare across a broken run."""
-    lookup = {(p.run,p.index): p for p in points}
-    out = {}
-    for p in points:
-        before = lookup.get((p.run,p.index-1), p)
-        after = lookup.get((p.run,p.index+1), p)
-        rate = ((after.temperature-before.temperature)*60/(after.time-before.time)
-                if after.time > before.time else 0.0)
-        out[(p.run,p.index)] = "warming" if rate > threshold else "cooling" if rate < -threshold else "steady"
-    return out
+def quantile(values, fraction):
+    ordered = sorted(values)
+    position = (len(ordered)-1)*fraction
+    i = int(position)
+    return ordered[i] + (ordered[min(i+1,len(ordered)-1)]-ordered[i])*(position-i)
 
 
-def temperature_groups(points: Sequence[Point], requested_width: float):
-    low, high = min(p.temperature for p in points), max(p.temperature for p in points)
-    # Keep the console table compact; never silently print hundreds of bins.
-    width = requested_width * max(1, math.ceil((high-low)/(12*requested_width)))
+def rmse(errors):
+    return math.sqrt(st.fmean(e*e for e in errors))
+
+
+def reduction(before, after):
+    return 'n/a' if before == 0 else f'{100*(1-after/before):+.2f}%'
+
+
+def spread(label, values):
+    sd = st.stdev(values) if len(values)>1 else 0.0
+    print(f'  {label:25s} {len(values):8,d} {st.fmean(values):14.6f} '
+          f'{sd*1000:12.3f} {(max(values)-min(values))*1000:12.3f} '
+          f'{(quantile(values,.95)-quantile(values,.05))*1000:12.3f}')
+
+
+def spread_header():
+    print('  series                           N        mean_ns        SD_ps       p-p_ps     P95-P5_ps')
+
+
+def name(degree, lag, width):
+    return f'{("constant", "linear", "quadratic", "cubic")[degree]} / lag {lag*width}s'
+
+
+def formula(model, lag_seconds):
+    print(f'  T_ref = {model.reference:.9f} C; x = T_C - T_ref')
+    print(f'  T_C is {"current block temperature" if not lag_seconds else str(lag_seconds)+" seconds earlier block temperature"}.')
+    expression = f'{model.coefficients[0]:.12g}'
+    for j,c in enumerate(model.coefficients[1:],1):
+        expression += f' {c:+.12g}*x' + (f'^{j}' if j>1 else '')
+    print(f'  predicted_LAP_ns = {expression}')
+    correction = ' '.join(f'{c:+.12g}*x'+(f'^{j}' if j>1 else '')
+                          for j,c in enumerate(model.coefficients[1:],1)) or '0'
+    print(f'  normalized_LAP_ns = measured_LAP_ns - ({correction})')
+    print(f'  Fitted temperature range: {model.low:.6f} .. {model.high:.6f} C')
+    for j,c in enumerate(model.coefficients):
+        print(f'    coefficient c{j} = {c:.12g} ns'+(f'/C^{j}' if j else ''))
+    if len(model.coefficients)>1:
+        print(f'  Sensitivity at T_ref: {model.coefficients[1]*1000:+.3f} ps/C')
+
+
+def shape(points, x, residual, args):
+    low, high = min(x), max(x)
+    width = max(args.temperature_bin_c,
+                args.temperature_bin_c*math.ceil((high-low)/(12*args.temperature_bin_c)))
     origin = math.floor(low/width)*width
     groups = {}
-    for p in points:
-        index = math.floor((p.temperature-origin)/width)
-        groups.setdefault(index, []).append(p)
-    return width, origin, groups
+    for i,t in enumerate(x):
+        groups.setdefault(math.floor((t-origin)/width),[]).append(i)
+    print(f'\n  FINAL TEST TEMPERATURE SHAPE ({width:g} C bins; residual = actual - frozen prediction)')
+    print('     mean_T_C    blocks     mean_LAP_ns    residual_ps   residual_SD_ps')
+    for _,indices in sorted(groups.items()):
+        e = [residual[i] for i in indices]
+        print(f'  {st.fmean(x[i] for i in indices):11.5f} {len(indices):9d} '
+              f'{st.fmean(points[i].lap_ns for i in indices):15.6f} '
+              f'{st.fmean(e)*1000:14.3f} '
+              f'{fmt(st.stdev(e)*1000 if len(e)>1 else None,3):>16}')
+    direction = {}
+    for i in range(1,len(points)):
+        a,b = points[i-1],points[i]
+        if a.run == b.run and b.index == a.index+1:
+            rate = (x[i]-x[i-1])*60/(b.time-a.time)
+            direction[i] = 'warm' if rate>args.direction_threshold_c_per_minute else (
+                'cool' if rate < -args.direction_threshold_c_per_minute else 'steady')
+    print('\n  FINAL TEST WARMING / COOLING (past-to-current predictor change)')
+    print(f'  Direction counts: {dict(Counter(direction.values()))}')
+    print('    mean_T_C   warm_N   cool_N   warm-minus-cool residual_ps')
+    gaps = []
+    for _,indices in sorted(groups.items()):
+        warm = [residual[i] for i in indices if direction.get(i)=='warm']
+        cool = [residual[i] for i in indices if direction.get(i)=='cool']
+        if len(warm)>=2 and len(cool)>=2:
+            gap = (st.fmean(warm)-st.fmean(cool))*1000
+            gaps.append(gap)
+            print(f'  {st.fmean(x[i] for i in indices):11.5f} {len(warm):8d} {len(cool):8d} {gap:32.3f}')
+    if not gaps:
+        print('  Insufficient overlapping warming/cooling blocks for a direction comparison.')
+    else:
+        print(f'  Largest absolute direction gap: {max(map(abs,gaps)):.3f} ps.')
+    print('  Persistent residual shape or direction gaps suggest temperature alone is incomplete.')
 
 
-def shape_report(points: Sequence[Point], model: Optional[Fit], args) -> None:
-    direction = directions(points, args.direction_threshold_c_per_minute)
-    width, origin, groups = temperature_groups(points, args.temperature_bin_c)
-    print(f"\n  Temperature shape ({width:g} C bins; SD describes block means, not individual laps):")
-    print("    mean_T_C    blocks       mean_LAP_ns     SD_ps     mean-fit_ps")
-    for _, bucket in sorted(groups.items()):
-        x, y = [p.temperature for p in bucket], [p.lap_ns for p in bucket]
-        residual = None if model is None else st.fmean(y)-model.predict(st.fmean(x),0)
-        print(f"    {st.fmean(x):8.4f} {len(y):9,d} {st.fmean(y):17.9f} "
-              f"{fmt(st.stdev(y)*1000 if len(y)>1 else None,3):>9} "
-              f"{fmt(None if residual is None else residual*1000,3):>15}")
-    counts = Counter(direction.values())
-    print(f"\n  Warming/cooling check: {dict(counts)}; steady band +/-{args.direction_threshold_c_per_minute:g} C/min")
-    comparisons = []
-    if model is not None:
-        for index, bucket in sorted(groups.items()):
-            warm = [p for p in bucket if direction[(p.run,p.index)] == "warming"]
-            cool = [p for p in bucket if direction[(p.run,p.index)] == "cooling"]
-            if len(warm) < 2 or len(cool) < 2:
-                continue
-            tw, tc = st.fmean(p.temperature for p in warm), st.fmean(p.temperature for p in cool)
-            # Adjust unequal within-bin temperatures to a common temperature.
-            # This is a descriptive linear adjustment, not a new calibration.
-            gap = st.fmean(p.lap_ns for p in warm)-st.fmean(p.lap_ns for p in cool)-model.beta*(tw-tc)
-            comparisons.append((origin+index*width, len(warm),len(cool),tw,tc,gap*1000))
-    if not comparisons:
-        print("    Insufficient shared-temperature warming/cooling support (need >=2 blocks each per bin).")
-        print("    A single warmup cannot establish a repeatable temperature-only function.")
-        return
-    print("    bin_low_C    warm cool    warm_T_C  cool_T_C   warm-minus-cool_ps")
-    for low, nw, nc, tw, tc, gap in comparisons:
-        print(f"    {low:9.4f} {nw:7d} {nc:4d} {tw:11.4f} {tc:9.4f} {gap:21.3f}")
-    print(f"    Largest absolute direction gap: {max(abs(c[-1]) for c in comparisons):.3f} ps.")
-    print("    Gaps use the fitted linear slope to adjust within-bin T differences; curvature can affect them.")
-
-
-def prediction_errors(actual: Sequence[float], predicted: Sequence[float]):
-    errors = [a-b for a,b in zip(actual,predicted)]
-    return math.sqrt(st.fmean(e*e for e in errors)), st.fmean(errors), st.stdev(errors) if len(errors)>1 else None
-
-
-def holdout_report(points: Sequence[Point], args) -> None:
-    # All lag candidates use identical targets. A run must contain the entire
-    # earlier predictor history; gaps are never interpolated or bridged.
-    steps = args.max_lag_seconds // args.bin_seconds
-    lookup = {(p.run,p.index): p for p in points}
-    targets = [p for p in points if p.index >= steps]
-    cut = 2*len(targets)//3
-    train, test = targets[:cut], targets[cut+steps+1:]
-    print(f"\n  Frozen later-data prediction (lags 0..{steps*args.bin_seconds}s; {len(train)} train / {len(test)} test blocks):")
-    if len(train) < MIN_TRAIN or len(test) < MIN_TEST:
-        print("    Need >=8 training and >=4 test blocks after lag support and separation.")
-        print("    Collect longer, reduce --bin-seconds, or reduce --max-lag-seconds.")
-        return
-    def temperatures(selected, lag):
-        return [lookup[(p.run,p.index-lag)].temperature for p in selected]
-    y = [p.lap_ns for p in train]
-    times = [p.time for p in train]
-    candidates = [(lag,fit(temperatures(train,lag),y)) for lag in range(steps+1)]
-    candidates = [(lag,m) for lag,m in candidates if m is not None]
-    if not candidates:
-        print("    Training temperature has no identifiable slope.")
-        return
-    lag, model = min(candidates, key=lambda item: (-item[1].r2,item[0]))
-    x, tx = temperatures(train,lag), temperatures(test,lag)
-    ty, tt = [p.lap_ns for p in test], [p.time for p in test]
-    trend = fit(times,y)
-    print(f"    Train {stamp(train[0].time)} .. {stamp(train[-1].time)}; test {stamp(test[0].time)} .. {stamp(test[-1].time)}")
-    print(f"    Training-selected lag +{lag*args.bin_seconds}s; slope {model.beta*1000:+.3f} ps/C")
-    print(f"    Frozen function: LAP_ns = {model.y0:.9f} + ({model.beta:+.9f}) * (T_C - {model.x0:.6f})")
-    low, high = min(x), max(x)
-    outside = sum(t < low or t > high for t in tx)
-    print(f"    Training T {low:.4f}..{high:.4f} C; {outside}/{len(tx)} test predictors outside that range.")
-    predictions = [("training mean",[st.fmean(y)]*len(test)),
-                   ("temperature",[model.predict(t,0) for t in tx])]
-    if trend is not None:
-        predictions.append(("elapsed time only",[trend.predict(t,0) for t in tt]))
-    print("    model                  RMSE_ps       bias_ps   residual_SD_ps")
-    scores = {}
-    for name, predicted in predictions:
-        rmse, bias, sd = prediction_errors(ty,predicted)
-        scores[name] = rmse
-        print(f"    {name:20s} {rmse*1000:10.3f} {bias*1000:13.3f} {fmt(None if sd is None else sd*1000,3):>16}")
-    if scores["training mean"] > 0:
-        print(f"    Temperature RMSE reduction vs training mean: {(1-scores['temperature']/scores['training mean'])*100:+.2f}%")
-    if "elapsed time only" in scores and scores["temperature"] >= scores["elapsed time only"]:
-        print("    Temperature did not beat elapsed-time prediction on this holdout.")
-    if lag == steps and steps:
-        print("    Chosen lag reaches the search limit; its optimum is not bracketed.")
-    print("    Coefficients/lag were frozen before evaluation; no test-set recentering.")
-
-
-@dataclass
-class Series:
-    label: str
-    campaign: str
-    signature: str
-    points: List[Point]
-    model: Optional[Fit]
-
-
-def epoch_report(campaign: str, samples: Sequence[Sample], reason: str, args) -> Series:
-    first, last = samples[0], samples[-1]
-    x, y = [s.temperature for s in samples], [s.lap_ns for s in samples]
-    label = f"{campaign}/epoch{first.epoch}"
-    print(f"\n{label}: {reason}")
-    print(f"  {stamp(first.time)} .. {stamp(last.time)}; {len(samples):,} usable seconds; {len(set(s.run for s in samples)):,} continuous runs")
-    print(f"  BME280 {min(x):.6f}..{max(x):.6f} C (span {max(x)-min(x):.6f}); LAP {min(y):.9f}..{max(y):.9f} ns")
-    same = longest = 1
-    repeated = 0
-    for a,b in zip(samples,samples[1:]):
-        if a.run == b.run and a.temperature == b.temperature:
-            same += 1
-            repeated += 1
-            longest = max(longest,same)
-        else:
-            same = 1
-    print(f"  Temperature snapshots: {len(set(x)):,} distinct values; {repeated:,} unchanged adjacent pairs; longest constant run {longest}s")
+def analyze(samples, reason, args):
+    print(f'\nEPOCH {samples[0].epoch}: {reason}')
+    print(f'  UTC {stamp(samples[0].time)} .. {stamp(samples[-1].time)}')
+    print(f'  Settings: {samples[0].signature}')
+    print(f'  Usable seconds: {len(samples):,}; continuous runs: {len(set(s.run for s in samples)):,}')
+    temperatures = [s.temperature for s in samples]
+    print(f'  BME280 range: {min(temperatures):.6f} .. {max(temperatures):.6f} C')
+    repeated = sum(a.run==b.run and a.temperature==b.temperature for a,b in zip(samples,samples[1:]))
+    print(f'  Adjacent identical BME280 readings: {repeated:,} (cached snapshots are not new independent readings).')
+    spread_header()
+    spread('all raw one-second means', [s.lap_ns for s in samples])
+    print(f'  Raw lap range: {min(s.lap_ns for s in samples):.9f} .. {max(s.lap_ns for s in samples):.9f} ns')
     points, omitted = blocks(samples,args.bin_seconds)
-    print(f"  Analysis uses {len(points):,} complete {args.bin_seconds}s blocks; {omitted:,} seconds in partial blocks omitted.")
-    model = association(points)
-    if points:
-        shape_report(points,model,args)
-        holdout_report(points,args)
-    return Series(label,campaign,first.signature,points,model)
-
-
-def transfer_report(series: Sequence[Series]) -> None:
-    print("\nCROSS-CAMPAIGN REPEATABILITY")
-    print("  Fit each source epoch separately; predict another campaign without refitting its offset.")
-    print("  Only matching recorded settings and temperatures inside the source's measured range are compared.")
-    comparisons = 0
-    for source in series:
-        if source.model is None:
+    print(f'  Complete {args.bin_seconds}-second blocks: {len(points):,}; seconds in incomplete blocks: {omitted:,}')
+    if len(points)<60:
+        print('  Need at least 60 complete blocks for model selection plus a later test.')
+        print('  Use a smaller --bin-seconds if continuity breaks leave too few complete blocks.')
+        return
+    print(f'  Descriptive block correlations: T vs LAP {fmt(pearson([p.temperature for p in points], [p.lap_ns for p in points]))}; '
+          f'T vs time {fmt(pearson([p.temperature for p in points], [p.time for p in points]))}')
+    lookup = {(p.run,p.index):p for p in points}
+    steps = args.max_lag_seconds//args.bin_seconds
+    targets = [p for p in points if p.index>=steps]
+    print(f'  Common target blocks for every candidate lag: {len(targets):,}/{len(points):,}')
+    if len(targets)<60:
+        print('  Too few blocks with complete lag history; reduce --max-lag-seconds or collect longer runs.')
+        return
+    cut = 7*len(targets)//10
+    development = targets[:cut]
+    # Time embargo prevents blocks/history from touching the preceding fit.
+    embargo = (steps+1)*args.bin_seconds
+    test = [p for p in targets[cut:] if p.time-development[-1].time>embargo]
+    folds = []
+    for fraction in (.4,.6,.8):
+        end = int(len(development)*fraction)
+        stop = int(len(development)*(fraction+.2)+1e-8)
+        train = development[:end]
+        validation = [p for p in development[end:stop] if p.time-train[-1].time>embargo]
+        if len(train)<10 or len(validation)<4:
+            print('  Not enough forward-validation support after separation; shorten blocks or lag range.')
+            return
+        folds.append((train,validation))
+    if len(test)<8:
+        print('  Need at least 8 final test blocks after separation; reduce the block/lag duration.')
+        return
+    def xs(rows,lag):
+        return [lookup[(p.run,p.index-lag)].temperature for p in rows]
+    def ys(rows):
+        return [p.lap_ns for p in rows]
+    print('\n  MODEL SELECTION (first 70% only; three expanding forward folds)')
+    print(f'  Separation: >{embargo}s; final test: {len(test):,} blocks, not used to choose degree or lag.')
+    for i,(train,val) in enumerate(folds,1):
+        print(f'  Fold {i}: fit {len(train):,}, validate {len(val):,}; validation {stamp(val[0].time)} .. {stamp(val[-1].time)}')
+    scored = []
+    for degree in range(args.max_degree+1):
+        for lag in (range(steps+1) if degree else [0]):
+            errors = []
+            fold_scores = []
+            for train,val in folds:
+                model = polynomial(xs(train,lag),ys(train),degree)
+                if model is None:
+                    break
+                e = [p.lap_ns-model.predict(t) for p,t in zip(val,xs(val,lag))]
+                errors.extend(e)
+                fold_scores.append(rmse(e))
+            if len(fold_scores)==3:
+                scored.append((degree,lag,rmse(errors),fold_scores))
+    print('  Best lag per degree; scores are prediction RMSE in ps:')
+    print('    candidate                    pooled       fold1       fold2       fold3')
+    best = []
+    for degree in range(args.max_degree+1):
+        entries = [entry for entry in scored if entry[0]==degree]
+        if not entries:
+            print(f'    degree {degree}: unidentifiable temperature population')
             continue
-        low, high = min(p.temperature for p in source.points),max(p.temperature for p in source.points)
-        for target in series:
-            if target.campaign == source.campaign or source.signature != target.signature:
-                continue
-            selected = [p for p in target.points if low <= p.temperature <= high]
-            if len(selected) < MIN_TEST:
-                continue
-            actual = [p.lap_ns for p in selected]
-            prediction = [source.model.predict(p.temperature,0) for p in selected]
-            rmse,bias,sd = prediction_errors(actual,prediction)
-            baseline = prediction_errors(actual,[source.model.y0]*len(selected))[0]
-            print(f"  {source.label} -> {target.label}: {len(selected)}/{len(target.points)} overlapping blocks")
-            print(f"    RMSE {rmse*1000:.3f} ps; bias {bias*1000:+.3f} ps; residual SD {fmt(None if sd is None else sd*1000,3)} ps; source-mean RMSE {baseline*1000:.3f} ps")
-            comparisons += 1
-    if not comparisons:
-        print("  No eligible comparison: supply multiple campaigns with matching settings and >=4 overlapping blocks.")
-    print("  These use contemporaneous BME280 (zero lag). Epochs/campaigns are never pooled to manufacture a slope.")
+        winner = min(entries,key=lambda e:(e[2],e[1]))
+        best.append(winner)
+        print(f'    {name(*winner[:2],args.bin_seconds):27s} '+ ' '.join(f'{v*1000:11.3f}' for v in [winner[2],*winner[3]]))
+    optimum = min(e[2] for e in scored)
+    # The tolerance is a declared engineering simplicity rule, not a confidence interval.
+    eligible = [e for e in scored if e[2]<=optimum*(1+args.simplicity_pct/100)+1e-12]
+    chosen = min(eligible,key=lambda e:(e[0],e[1]))
+    degree,lag,_,_ = chosen
+    print(f'  Choose simplest degree, then shortest lag, within {args.simplicity_pct:g}% of best CV RMSE.')
+    print(f'  FROZEN CHOICE: {name(degree,lag,args.bin_seconds)}')
+    model = polynomial(xs(development,lag),ys(development),degree)
+    assert model is not None
+    print('\n  FROZEN FORMULA (fitted on development only; no later-data recentering)')
+    formula(model,lag*args.bin_seconds)
+    tx, actual = xs(test,lag),ys(test)
+    predictions = [model.predict(t) for t in tx]
+    residual = [a-b for a,b in zip(actual,predictions)]
+    normalized = [a-model.correction(t) for a,t in zip(actual,tx)]
+    baseline = st.fmean(ys(development))
+    baseline_errors = [y-baseline for y in actual]
+    trend = polynomial([p.time for p in development],ys(development),1)
+    print('\n  FINAL UNSEEN TEST (same blocks in every comparison)')
+    print(f'  UTC {stamp(test[0].time)} .. {stamp(test[-1].time)}')
+    outside = [i for i,t in enumerate(tx) if not model.low<=t<=model.high]
+    print(f'  Predictor range: {min(tx):.6f} .. {max(tx):.6f} C; outside fit range: {len(outside):,}/{len(test):,}')
+    print('    prediction                       RMSE_ps        bias_ps     error_SD_ps')
+    comparisons = [('constant development mean',baseline_errors),('selected temperature formula',residual)]
+    if trend is not None:
+        comparisons.append(('elapsed-time line (diagnostic)',[p.lap_ns-trend.predict(p.time) for p in test]))
+    for label,e in comparisons:
+        print(f'    {label:31s} {rmse(e)*1000:12.3f} {st.fmean(e)*1000:14.3f} {st.stdev(e)*1000:15.3f}')
+    for label, indices in [('inside fit range',[i for i in range(len(tx)) if model.low<=tx[i]<=model.high]),
+                           ('outside fit range',outside)]:
+        if indices:
+            print(f'  {label}: {len(indices):,} blocks; formula RMSE {rmse([residual[i] for i in indices])*1000:.3f} ps; '
+                  f'constant RMSE {rmse([baseline_errors[i] for i in indices])*1000:.3f} ps')
+    spread_header()
+    spread('raw test block means',actual)
+    spread('normalized test blocks',normalized)
+    print(f'  Test RMSE reduction vs constant: {reduction(rmse(baseline_errors),rmse(residual))}')
+    print(f'  Test SD reduction: {reduction(st.stdev(actual),st.stdev(normalized))}')
+    print(f'  Test peak-to-peak reduction: {reduction(max(actual)-min(actual),max(normalized)-min(normalized))}')
+    print(f'  Residual correlation with T: {fmt(pearson(tx,residual))}; '
+          f'with elapsed time: {fmt(pearson([p.time for p in test],residual))}')
+    # Report actual one-second correction, separate from block-level fit performance.
+    # A block contains exactly width consecutive retained fragments in a run.
+    if lag==0:
+        selected = {(p.run,p.index) for p in test}
+        raw_seconds, corrected_seconds = [],[]
+        ordinal = Counter()
+        for s in samples:
+            index = ordinal[s.run]//args.bin_seconds
+            ordinal[s.run] += 1
+            if (s.run,index) in selected:
+                raw_seconds.append(s.lap_ns)
+                corrected_seconds.append(s.lap_ns-model.correction(s.temperature))
+        print('\n  SAME FINAL TEST, AT ONE-SECOND RESOLUTION (cached recorded temperature)')
+        spread_header()
+        spread('raw one-second means',raw_seconds)
+        spread('normalized one-second',corrected_seconds)
+        print('  Polynomial evaluated per second here; nonlinear averaging can differ from block evaluation.')
+    else:
+        print('  Lagged correction is evaluated at block resolution only; no interpolated one-second results.')
+    print('\n  FINAL TEST IN SIX CHRONOLOGICAL WINDOWS')
+    print('    UTC start                    N    mean_T_C  raw_mean_ns  normalized_mean_ns  residual_mean_ps')
+    for i in range(6):
+        indices = list(range(i*len(test)//6,(i+1)*len(test)//6))
+        if indices:
+            print(f'    {stamp(test[indices[0]].time):25s} {len(indices):5d} '
+                  f'{st.fmean(tx[j] for j in indices):11.5f} '
+                  f'{st.fmean(actual[j] for j in indices):12.6f} '
+                  f'{st.fmean(normalized[j] for j in indices):19.6f} '
+                  f'{st.fmean(residual[j] for j in indices)*1000:17.3f}')
+    shape(test,tx,residual,args)
+    print('\n  INTERPRETATION')
+    if degree==0:
+        print('  Forward validation did not justify a temperature correction under the simplicity rule.')
+    elif rmse(residual)<rmse(baseline_errors) and st.stdev(normalized)<st.stdev(actual):
+        print('  The frozen temperature formula improved both later prediction and later stability.')
+        print('  This is a candidate calibration for this setup and measured range, not yet a transfer test.')
+    else:
+        print('  The frozen formula did not improve both prediction and stability on later data.')
+        print('  Do not adopt it as an established correction; the residual tables identify what remains.')
+    if trend is not None and rmse(residual)>=rmse(comparisons[-1][1]):
+        print('  Temperature did not beat a simple elapsed-time line in this test; shared drift remains plausible.')
+    if outside:
+        print('  Some test temperatures are extrapolations; inspect inside-range results separately.')
+    if lag and lag==steps:
+        print('  Selected lag reaches the search boundary; a longer lag has not been evaluated.')
+    if degree==args.max_degree and degree>1:
+        print('  Selected curvature reaches the allowed degree; this alone is not a reason to increase it.')
+    print('  Full-data refitting is intentionally deferred so this displayed formula retains an honest test.')
 
 
-def export_csv(path: Path, campaigns: Sequence[Tuple[str, Sequence[Sample]]]) -> None:
-    with path.open("w",newline="",encoding="utf-8") as stream:
-        writer = csv.writer(stream)
-        writer.writerow(("campaign","row_id","published_at_utc","sequence","reset_count","update_count",
-                         "recovery_generation","epoch","run","bme280_temperature_c","lap_mean_ns","accepted_races"))
-        for campaign,samples in campaigns:
-            for s in samples:
-                writer.writerow((campaign,s.row_id,datetime.fromtimestamp(s.time,timezone.utc).isoformat(),
-                                 s.sequence,s.reset,s.update,s.generation,s.epoch,s.run,s.temperature,s.lap_ns,s.races))
-
-
-def arguments(argv: Sequence[str]) -> argparse.Namespace:
+def arguments(argv):
     parser = argparse.ArgumentParser(description=__doc__,formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("campaigns",nargs="+",help="one or more exact campaign names; analyzed separately")
-    parser.add_argument("--input",type=Path,help="read local PHOTONS JSON/JSONL instead of PostgreSQL")
-    parser.add_argument("--bin-seconds",type=int,default=60,help="nonoverlapping block duration (default 60)")
-    parser.add_argument("--temperature-bin-c",type=float,default=0.1,help="minimum temperature-bin width (default 0.1 C; enlarged for a compact table)")
-    parser.add_argument("--direction-threshold-c-per-minute",type=float,default=0.002,help="warming/cooling deadband (default +/-0.002 C/min)")
-    parser.add_argument("--max-lag-seconds",type=int,default=0,help="optional past-temperature lag search on training data (default 0)")
-    parser.add_argument("--skip-seconds",type=int,default=0,help="omit this duration from each campaign's first stored publication")
-    parser.add_argument("--start",type=utc,help="inclusive publication timestamp, with timezone")
-    parser.add_argument("--end",type=utc,help="exclusive publication timestamp, with timezone")
-    parser.add_argument("--batch-size",type=int,default=512)
-    parser.add_argument("--csv",type=Path,help="export the used raw per-second pairs, with campaign/epoch/run IDs")
+    parser.add_argument('campaign',help='exact campaign name, e.g. Short2')
+    parser.add_argument('--input',type=Path,help='PHOTONS JSON/JSONL instead of PostgreSQL')
+    parser.add_argument('--bin-seconds',type=int,default=60,help='complete nonoverlapping blocks (default 60)')
+    parser.add_argument('--max-degree',type=int,choices=(1,2,3),default=3,help='maximum polynomial degree (default 3)')
+    parser.add_argument('--max-lag-seconds',type=int,default=0,help='optional past-temperature search (default 0; multiple of block width)')
+    parser.add_argument('--simplicity-pct',type=float,default=5,help='prefer simpler models within this percent of best validation RMSE (default 5)')
+    parser.add_argument('--temperature-bin-c',type=float,default=.1,help='minimum report temperature-bin width (default .1)')
+    parser.add_argument('--direction-threshold-c-per-minute',type=float,default=.002)
+    parser.add_argument('--skip-seconds',type=int,default=0,help='omit initial campaign seconds (default 0)')
+    parser.add_argument('--start',type=utc,help='inclusive UTC/offset timestamp')
+    parser.add_argument('--end',type=utc,help='exclusive UTC/offset timestamp')
+    parser.add_argument('--batch-size',type=int,default=512)
     args = parser.parse_args(argv[1:])
-    if args.bin_seconds < 1 or args.batch_size < 1 or min(args.max_lag_seconds,args.skip_seconds) < 0:
-        parser.error("bin/batch sizes must be positive and lag/skip durations nonnegative")
-    if (not math.isfinite(args.temperature_bin_c) or args.temperature_bin_c <= 0 or
-            not math.isfinite(args.direction_threshold_c_per_minute) or args.direction_threshold_c_per_minute < 0):
-        parser.error("temperature-bin width must be positive and direction threshold nonnegative; both finite")
-    if args.start is not None and args.end is not None and args.start >= args.end:
-        parser.error("--start must precede --end")
-    if len(set(args.campaigns)) != len(args.campaigns):
-        parser.error("campaign names must be distinct")
+    if min(args.bin_seconds,args.batch_size)<1 or min(args.max_lag_seconds,args.skip_seconds)<0:
+        parser.error('block/batch size must be positive; lag/skip must be nonnegative')
+    if args.max_lag_seconds%args.bin_seconds:
+        parser.error('--max-lag-seconds must be a multiple of --bin-seconds')
+    if any(not math.isfinite(v) or v<0 for v in
+           (args.simplicity_pct,args.direction_threshold_c_per_minute)) or not math.isfinite(args.temperature_bin_c) or args.temperature_bin_c<=0:
+        parser.error('finite nonnegative tolerances and positive temperature-bin width required')
+    if args.start is not None and args.end is not None and args.start>=args.end:
+        parser.error('--start must precede --end')
     return args
 
 
-def main(argv: Sequence[str]) -> int:
+def main(argv):
     args = arguments(argv)
-    print("PHOTONS / BME280 RELATIONSHIP")
-    print("  Same-message temperature vs accepted one-second mean lap; equal weight per populated second.")
-    print("  Stored BME280 is a cached snapshot (normally ~30s or slower), not one fresh reading per second.")
-    print("  Exact sensor age is not recorded; repeated values are reported, never counted as independent experiments.")
-    print("  Continuity breaks distinguish counter gaps from publication timing; reasons may overlap and do not count crashes.")
-    all_samples = []
-    series = []
-    empty = False
-    for campaign in args.campaigns:
-        selected_args = argparse.Namespace(**vars(args),campaign=campaign)
-        rows = file_rows(args.input,campaign) if args.input else database_rows(selected_args)
-        samples,counts,reasons = collect(rows,selected_args)
-        print(f"\nCAMPAIGN {campaign}: " + "; ".join(f"{k}={v:,}" for k,v in counts.items()))
-        if not samples:
-            print("  No usable one-second pairs in this campaign/time range.")
-            empty = True
-            continue
-        all_samples.append((campaign,samples))
-        for epoch,reason in reasons.items():
-            series.append(epoch_report(campaign,[s for s in samples if s.epoch == epoch],reason,args))
-    if len(args.campaigns) > 1:
-        transfer_report(series)
-    if args.csv:
-        export_csv(args.csv,all_samples)
-        print(f"\nRaw paired observations exported: {args.csv}")
-    print("\nREADING THE RESULT")
-    print("  Look for consistent slopes, small same-temperature direction gaps, and low frozen prediction error.")
-    print("  A high R2 from one warmup does not establish determinism; compare cooling and separate campaigns.")
-    print("  SD here describes variation among time-block means, not individual-lap scatter or calibration uncertainty.")
-    print("  Adjacent observations can be correlated: no independent-sample p-values or standard errors are reported.")
-    print("  Unknown changes in hardware, clock speed or laser settings still require separate operator-selected runs.")
-    print("  Analysis only: raw data, live masthead and statistical populations are unchanged.")
-    return 1 if empty else 0
+    print(f'PHOTONS THERMAL NORMALIZATION REPORT {VERSION}',flush=True)
+    print(f'Campaign: {args.campaign}; generated UTC: {datetime.now(timezone.utc).isoformat(timespec="seconds")}')
+    print(f'Options: block={args.bin_seconds}s, max_degree={args.max_degree}, max_lag={args.max_lag_seconds}s, simplicity={args.simplicity_pct:g}%')
+    print(f'Selection: start={args.start}, end={args.end}, skip={args.skip_seconds}s; source={args.input or "read-only database"}')
+    print('Predictor: environment.temperature_c (BME280); target: photons.race.flight_ns.mean (ns).')
+    print('Equal weight per usable second; no cumulative means; no rejection based on lap magnitude.')
+    print('Loading campaign observations...',flush=True)
+    rows = file_rows(args.input,args.campaign) if args.input else database_rows(args)
+    samples,counts,reasons = collect(rows,args)
+    print('\nDATA ACCOUNTING')
+    for key,value in counts.items():
+        print(f'  {key}: {value:,}')
+    print('  Continuity-break reason counts can overlap. Partial blocks and lag-history losses are reported per epoch.')
+    if not samples:
+        print('No usable temperature/lap pairs. Report the accounting above before changing any filters.')
+        return 1
+    epochs = {}
+    for sample in samples:
+        epochs.setdefault(sample.epoch,[]).append(sample)
+    for epoch,observations in epochs.items():
+        analyze(observations,reasons[epoch],args)
+    print('\nREPORT NOTES')
+    print('  Epochs are fitted separately across recorded settings changes, resets and recovery.')
+    print('  Blocks and lag history never cross continuity gaps. Unknown hardware changes need explicit time selection.')
+    print('  All printed SDs describe one-second or block means, not individual-photon jitter or calibration uncertainty.')
+    print('  Time-correlated observations and cached temperatures are not independent thermal experiments.')
+    print('  No p-values or independent-sample confidence claims; validation tests prediction, not causation.')
+    print('  Repeatedly tuning against this final test makes it exploratory; confirm revisions on newly collected data.')
+    print('  No database writes, live compensation, stored measurements, or additional output files.')
+    print('END PHOTONS THERMAL REPORT')
+    return 0
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     raise SystemExit(main(sys.argv))
