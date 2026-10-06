@@ -88,6 +88,18 @@ find_command(const process_vtable_t* vtable, const char* name) {
     return nullptr;
 }
 
+static bool parse_positive_decimal_u64(const char* text, uint64_t& value) {
+    if (!text || !*text) return false;
+    value = 0ULL;
+    for (const char* p = text; *p; ++p) {
+        if (*p < '0' || *p > '9') return false;
+        const uint64_t digit = (uint64_t)(*p - '0');
+        if (value > (UINT64_MAX - digit) / 10ULL) return false;
+        value = value * 10ULL + digit;
+    }
+    return value != 0ULL;
+}
+
 // ============================================================================
 // Canonical helpers
 // ============================================================================
@@ -237,7 +249,8 @@ const process_vtable_t* process_get_vtable_by_name(const char* name) {
 // REQUEST / RESPONSE Command Processor (INSTRUMENTED)
 // ============================================================================
 
-void process_command(const Payload& request) {
+// RPC dispatch runs in foreground; reserve ITCM for timing-sensitive work.
+FLASHMEM void process_command(const Payload& request) {
 
     rpc_received++;
 
@@ -287,6 +300,25 @@ void process_command(const Payload& request) {
         return;
     }
 
+    // PHOTONS alone admits the operator shorthand `tc photons laps=N`.
+    // Normalize the command token here; the ordinary LAPS handler owns the
+    // rate limits and mutation, exactly as for structured {"laps": N} args.
+    const bool inline_laps = strcmp(subsystem_c, "PHOTONS") == 0 &&
+                             strncmp(command_c, "LAPS=", 5) == 0;
+    uint64_t inline_laps_value = 0ULL;
+    if (inline_laps) {
+        if (!parse_positive_decimal_u64(command_c + 5, inline_laps_value)) {
+            rpc_error_unknown_command++;
+            response.add("success", false);
+            response.add("message", "BAD");
+            response.add_object("payload", make_error_payload(
+                "PHOTONS LAPS= requires a positive decimal integer"));
+            send_response_or_overflow(request, response);
+            return;
+        }
+        command_c = "LAPS";
+    }
+
     // ---- Error path: unknown command ----
 
     const process_command_entry_t* entry =
@@ -302,14 +334,31 @@ void process_command(const Payload& request) {
         return;
     }
 
-    // ---- Happy path ----
-
-    rpc_routed++;
-
     Payload args;
     if (request.has("args")) {
         args = request.getPayload("args");
     }
+    if (inline_laps) {
+        uint64_t structured_laps = 0ULL;
+        if (args.has("laps")) {
+            if (!args.tryGetUInt64("laps", structured_laps) ||
+                structured_laps != inline_laps_value) {
+                rpc_error_unknown_command++;
+                response.add("success", false);
+                response.add("message", "BAD");
+                response.add_object("payload", make_error_payload(
+                    "PHOTONS LAPS= conflicts with structured laps argument"));
+                send_response_or_overflow(request, response);
+                return;
+            }
+        } else {
+            args.add("laps", inline_laps_value);
+        }
+    }
+
+    // ---- Happy path ----
+
+    rpc_routed++;
 
     rpc_handler_invoked++;
 
@@ -321,7 +370,13 @@ void process_command(const Payload& request) {
     // merely to add the RPC envelope: transport writes the four small metadata
     // fields and the handler JSON directly into the final queued wire image.
     // This keeps peak RAM2 demand to the handler Payload plus one TX allocation.
-    if (!transport_send_response(req_id, req_ts_ms, true, "OK", payload)) {
+    // Rate-setting rejections must remain failures at the operator/RPC surface.
+    // Preserve the existing envelope convention for every other command.
+    const bool rate_rejected = strcmp(subsystem_c, "PHOTONS") == 0 &&
+        (strcmp(command_c, "LAPS") == 0 || strcmp(command_c, "ENABLE") == 0) &&
+        payload.has("error");
+    if (!transport_send_response(req_id, req_ts_ms, !rate_rejected,
+                                 rate_rejected ? "BAD" : "OK", payload)) {
         send_overflow_response(request);
     }
 

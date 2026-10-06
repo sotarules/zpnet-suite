@@ -94,8 +94,16 @@
 //                           active-high DRV200 MOD command LOW/idle
 //   • DETECTOR_ACTIVATE   — commissioning-only activation of the already-subscribed PD200T
 //                           interrupt lane; requires the subsystem to be ENABLED
-//   • ENABLE [interval=N] — admit detector + laser cadence; Pi recovery then
+//   • ENABLE [laps=N]     — admit detector + laser cadence; Pi recovery then
 //                           establishes statistical ancestry and 1 Hz publication
+//                           interval= is retired; omitted laps retains the current request
+//                           Use LAPS to change the rate of an already enabled instrument.
+//   • LAPS [laps=N]       — inspect/set nominal launch opportunities per second
+//                           (tc photons laps=N shorthand). Default/bounds live in config.h.
+//                           A live change applies after the current capture window closes,
+//                           with no statistics/campaign reset or catch-up pulse burst.
+//                           Disabled/stopped instruments stay stopped. Accepted throughput
+//                           can be lower because of foreground work, quiet guards and rejects.
 //   • DISABLE             — quiesce detector, laser, races and fragment publication;
 //                           preserve established campaign/statistical history
 //   • START               — start a LANTERN campaign, or hot-cut an active campaign to a new name
@@ -628,6 +636,10 @@ struct photons_fragment_snapshot_t {
   bool race_engine_active = false;
   uint32_t race_cadence_hz = 0;
   uint64_t race_cadence_ns = 0;
+  // Configuration at the fragment boundary; a batch may straddle a rate change.
+  // Legacy cadence_hz remains floor(1e9/cadence_ns), not the requested rate.
+  uint32_t race_requested_laps_per_second = 0;
+  uint32_t race_applied_laps_per_second = 0;
   uint32_t race_pending_return_count = 0;
   uint32_t race_pending_return_count_previous = 0;
   uint64_t race_pulse_ns = 0;

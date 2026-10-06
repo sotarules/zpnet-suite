@@ -127,16 +127,27 @@ static constexpr uint64_t PHOTONS_PULSE_DEFAULT_NS = 1000ULL;
 // Commissioning parameters live together in config.h. They describe the
 // electrical pulse and observed GPIO/ISR receive interval, not fiber length.
 
-static constexpr uint64_t PHOTONS_CADENCE_MIN_NS = 10000ULL;
-static constexpr uint64_t PHOTONS_CADENCE_DEFAULT_NS = 500000ULL;
-static constexpr uint64_t PHOTONS_CADENCE_MAX_NS = 1000000000ULL;
+static_assert(PHOTONS_MIN_LAPS_PER_SECOND > 0U &&
+              PHOTONS_MIN_LAPS_PER_SECOND <= PHOTONS_DEFAULT_LAPS_PER_SECOND &&
+              PHOTONS_DEFAULT_LAPS_PER_SECOND <= PHOTONS_MAX_LAPS_PER_SECOND,
+              "PHOTONS default lap rate must fit the configured bounds");
+static constexpr uint64_t photons_interval_from_laps(uint32_t laps) {
+  return (PHOTONS_NS_PER_SECOND + laps - 1ULL) / laps;
+}
+static constexpr uint64_t PHOTONS_CADENCE_MIN_NS =
+    photons_interval_from_laps(PHOTONS_MAX_LAPS_PER_SECOND);
 static_assert(PHOTONS_RACE_PULSE_NS > 0ULL &&
               PHOTONS_RACE_PULSE_NS < PHOTONS_CADENCE_MIN_NS,
               "PHOTONS pulse must fit the minimum cadence interval");
 
 static constexpr uint32_t PHOTONS_RACE_HOLDOFF_NS = 0U; // retired wire field
 static bool g_photons_cadence_running = false;
-static uint64_t g_photons_cadence_ns = PHOTONS_CADENCE_DEFAULT_NS;
+// A live request takes effect after the old shot is settled at its ordinary
+// cadence boundary. Both rates are always defined; inequality means pending work.
+static uint32_t g_photons_requested_laps_per_second = PHOTONS_DEFAULT_LAPS_PER_SECOND;
+static uint32_t g_photons_applied_laps_per_second = PHOTONS_DEFAULT_LAPS_PER_SECOND;
+static uint64_t g_photons_cadence_ns =
+    photons_interval_from_laps(PHOTONS_DEFAULT_LAPS_PER_SECOND);
 static uint32_t g_photons_cadence_cycles = 0U;
 static uint32_t g_photons_race_pulse_cycles = 0U;
 // An actual launch normally anchors the next opportunity. A quiet-window skip
@@ -3206,6 +3217,25 @@ static void photons_race_close_window(void) {
   (void)photons_race_pending_return(race);
 }
 
+static void photons_cadence_apply_requested_rate(void) {
+  const uint32_t laps = g_photons_requested_laps_per_second;
+  if (laps < PHOTONS_MIN_LAPS_PER_SECOND ||
+      laps > PHOTONS_MAX_LAPS_PER_SECOND) __builtin_trap();
+  const uint64_t interval_ns = photons_interval_from_laps(laps);
+  const uint32_t cps = F_CPU_ACTUAL;
+  if (cps == 0U) __builtin_trap();
+  const uint64_t cycles =
+      ((uint64_t)cps * interval_ns + PHOTONS_NS_PER_SECOND - 1ULL) /
+      PHOTONS_NS_PER_SECOND;
+  if (cycles == 0ULL || cycles >= 0x80000000ULL) __builtin_trap();
+  g_photons_cadence_ns = interval_ns;
+  g_photons_cadence_cycles = (uint32_t)cycles;
+  g_photons_race_pulse_cycles = (uint32_t)(
+      ((uint64_t)cps * PHOTONS_RACE_PULSE_NS + PHOTONS_NS_PER_SECOND - 1ULL) /
+      PHOTONS_NS_PER_SECOND);
+  g_photons_applied_laps_per_second = laps;
+}
+
 static bool photons_cadence_ready(void*) {
   // TIMEPOP checks this in SpinIdle and before foreground service. Unsigned
   // subtraction crosses DWT wrap without moving the deadline onto a timer grid.
@@ -3225,6 +3255,11 @@ static void photons_cadence_service(void*) {
   photons_histogram_acquire();
   interrupt_photodiode_boundary_begin();
   photons_race_close_window();
+  // Keep the old shot's full window, even when the new cadence is shorter.
+  // The next shot and quiet-window check use the newly applied rate together.
+  if (g_photons_requested_laps_per_second != g_photons_applied_laps_per_second) {
+    photons_cadence_apply_requested_rate();
+  }
   auto& race = g_photons_race_foreground;
   // Complete the decision, physical launch, and receive arming as one bounded
   // transaction. Priority-0 clocks remain live; lower-priority work cannot hold
@@ -3298,14 +3333,7 @@ static void photons_cadence_stop(void) {
 
 static void photons_cadence_start(void) {
   if (g_photons_cadence_running) __builtin_trap();
-  const uint32_t cps = F_CPU_ACTUAL;
-  if (cps == 0U) __builtin_trap();
-  const uint64_t cycles =
-      ((uint64_t)cps * g_photons_cadence_ns + 999999999ULL) / 1000000000ULL;
-  if (cycles == 0ULL || cycles >= 0x80000000ULL) __builtin_trap();
-  g_photons_cadence_cycles = (uint32_t)cycles;
-  g_photons_race_pulse_cycles = (uint32_t)(
-      ((uint64_t)cps * PHOTONS_RACE_PULSE_NS + 999999999ULL) / 1000000000ULL);
+  photons_cadence_apply_requested_rate();
   g_photons_cadence_launches_since_start = 0ULL;
   photons_laser_mod_idle();
   g_photons_race_foreground.active = g_photons_recovery.publication_started;
@@ -4663,6 +4691,8 @@ static Payload& photons_fragment_payload(
   race.add("active", f.race_engine_active);
   race.add("cadence_hz", f.race_cadence_hz);
   race.add("cadence_ns", f.race_cadence_ns);
+  race.add("requested_laps_per_second", f.race_requested_laps_per_second);
+  race.add("applied_laps_per_second", f.race_applied_laps_per_second);
   race.add("pulse_ns", f.race_pulse_ns);
   race.add("launch_surrogate", "DRV200_MOD_HIGH_EDGE_OBSERVED");
   race.add("flight_interpretation", "OBSERVED_DWT_ENDPOINTS");
@@ -5162,6 +5192,8 @@ static FLASHMEM void photons_fragment_tick(
       fragment, race, g_last_fragment_race_completed_count,
       g_last_fragment_race_attempt_count, g_last_fragment_race_missed_count);
   fragment.race_cadence_ns = g_photons_cadence_ns;
+  fragment.race_requested_laps_per_second = g_photons_requested_laps_per_second;
+  fragment.race_applied_laps_per_second = g_photons_applied_laps_per_second;
   fragment.race_cadence_hz = (uint32_t)(PHOTONS_NS_PER_SECOND / g_photons_cadence_ns);
   fragment.race_pulse_ns = PHOTONS_RACE_PULSE_NS;
   fragment.race_cadence_tick_count_total = race.cadence_tick_count;
@@ -5563,12 +5595,11 @@ static void photons_start_fragment_publisher(void) {
 // Initialization
 // ============================================================================
 
-static FLASHMEM void photons_enable_acquisition(uint64_t interval_ns) {
+static FLASHMEM void photons_enable_acquisition(void) {
   if (!g_initialized || !g_subscription_ok) __builtin_trap();
   photons_laser_mod_idle();
   g_pulse_armed_sequence = 0U;
   photons_memory_barrier();
-  g_photons_cadence_ns = interval_ns;
 
   if (!interrupt_start(interrupt_subscriber_kind_t::PHOTODIODE)) {
     __builtin_trap();
@@ -5702,7 +5733,7 @@ FLASHMEM void process_photons_init(void) {
   timepop_register_foreground_service(
       photons_cadence_ready, photons_cadence_service, nullptr);
   g_initialized = true;
-  photons_enable_acquisition(g_photons_cadence_ns);
+  photons_enable_acquisition();
 }
 
 // ============================================================================
@@ -7003,6 +7034,8 @@ static FLASHMEM Payload cmd_report_photons(const Payload& /*args*/) {
   p.add("race_holdoff_max_cycles", canonical.race_holdoff_max_cycles);
   p.add("race_cadence_hz", canonical.race_cadence_hz);
   p.add("race_cadence_ns", canonical.race_cadence_ns);
+  p.add("race_requested_laps_per_second", canonical.race_requested_laps_per_second);
+  p.add("race_applied_laps_per_second", canonical.race_applied_laps_per_second);
   p.add("race_pulse_ns", PHOTONS_RACE_PULSE_NS);
   p.add("race_launch_surrogate", "DRV200_MOD_HIGH_EDGE_OBSERVED");
   p.add("race_cadence_tick_count_total", canonical.race_cadence_tick_count_total);
@@ -7493,8 +7526,18 @@ static FLASHMEM Payload cmd_detector_activate(const Payload& /*args*/) {
 
 static void photons_cadence_report(Payload& p) {
   p.add("laser_cadence_running", g_photons_cadence_running);
+  p.add("requested_laps_per_second", g_photons_requested_laps_per_second);
+  p.add("applied_laps_per_second", g_photons_applied_laps_per_second);
+  p.add("default_laps_per_second", PHOTONS_DEFAULT_LAPS_PER_SECOND);
+  p.add("min_laps_per_second", PHOTONS_MIN_LAPS_PER_SECOND);
+  p.add("max_laps_per_second", PHOTONS_MAX_LAPS_PER_SECOND);
+  p.add("lap_rate_semantics", "NOMINAL_LAUNCH_OPPORTUNITIES_PER_SECOND");
+  p.add("lap_rate_apply_policy", "AFTER_CURRENT_CAPTURE_WINDOW");
+  p.add("requested_interval_ns",
+        photons_interval_from_laps(g_photons_requested_laps_per_second));
   p.add("laser_cadence_scheduling", "ACTUAL_LAUNCH_OR_QUIET_SKIP_DWT");
   p.add("laser_cadence_ns", g_photons_cadence_ns);
+  p.add("laser_cadence_cycles", g_photons_cadence_cycles);
   p.add("laser_pulse_ns", PHOTONS_RACE_PULSE_NS);
   p.add("laser_launch_count_total", g_photons_laser_launch_count);
   p.add("laser_cadence_deferred_count", g_photons_cadence_deferred_count);
@@ -7510,23 +7553,59 @@ static void photons_cadence_report(Payload& p) {
   p.add("laser_timing", "TIMEPOP_FOREGROUND_ACTUAL_DWT_AT_MOD_HIGH");
 }
 
+static FLASHMEM Payload cmd_laps(const Payload& args) {
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::COMMAND);
+  if (!g_initialized || !g_subscription_ok) __builtin_trap();
+
+  uint64_t laps = g_photons_requested_laps_per_second;
+  if (args.has("interval") ||
+      (args.has("laps") && !args.tryGetUInt64("laps", laps)) ||
+      laps < PHOTONS_MIN_LAPS_PER_SECOND || laps > PHOTONS_MAX_LAPS_PER_SECOND) {
+    Payload p;
+    p.add("status", "laps_rejected");
+    p.add("error", "use laps=<integer laps per second> within the reported bounds");
+    photons_cadence_report(p);
+    return p;
+  }
+  if (args.has("laps")) {
+    g_photons_requested_laps_per_second = (uint32_t)laps;
+    // A stopped instrument is configured without starting its laser or detector.
+    if (!g_photons_cadence_running) photons_cadence_apply_requested_rate();
+  }
+
+  Payload p;
+  p.add("status", !args.has("laps") ? "laps_report" :
+      (g_photons_requested_laps_per_second == g_photons_applied_laps_per_second
+          ? "laps_configured" : "laps_pending"));
+  photons_cadence_report(p);
+  return p;
+}
+
 static FLASHMEM Payload cmd_enable(const Payload& args) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
 
-  uint64_t interval_ns = g_photons_cadence_ns;
-  if ((args.has("interval") && !args.tryGetUInt64("interval", interval_ns)) ||
-      interval_ns < PHOTONS_CADENCE_MIN_NS ||
-      interval_ns > PHOTONS_CADENCE_MAX_NS) {
+  uint64_t laps = g_photons_requested_laps_per_second;
+  if (args.has("interval") ||
+      (args.has("laps") && !args.tryGetUInt64("laps", laps)) ||
+      laps < PHOTONS_MIN_LAPS_PER_SECOND || laps > PHOTONS_MAX_LAPS_PER_SECOND) {
     Payload p;
-    p.add("status", "enable_rejected_interval");
-    p.add("error", "interval must be integer nanoseconds in 10000..1000000000");
+    p.add("status", "enable_rejected_laps");
+    p.add("error", "ENABLE uses laps=<integer laps per second>; interval is retired");
+    photons_cadence_report(p);
     return p;
   }
   if (!g_initialized || !g_subscription_ok) __builtin_trap();
 
   if (g_photons_enabled) {
     Payload p;
+    if (args.has("laps") && laps != g_photons_requested_laps_per_second) {
+      p.add("status", "enable_rejected_live_rate_change");
+      p.add("error", "already enabled; use PHOTONS LAPS to change the live rate");
+      photons_cadence_report(p);
+      return p;
+    }
     p.add("status", "already_enabled");
     p.add("enabled", true);
     photons_cadence_report(p);
@@ -7542,7 +7621,8 @@ static FLASHMEM Payload cmd_enable(const Payload& args) {
     __builtin_trap();
   }
 
-  photons_enable_acquisition(interval_ns);
+  g_photons_requested_laps_per_second = (uint32_t)laps;
+  photons_enable_acquisition();
 
   Payload p;
   p.add("status", "enabled");
@@ -7940,6 +8020,7 @@ static const process_command_entry_t PHOTONS_COMMANDS[] = {
   { "INIT",                cmd_init                },
   { "DETECTOR_ACTIVATE",   cmd_detector_activate   },
   { "ENABLE",              cmd_enable              },
+  { "LAPS",                cmd_laps                },
   { "DISABLE",             cmd_disable             },
   { "START",               cmd_start               },
   { "FLASH_CUT",           cmd_flash_cut           },

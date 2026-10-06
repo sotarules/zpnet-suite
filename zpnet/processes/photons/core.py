@@ -8324,7 +8324,9 @@ def cmd_enable(args: Optional[dict]) -> Dict[str, Any]:
                 },
             }
 
-        enable_args = {"interval": 500_000, **copy.deepcopy(args or {})}
+        # Firmware owns the configured laps/second; no-argument ENABLE must
+        # preserve that setting rather than overwrite it with a Pi default.
+        enable_args = copy.deepcopy(args or {})
         try:
             firmware_enable = (
                 {"status": "already_enabled", **copy.deepcopy(report)}

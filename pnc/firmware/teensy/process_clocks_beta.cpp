@@ -2589,7 +2589,8 @@ static bool restore_get_bool(const Payload& args, const char* key,
   return args.tryGetBool(key, out);
 }
 
-static bool restore_parse_welford(const Payload& args,
+// Recovery argument parsing is command-only and does not need scarce ITCM.
+static FLASHMEM bool restore_parse_welford(const Payload& args,
                                   const char* prefix,
                                   welford_t& out) {
   char key[72];
@@ -2609,7 +2610,7 @@ static bool restore_parse_welford(const Payload& args,
           out.min_val <= out.max_val);
 }
 
-static bool restore_parse_tau(const Payload& args,
+static FLASHMEM bool restore_parse_tau(const Payload& args,
                               const char* prefix,
                               time_clock_id_t clock_id,
                               clocks_alpha_tau_snapshot_t& out) {
@@ -2669,7 +2670,7 @@ static bool restore_parse_tau(const Payload& args,
          isfinite(out.interval_m2_ppb) && out.interval_m2_ppb >= 0_D;
 }
 
-static bool clocks_recovery_state_from_args(
+static FLASHMEM bool clocks_recovery_state_from_args(
     const Payload& args,
     clocks_recovery_restore_state_t& out) {
   out = clocks_recovery_restore_state_t{};
@@ -9833,7 +9834,7 @@ static bool clocks_ppb_restore_lifecycle_idle(void) {
          !clocks_campaign_recovery_lifecycle_active();
 }
 
-static bool clocks_ppb_restore_parse_endpoint(
+static FLASHMEM bool clocks_ppb_restore_parse_endpoint(
     const Payload& args,
     const char* prefix,
     clocks_alpha_ppb_cumulative_endpoint_snapshot_t& out) {
