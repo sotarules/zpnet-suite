@@ -1,25 +1,23 @@
 """Teensy-owned PT1000 observations mirrored into Pi SYSTEM context.
 
 Independent of the slow platform poller; REPORT performs no hardware I/O.
-PHOTONS uses this fresh RTD context as its normalization authority.
-The BME280 environment remains an independent witness.
+Fresh conversions enter SYSTEM's temperature mean once each. The direct Teensy
+RTD_REPORT remains instantaneous, preserving the firmware's forensic evidence.
 """
 
 import copy
 import math
-import threading
 import time
 
-_LOCK = threading.Lock()
-_READING = {"source": "TEENSY.SPI1.MAX31865", "status": "INITIALIZING"}
-_OBSERVED_AT = 0.0
-POLL_SECONDS = 1.0
-MAX_AGE_MS = 3000
+from zpnet.processes.system.temperature import accept_temperature, build_sensor_status, feature_status
+from zpnet.shared.temperature import TEMPERATURE_POLICY
+
+_POLICY = TEMPERATURE_POLICY["sources"]["rtd"]
+POLL_SECONDS = _POLICY["sample_period_ms"] / 1000
 
 
 def _accept_reading(reading: dict, request_started: float) -> None:
     """Store a complete response; never merge old temperature into new faults."""
-    global _READING, _OBSERVED_AT
     if not isinstance(reading, dict) or reading.get("schema") != "PT1000_MAX31865_V1":
         raise ValueError("missing PT1000_MAX31865_V1 response")
     item = copy.deepcopy(reading)
@@ -33,44 +31,27 @@ def _accept_reading(reading: dict, request_started: float) -> None:
     else:
         item.pop("temperature_c", None)
         item.pop("resistance_ohms", None)
-    with _LOCK:
-        _READING = item
-        # Request start conservatively includes RPC transit in sample age.
-        _OBSERVED_AT = request_started
+    key = (item["sample_sequence"], item["sampled_at_ms32"]) if item["status"] == "OK" else ()
+    accept_temperature("rtd", item, key, request_started)
 
 
 def _unavailable(reason: str) -> None:
-    global _READING, _OBSERVED_AT
-    with _LOCK:
-        _READING = {
-            "source": "TEENSY.SPI1.MAX31865",
-            "status": "UNAVAILABLE",
-            "error": reason,
-        }
-        _OBSERVED_AT = time.monotonic()
+    accept_temperature("rtd", {
+        "source": _POLICY["source"],
+        "schema": _POLICY["schema"],
+        "status": "UNAVAILABLE",
+        "error": reason,
+    }, (), time.monotonic())
 
 
 def build_rtd_status() -> dict:
-    with _LOCK:
-        item = copy.deepcopy(_READING)
-        observed_at = _OBSERVED_AT
-    elapsed_ms = max(0, int((time.monotonic() - observed_at) * 1000))
-    if item.get("status") == "OK":
-        item["age_ms"] += elapsed_ms
-        if item["age_ms"] > MAX_AGE_MS:
-            item["status"] = "STALE"
-            item.pop("temperature_c", None)
-            item.pop("resistance_ohms", None)
-    return item
+    return build_sensor_status("rtd")
 
 
 
 def rtd_feature_status() -> str:
     """Derive readiness from the same aging cache used by SYSTEM.REPORT."""
-    status = build_rtd_status()["status"]
-    if status == "INITIALIZING":
-        return "INITIALIZING"
-    return "NOMINAL" if status == "OK" else "HOLD"
+    return feature_status(build_rtd_status()["status"])
 
 
 def rtd_monitor() -> None:

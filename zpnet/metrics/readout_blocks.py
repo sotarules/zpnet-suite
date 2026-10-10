@@ -145,7 +145,6 @@ class _HeaderTelemetry:
 
 
 _HEADER_PI = _HeaderTelemetry("PI", "REPORT_METRICS")
-_HEADER_TEENSY = _HeaderTelemetry("TEENSY", "REPORT")
 
 
 class _RollingPubSubTap:
@@ -1056,9 +1055,12 @@ def _header_temperature(value, digits: int = 2) -> str:
 def status_header() -> str:
     try:
         s = _HEADER_PI.get()
-        teensy = _HEADER_TEENSY.get()
         net = s.get("network", {}).get("ssid") or "?"
-        pi_temperature = _header_temperature(s.get("pi", {}).get("cpu_temp_c"))
+        synthetic = s.get("temperature", {})
+        synthetic_temperature = (
+            _header_temperature(synthetic.get("temperature_c"), 4)
+            if synthetic.get("status") == "OK" else "?"
+        )
         rtd = s.get("rtd", {})
         rtd_temperature = (
             _header_temperature(rtd.get("temperature_c"), 4)
@@ -1068,7 +1070,6 @@ def status_header() -> str:
         temperature = _header_temperature(environment.get("temperature_c"), 4)
         if environment.get("stale") or environment.get("read_ok") is False:
             temperature = "?"
-        teensy_temperature = _header_temperature(teensy.get("cpu_temp_c"))
         gnss_mode = _gnss_from_system_snapshot(s).get("pos_mode") or "?"
 
         bat_v = "?"
@@ -1085,10 +1086,9 @@ def status_header() -> str:
         return (
             f" NET: {net}"
             f"  BAT: {bat_v}"
+            f"  TEMP: {synthetic_temperature}"
             f"  MAX31865: {rtd_temperature}"
             f"  BME280: {temperature}"
-            f"  PI: {pi_temperature}"
-            f"  TEENSY: {teensy_temperature}"
             f"  GNSS: {gnss_mode}"
         )
     except Exception:

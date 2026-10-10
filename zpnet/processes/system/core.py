@@ -7,12 +7,13 @@ Responsibilities:
   • Own the operator-selected current location and its durable SYSTEM config state
   • Coordinate named-location capture/selection with the GNSS receiver authority
   • Maintain the Pi-authored feature tree
+  • Own fresh-sample temperature means and the PHOTONS temperature authority
   • Publish no CLOCKS-domain stream and own no CLOCKS persistence or recovery
   • Expose the complete current platform context through SYSTEM.REPORT
 
 Process model:
   • One systemd service
-  • One Pi-context polling thread
+  • Slow Pi-context polling and independent one-second temperature samplers
   • One blocking command socket
   • One GNSS_ANNOUNCEMENT subscription
 
@@ -43,7 +44,12 @@ import requests
 from smbus2 import SMBus
 
 from zpnet.processes.processes import send_command, server_setup
-from zpnet.processes.system.rtd import build_rtd_status, rtd_feature_status, rtd_monitor
+from zpnet.processes.system.rtd import rtd_monitor
+from zpnet.processes.system.temperature import (
+    accept_temperature, build_sensor_status, build_temperature_context,
+    feature_status as temperature_feature_status,
+)
+from zpnet.shared.temperature import TEMPERATURE_POLICY
 from zpnet.shared.constants import (
     ZPNET_REMOTE_HOST,
     HTTP_TIMEOUT,
@@ -192,6 +198,8 @@ BME280_ADDR   = 0x76
 REG_ID        = 0xD0
 REG_CTRL_HUM  = 0xF2
 REG_CTRL_MEAS = 0xF4
+REG_STATUS    = 0xF3
+REG_CONFIG    = 0xF5
 REG_DATA      = 0xF7
 
 EXPECTED_CHIP_ID = 0x60
@@ -204,6 +212,9 @@ SEA_LEVEL_PRESSURE_HPA = 1013.25
 # publish a stale/error payload instead of killing the SYSTEM poller.
 BME280_RETRY_COUNT = 3
 BME280_RETRY_DELAY_SEC = 0.05
+_BME280_POLICY = TEMPERATURE_POLICY["sources"]["environment"]
+BME280_POLL_SECONDS = _BME280_POLICY["sample_period_ms"] / 1000
+BME280_CONVERSION_SECONDS = 0.010  # Bosch max 9.3 ms for T/P/H oversampling x1
 
 _BME280_CAL_CACHE: Optional[dict] = None
 _BME280_READ_LOCK = threading.Lock()
@@ -211,6 +222,7 @@ _BME280_LAST_GOOD: Optional[dict] = None
 _BME280_READ_FAIL_COUNT = 0
 _BME280_CONSECUTIVE_FAIL_COUNT = 0
 _BME280_RECOVERY_COUNT = 0
+_BME280_SAMPLE_SEQUENCE = 0
 
 REG_CURRENT = 0x01
 REG_VOLTAGE = 0x02
@@ -431,10 +443,15 @@ def _pi_feature_tree_snapshot() -> Dict[str, Dict[str, Dict[str, str]]]:
         return _copy_feature_tree(_PI_FEATURES)
 
 
-def _feature_tree_snapshot() -> Dict[str, Dict[str, Dict[str, str]]]:
+def _feature_tree_snapshot(temperature_context=None) -> Dict[str, Dict[str, Dict[str, str]]]:
     """Return the Pi-authored platform feature tree owned by SYSTEM."""
-    # Evaluate freshness at query time, even if the RTD monitor has stalled.
-    set_pi_feature("SYSTEM", "RTD", rtd_feature_status())
+    # Readiness and the reported composite share one observation. Query-time
+    # aging also expires the authority if either temperature sampler stalls.
+    if temperature_context is None:
+        temperature_context = build_temperature_context()
+    for field in ("environment", "rtd", "temperature"):
+        set_pi_feature("SYSTEM", field.upper(),
+                       temperature_feature_status(temperature_context[field]["status"]))
     with _FEATURE_LOCK:
         return _copy_feature_tree(_PI_FEATURES)
 
@@ -1050,11 +1067,19 @@ def compensate_humidity(adc_H: int, t_fine: float, cal: dict) -> float:
     return max(0.0, min(100.0, h))
 
 
+def _bme280_wait_ready(bus: SMBus) -> None:
+    deadline = time.monotonic() + 0.1
+    while bus.read_byte_data(BME280_ADDR, REG_STATUS) & 0x09:
+        if time.monotonic() >= deadline:
+            raise TimeoutError("BME280 conversion/NVM copy did not finish")
+        time.sleep(0.002)
+
+
 def _build_environment_status_once() -> dict:
     """Perform one complete BME280 transaction sequence.
 
-    This helper is intentionally allowed to raise.  The public
-    build_environment_status() wrapper owns retry/stale-payload behavior.
+    This helper is intentionally allowed to raise.  The
+    _read_environment_status() wrapper owns retry/stale-payload behavior.
     """
     global _BME280_CAL_CACHE
 
@@ -1063,20 +1088,22 @@ def _build_environment_status_once() -> dict:
         if chip_id != EXPECTED_CHIP_ID:
             raise RuntimeError(f"unexpected BME280 chip ID 0x{chip_id:02X}")
 
-        # Forced mode, oversampling x1.
-        #
-        # These writes are normal BME280 control-plane writes: ctrl_hum selects
-        # humidity oversampling, and ctrl_meas selects pressure/temperature
-        # oversampling plus measurement mode.  The calibration table is static
-        # after boot, so cache it after the first successful read to reduce the
-        # transaction footprint on the shared SMBus.
+        # The previous 0x27 selected NORMAL mode, despite its forced-mode comment.
+        # Enter sleep and wait for any old conversion before changing config.
+        # One explicit forced conversion per poll makes sample identity and
+        # cadence independent of REPORT_METRICS requests and the slow poller.
+        bus.write_byte_data(BME280_ADDR, REG_CTRL_MEAS, 0x24)
+        _bme280_wait_ready(bus)
+        bus.write_byte_data(BME280_ADDR, REG_CONFIG, 0x00)  # hardware IIR off
         bus.write_byte_data(BME280_ADDR, REG_CTRL_HUM, 0x01)
-        bus.write_byte_data(BME280_ADDR, REG_CTRL_MEAS, 0x27)
 
         if _BME280_CAL_CACHE is None:
             _BME280_CAL_CACHE = read_bme280_calibration(bus)
         cal = _BME280_CAL_CACHE
 
+        bus.write_byte_data(BME280_ADDR, REG_CTRL_MEAS, 0x25)  # T/P x1, forced
+        time.sleep(BME280_CONVERSION_SECONDS)
+        _bme280_wait_ready(bus)
         data = bus.read_i2c_block_data(BME280_ADDR, REG_DATA, 8)
         adc_P = (data[0] << 12) | (data[1] << 4) | (data[2] >> 4)
         adc_T = (data[3] << 12) | (data[4] << 4) | (data[5] >> 4)
@@ -1089,6 +1116,13 @@ def _build_environment_status_once() -> dict:
         altitude_m = 44330.0 * (1.0 - (pressure_hpa / SEA_LEVEL_PRESSURE_HPA) ** 0.1903)
 
         return {
+            "schema": _BME280_POLICY["schema"],
+            "source": _BME280_POLICY["source"],
+            "status": "OK",
+            "age_ms": 0,
+            "sample_period_ms": _BME280_POLICY["sample_period_ms"],
+            "sampled_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "measurement_mode": "FORCED",
             "sensor_address": "0x76",
             "sensor_present": True,
             "temperature_c": temp_c,
@@ -1117,6 +1151,9 @@ def _bme280_failure_payload(error: Exception, attempts: int) -> dict:
     }
 
     base.update({
+        "schema": _BME280_POLICY["schema"],
+        "source": _BME280_POLICY["source"],
+        "status": "UNAVAILABLE",
         "read_ok": False,
         "stale": _BME280_LAST_GOOD is not None,
         "retry_count": max(0, attempts - 1),
@@ -1130,7 +1167,10 @@ def _bme280_failure_payload(error: Exception, attempts: int) -> dict:
 
 
 def build_environment_status() -> dict:
-    # The slow platform poll and live metrics share calibration/retry state.
+    return build_sensor_status("environment")
+
+
+def _read_environment_status() -> dict:
     with _BME280_READ_LOCK:
         return _build_environment_status_locked()
 
@@ -1149,6 +1189,7 @@ def _build_environment_status_locked() -> dict:
     global _BME280_READ_FAIL_COUNT
     global _BME280_CONSECUTIVE_FAIL_COUNT
     global _BME280_RECOVERY_COUNT
+    global _BME280_SAMPLE_SEQUENCE
 
     last_error: Exception | None = None
 
@@ -1162,6 +1203,8 @@ def _build_environment_status_locked() -> dict:
             payload["consecutive_fail_count"] = 0
             payload["recovery_count"] = _BME280_RECOVERY_COUNT
             payload["retry_count"] = attempt - 1
+            _BME280_SAMPLE_SEQUENCE += 1
+            payload["sample_sequence"] = _BME280_SAMPLE_SEQUENCE
             _BME280_LAST_GOOD = dict(payload)
             return payload
         except OSError as e:
@@ -1192,6 +1235,16 @@ def _build_environment_status_locked() -> dict:
     logging.exception("[system] BME280 read failed after retries")
     return _bme280_failure_payload(last_error or RuntimeError("unknown BME280 error"),
                                    BME280_RETRY_COUNT)
+
+
+def environment_monitor() -> None:
+    """Acquire BME280 at 1 Hz, regardless of which reports/screens are open."""
+    while True:
+        started = time.monotonic()
+        reading = _read_environment_status()
+        key = (reading["sample_sequence"],) if reading["status"] == "OK" else ()
+        accept_temperature("environment", reading, key, started)
+        time.sleep(max(0.05, BME280_POLL_SECONDS - (time.monotonic() - started)))
 
 # ------------------------------------------------------------------
 # Power monitoring helpers (legacy: power_monitor)
@@ -1678,7 +1731,6 @@ def system_poller() -> None:
         pi_payload = build_pi_status()
         network_payload = build_network_status()
         sensor_payload = build_sensor_scan_status()
-        environment_payload = build_environment_status()
         gnss_payload = build_gnss_status()
         power_payload = build_power_status()
 
@@ -1698,6 +1750,8 @@ def system_poller() -> None:
                 "PI.SYSTEM.POSTGRES is not NOMINAL"
             )
 
+        temperature_context = build_temperature_context()
+        environment_payload = temperature_context["environment"]
         _update_builtin_pi_features(
             pi_payload=pi_payload,
             network_payload=network_payload,
@@ -1712,8 +1766,7 @@ def system_poller() -> None:
             "pi": dict(pi_payload),
             "network": dict(network_payload),
             "sensors": dict(sensor_payload),
-            "environment": dict(environment_payload),
-            "rtd": build_rtd_status(),
+            **temperature_context,
             "gnss": dict(gnss_payload),
             "power": dict(power_payload),
             "battery": dict(battery_payload),
@@ -1936,7 +1989,7 @@ def cmd_report_metrics(_: Optional[dict]) -> Dict:
         pi_temp = get_cpu_temp_c()
     except (OSError, ValueError):
         pi_temp = None
-    environment = build_environment_status()
+    temperature_context = build_temperature_context()
     gnss = build_gnss_status()
     with _SYSTEM_LOCK:
         power = copy.deepcopy(SYSTEM.get("power") or {})
@@ -1946,8 +1999,7 @@ def cmd_report_metrics(_: Optional[dict]) -> Dict:
         "payload": {
             "network": {"ssid": ssid},
             "pi": {"cpu_temp_c": pi_temp},
-            "environment": environment,
-            "rtd": build_rtd_status(),
+            **temperature_context,
             "gnss": gnss,
             "power": power,
         },
@@ -1968,10 +2020,11 @@ def cmd_report(_: Optional[dict]) -> Dict:
         "REPORT",
         _health_to_feature_status(gnss_payload.get("health_state")),
     )
-    snapshot["rtd"] = build_rtd_status()
+    temperature_context = build_temperature_context()
+    snapshot.update(temperature_context)
     snapshot["gnss"] = gnss_payload
     snapshot["location"] = _location_context(gnss_payload)
-    snapshot["features"] = _feature_tree_snapshot()
+    snapshot["features"] = _feature_tree_snapshot(temperature_context)
 
     return {
         "success": True,
@@ -2330,6 +2383,8 @@ def run() -> None:
     # socket appears without confusing process existence with service readiness.
     set_pi_feature("SYSTEM", "POSTGRES", "INITIALIZING")
     set_pi_feature("SYSTEM", "RTD", "INITIALIZING")
+    set_pi_feature("SYSTEM", "ENVIRONMENT", "INITIALIZING")
+    set_pi_feature("SYSTEM", "TEMPERATURE", "INITIALIZING")
     set_pi_feature("PUBSUB", "TEENSY_RPC", "INITIALIZING")
 
     # Expose SYSTEM before touching PostgreSQL.  Database startup/restart is a
@@ -2359,6 +2414,12 @@ def run() -> None:
         target=rtd_monitor,
         daemon=True,
         name="system-rtd-monitor",
+    ).start()
+
+    threading.Thread(
+        target=environment_monitor,
+        daemon=True,
+        name="system-environment-monitor",
     ).start()
 
     threading.Thread(

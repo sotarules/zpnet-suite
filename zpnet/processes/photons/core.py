@@ -185,6 +185,7 @@ SYSTEM_CONTEXT_FIELDS = (
     "sensors",
     "environment",
     "rtd",
+    "temperature",
     "location",
     "gnss",
     "power",
@@ -7219,6 +7220,7 @@ def _lantern_report_from_photons(photons: Payload) -> Dict[str, Any]:
         "location": copy.deepcopy(photons.get("location") or {}),
         "environment": copy.deepcopy(photons.get("environment") or {}),
         "rtd": copy.deepcopy(photons.get("rtd") or {}),
+        "temperature": copy.deepcopy(photons.get("temperature") or {}),
     }
 
 

@@ -12849,6 +12849,8 @@ def _tempest_detail_from_state_snapshot(state: Dict[str, Any]) -> Dict[str, Any]
         "fragment": fragment,
         "clocks": clocks,
         "environment": copy.deepcopy(state.get("environment")),
+        "rtd": copy.deepcopy(state.get("rtd")),
+        "temperature": copy.deepcopy(state.get("temperature")),
         "gnss": copy.deepcopy(state.get("gnss")),
         "extra_clocks": copy.deepcopy(adjudication.get("extra_clocks") or {}),
     }
@@ -12974,6 +12976,8 @@ def _recovery_timebase_from_clocks_state(
         "fragment": fragment,
         "clocks": copy.deepcopy(clocks),
         "environment": copy.deepcopy(state.get("environment")),
+        "rtd": copy.deepcopy(state.get("rtd")),
+        "temperature": copy.deepcopy(state.get("temperature")),
         "gnss": copy.deepcopy(state.get("gnss")),
         "extra_clocks": extra_clocks,
         "_db_detail_id": detail_id,
@@ -13839,6 +13843,8 @@ def _build_canonical_clocks_state(
         "network": copy.deepcopy(system_context.get("network") or {}),
         "sensors": copy.deepcopy(system_context.get("sensors") or {}),
         "environment": copy.deepcopy(system_context.get("environment") or {}),
+        "rtd": copy.deepcopy(system_context.get("rtd") or {}),
+        "temperature": copy.deepcopy(system_context.get("temperature") or {}),
         "location": copy.deepcopy(system_context.get("location") or {}),
         "gnss": gnss,
         "gnss_monitor": {
@@ -15166,6 +15172,8 @@ def _process_loop() -> None:
             # canonical live instrument without manufacturing restore_state.
             "clocks": copy.deepcopy(clocks_fragment.get("clocks") or {}),
             "environment": env_snapshot,
+            "rtd": copy.deepcopy(system_context.get("rtd") or {}),
+            "temperature": copy.deepcopy(system_context.get("temperature") or {}),
             "gnss": gnss_info,
             "extra_clocks": {
                 "gnss_raw_ns": gnss_raw_ns_int,
