@@ -2209,7 +2209,7 @@ class _PhotonsReadModel:
     def __init__(self):
         self._lock = threading.Lock()
         self._thread = None
-        self._snapshot = ([], None, "LOADING")
+        self._snapshot = (None, None, "LOADING")
 
     def get(self):
         with self._lock:
@@ -2249,6 +2249,7 @@ def photons_detail_readout() -> list[str]:
         return ["PHOTONS: FEED UNAVAILABLE"]
     live = payloads[-1]
     summaries, campaign_error, recoverable = _PHOTONS_READ_MODEL.get()
+    summaries = summaries or []
     campaign = live.get("campaign") or {}
     before = None
     if campaign:
@@ -2292,10 +2293,15 @@ def photons_detail_readout() -> list[str]:
 
 def photons_campaigns_readout() -> list[str]:
     """Show producer campaign means and the instrument buckets at each last row."""
-    try:
-        rows = _get_lantern_campaign_summaries()
-    except Exception as exc:
-        return ["\0LANTERN_CAMPAIGNS:ERROR", f"LANTERN CAMPAIGNS: UNAVAILABLE: {exc}"]
+    # SPACE arrives here directly from PHOTONS on the curses/input thread.
+    # Reuse its background snapshot: campaign history queries can take seconds
+    # as the database grows and must never block navigation or repaint.
+    rows, campaign_error, _ = _PHOTONS_READ_MODEL.get()
+    if campaign_error:
+        return ["\0LANTERN_CAMPAIGNS:ERROR",
+                f"LANTERN CAMPAIGNS: UNAVAILABLE: {campaign_error}"]
+    if rows is None:
+        return ["\0LANTERN_CAMPAIGNS:LOADING", "LANTERN CAMPAIGNS: LOADING"]
     newest_identity = str(rows[0].get("id")) if rows else "EMPTY"
     # Every row owns a recorded campaign mean, regardless of its active state.
     lines = [f"\0LANTERN_CAMPAIGN:{newest_identity}",
