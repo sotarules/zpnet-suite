@@ -808,6 +808,10 @@ def _send_normalization(system_context: Dict[str, Any]) -> None:
         raise RuntimeError(f"PHOTONS normalization update failed: {response!r}")
 
 
+class _CalibrationRestartRequired(RuntimeError):
+    """A policy deployment needs a new producer lifetime, not a failure latch."""
+
+
 def _normalization_epoch_migration() -> Optional[Dict[str, Any]]:
     """Inspect only the newest source; never fall back to an older calibration."""
     with open_db(row_dict=True) as conn:
@@ -6718,8 +6722,13 @@ def _perform_phase5_recovery(
         migration = _normalization_epoch_migration()
         if migration is not None:
             report = _fetch_teensy_recovery_report()
-            if report["publication_started"] or report["staging_active"]:
-                raise RuntimeError("PHOTONS calibration cutover requires a freshly rebooted, held Teensy")
+            if (report["publication_started"] or report["staging_active"]
+                    or report.get("normalization_id") not in (0, NORMALIZATION_ID)):
+                # DISABLE alone preserves the old calibration identity. Only a
+                # fresh producer can accept the replacement policy safely.
+                raise _CalibrationRestartRequired(
+                    "PHOTONS calibration changed; reboot Teensy to establish a fresh epoch"
+                )
             bringup = _fetch_teensy_bringup_report()
             if bringup is None:
                 raise RuntimeError("PHOTONS calibration cutover lacks held-producer bringup testimony")
@@ -7046,6 +7055,10 @@ def _perform_phase5_recovery(
             skipped=skipped,
             rows_scanned=rows_scanned,
         )
+    except _CalibrationRestartRequired:
+        # Expected deployment boundary; the startup owner waits and reclassifies.
+        # Do not count this as corrupt durable history or a scientific failure.
+        raise
     except Exception as exc:
         with _state_lock:
             _recovery_failure_count += 1
@@ -10931,6 +10944,57 @@ def _startup_commissioning_empty_heartbeat_cutover(
     return result
 
 
+def _wait_for_calibration_restart() -> None:
+    """Keep reports alive until the operator supplies a fresh, held producer."""
+    _campaign_control_ready.clear()
+    _runtime_recovery_hold.set()
+    _clear_recovery_proof_custody()
+    retired = 0
+    last_log_at = None
+    started = time.monotonic()
+    while True:
+        # These queued rows belong to the superseded calibration. The existing
+        # cutover already retires them; do it while waiting so an unattended
+        # deployment cannot grow an unbounded queue. Durable rows are untouched.
+        retired += _retire_fragment_queue_via_owner("CALIBRATION_RESTART_WAIT")
+        report = None
+        error = None
+        try:
+            report = _fetch_teensy_recovery_report()
+        except Exception as exc:
+            # USB/RPC can disappear during the requested reboot. This waiting
+            # state admits no science; full recovery validation runs again below.
+            error = str(exc)
+        if (report is not None and report["enabled"]
+                and not report["publication_started"]
+                and not report["staging_active"]
+                and report.get("normalization_id") == 0):
+            _recovery_status_set(
+                "CLASSIFYING", action_required=None, error=None,
+                ingress_rows_retired=retired,
+            )
+            return
+        now = time.monotonic()
+        _recovery_status_set(
+            "WAITING_FOR_CALIBRATION_REBOOT",
+            normalization_id=NORMALIZATION_ID,
+            observed_normalization_id=(report or {}).get("normalization_id"),
+            action_required="Reboot Teensy; PHOTONS will retry automatically",
+            ingress_rows_retired=retired,
+            waited_s=round(now - started, 3),
+            error=error,
+        )
+        if last_log_at is None or now - last_log_at >= STARTUP_INFRASTRUCTURE_STATUS_LOG_INTERVAL_S:
+            logging.warning(
+                "[photons/startup] calibration changed; waiting for a Teensy reboot "
+                "without HARD_FAILURE (%.1fs, %d old-calibration ingress rows retired). "
+                "No firmware reflash is required; recovery will resume automatically.",
+                now - started, retired,
+            )
+            last_log_at = now
+        time.sleep(1.0)
+
+
 def _startup_phase5_recovery_with_generation_retry(
     *, operator_enable_args: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], int]:
@@ -10970,6 +11034,12 @@ def _startup_phase5_recovery_with_generation_retry(
                 transport_generation=int(attempt_generation),
                 survival_ingress_barrier_monotonic=survival_barrier,
             )
+        except _CalibrationRestartRequired:
+            _wait_for_calibration_restart()
+            _wait_for_startup_infrastructure()
+            # Reread both durable history and the transport generation. Do not
+            # reuse the previous producer's recovery or campaign testimony.
+            continue
         except Exception as exc:
             current_generation = _runtime_teensy_rpc_generation()
             if (
