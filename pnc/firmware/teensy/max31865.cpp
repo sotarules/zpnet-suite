@@ -25,6 +25,19 @@ Phase phase = Phase::START;
 uint32_t deadline_ms = 0;
 uint32_t cycle_started_ms = 0;
 rtd_snapshot_t snapshot;
+uint8_t pre_clear_registers[8] = {};
+rtd_spi_trace_t pre_clear_spi;
+rtd_spi_trace_t check_spi;
+rtd_spi_trace_t registers_spi;
+
+// SPI1 is LPSPI3 on Teensy 4.1. Read only: never pop RDR, acknowledge SR,
+// flush FIFOs, or mask interrupts while collecting diagnostic evidence.
+inline rtd_spi_state_t spi_state() {
+  rtd_spi_state_t state;
+  state.sr = IMXRT_LPSPI3_S.SR;
+  state.fsr = IMXRT_LPSPI3_S.FSR;
+  return state;
+}
 
 void select() {
   SPI1.beginTransaction(SPISettings(SPI_HZ, MSBFIRST, SPI_MODE1));
@@ -45,12 +58,55 @@ void write_config(uint8_t value) {
   SPI1.transfer(value);
   deselect();
 }
-uint8_t read_config() {
+uint8_t read_config(rtd_spi_trace_t* trace = nullptr) {
+  if (trace) trace->before = spi_state();
   select();
   SPI1.transfer(0x00);
   const uint8_t value = SPI1.transfer(0);
+  if (trace) trace->after = spi_state();
   deselect();
   return value;
+}
+
+FLASHMEM void read_registers(uint8_t (&registers)[8], rtd_spi_trace_t& trace) {
+  trace.before = spi_state();
+  select();
+  SPI1.transfer(0x00);
+  for (uint8_t& value : registers) value = SPI1.transfer(0);
+  trace.after = spi_state();
+  deselect();
+}
+
+// Keep this cold copy out of the RAM-resident finish() even under optimization.
+FLASHMEM __attribute__((noinline)) void retain_failure_episode(rtd_status_t status) {
+  // A successful acquisition ends an episode; repeated failures cannot replace
+  // its initiating evidence. Keep boot's first failure as a separate record.
+  if (snapshot.status != rtd_status_t::OK &&
+      snapshot.status != rtd_status_t::INITIALIZING) return;
+  ++snapshot.failure_episodes;
+  rtd_failure_t& first = snapshot.latest_failure_episode;
+  first.attempt = snapshot.attempts;
+  first.captured_at_ms = millis();
+  first.sample_sequence = snapshot.sample_sequence;
+  first.status = status;
+  first.check = snapshot.check;
+  first.checked_config = snapshot.checked_config;
+  for (unsigned i = 0; i < 8; ++i) {
+    first.pre_clear_registers[i] = pre_clear_registers[i];
+    first.registers[i] = snapshot.registers[i];
+  }
+  first.trace_count = snapshot.trace_count;
+  for (unsigned i = 0; i < first.trace_count; ++i)
+    first.config_trace[i] = snapshot.config_trace[i];
+  first.pre_clear_spi = pre_clear_spi;
+  first.check_spi = check_spi;
+  first.registers_spi = registers_spi;
+  first.spi_cr = IMXRT_LPSPI3_S.CR;
+  first.spi_tcr = IMXRT_LPSPI3_S.TCR;
+  first.spi_ccr = IMXRT_LPSPI3_S.CCR;
+  first.spi_cfgr1 = IMXRT_LPSPI3_S.CFGR1;
+  first.ccm_cbcmr = CCM_CBCMR;
+  if (snapshot.first_failure.attempt == 0) snapshot.first_failure = first;
 }
 
 // IEC 60751 Callendar-Van Dusen relation, solved with six Newton steps.
@@ -78,10 +134,17 @@ bool temperature_from_ratio(Double ratio, Double& out) {
 }
 
 void finish(rtd_status_t status) {
+  if (snapshot.register_count == 1) {
+    // Preserve the failed single-byte check and its SPI trace separately.
+    // This full read happens before bias-off cleanup or the next fault clear.
+    read_registers(snapshot.registers, registers_spi);
+    snapshot.register_count = 8;
+  }
+  snapshot.fault_status = snapshot.registers[7] & 0xfc;
+  if (status != rtd_status_t::OK) retain_failure_episode(status);
   write_config(CONFIG); // bias off between readings, including fault cases
   snapshot.cleanup_config = read_config();
   snapshot.status = status;
-  if (status == rtd_status_t::SPI_ERROR) snapshot.fault_status = 0;
   if (status != rtd_status_t::OK) ++snapshot.errors;
   phase = Phase::START;
   // Never catch up by issuing a burst of conversions after foreground delays.
@@ -109,7 +172,10 @@ void service(void*) {
     return;
   }
   if (phase == Phase::OFF_SETTLE) {
-    snapshot.config_trace[snapshot.trace_count++] = read_config();
+    // Read all registers before the retry's first CLEAR_FAULT write, preserving
+    // an input fault even if that write clears it before the later check fails.
+    read_registers(pre_clear_registers, pre_clear_spi);
+    snapshot.config_trace[snapshot.trace_count++] = pre_clear_registers[0];
     // Reassert thresholds every cycle so a sensor-only reset recovers without
     // rebooting Teensy. SPI has no ACK; verify configuration and thresholds.
     select();
@@ -124,7 +190,8 @@ void service(void*) {
     return;
   }
   if (phase == Phase::SETTLE) {
-    snapshot.registers[0] = read_config();
+    snapshot.registers[0] = read_config(&check_spi);
+    snapshot.checked_config = snapshot.registers[0];
     snapshot.config_trace[snapshot.trace_count++] = snapshot.registers[0];
     snapshot.register_count = 1;
     snapshot.check_attempt = snapshot.attempts;
@@ -141,12 +208,11 @@ void service(void*) {
   }
 
   uint8_t registers[8];
-  select();
-  SPI1.transfer(0x00);
-  for (uint8_t& value : registers) value = SPI1.transfer(0);
-  deselect();
+  read_registers(registers, check_spi);
+  registers_spi = check_spi;
   for (unsigned i = 0; i < 8; ++i) snapshot.registers[i] = registers[i];
   snapshot.register_count = 8;
+  snapshot.checked_config = registers[0];
   snapshot.check_attempt = snapshot.attempts;
   snapshot.check = "CONVERSION_CONFIG";
   if (registers[0] != (CONFIG | BIAS)) {

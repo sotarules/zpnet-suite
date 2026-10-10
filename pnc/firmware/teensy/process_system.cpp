@@ -2749,6 +2749,64 @@ void system_enter_quiescence(void) {
 //   • No aggregation
 //   • No inference
 // ------------------------------------------------------------
+static FLASHMEM void rtd_add_registers(Payload& p, const char* key,
+                                      const uint8_t (&r)[8]) {
+  p.add_fmt(key, "%02X %02X %02X %02X %02X %02X %02X %02X",
+      (unsigned)r[0], (unsigned)r[1], (unsigned)r[2], (unsigned)r[3],
+      (unsigned)r[4], (unsigned)r[5], (unsigned)r[6], (unsigned)r[7]);
+}
+
+static FLASHMEM Payload rtd_spi_trace_payload(const rtd_spi_trace_t& trace) {
+  Payload p;
+  p.add_fmt("before_sr_hex", "%08lX", (unsigned long)trace.before.sr);
+  p.add_fmt("before_fsr_hex", "%08lX", (unsigned long)trace.before.fsr);
+  p.add("before_tx_count", trace.before.fsr & 0x1fU);
+  p.add("before_rx_count", (trace.before.fsr >> 16) & 0x1fU);
+  p.add_fmt("after_sr_hex", "%08lX", (unsigned long)trace.after.sr);
+  p.add_fmt("after_fsr_hex", "%08lX", (unsigned long)trace.after.fsr);
+  p.add("after_tx_count", trace.after.fsr & 0x1fU);
+  p.add("after_rx_count", (trace.after.fsr >> 16) & 0x1fU);
+  return p;
+}
+
+static FLASHMEM Payload rtd_first_failure_payload(const rtd_failure_t& first) {
+  Payload p;
+  p.add("attempt", first.attempt);
+  p.add("captured_at_ms32", first.captured_at_ms);
+  p.add("sample_sequence", first.sample_sequence);
+  p.add("status", max31865_status_name(first.status));
+  p.add("check", first.check);
+  const uint8_t difference = first.checked_config ^ 0x90U;
+  const char* reason = max31865_status_name(first.status);
+  if (first.status == rtd_status_t::SPI_ERROR && difference != 0)
+    reason = difference == 0x20 ? "ONE_SHOT_NOT_CLEARED" : "CONFIG_MISMATCH";
+  p.add("reason", reason);
+  p.add_fmt("checked_config_hex", "%02X", (unsigned)first.checked_config);
+  p.add_fmt("config_xor_expected_hex", "%02X", (unsigned)difference);
+  p.add("expected_config_hex", "90");
+  rtd_add_registers(p, "pre_clear_registers_hex", first.pre_clear_registers);
+  p.add("pre_clear_fault_status", (uint32_t)(first.pre_clear_registers[7] & 0xfc));
+  rtd_add_registers(p, "registers_hex", first.registers);
+  p.add("fault_status", (uint32_t)(first.registers[7] & 0xfc));
+  p.add("trace_count", (uint32_t)first.trace_count);
+  static const char* const trace_names[] = {
+    "before_off_hex", "after_off_hex", "off_settled_hex",
+    "after_bias_hex", "bias_settled_hex", "after_trigger_hex"
+  };
+  for (uint8_t i = 0; i < first.trace_count; ++i)
+    p.add_fmt(trace_names[i], "%02X", (unsigned)first.config_trace[i]);
+  p.add("spi_peripheral", "LPSPI3");
+  p.add_object("pre_clear_spi", rtd_spi_trace_payload(first.pre_clear_spi));
+  p.add_object("check_spi", rtd_spi_trace_payload(first.check_spi));
+  p.add_object("registers_spi", rtd_spi_trace_payload(first.registers_spi));
+  p.add_fmt("spi_cr_hex", "%08lX", (unsigned long)first.spi_cr);
+  p.add_fmt("spi_tcr_hex", "%08lX", (unsigned long)first.spi_tcr);
+  p.add_fmt("spi_ccr_hex", "%08lX", (unsigned long)first.spi_ccr);
+  p.add_fmt("spi_cfgr1_hex", "%08lX", (unsigned long)first.spi_cfgr1);
+  p.add_fmt("ccm_cbcmr_hex", "%08lX", (unsigned long)first.ccm_cbcmr);
+  return p;
+}
+
 // Cached acquisition only: reporting never initiates SPI or waits for a sample.
 static FLASHMEM Payload cmd_rtd_report(const Payload& /*args*/) {
   const rtd_snapshot_t& rtd = max31865_snapshot();
@@ -2762,13 +2820,15 @@ static FLASHMEM Payload cmd_rtd_report(const Payload& /*args*/) {
   p.add("attempts", rtd.attempts);
   p.add("errors", rtd.errors);
   p.add("fault_status", (uint32_t)rtd.fault_status);
+  p.add("fault_status_attempt", rtd.check_attempt);
   p.add("wires", 3U);
   p.add("reference_ohms", 4300U);
   p.add("nominal_ohms", 1000U);
   p.add("filter_hz", 60U);
   p.add("sample_period_ms", 1000U);
   Payload diagnostic;
-  diagnostic.add("driver_revision", "2026-10-09.3");
+  diagnostic.add("driver_revision", "2026-10-10.1");
+  diagnostic.add("failure_episodes", rtd.failure_episodes);
   diagnostic.add("cs_guard_ns", 1000U);
   diagnostic.add("off_settle_ms", 65U);
   diagnostic.add("trace_attempt", rtd.trace_attempt);
@@ -2786,7 +2846,9 @@ static FLASHMEM Payload cmd_rtd_report(const Payload& /*args*/) {
   diagnostic.add("attempt", rtd.check_attempt);
   diagnostic.add("register_count", (uint32_t)rtd.register_count);
   diagnostic.add("expected_config_hex", "90");
+  diagnostic.add_fmt("checked_config_hex", "%02X", (unsigned)rtd.checked_config);
   diagnostic.add("spi_hz", 500000U);
+  diagnostic.add("spi_hz_kind", "REQUESTED");
   diagnostic.add("mosi_pin", MAX31865_MOSI_PIN);
   diagnostic.add("miso_pin", MAX31865_MISO_PIN);
   diagnostic.add("sck_pin", MAX31865_SCK_PIN);
@@ -2795,12 +2857,13 @@ static FLASHMEM Payload cmd_rtd_report(const Payload& /*args*/) {
   if (rtd.register_count == 1) {
     diagnostic.add_fmt("registers_hex", "%02X", (unsigned)rtd.registers[0]);
   } else if (rtd.register_count == 8) {
-    diagnostic.add_fmt("registers_hex", "%02X %02X %02X %02X %02X %02X %02X %02X",
-        (unsigned)rtd.registers[0], (unsigned)rtd.registers[1],
-        (unsigned)rtd.registers[2], (unsigned)rtd.registers[3],
-        (unsigned)rtd.registers[4], (unsigned)rtd.registers[5],
-        (unsigned)rtd.registers[6], (unsigned)rtd.registers[7]);
+    rtd_add_registers(diagnostic, "registers_hex", rtd.registers);
   }
+  if (rtd.first_failure.attempt != 0)
+    diagnostic.add_object("first_failure", rtd_first_failure_payload(rtd.first_failure));
+  if (rtd.latest_failure_episode.attempt != rtd.first_failure.attempt)
+    diagnostic.add_object("latest_failure_episode",
+        rtd_first_failure_payload(rtd.latest_failure_episode));
   p.add_object("diagnostics", diagnostic);
   if (rtd.status == rtd_status_t::OK) {
     p.add("sampled_at_ms32", rtd.sampled_at_ms);
