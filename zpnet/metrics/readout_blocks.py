@@ -1059,6 +1059,11 @@ def status_header() -> str:
         teensy = _HEADER_TEENSY.get()
         net = s.get("network", {}).get("ssid") or "?"
         pi_temperature = _header_temperature(s.get("pi", {}).get("cpu_temp_c"))
+        rtd = s.get("rtd", {})
+        rtd_temperature = (
+            _header_temperature(rtd.get("temperature_c"), 4)
+            if rtd.get("status") == "OK" else "?"
+        )
         environment = s.get("environment", {})
         temperature = _header_temperature(environment.get("temperature_c"), 4)
         if environment.get("stale") or environment.get("read_ok") is False:
@@ -1080,6 +1085,7 @@ def status_header() -> str:
         return (
             f" NET: {net}"
             f"  BAT: {bat_v}"
+            f"  MAX31865: {rtd_temperature}"
             f"  BME280: {temperature}"
             f"  PI: {pi_temperature}"
             f"  TEENSY: {teensy_temperature}"

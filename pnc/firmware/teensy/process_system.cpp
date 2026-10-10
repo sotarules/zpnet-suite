@@ -15,6 +15,7 @@
 // =============================================================
 
 #include "process_system.h"
+#include "max31865.h"
 #include "crash_forensics.h"
 #include "execution_trace.h"
 #include "config.h"
@@ -2748,6 +2749,71 @@ void system_enter_quiescence(void) {
 //   • No aggregation
 //   • No inference
 // ------------------------------------------------------------
+// Cached acquisition only: reporting never initiates SPI or waits for a sample.
+static FLASHMEM Payload cmd_rtd_report(const Payload& /*args*/) {
+  const rtd_snapshot_t& rtd = max31865_snapshot();
+  Payload p;
+  p.add("schema", "PT1000_MAX31865_V1");
+  p.add("source", "TEENSY.SPI1.MAX31865");
+  const uint32_t age = (uint32_t)millis() - rtd.sampled_at_ms;
+  const bool stale = rtd.status == rtd_status_t::OK && age > 3000U;
+  p.add("status", stale ? "STALE" : max31865_status_name(rtd.status));
+  p.add("sample_sequence", rtd.sample_sequence);
+  p.add("attempts", rtd.attempts);
+  p.add("errors", rtd.errors);
+  p.add("fault_status", (uint32_t)rtd.fault_status);
+  p.add("wires", 3U);
+  p.add("reference_ohms", 4300U);
+  p.add("nominal_ohms", 1000U);
+  p.add("filter_hz", 60U);
+  p.add("sample_period_ms", 1000U);
+  Payload diagnostic;
+  diagnostic.add("driver_revision", "2026-10-09.3");
+  diagnostic.add("cs_guard_ns", 1000U);
+  diagnostic.add("off_settle_ms", 65U);
+  diagnostic.add("trace_attempt", rtd.trace_attempt);
+  diagnostic.add("trace_count", (uint32_t)rtd.trace_count);
+  // Only populated fields are emitted; in-progress trace has its own attempt.
+  static const char* const trace_names[] = {
+    "before_off_hex", "after_off_hex", "off_settled_hex",
+    "after_bias_hex", "bias_settled_hex", "after_trigger_hex"
+  };
+  for (uint8_t i = 0; i < rtd.trace_count; ++i)
+    diagnostic.add_fmt(trace_names[i], "%02X", (unsigned)rtd.config_trace[i]);
+  if (rtd.check_attempt)
+    diagnostic.add_fmt("cleanup_config_hex", "%02X", (unsigned)rtd.cleanup_config);
+  diagnostic.add("check", rtd.check);
+  diagnostic.add("attempt", rtd.check_attempt);
+  diagnostic.add("register_count", (uint32_t)rtd.register_count);
+  diagnostic.add("expected_config_hex", "90");
+  diagnostic.add("spi_hz", 500000U);
+  diagnostic.add("mosi_pin", MAX31865_MOSI_PIN);
+  diagnostic.add("miso_pin", MAX31865_MISO_PIN);
+  diagnostic.add("sck_pin", MAX31865_SCK_PIN);
+  diagnostic.add("cs_pin", MAX31865_CS_PIN);
+  // Hex bytes in address order 00..07, captured before bias-off cleanup.
+  if (rtd.register_count == 1) {
+    diagnostic.add_fmt("registers_hex", "%02X", (unsigned)rtd.registers[0]);
+  } else if (rtd.register_count == 8) {
+    diagnostic.add_fmt("registers_hex", "%02X %02X %02X %02X %02X %02X %02X %02X",
+        (unsigned)rtd.registers[0], (unsigned)rtd.registers[1],
+        (unsigned)rtd.registers[2], (unsigned)rtd.registers[3],
+        (unsigned)rtd.registers[4], (unsigned)rtd.registers[5],
+        (unsigned)rtd.registers[6], (unsigned)rtd.registers[7]);
+  }
+  p.add_object("diagnostics", diagnostic);
+  if (rtd.status == rtd_status_t::OK) {
+    p.add("sampled_at_ms32", rtd.sampled_at_ms);
+    p.add("age_ms", age);
+    p.add("raw_code", (uint32_t)rtd.raw_code);
+    if (!stale) {
+      p.add("resistance_ohms", toFixedDecimal(rtd.resistance_ohms, 4));
+      p.add("temperature_c", toFixedDecimal(rtd.temperature_c, 4));
+    }
+  }
+  return p;
+}
+
 static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
   Payload p;
 
@@ -2780,6 +2846,7 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
   const fixed_decimal_t cpu_temperature = toFixedDecimal(cpuTempC(), 2);
   p.add("cpu_temp_c", cpu_temperature);
   p.add("cpu_temp_source", "ON_DIE_TEMPMON");
+  p.add_object("rtd", cmd_rtd_report(Payload{}));
 
   // Heap availability
   // MULE: COMMENTED OUT for STABILITY
@@ -4268,6 +4335,7 @@ static FLASHMEM Payload cmd_status(const Payload& /*args*/) {
 
 static const process_command_entry_t SYSTEM_COMMANDS[] = {
   { "REPORT",           cmd_report           },
+  { "RTD_REPORT",       cmd_rtd_report       },
   { "PROCESS_INFO",     cmd_process_info     },
   { "TRANSPORT_INFO",   cmd_transport_info   },
   { "PAYLOAD_INFO",     cmd_payload_info     },

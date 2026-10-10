@@ -144,7 +144,7 @@ static const int LASER_MOD_PIN      = 35;
 //   not assume stock digitalRead(34) follows the changed GPIO bank.
 //   This is the authoritative optical timing signal.
 //
-// PD200T PD OUT is disconnected from the Teensy; pin 38/A14 is unassigned.
+// PD200T PD OUT is disconnected from the Teensy; pin 38 is now MAX31865 CS.
 // Receiver timing uses only TTL OUT on pin 34.
 //
 // PD200T MON is the comparator-threshold monitor from the blue threshold
@@ -152,6 +152,24 @@ static const int LASER_MOD_PIN      = 35;
 //
 
 static const int PHOTODIODE_EDGE_PIN = 34;
+
+// --------------------------------------------------------------
+// PT1000 RTD / MAX31865 -- installed hardware SPI1 wiring (2026-10-09)
+// --------------------------------------------------------------
+// Pins are Teensy digital labels, not connector-position numbers.
+// Use SPI1 (LPSPI3), never SPI: SPI SCK pin 13 belongs to OCXO1.
+// Before SPI1.begin(), explicitly select setMOSI(26), setMISO(39),
+// setSCK(27) using the constants below. Default MISO1 can be pin 1,
+// which belongs to GNSS PPS. Drive CS as an active-low GPIO, idle HIGH.
+// Power: PURPLE Teensy 3.3V -> breakout VIN; BLACK Teensy GND -> breakout GND.
+// Probe is installed beside the fiber beneath the heater pad.
+// Breakout 3V3 regulator output and RDY are left disconnected.
+// Wiring is installed; these declarations do not enable sensor acquisition.
+static constexpr uint8_t MAX31865_SPI_BUS_INDEX = 1;
+static constexpr int MAX31865_MOSI_PIN = 26; // GREEN: Teensy -> MAX31865 SDI
+static constexpr int MAX31865_MISO_PIN = 39; // BLUE: Teensy <- MAX31865 SDO
+static constexpr int MAX31865_SCK_PIN  = 27; // YELLOW: Teensy -> MAX31865 CLK
+static constexpr int MAX31865_CS_PIN   = 38; // ORANGE: Teensy -> MAX31865 CS
 
 // --------------------------------------------------------------
 // GNSS timing pins

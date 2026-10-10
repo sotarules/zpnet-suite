@@ -62,6 +62,7 @@ set(ZPNET_SOURCES
     build_fingerprint.cpp
     debug.cpp
     double.cpp
+    max31865.cpp
     memory_info.cpp
     payload.cpp
     process.cpp
@@ -88,6 +89,7 @@ set(ZPNET_HEADERS
     debug.h
     double.h
     integer_only.h
+    max31865.h
     memory_info.h
     payload.h
     process.h

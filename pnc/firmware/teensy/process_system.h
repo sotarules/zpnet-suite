@@ -48,7 +48,8 @@
  *       - firmware version
  *       - scaled-integer CPU usage metrics
  *       - internal diagnostics
- *       - floating-point environmental telemetry is intentionally excluded
+ *       - cached PT1000/MAX31865 temperature using integer-backed decimals
+ *   • RTD_REPORT — compact cached RTD snapshot; no SPI reads during reporting
  *   • EXECUTION_TRACE — return bounded causal breadcrumbs from independent
  *     PRIORITY0, PRIORITY16, PRIORITY32, and FOREGROUND notebooks.  Each live
  *     ring runs in RAM1; fault entry freezes all committed notebooks into its

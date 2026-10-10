@@ -20,6 +20,7 @@
 #include "process_photons.h"
 #include "process_timepop.h"
 #include "process_system.h"
+#include "max31865.h"
 #include "process_pubsub.h"
 #include "process_performance.h"
 
@@ -269,6 +270,8 @@ void setup() {
   process_pubsub_register();
 
   process_system_register();
+
+  max31865_init();
 
   process_performance_register();
 }

@@ -43,6 +43,7 @@ import requests
 from smbus2 import SMBus
 
 from zpnet.processes.processes import send_command, server_setup
+from zpnet.processes.system.rtd import build_rtd_status, rtd_feature_status, rtd_monitor
 from zpnet.shared.constants import (
     ZPNET_REMOTE_HOST,
     HTTP_TIMEOUT,
@@ -432,6 +433,8 @@ def _pi_feature_tree_snapshot() -> Dict[str, Dict[str, Dict[str, str]]]:
 
 def _feature_tree_snapshot() -> Dict[str, Dict[str, Dict[str, str]]]:
     """Return the Pi-authored platform feature tree owned by SYSTEM."""
+    # Evaluate freshness at query time, even if the RTD monitor has stalled.
+    set_pi_feature("SYSTEM", "RTD", rtd_feature_status())
     with _FEATURE_LOCK:
         return _copy_feature_tree(_PI_FEATURES)
 
@@ -1710,6 +1713,7 @@ def system_poller() -> None:
             "network": dict(network_payload),
             "sensors": dict(sensor_payload),
             "environment": dict(environment_payload),
+            "rtd": build_rtd_status(),
             "gnss": dict(gnss_payload),
             "power": dict(power_payload),
             "battery": dict(battery_payload),
@@ -1943,6 +1947,7 @@ def cmd_report_metrics(_: Optional[dict]) -> Dict:
             "network": {"ssid": ssid},
             "pi": {"cpu_temp_c": pi_temp},
             "environment": environment,
+            "rtd": build_rtd_status(),
             "gnss": gnss,
             "power": power,
         },
@@ -1963,6 +1968,7 @@ def cmd_report(_: Optional[dict]) -> Dict:
         "REPORT",
         _health_to_feature_status(gnss_payload.get("health_state")),
     )
+    snapshot["rtd"] = build_rtd_status()
     snapshot["gnss"] = gnss_payload
     snapshot["location"] = _location_context(gnss_payload)
     snapshot["features"] = _feature_tree_snapshot()
@@ -2323,6 +2329,7 @@ def run() -> None:
     # independently starting processes query SYSTEM immediately after its command
     # socket appears without confusing process existence with service readiness.
     set_pi_feature("SYSTEM", "POSTGRES", "INITIALIZING")
+    set_pi_feature("SYSTEM", "RTD", "INITIALIZING")
     set_pi_feature("PUBSUB", "TEENSY_RPC", "INITIALIZING")
 
     # Expose SYSTEM before touching PostgreSQL.  Database startup/restart is a
@@ -2348,6 +2355,12 @@ def run() -> None:
     # Formal PUBSUB topology already exists independently of SYSTEM process
     # lifetime. Start platform observation immediately; DB-dependent observations
     # remain HOLD until PI.SYSTEM.POSTGRES is proved NOMINAL.
+    threading.Thread(
+        target=rtd_monitor,
+        daemon=True,
+        name="system-rtd-monitor",
+    ).start()
+
     threading.Thread(
         target=system_poller,
         daemon=True,

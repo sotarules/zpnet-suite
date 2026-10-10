@@ -102,7 +102,10 @@ GND           Black         GND                Battery branching ground         
 32            Orange        GNSS_PPS_RELAY     GPIO relay to Pi
 34            Coax          PHOTODIODE_INT     Koheron PD200T TTL out                Comparator timing / GPIO2[29] IRQ P0
 35            Coax/pigtail  LASER_MOD          TC4427 MDM -> Koheron DRV200 MOD     Active-high: LOW idle; HIGH positive modulation
-38            --            FREE               --                                   Released 2026-09-18; PD OUT cable removed
+26            Green         MAX31865_MOSI      MAX31865 SDI                         SPI1 data to sensor
+27            Yellow        MAX31865_SCK       MAX31865 CLK                         SPI1 clock
+38            Orange        MAX31865_CS        MAX31865 CS                          Active-low GPIO chip select
+39            Blue          MAX31865_MISO      MAX31865 SDO                         SPI1 data from sensor
 
 30            --            FREE               --                                   Released 2026-09-13; EV5491 retired
 
@@ -128,6 +131,36 @@ Interrupt priority / GPIO routing summary:
 
 =============================================================================*/
 
+
+
+/*=============================================================================
+ MAX31865 / PT1000 -- FINAL TEENSY SPI1 ASSIGNMENTS (2026-10-09)
+-------------------------------------------------------------------------------
+
+Installed and connected 2026-10-09. Dedicated six-wire 26 AWG Kynar harness.
+Probe is beside the fiber beneath the heater pad in the recessed Velcro base.
+
+MAX31865 terminal    Teensy terminal    Wire color    Signal / direction
+-------------------------------------------------------------------------------
+VIN                  3.3V               Purple        Power; NOT Teensy VIN
+GND                  GND                Black         Common power / logic ground
+3V3                  --                 --            Regulator output; disconnected
+CLK                  27                 Yellow        SPI1 SCK: Teensy -> sensor
+SDO                  39                 Blue          SPI1 MISO: sensor -> Teensy
+SDI                  26                 Green         SPI1 MOSI: Teensy -> sensor
+CS                   38                 Orange        Active LOW, idle HIGH
+RDY                  --                 --            Disconnected; no interrupt pin
+
+Numbers refer to Teensy digital pin labels on the screw-terminal breakout.
+Colors identify this dedicated harness; SPI wires do not connect to I2C rails.
+Pin 38 was released from PD OUT and is now reserved exclusively for RTD CS.
+SPI1 is LPSPI3. Explicitly select MOSI=26, MISO=39, SCK=27 BEFORE SPI1.begin().
+Do not use default MISO1 pin 1 (GNSS PPS) or SPI SCK pin 13 (OCXO1).
+No existing clock or optical signal needs to move.
+
+Hardware is installed; sensor acquisition firmware is a separate change.
+The three-wire PT1000 requires the MAX31865 three-wire solder-jumper setup.
+=============================================================================*/
 
 
 /*=============================================================================
@@ -204,7 +237,7 @@ Notes:
   PPS/OCXO sources. PHOTONS protects predicted +/-5 us tick windows before
   launching; unexpected equal-priority serialization retains delay testimony.
 • PD OUT support retired 2026-09-18: the PD OUT-to-Teensy cable is removed,
-  pin 38/A14 is unassigned, and firmware no longer configures or ADC-reads that
+  pin 38 is now reserved for MAX31865 CS. Firmware no longer ADC-reads that
   pin or publishes photodiode_analog_v. TTL OUT on pin 34 remains the receiver
   timing input. DRV200 laser-monitor telemetry is separate and retained.
 • Observed before removal: connecting PD OUT to the Teensy corrupted TTL OUT

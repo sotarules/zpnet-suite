@@ -7998,7 +7998,9 @@ static uint8_t payload_kind_code_from_json_type(json_value_type_t type) {
     }
 }
 
-bool Payload::parseJSON(const uint8_t* data, size_t len) {
+// JSON decoding runs in foreground command/object handling. Keep its code in
+// flash so it does not consume the 32 KiB ITCM banks shared with the RAM1 stack.
+FLASHMEM bool Payload::parseJSON(const uint8_t* data, size_t len) {
     payload_contract_state_t before{};
     if (!_contract_begin(PAYLOAD_OP_PARSEJSON_DATA, &before)) return false;
 
