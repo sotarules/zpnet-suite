@@ -57,6 +57,7 @@ from zpnet.processes.processes import (
 )
 from zpnet.processes.photons.normalization import (
     NORMALIZATION_ID, POLICY as NORMALIZATION_POLICY, command_args as normalization_args,
+    TemperatureUnavailable,
 )
 from zpnet.shared.constants import Payload
 from zpnet.shared.db import DatabaseContentionRetry, open_db
@@ -7634,10 +7635,14 @@ def _state_loop() -> None:
                             "sequence": fragment.get("sequence") if isinstance(fragment, dict) else None,
                             "reason": str(exc),
                         }
+                        if isinstance(exc, TemperatureUnavailable):
+                            # Keep the exact constituent statuses/ages available
+                            # in REPORT without a traceback for a normal wait.
+                            failure["temperature"] = copy.deepcopy(system_context["temperature"])
                         with _state_lock:
                             _system_report_retry_count += 1
                             _last_system_report_failure = failure
-                        if not system_failure_logged:
+                        if not isinstance(exc, TemperatureUnavailable) and not system_failure_logged:
                             logging.exception(
                                 "⚠️ [photons] SYSTEM.REPORT unavailable for PHOTONS sequence=%s; retrying",
                                 failure["sequence"],

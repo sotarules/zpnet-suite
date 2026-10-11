@@ -53,15 +53,25 @@ def _at(context, path):
     return context
 
 
+class TemperatureUnavailable(ValueError):
+    """The configured authority is temporarily waiting for fresh sensor data."""
+
+
 def temperature_c(system_context):
     """Require the exact SYSTEM temperature model admitted by this calibration."""
     quality = _at(system_context, POLICY["quality_path"])
-    if (quality["status"] != "OK"
-            or quality["source"] != POLICY["temperature_source"]
+    if (quality["source"] != POLICY["temperature_source"]
             or quality["schema"] != POLICY["temperature_schema"]
-            or quality["model_id"] != POLICY["temperature_model_id"]
-            or not 0 <= quality["age_ms"] <= POLICY["maximum_sample_age_ms"]):
-        raise ValueError("PHOTONS synthetic temperature authority unavailable, stale or mismatched")
+            or quality["model_id"] != POLICY["temperature_model_id"]):
+        raise ValueError("PHOTONS synthetic temperature authority mismatched")
+    # Availability is an ordinary retry condition. Keep malformed testimony
+    # and model mismatches distinct so the caller cannot silence those errors.
+    if quality["status"] in ("INITIALIZING", "UNAVAILABLE"):
+        raise TemperatureUnavailable(f"PHOTONS synthetic temperature {quality['status']}")
+    if quality["status"] != "OK" or not 0 <= quality["age_ms"]:
+        raise ValueError("PHOTONS synthetic temperature status or age malformed")
+    if quality["age_ms"] > POLICY["maximum_sample_age_ms"]:
+        raise TemperatureUnavailable("PHOTONS synthetic temperature stale")
     value = Decimal(str(_at(system_context, POLICY["temperature_path"])))
     if not value.is_finite():
         raise ValueError("PHOTONS normalization temperature must be finite")
