@@ -540,8 +540,7 @@ def shape(points, x, residual, args):
     groups = {}
     for i,t in enumerate(x):
         groups.setdefault(math.floor((t-origin)/width),[]).append(i)
-    print(f'
-  FINAL TEST TEMPERATURE SHAPE ({width:g} C bins; residual = actual - frozen prediction)')
+    print(f'\n  FINAL TEST TEMPERATURE SHAPE ({width:g} C bins; residual = actual - frozen prediction)')
     print('     mean_T_C    blocks     mean_LAP_ns    residual_ps   residual_SD_ps')
     for _,indices in sorted(groups.items()):
         e = [residual[i] for i in indices]
@@ -556,8 +555,7 @@ def shape(points, x, residual, args):
             rate = (x[i]-x[i-1])*60/(b.time-a.time)
             direction[i] = 'warm' if rate>args.direction_threshold_c_per_minute else (
                 'cool' if rate < -args.direction_threshold_c_per_minute else 'steady')
-    print('
-  FINAL TEST WARMING / COOLING (past-to-current predictor change)')
+    print('\n  FINAL TEST WARMING / COOLING (past-to-current predictor change)')
     print(f'  Direction counts: {dict(Counter(direction.values()))}')
     print('    mean_T_C   warm_N   cool_N   warm-minus-cool residual_ps')
     gaps = []
@@ -577,8 +575,7 @@ def shape(points, x, residual, args):
 
 def deployed_comparison(samples, points, canonical_points, sensor):
     """Describe the installed correction even when there is too little data to fit."""
-    print('
-  DEPLOYED NORMALIZATION (same observations; no refitting)')
+    print('\n  DEPLOYED NORMALIZATION (same observations; no refitting)')
     print(f'  Firmware normalization_id: {samples[0].normalization_id}')
     print('  uncorrected_LAP_ns = canonical_LAP_ns + recorded_correction_fs / 1,000,000')
     print('  Reconstruction retains the stored LAP rounding; no current policy is imported.')
@@ -612,8 +609,7 @@ def deployed_comparison(samples, points, canonical_points, sensor):
     print(f'  Descriptive {SENSOR_LABELS[sensor]} correlation: uncorrected={fmt(pearson(temperatures,raw))}; '
           f'deployed={fmt(pearson(temperatures,canonical))}')
     print('  Descriptive comparison only; this does not establish calibration accuracy or causation.')
-    print('
-  DEPLOYED NORMALIZATION IN SIX CHRONOLOGICAL WINDOWS (all usable seconds)')
+    print('\n  DEPLOYED NORMALIZATION IN SIX CHRONOLOGICAL WINDOWS (all usable seconds)')
     print('    UTC start                    N    mean_T_C  uncorrected_ns    deployed_ns  correction_ns')
     for i in range(6):
         window = samples[i*len(samples)//6:(i+1)*len(samples)//6]
@@ -626,10 +622,8 @@ def deployed_comparison(samples, points, canonical_points, sensor):
 
 
 def analyze(samples, reason, args):
-    print(f'
-SENSOR: {SENSOR_LABELS[args.sensor]} (recorded mean)')
-    print(f'
-EPOCH {samples[0].epoch}: {reason}')
+    print(f'\nSENSOR: {SENSOR_LABELS[args.sensor]} (recorded mean)')
+    print(f'\nEPOCH {samples[0].epoch}: {reason}')
     print(f'  UTC {stamp(samples[0].time)} .. {stamp(samples[-1].time)}')
     print(f'  Settings: {samples[0].signature}')
     print(f'  Usable seconds: {len(samples):,}; continuous runs: {len(set(s.run for s in samples)):,}')
@@ -648,8 +642,7 @@ EPOCH {samples[0].epoch}: {reason}')
     if deployed:
         deployed_comparison(samples,points,canonical_points,args.sensor)
     if len(points)<60:
-        print('
-  MODEL SELECTION DEFERRED: need at least 60 complete blocks plus adequate later-test support.')
+        print('\n  MODEL SELECTION DEFERRED: need at least 60 complete blocks plus adequate later-test support.')
         print('  Collect longer runs across thermal cycles; smaller blocks do not create independent sensor observations.')
         return
     print(f'  Descriptive block correlations: T vs uncorrected LAP {fmt(pearson([p.temperature for p in points], [p.lap_ns for p in points]))}; '
@@ -683,8 +676,7 @@ EPOCH {samples[0].epoch}: {reason}')
         return [lookup[(p.run,p.index-lag)].temperature for p in rows]
     def ys(rows):
         return [p.lap_ns for p in rows]
-    print('
-  MODEL SELECTION ON UNCORRECTED LAP (first 70% only; three expanding forward folds)')
+    print('\n  MODEL SELECTION ON UNCORRECTED LAP (first 70% only; three expanding forward folds)')
     print(f'  Separation: >{embargo}s; final test: {len(test):,} blocks, not used to choose degree or lag.')
     for i,(train,val) in enumerate(folds,1):
         print(f'  Fold {i}: fit {len(train):,}, validate {len(val):,}; validation {stamp(val[0].time)} .. {stamp(val[-1].time)}')
@@ -722,8 +714,7 @@ EPOCH {samples[0].epoch}: {reason}')
     print(f'  FROZEN CHOICE: {name(degree,lag,args.bin_seconds)}')
     model = polynomial(xs(development,lag),ys(development),degree)
     assert model is not None
-    print('
-  FROZEN CANDIDATE FORMULA (fitted on uncorrected development LAP only; no later-data recentering)')
+    print('\n  FROZEN CANDIDATE FORMULA (fitted on uncorrected development LAP only; no later-data recentering)')
     formula(model,lag*args.bin_seconds)
     tx, actual = xs(test,lag),ys(test)
     predictions = [model.predict(t) for t in tx]
@@ -732,8 +723,7 @@ EPOCH {samples[0].epoch}: {reason}')
     baseline = st.fmean(ys(development))
     baseline_errors = [y-baseline for y in actual]
     trend = polynomial([p.time for p in development],ys(development),1)
-    print('
-  FINAL UNSEEN TEST (same blocks in every comparison)')
+    print('\n  FINAL UNSEEN TEST (same blocks in every comparison)')
     print(f'  UTC {stamp(test[0].time)} .. {stamp(test[-1].time)}')
     outside = [i for i,t in enumerate(tx) if not model.low<=t<=model.high]
     print(f'  Predictor range: {min(tx):.6f} .. {max(tx):.6f} C; outside fit range: {len(outside):,}/{len(test):,}')
@@ -775,8 +765,7 @@ EPOCH {samples[0].epoch}: {reason}')
                 raw_seconds.append(s.lap_ns)
                 corrected_seconds.append(s.lap_ns-model.correction(s.temperature))
                 deployed_seconds.append(s.canonical_ns)
-        print('
-  SAME FINAL TEST, AT ONE-SECOND RESOLUTION (cached recorded temperature)')
+        print('\n  SAME FINAL TEST, AT ONE-SECOND RESOLUTION (cached recorded temperature)')
         spread_header()
         spread('uncorrected one-second',raw_seconds)
         spread('candidate one-second',corrected_seconds)
@@ -785,8 +774,7 @@ EPOCH {samples[0].epoch}: {reason}')
         print('  Polynomial evaluated per second here; nonlinear averaging can differ from block evaluation.')
     else:
         print('  Lagged correction is evaluated at block resolution only; no interpolated one-second results.')
-    print('
-  FINAL TEST IN SIX CHRONOLOGICAL WINDOWS')
+    print('\n  FINAL TEST IN SIX CHRONOLOGICAL WINDOWS')
     print('    UTC start                    N    mean_T_C  uncorrected_ns   candidate_mean_ns  residual_mean_ps')
     for i in range(6):
         indices = list(range(i*len(test)//6,(i+1)*len(test)//6))
@@ -797,8 +785,7 @@ EPOCH {samples[0].epoch}: {reason}')
                   f'{st.fmean(normalized[j] for j in indices):19.6f} '
                   f'{st.fmean(residual[j] for j in indices)*1000:17.3f}')
     shape(test,tx,residual,args)
-    print('
-  INTERPRETATION')
+    print('\n  INTERPRETATION')
     if degree==0:
         print('  Forward validation did not justify a temperature correction under the simplicity rule.')
     elif rmse(residual)<rmse(baseline_errors) and st.stdev(normalized)<st.stdev(actual):
@@ -864,8 +851,7 @@ def main(argv):
     print('Loading campaign observations...',flush=True)
     rows = file_rows(args.input,args.campaign) if args.input else database_rows(args)
     samples,counts,reasons = collect(rows,args)
-    print('
-DATA ACCOUNTING')
+    print('\nDATA ACCOUNTING')
     for key,value in counts.items():
         print(f'  {key}: {value:,}')
     print('  Continuity-break reason counts can overlap. Partial blocks and lag-history losses are reported per epoch.')
@@ -882,8 +868,7 @@ DATA ACCOUNTING')
             sensor_args.sensor = sensor
             selected = [replace(s, temperature=dict(s.sensor_temperatures)[sensor]) for s in observations]
             analyze(selected,reasons[epoch],sensor_args)
-    print('
-REPORT NOTES')
+    print('\nREPORT NOTES')
     print('  Epochs are fitted separately across recorded settings/calibration/synthetic-model changes, resets and recovery.')
     print('  Deployed = stored canonical LAP; uncorrected = original legacy LAP or reconstructed pre-correction LAP.')
     print('  Candidate formulas always fit uncorrected LAP and replace, rather than compound, the deployed correction.')
