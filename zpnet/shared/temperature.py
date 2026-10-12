@@ -44,6 +44,16 @@ TEMPERATURE_POLICY = {
         },
     },
 }
+# Preserve the installed two-sensor calibration identity while the PD-side
+# BME280 is acquired as an independent physical witness. The full inventory
+# above still feeds SYSTEM and individual PHOTONS records.
+CALIBRATION_TEMPERATURE_POLICY = {
+    **TEMPERATURE_POLICY,
+    "sources": {
+        name: policy for name, policy in TEMPERATURE_POLICY["sources"].items()
+        if name != "receiver"
+    },
+}
 TEMPERATURE_MODEL_ID = int(hashlib.sha256(
-    json.dumps(TEMPERATURE_POLICY, sort_keys=True, separators=(",", ":")).encode()
+    json.dumps(CALIBRATION_TEMPERATURE_POLICY, sort_keys=True, separators=(",", ":")).encode()
 ).hexdigest()[:8], 16)

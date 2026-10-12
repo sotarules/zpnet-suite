@@ -19,7 +19,9 @@ All configured sensors are required; an outage never changes the mixture.
 import hashlib
 import json
 from decimal import Decimal, ROUND_HALF_EVEN
-from zpnet.shared.temperature import TEMPERATURE_MODEL_ID, TEMPERATURE_POLICY
+from zpnet.shared.temperature import (
+    TEMPERATURE_MODEL_ID, TEMPERATURE_POLICY, CALIBRATION_TEMPERATURE_POLICY,
+)
 
 
 POLICY = {
@@ -30,13 +32,13 @@ POLICY = {
     "temperature_source": TEMPERATURE_POLICY["source"],
     "temperature_schema": TEMPERATURE_POLICY["schema"],
     "temperature_model_id": TEMPERATURE_MODEL_ID,
-    "temperature_model": TEMPERATURE_POLICY,
+    "temperature_model": CALIBRATION_TEMPERATURE_POLICY,
     "maximum_sample_age_ms": max(
-        item["maximum_age_ms"] for item in TEMPERATURE_POLICY["sources"].values()
+        item["maximum_age_ms"] for item in CALIBRATION_TEMPERATURE_POLICY["sources"].values()
     ),
     "calibration_basis": "PROVISIONAL_TRANSFER_OF_SHORT2_BME280_ZERO_LAG_FIT",
     "witness_temperature_paths": [
-        [name, "raw_temperature_c"] for name in TEMPERATURE_POLICY["sources"]
+        [name, "raw_temperature_c"] for name in CALIBRATION_TEMPERATURE_POLICY["sources"]
     ],
     "reference_c": "34.878255509",
     "coefficients_ns": ["2.46050130414"],

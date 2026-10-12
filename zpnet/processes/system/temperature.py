@@ -7,7 +7,9 @@ import time
 from collections import deque
 from statistics import fmean
 
-from zpnet.shared.temperature import TEMPERATURE_MODEL_ID, TEMPERATURE_POLICY
+from zpnet.shared.temperature import (
+    TEMPERATURE_MODEL_ID, TEMPERATURE_POLICY, CALIBRATION_TEMPERATURE_POLICY,
+)
 
 
 _LOCK = threading.Lock()
@@ -116,7 +118,9 @@ def build_temperature_context() -> dict:
         now = time.monotonic()
         context = {name: _source_snapshot(name, now) for name in _SOURCES}
     components = {}
-    for name, policy in _SOURCES.items():
+    # Only the deployed calibration members contribute to the synthetic scalar.
+    # Other configured sensors remain independently sampled and reported.
+    for name, policy in CALIBRATION_TEMPERATURE_POLICY["sources"].items():
         item = context[name]
         component = {"source": policy["source"], "weight": policy["weight"],
                      "status": item["status"]}
