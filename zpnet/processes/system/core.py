@@ -194,8 +194,6 @@ POWER_CONFIG_BY_BUS = {
 BME280_ID_REG = 0xD0
 BME280_EXPECTED_ID = 0x60
 
-BME280_ADDR   = 0x76
-
 REG_ID        = 0xD0
 REG_CTRL_HUM  = 0xF2
 REG_CTRL_MEAS = 0xF4
@@ -447,7 +445,7 @@ def _pi_feature_tree_snapshot() -> Dict[str, Dict[str, Dict[str, str]]]:
 def _feature_tree_snapshot(temperature_context=None) -> Dict[str, Dict[str, Dict[str, str]]]:
     """Return the Pi-authored platform feature tree owned by SYSTEM."""
     # Readiness and the reported composite share one observation. Query-time
-    # aging also expires the authority if either temperature sampler stalls.
+    # aging also expires the authority if any temperature sampler stalls.
     if temperature_context is None:
         temperature_context = build_temperature_context()
     for field in (*TEMPERATURE_POLICY["sources"], "temperature"):
@@ -1246,7 +1244,8 @@ def environment_monitor(name: str = "environment") -> None:
         reading = _read_environment_status(name)
         key = (reading["sample_sequence"],) if reading["status"] == "OK" else ()
         accept_temperature(name, reading, key, started)
-        time.sleep(max(0.05, (TEMPERATURE_POLICY["sources"][name]["sample_period_ms"] / 1000) - (time.monotonic() - started)))
+        period = TEMPERATURE_POLICY["sources"][name]["sample_period_ms"] / 1000
+        time.sleep(max(0.05, period - (time.monotonic() - started)))
 
 # ------------------------------------------------------------------
 # Power monitoring helpers (legacy: power_monitor)
