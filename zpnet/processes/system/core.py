@@ -157,7 +157,8 @@ I2C_SENSORS_BY_BUS = {
         0x41: "INA260 0x41 (5v Rail+",
         0x44: "INA260 0x44 (12v Rail)",
         0x66: "EV5491 0x66 (Laser Controller)",
-        0x76: "BME280 0x76 (Environment)",
+        0x76: "BME280 0x76 (Control Tower under Pi)",
+        0x77: "BME280 0x77 (Center Tower near PD200T)",
         0x4C: "AD5693R 0x4C (OCXO2 DAC)",
         0x4E: "AD5693R 0x4E (OCXO1 DAC)",
         # 0x57 will appear via scan but is ignored (EEPROM)
@@ -212,17 +213,17 @@ SEA_LEVEL_PRESSURE_HPA = 1013.25
 # publish a stale/error payload instead of killing the SYSTEM poller.
 BME280_RETRY_COUNT = 3
 BME280_RETRY_DELAY_SEC = 0.05
-_BME280_POLICY = TEMPERATURE_POLICY["sources"]["environment"]
-BME280_POLL_SECONDS = _BME280_POLICY["sample_period_ms"] / 1000
 BME280_CONVERSION_SECONDS = 0.010  # Bosch max 9.3 ms for T/P/H oversampling x1
-
-_BME280_CAL_CACHE: Optional[dict] = None
+BME280_SOURCE_ADDRESSES = {"environment": 0x76, "receiver": 0x77}
+# Both parts share SMBus1. Serialize their multi-register conversion sequences;
+# keep independent calibration, sequence, fault, and recovery histories.
 _BME280_READ_LOCK = threading.Lock()
-_BME280_LAST_GOOD: Optional[dict] = None
-_BME280_READ_FAIL_COUNT = 0
-_BME280_CONSECUTIVE_FAIL_COUNT = 0
-_BME280_RECOVERY_COUNT = 0
-_BME280_SAMPLE_SEQUENCE = 0
+_BME280_STATES = {
+    name: {"cal": None, "last_good": None, "read_fail_count": 0,
+           "consecutive_fail_count": 0, "recovery_count": 0,
+           "sample_sequence": 0}
+    for name in BME280_SOURCE_ADDRESSES
+}
 
 REG_CURRENT = 0x01
 REG_VOLTAGE = 0x02
@@ -449,7 +450,7 @@ def _feature_tree_snapshot(temperature_context=None) -> Dict[str, Dict[str, Dict
     # aging also expires the authority if either temperature sampler stalls.
     if temperature_context is None:
         temperature_context = build_temperature_context()
-    for field in ("environment", "rtd", "temperature"):
+    for field in (*TEMPERATURE_POLICY["sources"], "temperature"):
         set_pi_feature("SYSTEM", field.upper(),
                        temperature_feature_status(temperature_context[field]["status"]))
     with _FEATURE_LOCK:
@@ -995,38 +996,38 @@ def read_s16_le(bus: SMBus, addr: int, reg: int) -> int:
     return val
 
 
-def read_bme280_calibration(bus: SMBus) -> dict:
+def read_bme280_calibration(bus: SMBus, address: int) -> dict:
     cal = {}
 
     # Temperature
-    cal["dig_T1"] = read_u16_le(bus, BME280_ADDR, 0x88)
-    cal["dig_T2"] = read_s16_le(bus, BME280_ADDR, 0x8A)
-    cal["dig_T3"] = read_s16_le(bus, BME280_ADDR, 0x8C)
+    cal["dig_T1"] = read_u16_le(bus, address, 0x88)
+    cal["dig_T2"] = read_s16_le(bus, address, 0x8A)
+    cal["dig_T3"] = read_s16_le(bus, address, 0x8C)
 
     # Pressure
-    cal["dig_P1"] = read_u16_le(bus, BME280_ADDR, 0x8E)
-    cal["dig_P2"] = read_s16_le(bus, BME280_ADDR, 0x90)
-    cal["dig_P3"] = read_s16_le(bus, BME280_ADDR, 0x92)
-    cal["dig_P4"] = read_s16_le(bus, BME280_ADDR, 0x94)
-    cal["dig_P5"] = read_s16_le(bus, BME280_ADDR, 0x96)
-    cal["dig_P6"] = read_s16_le(bus, BME280_ADDR, 0x98)
-    cal["dig_P7"] = read_s16_le(bus, BME280_ADDR, 0x9A)
-    cal["dig_P8"] = read_s16_le(bus, BME280_ADDR, 0x9C)
-    cal["dig_P9"] = read_s16_le(bus, BME280_ADDR, 0x9E)
+    cal["dig_P1"] = read_u16_le(bus, address, 0x8E)
+    cal["dig_P2"] = read_s16_le(bus, address, 0x90)
+    cal["dig_P3"] = read_s16_le(bus, address, 0x92)
+    cal["dig_P4"] = read_s16_le(bus, address, 0x94)
+    cal["dig_P5"] = read_s16_le(bus, address, 0x96)
+    cal["dig_P6"] = read_s16_le(bus, address, 0x98)
+    cal["dig_P7"] = read_s16_le(bus, address, 0x9A)
+    cal["dig_P8"] = read_s16_le(bus, address, 0x9C)
+    cal["dig_P9"] = read_s16_le(bus, address, 0x9E)
 
     # Humidity
-    cal["dig_H1"] = bus.read_byte_data(BME280_ADDR, 0xA1)
-    cal["dig_H2"] = read_s16_le(bus, BME280_ADDR, 0xE1)
-    cal["dig_H3"] = bus.read_byte_data(BME280_ADDR, 0xE3)
+    cal["dig_H1"] = bus.read_byte_data(address, 0xA1)
+    cal["dig_H2"] = read_s16_le(bus, address, 0xE1)
+    cal["dig_H3"] = bus.read_byte_data(address, 0xE3)
 
-    e4 = bus.read_byte_data(BME280_ADDR, 0xE4)
-    e5 = bus.read_byte_data(BME280_ADDR, 0xE5)
-    e6 = bus.read_byte_data(BME280_ADDR, 0xE6)
+    e4 = bus.read_byte_data(address, 0xE4)
+    e5 = bus.read_byte_data(address, 0xE5)
+    e6 = bus.read_byte_data(address, 0xE6)
 
     cal["dig_H4"] = (e4 << 4) | (e5 & 0x0F)
     cal["dig_H5"] = (e6 << 4) | (e5 >> 4)
 
-    cal["dig_H6"] = bus.read_byte_data(BME280_ADDR, 0xE7)
+    cal["dig_H6"] = bus.read_byte_data(address, 0xE7)
     if cal["dig_H6"] & 0x80:
         cal["dig_H6"] -= 256
 
@@ -1067,24 +1068,26 @@ def compensate_humidity(adc_H: int, t_fine: float, cal: dict) -> float:
     return max(0.0, min(100.0, h))
 
 
-def _bme280_wait_ready(bus: SMBus) -> None:
+def _bme280_wait_ready(bus: SMBus, address: int) -> None:
     deadline = time.monotonic() + 0.1
-    while bus.read_byte_data(BME280_ADDR, REG_STATUS) & 0x09:
+    while bus.read_byte_data(address, REG_STATUS) & 0x09:
         if time.monotonic() >= deadline:
             raise TimeoutError("BME280 conversion/NVM copy did not finish")
         time.sleep(0.002)
 
 
-def _build_environment_status_once() -> dict:
+def _build_environment_status_once(name: str) -> dict:
     """Perform one complete BME280 transaction sequence.
 
     This helper is intentionally allowed to raise.  The
     _read_environment_status() wrapper owns retry/stale-payload behavior.
     """
-    global _BME280_CAL_CACHE
+    policy = TEMPERATURE_POLICY["sources"][name]
+    address = BME280_SOURCE_ADDRESSES[name]
+    state = _BME280_STATES[name]
 
     with open_i2c(I2C_BUS_LEGACY) as bus:
-        chip_id = bus.read_byte_data(BME280_ADDR, REG_ID)
+        chip_id = bus.read_byte_data(address, REG_ID)
         if chip_id != EXPECTED_CHIP_ID:
             raise RuntimeError(f"unexpected BME280 chip ID 0x{chip_id:02X}")
 
@@ -1092,19 +1095,19 @@ def _build_environment_status_once() -> dict:
         # Enter sleep and wait for any old conversion before changing config.
         # One explicit forced conversion per poll makes sample identity and
         # cadence independent of REPORT_METRICS requests and the slow poller.
-        bus.write_byte_data(BME280_ADDR, REG_CTRL_MEAS, 0x24)
-        _bme280_wait_ready(bus)
-        bus.write_byte_data(BME280_ADDR, REG_CONFIG, 0x00)  # hardware IIR off
-        bus.write_byte_data(BME280_ADDR, REG_CTRL_HUM, 0x01)
+        bus.write_byte_data(address, REG_CTRL_MEAS, 0x24)
+        _bme280_wait_ready(bus, address)
+        bus.write_byte_data(address, REG_CONFIG, 0x00)  # hardware IIR off
+        bus.write_byte_data(address, REG_CTRL_HUM, 0x01)
 
-        if _BME280_CAL_CACHE is None:
-            _BME280_CAL_CACHE = read_bme280_calibration(bus)
-        cal = _BME280_CAL_CACHE
+        if state["cal"] is None:
+            state["cal"] = read_bme280_calibration(bus, address)
+        cal = state["cal"]
 
-        bus.write_byte_data(BME280_ADDR, REG_CTRL_MEAS, 0x25)  # T/P x1, forced
+        bus.write_byte_data(address, REG_CTRL_MEAS, 0x25)  # T/P x1, forced
         time.sleep(BME280_CONVERSION_SECONDS)
-        _bme280_wait_ready(bus)
-        data = bus.read_i2c_block_data(BME280_ADDR, REG_DATA, 8)
+        _bme280_wait_ready(bus, address)
+        data = bus.read_i2c_block_data(address, REG_DATA, 8)
         adc_P = (data[0] << 12) | (data[1] << 4) | (data[2] >> 4)
         adc_T = (data[3] << 12) | (data[4] << 4) | (data[5] >> 4)
         adc_H = (data[6] << 8) | data[7]
@@ -1116,14 +1119,14 @@ def _build_environment_status_once() -> dict:
         altitude_m = 44330.0 * (1.0 - (pressure_hpa / SEA_LEVEL_PRESSURE_HPA) ** 0.1903)
 
         return {
-            "schema": _BME280_POLICY["schema"],
-            "source": _BME280_POLICY["source"],
+            "schema": policy["schema"],
+            "source": policy["source"],
             "status": "OK",
             "age_ms": 0,
-            "sample_period_ms": _BME280_POLICY["sample_period_ms"],
+            "sample_period_ms": policy["sample_period_ms"],
             "sampled_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "measurement_mode": "FORCED",
-            "sensor_address": "0x76",
+            "sensor_address": f"0x{address:02X}",
             "sensor_present": True,
             "temperature_c": temp_c,
             "pressure_hpa": round(pressure_hpa, 2),
@@ -1132,17 +1135,20 @@ def _build_environment_status_once() -> dict:
             "read_ok": True,
             "stale": False,
             "retry_count": 0,
-            "read_fail_count": _BME280_READ_FAIL_COUNT,
+            "read_fail_count": state["read_fail_count"],
             "consecutive_fail_count": 0,
-            "recovery_count": _BME280_RECOVERY_COUNT,
+            "recovery_count": state["recovery_count"],
             "last_error": "",
             "health_state": "NOMINAL",
         }
 
 
-def _bme280_failure_payload(error: Exception, attempts: int) -> dict:
-    base = dict(_BME280_LAST_GOOD) if _BME280_LAST_GOOD else {
-        "sensor_address": "0x76",
+def _bme280_failure_payload(name: str, error: Exception, attempts: int) -> dict:
+    state = _BME280_STATES[name]
+    policy = TEMPERATURE_POLICY["sources"][name]
+    address = BME280_SOURCE_ADDRESSES[name]
+    base = dict(state["last_good"]) if state["last_good"] else {
+        "sensor_address": f"0x{address:02X}",
         "sensor_present": False,
         "temperature_c": None,
         "pressure_hpa": None,
@@ -1151,15 +1157,15 @@ def _bme280_failure_payload(error: Exception, attempts: int) -> dict:
     }
 
     base.update({
-        "schema": _BME280_POLICY["schema"],
-        "source": _BME280_POLICY["source"],
+        "schema": policy["schema"],
+        "source": policy["source"],
         "status": "UNAVAILABLE",
         "read_ok": False,
-        "stale": _BME280_LAST_GOOD is not None,
+        "stale": state["last_good"] is not None,
         "retry_count": max(0, attempts - 1),
-        "read_fail_count": _BME280_READ_FAIL_COUNT,
-        "consecutive_fail_count": _BME280_CONSECUTIVE_FAIL_COUNT,
-        "recovery_count": _BME280_RECOVERY_COUNT,
+        "read_fail_count": state["read_fail_count"],
+        "consecutive_fail_count": state["consecutive_fail_count"],
+        "recovery_count": state["recovery_count"],
         "last_error": f"{type(error).__name__}: {error}",
         "health_state": "HOLD",
     })
@@ -1170,12 +1176,12 @@ def build_environment_status() -> dict:
     return build_sensor_status("environment")
 
 
-def _read_environment_status() -> dict:
+def _read_environment_status(name: str = "environment") -> dict:
     with _BME280_READ_LOCK:
-        return _build_environment_status_locked()
+        return _build_environment_status_locked(name)
 
 
-def _build_environment_status_locked() -> dict:
+def _build_environment_status_locked(name: str) -> dict:
     """
     Read environmental data from BME280.
 
@@ -1185,32 +1191,28 @@ def _build_environment_status_locked() -> dict:
       • Returns last-known-good/stale telemetry after exhausted retries
       • Never terminates the SYSTEM poller because of BME280 bus contention
     """
-    global _BME280_LAST_GOOD
-    global _BME280_READ_FAIL_COUNT
-    global _BME280_CONSECUTIVE_FAIL_COUNT
-    global _BME280_RECOVERY_COUNT
-    global _BME280_SAMPLE_SEQUENCE
+    state = _BME280_STATES[name]
 
     last_error: Exception | None = None
 
     for attempt in range(1, BME280_RETRY_COUNT + 1):
         try:
-            payload = _build_environment_status_once()
-            if _BME280_CONSECUTIVE_FAIL_COUNT:
-                _BME280_RECOVERY_COUNT += 1
-            _BME280_CONSECUTIVE_FAIL_COUNT = 0
-            payload["read_fail_count"] = _BME280_READ_FAIL_COUNT
+            payload = _build_environment_status_once(name)
+            if state["consecutive_fail_count"]:
+                state["recovery_count"] += 1
+            state["consecutive_fail_count"] = 0
+            payload["read_fail_count"] = state["read_fail_count"]
             payload["consecutive_fail_count"] = 0
-            payload["recovery_count"] = _BME280_RECOVERY_COUNT
+            payload["recovery_count"] = state["recovery_count"]
             payload["retry_count"] = attempt - 1
-            _BME280_SAMPLE_SEQUENCE += 1
-            payload["sample_sequence"] = _BME280_SAMPLE_SEQUENCE
-            _BME280_LAST_GOOD = dict(payload)
+            state["sample_sequence"] += 1
+            payload["sample_sequence"] = state["sample_sequence"]
+            state["last_good"] = dict(payload)
             return payload
         except OSError as e:
             last_error = e
-            _BME280_READ_FAIL_COUNT += 1
-            _BME280_CONSECUTIVE_FAIL_COUNT += 1
+            state["read_fail_count"] += 1
+            state["consecutive_fail_count"] += 1
             if attempt < BME280_RETRY_COUNT:
                 logging.warning(
                     "[system] BME280 transient I2C error on attempt %d/%d: %s",
@@ -1221,8 +1223,8 @@ def _build_environment_status_locked() -> dict:
                 time.sleep(BME280_RETRY_DELAY_SEC)
         except Exception as e:
             last_error = e
-            _BME280_READ_FAIL_COUNT += 1
-            _BME280_CONSECUTIVE_FAIL_COUNT += 1
+            state["read_fail_count"] += 1
+            state["consecutive_fail_count"] += 1
             if attempt < BME280_RETRY_COUNT:
                 logging.warning(
                     "[system] BME280 read error on attempt %d/%d: %s",
@@ -1233,18 +1235,18 @@ def _build_environment_status_locked() -> dict:
                 time.sleep(BME280_RETRY_DELAY_SEC)
 
     logging.exception("[system] BME280 read failed after retries")
-    return _bme280_failure_payload(last_error or RuntimeError("unknown BME280 error"),
+    return _bme280_failure_payload(name, last_error or RuntimeError("unknown BME280 error"),
                                    BME280_RETRY_COUNT)
 
 
-def environment_monitor() -> None:
+def environment_monitor(name: str = "environment") -> None:
     """Acquire BME280 at 1 Hz, regardless of which reports/screens are open."""
     while True:
         started = time.monotonic()
-        reading = _read_environment_status()
+        reading = _read_environment_status(name)
         key = (reading["sample_sequence"],) if reading["status"] == "OK" else ()
-        accept_temperature("environment", reading, key, started)
-        time.sleep(max(0.05, BME280_POLL_SECONDS - (time.monotonic() - started)))
+        accept_temperature(name, reading, key, started)
+        time.sleep(max(0.05, (TEMPERATURE_POLICY["sources"][name]["sample_period_ms"] / 1000) - (time.monotonic() - started)))
 
 # ------------------------------------------------------------------
 # Power monitoring helpers (legacy: power_monitor)
@@ -2416,11 +2418,13 @@ def run() -> None:
         name="system-rtd-monitor",
     ).start()
 
-    threading.Thread(
-        target=environment_monitor,
-        daemon=True,
-        name="system-environment-monitor",
-    ).start()
+    for sensor_name in BME280_SOURCE_ADDRESSES:
+        threading.Thread(
+            target=environment_monitor,
+            args=(sensor_name,),
+            daemon=True,
+            name=f"system-{sensor_name}-monitor",
+        ).start()
 
     threading.Thread(
         target=system_poller,
