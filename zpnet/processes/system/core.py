@@ -556,13 +556,14 @@ def build_pi_status() -> dict:
         "undervoltage_flags": get_undervoltage_flags(),
     }
 
-    temp = payload["cpu_temp_c"] or 0.0
-    load = payload["load_1m"]
+    temp = payload["cpu_temp_c"]
     mem_pct = payload["memory"]["percent"]
 
-    if temp < 70 and load < 4.0 and mem_pct < 85:
+    # Raspberry Pi thermal throttling begins around 80 C, with the hard
+    # thermal limit at 85 C. Load averages are telemetry, not host faults.
+    if temp < 80 and mem_pct < 85:
         payload["health_state"] = "NOMINAL"
-    elif temp < 80 and mem_pct < 95:
+    elif temp < 85 and mem_pct < 95:
         payload["health_state"] = "HOLD"
     else:
         payload["health_state"] = "DOWN"
