@@ -1,11 +1,18 @@
-"""Infer BME280 temperature compensation for one PHOTONS campaign.
+"""Infer recorded sensor-temperature compensation for one PHOTONS campaign.
 
-    zt photons_thermal Short2
-    zt photons_thermal Short2 --max-lag-seconds 600
-    python3 photons_thermal.py Short2 --input Short2.jsonl
+    zt photons_thermal External1
+    zt photons_thermal External1 --sensor compare --max-degree 1
+    zt photons_thermal External1 --max-lag-seconds 600
+    python3 photons_thermal.py External1 --input External1.jsonl
 
 Prints the complete report to STDOUT; no files or database values are changed.
-Uses the same-message BME280 and one-second mean lap, never cumulative means.
+Uses recorded temperature and one-second mean lap, never cumulative means.
+--sensor selects synthetic (default), bme280, max31865, or compare.
+Individual sensors use temperature.components' recorded smoothed means, not raw
+readings or independently refreshed SYSTEM fields. Missing selected readings are
+omitted; no fallback or reconstruction from today's sensor weights is performed.
+Compare uses the intersection of all three predictors with common blocks/splits;
+each sensor's degree/lag is chosen on development data, not on the final test.
 For normalized rows, reconstructs uncorrected LAP using the recorded firmware
 offset, and compares it with canonical LAP on the same observations. New models
 fit uncorrected LAP; they are replacement candidates, never a second correction.
@@ -17,6 +24,7 @@ on complete, uninterrupted blocks. Positive lag means temperature BEFORE lap.
 Standard library only, plus zpnet.shared.db when reading the database.
 main(argv) includes the program name, as required by the zt runner.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -33,7 +41,13 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 SCHEMA = "PHOTONS_V1"
 MIN_FIT = 3
-VERSION = "2026-10-05.2"
+VERSION = "2026-10-11.2"
+SENSORS = ("synthetic", "bme280", "max31865")
+SENSOR_LABELS = {"synthetic": "Synthetic temperature",
+                 "bme280": "BME280", "max31865": "MAX31865"}
+SENSOR_COMPONENTS = {"bme280": ("environment", "PI.I2C1.BME280.0x76"),
+                     "max31865": ("rtd", "TEENSY.SPI1.MAX31865")}
+
 
 
 def utc(value: Any) -> float:
@@ -84,11 +98,12 @@ class Sample:
     correction_fs: int = 0
     applied_temperature: Optional[float] = None
     correction_age_ms: Optional[int] = None
+    sensor_temperatures: Tuple[Tuple[str, float], ...] = ()
     epoch: int = 0
     run: int = 0
 
 
-def parse_sample(row_id: int, p: Dict[str, Any]) -> Tuple[Optional[Sample], str]:
+def parse_sample(row_id: int, p: Dict[str, Any], sensor: str = "synthetic") -> Tuple[Optional[Sample], str]:
     """Optional environmental context may be absent; science remains strict."""
     if p["schema"] != SCHEMA:
         raise ValueError(f"expected {SCHEMA}")
@@ -97,19 +112,41 @@ def parse_sample(row_id: int, p: Dict[str, Any]) -> Tuple[Optional[Sample], str]
         raise ValueError("thermal analysis requires one-second fragments")
     if ph["snapshot_ok"] is not True:
         return None, "snapshot_not_ok"
-    # SYSTEM serves REPORT before its first platform poll completes; PHOTONS
-    # lawfully carries {} for environmental context that is not available yet.
-    env = p.get("environment")
-    if env is None:
-        return None, "temperature_not_recorded"
-    if not isinstance(env, dict):
-        raise ValueError("environment must be an object or null")
-    if env.get("temperature_c") is None:
-        return None, "temperature_not_recorded"
-    if any(key not in env for key in ("sensor_present", "read_ok", "stale")):
-        return None, "environment_quality_not_recorded"
-    if env["sensor_present"] is not True or env["read_ok"] is not True or env["stale"] is not False:
-        return None, "environment_unavailable_or_stale"
+    # All predictors come from one historical thermal snapshot. Do not mix
+    # component means with separately refreshed top-level SYSTEM fields.
+    thermal = p.get("temperature")
+    if not thermal:
+        return None, "temperature_context_not_recorded"
+    if not isinstance(thermal, dict):
+        raise ValueError("temperature must be an object or null")
+    if (thermal["schema"] != "SYNTHETIC_TEMPERATURE_V1"
+            or thermal["source"] != "PI.SYSTEM.TEMPERATURE"):
+        raise ValueError("unsupported synthetic temperature source/schema")
+    model_id = integer(thermal["model_id"])
+    if not 0 < model_id < 2**32:
+        raise ValueError("synthetic temperature requires a nonzero uint32 model identity")
+    selected = SENSORS if sensor == "compare" else (sensor,)
+    readings = {}
+    predictor_settings = {}
+    for name in selected:
+        if name == "synthetic":
+            item = thermal
+            settings = {"source": thermal["source"]}
+        else:
+            component, source = SENSOR_COMPONENTS[name]
+            item = (thermal.get("components") or {}).get(component)
+            if item is None:
+                return None, name + "_not_recorded"
+            if item["source"] != source:
+                raise ValueError(f"unexpected {name} source: {item['source']}")
+            settings = {"source": source,
+                        "window_samples": item["smoothing"]["window_samples"]} if item["status"] == "OK" else {}
+        if item["status"] != "OK":
+            return None, name + "_unavailable"
+        integer(item["age_ms"])
+        readings[name] = number(item["temperature_c"])
+        predictor_settings[name] = settings
+    temperature = readings[selected[0]]
     race = ph["race"]
     flight = race["flight_ns"]
     n = integer(flight["n"])
@@ -145,6 +182,15 @@ def parse_sample(row_id: int, p: Dict[str, Any]) -> Tuple[Optional[Sample], str]
             if (policy.get("schema") != "PHOTONS_THERMAL_NORMALIZATION_V1" or
                     policy.get("application") != "UNIFORM_OFFSET_AT_FRAGMENT_DRAIN"):
                 raise ValueError("unsupported normalization reconstruction contract")
+    if policy is not None and policy.get("temperature_path") == ["temperature", "temperature_c"]:
+        if policy["temperature_model_id"] != model_id:
+            raise ValueError("recorded synthetic temperature and normalization model disagree")
+        maximum_age = integer(policy["maximum_sample_age_ms"])
+        for name in selected:
+            item = (thermal if name == "synthetic" else
+                    thermal["components"][SENSOR_COMPONENTS[name][0]])
+            if item["age_ms"] > maximum_age:
+                return None, name + "_stale"
     # Undo exactly the applied offset; never recompute it from SYSTEM temperature.
     uncorrected_ns = canonical_ns + correction_fs / 1_000_000
     # Per-second center/radius/state are data, not configuration changes.
@@ -155,6 +201,9 @@ def parse_sample(row_id: int, p: Dict[str, Any]) -> Tuple[Optional[Sample], str]
         "core": {k: core.get(k) for k in (
             "algorithm", "minimum_count", "minimum_radius_cycles", "mad_multiplier", "minimum_retained_pct")},
         "normalization": {"id": normalization_id, "policy": policy},
+        "temperature_predictor": {"schema": thermal["schema"],
+                                  "source": thermal["source"], "model_id": model_id,
+                                  "selected": predictor_settings},
     }, sort_keys=True)
     projection = ph.get("projection") or {}
     pps = projection.get("anchor_pps_count")
@@ -163,14 +212,14 @@ def parse_sample(row_id: int, p: Dict[str, Any]) -> Tuple[Optional[Sample], str]
     return Sample(
         row_id=row_id, time=utc(p["published_at_utc"]), sequence=integer(p["sequence"]),
         reset=integer(ph["stats"]["reset_count"]), pps=None if pps is None else integer(pps),
-        temperature=number(env["temperature_c"]), lap_ns=uncorrected_ns, races=n,
+        temperature=temperature, lap_ns=uncorrected_ns, races=n,
         signature=signature,
         update=None if update is None else integer(update),
         generation=None if generation is None else integer(generation),
         receipt=p.get("recovery_receipt") is not None,
         canonical_ns=canonical_ns, normalization_id=normalization_id,
         correction_fs=correction_fs, applied_temperature=applied_temperature,
-        correction_age_ms=correction_age_ms,
+        correction_age_ms=correction_age_ms, sensor_temperatures=tuple(readings.items()),
     ), "used"
 
 
@@ -184,7 +233,7 @@ def database_rows(args: argparse.Namespace) -> Iterable[Tuple[int, Dict[str, Any
             'schema', payload -> 'schema',
             'sequence', payload -> 'sequence',
             'published_at_utc', payload -> 'published_at_utc',
-            'environment', payload -> 'environment',
+            'temperature', payload -> 'temperature',
             'normalization', payload -> 'normalization',
             'recovery_receipt', payload -> 'recovery_receipt',
             'photons', jsonb_build_object(
@@ -263,13 +312,12 @@ def collect(rows: Iterable[Tuple[int, Dict[str, Any]]], args: argparse.Namespace
                     (args.end is not None and t >= args.end) or t < origin + args.skip_seconds):
                 counts["outside_selected_time"] += 1
                 continue
-            sample, disposition = parse_sample(row_id, p)
+            sample, disposition = parse_sample(row_id, p, args.sensor)
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(f"row {row_id}: {exc}") from exc
         if sample is None:
             counts[disposition] += 1
-            if counts[disposition] == 1 and disposition in (
-                    "temperature_not_recorded", "environment_quality_not_recorded"):
+            if counts[disposition] == 1 and disposition.endswith(("_not_recorded", "_unavailable", "_stale")):
                 print(f"  {args.campaign}: first {disposition} at row {row_id}; omitted from thermal pairs.")
             continue
         changes = []
@@ -295,7 +343,7 @@ def collect(rows: Iterable[Tuple[int, Dict[str, Any]]], args: argparse.Namespace
                 counts["duplicate_fragment"] += 1
                 continue
             if sample.signature != prev.signature:
-                changes.append("acquisition/core settings or normalization policy changed")
+                changes.append("acquisition/core settings, normalization policy or synthetic temperature model changed")
             if (sample.sequence <= prev.sequence or
                     (sample.pps is not None and prev.pps is not None and sample.pps < prev.pps) or
                     (sample.update is not None and prev.update is not None and sample.update <= prev.update)):
@@ -519,7 +567,7 @@ def shape(points, x, residual, args):
     print('  Persistent residual shape or direction gaps suggest temperature alone is incomplete.')
 
 
-def deployed_comparison(samples, points, canonical_points):
+def deployed_comparison(samples, points, canonical_points, sensor):
     """Describe the installed correction even when there is too little data to fit."""
     print('\n  DEPLOYED NORMALIZATION (same observations; no refitting)')
     print(f'  Firmware normalization_id: {samples[0].normalization_id}')
@@ -528,16 +576,16 @@ def deployed_comparison(samples, points, canonical_points):
     policy = json.loads(samples[0].signature)['normalization']['policy']
     if policy is None:
         print('  Policy document absent; reconstruction uses the recorded uniform firmware offset.')
-    elif policy.get('temperature_path') != ['environment', 'temperature_c']:
-        print('  Deployed sensor differs from BME280; new candidate fits still use BME280 only.')
+    elif sensor != 'synthetic' or policy.get('temperature_path') != ['temperature', 'temperature_c']:
+        print('  Deployed predictor differs from the selected report sensor; recorded offsets still reconstruct LAP.')
     corrections = [s.correction_fs/1_000_000 for s in samples]
     applied = [s.applied_temperature for s in samples]
     ages = [s.correction_age_ms for s in samples]
     print(f'  Recorded correction range: {min(corrections):+.6f} .. {max(corrections):+.6f} ns')
     print(f'  Applied sensor range: {min(applied):.6f} .. {max(applied):.6f} C')
     print(f'  Correction refresh age: median={st.median(ages):.0f} ms; max={max(ages):,} ms (not physical sensor-reading age).')
-    if policy is not None and policy.get('temperature_path') == ['environment', 'temperature_c']:
-        print(f'  Max |applied BME280 - row SYSTEM BME280|: '
+    if sensor == 'synthetic' and policy is not None and policy.get('temperature_path') == ['temperature', 'temperature_c']:
+        print(f'  Max |applied synthetic temperature - row SYSTEM synthetic temperature|: '
               f'{max(abs(s.applied_temperature-s.temperature) for s in samples):.6f} C')
     raw = [s.lap_ns for s in samples]
     canonical = [s.canonical_ns for s in samples]
@@ -552,7 +600,7 @@ def deployed_comparison(samples, points, canonical_points):
         spread('uncorrected block means', [p.lap_ns for p in points])
         spread('deployed block means', [p.lap_ns for p in canonical_points])
     temperatures = [s.temperature for s in samples]
-    print(f'  Descriptive BME280 correlation: uncorrected={fmt(pearson(temperatures,raw))}; '
+    print(f'  Descriptive {SENSOR_LABELS[sensor]} correlation: uncorrected={fmt(pearson(temperatures,raw))}; '
           f'deployed={fmt(pearson(temperatures,canonical))}')
     print('  Descriptive comparison only; this does not establish calibration accuracy or causation.')
     print('\n  DEPLOYED NORMALIZATION IN SIX CHRONOLOGICAL WINDOWS (all usable seconds)')
@@ -568,14 +616,15 @@ def deployed_comparison(samples, points, canonical_points):
 
 
 def analyze(samples, reason, args):
+    print(f'\nSENSOR: {SENSOR_LABELS[args.sensor]} (recorded mean)')
     print(f'\nEPOCH {samples[0].epoch}: {reason}')
     print(f'  UTC {stamp(samples[0].time)} .. {stamp(samples[-1].time)}')
     print(f'  Settings: {samples[0].signature}')
     print(f'  Usable seconds: {len(samples):,}; continuous runs: {len(set(s.run for s in samples)):,}')
     temperatures = [s.temperature for s in samples]
-    print(f'  BME280 range: {min(temperatures):.6f} .. {max(temperatures):.6f} C')
+    print(f'  {SENSOR_LABELS[args.sensor]} range: {min(temperatures):.6f} .. {max(temperatures):.6f} C')
     repeated = sum(a.run==b.run and a.temperature==b.temperature for a,b in zip(samples,samples[1:]))
-    print(f'  Adjacent identical BME280 readings: {repeated:,} (cached snapshots are not new independent readings).')
+    print(f'  Adjacent identical {SENSOR_LABELS[args.sensor]} readings: {repeated:,} (equal values need not be duplicate samples; overlapping means are time-correlated).')
     deployed = samples[0].normalization_id is not None
     print(f'  Canonical LAP: {"already normalized; model target reconstructed from recorded offsets" if deployed else "uncorrected legacy measurements"}.')
     spread_header()
@@ -585,7 +634,7 @@ def analyze(samples, reason, args):
     canonical_points, _ = blocks([replace(s,lap_ns=s.canonical_ns) for s in samples],args.bin_seconds)
     print(f'  Complete {args.bin_seconds}-second blocks: {len(points):,}; seconds in incomplete blocks: {omitted:,}')
     if deployed:
-        deployed_comparison(samples,points,canonical_points)
+        deployed_comparison(samples,points,canonical_points,args.sensor)
     if len(points)<60:
         print('\n  MODEL SELECTION DEFERRED: need at least 60 complete blocks plus adequate later-test support.')
         print('  Collect longer runs across thermal cycles; smaller blocks do not create independent sensor observations.')
@@ -752,7 +801,9 @@ def analyze(samples, reason, args):
 
 def arguments(argv):
     parser = argparse.ArgumentParser(description=__doc__,formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('campaign',help='exact campaign name, e.g. Short2')
+    parser.add_argument('campaign',help='exact campaign name, e.g. External1')
+    parser.add_argument('--sensor',choices=(*SENSORS, 'compare'),default='synthetic',
+                        help='recorded mean predictor; compare uses common observations (default synthetic)')
     parser.add_argument('--input',type=Path,help='PHOTONS JSON/JSONL instead of PostgreSQL')
     parser.add_argument('--bin-seconds',type=int,default=60,help='complete nonoverlapping blocks (default 60)')
     parser.add_argument('--max-degree',type=int,choices=(1,2,3),default=3,help='maximum polynomial degree (default 3)')
@@ -781,10 +832,15 @@ def main(argv):
     args = arguments(argv)
     print(f'PHOTONS THERMAL NORMALIZATION REPORT {VERSION}',flush=True)
     print(f'Campaign: {args.campaign}; generated UTC: {datetime.now(timezone.utc).isoformat(timespec="seconds")}')
-    print(f'Options: block={args.bin_seconds}s, max_degree={args.max_degree}, max_lag={args.max_lag_seconds}s, simplicity={args.simplicity_pct:g}%')
+    print(f'Options: sensor={args.sensor}, block={args.bin_seconds}s, max_degree={args.max_degree}, max_lag={args.max_lag_seconds}s, simplicity={args.simplicity_pct:g}%')
     print(f'Selection: start={args.start}, end={args.end}, skip={args.skip_seconds}s; source={args.input or "read-only database"}')
-    print('Predictor: environment.temperature_c (BME280); target: uncorrected one-second LAP (ns).')
-    print('Legacy rows use photons.race.flight_ns.mean directly; normalized rows add back the recorded firmware correction.')
+    print(f'Predictor selection: {args.sensor}; target: uncorrected one-second LAP (ns).')
+    print('Synthetic uses temperature.temperature_c; BME280/MAX31865 use recorded temperature.components means.')
+    print('Rows missing a selected reading are omitted; no fallback, new smoothing, or recomputation.')
+    if args.sensor == 'compare':
+        print('Comparison requires all three predictors on every retained row; blocks and time splits are shared.')
+        print('Sensor-specific degree/lag choices use development folds only. Final-test ranking is exploratory.')
+    print('Unnormalized rows use photons.race.flight_ns.mean directly; normalized rows add back the recorded firmware correction.')
     print('Equal weight per usable second; no cumulative means; no rejection based on lap magnitude.')
     print('Loading campaign observations...',flush=True)
     rows = file_rows(args.input,args.campaign) if args.input else database_rows(args)
@@ -800,14 +856,18 @@ def main(argv):
     for sample in samples:
         epochs.setdefault(sample.epoch,[]).append(sample)
     for epoch,observations in epochs.items():
-        analyze(observations,reasons[epoch],args)
+        for sensor in (SENSORS if args.sensor == 'compare' else (args.sensor,)):
+            sensor_args = argparse.Namespace(**vars(args))
+            sensor_args.sensor = sensor
+            selected = [replace(s, temperature=dict(s.sensor_temperatures)[sensor]) for s in observations]
+            analyze(selected,reasons[epoch],sensor_args)
     print('\nREPORT NOTES')
-    print('  Epochs are fitted separately across recorded settings/calibration changes, resets and recovery.')
+    print('  Epochs are fitted separately across recorded settings/calibration/synthetic-model changes, resets and recovery.')
     print('  Deployed = stored canonical LAP; uncorrected = original legacy LAP or reconstructed pre-correction LAP.')
     print('  Candidate formulas always fit uncorrected LAP and replace, rather than compound, the deployed correction.')
     print('  Blocks and lag history never cross continuity gaps. Unknown hardware changes need explicit time selection.')
     print('  All printed SDs describe one-second or block means, not individual-photon jitter or calibration uncertainty.')
-    print('  Time-correlated observations and cached temperatures are not independent thermal experiments.')
+    print('  Overlapping sensor means and cached temperatures are not independent thermal experiments.')
     print('  No p-values or independent-sample confidence claims; validation tests prediction, not causation.')
     print('  Repeatedly tuning against this final test makes it exploratory; confirm revisions on newly collected data.')
     print('  No database writes, live compensation, stored measurements, or additional output files.')
