@@ -4,6 +4,14 @@ import hashlib
 import json
 
 
+# Acquisition identity is separate from the deployed normalization model.
+BME280_DEVICES = {
+    "environment": {"key": "pi", "bus": 1, "address": 0x76, "label": "BME280 PI"},
+    "receiver": {"key": "pd", "bus": 1, "address": 0x77, "label": "BME280 PD"},
+    "otdr": {"key": "otdr", "bus": 2, "address": 0x77, "label": "BME280 OTDR"},
+}
+
+
 # Add another named source here and have its sampler call accept_temperature().
 # Weights apply to sensor means, never to the number of polls or samples. Keep
 # the membership fixed during outages: silently dropping a warmer/cooler sensor
@@ -34,6 +42,14 @@ TEMPERATURE_POLICY = {
             "maximum_age_ms": 3000,
             "weight": 1,
         },
+        "otdr": {
+            "source": "PI.I2C2.BME280.0x77",
+            "schema": "BME280_V1",
+            "sample_period_ms": 1000,
+            "window_samples": 30,
+            "maximum_age_ms": 3000,
+            "weight": 1,
+        },
         "rtd": {
             "source": "TEENSY.SPI1.MAX31865",
             "schema": "PT1000_MAX31865_V1",
@@ -44,14 +60,13 @@ TEMPERATURE_POLICY = {
         },
     },
 }
-# Preserve the installed two-sensor calibration identity while the PD-side
-# BME280 is acquired as an independent physical witness. The full inventory
-# above still feeds SYSTEM and individual PHOTONS records.
+# Preserve the installed two-sensor calibration identity. PD and OTDR are
+# independent environmental witnesses, not new normalization members.
 CALIBRATION_TEMPERATURE_POLICY = {
     **TEMPERATURE_POLICY,
     "sources": {
-        name: policy for name, policy in TEMPERATURE_POLICY["sources"].items()
-        if name != "receiver"
+        name: TEMPERATURE_POLICY["sources"][name]
+        for name in ("environment", "rtd")
     },
 }
 TEMPERATURE_MODEL_ID = int(hashlib.sha256(

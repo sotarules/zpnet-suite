@@ -8,7 +8,7 @@ from collections import deque
 from statistics import fmean
 
 from zpnet.shared.temperature import (
-    TEMPERATURE_MODEL_ID, TEMPERATURE_POLICY, CALIBRATION_TEMPERATURE_POLICY,
+    BME280_DEVICES, TEMPERATURE_MODEL_ID, TEMPERATURE_POLICY, CALIBRATION_TEMPERATURE_POLICY,
 )
 
 
@@ -94,11 +94,17 @@ def _source_snapshot(name: str, now: float) -> dict:
             item.pop("raw_temperature_c", None)
             item.pop("smoothing", None)
             item.pop("resistance_ohms", None)
-    if name in ("environment", "receiver"):
+    if name in BME280_DEVICES:
+        device = BME280_DEVICES[name]
+        item["label"] = device["label"]
+        item["sensor_bus"] = device["bus"]
+        item["sensor_address"] = f"0x{device['address']:02X}"
         item["health_state"] = feature_status(item["status"])
         if item["status"] != "OK":
             item["read_ok"] = False
             item["stale"] = item["status"] != "INITIALIZING"
+            for key in ("pressure_hpa", "humidity_pct", "altitude_m"):
+                item.pop(key, None)
     return item
 
 
@@ -146,5 +152,12 @@ def build_temperature_context() -> dict:
         combined["age_ms"] = max(item["age_ms"] for item in components.values())
     else:
         combined["status"] = "INITIALIZING" if "INITIALIZING" in statuses else "UNAVAILABLE"
-    context["temperature"] = combined
-    return context
+    environment = {
+        device["key"]: context[name] for name, device in BME280_DEVICES.items()
+    }
+    health = [item["health_state"] for item in environment.values()]
+    environment["health_state"] = (
+        "HOLD" if "HOLD" in health else
+        "INITIALIZING" if "INITIALIZING" in health else "NOMINAL"
+    )
+    return {"environment": environment, "rtd": context["rtd"], "temperature": combined}

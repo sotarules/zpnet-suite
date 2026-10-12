@@ -2,7 +2,7 @@
 ZPNet SYSTEM Process (Pi-side platform-context authority)
 
 Responsibilities:
-  • Collect Raspberry Pi host, network, sensor, environment, power, and battery state
+  • Collect Raspberry Pi host, network, environment, power, and battery state
   • Fold the current GNSS receiver announcement into the platform context
   • Own the operator-selected current location and its durable SYSTEM config state
   • Coordinate named-location capture/selection with the GNSS receiver authority
@@ -46,10 +46,10 @@ from smbus2 import SMBus
 from zpnet.processes.processes import send_command, server_setup
 from zpnet.processes.system.rtd import rtd_monitor
 from zpnet.processes.system.temperature import (
-    accept_temperature, build_sensor_status, build_temperature_context,
+    accept_temperature, build_temperature_context,
     feature_status as temperature_feature_status,
 )
-from zpnet.shared.temperature import TEMPERATURE_POLICY
+from zpnet.shared.temperature import BME280_DEVICES, TEMPERATURE_POLICY
 from zpnet.shared.constants import (
     ZPNET_REMOTE_HOST,
     HTTP_TIMEOUT,
@@ -137,43 +137,6 @@ I2C_BUS_LEGACY = 1          # SMBUS1 — hardware I2C (SDA/SCL)
 I2C_BUS_EXPANDED = 2        # SMBUS2 — i2c-gpio on GPIO23/24
 
 # ------------------------------------------------------------------
-# I2C ADDRESSES THAT ARE REAL BUT NOT SENSORS (must be ignored)
-# ------------------------------------------------------------------
-# Many DS3231 breakout boards include an AT24Cxx EEPROM at 0x57
-# alongside the RTC at 0x68. It will appear on any bus that hosts
-# such an RTC module.
-I2C_IGNORE_ADDRS = {
-    0x57,  # AT24Cxx EEPROM (RTC companion)
-}
-
-# ------------------------------------------------------------------
-# SENSOR INVENTORY BY BUS (explicit, no hidden assumptions)
-# ------------------------------------------------------------------
-
-I2C_SENSORS_BY_BUS = {
-    I2C_BUS_LEGACY: {
-
-        0x40: "INA260 0x40 (3.3v Rail)",
-        0x41: "INA260 0x41 (5v Rail+",
-        0x44: "INA260 0x44 (12v Rail)",
-        0x66: "EV5491 0x66 (Laser Controller)",
-        0x76: "BME280 0x76 (Control Tower under Pi)",
-        0x77: "BME280 0x77 (Center Tower near PD200T)",
-        0x4C: "AD5693R 0x4C (OCXO2 DAC)",
-        0x4E: "AD5693R 0x4E (OCXO1 DAC)",
-        # 0x57 will appear via scan but is ignored (EEPROM)
-    },
-
-    I2C_BUS_EXPANDED: {
-        0x40: "INA260 0x40 (Pi Domain)",
-        0x41: "INA260 0x41 (OCXO1 Domain)",
-        0x44: "INA260 0x44 (OCXO1 Domain)",
-        0x45: "INA260 0x45 (Teensy Domain)"
-        # 0x57 will appear via scan but is ignored (EEPROM)
-    },
-}
-
-# ------------------------------------------------------------------
 # Power monitoring (legacy: power_monitor)
 # ------------------------------------------------------------------
 
@@ -191,9 +154,6 @@ POWER_CONFIG_BY_BUS = {
     }
 }
 
-BME280_ID_REG = 0xD0
-BME280_EXPECTED_ID = 0x60
-
 REG_ID        = 0xD0
 REG_CTRL_HUM  = 0xF2
 REG_CTRL_MEAS = 0xF4
@@ -204,23 +164,23 @@ REG_DATA      = 0xF7
 EXPECTED_CHIP_ID = 0x60
 SEA_LEVEL_PRESSURE_HPA = 1013.25
 
-# BME280 is on the shared legacy SMBus with the OCXO DACs.  Pi CLOCKS keeps DAC
-# writes sparse, but the BME280 calibration/data read is still a multi-register
+# BME280s share buses with other devices. Pi CLOCKS keeps DAC writes sparse,
+# but each BME280 calibration/data read is still a multi-register
 # transaction and can occasionally lose arbitration / NACK mid-sequence.  Treat
 # environmental telemetry as best-effort context: retry a few times, then
 # publish a stale/error payload instead of killing the SYSTEM poller.
 BME280_RETRY_COUNT = 3
 BME280_RETRY_DELAY_SEC = 0.05
 BME280_CONVERSION_SECONDS = 0.010  # Bosch max 9.3 ms for T/P/H oversampling x1
-BME280_SOURCE_ADDRESSES = {"environment": 0x76, "receiver": 0x77}
-# Both parts share SMBus1. Serialize their multi-register conversion sequences;
-# keep independent calibration, sequence, fault, and recovery histories.
-_BME280_READ_LOCK = threading.Lock()
+# Serialize BME280 conversions per bus; SMBus2 does not wait on SMBus1.
+_BME280_READ_LOCKS = {
+    bus: threading.Lock() for bus in {device["bus"] for device in BME280_DEVICES.values()}
+}
 _BME280_STATES = {
     name: {"cal": None, "last_good": None, "read_fail_count": 0,
            "consecutive_fail_count": 0, "recovery_count": 0,
            "sample_sequence": 0}
-    for name in BME280_SOURCE_ADDRESSES
+    for name in BME280_DEVICES
 }
 
 REG_CURRENT = 0x01
@@ -448,7 +408,12 @@ def _feature_tree_snapshot(temperature_context=None) -> Dict[str, Dict[str, Dict
     # aging also expires the authority if any temperature sampler stalls.
     if temperature_context is None:
         temperature_context = build_temperature_context()
-    for field in (*TEMPERATURE_POLICY["sources"], "temperature"):
+    environment = temperature_context["environment"]
+    for device in BME280_DEVICES.values():
+        set_pi_feature("SYSTEM", f"BME280_{device['key'].upper()}",
+                       environment[device["key"]]["health_state"])
+    set_pi_feature("SYSTEM", "ENVIRONMENT", environment["health_state"])
+    for field in ("rtd", "temperature"):
         set_pi_feature("SYSTEM", field.upper(),
                        temperature_feature_status(temperature_context[field]["status"]))
     with _FEATURE_LOCK:
@@ -458,15 +423,11 @@ def _feature_tree_snapshot(temperature_context=None) -> Dict[str, Dict[str, Dict
 def _update_builtin_pi_features(*,
                                 pi_payload: Dict[str, Any],
                                 network_payload: Dict[str, Any],
-                                sensor_payload: Dict[str, Any],
-                                environment_payload: Dict[str, Any],
                                 gnss_payload: Dict[str, Any],
                                 power_payload: Dict[str, Any],
                                 battery_payload: Dict[str, Any]) -> None:
     set_pi_feature("SYSTEM", "HOST", _health_to_feature_status(pi_payload.get("health_state")))
     set_pi_feature("SYSTEM", "NETWORK", _health_to_feature_status(network_payload.get("network_status")))
-    set_pi_feature("SYSTEM", "SENSORS", _health_to_feature_status(sensor_payload.get("health_state")))
-    set_pi_feature("SYSTEM", "ENVIRONMENT", _health_to_feature_status(environment_payload.get("health_state")))
     set_pi_feature("GNSS", "REPORT", _health_to_feature_status(gnss_payload.get("health_state")))
     set_pi_feature("SYSTEM", "POWER", _health_to_feature_status(power_payload.get("health_state")))
     set_pi_feature("SYSTEM", "BATTERY", _health_to_feature_status(battery_payload.get("health_state")))
@@ -923,61 +884,6 @@ def build_gnss_status() -> dict:
     return {**gnss, "announcement": metadata, "health_state": health}
 
 # ------------------------------------------------------------------
-# Sensor scan
-# ------------------------------------------------------------------
-
-def build_sensor_scan_status() -> dict:
-    """
-    Build sensor scan snapshot.
-
-    Semantics:
-      • Reports electrical presence only
-      • Two buses are first-class: SMBUS1 and SMBUS2
-      • Scan never crashes the poller
-      • Generic probes are best-effort; protocol reads belong elsewhere
-      • EEPROM companions (0x57) are ignored explicitly
-      • health_state is NOMINAL only if all sensors are NOMINAL
-    """
-    # Top-level snapshot is heterogeneous:
-    #   - per-bus entries are dict[str, str]
-    #   - health_state is a scalar
-    snapshot: dict[str, object] = {}
-    all_nominal = True
-
-    for bus_id, devices in I2C_SENSORS_BY_BUS.items():
-        results: dict[str, str] = {}
-        snapshot[f"i2c-{bus_id}"] = results
-
-        try:
-            with open_i2c(bus_id) as bus:
-                for addr, label in devices.items():
-
-                    if addr in I2C_IGNORE_ADDRS:
-                        continue
-
-                    # MiniMongo-safe key: address only (no periods)
-                    rail_key = f"0x{addr:02X}"
-
-                    # Presence probe: best-effort.
-                    # Some devices do not support SMBus quick ops; do not treat
-                    # that as absence. We only require that the bus itself works.
-                    try:
-                        bus.write_quick(addr)
-                        results[rail_key] = "NOMINAL"
-                    except OSError:
-                        results[rail_key] = "PRESENT"
-                        all_nominal = False
-
-        except Exception:
-            logging.exception(f"[system] sensor scan failed on i2c-{bus_id}")
-            snapshot[f"i2c-{bus_id}"] = {"error": "scan_failed"}
-            all_nominal = False
-
-    snapshot["health_state"] = "NOMINAL" if all_nominal else "ANOMALY"
-    return snapshot
-
-
-# ------------------------------------------------------------------
 # Environment helpers (migrated from environment_monitor)
 # ------------------------------------------------------------------
 
@@ -1081,10 +987,11 @@ def _build_environment_status_once(name: str) -> dict:
     _read_environment_status() wrapper owns retry/stale-payload behavior.
     """
     policy = TEMPERATURE_POLICY["sources"][name]
-    address = BME280_SOURCE_ADDRESSES[name]
+    device = BME280_DEVICES[name]
+    address = device["address"]
     state = _BME280_STATES[name]
 
-    with open_i2c(I2C_BUS_LEGACY) as bus:
+    with open_i2c(device["bus"]) as bus:
         chip_id = bus.read_byte_data(address, REG_ID)
         if chip_id != EXPECTED_CHIP_ID:
             raise RuntimeError(f"unexpected BME280 chip ID 0x{chip_id:02X}")
@@ -1124,6 +1031,8 @@ def _build_environment_status_once(name: str) -> dict:
             "sample_period_ms": policy["sample_period_ms"],
             "sampled_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "measurement_mode": "FORCED",
+            "label": device["label"],
+            "sensor_bus": device["bus"],
             "sensor_address": f"0x{address:02X}",
             "sensor_present": True,
             "temperature_c": temp_c,
@@ -1144,7 +1053,8 @@ def _build_environment_status_once(name: str) -> dict:
 def _bme280_failure_payload(name: str, error: Exception, attempts: int) -> dict:
     state = _BME280_STATES[name]
     policy = TEMPERATURE_POLICY["sources"][name]
-    address = BME280_SOURCE_ADDRESSES[name]
+    device = BME280_DEVICES[name]
+    address = device["address"]
     base = dict(state["last_good"]) if state["last_good"] else {
         "sensor_address": f"0x{address:02X}",
         "sensor_present": False,
@@ -1170,12 +1080,8 @@ def _bme280_failure_payload(name: str, error: Exception, attempts: int) -> dict:
     return base
 
 
-def build_environment_status() -> dict:
-    return build_sensor_status("environment")
-
-
-def _read_environment_status(name: str = "environment") -> dict:
-    with _BME280_READ_LOCK:
+def _read_environment_status(name: str) -> dict:
+    with _BME280_READ_LOCKS[BME280_DEVICES[name]["bus"]]:
         return _build_environment_status_locked(name)
 
 
@@ -1237,7 +1143,7 @@ def _build_environment_status_locked(name: str) -> dict:
                                    BME280_RETRY_COUNT)
 
 
-def environment_monitor(name: str = "environment") -> None:
+def environment_monitor(name: str) -> None:
     """Acquire BME280 at 1 Hz, regardless of which reports/screens are open."""
     while True:
         started = time.monotonic()
@@ -1731,7 +1637,6 @@ def system_poller() -> None:
     while True:
         pi_payload = build_pi_status()
         network_payload = build_network_status()
-        sensor_payload = build_sensor_scan_status()
         gnss_payload = build_gnss_status()
         power_payload = build_power_status()
 
@@ -1752,12 +1657,10 @@ def system_poller() -> None:
             )
 
         temperature_context = build_temperature_context()
-        environment_payload = temperature_context["environment"]
+        _feature_tree_snapshot(temperature_context)
         _update_builtin_pi_features(
             pi_payload=pi_payload,
             network_payload=network_payload,
-            sensor_payload=sensor_payload,
-            environment_payload=environment_payload,
             gnss_payload=gnss_payload,
             power_payload=power_payload,
             battery_payload=battery_payload,
@@ -1766,7 +1669,6 @@ def system_poller() -> None:
         pi_context = {
             "pi": dict(pi_payload),
             "network": dict(network_payload),
-            "sensors": dict(sensor_payload),
             **temperature_context,
             "gnss": dict(gnss_payload),
             "power": dict(power_payload),
@@ -2385,6 +2287,8 @@ def run() -> None:
     set_pi_feature("SYSTEM", "POSTGRES", "INITIALIZING")
     set_pi_feature("SYSTEM", "RTD", "INITIALIZING")
     set_pi_feature("SYSTEM", "ENVIRONMENT", "INITIALIZING")
+    for device in BME280_DEVICES.values():
+        set_pi_feature("SYSTEM", f"BME280_{device['key'].upper()}", "INITIALIZING")
     set_pi_feature("SYSTEM", "TEMPERATURE", "INITIALIZING")
     set_pi_feature("PUBSUB", "TEENSY_RPC", "INITIALIZING")
 
@@ -2417,7 +2321,7 @@ def run() -> None:
         name="system-rtd-monitor",
     ).start()
 
-    for sensor_name in BME280_SOURCE_ADDRESSES:
+    for sensor_name in BME280_DEVICES:
         threading.Thread(
             target=environment_monitor,
             args=(sensor_name,),

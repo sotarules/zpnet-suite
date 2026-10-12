@@ -10814,7 +10814,7 @@ def _environment_from_system_report(
     system_context: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Project the established TEMPEST environment shape from SYSTEM.REPORT."""
-    env = system_context.get("environment") if isinstance(system_context.get("environment"), dict) else {}
+    env = system_context["environment"]["pi"]
     gnss = _system_gnss_info(system_context)
     gnss_clock = gnss.get("clock") if isinstance(gnss.get("clock"), dict) else {}
     pi = system_context.get("pi") if isinstance(system_context.get("pi"), dict) else {}
@@ -13841,7 +13841,6 @@ def _build_canonical_clocks_state(
         # SYSTEM-owned source payloads remain transitive and structurally intact.
         "pi": copy.deepcopy(system_context.get("pi") or {}),
         "network": copy.deepcopy(system_context.get("network") or {}),
-        "sensors": copy.deepcopy(system_context.get("sensors") or {}),
         "environment": copy.deepcopy(system_context.get("environment") or {}),
         "rtd": copy.deepcopy(system_context.get("rtd") or {}),
         "temperature": copy.deepcopy(system_context.get("temperature") or {}),

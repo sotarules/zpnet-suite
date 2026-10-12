@@ -433,7 +433,10 @@ _FEATURE_CELLS = (
     ("PI POWER", "PI.SYSTEM.POWER"),
     ("PI HOST", "PI.SYSTEM.HOST"),
     ("PI ENV", "PI.SYSTEM.ENVIRONMENT"),
-    ("PI SENS", "PI.SYSTEM.SENSORS"),
+    ("BME PI", "PI.SYSTEM.BME280_PI"),
+    ("BME PD", "PI.SYSTEM.BME280_PD"),
+    ("BME OTDR", "PI.SYSTEM.BME280_OTDR"),
+    ("RTD", "PI.SYSTEM.RTD"),
 )
 
 
@@ -453,12 +456,14 @@ def feature_status_readout() -> Generator[str, None, None]:
 def environment_status_readout() -> Generator[str, None, None]:
     env = _dict(get_system_snapshot().get("environment"))
     yield f"ENVIRONMENT: {env.get('health_state', 'UNKNOWN')}"
-    yield f"TEMP: {_num(env.get('temperature_c'), 2, False, ' C')}"
-    yield f"HUMIDITY: {_num(env.get('humidity_pct'), 2, False, ' %')}"
-    yield f"PRESSURE: {_num(env.get('pressure_hpa'), 2, False, ' HPA')}"
-    yield f"BARO ALT: {_num(env.get('altitude_m'), 1, False, ' M')}"
-    yield f"READ OK: {_yes_no(env.get('read_ok'))}  STALE: {_yes_no(env.get('stale'))}"
-    yield f"FAILURES: {_integer(env.get('read_fail_count'))}  RECOVERIES: {_integer(env.get('recovery_count'))}"
+    for key, label in (("pi", "BME280 PI"), ("pd", "BME280 PD"), ("otdr", "BME280 OTDR")):
+        reading = _dict(env.get(key))
+        status = reading.get("status", "INITIALIZING")
+        yield f"{label}: {status}"
+        if status == "OK":
+            yield f"  TEMP: {_num(reading['temperature_c'], 4, False, ' C')}  RH: {_num(reading['humidity_pct'], 2, False, ' %')}"
+            yield f"  BARO: {_num(reading['pressure_hpa'], 2, False, ' HPA')}  ALT: {_num(reading['altitude_m'], 1, False, ' M')}"
+        yield f"  FAIL: {_integer(reading.get('read_fail_count'))}  RECOVER: {_integer(reading.get('recovery_count'))}"
 
 
 def network_status_readout() -> Generator[str, None, None]:

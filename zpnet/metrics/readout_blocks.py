@@ -1067,15 +1067,13 @@ def status_header() -> str:
             if rtd.get("status") == "OK" else "?"
         )
         environment = s.get("environment", {})
-        temperature = _header_temperature(environment.get("temperature_c"), 4)
-        if environment.get("stale") or environment.get("read_ok") is False:
-            temperature = "?"
-        receiver = s.get("receiver", {})
-        receiver_temperature = (
-            _header_temperature(receiver.get("temperature_c"), 4)
-            if receiver.get("status") == "OK" else "?"
-        )
-        gnss_mode = _gnss_from_system_snapshot(s).get("pos_mode") or "?"
+        bme_temperatures = {}
+        for key in ("pi", "pd", "otdr"):
+            reading = environment.get(key, {})
+            bme_temperatures[key] = (
+                _header_temperature(reading.get("temperature_c"), 4)
+                if reading.get("status") == "OK" else "?"
+            )
 
         bat_v = "?"
         power = s.get("power", {})
@@ -1089,13 +1087,13 @@ def status_header() -> str:
                         bat_v = f"{volts:.2f}V"
 
         return (
-            f" NET: {net}"
-            f"  BAT: {bat_v}"
+            f" MAX31865: {rtd_temperature}"
+            f"  BME280 PI: {bme_temperatures['pi']}"
+            f"  BME280 PD: {bme_temperatures['pd']}"
+            f"  BME280 OTDR: {bme_temperatures['otdr']}"
             f"  TEMP: {synthetic_temperature}"
-            f"  MAX31865: {rtd_temperature}"
-            f"  BME280 PI: {temperature}"
-            f"  BME280 PD: {receiver_temperature}"
-            f"  GNSS: {gnss_mode}"
+            f"  BAT: {bat_v}"
+            f"  NET: {net}"
         )
     except Exception:
         return " STATUS: UNAVAILABLE"
@@ -1670,26 +1668,26 @@ def clocks_combined_readout() -> list[str]:
     env = snapshot.get("environment", {})
     pi_data = snapshot.get("pi", {})
     teensy_data = snapshot.get("teensy", {})
-    temp_c = env.get("temperature_c")
-    humidity = env.get("humidity_pct")
-    pressure = env.get("pressure_hpa")
-    baro_alt = env.get("altitude_m")
+    for key, label in (("pi", "BME280 PI"), ("pd", "BME280 PD"), ("otdr", "BME280 OTDR")):
+        reading = env.get(key, {})
+        status = reading.get("status", "INITIALIZING")
+        parts = [f"{label}: {status}"]
+        if status == "OK":
+            parts.extend((
+                f"TEMP: {reading['temperature_c']:.4f}°C",
+                f"RH: {reading['humidity_pct']:.2f}%",
+                f"BARO: {reading['pressure_hpa']:.2f}hPa",
+                f"BARO_ALT: {reading['altitude_m']:.1f}m",
+            ))
+        lines.append("  ".join(parts))
     pi_temp = pi_data.get("cpu_temp_c")
     teensy_temp = teensy_data.get("cpu_temp_c")
     env_parts = []
-    if temp_c is not None:
-        env_parts.append(f"AMBIENT: {temp_c:.1f}°C")
-    if humidity is not None:
-        env_parts.append(f"RH: {humidity:.0f}%")
-    if pressure is not None:
-        env_parts.append(f"BARO: {pressure:.1f}hPa")
-    if baro_alt is not None:
-        env_parts.append(f"BARO_ALT: {baro_alt:.1f}m")
     if pi_temp is not None:
         env_parts.append(f"PI: {pi_temp:.1f}°C")
     if teensy_temp is not None:
         env_parts.append(f"TEENSY: {teensy_temp:.1f}°C")
-    lines.append("ENV   " + "  ".join(env_parts))
+    lines.append("HOST  " + "  ".join(env_parts))
     lines.append("")
 
     lines.extend(feature_status_grid_lines())

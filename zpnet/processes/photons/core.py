@@ -183,9 +183,7 @@ PHOTONS_QUEUE_OWNER_CONTROL_TIMEOUT_S = 180.0
 SYSTEM_CONTEXT_FIELDS = (
     "pi",
     "network",
-    "sensors",
     "environment",
-    "receiver",
     "rtd",
     "temperature",
     "location",
@@ -3493,6 +3491,10 @@ def _make_photons(
     for field in SYSTEM_CONTEXT_FIELDS:
         value = system_context.get(field)
         state[field] = copy.deepcopy(value) if isinstance(value, dict) else {}
+
+    # Preserve the existing PHOTONS_V1 thermal-report witness path while SYSTEM
+    # groups all three environmental devices under their physical locations.
+    state["receiver"] = copy.deepcopy(system_context["environment"]["pd"])
 
     # Preserve the exact Teensy-owned instrument subtree.  Context enrichment
     # never reaches inside or re-authors firmware optical science.
