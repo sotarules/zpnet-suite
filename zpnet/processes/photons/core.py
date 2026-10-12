@@ -189,7 +189,6 @@ SYSTEM_CONTEXT_FIELDS = (
     "location",
     "gnss",
     "power",
-    "battery",
 )
 
 

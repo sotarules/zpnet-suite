@@ -10819,7 +10819,6 @@ def _environment_from_system_report(
     gnss_clock = gnss.get("clock") if isinstance(gnss.get("clock"), dict) else {}
     pi = system_context.get("pi") if isinstance(system_context.get("pi"), dict) else {}
     power = system_context.get("power") if isinstance(system_context.get("power"), dict) else {}
-    battery = system_context.get("battery") if isinstance(system_context.get("battery"), dict) else {}
 
     i2c2 = power.get("i2c-2") if isinstance(power.get("i2c-2"), dict) else {}
     def rail(address: str) -> Dict[str, Any]:
@@ -10840,12 +10839,6 @@ def _environment_from_system_report(
         "teensy_power": {k: rail("0x45").get(k) for k in ("volts", "amps", "watts")},
         "ocxo1_power": {k: rail("0x44").get(k) for k in ("volts", "amps", "watts")},
         "ocxo2_power": {k: rail("0x41").get(k) for k in ("volts", "amps", "watts")},
-        "battery": {
-            "remaining_pct": battery.get("remaining_pct"),
-            "tte_minutes": battery.get("tte_minutes"),
-            "wh_remaining": battery.get("wh_remaining_estimate"),
-            "health_state": battery.get("health_state"),
-        },
     }
 
 
@@ -13858,7 +13851,6 @@ def _build_canonical_clocks_state(
             "gnss_source_fresh": bool(gnss),
         },
         "power": copy.deepcopy(system_context.get("power") or {}),
-        "battery": copy.deepcopy(system_context.get("battery") or {}),
         "clocks": clocks,
         "features": features,
         "stats_reset": copy.deepcopy(pi_clocks.get("stats_reset") or {}),

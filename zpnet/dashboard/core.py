@@ -97,9 +97,10 @@ def header_readout(prefix: str = "") -> list[str]:
     network = system.get("network", {}) if isinstance(system.get("network"), dict) else {}
     net_state = network.get("network_status", "UNKNOWN")
 
-    battery = system.get("battery", {}) if isinstance(system.get("battery"), dict) else {}
-    remaining_pct = battery.get("remaining_pct")
-    batt_str = f"{remaining_pct:.1f}%" if isinstance(remaining_pct, (int, float)) else "N/A"
+    power = system.get("power", {})
+    battery_rail = power.get("i2c-1", {}).get("0x44", {})
+    volts = battery_rail.get("volts")
+    batt_str = f"{volts:.2f}V" if isinstance(volts, (int, float)) else "N/A"
 
     return [
         f"{prefix}NET: {net_state}  BAT: {batt_str}  SYS: {overall}",
@@ -119,7 +120,6 @@ from zpnet.dashboard.readout_blocks import (
     gnss_report_readout,
     feature_status_readout,
     environment_status_readout,
-    battery_status_readout,
     power_status_readout,
     network_status_readout,
     raspberry_pi_status_readout,
@@ -136,7 +136,6 @@ READOUTS: list[Callable[[], Readout]] = [
     gnss_report_readout,
     feature_status_readout,
     environment_status_readout,
-    battery_status_readout,
     power_status_readout,
     network_status_readout,
     raspberry_pi_status_readout,

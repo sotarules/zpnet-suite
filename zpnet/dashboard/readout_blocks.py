@@ -504,21 +504,6 @@ def power_status_readout() -> Generator[str, None, None]:
     yield f"TOTAL LOAD: {load:.3f} W   *=STALE"
 
 
-def battery_status_readout() -> Generator[str, None, None]:
-    snapshot = get_system_snapshot()
-    battery = _dict(snapshot.get("battery"))
-    rail = next((r for r in _power_rails(snapshot) if str(r.get("label", "")).lower() == "battery"), {})
-    yield f"BATTERY STATUS: {battery.get('health_state', 'UNKNOWN')}"
-    yield f"REMAINING: {_num(battery.get('remaining_pct'), 1, False, ' %')}"
-    tte = _to_float(battery.get("tte_minutes"))
-    yield f"TIME TO EMPTY: {'---' if tte is None or not math.isfinite(tte) else f'{tte:.1f} MIN'}"
-    yield f"VOLTAGE: {_num(rail.get('volts'), 3, False, ' V')}"
-    yield f"CURRENT: {_num(rail.get('amps'), 3, False, ' A')}"
-    yield f"POWER: {_num(rail.get('watts'), 3, False, ' W')}"
-    yield f"USED: {_num(battery.get('wh_used_since_recharge'), 2, False, ' WH')}  LEFT: {_num(battery.get('wh_remaining_estimate'), 2, False, ' WH')}"
-    yield f"SAMPLES: {_integer(battery.get('samples_used'))}"
-
-
 def raspberry_pi_status_readout() -> Generator[str, None, None]:
     pi = _dict(get_system_snapshot().get("pi"))
     memory = _dict(pi.get("memory"))

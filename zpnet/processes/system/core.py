@@ -2,7 +2,7 @@
 ZPNet SYSTEM Process (Pi-side platform-context authority)
 
 Responsibilities:
-  • Collect Raspberry Pi host, network, environment, power, and battery state
+  • Collect Raspberry Pi host, network, environment, and power state
   • Fold the current GNSS receiver announcement into the platform context
   • Own the operator-selected current location and its durable SYSTEM config state
   • Coordinate named-location capture/selection with the GNSS receiver authority
@@ -65,7 +65,6 @@ from zpnet.shared.util import (
     feature_status,
     normalize_feature_status,
     normalize_payload,
-    normalize_ts,
 )
 
 # ------------------------------------------------------------------
@@ -199,14 +198,6 @@ _INA260_LAST_GOOD: Dict[Tuple[int, int], dict] = {}
 _INA260_READ_FAIL_COUNT: Dict[Tuple[int, int], int] = {}
 _INA260_CONSECUTIVE_FAIL_COUNT: Dict[Tuple[int, int], int] = {}
 _INA260_RECOVERY_COUNT: Dict[Tuple[int, int], int] = {}
-
-# ------------------------------------------------------------------
-# Battery monitoring (legacy: battery_monitor)
-# ------------------------------------------------------------------
-
-BATTERY_LABEL = "Battery"
-BATTERY_CAPACITY_WH = 640.0          # example — use your real value
-POWER_SAMPLE_STEP = 5                # same semantics as before
 
 # ------------------------------------------------------------------
 # Authoritative SYSTEM snapshot
@@ -424,13 +415,11 @@ def _update_builtin_pi_features(*,
                                 pi_payload: Dict[str, Any],
                                 network_payload: Dict[str, Any],
                                 gnss_payload: Dict[str, Any],
-                                power_payload: Dict[str, Any],
-                                battery_payload: Dict[str, Any]) -> None:
+                                power_payload: Dict[str, Any]) -> None:
     set_pi_feature("SYSTEM", "HOST", _health_to_feature_status(pi_payload.get("health_state")))
     set_pi_feature("SYSTEM", "NETWORK", _health_to_feature_status(network_payload.get("network_status")))
     set_pi_feature("GNSS", "REPORT", _health_to_feature_status(gnss_payload.get("health_state")))
     set_pi_feature("SYSTEM", "POWER", _health_to_feature_status(power_payload.get("health_state")))
-    set_pi_feature("SYSTEM", "BATTERY", _health_to_feature_status(battery_payload.get("health_state")))
 
 
 # ------------------------------------------------------------------
@@ -1229,9 +1218,9 @@ def _ina260_failure_payload(bus_id: int,
 def read_ina260_defensive(bus_id: int, bus: SMBus, addr: int) -> dict:
     """Read one INA260 rail with retry/stale-payload behavior.
 
-    INA260 readings are useful context and battery-accounting inputs, but an
-    occasional SMBus I/O error should not terminate the SYSTEM poller.  A
-    successful read becomes the last-known-good payload for that bus/address.
+    INA260 readings are useful power telemetry, but an occasional SMBus I/O
+    error should not terminate the SYSTEM poller. A successful read becomes
+    the last-known-good payload for that bus/address.
     """
     key = _ina260_key(bus_id, addr)
     last_error: BaseException | None = None
@@ -1377,161 +1366,6 @@ def build_power_status() -> dict:
 
 
 # ------------------------------------------------------------------
-# Battery status helpers
-# ------------------------------------------------------------------
-
-def extract_battery_power_w(system_payload: dict) -> Optional[float]:
-    power = system_payload.get("power", {})
-
-    for key, bus in power.items():
-        if not key.startswith("i2c-"):
-            continue
-
-        for rail in bus.values():
-            if rail.get("label") == BATTERY_LABEL:
-                return rail.get("watts")
-
-    return None
-
-
-def get_last_battery_swap_ts() -> Optional[datetime]:
-    with open_db(row_dict=True) as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT ts
-            FROM zpnet_events
-            WHERE event_type = 'SWAP_BATTERY'
-            ORDER BY ts DESC
-            LIMIT 1
-            """
-        )
-        row = cur.fetchone()
-
-    if not row:
-        return None
-
-    return normalize_ts(row["ts"])
-
-
-def build_battery_status() -> dict:
-    """
-    Build battery state-of-charge snapshot.
-
-    Semantics:
-      • Read-only
-      • Derived from SYSTEM power rails
-      • Integration window anchored at last SWAP_BATTERY
-      • No aggregates
-      • No events emitted
-    """
-
-    payload = {
-        "remaining_pct": None,
-        "tte_minutes": None,
-        "wh_used_since_recharge": None,
-        "wh_remaining_estimate": None,
-        "samples_used": 0,
-        "sample_step": POWER_SAMPLE_STEP,
-        "battery_capacity_wh": BATTERY_CAPACITY_WH,
-        "health_state": "UNKNOWN",
-    }
-
-    # --------------------------------------------------------------
-    # Determine integration start
-    # --------------------------------------------------------------
-    swap_ts = get_last_battery_swap_ts()
-    if not swap_ts:
-        return payload
-
-    # --------------------------------------------------------------
-    # Fetch SYSTEM_STATUS samples since swap
-    # --------------------------------------------------------------
-    with open_db(row_dict=True) as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT ts, payload
-            FROM zpnet_events
-            WHERE event_type = 'SYSTEM_STATUS'
-              AND ts >= %s
-            ORDER BY ts ASC
-            """,
-            (swap_ts,),
-        )
-        rows = cur.fetchall()
-
-    if len(rows) < 2:
-        return payload
-
-    total_wh = 0.0
-    last_ts = None
-    last_power = None
-    samples_used = 0
-
-    # --------------------------------------------------------------
-    # Integrate battery power over time
-    # --------------------------------------------------------------
-    for i in range(0, len(rows), POWER_SAMPLE_STEP):
-        row = rows[i]
-
-        ts = normalize_ts(row["ts"])
-        system = normalize_payload(row["payload"])
-
-        power_w = extract_battery_power_w(system)
-        if power_w is None:
-            continue
-
-        if last_ts is not None and last_power is not None:
-            dt = (ts - last_ts).total_seconds()
-            avg_power = (power_w + last_power) / 2.0
-            total_wh += abs(avg_power * dt / 3600.0)
-            samples_used += 1
-
-        last_ts = ts
-        last_power = power_w
-
-    # --------------------------------------------------------------
-    # Compute remaining capacity
-    # --------------------------------------------------------------
-    remaining_wh = max(0.0, BATTERY_CAPACITY_WH - total_wh)
-    remaining_pct = round(
-        100.0 * remaining_wh / BATTERY_CAPACITY_WH, 1
-    )
-
-    if last_power and last_power > 1.0:
-        tte_minutes = round(remaining_wh / last_power * 60.0, 1)
-    else:
-        tte_minutes = float("inf")
-
-    # --------------------------------------------------------------
-    # Health classification
-    # --------------------------------------------------------------
-    if remaining_pct <= 3:
-        health_state = "DOWN"
-    elif remaining_pct <= 10:
-        health_state = "HOLD"
-    else:
-        health_state = "NOMINAL"
-
-    # --------------------------------------------------------------
-    # Final payload
-    # --------------------------------------------------------------
-    payload.update(
-        {
-            "remaining_pct": remaining_pct,
-            "tte_minutes": tte_minutes,
-            "wh_used_since_recharge": round(total_wh, 2),
-            "wh_remaining_estimate": round(remaining_wh, 2),
-            "samples_used": samples_used,
-            "health_state": health_state,
-        }
-    )
-
-    return payload
-
-
-# ------------------------------------------------------------------
 # Application-level infrastructure readiness
 # ------------------------------------------------------------------
 
@@ -1604,20 +1438,6 @@ def _postgres_monitor_loop() -> None:
         time.sleep(POSTGRES_PROBE_INTERVAL_S)
 
 
-def _battery_postgres_hold_payload(reason: str) -> Dict[str, Any]:
-    return {
-        "remaining_pct": None,
-        "tte_minutes": None,
-        "wh_used_since_recharge": None,
-        "wh_remaining_estimate": None,
-        "samples_used": 0,
-        "sample_step": POWER_SAMPLE_STEP,
-        "battery_capacity_wh": BATTERY_CAPACITY_WH,
-        "health_state": "HOLD",
-        "readiness_reason": str(reason),
-    }
-
-
 # ------------------------------------------------------------------
 # Pi context publication surface
 # ------------------------------------------------------------------
@@ -1640,22 +1460,6 @@ def system_poller() -> None:
         gnss_payload = build_gnss_status()
         power_payload = build_power_status()
 
-        if _POSTGRES_READY.is_set():
-            try:
-                battery_payload = build_battery_status()
-            except Exception as exc:
-                _postgres_mark_unavailable(exc)
-                logging.warning(
-                    "⏳ [system/readiness] battery history unavailable with PostgreSQL; "
-                    "publishing HOLD context: %s",
-                    exc,
-                )
-                battery_payload = _battery_postgres_hold_payload(str(exc))
-        else:
-            battery_payload = _battery_postgres_hold_payload(
-                "PI.SYSTEM.POSTGRES is not NOMINAL"
-            )
-
         temperature_context = build_temperature_context()
         _feature_tree_snapshot(temperature_context)
         _update_builtin_pi_features(
@@ -1663,7 +1467,6 @@ def system_poller() -> None:
             network_payload=network_payload,
             gnss_payload=gnss_payload,
             power_payload=power_payload,
-            battery_payload=battery_payload,
         )
 
         pi_context = {
@@ -1672,7 +1475,6 @@ def system_poller() -> None:
             **temperature_context,
             "gnss": dict(gnss_payload),
             "power": dict(power_payload),
-            "battery": dict(battery_payload),
         }
         _update_pi_context(pi_context)
 
@@ -2240,25 +2042,6 @@ def cmd_set_feature(args: Optional[dict]) -> Dict:
         },
     }
 
-def cmd_swap_battery(_: Optional[dict]) -> Dict:
-    if not _POSTGRES_READY.is_set():
-        return {
-            "success": False,
-            "message": "SWAP_BATTERY requires PI.SYSTEM.POSTGRES=NOMINAL",
-        }
-    try:
-        create_event("SWAP_BATTERY", None)
-    except Exception as exc:
-        _postgres_mark_unavailable(exc)
-        return {
-            "success": False,
-            "message": f"SWAP_BATTERY persistence failed: {exc}",
-        }
-    return {
-        "success": True,
-        "message": "OK",
-    }
-
 COMMANDS = {
     "REPORT": cmd_report,
     "REPORT_METRICS": cmd_report_metrics,
@@ -2271,7 +2054,6 @@ COMMANDS = {
     "REPORT_FEATURES": cmd_features,
     "GET_FEATURE": cmd_get_feature,
     "SET_FEATURE": cmd_set_feature,
-    "SWAP_BATTERY": cmd_swap_battery,
 }
 
 # ---------------------------------------------------------------------
