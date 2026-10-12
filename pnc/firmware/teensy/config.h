@@ -37,7 +37,7 @@ static constexpr uint32_t PHOTONS_RECEIVE_MAX_NS = 10000U;
 // Requested launch opportunities per second. Foreground work, quiet guards and
 // science admission can reduce the measured completed/accepted laps per second.
 // The interval is derived with upward rounding; 2000 retains the 500 us default.
-static constexpr uint32_t PHOTONS_DEFAULT_LAPS_PER_SECOND = 100000U;
+static constexpr uint32_t PHOTONS_DEFAULT_LAPS_PER_SECOND = 1000U;
 static constexpr uint32_t PHOTONS_MIN_LAPS_PER_SECOND = 1U;
 static constexpr uint32_t PHOTONS_MAX_LAPS_PER_SECOND = 100000U;
 
