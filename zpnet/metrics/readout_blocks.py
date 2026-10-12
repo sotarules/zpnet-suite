@@ -1070,6 +1070,11 @@ def status_header() -> str:
         temperature = _header_temperature(environment.get("temperature_c"), 4)
         if environment.get("stale") or environment.get("read_ok") is False:
             temperature = "?"
+        receiver = s.get("receiver", {})
+        receiver_temperature = (
+            _header_temperature(receiver.get("temperature_c"), 4)
+            if receiver.get("status") == "OK" else "?"
+        )
         gnss_mode = _gnss_from_system_snapshot(s).get("pos_mode") or "?"
 
         bat_v = "?"
@@ -1088,7 +1093,8 @@ def status_header() -> str:
             f"  BAT: {bat_v}"
             f"  TEMP: {synthetic_temperature}"
             f"  MAX31865: {rtd_temperature}"
-            f"  BME280: {temperature}"
+            f"  BME280 PI: {temperature}"
+            f"  BME280 PD: {receiver_temperature}"
             f"  GNSS: {gnss_mode}"
         )
     except Exception:

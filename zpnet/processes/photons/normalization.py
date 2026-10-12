@@ -3,8 +3,9 @@
 L_canonical = L_observed - sum(c[k] * (T - T_ref)**(k + 1)).
 Coefficients are in ns/C**(k+1). Calibration identity changes automatically with
 policy; a different identity starts a fresh measurement epoch, never a mixed one.
-SYSTEM's synthetic temperature combines the configured sensor means. Its model
-identity includes each window and weight. The numerical coefficients remain the
+SYSTEM's synthetic temperature retains the original two-sensor calibration model.
+The PD-side BME280 remains a separate, recorded witness during this epoch.
+The model identity includes each window and weight. The numerical coefficients remain the
 Short2 BME280 zero-lag fit, provisionally transferred; refit against the synthetic
 temperature and reconstructed uncorrected LAP in the new heating arrangement.
 

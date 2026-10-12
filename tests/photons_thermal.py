@@ -7,11 +7,12 @@
 
 Prints the complete report to STDOUT; no files or database values are changed.
 Uses recorded temperature and one-second mean lap, never cumulative means.
---sensor selects synthetic (default), bme280, max31865, or compare.
-Individual sensors use temperature.components' recorded smoothed means, not raw
-readings or independently refreshed SYSTEM fields. Missing selected readings are
-omitted; no fallback or reconstruction from today's sensor weights is performed.
-Compare uses the intersection of all three predictors with common blocks/splits;
+--sensor selects synthetic (default), bme280, bme280_receiver, max31865, compare,
+ or compare-legacy.
+Individual sensors use the same recorded SYSTEM snapshot: the deployed aggregate's
+components, and top-level receiver when excluded from the calibration mixture.
+Missing selected readings are omitted; no new smoothing or weight reconstruction.
+Compare uses the intersection of all four predictors with common blocks/splits;
 each sensor's degree/lag is chosen on development data, not on the final test.
 For normalized rows, reconstructs uncorrected LAP using the recorded firmware
 offset, and compares it with canonical LAP on the same observations. New models
@@ -41,11 +42,15 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 SCHEMA = "PHOTONS_V1"
 MIN_FIT = 3
-VERSION = "2026-10-11.2"
-SENSORS = ("synthetic", "bme280", "max31865")
+VERSION = "2026-10-12.1"
+SENSORS = ("synthetic", "bme280", "bme280_receiver", "max31865")
+LEGACY_SENSORS = ("synthetic", "bme280", "max31865")
 SENSOR_LABELS = {"synthetic": "Synthetic temperature",
-                 "bme280": "BME280", "max31865": "MAX31865"}
+                 "bme280": "BME280 under Pi (0x76)",
+                 "bme280_receiver": "BME280 near PD200T (0x77)",
+                 "max31865": "MAX31865 under fiber pad"}
 SENSOR_COMPONENTS = {"bme280": ("environment", "PI.I2C1.BME280.0x76"),
+                     "bme280_receiver": ("receiver", "PI.I2C1.BME280.0x77"),
                      "max31865": ("rtd", "TEENSY.SPI1.MAX31865")}
 
 
@@ -125,7 +130,8 @@ def parse_sample(row_id: int, p: Dict[str, Any], sensor: str = "synthetic") -> T
     model_id = integer(thermal["model_id"])
     if not 0 < model_id < 2**32:
         raise ValueError("synthetic temperature requires a nonzero uint32 model identity")
-    selected = SENSORS if sensor == "compare" else (sensor,)
+    selected = (SENSORS if sensor == "compare" else
+                LEGACY_SENSORS if sensor == "compare-legacy" else (sensor,))
     readings = {}
     predictor_settings = {}
     for name in selected:
@@ -134,7 +140,10 @@ def parse_sample(row_id: int, p: Dict[str, Any], sensor: str = "synthetic") -> T
             settings = {"source": thermal["source"]}
         else:
             component, source = SENSOR_COMPONENTS[name]
-            item = (thermal.get("components") or {}).get(component)
+            # During the legacy two-sensor calibration epoch, receiver is a
+            # separately recorded witness rather than an aggregate component.
+            item = (p.get("receiver") if name == "bme280_receiver" else
+                    (thermal.get("components") or {}).get(component))
             if item is None:
                 return None, name + "_not_recorded"
             if item["source"] != source:
@@ -188,6 +197,7 @@ def parse_sample(row_id: int, p: Dict[str, Any], sensor: str = "synthetic") -> T
         maximum_age = integer(policy["maximum_sample_age_ms"])
         for name in selected:
             item = (thermal if name == "synthetic" else
+                    p["receiver"] if name == "bme280_receiver" else
                     thermal["components"][SENSOR_COMPONENTS[name][0]])
             if item["age_ms"] > maximum_age:
                 return None, name + "_stale"
@@ -234,6 +244,7 @@ def database_rows(args: argparse.Namespace) -> Iterable[Tuple[int, Dict[str, Any
             'sequence', payload -> 'sequence',
             'published_at_utc', payload -> 'published_at_utc',
             'temperature', payload -> 'temperature',
+            'receiver', payload -> 'receiver',
             'normalization', payload -> 'normalization',
             'recovery_receipt', payload -> 'recovery_receipt',
             'photons', jsonb_build_object(
@@ -802,7 +813,7 @@ def analyze(samples, reason, args):
 def arguments(argv):
     parser = argparse.ArgumentParser(description=__doc__,formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('campaign',help='exact campaign name, e.g. External1')
-    parser.add_argument('--sensor',choices=(*SENSORS, 'compare'),default='synthetic',
+    parser.add_argument('--sensor',choices=(*SENSORS, 'compare', 'compare-legacy'),default='synthetic',
                         help='recorded mean predictor; compare uses common observations (default synthetic)')
     parser.add_argument('--input',type=Path,help='PHOTONS JSON/JSONL instead of PostgreSQL')
     parser.add_argument('--bin-seconds',type=int,default=60,help='complete nonoverlapping blocks (default 60)')
@@ -835,10 +846,10 @@ def main(argv):
     print(f'Options: sensor={args.sensor}, block={args.bin_seconds}s, max_degree={args.max_degree}, max_lag={args.max_lag_seconds}s, simplicity={args.simplicity_pct:g}%')
     print(f'Selection: start={args.start}, end={args.end}, skip={args.skip_seconds}s; source={args.input or "read-only database"}')
     print(f'Predictor selection: {args.sensor}; target: uncorrected one-second LAP (ns).')
-    print('Synthetic uses temperature.temperature_c; BME280/MAX31865 use recorded temperature.components means.')
+    print('Synthetic uses temperature.temperature_c; individual BME280s/MAX31865 use recorded temperature.components means.')
     print('Rows missing a selected reading are omitted; no fallback, new smoothing, or recomputation.')
-    if args.sensor == 'compare':
-        print('Comparison requires all three predictors on every retained row; blocks and time splits are shared.')
+    if args.sensor in ('compare', 'compare-legacy'):
+        print(f'Comparison requires all {len(SENSORS if args.sensor == "compare" else LEGACY_SENSORS)} predictors on every retained row; blocks and time splits are shared.')
         print('Sensor-specific degree/lag choices use development folds only. Final-test ranking is exploratory.')
     print('Unnormalized rows use photons.race.flight_ns.mean directly; normalized rows add back the recorded firmware correction.')
     print('Equal weight per usable second; no cumulative means; no rejection based on lap magnitude.')
@@ -856,7 +867,8 @@ def main(argv):
     for sample in samples:
         epochs.setdefault(sample.epoch,[]).append(sample)
     for epoch,observations in epochs.items():
-        for sensor in (SENSORS if args.sensor == 'compare' else (args.sensor,)):
+        for sensor in (SENSORS if args.sensor == 'compare' else
+                       LEGACY_SENSORS if args.sensor == 'compare-legacy' else (args.sensor,)):
             sensor_args = argparse.Namespace(**vars(args))
             sensor_args.sensor = sensor
             selected = [replace(s, temperature=dict(s.sensor_temperatures)[sensor]) for s in observations]

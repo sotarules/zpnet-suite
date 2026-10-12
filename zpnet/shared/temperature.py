@@ -26,6 +26,14 @@ TEMPERATURE_POLICY = {
             "maximum_age_ms": 3000,
             "weight": 1,
         },
+        "receiver": {
+            "source": "PI.I2C1.BME280.0x77",
+            "schema": "BME280_V1",
+            "sample_period_ms": 1000,
+            "window_samples": 30,
+            "maximum_age_ms": 3000,
+            "weight": 1,
+        },
         "rtd": {
             "source": "TEENSY.SPI1.MAX31865",
             "schema": "PT1000_MAX31865_V1",

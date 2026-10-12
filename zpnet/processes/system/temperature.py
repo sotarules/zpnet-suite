@@ -92,7 +92,7 @@ def _source_snapshot(name: str, now: float) -> dict:
             item.pop("raw_temperature_c", None)
             item.pop("smoothing", None)
             item.pop("resistance_ohms", None)
-    if name == "environment":
+    if name in ("environment", "receiver"):
         item["health_state"] = feature_status(item["status"])
         if item["status"] != "OK":
             item["read_ok"] = False
@@ -106,7 +106,7 @@ def build_sensor_status(name: str) -> dict:
 
 
 def build_temperature_context() -> dict:
-    """Take both source means and their fixed-weight composite in one snapshot.
+    """Take all source means and their fixed-weight composite in one snapshot.
 
     Sensor faults expire the authority instead of changing its composition.
     Early/restarted means use the available samples and expose their count.
