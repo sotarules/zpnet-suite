@@ -1,0 +1,629 @@
+diff --git a/tests/photons_thermal.py b/tests/photons_thermal.py
+index 4ba1467..a20c607 100644
+--- a/tests/photons_thermal.py
++++ b/tests/photons_thermal.py
+@@ -7,11 +7,12 @@
+ 
+ Prints the complete report to STDOUT; no files or database values are changed.
+ Uses recorded temperature and one-second mean lap, never cumulative means.
+---sensor selects synthetic (default), bme280, max31865, or compare.
++--sensor selects synthetic (default), bme280, bme280_receiver, max31865, compare,
++ or compare-legacy.
+ Individual sensors use temperature.components' recorded smoothed means, not raw
+ readings or independently refreshed SYSTEM fields. Missing selected readings are
+ omitted; no fallback or reconstruction from today's sensor weights is performed.
+-Compare uses the intersection of all three predictors with common blocks/splits;
++Compare uses the intersection of all four predictors with common blocks/splits;
+ each sensor's degree/lag is chosen on development data, not on the final test.
+ For normalized rows, reconstructs uncorrected LAP using the recorded firmware
+ offset, and compares it with canonical LAP on the same observations. New models
+@@ -41,11 +42,15 @@
+ 
+ SCHEMA = "PHOTONS_V1"
+ MIN_FIT = 3
+-VERSION = "2026-10-11.2"
+-SENSORS = ("synthetic", "bme280", "max31865")
++VERSION = "2026-10-11.3"
++SENSORS = ("synthetic", "bme280", "bme280_receiver", "max31865")
++LEGACY_SENSORS = ("synthetic", "bme280", "max31865")
+ SENSOR_LABELS = {"synthetic": "Synthetic temperature",
+-                 "bme280": "BME280", "max31865": "MAX31865"}
++                 "bme280": "BME280 under Pi (0x76)",
++                 "bme280_receiver": "BME280 near PD200T (0x77)",
++                 "max31865": "MAX31865 under fiber pad"}
+ SENSOR_COMPONENTS = {"bme280": ("environment", "PI.I2C1.BME280.0x76"),
++                     "bme280_receiver": ("receiver", "PI.I2C1.BME280.0x77"),
+                      "max31865": ("rtd", "TEENSY.SPI1.MAX31865")}
+ 
+ 
+@@ -125,7 +130,8 @@ def parse_sample(row_id: int, p: Dict[str, Any], sensor: str = "synthetic") -> T
+     model_id = integer(thermal["model_id"])
+     if not 0 < model_id < 2**32:
+         raise ValueError("synthetic temperature requires a nonzero uint32 model identity")
+-    selected = SENSORS if sensor == "compare" else (sensor,)
++    selected = (SENSORS if sensor == "compare" else
++                LEGACY_SENSORS if sensor == "compare-legacy" else (sensor,))
+     readings = {}
+     predictor_settings = {}
+     for name in selected:
+@@ -802,7 +808,7 @@ def ys(rows):
+ def arguments(argv):
+     parser = argparse.ArgumentParser(description=__doc__,formatter_class=argparse.RawDescriptionHelpFormatter)
+     parser.add_argument('campaign',help='exact campaign name, e.g. External1')
+-    parser.add_argument('--sensor',choices=(*SENSORS, 'compare'),default='synthetic',
++    parser.add_argument('--sensor',choices=(*SENSORS, 'compare', 'compare-legacy'),default='synthetic',
+                         help='recorded mean predictor; compare uses common observations (default synthetic)')
+     parser.add_argument('--input',type=Path,help='PHOTONS JSON/JSONL instead of PostgreSQL')
+     parser.add_argument('--bin-seconds',type=int,default=60,help='complete nonoverlapping blocks (default 60)')
+@@ -835,10 +841,10 @@ def main(argv):
+     print(f'Options: sensor={args.sensor}, block={args.bin_seconds}s, max_degree={args.max_degree}, max_lag={args.max_lag_seconds}s, simplicity={args.simplicity_pct:g}%')
+     print(f'Selection: start={args.start}, end={args.end}, skip={args.skip_seconds}s; source={args.input or "read-only database"}')
+     print(f'Predictor selection: {args.sensor}; target: uncorrected one-second LAP (ns).')
+-    print('Synthetic uses temperature.temperature_c; BME280/MAX31865 use recorded temperature.components means.')
++    print('Synthetic uses temperature.temperature_c; individual BME280s/MAX31865 use recorded temperature.components means.')
+     print('Rows missing a selected reading are omitted; no fallback, new smoothing, or recomputation.')
+-    if args.sensor == 'compare':
+-        print('Comparison requires all three predictors on every retained row; blocks and time splits are shared.')
++    if args.sensor in ('compare', 'compare-legacy'):
++        print(f'Comparison requires all {len(SENSORS if args.sensor == "compare" else LEGACY_SENSORS)} predictors on every retained row; blocks and time splits are shared.')
+         print('Sensor-specific degree/lag choices use development folds only. Final-test ranking is exploratory.')
+     print('Unnormalized rows use photons.race.flight_ns.mean directly; normalized rows add back the recorded firmware correction.')
+     print('Equal weight per usable second; no cumulative means; no rejection based on lap magnitude.')
+@@ -856,7 +862,8 @@ def main(argv):
+     for sample in samples:
+         epochs.setdefault(sample.epoch,[]).append(sample)
+     for epoch,observations in epochs.items():
+-        for sensor in (SENSORS if args.sensor == 'compare' else (args.sensor,)):
++        for sensor in (SENSORS if args.sensor == 'compare' else
++                       LEGACY_SENSORS if args.sensor == 'compare-legacy' else (args.sensor,)):
+             sensor_args = argparse.Namespace(**vars(args))
+             sensor_args.sensor = sensor
+             selected = [replace(s, temperature=dict(s.sensor_temperatures)[sensor]) for s in observations]
+diff --git a/tests/test_temperature_sources.py b/tests/test_temperature_sources.py
+new file mode 100644
+index 0000000..32ea7db
+--- /dev/null
++++ b/tests/test_temperature_sources.py
+@@ -0,0 +1,66 @@
++"""Three-source thermal aggregation regression tests (hardware-free)."""
++
++import importlib
++import time
++import unittest
++
++from zpnet.shared.temperature import TEMPERATURE_POLICY, TEMPERATURE_MODEL_ID
++import zpnet.processes.system.temperature as thermal
++
++
++class ThreeSensorTemperatureTests(unittest.TestCase):
++    def setUp(self):
++        self.thermal = importlib.reload(thermal)
++
++    def reading(self, name, temperature, sequence=1):
++        policy = TEMPERATURE_POLICY["sources"][name]
++        now = time.monotonic()
++        self.thermal.accept_temperature(
++            name,
++            {"source": policy["source"], "schema": policy["schema"],
++             "status": "OK", "temperature_c": temperature,
++             "age_ms": 0, "sample_sequence": sequence},
++            (sequence,), now,
++        )
++
++    def test_policy_has_physical_sources(self):
++        self.assertEqual(set(TEMPERATURE_POLICY["sources"]),
++                         {"environment", "receiver", "rtd"})
++        self.assertEqual(TEMPERATURE_POLICY["sources"]["environment"]["source"],
++                         "PI.I2C1.BME280.0x76")
++        self.assertEqual(TEMPERATURE_POLICY["sources"]["receiver"]["source"],
++                         "PI.I2C1.BME280.0x77")
++        self.assertGreater(TEMPERATURE_MODEL_ID, 0)
++
++    def test_aggregate_keeps_individual_sources(self):
++        self.reading("environment", 35.0)
++        self.reading("receiver", 30.0)
++        self.reading("rtd", 31.0)
++        context = self.thermal.build_temperature_context()
++        aggregate = context["temperature"]
++        self.assertEqual(aggregate["status"], "OK")
++        self.assertAlmostEqual(aggregate["temperature_c"], 32.0)
++        self.assertEqual(set(aggregate["components"]),
++                         {"environment", "receiver", "rtd"})
++        self.assertEqual(context["receiver"]["temperature_c"], 30.0)
++        self.assertEqual(aggregate["components"]["receiver"]["temperature_c"], 30.0)
++
++    def test_receiver_unavailable_does_not_reweight_aggregate(self):
++        self.reading("environment", 35.0)
++        self.reading("receiver", 30.0)
++        self.reading("rtd", 31.0)
++        policy = TEMPERATURE_POLICY["sources"]["receiver"]
++        self.thermal.accept_temperature(
++            "receiver",
++            {"source": policy["source"], "schema": policy["schema"],
++             "status": "UNAVAILABLE", "age_ms": 0},
++            (), time.monotonic(),
++        )
++        context = self.thermal.build_temperature_context()
++        self.assertEqual(context["receiver"]["status"], "UNAVAILABLE")
++        self.assertEqual(context["temperature"]["status"], "UNAVAILABLE")
++        self.assertNotIn("temperature_c", context["temperature"])
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/zpnet/metrics/readout_blocks.py b/zpnet/metrics/readout_blocks.py
+index d7308d3..d7b4f49 100644
+--- a/zpnet/metrics/readout_blocks.py
++++ b/zpnet/metrics/readout_blocks.py
+@@ -1070,6 +1070,11 @@ def status_header() -> str:
+         temperature = _header_temperature(environment.get("temperature_c"), 4)
+         if environment.get("stale") or environment.get("read_ok") is False:
+             temperature = "?"
++        receiver = s.get("receiver", {})
++        receiver_temperature = (
++            _header_temperature(receiver.get("temperature_c"), 4)
++            if receiver.get("status") == "OK" else "?"
++        )
+         gnss_mode = _gnss_from_system_snapshot(s).get("pos_mode") or "?"
+ 
+         bat_v = "?"
+@@ -1088,7 +1093,8 @@ def status_header() -> str:
+             f"  BAT: {bat_v}"
+             f"  TEMP: {synthetic_temperature}"
+             f"  MAX31865: {rtd_temperature}"
+-            f"  BME280: {temperature}"
++            f"  BME280 PI: {temperature}"
++            f"  BME280 PD: {receiver_temperature}"
+             f"  GNSS: {gnss_mode}"
+         )
+     except Exception:
+diff --git a/zpnet/processes/photons/core.py b/zpnet/processes/photons/core.py
+index 5823c8f..507a704 100644
+--- a/zpnet/processes/photons/core.py
++++ b/zpnet/processes/photons/core.py
+@@ -185,6 +185,7 @@
+     "network",
+     "sensors",
+     "environment",
++    "receiver",
+     "rtd",
+     "temperature",
+     "location",
+@@ -7233,6 +7234,7 @@ def _lantern_report_from_photons(photons: Payload) -> Dict[str, Any]:
+         "race": copy.deepcopy(race),
+         "location": copy.deepcopy(photons.get("location") or {}),
+         "environment": copy.deepcopy(photons.get("environment") or {}),
++        "receiver": copy.deepcopy(photons.get("receiver") or {}),
+         "rtd": copy.deepcopy(photons.get("rtd") or {}),
+         "temperature": copy.deepcopy(photons.get("temperature") or {}),
+     }
+diff --git a/zpnet/processes/photons/normalization.py b/zpnet/processes/photons/normalization.py
+index 885934a..c8397c0 100644
+--- a/zpnet/processes/photons/normalization.py
++++ b/zpnet/processes/photons/normalization.py
+@@ -3,7 +3,7 @@
+ L_canonical = L_observed - sum(c[k] * (T - T_ref)**(k + 1)).
+ Coefficients are in ns/C**(k+1). Calibration identity changes automatically with
+ policy; a different identity starts a fresh measurement epoch, never a mixed one.
+-SYSTEM's synthetic temperature combines the configured sensor means. Its model
++SYSTEM's synthetic temperature combines the three configured sensor means. Its model
+ identity includes each window and weight. The numerical coefficients remain the
+ Short2 BME280 zero-lag fit, provisionally transferred; refit against the synthetic
+ temperature and reconstructed uncorrected LAP in the new heating arrangement.
+@@ -33,7 +33,7 @@
+     "maximum_sample_age_ms": max(
+         item["maximum_age_ms"] for item in TEMPERATURE_POLICY["sources"].values()
+     ),
+-    "calibration_basis": "PROVISIONAL_TRANSFER_OF_SHORT2_BME280_ZERO_LAG_FIT",
++    "calibration_basis": "PROVISIONAL_SHORT2_BME280_FIT_TRANSFERRED_TO_THREE_SENSOR_MODEL",
+     "witness_temperature_paths": [
+         [name, "raw_temperature_c"] for name in TEMPERATURE_POLICY["sources"]
+     ],
+diff --git a/zpnet/processes/system/core.py b/zpnet/processes/system/core.py
+index c41cfe2..4198986 100644
+--- a/zpnet/processes/system/core.py
++++ b/zpnet/processes/system/core.py
+@@ -157,7 +157,8 @@
+         0x41: "INA260 0x41 (5v Rail+",
+         0x44: "INA260 0x44 (12v Rail)",
+         0x66: "EV5491 0x66 (Laser Controller)",
+-        0x76: "BME280 0x76 (Environment)",
++        0x76: "BME280 0x76 (Control Tower under Pi)",
++        0x77: "BME280 0x77 (Center Tower near PD200T)",
+         0x4C: "AD5693R 0x4C (OCXO2 DAC)",
+         0x4E: "AD5693R 0x4E (OCXO1 DAC)",
+         # 0x57 will appear via scan but is ignored (EEPROM)
+@@ -193,8 +194,6 @@
+ BME280_ID_REG = 0xD0
+ BME280_EXPECTED_ID = 0x60
+ 
+-BME280_ADDR   = 0x76
+-
+ REG_ID        = 0xD0
+ REG_CTRL_HUM  = 0xF2
+ REG_CTRL_MEAS = 0xF4
+@@ -212,17 +211,17 @@
+ # publish a stale/error payload instead of killing the SYSTEM poller.
+ BME280_RETRY_COUNT = 3
+ BME280_RETRY_DELAY_SEC = 0.05
+-_BME280_POLICY = TEMPERATURE_POLICY["sources"]["environment"]
+-BME280_POLL_SECONDS = _BME280_POLICY["sample_period_ms"] / 1000
+ BME280_CONVERSION_SECONDS = 0.010  # Bosch max 9.3 ms for T/P/H oversampling x1
+-
+-_BME280_CAL_CACHE: Optional[dict] = None
++BME280_SOURCE_ADDRESSES = {"environment": 0x76, "receiver": 0x77}
++# Both parts share SMBus1. Serialize their multi-register conversion sequences;
++# keep independent calibration, sequence, fault, and recovery histories.
+ _BME280_READ_LOCK = threading.Lock()
+-_BME280_LAST_GOOD: Optional[dict] = None
+-_BME280_READ_FAIL_COUNT = 0
+-_BME280_CONSECUTIVE_FAIL_COUNT = 0
+-_BME280_RECOVERY_COUNT = 0
+-_BME280_SAMPLE_SEQUENCE = 0
++_BME280_STATES = {
++    name: {"cal": None, "last_good": None, "read_fail_count": 0,
++           "consecutive_fail_count": 0, "recovery_count": 0,
++           "sample_sequence": 0}
++    for name in BME280_SOURCE_ADDRESSES
++}
+ 
+ REG_CURRENT = 0x01
+ REG_VOLTAGE = 0x02
+@@ -446,10 +445,10 @@ def _pi_feature_tree_snapshot() -> Dict[str, Dict[str, Dict[str, str]]]:
+ def _feature_tree_snapshot(temperature_context=None) -> Dict[str, Dict[str, Dict[str, str]]]:
+     """Return the Pi-authored platform feature tree owned by SYSTEM."""
+     # Readiness and the reported composite share one observation. Query-time
+-    # aging also expires the authority if either temperature sampler stalls.
++    # aging also expires the authority if any temperature sampler stalls.
+     if temperature_context is None:
+         temperature_context = build_temperature_context()
+-    for field in ("environment", "rtd", "temperature"):
++    for field in (*TEMPERATURE_POLICY["sources"], "temperature"):
+         set_pi_feature("SYSTEM", field.upper(),
+                        temperature_feature_status(temperature_context[field]["status"]))
+     with _FEATURE_LOCK:
+@@ -995,38 +994,38 @@ def read_s16_le(bus: SMBus, addr: int, reg: int) -> int:
+     return val
+ 
+ 
+-def read_bme280_calibration(bus: SMBus) -> dict:
++def read_bme280_calibration(bus: SMBus, address: int) -> dict:
+     cal = {}
+ 
+     # Temperature
+-    cal["dig_T1"] = read_u16_le(bus, BME280_ADDR, 0x88)
+-    cal["dig_T2"] = read_s16_le(bus, BME280_ADDR, 0x8A)
+-    cal["dig_T3"] = read_s16_le(bus, BME280_ADDR, 0x8C)
++    cal["dig_T1"] = read_u16_le(bus, address, 0x88)
++    cal["dig_T2"] = read_s16_le(bus, address, 0x8A)
++    cal["dig_T3"] = read_s16_le(bus, address, 0x8C)
+ 
+     # Pressure
+-    cal["dig_P1"] = read_u16_le(bus, BME280_ADDR, 0x8E)
+-    cal["dig_P2"] = read_s16_le(bus, BME280_ADDR, 0x90)
+-    cal["dig_P3"] = read_s16_le(bus, BME280_ADDR, 0x92)
+-    cal["dig_P4"] = read_s16_le(bus, BME280_ADDR, 0x94)
+-    cal["dig_P5"] = read_s16_le(bus, BME280_ADDR, 0x96)
+-    cal["dig_P6"] = read_s16_le(bus, BME280_ADDR, 0x98)
+-    cal["dig_P7"] = read_s16_le(bus, BME280_ADDR, 0x9A)
+-    cal["dig_P8"] = read_s16_le(bus, BME280_ADDR, 0x9C)
+-    cal["dig_P9"] = read_s16_le(bus, BME280_ADDR, 0x9E)
++    cal["dig_P1"] = read_u16_le(bus, address, 0x8E)
++    cal["dig_P2"] = read_s16_le(bus, address, 0x90)
++    cal["dig_P3"] = read_s16_le(bus, address, 0x92)
++    cal["dig_P4"] = read_s16_le(bus, address, 0x94)
++    cal["dig_P5"] = read_s16_le(bus, address, 0x96)
++    cal["dig_P6"] = read_s16_le(bus, address, 0x98)
++    cal["dig_P7"] = read_s16_le(bus, address, 0x9A)
++    cal["dig_P8"] = read_s16_le(bus, address, 0x9C)
++    cal["dig_P9"] = read_s16_le(bus, address, 0x9E)
+ 
+     # Humidity
+-    cal["dig_H1"] = bus.read_byte_data(BME280_ADDR, 0xA1)
+-    cal["dig_H2"] = read_s16_le(bus, BME280_ADDR, 0xE1)
+-    cal["dig_H3"] = bus.read_byte_data(BME280_ADDR, 0xE3)
++    cal["dig_H1"] = bus.read_byte_data(address, 0xA1)
++    cal["dig_H2"] = read_s16_le(bus, address, 0xE1)
++    cal["dig_H3"] = bus.read_byte_data(address, 0xE3)
+ 
+-    e4 = bus.read_byte_data(BME280_ADDR, 0xE4)
+-    e5 = bus.read_byte_data(BME280_ADDR, 0xE5)
+-    e6 = bus.read_byte_data(BME280_ADDR, 0xE6)
++    e4 = bus.read_byte_data(address, 0xE4)
++    e5 = bus.read_byte_data(address, 0xE5)
++    e6 = bus.read_byte_data(address, 0xE6)
+ 
+     cal["dig_H4"] = (e4 << 4) | (e5 & 0x0F)
+     cal["dig_H5"] = (e6 << 4) | (e5 >> 4)
+ 
+-    cal["dig_H6"] = bus.read_byte_data(BME280_ADDR, 0xE7)
++    cal["dig_H6"] = bus.read_byte_data(address, 0xE7)
+     if cal["dig_H6"] & 0x80:
+         cal["dig_H6"] -= 256
+ 
+@@ -1067,24 +1066,26 @@ def compensate_humidity(adc_H: int, t_fine: float, cal: dict) -> float:
+     return max(0.0, min(100.0, h))
+ 
+ 
+-def _bme280_wait_ready(bus: SMBus) -> None:
++def _bme280_wait_ready(bus: SMBus, address: int) -> None:
+     deadline = time.monotonic() + 0.1
+-    while bus.read_byte_data(BME280_ADDR, REG_STATUS) & 0x09:
++    while bus.read_byte_data(address, REG_STATUS) & 0x09:
+         if time.monotonic() >= deadline:
+             raise TimeoutError("BME280 conversion/NVM copy did not finish")
+         time.sleep(0.002)
+ 
+ 
+-def _build_environment_status_once() -> dict:
++def _build_environment_status_once(name: str) -> dict:
+     """Perform one complete BME280 transaction sequence.
+ 
+     This helper is intentionally allowed to raise.  The
+     _read_environment_status() wrapper owns retry/stale-payload behavior.
+     """
+-    global _BME280_CAL_CACHE
++    policy = TEMPERATURE_POLICY["sources"][name]
++    address = BME280_SOURCE_ADDRESSES[name]
++    state = _BME280_STATES[name]
+ 
+     with open_i2c(I2C_BUS_LEGACY) as bus:
+-        chip_id = bus.read_byte_data(BME280_ADDR, REG_ID)
++        chip_id = bus.read_byte_data(address, REG_ID)
+         if chip_id != EXPECTED_CHIP_ID:
+             raise RuntimeError(f"unexpected BME280 chip ID 0x{chip_id:02X}")
+ 
+@@ -1092,19 +1093,19 @@ def _build_environment_status_once() -> dict:
+         # Enter sleep and wait for any old conversion before changing config.
+         # One explicit forced conversion per poll makes sample identity and
+         # cadence independent of REPORT_METRICS requests and the slow poller.
+-        bus.write_byte_data(BME280_ADDR, REG_CTRL_MEAS, 0x24)
+-        _bme280_wait_ready(bus)
+-        bus.write_byte_data(BME280_ADDR, REG_CONFIG, 0x00)  # hardware IIR off
+-        bus.write_byte_data(BME280_ADDR, REG_CTRL_HUM, 0x01)
++        bus.write_byte_data(address, REG_CTRL_MEAS, 0x24)
++        _bme280_wait_ready(bus, address)
++        bus.write_byte_data(address, REG_CONFIG, 0x00)  # hardware IIR off
++        bus.write_byte_data(address, REG_CTRL_HUM, 0x01)
+ 
+-        if _BME280_CAL_CACHE is None:
+-            _BME280_CAL_CACHE = read_bme280_calibration(bus)
+-        cal = _BME280_CAL_CACHE
++        if state["cal"] is None:
++            state["cal"] = read_bme280_calibration(bus, address)
++        cal = state["cal"]
+ 
+-        bus.write_byte_data(BME280_ADDR, REG_CTRL_MEAS, 0x25)  # T/P x1, forced
++        bus.write_byte_data(address, REG_CTRL_MEAS, 0x25)  # T/P x1, forced
+         time.sleep(BME280_CONVERSION_SECONDS)
+-        _bme280_wait_ready(bus)
+-        data = bus.read_i2c_block_data(BME280_ADDR, REG_DATA, 8)
++        _bme280_wait_ready(bus, address)
++        data = bus.read_i2c_block_data(address, REG_DATA, 8)
+         adc_P = (data[0] << 12) | (data[1] << 4) | (data[2] >> 4)
+         adc_T = (data[3] << 12) | (data[4] << 4) | (data[5] >> 4)
+         adc_H = (data[6] << 8) | data[7]
+@@ -1116,14 +1117,14 @@ def _build_environment_status_once() -> dict:
+         altitude_m = 44330.0 * (1.0 - (pressure_hpa / SEA_LEVEL_PRESSURE_HPA) ** 0.1903)
+ 
+         return {
+-            "schema": _BME280_POLICY["schema"],
+-            "source": _BME280_POLICY["source"],
++            "schema": policy["schema"],
++            "source": policy["source"],
+             "status": "OK",
+             "age_ms": 0,
+-            "sample_period_ms": _BME280_POLICY["sample_period_ms"],
++            "sample_period_ms": policy["sample_period_ms"],
+             "sampled_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+             "measurement_mode": "FORCED",
+-            "sensor_address": "0x76",
++            "sensor_address": f"0x{address:02X}",
+             "sensor_present": True,
+             "temperature_c": temp_c,
+             "pressure_hpa": round(pressure_hpa, 2),
+@@ -1132,17 +1133,20 @@ def _build_environment_status_once() -> dict:
+             "read_ok": True,
+             "stale": False,
+             "retry_count": 0,
+-            "read_fail_count": _BME280_READ_FAIL_COUNT,
++            "read_fail_count": state["read_fail_count"],
+             "consecutive_fail_count": 0,
+-            "recovery_count": _BME280_RECOVERY_COUNT,
++            "recovery_count": state["recovery_count"],
+             "last_error": "",
+             "health_state": "NOMINAL",
+         }
+ 
+ 
+-def _bme280_failure_payload(error: Exception, attempts: int) -> dict:
+-    base = dict(_BME280_LAST_GOOD) if _BME280_LAST_GOOD else {
+-        "sensor_address": "0x76",
++def _bme280_failure_payload(name: str, error: Exception, attempts: int) -> dict:
++    state = _BME280_STATES[name]
++    policy = TEMPERATURE_POLICY["sources"][name]
++    address = BME280_SOURCE_ADDRESSES[name]
++    base = dict(state["last_good"]) if state["last_good"] else {
++        "sensor_address": f"0x{address:02X}",
+         "sensor_present": False,
+         "temperature_c": None,
+         "pressure_hpa": None,
+@@ -1151,15 +1155,15 @@ def _bme280_failure_payload(error: Exception, attempts: int) -> dict:
+     }
+ 
+     base.update({
+-        "schema": _BME280_POLICY["schema"],
+-        "source": _BME280_POLICY["source"],
++        "schema": policy["schema"],
++        "source": policy["source"],
+         "status": "UNAVAILABLE",
+         "read_ok": False,
+-        "stale": _BME280_LAST_GOOD is not None,
++        "stale": state["last_good"] is not None,
+         "retry_count": max(0, attempts - 1),
+-        "read_fail_count": _BME280_READ_FAIL_COUNT,
+-        "consecutive_fail_count": _BME280_CONSECUTIVE_FAIL_COUNT,
+-        "recovery_count": _BME280_RECOVERY_COUNT,
++        "read_fail_count": state["read_fail_count"],
++        "consecutive_fail_count": state["consecutive_fail_count"],
++        "recovery_count": state["recovery_count"],
+         "last_error": f"{type(error).__name__}: {error}",
+         "health_state": "HOLD",
+     })
+@@ -1170,12 +1174,12 @@ def build_environment_status() -> dict:
+     return build_sensor_status("environment")
+ 
+ 
+-def _read_environment_status() -> dict:
++def _read_environment_status(name: str = "environment") -> dict:
+     with _BME280_READ_LOCK:
+-        return _build_environment_status_locked()
++        return _build_environment_status_locked(name)
+ 
+ 
+-def _build_environment_status_locked() -> dict:
++def _build_environment_status_locked(name: str) -> dict:
+     """
+     Read environmental data from BME280.
+ 
+@@ -1185,32 +1189,28 @@ def _build_environment_status_locked() -> dict:
+       • Returns last-known-good/stale telemetry after exhausted retries
+       • Never terminates the SYSTEM poller because of BME280 bus contention
+     """
+-    global _BME280_LAST_GOOD
+-    global _BME280_READ_FAIL_COUNT
+-    global _BME280_CONSECUTIVE_FAIL_COUNT
+-    global _BME280_RECOVERY_COUNT
+-    global _BME280_SAMPLE_SEQUENCE
++    state = _BME280_STATES[name]
+ 
+     last_error: Exception | None = None
+ 
+     for attempt in range(1, BME280_RETRY_COUNT + 1):
+         try:
+-            payload = _build_environment_status_once()
+-            if _BME280_CONSECUTIVE_FAIL_COUNT:
+-                _BME280_RECOVERY_COUNT += 1
+-            _BME280_CONSECUTIVE_FAIL_COUNT = 0
+-            payload["read_fail_count"] = _BME280_READ_FAIL_COUNT
++            payload = _build_environment_status_once(name)
++            if state["consecutive_fail_count"]:
++                state["recovery_count"] += 1
++            state["consecutive_fail_count"] = 0
++            payload["read_fail_count"] = state["read_fail_count"]
+             payload["consecutive_fail_count"] = 0
+-            payload["recovery_count"] = _BME280_RECOVERY_COUNT
++            payload["recovery_count"] = state["recovery_count"]
+             payload["retry_count"] = attempt - 1
+-            _BME280_SAMPLE_SEQUENCE += 1
+-            payload["sample_sequence"] = _BME280_SAMPLE_SEQUENCE
+-            _BME280_LAST_GOOD = dict(payload)
++            state["sample_sequence"] += 1
++            payload["sample_sequence"] = state["sample_sequence"]
++            state["last_good"] = dict(payload)
+             return payload
+         except OSError as e:
+             last_error = e
+-            _BME280_READ_FAIL_COUNT += 1
+-            _BME280_CONSECUTIVE_FAIL_COUNT += 1
++            state["read_fail_count"] += 1
++            state["consecutive_fail_count"] += 1
+             if attempt < BME280_RETRY_COUNT:
+                 logging.warning(
+                     "[system] BME280 transient I2C error on attempt %d/%d: %s",
+@@ -1221,8 +1221,8 @@ def _build_environment_status_locked() -> dict:
+                 time.sleep(BME280_RETRY_DELAY_SEC)
+         except Exception as e:
+             last_error = e
+-            _BME280_READ_FAIL_COUNT += 1
+-            _BME280_CONSECUTIVE_FAIL_COUNT += 1
++            state["read_fail_count"] += 1
++            state["consecutive_fail_count"] += 1
+             if attempt < BME280_RETRY_COUNT:
+                 logging.warning(
+                     "[system] BME280 read error on attempt %d/%d: %s",
+@@ -1233,18 +1233,19 @@ def _build_environment_status_locked() -> dict:
+                 time.sleep(BME280_RETRY_DELAY_SEC)
+ 
+     logging.exception("[system] BME280 read failed after retries")
+-    return _bme280_failure_payload(last_error or RuntimeError("unknown BME280 error"),
++    return _bme280_failure_payload(name, last_error or RuntimeError("unknown BME280 error"),
+                                    BME280_RETRY_COUNT)
+ 
+ 
+-def environment_monitor() -> None:
++def environment_monitor(name: str = "environment") -> None:
+     """Acquire BME280 at 1 Hz, regardless of which reports/screens are open."""
+     while True:
+         started = time.monotonic()
+-        reading = _read_environment_status()
++        reading = _read_environment_status(name)
+         key = (reading["sample_sequence"],) if reading["status"] == "OK" else ()
+-        accept_temperature("environment", reading, key, started)
+-        time.sleep(max(0.05, BME280_POLL_SECONDS - (time.monotonic() - started)))
++        accept_temperature(name, reading, key, started)
++        period = TEMPERATURE_POLICY["sources"][name]["sample_period_ms"] / 1000
++        time.sleep(max(0.05, period - (time.monotonic() - started)))
+ 
+ # ------------------------------------------------------------------
+ # Power monitoring helpers (legacy: power_monitor)
+@@ -2416,11 +2417,13 @@ def run() -> None:
+         name="system-rtd-monitor",
+     ).start()
+ 
+-    threading.Thread(
+-        target=environment_monitor,
+-        daemon=True,
+-        name="system-environment-monitor",
+-    ).start()
++    for sensor_name in BME280_SOURCE_ADDRESSES:
++        threading.Thread(
++            target=environment_monitor,
++            args=(sensor_name,),
++            daemon=True,
++            name=f"system-{sensor_name}-monitor",
++        ).start()
+ 
+     threading.Thread(
+         target=system_poller,
+diff --git a/zpnet/processes/system/temperature.py b/zpnet/processes/system/temperature.py
+index 090c7d8..628dca2 100644
+--- a/zpnet/processes/system/temperature.py
++++ b/zpnet/processes/system/temperature.py
+@@ -92,7 +92,7 @@ def _source_snapshot(name: str, now: float) -> dict:
+             item.pop("raw_temperature_c", None)
+             item.pop("smoothing", None)
+             item.pop("resistance_ohms", None)
+-    if name == "environment":
++    if name in ("environment", "receiver"):
+         item["health_state"] = feature_status(item["status"])
+         if item["status"] != "OK":
+             item["read_ok"] = False
+@@ -106,7 +106,7 @@ def build_sensor_status(name: str) -> dict:
+ 
+ 
+ def build_temperature_context() -> dict:
+-    """Take both source means and their fixed-weight composite in one snapshot.
++    """Take all source means and their fixed-weight composite in one snapshot.
+ 
+     Sensor faults expire the authority instead of changing its composition.
+     Early/restarted means use the available samples and expose their count.
+diff --git a/zpnet/shared/temperature.py b/zpnet/shared/temperature.py
+index f5f5455..9fa01c7 100644
+--- a/zpnet/shared/temperature.py
++++ b/zpnet/shared/temperature.py
+@@ -26,6 +26,14 @@
+             "maximum_age_ms": 3000,
+             "weight": 1,
+         },
++        "receiver": {
++            "source": "PI.I2C1.BME280.0x77",
++            "schema": "BME280_V1",
++            "sample_period_ms": 1000,
++            "window_samples": 30,
++            "maximum_age_ms": 3000,
++            "weight": 1,
++        },
+         "rtd": {
+             "source": "TEENSY.SPI1.MAX31865",
+             "schema": "PT1000_MAX31865_V1",
