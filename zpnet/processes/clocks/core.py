@@ -370,6 +370,10 @@ PPB_PI_CHECKPOINT_SCHEMA = "PI_CLOCKS_PPB_RESTORE_CHECKPOINT_V1"
 CLOCKS_RECOVERY_CONFIG_KEY = "CLOCKS_RECOVERY"
 CLOCKS_ALPHA_LINEAGE_CUTOFF_CONFIG_KEY = "CLOCKS_ALPHA_LINEAGE_CUTOFF"
 CLOCKS_ALPHA_LINEAGE_CUTOFF_SCHEMA = "PI_CLOCKS_ALPHA_LINEAGE_CUTOFF_V1"
+# Restore authority exclusions are exclusive ID intervals. Unlike rewriting every
+# historical TEMPEST payload, a single durable config row bounds recovery work.
+CLOCKS_RESTORE_SUPERSEDED_RANGES_CONFIG_KEY = "CLOCKS_RESTORE_SUPERSEDED_RANGES"
+CLOCKS_RESTORE_SUPERSEDED_RANGES_SCHEMA = "PI_CLOCKS_RESTORE_SUPERSEDED_RANGES_V1"
 CLOCKS_RECOVERY_SNAPSHOT_SCHEMA = "PI_CLOCKS_RECOVERY_SNAPSHOT_V1"
 CLOCKS_RECOVERY_DESIRED_STATE_SCHEMA = "PI_CLOCKS_RECOVERY_DESIRED_STATE_V1"
 CLOCKS_RECOVERY_RECEIPT_SCHEMA = "PI_CLOCKS_RECOVERY_RECEIPT_V1"
@@ -6068,6 +6072,12 @@ def _retire_orphaned_clocks_recovery_config_if_domain_empty() -> Dict[str, Any]:
             raise RuntimeError(
                 f"config.{CLOCKS_RECOVERY_CONFIG_KEY} is not a singleton: rows={deleted}"
             )
+        # External truncation can reset detail IDs without invoking CLOCKS.TRUNCATE.
+        # The old exclusive ranges must not exclude observations in the new epoch.
+        cur.execute(
+            "DELETE FROM config WHERE config_key = %s",
+            (CLOCKS_RESTORE_SUPERSEDED_RANGES_CONFIG_KEY,),
+        )
 
     return {
         "domain_empty": True,
@@ -6520,9 +6530,60 @@ def _alpha_lineage_cutoff_detail_id() -> int:
     return int(marker.get("cutoff_detail_id") or 0) if marker is not None else 0
 
 
+def _decode_clocks_restore_superseded_ranges(payload: Any) -> list[tuple[int, int]]:
+    """Read exclusive source/recovered boundaries; invalid custody is fatal."""
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema") != CLOCKS_RESTORE_SUPERSEDED_RANGES_SCHEMA
+        or not isinstance(payload.get("ranges"), list)
+    ):
+        raise RuntimeError("malformed CLOCKS restore supersession ranges")
+
+    ranges: list[tuple[int, int]] = []
+    for entry in payload["ranges"]:
+        if not isinstance(entry, dict):
+            raise RuntimeError("malformed CLOCKS restore supersession interval")
+        source = _as_int(entry.get("source_detail_id"))
+        recovered = _as_int(entry.get("first_recovered_detail_id"))
+        if source is None or source <= 0 or recovered is None or recovered <= source:
+            raise RuntimeError("invalid CLOCKS restore supersession boundaries")
+        ranges.append((int(source), int(recovered)))
+    return sorted(set(ranges))
+
+
+def _read_clocks_restore_superseded_ranges() -> list[tuple[int, int]]:
+    """Return durable exclusions; historical observations remain unchanged."""
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT payload FROM config WHERE config_key = %s",
+            (CLOCKS_RESTORE_SUPERSEDED_RANGES_CONFIG_KEY,),
+        )
+        row = cur.fetchone()
+    return _decode_clocks_restore_superseded_ranges(row["payload"]) if row else []
+
+
+def _clocks_restore_superseded_sql() -> tuple[str, tuple[int, ...]]:
+    """SQL predicate for restore-authority readers, applied before LIMIT.
+
+    A restored source and the first recovered boundary are both legitimate
+    observations. Only rows strictly between them lack restore authority. The
+    explicit payload marker continues to cover pre-migration quarantines.
+    """
+    ranges = _read_clocks_restore_superseded_ranges()
+    predicate = "".join(
+        "\n              AND NOT (id > %s AND id < %s)" for _ in ranges
+    )
+    parameters = tuple(value for pair in ranges for value in pair)
+    return predicate, parameters
+
+
 def _legacy_clocks_recovery_checkpoint() -> Optional[Dict[str, Any]]:
     """One-time migration bridge from pre-singleton CLOCKS rows."""
     cutoff_detail_id = _alpha_lineage_cutoff_detail_id()
+    excluded_sql, excluded_params = _clocks_restore_superseded_sql()
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
         cur.execute(
@@ -6534,10 +6595,11 @@ def _legacy_clocks_recovery_checkpoint() -> Optional[Dict[str, Any]]:
               AND NOT (payload @> '{"holistic_restore_superseded":true}'::jsonb)
               AND payload #>> '{schema}' = 'CLOCKS_V4'
               AND payload #> '{clocks,ppb_restore_checkpoint}' IS NOT NULL
+            """ + excluded_sql + """
             ORDER BY id DESC
             LIMIT 64
             """,
-            (CAMPAIGN_TYPE_TEMPEST, int(cutoff_detail_id)),
+            (CAMPAIGN_TYPE_TEMPEST, int(cutoff_detail_id), *excluded_params),
         )
         rows = cur.fetchall()
 
@@ -6625,6 +6687,14 @@ def _clocks_recovery_source_row(checkpoint: Dict[str, Any]) -> Optional[Dict[str
         raise RuntimeError(
             f"config.{CLOCKS_RECOVERY_CONFIG_KEY} source detail_id={source_detail_id} "
             f"belongs to terminated Alpha lineage cutoff<={cutoff_detail_id}"
+        )
+    if any(
+        source < source_detail_id < recovered
+        for source, recovered in _read_clocks_restore_superseded_ranges()
+    ):
+        raise RuntimeError(
+            f"config.{CLOCKS_RECOVERY_CONFIG_KEY} source detail_id={source_detail_id} "
+            "belongs to a superseded dead-producer interval"
         )
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
@@ -6874,16 +6944,18 @@ def _supersede_dead_producer_restore_rows(
     campaign_name: str,
     first_public_count: int,
 ) -> Dict[str, Any]:
-    """Exclude intervening rows that do not already carry restore exclusion.
+    """Retire the intervening restore-authority interval in one durable write.
 
-    The first recovered campaign row has already passed through canonical CLOCKS
-    persistence before the recovery processor signals it.  Every TEMPEST row
-    inserted after the durable recovery source but before that row must be
-    excluded from later Holistic Restore replay. Live recovery may already have
-    quarantined hours of surviving-producer observations in that interval.
-    Their explicit payload marker already denies restore authority: preserve
-    those rows, including their original science viability and custody evidence.
-    Only previously unclassified rows need the cold-bootstrap exclusion update.
+    The first recovered public row is already durable when the TEMPEST processor
+    pauses on it. Rewriting every intervening JSONB observation used to hold that
+    processor past its 45-second resume deadline and the PostgreSQL statement
+    timeout. Store the *exclusive* ID range instead. This is an authority cut,
+    not a reinterpretation of historical science viability: this cut leaves
+    the historical payloads and their recovery-custody evidence untouched.
+
+    Commit the range before reopening the processor. A crash after this commit
+    cannot accidentally promote an intervening row on the next restore attempt.
+    Both the durable source and first admitted public row remain eligible.
     """
     base_detail_id = int(base_detail_id)
     first_public_count = int(first_public_count)
@@ -6899,11 +6971,13 @@ def _supersede_dead_producer_restore_rows(
                 FROM campaign_detail
                 WHERE campaign_type = %s
                   AND campaign = %s
+                  AND id > %s
                   AND payload #>> '{campaign,public_count}' = %s
                 ORDER BY id DESC
                 LIMIT 1
                 """,
-                (CAMPAIGN_TYPE_TEMPEST, campaign_name, str(first_public_count)),
+                (CAMPAIGN_TYPE_TEMPEST, campaign_name,
+                 base_detail_id, str(first_public_count)),
             )
             row = cur.fetchone()
             if row is None:
@@ -6915,32 +6989,47 @@ def _supersede_dead_producer_restore_rows(
                 raise RuntimeError(
                     "cold-bootstrap recovered row does not follow recovery source"
                 )
+
+            # Serialize concurrent recovery attempts at the config row. No
+            # historical campaign_detail UPDATE, no TOAST rewrite, no long
+            # transaction holding the first accepted TEMPEST candidate hostage.
             cur.execute(
-                """
-                UPDATE campaign_detail
-                SET viable = false,
-                    payload = payload || jsonb_build_object(
-                        'holistic_restore_superseded', true,
-                        'holistic_restore_superseded_by_detail_id', %s::bigint
-                    )
-                WHERE campaign_type = %s
-                  AND id > %s
-                  AND id < %s
-                  AND NOT (payload @> '{"holistic_restore_superseded":true}'::jsonb)
-                """,
-                (
-                    recovered_detail_id,
-                    CAMPAIGN_TYPE_TEMPEST,
-                    base_detail_id,
-                    recovered_detail_id,
-                ),
+                "SELECT payload FROM config WHERE config_key = %s FOR UPDATE",
+                (CLOCKS_RESTORE_SUPERSEDED_RANGES_CONFIG_KEY,),
             )
-            superseded = int(cur.rowcount or 0)
+            prior = cur.fetchone()
+            ranges = (
+                _decode_clocks_restore_superseded_ranges(prior["payload"])
+                if prior is not None else []
+            )
+            ranges = sorted(set([*ranges, (base_detail_id, recovered_detail_id)]))
+            marker = {
+                "schema": CLOCKS_RESTORE_SUPERSEDED_RANGES_SCHEMA,
+                "ranges": [
+                    {"source_detail_id": source,
+                     "first_recovered_detail_id": recovered}
+                    for source, recovered in ranges
+                ],
+            }
+            encoded = json.dumps(marker, separators=(",", ":"), ensure_ascii=False)
+            if prior is None:
+                cur.execute(
+                    "INSERT INTO config (config_key, payload) VALUES (%s, %s::jsonb)",
+                    (CLOCKS_RESTORE_SUPERSEDED_RANGES_CONFIG_KEY, encoded),
+                )
+            else:
+                cur.execute(
+                    "UPDATE config SET payload = %s::jsonb WHERE config_key = %s",
+                    (encoded, CLOCKS_RESTORE_SUPERSEDED_RANGES_CONFIG_KEY),
+                )
+            if cur.rowcount != 1:
+                raise RuntimeError("CLOCKS restore supersession boundary did not commit")
 
     return {
         "base_detail_id": base_detail_id,
         "recovered_detail_id": recovered_detail_id,
-        "rows_marked_nonviable": superseded,
+        "ranges": len(ranges),
+        "rows_rewritten": 0,
     }
 
 
@@ -10044,6 +10133,11 @@ def _surrender_unresurrectable_alpha_lineage(
                 "DB_CUTOFF_WRITTEN", cutoff_detail_id=lineage_cutoff_detail_id
             )
 
+            # The global lineage cutoff now retires all old ID intervals.
+            cur.execute(
+                "DELETE FROM config WHERE config_key = %s",
+                (CLOCKS_RESTORE_SUPERSEDED_RANGES_CONFIG_KEY,),
+            )
             note_surrender_phase("DB_RECOVERY_CONFIG_DELETE")
             cur.execute(
                 "DELETE FROM config WHERE config_key = %s",
@@ -13029,6 +13123,7 @@ def _load_last_recoverable_tempest_detail(
     scan_limit: int = 64,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], int]:
     """Return the newest adjudicated CLOCKS_V4 TEMPEST state usable for recovery."""
+    excluded_sql, excluded_params = _clocks_restore_superseded_sql()
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
         cur.execute(
@@ -13040,12 +13135,14 @@ def _load_last_recoverable_tempest_detail(
               AND viable = true
               AND NOT (payload @> '{"holistic_restore_superseded":true}'::jsonb)
               AND payload #> '{campaign,adjudication}' IS NOT NULL
+            """ + excluded_sql + """
             ORDER BY id DESC
             LIMIT %s
             """,
             (
                 CAMPAIGN_TYPE_TEMPEST,
                 campaign_name,
+                *excluded_params,
                 int(scan_limit),
             ),
         )
@@ -16389,6 +16486,10 @@ def _destructive_repair_lineage_reset() -> Dict[str, Any]:
                 (CLOCKS_RECOVERY_CONFIG_KEY,),
             )
             recovery_config_count = int(cur.rowcount or 0)
+            cur.execute(
+                "DELETE FROM config WHERE config_key = %s",
+                (CLOCKS_RESTORE_SUPERSEDED_RANGES_CONFIG_KEY,),
+            )
 
     return {
         "campaign_details_deleted": detail_count,
@@ -17709,10 +17810,10 @@ def _restore_active_campaign_state(
     )
     logging.info(
         "🧹 [recovery] dead-producer evidence boundary: kept source id=%d, "
-        "recovered id=%d, marked %d intervening row(s) non-viable",
+        "recovered id=%d, durable supersession ranges=%d, historical rows rewritten=0",
         int(dead_producer_restore_supersede["base_detail_id"]),
         int(dead_producer_restore_supersede["recovered_detail_id"]),
-        int(dead_producer_restore_supersede["rows_marked_nonviable"]),
+        int(dead_producer_restore_supersede["ranges"]),
     )
 
     recovery_custody = _finalize_recovery_clocks_custody(
@@ -18776,10 +18877,11 @@ def cmd_truncate(args: Optional[dict]) -> Dict[str, Any]:
                     "TRUNCATE TABLE campaign_detail, campaign_master RESTART IDENTITY"
                 )
                 cur.execute(
-                    "DELETE FROM config WHERE config_key IN (%s, %s, %s)",
+                    "DELETE FROM config WHERE config_key IN (%s, %s, %s, %s)",
                     (
                         CLOCKS_RECOVERY_CONFIG_KEY,
                         CLOCKS_ALPHA_LINEAGE_CUTOFF_CONFIG_KEY,
+                        CLOCKS_RESTORE_SUPERSEDED_RANGES_CONFIG_KEY,
                         "PHOTONS_RECOVERY",
                     ),
                 )
