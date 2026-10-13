@@ -1,38 +1,17 @@
-"""
-ZPNet PHOTONS Process — canonical optical instrument + LANTERN campaign lifecycle.
+"""ZPNet PHOTONS: raw Teensy acquisition, Pi thermal interpretation and LANTERN.
 
-Campaign symmetry contract:
+The Teensy owns physical races, science admission, raw GNSS-projected sufficient
+statistics, exact campaign boundaries and recovery. The Pi preserves that entire
+instrument subtree and adds a separately versioned one-second measurement:
+raw distribution, thermal features, correction and normalized distribution.
+Neither model fitting nor model deployment mutates acquisition/recovery ancestry.
 
-    Pi LANTERN lifecycle authority
-        -> Teensy PHOTONS.START / PHOTONS.STOP
-        -> firmware-authored LANTERN_FRAGMENT_V1 boundary + CAMP statistics
-        -> PHOTONS_FRAGMENT_V1
-        -> Pi structural/accounting court + SYSTEM context
-        -> Pi adds durable campaign identity/provenance only
-        -> canonical PHOTONS_V1
-        -> ordered persistence + campaign_master read model
+PHOTONS_FRAGMENT -> raw custody court + timed SYSTEM snapshot -> Pi measurement
+-> canonical PHOTONS -> ordered PostgreSQL persistence + LANTERN read model.
 
-The Teensy remains the optical-science authority and runs continuously.
-START/STOP never start or stop physical PHOTONS measurement and never reset the
-always-on Welford/Better-Buckets population.  As in CLOCKS, START only tells the
-firmware which recording lifecycle is beginning; firmware snapshots its own
-cumulative accepted-lap N/T at a published boundary and authors the CAMP mean
-lap duration from that origin. Welford measures scatter of accepted lap times.
-
-The Pi does not recompute, smooth, repair, or re-adjudicate lap or CAMP science.
-It owns campaign_master identity, restart policy, and
-persistence.  Firmware owns the exact START/STOP measurement boundary.
-
-Lap means use thermally normalized nanoseconds. Pi supplies the configured
-temperature correction; firmware applies it before Welford/N/T accumulation.
-Durable recovery restores aggregate sufficient state plus only the
-bounded PPB endpoint history the Pi literally possesses.  A surviving producer is
-never repaired, replayed, or interrogated merely because the Pi restarted: current-
-session PHOTONS_FRAGMENT testimony proves monotonic descent, Pi restores only its
-own custody, and ordinary producer-authored deltas warm any observations it missed.
-If the producer was lost, held restore may deliberately install only the literal
-suffix Pi already possesses and surrender unseen rolling ancestry instead of
-inventing it.  Physical edge ancestry is always reacquired after restart.
+A raw acquisition epoch replaces the former firmware-normalized population once.
+Historical rows remain intact. Subsequent Pi model changes need only a PHOTONS
+process restart; they never require a Teensy reboot or a new raw statistics epoch.
 """
 
 from __future__ import annotations
@@ -56,8 +35,7 @@ from zpnet.processes.processes import (
     server_setup,
 )
 from zpnet.processes.photons.normalization import (
-    NORMALIZATION_ID, POLICY as NORMALIZATION_POLICY, command_args as normalization_args,
-    TemperatureUnavailable,
+    ACQUISITION_ID, Normalizer,
 )
 from zpnet.shared.constants import Payload
 from zpnet.shared.db import DatabaseContentionRetry, open_db
@@ -151,7 +129,6 @@ PHOTONS_PERSIST_RETRY_S = 0.25
 STARTUP_INFRASTRUCTURE_REQUIRED = (
     "PI.SYSTEM.POSTGRES",
     "PI.PUBSUB.TEENSY_RPC",
-    NORMALIZATION_POLICY["readiness_feature"],
 )
 STARTUP_INFRASTRUCTURE_POLL_S = 0.5
 STARTUP_INFRASTRUCTURE_QUIET_GRACE_S = 5.0
@@ -195,6 +172,9 @@ SYSTEM_CONTEXT_FIELDS = (
 # ---------------------------------------------------------------------
 # Live state
 # ---------------------------------------------------------------------
+
+# One owner: the ordered state worker. Flash cuts do not reset thermal history.
+_normalizer = Normalizer()
 
 _state_lock = threading.Lock()
 _campaign_lock = threading.Lock()
@@ -597,8 +577,6 @@ def _request_teensy_subsystem_command(
     args: Optional[dict] = None,
 ) -> Dict[str, Any]:
     """Delegate ENABLE/DISABLE to the firmware and require its physical verdict."""
-    if command == "ENABLE":
-        _send_normalization(_fetch_system_report())
     kwargs: Dict[str, Any] = {
         "machine": "TEENSY",
         "subsystem": SUBSYSTEM,
@@ -774,7 +752,9 @@ def _validate_firmware_campaign(
 
 
 def _fetch_system_report() -> Dict[str, Any]:
-    """Pull the authoritative current platform context from Pi SYSTEM."""
+    """Pull SYSTEM context and bound its observation time by the RPC round trip."""
+    started = time.monotonic()
+    started_utc = time.time()
     response = send_command(
         machine="PI",
         subsystem="SYSTEM",
@@ -785,58 +765,46 @@ def _fetch_system_report() -> Dict[str, Any]:
     payload = response.get("payload") if isinstance(response, dict) else None
     if not isinstance(response, dict) or not response.get("success") or not isinstance(payload, dict):
         raise RuntimeError(f"SYSTEM.REPORT unavailable: {response!r}")
-    return copy.deepcopy(payload)
+    result = copy.deepcopy(payload)
+    elapsed = time.monotonic() - started
+    result["_pi_context_timing"] = {
+        "monotonic": started + elapsed / 2,
+        "context_at_utc": datetime.fromtimestamp(started_utc + elapsed / 2, timezone.utc).isoformat(),
+        "round_trip_ms": elapsed * 1000,
+    }
+    return result
 
 
-def _send_normalization(system_context: Dict[str, Any]) -> None:
-    """Refresh the firmware's correction for subsequent foreground batch cuts.
-
-    This does not rewrite the already-received fragment. Its frozen correction
-    fields identify what it used, independently of the newer SYSTEM context.
-    """
-    args = normalization_args(system_context)
-    response = send_command(
-        machine="TEENSY", subsystem=SUBSYSTEM, command="SET_NORMALIZATION",
-        args=args, retries=1, retry_delay_s=0.0,
-    )
-    payload = response.get("payload") if isinstance(response, dict) else None
-    if (not isinstance(response, dict) or not response.get("success")
-            or not isinstance(payload, dict)
-            or payload.get("status") != "normalization_updated"
-            or any(payload.get(k) != v for k, v in args.items())):
-        raise RuntimeError(f"PHOTONS normalization update failed: {response!r}")
+class _AcquisitionRestartRequired(RuntimeError):
+    """The one-time raw cutover needs matching firmware, not a thermal-model reset."""
 
 
-class _CalibrationRestartRequired(RuntimeError):
-    """A policy deployment needs a new producer lifetime, not a failure latch."""
-
-
-def _normalization_epoch_migration() -> Optional[Dict[str, Any]]:
-    """Inspect only the newest source; never fall back to an older calibration."""
+def _acquisition_epoch_migration() -> Optional[Dict[str, Any]]:
+    """Retire corrected ancestry once; Pi model changes never enter this court."""
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
         cur.execute("""
-            SELECT id, payload #> '{photons,stats,normalization_id}' AS normalization_id
+            SELECT id, payload #> '{photons,stats,acquisition_id}' AS acquisition_id
             FROM campaign_detail
             WHERE campaign_type = %s AND payload #>> '{photons,source}' = %s
             ORDER BY id DESC LIMIT 1
         """, (CAMPAIGN_TYPE_LANTERN, "PD200T_REAL_RACE"))
         row = cur.fetchone()
-    if row is None or row["normalization_id"] == NORMALIZATION_ID:
+    if row is None or row["acquisition_id"] == ACQUISITION_ID:
         return None
     return {
-        "schema": "PHOTONS_NORMALIZATION_EPOCH_MIGRATION_V1",
-        "from_normalization_id": row["normalization_id"],
-        "normalization_id": NORMALIZATION_ID,
+        "schema": "PHOTONS_ACQUISITION_EPOCH_MIGRATION_V1",
+        "from_acquisition_id": row["acquisition_id"],
+        "acquisition_id": ACQUISITION_ID,
         "previous_detail_id": int(row["id"]),
         "to_source": "PD200T_REAL_RACE",
         "historical_detail_rows_preserved": _count_current_lantern_details(),
-        "producer_action": "COLD_START_NEW_CALIBRATION_EPOCH",
+        "producer_action": "COLD_START_NEW_RAW_ACQUISITION_EPOCH",
     }
 
 
-def _close_lantern_for_normalization(active_master, migration) -> None:
-    """Close old calibration custody only after startup proves a held producer.
+def _close_lantern_for_acquisition(active_master, migration) -> None:
+    """Close old corrected acquisition custody only after startup proves a held producer.
 
     A reflashed producer cannot author the old campaign's final fragment. Record
     its last durable boundary as interrupted; never fabricate a physical STOP.
@@ -853,10 +821,10 @@ def _close_lantern_for_normalization(active_master, migration) -> None:
         closure = {
             "stopped_at": last["ts"].isoformat() if last else active_master["started_at"],
             "interrupted_at": _utc_now_z(),
-            "stop_reason": "NORMALIZATION_EPOCH_CUTOVER",
+            "stop_reason": "RAW_ACQUISITION_EPOCH_CUTOVER",
             "stop_boundary_pending": False,
             "stop_boundary_contract": "LAST_DURABLE_ROW_AFTER_PRODUCER_REBOOT",
-            "normalization_cutover": dict(
+            "acquisition_cutover": dict(
                 migration, last_campaign_detail_id=int(last["id"]) if last else None,
             ),
         }
@@ -867,9 +835,9 @@ def _close_lantern_for_normalization(active_master, migration) -> None:
         """, (json.dumps(closure), int(active_master["campaign_id"]),
               CAMPAIGN_TYPE_LANTERN, campaign))
         if cur.rowcount != 1:
-            raise RuntimeError("normalization cutover did not close exactly one active LANTERN master")
+            raise RuntimeError("raw acquisition cutover did not close exactly one active LANTERN master")
     logging.warning(
-        "[photons/normalization] closed interrupted campaign '%s' at durable detail=%s; history preserved",
+        "[photons/acquisition] closed interrupted campaign '%s' at durable detail=%s; history preserved",
         campaign, int(last["id"]) if last else None,
     )
 
@@ -1226,8 +1194,8 @@ def _validate_photons_fragment(fragment: Payload) -> Tuple[int, int, Optional[in
         raise ValueError(f"unsupported PHOTONS science schema {science.get('schema')!r}")
     if stats.get("schema") != PHOTONS_STATS_SCHEMA:
         raise ValueError(f"unsupported PHOTONS stats schema {stats.get('schema')!r}")
-    if stats.get("normalization_id") != NORMALIZATION_ID:
-        raise ValueError("PHOTONS calibration identity does not match the configured policy")
+    if stats.get("acquisition_id") != ACQUISITION_ID:
+        raise ValueError("PHOTONS raw acquisition identity does not match this Pi build")
     if stats.get("lap_semantics") != PHOTONS_LAP_SEMANTICS:
         raise ValueError(
             f"unsupported PHOTONS lap semantics {stats.get('lap_semantics')!r}"
@@ -1816,8 +1784,8 @@ def _validate_firmware_ppb_checkpoint_delta(stats: Dict[str, Any]) -> Dict[str, 
             f"{raw.get('schema')!r}"
         )
 
-    if stats.get("normalization_id") != NORMALIZATION_ID:
-        raise ValueError("PHOTONS calibration identity does not match the configured policy")
+    if stats.get("acquisition_id") != ACQUISITION_ID:
+        raise ValueError("PHOTONS raw acquisition identity does not match this Pi build")
     if stats.get("lap_semantics") != PHOTONS_LAP_SEMANTICS:
         raise ValueError(
             f"unsupported PHOTONS Better-Buckets semantics {stats.get('lap_semantics')!r}"
@@ -3484,6 +3452,16 @@ def _make_photons(
         "published_at_utc": _utc_now_z(),
     }
 
+    ingress = fragment["_pi_ingress"]
+    context_timing = system_context["_pi_context_timing"]
+    state["context_timing"] = {
+        "fragment_received_at_utc": ingress["utc"],
+        "context_at_utc": context_timing["context_at_utc"],
+        "context_after_ingress_ms": (context_timing["monotonic"] - ingress["monotonic"]) * 1000,
+        "round_trip_ms": context_timing["round_trip_ms"],
+        "alignment": "SYSTEM_RPC_MIDPOINT_V1",
+    }
+
     # SYSTEM-owned source payloads remain transitive and structurally intact.
     # Missing optional objects remain explicit empty objects; PHOTONS does not
     # synthesize replacement environmental, GNSS, power, or platform testimony.
@@ -3495,10 +3473,9 @@ def _make_photons(
     # groups all three environmental devices under their physical locations.
     state["receiver"] = copy.deepcopy(system_context["environment"]["pd"])
 
-    # Preserve the exact Teensy-owned instrument subtree.  Context enrichment
-    # never reaches inside or re-authors firmware optical science.
+    # Keep raw acquisition and recovery testimony intact. Pi interpretation
+    # lives in measurement, independently of the firmware accumulators.
     state["photons"] = copy.deepcopy(instrument)
-    state["normalization"] = dict(NORMALIZATION_POLICY, normalization_id=NORMALIZATION_ID)
     stats = _require_dict(instrument.get("stats"), "PHOTONS_FRAGMENT.photons.stats")
 
     # Fold the producer-authored Better-Buckets delta before publication. The
@@ -3527,6 +3504,8 @@ def _make_photons(
                 "rejecting canonical PHOTONS row"
             )
             raise
+    state["normalization"] = _normalizer.policy_snapshot()
+    state["measurement"] = _normalizer.measure(state)
     return state, checkpoint
 
 
@@ -3669,8 +3648,8 @@ def _canonical_recovery_state_from_row(
     ) != sequence:
         raise ValueError("campaign_detail sequence does not match canonical payload")
     instrument = _require_dict(state.get("photons"), "PHOTONS.photons")
-    if instrument.get("stats", {}).get("normalization_id") != NORMALIZATION_ID:
-        raise ValueError("PHOTONS restore source belongs to a different calibration")
+    if instrument.get("stats", {}).get("acquisition_id") != ACQUISITION_ID:
+        raise ValueError("PHOTONS restore source belongs to a different acquisition epoch")
     if instrument.get("schema") != PHOTONS_INSTRUMENT_SCHEMA:
         raise ValueError("canonical PHOTONS instrument schema mismatch")
 
@@ -4587,8 +4566,7 @@ def _send_teensy_recovery_command(
     accepted_statuses: set[str],
 ) -> Dict[str, Any]:
     if command in {"RECOVERY_COMMIT", "RECOVERY_COLD_START"}:
-        _send_normalization(_fetch_system_report())
-        args = dict(args or {}, normalization_id=NORMALIZATION_ID)
+        args = dict(args or {}, acquisition_id=ACQUISITION_ID)
     if args is None:
         response = send_command(
             machine="TEENSY",
@@ -4627,8 +4605,8 @@ def _fetch_teensy_recovery_report() -> Dict[str, Any]:
     payload = response.get("payload") if isinstance(response, dict) else None
     if not isinstance(response, dict) or not response.get("success") or not isinstance(payload, dict):
         raise RuntimeError(f"Teensy PHOTONS.REPORT_RECOVERY unavailable: {response!r}")
-    if payload.get("normalization_protocol") != 1:
-        raise RuntimeError("PHOTONS normalization requires the matching Teensy firmware")
+    if payload.get("acquisition_id") != ACQUISITION_ID:
+        raise _AcquisitionRestartRequired("PHOTONS requires the matching raw-acquisition Teensy firmware")
     if payload.get("schema") != "PHOTONS_RECOVERY_REPORT_V1":
         raise RuntimeError(
             f"unsupported Teensy PHOTONS recovery schema {payload.get('schema')!r}"
@@ -6722,23 +6700,23 @@ def _perform_phase5_recovery(
             )
 
         active_master = _load_active_lantern_master()
-        migration = _normalization_epoch_migration()
+        migration = _acquisition_epoch_migration()
         if migration is not None:
             report = _fetch_teensy_recovery_report()
             if (report["publication_started"] or report["staging_active"]
-                    or report.get("normalization_id") not in (0, NORMALIZATION_ID)):
-                # DISABLE alone preserves the old calibration identity. Only a
-                # fresh producer can accept the replacement policy safely.
-                raise _CalibrationRestartRequired(
-                    "PHOTONS calibration changed; reboot Teensy to establish a fresh epoch"
+                    or report.get("acquisition_id") != ACQUISITION_ID):
+                # Raw sufficient statistics cannot restore the old corrected
+                # population. A held producer establishes the new raw epoch.
+                raise _AcquisitionRestartRequired(
+                    "PHOTONS acquisition changed; flash matching Teensy firmware to establish a raw epoch"
                 )
             bringup = _fetch_teensy_bringup_report()
             if bringup is None:
-                raise RuntimeError("PHOTONS calibration cutover lacks held-producer bringup testimony")
+                raise RuntimeError("PHOTONS acquisition cutover lacks held-producer bringup testimony")
             _startup_activate_detector_for_heartbeat(bringup)
             if active_master is not None:
-                _close_lantern_for_normalization(active_master, migration)
-            logging.warning("[photons/normalization] new calibration epoch: %s", migration)
+                _close_lantern_for_acquisition(active_master, migration)
+            logging.warning("[photons/acquisition] new raw acquisition epoch: %s", migration)
             return _startup_cold_start(
                 active_master=None,
                 rows_seen=migration["historical_detail_rows_preserved"],
@@ -7058,7 +7036,7 @@ def _perform_phase5_recovery(
             skipped=skipped,
             rows_scanned=rows_scanned,
         )
-    except _CalibrationRestartRequired:
+    except _AcquisitionRestartRequired:
         # Expected deployment boundary; the startup owner waits and reclassifies.
         # Do not count this as corrupt durable history or a scientific failure.
         raise
@@ -7238,6 +7216,8 @@ def _lantern_report_from_photons(photons: Payload) -> Dict[str, Any]:
         "receiver": copy.deepcopy(photons.get("receiver") or {}),
         "rtd": copy.deepcopy(photons.get("rtd") or {}),
         "temperature": copy.deepcopy(photons.get("temperature") or {}),
+        "normalization": copy.deepcopy(photons["normalization"]),
+        "measurement": copy.deepcopy(photons["measurement"]),
     }
 
 
@@ -7569,6 +7549,7 @@ def on_photons_fragment(fragment: Payload) -> None:
     copied = copy.deepcopy(fragment)
     ingress_monotonic = time.monotonic()
     ingress_utc = _utc_now_z()
+    copied["_pi_ingress"] = {"monotonic": ingress_monotonic, "utc": ingress_utc}
     with _state_lock:
         _fragments_received += 1
         _latest_fragment = copied
@@ -7630,7 +7611,6 @@ def _state_loop() -> None:
                         break
                     try:
                         system_context = _fetch_system_report()
-                        _send_normalization(system_context)
                         break
                     except Exception as exc:
                         failure = {
@@ -7638,14 +7618,10 @@ def _state_loop() -> None:
                             "sequence": fragment.get("sequence") if isinstance(fragment, dict) else None,
                             "reason": str(exc),
                         }
-                        if isinstance(exc, TemperatureUnavailable):
-                            # Keep the exact constituent statuses/ages available
-                            # in REPORT without a traceback for a normal wait.
-                            failure["temperature"] = copy.deepcopy(system_context["temperature"])
                         with _state_lock:
                             _system_report_retry_count += 1
                             _last_system_report_failure = failure
-                        if not isinstance(exc, TemperatureUnavailable) and not system_failure_logged:
+                        if not system_failure_logged:
                             logging.exception(
                                 "⚠️ [photons] SYSTEM.REPORT unavailable for PHOTONS sequence=%s; retrying",
                                 failure["sequence"],
@@ -10952,7 +10928,7 @@ def _startup_commissioning_empty_heartbeat_cutover(
     return result
 
 
-def _wait_for_calibration_restart() -> None:
+def _wait_for_acquisition_restart() -> None:
     """Keep reports alive until the operator supplies a fresh, held producer."""
     _campaign_control_ready.clear()
     _runtime_recovery_hold.set()
@@ -10961,10 +10937,10 @@ def _wait_for_calibration_restart() -> None:
     last_log_at = None
     started = time.monotonic()
     while True:
-        # These queued rows belong to the superseded calibration. The existing
+        # These queued rows belong to the superseded acquisition epoch. The existing
         # cutover already retires them; do it while waiting so an unattended
         # deployment cannot grow an unbounded queue. Durable rows are untouched.
-        retired += _retire_fragment_queue_via_owner("CALIBRATION_RESTART_WAIT")
+        retired += _retire_fragment_queue_via_owner("ACQUISITION_RESTART_WAIT")
         report = None
         error = None
         try:
@@ -10976,7 +10952,7 @@ def _wait_for_calibration_restart() -> None:
         if (report is not None and report["enabled"]
                 and not report["publication_started"]
                 and not report["staging_active"]
-                and report.get("normalization_id") == 0):
+                and report.get("acquisition_id") == ACQUISITION_ID):
             _recovery_status_set(
                 "CLASSIFYING", action_required=None, error=None,
                 ingress_rows_retired=retired,
@@ -10984,19 +10960,19 @@ def _wait_for_calibration_restart() -> None:
             return
         now = time.monotonic()
         _recovery_status_set(
-            "WAITING_FOR_CALIBRATION_REBOOT",
-            normalization_id=NORMALIZATION_ID,
-            observed_normalization_id=(report or {}).get("normalization_id"),
-            action_required="Reboot Teensy; PHOTONS will retry automatically",
+            "WAITING_FOR_ACQUISITION_REBOOT",
+            acquisition_id=ACQUISITION_ID,
+            observed_acquisition_id=(report or {}).get("acquisition_id"),
+            action_required="Flash matching Teensy firmware; PHOTONS will retry automatically",
             ingress_rows_retired=retired,
             waited_s=round(now - started, 3),
             error=error,
         )
         if last_log_at is None or now - last_log_at >= STARTUP_INFRASTRUCTURE_STATUS_LOG_INTERVAL_S:
             logging.warning(
-                "[photons/startup] calibration changed; waiting for a Teensy reboot "
-                "without HARD_FAILURE (%.1fs, %d old-calibration ingress rows retired). "
-                "No firmware reflash is required; recovery will resume automatically.",
+                "[photons/startup] acquisition changed; waiting for matching Teensy firmware "
+                "without HARD_FAILURE (%.1fs, %d old-acquisition ingress rows retired). "
+                "Flash matching firmware; recovery will resume automatically.",
                 now - started, retired,
             )
             last_log_at = now
@@ -11042,8 +11018,8 @@ def _startup_phase5_recovery_with_generation_retry(
                 transport_generation=int(attempt_generation),
                 survival_ingress_barrier_monotonic=survival_barrier,
             )
-        except _CalibrationRestartRequired:
-            _wait_for_calibration_restart()
+        except _AcquisitionRestartRequired:
+            _wait_for_acquisition_restart()
             _wait_for_startup_infrastructure()
             # Reread both durable history and the transport generation. Do not
             # reuse the previous producer's recovery or campaign testimony.

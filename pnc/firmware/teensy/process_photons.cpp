@@ -40,17 +40,9 @@
 static constexpr uint64_t PHOTONS_FRAGMENT_PERIOD_NS = 1000000000ULL;
 static constexpr uint64_t PHOTONS_NS_PER_SECOND = 1000000000ULL;
 
-// Pi owns sensor selection and the frozen formula. Firmware owns application
-// before every canonical Welford/N/T update. All accesses are foreground-only.
-static uint32_t g_normalization_id = 0U;
-static int32_t g_normalization_temperature_micro_c = 0;
-static int32_t g_normalization_correction_fs = 0;
-static uint32_t g_normalization_received_ms = 0U;
-
-static Double photons_normalization_correction_ns(void) {
-  if (g_normalization_id == 0U) __builtin_trap();
-  return (Double)g_normalization_correction_fs / 1000000_D;
-}
+// Raw acquisition identity is independent of every Pi thermal model. Never
+// restore the old thermally corrected sufficient state into this population.
+static constexpr uint32_t PHOTONS_ACQUISITION_ID = 0x52415731UL; // 'RAW1'
 
 
 // i.MX RT1062 RAM2 is write-back cached in 32-byte lines.  PHOTONS places only
@@ -1708,12 +1700,10 @@ static void photons_lap_science_accept(
 
   photons_welford_update(
       g_accepted_raw_cycles_welford, (Double)candidate.raw_cycles);
-  const Double normalized_ns =
-      (Double)candidate.lap_gnss_ns - photons_normalization_correction_ns();
-  if (normalized_ns <= 0_D) __builtin_trap();
-  const uint64_t total_ns = (uint64_t)(normalized_ns + 0.5_D);
+  const Double raw_ns = (Double)candidate.lap_gnss_ns;
+  const uint64_t total_ns = candidate.lap_gnss_ns;
   g_total_lap_gnss_ns += total_ns;
-  photons_welford_update(g_lap_time_welford, normalized_ns);
+  photons_welford_update(g_lap_time_welford, raw_ns);
   g_photons_custody_lap_count++;
   g_photons_custody_total_lap_gnss_ns += total_ns;
 
@@ -2452,13 +2442,12 @@ static photons_fragment_drain_result_t photons_drain_raw_laps(void) {
         race_batch.accepted_sumsq_cycles);
     const Double ns_per_cycle =
         (Double)PHOTONS_NS_PER_SECOND / (Double)cps;
-    const Double correction_ns = photons_normalization_correction_ns();
-    const Double mean_ns = mean_cycles * ns_per_cycle - correction_ns;
-    const Double min_ns = (Double)race_batch.accepted_min_cycles * ns_per_cycle - correction_ns;
-    const Double max_ns = (Double)race_batch.accepted_max_cycles * ns_per_cycle - correction_ns;
+    const Double mean_ns = mean_cycles * ns_per_cycle;
+    const Double min_ns = (Double)race_batch.accepted_min_cycles * ns_per_cycle;
+    const Double max_ns = (Double)race_batch.accepted_max_cycles * ns_per_cycle;
     if (min_ns <= 0_D) __builtin_trap();
-    // Translation preserves within-fragment M2. The ordinary merge includes
-    // differences between normalized fragment means in the lifetime variance.
+    // Preserve raw GNSS-projected sufficient statistics. Thermal interpretation
+    // belongs to the Pi and never changes acquisition or recovery state.
     const Double m2_ns = m2_cycles * ns_per_cycle * ns_per_cycle;
 
     photons_welford_merge_batch(
@@ -2635,7 +2624,7 @@ static photons_fragment_drain_result_t photons_drain_raw_laps(void) {
     // mutate the canonical lifetime population.
     photons_welford_update(
         result.projected_flight_welford,
-        (Double)lap_gnss_ns - photons_normalization_correction_ns());
+        (Double)lap_gnss_ns);
 
     science_candidate.lap_gnss_ns = lap_gnss_ns;
     photons_lap_science_projected_candidate(science_candidate);
@@ -4909,10 +4898,7 @@ static Payload& photons_fragment_payload(
 
   stats.add("schema", "PHOTONS_INSTRUMENT_STATS_V1");
   stats.add("lap_semantics", "MEAN_LAP_NS_V1");
-  stats.add("normalization_id", f.normalization_id);
-  stats.add("normalization_temperature_micro_c", f.normalization_temperature_micro_c);
-  stats.add("normalization_correction_fs", f.normalization_correction_fs);
-  stats.add("normalization_update_age_ms", f.normalization_update_age_ms);
+  stats.add("acquisition_id", PHOTONS_ACQUISITION_ID);
   stats.add("valid", f.stats.valid);
   stats.add("reset_count", f.stats.reset_count);
   stats.add("update_count", f.stats.update_count);
@@ -5168,10 +5154,6 @@ static FLASHMEM void photons_fragment_tick(
   photons_fragment_snapshot_t& fragment = g_photons_fragment_build;
   fragment = photons_fragment_snapshot_t{};
   fragment.snapshot_ok = true;
-  fragment.normalization_id = g_normalization_id;
-  fragment.normalization_temperature_micro_c = g_normalization_temperature_micro_c;
-  fragment.normalization_correction_fs = g_normalization_correction_fs;
-  fragment.normalization_update_age_ms = millis() - g_normalization_received_ms;
   fragment.sequence = ++g_fragment_sequence;
   fragment.publish_count = g_publish_count + 1U;
   fragment.fragment_period_ns = PHOTONS_FRAGMENT_PERIOD_NS;
@@ -5564,7 +5546,7 @@ static void photons_recovery_clear_physical_ancestry(void) {
 
 
 static void photons_start_fragment_publisher(void) {
-  if (!g_photons_enabled || g_normalization_id == 0U ||
+  if (!g_photons_enabled ||
       g_photons_recovery.publication_started ||
       g_fragment_timer != TIMEPOP_INVALID_HANDLE ||
       !g_photons_ppb_previous_endpoint_valid ||
@@ -5751,32 +5733,6 @@ static bool photons_recovery_get_u64(const Payload& args,
                                      const char* key,
                                      uint64_t& out) {
   return args.has(key) && args.tryGetUInt64(key, out);
-}
-
-
-static FLASHMEM Payload cmd_set_normalization(const Payload& args) {
-  const photons_foreground_custody_t custody(photons_foreground_owner_t::COMMAND);
-  uint32_t identity = 0U;
-  int32_t temperature_micro_c = 0;
-  int32_t correction_fs = 0;
-  Payload p;
-  if (!args.tryGetUInt("normalization_id", identity) || identity == 0U ||
-      !args.tryGetInt("temperature_micro_c", temperature_micro_c) ||
-      !args.tryGetInt("correction_fs", correction_fs) ||
-      (g_normalization_id != 0U && identity != g_normalization_id)) {
-    p.add("status", "normalization_rejected");
-    p.add("error", "integer calibration testimony required; changing identity requires a fresh epoch");
-    return p;
-  }
-  g_normalization_id = identity;
-  g_normalization_temperature_micro_c = temperature_micro_c;
-  g_normalization_correction_fs = correction_fs;
-  g_normalization_received_ms = millis();
-  p.add("status", "normalization_updated");
-  p.add("normalization_id", identity);
-  p.add("temperature_micro_c", temperature_micro_c);
-  p.add("correction_fs", correction_fs);
-  return p;
 }
 
 
@@ -6283,11 +6239,11 @@ static FLASHMEM Payload cmd_recovery_commit(const Payload& args) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
   if (!g_photons_enabled) return photons_disabled_reject("RECOVERY_COMMIT");
-  uint32_t normalization_id = 0U;
-  if (!args.tryGetUInt("normalization_id", normalization_id) ||
-      normalization_id == 0U || normalization_id != g_normalization_id) {
-    return photons_recovery_reject("normalization_required",
-        "install and identify the matching normalization before releasing measurement");
+  uint32_t acquisition_id = 0U;
+  if (!args.tryGetUInt("acquisition_id", acquisition_id) ||
+      acquisition_id != PHOTONS_ACQUISITION_ID) {
+    return photons_recovery_reject("acquisition_mismatch",
+        "raw PHOTONS acquisition identity required before releasing measurement");
   }
 
   photons_recovery_protocol_t& protocol = g_photons_recovery_protocol;
@@ -6559,11 +6515,11 @@ static FLASHMEM Payload cmd_recovery_cold_start(const Payload& args) {
   const photons_foreground_custody_t custody(
       photons_foreground_owner_t::COMMAND);
   if (!g_photons_enabled) return photons_disabled_reject("RECOVERY_COLD_START");
-  uint32_t normalization_id = 0U;
-  if (!args.tryGetUInt("normalization_id", normalization_id) ||
-      normalization_id == 0U || normalization_id != g_normalization_id) {
-    return photons_recovery_reject("normalization_required",
-        "install and identify the matching normalization before releasing measurement");
+  uint32_t acquisition_id = 0U;
+  if (!args.tryGetUInt("acquisition_id", acquisition_id) ||
+      acquisition_id != PHOTONS_ACQUISITION_ID) {
+    return photons_recovery_reject("acquisition_mismatch",
+        "raw PHOTONS acquisition identity required before releasing measurement");
   }
 
   if (g_photons_recovery.publication_started ||
@@ -6717,11 +6673,7 @@ static FLASHMEM Payload cmd_report_recovery(const Payload& /*args*/) {
   Payload p;
   photons_prepare_operational_report(p);
   p.add("lap_semantics", "MEAN_LAP_NS_V1");
-  p.add("normalization_protocol", 1U);
-  p.add("normalization_id", g_normalization_id);
-  p.add("normalization_temperature_micro_c", g_normalization_temperature_micro_c);
-  p.add("normalization_correction_fs", g_normalization_correction_fs);
-  p.add("normalization_update_age_ms", millis() - g_normalization_received_ms);
+  p.add("acquisition_id", PHOTONS_ACQUISITION_ID);
   p.add("report", "PHOTONS_RECOVERY");
   p.add("schema", "PHOTONS_RECOVERY_REPORT_V1");
   p.add("restore_schema_version", PHOTONS_RECOVERY_SCHEMA_VERSION);
@@ -8013,7 +7965,6 @@ static FLASHMEM Payload cmd_off(const Payload& /*args*/) {
 // ============================================================================
 
 static const process_command_entry_t PHOTONS_COMMANDS[] = {
-  { "SET_NORMALIZATION",   cmd_set_normalization   },
   { "REPORT_HISTOGRAM",    cmd_report_histogram    },
   { "REPORT_ENVELOPE",     cmd_report_envelope     },
   { "REPORT_CORE",         cmd_report_core         },

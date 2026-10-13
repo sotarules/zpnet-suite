@@ -109,7 +109,6 @@
 //   • START               — start a LANTERN campaign, or hot-cut an active campaign to a new name
 //   • FLASH_CUT           — explicit hot campaign boundary preserving the enabled instrument epoch
 //   • STOP                — request campaign closure; the next published campaign fragment is final
-//   • SET_NORMALIZATION   — Pi-owned calibration identity, temperature and additive correction
 //   • REPORT              — compact operational/device report including active-high MOD state,
 //                           laser monitor and pin-34 interrupt custody; no PD OUT ADC telemetry
 //   • WAVEON interval=N width=W — commissioning pulse train on LASER_MOD_PIN 35.
@@ -598,12 +597,9 @@ struct photons_fragment_recovery_snapshot_t {
 // Canonical once-per-second PHOTONS handoff.  The always-on instrument subtree
 // remains authoritative and campaign-independent.  Optional campaign testimony
 // is a recording-relative sibling authored by firmware, matching CLOCKS_FRAGMENT:
-// Pi may add durable campaign identity but never recomputes CAMP mean duration.
+// Pi adds durable campaign identity and a separate thermal interpretation.
+// Firmware CAMP and all restore statistics remain raw GNSS-projected values.
 struct photons_fragment_snapshot_t {
-  uint32_t normalization_id = 0U;
-  int32_t normalization_temperature_micro_c = 0;
-  int32_t normalization_correction_fs = 0;
-  uint32_t normalization_update_age_ms = 0U;
   // SPURIOUS is a count of active-detector arrivals rejected before raw queue
   // admission, not a count of flights. One flight may have spurious arrivals
   // and still complete or be MISSED. Totals are boot-lifetime ISR testimony;

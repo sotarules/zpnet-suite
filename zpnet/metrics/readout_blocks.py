@@ -2271,6 +2271,13 @@ def photons_detail_readout() -> list[str]:
         name += " [FINAL]"
     lines = [f"CAMPAIGN: {name}  UNITS: ns"
              f"  ELAPSED: {_seconds_to_hms(summary['seconds'])}  RECOVERABLE: {recoverable}"]
+    measurement = live.get("measurement")
+    if measurement is not None:
+        normalized = measurement["normalized_flight_ns"]
+        mean = normalized["mean"] if normalized is not None else None
+        lines.append("RAW LAP / BUCKETS / CAMP; Pi corrected latest second: "
+                     + _fmt(mean, '.6f', 0)
+                     + f" ns  {measurement['status']}  MODEL: {measurement['normalization_id'][:12]}")
     if campaign_error:
         lines.append(f"LANTERN READ MODEL: UNAVAILABLE: {campaign_error}")
     if campaign and not summary["scatter"] and summary["mean"] is not None:
