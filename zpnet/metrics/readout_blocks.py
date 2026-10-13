@@ -100,11 +100,20 @@ HEADER_MAX_AGE_S = 6.0
 
 
 class _HeaderTelemetry:
-    """One background RPC per source; repaint never waits for hardware."""
+    """One background RPC per source; repaint never waits for hardware.
 
-    def __init__(self, machine: str, command: str):
+    Pi thermal monitoring is frequent, but the Teensy die reading is an
+    independent slow diagnostic. A periodic SYSTEM.REPORT must not add 2 Hz
+    command traffic to our clock and optical acquisition processes.
+    """
+
+    def __init__(self, machine: str, command: str, *,
+                 poll_interval_s: float = HEADER_POLL_INTERVAL_S,
+                 max_age_s: float = HEADER_MAX_AGE_S):
         self._machine = machine
         self._command = command
+        self._poll_interval_s = poll_interval_s
+        self._max_age_s = max_age_s
         self._lock = threading.Lock()
         self._thread = None
         self._payload = {}
@@ -119,7 +128,7 @@ class _HeaderTelemetry:
                     daemon=True,
                 )
                 self._thread.start()
-            if time.monotonic() - self._sampled_at > HEADER_MAX_AGE_S:
+            if time.monotonic() - self._sampled_at > self._max_age_s:
                 return {}
             return self._payload
 
@@ -141,10 +150,12 @@ class _HeaderTelemetry:
                 # An unavailable command plane must not freeze the UI. The
                 # previous reading expires rather than looking current forever.
                 pass
-            time.sleep(HEADER_POLL_INTERVAL_S)
+            time.sleep(self._poll_interval_s)
 
 
 _HEADER_PI = _HeaderTelemetry("PI", "REPORT_METRICS")
+_HEADER_TEENSY = _HeaderTelemetry("TEENSY", "REPORT", poll_interval_s=20.0,
+                                  max_age_s=60.0)
 
 
 class _RollingPubSubTap:
@@ -1053,27 +1064,13 @@ def _header_temperature(value, digits: int = 2) -> str:
 
 
 def status_header() -> str:
+    """Compact operational title bar; scientific sensor detail lives in both views."""
     try:
         s = _HEADER_PI.get()
+        teensy = _HEADER_TEENSY.get()
         net = s.get("network", {}).get("ssid") or "?"
-        synthetic = s.get("temperature", {})
-        synthetic_temperature = (
-            _header_temperature(synthetic.get("temperature_c"), 4)
-            if synthetic.get("status") == "OK" else "?"
-        )
-        rtd = s.get("rtd", {})
-        rtd_temperature = (
-            _header_temperature(rtd.get("temperature_c"), 4)
-            if rtd.get("status") == "OK" else "?"
-        )
-        environment = s.get("environment", {})
-        bme_temperatures = {}
-        for key in ("pi", "pd", "otdr"):
-            reading = environment.get(key, {})
-            bme_temperatures[key] = (
-                _header_temperature(reading.get("temperature_c"), 4)
-                if reading.get("status") == "OK" else "?"
-            )
+        pi_temperature = _header_temperature(s.get("pi", {}).get("cpu_temp_c"), 1)
+        teensy_temperature = _header_temperature(teensy.get("cpu_temp_c"), 1)
 
         bat_v = "?"
         power = s.get("power", {})
@@ -1086,17 +1083,48 @@ def status_header() -> str:
                     if volts is not None:
                         bat_v = f"{volts:.2f}V"
 
-        return (
-            f" MAX31865: {rtd_temperature}"
-            f"  BME280 PI: {bme_temperatures['pi']}"
-            f"  BME280 PD: {bme_temperatures['pd']}"
-            f"  BME280 OTDR: {bme_temperatures['otdr']}"
-            f"  TEMP: {synthetic_temperature}"
-            f"  BAT: {bat_v}"
-            f"  NET: {net}"
-        )
+        return (f" NET: {net}  BAT: {bat_v}"
+                f"  PI: {pi_temperature}  TEENSY: {teensy_temperature}")
     except Exception:
         return " STATUS: UNAVAILABLE"
+
+
+def environment_sensor_block(snapshot: dict) -> list[str]:
+    """One common, column-aligned physical sensor block for CLOCKS and PHOTONS.
+
+    These are observed SYSTEM sensor values, not normalized or synthetic
+    temperatures. The three BME280 channels carry humidity, pressure and
+    barometric altitude; the fiber-pad MAX31865 is temperature-only. Missing
+    observations retain their source status without inventing environmental data.
+    """
+    environment = snapshot.get("environment") or {}
+    columns = (f"{'SENSOR':<12} {'STATE':<12} {'TEMP(C)':>10}"
+               f" {'RH(%)':>9} {'BARO(hPa)':>11} {'BARO_ALT(m)':>12}")
+    lines = [columns]
+
+    def fmt(value, decimals: int, width: int) -> str:
+        number = _to_float(value)
+        return f"{number:>{width}.{decimals}f}" if number is not None else f"{'---':>{width}}"
+
+    for key, label in (("pi", "BME280 PI"), ("pd", "BME280 PD"),
+                       ("otdr", "BME280 OTDR")):
+        reading = environment.get(key) or {}
+        state = str(reading.get("status") or "INITIALIZING")
+        active = state == "OK"
+        lines.append(
+            f"{label:<12} {state:<12}"
+            + f" {fmt(reading.get('temperature_c') if active else None, 4, 10)}"
+            + f" {fmt(reading.get('humidity_pct') if active else None, 2, 9)}"
+            + f" {fmt(reading.get('pressure_hpa') if active else None, 2, 11)}"
+            + f" {fmt(reading.get('altitude_m') if active else None, 1, 12)}"
+        )
+
+    rtd = snapshot.get("rtd") or {}
+    state = str(rtd.get("status") or "INITIALIZING")
+    lines.append(f"{'MAX31865':<12} {state:<12}"
+                 + f" {fmt(rtd.get('temperature_c') if state == 'OK' else None, 4, 10)}"
+                 + f" {'---':>9} {'---':>11} {'---':>12}")
+    return lines
 
 
 
@@ -1664,30 +1692,9 @@ def clocks_combined_readout() -> list[str]:
     lines.append(gnss_line)
     lines.append("")
 
-    # ── Environment ──
-    env = snapshot.get("environment", {})
-    pi_data = snapshot.get("pi", {})
-    teensy_data = snapshot.get("teensy", {})
-    for key, label in (("pi", "BME280 PI"), ("pd", "BME280 PD"), ("otdr", "BME280 OTDR")):
-        reading = env.get(key, {})
-        status = reading.get("status", "INITIALIZING")
-        parts = [f"{label}: {status}"]
-        if status == "OK":
-            parts.extend((
-                f"TEMP: {reading['temperature_c']:.4f}°C",
-                f"RH: {reading['humidity_pct']:.2f}%",
-                f"BARO: {reading['pressure_hpa']:.2f}hPa",
-                f"BARO_ALT: {reading['altitude_m']:.1f}m",
-            ))
-        lines.append("  ".join(parts))
-    pi_temp = pi_data.get("cpu_temp_c")
-    teensy_temp = teensy_data.get("cpu_temp_c")
-    env_parts = []
-    if pi_temp is not None:
-        env_parts.append(f"PI: {pi_temp:.1f}°C")
-    if teensy_temp is not None:
-        env_parts.append(f"TEENSY: {teensy_temp:.1f}°C")
-    lines.append("HOST  " + "  ".join(env_parts))
+    # Both instrument readouts share the same physical sensor presentation.
+    # CLOCKS retains its historical position immediately below GNSS status.
+    lines.extend(environment_sensor_block(snapshot))
     lines.append("")
 
     lines.extend(feature_status_grid_lines())
@@ -2299,6 +2306,8 @@ def photons_detail_readout() -> list[str]:
             + " " + _fmt(row["unarmed"], '>6d', 6)
             + " " + _fmt(row["stddev"], '>10.6f', 10)
             + " " + _fmt(row["stderr"], '>10.6f', 10))
+    # Locate the four sensor witnesses directly beneath the live one-second tail.
+    lines.extend(["", *environment_sensor_block(live)])
     return lines
 
 
