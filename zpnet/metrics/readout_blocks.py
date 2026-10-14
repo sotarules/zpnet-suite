@@ -1129,6 +1129,75 @@ def environment_sensor_block(snapshot: dict) -> list[str]:
     return lines
 
 
+def photons_temperature_block(snapshot: dict) -> list[str]:
+    """Operator view of Pi-owned temperature populations in familiar buckets.
+
+    CLOCKS continues using environment_sensor_block unchanged. PHOTONS gets
+    mean temperatures on the same windows as its photon means, with CAMP SD
+    and the current BME280 humidity, pressure and altitude still accessible.
+    The `~` suffix flags incomplete coverage: a warm window, missed physical
+    samples, or a TOTAL/CAMP population deployed mid-epoch. It is never an
+    independent-sample uncertainty or a statement that temperature is stable.
+    """
+    data = snapshot.get("temperature_stats")
+    if not isinstance(data, dict):
+        return [line.upper() for line in environment_sensor_block(snapshot)]
+    if data.get("schema") != "PI_PHOTONS_TEMPERATURE_STATS_V1":
+        raise ValueError("unsupported PHOTONS temperature statistics schema")
+    environment = snapshot.get("environment") or {}
+    rtd = snapshot.get("rtd") or {}
+    spans = (("600", "10-MIN"), ("3600", "60-MIN"),
+             ("28800", "8-HOUR"), ("86400", "24-HOUR"))
+    header = (f"{'SENSOR':<12} {'STATE':<12} {'NOW':>10}"
+              + ''.join(f" {label:>10}" for _, label in spans)
+              + f" {'TOTAL':>10} {'CAMP':>10} {'CAMP_SD':>9}")
+    lines = [header]
+
+    def observed(value, digits=4, width=10):
+        number = _to_float(value)
+        if number is None or not math.isfinite(number):
+            return f"{'---':>{width}}"
+        return f"{number:>{width}.{digits}f}"
+
+    def mean(pop):
+        if not isinstance(pop, dict) or pop.get("mean_c") is None:
+            return f"{'---':>10}"
+        value = f"{float(pop['mean_c']):.4f}"
+        if not pop.get("complete"):
+            value += "~"
+        return f"{value:>10}"
+
+    for key, label in (("pi", "BME280 PI"), ("pd", "BME280 PD"),
+                       ("otdr", "BME280 OTDR"), ("rtd", "MAX31865")):
+        reading = rtd if key == "rtd" else environment.get(key) or {}
+        state = str(reading.get("status") or "INITIALIZING").upper()
+        active = state == "OK"
+        population = (data.get("camp") or {}).get(key) or {}
+        row = (f"{label:<12} {state:<12}"
+               + " " + observed(reading.get("temperature_c") if active else None)
+               + ''.join(" " + mean((data["windows"][span] or {}).get(key))
+                         for span, _ in spans)
+               + " " + mean(data["total"].get(key))
+               + " " + mean(population)
+               + " " + observed(population.get("sd_c"), 5, 9))
+        lines.append(row)
+
+    # Preserve the non-temperature BME280 witnesses without tripling terminal
+    # width: a single status-aligned footer retains RH, pressure and altitude.
+    # The compact values are instantaneous readings, NOT bucketed populations.
+    details = []
+    for key in ("pi", "pd", "otdr"):
+        reading = environment.get(key) or {}
+        valid = reading.get("status") == "OK"
+        if not valid:
+            details.append(f"{key.upper()}:---")
+            continue
+        rh = observed(reading.get("humidity_pct"), 2, 0)
+        pressure = observed(reading.get("pressure_hpa"), 2, 0)
+        altitude = observed(reading.get("altitude_m"), 1, 0)
+        details.append(f"{key.upper()}:{rh}/{pressure}/{altitude}")
+    lines.append("RH(%)/BARO(HPA)/ALT(M) NOW: " + "  ".join(details))
+    return lines
 
 
 # ---------------------------------------------------------------------
@@ -2360,9 +2429,9 @@ def photons_detail_readout() -> list[str]:
             + " " + _fmt(row["unarmed"], '>6d', 6)
             + " " + _fmt(row["stddev"], '>10.6f', 10)
             + " " + _fmt(row["stderr"], '>10.6f', 10))
-    # CLOCKS shares the sensor renderer, but only PHOTONS requests uppercase
-    # sensor-column units (RH(%), BARO(HPA), BARO_ALT(M)) here.
-    lines.extend(["", *(sensor_line.upper() for sensor_line in environment_sensor_block(live))])
+    # CLOCKS retains its existing physical-sensor readout. PHOTONS alone
+    # displays Pi-owned thermal populations beside those physical witnesses.
+    lines.extend(["", *photons_temperature_block(live)])
     return lines
 
 

@@ -38,6 +38,7 @@ from zpnet.processes.photons.normalization import (
     ACQUISITION_ID, Normalizer,
 )
 from zpnet.processes.photons.stability import StabilityAccumulator
+from zpnet.processes.photons.temperature_stats import TemperatureAccumulator
 from zpnet.shared.constants import Payload
 from zpnet.shared.db import DatabaseContentionRetry, open_db
 from zpnet.shared.logger import setup_logging
@@ -180,6 +181,10 @@ _normalizer = Normalizer()
 # disjoint and campaign-local. One canonical PHOTONS row owns the exact compact
 # restart checkpoint for every scale. No additional Teensy statistics are needed.
 _stability = StabilityAccumulator()
+# Physical temperature witnesses are useful to PHOTONS even when no campaign is
+# recording. The Pi owns their cumulative Welford populations and transient
+# trailing windows; no Teensy firmware or SYSTEM statistical authority changes.
+_temperature_stats = TemperatureAccumulator()
 
 _state_lock = threading.Lock()
 _campaign_lock = threading.Lock()
@@ -2571,9 +2576,19 @@ def _normalize_saved_ppb_checkpoint(value: Any) -> Dict[str, Any]:
     return normalized
 
 
-def _write_photons_recovery_config(cur: Any, checkpoint: Dict[str, Any]) -> None:
-    """Persist the literal PHOTONS recovery image as one singleton config row."""
+def _write_photons_recovery_config(
+    cur: Any, checkpoint: Dict[str, Any], temperature_rolling: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Persist ONE atomically owned PHOTONS recovery singleton.
+
+    The existing Pi-owned literal Better-Buckets proof and the new bounded
+    temperature ring are one committed recovery image. Only the latter is
+    replaced in place rather than redundantly written into all PHOTONS details.
+    This update uses the SAME transaction as campaign_detail's canonical row.
+    """
     normalized = _normalize_saved_ppb_checkpoint(checkpoint)
+    if temperature_rolling is not None:
+        normalized["temperature_rolling"] = copy.deepcopy(temperature_rolling)
     encoded = json.dumps(normalized, separators=(",", ":"))
     cur.execute(
         "UPDATE config SET payload = %s::jsonb WHERE config_key = %s",
@@ -2608,7 +2623,14 @@ def _read_photons_recovery_config() -> Optional[Dict[str, Any]]:
     payload = row["payload"]
     if isinstance(payload, str):
         payload = json.loads(payload)
-    return _normalize_saved_ppb_checkpoint(payload)
+    normalized = _normalize_saved_ppb_checkpoint(payload)
+    # Normalization of the Teensy's literal ring intentionally accepts only
+    # its familiar fields. Carry this Pi-owned extension unchanged to the
+    # already-selected temperature recovery court; it validates sequence,
+    # firmware update_count, source sensor witnesses, image bounds and SHA256.
+    if "temperature_rolling" in payload:
+        normalized["temperature_rolling"] = copy.deepcopy(payload["temperature_rolling"])
+    return normalized
 
 
 def _retire_orphaned_photons_recovery_config_if_domain_empty() -> Dict[str, Any]:
@@ -6507,6 +6529,7 @@ def _startup_cold_start(
     # The authorized fresh epoch reuses reset/update identities from zero. Drop
     # the previous epoch's Pi ledger before firmware can publish its first row.
     _stability.reset()
+    _temperature_stats.reset()
     with _ppb_checkpoint_lock:
         _ppb_checkpoint_runtime = _ppb_checkpoint_new_runtime(reason="COLD_START")
     _arm_recovery_proof({
@@ -6800,6 +6823,17 @@ def _perform_phase5_recovery(
         # Old pre-stability rows start with explicitly partial history; never
         # reconstruct or invent unseen measurements during startup.
         _stability.restore(snapshot.canonical if snapshot is not None else None)
+        # The one source selected by Phase-5 supplies BOTH components of
+        # temperature continuation: TOTAL/CAMP Welford checkpoint in canonical
+        # PHOTONS and the short-second/long-minute ring from the ALREADY-LOADED
+        # config.PHOTONS_RECOVERY singleton. No additional SQL or history replay.
+        # Older source images legitimately lack the rolling extension; those
+        # windows begin visibly partial, but TOTAL/CAMP retain exact lineage.
+        _temperature_stats.restore(
+            snapshot.canonical if snapshot is not None else None,
+            rolling_checkpoint=(snapshot.ppb_restore_checkpoint.get("temperature_rolling")
+                                if snapshot is not None else None),
+        )
 
         if snapshot is not None:
             # Seed Pi-owned literal custody before either live adoption or held
@@ -7232,6 +7266,13 @@ def _lantern_report_from_photons(photons: Payload) -> Dict[str, Any]:
         "temperature": copy.deepcopy(photons.get("temperature") or {}),
         "normalization": copy.deepcopy(photons["normalization"]),
         "measurement": copy.deepcopy(photons["measurement"]),
+        # The canonical detail record remains the ONLY checkpoint authority.
+        # Campaign master publishes sensor means/coverage for display only.
+        "temperature_stats": {
+            key: copy.deepcopy(value)
+            for key, value in photons["temperature_stats"].items()
+            if key != "checkpoint"
+        },
         # Campaign master is a compact read model, not another checkpoint
         # authority. The full checkpoint lives only in its canonical detail row.
         "stability": {
@@ -7242,7 +7283,8 @@ def _lantern_report_from_photons(photons: Payload) -> Dict[str, Any]:
 
 
 def _persist_photons(
-    photons: Payload, checkpoint: Dict[str, Any]
+    photons: Payload, checkpoint: Dict[str, Any],
+    temperature_rolling: Dict[str, Any],
 ) -> int:
     """Persist one canonical PHOTONS row and advance the LANTERN read model.
 
@@ -7254,6 +7296,18 @@ def _persist_photons(
         raise RuntimeError(
             "PHOTONS recovery checkpoint identity does not match canonical observation"
         )
+    # All three representations belong to exactly ONE producer observation.
+    # Never accept a temperature ring from a later queued observation merely
+    # because it happens to be the most recently computed in the state worker.
+    stats = _require_dict(photons["photons"]["stats"], "PHOTONS stats")
+    cumulative = _require_dict(photons["temperature_stats"]["checkpoint"],
+                               "PHOTONS temperature checkpoint")
+    if (temperature_rolling["sequence"] != photons["sequence"]
+            or temperature_rolling["update_count"] != stats["update_count"]
+            or temperature_rolling["reset_count"] != stats["reset_count"]
+            or cumulative["sequence"] != photons["sequence"]
+            or cumulative["reset_count"] != stats["reset_count"]):
+        raise RuntimeError("PHOTONS temperature/firmware recovery identity mismatch")
     sequence = photons["sequence"]
     pps_count = photons.get("pps_count")
     campaign = photons.get("campaign")
@@ -7398,7 +7452,10 @@ def _persist_photons(
                         "final LANTERN firmware row did not close exactly one campaign_master"
                     )
 
-        _write_photons_recovery_config(cur, checkpoint)
+        # The exact rolling continuation is stored in the same singleton
+        # as the existing PHOTONS firmware restore image, inside the SAME
+        # transaction as the canonical measurement and cumulative Welfords.
+        _write_photons_recovery_config(cur, checkpoint, temperature_rolling)
 
     # Crossing the open_db context is the irreversible durability boundary.
     # Return the committed identity to the worker; post-commit recovery-proof
@@ -7740,7 +7797,18 @@ def _state_loop() -> None:
                     # is attached BEFORE publication and BEFORE the ordered
                     # persistence transaction. Restart always resumes from the
                     # exact last committed measurement + its checkpoint.
+                    temperature_input = _temperature_stats.preflight(photons)
                     photons["stability"] = _stability.ingest(photons)
+                    # Temperature TOTAL/CAMP checkpoints join this exact same
+                    # canonical record; trailing windows are reconstructed from
+                    # persisted source observations if the Pi restarts.
+                    photons["temperature_stats"] = _temperature_stats.ingest(
+                        photons, prepared=temperature_input
+                    )
+                    # Snapshot the rolling image NOW, under the single state
+                    # worker. The persist worker may lag by seconds or minutes;
+                    # querying its live calculator later would splice cursors.
+                    temperature_rolling = _temperature_stats.rolling_checkpoint()
                 except Exception as exc:
                     rejection = {
                         "rejected_at_utc": _utc_now_z(),
@@ -7785,6 +7853,7 @@ def _state_loop() -> None:
                     {
                         "photons": copy.deepcopy(photons),
                         "ppb_restore_checkpoint": copy.deepcopy(ppb_restore_checkpoint),
+                        "temperature_rolling_checkpoint": temperature_rolling,
                     }
                 )
                 _note_persist_queue_depth()
@@ -7815,6 +7884,7 @@ def _persistence_loop() -> None:
         persist_item = None
         photons = None
         checkpoint = None
+        temperature_rolling = None
         with _maintenance_lock:
             try:
                 persist_item = _persist_queue.get_nowait()
@@ -7825,6 +7895,10 @@ def _persistence_loop() -> None:
                 checkpoint = _require_dict(
                     persist_item.get("ppb_restore_checkpoint"),
                     "PHOTONS persistence recovery checkpoint",
+                )
+                temperature_rolling = _require_dict(
+                    persist_item.get("temperature_rolling_checkpoint"),
+                    "PHOTONS temperature rolling recovery image",
                 )
             if photons is None:
                 pass
@@ -7838,7 +7912,8 @@ def _persistence_loop() -> None:
                 )
                 while True:
                     try:
-                        detail_id = _persist_photons(photons, checkpoint)
+                        detail_id = _persist_photons(
+                            photons, checkpoint, temperature_rolling)
                         with _state_lock:
                             _rows_persisted += 1
                     except Exception as exc:
