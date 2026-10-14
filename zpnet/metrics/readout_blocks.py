@@ -89,9 +89,9 @@ PHOTONS_TOPIC = "PHOTONS"
 CLOCKS_RECOVERY_CONFIG_KEY = "CLOCKS_RECOVERY"
 PHOTONS_RECOVERY_CONFIG_KEY = "PHOTONS_RECOVERY"
 CAMPAIGN_TYPE_LANTERN = "LANTERN"
-# Only the last ten complete cadence cells belong in the laptop operator view.
+# Retain twenty complete one-second cadence cells in the operator view.
 # The tap retains one predecessor for continuity with the existing read model.
-PHOTONS_ROLLING_ROWS = 10
+PHOTONS_ROLLING_ROWS = 20
 PHOTONS_UPDATED = threading.Event()
 
 _LIVE_CACHE = create_pubsub_cache(CLOCKS_TOPIC)
@@ -2326,20 +2326,10 @@ def photons_detail_readout() -> list[str]:
     if campaign.get("final"):
         name += " [FINAL]"
 
-    # Only the campaign NAME retains its operator-selected capitalization.
-    # All other visible text, including identity/model metadata, is uppercase.
-    stability = live.get("stability") or {}
-    if stability.get("schema") == "PI_PHOTONS_STABILITY_V1":
-        coverage = ("FULL" if stability.get("complete_from_start")
-                    else "PARTIAL" if stability.get("status") == "ACTIVE"
-                    else "NO CAMPAIGN")
-        gaps = str(stability.get("gap_count", 0))
-    else:
-        coverage, gaps = "NOT RECORDED", "---"
+    # Only the campaign name retains its operator-selected capitalization.
     line = (f"CAMPAIGN: {name}  UNITS: NS"
             f"  ELAPSED: {_seconds_to_hms(summary['seconds'])}"
-            f"  RECOVERABLE: {str(recoverable).upper()}"
-            f"  STABILITY: {coverage}  GAPS: {gaps}")
+            f"  RECOVERABLE: {str(recoverable).upper()}")
     measurement = live.get("measurement")
     if measurement is not None:
         status = str(measurement["status"]).upper()
@@ -2353,7 +2343,8 @@ def photons_detail_readout() -> list[str]:
     if campaign_error:
         line += "  READ MODEL: UNAVAILABLE"
     lines = [line]
-    lines.extend(["", *_photons_stability_lines(live), "",
+    lines.extend(["", _photons_summary_header(bool(campaign)),
+                  _photons_summary_line(summary, bool(campaign), summary["mean"]), "",
                   f"{'SEC':<8} {'LAP':>12} {'ACCEPT':>8} {'EXCL':>7} {'MISSED':>7} {'SPURIOUS':>8}"
                   f" {'EARLY':>6} {'DUP':>6} {'LATE':>6} {'UNARM':>6} {'SD':>10} {'SE':>10}"])
     for row in _photons_rolling_rows(payloads):
