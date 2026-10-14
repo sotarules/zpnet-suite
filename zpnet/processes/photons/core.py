@@ -37,6 +37,7 @@ from zpnet.processes.processes import (
 from zpnet.processes.photons.normalization import (
     ACQUISITION_ID, Normalizer,
 )
+from zpnet.processes.photons.stability import StabilityAccumulator
 from zpnet.shared.constants import Payload
 from zpnet.shared.db import DatabaseContentionRetry, open_db
 from zpnet.shared.logger import setup_logging
@@ -175,6 +176,10 @@ SYSTEM_CONTEXT_FIELDS = (
 
 # One owner: the ordered state worker. Flash cuts do not reset thermal history.
 _normalizer = Normalizer()
+# Unlike the firmware's rolling Better-Buckets, Pi stability populations are
+# disjoint and campaign-local. One canonical PHOTONS row owns the exact compact
+# restart checkpoint for every scale. No additional Teensy statistics are needed.
+_stability = StabilityAccumulator()
 
 _state_lock = threading.Lock()
 _campaign_lock = threading.Lock()
@@ -6501,6 +6506,7 @@ def _startup_cold_start(
     drained = _retire_fragment_queue_via_owner("COLD_START")
     # The authorized fresh epoch reuses reset/update identities from zero. Drop
     # the previous epoch's Pi ledger before firmware can publish its first row.
+    _stability.reset()
     with _ppb_checkpoint_lock:
         _ppb_checkpoint_runtime = _ppb_checkpoint_new_runtime(reason="COLD_START")
     _arm_recovery_proof({
@@ -6786,6 +6792,14 @@ def _perform_phase5_recovery(
                     "migration; STOP it before deploying the real-race producer"
                 )
             legacy_source_migration_required = True
+
+        # Restore the Pi-only stability accumulator from exactly the canonical
+        # observation already selected by the producer's Phase-5 recovery court.
+        # Its full checkpoint was committed in the SAME campaign_detail row as
+        # the one-second measurement, so no independently advancing cursor exists.
+        # Old pre-stability rows start with explicitly partial history; never
+        # reconstruct or invent unseen measurements during startup.
+        _stability.restore(snapshot.canonical if snapshot is not None else None)
 
         if snapshot is not None:
             # Seed Pi-owned literal custody before either live adoption or held
@@ -7218,6 +7232,12 @@ def _lantern_report_from_photons(photons: Payload) -> Dict[str, Any]:
         "temperature": copy.deepcopy(photons.get("temperature") or {}),
         "normalization": copy.deepcopy(photons["normalization"]),
         "measurement": copy.deepcopy(photons["measurement"]),
+        # Campaign master is a compact read model, not another checkpoint
+        # authority. The full checkpoint lives only in its canonical detail row.
+        "stability": {
+            k: copy.deepcopy(v)
+            for k, v in photons["stability"].items() if k != "checkpoint"
+        },
     }
 
 
@@ -7716,6 +7736,11 @@ def _state_loop() -> None:
                         photons["campaign"] = _campaign_decoration_from_firmware(
                             firmware_campaign
                         )
+                    # The state worker is the exclusive statistics owner. This
+                    # is attached BEFORE publication and BEFORE the ordered
+                    # persistence transaction. Restart always resumes from the
+                    # exact last committed measurement + its checkpoint.
+                    photons["stability"] = _stability.ingest(photons)
                 except Exception as exc:
                     rejection = {
                         "rejected_at_utc": _utc_now_z(),

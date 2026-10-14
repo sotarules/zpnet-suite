@@ -89,7 +89,9 @@ PHOTONS_TOPIC = "PHOTONS"
 CLOCKS_RECOVERY_CONFIG_KEY = "CLOCKS_RECOVERY"
 PHOTONS_RECOVERY_CONFIG_KEY = "PHOTONS_RECOVERY"
 CAMPAIGN_TYPE_LANTERN = "LANTERN"
-PHOTONS_ROLLING_ROWS = 25
+# Only the last ten complete cadence cells belong in the laptop operator view.
+# The tap retains one predecessor for continuity with the existing read model.
+PHOTONS_ROLLING_ROWS = 10
 PHOTONS_UPDATED = threading.Event()
 
 _LIVE_CACHE = create_pubsub_cache(CLOCKS_TOPIC)
@@ -2156,6 +2158,7 @@ def _get_lantern_campaign_summaries() -> list[dict]:
             "id": _to_int(row.get("id")),
             "campaign": row.get("campaign"),
             "active": bool(row.get("active")),
+            "stability": last_payload.get("stability") or (master_payload.get("report") or {}).get("stability"),
             "started_at": master_payload.get("started_at"),
             "stopped_at": master_payload.get("stopped_at"),
             "interrupted_at": master_payload.get("interrupted_at"),
@@ -2252,6 +2255,52 @@ class _PhotonsReadModel:
 
 _PHOTONS_READ_MODEL = _PhotonsReadModel()
 
+def _stability_cell(value, decimals=2, width=11) -> str:
+    if value is None:
+        return f"{'---':>{width}}"
+    return f"{float(value):>{width}.{decimals}f}"
+
+
+def _photons_stability_lines(payload: dict) -> list[str]:
+    """Compact uppercase block table; meaning and checkpoint authority unchanged.
+
+    ROLL_NS is the Teensy trailing instrument mean; OPEN_NS is the campaign's
+    unfinished block. The SD columns describe completed disjoint block means,
+    not uncertainty on the campaign mean. Operational context is displayed on
+    the CAMPAIGN line, never in extra caption rows.
+    """
+    data = payload.get("stability")
+    if not isinstance(data, dict) or data.get("schema") != "PI_PHOTONS_STABILITY_V1":
+        return []
+    if data.get("status") != "ACTIVE":
+        return []
+    bucket_means = _photons_producer_lap_buckets(payload)
+    labels = ((60, "1-MIN", None), (600, "10-MIN", "10_min"),
+              (3600, "60-MIN", "60_min"), (14400, "4-HOUR", None),
+              (28800, "8-HOUR", "8_hour"), (86400, "24-HOUR", "24_hour"))
+    lines = [
+        f"{'WINDOW':<8} {'ROLL_NS':>12} {'OPEN_NS':>12} {'BLOCKS':>7} "
+        f"{'RAW_SDPS':>10} {'NORM_SDPS':>10} {'ADJPS':>10} {'TRENDPS/H':>11}",
+    ]
+    windows = data.get("windows") or {}
+    for seconds, label, bucket in labels:
+        stat = windows.get(str(seconds)) or {}
+        raw = stat.get("raw") or {}
+        normalized = stat.get("normalized") or {}
+        roll = bucket_means.get(bucket) if bucket is not None else None
+        blocks = raw.get("block_count")
+        lines.append(
+            f"{label:<8}"
+            + _stability_cell(roll, 6, 13)
+            + _stability_cell(raw.get("current_block_mean_ns"), 6, 13)
+            + f"{str(blocks if blocks is not None else '---'):>7} "
+            + _stability_cell(raw.get("block_sd_ps"), 2, 10)
+            + _stability_cell(normalized.get("block_sd_ps"), 2, 11)
+            + _stability_cell(raw.get("allan_ps"), 2, 10)
+            + _stability_cell(raw.get("trend_ps_per_hour"), 2, 11)
+        )
+    return lines
+
 
 def photons_detail_readout() -> list[str]:
     """Show selected population means/scatter above individual cadence cells."""
@@ -2276,21 +2325,35 @@ def photons_detail_readout() -> list[str]:
     name = str(campaign.get("campaign") or "STOPPED")
     if campaign.get("final"):
         name += " [FINAL]"
-    lines = [f"CAMPAIGN: {name}  UNITS: ns"
-             f"  ELAPSED: {_seconds_to_hms(summary['seconds'])}  RECOVERABLE: {recoverable}"]
+
+    # Only the campaign NAME retains its operator-selected capitalization.
+    # All other visible text, including identity/model metadata, is uppercase.
+    stability = live.get("stability") or {}
+    if stability.get("schema") == "PI_PHOTONS_STABILITY_V1":
+        coverage = ("FULL" if stability.get("complete_from_start")
+                    else "PARTIAL" if stability.get("status") == "ACTIVE"
+                    else "NO CAMPAIGN")
+        gaps = str(stability.get("gap_count", 0))
+    else:
+        coverage, gaps = "NOT RECORDED", "---"
+    line = (f"CAMPAIGN: {name}  UNITS: NS"
+            f"  ELAPSED: {_seconds_to_hms(summary['seconds'])}"
+            f"  RECOVERABLE: {str(recoverable).upper()}"
+            f"  STABILITY: {coverage}  GAPS: {gaps}")
     measurement = live.get("measurement")
     if measurement is not None:
-        normalized = measurement["normalized_flight_ns"]
-        mean = normalized["mean"] if normalized is not None else None
-        lines.append("RAW LAP / BUCKETS / CAMP; Pi corrected latest second: "
-                     + _fmt(mean, '.6f', 0)
-                     + f" ns  {measurement['status']}  MODEL: {measurement['normalization_id'][:12]}")
+        status = str(measurement["status"]).upper()
+        line += (f"  {status}"
+                 f"  MODEL: {str(measurement['normalization_id'])[:12].upper()}")
+        if status != "IDENTITY":
+            # Under identity the one-second tail already shows this same mean.
+            # After calibration, keep the distinct Pi-corrected mean visible.
+            normalized = measurement["normalized_flight_ns"]
+            line += f"  NORM: {_fmt(normalized['mean'] if normalized else None, '.6f', 0)} NS"
     if campaign_error:
-        lines.append(f"LANTERN READ MODEL: UNAVAILABLE: {campaign_error}")
-    if campaign and not summary["scatter"] and summary["mean"] is not None:
-        lines.append("CAMPAIGN SD/SE: UNAVAILABLE (exact campaign population not retained)")
-    lines.extend(["", _photons_summary_header(bool(campaign)),
-                  _photons_summary_line(summary, bool(campaign), summary["mean"]), "",
+        line += "  READ MODEL: UNAVAILABLE"
+    lines = [line]
+    lines.extend(["", *_photons_stability_lines(live), "",
                   f"{'SEC':<8} {'LAP':>12} {'ACCEPT':>8} {'EXCL':>7} {'MISSED':>7} {'SPURIOUS':>8}"
                   f" {'EARLY':>6} {'DUP':>6} {'LATE':>6} {'UNARM':>6} {'SD':>10} {'SE':>10}"])
     for row in _photons_rolling_rows(payloads):
@@ -2306,40 +2369,50 @@ def photons_detail_readout() -> list[str]:
             + " " + _fmt(row["unarmed"], '>6d', 6)
             + " " + _fmt(row["stddev"], '>10.6f', 10)
             + " " + _fmt(row["stderr"], '>10.6f', 10))
-    # Locate the four sensor witnesses directly beneath the live one-second tail.
-    lines.extend(["", *environment_sensor_block(live)])
+    # CLOCKS shares the sensor renderer, but only PHOTONS requests uppercase
+    # sensor-column units (RH(%), BARO(HPA), BARO_ALT(M)) here.
+    lines.extend(["", *(sensor_line.upper() for sensor_line in environment_sensor_block(live))])
     return lines
 
 
 def photons_campaigns_readout() -> list[str]:
-    """Show producer campaign means and the instrument buckets at each last row."""
-    # SPACE arrives here directly from PHOTONS on the curses/input thread.
-    # Reuse its background snapshot: campaign history queries can take seconds
-    # as the database grows and must never block navigation or repaint.
+    """Show campaign-local stability, never a trailing instrument bucket as campaign SD."""
+    # Historical rows are read by the existing one-second background read model.
+    # This view performs no regression, Welford, or database work on repaint.
     rows, campaign_error, _ = _PHOTONS_READ_MODEL.get()
     if campaign_error:
         return ["\0LANTERN_CAMPAIGNS:ERROR",
-                f"LANTERN CAMPAIGNS: UNAVAILABLE: {campaign_error}"]
+                f"LANTERN CAMPAIGNS: UNAVAILABLE: {str(campaign_error).upper()}"]
     if rows is None:
         return ["\0LANTERN_CAMPAIGNS:LOADING", "LANTERN CAMPAIGNS: LOADING"]
     newest_identity = str(rows[0].get("id")) if rows else "EMPTY"
-    # Every row owns a recorded campaign mean, regardless of its active state.
     lines = [f"\0LANTERN_CAMPAIGN:{newest_identity}",
-             f"{'CAMPAIGN':<14} " + _photons_summary_header(True)]
+             f"{'CAMPAIGN':<18} {'SEC':>8} {'CAMP_NS':>13} {'10M_SDPS':>10}"
+             f" {'60M_SDPS':>10} {'60M_TREND':>11} {'60M_N':>7} {'HISTORY':>9}"]
     if not rows:
         return lines + ["", "NO LANTERN CAMPAIGNS"]
-    for row_index, row in enumerate(rows):
+    for row in rows:
         name = str(row.get("campaign") or "?")
         if row.get("campaign_mean_lap_ns") is None:
             name += " [WAIT]"
         elif row.get("interrupted_at"):
             name += " [INT]"
-        summary = {"seconds": row.get("seconds"), "mean": row.get("campaign_mean_lap_ns"),
-                   "buckets": row.get("lap_buckets") or {}, "scatter": row.get("stats") or {}}
-        lines.append(_campaign_cell(name, bool(row.get("active")), 14) + " "
-                     + _photons_summary_line(summary, True, summary["mean"]))
-        if row_index != len(rows) - 1:
-            lines.append("")
+        stability = row.get("stability") or {}
+        windows = stability.get("windows") or {}
+        ten = (windows.get("600") or {}).get("raw") or {}
+        hour = (windows.get("3600") or {}).get("raw") or {}
+        history = ("FULL" if stability.get("complete_from_start")
+                   else "PARTIAL" if stability.get("status") == "ACTIVE"
+                   else "---")
+        lines.append(
+            _campaign_cell(name, bool(row.get("active")), 18)
+            + f" {str(row.get('seconds') if row.get('seconds') is not None else '---'):>8}"
+            + _stability_cell(row.get("campaign_mean_lap_ns"), 6, 14)
+            + _stability_cell(ten.get("block_sd_ps"), 2, 11)
+            + _stability_cell(hour.get("block_sd_ps"), 2, 11)
+            + _stability_cell(hour.get("trend_ps_per_hour"), 2, 12)
+            + f" {str(hour.get('block_count', '---')):>7} {history:>9}"
+        )
     return lines
 
 
