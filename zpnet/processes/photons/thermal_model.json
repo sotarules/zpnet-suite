@@ -1,6 +1,6 @@
 {
   "schema": "PI_PHOTONS_THERMAL_MODEL_V1",
-  "feature_id": "72e154c8a077130471796b437b277720c13acc4314b1bd0bd1fc00bac9d71f92",
+  "feature_id": "3e973fd49451be6252139c5d58390b63bb522e6062ef279e89e718be29e3b17f",
   "feature_policy": {
     "schema": "PHOTONS_THERMAL_FEATURES_V1",
     "sources": {

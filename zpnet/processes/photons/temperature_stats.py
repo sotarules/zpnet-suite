@@ -447,6 +447,40 @@ class TemperatureAccumulator:
             # Preserve its ability to recover if such a row is encountered.
             if image is None:
                 image = rolling_checkpoint
+            # The physical I2C2 sensor moved from the OTDR interior to ambient
+            # outside the case. Its OLD 'otdr' observations are not measurements
+            # of the new 'out' environment. Nor can we reinterpret the positional
+            # rolling image: it has no sensor-role identifier.
+            # Preserve the canonical old checkpoint untouched, but begin a new
+            # explicitly partial temperature epoch from this producer cursor.
+            # This is a legitimate sensor-role cutover, not missing data and not
+            # a reason to reject the otherwise valid PHOTONS recovery source.
+            if (set(state["total"]) == {"pi", "pd", "otdr", "rtd"}
+                    and set(state["camp"]) == {"pi", "pd", "otdr", "rtd"}):
+                if (state["schema"] != SCHEMA or state["sequence"] != sequence
+                        or state["reset_count"] != reset_count
+                        or state["campaign_id"] != campaign.get("campaign_id")
+                        or state["public_count"] != campaign.get("public_count")
+                        or state["campaign"] != campaign.get("campaign")
+                        or not isinstance(state["total_seconds"], int)
+                        or not isinstance(state["camp_seconds"], int)):
+                    raise ValueError("legacy OTDR temperature checkpoint disagrees with recovery source")
+                self.state.update({
+                    "sequence": sequence, "reset_count": reset_count,
+                    "campaign_id": campaign.get("campaign_id"),
+                    "campaign": campaign.get("campaign"),
+                    "public_count": campaign.get("public_count"),
+                    "total_complete": False, "campaign_complete": False,
+                })
+                self.last_rolling_sequence = sequence
+                self.last_rolling_update_count = update_count
+                self.last_rolling_reset_count = reset_count
+                logging.info(
+                    "[photons/temperature] OTDR -> OUT physical-role cutover "
+                    "at durable sequence=%d; prior temperature statistics "
+                    "remain historical; new populations start partial", sequence,
+                )
+                return
             if (state["schema"] != SCHEMA or state["sequence"] != sequence
                     or state["reset_count"] != reset_count
                     or state["campaign_id"] != campaign.get("campaign_id")
