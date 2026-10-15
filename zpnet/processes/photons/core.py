@@ -5246,6 +5246,55 @@ def _refresh_ppb_checkpoint_from_live_photons() -> Dict[str, Any]:
     )
 
 
+def _request_incomplete_ppb_reacquisition(reason: str) -> None:
+    """Complete Pi custody AFTER a surviving producer passes its recovery court.
+
+    The zero-RPC survivor path deliberately uses PHOTONS_FRAGMENT testimony to
+    admit the producer, not PPB_EXPORT during startup. The first new fragment may
+    expose a gap from an extended Pi outage, however. That gap occurs while
+    _campaign_control_ready is still clear, so _ppb_checkpoint_ingest correctly
+    declines to start asynchronous producer RPCs. Historically we never revisited
+    this decision after opening RUNNING. The saved minute ring then contained only
+    the post-outage suffix: a later Teensy reset could restore the cumulative
+    populations but would surrender much of the 24-hour Better-Buckets history.
+
+    This handoff checks the CURRENT Pi ring against the firmware-authored count
+    reported on its ordinary PHOTONS_FRAGMENT deltas, after startup is complete.
+    A partial Pi ring schedules the existing read-only, proof-checked full-ring
+    export on its dedicated worker. The worker does not mutate the Teensy, and
+    its result becomes durable only when ordered PHOTONS persistence commits an
+    aligned one-second canonical record plus config.PHOTONS_RECOVERY.
+
+    Never synthesize endpoints or relax failure courts. A truly reset producer
+    cannot return history that no longer exists; this is a forward repair of Pi
+    custody while the surviving instrument still possesses that history.
+    """
+    global _ppb_checkpoint_reacquire_request_count
+
+    if not _campaign_control_ready.is_set() or _hard_failure_active():
+        return
+    with _ppb_checkpoint_lock:
+        checkpoint = _ppb_checkpoint_snapshot_locked(
+            _ppb_checkpoint_runtime_ensure_locked()
+        )
+        missing_second = max(
+            0, int(checkpoint["expected_second_count"]) - int(checkpoint["second_count"])
+        )
+        missing_minute = max(
+            0, int(checkpoint["expected_minute_count"]) - int(checkpoint["minute_count"])
+        )
+        if not (missing_second or missing_minute):
+            return
+        _ppb_checkpoint_reacquire_request_count += 1
+        _ppb_checkpoint_reacquire_requested.set()
+    logging.warning(
+        "🧭 [photons/ppb] %s: surviving producer has %d second and %d minute "
+        "endpoint(s) missing from Pi checkpoint; requesting verified full-ring "
+        "reacquisition after recovery (no firmware mutation)",
+        reason, missing_second, missing_minute,
+    )
+
+
 def _ppb_checkpoint_reacquire_loop() -> None:
     """Repair Pi Better-Buckets custody from the surviving producer after a live gap."""
     global _ppb_checkpoint_reacquire_success_count
@@ -8119,6 +8168,9 @@ def _runtime_reconcile_teensy_generation(previous_generation: int,
                 source="RUNTIME_GENERATION_MONITOR",
                 details=copy.deepcopy(_runtime_recovery_last),
             )
+            _request_incomplete_ppb_reacquisition(
+                "RUNTIME_SURVIVING_PRODUCER_REATTACH"
+            )
             logging.info(
                 "✅ [photons/ambient restore] transport generation=%d reattached to "
                 "the surviving PHOTONS producer from PHOTONS_FRAGMENT with zero Teensy RPC",
@@ -8512,6 +8564,10 @@ def cmd_enable(args: Optional[dict]) -> Dict[str, Any]:
             reason="operator_enable_complete",
             source="PHOTONS.ENABLE",
         )
+        if recovery.get("mode") == "LIVE_PRODUCER_ADOPT":
+            _request_incomplete_ppb_reacquisition(
+                "OPERATOR_ENABLE_SURVIVING_PRODUCER"
+            )
         _start_runtime_teensy_generation_monitor(initial_generation)
         return {
             "success": True,
@@ -11358,6 +11414,10 @@ def run() -> None:
                 reason="phase5_recovery_complete",
                 source="RUN",
             )
+            if recovery.get("mode") == "LIVE_PRODUCER_ADOPT":
+                _request_incomplete_ppb_reacquisition(
+                    "STARTUP_SURVIVING_PRODUCER"
+                )
             proof = recovery.get("proof") if isinstance(recovery.get("proof"), dict) else {}
             _start_runtime_teensy_generation_monitor(initial_generation)
             logging.info(

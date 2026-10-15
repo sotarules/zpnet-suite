@@ -8,7 +8,7 @@ import json
 BME280_DEVICES = {
     "environment": {"key": "pi", "bus": 1, "address": 0x76, "label": "BME280 PI"},
     "receiver": {"key": "pd", "bus": 1, "address": 0x77, "label": "BME280 PD"},
-    "otdr": {"key": "otdr", "bus": 2, "address": 0x77, "label": "BME280 OTDR"},
+    "out": {"key": "out", "bus": 2, "address": 0x77, "label": "BME280 OUT"},
 }
 
 
@@ -42,7 +42,7 @@ TEMPERATURE_POLICY = {
             "maximum_age_ms": 3000,
             "weight": 1,
         },
-        "otdr": {
+        "out": {
             "source": "PI.I2C2.BME280.0x77",
             "schema": "BME280_V1",
             "sample_period_ms": 1000,
@@ -60,7 +60,7 @@ TEMPERATURE_POLICY = {
         },
     },
 }
-# Preserve the installed two-sensor calibration identity. PD and OTDR are
+# Preserve the installed two-sensor calibration identity. PD and OUT are
 # independent environmental witnesses, not new normalization members.
 CALIBRATION_TEMPERATURE_POLICY = {
     **TEMPERATURE_POLICY,

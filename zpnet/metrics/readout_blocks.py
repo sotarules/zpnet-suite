@@ -1109,7 +1109,7 @@ def environment_sensor_block(snapshot: dict) -> list[str]:
         return f"{number:>{width}.{decimals}f}" if number is not None else f"{'---':>{width}}"
 
     for key, label in (("pi", "BME280 PI"), ("pd", "BME280 PD"),
-                       ("otdr", "BME280 OTDR")):
+                       ("out", "BME280 OUT")):
         reading = environment.get(key) or {}
         state = str(reading.get("status") or "INITIALIZING")
         active = state == "OK"
@@ -1130,30 +1130,38 @@ def environment_sensor_block(snapshot: dict) -> list[str]:
 
 
 def photons_temperature_block(snapshot: dict) -> list[str]:
-    """Operator view of Pi-owned temperature populations in familiar buckets.
+    """Align physical temperatures with the preceding PHOTONS mean columns.
 
-    CLOCKS continues using environment_sensor_block unchanged. PHOTONS gets
-    mean temperatures on the same windows as its photon means, with CAMP SD
-    and the current BME280 humidity, pressure and altitude still accessible.
-    The `~` suffix flags incomplete coverage: a warm window, missed physical
-    samples, or a TOTAL/CAMP population deployed mid-epoch. It is never an
-    independent-sample uncertainty or a statement that temperature is stable.
+    The PHOTONS science header uses an eight-character label, a separator,
+    then 12-character right-justified columns. Use precisely that geometry:
+    NOW sits below LAP, each temperature window below its photon window,
+    CAMP below CAMP, and CAMP_SD below the photon SD column. Short BME labels
+    fit the existing eight-character label without shifting any data columns.
+
+    Partial-coverage facts remain present in temperature_stats and its durable
+    checkpoint. The operator explicitly chose not to render '~' markers; hiding
+    that annotation does not promote an incomplete population to a complete one.
+    CLOCKS retains its independent environment_sensor_block layout unchanged.
     """
     data = snapshot.get("temperature_stats")
-    if not isinstance(data, dict):
-        return [line.upper() for line in environment_sensor_block(snapshot)]
-    if data.get("schema") != "PI_PHOTONS_TEMPERATURE_STATS_V1":
+    if data is not None and (not isinstance(data, dict) or
+                             data.get("schema") != "PI_PHOTONS_TEMPERATURE_STATS_V1"):
         raise ValueError("unsupported PHOTONS temperature statistics schema")
+    # Always render the same layout, even before the first statistical record.
+    # Only the live physical NOW readings are then available.
+    data = data or {}
     environment = snapshot.get("environment") or {}
     rtd = snapshot.get("rtd") or {}
+    has_campaign = bool(snapshot.get("campaign"))
     spans = (("600", "10-MIN"), ("3600", "60-MIN"),
              ("28800", "8-HOUR"), ("86400", "24-HOUR"))
-    header = (f"{'SENSOR':<12} {'STATE':<12} {'NOW':>10}"
-              + ''.join(f" {label:>10}" for _, label in spans)
-              + f" {'TOTAL':>10} {'CAMP':>10} {'CAMP_SD':>9}")
-    lines = [header]
+    labels = ["NOW", *(label for _, label in spans), "TOTAL"]
+    if has_campaign:
+        labels.append("CAMP")
+    lines = [f"{'TEMP':<8} " + " ".join(f"{label:>12}" for label in labels)
+             + (f" {'CAMP_SD':>10}" if has_campaign else "")]
 
-    def observed(value, digits=4, width=10):
+    def observed(value, digits=4, width=12):
         number = _to_float(value)
         if number is None or not math.isfinite(number):
             return f"{'---':>{width}}"
@@ -1161,42 +1169,38 @@ def photons_temperature_block(snapshot: dict) -> list[str]:
 
     def mean(pop):
         if not isinstance(pop, dict) or pop.get("mean_c") is None:
-            return f"{'---':>10}"
-        value = f"{float(pop['mean_c']):.4f}"
-        if not pop.get("complete"):
-            value += "~"
-        return f"{value:>10}"
+            return f"{'---':>12}"
+        return observed(pop["mean_c"])
 
-    for key, label in (("pi", "BME280 PI"), ("pd", "BME280 PD"),
-                       ("otdr", "BME280 OTDR"), ("rtd", "MAX31865")):
+    windows = data.get("windows") or {}
+    totals = data.get("total") or {}
+    campaigns = data.get("camp") or {}
+    for key, label in (("pi", "BME PI"), ("pd", "BME PD"),
+                       ("out", "BME OUT"), ("rtd", "MAX31865")):
         reading = rtd if key == "rtd" else environment.get(key) or {}
-        state = str(reading.get("status") or "INITIALIZING").upper()
-        active = state == "OK"
-        population = (data.get("camp") or {}).get(key) or {}
-        row = (f"{label:<12} {state:<12}"
-               + " " + observed(reading.get("temperature_c") if active else None)
-               + ''.join(" " + mean((data["windows"][span] or {}).get(key))
-                         for span, _ in spans)
-               + " " + mean(data["total"].get(key))
-               + " " + mean(population)
-               + " " + observed(population.get("sd_c"), 5, 9))
+        population = campaigns.get(key) or {}
+        row = (f"{label:<8} "
+               + observed(reading.get("temperature_c") if reading.get("status") == "OK" else None)
+               + ''.join(" " + mean((windows.get(span) or {}).get(key)) for span, _ in spans)
+               + " " + mean(totals.get(key))
+               + ((" " + mean(population) + " " + observed(population.get("sd_c"), 5, 10))
+                  if has_campaign else ""))
         lines.append(row)
 
-    # Preserve the non-temperature BME280 witnesses without tripling terminal
-    # width: a single status-aligned footer retains RH, pressure and altitude.
-    # The compact values are instantaneous readings, NOT bucketed populations.
-    details = []
-    for key in ("pi", "pd", "otdr"):
+    # The separate SENSOR section contains only the three BME280 channels.
+    # These are their latest physical RH, pressure and barometric altitude
+    # readings, not derived temperature statistics and not statistical means.
+    lines.extend(["", f"{'SENSOR':<12} {'RH(%)':>9} {'BARO(HPA)':>11} {'BARO_ALT(M)':>12}"])
+    for key, label in (("pi", "BME280 PI"), ("pd", "BME280 PD"),
+                       ("out", "BME280 OUT")):
         reading = environment.get(key) or {}
         valid = reading.get("status") == "OK"
-        if not valid:
-            details.append(f"{key.upper()}:---")
-            continue
-        rh = observed(reading.get("humidity_pct"), 2, 0)
-        pressure = observed(reading.get("pressure_hpa"), 2, 0)
-        altitude = observed(reading.get("altitude_m"), 1, 0)
-        details.append(f"{key.upper()}:{rh}/{pressure}/{altitude}")
-    lines.append("RH(%)/BARO(HPA)/ALT(M) NOW: " + "  ".join(details))
+        lines.append(
+            f"{label:<12} "
+            + observed(reading.get("humidity_pct") if valid else None, 2, 9)
+            + " " + observed(reading.get("pressure_hpa") if valid else None, 2, 11)
+            + " " + observed(reading.get("altitude_m") if valid else None, 1, 12)
+        )
     return lines
 
 
@@ -2413,7 +2417,8 @@ def photons_detail_readout() -> list[str]:
         line += "  READ MODEL: UNAVAILABLE"
     lines = [line]
     lines.extend(["", _photons_summary_header(bool(campaign)),
-                  _photons_summary_line(summary, bool(campaign), summary["mean"]), "",
+                  _photons_summary_line(summary, bool(campaign), summary["mean"]),
+                  "", *photons_temperature_block(live), "",
                   f"{'SEC':<8} {'LAP':>12} {'ACCEPT':>8} {'EXCL':>7} {'MISSED':>7} {'SPURIOUS':>8}"
                   f" {'EARLY':>6} {'DUP':>6} {'LATE':>6} {'UNARM':>6} {'SD':>10} {'SE':>10}"])
     for row in _photons_rolling_rows(payloads):
@@ -2429,9 +2434,6 @@ def photons_detail_readout() -> list[str]:
             + " " + _fmt(row["unarmed"], '>6d', 6)
             + " " + _fmt(row["stddev"], '>10.6f', 10)
             + " " + _fmt(row["stderr"], '>10.6f', 10))
-    # CLOCKS retains its existing physical-sensor readout. PHOTONS alone
-    # displays Pi-owned thermal populations beside those physical witnesses.
-    lines.extend(["", *photons_temperature_block(live)])
     return lines
 
 

@@ -435,7 +435,7 @@ _FEATURE_CELLS = (
     ("PI ENV", "PI.SYSTEM.ENVIRONMENT"),
     ("BME PI", "PI.SYSTEM.BME280_PI"),
     ("BME PD", "PI.SYSTEM.BME280_PD"),
-    ("BME OTDR", "PI.SYSTEM.BME280_OTDR"),
+    ("BME OUT", "PI.SYSTEM.BME280_OUT"),
     ("RTD", "PI.SYSTEM.RTD"),
 )
 
@@ -456,7 +456,7 @@ def feature_status_readout() -> Generator[str, None, None]:
 def environment_status_readout() -> Generator[str, None, None]:
     env = _dict(get_system_snapshot().get("environment"))
     yield f"ENVIRONMENT: {env.get('health_state', 'UNKNOWN')}"
-    for key, label in (("pi", "BME280 PI"), ("pd", "BME280 PD"), ("otdr", "BME280 OTDR")):
+    for key, label in (("pi", "BME280 PI"), ("pd", "BME280 PD"), ("out", "BME280 OUT")):
         reading = _dict(env.get(key))
         status = reading.get("status", "INITIALIZING")
         yield f"{label}: {status}"

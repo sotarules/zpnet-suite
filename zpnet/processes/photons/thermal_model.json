@@ -20,10 +20,10 @@
         "source": "PI.I2C1.BME280.0x77",
         "value": "raw_temperature_c"
       },
-      "otdr": {
+      "out": {
         "path": [
           "environment",
-          "otdr"
+          "out"
         ],
         "source": "PI.I2C2.BME280.0x77",
         "value": "raw_temperature_c"

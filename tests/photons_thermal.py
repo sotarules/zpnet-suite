@@ -7,14 +7,14 @@
 
 Prints the complete report to STDOUT; no files or database values are changed.
 Uses recorded temperature and one-second mean lap, never cumulative means.
---sensor selects synthetic (default), bme280, bme280_receiver, bme280_otdr,
+--sensor selects synthetic (default), bme280, bme280_receiver, bme280_out,
 max31865, compare, or compare-legacy.
-Current BME280 means come from environment.pi/pd/otdr in the recorded SYSTEM
+Current BME280 means come from environment.pi/pd/out in the recorded SYSTEM
 snapshot. MAX31865 uses the deployed aggregate's recorded rtd component.
-Legacy rows use the PI component and top-level receiver; OTDR is not invented.
+Legacy rows use the PI component and top-level receiver; OUT is not invented.
 Missing selected readings are omitted; no new smoothing or weight reconstruction.
 Compare uses all five predictors on common rows/blocks/splits; compare-legacy
-uses synthetic, PI BME280 and MAX31865 without requiring PD or OTDR.
+uses synthetic, PI BME280 and MAX31865 without requiring PD or OUT.
 Each sensor's degree/lag is chosen on development data, not on the final test.
 New rows read the immutable raw one-second distribution directly and compare
 it with the separately recorded Pi correction. Legacy rows reconstruct raw LAP
@@ -45,18 +45,18 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 SCHEMA = "PHOTONS_V1"
 MIN_FIT = 3
 VERSION = "2026-10-12.3"
-SENSORS = ("synthetic", "bme280", "bme280_receiver", "bme280_otdr", "max31865")
+SENSORS = ("synthetic", "bme280", "bme280_receiver", "bme280_out", "max31865")
 LEGACY_SENSORS = ("synthetic", "bme280", "max31865")
 SENSOR_LABELS = {"synthetic": "Synthetic temperature",
                  "bme280": "BME280 under Pi (I2C1/0x76)",
                  "bme280_receiver": "BME280 near PD200T (I2C1/0x77)",
-                 "bme280_otdr": "BME280 at OTDR (I2C2/0x77)",
+                 "bme280_out": "BME280 OUT (I2C2/0x77)",
                  "max31865": "MAX31865 under fiber pad"}
 SENSOR_COMPONENTS = {"bme280": ("environment", "PI.I2C1.BME280.0x76"),
                      "bme280_receiver": ("receiver", "PI.I2C1.BME280.0x77"),
-                     "bme280_otdr": ("otdr", "PI.I2C2.BME280.0x77"),
+                     "bme280_out": ("out", "PI.I2C2.BME280.0x77"),
                      "max31865": ("rtd", "TEENSY.SPI1.MAX31865")}
-BME280_KEYS = {"bme280": "pi", "bme280_receiver": "pd", "bme280_otdr": "otdr"}
+BME280_KEYS = {"bme280": "pi", "bme280_receiver": "pd", "bme280_out": "out"}
 
 
 
@@ -131,8 +131,8 @@ def sensor_reading(p: Dict[str, Any], thermal: Dict[str, Any], name: str):
         # Historical records predate the grouped environmental snapshot.
         if name == "bme280_receiver":
             return p.get("receiver"), ["receiver"]
-        if name == "bme280_otdr":
-            return None, ["environment", "otdr"]
+        if name == "bme280_out":
+            return None, ["environment", "out"]
     component = SENSOR_COMPONENTS[name][0]
     return (thermal.get("components") or {}).get(component), ["temperature", "components", component]
 
@@ -907,7 +907,7 @@ def main(argv):
     print(f'Options: sensor={args.sensor}, block={args.bin_seconds}s, max_degree={args.max_degree}, max_lag={args.max_lag_seconds}s, simplicity={args.simplicity_pct:g}%')
     print(f'Selection: start={args.start}, end={args.end}, skip={args.skip_seconds}s; source={args.input or "read-only database"}')
     print(f'Predictor selection: {args.sensor}; target: uncorrected one-second LAP (ns).')
-    print('Synthetic: temperature.temperature_c; BME280 PI/PD/OTDR: environment.pi/pd/otdr.temperature_c.')
+    print('Synthetic: temperature.temperature_c; BME280 PI/PD/OUT: environment.pi/pd/out.temperature_c.')
     print('MAX31865: temperature.components.rtd.temperature_c. Legacy PI/PD use the recorded component/receiver paths.')
     print('Rows missing a selected reading are omitted; missing grouped sensors never fall back to legacy aliases.')
     print('No new smoothing or recomputation; predictor path changes start separate epochs.')

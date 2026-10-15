@@ -24,7 +24,7 @@ MODEL_PATH = Path(__file__).with_name("thermal_model.json")
 SENSORS = {
     "pi": (("environment", "pi"), "PI.I2C1.BME280.0x76"),
     "pd": (("environment", "pd"), "PI.I2C1.BME280.0x77"),
-    "otdr": (("environment", "otdr"), "PI.I2C2.BME280.0x77"),
+    "out": (("environment", "out"), "PI.I2C2.BME280.0x77"),
     "rtd": (("rtd",), "TEENSY.SPI1.MAX31865"),
 }
 FEATURE_POLICY = {
