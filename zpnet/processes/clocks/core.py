@@ -7604,6 +7604,51 @@ def _refresh_ppb_checkpoint_from_proved_alpha() -> Dict[str, Any]:
         raise
 
 
+def _reacquire_ppb_after_proved_live_startup() -> None:
+    """Repair Pi's bounded history from proved Alpha, never its science state.
+
+    A Pi-only restart can miss producer endpoints while Alpha keeps running.
+    The complete durable checkpoint is retained, but a warming Pi ring cannot
+    supersede it. Reacquire only after normal startup has proved and adopted the
+    surviving producer; PPB_EXPORT is read-only and is not an Alpha restore.
+    """
+    if (_hard_failure_active() or not _startup_control_ready.is_set()
+            or not _clocks_subsystem_enabled.is_set()):
+        return
+    with _ppb_checkpoint_lock:
+        snapshot = _ppb_checkpoint_snapshot_locked(
+            _ppb_checkpoint_runtime_ensure_locked()
+        )
+    if snapshot.get("recoverable"):
+        return
+    logging.info(
+        "📦 [clocks/ppb] surviving Alpha proved but Pi rings are partial: "
+        "reset=%s update=%s second=%s/%s minute=%s/%s; "
+        "requesting read-only full-ring reacquisition",
+        snapshot.get("reset_count"), snapshot.get("update_count"),
+        snapshot.get("second_count"), snapshot.get("expected_second_count"),
+        snapshot.get("minute_count"), snapshot.get("expected_minute_count"),
+    )
+    try:
+        refreshed = _refresh_ppb_checkpoint_from_proved_alpha()
+    except Exception:
+        # A failed read-only export must not turn an otherwise healthy Alpha
+        # into HARD_FAILURE or replace the last complete durable checkpoint.
+        # Ordinary producer deltas continue warming the Pi rings.
+        logging.exception(
+            "⚠️ [clocks/ppb] surviving-Alpha ring reacquisition failed; "
+            "retaining durable recovery authority and ordinary delta warming"
+        )
+        return
+    logging.info(
+        "✅ [clocks/ppb] surviving-Alpha rings reacquired: reset=%s "
+        "update=%s second=%s minute=%s; next canonical row can "
+        "advance config.CLOCKS_RECOVERY",
+        refreshed.get("reset_count"), refreshed.get("update_count"),
+        refreshed.get("second_count"), refreshed.get("minute_count"),
+    )
+
+
 def _probe_teensy_recovery_epoch() -> Tuple[bool, Dict[str, Any]]:
     """Return explicit Teensy epoch readiness together with its lifecycle testimony."""
     last_status: Dict[str, Any] = {}
@@ -8684,6 +8729,8 @@ class _HolisticInstrumentVerdict:
 
 def _restore_instrument_from_clocks(
     detail: Dict[str, Any],
+    *,
+    campaign_source_detail: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], _HolisticInstrumentVerdict]:
     clocks = _clocks_payload(detail)
     gnss_raw = _clocks_gnss_raw_payload(detail)
@@ -8902,7 +8949,10 @@ def _restore_instrument_from_clocks(
             if isinstance(durable_campaign, dict) and durable_campaign
             else ""
         )
-        if active_campaign_name and durable_campaign_name == active_campaign_name:
+        if active_campaign_name and (
+            durable_campaign_name == active_campaign_name
+            or campaign_source_detail is not None
+        ):
             loss_proof = {
                 "proved": True,
                 "alpha_lost": True,
@@ -9039,7 +9089,10 @@ def _restore_instrument_from_clocks(
         if isinstance(durable_campaign, dict) and durable_campaign
         else ""
     )
-    if active_campaign_name and durable_campaign_name == active_campaign_name:
+    if active_campaign_name and (
+        durable_campaign_name == active_campaign_name
+        or campaign_source_detail is not None
+    ):
         loss_proof = {
             "proved": True,
             "alpha_lost": True,
@@ -9594,6 +9647,7 @@ def _adopt_surviving_clocks_producer(
     snapshot_detail: Dict[str, Any],
     active_campaign: Optional[Dict[str, Any]],
     instrument_verdict: _HolisticInstrumentVerdict,
+    campaign_source_detail: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Keep every live-adoption failure outside firmware RECOVER cleanup."""
     global _campaign_active
@@ -9603,6 +9657,7 @@ def _adopt_surviving_clocks_producer(
             snapshot_detail=snapshot_detail,
             active_campaign=active_campaign,
             instrument_verdict=instrument_verdict,
+            campaign_source_detail=campaign_source_detail,
         )
     except HardFailureRequired:
         raise
@@ -9637,6 +9692,7 @@ def _adopt_surviving_clocks_producer_pi_state(
     snapshot_detail: Dict[str, Any],
     active_campaign: Optional[Dict[str, Any]],
     instrument_verdict: _HolisticInstrumentVerdict,
+    campaign_source_detail: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Prove and adopt a surviving CLOCKS producer without mutating it."""
     global _campaign_active, _accepted_pps_vclock_count
@@ -9682,8 +9738,9 @@ def _adopt_surviving_clocks_producer_pi_state(
 
     # Everything below this point is Pi-owned state.  Better-Buckets resumes from
     # the durable singleton plus the ordinary producer-authored deltas already
-    # carried on CLOCKS_FRAGMENT.  Do not query Alpha with PPB_EXPORT_* merely to
-    # accelerate convergence after an observer gap.
+    # carried on CLOCKS_FRAGMENT. Adoption itself does not export producer rings;
+    # read-only reacquisition of incomplete Pi custody occurs after RUNNING,
+    # and only after the surviving Alpha has been independently proved.
     with _ppb_checkpoint_lock:
         ppb_runtime = _ppb_checkpoint_runtime_ensure_locked()
         ppb_snapshot = _ppb_checkpoint_snapshot_locked(ppb_runtime)
@@ -9736,6 +9793,7 @@ def _adopt_surviving_clocks_producer_pi_state(
 
     campaign_adoption: Dict[str, Any]
     recovery_custody: Optional[Dict[str, Any]] = None
+    beta_rearmed = False
     if live_campaign_state == "STARTED":
         if not campaign_name or live_campaign_name != campaign_name:
             raise RuntimeError(
@@ -9838,11 +9896,15 @@ def _adopt_surviving_clocks_producer_pi_state(
             )
 
         if active_campaign is not None:
-            raise RuntimeError(
-                "durable TEMPEST intent is active but the proved surviving "
-                "CLOCKS_FRAGMENT stream says Beta is stopped; zero-RPC live recovery "
-                "refuses CLOCKS.REARM or any other Teensy command"
+            # Alpha's lineage has already been proved.  Restore only Beta's
+            # recording coordinate from the exact durable CLOCKS source;
+            # firmware REARM independently requires the retained campaign
+            # identity and a surviving SmartZero Alpha epoch.
+            campaign_adoption, recovery_custody = _rearm_surviving_clocks_campaign(
+                snapshot_detail=campaign_source_detail or snapshot_detail,
+                active_campaign=active_campaign,
             )
+            beta_rearmed = True
         else:
             if _recovery_custody_snapshot().get("active"):
                 recovery_custody = _finalize_live_recovery_custody_without_campaign(
@@ -9874,10 +9936,11 @@ def _adopt_surviving_clocks_producer_pi_state(
         "success": True,
         "mode": "LIVE_PRODUCER_ADOPT",
         "producer_reuse": True,
-        "producer_mutated": False,
-        "producer_mutation_commands": [],
-        "teensy_rpc_used": False,
+        "producer_mutated": beta_rearmed,
+        "producer_mutation_commands": ["CLOCKS.REARM"] if beta_rearmed else [],
+        "teensy_rpc_used": beta_rearmed,
         "alpha_mutated": False,
+        "campaign_execution_mutated": beta_rearmed,
         "snapshot_detail_id": _as_int(snapshot_detail.get("_db_detail_id")),
         "producer_descendant_proof": descendant,
         # Compatibility field names; values come from CLOCKS_FRAGMENT, not RPC.
@@ -9901,10 +9964,12 @@ def _adopt_surviving_clocks_producer_pi_state(
         **copy.deepcopy(result),
     }
     logging.info(
-        "✅ [holistic restore] surviving Alpha/Beta adopted from CLOCKS_FRAGMENT with "
-        "zero Teensy RPC: campaign=%s observed_state=%s",
-        live_campaign_name or "NONE",
+        "✅ [holistic restore] surviving Alpha adopted from CLOCKS_FRAGMENT: "
+        "campaign=%s observed_state=%s beta_rearmed=%s Teensy_RPC=%s",
+        campaign_name or live_campaign_name or "NONE",
         live_campaign_state or "STOPPED",
+        beta_rearmed,
+        beta_rearmed,
     )
     return result
 
@@ -10212,6 +10277,10 @@ def _holistic_restore(
     """Converge CLOCKS from one durable snapshot and current producer testimony."""
     active_campaign = _get_active_campaign()
     detail, skipped = _read_latest_recoverable_clocks_state()
+    campaign_source_detail = (
+        _exact_active_tempest_restore_boundary(active_campaign, detail)
+        if active_campaign is not None and detail is not None else None
+    )
     result: Dict[str, Any] = {
         "schema": "PI_CLOCKS_HOLISTIC_RESTORE_V1",
         "active_campaign": active_campaign.get("campaign") if active_campaign else None,
@@ -10250,7 +10319,9 @@ def _holistic_restore(
                 "(skipped_unrecoverable=%d)",
                 detail.get("sequence"), skipped,
             )
-            instrument_result, instrument_verdict = _restore_instrument_from_clocks(detail)
+            instrument_result, instrument_verdict = _restore_instrument_from_clocks(
+                detail, campaign_source_detail=campaign_source_detail,
+            )
             result["instrument"] = instrument_result
 
             if (
@@ -10261,6 +10332,7 @@ def _holistic_restore(
                     snapshot_detail=detail,
                     active_campaign=active_campaign,
                     instrument_verdict=instrument_verdict,
+                    campaign_source_detail=campaign_source_detail,
                 )
                 result["instrument"] = adoption
                 result["campaign"] = copy.deepcopy(adoption.get("campaign_adoption"))
@@ -10307,6 +10379,7 @@ def _holistic_restore(
             campaign_result = _restore_active_campaign_state(
                 preverified_location=preverified_location,
                 startup_instrument_verdict=instrument_verdict,
+                campaign_source_detail=campaign_source_detail,
             )
         except AlphaResurrectionImpossible as exc:
             surrender = _surrender_unresurrectable_alpha_lineage(
@@ -13092,6 +13165,78 @@ def _recovery_timebase_from_clocks_snapshot(
         source_detail_id=int(snapshot.source_detail_id),
         source_campaign=snapshot.source_campaign,
     )
+
+
+def _exact_active_tempest_restore_boundary(
+    active_campaign: Dict[str, Any], alpha_detail: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Resolve Beta independently from the latest complete Alpha checkpoint.
+
+    The campaign DAC recorder commits its exact last_detail_id alongside each
+    adjudicated campaign observation. Use that one durable foreign key, never
+    a backward SQL scan or an incomplete Pi Better-Buckets ring as Beta custody.
+    """
+    name = str(active_campaign.get("campaign") or "").strip()
+    alpha_campaign = _state_campaign(alpha_detail)
+    if (name and _tempest_campaign_name(alpha_campaign) == name
+            and str(alpha_campaign.get("state") or "").upper() == "STARTED"):
+        return None  # The original single-row recovery contract still applies.
+
+    master = active_campaign.get("payload")
+    dac = master.get("campaign_dac") if isinstance(master, dict) else None
+    detail_id = _as_int(dac.get("last_detail_id")) if isinstance(dac, dict) else None
+    if not name or detail_id is None or detail_id <= 0:
+        return None  # A zero-row Flash Cut retains its existing separate court.
+    alpha_id = _as_int(alpha_detail.get("_db_detail_id"))
+    if alpha_id is None or detail_id <= alpha_id:
+        raise RuntimeError("active TEMPEST boundary does not follow the Alpha checkpoint")
+
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, campaign, payload FROM campaign_detail "
+            "WHERE id = %s AND campaign_type = %s AND campaign = %s",
+            (int(detail_id), CAMPAIGN_TYPE_TEMPEST, name),
+        )
+        bound = cur.fetchone()
+    if bound is None:
+        raise RuntimeError("active TEMPEST last_detail_id has no matching durable row")
+    state = bound["payload"]
+    if isinstance(state, str):
+        state = json.loads(state)
+    if not isinstance(state, dict) or state.get("schema") != "CLOCKS_V4":
+        raise RuntimeError("active TEMPEST bound row is not canonical CLOCKS_V4")
+    if state.get("holistic_restore_superseded") is True:
+        raise RuntimeError("active TEMPEST bound row is superseded recovery testimony")
+    state = copy.deepcopy(state)
+    state["_db_detail_id"] = int(detail_id)
+    beta = _state_campaign(state)
+    if (_tempest_campaign_name(beta) != name
+            or str(beta.get("state") or "").upper() != "STARTED"
+            or _as_int(beta.get("public_count")) != _as_int(dac.get("last_public_count"))
+            or _as_int(state.get("sequence")) != _as_int(dac.get("last_sequence"))):
+        raise RuntimeError("active TEMPEST master/detail boundary identity mismatch")
+
+    alpha_stats = _clocks_payload(alpha_detail).get("stats") or {}
+    beta_stats = _clocks_payload(state).get("stats") or {}
+    if (_as_int(alpha_stats.get("reset_count")) != _as_int(beta_stats.get("reset_count"))
+            or _as_int(alpha_stats.get("update_count")) is None
+            or _as_int(beta_stats.get("update_count")) is None
+            or int(beta_stats["update_count"]) < int(alpha_stats["update_count"])):
+        raise RuntimeError("active TEMPEST boundary does not descend from Alpha epoch")
+
+    tb = _recovery_timebase_from_clocks_state(
+        state, name, source_detail_id=int(detail_id), source_campaign=name,
+    )
+    if not _recovery_timebase_snapshot(tb).get("recoverable"):
+        raise RuntimeError("exact active TEMPEST boundary is not recovery-ready")
+    logging.info(
+        "📍 [holistic restore] independent TEMPEST boundary bound: campaign=%s "
+        "beta_detail=%d alpha_detail=%d beta_public=%s alpha_update=%s beta_update=%s",
+        name, int(detail_id), int(alpha_id), beta.get("public_count"),
+        alpha_stats.get("update_count"), beta_stats.get("update_count"),
+    )
+    return state
 
 
 def _has_tempest_state_details(campaign_name: str) -> bool:
@@ -17090,6 +17235,7 @@ def _restore_active_campaign_state(
     *,
     preverified_location: Optional[Dict[str, Any]] = None,
     startup_instrument_verdict: Optional[_HolisticInstrumentVerdict] = None,
+    campaign_source_detail: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Restore one dead producer and its durable TEMPEST state atomically.
 
@@ -17179,6 +17325,21 @@ def _restore_active_campaign_state(
         and snapshot_campaign_state == "STARTED"
         and snapshot_public_count > 0
     )
+
+    # Alpha's complete recovery ring may be older than the latest campaign.
+    # Bind Beta by its exact campaign-master DAC receipt, never by a backward
+    # search for a convenient observation or by blending two CLOCKS payloads.
+    if not snapshot_owns_running_campaign and combined_snapshot is not None:
+        if campaign_source_detail is None:
+            campaign_source_detail = _exact_active_tempest_restore_boundary(
+                row, combined_snapshot.restore_detail()
+            )
+        if campaign_source_detail is not None:
+            beta = _state_campaign(campaign_source_detail)
+            if (_tempest_campaign_name(beta) != campaign_name
+                    or str(beta.get("state") or "").upper() != "STARTED"):
+                raise RuntimeError("bound TEMPEST recovery source changed campaign identity")
+            snapshot_owns_running_campaign = True
 
     if not snapshot_owns_running_campaign:
         _diag["recovery_missing_timebase"] += 1
@@ -17287,8 +17448,13 @@ def _restore_active_campaign_state(
 
     assert combined_snapshot is not None
     combined_recovery_detail = combined_snapshot.restore_detail()
-    last_tb = _recovery_timebase_from_clocks_snapshot(
-        combined_snapshot, campaign_name
+    last_tb = (
+        _recovery_timebase_from_clocks_state(
+            campaign_source_detail, campaign_name,
+            source_detail_id=int(campaign_source_detail["_db_detail_id"]),
+            source_campaign=campaign_name,
+        ) if campaign_source_detail is not None
+        else _recovery_timebase_from_clocks_snapshot(combined_snapshot, campaign_name)
     )
     recovery_snapshot = _recovery_timebase_snapshot(last_tb)
     skipped_unrecoverable_rows = 0
@@ -17340,6 +17506,7 @@ def _restore_active_campaign_state(
             snapshot_detail=combined_recovery_detail,
             active_campaign=row,
             instrument_verdict=startup_instrument_verdict,
+            campaign_source_detail=campaign_source_detail,
         )
     if producer_disposition != "LOST":
         raise RuntimeError(
@@ -17460,7 +17627,11 @@ def _restore_active_campaign_state(
         "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "campaign": campaign_name,
         "recovery_source_db_id": recovery_source_db_id,
-        "recovery_authority": "CLOCKS_RECOVERY_SNAPSHOT",
+        "campaign_source_db_id": int(last_tb["_db_detail_id"]),
+        "recovery_authority": (
+            "CLOCKS_ALPHA_PLUS_EXACT_TEMPEST_BOUNDARY"
+            if campaign_source_detail is not None else "CLOCKS_RECOVERY_SNAPSHOT"
+        ),
         "campaign_adjudication_authority": "HISTORY_ONLY_NOT_REQUIRED",
         "desired_state_schema": desired_state.get("schema"),
         "last_pps_vclock_count": int(last_pps_vclock_count),
@@ -17801,7 +17972,7 @@ def _restore_active_campaign_state(
             {"campaign": campaign_name, "last_timebase": last_tb},
         )
     dead_producer_restore_supersede = _supersede_dead_producer_restore_rows(
-        base_detail_id=int(recovery_source_db_id),
+        base_detail_id=int(last_tb["_db_detail_id"]),
         campaign_name=campaign_name,
         first_public_count=int(teensy_pps_vclock_count),
     )
@@ -19692,12 +19863,18 @@ def run() -> None:
         reason="startup_holistic_restore",
         source="RUN",
     )
+    proved_surviving_alpha = False
     try:
         result = _holistic_restore(preverified_location=startup_location)
         result["startup_watchdog_reconciliation"] = (
             _reconcile_deferred_startup_watchdogs()
         )
         instrument = result.get("instrument") if isinstance(result.get("instrument"), dict) else {}
+        proved_surviving_alpha = bool(
+            instrument.get("mode") == "LIVE_PRODUCER_ADOPT"
+            and instrument.get("producer_reuse") is True
+            and instrument.get("alpha_mutated") is False
+        )
         campaign_result = result.get("campaign") if isinstance(result.get("campaign"), dict) else {}
         instrument_proof = instrument.get("proof") if isinstance(instrument.get("proof"), dict) else {}
         observed = instrument_proof.get("observed") if isinstance(instrument_proof.get("observed"), dict) else {}
@@ -19805,6 +19982,15 @@ def run() -> None:
                 _hard_failure_active(),
                 _startup_control_ready.is_set(),
             )
+
+    if proved_surviving_alpha and _startup_control_ready.is_set():
+        # Startup's zero-RPC adoption remains untouched. A proved survivor
+        # with partial Pi ring custody receives read-only maintenance afterward.
+        threading.Thread(
+            target=_reacquire_ppb_after_proved_live_startup,
+            daemon=True,
+            name="clocks-proved-alpha-ppb-reacquire",
+        ).start()
 
     threading.Thread(
         target=_timebase_silence_monitor_loop,
