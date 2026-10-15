@@ -17,7 +17,6 @@ process restart; they never require a Teensy reboot or a new raw statistics epoc
 from __future__ import annotations
 
 import copy
-import hashlib
 import json
 from collections import deque
 from dataclasses import dataclass
@@ -34,15 +33,1518 @@ from zpnet.processes.processes import (
     send_command,
     server_setup,
 )
-from zpnet.processes.photons.normalization import (
-    ACQUISITION_ID, Normalizer,
-)
-from zpnet.processes.photons.stability import StabilityAccumulator
-from zpnet.processes.photons.temperature_stats import TemperatureAccumulator
 from zpnet.shared.constants import Payload
 from zpnet.shared.db import DatabaseContentionRetry, open_db
 from zpnet.shared.logger import setup_logging
 
+
+# ======================================================================
+# PHOTONS: Normalization and physical sensor identities
+# ======================================================================
+
+# Matches process_photons.cpp. This is NOT a thermal-model identity.
+ACQUISITION_ID = 0x52415731  # RAW1: uncorrected, GNSS-projected accepted races
+PHOTONS_MEASUREMENT_SCHEMA = "PI_PHOTONS_MEASUREMENT_V1"
+THERMAL_SENSOR_PATHS = {
+    "pi": (("environment", "pi"), "PI.I2C1.BME280.0x76"),
+    "pd": (("environment", "pd"), "PI.I2C1.BME280.0x77"),
+    "out": (("environment", "out"), "PI.I2C2.BME280.0x77"),
+    "rtd": (("rtd",), "TEENSY.SPI1.MAX31865"),
+}
+THERMAL_FEATURE_POLICY = {
+    "sources": {name: {"path": list(path), "source": source,
+                       "value": "raw_temperature_c"}
+                for name, (path, source) in THERMAL_SENSOR_PATHS.items()},
+    "maximum_sample_age_ms": 3000,
+    "maximum_context_delay_ms": 1500,
+    "maximum_context_round_trip_ms": 500,
+    "maximum_gap_seconds": 3,
+    "ema_seconds": [30, 120, 600],
+    "warmup_time_constants": 5,
+    "integration": "CAUSAL_ENDPOINT_EMA_ACTUAL_SAMPLE_INTERVAL",
+}
+
+
+DEFAULT_THERMAL_MODEL = {
+    "feature_policy": THERMAL_FEATURE_POLICY,
+    "application": "SUBTRACT_ONE_OFFSET_PER_SECOND",
+    "calibration_basis": "UNCALIBRATED_IDENTITY_BASELINE",
+    "acquisition_signature": None,
+    "reference": {},
+    "domain": {},
+    "terms": [],
+}
+
+# These are readable labels, not content-derived identities. The complete model
+# and acquisition policies travel as JSON; mathematical continuity compares the
+# policies themselves. A sensor-label edit cannot change a cryptographic token
+# and thereby prevent the instrument from starting.
+THERMAL_FEATURE_ID = "PHOTONS_THERMAL_FEATURES_V1"
+
+
+def model_semantics(model):
+    """The actual correction, independent of a descriptive name or unused sensor."""
+    if not model["terms"]:
+        return {"application": "IDENTITY"}
+    return {key: copy.deepcopy(model[key]) for key in
+            ("application", "terms", "reference", "domain",
+             "acquisition_signature", "feature_policy")}
+
+
+def identity(model):
+    """Retained public helper: a model's explicit human-readable deployment name."""
+    return ("PHOTONS_IDENTITY" if not model["terms"]
+            else model.get("normalization_id", model["calibration_basis"]))
+
+
+THERMAL_FEATURE_NAMES = tuple(
+    feature for name in THERMAL_SENSOR_PATHS for feature in
+    (f"{name}.temperature_c", f"{name}.rate_c_per_s",
+     *(f"{name}.lag_{tau}_c" for tau in THERMAL_FEATURE_POLICY["ema_seconds"]))
+)
+
+
+def timestamp(value):
+    value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if value.tzinfo is None:
+        raise ValueError("PHOTONS timestamps require a timezone")
+    return value.timestamp()
+
+
+def acquisition_signature(state):
+    """Model domain excludes campaign, location, temperature values and time."""
+    photons = state["photons"]
+    return {
+        "acquisition_id": photons["stats"]["acquisition_id"],
+        "race": {key: photons["race"].get(key) for key in (
+            "schema", "cadence_ns", "pulse_ns", "capture_gate", "capture_min_ns",
+            "capture_max_ns", "launch_bracket_max_cycles", "flight_interpretation",
+            "launch_timing_policy")},
+        "core": {key: photons["core"].get(key) for key in (
+            "algorithm", "minimum_count", "minimum_radius_cycles", "mad_multiplier",
+            "minimum_retained_pct")},
+    }
+
+
+def deploy_model(model):
+    """Attach an ordinary readable model name to the deployed policy."""
+    result = copy.deepcopy(model)
+    result["normalization_id"] = identity(result)
+    result["feature_id"] = THERMAL_FEATURE_ID
+    return result
+
+
+def term_values(model, features):
+    return [math.prod(features[name] - model["reference"][name]
+                      for name in term["factors"]) for term in model["terms"]]
+
+
+def correction(model, features):
+    return math.fsum(term["coefficient_ns"] * value for term, value in
+                     zip(model["terms"], term_values(model, features)))
+
+
+def corrected_distribution(raw, offset):
+    """A common offset translates mean/extrema; count and within-second M2 stay raw."""
+    out = copy.deepcopy(raw)
+    if raw["n"]:
+        for key in ("mean", "min", "max"):
+            out[key] -= offset
+    return out
+
+
+class ThermalHistory:
+    """Bounded causal state, keyed by physical source rather than display label."""
+
+    def __init__(self):
+        self.previous = None
+        self.sensors = {}
+
+    def checkpoint(self):
+        return {"previous": copy.deepcopy(self.previous),
+                "sensors": copy.deepcopy(self.sensors)}
+
+    def restore(self, checkpoint):
+        self.previous = copy.deepcopy(checkpoint["previous"])
+        self.sensors = copy.deepcopy(checkpoint["sensors"])
+
+    def observe(self, state):
+        timing = state["context_timing"]
+        now = timestamp(timing["context_at_utc"])
+        received = timestamp(timing["fragment_received_at_utc"])
+        cursor = {"sequence": state["sequence"], "received_at": received}
+        previous_cursor = self.previous
+        gap = (previous_cursor is not None and
+               (state["sequence"] != previous_cursor["sequence"] + 1
+                or not 0 < received - previous_cursor["received_at"] <=
+                THERMAL_FEATURE_POLICY["maximum_gap_seconds"]))
+        self.previous = cursor
+        values, witnesses = {}, {}
+        aligned = (0 <= timing["context_after_ingress_ms"] <= THERMAL_FEATURE_POLICY["maximum_context_delay_ms"]
+                   and 0 <= timing["round_trip_ms"] <= THERMAL_FEATURE_POLICY["maximum_context_round_trip_ms"])
+        if not aligned:
+            # Keep the last mathematical state. Its timestamps will expose the
+            # observation gap when an aligned physical sample next arrives.
+            return {"feature_id": THERMAL_FEATURE_ID, "values": {}, "sensors": {},
+                    "status": "CONTEXT_TOO_LATE"}
+
+        for name, (path, source) in THERMAL_SENSOR_PATHS.items():
+            item = state
+            for part in path:
+                item = item.get(part, {})
+            status = item.get("status", "NOT_RECORDED")
+            if status != "OK":
+                witnesses[name] = {"status": status}
+                continue
+            age = item["age_ms"]
+            value = item["raw_temperature_c"]
+            if age < 0 or not math.isfinite(value):
+                raise ValueError(f"malformed PHOTONS temperature: {name}")
+            if age + timing["round_trip_ms"] > THERMAL_FEATURE_POLICY["maximum_sample_age_ms"]:
+                witnesses[name] = {"status": "STALE", "age_ms": age}
+                continue
+            if name == "rtd":
+                # RTD sample counters are boot-relative. The restored producer's
+                # generation distinguishes a new conversion from a prior boot's
+                # numerically identical key. JSON lists retain their type across
+                # serialization, unlike the former tuple-only transient state.
+                key = [state["photons"]["recovery"]["generation"],
+                       item["sample_sequence"], item["sampled_at_ms32"]]
+                sample_time = now - age / 1000
+            else:
+                key = item["sampled_at_utc"]
+                sample_time = timestamp(key)
+            previous = self.sensors.get(source)
+            if previous is not None and key == previous["key"]:
+                if value != previous["value"]:
+                    raise ValueError("one thermal sample identity has two temperatures")
+                current = previous
+                sample_time = current["time"]
+            else:
+                dt = sample_time - previous["time"] if previous is not None else 0
+                if previous is None:
+                    current = {"start": sample_time, "coverage_start": sample_time,
+                               "ema": {str(tau): value for tau in THERMAL_FEATURE_POLICY["ema_seconds"]},
+                               "gap_count": 0}
+                elif gap or not 0 < dt <= THERMAL_FEATURE_POLICY["maximum_gap_seconds"]:
+                    # Restoring memory and knowing the unobserved thermal path
+                    # are different claims. Preserve each exact EMA, but do not
+                    # invent an integral over the missing interval or advertise
+                    # a lag feature as mature until fresh coverage warrants it.
+                    current = copy.deepcopy(previous)
+                    current.pop("rate", None)
+                    current["coverage_start"] = sample_time
+                    current["gap_count"] += 1
+                else:
+                    current = {"start": previous["start"],
+                               "coverage_start": previous["coverage_start"],
+                               "gap_count": previous["gap_count"],
+                               "rate": (value - previous["value"]) / dt,
+                               "ema": {tau: old + (-math.expm1(-dt / int(tau))) * (value - old)
+                                       for tau, old in previous["ema"].items()}}
+                current.update(key=key, time=sample_time, value=value)
+                self.sensors[source] = current
+            span = sample_time - current["coverage_start"]
+            values[f"{name}.temperature_c"] = value
+            if "rate" in current:
+                values[f"{name}.rate_c_per_s"] = current["rate"]
+            for tau, average in current["ema"].items():
+                if span >= THERMAL_FEATURE_POLICY["warmup_time_constants"] * int(tau):
+                    values[f"{name}.lag_{tau}_c"] = value - average
+            witnesses[name] = {"status": "OK", "source": source, "age_ms": age,
+                               "history_seconds": span, "gap_count": current["gap_count"],
+                               "sample_key": copy.deepcopy(key), "raw_temperature_c": value}
+        return {"feature_id": THERMAL_FEATURE_ID, "values": values, "sensors": witnesses,
+                "status": "RECORDED"}
+
+
+class Normalizer:
+    def __init__(self, model=None):
+        if model is None:
+            model = copy.deepcopy(DEFAULT_THERMAL_MODEL)
+        self.model = deploy_model(model)
+        self.model_id = identity(self.model)
+        self.needed = set(self.model["reference"])
+        self.history = ThermalHistory()
+
+    def policy_snapshot(self):
+        return {**copy.deepcopy(self.model), "normalization_id": self.model_id}
+
+    def checkpoint(self):
+        """Called by the state owner at the same boundary as all other populations."""
+        return self.history.checkpoint()
+
+    def restore(self, checkpoint):
+        self.history = ThermalHistory()
+        if checkpoint is not None:
+            self.history.restore(checkpoint)
+        # A legacy canonical row records feature outputs, not every immature
+        # EMA. Do not guess that missing internal state from rounded outputs.
+        # The identity model does not depend on thermal maturity; retained
+        # photon/temperature/stability populations are entirely unaffected.
+
+    def measure(self, state):
+        photons = state["photons"]
+        if photons["stats"]["acquisition_id"] != ACQUISITION_ID:
+            raise ValueError("normalization requires raw acquisition")
+        raw = copy.deepcopy(photons["race"]["flight_ns"])
+        thermal = self.history.observe(state)
+        out = {"schema": PHOTONS_MEASUREMENT_SCHEMA, "authority": "PI.PHOTONS",
+               "acquisition_id": ACQUISITION_ID, "normalization_id": self.model_id,
+               "acquisition_signature": acquisition_signature(state),
+               "raw_flight_ns": raw, "thermal": thermal,
+               "normalized_flight_ns": None, "correction_ns": None}
+        if not raw["n"]:
+            out["status"] = "NO_ACCEPTED_RACES"
+            return out
+        if self.model["terms"] and self.model["acquisition_signature"] != acquisition_signature(state):
+            out["status"] = "ACQUISITION_CHANGED"
+            return out
+        if self.model["terms"] and self.model["feature_policy"] != THERMAL_FEATURE_POLICY:
+            out["status"] = "FEATURE_POLICY_CHANGED"
+            return out
+        missing = sorted(self.needed - thermal["values"].keys())
+        if missing:
+            out.update(status="THERMAL_HISTORY_UNAVAILABLE", missing_features=missing)
+            return out
+        outside = [name for name in sorted(self.needed)
+                   if not self.model["domain"][name][0] <= thermal["values"][name] <= self.model["domain"][name][1]]
+        if outside:
+            out.update(status="OUTSIDE_CALIBRATION_DOMAIN", outside_features=outside)
+            return out
+        offset = correction(self.model, thermal["values"])
+        if not math.isfinite(offset):
+            raise ValueError("nonfinite PHOTONS model correction")
+        out.update(status="CORRECTED" if self.model["terms"] else "IDENTITY",
+                   correction_ns=offset, normalized_flight_ns=corrected_distribution(raw, offset))
+        return out
+
+# ======================================================================
+# PHOTONS: Stability populations
+# ======================================================================
+
+STABILITY_SCHEMA = "PI_PHOTONS_STABILITY_V1"
+STABILITY_WINDOWS = (60, 600, 3600, 14400, 28800, 86400)
+TIMING_GAP_SECONDS = 3.0
+
+
+def _time(value):
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+
+
+def _population():
+    return {
+        "n": 0, "mean_ns": 0.0, "m2_ns2": 0.0,
+        "minimum_ns": None, "maximum_ns": None,
+        "previous_index": None, "previous_mean_ns": None,
+        "last_completed_index": None,
+        "allan_pairs": 0, "allan_sum_sq_ns2": 0.0,
+        "x_mean": 0.0, "sxx": 0.0, "sxy": 0.0,
+    }
+
+
+def _window(seconds):
+    return {
+        "seconds": seconds, "open": None,
+        "raw": _population(), "normalized": _population(),
+        "discarded_partial_blocks": 0,
+    }
+
+
+def _append(pop, index, mean):
+    n = pop["n"] + 1
+    dy = mean - pop["mean_ns"]
+    updated_mean = pop["mean_ns"] + dy / n
+    pop["m2_ns2"] += dy * (mean - updated_mean)
+    pop["mean_ns"] = updated_mean
+    pop["minimum_ns"] = mean if pop["minimum_ns"] is None else min(pop["minimum_ns"], mean)
+    pop["maximum_ns"] = mean if pop["maximum_ns"] is None else max(pop["maximum_ns"], mean)
+    # Online covariance between exact campaign-aligned block index and its mean.
+    dx = index - pop["x_mean"]
+    new_x = pop["x_mean"] + dx / n
+    pop["sxx"] += dx * (index - new_x)
+    pop["sxy"] += dx * (mean - updated_mean)
+    pop["x_mean"] = new_x
+    if pop["previous_index"] is not None and index == pop["previous_index"] + 1:
+        pop["allan_pairs"] += 1
+        pop["allan_sum_sq_ns2"] += (mean - pop["previous_mean_ns"]) ** 2
+    pop["previous_index"] = index
+    pop["previous_mean_ns"] = mean
+    pop["last_completed_index"] = index
+    pop["n"] = n
+
+
+def _window_summary(window):
+    result = {"seconds": window["seconds"],
+              "discarded_partial_blocks": window["discarded_partial_blocks"]}
+    opened = window["open"]
+    for name in ("raw", "normalized"):
+        pop = window[name]
+        n = pop["n"]
+        active_n = opened[name + "_n"] if opened is not None else 0
+        active_mean = opened[name + "_mean_ns"] if active_n else None
+        result[name] = {
+            "block_count": n,
+            "current_block_mean_ns": active_mean,
+            "current_block_observed_seconds": opened["slots"] if opened else 0,
+            "current_block_accepted_races": active_n,
+            "completed_mean_ns": pop["mean_ns"] if n else None,
+            "latest_completed_mean_ns": (pop["mean_ns"] if n else None),
+            "last_completed_start_second": (pop["last_completed_index"] * window["seconds"] + 1
+                                            if pop["last_completed_index"] is not None else None),
+            "last_completed_end_second": ((pop["last_completed_index"] + 1) * window["seconds"]
+                                          if pop["last_completed_index"] is not None else None),
+            "block_sd_ps": (1000.0 * math.sqrt(max(0.0, pop["m2_ns2"] / (n - 1)))
+                            if n > 1 else None),
+            "allan_ps": (1000.0 * math.sqrt(pop["allan_sum_sq_ns2"] / (2 * pop["allan_pairs"]))
+                         if pop["allan_pairs"] else None),
+            "trend_ps_per_hour": (1000.0 * 3600.0 * pop["sxy"] / (pop["sxx"] * window["seconds"])
+                                  if n >= 3 and pop["sxx"] > 0 else None),
+            "uncertainty_ps": None,  # Correlation-aware campaign uncertainty not yet established.
+        }
+    return result
+
+
+def _add_second(open_block, name, flight):
+    if not isinstance(flight, dict) or flight.get("n", 0) == 0:
+        return
+    n = int(flight["n"])
+    value = float(flight["mean"])
+    if n <= 0 or not math.isfinite(value):
+        raise ValueError("PHOTONS stability requires finite positive-count mean")
+    prior = open_block[name + "_n"]
+    total = prior + n
+    open_block[name + "_mean_ns"] += (value - open_block[name + "_mean_ns"]) * n / total
+    open_block[name + "_n"] = total
+    open_block[name + "_slots"] += 1
+
+
+class StabilityAccumulator:
+    """Single state-worker owner; carry last committed snapshot across Pi restart."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self._state = {"schema": STABILITY_SCHEMA, "sequence": None, "published_at_utc": None,
+                       "campaign_id": None, "campaign": None, "public_count": None,
+                       "acquisition_id": None, "normalization_id": None,
+                       "gap_count": 0,
+                       "normalization_policy": None, "normalization_changes": 0,
+                       "elapsed_pause_count": 0, "elapsed_pause_seconds": 0.0,
+                       "windows": {str(s): _window(s) for s in STABILITY_WINDOWS}}
+
+    def checkpoint(self):
+        return copy.deepcopy(self._state)
+
+    def restore(self, canonical):
+        """Assign the saved Welfords, open blocks, covariance and adjacency state."""
+        self.reset()
+        if canonical is None:
+            return
+        existing = canonical.get("stability")
+        if existing is not None:
+            self._state = copy.deepcopy(existing["checkpoint"])
+            # Legacy checkpoints retained a history-fullness label. The
+            # underlying observed blocks and discontinuities are the evidence.
+            self._state.pop("complete_from_start", None)
+            # Legacy hashes named this same policy. Adopt a readable name without
+            # treating that representation change as a new mathematical epoch.
+            self._state["normalization_id"] = identity(canonical["normalization"])
+            self._state.setdefault("normalization_policy", model_semantics(canonical["normalization"]))
+            self._state.setdefault("normalization_changes", 0)
+            self._state.setdefault("elapsed_pause_count", 0)
+            self._state.setdefault("elapsed_pause_seconds", 0.0)
+            return
+        # A pre-feature row never stored these populations. Preserve its cursor
+        # without claiming that the new calculator witnessed earlier blocks.
+        campaign = canonical.get("campaign") or {}
+        self._state.update(sequence=canonical["sequence"],
+                           published_at_utc=canonical["published_at_utc"],
+                           campaign_id=campaign.get("campaign_id"),
+                           campaign=campaign.get("campaign"),
+                           public_count=campaign.get("public_count"),
+                           acquisition_id=canonical["measurement"]["acquisition_id"],
+                           normalization_id=identity(canonical["normalization"]),
+                           normalization_policy=model_semantics(canonical["normalization"]))
+
+    def _new_epoch(self, campaign, measurement):
+        self.reset()
+        self._state.update({
+            "campaign_id": campaign["campaign_id"], "campaign": campaign["campaign"],
+            "acquisition_id": measurement["acquisition_id"],
+            "normalization_id": measurement["normalization_id"],
+            "gap_count": 0,  # A new campaign/model epoch has its own gap ledger.
+        })
+
+    def ingest(self, photons):
+        # Rejected input must not partially advance the live checkpoint. The
+        # state worker only publishes a returned result after this transaction.
+        before = self._state
+        self._state = copy.deepcopy(before)
+        try:
+            return self._ingest(photons)
+        except Exception:
+            self._state = before
+            raise
+
+    def _ingest(self, photons):
+        s = self._state
+        sequence = int(photons["sequence"])
+        measurement = photons["measurement"]
+        campaign = photons.get("campaign") or {}
+        stamp = photons["published_at_utc"]
+        if s["sequence"] is not None and sequence <= s["sequence"]:
+            raise ValueError("PHOTONS stability sequence did not advance")
+
+        campaign_id = campaign.get("campaign_id")
+        public_count = campaign.get("public_count")
+        if campaign_id is None:
+            # No campaign owns the current observation; avoid reusing a completed
+            # campaign's partial block in an unrelated future START.
+            self.reset()
+            s = self._state
+            s.update({"sequence": sequence, "published_at_utc": stamp,
+                      "acquisition_id": measurement["acquisition_id"],
+                      "normalization_id": measurement["normalization_id"]})
+            return self._surface()
+
+        if not isinstance(public_count, int) or public_count <= 0:
+            raise ValueError("PHOTONS stability requires positive campaign public_count")
+        policy = model_semantics(photons["normalization"])
+        fresh = (s["campaign_id"] != campaign_id
+                 or s["acquisition_id"] != measurement["acquisition_id"])
+        if fresh:
+            self._new_epoch(campaign, measurement)
+            s = self._state
+        else:
+            prior_public = s["public_count"]
+            consistent = (prior_public is not None
+                          and public_count == prior_public + 1
+                          and (s["sequence"] is None or sequence == s["sequence"] + 1))
+            if s["published_at_utc"] is not None:
+                elapsed = _time(stamp) - _time(s["published_at_utc"])
+                if elapsed > TIMING_GAP_SECONDS:
+                    s["elapsed_pause_count"] += 1
+                    s["elapsed_pause_seconds"] += elapsed - 1.0
+            if not consistent:
+                s["gap_count"] += 1
+                for window in s["windows"].values():
+                    if window["open"] is not None:
+                        window["discarded_partial_blocks"] += 1
+                    window["open"] = None
+                    for name in ("raw", "normalized"):
+                        window[name]["previous_index"] = None
+                        window[name]["previous_mean_ns"] = None
+
+        if s["normalization_policy"] is not None and s["normalization_policy"] != policy:
+            # A model deployment is not permission to destroy raw populations.
+            # Nor may an unfinished normalized block mix two corrections.
+            for window in s["windows"].values():
+                window["normalized"] = _population()
+                if window["open"] is not None:
+                    window["open"].update(normalized_n=0, normalized_mean_ns=0.0,
+                                          normalized_slots=0)
+            s["normalization_changes"] += 1
+        s["normalization_policy"] = policy
+        s["normalization_id"] = measurement["normalization_id"]
+
+        raw = measurement["raw_flight_ns"]
+        normalized = measurement["normalized_flight_ns"]
+        for seconds in STABILITY_WINDOWS:
+            window = s["windows"][str(seconds)]
+            index = (public_count - 1) // seconds
+            position = (public_count - 1) % seconds + 1
+            opened = window["open"]
+            if opened is None or opened["index"] != index:
+                if opened is not None:
+                    window["discarded_partial_blocks"] += 1
+                    for name in ("raw", "normalized"):
+                        window[name]["previous_index"] = None
+                        window[name]["previous_mean_ns"] = None
+                opened = {"index": index, "slots": 0,
+                          "first_position": position,
+                          "raw_n": 0, "raw_mean_ns": 0.0, "raw_slots": 0,
+                          "normalized_n": 0, "normalized_mean_ns": 0.0,
+                          "normalized_slots": 0}
+                window["open"] = opened
+            opened["slots"] += 1
+            _add_second(opened, "raw", raw)
+            _add_second(opened, "normalized", normalized)
+            if position == seconds:
+                complete = (opened["first_position"] == 1 and opened["slots"] == seconds)
+                if complete and opened["raw_slots"] == seconds:
+                    _append(window["raw"], index, opened["raw_mean_ns"])
+                else:
+                    window["raw"]["previous_index"] = None
+                    window["raw"]["previous_mean_ns"] = None
+                if complete and opened["normalized_slots"] == seconds:
+                    _append(window["normalized"], index, opened["normalized_mean_ns"])
+                else:
+                    window["normalized"]["previous_index"] = None
+                    window["normalized"]["previous_mean_ns"] = None
+                if not complete or opened["raw_slots"] != seconds:
+                    window["discarded_partial_blocks"] += 1
+                window["open"] = None
+
+        s.update({"sequence": sequence, "published_at_utc": stamp,
+                  "public_count": public_count})
+        return self._surface()
+
+    def _surface(self):
+        s = self._state
+        return {"schema": STABILITY_SCHEMA, "status": ("ACTIVE" if s["campaign_id"] else "NO_CAMPAIGN"),
+                "campaign": s["campaign"], "campaign_id": s["campaign_id"],
+                "gap_count": s["gap_count"],
+                "time_basis": "OBSERVED_PRODUCER_SECONDS",
+                "elapsed_pause_count": s["elapsed_pause_count"],
+                "elapsed_pause_seconds": s["elapsed_pause_seconds"],
+                "normalization_changes": s["normalization_changes"],
+                "uncertainty_status": "NOT_ESTABLISHED_CORRELATED_DRIFT",
+                "windows": {key: _window_summary(window) for key, window in s["windows"].items()},
+                "checkpoint": copy.deepcopy(s)}
+
+# ======================================================================
+# PHOTONS: Temperature populations and JSON continuation
+# ======================================================================
+
+TEMPERATURE_STATS_SCHEMA = "PI_PHOTONS_TEMPERATURE_STATS_V1"
+TEMPERATURE_SENSORS = tuple(THERMAL_SENSOR_PATHS)
+TEMPERATURE_WINDOWS = (600, 3600, 28800, 86400)
+SHORT_LIMIT = 600
+MINUTE_LIMIT = 1440
+TEMPERATURE_SCALE = 1_000_000
+MISSING = -(1 << 31)
+
+
+def _sensor_sources():
+    return {name: source for name, (_path, source) in THERMAL_SENSOR_PATHS.items()}
+
+
+def _current_names(values, saved_sources=None):
+    """Project durable hardware identity onto today's readout names.
+
+    Old images precede the explicit source map. Their four physical lanes are
+    known: the sole rename was I2C2/0x77, formerly OTDR and now OUT. New images
+    always carry the map, so subsequent label changes need no new migration.
+    """
+    if saved_sources is None:
+        saved_sources = {"pi": "PI.I2C1.BME280.0x76",
+                         "pd": "PI.I2C1.BME280.0x77",
+                         "out" if "out" in values else "otdr": "PI.I2C2.BME280.0x77",
+                         "rtd": "TEENSY.SPI1.MAX31865"}
+    by_source = {source: values[name] for name, source in saved_sources.items()}
+    return {name: copy.deepcopy(by_source[source])
+            for name, source in _sensor_sources().items()}
+
+
+def _minute_json(minute):
+    if minute is None:
+        return None
+    return {"index": minute["index"], "slots": minute["slots"],
+            "gaps": minute["gaps"],
+            "sensors": {name: {"n": minute["counts"][i],
+                               "sum_microdegree_c": minute["sums"][i]}
+                        for i, name in enumerate(TEMPERATURE_SENSORS)}}
+
+
+def _minute_from_json(minute, sources):
+    if minute is None:
+        return None
+    values = _current_names(minute["sensors"], sources)
+    return {"index": minute["index"], "slots": minute["slots"],
+            "gaps": minute["gaps"],
+            "counts": [values[name]["n"] for name in TEMPERATURE_SENSORS],
+            "sums": [values[name]["sum_microdegree_c"] for name in TEMPERATURE_SENSORS]}
+
+
+def _read_legacy_rolling(image):
+    """Read-only bridge for already committed pre-JSON temperature images.
+
+    This is the old fixed layout, not a second checkpoint writer. Read every
+    retained entry once, discard the old packaging, and subsequently persist
+    only the named JSON fields returned here. No historical SQL is involved.
+    """
+    import base64
+    import struct
+    import zlib
+
+    second = struct.Struct("<qqB4i")
+    minute = struct.Struct("<qBB4B4q")
+    header = struct.Struct("<III")
+    raw = zlib.decompress(base64.b64decode(image["image"]))
+    ns, nm, no = header.unpack_from(raw)
+    offset = header.size
+    seconds = []
+    for _ in range(ns):
+        sequence, update_count, gap, *values = second.unpack_from(raw, offset)
+        offset += second.size
+        seconds.append({"sequence": sequence, "update_count": update_count,
+                        "gap": bool(gap), "temperature_c": _temperatures(values)})
+    minutes = []
+    for _ in range(nm + no):
+        index, slots, gaps, *values = minute.unpack_from(raw, offset)
+        offset += minute.size
+        minutes.append(_minute_json({"index": index, "slots": slots, "gaps": gaps,
+                                     "counts": values[:4], "sums": values[4:]}))
+    # Ordinary unpacking detects short input. An extra suffix is also an
+    # implementation-integrity error, not permission to reset the populations.
+    if offset != len(raw):
+        raise RuntimeError("legacy temperature image has unconsumed bytes")
+    return {"sequence": image["sequence"], "update_count": image["update_count"],
+            "reset_count": image["reset_count"], "sensor_sources": _sensor_sources(),
+            "seconds": seconds, "minutes": minutes[:nm],
+            "open_minute": minutes[nm] if no else None,
+            "short_population": _current_names(image["short_population"]),
+            "short_gaps": image["short_gaps"]}
+
+
+def _quantized(values):
+    out = []
+    for name in TEMPERATURE_SENSORS:
+        value = values[name]
+        if value is None:
+            out.append(MISSING)
+            continue
+        q = round(float(value) * TEMPERATURE_SCALE)
+        if not MISSING < q <= (1 << 31) - 1:
+            raise ValueError(f"PHOTONS {name} temperature exceeds the bounded rolling representation")
+        out.append(q)
+    return tuple(out)
+
+
+def _temperatures(q):
+    return {name: None if value == MISSING else value / TEMPERATURE_SCALE
+            for name, value in zip(TEMPERATURE_SENSORS, q)}
+
+
+def _new_minute(index):
+    return {"index": index, "slots": 0, "gaps": 0,
+            "counts": [0, 0, 0, 0], "sums": [0, 0, 0, 0]}
+
+
+def _minute_append(minute, q, gap):
+    minute["slots"] += 1
+    minute["gaps"] += int(gap)
+    if minute["slots"] > 60 or minute["gaps"] > 60:
+        raise ValueError("PHOTONS thermal minute grid contains excess observations")
+    for i, value in enumerate(q):
+        if value != MISSING:
+            minute["counts"][i] += 1
+            minute["sums"][i] += value
+
+
+def _empty():
+    return {"n": 0, "mean": 0.0, "m2": 0.0}
+
+
+def _populations():
+    return {name: _empty() for name in TEMPERATURE_SENSORS}
+
+
+def _add(p, value):
+    n = p["n"] + 1
+    delta = value - p["mean"]
+    mean = p["mean"] + delta / n
+    p["m2"] += delta * (value - mean)
+    p["mean"] = mean
+    p["n"] = n
+
+
+def _remove(p, value):
+    n = p["n"]
+    if n == 1:
+        p.update(_empty())
+    else:
+        mean = (p["mean"] * n - value) / (n - 1)
+        p["m2"] = max(0.0, p["m2"] - (value - p["mean"]) * (value - mean))
+        p["mean"] = mean
+        p["n"] = n - 1
+
+
+def _surface(p):
+    n = p["n"]
+    return {
+        "n": n,
+        "mean_c": p["mean"] if n else None,
+        "sd_c": math.sqrt(max(0.0, p["m2"] / (n - 1))) if n > 1 else None,
+    }
+
+
+def _observations(environment, rtd):
+    """No fallback paths: an absent/invalid physical sensor remains absent."""
+    result = {}
+    for name in TEMPERATURE_SENSORS:
+        node = rtd if name == "rtd" else environment.get(name)
+        node = node or {}
+        if node.get("status") != "OK":
+            result[name] = None
+            continue
+        value = node.get("temperature_c")
+        if type(value) not in (int, float) or not math.isfinite(value):
+            raise ValueError(f"PHOTONS {name} OK temperature is not finite numeric testimony")
+        result[name] = float(value)
+    return result
+
+
+@dataclass
+class _Window:
+    seconds: int
+
+    def __post_init__(self):
+        self.entries = deque()
+        self.populations = _populations()
+        self.gaps = 0
+
+    def append(self, sequence, values, gap):
+        self.entries.append((sequence, values, bool(gap)))
+        self.gaps += bool(gap)
+        for name, value in values.items():
+            if value is not None:
+                _add(self.populations[name], value)
+        while len(self.entries) > self.seconds:
+            _, expired, was_gap = self.entries.popleft()
+            self.gaps -= was_gap
+            for name, value in expired.items():
+                if value is not None:
+                    _remove(self.populations[name], value)
+
+    def summarize(self):
+        # The first entry's gap flag refers to the predecessor OUTSIDE this
+        # window. It must not contaminate an otherwise complete local window.
+        interrupted = self.gaps - (int(self.entries[0][2]) if self.entries else 0)
+        return {
+            name: {**_surface(pop),
+                   "complete": (len(self.entries) == self.seconds
+                                and interrupted == 0 and pop["n"] == self.seconds)}
+            for name, pop in self.populations.items()
+        }
+
+
+class TemperatureAccumulator:
+    """One state owner; canonical Welfords and singleton rings commit together."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.state = {
+            "schema": TEMPERATURE_STATS_SCHEMA, "sensor_sources": _sensor_sources(),
+            "sensor_label_history": {source: [name] for name, source in _sensor_sources().items()},
+            "sequence": None, "reset_count": None,
+            "campaign_id": None, "campaign": None, "public_count": None,
+            "total_complete": True, "campaign_complete": False,
+            "gap_count": 0, "total_seconds": 0, "camp_seconds": 0,
+            "total": _populations(), "camp": _populations(),
+        }
+        self._clear_rolling()
+
+    def _clear_rolling(self):
+        # All four windows share this ONE minute ring and recent-second tail.
+        self.short = _Window(SHORT_LIMIT)
+        self.second_tail = deque(maxlen=SHORT_LIMIT)
+        self.minutes = deque(maxlen=MINUTE_LIMIT)
+        self.open_minute = None
+        self.last_rolling_sequence = None
+        self.last_rolling_update_count = None
+        self.last_rolling_reset_count = None
+
+    def _append_rolling(self, sequence, update_count, reset_count, values):
+        if (self.last_rolling_sequence is not None and
+                (reset_count != self.last_rolling_reset_count
+                 or sequence <= self.last_rolling_sequence
+                 or update_count <= self.last_rolling_update_count)):
+            # Physical stats reset/source cutover is a distinct rolling epoch.
+            self._clear_rolling()
+        gap = (self.last_rolling_sequence is not None and
+               (sequence != self.last_rolling_sequence + 1
+                or update_count != self.last_rolling_update_count + 1))
+        q = _quantized(values)
+        entry = (sequence, update_count, int(gap), q)
+        self.second_tail.append(entry)
+        self.short.append(sequence, _temperatures(q), gap)
+
+        minute_index = (update_count - 1) // 60
+        if self.open_minute is None:
+            self.open_minute = _new_minute(minute_index)
+        elif minute_index != self.open_minute["index"]:
+            if minute_index <= self.open_minute["index"]:
+                raise ValueError("PHOTONS temperature minute index moved backward")
+            # A producer gap can skip some or all of a minute; no synthetic
+            # complete interval is invented for the missing observations.
+            self.minutes.append(self.open_minute)
+            self.open_minute = _new_minute(minute_index)
+        _minute_append(self.open_minute, q, gap)
+        if update_count % 60 == 0:
+            self.minutes.append(self.open_minute)
+            self.open_minute = None
+
+        self.last_rolling_sequence = sequence
+        self.last_rolling_update_count = update_count
+        self.last_rolling_reset_count = reset_count
+
+    def _minute_surface(self, span):
+        """Most recent completed producer-minute grid, not a 1-Hz window.
+
+        A mean may be available even when the window has not yet accumulated
+        all 60/480/1440 complete minutes; the resulting incomplete flag is
+        crucial testimony. Missing sensor values reduce N, never interpolate.
+        A gap between physically neighboring complete minutes is represented
+        by a gap in their producer indices or by an interruption in one minute.
+        """
+        count = span // 60
+        current_update = self.last_rolling_update_count or 0
+        end_index = ((current_update - 1) // 60
+                     - (1 if current_update % 60 else 0))
+        # A producer-minute becomes available on its sixtieth sample. A
+        # partially acquired next minute does not replace that endpoint.
+        start_index = end_index - count + 1
+        selected = [m for m in self.minutes if start_index <= m["index"] <= end_index]
+        complete_grid = (len(selected) == count
+                         and all(m["index"] == start_index+i and m["slots"] == 60
+                                 and m["gaps"] == 0 for i,m in enumerate(selected)))
+        out = {}
+        for i, name in enumerate(TEMPERATURE_SENSORS):
+            n = sum(m["counts"][i] for m in selected)
+            total_q = sum(m["sums"][i] for m in selected)
+            out[name] = {"n": n,
+                         "mean_c": total_q / (n*TEMPERATURE_SCALE) if n else None,
+                         "sd_c": None,
+                         "complete": complete_grid and n == span}
+        return out
+
+    def _rolling_image(self):
+        """Take an independent, readable continuation image at this exact cursor."""
+        return {"sequence": self.last_rolling_sequence,
+                "update_count": self.last_rolling_update_count,
+                "reset_count": self.last_rolling_reset_count,
+                "sensor_sources": _sensor_sources(),
+                "seconds": [{"sequence": sequence, "update_count": update_count,
+                             "gap": bool(gap), "temperature_c": _temperatures(q)}
+                            for sequence, update_count, gap, q in self.second_tail],
+                "minutes": [_minute_json(minute) for minute in self.minutes],
+                "open_minute": _minute_json(self.open_minute),
+                "short_population": copy.deepcopy(self.short.populations),
+                "short_gaps": self.short.gaps}
+
+    def _restore_rolling(self, image, canonical):
+        if "image" in image:
+            image = _read_legacy_rolling(image)
+        sources = image["sensor_sources"]
+        # Build containers directly. Replaying even these bounded samples would
+        # take a different floating-point path; the saved Welford is authoritative.
+        self.second_tail = deque(maxlen=SHORT_LIMIT)
+        self.short = _Window(SHORT_LIMIT)
+        for entry in image["seconds"]:
+            values = _current_names(entry["temperature_c"], sources)
+            sequence, update_count, gap = entry["sequence"], entry["update_count"], entry["gap"]
+            self.second_tail.append((sequence, update_count, int(gap), _quantized(values)))
+            self.short.entries.append((sequence, values, bool(gap)))
+        self.short.populations = _current_names(image["short_population"], sources)
+        self.short.gaps = image["short_gaps"]
+        self.minutes = deque((_minute_from_json(m, sources) for m in image["minutes"]),
+                             maxlen=MINUTE_LIMIT)
+        self.open_minute = _minute_from_json(image["open_minute"], sources)
+        self.last_rolling_sequence = image["sequence"]
+        self.last_rolling_update_count = image["update_count"]
+        self.last_rolling_reset_count = image["reset_count"]
+        logging.info("[photons/temperature] restored sequence=%s seconds=%d minutes=%d "
+                     "with unfinished minute and exact Welfords; no replay",
+                     self.last_rolling_sequence, len(self.second_tail), len(self.minutes))
+
+    def rolling_checkpoint(self):
+        """Snapshot the same one-second position as our cumulative checkpoint.
+
+        This object travels ONLY through the ordered persistence queue to the
+        existing singleton; it is not copied into published/canonical PHOTONS.
+        The state worker must call it immediately after ingest, before any next
+        observed fragment advances the accumulator.
+        """
+        return self._rolling_image()
+
+    def restore(self, canonical, rolling_checkpoint=None):
+        """Assign the temperature part of the selected holistic instrument state."""
+        self.reset()
+        if canonical is None:
+            return
+        sequence = canonical["sequence"]
+        stats = canonical["photons"]["stats"]
+        campaign = canonical.get("campaign") or {}
+        existing = canonical.get("temperature_stats")
+        if existing is not None:
+            state = copy.deepcopy(existing["checkpoint"])
+            embedded = state.pop("rolling", None)
+            if rolling_checkpoint is None:
+                rolling_checkpoint = embedded
+            sources = state.get("sensor_sources")
+            labels = state.setdefault("sensor_label_history", {})
+            old_names = list(state["total"])
+            old_sources = sources or {name: ("PI.I2C2.BME280.0x77" if name == "otdr"
+                                            else _sensor_sources()[name]) for name in old_names}
+            for name, source in old_sources.items():
+                names = labels.setdefault(source, [])
+                if name not in names:
+                    names.append(name)
+            for name, source in _sensor_sources().items():
+                names = labels.setdefault(source, [])
+                if name not in names:
+                    names.append(name)
+            state["total"] = _current_names(state["total"], sources)
+            state["camp"] = _current_names(state["camp"], sources)
+            state["sensor_sources"] = _sensor_sources()
+            self.state = state
+        else:
+            # One-time adoption of a row from before temperature statistics
+            # existed. It contains no temperature populations to resurrect.
+            self.state.update(sequence=sequence, reset_count=stats["reset_count"],
+                              campaign_id=campaign.get("campaign_id"),
+                              campaign=campaign.get("campaign"),
+                              public_count=campaign.get("public_count"),
+                              total_complete=False, campaign_complete=False)
+        if rolling_checkpoint is not None:
+            self._restore_rolling(rolling_checkpoint, canonical)
+        else:
+            # This is only the pre-rolling implementation's migration path.
+            # A current writer always supplies the whole ring, even when empty.
+            self.last_rolling_sequence = sequence
+            self.last_rolling_update_count = stats["update_count"]
+            self.last_rolling_reset_count = stats["reset_count"]
+            logging.warning("[photons/temperature] legacy checkpoint did not retain rolling "
+                            "history; preserved every available cumulative population")
+
+    def preflight(self, canonical):
+        """Validate before ANY accumulator (including stability) advances.
+
+        PHOTONS' producer and stability calculations are stateful. A bad SYSTEM
+        temperature must not be discovered only after another one-second
+        accumulator has accepted that same ultimately rejected observation.
+        """
+        sequence = int(canonical["sequence"])
+        stats = canonical["photons"]["stats"]
+        reset_count = int(stats["reset_count"])
+        update_count = int(stats["update_count"])
+        campaign = canonical.get("campaign") or {}
+        campaign_id = campaign.get("campaign_id")
+        public_count = campaign.get("public_count")
+        values = _observations(canonical.get("environment") or {}, canonical.get("rtd") or {})
+        if campaign_id is not None and (not isinstance(public_count, int) or public_count <= 0):
+            raise ValueError("invalid PHOTONS temperature campaign public count")
+        s = self.state
+        if s["sequence"] is not None and s["reset_count"] == reset_count and sequence <= s["sequence"]:
+            raise ValueError("PHOTONS temperature sequence did not advance")
+        # Preserve the existing microdegree rolling arithmetic. Source readings
+        # and cumulative Welfords retain their original full precision.
+        _quantized(values)
+        return sequence, reset_count, update_count, campaign, campaign_id, public_count, values
+
+    def ingest(self, canonical, *, prepared=None):
+        (sequence, reset_count, update_count, campaign, campaign_id,
+         public_count, values) = prepared if prepared is not None else self.preflight(canonical)
+        s = self.state
+        new_epoch = s["reset_count"] is not None and reset_count != s["reset_count"]
+        if new_epoch:
+            # Firmware STATS_RESET changes the always-on epoch, not LANTERN.
+            # Preserve the still-active campaign's exact population and cursor.
+            campaign_state = {key: copy.deepcopy(s[key]) for key in
+                              ("camp", "camp_seconds", "campaign_complete", "campaign_id",
+                               "campaign", "public_count", "sensor_label_history")}
+            self.reset()
+            s = self.state
+            s.update(campaign_state)
+            s["total_complete"] = update_count == 1
+        elif s["sequence"] is None:
+            # Firmware sequence can continue across STATS_RESET, so the
+            # epoch-local update_count (not global sequence) defines TOTAL's
+            # first full statistical observation.
+            s["total_complete"] = update_count == 1
+        if s["sequence"] is not None and sequence != s["sequence"] + 1:
+            s["total_complete"] = False
+            s["gap_count"] += 1
+            if campaign_id == s["campaign_id"]:
+                s["campaign_complete"] = False
+        if campaign_id != s["campaign_id"]:
+            s["camp"] = _populations()
+            s["camp_seconds"] = 0
+            s["campaign_complete"] = bool(campaign_id is not None and public_count == 1)
+        elif campaign_id is not None and s["public_count"] is not None:
+            if public_count != s["public_count"] + 1:
+                s["campaign_complete"] = False
+        s["total_seconds"] += 1
+        if campaign_id is not None:
+            s["camp_seconds"] += 1
+        for name, value in values.items():
+            if value is not None:
+                _add(s["total"][name], value)
+                if campaign_id is not None:
+                    _add(s["camp"][name], value)
+        self._append_rolling(sequence, update_count, reset_count, values)
+        s.update({"sequence": sequence, "reset_count": reset_count,
+                  "campaign_id": campaign_id, "campaign": campaign.get("campaign"),
+                  "public_count": public_count})
+        return self._surface(values)
+
+    def _surface(self, current):
+        s = self.state
+        # TOTAL/CAMP Welfords remain in the canonical PHOTONS row; the bounded
+        # rolling ring is instead stored in config.PHOTONS_RECOVERY as another
+        # component of the same atomically committed resurrection image.
+        checkpoint = copy.deepcopy(s)
+        return {
+            "schema": TEMPERATURE_STATS_SCHEMA,
+            "observed": current,
+            "windows": {"600": self.short.summarize(),
+                        **{str(span): self._minute_surface(span)
+                           for span in TEMPERATURE_WINDOWS if span != SHORT_LIMIT}},
+            "total": {name: {**_surface(p),
+                             "complete": (s["total_complete"]
+                                          and p["n"] == s["total_seconds"])}
+                      for name, p in s["total"].items()},
+            "camp": ({name: {**_surface(p),
+                             "complete": (s["campaign_complete"]
+                                          and p["n"] == s["camp_seconds"])}
+                      for name, p in s["camp"].items()} if s["campaign_id"] is not None else None),
+            "gap_count": s["gap_count"],
+            "checkpoint": checkpoint,
+        }
+
+# ======================================================================
+# PHOTONS: Checkpoint store and recovery operations
+# ======================================================================
+
+PHOTONS_SINGLETON_KEY = "PHOTONS_RECOVERY"
+PHOTONS_CHECKPOINT_CAMPAIGN_TYPE = "LANTERN"
+
+
+def _payload(value):
+    return json.loads(value) if isinstance(value, str) else copy.deepcopy(value)
+
+
+def _literal(checkpoint):
+    """Read the installed representation once; never write it again.
+
+    Old firmware delta signatures were JSON serialized inside a JSON string.
+    Old temperature rings were binary compressed inside a JSON string. Neither
+    transformation defines the statistical state. Unwrap both without changing
+    any retained endpoints, integer sums, or Welford accumulator values.
+    """
+    saved = copy.deepcopy(checkpoint)
+    signature = saved.get("last_delta_signature")
+    if isinstance(signature, str):
+        saved["last_delta_signature"] = json.loads(signature)
+    rolling = saved.get("temperature_rolling")
+    if rolling is not None and "image" in rolling:
+        saved["temperature_rolling"] = _read_legacy_rolling(rolling)
+    return saved
+
+
+def source_row(checkpoint):
+    """Materialize a database-row view from the singleton, without database IO."""
+    canonical = copy.deepcopy(checkpoint["canonical"])
+    campaign = canonical.get("campaign") or {}
+    return {
+        "id": checkpoint["durable_source_detail_id"],
+        "ts": canonical["published_at_utc"],
+        "campaign": campaign.get("campaign"),
+        "viable": True,
+        "payload": canonical,
+        "sequence": canonical["sequence"],
+        "pps_count": canonical.get("pps_count"),
+        # Private transport between the source selector and projection. It is
+        # not embedded in canonical PHOTONS and cannot form a recursive image.
+        "_recovery_checkpoint": copy.deepcopy(checkpoint),
+    }
+
+
+def _identity(canonical):
+    stats = canonical["photons"]["stats"]
+    return canonical["sequence"], stats["reset_count"], stats["update_count"]
+
+
+class CheckpointStore:
+    def __init__(self, open_db):
+        self.open_db = open_db
+
+    @staticmethod
+    def _read(cur, *, lock=False):
+        cur.execute(
+            "SELECT payload FROM config WHERE config_key = %s" +
+            (" FOR UPDATE" if lock else ""), (PHOTONS_SINGLETON_KEY,),
+        )
+        row = cur.fetchone()
+        return None if row is None else _payload(row["payload"])
+
+    @staticmethod
+    def _put(cur, saved):
+        text = json.dumps(saved, separators=(",", ":"), allow_nan=False)
+        cur.execute("UPDATE config SET payload = %s::jsonb WHERE config_key = %s",
+                    (text, PHOTONS_SINGLETON_KEY))
+        if cur.rowcount == 0:
+            cur.execute("INSERT INTO config (config_key, payload) VALUES (%s, %s::jsonb)",
+                        (PHOTONS_SINGLETON_KEY, text))
+
+    def read(self):
+        with self.open_db(row_dict=True) as conn:
+            saved = self._read(conn.cursor())
+        return None if saved is None else _literal(saved)
+
+    def load_source(self):
+        """One current-state read on every normal restart, independent of campaign.
+
+        The installed pre-holistic writer did not record its database owner ID.
+        Its first upgrade must bind the newest LANTERN observation, once, while
+        holding the singleton lock. This is one bounded head read, not a search
+        for a convenient older row, and never statistical replay. A mismatch is
+        an integrity failure; do not fall back, reset, or manufacture history.
+        Subsequent writers retain the canonical observation directly, so this
+        migration branch is never part of normal recovery.
+        """
+        with self.open_db(row_dict=True) as conn:
+            cur = conn.cursor()
+            saved = self._read(cur, lock=True)
+            if saved is not None and "canonical" in saved:
+                return source_row(_literal(saved))
+            if saved is not None and "durable_source_detail_id" in saved:
+                cur.execute(
+                    "SELECT id, ts, campaign, viable, payload, sequence, pps_count "
+                    "FROM campaign_detail WHERE id = %s AND campaign_type = %s",
+                    (saved["durable_source_detail_id"], PHOTONS_CHECKPOINT_CAMPAIGN_TYPE),
+                )
+            else:
+                cur.execute(
+                    "SELECT id, ts, campaign, viable, payload, sequence, pps_count "
+                    "FROM campaign_detail WHERE campaign_type = %s "
+                    "ORDER BY id DESC LIMIT 1", (PHOTONS_CHECKPOINT_CAMPAIGN_TYPE,),
+                )
+            row = cur.fetchone()
+            if row is None:
+                if saved is not None:
+                    raise RuntimeError("PHOTONS checkpoint has no durable owner")
+                return None
+            canonical = _payload(row["payload"])
+            if saved is None:
+                # Sole bridge for the older embedded-checkpoint implementation.
+                # A nonempty modern database without its singleton is not empty.
+                saved = canonical["ppb_restore_checkpoint"]
+            saved = _literal(saved)
+            stats = canonical["photons"]["stats"]
+            if (stats["reset_count"] != saved["reset_count"] or
+                    stats["update_count"] != saved["update_count"] or
+                    stats["lap_count"] != saved["current"]["lap_count"] or
+                    stats["total_lap_gnss_ns"] != saved["current"]["total_lap_gnss_ns"]):
+                raise RuntimeError("PHOTONS legacy checkpoint and its newest observation disagree")
+            saved["durable_source_detail_id"] = row["id"]
+            saved["canonical"] = canonical
+            self._put(cur, saved)
+            logging.info("[photons/state] bound legacy checkpoint to detail_id=%d; "
+                         "all retained continuation preserved", row["id"])
+            return source_row(saved)
+
+    def write(self, cur, checkpoint, temperature_rolling=None, *,
+              canonical=None, source_detail_id=None, normalization_state=None):
+        """Called in the SAME transaction as the canonical row INSERT.
+
+        All arguments are immutable snapshots captured by the single state
+        owner. Never read live calculators here: this worker may be behind them.
+        The operation journal is current control state, merged under the same
+        row lock, rather than a stale queued copy of an earlier control phase.
+        """
+        prior = self._read(cur, lock=True)
+        saved = _literal(checkpoint)
+        if canonical is not None:
+            saved["canonical"] = copy.deepcopy(canonical)
+            saved["durable_source_detail_id"] = source_detail_id
+            saved["normalization_state"] = copy.deepcopy(normalization_state)
+        if temperature_rolling is not None:
+            saved["temperature_rolling"] = copy.deepcopy(temperature_rolling)
+        if prior is not None:
+            for key in ("restore_operation", "last_restore"):
+                saved.pop(key, None)
+                if key in prior:
+                    saved[key] = copy.deepcopy(prior[key])
+        operation = saved.get("restore_operation")
+        if canonical is not None and operation is not None and operation["proof"] is None:
+            recovery = canonical["photons"]["recovery"]
+            source = operation["source"]
+            sequence, reset_count, update_count = _identity(canonical)
+            if (recovery["generation"] == operation["generation"] and
+                    sequence > source["sequence"] and
+                    reset_count == source["reset_count"] and
+                    update_count > source["update_count"] and
+                    sequence - source["sequence"] == update_count - source["update_count"]):
+                operation["proof"] = {
+                    "detail_id": source_detail_id, "sequence": sequence,
+                    "reset_count": reset_count, "update_count": update_count,
+                    "generation": operation["generation"],
+                    "published_at_utc": canonical["published_at_utc"],
+                }
+        self._put(cur, saved)
+
+    def begin_restore(self, source, generation):
+        """Commit source ownership BEFORE any mutating Teensy recovery command."""
+        with self.open_db(row_dict=True) as conn:
+            cur = conn.cursor()
+            saved = self._read(cur, lock=True)
+            if saved["durable_source_detail_id"] != source["db_detail_id"]:
+                raise RuntimeError("PHOTONS restore source advanced during staging admission")
+            saved["restore_operation"] = {
+                "generation": generation,
+                "source": {"detail_id": source["db_detail_id"],
+                           "sequence": source["sequence"],
+                           "reset_count": source["reset_count"],
+                           "update_count": source["update_count"]},
+                "proof": None,
+            }
+            self._put(cur, saved)
+
+    def acknowledge_restore(self, generation):
+        """Call only AFTER Teensy acknowledges the durable proof.
+
+        A crash before this write leaves a harmless recorded operation; the next
+        process can repeat the acknowledgement. Queued observation writers read
+        this control field under its lock, so cannot resurrect an acknowledged
+        operation from an older in-memory copy.
+        """
+        with self.open_db(row_dict=True) as conn:
+            cur = conn.cursor()
+            saved = self._read(cur, lock=True)
+            operation = saved.get("restore_operation") if saved is not None else None
+            if operation is not None and operation["generation"] == generation:
+                saved["last_restore"] = saved.pop("restore_operation")
+                self._put(cur, saved)
+
+    def find_proof(self, generation, sequence, update_count):
+        """Read the journal's named proof row; an interrupted observer may miss N+1."""
+        saved = self.read()
+        if saved is None:
+            return None
+        operation = saved.get("restore_operation") or saved.get("last_restore")
+        proof = None
+        if operation is not None and operation["generation"] == generation:
+            proof = operation["proof"]
+        canonical = saved.get("canonical")
+        if proof is None and canonical is not None:
+            stats = canonical["photons"]["stats"]
+            recovery = canonical["photons"]["recovery"]
+            if (recovery["generation"] == generation and recovery["proof_advanced"]
+                    and canonical["sequence"] >= sequence
+                    and stats["update_count"] >= update_count):
+                return {"detail_id": saved["durable_source_detail_id"],
+                        "canonical": copy.deepcopy(canonical)}
+        if proof is None:
+            return None
+        if saved["durable_source_detail_id"] == proof["detail_id"]:
+            return {"detail_id": proof["detail_id"], "canonical": copy.deepcopy(canonical)}
+        with self.open_db(row_dict=True) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT payload FROM campaign_detail WHERE id = %s AND campaign_type = %s",
+                        (proof["detail_id"], PHOTONS_CHECKPOINT_CAMPAIGN_TYPE))
+            row = cur.fetchone()
+        if row is None:
+            raise RuntimeError("PHOTONS journal's durable proof row was removed")
+        return {"detail_id": proof["detail_id"], "canonical": _payload(row["payload"])}
+
+    def original_source_id(self, sequence, reset_count, update_count):
+        saved = self.read()
+        for key in ("restore_operation", "last_restore"):
+            operation = saved.get(key)
+            if operation is not None:
+                source = operation["source"]
+                if (source["sequence"], source["reset_count"], source["update_count"]) == (
+                        sequence, reset_count, update_count):
+                    return source["detail_id"]
+        if _identity(saved["canonical"]) == (sequence, reset_count, update_count):
+            return saved["durable_source_detail_id"]
+        raise RuntimeError("PHOTONS restore source ID was not retained by the legacy writer")
+
+
+def live_campaign_cursor(source):
+    """Only a witnessed campaign row is a cursor for a surviving producer.
+
+    A zero-count pending START belongs to dead-producer desired state, not to
+    a live producer's already committed private campaign boundary.
+    """
+    if source is not None and (source.get("campaign_restore") or {}).get("public_count", 0) > 0:
+        return source
+    return None
+
+
+def prepare_source(row, active_master, *, restore_schema_version=1):
+    """Project our committed state onto the existing Teensy restore command.
+
+    This is a translation of owned fields, not schema validation or a search
+    for a row that passes a test. Physical acquisition ancestry is not revived:
+    pending shots and detector seeds must be reacquired, exactly as in CLOCKS.
+    Empty populations are state too, including a campaign waiting for race 1.
+    """
+    state = copy.deepcopy(row["payload"])
+    instrument = state["photons"]
+    stats = instrument["stats"]
+    science = instrument["science"]
+    accepted, excluded = science["accepted"], science["excluded"]
+    sequence, reset_count, update_count = _identity(state)
+    pending = int(science["seed_pending"])
+    args = {
+        "restore_schema_version": restore_schema_version,
+        "source_sequence": sequence,
+        "source_publish_count": state["publish_count"],
+        "source_reset_count": reset_count,
+        "source_update_count": update_count,
+        "stats_lap_count": stats["lap_count"],
+        "stats_total_lap_gnss_ns": stats["total_lap_gnss_ns"],
+        "custody_lap_count": stats["custody_lap_count"],
+        "custody_total_lap_gnss_ns": stats["custody_total_lap_gnss_ns"],
+        "accepted_count": accepted["count"],
+        "excluded_count": excluded["count"],
+        "dropped_pending_seed_count": pending,
+        "campaign_active": active_master is not None,
+    }
+    if "requested_laps_per_second" in instrument["race"]:
+        args["requested_laps_per_second"] = instrument["race"]["requested_laps_per_second"]
+    for name in ("projection_invalid", "seed_disagreement", "raw_cycle_excursion", "isr_delay"):
+        args[name] = science["exclusion_reasons"][name]
+    for prefix, population in (
+            ("accepted_projected", accepted["projected_lap_ns"]),
+            ("accepted_raw", accepted["raw_cycles"]),
+            ("excluded_raw", excluded["raw_cycles"]),
+            ("excluded_projected", excluded["projected_lap_ns"])):
+        args[prefix + "_n"] = population["n"]
+        for name in ("mean", "m2", "min", "max"):
+            # The firmware's decimal parser consumes text, without a binary
+            # transport format. Seventeen significant digits round-trip float64.
+            value = population[name] if population["n"] else 0.0
+            args[prefix + "_" + name] = format(float(value), ".17g")
+    campaign_restore = None
+    if active_master is not None:
+        campaign = state.get("campaign") or {}
+        if campaign.get("campaign_id") == active_master["campaign_id"]:
+            campaign_stats = campaign["stats"]
+            start = campaign["start_after_sequence"]
+            public_count = campaign["public_count"]
+            laps = campaign_stats["lap_count"]
+            duration = campaign_stats["total_lap_gnss_ns"]
+        else:
+            # START/FLASH_CUT intent was committed to campaign_master but no new
+            # public row crossed durability before power was lost. Install that
+            # campaign at the saved global boundary with zero observed laps;
+            # never reuse a preceding campaign's population or reset the system.
+            start, public_count, laps, duration = sequence, 0, 0, 0
+        campaign_restore = {
+            "campaign": active_master["campaign"],
+            "campaign_id": active_master["campaign_id"],
+            "start_after_sequence": start, "public_count": public_count,
+            "lap_count": laps, "total_lap_gnss_ns": duration,
+            "origin_lap_count": stats["custody_lap_count"] - laps,
+            "origin_total_lap_gnss_ns": stats["custody_total_lap_gnss_ns"] - duration,
+        }
+        args["campaign"] = campaign_restore["campaign"]
+        for name in ("origin_lap_count", "origin_total_lap_gnss_ns", "start_after_sequence",
+                     "public_count", "lap_count", "total_lap_gnss_ns"):
+            args["campaign_" + name] = campaign_restore[name]
+    return {
+        "canonical": state, "db_detail_id": row["id"], "db_ts": str(row["ts"]),
+        "sequence": sequence, "publish_count": state["publish_count"],
+        "reset_count": reset_count, "update_count": update_count,
+        "lap_count": stats["lap_count"], "total_lap_gnss_ns": stats["total_lap_gnss_ns"],
+        "custody_lap_count": stats["custody_lap_count"],
+        "custody_total_lap_gnss_ns": stats["custody_total_lap_gnss_ns"],
+        "welford_grand_ratio_diagnostic": None,
+        "restore_args": args, "campaign_restore": campaign_restore,
+        "pending_seed_dropped": pending,
+    }
+
+
+def slot_positions(runtime, history):
+    """Human-readable producer ring positions; null means an unobserved entry."""
+    slots = runtime.get(history + "_slots", runtime[history + "_history"])
+    return [None if endpoint is None else endpoint["sequence"] for endpoint in slots]
+
+
+def restored_slots(saved, history):
+    """Reinstate ring position, including holes, without losing retained entries."""
+    values = saved[history + "_history"]
+    positions = saved.get(history + "_slots")
+    if positions is None:
+        # The legacy gap implementation retained only a suffix. Missing prefix
+        # positions are unknown, not zero-valued physical endpoints.
+        return ([None] * (saved["expected_" + history + "_count"] - len(values))
+                + copy.deepcopy(values))
+    endpoints = {item["sequence"]: item for item in values}
+    return [None if position is None else copy.deepcopy(endpoints[position])
+            for position in positions]
+
+
+def retain_gap_history(runtime, delta, second_capacity, minute_capacity):
+    """CLOCKS-style retention, extended to explicitly retained missing positions.
+
+    A Pi outage does not erase old producer endpoints. Each unseen SECOND adds
+    one unknown position; only unseen minute boundaries add unknown MINUTEs.
+    Normal bounded-ring eviction still applies. In particular a short outage
+    within one minute leaves every long-window endpoint intact. A later live
+    export replaces unknown positions with actual producer testimony.
+    """
+    from collections import deque
+    missing = {
+        "second": delta["update_count"] - runtime["last_update_count"] - 1,
+        "minute": delta["last_minute_key"] - runtime["last_minute_key"]
+                  - int(delta["minute_append_valid"]),
+    }
+    for history, capacity in (("second", second_capacity), ("minute", minute_capacity)):
+        key = history + "_slots"
+        if key not in runtime:
+            values = list(runtime[history + "_history"])
+            prefix = runtime["expected_" + history + "_count"] - len(values)
+            runtime[key] = deque([None] * prefix + copy.deepcopy(values), maxlen=capacity)
+        runtime[key].extend([None] * min(capacity, max(0, missing[history])))
+        runtime[history + "_history"] = deque(
+            (copy.deepcopy(item) for item in runtime[key] if item is not None),
+            maxlen=capacity,
+        )
+
+
+def append_retained_slot(runtime, history, endpoint, capacity):
+    """Advance both the known endpoints and their original ring positions."""
+    from collections import deque
+    key = history + "_slots"
+    if key in runtime:
+        runtime[key].append(copy.deepcopy(endpoint))
+        runtime[history + "_history"] = deque(
+            (copy.deepcopy(item) for item in runtime[key] if item is not None),
+            maxlen=capacity,
+        )
+
+# ======================================================================
+# PHOTONS: One Pi-owned transaction across the calculations
+# ======================================================================
+
+class AnalysisState:
+    def __init__(self):
+        self.normalizer = Normalizer()
+        self.stability = StabilityAccumulator()
+        self.temperature = TemperatureAccumulator()
+
+    def reset(self):
+        self.normalizer.restore(None)
+        self.stability.reset()
+        self.temperature.reset()
+
+    def restore(self, canonical, checkpoint):
+        """Restore the complete Pi part before authorizing the next observation."""
+        self.stability.restore(canonical)
+        self.temperature.restore(canonical, rolling_checkpoint=(
+            checkpoint.get("temperature_rolling") if checkpoint is not None else None))
+        self.normalizer.restore(
+            checkpoint.get("normalization_state") if checkpoint is not None else None)
+
+    def memory(self):
+        """Private transaction savepoint; not another persistence representation."""
+        return copy.deepcopy((self.normalizer.__dict__, self.stability.__dict__,
+                              self.temperature.__dict__))
+
+    def rollback(self, saved):
+        # Keep the object identities used by the core's single-owner aliases.
+        for component, state in zip((self.normalizer, self.stability, self.temperature), saved):
+            component.__dict__.clear()
+            component.__dict__.update(state)
 
 # ---------------------------------------------------------------------
 # Contract
@@ -175,16 +1677,12 @@ SYSTEM_CONTEXT_FIELDS = (
 # Live state
 # ---------------------------------------------------------------------
 
-# One owner: the ordered state worker. Flash cuts do not reset thermal history.
-_normalizer = Normalizer()
-# Unlike the firmware's rolling Better-Buckets, Pi stability populations are
-# disjoint and campaign-local. One canonical PHOTONS row owns the exact compact
-# restart checkpoint for every scale. No additional Teensy statistics are needed.
-_stability = StabilityAccumulator()
-# Physical temperature witnesses are useful to PHOTONS even when no campaign is
-# recording. The Pi owns their cumulative Welford populations and transient
-# trailing windows; no Teensy firmware or SYSTEM statistical authority changes.
-_temperature_stats = TemperatureAccumulator()
+# One ordered owner, one save/restore transaction, independent of campaign.
+_analysis = AnalysisState()
+_normalizer = _analysis.normalizer
+_stability = _analysis.stability
+_temperature_stats = _analysis.temperature
+_checkpoint_store = CheckpointStore(open_db)
 
 _state_lock = threading.Lock()
 _campaign_lock = threading.Lock()
@@ -2041,7 +3539,7 @@ def _validate_firmware_ppb_checkpoint_delta(stats: Dict[str, Any]) -> Dict[str, 
     }
 
 
-def _ppb_checkpoint_delta_signature(delta: Dict[str, Any]) -> str:
+def _ppb_checkpoint_delta_signature(delta: Dict[str, Any]) -> Dict[str, Any]:
     stable = {
         key: delta.get(key)
         for key in (
@@ -2064,7 +3562,7 @@ def _ppb_checkpoint_delta_signature(delta: Dict[str, Any]) -> str:
             "proof",
         )
     }
-    return json.dumps(stable, sort_keys=True, separators=(",", ":"))
+    return copy.deepcopy(stable)
 
 
 def _ppb_checkpoint_new_runtime(
@@ -2175,6 +3673,8 @@ def _ppb_checkpoint_snapshot_locked(runtime: Dict[str, Any]) -> Dict[str, Any]:
         "minute_count": len(minute_history),
         "second_history": second_history,
         "minute_history": minute_history,
+        "second_slots": slot_positions(runtime, "second"),
+        "minute_slots": slot_positions(runtime, "minute"),
         "contiguous_from_update_count": runtime.get(
             "contiguous_from_update_count"
         ),
@@ -2274,7 +3774,10 @@ def _ppb_checkpoint_ingest(stats: Dict[str, Any]) -> Dict[str, Any]:
             previous_update = None
 
         if previous_update is not None and update_count == int(previous_update):
-            if runtime.get("last_delta_signature") not in (None, signature):
+            previous_signature = runtime.get("last_delta_signature")
+            if isinstance(previous_signature, str):
+                previous_signature = json.loads(previous_signature)
+            if previous_signature is not None and previous_signature != signature:
                 raise RuntimeError(
                     "duplicate PHOTONS checkpoint identity changed producer testimony: "
                     f"reset={reset_count} update={update_count}"
@@ -2320,21 +3823,19 @@ def _ppb_checkpoint_ingest(stats: Dict[str, Any]) -> Dict[str, Any]:
                 "observed_update_count": update_count,
                 "missing_rows": max(0, update_count - int(previous_update) - 1),
             }
-            _ppb_checkpoint_runtime = _ppb_checkpoint_new_runtime(
-                reason="PI_OBSERVATION_GAP",
-                gap_count=int(runtime.get("gap_count") or 0) + 1,
-                last_gap=gap,
-            )
-            runtime = _ppb_checkpoint_runtime
+            if delta["valid"]:
+                retain_gap_history(
+                    runtime, delta, PHOTONS_RECOVERY_SECOND_CAPACITY,
+                    PHOTONS_RECOVERY_MINUTE_CAPACITY,
+                )
+            runtime["gap_count"] = int(runtime.get("gap_count") or 0) + 1
+            runtime["last_gap"] = gap
+            runtime["contiguous_from_update_count"] = update_count
             _ppb_checkpoint_gap_count += 1
 
-            # A Pi observation gap destroys Pi-owned literal ring custody, but it
-            # does not destroy the surviving Teensy producer's Better-Buckets
-            # ancestry.  During startup live adoption we deliberately do not query the
-            # healthy producer; the checkpoint remains warming from ordinary deltas.
-            # During ordinary RUNNING state, a newly detected gap may still request the
-            # existing read-only producer-authority reacquisition asynchronously.
-            # Never reconstruct the missing rows locally.
+            # Preserve every still-retained endpoint and explicitly account for
+            # unobserved ring positions. Reacquire holes from a surviving
+            # producer, not by waiting another day or replaying PostgreSQL.
             if _campaign_control_ready.is_set():
                 _ppb_checkpoint_reacquire_request_count += 1
                 _ppb_checkpoint_reacquire_requested.set()
@@ -2403,6 +3904,8 @@ def _ppb_checkpoint_ingest(stats: Dict[str, Any]) -> Dict[str, Any]:
         ):
             raise RuntimeError("PHOTONS second append is not newer than Pi ledger tail")
         runtime["second_history"].append(second_endpoint)
+        append_retained_slot(runtime, "second", second_endpoint,
+                             PHOTONS_RECOVERY_SECOND_CAPACITY)
 
         if delta["minute_append_valid"]:
             minute_endpoint = copy.deepcopy(delta["minute_append"])
@@ -2413,6 +3916,8 @@ def _ppb_checkpoint_ingest(stats: Dict[str, Any]) -> Dict[str, Any]:
                     "PHOTONS minute append is not newer than Pi ledger tail"
                 )
             runtime["minute_history"].append(minute_endpoint)
+            append_retained_slot(runtime, "minute", minute_endpoint,
+                                 PHOTONS_RECOVERY_MINUTE_CAPACITY)
 
         runtime["reset_count"] = reset_count
         runtime["last_update_count"] = update_count
@@ -2560,6 +4065,10 @@ def _normalize_saved_ppb_checkpoint(value: Any) -> Dict[str, Any]:
     runtime["current"] = current
     runtime["second_history"].extend(copy.deepcopy(second_history))
     runtime["minute_history"].extend(copy.deepcopy(minute_history))
+    runtime["second_slots"] = deque(restored_slots(value, "second"),
+                                    maxlen=PHOTONS_RECOVERY_SECOND_CAPACITY)
+    runtime["minute_slots"] = deque(restored_slots(value, "minute"),
+                                    maxlen=PHOTONS_RECOVERY_MINUTE_CAPACITY)
     runtime["contiguous_from_update_count"] = value.get(
         "contiguous_from_update_count"
     )
@@ -2578,59 +4087,18 @@ def _normalize_saved_ppb_checkpoint(value: Any) -> Dict[str, Any]:
 
 def _write_photons_recovery_config(
     cur: Any, checkpoint: Dict[str, Any], temperature_rolling: Optional[Dict[str, Any]] = None,
+    *, canonical=None, source_detail_id=None, normalization_state=None,
 ) -> None:
-    """Persist ONE atomically owned PHOTONS recovery singleton.
-
-    The existing Pi-owned literal Better-Buckets proof and the new bounded
-    temperature ring are one committed recovery image. Only the latter is
-    replaced in place rather than redundantly written into all PHOTONS details.
-    This update uses the SAME transaction as campaign_detail's canonical row.
-    """
-    normalized = _normalize_saved_ppb_checkpoint(checkpoint)
-    if temperature_rolling is not None:
-        normalized["temperature_rolling"] = copy.deepcopy(temperature_rolling)
-    encoded = json.dumps(normalized, separators=(",", ":"))
-    cur.execute(
-        "UPDATE config SET payload = %s::jsonb WHERE config_key = %s",
-        (encoded, PHOTONS_RECOVERY_CONFIG_KEY),
+    """Commit the complete literal continuation with its exact observation owner."""
+    _checkpoint_store.write(
+        cur, checkpoint, temperature_rolling, canonical=canonical,
+        source_detail_id=source_detail_id, normalization_state=normalization_state,
     )
-    if cur.rowcount > 1:
-        raise RuntimeError(
-            f"config.{PHOTONS_RECOVERY_CONFIG_KEY} is not a singleton: rows={cur.rowcount}"
-        )
-    if cur.rowcount == 0:
-        cur.execute(
-            "INSERT INTO config (config_key, payload) VALUES (%s, %s::jsonb)",
-            (PHOTONS_RECOVERY_CONFIG_KEY, encoded),
-        )
-        if cur.rowcount != 1:
-            raise RuntimeError(
-                f"config.{PHOTONS_RECOVERY_CONFIG_KEY} insert did not create exactly one row"
-            )
 
 
 def _read_photons_recovery_config() -> Optional[Dict[str, Any]]:
-    """Read config.PHOTONS_RECOVERY, or None before the first durable checkpoint."""
-    with open_db(row_dict=True) as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT payload FROM config WHERE config_key = %s",
-            (PHOTONS_RECOVERY_CONFIG_KEY,),
-        )
-        row = cur.fetchone()
-    if row is None:
-        return None
-    payload = row["payload"]
-    if isinstance(payload, str):
-        payload = json.loads(payload)
-    normalized = _normalize_saved_ppb_checkpoint(payload)
-    # Normalization of the Teensy's literal ring intentionally accepts only
-    # its familiar fields. Carry this Pi-owned extension unchanged to the
-    # already-selected temperature recovery court; it validates sequence,
-    # firmware update_count, source sensor witnesses, image bounds and SHA256.
-    if "temperature_rolling" in payload:
-        normalized["temperature_rolling"] = copy.deepcopy(payload["temperature_rolling"])
-    return normalized
+    """Read one current-state singleton without losing Pi-owned extensions."""
+    return _checkpoint_store.read()
 
 
 def _retire_orphaned_photons_recovery_config_if_domain_empty() -> Dict[str, Any]:
@@ -2705,20 +4173,13 @@ def _retire_orphaned_photons_recovery_config_if_domain_empty() -> Dict[str, Any]
 def _photons_checkpoint_receipt_summary(
     checkpoint: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """Fingerprint one exact private PHOTONS checkpoint without copying its rings."""
+    """Report literal source coordinates and ring counts, not a fingerprint."""
     if checkpoint is None:
-        return {
-            "schema": PHOTONS_PPB_PI_CHECKPOINT_SCHEMA,
-            "sha256": None,
-            "digest_available": False,
-            "digest_reason": "SOURCE_CHECKPOINT_NOT_RETAINED_ACROSS_PRIOR_COMMIT",
-        }
-    saved = _normalize_saved_ppb_checkpoint(checkpoint)
-    encoded = json.dumps(saved, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return {"source": "NOT_RETAINED_BY_LEGACY_WRITER"}
+    saved = checkpoint
     return {
         "schema": saved.get("schema"),
-        "sha256": hashlib.sha256(encoded).hexdigest(),
-        "digest_available": True,
+        "source_detail_id": saved.get("durable_source_detail_id"),
         "reset_count": int(saved["reset_count"]),
         "update_count": int(saved["update_count"]),
         "current_sequence": int(saved["current_sequence"]),
@@ -2739,39 +4200,10 @@ def _find_photons_recovery_source_detail_id(
     source_reset_count: int,
     source_update_count: int,
 ) -> int:
-    """Resolve firmware source identity to exactly one earlier canonical PHOTONS row."""
-    with open_db(row_dict=True) as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT id
-            FROM campaign_detail
-            WHERE campaign_type = %s
-              AND id < %s
-              AND payload #>> '{schema}' = %s
-              AND payload #>> '{sequence}' = %s
-              AND payload #>> '{photons,stats,reset_count}' = %s
-              AND payload #>> '{photons,stats,update_count}' = %s
-            ORDER BY id DESC
-            LIMIT 2
-            """,
-            (
-                CAMPAIGN_TYPE_LANTERN,
-                int(boundary_detail_id),
-                PHOTONS_SCHEMA,
-                str(int(source_sequence)),
-                str(int(source_reset_count)),
-                str(int(source_update_count)),
-            ),
-        )
-        rows = cur.fetchall()
-    if len(rows) != 1:
-        raise RuntimeError(
-            "PHOTONS recovery source identity is not unique: "
-            f"boundary={boundary_detail_id} sequence={source_sequence} "
-            f"reset/update={source_reset_count}/{source_update_count} rows={len(rows)}"
-        )
-    return int(rows[0]["id"])
+    """Use the source ID committed before RECOVERY_BEGIN, without history SQL."""
+    return _checkpoint_store.original_source_id(
+        source_sequence, source_reset_count, source_update_count,
+    )
 
 
 def _record_photons_recovery_receipt(
@@ -2818,7 +4250,10 @@ def _record_photons_recovery_receipt(
         )
 
     mode = str(recovery_mode).strip().upper()
-    exact_n_plus_1 = mode in {"HELD_RESTORE", "PENDING_RESTORE_PROOF"}
+    # A fresh restore proves N+1. A Pi that itself restarted during that
+    # handshake may first durably observe a later, real descendant. Preserve
+    # that distinction; do not hunt for or manufacture a missing first row.
+    exact_n_plus_1 = mode == "HELD_RESTORE"
     checkpoint_summary = _photons_checkpoint_receipt_summary(source_checkpoint)
     if source_checkpoint is not None and (
         int(checkpoint_summary["reset_count"]) != source_reset
@@ -2988,11 +4423,10 @@ def _record_photons_recovery_receipt(
 
     logging.info(
         "🧾 [photons/recovery] durable recovery receipt recorded: mode=%s source_id=%d "
-        "boundary_id=%d checkpoint_sha256=%s",
+        "boundary_id=%d",
         mode,
         int(source_id),
         int(boundary_id),
-        checkpoint_summary.get("sha256") or "UNAVAILABLE",
     )
     return receipt
 
@@ -3000,28 +4434,13 @@ def _record_photons_recovery_receipt(
 def _photons_recovery_source_row(
     checkpoint: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
-    """Return the durable PHOTONS row whose statistics identity owns checkpoint."""
-    saved = _normalize_saved_ppb_checkpoint(checkpoint)
-    with open_db(row_dict=True) as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT id, campaign
-            FROM campaign_detail
-            WHERE campaign_type = %s
-              AND payload #>> '{photons,stats,reset_count}' = %s
-              AND payload #>> '{photons,stats,update_count}' = %s
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (
-                CAMPAIGN_TYPE_LANTERN,
-                str(int(saved["reset_count"])),
-                str(int(saved["update_count"])),
-            ),
-        )
-        row = cur.fetchone()
-    return copy.deepcopy(row) if isinstance(row, dict) else None
+    """Return the singleton's exact owner; never rediscover it by JSON statistics."""
+    if "canonical" in checkpoint:
+        campaign = checkpoint["canonical"].get("campaign") or {}
+        return {"id": checkpoint["durable_source_detail_id"],
+                "campaign": campaign.get("campaign")}
+    row = _checkpoint_store.load_source()
+    return None if row is None else {"id": row["id"], "campaign": row["campaign"]}
 
 
 def _checkpoint_matches_photons_state(
@@ -3059,9 +4478,9 @@ def _checkpoint_matches_photons_source(
         == int(source["update_count"])
         and _require_int(current.get("sequence"), "PHOTONS recovery current.sequence", minimum=1)
         == int(source["update_count"])
-        and _require_int(current.get("lap_count"), "PHOTONS recovery current.lap_count", minimum=1)
+        and _require_int(current.get("lap_count"), "PHOTONS recovery current.lap_count")
         == int(source["lap_count"])
-        and _require_int(current.get("total_lap_gnss_ns"), "PHOTONS recovery current.total_lap_gnss_ns", minimum=1)
+        and _require_int(current.get("total_lap_gnss_ns"), "PHOTONS recovery current.total_lap_gnss_ns")
         == int(source["total_lap_gnss_ns"])
     )
 
@@ -3069,7 +4488,9 @@ def _checkpoint_matches_photons_source(
 def _recovery_checkpoint_for_selected_row(
     row: Dict[str, Any], source: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """Load singleton recovery custody, migrating one legacy embedded row if needed."""
+    """Use the exact checkpoint loaded with this source, not a newer second read."""
+    if "_recovery_checkpoint" in row:
+        return copy.deepcopy(row["_recovery_checkpoint"])
     checkpoint = _read_photons_recovery_config()
     if checkpoint is None:
         payload = row.get("payload")
@@ -3311,6 +4732,10 @@ def _restore_ppb_checkpoint_runtime(
         runtime["current"] = copy.deepcopy(saved["current"])
         runtime["second_history"].extend(copy.deepcopy(saved["second_history"]))
         runtime["minute_history"].extend(copy.deepcopy(saved["minute_history"]))
+        runtime["second_slots"] = deque(restored_slots(saved, "second"),
+                                        maxlen=PHOTONS_RECOVERY_SECOND_CAPACITY)
+        runtime["minute_slots"] = deque(restored_slots(saved, "minute"),
+                                        maxlen=PHOTONS_RECOVERY_MINUTE_CAPACITY)
         runtime["contiguous_from_update_count"] = saved.get(
             "contiguous_from_update_count"
         )
@@ -3415,6 +4840,12 @@ def _adopt_held_restore_checkpoint_runtime(
         runtime["minute_history"].extend(copy.deepcopy(minute_history))
         runtime["expected_second_count"] = len(second_history)
         runtime["expected_minute_count"] = len(minute_history)
+        # A newborn owns exactly the literal entries just installed. Unknown
+        # positions from its predecessor are not fabricated firmware endpoints.
+        runtime["second_slots"] = deque(copy.deepcopy(second_history),
+                                        maxlen=PHOTONS_RECOVERY_SECOND_CAPACITY)
+        runtime["minute_slots"] = deque(copy.deepcopy(minute_history),
+                                        maxlen=PHOTONS_RECOVERY_MINUTE_CAPACITY)
         runtime["seed_source"] = (
             "DURABLE_LITERAL_SUFFIX_HELD_RESTORE"
             if literal_history.get("history_truncated")
@@ -3457,6 +4888,83 @@ def _ppb_checkpoint_report_surface() -> Dict[str, Any]:
                 _ppb_checkpoint_reacquire_last_failure
             ),
         }
+
+
+def _restore_photons_pi_state(snapshot):
+    """One recovery entry point for all Pi populations and the current readout."""
+    global _latest_photons
+    canonical = snapshot.canonical if snapshot is not None else None
+    checkpoint = snapshot.ppb_restore_checkpoint if snapshot is not None else None
+    _analysis.restore(canonical, checkpoint)
+    with _state_lock:
+        _latest_photons = copy.deepcopy(canonical)
+
+
+def _state_transaction_savepoint():
+    # Called with the existing maintenance lock held by the state owner.
+    with _ppb_checkpoint_lock, _campaign_lock:
+        return (_analysis.memory(), copy.deepcopy(_ppb_checkpoint_runtime),
+                copy.deepcopy(_active_campaign), copy.deepcopy(_closing_campaigns))
+
+
+def _state_transaction_rollback(saved):
+    global _ppb_checkpoint_runtime, _active_campaign, _closing_campaigns
+    with _ppb_checkpoint_lock, _campaign_lock:
+        _analysis.rollback(saved[0])
+        _ppb_checkpoint_runtime = saved[1]
+        _active_campaign, _closing_campaigns = saved[2], saved[3]
+
+
+def _active_lantern_has_committed_state(master):
+    if master is None:
+        return False
+    saved = _read_photons_recovery_config()
+    if saved is not None and "canonical" in saved:
+        campaign = saved["canonical"].get("campaign") or {}
+        return (campaign.get("campaign_id") == master["campaign_id"]
+                and campaign.get("public_count", 0) > 0)
+    # Only the pre-holistic first-upgrade path needs this legacy head probe.
+    return _lantern_campaign_has_details(master["campaign"])
+
+
+def _complete_live_checkpoint():
+    """Do not call recovery complete while producer-ring custody is warming.
+
+    Ordinary gap-free reuse costs no producer RPC. Missing positions are fetched
+    read-only from the survivor, then the controller waits for their aligned
+    observation + whole checkpoint to cross the normal persistence transaction.
+    Neither this controller nor the export worker writes a competing snapshot.
+    """
+    with _ppb_checkpoint_lock:
+        current = _ppb_checkpoint_snapshot_locked(_ppb_checkpoint_runtime_ensure_locked())
+    if (current["status"] in {"RECOVERABLE", "WAITING_FOR_FIRST_RACE"} and
+            current["second_count"] == current["expected_second_count"] and
+            current["minute_count"] == current["expected_minute_count"]):
+        result = {"refreshed": False, "teensy_rpc_used": False,
+                  "basis": "RETAINED_PRODUCER_ENDPOINTS",
+                  "reset_count": current["reset_count"], "update_count": current["update_count"]}
+    else:
+        result = _refresh_ppb_checkpoint_from_live_photons()
+        result["teensy_rpc_used"] = True
+    deadline = time.monotonic() + PHOTONS_RECOVERY_PROOF_TIMEOUT_S
+    while time.monotonic() < deadline:
+        saved = _read_photons_recovery_config()
+        if saved is not None:
+            if saved["reset_count"] != result["reset_count"]:
+                raise RuntimeError("PHOTONS epoch changed during live checkpoint completion")
+            if (saved["status"] in {"RECOVERABLE", "WAITING_FOR_FIRST_RACE"} and
+                    saved["update_count"] >= result["update_count"] and
+                    saved["second_count"] == saved["expected_second_count"] and
+                    saved["minute_count"] == saved["expected_minute_count"]):
+                return {**result, "durable_source_detail_id": saved["durable_source_detail_id"],
+                        "durable_update_count": saved["update_count"],
+                        "status": saved["status"], "recoverable": saved["recoverable"],
+                        "second_count": saved["second_count"],
+                        "minute_count": saved["minute_count"]}
+        if _hard_failure_active():
+            raise RuntimeError("PHOTONS failed before whole live checkpoint reached durability")
+        time.sleep(0.05)
+    raise RuntimeError("PHOTONS whole live checkpoint did not reach durability")
 
 
 def _make_photons(
@@ -4096,10 +5604,8 @@ def _photons_recovery_snapshot_from_row(
     require_active_campaign: bool,
 ) -> _PhotonsRecoverySnapshot:
     """Bind one canonical PHOTONS row to its exact singleton recovery sidecar."""
-    source = _canonical_recovery_state_from_row(
-        row,
-        active_master=active_master,
-        require_active_campaign=require_active_campaign,
+    source = prepare_source(
+        row, active_master, restore_schema_version=PHOTONS_RECOVERY_SCHEMA_VERSION,
     )
     checkpoint = _recovery_checkpoint_for_selected_row(row, source)
     if not _checkpoint_matches_photons_source(checkpoint, source):
@@ -4404,36 +5910,11 @@ def _load_newest_recovery_or_empty_heartbeat(
     int,
     Optional[Dict[str, Any]],
 ]:
-    """Classify newest durable PHOTONS without treating empty heartbeat as corruption."""
-    try:
-        snapshot, skipped, rows_scanned = _load_newest_recoverable_photons_state(
-            active_master=active_master,
-            require_active_campaign=require_active_campaign,
-        )
-        return snapshot, skipped, rows_scanned, None
-    except RuntimeError as exc:
-        empty = _load_newest_empty_photons_heartbeat_state(
-            active_master=active_master,
-            require_active_campaign=require_active_campaign,
-        )
-        if empty is None:
-            raise
-        logging.warning(
-            "🫀 [photons/recovery] newest durable PHOTONS row id=%d is a lawful "
-            "zero-race heartbeat epoch, not a resurrection source; preserving it "
-            "without falling back to older science: %s",
-            int(empty["detail_id"]),
-            exc,
-        )
-        return (
-            None,
-            [{
-                "id": int(empty["detail_id"]),
-                "reason": "LAWFUL_EMPTY_HEARTBEAT_NOT_RESURRECTION_SOURCE",
-            }],
-            1,
-            empty,
-        )
+    """Zero races do not make existing temperature/chronology state disposable."""
+    snapshot, skipped, rows_scanned = _load_newest_recoverable_photons_state(
+        active_master=active_master, require_active_campaign=require_active_campaign,
+    )
+    return snapshot, skipped, rows_scanned, None
 
 
 def _load_newest_recoverable_photons_state(
@@ -4441,42 +5922,8 @@ def _load_newest_recoverable_photons_state(
     active_master: Optional[Dict[str, Any]],
     require_active_campaign: bool,
 ) -> Tuple[Optional[_PhotonsRecoverySnapshot], List[Dict[str, Any]], int]:
-    """Return the newest declarative PHOTONS snapshot or fail on contradiction.
-
-    Phase 3 forbids ancestry search-by-convenience.  Once durable PHOTONS history
-    exists, a newer row that fails the recovery court is evidence of a contradiction,
-    not permission to walk backward until an older row happens to pass.
-    """
-    with open_db(row_dict=True) as conn:
-        cur = conn.cursor()
-        if require_active_campaign:
-            assert active_master is not None
-            cur.execute(
-                """
-                SELECT id, ts, campaign, viable, payload, sequence, pps_count
-                FROM campaign_detail
-                WHERE campaign_type = %s
-                  AND campaign = %s
-                  AND payload #>> '{photons,source}' = %s
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (CAMPAIGN_TYPE_LANTERN, active_master["campaign"], "PD200T_REAL_RACE"),
-            )
-        else:
-            cur.execute(
-                """
-                SELECT id, ts, campaign, viable, payload, sequence, pps_count
-                FROM campaign_detail
-                WHERE campaign_type = %s
-                  AND payload #>> '{photons,source}' = %s
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (CAMPAIGN_TYPE_LANTERN, "PD200T_REAL_RACE"),
-            )
-        row = cur.fetchone()
-
+    """Read the complete current state, without a campaign/history predicate."""
+    row = _checkpoint_store.load_source()
     if row is None:
         return None, [], 0
 
@@ -5041,7 +6488,15 @@ def _ppb_export_collect_history(
     return ordered, complete
 
 
+_ppb_live_export_lock = threading.Lock()
+
+
 def _refresh_ppb_checkpoint_from_live_photons() -> Dict[str, Any]:
+    with _ppb_live_export_lock:
+        return _refresh_ppb_checkpoint_from_live_photons_owned()
+
+
+def _refresh_ppb_checkpoint_from_live_photons_owned() -> Dict[str, Any]:
     """Reacquire exact Better-Buckets rings from a proved surviving PHOTONS producer."""
     started = time.monotonic()
     attempts = 0
@@ -5770,8 +7225,12 @@ def _recovery_proof_matches(
             return False
         return (
             reset_count == int(expected["source_reset_count"])
-            and sequence == int(expected["source_sequence"]) + 1
-            and update_count == int(expected["source_update_count"]) + 1
+            and sequence > int(expected["source_sequence"])
+            and update_count > int(expected["source_update_count"])
+            and sequence - int(expected["source_sequence"])
+                == update_count - int(expected["source_update_count"])
+            and (mode == "FIRMWARE_PENDING_PROOF" or
+                 sequence == int(expected["source_sequence"]) + 1)
             and lap_count >= int(expected["source_lap_count"])
             and total_ns >= int(expected["source_total_lap_gnss_ns"])
             and custody_laps >= int(expected["source_custody_lap_count"])
@@ -5865,47 +7324,8 @@ def _note_recovery_proof_persisted(
 def _find_durable_firmware_proof(
     *, generation: int, sequence: int, update_count: int
 ) -> Optional[Dict[str, Any]]:
-    if generation <= 0 or sequence <= 0 or update_count <= 0:
-        return None
-    with open_db(row_dict=True) as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT id, payload
-            FROM campaign_detail
-            WHERE campaign_type = %s
-              AND sequence = %s
-            ORDER BY id DESC
-            LIMIT 32
-            """,
-            (CAMPAIGN_TYPE_LANTERN, sequence),
-        )
-        rows = cur.fetchall()
-    for row in rows:
-        payload = row["payload"]
-        if isinstance(payload, str):
-            payload = json.loads(payload)
-        if not isinstance(payload, dict):
-            continue
-        instrument = payload.get("photons")
-        recovery = instrument.get("recovery") if isinstance(instrument, dict) else None
-        stats = instrument.get("stats") if isinstance(instrument, dict) else None
-        if not isinstance(recovery, dict) or not isinstance(stats, dict):
-            continue
-        try:
-            if (
-                _require_int(recovery.get("generation"), "durable proof generation")
-                == generation
-                and _require_int(payload.get("sequence"), "durable proof sequence")
-                == sequence
-                and _require_int(stats.get("update_count"), "durable proof update")
-                == update_count
-                and _require_bool(recovery.get("proof_advanced"), "durable proof advanced")
-            ):
-                return {"detail_id": int(row["id"]), "canonical": copy.deepcopy(payload)}
-        except Exception:
-            continue
-    return None
+    """Resume an interrupted ACK by its saved row ID, never by a history search."""
+    return _checkpoint_store.find_proof(generation, sequence, update_count)
 
 
 def _wait_for_recovery_proof() -> Dict[str, Any]:
@@ -5935,6 +7355,7 @@ def _acknowledge_recovery_proof(proof: Dict[str, Any]) -> None:
         },
         accepted_statuses={"recovery_proof_committed"},
     )
+    _checkpoint_store.acknowledge_restore(int(proof["generation"]))
 
 
 def _stage_recovery_history(
@@ -6271,6 +7692,7 @@ def _startup_finish_pending_recovery_proof(
     campaign_adoption = _adopt_live_lantern_state(
         active_master,
         live_report=broad,
+        durable_cursor_source=live_campaign_cursor(source),
     )
     _start_workers()
     proof = _wait_for_recovery_proof()
@@ -6285,7 +7707,7 @@ def _startup_finish_pending_recovery_proof(
         producer_mutated=True,
     )
     _acknowledge_recovery_proof(proof)
-    ppb_live_refresh = _refresh_ppb_checkpoint_from_live_photons()
+    ppb_live_refresh = _complete_live_checkpoint()
 
     if campaign_adoption["active_master"]:
         _mark_active_campaign_recovered(
@@ -6425,6 +7847,7 @@ def _startup_held_restore(
             "update_count": int(source["update_count"]) + 1,
         },
     )
+    _checkpoint_store.begin_restore(source, generation)
     try:
         staged = _stage_recovery_history(generation=generation, history=literal_history)
         commit_args = copy.deepcopy(restore_args)
@@ -6577,8 +8000,7 @@ def _startup_cold_start(
     drained = _retire_fragment_queue_via_owner("COLD_START")
     # The authorized fresh epoch reuses reset/update identities from zero. Drop
     # the previous epoch's Pi ledger before firmware can publish its first row.
-    _stability.reset()
-    _temperature_stats.reset()
+    _analysis.reset()
     with _ppb_checkpoint_lock:
         _ppb_checkpoint_runtime = _ppb_checkpoint_new_runtime(reason="COLD_START")
     _arm_recovery_proof({
@@ -6647,7 +8069,7 @@ def _startup_adopt_live_producer(
     skipped: List[Dict[str, Any]],
     rows_scanned: int,
 ) -> Dict[str, Any]:
-    """Adopt a current-session PHOTONS_FRAGMENT descendant with zero Teensy RPC."""
+    """Adopt a survivor without mutation, completing any missing ring custody."""
     global _recovery_live_adopt_count
 
     if bool(live_witness.get("proof_pending")):
@@ -6662,7 +8084,7 @@ def _startup_adopt_live_producer(
     campaign_adoption = _adopt_live_lantern_state(
         active_master,
         live_report=live_report,
-        durable_cursor_source=source,
+        durable_cursor_source=live_campaign_cursor(source),
     )
 
     expected = {"mode": "LIVE_PRODUCER_ADOPT", **floor}
@@ -6679,28 +8101,7 @@ def _startup_adopt_live_producer(
     try:
         _start_workers()
         proof = _wait_for_recovery_proof()
-        with _ppb_checkpoint_lock:
-            ppb_snapshot = _ppb_checkpoint_snapshot_locked(
-                _ppb_checkpoint_runtime_ensure_locked()
-            )
-        ppb_live_refresh = {
-            "refreshed": False,
-            "basis": "PHOTONS_FRAGMENT_DELTA_CUSTODY",
-            "teensy_rpc_used": False,
-            "recoverable": bool(ppb_snapshot.get("recoverable")),
-            "status": ppb_snapshot.get("status"),
-            "reset_count": ppb_snapshot.get("reset_count"),
-            "update_count": ppb_snapshot.get("update_count"),
-            "second_count": int(ppb_snapshot.get("second_count") or 0),
-            "expected_second_count": int(
-                ppb_snapshot.get("expected_second_count") or 0
-            ),
-            "minute_count": int(ppb_snapshot.get("minute_count") or 0),
-            "expected_minute_count": int(
-                ppb_snapshot.get("expected_minute_count") or 0
-            ),
-            "gap_count": int(ppb_snapshot.get("gap_count") or 0),
-        }
+        ppb_live_refresh = _complete_live_checkpoint()
     finally:
         _startup_live_adopt_custody_active.clear()
 
@@ -6737,13 +8138,14 @@ def _startup_adopt_live_producer(
         "producer_reuse": True,
         "producer_mutated": False,
         "producer_mutation_commands": [],
-        "teensy_rpc_used": False,
-        "survival_witness_source": "PHOTONS_FRAGMENT",
+        "teensy_rpc_used": (bool(ppb_live_refresh["teensy_rpc_used"])
+                            or live_witness.get("source") == "REPORT_RECOVERY"),
+        "survival_witness_source": live_witness.get("source", "PHOTONS_FRAGMENT"),
     }
     _recovery_status_set("COMPLETE", **result)
     logging.info(
-        "✅ [photons/recovery] current-session PHOTONS_FRAGMENT proved surviving "
-        "producer with zero Teensy RPC: sequence=%s update=%s campaign=%s/%s",
+        "✅ [photons/recovery] surviving producer adopted with complete durable "
+        "state: sequence=%s update=%s campaign=%s/%s",
         floor.get("sequence"),
         floor.get("update_count"),
         live_report.get("campaign") or "NONE",
@@ -6767,7 +8169,10 @@ def _perform_phase5_recovery(
     try:
         # Classify the producer using read-only testimony. A live producer must
         # never receive a restore mutation merely because the Pi restarted.
-        empty_domain = _retire_orphaned_photons_recovery_config_if_domain_empty()
+        saved_state = _read_photons_recovery_config()
+        empty_domain = ({"domain_empty": False}
+                        if saved_state is not None and "canonical" in saved_state else
+                        _retire_orphaned_photons_recovery_config_if_domain_empty())
         if empty_domain.get("domain_empty"):
             logging.warning(
                 "🧹 [photons/recovery] durable LANTERN domain is empty "
@@ -6778,7 +8183,9 @@ def _perform_phase5_recovery(
             )
 
         active_master = _load_active_lantern_master()
-        migration = _acquisition_epoch_migration()
+        migration = (None if saved_state is not None and "canonical" in saved_state
+                     and saved_state["canonical"]["photons"]["stats"]["acquisition_id"] == ACQUISITION_ID
+                     else _acquisition_epoch_migration())
         if migration is not None:
             report = _fetch_teensy_recovery_report()
             if (report["publication_started"] or report["staging_active"]
@@ -6800,11 +8207,7 @@ def _perform_phase5_recovery(
                 rows_seen=migration["historical_detail_rows_preserved"],
                 source_epoch_migration=migration,
             )
-        active_detail_present = (
-            _lantern_campaign_has_details(active_master["campaign"])
-            if active_master is not None
-            else False
-        )
+        active_detail_present = _active_lantern_has_committed_state(active_master)
         require_active_campaign = active_master is not None and active_detail_present
         snapshot, skipped, rows_scanned, empty_heartbeat_epoch = (
             _load_newest_recovery_or_empty_heartbeat(
@@ -6871,18 +8274,7 @@ def _perform_phase5_recovery(
         # the one-second measurement, so no independently advancing cursor exists.
         # Old pre-stability rows start with explicitly partial history; never
         # reconstruct or invent unseen measurements during startup.
-        _stability.restore(snapshot.canonical if snapshot is not None else None)
-        # The one source selected by Phase-5 supplies BOTH components of
-        # temperature continuation: TOTAL/CAMP Welford checkpoint in canonical
-        # PHOTONS and the short-second/long-minute ring from the ALREADY-LOADED
-        # config.PHOTONS_RECOVERY singleton. No additional SQL or history replay.
-        # Older source images legitimately lack the rolling extension; those
-        # windows begin visibly partial, but TOTAL/CAMP retain exact lineage.
-        _temperature_stats.restore(
-            snapshot.canonical if snapshot is not None else None,
-            rolling_checkpoint=(snapshot.ppb_restore_checkpoint.get("temperature_rolling")
-                                if snapshot is not None else None),
-        )
+        _restore_photons_pi_state(snapshot)
 
         if snapshot is not None:
             # Seed Pi-owned literal custody before either live adoption or held
@@ -7107,13 +8499,19 @@ def _perform_phase5_recovery(
         if report["publication_started"]:
             if not isinstance(broad_preflight, dict):
                 raise RuntimeError("live PHOTONS recovery lacks broad preflight testimony")
+            # The report fallback uses the same non-mutating adoption contract
+            # as a current-session fragment; do not call it with retired keywords.
+            witness = {
+                "floor": _validate_live_teensy_against_durable_source(report, source),
+                "campaign_report": broad_preflight,
+                "proof_pending": False,
+                "producer_recovery_generation": report["generation"],
+                "source": "REPORT_RECOVERY",
+            }
             return _startup_adopt_live_producer(
-                active_master=active_master,
-                source=source,
-                recovery_report=report,
-                broad_report=broad_preflight,
-                skipped=skipped,
-                rows_scanned=rows_scanned,
+                active_master=active_master, source=source, live_witness=witness,
+                transport_generation=int(transport_generation or _runtime_teensy_rpc_generation() or 0),
+                skipped=skipped, rows_scanned=rows_scanned,
             )
         if source is None:
             return _startup_cold_start(
@@ -7333,7 +8731,7 @@ def _lantern_report_from_photons(photons: Payload) -> Dict[str, Any]:
 
 def _persist_photons(
     photons: Payload, checkpoint: Dict[str, Any],
-    temperature_rolling: Dict[str, Any],
+    temperature_rolling: Dict[str, Any], normalization_state: Dict[str, Any],
 ) -> int:
     """Persist one canonical PHOTONS row and advance the LANTERN read model.
 
@@ -7504,7 +8902,11 @@ def _persist_photons(
         # The exact rolling continuation is stored in the same singleton
         # as the existing PHOTONS firmware restore image, inside the SAME
         # transaction as the canonical measurement and cumulative Welfords.
-        _write_photons_recovery_config(cur, checkpoint, temperature_rolling)
+        _write_photons_recovery_config(
+            cur, checkpoint, temperature_rolling,
+            canonical=photons_for_storage, source_detail_id=detail_id,
+            normalization_state=normalization_state,
+        )
 
     # Crossing the open_db context is the irreversible durability boundary.
     # Return the committed identity to the worker; post-commit recovery-proof
@@ -7760,6 +9162,7 @@ def _state_loop() -> None:
                         _hard_failure_state_dropped += 1
                     continue
 
+                savepoint = _state_transaction_savepoint()
                 try:
                     photons, ppb_restore_checkpoint = _make_photons(
                         fragment, system_context
@@ -7848,9 +9251,9 @@ def _state_loop() -> None:
                     # exact last committed measurement + its checkpoint.
                     temperature_input = _temperature_stats.preflight(photons)
                     photons["stability"] = _stability.ingest(photons)
-                    # Temperature TOTAL/CAMP checkpoints join this exact same
-                    # canonical record; trailing windows are reconstructed from
-                    # persisted source observations if the Pi restarts.
+                    # Temperature TOTAL/CAMP and trailing expiration state join
+                    # this exact observation. Restore assigns the saved state;
+                    # it does not read/replay historical observations.
                     photons["temperature_stats"] = _temperature_stats.ingest(
                         photons, prepared=temperature_input
                     )
@@ -7858,7 +9261,9 @@ def _state_loop() -> None:
                     # worker. The persist worker may lag by seconds or minutes;
                     # querying its live calculator later would splice cursors.
                     temperature_rolling = _temperature_stats.rolling_checkpoint()
+                    normalization_state = _normalizer.checkpoint()
                 except Exception as exc:
+                    _state_transaction_rollback(savepoint)
                     rejection = {
                         "rejected_at_utc": _utc_now_z(),
                         "reason": str(exc),
@@ -7903,6 +9308,7 @@ def _state_loop() -> None:
                         "photons": copy.deepcopy(photons),
                         "ppb_restore_checkpoint": copy.deepcopy(ppb_restore_checkpoint),
                         "temperature_rolling_checkpoint": temperature_rolling,
+                        "normalization_state": normalization_state,
                     }
                 )
                 _note_persist_queue_depth()
@@ -7962,7 +9368,9 @@ def _persistence_loop() -> None:
                 while True:
                     try:
                         detail_id = _persist_photons(
-                            photons, checkpoint, temperature_rolling)
+                            photons, checkpoint, temperature_rolling,
+                            persist_item["normalization_state"],
+                        )
                         with _state_lock:
                             _rows_persisted += 1
                     except Exception as exc:
@@ -8104,11 +9512,7 @@ def _runtime_reconcile_teensy_generation(previous_generation: int,
         # can simply release the hold with zero Teensy RPC.
         survival_barrier = time.monotonic()
         active_master = _load_active_lantern_master()
-        active_detail_present = (
-            _lantern_campaign_has_details(active_master["campaign"])
-            if active_master is not None
-            else False
-        )
+        active_detail_present = _active_lantern_has_committed_state(active_master)
         snapshot, _skipped, _rows_scanned, _empty_heartbeat_epoch = (
             _load_newest_recovery_or_empty_heartbeat(
                 active_master=active_master,
@@ -8141,6 +9545,7 @@ def _runtime_reconcile_teensy_generation(previous_generation: int,
 
         if live_witness is not None and not live_witness.get("proof_pending"):
             _runtime_recovery_hold.clear()
+            ppb_live_refresh = _complete_live_checkpoint()
             _campaign_control_ready.set()
             _runtime_recovery_generation = int(observed_generation)
             with _state_lock:
@@ -8159,7 +9564,8 @@ def _runtime_reconcile_teensy_generation(previous_generation: int,
                     ),
                     "survival_floor": copy.deepcopy(live_witness.get("floor")),
                     "producer_mutated": False,
-                    "teensy_rpc_used": False,
+                    "teensy_rpc_used": bool(ppb_live_refresh["teensy_rpc_used"]),
+                    "ppb_live_refresh": copy.deepcopy(ppb_live_refresh),
                     "completed_at_utc": _utc_now_z(),
                 }
             _set_operational_state(

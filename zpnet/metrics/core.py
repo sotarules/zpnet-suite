@@ -140,7 +140,8 @@ def _main(stdscr: curses.window) -> None:
         # -----------------------------------------------------
         # Input handling
         # -----------------------------------------------------
-        live_photons = readouts[readout_index].name == "PHOTONS"
+        live_photons = readouts[readout_index].name in (
+            "PHOTONS", "PHOTON CAMPAIGNS")
         stdscr.timeout(0 if live_photons else int(REFRESH_INTERVAL_S * 1000))
         key = stdscr.getch()
 
@@ -191,7 +192,7 @@ def _main(stdscr: curses.window) -> None:
         readout = readouts[readout_index]
         readout_name = readout.name
 
-        if readout_name == "PHOTONS":
+        if readout_name in ("PHOTONS", "PHOTON CAMPAIGNS"):
             # Clear BEFORE taking the snapshot. An arrival during rendering
             # stays signaled and causes another pass instead of being lost.
             PHOTONS_UPDATED.clear()

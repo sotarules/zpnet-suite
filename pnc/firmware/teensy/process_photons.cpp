@@ -4303,14 +4303,15 @@ static FLASHMEM void photons_payload_add_welford(
   Payload& obj = g_photons_fragment_welford;
   obj.clear();
   obj.add("n", w.n);
-  obj.add("mean", toFixedDecimal(w.mean, 6));
-  // M2 grows with population and squared excursions; it is not bounded by
-  // the fixed-decimal whole-part limit. Preserve all binary64 recovery digits.
+  // N/mean/M2/min/max are continuation state, not rounded display values.
+  // Decimal JSON must round-trip every binary64 accumulator digit; otherwise
+  // each reboot changes the starting point of the next Welford update.
+  obj.add("mean", toScientificDecimal(w.mean));
   obj.add("m2", toScientificDecimal(w.m2));
   obj.add("stddev", toFixedDecimal(w.stddev, 6));
   obj.add("stderr", toFixedDecimal(w.stderr_value, 6));
-  obj.add("min", toFixedDecimal(w.min, 6));
-  obj.add("max", toFixedDecimal(w.max, 6));
+  obj.add("min", toScientificDecimal(w.min));
+  obj.add("max", toScientificDecimal(w.max));
   parent.add_object(name, obj);
   obj.clear();
 }
@@ -6344,8 +6345,11 @@ static FLASHMEM Payload cmd_recovery_commit(const Payload& args) {
   const uint64_t derived_excluded_count =
       photons_lap_science_excluded_count_from_reasons(recovery_reasons);
 
-  if (accepted_count == 0ULL || stats_lap_count != accepted_count ||
-      stats_total_ns == 0ULL || custody_lap_count < stats_lap_count ||
+  // An empty optical population is still a populated instrument state: its
+  // publication chronology, temperature history and campaign may be nonempty.
+  if (stats_lap_count != accepted_count ||
+      ((stats_lap_count == 0ULL) != (stats_total_ns == 0ULL)) ||
+      custody_lap_count < stats_lap_count ||
       custody_total_ns < stats_total_ns ||
       accepted_projected.n != accepted_count ||
       accepted_raw.n != accepted_count ||
@@ -6395,10 +6399,9 @@ static FLASHMEM Payload cmd_recovery_commit(const Payload& args) {
             args, "campaign_start_after_sequence",
             campaign_start_after_sequence) ||
         campaign_start_after_sequence == 0U ||
-        campaign_start_after_sequence >= source_sequence ||
+        campaign_start_after_sequence > source_sequence ||
         !photons_recovery_get_u32(
             args, "campaign_public_count", campaign_public_count) ||
-        campaign_public_count == 0U ||
         campaign_public_count !=
             source_sequence - campaign_start_after_sequence ||
         !photons_recovery_get_u64(
@@ -6416,8 +6419,20 @@ static FLASHMEM Payload cmd_recovery_commit(const Payload& args) {
     safeCopy(campaign_name, sizeof(campaign_name), supplied_name);
   }
 
+  // The requested cadence is instrument configuration, not a boot default.
+  // Older Pi versions omit it; their existing behavior remains unchanged.
+  uint32_t requested_laps = g_photons_requested_laps_per_second;
+  (void)args.tryGetUInt("requested_laps_per_second", requested_laps);
+  if (requested_laps < PHOTONS_MIN_LAPS_PER_SECOND ||
+      requested_laps > PHOTONS_MAX_LAPS_PER_SECOND) {
+    return photons_recovery_reject("recovery_commit_rejected_cadence",
+                                   "saved cadence is outside instrument limits");
+  }
+
   // All parsing and accounting courts have passed.  From here to publication
   // start, installation is one foreground transaction and no PHOTONS timer runs.
+  g_photons_requested_laps_per_second = requested_laps;
+  photons_cadence_apply_requested_rate();
   g_lap_time_welford = accepted_projected;
   g_accepted_raw_cycles_welford = accepted_raw;
   g_excluded_raw_cycles_welford = excluded_raw;
@@ -6623,26 +6638,31 @@ static FLASHMEM Payload cmd_recovery_proof_ack(const Payload& args) {
   const bool same_lineage =
       parsed &&
       g_photons_recovery.restored &&
-      g_photons_recovery.proof_pending &&
+      (g_photons_recovery.proof_pending || g_photons_recovery.proof_committed) &&
       g_photons_recovery.proof_advanced_published &&
       generation == g_photons_recovery.generation &&
       g_photons_recovery.proof_sequence ==
           g_photons_recovery.source_sequence + 1U &&
       g_photons_recovery.proof_update_count ==
           g_photons_recovery.source_update_count + 1U &&
-      sequence == g_photons_recovery.proof_sequence &&
-      update_count == g_photons_recovery.proof_update_count &&
+      // Fresh recovery normally acknowledges N+1. If the Pi restarted during
+      // the handshake, it can acknowledge its first actually durable descendant
+      // without replaying an unobserved first row or resetting this survivor.
+      sequence >= g_photons_recovery.proof_sequence &&
+      update_count >= g_photons_recovery.proof_update_count &&
+      sequence - g_photons_recovery.proof_sequence ==
+          update_count - g_photons_recovery.proof_update_count &&
       sequence <= g_fragment_sequence &&
       update_count <= g_photons_stats_update_count;
   if (!same_lineage) {
     return photons_recovery_reject(
         "recovery_proof_ack_rejected",
-        "durable proof is not the exact first recovery successor row");
+        "durable proof is not a published descendant of the installed restore");
   }
 
+  if (g_photons_recovery.proof_pending) g_photons_recovery.proof_ack_count++;
   g_photons_recovery.proof_pending = false;
   g_photons_recovery.proof_committed = true;
-  g_photons_recovery.proof_ack_count++;
 
   Payload p;
   p.add("status", "recovery_proof_committed");

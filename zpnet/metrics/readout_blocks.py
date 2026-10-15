@@ -2132,8 +2132,10 @@ def _photons_summary(payload: dict, before: dict | None = None) -> dict:
     seconds = _to_int(campaign.get("public_count") if campaign else instrument_stats.get("update_count"))
     if seconds is None or seconds < 0:
         raise ValueError("PHOTONS population seconds are missing")
-    scatter = (_photons_population_delta(before, payload) if campaign
-               else _photons_instrument_stats(payload))
+    # SD/SE describe accepted races in the current resettable TOTAL population.
+    # Campaign-start Welford subtraction cannot cross PHOTONS.STATS_RESET;
+    # that would erase the presentation even while TOTAL continues normally.
+    scatter = _photons_instrument_stats(payload)
     return {
         "seconds": seconds,
         "mean": _photons_population_mean(selected),
@@ -2147,7 +2149,7 @@ def _photons_summary_header(include_campaign: bool) -> str:
     if include_campaign:
         labels.append("CAMP")
     return (f"{'SEC':<8} " + " ".join(f"{label:>12}" for label in labels)
-            + f" {'SD':>10} {'SE':>10}")
+            + f" {'TOTAL_SD':>10} {'TOTAL_SE':>10}")
 
 
 def _photons_summary_line(summary: dict, include_campaign: bool, campaign_mean=None) -> str:
@@ -2240,6 +2242,7 @@ def _get_lantern_campaign_summaries() -> list[dict]:
             "first_sequence": _to_int(row.get("first_sequence")),
             "last_sequence": _to_int(row.get("last_sequence")),
             "stats": stats,
+            "total_scatter": _photons_instrument_stats(last_payload),
             "lap_buckets": _photons_producer_lap_buckets(last_payload, historical=True),
             "campaign_mean_lap_ns": _photons_population_mean(campaign_stats) if campaign_stats else None,
             "seconds": _to_int((last_payload.get("campaign") or {}).get("public_count")),
@@ -2438,9 +2441,13 @@ def photons_detail_readout() -> list[str]:
 
 
 def photons_campaigns_readout() -> list[str]:
-    """Show campaign-local stability, never a trailing instrument bucket as campaign SD."""
-    # Historical rows are read by the existing one-second background read model.
-    # This view performs no regression, Welford, or database work on repaint.
+    """Display each campaign's last durable LAP/rolling/TOTAL/CAMP means.
+
+    All means come from the canonical observation at the campaign's current
+    or final boundary. The rolling windows describe the instrument at that
+    moment; they are not separate campaign-only rolling populations. Neither
+    block stability nor history coverage belongs in this operator table.
+    """
     rows, campaign_error, _ = _PHOTONS_READ_MODEL.get()
     if campaign_error:
         return ["\0LANTERN_CAMPAIGNS:ERROR",
@@ -2448,32 +2455,48 @@ def photons_campaigns_readout() -> list[str]:
     if rows is None:
         return ["\0LANTERN_CAMPAIGNS:LOADING", "LANTERN CAMPAIGNS: LOADING"]
     newest_identity = str(rows[0].get("id")) if rows else "EMPTY"
+    columns = ("LAP", "10-MIN", "60-MIN", "8-HOUR", "24-HOUR", "TOTAL", "CAMP")
     lines = [f"\0LANTERN_CAMPAIGN:{newest_identity}",
-             f"{'CAMPAIGN':<18} {'SEC':>8} {'CAMP_NS':>13} {'10M_SDPS':>10}"
-             f" {'60M_SDPS':>10} {'60M_TREND':>11} {'60M_N':>7} {'HISTORY':>9}"]
+             f"{'CAMPAIGN':<18} {'SEC':>8} "
+             + " ".join(f"{label:>12}" for label in columns)
+             + f" {'TOTAL_SD':>10} {'TOTAL_SE':>10}"]
     if not rows:
         return lines + ["", "NO LANTERN CAMPAIGNS"]
+    # Historical campaign rows remain the one-second background PostgreSQL
+    # read model. The active campaign has a fresher, already-authoritative
+    # canonical PHOTONS publication; use it without querying the database on
+    # each display refresh. Match the durable campaign ID, not just its name.
+    live = _get_photons_snapshot()
+    live_campaign = live.get("campaign")
+    live_identity = (
+        live_campaign if isinstance(live_campaign, dict)
+        and not live_campaign.get("final") else None
+    )
     for row in rows:
+        if (row.get("active") and live_identity is not None
+                and live_identity.get("campaign_id") == row.get("id")
+                and live_identity.get("campaign") == row.get("campaign")
+                and (_to_int(live.get("sequence")) or -1) >= (row.get("last_sequence") or -1)):
+            current = _photons_summary(live)
+            row = {**row, "seconds": current["seconds"], "campaign_mean_lap_ns": current["mean"],
+                   "lap_buckets": current["buckets"], "total_scatter": current["scatter"]}
         name = str(row.get("campaign") or "?")
-        if row.get("campaign_mean_lap_ns") is None:
+        lap = row.get("campaign_mean_lap_ns")
+        if lap is None:
             name += " [WAIT]"
         elif row.get("interrupted_at"):
             name += " [INT]"
-        stability = row.get("stability") or {}
-        windows = stability.get("windows") or {}
-        ten = (windows.get("600") or {}).get("raw") or {}
-        hour = (windows.get("3600") or {}).get("raw") or {}
-        history = ("FULL" if stability.get("complete_from_start")
-                   else "PARTIAL" if stability.get("status") == "ACTIVE"
-                   else "---")
+        buckets = row.get("lap_buckets") or {}
+        scatter = row.get("total_scatter") or {}
+        values = [lap] + [buckets.get(key) for key in PPB_BUCKET_KEYS] + [lap]
+        if len(lines) > 2 and lines[-1] != "":
+            lines.append("")
         lines.append(
             _campaign_cell(name, bool(row.get("active")), 18)
-            + f" {str(row.get('seconds') if row.get('seconds') is not None else '---'):>8}"
-            + _stability_cell(row.get("campaign_mean_lap_ns"), 6, 14)
-            + _stability_cell(ten.get("block_sd_ps"), 2, 11)
-            + _stability_cell(hour.get("block_sd_ps"), 2, 11)
-            + _stability_cell(hour.get("trend_ps_per_hour"), 2, 12)
-            + f" {str(hour.get('block_count', '---')):>7} {history:>9}"
+            + f" {str(row.get('seconds') if row.get('seconds') is not None else '---'):>8} "
+            + " ".join(_fmt(value, '>12.6f', 12) for value in values)
+            + " " + _fmt(scatter.get("stddev"), '>10.6f', 10)
+            + " " + _fmt(scatter.get("stderr"), '>10.6f', 10)
         )
     return lines
 

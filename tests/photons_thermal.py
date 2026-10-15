@@ -236,10 +236,9 @@ def parse_sample(row_id: int, p: Dict[str, Any], sensor: str = "synthetic") -> T
     uncorrected_ns = canonical_ns + correction_ns
     raw_source = "LEGACY_RECONSTRUCTED" if normalization_id is not None else "LEGACY"
     if measurement is not None:
-        from zpnet.processes.photons.normalization import ACQUISITION_ID, MEASUREMENT_SCHEMA
-        if (measurement["schema"] != MEASUREMENT_SCHEMA or
-                stats["acquisition_id"] != ACQUISITION_ID or
-                measurement["acquisition_id"] != ACQUISITION_ID):
+        # RAW1 is an acquisition constant, not an import from Pi process code.
+        if (stats["acquisition_id"] != 0x52415731 or
+                measurement["acquisition_id"] != 0x52415731):
             raise ValueError("unsupported raw PHOTONS measurement contract")
         raw = measurement["raw_flight_ns"]
         if raw != flight:
