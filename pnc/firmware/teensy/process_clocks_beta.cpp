@@ -2136,9 +2136,22 @@ static void clocks_fragment_schedule_publish(void) {
   uint32_t generation = g_clocks_fragment_publication_service_generation + 1U;
   if (generation == 0U) generation = 1U;
 
+  // Beta has already proved that the retained Pi observation cannot be
+  // delivered. Its only remaining work is consumer-owned retirement, not a
+  // transport retry. A timed one-shot may be quarantined if its compare edge
+  // is missed, indefinitely stranding that retirement and the next campaign
+  // rows. Wake the existing retirement court through foreground ALAP instead.
+  // Real, still-deliverable transport retries retain their 25 ms backoff.
+  const bool observer_retired_retry =
+      g_clocks_fragment_publication_retry_snapshot_valid &&
+      clocks_fragment_retry_reason_is_observer_plane(
+          g_clocks_fragment_publication_retry_reason_id) &&
+      clocks_fragment_campaign_sequence_observer_retired(
+          g_clocks_fragment_publication_retry_sequence);
   const bool delayed_retry =
       g_clocks_fragment_publication_retry_snapshot_valid &&
-      g_clocks_fragment_publication_retry_attempt_count > 0U;
+      g_clocks_fragment_publication_retry_attempt_count > 0U &&
+      !observer_retired_retry;
   const timepop_handle_t handle = delayed_retry
       ? timepop_arm(CLOCKS_FRAGMENT_RETRY_DELAY_NS,
                     false,
