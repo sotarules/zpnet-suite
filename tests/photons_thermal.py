@@ -254,8 +254,11 @@ def parse_sample(row_id: int, p: Dict[str, Any], sensor: str = "synthetic") -> T
             if abs(uncorrected_ns - correction_ns - canonical_ns) > 1e-9:
                 raise ValueError("Pi correction does not close with raw and normalized means")
             normalization_id = measurement["normalization_id"]
-        if policy is None or policy["normalization_id"] != measurement["normalization_id"]:
-            raise ValueError("Pi normalization policy/measurement identity mismatch")
+        if measurement.get("normalization_id") is not None:
+            if policy is None or policy.get("normalization_id") != measurement["normalization_id"]:
+                raise ValueError("Pi normalization policy/measurement identity mismatch")
+        elif policy is not None or normalized is not None or measurement["correction_ns"] is not None:
+            raise ValueError("uncalibrated PHOTONS must not claim normalized science")
     # Per-second center/radius/state are data, not configuration changes.
     signature = json.dumps({
         "race": {k: race.get(k) for k in (

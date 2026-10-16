@@ -2407,15 +2407,11 @@ def photons_detail_readout() -> list[str]:
             f"  ELAPSED: {_seconds_to_hms(summary['seconds'])}"
             f"  RECOVERABLE: {str(recoverable).upper()}")
     measurement = live.get("measurement")
-    if measurement is not None:
-        status = str(measurement["status"]).upper()
-        line += (f"  {status}"
-                 f"  MODEL: {str(measurement['normalization_id'])[:12].upper()}")
-        if status != "IDENTITY":
-            # Under identity the one-second tail already shows this same mean.
-            # After calibration, keep the distinct Pi-corrected mean visible.
-            normalized = measurement["normalized_flight_ns"]
-            line += f"  NORM: {_fmt(normalized['mean'] if normalized else None, '.6f', 0)} NS"
+    # Report a second, corrected mean only when a real calibration produced one.
+    if isinstance(measurement, dict) and measurement.get("status") == "CORRECTED":
+        normalized = measurement.get("normalized_flight_ns")
+        if isinstance(normalized, dict):
+            line += f"  NORM: {_fmt(normalized.get('mean'), '.6f', 0)} NS"
     if campaign_error:
         line += "  READ MODEL: UNAVAILABLE"
     lines = [line]

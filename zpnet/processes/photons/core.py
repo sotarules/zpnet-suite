@@ -39,7 +39,7 @@ from zpnet.shared.logger import setup_logging
 
 
 # ======================================================================
-# PHOTONS: Normalization and physical sensor identities
+# PHOTONS: Optional calibrated normalization and physical sensor identities
 # ======================================================================
 
 # Matches process_photons.cpp. This is NOT a thermal-model identity.
@@ -65,36 +65,19 @@ THERMAL_FEATURE_POLICY = {
 }
 
 
-DEFAULT_THERMAL_MODEL = {
-    "feature_policy": THERMAL_FEATURE_POLICY,
-    "application": "SUBTRACT_ONE_OFFSET_PER_SECOND",
-    "calibration_basis": "UNCALIBRATED_IDENTITY_BASELINE",
-    "acquisition_signature": None,
-    "reference": {},
-    "domain": {},
-    "terms": [],
-}
-
-# These are readable labels, not content-derived identities. The complete model
-# and acquisition policies travel as JSON; mathematical continuity compares the
-# policies themselves. A sensor-label edit cannot change a cryptographic token
-# and thereby prevent the instrument from starting.
+# A calibration is optional. Without fitted terms PHOTONS remains a raw
+# instrument: there is no substitute model and no zero-offset correction.
+# The complete deployed policy travels as JSON when a calibration exists.
 THERMAL_FEATURE_ID = "PHOTONS_THERMAL_FEATURES_V1"
 
 
 def model_semantics(model):
-    """The actual correction, independent of a descriptive name or unused sensor."""
-    if not model["terms"]:
-        return {"application": "IDENTITY"}
+    """Return the actual fitted correction, or None when no calibration exists."""
+    if not isinstance(model, dict) or not model.get("terms"):
+        return None
     return {key: copy.deepcopy(model[key]) for key in
             ("application", "terms", "reference", "domain",
              "acquisition_signature", "feature_policy")}
-
-
-def identity(model):
-    """Retained public helper: a model's explicit human-readable deployment name."""
-    return ("PHOTONS_IDENTITY" if not model["terms"]
-            else model.get("normalization_id", model["calibration_basis"]))
 
 
 THERMAL_FEATURE_NAMES = tuple(
@@ -127,9 +110,14 @@ def acquisition_signature(state):
 
 
 def deploy_model(model):
-    """Attach an ordinary readable model name to the deployed policy."""
+    """Deploy only a real, explicitly identified calibrated correction."""
+    if not isinstance(model, dict) or not model.get("terms"):
+        raise ValueError("PHOTONS calibration must contain fitted correction terms")
     result = copy.deepcopy(model)
-    result["normalization_id"] = identity(result)
+    name = str(result.get("normalization_id") or result.get("calibration_basis") or "").strip()
+    if not name:
+        raise ValueError("PHOTONS calibrated correction requires a deployment name")
+    result["normalization_id"] = name
     result["feature_id"] = THERMAL_FEATURE_ID
     return result
 
@@ -260,15 +248,14 @@ class ThermalHistory:
 
 class Normalizer:
     def __init__(self, model=None):
-        if model is None:
-            model = copy.deepcopy(DEFAULT_THERMAL_MODEL)
-        self.model = deploy_model(model)
-        self.model_id = identity(self.model)
-        self.needed = set(self.model["reference"])
+        # None means acquisition-only, not an implicit correction model.
+        self.model = deploy_model(model) if model is not None else None
+        self.model_id = self.model["normalization_id"] if self.model is not None else None
+        self.needed = set(self.model["reference"]) if self.model is not None else set()
         self.history = ThermalHistory()
 
     def policy_snapshot(self):
-        return {**copy.deepcopy(self.model), "normalization_id": self.model_id}
+        return copy.deepcopy(self.model)
 
     def checkpoint(self):
         """Called by the state owner at the same boundary as all other populations."""
@@ -280,27 +267,29 @@ class Normalizer:
             self.history.restore(checkpoint)
         # A legacy canonical row records feature outputs, not every immature
         # EMA. Do not guess that missing internal state from rounded outputs.
-        # The identity model does not depend on thermal maturity; retained
-        # photon/temperature/stability populations are entirely unaffected.
 
     def measure(self, state):
         photons = state["photons"]
         if photons["stats"]["acquisition_id"] != ACQUISITION_ID:
-            raise ValueError("normalization requires raw acquisition")
+            raise ValueError("PHOTONS requires raw acquisition")
         raw = copy.deepcopy(photons["race"]["flight_ns"])
         thermal = self.history.observe(state)
         out = {"schema": PHOTONS_MEASUREMENT_SCHEMA, "authority": "PI.PHOTONS",
-               "acquisition_id": ACQUISITION_ID, "normalization_id": self.model_id,
+               "acquisition_id": ACQUISITION_ID,
                "acquisition_signature": acquisition_signature(state),
                "raw_flight_ns": raw, "thermal": thermal,
                "normalized_flight_ns": None, "correction_ns": None}
         if not raw["n"]:
             out["status"] = "NO_ACCEPTED_RACES"
             return out
-        if self.model["terms"] and self.model["acquisition_signature"] != acquisition_signature(state):
+        if self.model is None:
+            out["status"] = "RAW_ONLY"
+            return out
+        out["normalization_id"] = self.model_id
+        if self.model["acquisition_signature"] != acquisition_signature(state):
             out["status"] = "ACQUISITION_CHANGED"
             return out
-        if self.model["terms"] and self.model["feature_policy"] != THERMAL_FEATURE_POLICY:
+        if self.model["feature_policy"] != THERMAL_FEATURE_POLICY:
             out["status"] = "FEATURE_POLICY_CHANGED"
             return out
         missing = sorted(self.needed - thermal["values"].keys())
@@ -315,8 +304,8 @@ class Normalizer:
         offset = correction(self.model, thermal["values"])
         if not math.isfinite(offset):
             raise ValueError("nonfinite PHOTONS model correction")
-        out.update(status="CORRECTED" if self.model["terms"] else "IDENTITY",
-                   correction_ns=offset, normalized_flight_ns=corrected_distribution(raw, offset))
+        out.update(status="CORRECTED", correction_ns=offset,
+                   normalized_flight_ns=corrected_distribution(raw, offset))
         return out
 
 # ======================================================================
@@ -442,19 +431,29 @@ class StabilityAccumulator:
         self.reset()
         if canonical is None:
             return
+        model = canonical.get("normalization")
+        policy = model_semantics(model)
+        name = (model.get("normalization_id") or model.get("calibration_basis")) if policy else None
         existing = canonical.get("stability")
         if existing is not None:
             self._state = copy.deepcopy(existing["checkpoint"])
             # Legacy checkpoints retained a history-fullness label. The
             # underlying observed blocks and discontinuities are the evidence.
             self._state.pop("complete_from_start", None)
-            # Legacy hashes named this same policy. Adopt a readable name without
-            # treating that representation change as a new mathematical epoch.
-            self._state["normalization_id"] = identity(canonical["normalization"])
-            self._state.setdefault("normalization_policy", model_semantics(canonical["normalization"]))
+            self._state["normalization_id"] = name
+            self._state["normalization_policy"] = policy
             self._state.setdefault("normalization_changes", 0)
             self._state.setdefault("elapsed_pause_count", 0)
             self._state.setdefault("elapsed_pause_seconds", 0.0)
+            if policy is None:
+                # Older uncalibrated rows stored a fabricated zero-offset
+                # normalized copy. Remove only that derivative population;
+                # preserve every raw block, gap, cursor and campaign boundary.
+                for window in self._state["windows"].values():
+                    window["normalized"] = _population()
+                    if window["open"] is not None:
+                        window["open"].update(normalized_n=0, normalized_mean_ns=0.0,
+                                              normalized_slots=0)
             return
         # A pre-feature row never stored these populations. Preserve its cursor
         # without claiming that the new calculator witnessed earlier blocks.
@@ -465,15 +464,15 @@ class StabilityAccumulator:
                            campaign=campaign.get("campaign"),
                            public_count=campaign.get("public_count"),
                            acquisition_id=canonical["measurement"]["acquisition_id"],
-                           normalization_id=identity(canonical["normalization"]),
-                           normalization_policy=model_semantics(canonical["normalization"]))
+                           normalization_id=name,
+                           normalization_policy=policy)
 
     def _new_epoch(self, campaign, measurement):
         self.reset()
         self._state.update({
             "campaign_id": campaign["campaign_id"], "campaign": campaign["campaign"],
             "acquisition_id": measurement["acquisition_id"],
-            "normalization_id": measurement["normalization_id"],
+            "normalization_id": measurement.get("normalization_id"),
             "gap_count": 0,  # A new campaign/model epoch has its own gap ledger.
         })
 
@@ -506,12 +505,12 @@ class StabilityAccumulator:
             s = self._state
             s.update({"sequence": sequence, "published_at_utc": stamp,
                       "acquisition_id": measurement["acquisition_id"],
-                      "normalization_id": measurement["normalization_id"]})
+                      "normalization_id": measurement.get("normalization_id")})
             return self._surface()
 
         if not isinstance(public_count, int) or public_count <= 0:
             raise ValueError("PHOTONS stability requires positive campaign public_count")
-        policy = model_semantics(photons["normalization"])
+        policy = model_semantics(photons.get("normalization"))
         fresh = (s["campaign_id"] != campaign_id
                  or s["acquisition_id"] != measurement["acquisition_id"])
         if fresh:
@@ -537,9 +536,9 @@ class StabilityAccumulator:
                         window[name]["previous_index"] = None
                         window[name]["previous_mean_ns"] = None
 
-        if s["normalization_policy"] is not None and s["normalization_policy"] != policy:
-            # A model deployment is not permission to destroy raw populations.
-            # Nor may an unfinished normalized block mix two corrections.
+        if s["sequence"] is not None and s["normalization_policy"] != policy:
+            # A model deployment/removal is not permission to destroy raw
+            # populations; only derived normalized blocks change epochs.
             for window in s["windows"].values():
                 window["normalized"] = _population()
                 if window["open"] is not None:
@@ -547,7 +546,7 @@ class StabilityAccumulator:
                                           normalized_slots=0)
             s["normalization_changes"] += 1
         s["normalization_policy"] = policy
-        s["normalization_id"] = measurement["normalization_id"]
+        s["normalization_id"] = measurement.get("normalization_id")
 
         raw = measurement["raw_flight_ns"]
         normalized = measurement["normalized_flight_ns"]
@@ -5039,7 +5038,10 @@ def _make_photons(
                 "rejecting canonical PHOTONS row"
             )
             raise
-    state["normalization"] = _normalizer.policy_snapshot()
+    # No normalization object exists until an actual calibration is deployed.
+    normalization = _normalizer.policy_snapshot()
+    if normalization is not None:
+        state["normalization"] = normalization
     state["measurement"] = _normalizer.measure(state)
     return state, checkpoint
 
@@ -8711,7 +8713,10 @@ def _lantern_report_from_photons(photons: Payload) -> Dict[str, Any]:
         "receiver": copy.deepcopy(photons.get("receiver") or {}),
         "rtd": copy.deepcopy(photons.get("rtd") or {}),
         "temperature": copy.deepcopy(photons.get("temperature") or {}),
-        "normalization": copy.deepcopy(photons["normalization"]),
+        **({"normalization": copy.deepcopy(photons["normalization"])}
+           if "normalization" in photons else {}),
+        **({"normalization": copy.deepcopy(photons["normalization"])}
+           if "normalization" in photons else {}),
         "measurement": copy.deepcopy(photons["measurement"]),
         # The canonical detail record remains the ONLY checkpoint authority.
         # Campaign master publishes sensor means/coverage for display only.
