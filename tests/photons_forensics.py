@@ -3,17 +3,17 @@
 Search every independent numeric fact carried by PHOTONS_V1 for relationships
 with the canonical one-second race mean:
 
-    zt photons_forensics Pelican1
-    zt photons_forensics Pelican1 --bin-seconds 60 --max-lag-seconds 1800
-    zt photons_forensics Pelican1 --output-dir /tmp/Pelican1-forensics
-    zt photons_forensics Pelican1 --input /tmp/Pelican1.jsonl
+    zt photons_forensics
+    zt photons_forensics --hours 48 --bin-seconds 60 --max-lag-seconds 1800
+    zt photons_forensics --output-dir /tmp/photons-forensics-48h
+    zt photons_forensics --input /tmp/photons.jsonl
 
 The target is photons.race.flight_ns.mean.  Every populated one-second fragment
 has equal weight regardless of accepted race count.  Cumulative/campaign means,
 raw-cycle centers, the lower envelope, and other LAP-derived surfaces are never
 used as predictors.  Monotonic counters are converted to per-second rates rather
 than correlated in cumulative form.  Database access is read-only and restricted
-to the selected LANTERN campaign.
+to all LANTERN observations in the requested time window, across campaigns.
 
 The report screens each usable predictor several ways: raw Pearson and Spearman
 association, predictor-versus-time correlation, linear-time-detrended association,
@@ -43,14 +43,14 @@ import statistics as st
 import sys
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 SCHEMA = "PHOTONS_V1"
 TARGET_PATH = "photons.race.flight_ns.mean"
-TEMPERATURE_PATH = "environment.temperature_c"
+TEMPERATURE_PATH = "rtd.raw_temperature_c"
 ELAPSED_PATH = "derived.elapsed_time_s"
 ACCEPTED_PATH = "derived.accepted_races_this_fragment"
 MIN_FIT = 3
@@ -96,6 +96,7 @@ SCIENCE_ALLOWED_PREFIXES = (
 
 IDENTIFIER_PATHS = {
     "campaign.campaign_id",
+    "campaign.public_count",
     "campaign.start_after_sequence",
     "photons.core.sequence",
     "photons.interrupt.source_pin",
@@ -167,6 +168,7 @@ class Sample:
     lap_ns: float
     races: int
     signature: str
+    campaign: str
     values: Dict[str, float]
     epoch: int = 0
     run: int = 0
@@ -404,6 +406,7 @@ def parse_sample(row_id: int, p: Dict[str, Any]) -> Tuple[Optional[Sample], str,
         lap_ns=number(flight["mean"]),
         races=races,
         signature=acquisition_signature(p),
+        campaign=str((p.get("campaign") or {}).get("campaign") or "NO_CAMPAIGN"),
         values=values,
     ), "used", labels
 
@@ -449,20 +452,29 @@ def database_rows(args: argparse.Namespace) -> Iterable[Tuple[int, Dict[str, Any
             )
         ) AS forensic_payload
         FROM campaign_detail
-        WHERE campaign_type = %s AND campaign = %s AND payload ->> 'schema' = %s
-        ORDER BY id ASC
+        WHERE campaign_type = %s AND ts >= %s AND ts < %s
+          AND payload ->> 'schema' = %s
+        ORDER BY ts ASC, id ASC
     """
-    with open_db(row_dict=True) as conn:
-        conn.execute("SET TRANSACTION READ ONLY")
-        cur = conn.cursor(name="photons_forensics")
-        cur.itersize = args.batch_size
-        cur.execute(sql, ("LANTERN", args.campaign, SCHEMA))
-        for row in cur:
-            payload = row["forensic_payload"]
-            yield int(row["id"]), json.loads(payload) if isinstance(payload, str) else payload
+    # Bound each query by a short UTC interval. A single 48-hour server-side
+    # cursor can exceed the production statement timeout on its first FETCH.
+    # Each slice remains read-only; no global DB timeout or schema change.
+    start = args.start
+    while start < args.end:
+        end = min(args.end, start + args.query_minutes * 60)
+        with open_db(row_dict=True) as conn:
+            conn.execute("SET TRANSACTION READ ONLY")
+            with conn.cursor(name="photons_forensics") as cur:
+                cur.itersize = args.batch_size
+                cur.execute(sql, ("LANTERN", datetime.fromtimestamp(start, timezone.utc),
+                                  datetime.fromtimestamp(end, timezone.utc), SCHEMA))
+                for row in cur:
+                    payload = row["forensic_payload"]
+                    yield int(row["id"]), json.loads(payload) if isinstance(payload, str) else payload
+        start = end
 
 
-def file_rows(path: Path, campaign: str) -> Iterable[Tuple[int, Dict[str, Any]]]:
+def file_rows(path: Path) -> Iterable[Tuple[int, Dict[str, Any]]]:
     text = path.read_text(encoding="utf-8-sig").strip()
     if text.endswith("&#x20;"):
         text = text[:-6].rstrip()
@@ -477,8 +489,7 @@ def file_rows(path: Path, campaign: str) -> Iterable[Tuple[int, Dict[str, Any]]]
             records = [json.loads(line.removeprefix("PHOTONS ")) for line in text.splitlines() if line.strip()]
     for index, record in enumerate(records, 1):
         payload = record.get("payload", record)
-        campaign_block = payload.get("campaign") if isinstance(payload.get("campaign"), dict) else {}
-        if payload.get("schema") == SCHEMA and campaign_block.get("campaign") == campaign:
+        if payload.get("schema") == SCHEMA:
             yield index, payload
 
 
@@ -521,6 +532,8 @@ def collect(rows: Iterable[Tuple[int, Dict[str, Any]]], args: argparse.Namespace
 
         changes: List[str] = []
         if previous is not None:
+            if sample.campaign != previous.campaign:
+                changes.append("campaign boundary")
             if sample.reset != previous.reset:
                 changes.append("statistics reset")
             if sample.signature != previous.signature:
@@ -1357,11 +1370,11 @@ def write_samples_csv(path: Path, samples: Sequence[Sample], metrics: Sequence[M
     keys = [metric.key for metric in metrics]
     with path.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.writer(stream)
-        writer.writerow(("row_id", "published_at_utc", "sequence", "reset_count", "epoch", "run",
+        writer.writerow(("row_id", "published_at_utc", "campaign", "sequence", "reset_count", "epoch", "run",
                          "lap_mean_ns", "accepted_races", *keys))
         for sample in samples:
             writer.writerow((
-                sample.row_id, stamp(sample.time), sample.sequence, sample.reset, sample.epoch, sample.run,
+                sample.row_id, stamp(sample.time), sample.campaign, sample.sequence, sample.reset, sample.epoch, sample.run,
                 sample.lap_ns, sample.races, *(sample.values.get(key, "") for key in keys),
             ))
 
@@ -1458,7 +1471,7 @@ th:first-child, td:first-child {{ text-align: left; min-width: 330px; }}
 .warning {{ border-left: 5px solid #b16d18; }} code {{ font-family: ui-monospace, monospace; }}
 </style></head><body>
 <h1>PHOTONS forensic correlation reconnaissance</h1>
-<p><strong>Campaign:</strong> {html.escape(campaign)} &nbsp; <strong>Interval:</strong> {stamp(samples[0].time)} .. {stamp(samples[-1].time)}</p>
+<p><strong>Scope:</strong> {html.escape(campaign)} &nbsp; <strong>Interval:</strong> {stamp(samples[0].time)} .. {stamp(samples[-1].time)}</p>
 <div class="card warning"><strong>Interpretation boundary.</strong> This report screens hypotheses. It does not prove cause, does not install a correction, and deliberately reports no IID p-values. Shared time drift, autocorrelation, related telemetry surfaces, mathematical coupling, and multiple comparisons can all produce impressive-looking associations.</div>
 <div class="card"><strong>Target:</strong> <code>{TARGET_PATH}</code>; one equal-weight observation per populated one-second fragment.<br>
 <strong>Usable seconds:</strong> {len(samples):,}; <strong>epochs:</strong> {len(reasons):,}; <strong>runs:</strong> {len(set(sample.run for sample in samples)):,}; <strong>analyzed predictors:</strong> {len(metrics):,}; <strong>omitted after screening:</strong> {len(omitted):,}.<br>
@@ -1470,7 +1483,7 @@ th:first-child, td:first-child {{ text-align: left; min-width: 330px; }}
 {leaderboard(metrics, 'holdout_predictor_improvement_vs_time_pct', 'Predictors that beat elapsed time on holdout', positive_only=True)}
 </div>
 <h2>Temperature plateaus</h2>
-<p>Sliding {args.plateau_seconds}s windows with BME280 span at most {args.plateau_temperature_span_c:.6f} C. Strongest non-overlapping windows are retained.</p>
+<p>Sliding {args.plateau_seconds}s windows with RTD span at most {args.plateau_temperature_span_c:.6f} C. Strongest non-overlapping windows are retained.</p>
 <table><thead><tr><th>Start</th><th>End</th><th>Temperature span C</th><th>Fitted LAP change ps</th><th>Slope ps/min</th><th>LAP span ps</th></tr></thead><tbody>{plateau_rows or '<tr><td colspan="6">No qualifying plateau windows.</td></tr>'}</tbody></table>
 <h2>All analyzed predictors</h2>
 <p>Click a column heading to sort. Click a variable for its four-panel SVG: raw scatter, standardized time alignment, linearly detrended scatter, and adjacent changes.</p>
@@ -1520,7 +1533,8 @@ def print_leaderboard(metrics: Sequence[Metric], field: str, title: str, limit: 
 
 def arguments(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("campaign")
+    parser.add_argument("--hours", type=float, default=48.0,
+                        help="rolling observation window ending now (default 48 hours)")
     parser.add_argument("--input", type=Path, help="read PHOTONS JSON/JSONL instead of PostgreSQL")
     parser.add_argument("--output-dir", type=Path, help="report directory (default ./<campaign>-photons-forensics)")
     parser.add_argument("--bin-seconds", type=int, default=60,
@@ -1535,7 +1549,7 @@ def arguments(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--plateau-seconds", type=int, default=600,
                         help="temperature-flat window duration (default 600)")
     parser.add_argument("--plateau-temperature-span-c", type=float, default=0.02,
-                        help="maximum BME280 span in a flat window (default 0.02 C)")
+                        help="maximum RTD span in a flat window (default 0.02 C)")
     parser.add_argument("--include", help="regular expression selecting predictor keys")
     parser.add_argument("--exclude", help="regular expression removing predictor keys")
     parser.add_argument("--top", type=int, default=15, help="rows per console leaderboard (default 15)")
@@ -1545,39 +1559,46 @@ def arguments(argv: Sequence[str]) -> argparse.Namespace:
                         help="omit this duration from campaign's first stored publication")
     parser.add_argument("--start", type=utc, help="inclusive timestamp with timezone")
     parser.add_argument("--end", type=utc, help="exclusive timestamp with timezone")
-    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--query-minutes", type=int, default=10,
+                        help="database query interval in minutes (default 10; try 2 if timed out)")
+    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--csv", type=Path, help="optional wide CSV of all usable one-second observations")
     args = parser.parse_args(argv[1:])
 
     positive_ints = (args.bin_seconds, args.min_observations, args.plateau_seconds,
-                     args.top, args.max_plot_points, args.batch_size)
+                     args.top, args.max_plot_points, args.batch_size, args.query_minutes)
     if min(positive_ints) < 1 or min(args.max_lag_seconds, args.skip_seconds) < 0:
         parser.error("durations/counts must be positive and lag/skip nonnegative")
     if not 0 < args.min_coverage <= 1 or not 0 < args.min_block_coverage <= 1:
         parser.error("coverage values must be in (0, 1]")
     if args.plateau_temperature_span_c < 0:
         parser.error("plateau temperature span must be nonnegative")
-    if args.start is not None and args.end is not None and args.start >= args.end:
+    if args.hours <= 0:
+        parser.error("--hours must be positive")
+    if args.end is None:
+        args.end = datetime.now(timezone.utc).timestamp()
+    if args.start is None:
+        args.start = args.end - args.hours * 3600
+    if args.start >= args.end:
         parser.error("--start must precede --end")
     if args.include:
         re.compile(args.include)
     if args.exclude:
         re.compile(args.exclude)
     if args.output_dir is None:
-        campaign_stem = re.sub(r"[^a-zA-Z0-9._-]+", "-", args.campaign).strip("-.") or "campaign"
-        args.output_dir = Path(f"{campaign_stem}-photons-forensics")
+        args.output_dir = Path("photons-forensics-48h")
     return args
 
 
 def main(argv: Sequence[str]) -> int:
     args = arguments(argv)
-    source = file_rows(args.input, args.campaign) if args.input else database_rows(args)
+    source = file_rows(args.input) if args.input else database_rows(args)
     samples, counts, reasons, labels = collect(source, args)
-    print(f"PHOTONS FORENSIC CORRELATION ANALYSIS — {args.campaign}")
+    print(f"PHOTONS FORENSIC CORRELATION ANALYSIS — ALL CAMPAIGNS")
     print(f"  Target: {TARGET_PATH}; equal weight per populated one-second fragment.")
     print("  Counts: " + "; ".join(f"{key}={value:,}" for key, value in counts.items()))
     if not samples:
-        print("  No usable observations in the selected campaign/time interval.")
+        print("  No usable observations in the selected time interval.")
         return 1
 
     samples, specs, excluded, transformed = prepare_variables(samples, labels)
@@ -1633,7 +1654,8 @@ def main(argv: Sequence[str]) -> int:
 
     report = {
         "schema": "PHOTONS_FORENSICS_V1",
-        "campaign": args.campaign,
+        "scope": "ALL_CAMPAIGNS",
+        "campaigns": dict(Counter(sample.campaign for sample in samples)),
         "target": TARGET_PATH,
         "selected_start_utc": stamp(samples[0].time),
         "selected_end_utc": stamp(samples[-1].time),
@@ -1644,6 +1666,7 @@ def main(argv: Sequence[str]) -> int:
         "arguments": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
         "metrics": [asdict(metric) for metric in metrics],
         "temperature_plateaus": [asdict(plateau) for plateau in plateaus],
+        "temperature_plateau_sensor": TEMPERATURE_PATH,
         "interpretation": [
             "screening does not establish causation",
             "adjacent observations are autocorrelated",
@@ -1654,9 +1677,10 @@ def main(argv: Sequence[str]) -> int:
         ],
     }
     (output / "report.json").write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
-    write_index(output / "index.html", args.campaign, samples, counts, reasons, metrics, plateaus, omitted, args)
+    write_index(output / "index.html", "ALL CAMPAIGNS", samples, counts, reasons, metrics, plateaus, omitted, args)
 
     print(f"  Interval: {stamp(samples[0].time)} .. {stamp(samples[-1].time)}")
+    print("  Campaign coverage: " + "; ".join(f"{k}={v:,}" for k, v in sorted(Counter(x.campaign for x in samples).items())))
     print(f"  Epochs={len(reasons):,}; runs={len(set(sample.run for sample in samples)):,}; "
           f"numeric predictors analyzed={len(metrics):,}; omitted={len(omitted):,}")
     print_leaderboard(metrics, "detrended_r", "LARGEST TIME-DETRENDED ASSOCIATIONS", args.top)

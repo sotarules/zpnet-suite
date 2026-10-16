@@ -1093,6 +1093,8 @@ def _build_environment_status_locked(name: str) -> dict:
         try:
             payload = _build_environment_status_once(name)
             if state["consecutive_fail_count"]:
+                if state["consecutive_fail_count"] >= BME280_RETRY_COUNT:
+                    logging.info("[system] %s recovered", BME280_DEVICES[name]["label"])
                 state["recovery_count"] += 1
             state["consecutive_fail_count"] = 0
             payload["read_fail_count"] = state["read_fail_count"]
@@ -1108,27 +1110,21 @@ def _build_environment_status_locked(name: str) -> dict:
             state["read_fail_count"] += 1
             state["consecutive_fail_count"] += 1
             if attempt < BME280_RETRY_COUNT:
-                logging.warning(
-                    "[system] BME280 transient I2C error on attempt %d/%d: %s",
-                    attempt,
-                    BME280_RETRY_COUNT,
-                    e,
-                )
                 time.sleep(BME280_RETRY_DELAY_SEC)
         except Exception as e:
             last_error = e
             state["read_fail_count"] += 1
             state["consecutive_fail_count"] += 1
             if attempt < BME280_RETRY_COUNT:
-                logging.warning(
-                    "[system] BME280 read error on attempt %d/%d: %s",
-                    attempt,
-                    BME280_RETRY_COUNT,
-                    e,
-                )
                 time.sleep(BME280_RETRY_DELAY_SEC)
 
-    logging.exception("[system] BME280 read failed after retries")
+    if state["consecutive_fail_count"] == BME280_RETRY_COUNT:
+        logging.warning(
+            "[system] %s unavailable after %d attempts: %s",
+            BME280_DEVICES[name]["label"],
+            BME280_RETRY_COUNT,
+            last_error,
+        )
     return _bme280_failure_payload(name, last_error or RuntimeError("unknown BME280 error"),
                                    BME280_RETRY_COUNT)
 
