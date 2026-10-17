@@ -8,6 +8,7 @@
 struct photons_pd_out_batch_t {
   uint64_t pair_count = 0;
   uint64_t high_sum = 0;
+  uint64_t high_sum_squares = 0; // exact raw-code second moment for HIGH witness
   uint64_t low_sum = 0;
   uint64_t high_delay_cycles_sum = 0;
   uint64_t low_delay_cycles_sum = 0;

@@ -3881,7 +3881,8 @@ PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_core, 2048U);
 // the nested flight_ns Welford. Keep explicit fixed custody with schema headroom.
 // Explicit acquisition bounds and four uint64 rejection reasons (total/delta).
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_race, 4096U);
-PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_pd_out, 1024U);
+// Include the temporary HIGH raw moments and trigger-delay witness.
+PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_pd_out, 2048U);
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_raw_cycles, 1024U);
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_projection, 1024U);
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_science, 3072U);
@@ -4669,8 +4670,13 @@ static Payload& photons_fragment_payload(
   pd_out.clear();
   pd_out.add("pin", PHOTODIODE_ANALOG_PIN);
   pd_out.add("adc_bits", 12U);
+  pd_out.add("high_delay_target_ns", PHOTONS_PD_OUT_HIGH_DELAY_NS);
+  pd_out.add("dwt_cycles_per_second", (uint32_t)F_CPU_ACTUAL);
   pd_out.add("low_delay_target_ns", PHOTONS_PD_OUT_LOW_DELAY_NS);
   pd_out.add("pair_count", f.pd_out.pair_count);
+  // Exact per-fragment moments; Python computes sample SD/SE off the MCU.
+  pd_out.add("high_sum_counts", f.pd_out.high_sum);
+  pd_out.add("high_sum_squares_counts", f.pd_out.high_sum_squares);
   pd_out.add("busy_edges", f.pd_out.busy_edges);
   pd_out.add("high_not_ready", f.pd_out.high_not_ready);
   pd_out.add("high_start_count_total", f.pd_out.high_start_count_total);

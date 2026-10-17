@@ -3,6 +3,14 @@
     zt photons_cadence_witness --seconds 60
     zt photons_cadence_witness --seconds 60 --jsonl
     python3 photons_cadence_witness.py --seconds 60
+    zt photons_cadence_witness --adc-high
+    zt photons_cadence_witness --adc-high --fragments 60 --jsonl
+
+--adc-high reports HIGH ADC mean, sample SD and SE from the next completed
+fragment (normally one second), or --fragments N consecutive fragments. This
+mode only reads PHOTONS_FRAGMENT; it does not request cadence or health reports.
+It requires the HIGH delay/raw-moments firmware patch. mV is a nominal display
+conversion; SE assumes independent samples and does not establish accuracy.
 
 Prints the complete report to STDOUT; no files or database values are changed.
 Observes PHOTONS_FRAGMENT and PHOTONS through the read-only PUBSUB tap, requests
@@ -20,6 +28,7 @@ import argparse
 from collections import deque
 from datetime import datetime, timezone
 import json
+import math
 from pathlib import Path
 import socket
 import statistics
@@ -28,7 +37,7 @@ import sys
 import threading
 import time
 
-VERSION = '2026-10-17.3'
+VERSION = '2026-10-17.5'
 TAP = '/tmp/zpnet_pubsub_tap.sock'
 COMMAND = '/tmp/zpnet-photons-command.sock'
 TOPICS = ('PHOTONS_FRAGMENT', 'PHOTONS')
@@ -297,16 +306,155 @@ def print_record(row):
 
 def arguments(argv):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--seconds', type=int, default=60, help='capture duration in seconds (default 60)')
+    parser.add_argument('--seconds', type=int, default=60, help='cadence mode duration in seconds (default 60)')
     parser.add_argument('--jsonl', action='store_true', help='print complete JSONL records instead of the text report')
+    parser.add_argument('--adc-high', action='store_true', help='report per-fragment ADC HIGH statistics')
+    parser.add_argument('--fragments', type=int, default=1,
+                        help='ADC HIGH mode: number of fragments (default 1)')
+    parser.add_argument('--timeout', type=float, default=10,
+                        help='ADC HIGH mode: seconds waiting for each fragment (default 10)')
+    parser.add_argument('--reference-mv', type=float, default=3300,
+                        help='ADC HIGH mode: nominal reference, not calibration (default 3300)')
     args = parser.parse_args(argv[1:])
     if args.seconds <= 0:
         parser.error('--seconds must be positive')
+    if args.fragments < 1 or not math.isfinite(args.timeout) or args.timeout <= 0:
+        parser.error('--fragments and --timeout must be positive')
+    if not math.isfinite(args.reference_mv) or args.reference_mv <= 0:
+        parser.error('--reference-mv must be positive and finite')
     return args
+
+
+def high_statistics(n, total, squares):
+    """Exact integer variance numerator avoids cancellation near a constant HIGH."""
+    if n == 0:
+        return None, None, None
+    mean = total / n
+    if n == 1:
+        return mean, None, None
+    sd = math.sqrt((n * squares - total * total) / (n * (n - 1)))
+    return mean, sd, sd / math.sqrt(n)
+
+
+def observation(payload, reference_mv):
+    instrument = payload['photons']
+    pd = instrument['pd_out']
+    n = pd['pair_count']
+    # Missing instrumentation is an error, even for a fragment with no pairs.
+    total = pd['high_sum_counts']
+    squares = pd['high_sum_squares_counts']
+    target = pd['high_delay_target_ns']
+    cps = pd['dwt_cycles_per_second']
+    mean, sd, se = high_statistics(n, total, squares)
+    scale = reference_mv / ((1 << pd['adc_bits']) - 1)
+    return {
+        'kind': 'fragment', 'sequence': payload['sequence'],
+        'observed_utc': datetime.now(timezone.utc).isoformat(),
+        'fragment_elapsed_ms': instrument['fragment_elapsed_ms'],
+        'n': n, 'high_mean_counts': mean, 'high_sd_counts': sd,
+        'high_se_counts': se,
+        'high_mean_mv': None if mean is None else mean * scale,
+        'high_sd_mv': None if sd is None else sd * scale,
+        'high_se_mv': None if se is None else se * scale,
+        'low_mean_mv': None if n == 0 else float(pd['low_mean_counts']) * scale,
+        'high_delay_target_ns': target,
+        'high_start_after_entry_mean_ns': None if n == 0 else
+            float(pd['high_start_after_entry_mean_cycles']) * 1e9 / cps,
+        'low_start_after_high_mean_ns': None if n == 0 else
+            float(pd['low_start_after_high_mean_cycles']) * 1e9 / cps,
+        'busy_edges': pd['busy_edges'], 'high_not_ready': pd['high_not_ready'],
+        'pd_out': pd,
+    }
+
+
+def number(value):
+    return 'n/a' if value is None else f'{value:.3f}'
+
+
+def print_fragment(row):
+    print(f"\nFragment {row['sequence']}  window={row['fragment_elapsed_ms']} ms"
+          f"  N={row['n']}  sequence_step={row['sequence_step']}")
+    print('                   MEAN           SD           SE')
+    for unit in ('counts', 'mv'):
+        values = [number(row[f'high_{stat}_{unit}']) for stat in ('mean', 'sd', 'se')]
+        label = 'HIGH counts' if unit == 'counts' else 'HIGH mV'
+        print(f'{label:12s}' + ''.join(f'{value:>13s}' for value in values))
+    print(f"LOW mean={number(row['low_mean_mv'])} mV; "
+          f"HIGH target={row['high_delay_target_ns']} ns; "
+          f"entry->HIGH trigger mean={number(row['high_start_after_entry_mean_ns'])} ns")
+    print(f"HIGH->LOW trigger mean={number(row['low_start_after_high_mean_ns'])} ns; "
+          f"busy_edges={row['busy_edges']}; high_not_ready={row['high_not_ready']}")
+    if row['n'] == 0:
+        print('NO COMPLETED ADC PAIRS in this fragment.')
+
+
+def adc_high_report(args):
+    def emit(row):
+        if args.jsonl:
+            print(json.dumps(row, separators=(',', ':'), allow_nan=False), flush=True)
+        elif row['kind'] == 'fragment':
+            print_fragment(row)
+            sys.stdout.flush()
+        else:
+            print(row['message'], flush=True)
+
+    emit({'kind': 'start', 'version': VERSION, 'reference_mv': args.reference_mv,
+          'message': f'PHOTONS ADC HIGH witness {VERSION}\n'
+          'Each row covers completed physical ADC pairs in one firmware fragment, not accepted laps.\n'
+          'SD is sample SD; SE = SD/sqrt(N), assuming independent samples. Neither establishes accuracy.\n'
+          f'mV uses nominal reference {args.reference_mv:g} mV. Trigger timing is relative to ISR entry,\n'
+          'not the physical edge or ADC aperture. n/a means the statistic is undefined.'})
+    received = 0
+    previous = None
+    pairs = 0
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(args.timeout)
+            sock.connect(TAP)
+            sock.sendall(b'{"type":"set_topics","topics":["PHOTONS_FRAGMENT"]}\n')
+            buffer = b''
+            deadline = time.monotonic() + args.timeout
+            while received < args.fragments:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError('Timed out waiting for PHOTONS_FRAGMENT')
+                sock.settimeout(remaining)
+                chunk = sock.recv(65536)
+                if not chunk:
+                    raise ConnectionError('PUBSUB tap disconnected')
+                buffer += chunk
+                while b'\n' in buffer and received < args.fragments:
+                    line, buffer = buffer.split(b'\n', 1)
+                    if not line.strip():
+                        continue
+                    message = json.loads(line)
+                    if message.get('type') != 'publish':
+                        emit({'kind': 'tap_control', 'message': json.dumps(message)})
+                        continue
+                    if message['topic'] != 'PHOTONS_FRAGMENT':
+                        continue
+                    row = observation(message['payload'], args.reference_mv)
+                    row['sequence_step'] = None if previous is None else row['sequence'] - previous
+                    emit(row)
+                    previous = row['sequence']
+                    received += 1
+                    pairs += row['n']
+                    deadline = time.monotonic() + args.timeout
+    except KeyboardInterrupt:
+        emit({'kind': 'interrupted', 'message': f'Interrupted after {received} fragments.'})
+        return 130
+    except (OSError, KeyError, ValueError) as exc:
+        emit({'kind': 'error', 'message': f'ERROR: {exc}. Check acquisition and patched firmware.'})
+        return 1
+    emit({'kind': 'end', 'fragments': received, 'pairs': pairs,
+          'message': f'Captured {received} fragments / {pairs} completed ADC pairs.'})
+    return 0 if pairs else 1
 
 
 def main(argv):
     args = arguments(argv)
+    if args.adc_high:
+        return adc_high_report(args)
     output_lock = threading.Lock()
     def emit(value):
         with output_lock:

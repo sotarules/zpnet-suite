@@ -20,6 +20,8 @@ static constexpr uint32_t PD_TIMER_TICKS =
 
 enum class pd_phase_t : uint32_t { IDLE, SAMPLING_HIGH, SAMPLING_LOW };
 static volatile pd_phase_t g_pd_phase = pd_phase_t::IDLE;
+// Computed at init, before acquisition, using the configured CPU clock.
+static uint32_t g_pd_high_delay_cycles;
 static uint32_t g_pd_edge_dwt;
 static uint32_t g_pd_high_dwt;
 static uint32_t g_pd_low_dwt;
@@ -64,6 +66,8 @@ static void pd_low_complete_isr() {
   __asm__ volatile ("dmb" ::: "memory");
   g_pd_totals.pair_count++;
   g_pd_totals.high_sum += g_pd_high;
+  // A 12-bit code squared fits uint32_t. No floating point in this ISR.
+  g_pd_totals.high_sum_squares += g_pd_high * g_pd_high;
   g_pd_totals.low_sum += low;
   g_pd_totals.high_delay_cycles_sum += (uint32_t)(g_pd_high_dwt - g_pd_edge_dwt);
   g_pd_totals.low_delay_cycles_sum += (uint32_t)(g_pd_low_dwt - g_pd_high_dwt);
@@ -81,6 +85,10 @@ void photons_pd_out_high_isr(uint32_t edge_entry_dwt) {
   }
   g_pd_phase = pd_phase_t::SAMPLING_HIGH;
   g_pd_edge_dwt = edge_entry_dwt;
+  // Count work already elapsed since entry; do not add a fresh 200 ns here.
+  // Unsigned subtraction also handles the DWT counter wrapping in this wait.
+  // IRQ priorities/masks and the immutable lap timestamp remain unchanged.
+  while ((uint32_t)(ARM_DWT_CYCCNT - edge_entry_dwt) < g_pd_high_delay_cycles) {}
   g_pd_high_dwt = ARM_DWT_CYCCNT;
   ADC2_HC0 = ADC_HC_ADCH(PD_CHANNEL); // start HIGH; no conversion wait, no IRQ
   GPT2_CR = PD_TIMER_CONFIG | GPT_CR_EN; // ENMOD restarts the counter at zero
@@ -88,6 +96,10 @@ void photons_pd_out_high_isr(uint32_t edge_entry_dwt) {
 }
 
 void photons_pd_out_init() {
+  if (F_CPU_ACTUAL == 0U) __builtin_trap();
+  g_pd_high_delay_cycles = (uint32_t)(
+      ((uint64_t)F_CPU_ACTUAL * PHOTONS_PD_OUT_HIGH_DELAY_NS + 999999999ULL) /
+      1000000000ULL); // round up: the target is a minimum
   pinMode(PHOTODIODE_ANALOG_PIN, INPUT_DISABLE);
   // Core startup has calibrated ADC2. Use a single 12-bit conversion, shortest
   // acquisition, no hardware averaging. IPG/8 = 18.75 MHz at the 600 MHz build.
@@ -146,6 +158,7 @@ static photons_pd_out_batch_t pd_snapshot() {
     __asm__ volatile ("dmb" ::: "memory");
     out.pair_count = g_pd_totals.pair_count;
     out.high_sum = g_pd_totals.high_sum;
+    out.high_sum_squares = g_pd_totals.high_sum_squares;
     out.low_sum = g_pd_totals.low_sum;
     out.high_delay_cycles_sum = g_pd_totals.high_delay_cycles_sum;
     out.low_delay_cycles_sum = g_pd_totals.low_delay_cycles_sum;
@@ -166,6 +179,7 @@ photons_pd_out_batch_t photons_pd_out_take_batch() {
   photons_pd_out_batch_t out;
   out.pair_count = now.pair_count - g_pd_previous.pair_count;
   out.high_sum = now.high_sum - g_pd_previous.high_sum;
+  out.high_sum_squares = now.high_sum_squares - g_pd_previous.high_sum_squares;
   out.low_sum = now.low_sum - g_pd_previous.low_sum;
   out.high_delay_cycles_sum = now.high_delay_cycles_sum - g_pd_previous.high_delay_cycles_sum;
   out.low_delay_cycles_sum = now.low_delay_cycles_sum - g_pd_previous.low_delay_cycles_sum;
