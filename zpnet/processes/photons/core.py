@@ -1249,7 +1249,24 @@ class CheckpointStore:
         The operation journal is current control state, merged under the same
         row lock, rather than a stale queued copy of an earlier control phase.
         """
-        prior = self._read(cur, lock=True)
+        # Only the two live journal fields survive from the prior singleton.
+        # Keep the same row lock, without transferring/decoding/copying its full
+        # photon and temperature rings back into Python on every observation.
+        # CASE preserves absent keys versus explicit JSON null exactly.
+        cur.execute(
+            """
+            SELECT
+                (CASE WHEN payload ? 'restore_operation' THEN
+                    jsonb_build_object('restore_operation', payload -> 'restore_operation')
+                 ELSE '{}'::jsonb END) ||
+                (CASE WHEN payload ? 'last_restore' THEN
+                    jsonb_build_object('last_restore', payload -> 'last_restore')
+                 ELSE '{}'::jsonb END) AS payload
+            FROM config WHERE config_key = %s FOR UPDATE
+            """, (PHOTONS_SINGLETON_KEY,),
+        )
+        row = cur.fetchone()
+        prior = None if row is None else _payload(row["payload"])
         saved = _literal(checkpoint)
         if canonical is not None:
             saved["canonical"] = copy.deepcopy(canonical)

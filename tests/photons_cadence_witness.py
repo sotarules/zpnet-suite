@@ -4,6 +4,7 @@
     zt photons_cadence_witness --seconds 60 --jsonl
     python3 photons_cadence_witness.py --seconds 60
     zt photons_cadence_witness --adc-high
+    zt photons_cadence_witness --db
     zt photons_cadence_witness --adc-high --fragments 60 --jsonl
 
 --adc-high reports HIGH ADC mean, sample SD and SE from the next completed
@@ -20,7 +21,11 @@ timestamps provide separate evidence of ingress, SYSTEM RPC and construction.
 Instrumented PHOTONS REPORT adds bounded per-sequence monotonic stage timings;
 these stay outside canonical measurements and recovery state. Only publish calls
 inside this capture window are included; repeated REPORT samples are deduplicated.
-Standard library only. main(argv) includes the program name for the zt runner.
+--db captures host memory/swap, process RSS, disk space, PHOTONS backlog and
+bounded read-only PostgreSQL diagnostics. It prints host evidence before trying
+the database. No acquisition/service changes. PostgreSQL mode uses the installed
+psycopg driver and shared connection configuration; other modes use only the
+standard library. main(argv) includes the program name for the zt runner.
 """
 from __future__ import annotations
 
@@ -37,7 +42,7 @@ import sys
 import threading
 import time
 
-VERSION = '2026-10-17.5'
+VERSION = '2026-10-17.6'
 TAP = '/tmp/zpnet_pubsub_tap.sock'
 COMMAND = '/tmp/zpnet-photons-command.sock'
 TOPICS = ('PHOTONS_FRAGMENT', 'PHOTONS')
@@ -308,7 +313,9 @@ def arguments(argv):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--seconds', type=int, default=60, help='cadence mode duration in seconds (default 60)')
     parser.add_argument('--jsonl', action='store_true', help='print complete JSONL records instead of the text report')
-    parser.add_argument('--adc-high', action='store_true', help='report per-fragment ADC HIGH statistics')
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument('--db', action='store_true', help='capture host resources and read-only database diagnostics')
+    modes.add_argument('--adc-high', action='store_true', help='report per-fragment ADC HIGH statistics')
     parser.add_argument('--fragments', type=int, default=1,
                         help='ADC HIGH mode: number of fragments (default 1)')
     parser.add_argument('--timeout', type=float, default=10,
@@ -451,8 +458,147 @@ def adc_high_report(args):
     return 0 if pairs else 1
 
 
+DB_PROBE = r'''
+import json
+import time
+import psycopg
+from psycopg.rows import dict_row
+from zpnet.shared.db import PG_DSN
+
+def emit(value):
+    print(json.dumps(value, default=str), flush=True)
+
+started = time.monotonic()
+emit({'stage': 'connect_started'})
+with psycopg.connect(
+    PG_DSN, row_factory=dict_row, autocommit=True, connect_timeout=3,
+    application_name='ZPNET:photons_cadence_witness',
+    options='-c default_transaction_read_only=on -c statement_timeout=3000 -c lock_timeout=1000',
+) as conn:
+    emit({'stage': 'connected', 'elapsed_ms': round((time.monotonic()-started)*1000, 3)})
+    queries = (
+        ('server', """SELECT current_database() AS database,
+            current_setting('server_version') AS version,
+            current_setting('max_connections') AS max_connections,
+            pg_postmaster_start_time() AS started_at"""),
+        ('database', """SELECT numbackends, xact_commit, xact_rollback,
+            blks_read, blks_hit, temp_files, temp_bytes, deadlocks, stats_reset
+            FROM pg_stat_database WHERE datname = current_database()"""),
+        ('session_groups', """SELECT datname, backend_type, state,
+            wait_event_type, wait_event, count(*) AS sessions
+            FROM pg_stat_activity GROUP BY 1,2,3,4,5 ORDER BY sessions DESC LIMIT 30"""),
+        ('busy_sessions', """SELECT pid, application_name, backend_type, state,
+            wait_event_type, wait_event,
+            EXTRACT(EPOCH FROM clock_timestamp()-xact_start) AS transaction_age_s,
+            EXTRACT(EPOCH FROM clock_timestamp()-query_start) AS query_age_s,
+            pg_blocking_pids(pid) AS blocking_pids
+            FROM pg_stat_activity WHERE pid <> pg_backend_pid()
+              AND (state IS DISTINCT FROM 'idle')
+            ORDER BY xact_start NULLS LAST, query_start NULLS LAST LIMIT 20"""),
+        ('tables', """SELECT schemaname, relname, n_live_tup, n_dead_tup,
+            n_tup_ins, n_tup_upd, n_tup_del, last_autovacuum, last_autoanalyze,
+            pg_total_relation_size(relid) AS total_bytes
+            FROM pg_stat_user_tables WHERE relname IN
+              ('config', 'campaign_detail', 'campaign_master')"""),
+        ('checkpoint_sizes', """SELECT config_key,
+            pg_column_size(payload) AS stored_bytes,
+            octet_length(payload::text) AS json_text_bytes
+            FROM config WHERE config_key IN ('PHOTONS_RECOVERY', 'CLOCKS_RECOVERY')"""),
+    )
+    for name, sql in queries:
+        emit({'stage': name+'_started'})
+        started = time.monotonic()
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            emit({'stage': name, 'elapsed_ms': round((time.monotonic()-started)*1000, 3),
+                  'rows': cur.fetchall()})
+'''
+
+
+def database_report(args):
+    """One bounded diagnostic capture; no table scans of measurement history."""
+    exit_code = 0
+
+    def emit(section, value):
+        if args.jsonl:
+            print(json.dumps({'kind': 'db_diagnostic', 'at_utc': stamp(),
+                              'section': section, 'value': value}, default=str), flush=True)
+        elif isinstance(value, dict) and 'stdout' in value:
+            print(f'\n{section}', flush=True)
+            print(json.dumps({key: item for key, item in value.items()
+                              if key not in ('stdout', 'stderr')}), flush=True)
+            print(value['stdout'], flush=True)
+            if value['stderr']:
+                print('STDERR: ' + value['stderr'], flush=True)
+        else:
+            print(f'\n{section}\n' + (value if isinstance(value, str) else
+                                      json.dumps(value, indent=2, default=str)), flush=True)
+
+    def run(section, command, timeout, *, cwd=None, lines=None):
+        nonlocal exit_code
+        started = time.monotonic()
+        try:
+            result = subprocess.run(command, capture_output=True, text=True,
+                                    timeout=timeout, cwd=cwd)
+            output = result.stdout
+            if lines is not None:
+                output = '\n'.join(output.splitlines()[:lines])
+            emit(section, {'elapsed_ms': round((time.monotonic()-started)*1000, 3),
+                           'returncode': result.returncode, 'stdout': output,
+                           'stderr': result.stderr})
+            if result.returncode:
+                exit_code = 1
+        except subprocess.TimeoutExpired as exc:
+            # Timeout output can be bytes even with text=True; preserve evidence
+            # produced before the connection or statement stalled.
+            out = exc.stdout or b''
+            err = exc.stderr or b''
+            emit(section, {'error': f'Exceeded {timeout}s wall-clock limit',
+                           'stdout': out.decode(errors='replace') if isinstance(out, bytes) else out,
+                           'stderr': err.decode(errors='replace') if isinstance(err, bytes) else err})
+            exit_code = 1
+        except OSError as exc:
+            emit(section, {'error': str(exc)})
+            exit_code = 1
+
+    emit('PHOTONS DATABASE / RESOURCE WITNESS',
+         f'{VERSION}; read-only snapshot. No service restart or acquisition changes.\n'
+         'PostgreSQL activity visibility depends on the configured DB role.\n'
+         'vmstat: first row is since boot; subsequent rows cover one second.\n'
+         'No full checkpoint payloads, query text or connection credentials are printed.')
+    try:
+        run('HOST MEMORY', ['free', '-m'], 3)
+        run('LARGEST PROCESSES (RSS KiB)',
+            ['ps', '-eo', 'pid,comm,rss,pcpu,stat', '--sort=-rss'], 3, lines=21)
+        run('FILESYSTEM SPACE', ['df', '-h', '-l'], 3)
+        run('SWAP / CPU / IO', ['vmstat', '1', '5'], 8)
+        try:
+            emit('PHOTONS PROCESS', process_memory())
+            response = report()
+            if not response['success']:
+                raise RuntimeError(str(response))
+            payload = response['payload']
+            emit('PHOTONS BACKLOG', {key: payload[key] for key in COUNTERS})
+            emit('PHOTONS STATE', {'operational_state': payload['operational_state'],
+                                   'recovery': payload['recovery']})
+        except (OSError, KeyError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+            emit('PHOTONS REPORT ERROR', str(exc))
+            exit_code = 1
+        # A separate process puts a wall-clock bound on all DB work, even if
+        # connection startup, scheduling or socket IO ignores server deadlines.
+        run('POSTGRESQL', [sys.executable, '-c', DB_PROBE], 15,
+            cwd=Path(__file__).resolve().parents[1])
+    except KeyboardInterrupt:
+        emit('INTERRUPTED', 'Diagnostic capture interrupted.')
+        return 130
+    emit('END DATABASE / RESOURCE WITNESS', {'returncode': exit_code})
+    return exit_code
+
+
 def main(argv):
     args = arguments(argv)
+    if args.db:
+        return database_report(args)
     if args.adc_high:
         return adc_high_report(args)
     output_lock = threading.Lock()
