@@ -30,14 +30,13 @@ Author: The Mule + GPT
 
 import curses
 import logging
+import math
 import time
 from dataclasses import dataclass
 from typing import Callable
 
 from zpnet.shared.logger import setup_logging
-from zpnet.metrics.readout_blocks import (
-    PHOTONS_UPDATED, READOUTS, status_header,
-)
+from zpnet.metrics.readout_blocks import READOUTS, status_header
 
 # ---------------------------------------------------------------------
 # Configuration
@@ -45,7 +44,6 @@ from zpnet.metrics.readout_blocks import (
 
 REFRESH_INTERVAL_S = 1.0         # screen repaint cadence
 CYCLE_INTERVAL_S = 8.0           # auto-advance cadence (when unlocked)
-PHOTONS_KEY_POLL_S = 0.050       # keyboard polling; publications wake immediately
 
 
 @dataclass(frozen=True)
@@ -76,7 +74,8 @@ def _page_step(body_height: int) -> int:
 def _photons_visible_lines(lines: list[str], body_height: int) -> list[str]:
     """Keep the fixed headings and newest tail rows on shorter terminals."""
     for index, line in enumerate(lines):
-        if line.split() == ["SEC", "LAP", "ACCEPT", "EXCL", "MISSED", "SD", "SE"]:
+        columns = line.split()
+        if columns[:2] == ["SEC", "LAP"] and "ACCEPT" in columns:
             header_end = index + 1
             row_count = body_height - header_end
             if row_count > 0:
@@ -131,7 +130,7 @@ def _main(stdscr: curses.window) -> None:
     scroll_offsets = {readout.name: 0 for readout in readouts}
     readout_top_identity = {readout.name: None for readout in readouts}
     last_cycle_time = time.monotonic()
-    last_repaint_time = 0.0
+    next_repaint_time = time.monotonic()
 
     # ---------------------------------------------------------
     # Main loop
@@ -140,16 +139,13 @@ def _main(stdscr: curses.window) -> None:
         # -----------------------------------------------------
         # Input handling
         # -----------------------------------------------------
-        live_photons = readouts[readout_index].name in (
-            "PHOTONS", "PHOTON CAMPAIGNS")
-        stdscr.timeout(0 if live_photons else int(REFRESH_INTERVAL_S * 1000))
+        # Publications and metadata update caches; only this clock schedules
+        # periodic repaints. Keyboard/resize events still wake immediately.
+        remaining = next_repaint_time - time.monotonic()
+        stdscr.timeout(max(0, math.ceil(remaining * 1000)))
         key = stdscr.getch()
 
-        if (live_photons and key == -1 and not PHOTONS_UPDATED.is_set()
-                and time.monotonic() - last_repaint_time < REFRESH_INTERVAL_S):
-            # Sleep without holding up incoming publications. Recheck keyboard
-            # input at 50 ms intervals, but repaint only on arrival/key/timer.
-            PHOTONS_UPDATED.wait(PHOTONS_KEY_POLL_S)
+        if key == -1 and time.monotonic() < next_repaint_time:
             continue
 
         if key == ord("q") or key == ord("Q"):
@@ -191,11 +187,6 @@ def _main(stdscr: curses.window) -> None:
         # -----------------------------------------------------
         readout = readouts[readout_index]
         readout_name = readout.name
-
-        if readout_name in ("PHOTONS", "PHOTON CAMPAIGNS"):
-            # Clear BEFORE taking the snapshot. An arrival during rendering
-            # stays signaled and causes another pass instead of being lost.
-            PHOTONS_UPDATED.clear()
 
         try:
             header = status_header()
@@ -257,7 +248,12 @@ def _main(stdscr: curses.window) -> None:
                 pass
 
         stdscr.refresh()
-        last_repaint_time = time.monotonic()
+        now = time.monotonic()
+        if now >= next_repaint_time:
+            # Keep the one-second cadence independent of render time or keys.
+            # A slow repaint skips elapsed slots instead of issuing a burst.
+            elapsed_slots = int((now - next_repaint_time) / REFRESH_INTERVAL_S) + 1
+            next_repaint_time += elapsed_slots * REFRESH_INTERVAL_S
 
 
 # ---------------------------------------------------------------------
