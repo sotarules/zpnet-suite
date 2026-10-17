@@ -30,7 +30,7 @@ static constexpr uint64_t NS_PER_MICROSECOND = 1000ULL;
 // Receive bounds include detector/electronics/ISR latency; do not set the upper
 // bound to the calculated optical propagation alone. Defaults acquire both a
 // short patch cable and the ~1 km spool. All conversions use F_CPU_ACTUAL.
-static constexpr uint64_t PHOTONS_RACE_PULSE_NS = 200ULL;
+static constexpr uint64_t PHOTONS_RACE_PULSE_NS = 1000ULL;
 static constexpr uint32_t PHOTONS_RECEIVE_MIN_NS = 1U;
 static constexpr uint32_t PHOTONS_RECEIVE_MAX_NS = 10000U;
 
@@ -144,7 +144,10 @@ static const int LASER_MOD_PIN      = 35;
 //   not assume stock digitalRead(34) follows the changed GPIO bank.
 //   This is the authoritative optical timing signal.
 //
-// PD200T PD OUT is disconnected from the Teensy; pin 38 is now MAX31865 CS.
+// PHOTODIODE_ANALOG_PIN:
+//   PD200T PD OUT analog diagnostic input: Teensy 40 / A16 (0..3.3 V).
+//   Dedicated ADC2 channel 9 captures HIGH/LOW diagnostic pairs.
+//   Original PD OUT pin 38 remains MAX31865 CS.
 // Receiver timing uses only TTL OUT on pin 34.
 //
 // PD200T MON is the comparator-threshold monitor from the blue threshold
@@ -152,6 +155,8 @@ static const int LASER_MOD_PIN      = 35;
 //
 
 static const int PHOTODIODE_EDGE_PIN = 34;
+static const int PHOTODIODE_ANALOG_PIN = 40; // A16; PD200T PD OUT
+static constexpr uint32_t PHOTONS_PD_OUT_LOW_DELAY_NS = 2000U;
 
 // --------------------------------------------------------------
 // PT1000 RTD / MAX31865 -- installed hardware SPI1 wiring (2026-10-09)

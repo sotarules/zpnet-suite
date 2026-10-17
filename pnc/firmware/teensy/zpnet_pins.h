@@ -106,6 +106,7 @@ GND           Black         GND                Battery branching ground         
 27            Yellow        MAX31865_SCK       MAX31865 CLK                         SPI1 clock
 38            Orange        MAX31865_CS        MAX31865 CS                          Active-low GPIO chip select
 39            Blue          MAX31865_MISO      MAX31865 SDO                         SPI1 data from sensor
+40            Coax          PHOTODIODE_ANALOG  Koheron PD200T PD OUT                 A16; ADC2 channel 9 HIGH/LOW acquisition
 
 30            --            FREE               --                                   Released 2026-09-13; EV5491 retired
 
@@ -227,7 +228,7 @@ Used outputs:
 Output / Signal      Teensy Pin    ZPNet Signal Name       Purpose
 ---------------------------------------------------------------------------
 TTL out              34            PHOTODIODE_INT          Comparator timing edge / GPIO IRQ
-PD OUT               --            --                      No Teensy connection; external scope diagnostics only
+PD OUT               40 / A16      PHOTODIODE_ANALOG       ADC2 channel 9; HIGH/LOW pulse diagnostics
 
 Notes:
 • TTL out is the authoritative digital photodetector timing signal presented
@@ -236,16 +237,23 @@ Notes:
   pad to GPIO2[29] and services IRQ_GPIO2_16_31 at Priority 0 alongside the
   PPS/OCXO sources. PHOTONS protects predicted +/-5 us tick windows before
   launching; unexpected equal-priority serialization retains delay testimony.
-• PD OUT support retired 2026-09-18: the PD OUT-to-Teensy cable is removed,
-  pin 38 is now reserved for MAX31865 CS. Firmware no longer ADC-reads that
-  pin or publishes photodiode_analog_v. TTL OUT on pin 34 remains the receiver
-  timing input. DRV200 laser-monitor telemetry is separate and retained.
+• PD OUT reconnection assignment (2026-10-16): Teensy pin 40 / A16.
+  Coax center -> pin 40; shield -> Teensy/system GND. Input range: 0..3.3 V.
+  Firmware captures HIGH from the GPIO ISR and LOW via a GPT2 one-shot with
+  a 2000 ns target delay plus IRQ latency. ADC2 completion accumulates pairs;
+  PHOTONS_FRAGMENT.photons.pd_out publishes one-second mean ADC counts.
+  ADC2 and GPT2 are reserved for this diagnostic. Their IRQ priority is 64.
+  Scope verification of the ADC aperture remains an experimental step.
+• Original PD OUT support on pin 38 was retired 2026-09-18. Pin 38 is now
+  exclusively MAX31865 CS; do not reconnect PD OUT there. TTL OUT on pin 34
+  remains the timing input. DRV200 laser-monitor telemetry is separate.
 • Observed before removal: connecting PD OUT to the Teensy corrupted TTL OUT
   on the scope and coincided with an interrupt storm/system unresponsiveness;
   disconnecting PD OUT restored a clean TTL waveform. The electrical mechanism
-  was not established. Use an external scope for PD OUT diagnostics.
+  was not established. Observe TTL OUT and PD OUT together with passive
+  probes during reconnection, then again when ADC sampling is enabled.
 • The calibration observations below are retained as scope-based history;
-  they do not imply a current PD OUT connection to the Teensy.
+  they do not establish the behavior of the new pin 40 connection.
 • MON is the blue-pot comparator-threshold monitor and is not connected to the
   Teensy in the current architecture.
 • Selected PD200T comparator threshold (2026-09-20): MON = 0.407 V.

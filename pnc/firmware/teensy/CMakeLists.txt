@@ -72,6 +72,7 @@ set(ZPNET_SOURCES
     process_interrupt.cpp
     process_performance.cpp
     process_photons.cpp
+    photons_pd_out.cpp
     process_pubsub.cpp
     process_system.cpp
     process_timepop.cpp
@@ -98,6 +99,7 @@ set(ZPNET_HEADERS
     process_interrupt.h
     process_performance.h
     process_photons.h
+    photons_pd_out.h
     process_pubsub.h
     process_system.h
     process_timepop.h

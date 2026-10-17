@@ -1,6 +1,7 @@
 #pragma once
 
 #include "double.h"
+#include "photons_pd_out.h"
 #include <stdint.h>
 
 // ============================================================================
@@ -16,7 +17,8 @@
 //   • process_interrupt owns PD200T comparator edge capture and immutable
 //     DWT-at-edge custody.
 //   • PHOTONS consumes those edge facts and publishes PHOTONS_FRAGMENT.
-//   • PHOTONS processing is foreground-only. Raw edge capture belongs to
+//   • Optical processing is foreground-only. PD OUT analog acquisition uses
+//     ADC2/GPT2 interrupts and a separate cumulative handoff. Raw edge capture belongs to
 //     process_interrupt; edge delivery runs as a bounded foreground service.
 //     Scheduling/statistics transactions have one foreground owner at a time:
 //     the cadence callback, 1 Hz fragment transaction,
@@ -693,6 +695,7 @@ struct photons_fragment_snapshot_t {
   uint32_t race_reference_gate_cycles = 0;
   uint32_t race_seed_count = 0;
   photons_fragment_welford_snapshot_t race_flight_this_fragment{};
+  photons_pd_out_batch_t pd_out{};
   photons_envelope_snapshot_t envelope{};
   photons_core_snapshot_t core{};
 

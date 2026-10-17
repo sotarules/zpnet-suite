@@ -1,4 +1,5 @@
 #include "integer_only.h"
+#include "photons_pd_out.h"
 // ============================================================================
 // process_interrupt.cpp
 // ============================================================================
@@ -5847,14 +5848,18 @@ static void photodiode_raw_push(uint32_t entry_dwt,
 
 static void photodiode_gpio2_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;
+  const uint32_t status =
+      GPIO2_ISR & GPIO2_IMR & PHOTODIODE_GPIO2_HIGH_HALF_MASK;
+  // Preserve the timestamp first, then start the analog sample before the
+  // diagnostic bookkeeping. A stale empty NVIC delivery must not create a pair.
+  if ((status & PHOTODIODE_GPIO2_MASK) != 0U)
+    photons_pd_out_high_isr(isr_entry_dwt_raw);
   const interrupt_arrival_capture_t arrival_capture =
       interrupt_delay_capture_entry_fast(interrupt_execution_source_t::PHOTODIODE);
   interrupt_isr_diag_enter(
       g_interrupt_priority_runtime.photodiode, isr_entry_dwt_raw);
   interrupt_note_science_preemption(
       g_interrupt_priority_runtime.photodiode_preempted_qtimer1_count);
-  const uint32_t status =
-      GPIO2_ISR & GPIO2_IMR & PHOTODIODE_GPIO2_HIGH_HALF_MASK;
   if ((status & (PHOTODIODE_GPIO2_HIGH_HALF_MASK &
                  ~PHOTODIODE_GPIO2_MASK)) != 0U) __builtin_trap();
   // NVIC delivery can outlive GPIO status cleared at an acquisition boundary.

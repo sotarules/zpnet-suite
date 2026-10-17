@@ -3381,7 +3381,8 @@ static void photons_laser_initialize_hardware(void) {
   if (digitalRead(LASER_MOD_PIN) != LOW) __builtin_trap();
 
   pinMode(LASER_MONITOR_PIN, INPUT);
-  analogReadResolution(12);
+  // ADC setup is boot-only: analogReadResolution() would also reconfigure the
+  // dedicated PD OUT ADC2 if called by a later PHOTONS.INIT command.
 }
 
 static photons_device_snapshot_t photons_device_snapshot(void) {
@@ -3826,7 +3827,7 @@ static const photons_fragment_snapshot_t& photons_report_fragment_snapshot(void)
       sizeof(name##_storage))
 
 // Reserve 2 KiB for the new nested envelope testimony and its framing.
-static constexpr size_t PHOTONS_FRAGMENT_ROOT_CAPACITY = 15360U;
+static constexpr size_t PHOTONS_FRAGMENT_ROOT_CAPACITY = 16384U;
 static constexpr size_t PHOTONS_FRAGMENT_ROOT_GUARD_WORDS =
     PHOTONS_RAM2_CACHE_LINE_BYTES / sizeof(uint32_t);
 static constexpr size_t PHOTONS_FRAGMENT_ROOT_SECTOR_BYTES = 1024U;
@@ -3870,7 +3871,7 @@ static Payload g_photons_fragment_root(
     Payload::StorageMode::FIXED,
     g_photons_fragment_root_region.storage,
     sizeof(g_photons_fragment_root_region.storage));
-PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_instrument, 14336U);
+PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_instrument, 15360U);
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_envelope, 2048U);
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_core, 2048U);
 
@@ -3880,6 +3881,7 @@ PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_core, 2048U);
 // the nested flight_ns Welford. Keep explicit fixed custody with schema headroom.
 // Explicit acquisition bounds and four uint64 rejection reasons (total/delta).
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_race, 4096U);
+PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_pd_out, 1024U);
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_raw_cycles, 1024U);
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_projection, 1024U);
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_science, 3072U);
@@ -4617,6 +4619,7 @@ static Payload& photons_fragment_payload(
   Payload& root = g_photons_fragment_root;
   Payload& instrument = g_photons_fragment_instrument;
   Payload& race = g_photons_fragment_race;
+  Payload& pd_out = g_photons_fragment_pd_out;
   Payload& raw = g_photons_fragment_raw_cycles;
   Payload& projection = g_photons_fragment_projection;
   Payload& science = g_photons_fragment_science;
@@ -4663,6 +4666,37 @@ static Payload& photons_fragment_payload(
   instrument.add("publish_reject_count_before_fragment",
                  f.publish_reject_count_before_fragment);
   instrument.add("source", "PD200T_REAL_RACE");
+  pd_out.clear();
+  pd_out.add("pin", PHOTODIODE_ANALOG_PIN);
+  pd_out.add("adc_bits", 12U);
+  pd_out.add("low_delay_target_ns", PHOTONS_PD_OUT_LOW_DELAY_NS);
+  pd_out.add("pair_count", f.pd_out.pair_count);
+  pd_out.add("busy_edges", f.pd_out.busy_edges);
+  pd_out.add("high_not_ready", f.pd_out.high_not_ready);
+  pd_out.add("high_start_count_total", f.pd_out.high_start_count_total);
+  pd_out.add("timer_irq_count_total", f.pd_out.timer_irq_count_total);
+  pd_out.add("low_irq_count_total", f.pd_out.low_irq_count_total);
+  pd_out.add("phase", f.pd_out.phase);
+  pd_out.add("gpt_cr", f.pd_out.gpt_cr);
+  pd_out.add("gpt_cnt", f.pd_out.gpt_cnt);
+  pd_out.add("gpt_sr", f.pd_out.gpt_sr);
+  pd_out.add("gpt_ir", f.pd_out.gpt_ir);
+  pd_out.add("adc_hc0", f.pd_out.adc_hc0);
+  pd_out.add("adc_hs", f.pd_out.adc_hs);
+  pd_out.add("adc_cfg", f.pd_out.adc_cfg);
+  pd_out.add("adc_gc", f.pd_out.adc_gc);
+  pd_out.add("irq_enabled_mask", f.pd_out.irq_enabled_mask);
+  if (f.pd_out.pair_count != 0ULL) {
+    const Double count = Double(f.pd_out.pair_count);
+    pd_out.add("high_mean_counts", toFixedDecimal(Double(f.pd_out.high_sum) / count, 6));
+    pd_out.add("low_mean_counts", toFixedDecimal(Double(f.pd_out.low_sum) / count, 6));
+    pd_out.add("high_start_after_entry_mean_cycles",
+               toFixedDecimal(Double(f.pd_out.high_delay_cycles_sum) / count, 3));
+    pd_out.add("low_start_after_high_mean_cycles",
+               toFixedDecimal(Double(f.pd_out.low_delay_cycles_sum) / count, 3));
+  }
+  instrument.add_object("pd_out", pd_out);
+  pd_out.clear();
   instrument.add("edge_count_total", f.edge_count_total);
   instrument.add("edges_this_fragment", f.edges_this_fragment);
   // Legacy wire fields remain zero while downstream callers migrate naming.
@@ -5122,6 +5156,7 @@ static FLASHMEM void photons_fragment_tick(
   // This is a foreground batch boundary, not the scheduled CH2 event time.
   // Unsigned subtraction handles millis() rollover for ordinary batch spans.
   const uint32_t fragment_cut_ms = millis();
+  const auto pd_out_batch = photons_pd_out_take_batch();
   const uint32_t fragment_elapsed_ms = fragment_cut_ms - g_last_fragment_cut_ms;
   g_last_fragment_cut_ms = fragment_cut_ms;
   const photons_fragment_drain_result_t drain =
@@ -5285,6 +5320,7 @@ static FLASHMEM void photons_fragment_tick(
   fragment.race_flight_this_fragment =
       photons_welford_snapshot(drain.projected_flight_welford);
 
+  fragment.pd_out = pd_out_batch;
   fragment.envelope = g_photons_envelope.latest;
   fragment.core = g_photons_core.latest;
 
@@ -5560,6 +5596,7 @@ static void photons_start_fragment_publisher(void) {
   // Rebase on every publisher start so disabled/recovery time is not charged
   // to the first batch. Rejected publications still advance the batch boundary.
   g_last_fragment_cut_ms = millis();
+  photons_pd_out_rebase();
   g_fragment_timer = timepop_arm_recurring_service(
       PHOTONS_FRAGMENT_PERIOD_NS,
       photons_fragment_tick,
@@ -5702,6 +5739,8 @@ FLASHMEM void process_photons_init(void) {
 
   photons_race_prepare();
   photons_laser_initialize_hardware();
+  analogReadResolution(12);
+  photons_pd_out_init();
 
   interrupt_photodiode_subscription_t subscription{};
   subscription.on_edge = photons_on_photodiode_edge;
@@ -7653,6 +7692,7 @@ static FLASHMEM Payload cmd_disable(const Payload&) {
     }
     g_interrupt_started = false;
   }
+  photons_pd_out_stop();
 
   g_pulse_armed_sequence = 0U;
   photons_memory_barrier();
