@@ -17,12 +17,14 @@ process restart; they never require a Teensy reboot or a new raw statistics epoc
 from __future__ import annotations
 
 import copy
+import gc
 import json
 from collections import deque
 from dataclasses import dataclass
 import logging
 import math
 import queue
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -1703,12 +1705,47 @@ _cadence_started_ns = time.monotonic_ns()
 _cadence_lock = threading.Lock()
 _cadence_samples = deque(maxlen=120)
 _cadence_sample_count = 0
+# The state worker alone owns these counters. Collections on another thread
+# are not charged as its GC work; thread CPU vs elapsed time exposes waiting.
+_cadence_state_thread_id = None
+_cadence_gc_started_ns = 0
+_cadence_gc_totals = [(0, 0, 0), (0, 0, 0), (0, 0, 0)]
+
+
+def _cadence_gc_callback(phase, info):
+    global _cadence_gc_started_ns
+    if threading.get_ident() != _cadence_state_thread_id:
+        return
+    if phase == "start":
+        _cadence_gc_started_ns = time.monotonic_ns()
+    else:
+        elapsed = time.monotonic_ns() - _cadence_gc_started_ns
+        generation = info["generation"]
+        count, duration, collected = _cadence_gc_totals[generation]
+        _cadence_gc_totals[generation] = (count + 1, duration + elapsed,
+                                        collected + info["collected"])
 
 
 def _cadence_mark(timing, name):
     now = time.monotonic_ns()
+    cpu = time.thread_time_ns()
+    # Read existing scalar tuples before allocating diagnostic containers. GC
+    # triggered by the instrumentation itself then belongs to the next span,
+    # just as its elapsed time does. No locks, logging or object-graph inspection
+    # execute in the collector callback, and GC policy is never changed.
+    g0, g1, g2 = _cadence_gc_totals
     timing["stages_ms"][name] = (now - timing["last_ns"]) / 1_000_000
+    timing["stage_cpu_ms"][name] = (cpu - timing["last_cpu_ns"]) / 1_000_000
+    previous = timing["last_gc"]
+    current = (g0, g1, g2)
+    timing["stage_gc"][name] = {
+        "collections": [new[0] - old[0] for old, new in zip(previous, current)],
+        "elapsed_ms": [(new[1] - old[1]) / 1_000_000 for old, new in zip(previous, current)],
+        "collected": [new[2] - old[2] for old, new in zip(previous, current)],
+    }
     timing["last_ns"] = now
+    timing["last_cpu_ns"] = cpu
+    timing["last_gc"] = current
     return now
 
 
@@ -1726,6 +1763,8 @@ def _record_cadence(timing, photons, ingress_monotonic,
                                   ingress_monotonic) * 1000,
         "state_total_ms": (timing["last_ns"] - timing["started_ns"]) / 1_000_000,
         "stages_ms": timing["stages_ms"],
+        "stage_cpu_ms": timing["stage_cpu_ms"],
+        "stage_gc": timing["stage_gc"],
     }
     with _cadence_lock:
         _cadence_sample_count += 1
@@ -1742,6 +1781,10 @@ def _cadence_report():
     # Completed samples are never mutated. Copy after releasing the lock so
     # REPORT serialization cannot hold up the state owner's diagnostic append.
     report["samples"] = copy.deepcopy(report["samples"])
+    report["runtime"] = {"python": sys.version.split()[0],
+                         "gc_enabled": gc.isenabled(),
+                         "gc_thresholds": list(gc.get_threshold()),
+                         "gc_scope": "STATE_WORKER_THREAD"}
     return report
 
 _fragment_queue: queue.Queue[Payload] = queue.Queue(maxsize=PHOTONS_INGRESS_QUEUE_MAXSIZE)
@@ -3656,6 +3699,8 @@ def _ppb_checkpoint_runtime_ensure_locked() -> Dict[str, Any]:
 
 
 def _ppb_checkpoint_snapshot_locked(runtime: Dict[str, Any]) -> Dict[str, Any]:
+    # Detach every mutable field here. The state owner can transfer this image
+    # directly to ordered persistence without copying the complete rings again.
     second_history = [copy.deepcopy(value) for value in runtime["second_history"]]
     minute_history = [copy.deepcopy(value) for value in runtime["minute_history"]]
     expected_second = int(runtime.get("expected_second_count") or 0)
@@ -3731,7 +3776,7 @@ def _ppb_checkpoint_snapshot_locked(runtime: Dict[str, Any]) -> Dict[str, Any]:
         "last_gap": copy.deepcopy(runtime.get("last_gap")),
         "seed_source": runtime.get("seed_source"),
         "seed_source_db_detail_id": runtime.get("seed_source_db_detail_id"),
-        "last_delta_signature": runtime.get("last_delta_signature"),
+        "last_delta_signature": copy.deepcopy(runtime.get("last_delta_signature")),
         "proof_checks": int(runtime.get("proof_checks") or 0),
     }
 
@@ -4000,7 +4045,10 @@ def _ppb_checkpoint_ingest(stats: Dict[str, Any]) -> Dict[str, Any]:
             )
             _ppb_checkpoint_warming_rows += 1
         _ppb_checkpoint_rows_verified += 1
-        return _ppb_checkpoint_snapshot_locked(runtime)
+        # Only status_reason changed after this independent image was built.
+        # Keep the proof check above; reuse its snapshot with the final reason.
+        snapshot["status_reason"] = runtime["status_reason"]
+        return snapshot
 
 
 def _normalize_saved_ppb_checkpoint(value: Any) -> Dict[str, Any]:
@@ -9172,7 +9220,10 @@ def _state_loop() -> None:
     global _last_structural_rejection
     global _last_system_report_failure
     global _hard_failure_state_dropped
+    global _cadence_state_thread_id
 
+    _cadence_state_thread_id = threading.get_ident()
+    gc.callbacks.append(_cadence_gc_callback)
     _state_worker_started.set()
     logging.info("🚀 [photons] canonical PHOTONS_V1 state worker started")
 
@@ -9189,8 +9240,9 @@ def _state_loop() -> None:
             time.sleep(0.01)
             continue
         state_lock_requested_ns = time.monotonic_ns()
+        state_lock_requested_cpu_ns = time.thread_time_ns()
+        state_gc0, state_gc1, state_gc2 = _cadence_gc_totals
         with _maintenance_lock:
-            state_lock_acquired_ns = time.monotonic_ns()
             # Recovery may have set its hold while we waited for this lock.
             # Do not enqueue another canonical row after its drain boundary.
             if _runtime_recovery_hold.is_set():
@@ -9210,11 +9262,14 @@ def _state_loop() -> None:
 
                 timing = {
                     "started_ns": state_lock_requested_ns,
-                    "last_ns": state_lock_acquired_ns,
-                    "stages_ms": {"state_lock": (state_lock_acquired_ns -
-                                                state_lock_requested_ns) / 1_000_000},
+                    "last_ns": state_lock_requested_ns,
+                    "last_cpu_ns": state_lock_requested_cpu_ns,
+                    "last_gc": (state_gc0, state_gc1, state_gc2),
+                    "stages_ms": {}, "stage_cpu_ms": {}, "stage_gc": {},
                 }
-                _cadence_mark(timing, "dequeue")
+                # Lock acquisition and dequeue are one measured span here;
+                # this also includes the processed-counter lock and setup.
+                _cadence_mark(timing, "state_lock_dequeue")
                 system_failure_logged = False
                 while True:
                     if _hard_failure_active() and not _repair_active():
@@ -9400,7 +9455,10 @@ def _state_loop() -> None:
 
                 persist_item = {
                     "photons": copy.deepcopy(photons),
-                    "ppb_restore_checkpoint": copy.deepcopy(ppb_restore_checkpoint),
+                    # Already detached under the checkpoint lock. Transfer
+                    # ownership exactly as for the temperature/normalizer images;
+                    # the state worker never mutates this checkpoint after enqueue.
+                    "ppb_restore_checkpoint": ppb_restore_checkpoint,
                     "temperature_rolling_checkpoint": temperature_rolling,
                     "normalization_state": normalization_state,
                 }

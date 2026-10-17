@@ -28,7 +28,7 @@ import sys
 import threading
 import time
 
-VERSION = '2026-10-17.2'
+VERSION = '2026-10-17.3'
 TAP = '/tmp/zpnet_pubsub_tap.sock'
 COMMAND = '/tmp/zpnet-photons-command.sock'
 TOPICS = ('PHOTONS_FRAGMENT', 'PHOTONS')
@@ -94,6 +94,9 @@ class Witness:
         self.processing_previous = {}
         self.processing_series = {}
         self.processing_count = 0
+        self.gc_samples = 0
+        self.gc_collections = [0, 0, 0]
+        self.gc_collected = [0, 0, 0]
 
     def measure(self, name, value):
         self.series.setdefault(name, []).append(value)
@@ -170,6 +173,16 @@ class Witness:
                 self.processing_series.setdefault(name, []).append(sample[name])
             for name, value in sample['stages_ms'].items():
                 self.processing_series.setdefault('stage.'+name, []).append(value)
+            if 'stage_cpu_ms' in sample:
+                for name, value in sample['stage_cpu_ms'].items():
+                    self.processing_series.setdefault('cpu.'+name, []).append(value)
+            if 'stage_gc' in sample:
+                self.gc_samples += 1
+                for name, value in sample['stage_gc'].items():
+                    self.processing_series.setdefault('gc.'+name, []).append(sum(value['elapsed_ms']))
+                    for generation in range(3):
+                        self.gc_collections[generation] += value['collections'][generation]
+                        self.gc_collected[generation] += value['collected'][generation]
             self.processing_count += 1
             self.emit(row)
 
@@ -182,6 +195,9 @@ class Witness:
                 'median':round(statistics.median(values), 3),
                 'max':round(ordered[-1], 3)}
         result['processing_samples'] = self.processing_count
+        result['gc_samples'] = self.gc_samples
+        result['gc_collections'] = self.gc_collections
+        result['gc_collected'] = self.gc_collected
         result['processing_timings_ms'] = {}
         for name, values in self.processing_series.items():
             result['processing_timings_ms'][name] = {
@@ -204,7 +220,10 @@ def print_record(row):
         print('SAVE = RPC end to canonical construction estimate; AFTER = construction to tap.')
         print('published_at_utc marks construction, not the actual publish call.')
         print('PROCESSING rows are direct monotonic timings from REPORT, keyed by sequence.')
-        print('Stages are elapsed time, including scheduling/GC; they do not isolate CPU time.')
+        print('Stages: elapsed/CPU/GC milliseconds. CPU is state-thread execution time.')
+        print('GC is completed cyclic collection on that thread; it overlaps elapsed/CPU, not additive.')
+        print('Collections on other threads and reference-count disposal are not measured as GC.')
+        print('Elapsed minus CPU includes waits/scheduling; it does not identify their cause.')
         print('Publish call timing ends at local handoff, not broker delivery or database commit.')
         print('State total runs from state-lock request through persistence enqueue; stages partition it.')
         print('savepoint_complete/canonical_complete include return and replaced-object cleanup.')
@@ -223,9 +242,18 @@ def print_record(row):
               f'update={row["update_count"]} step={row.get("sequence_step", "-")} '
               f'call_interval={interval} ingress_to_publish={row["ingress_to_publish_ms"]:.3f} '
               f'state_total={row["state_total_ms"]:.3f} ms')
-        stages = [f'{name}={value:.3f}' for name, value in row['stages_ms'].items()]
-        for offset in range(0, len(stages), 4):
-            print('  ' + '  '.join(stages[offset:offset+4]))
+        if 'stage_cpu_ms' in row and 'stage_gc' in row:
+            stages = [f'{name}={value:.3f}/{row["stage_cpu_ms"][name]:.3f}/'
+                      f'{sum(row["stage_gc"][name]["elapsed_ms"]):.3f}'
+                      for name, value in row['stages_ms'].items()]
+            counts = [sum(value['collections'][g] for value in row['stage_gc'].values()) for g in range(3)]
+            collected = [sum(value['collected'][g] for value in row['stage_gc'].values()) for g in range(3)]
+            print(f'  Cyclic GC generations 0/1/2: collections={counts}; objects collected={collected}')
+        else:
+            stages = [f'{name}={value:.3f}' for name, value in row['stages_ms'].items()]
+            print('  CPU/GC instrumentation unavailable; stages show elapsed time only.')
+        for offset in range(0, len(stages), 3):
+            print('  ' + '  '.join(stages[offset:offset+3]))
     elif kind == 'health':
         print(f'HEALTH {row["at_utc"]}')
         memory = row.get('memory')
@@ -238,7 +266,7 @@ def print_record(row):
             for key in ('last_system_report_failure', 'last_persistence_failure'):
                 if counters.get(key) is not None:
                     print(f'  {key}: {json.dumps(counters[key])}')
-        for key in ('report_round_trip_ms', 'memory_error', 'report_error', 'processing_timing'):
+        for key in ('report_round_trip_ms', 'memory_error', 'report_error', 'processing_timing', 'runtime'):
             if key in row:
                 print(f'  {key}: {row[key]}')
     elif kind == 'summary':
@@ -249,6 +277,9 @@ def print_record(row):
             print(f'{name:37} {stats["n"]:6} {stats["min"]:12.3f} '
                   f'{stats["median"]:12.3f} {stats["max"]:12.3f}')
         print(f'\nDIRECT MONOTONIC PROCESSING: {row["processing_samples"]} completed samples')
+        print(f'Cyclic GC diagnostics: {row["gc_samples"]} samples; generations 0/1/2: '
+              f'collections={row["gc_collections"]}; objects collected={row["gc_collected"]}')
+        print('stage.* = elapsed; cpu.* = state-thread CPU; gc.* = cyclic GC elapsed (overlapping).')
         print(f'{"Timing (ms)":42} {"N":>6} {"Minimum":>12} {"Median":>12} {"Maximum":>12}')
         for name, stats in row['processing_timings_ms'].items():
             print(f'{name:42} {stats["n"]:6} {stats["min"]:12.3f} '
@@ -306,6 +337,8 @@ def main(argv):
                     row['processing_timing'] = 'Instrumentation not installed in this PHOTONS process.'
                 else:
                     witness.accept_processing(timing)
+                    if 'runtime' in timing:
+                        row['runtime'] = timing['runtime']
                     row['processing_timing'] = (
                         f'{timing["sample_count"]} completed since process start; '
                         f'{len(timing["samples"])}/{timing["capacity"]} retained')
