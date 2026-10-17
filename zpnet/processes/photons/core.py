@@ -1689,10 +1689,60 @@ _recovery_lock = threading.RLock()
 _subsystem_lifecycle_lock = threading.RLock()
 _subsystem_lifecycle_known = threading.Event()
 _subsystem_enabled = threading.Event()
-# Serialize worker publication/persistence with destructive maintenance commands.
-# PHOTONS is only 1 Hz, so this intentionally favors an exact maintenance boundary
-# over parallelism that could let a pre-CLEAR campaign row reappear afterward.
+# Publication and persistence have independent owners. Database writes/retries
+# must not hold the state worker's lock. A boundary needing both owners takes
+# _maintenance_lock first, then _persistence_lock. Destructive bulk maintenance
+# also uses the existing owner-quiescence handshakes before changing storage.
 _maintenance_lock = threading.RLock()
+_persistence_lock = threading.RLock()
+
+# Bounded process-local diagnostics only: never part of canonical measurements,
+# persistence items, rollback state or recovery authority. REPORT copies only
+# these small completed records; no diagnostic lock spans scientific work.
+_cadence_started_ns = time.monotonic_ns()
+_cadence_lock = threading.Lock()
+_cadence_samples = deque(maxlen=120)
+_cadence_sample_count = 0
+
+
+def _cadence_mark(timing, name):
+    now = time.monotonic_ns()
+    timing["stages_ms"][name] = (now - timing["last_ns"]) / 1_000_000
+    timing["last_ns"] = now
+    return now
+
+
+def _record_cadence(timing, photons, ingress_monotonic,
+                    publish_started_ns, publish_returned_ns):
+    global _cadence_sample_count
+    stats = photons["photons"]["stats"]
+    sample = {
+        "sequence": photons["sequence"],
+        "reset_count": stats["reset_count"],
+        "update_count": stats["update_count"],
+        "publish_started_monotonic_ns": publish_started_ns,
+        "publish_returned_monotonic_ns": publish_returned_ns,
+        "ingress_to_publish_ms": (publish_started_ns / 1_000_000_000 -
+                                  ingress_monotonic) * 1000,
+        "state_total_ms": (timing["last_ns"] - timing["started_ns"]) / 1_000_000,
+        "stages_ms": timing["stages_ms"],
+    }
+    with _cadence_lock:
+        _cadence_sample_count += 1
+        sample["sample_id"] = _cadence_sample_count
+        _cadence_samples.append(sample)
+
+
+def _cadence_report():
+    with _cadence_lock:
+        report = {"started_monotonic_ns": _cadence_started_ns,
+                  "capacity": _cadence_samples.maxlen,
+                  "sample_count": _cadence_sample_count,
+                  "samples": list(_cadence_samples)}
+    # Completed samples are never mutated. Copy after releasing the lock so
+    # REPORT serialization cannot hold up the state owner's diagnostic append.
+    report["samples"] = copy.deepcopy(report["samples"])
+    return report
 
 _fragment_queue: queue.Queue[Payload] = queue.Queue(maxsize=PHOTONS_INGRESS_QUEUE_MAXSIZE)
 _persist_queue: queue.Queue[Dict[str, Any]] = queue.Queue(maxsize=PHOTONS_PERSIST_QUEUE_MAXSIZE)
@@ -4899,11 +4949,18 @@ def _restore_photons_pi_state(snapshot):
         _latest_photons = copy.deepcopy(canonical)
 
 
-def _state_transaction_savepoint():
+def _state_transaction_savepoint(timing):
     # Called with the existing maintenance lock held by the state owner.
     with _ppb_checkpoint_lock, _campaign_lock:
-        return (_analysis.memory(), copy.deepcopy(_ppb_checkpoint_runtime),
-                copy.deepcopy(_active_campaign), copy.deepcopy(_closing_campaigns))
+        _cadence_mark(timing, "savepoint_locks")
+        analysis = _analysis.memory()
+        _cadence_mark(timing, "savepoint_analysis_copy")
+        ppb = copy.deepcopy(_ppb_checkpoint_runtime)
+        _cadence_mark(timing, "savepoint_ppb_copy")
+        active = copy.deepcopy(_active_campaign)
+        closing = copy.deepcopy(_closing_campaigns)
+        _cadence_mark(timing, "savepoint_campaign_copy")
+        return analysis, ppb, active, closing
 
 
 def _state_transaction_rollback(saved):
@@ -4967,7 +5024,7 @@ def _complete_live_checkpoint():
 
 
 def _make_photons(
-    fragment: Payload, system_context: Dict[str, Any]
+    fragment: Payload, system_context: Dict[str, Any], timing
 ) -> Tuple[Payload, Dict[str, Any]]:
     """Form canonical PHOTONS_V1 from firmware testimony + authoritative SYSTEM context."""
     global _ppb_checkpoint_runtime
@@ -4976,6 +5033,7 @@ def _make_photons(
 
     sequence, publish_count, pps_count, instrument = _validate_photons_fragment(fragment)
     system_context = _require_dict(system_context, "SYSTEM.REPORT.payload")
+    _cadence_mark(timing, "fragment_validation")
 
     state: Payload = {
         "schema": PHOTONS_SCHEMA,
@@ -5012,13 +5070,18 @@ def _make_photons(
     state["photons"] = copy.deepcopy(instrument)
     stats = _require_dict(instrument.get("stats"), "PHOTONS_FRAGMENT.photons.stats")
 
+    _cadence_mark(timing, "canonical_context_copy")
+
     # Fold the producer-authored Better-Buckets delta before publication. The
     # complete literal recovery image is private continuation state committed to
     # config.PHOTONS_RECOVERY; canonical PHOTONS never transports the bounded ring.
     with _ppb_checkpoint_lock:
+        _cadence_mark(timing, "ppb_lock")
         checkpoint_before = copy.deepcopy(_ppb_checkpoint_runtime)
+        _cadence_mark(timing, "ppb_rollback_copy")
         try:
             checkpoint = _ppb_checkpoint_ingest(stats)
+            _cadence_mark(timing, "ppb_ingest_snapshot")
         except Exception as exc:
             _ppb_checkpoint_runtime = checkpoint_before
             _ppb_checkpoint_ingest_failure_count += 1
@@ -5043,6 +5106,7 @@ def _make_photons(
     if normalization is not None:
         state["normalization"] = normalization
     state["measurement"] = _normalizer.measure(state)
+    _cadence_mark(timing, "normalization")
     return state, checkpoint
 
 
@@ -9124,7 +9188,13 @@ def _state_loop() -> None:
         if _runtime_recovery_hold.is_set():
             time.sleep(0.01)
             continue
+        state_lock_requested_ns = time.monotonic_ns()
         with _maintenance_lock:
+            state_lock_acquired_ns = time.monotonic_ns()
+            # Recovery may have set its hold while we waited for this lock.
+            # Do not enqueue another canonical row after its drain boundary.
+            if _runtime_recovery_hold.is_set():
+                continue
             try:
                 fragment = _fragment_queue.get_nowait()
             except queue.Empty:
@@ -9138,6 +9208,13 @@ def _state_loop() -> None:
                 with _state_lock:
                     _fragments_processed += 1
 
+                timing = {
+                    "started_ns": state_lock_requested_ns,
+                    "last_ns": state_lock_acquired_ns,
+                    "stages_ms": {"state_lock": (state_lock_acquired_ns -
+                                                state_lock_requested_ns) / 1_000_000},
+                }
+                _cadence_mark(timing, "dequeue")
                 system_failure_logged = False
                 while True:
                     if _hard_failure_active() and not _repair_active():
@@ -9167,11 +9244,14 @@ def _state_loop() -> None:
                         _hard_failure_state_dropped += 1
                     continue
 
-                savepoint = _state_transaction_savepoint()
+                _cadence_mark(timing, "system_report")
+                savepoint = _state_transaction_savepoint(timing)
+                _cadence_mark(timing, "savepoint_complete")
                 try:
                     photons, ppb_restore_checkpoint = _make_photons(
-                        fragment, system_context
+                        fragment, system_context, timing
                     )
+                    _cadence_mark(timing, "canonical_complete")
 
                     # Producer-declared rolling custody loss is not an ordinary
                     # science exclusion.  The current row cannot carry durable
@@ -9254,19 +9334,25 @@ def _state_loop() -> None:
                     # is attached BEFORE publication and BEFORE the ordered
                     # persistence transaction. Restart always resumes from the
                     # exact last committed measurement + its checkpoint.
+                    _cadence_mark(timing, "campaign")
                     temperature_input = _temperature_stats.preflight(photons)
+                    _cadence_mark(timing, "temperature_preflight")
                     photons["stability"] = _stability.ingest(photons)
+                    _cadence_mark(timing, "stability")
                     # Temperature TOTAL/CAMP and trailing expiration state join
                     # this exact observation. Restore assigns the saved state;
                     # it does not read/replay historical observations.
                     photons["temperature_stats"] = _temperature_stats.ingest(
                         photons, prepared=temperature_input
                     )
+                    _cadence_mark(timing, "temperature_ingest")
                     # Snapshot the rolling image NOW, under the single state
                     # worker. The persist worker may lag by seconds or minutes;
                     # querying its live calculator later would splice cursors.
                     temperature_rolling = _temperature_stats.rolling_checkpoint()
+                    _cadence_mark(timing, "temperature_snapshot")
                     normalization_state = _normalizer.checkpoint()
+                    _cadence_mark(timing, "normalization_snapshot")
                 except Exception as exc:
                     _state_transaction_rollback(savepoint)
                     rejection = {
@@ -9302,21 +9388,29 @@ def _state_loop() -> None:
                     continue
 
                 with _state_lock:
+                    _cadence_mark(timing, "latest_state_lock")
                     _latest_photons = copy.deepcopy(photons)
 
+                publish_started_ns = _cadence_mark(timing, "latest_state_copy")
                 publish(PHOTONS_TOPIC, photons)
+                publish_returned_ns = _cadence_mark(timing, "publish_call")
                 with _state_lock:
                     _photons_published += 1
+                _cadence_mark(timing, "publication_counter")
 
-                _persist_queue.put_nowait(
-                    {
-                        "photons": copy.deepcopy(photons),
-                        "ppb_restore_checkpoint": copy.deepcopy(ppb_restore_checkpoint),
-                        "temperature_rolling_checkpoint": temperature_rolling,
-                        "normalization_state": normalization_state,
-                    }
-                )
+                persist_item = {
+                    "photons": copy.deepcopy(photons),
+                    "ppb_restore_checkpoint": copy.deepcopy(ppb_restore_checkpoint),
+                    "temperature_rolling_checkpoint": temperature_rolling,
+                    "normalization_state": normalization_state,
+                }
+                _cadence_mark(timing, "persistence_item_copy")
+                _persist_queue.put_nowait(persist_item)
+                del persist_item
                 _note_persist_queue_depth()
+                _cadence_mark(timing, "persistence_enqueue")
+                _record_cadence(timing, photons, fragment["_pi_ingress"]["monotonic"],
+                                publish_started_ns, publish_returned_ns)
 
 
         if fragment is None:
@@ -9345,7 +9439,7 @@ def _persistence_loop() -> None:
         photons = None
         checkpoint = None
         temperature_rolling = None
-        with _maintenance_lock:
+        with _persistence_lock:
             try:
                 persist_item = _persist_queue.get_nowait()
             except queue.Empty:
@@ -9456,10 +9550,10 @@ def _wait_for_runtime_recovery_persistence_boundary() -> Dict[str, Any]:
         if _hard_failure_active():
             raise RuntimeError("PHOTONS entered HARD_FAILURE before ambient persistence barrier")
         if _persist_queue.empty():
-            # Empty alone is insufficient: the persistence worker may already own
-            # an item.  Crossing _maintenance_lock proves that any such transaction
-            # has completed before the recovery source is selected.
-            with _maintenance_lock:
+            # Finish an in-flight state row first; it may still enqueue its
+            # checkpoint. Then cross the writer's commit/proof boundary, even
+            # if it has already removed the last item from the queue.
+            with _maintenance_lock, _persistence_lock:
                 if _persist_queue.empty():
                     return {
                         "waited_s": round(time.monotonic() - started, 3),
@@ -10639,32 +10733,34 @@ def cmd_delete(args: Optional[dict]) -> Dict[str, Any]:
         if any(item.get("campaign") == campaign_name for item in _closing_campaigns):
             return {"success": False, "message": f"Campaign '{campaign_name}' final firmware row is still pending"}
 
-    recovery_checkpoint = _read_photons_recovery_config()
-    if recovery_checkpoint is not None:
-        recovery_source = _photons_recovery_source_row(recovery_checkpoint)
-        if recovery_source is None:
-            return {
-                "success": False,
-                "message": (
-                    f"config.{PHOTONS_RECOVERY_CONFIG_KEY} has no matching durable "
-                    "PHOTONS source; refusing campaign deletion"
-                ),
-            }
-        if str(recovery_source.get("campaign") or "") == campaign_name:
-            return {
-                "success": False,
-                "message": (
-                    f"Campaign '{campaign_name}' still owns current PHOTONS recovery "
-                    "custody — retry after the next ambient PHOTONS row"
-                ),
-            }
-
-    with _maintenance_lock:
+    with _maintenance_lock, _persistence_lock:
         if campaign_name in _pending_persist_campaign_names():
             return {
                 "success": False,
                 "message": f"Campaign '{campaign_name}' still has ordered persistence pending; retry shortly",
             }
+        # The writer may have committed the final campaign row while DELETE
+        # waited. Inspect recovery ownership only after crossing its boundary.
+        recovery_checkpoint = _read_photons_recovery_config()
+        if recovery_checkpoint is not None:
+            recovery_source = _photons_recovery_source_row(recovery_checkpoint)
+            if recovery_source is None:
+                return {
+                    "success": False,
+                    "message": (
+                        f"config.{PHOTONS_RECOVERY_CONFIG_KEY} has no matching durable "
+                        "PHOTONS source; refusing campaign deletion"
+                    ),
+                }
+            if str(recovery_source.get("campaign") or "") == campaign_name:
+                return {
+                    "success": False,
+                    "message": (
+                        f"Campaign '{campaign_name}' still owns current PHOTONS recovery "
+                        "custody — retry after the next ambient PHOTONS row"
+                    ),
+                }
+
         try:
             with open_db(row_dict=True) as conn:
                 cur = conn.cursor()
@@ -11897,6 +11993,7 @@ def cmd_report(_: Optional[dict]) -> dict:
             "latest_photons": copy.deepcopy(_latest_photons),
         }
 
+    payload["cadence_timing"] = _cadence_report()
     payload["recovery"] = _recovery_report_surface()
     with _campaign_lock:
         payload["lantern"] = {
