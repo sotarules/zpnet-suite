@@ -2277,15 +2277,13 @@ def _photons_rolling_rows(payloads: list[dict]) -> list[dict]:
             raise ValueError("PHOTONS cadence-cell seconds are missing")
         n = stats["n"]
         pd_out = current["photons"]["pd_out"]
-        low_mv = high_mv = None
-        if pd_out["pair_count"] > 0:
+        high_mv = None
+        if pd_out["sample_count"] > 0:
             mv_per_count = PHOTONS_ADC_REFERENCE_MV / ((1 << pd_out["adc_bits"]) - 1)
-            low_mv = pd_out["low_mean_counts"] * mv_per_count
             high_mv = pd_out["high_mean_counts"] * mv_per_count
         rows.append({
             "second": seconds,
             "mean": stats["mean"] if n > 0 else None,
-            "low_mv": low_mv,
             "high_mv": high_mv,
             "accepted": stats["accepted"],
             "excluded": stats["excluded"],
@@ -2425,13 +2423,12 @@ def photons_detail_readout() -> list[str]:
     lines.extend(["", _photons_summary_header(bool(campaign)),
                   _photons_summary_line(summary, bool(campaign), summary["mean"]),
                   "", *photons_temperature_block(live), "",
-                  f"{'SEC':<8} {'LAP':>12} {'LOW_mV':>9} {'HIGH_mV':>9}"
+                  f"{'SEC':<8} {'LAP':>12} {'HIGH_mV':>9}"
                   f" {'ACCEPT':>8} {'EXCL':>7} {'MISSED':>7} {'SPURIOUS':>8}"
                   f" {'EARLY':>6} {'DUP':>6} {'LATE':>6} {'UNARM':>6} {'SD':>10} {'SE':>10}"])
     for row in _photons_rolling_rows(payloads):
         lines.append(
             _fmt(row["second"], 'd', 0).ljust(8) + " " + _fmt(row["mean"], '>12.6f', 12)
-            + " " + _fmt(row["low_mv"], '>9.3f', 9)
             + " " + _fmt(row["high_mv"], '>9.3f', 9)
             + " " + _fmt(row["accepted"], '>8d', 8)
             + " " + _fmt(row["excluded"], '>7d', 7)

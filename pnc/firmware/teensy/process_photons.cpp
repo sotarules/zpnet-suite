@@ -4672,34 +4672,24 @@ static Payload& photons_fragment_payload(
   pd_out.add("adc_bits", 12U);
   pd_out.add("high_delay_target_ns", PHOTONS_PD_OUT_HIGH_DELAY_NS);
   pd_out.add("dwt_cycles_per_second", (uint32_t)F_CPU_ACTUAL);
-  pd_out.add("low_delay_target_ns", PHOTONS_PD_OUT_LOW_DELAY_NS);
-  pd_out.add("pair_count", f.pd_out.pair_count);
+  pd_out.add("sample_count", f.pd_out.sample_count);
   // Exact per-fragment moments; Python computes sample SD/SE off the MCU.
   pd_out.add("high_sum_counts", f.pd_out.high_sum);
   pd_out.add("high_sum_squares_counts", f.pd_out.high_sum_squares);
   pd_out.add("busy_edges", f.pd_out.busy_edges);
-  pd_out.add("high_not_ready", f.pd_out.high_not_ready);
   pd_out.add("high_start_count_total", f.pd_out.high_start_count_total);
-  pd_out.add("timer_irq_count_total", f.pd_out.timer_irq_count_total);
-  pd_out.add("low_irq_count_total", f.pd_out.low_irq_count_total);
+  pd_out.add("high_irq_count_total", f.pd_out.high_irq_count_total);
   pd_out.add("phase", f.pd_out.phase);
-  pd_out.add("gpt_cr", f.pd_out.gpt_cr);
-  pd_out.add("gpt_cnt", f.pd_out.gpt_cnt);
-  pd_out.add("gpt_sr", f.pd_out.gpt_sr);
-  pd_out.add("gpt_ir", f.pd_out.gpt_ir);
   pd_out.add("adc_hc0", f.pd_out.adc_hc0);
   pd_out.add("adc_hs", f.pd_out.adc_hs);
   pd_out.add("adc_cfg", f.pd_out.adc_cfg);
   pd_out.add("adc_gc", f.pd_out.adc_gc);
-  pd_out.add("irq_enabled_mask", f.pd_out.irq_enabled_mask);
-  if (f.pd_out.pair_count != 0ULL) {
-    const Double count = Double(f.pd_out.pair_count);
+  pd_out.add("adc_irq_enabled", f.pd_out.adc_irq_enabled);
+  if (f.pd_out.sample_count != 0ULL) {
+    const Double count = Double(f.pd_out.sample_count);
     pd_out.add("high_mean_counts", toFixedDecimal(Double(f.pd_out.high_sum) / count, 6));
-    pd_out.add("low_mean_counts", toFixedDecimal(Double(f.pd_out.low_sum) / count, 6));
     pd_out.add("high_start_after_entry_mean_cycles",
                toFixedDecimal(Double(f.pd_out.high_delay_cycles_sum) / count, 3));
-    pd_out.add("low_start_after_high_mean_cycles",
-               toFixedDecimal(Double(f.pd_out.low_delay_cycles_sum) / count, 3));
   }
   instrument.add_object("pd_out", pd_out);
   pd_out.clear();

@@ -146,7 +146,7 @@ static const int LASER_MOD_PIN      = 35;
 //
 // PHOTODIODE_ANALOG_PIN:
 //   PD200T PD OUT analog diagnostic input: Teensy 40 / A16 (0..3.3 V).
-//   Dedicated ADC2 channel 9 captures HIGH/LOW diagnostic pairs.
+//   Dedicated ADC2 channel 9 captures HIGH diagnostic samples.
 //   Original PD OUT pin 38 remains MAX31865 CS.
 // Receiver timing uses only TTL OUT on pin 34.
 //
@@ -159,7 +159,6 @@ static const int PHOTODIODE_ANALOG_PIN = 40; // A16; PD200T PD OUT
 // Minimum HIGH software-trigger delay from immutable photodiode ISR entry.
 // This does not measure the physical edge-to-entry latency or ADC aperture.
 static constexpr uint32_t PHOTONS_PD_OUT_HIGH_DELAY_NS = 200U;
-static constexpr uint32_t PHOTONS_PD_OUT_LOW_DELAY_NS = 2000U;
 
 // --------------------------------------------------------------
 // PT1000 RTD / MAX31865 -- installed hardware SPI1 wiring (2026-10-09)

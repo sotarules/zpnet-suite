@@ -42,7 +42,7 @@ import sys
 import threading
 import time
 
-VERSION = '2026-10-17.6'
+VERSION = '2026-10-17.7'
 TAP = '/tmp/zpnet_pubsub_tap.sock'
 COMMAND = '/tmp/zpnet-photons-command.sock'
 TOPICS = ('PHOTONS_FRAGMENT', 'PHOTONS')
@@ -346,8 +346,8 @@ def high_statistics(n, total, squares):
 def observation(payload, reference_mv):
     instrument = payload['photons']
     pd = instrument['pd_out']
-    n = pd['pair_count']
-    # Missing instrumentation is an error, even for a fragment with no pairs.
+    n = pd['sample_count']
+    # Missing instrumentation is an error, even for a fragment with no samples.
     total = pd['high_sum_counts']
     squares = pd['high_sum_squares_counts']
     target = pd['high_delay_target_ns']
@@ -363,13 +363,10 @@ def observation(payload, reference_mv):
         'high_mean_mv': None if mean is None else mean * scale,
         'high_sd_mv': None if sd is None else sd * scale,
         'high_se_mv': None if se is None else se * scale,
-        'low_mean_mv': None if n == 0 else float(pd['low_mean_counts']) * scale,
         'high_delay_target_ns': target,
         'high_start_after_entry_mean_ns': None if n == 0 else
             float(pd['high_start_after_entry_mean_cycles']) * 1e9 / cps,
-        'low_start_after_high_mean_ns': None if n == 0 else
-            float(pd['low_start_after_high_mean_cycles']) * 1e9 / cps,
-        'busy_edges': pd['busy_edges'], 'high_not_ready': pd['high_not_ready'],
+        'busy_edges': pd['busy_edges'],
         'pd_out': pd,
     }
 
@@ -386,13 +383,11 @@ def print_fragment(row):
         values = [number(row[f'high_{stat}_{unit}']) for stat in ('mean', 'sd', 'se')]
         label = 'HIGH counts' if unit == 'counts' else 'HIGH mV'
         print(f'{label:12s}' + ''.join(f'{value:>13s}' for value in values))
-    print(f"LOW mean={number(row['low_mean_mv'])} mV; "
-          f"HIGH target={row['high_delay_target_ns']} ns; "
+    print(f"HIGH target={row['high_delay_target_ns']} ns; "
           f"entry->HIGH trigger mean={number(row['high_start_after_entry_mean_ns'])} ns")
-    print(f"HIGH->LOW trigger mean={number(row['low_start_after_high_mean_ns'])} ns; "
-          f"busy_edges={row['busy_edges']}; high_not_ready={row['high_not_ready']}")
+    print(f"busy_edges={row['busy_edges']}")
     if row['n'] == 0:
-        print('NO COMPLETED ADC PAIRS in this fragment.')
+        print('NO COMPLETED ADC HIGH SAMPLES in this fragment.')
 
 
 def adc_high_report(args):
@@ -407,13 +402,13 @@ def adc_high_report(args):
 
     emit({'kind': 'start', 'version': VERSION, 'reference_mv': args.reference_mv,
           'message': f'PHOTONS ADC HIGH witness {VERSION}\n'
-          'Each row covers completed physical ADC pairs in one firmware fragment, not accepted laps.\n'
+          'Each row covers completed physical ADC HIGH samples in one firmware fragment, not accepted laps.\n'
           'SD is sample SD; SE = SD/sqrt(N), assuming independent samples. Neither establishes accuracy.\n'
           f'mV uses nominal reference {args.reference_mv:g} mV. Trigger timing is relative to ISR entry,\n'
           'not the physical edge or ADC aperture. n/a means the statistic is undefined.'})
     received = 0
     previous = None
-    pairs = 0
+    samples = 0
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             sock.settimeout(args.timeout)
@@ -445,7 +440,7 @@ def adc_high_report(args):
                     emit(row)
                     previous = row['sequence']
                     received += 1
-                    pairs += row['n']
+                    samples += row['n']
                     deadline = time.monotonic() + args.timeout
     except KeyboardInterrupt:
         emit({'kind': 'interrupted', 'message': f'Interrupted after {received} fragments.'})
@@ -453,9 +448,9 @@ def adc_high_report(args):
     except (OSError, KeyError, ValueError) as exc:
         emit({'kind': 'error', 'message': f'ERROR: {exc}. Check acquisition and patched firmware.'})
         return 1
-    emit({'kind': 'end', 'fragments': received, 'pairs': pairs,
-          'message': f'Captured {received} fragments / {pairs} completed ADC pairs.'})
-    return 0 if pairs else 1
+    emit({'kind': 'end', 'fragments': received, 'samples': samples,
+          'message': f'Captured {received} fragments / {samples} completed ADC HIGH samples.'})
+    return 0 if samples else 1
 
 
 DB_PROBE = r'''

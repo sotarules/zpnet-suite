@@ -18,7 +18,7 @@
 //     DWT-at-edge custody.
 //   • PHOTONS consumes those edge facts and publishes PHOTONS_FRAGMENT.
 //   • Optical processing is foreground-only. PD OUT analog acquisition uses
-//     ADC2/GPT2 interrupts and a separate cumulative handoff. Raw edge capture belongs to
+//     the ADC2 completion interrupt and a separate cumulative handoff. Raw edge capture belongs to
 //     process_interrupt; edge delivery runs as a bounded foreground service.
 //     Scheduling/statistics transactions have one foreground owner at a time:
 //     the cadence callback, 1 Hz fragment transaction,

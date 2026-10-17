@@ -5851,7 +5851,8 @@ static void photodiode_gpio2_isr(void) {
   const uint32_t status =
       GPIO2_ISR & GPIO2_IMR & PHOTODIODE_GPIO2_HIGH_HALF_MASK;
   // Preserve the timestamp first, then start the analog sample before the
-  // diagnostic bookkeeping. A stale empty NVIC delivery must not create a pair.
+  // diagnostic bookkeeping. The existing ADC2 IRQ completes HIGH; no LOW timer.
+  // A stale empty NVIC delivery must not create a sample.
   if ((status & PHOTODIODE_GPIO2_MASK) != 0U)
     photons_pd_out_high_isr(isr_entry_dwt_raw);
   const interrupt_arrival_capture_t arrival_capture =
