@@ -1,5 +1,6 @@
 #include "integer_only.h"
 #include "photons_pd_out.h"
+#include "double.h"
 // ============================================================================
 // process_interrupt.cpp
 // ============================================================================
@@ -18,7 +19,12 @@
 //   * its dedicated vector shares science priority without sharing PPS dispatch;
 //   * foreground protects predicted one-second PPS/OCXO windows before launch;
 //   * unexpected equal-priority collisions remain attributed in both directions;
-//   * the ISR only captures and queues raw evidence; foreground owns admission.
+//   * the ISR triggers one ADC conversion and queues raw evidence;
+//     foreground owns flight admission and report serialization.
+//
+// Priority 16 also collects ADC HIGH via a software-pended ADC2 vector.
+// ADC hardware interrupt generation stays disabled; science may preempt its wait.
+// The general clock continuation stays at Priority 32.
 //
 // Priority 16 owns the shared QTimer1 capture vector:
 //   * native VCLOCK CH0 and TimePop CH2 necessarily share one NVIC priority;
@@ -96,6 +102,7 @@ static constexpr uint32_t INTERRUPT_PRIORITY_SCIENCE = 0U;
 static constexpr uint32_t INTERRUPT_PRIORITY_VCLOCK_TIMEPOP = 16U;
 static constexpr uint32_t INTERRUPT_PRIORITY_CONTINUATION = 32U;
 static constexpr uint32_t INTERRUPT_PRIORITY_PHOTODIODE = 0U;
+static constexpr uint32_t INTERRUPT_PRIORITY_ADC_HIGH = 16U;
 static constexpr uint32_t INTERRUPT_PRIORITY0_PRESERVING_BASEPRI =
     INTERRUPT_PRIORITY_VCLOCK_TIMEPOP;
 static constexpr uint32_t INTERRUPT_HANDOFF_IRQ_NUMBER = 71U;
@@ -232,6 +239,7 @@ struct interrupt_priority_runtime_t {
   interrupt_isr_runtime_diag_t pps{};
   interrupt_isr_runtime_diag_t continuation{};
   interrupt_isr_runtime_diag_t photodiode{};
+  interrupt_isr_runtime_diag_t adc_high{};
 
   volatile uint32_t qtimer1_preempted_continuation_count = 0U;
   volatile uint32_t ocxo1_preempted_qtimer1_count = 0U;
@@ -315,6 +323,10 @@ static inline void interrupt_isr_diag_exit(
 
 static inline void interrupt_note_science_preemption(
     volatile uint32_t& qtimer1_counter) {
+  if (g_interrupt_priority_runtime.adc_high.active) {
+    g_interrupt_priority_runtime.adc_high.preempted_during_current_entry = true;
+    g_interrupt_priority_runtime.adc_high.preempted_by_higher_tier_count++;
+  }
   if (g_interrupt_priority_runtime.qtimer1.active) {
     g_interrupt_priority_runtime.qtimer1.preempted_during_current_entry = true;
     qtimer1_counter++;
@@ -3660,6 +3672,8 @@ static uint32_t interrupt_delay_source_bit(interrupt_execution_source_t source) 
       return INTERRUPT_DELAY_SOURCE_BIT_PPS;
     case interrupt_execution_source_t::CONTINUATION:
       return INTERRUPT_DELAY_SOURCE_BIT_CONTINUATION;
+    case interrupt_execution_source_t::ADC_HIGH:
+      return INTERRUPT_DELAY_SOURCE_BIT_ADC_HIGH;
     case interrupt_execution_source_t::PHOTODIODE:
       return INTERRUPT_DELAY_SOURCE_BIT_PHOTODIODE;
     default:
@@ -3678,6 +3692,8 @@ static uint32_t interrupt_delay_source_priority(
       return INTERRUPT_PRIORITY_VCLOCK_TIMEPOP;
     case interrupt_execution_source_t::CONTINUATION:
       return INTERRUPT_PRIORITY_CONTINUATION;
+    case interrupt_execution_source_t::ADC_HIGH:
+      return INTERRUPT_PRIORITY_ADC_HIGH;
     case interrupt_execution_source_t::PHOTODIODE:
       return INTERRUPT_PRIORITY_PHOTODIODE;
     default:
@@ -3698,6 +3714,8 @@ static interrupt_delay_cause_t interrupt_delay_cause_from_source(
       return interrupt_delay_cause_t::PPS;
     case interrupt_execution_source_t::CONTINUATION:
       return interrupt_delay_cause_t::CONTINUATION;
+    case interrupt_execution_source_t::ADC_HIGH:
+      return interrupt_delay_cause_t::ADC_HIGH;
     case interrupt_execution_source_t::PHOTODIODE:
       return interrupt_delay_cause_t::PHOTODIODE;
     default:
@@ -3769,13 +3787,16 @@ static uint32_t interrupt_delay_lower_active_mask(
       source == interrupt_execution_source_t::OCXO2 ||
       source == interrupt_execution_source_t::PPS ||
       source == interrupt_execution_source_t::PHOTODIODE) {
+    if (g_interrupt_priority_runtime.adc_high.active)
+      mask |= INTERRUPT_DELAY_SOURCE_BIT_ADC_HIGH;
     if (g_interrupt_priority_runtime.qtimer1.active) {
       mask |= INTERRUPT_DELAY_SOURCE_BIT_QTIMER1;
     }
     if (g_interrupt_priority_runtime.continuation.active) {
       mask |= INTERRUPT_DELAY_SOURCE_BIT_CONTINUATION;
     }
-  } else if (source == interrupt_execution_source_t::QTIMER1) {
+  } else if (source == interrupt_execution_source_t::QTIMER1 ||
+             source == interrupt_execution_source_t::ADC_HIGH) {
     if (g_interrupt_priority_runtime.continuation.active) {
       mask |= INTERRUPT_DELAY_SOURCE_BIT_CONTINUATION;
     }
@@ -3837,6 +3858,8 @@ static bool interrupt_delay_source_active(
       return g_interrupt_priority_runtime.pps.active;
     case interrupt_execution_source_t::CONTINUATION:
       return g_interrupt_priority_runtime.continuation.active;
+    case interrupt_execution_source_t::ADC_HIGH:
+      return g_interrupt_priority_runtime.adc_high.active;
     case interrupt_execution_source_t::PHOTODIODE:
       return g_interrupt_priority_runtime.photodiode.active;
     default:
@@ -4245,7 +4268,9 @@ static bool interrupt_priority_readback_all_match(void) {
       interrupt_nvic_priority_read(INTERRUPT_HANDOFF_IRQ_NUMBER) ==
           INTERRUPT_PRIORITY_CONTINUATION &&
       interrupt_nvic_priority_read((uint32_t)PHOTODIODE_IRQ) ==
-          INTERRUPT_PRIORITY_PHOTODIODE;
+          INTERRUPT_PRIORITY_PHOTODIODE &&
+      interrupt_nvic_priority_read((uint32_t)IRQ_ADC2) ==
+          INTERRUPT_PRIORITY_ADC_HIGH;
   if (!OCXO1_DISABLED) {
     match = match &&
         interrupt_nvic_priority_read((uint32_t)IRQ_QTIMER2) ==
@@ -5846,15 +5871,39 @@ static void photodiode_raw_push(uint32_t entry_dwt,
   __atomic_store_n(&g_photodiode_raw_head, head + 1U, __ATOMIC_RELEASE);
 }
 
+// Reuse the owned ADC2 vector only as a software handoff. ADC2_HC0.AIEN
+// remains clear, so the peripheral never requests this interrupt itself.
+static void adc_high_handoff_isr(void) {
+  const uint32_t entry = ARM_DWT_CYCCNT;
+  interrupt_isr_diag_enter(g_interrupt_priority_runtime.adc_high, entry);
+  const interrupt_arrival_capture_t arrival =
+      interrupt_delay_capture_entry_fast(interrupt_execution_source_t::ADC_HIGH);
+  if (g_interrupt_priority_runtime.continuation.active) {
+    g_interrupt_priority_runtime.continuation.preempted_during_current_entry = true;
+    g_interrupt_priority_runtime.continuation.preempted_by_higher_tier_count++;
+  }
+  photons_pd_out_complete_isr();
+  // Name any equal-priority QTimer1 delay honestly; never attribute this wait
+  // as a Priority-0 clock blocker. PPS and OCXO can preempt throughout.
+  interrupt_delay_note_isr_exit(interrupt_execution_source_t::ADC_HIGH,
+                                entry, arrival);
+  interrupt_isr_diag_exit(g_interrupt_priority_runtime.adc_high, entry);
+}
+
+void interrupt_adc_high_configure() {
+  NVIC_DISABLE_IRQ(IRQ_ADC2);
+  attachInterruptVector(IRQ_ADC2, adc_high_handoff_isr);
+  NVIC_SET_PRIORITY(IRQ_ADC2, INTERRUPT_PRIORITY_ADC_HIGH);
+  NVIC_CLEAR_PENDING(IRQ_ADC2);
+  interrupt_handoff_barrier();
+  NVIC_ENABLE_IRQ(IRQ_ADC2);
+}
+
 static void photodiode_gpio2_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;
   const uint32_t status =
       GPIO2_ISR & GPIO2_IMR & PHOTODIODE_GPIO2_HIGH_HALF_MASK;
-  // Preserve the timestamp first, then start the analog sample before the
-  // diagnostic bookkeeping. The existing ADC2 IRQ completes HIGH; no LOW timer.
-  // A stale empty NVIC delivery must not create a sample.
-  if ((status & PHOTODIODE_GPIO2_MASK) != 0U)
-    photons_pd_out_high_isr(isr_entry_dwt_raw);
+  // Preserve pending-at-entry evidence before triggering the ADC.
   const interrupt_arrival_capture_t arrival_capture =
       interrupt_delay_capture_entry_fast(interrupt_execution_source_t::PHOTODIODE);
   interrupt_isr_diag_enter(
@@ -5867,10 +5916,14 @@ static void photodiode_gpio2_isr(void) {
   // An empty entry carries no edge: leave GPIO untouched and complete the ISR
   // bookkeeping below. A later edge remains pending for its own capture.
   if ((status & PHOTODIODE_GPIO2_MASK) != 0U) {
+    photons_pd_out_high_isr(isr_entry_dwt_raw);
     GPIO2_ISR = PHOTODIODE_GPIO2_MASK;
     dmb_barrier();
     photodiode_raw_push(isr_entry_dwt_raw, arrival_capture,
                         photodiode_capture_kind_t::PHYSICAL);
+    dmb_barrier(); // publish conversion custody before the software handoff
+    interrupt_nvic_ispr_word((uint32_t)IRQ_ADC2) =
+        interrupt_nvic_irq_mask((uint32_t)IRQ_ADC2);
   }
   const bool preempted_after_entry =
       g_interrupt_priority_runtime.photodiode.preempted_during_current_entry;
@@ -5886,6 +5939,11 @@ static void photodiode_gpio2_isr(void) {
   if (diag.last_isr_wall_cycles > diag.max_isr_wall_cycles)
     diag.max_isr_wall_cycles = diag.last_isr_wall_cycles;
   if (preempted_after_entry) diag.preempted_after_entry_count++;
+  // Quiet admission reserves this complete physical ISR residence. Enforce its
+  // premise at the tail: trigger, raw handoff and diagnostics, never conversion wait.
+  if ((status & PHOTODIODE_GPIO2_MASK) != 0U &&
+      (uint32_t)(ARM_DWT_CYCCNT - isr_entry_dwt_raw) >=
+          photons_pd_out_isr_budget_cycles()) __builtin_trap();
 }
 
 static void pps_gpio_isr(void) {
@@ -7250,6 +7308,7 @@ FLASHMEM void process_interrupt_init(void) {
   g_interrupt_runtime_ready = true;
   interrupt_features_mark_initializing();
   interrupt_handoff_configure();
+  interrupt_adc_high_configure();
   (void)vclock_heartbeat_arm();
 }
 
@@ -7770,6 +7829,116 @@ static FLASHMEM void add_photodiode_launch_trace(Payload& payload) {
   }
 }
 
+// Each page is serialized before the foreground scheduler may rotate the banks.
+// Capture and report storage both live in RAM2; no full capture reaches the stack.
+static constexpr uint32_t ADC_CAPTURE_REPORT_MAX_ROWS = 64U;
+static constexpr size_t ADC_CAPTURE_REPORT_BYTES = 8U * 1024U;
+alignas(uint32_t) static DMAMEM char g_adc_capture_report[ADC_CAPTURE_REPORT_BYTES];
+alignas(uint32_t) static DMAMEM char g_adc_capture_report_row[512];
+// Per-row bound includes the Payload directory entry, row key, and JSON object.
+// The remaining 4096 bytes cover report and first-sample timing metadata.
+static_assert(4096U + ADC_CAPTURE_REPORT_MAX_ROWS * 64U <=
+                  ADC_CAPTURE_REPORT_BYTES,
+              "ADC capture report page exceeds fixed RAM2 storage");
+
+static FLASHMEM Payload cmd_report_adc_capture(const Payload& args) {
+  Payload p(Payload::StorageMode::FIXED, g_adc_capture_report,
+            sizeof(g_adc_capture_report));
+  p.add("report", "INTERRUPT_ADC_CAPTURE");
+  p.add("version", "2026-10-17.2");
+  p.add("page_limit", ADC_CAPTURE_REPORT_MAX_ROWS);
+
+  uint32_t index = 0U;
+  uint32_t count = 20U;
+  if ((args.has("index") && !args.tryGetUInt("index", index)) ||
+      (args.has("count") && !args.tryGetUInt("count", count)) ||
+      count == 0U || count > ADC_CAPTURE_REPORT_MAX_ROWS) {
+    p.add("error", "index must be unsigned; count must be an integer from 1 to 64");
+    return p;
+  }
+  p.add("requested_index", index);
+  p.add("requested_count", count);
+
+  // The producer swaps only from foreground. This reference remains immutable
+  // throughout this non-nested RPC callback; do not copy its raw array.
+  const photons_pd_out_capture_t& capture = photons_pd_out_capture_latest();
+  if (capture.capture_id == 0U) {
+    p.add("error", "no completed ADC capture; wait for a PHOTONS fragment");
+    return p;
+  }
+  p.add("capture_id", capture.capture_id);
+  p.add("started_at_ms", capture.started_at_ms);
+  p.add("completed_at_ms", capture.completed_at_ms);
+  p.add("age_ms", (uint32_t)(millis() - capture.completed_at_ms));
+  p.add("elapsed_ms", (uint32_t)(capture.completed_at_ms - capture.started_at_ms));
+  p.add("rows_seen", capture.rows_seen);
+  p.add("stored_rows", capture.stored_rows);
+  p.add("omitted_rows", capture.rows_seen - capture.stored_rows);
+  p.add("row_capacity", PHOTONS_PD_OUT_CAPTURE_ROWS);
+  p.add("samples_per_row", PHOTONS_PD_OUT_CAPTURE_SAMPLES);
+  p.add("population", "PHYSICAL_PHOTODIODE_EDGES_NOT_ACCEPTED_LAPS");
+  p.add("capture_policy", "FIRST_1000_SAMPLES_PER_COMPLETED_FRAGMENT");
+  p.add("refresh", "AUTOMATIC_EACH_PHOTONS_FRAGMENT_FOREGROUND_BOUNDARY");
+  p.add("page_scope", "LATEST_COMPLETED_CAPTURE_AT_THIS_REQUEST");
+  p.add("acquisition", "SINGLE_P0_TRIGGER_P16_COMPLETION");
+  p.add("adc_pin", 40U);
+  p.add("adc_bits", 12U);
+  p.add("reference_mv", 3300U);
+  p.add("reference", "NOMINAL_NOT_CALIBRATED");
+  p.add("reported_units", "mV");
+  p.add("conversion", "RAW_CODE_TIMES_3300_DIVIDED_BY_4095");
+  p.add("sample_processing", "NONE_NO_AVERAGING_FILTERING_OR_VOTING");
+  p.add("published_high", "ONE_SAMPLE_PER_PHYSICAL_CAPTURE");
+  p.add("dwt_cycles_per_second", (uint32_t)F_CPU_ACTUAL);
+  p.add("high_delay_target_ns", PHOTONS_PD_OUT_HIGH_DELAY_NS);
+  p.add("conversion_timeout_ns", PHOTONS_PD_OUT_CONVERSION_TIMEOUT_NS);
+  p.add("isr_budget_ns", PHOTONS_PD_OUT_ISR_BUDGET_NS);
+  p.add("timing_scope", "FIRST_STORED_ROW_ONLY");
+  p.add("start_cycles_origin", "PHOTODIODE_ISR_ENTRY_NOT_PHYSICAL_EDGE");
+  p.add("read_cycles_scope", "TRIGGER_TO_RESULT_READ_INCLUDES_HANDOFF_AND_PREEMPTION_NOT_APERTURE");
+
+  if (index > capture.stored_rows) {
+    p.add("error", "index exceeds stored_rows in the latest completed capture");
+    return p;
+  }
+  const uint32_t remaining = capture.stored_rows - index;
+  const uint32_t returned = count < remaining ? count : remaining;
+  p.add("returned_count", returned);
+  p.add("next_index", index + returned);
+
+  Payload row(Payload::StorageMode::FIXED, g_adc_capture_report_row,
+              sizeof(g_adc_capture_report_row));
+  if (capture.stored_rows != 0U) {
+    p.add("first_entry_dwt", capture.first_entry_dwt);
+    // One timing object fits the ordinary inline Payload storage.
+    Payload timing;
+    for (uint32_t sample = 0U; sample < PHOTONS_PD_OUT_CAPTURE_SAMPLES; ++sample) {
+      row.clear();
+      row.add("start_cycles", capture.start_cycles[sample]);
+      row.add("read_cycles", capture.read_cycles[sample]);
+      char key[16];
+      snprintf(key, sizeof(key), "sample_%u", (unsigned)(sample + 1U));
+      timing.add_object(key, row);
+    }
+    p.add_object("first_row_timing", timing);
+  }
+
+  for (uint32_t offset = 0U; offset < returned; ++offset) {
+    const uint32_t row_index = index + offset;
+    row.clear();
+    for (uint32_t sample = 0U; sample < PHOTONS_PD_OUT_CAPTURE_SAMPLES; ++sample) {
+      char key[20];
+      snprintf(key, sizeof(key), "sample_%u_mv", (unsigned)(sample + 1U));
+      row.add(key, toFixedDecimal(
+          Double(capture.samples[row_index][sample]) * 3300_D / 4095_D, 3));
+    }
+    char key[16];
+    snprintf(key, sizeof(key), "row_%04u", (unsigned)row_index);
+    p.add_object(key, row);
+  }
+  return p;
+}
+
 static FLASHMEM Payload cmd_report_photodiode(const Payload&) {
   Payload payload;
   payload.add("report", "INTERRUPT_PHOTODIODE");
@@ -7783,7 +7952,7 @@ static FLASHMEM Payload cmd_report_priorities(const Payload&) {
   Payload payload;
   payload.add("report", "INTERRUPT_PRIORITIES");
   payload.add("topology",
-              "P0_SCIENCE_AND_PHOTODIODE__P16_QTIMER1__P32_CONTINUATION__FOREGROUND");
+              "P0_SCIENCE_AND_PHOTODIODE__P16_QTIMER1_AND_ADC_HIGH__P32_CONTINUATION");
   payload.add("basepri_mask_threshold",
               INTERRUPT_PRIORITY0_PRESERVING_BASEPRI);
   payload.add("current_ipsr", interrupt_ipsr());
@@ -7834,6 +8003,12 @@ static FLASHMEM Payload cmd_report_priorities(const Payload&) {
       payload, "photodiode", (uint32_t)PHOTODIODE_IRQ,
       INTERRUPT_PRIORITY_PHOTODIODE,
       g_interrupt_priority_runtime.photodiode);
+
+  add_irq_priority_report(
+      payload, "adc_high", (uint32_t)IRQ_ADC2,
+      INTERRUPT_PRIORITY_ADC_HIGH, g_interrupt_priority_runtime.adc_high);
+  payload.add("adc_high_request", "SOFTWARE_PEND_ADC2_VECTOR_AIEN_CLEAR");
+  payload.add("adc_high_peripheral_irq_enabled", (ADC2_HC0 & ADC_HC_AIEN) != 0U);
 
   payload.add("qtimer1_preempted_continuation_count",
               (uint32_t)g_interrupt_priority_runtime
@@ -7890,7 +8065,7 @@ static FLASHMEM Payload cmd_report_status(const Payload&) {
   payload.add("ocxo_rollover_owner", "VCLOCK_HEARTBEAT");
   payload.add("ocxo_boundary_period_ticks", OCXO_ONE_SECOND_TICKS);
   payload.add("priority_topology",
-              "SCIENCE_0_PHOTODIODE_0_QTIMER1_16_CONTINUATION_32");
+              "SCIENCE_0_PHOTODIODE_0_QTIMER1_16_ADC_HIGH_16_CONTINUATION_32");
   payload.add("priority0_science", INTERRUPT_PRIORITY_SCIENCE);
   payload.add("priority16_vclock_timepop",
               INTERRUPT_PRIORITY_VCLOCK_TIMEPOP);
@@ -8624,6 +8799,7 @@ static const process_command_entry_t INTERRUPT_COMMANDS[] = {
   { "REPORT_PRIORITIES", cmd_report_priorities },
   { "REPORT_PPS", cmd_report_pps },
   { "REPORT_PHOTODIODE", cmd_report_photodiode },
+  { "REPORT_ADC_CAPTURE", cmd_report_adc_capture },
   { "REPORT_CADENCE", cmd_report_cadence },
   { "REPORT_SMARTZERO", cmd_report_smartzero },
   { "REPORT_HANDOFF", cmd_report_handoff },
@@ -8708,6 +8884,7 @@ const char* interrupt_delay_cause_str(interrupt_delay_cause_t cause) {
       return "MASKING_OR_UNKNOWN_CPU";
     case interrupt_delay_cause_t::MULTIPLE_ISR: return "MULTIPLE_ISR";
     case interrupt_delay_cause_t::PHOTODIODE: return "PHOTODIODE";
+    case interrupt_delay_cause_t::ADC_HIGH: return "ADC_HIGH";
     default: return "UNKNOWN";
   }
 }
@@ -8721,6 +8898,7 @@ const char* interrupt_execution_source_str(
     case interrupt_execution_source_t::PPS: return "PPS";
     case interrupt_execution_source_t::CONTINUATION: return "CONTINUATION";
     case interrupt_execution_source_t::PHOTODIODE: return "PHOTODIODE";
+    case interrupt_execution_source_t::ADC_HIGH: return "ADC_HIGH";
     default: return "NONE";
   }
 }

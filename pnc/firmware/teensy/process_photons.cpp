@@ -3256,8 +3256,13 @@ static void photons_cadence_service(void*) {
   const uint32_t prior_basepri = interrupt_photons_launch_guard_enter();
   const uint32_t receive_cycles =
       photons_receive_upper_cycles(g_photons_cadence_cycles - 1U);
-  const uint32_t acquisition_cycles = receive_cycles > g_photons_race_pulse_cycles
-      ? receive_cycles : g_photons_race_pulse_cycles;
+  // A receive edge can arrive at the end of its admissible horizon and then
+  // hold priority zero through three synchronous ADC conversions. Reserve that
+  // residence for CLOCKS avoidance without widening scientific acceptance.
+  const uint32_t receive_and_adc_cycles =
+      receive_cycles + photons_pd_out_isr_budget_cycles();
+  const uint32_t acquisition_cycles = receive_and_adc_cycles > g_photons_race_pulse_cycles
+      ? receive_and_adc_cycles : g_photons_race_pulse_cycles;
   const uint32_t blockers = interrupt_photons_quiet_blockers(
       acquisition_cycles);
   g_photons_quiet_last_blocker_mask = blockers;
@@ -3826,8 +3831,8 @@ static const photons_fragment_snapshot_t& photons_report_fragment_snapshot(void)
       name##_storage,                                                     \
       sizeof(name##_storage))
 
-// Reserve 2 KiB for the new nested envelope testimony and its framing.
-static constexpr size_t PHOTONS_FRAGMENT_ROOT_CAPACITY = 16384U;
+// Preserve existing envelope headroom and reserve 1 KiB for HIGH window testimony.
+static constexpr size_t PHOTONS_FRAGMENT_ROOT_CAPACITY = 17408U;
 static constexpr size_t PHOTONS_FRAGMENT_ROOT_GUARD_WORDS =
     PHOTONS_RAM2_CACHE_LINE_BYTES / sizeof(uint32_t);
 static constexpr size_t PHOTONS_FRAGMENT_ROOT_SECTOR_BYTES = 1024U;
@@ -3871,7 +3876,7 @@ static Payload g_photons_fragment_root(
     Payload::StorageMode::FIXED,
     g_photons_fragment_root_region.storage,
     sizeof(g_photons_fragment_root_region.storage));
-PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_instrument, 15360U);
+PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_instrument, 16384U);
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_envelope, 2048U);
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_core, 2048U);
 
@@ -3881,8 +3886,9 @@ PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_core, 2048U);
 // the nested flight_ns Welford. Keep explicit fixed custody with schema headroom.
 // Explicit acquisition bounds and four uint64 rejection reasons (total/delta).
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_race, 4096U);
-// Include the temporary HIGH raw moments and trigger-delay witness.
-PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_pd_out, 2048U);
+// Include per-fragment moments and the nested 60-second HIGH population.
+PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_pd_out, 3072U);
+PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_high_window, 1024U);
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_raw_cycles, 1024U);
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_projection, 1024U);
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_science, 3072U);
@@ -4670,6 +4676,11 @@ static Payload& photons_fragment_payload(
   pd_out.clear();
   pd_out.add("pin", PHOTODIODE_ANALOG_PIN);
   pd_out.add("adc_bits", 12U);
+  pd_out.add("acquisition", "SINGLE_P0_TRIGGER_P16_COMPLETION");
+  pd_out.add("samples_per_capture", PHOTONS_PD_OUT_CAPTURE_SAMPLES);
+  pd_out.add("published_high_sample", 1U);
+  pd_out.add("completion_priority", 16U);
+  pd_out.add("completion_request", "SOFTWARE_PEND_ADC2_VECTOR_AIEN_CLEAR");
   pd_out.add("high_delay_target_ns", PHOTONS_PD_OUT_HIGH_DELAY_NS);
   pd_out.add("dwt_cycles_per_second", (uint32_t)F_CPU_ACTUAL);
   pd_out.add("sample_count", f.pd_out.sample_count);
@@ -4678,7 +4689,7 @@ static Payload& photons_fragment_payload(
   pd_out.add("high_sum_squares_counts", f.pd_out.high_sum_squares);
   pd_out.add("busy_edges", f.pd_out.busy_edges);
   pd_out.add("high_start_count_total", f.pd_out.high_start_count_total);
-  pd_out.add("high_irq_count_total", f.pd_out.high_irq_count_total);
+  pd_out.add("high_complete_count_total", f.pd_out.high_complete_count_total);
   pd_out.add("phase", f.pd_out.phase);
   pd_out.add("adc_hc0", f.pd_out.adc_hc0);
   pd_out.add("adc_hs", f.pd_out.adc_hs);
@@ -4691,6 +4702,27 @@ static Payload& photons_fragment_payload(
     pd_out.add("high_start_after_entry_mean_cycles",
                toFixedDecimal(Double(f.pd_out.high_delay_cycles_sum) / count, 3));
   }
+  // Freeze producer-authored window testimony; Pi carries this object unchanged.
+  // Mean is omitted for an empty population, never fabricated as zero.
+  Payload& high_window = g_photons_fragment_high_window;
+  high_window.clear();
+  const auto& w = f.pd_out.high_window;
+  high_window.add("target_ms", PHOTONS_PD_OUT_HIGH_WINDOW_MS);
+  high_window.add("elapsed_ms", w.elapsed_ms);
+  high_window.add("fragments", w.fragments);
+  high_window.add("started_at_ms", w.completed_at_ms - (uint32_t)w.elapsed_ms);
+  high_window.add("completed_at_ms", w.completed_at_ms);
+  high_window.add("sample_count", w.sample_count);
+  high_window.add("high_sum_counts", w.high_sum);
+  high_window.add("high_sum_squares_counts", w.high_sum_squares);
+  high_window.add("reference_mv", 3300U); // nominal, not an ADC calibration
+  if (w.sample_count != 0ULL) {
+    const Double mean = Double(w.high_sum) / Double(w.sample_count);
+    high_window.add("high_mean_counts", toFixedDecimal(mean, 6));
+    high_window.add("high_mean_mv", toFixedDecimal(mean * 3300_D / 4095_D, 6));
+  }
+  pd_out.add_object("high_window", high_window);
+  high_window.clear();
   instrument.add_object("pd_out", pd_out);
   pd_out.clear();
   instrument.add("edge_count_total", f.edge_count_total);
@@ -5152,7 +5184,7 @@ static FLASHMEM void photons_fragment_tick(
   // This is a foreground batch boundary, not the scheduled CH2 event time.
   // Unsigned subtraction handles millis() rollover for ordinary batch spans.
   const uint32_t fragment_cut_ms = millis();
-  const auto pd_out_batch = photons_pd_out_take_batch();
+  const auto pd_out_batch = photons_pd_out_take_batch(fragment_cut_ms);
   const uint32_t fragment_elapsed_ms = fragment_cut_ms - g_last_fragment_cut_ms;
   g_last_fragment_cut_ms = fragment_cut_ms;
   const photons_fragment_drain_result_t drain =
@@ -5592,7 +5624,7 @@ static void photons_start_fragment_publisher(void) {
   // Rebase on every publisher start so disabled/recovery time is not charged
   // to the first batch. Rejected publications still advance the batch boundary.
   g_last_fragment_cut_ms = millis();
-  photons_pd_out_rebase();
+  photons_pd_out_rebase(g_last_fragment_cut_ms);
   g_fragment_timer = timepop_arm_recurring_service(
       PHOTONS_FRAGMENT_PERIOD_NS,
       photons_fragment_tick,

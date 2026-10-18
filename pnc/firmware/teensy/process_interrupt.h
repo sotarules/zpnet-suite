@@ -8,7 +8,7 @@
 //
 // Execution tiers:
 //   Priority 0  — PPS, OCXO1, OCXO2 and guarded PHOTODIODE capture
-//   Priority 16 — shared QTimer1 VCLOCK + TimePop CH2 capture
+//   Priority 16 — QTimer1 VCLOCK + TimePop CH2 capture; software ADC HIGH completion
 //   Priority 32 — CLOCKS continuation/handoff and compare rearm
 //   Foreground  — TimePop policy and all application callbacks, including PHOTONS
 // ============================================================================
@@ -123,6 +123,7 @@ enum class interrupt_delay_cause_t : uint8_t {
   MASKING_OR_UNKNOWN_CPU = 6,  // Legacy wire value; no longer inferred from CNTR.
   MULTIPLE_ISR = 7,
   PHOTODIODE = 8,
+  ADC_HIGH = 9,
   UNKNOWN = 255,
 };
 
@@ -144,6 +145,7 @@ enum class interrupt_execution_source_t : uint8_t {
   PPS = 4,
   CONTINUATION = 5,
   PHOTODIODE = 6,
+  ADC_HIGH = 7,
 };
 
 static constexpr uint32_t INTERRUPT_DELAY_SOURCE_BIT_QTIMER1 = 1U << 0;
@@ -154,6 +156,7 @@ static constexpr uint32_t INTERRUPT_DELAY_SOURCE_BIT_CONTINUATION = 1U << 4;
 // Dedicated identity for the Priority-0 PHOTODIODE GPIO2[29] source. Equal
 // priority captures can serialize one another; pending-at-exit names the blocker.
 static constexpr uint32_t INTERRUPT_DELAY_SOURCE_BIT_PHOTODIODE = 1U << 5;
+static constexpr uint32_t INTERRUPT_DELAY_SOURCE_BIT_ADC_HIGH = 1U << 6;
 
 // First-instruction testimony captured before handler work.  This is intentionally
 // scalar-only so Priority 0 can preserve it without allocation or borrowed state.

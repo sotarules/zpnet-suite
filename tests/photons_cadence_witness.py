@@ -4,14 +4,26 @@
     zt photons_cadence_witness --seconds 60 --jsonl
     python3 photons_cadence_witness.py --seconds 60
     zt photons_cadence_witness --adc-high
+    zt photons_cadence_witness --adc-capture --index 0 --count 20
     zt photons_cadence_witness --db
-    zt photons_cadence_witness --adc-high --fragments 60 --jsonl
+    zt photons_cadence_witness --adc-high --fragments 120 --window-seconds 60 --jsonl
 
 --adc-high reports HIGH ADC mean, sample SD and SE from the next completed
 fragment (normally one second), or --fragments N consecutive fragments. This
 mode only reads PHOTONS_FRAGMENT; it does not request cadence or health reports.
-It requires the HIGH delay/raw-moments firmware patch. mV is a nominal display
-conversion; SE assumes independent samples and does not establish accuracy.
+Also reports a rolling population over --window-seconds (default 60), combining
+integer sums, squared sums and counts, never rounded per-second means. Whole
+fragments cover at least the requested span once warmed up; actual span is shown.
+Sequence gaps or acquisition changes restart this diagnostic window. Separately
+shows the firmware's published 60-second window, which runs independently of this
+report. Neither window changes lap normalization. Requires the published HIGH
+window firmware patch. mV uses a nominal reference; SE assumes independent
+samples and does not establish accuracy.
+
+--adc-capture reads one page of the latest completed RAM2 single-sample capture through
+the established Teensy RPC broker. Each ADC reading is displayed separately in mV;
+there is no averaging, filtering or voting. Capture refreshes every PHOTONS fragment,
+so separate requests can have different capture IDs. --jsonl retains the full payload.
 
 Prints the complete report to STDOUT; no files or database values are changed.
 Observes PHOTONS_FRAGMENT and PHOTONS through the read-only PUBSUB tap, requests
@@ -25,7 +37,7 @@ inside this capture window are included; repeated REPORT samples are deduplicate
 bounded read-only PostgreSQL diagnostics. It prints host evidence before trying
 the database. No acquisition/service changes. PostgreSQL mode uses the installed
 psycopg driver and shared connection configuration; other modes use only the
-standard library. main(argv) includes the program name for the zt runner.
+standard library, with --adc-capture using the shared RPC client. main(argv) includes the program name for the zt runner.
 """
 from __future__ import annotations
 
@@ -42,7 +54,7 @@ import sys
 import threading
 import time
 
-VERSION = '2026-10-17.7'
+VERSION = '2026-10-18.1'
 TAP = '/tmp/zpnet_pubsub_tap.sock'
 COMMAND = '/tmp/zpnet-photons-command.sock'
 TOPICS = ('PHOTONS_FRAGMENT', 'PHOTONS')
@@ -316,8 +328,15 @@ def arguments(argv):
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument('--db', action='store_true', help='capture host resources and read-only database diagnostics')
     modes.add_argument('--adc-high', action='store_true', help='report per-fragment ADC HIGH statistics')
+    modes.add_argument('--adc-capture', action='store_true', help='dump individual ADC samples from the latest completed capture')
+    parser.add_argument('--index', type=int, default=0,
+                        help='ADC capture mode: starting row index (default 0)')
+    parser.add_argument('--count', type=int, default=20,
+                        help='ADC capture mode: requested rows, 1 to 64 (default 20)')
     parser.add_argument('--fragments', type=int, default=1,
                         help='ADC HIGH mode: number of fragments (default 1)')
+    parser.add_argument('--window-seconds', type=int, default=60,
+                        help='ADC HIGH mode: rolling population span, at least 2 seconds (default 60)')
     parser.add_argument('--timeout', type=float, default=10,
                         help='ADC HIGH mode: seconds waiting for each fragment (default 10)')
     parser.add_argument('--reference-mv', type=float, default=3300,
@@ -325,10 +344,14 @@ def arguments(argv):
     args = parser.parse_args(argv[1:])
     if args.seconds <= 0:
         parser.error('--seconds must be positive')
+    if args.window_seconds < 2:
+        parser.error('--window-seconds must be at least 2')
     if args.fragments < 1 or not math.isfinite(args.timeout) or args.timeout <= 0:
         parser.error('--fragments and --timeout must be positive')
     if not math.isfinite(args.reference_mv) or args.reference_mv <= 0:
         parser.error('--reference-mv must be positive and finite')
+    if not 0 <= args.index <= 1000 or not 1 <= args.count <= 64:
+        parser.error('--index must be 0 to 1000; --count must be 1 to 64')
     return args
 
 
@@ -371,6 +394,64 @@ def observation(payload, reference_mv):
     }
 
 
+class HighWindow:
+    """One population from exact fragment moments; retain whole fragments only."""
+    def __init__(self, seconds, reference_mv):
+        self.target_ms = seconds * 1000
+        self.reference_mv = reference_mv
+        self.rows = deque()
+        self.elapsed_ms = self.n = self.total = self.squares = 0
+        self.previous = None
+        self.acquisition = None
+
+    def add(self, row):
+        pd = row['pd_out']
+        acquisition = (pd['adc_bits'], pd.get('acquisition'),
+                       pd['high_delay_target_ns'], pd['dwt_cycles_per_second'])
+        reason = None
+        if self.previous is not None:
+            if row['sequence'] != self.previous + 1:
+                reason = 'fragment sequence discontinuity'
+            elif acquisition != self.acquisition:
+                reason = 'ADC acquisition changed'
+        if reason is not None:
+            self.rows.clear()
+            self.elapsed_ms = self.n = self.total = self.squares = 0
+        elapsed = row['fragment_elapsed_ms']
+        if elapsed <= 0:
+            raise ValueError('ADC fragment duration must be positive')
+        entry = (row['sequence'], elapsed, row['n'],
+                 pd['high_sum_counts'], pd['high_sum_squares_counts'])
+        self.rows.append(entry)
+        self.elapsed_ms += elapsed
+        self.n += entry[2]
+        self.total += entry[3]
+        self.squares += entry[4]
+        # Keep the shortest suffix covering the target span; no invented
+        # fractional-fragment samples at the oldest edge of the window.
+        while len(self.rows) > 1 and self.elapsed_ms - self.rows[0][1] >= self.target_ms:
+            _, duration, n, total, squares = self.rows.popleft()
+            self.elapsed_ms -= duration
+            self.n -= n
+            self.total -= total
+            self.squares -= squares
+        self.previous = row['sequence']
+        self.acquisition = acquisition
+        mean, sd, se = high_statistics(self.n, self.total, self.squares)
+        scale = self.reference_mv / ((1 << pd['adc_bits']) - 1)
+        return {
+            'target_seconds': self.target_ms / 1000,
+            'elapsed_seconds': self.elapsed_ms / 1000,
+            'fragments': len(self.rows), 'first_sequence': self.rows[0][0],
+            'last_sequence': row['sequence'], 'n': self.n,
+            'high_sum_counts': self.total, 'high_sum_squares_counts': self.squares,
+            'high_mean_mv': None if mean is None else mean * scale,
+            'high_sd_mv': None if sd is None else sd * scale,
+            'high_se_mv': None if se is None else se * scale,
+            'reset_reason': reason,
+        }
+
+
 def number(value):
     return 'n/a' if value is None else f'{value:.3f}'
 
@@ -388,6 +469,98 @@ def print_fragment(row):
     print(f"busy_edges={row['busy_edges']}")
     if row['n'] == 0:
         print('NO COMPLETED ADC HIGH SAMPLES in this fragment.')
+    published = row['pd_out']['high_window']
+    progress = 'warming up' if published['elapsed_ms'] < published['target_ms'] else 'full span'
+    published_mean = published['high_mean_mv'] if published['sample_count'] > 0 else None
+    print(f"PUBLISHED HIGH: MEAN={number(published_mean)} mV; "
+          f"{published['elapsed_ms'] / 1000:.3f} s / "
+          f"{published['target_ms'] / 1000:g} s target ({progress}); "
+          f"fragments={published['fragments']} N={published['sample_count']}; "
+          f"nominal reference={published['reference_mv']} mV")
+    window = row['rolling']
+    if window['reset_reason']:
+        print(f"ROLLING WINDOW RESTARTED: {window['reset_reason']}")
+    progress = 'warming up' if window['elapsed_seconds'] < window['target_seconds'] else 'full span'
+    print(f"LOCAL ROLLING HIGH: {window['elapsed_seconds']:.3f} s / "
+          f"{window['target_seconds']:g} s target ({progress}); "
+          f"fragments={window['fragments']} N={window['n']}")
+    print(f"  MEAN={number(window['high_mean_mv'])} mV; "
+          f"SD={number(window['high_sd_mv'])} mV; "
+          f"SE={number(window['high_se_mv'])} mV (independence assumption)")
+
+
+def adc_capture_report(args):
+    """One read-only Teensy RPC; display each raw capture without reduction."""
+    try:
+        from zpnet.processes.processes import send_command
+
+        response = send_command(
+            machine='TEENSY', subsystem='INTERRUPT', command='REPORT_ADC_CAPTURE',
+            args={'index': args.index, 'count': args.count}, retries=1)
+        payload = response['payload']
+        if not response['success'] or 'error' in payload:
+            if args.jsonl:
+                print(json.dumps({'kind': 'error', 'response': response},
+                                 separators=(',', ':'), allow_nan=False))
+            else:
+                message = payload['error'] if 'error' in payload else response['message']
+                print(f'ERROR: {message}')
+            return 1
+        if args.jsonl:
+            print(json.dumps(payload, separators=(',', ':'), allow_nan=False))
+            return 0
+
+        if payload['samples_per_row'] != 1:
+            raise ValueError('single-sample firmware required for this report version')
+
+        print(f'PHOTONS ADC SINGLE CAPTURE REPORT {VERSION}')
+        print(f"Capture {payload['capture_id']}  window={payload['elapsed_ms']} ms  "
+              f"rows seen={payload['rows_seen']}  stored={payload['stored_rows']}  "
+              f"omitted={payload['omitted_rows']}")
+        print(f"Boot milliseconds: {payload['started_at_ms']} -> {payload['completed_at_ms']}; "
+              f"requested index={payload['requested_index']} count={payload['requested_count']}; "
+              f"returned={payload['returned_count']} next_index={payload['next_index']}")
+        print(f"One {payload['adc_bits']}-bit ADC2 reading per edge on pin {payload['adc_pin']}; "
+              f"nominal reference={payload['reference_mv']} mV.")
+        print('Each value is one reading expressed in mV; no averaging, filtering or voting.')
+        print('The latest completed capture refreshes automatically; separate calls may show different capture IDs.')
+        if payload['stored_rows']:
+            cps = payload['dwt_cycles_per_second']
+            timing = payload['first_row_timing']
+            print(f"First stored row only: entry DWT={payload['first_entry_dwt']}; CPU={cps} cycles/s; "
+                  f"HIGH target={payload['high_delay_target_ns']} ns")
+            print('             START cycles       START ns        READ cycles        READ ns')
+            for sample in range(1, payload['samples_per_row'] + 1):
+                values = timing[f'sample_{sample}']
+                start = values['start_cycles']
+                duration = values['read_cycles']
+                print(f'{sample:>6d} {start:>18d} {start * 1e9 / cps:>14.3f} '
+                      f'{duration:>18d} {duration * 1e9 / cps:>14.3f}')
+            print('START is from ISR entry; READ includes handoff and preemption through result read, not ADC aperture.')
+        else:
+            print('No ADC samples in this completed window; first-row timing is unavailable.')
+        print('   INDEX       SAMPLE 1 mV')
+        first = payload['requested_index']
+        for index in range(first, first + payload['returned_count']):
+            row = payload[f'row_{index:04d}']
+            print(f'{index:8d}' + ''.join(f"{row[f'sample_{sample}_mv']:18.3f}"
+                                         for sample in range(1, payload['samples_per_row'] + 1)))
+        if not payload['returned_count']:
+            print('No rows in this requested page.')
+        return 0
+    except KeyboardInterrupt:
+        if args.jsonl:
+            print(json.dumps({'kind': 'interrupted', 'message': 'ADC capture report interrupted'}))
+        else:
+            print('ADC capture report interrupted.')
+        return 130
+    except (ImportError, OSError, KeyError, TypeError, ValueError, RuntimeError, ZeroDivisionError) as exc:
+        message = f'ERROR: {exc}. Check the Teensy RPC broker and patched firmware.'
+        if args.jsonl:
+            print(json.dumps({'kind': 'error', 'message': message}))
+        else:
+            print(message)
+        return 1
 
 
 def adc_high_report(args):
@@ -405,10 +578,14 @@ def adc_high_report(args):
           'Each row covers completed physical ADC HIGH samples in one firmware fragment, not accepted laps.\n'
           'SD is sample SD; SE = SD/sqrt(N), assuming independent samples. Neither establishes accuracy.\n'
           f'mV uses nominal reference {args.reference_mv:g} mV. Trigger timing is relative to ISR entry,\n'
-          'not the physical edge or ADC aperture. n/a means the statistic is undefined.'})
+          'not the physical edge or ADC aperture. n/a means the statistic is undefined.\n'
+          f'Rolling window target={args.window_seconds} s; integer moments pooled across whole fragments.\n'
+          'PUBLISHED HIGH comes from firmware; LOCAL ROLLING HIGH starts with this report.\n'
+          'Both means lag changes. One-second HIGH and lap normalization remain unchanged.'})
     received = 0
     previous = None
     samples = 0
+    window = HighWindow(args.window_seconds, args.reference_mv)
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             sock.settimeout(args.timeout)
@@ -437,6 +614,7 @@ def adc_high_report(args):
                         continue
                     row = observation(message['payload'], args.reference_mv)
                     row['sequence_step'] = None if previous is None else row['sequence'] - previous
+                    row['rolling'] = window.add(row)
                     emit(row)
                     previous = row['sequence']
                     received += 1
@@ -596,6 +774,8 @@ def main(argv):
         return database_report(args)
     if args.adc_high:
         return adc_high_report(args)
+    if args.adc_capture:
+        return adc_capture_report(args)
     output_lock = threading.Lock()
     def emit(value):
         with output_lock:

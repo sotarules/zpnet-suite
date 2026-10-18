@@ -1,6 +1,7 @@
-"""Infer recorded sensor-temperature compensation for one PHOTONS campaign.
+"""Infer recorded temperature or ADC HIGH compensation for one PHOTONS campaign.
 
     zt photons_thermal External1
+    zt photons_thermal HeatCool1 --sensor high --max-degree 1
     zt photons_thermal External1 --sensor compare --max-degree 1
     zt photons_thermal External1 --max-lag-seconds 600
     python3 photons_thermal.py External1 --input External1.jsonl
@@ -24,6 +25,16 @@ validation within the first 70%; the last 30% tests the frozen choice once.
 The default uses current temperature only. Optional lag uses past temperatures
 on complete, uninterrupted blocks. Positive lag means temperature BEFORE lap.
 
+--sensor high pools exact ADC sums/counts and accepted-race-weighted raw LAP
+over the SAME nonoverlapping consecutive fragments. --bin-seconds is the nominal
+block width in one-second fragments; actual firmware durations are reported.
+HIGH60 is not averaged again and no temperature context is required. HIGH units
+are nominal mV (3300/4095), not calibrated voltage. Both physical ADC samples and
+accepted races retain their own counts; they are not assumed to be paired events.
+HIGH analysis uses zero lag. Direction means rising/falling voltage, not measured
+warming/cooling. Full-campaign direction tables are descriptive, including fit
+data; only the chronological final test measures held-out prediction.
+
 Standard library only, plus zpnet.shared.db when reading the database.
 main(argv) includes the program name, as required by the zt runner.
 """
@@ -44,10 +55,12 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 SCHEMA = "PHOTONS_V1"
 MIN_FIT = 3
-VERSION = "2026-10-12.3"
+VERSION = "2026-10-18.1"
+HIGH_REFERENCE_MV = 3300
+HIGH_MV_PER_COUNT = HIGH_REFERENCE_MV / 4095
 SENSORS = ("synthetic", "bme280", "bme280_receiver", "bme280_out", "max31865")
 LEGACY_SENSORS = ("synthetic", "bme280", "max31865")
-SENSOR_LABELS = {"synthetic": "Synthetic temperature",
+SENSOR_LABELS = {"high": "PD OUT HIGH", "synthetic": "Synthetic temperature",
                  "bme280": "BME280 under Pi (I2C1/0x76)",
                  "bme280_receiver": "BME280 near PD200T (I2C1/0x77)",
                  "bme280_out": "BME280 OUT (I2C2/0x77)",
@@ -96,7 +109,7 @@ class Sample:
     sequence: int
     reset: int
     pps: Optional[int]
-    temperature: float
+    temperature: float  # predictor: C for thermal modes, mV for --sensor high
     lap_ns: float
     races: int
     signature: str
@@ -110,6 +123,10 @@ class Sample:
     applied_temperature: Optional[float] = None
     correction_age_ms: Optional[int] = None
     sensor_temperatures: Tuple[Tuple[str, float], ...] = ()
+    adc_count: Optional[int] = None
+    adc_sum: Optional[int] = None
+    adc_squares: Optional[int] = None
+    fragment_elapsed_ms: Optional[int] = None
     epoch: int = 0
     run: int = 0
 
@@ -146,46 +163,77 @@ def parse_sample(row_id: int, p: Dict[str, Any], sensor: str = "synthetic") -> T
         raise ValueError("thermal analysis requires one-second fragments")
     if ph["snapshot_ok"] is not True:
         return None, "snapshot_not_ok"
-    # Use only this row's recorded SYSTEM snapshot. The current grouped BME280
-    # readings and composite components are authored from the same observation.
-    thermal = p.get("temperature")
-    if not thermal:
-        return None, "temperature_context_not_recorded"
-    if not isinstance(thermal, dict):
-        raise ValueError("temperature must be an object or null")
-    if (thermal["schema"] != "SYNTHETIC_TEMPERATURE_V1"
-            or thermal["source"] != "PI.SYSTEM.TEMPERATURE"):
-        raise ValueError("unsupported synthetic temperature source/schema")
-    model_id = integer(thermal["model_id"])
-    if not 0 < model_id < 2**32:
-        raise ValueError("synthetic temperature requires a nonzero uint32 model identity")
-    selected = (SENSORS if sensor == "compare" else
-                LEGACY_SENSORS if sensor == "compare-legacy" else (sensor,))
-    readings = {}
-    selected_items = {}
-    predictor_settings = {}
-    for name in selected:
-        item, path = sensor_reading(p, thermal, name)
-        if item is None:
-            return None, name + "_not_recorded"
-        if not isinstance(item, dict):
-            raise ValueError(f"{name} reading must be an object")
-        if name == "synthetic":
-            settings = {"source": thermal["source"], "path": path}
-        else:
-            source = SENSOR_COMPONENTS[name][1]
-            if item["source"] != source:
-                raise ValueError(f"unexpected {name} source: {item['source']}")
-            if path[0] == "environment" and item["schema"] != "BME280_V1":
-                raise ValueError(f"unexpected {name} schema: {item['schema']}")
-            settings = {"source": source, "path": path,
-                        "window_samples": item["smoothing"]["window_samples"]} if item["status"] == "OK" else {}
-        if item["status"] != "OK":
-            return None, name + "_unavailable"
-        integer(item["age_ms"])
-        readings[name] = number(item["temperature_c"])
-        selected_items[name] = item
-        predictor_settings[name] = settings
+    adc_count = adc_sum = adc_squares = elapsed_ms = None
+    if sensor == "high":
+        pd = ph.get("pd_out")
+        if pd is None:
+            return None, "high_not_recorded"
+        adc_count = integer(pd["sample_count"])
+        adc_sum = integer(pd["high_sum_counts"])
+        adc_squares = integer(pd["high_sum_squares_counts"])
+        if integer(pd["adc_bits"]) != 12:
+            raise ValueError("HIGH requires recorded 12-bit ADC codes")
+        if (adc_sum > adc_count * 4095 or adc_squares > adc_sum * 4095 or
+                adc_count * adc_squares < adc_sum * adc_sum):
+            raise ValueError("HIGH raw moments do not describe a 12-bit population")
+        if "high_window" in pd and pd["high_window"]["reference_mv"] != HIGH_REFERENCE_MV:
+            raise ValueError("HIGH nominal reference differs from the published window")
+        if adc_count == 0:
+            return None, "high_no_samples"
+        elapsed_ms = integer(ph["fragment_elapsed_ms"])
+        if elapsed_ms == 0:
+            raise ValueError("HIGH fragment duration must be positive")
+        selected = ("high",)
+        readings = {"high": adc_sum / adc_count * HIGH_MV_PER_COUNT}
+        predictor_signature = {
+            "path": ["photons", "pd_out"], "reference_mv": HIGH_REFERENCE_MV,
+            "acquisition": {key: pd[key] for key in (
+                "adc_bits", "acquisition", "samples_per_capture", "published_high_sample",
+                "high_delay_target_ns", "dwt_cycles_per_second")},
+        }
+    else:
+        # Use only this row's recorded SYSTEM snapshot. The current grouped BME280
+        # readings and composite components are authored from the same observation.
+        thermal = p.get("temperature")
+        if not thermal:
+            return None, "temperature_context_not_recorded"
+        if not isinstance(thermal, dict):
+            raise ValueError("temperature must be an object or null")
+        if (thermal["schema"] != "SYNTHETIC_TEMPERATURE_V1"
+                or thermal["source"] != "PI.SYSTEM.TEMPERATURE"):
+            raise ValueError("unsupported synthetic temperature source/schema")
+        model_id = integer(thermal["model_id"])
+        if not 0 < model_id < 2**32:
+            raise ValueError("synthetic temperature requires a nonzero uint32 model identity")
+        selected = (SENSORS if sensor == "compare" else
+                    LEGACY_SENSORS if sensor == "compare-legacy" else (sensor,))
+        readings = {}
+        selected_items = {}
+        predictor_settings = {}
+        for name in selected:
+            item, path = sensor_reading(p, thermal, name)
+            if item is None:
+                return None, name + "_not_recorded"
+            if not isinstance(item, dict):
+                raise ValueError(f"{name} reading must be an object")
+            if name == "synthetic":
+                settings = {"source": thermal["source"], "path": path}
+            else:
+                source = SENSOR_COMPONENTS[name][1]
+                if item["source"] != source:
+                    raise ValueError(f"unexpected {name} source: {item['source']}")
+                if path[0] == "environment" and item["schema"] != "BME280_V1":
+                    raise ValueError(f"unexpected {name} schema: {item['schema']}")
+                settings = {"source": source, "path": path,
+                            "window_samples": item["smoothing"]["window_samples"]} if item["status"] == "OK" else {}
+            if item["status"] != "OK":
+                return None, name + "_unavailable"
+            integer(item["age_ms"])
+            readings[name] = number(item["temperature_c"])
+            selected_items[name] = item
+            predictor_settings[name] = settings
+        predictor_signature = {"schema": thermal["schema"], "source": thermal["source"],
+                               "model_id": model_id, "selected": predictor_settings}
     temperature = readings[selected[0]]
     race = ph["race"]
     flight = race["flight_ns"]
@@ -223,7 +271,7 @@ def parse_sample(row_id: int, p: Dict[str, Any], sensor: str = "synthetic") -> T
             if (policy.get("schema") != "PHOTONS_THERMAL_NORMALIZATION_V1" or
                     policy.get("application") != "UNIFORM_OFFSET_AT_FRAGMENT_DRAIN"):
                 raise ValueError("unsupported normalization reconstruction contract")
-    if policy is not None and policy.get("temperature_path") == ["temperature", "temperature_c"]:
+    if sensor != "high" and policy is not None and policy.get("temperature_path") == ["temperature", "temperature_c"]:
         if policy["temperature_model_id"] != model_id:
             raise ValueError("recorded synthetic temperature and normalization model disagree")
         maximum_age = integer(policy["maximum_sample_age_ms"])
@@ -267,9 +315,7 @@ def parse_sample(row_id: int, p: Dict[str, Any], sensor: str = "synthetic") -> T
         "core": {k: core.get(k) for k in (
             "algorithm", "minimum_count", "minimum_radius_cycles", "mad_multiplier", "minimum_retained_pct")},
         "normalization": {"id": normalization_id, "policy": policy},
-        "temperature_predictor": {"schema": thermal["schema"],
-                                  "source": thermal["source"], "model_id": model_id,
-                                  "selected": predictor_settings},
+        "predictor": predictor_signature,
     }, sort_keys=True)
     projection = ph.get("projection") or {}
     pps = projection.get("anchor_pps_count")
@@ -286,6 +332,8 @@ def parse_sample(row_id: int, p: Dict[str, Any], sensor: str = "synthetic") -> T
         canonical_ns=canonical_ns, normalization_id=normalization_id,
         correction_ns=correction_ns, raw_source=raw_source, applied_temperature=applied_temperature,
         correction_age_ms=correction_age_ms, sensor_temperatures=tuple(readings.items()),
+        adc_count=adc_count, adc_sum=adc_sum, adc_squares=adc_squares,
+        fragment_elapsed_ms=elapsed_ms,
     ), "used"
 
 
@@ -308,6 +356,8 @@ def database_rows(args: argparse.Namespace) -> Iterable[Tuple[int, Dict[str, Any
             'photons', jsonb_build_object(
                 'snapshot_ok', payload #> '{photons,snapshot_ok}',
                 'fragment_period_ns', payload #> '{photons,fragment_period_ns}',
+                'fragment_elapsed_ms', payload #> '{photons,fragment_elapsed_ms}',
+                'pd_out', payload #> '{photons,pd_out}',
                 'stats', jsonb_build_object(
                     'reset_count', payload #> '{photons,stats,reset_count}',
                     'update_count', payload #> '{photons,stats,update_count}',
@@ -406,14 +456,18 @@ def collect(rows: Iterable[Tuple[int, Dict[str, Any]]], args: argparse.Namespace
             repeated_receipt = not sample.receipt or prev.receipt
             if same_generation and repeated_receipt and identity == previous_identity:
                 if (sample.lap_ns, sample.canonical_ns, sample.correction_ns,
-                    sample.applied_temperature, sample.correction_age_ms, sample.races, sample.signature) != (
+                    sample.applied_temperature, sample.correction_age_ms, sample.races, sample.signature,
+                    sample.adc_count, sample.adc_sum, sample.adc_squares,
+                    sample.fragment_elapsed_ms) != (
                     prev.lap_ns, prev.canonical_ns, prev.correction_ns,
-                    prev.applied_temperature, prev.correction_age_ms, prev.races, prev.signature):
+                    prev.applied_temperature, prev.correction_age_ms, prev.races, prev.signature,
+                    prev.adc_count, prev.adc_sum, prev.adc_squares,
+                    prev.fragment_elapsed_ms):
                     raise ValueError(f"row {row_id}: repeated fragment has conflicting science/settings")
                 counts["duplicate_fragment"] += 1
                 continue
             if sample.signature != prev.signature:
-                changes.append("acquisition/core settings, normalization policy or temperature predictor model/path changed")
+                changes.append("acquisition/core settings, normalization policy or predictor settings/path changed")
             if (sample.sequence <= prev.sequence or
                     (sample.pps is not None and prev.pps is not None and sample.pps < prev.pps) or
                     (sample.update is not None and prev.update is not None and sample.update <= prev.update)):
@@ -450,9 +504,10 @@ class Point:
     time: float
     temperature: float
     lap_ns: float
+    elapsed_ms: Optional[int] = None
 
 
-def blocks(samples: Sequence[Sample], width: int) -> Tuple[List[Point], int]:
+def blocks(samples: Sequence[Sample], width: int, high: bool = False) -> Tuple[List[Point], int]:
     out = []
     bucket: List[Sample] = []
     index = 0
@@ -465,8 +520,17 @@ def blocks(samples: Sequence[Sample], width: int) -> Tuple[List[Point], int]:
             index = 0
         bucket.append(s)
         if len(bucket) == width:
-            out.append(Point(s.run, index, st.fmean(v.time for v in bucket),
-                             st.fmean(v.temperature for v in bucket), st.fmean(v.lap_ns for v in bucket)))
+            if high:
+                # Exact raw-code pooling, not a mean of rounded means or HIGH60.
+                # Lap and HIGH cover the same fragments but different populations.
+                predictor = sum(v.adc_sum for v in bucket) / sum(v.adc_count for v in bucket) * HIGH_MV_PER_COUNT
+                lap = math.fsum(v.lap_ns * v.races for v in bucket) / sum(v.races for v in bucket)
+                elapsed_ms = sum(v.fragment_elapsed_ms for v in bucket)
+            else:
+                predictor = st.fmean(v.temperature for v in bucket)
+                lap = st.fmean(v.lap_ns for v in bucket)
+                elapsed_ms = None
+            out.append(Point(s.run, index, st.fmean(v.time for v in bucket), predictor, lap, elapsed_ms))
             index += 1
             used += width
             bucket = []
@@ -579,9 +643,12 @@ def name(degree, lag, width):
     return f'{("constant", "linear", "quadratic", "cubic")[degree]} / lag {lag*width}s'
 
 
-def formula(model, lag_seconds):
-    print(f'  T_ref = {model.reference:.9f} C; x = T_C - T_ref')
-    print(f'  T_C is {"current block temperature" if not lag_seconds else str(lag_seconds)+" seconds earlier block temperature"}.')
+def formula(model, lag_seconds, sensor="synthetic"):
+    unit = "mV" if sensor == "high" else "C"
+    symbol = "HIGH_mV" if sensor == "high" else "T_C"
+    predictor = "HIGH" if sensor == "high" else "temperature"
+    print(f'  reference = {model.reference:.9f} {unit}; x = {symbol} - reference')
+    print(f'  {symbol} is the {"current" if not lag_seconds else str(lag_seconds)+" seconds earlier"} block {predictor}.')
     expression = f'{model.coefficients[0]:.12g}'
     for j,c in enumerate(model.coefficients[1:],1):
         expression += f' {c:+.12g}*x' + (f'^{j}' if j>1 else '')
@@ -590,23 +657,28 @@ def formula(model, lag_seconds):
                           for j,c in enumerate(model.coefficients[1:],1)) or '0'
     print(f'  candidate_normalized_LAP_ns = uncorrected_LAP_ns - ({correction})')
     print('  Apply this candidate to uncorrected LAP, never on top of an existing correction.')
-    print(f'  Fitted temperature range: {model.low:.6f} .. {model.high:.6f} C')
+    print(f'  Fitted {predictor} range: {model.low:.6f} .. {model.high:.6f} {unit}')
     for j,c in enumerate(model.coefficients):
-        print(f'    coefficient c{j} = {c:.12g} ns'+(f'/C^{j}' if j else ''))
+        print(f'    coefficient c{j} = {c:.12g} ns'+(f'/{unit}^{j}' if j else ''))
     if len(model.coefficients)>1:
-        print(f'  Sensitivity at T_ref: {model.coefficients[1]*1000:+.3f} ps/C')
+        print(f'  Sensitivity at reference: {model.coefficients[1]*1000:+.3f} ps/{unit}')
 
 
-def shape(points, x, residual, args):
+def shape(points, x, residual, args, scope="FINAL TEST"):
+    high_mode = args.sensor == "high"
+    unit = "mV" if high_mode else "C"
+    column = "HIGH_mV" if high_mode else "mean_T_C"
+    up, down = ("rising", "falling") if high_mode else ("warm", "cool")
+    threshold = args.direction_threshold_mv_per_minute if high_mode else args.direction_threshold_c_per_minute
+    minimum_width = args.high_bin_mv if high_mode else args.temperature_bin_c
     low, high = min(x), max(x)
-    width = max(args.temperature_bin_c,
-                args.temperature_bin_c*math.ceil((high-low)/(12*args.temperature_bin_c)))
+    width = max(minimum_width, minimum_width*math.ceil((high-low)/(12*minimum_width)))
     origin = math.floor(low/width)*width
     groups = {}
     for i,t in enumerate(x):
         groups.setdefault(math.floor((t-origin)/width),[]).append(i)
-    print(f'\n  FINAL TEST TEMPERATURE SHAPE ({width:g} C bins; residual = actual - frozen prediction)')
-    print('     mean_T_C    blocks     mean_LAP_ns    residual_ps   residual_SD_ps')
+    print(f'\n  {scope} PREDICTOR SHAPE ({width:g} {unit} bins; residual = actual - frozen prediction)')
+    print(f'  {column:>11s}    blocks     mean_LAP_ns    residual_ps   residual_SD_ps')
     for _,indices in sorted(groups.items()):
         e = [residual[i] for i in indices]
         print(f'  {st.fmean(x[i] for i in indices):11.5f} {len(indices):9d} '
@@ -618,24 +690,25 @@ def shape(points, x, residual, args):
         a,b = points[i-1],points[i]
         if a.run == b.run and b.index == a.index+1:
             rate = (x[i]-x[i-1])*60/(b.time-a.time)
-            direction[i] = 'warm' if rate>args.direction_threshold_c_per_minute else (
-                'cool' if rate < -args.direction_threshold_c_per_minute else 'steady')
-    print('\n  FINAL TEST WARMING / COOLING (past-to-current predictor change)')
+            direction[i] = up if rate>threshold else (down if rate < -threshold else 'steady')
+    print(f'\n  {scope} {up.upper()} / {down.upper()} (predictor change; threshold={threshold:g} {unit}/minute)')
+    if high_mode:
+        print('  Falling HIGH may accompany heating; direction labels describe voltage, not temperature.')
     print(f'  Direction counts: {dict(Counter(direction.values()))}')
-    print('    mean_T_C   warm_N   cool_N   warm-minus-cool residual_ps')
+    print(f'  {column:>11s} {up+"_N":>8s} {down+"_N":>8s}   {up}-minus-{down} residual_ps')
     gaps = []
     for _,indices in sorted(groups.items()):
-        warm = [residual[i] for i in indices if direction.get(i)=='warm']
-        cool = [residual[i] for i in indices if direction.get(i)=='cool']
+        warm = [residual[i] for i in indices if direction.get(i)==up]
+        cool = [residual[i] for i in indices if direction.get(i)==down]
         if len(warm)>=2 and len(cool)>=2:
             gap = (st.fmean(warm)-st.fmean(cool))*1000
             gaps.append(gap)
             print(f'  {st.fmean(x[i] for i in indices):11.5f} {len(warm):8d} {len(cool):8d} {gap:32.3f}')
     if not gaps:
-        print('  Insufficient overlapping warming/cooling blocks for a direction comparison.')
+        print(f'  Insufficient overlapping {up}/{down} blocks for a direction comparison.')
     else:
         print(f'  Largest absolute direction gap: {max(map(abs,gaps)):.3f} ps.')
-    print('  Persistent residual shape or direction gaps suggest temperature alone is incomplete.')
+    print('  Residual shape or direction gaps identify structure not captured by the fitted predictor formula.')
 
 
 def deployed_comparison(samples, points, canonical_points, sensor):
@@ -678,7 +751,8 @@ def deployed_comparison(samples, points, canonical_points, sensor):
           f'deployed={fmt(pearson(temperatures,canonical))}')
     print('  Descriptive comparison only; this does not establish calibration accuracy or causation.')
     print('\n  DEPLOYED NORMALIZATION IN SIX CHRONOLOGICAL WINDOWS (all usable seconds)')
-    print('    UTC start                    N    mean_T_C  uncorrected_ns    deployed_ns  correction_ns')
+    column = 'HIGH_mV' if sensor == 'high' else 'mean_T_C'
+    print(f'    UTC start                    N  {column:>10s}  uncorrected_ns    deployed_ns  correction_ns')
     for i in range(6):
         window = samples[i*len(samples)//6:(i+1)*len(samples)//6]
         if window:
@@ -690,13 +764,17 @@ def deployed_comparison(samples, points, canonical_points, sensor):
 
 
 def analyze(samples, reason, args):
+    high = args.sensor == "high"
+    unit = "mV" if high else "C"
+    predictor = "HIGH" if high else "temperature"
+    column = "HIGH_mV" if high else "mean_T_C"
     print(f'\nSENSOR: {SENSOR_LABELS[args.sensor]} (recorded mean)')
     print(f'\nEPOCH {samples[0].epoch}: {reason}')
     print(f'  UTC {stamp(samples[0].time)} .. {stamp(samples[-1].time)}')
     print(f'  Settings: {samples[0].signature}')
     print(f'  Usable seconds: {len(samples):,}; continuous runs: {len(set(s.run for s in samples)):,}')
     temperatures = [s.temperature for s in samples]
-    print(f'  {SENSOR_LABELS[args.sensor]} range: {min(temperatures):.6f} .. {max(temperatures):.6f} C')
+    print(f'  {SENSOR_LABELS[args.sensor]} range: {min(temperatures):.6f} .. {max(temperatures):.6f} {unit}')
     repeated = sum(a.run==b.run and a.temperature==b.temperature for a,b in zip(samples,samples[1:]))
     print(f'  Adjacent identical {SENSOR_LABELS[args.sensor]} readings: {repeated:,} (equal values need not be duplicate samples; overlapping means are time-correlated).')
     deployed = samples[0].normalization_id is not None
@@ -704,17 +782,22 @@ def analyze(samples, reason, args):
     spread_header()
     spread('uncorrected one-second', [s.lap_ns for s in samples])
     print(f'  Uncorrected lap range: {min(s.lap_ns for s in samples):.9f} .. {max(s.lap_ns for s in samples):.9f} ns')
-    points, omitted = blocks(samples,args.bin_seconds)
-    canonical_points, _ = blocks([replace(s,lap_ns=s.canonical_ns) for s in samples],args.bin_seconds)
-    print(f'  Complete {args.bin_seconds}-second blocks: {len(points):,}; seconds in incomplete blocks: {omitted:,}')
+    points, omitted = blocks(samples,args.bin_seconds,high)
+    canonical_points, _ = blocks([replace(s,lap_ns=s.canonical_ns) for s in samples],args.bin_seconds,high)
+    print(f'  Complete {args.bin_seconds}-fragment blocks: {len(points):,}; fragments in incomplete blocks: {omitted:,}')
+    if high:
+        print(f'  Physical ADC samples: {sum(s.adc_count for s in samples):,}; accepted races: {sum(s.races for s in samples):,}.')
+        if points:
+            print(f'  Actual block duration: {min(p.elapsed_ms for p in points)/1000:.3f} .. {max(p.elapsed_ms for p in points)/1000:.3f} s.')
+        print('  HIGH is sample-weighted; LAP is accepted-race-weighted over the same fragments. Blocks have equal fit weight.')
     if deployed:
         deployed_comparison(samples,points,canonical_points,args.sensor)
     if len(points)<60:
         print('\n  MODEL SELECTION DEFERRED: need at least 60 complete blocks plus adequate later-test support.')
         print('  Collect longer runs across thermal cycles; smaller blocks do not create independent sensor observations.')
         return
-    print(f'  Descriptive block correlations: T vs uncorrected LAP {fmt(pearson([p.temperature for p in points], [p.lap_ns for p in points]))}; '
-          f'T vs time {fmt(pearson([p.temperature for p in points], [p.time for p in points]))}')
+    print(f'  Descriptive block correlations: {predictor} vs uncorrected LAP {fmt(pearson([p.temperature for p in points], [p.lap_ns for p in points]))}; '
+          f'{predictor} vs time {fmt(pearson([p.temperature for p in points], [p.time for p in points]))}')
     lookup = {(p.run,p.index):p for p in points}
     steps = args.max_lag_seconds//args.bin_seconds
     targets = [p for p in points if p.index>=steps]
@@ -768,7 +851,7 @@ def analyze(samples, reason, args):
     for degree in range(args.max_degree+1):
         entries = [entry for entry in scored if entry[0]==degree]
         if not entries:
-            print(f'    degree {degree}: unidentifiable temperature population')
+            print(f'    degree {degree}: unidentifiable {predictor} population')
             continue
         winner = min(entries,key=lambda e:(e[2],e[1]))
         best.append(winner)
@@ -783,7 +866,7 @@ def analyze(samples, reason, args):
     model = polynomial(xs(development,lag),ys(development),degree)
     assert model is not None
     print('\n  FROZEN CANDIDATE FORMULA (fitted on uncorrected development LAP only; no later-data recentering)')
-    formula(model,lag*args.bin_seconds)
+    formula(model,lag*args.bin_seconds,args.sensor)
     tx, actual = xs(test,lag),ys(test)
     predictions = [model.predict(t) for t in tx]
     residual = [a-b for a,b in zip(actual,predictions)]
@@ -794,9 +877,9 @@ def analyze(samples, reason, args):
     print('\n  FINAL UNSEEN TEST (same blocks in every comparison)')
     print(f'  UTC {stamp(test[0].time)} .. {stamp(test[-1].time)}')
     outside = [i for i,t in enumerate(tx) if not model.low<=t<=model.high]
-    print(f'  Predictor range: {min(tx):.6f} .. {max(tx):.6f} C; outside fit range: {len(outside):,}/{len(test):,}')
+    print(f'  Predictor range: {min(tx):.6f} .. {max(tx):.6f} {unit}; outside fit range: {len(outside):,}/{len(test):,}')
     print('    prediction                       RMSE_ps        bias_ps     error_SD_ps')
-    comparisons = [('constant development mean',baseline_errors),('selected temperature formula',residual)]
+    comparisons = [('constant development mean',baseline_errors),(f'selected {predictor} formula',residual)]
     if trend is not None:
         comparisons.append(('elapsed-time line (diagnostic)',[p.lap_ns-trend.predict(p.time) for p in test]))
     for label,e in comparisons:
@@ -818,11 +901,11 @@ def analyze(samples, reason, args):
     print(f'  Test RMSE reduction vs constant: {reduction(rmse(baseline_errors),rmse(residual))}')
     print(f'  Test SD reduction: {reduction(st.stdev(actual),st.stdev(normalized))}')
     print(f'  Test peak-to-peak reduction: {reduction(max(actual)-min(actual),max(normalized)-min(normalized))}')
-    print(f'  Residual correlation with T: {fmt(pearson(tx,residual))}; '
+    print(f'  Residual correlation with {predictor}: {fmt(pearson(tx,residual))}; '
           f'with elapsed time: {fmt(pearson([p.time for p in test],residual))}')
     # Report actual one-second correction, separate from block-level fit performance.
     # A block contains exactly width consecutive retained fragments in a run.
-    if lag==0:
+    if lag==0 and not high:
         selected = {(p.run,p.index) for p in test}
         raw_seconds, corrected_seconds, deployed_seconds = [],[],[]
         ordinal = Counter()
@@ -840,10 +923,12 @@ def analyze(samples, reason, args):
         if deployed:
             spread('deployed one-second',deployed_seconds)
         print('  Polynomial evaluated per second here; nonlinear averaging can differ from block evaluation.')
+    elif high:
+        print('  HIGH correction is evaluated on matched blocks only; no live one-second correction is inferred.')
     else:
         print('  Lagged correction is evaluated at block resolution only; no interpolated one-second results.')
     print('\n  FINAL TEST IN SIX CHRONOLOGICAL WINDOWS')
-    print('    UTC start                    N    mean_T_C  uncorrected_ns   candidate_mean_ns  residual_mean_ps')
+    print(f'    UTC start                    N  {column:>10s}  uncorrected_ns   candidate_mean_ns  residual_mean_ps')
     for i in range(6):
         indices = list(range(i*len(test)//6,(i+1)*len(test)//6))
         if indices:
@@ -853,19 +938,26 @@ def analyze(samples, reason, args):
                   f'{st.fmean(normalized[j] for j in indices):19.6f} '
                   f'{st.fmean(residual[j] for j in indices)*1000:17.3f}')
     shape(test,tx,residual,args)
+    if high:
+        # Describe all directions, including cycles outside the final test.
+        # Never refit or use this descriptive table for candidate selection.
+        all_x = [p.temperature for p in points]
+        all_residual = [p.lap_ns-model.predict(x) for p,x in zip(points,all_x)]
+        print('\n  Full-campaign direction comparison includes development data and possible extrapolation; descriptive only.')
+        shape(points,all_x,all_residual,args,scope="ALL BLOCKS (DESCRIPTIVE)")
     print('\n  INTERPRETATION')
     if degree==0:
-        print('  Forward validation did not justify a temperature correction under the simplicity rule.')
+        print(f'  Forward validation did not justify a {predictor} correction under the simplicity rule.')
     elif rmse(residual)<rmse(baseline_errors) and st.stdev(normalized)<st.stdev(actual):
-        print('  The frozen temperature formula improved both later prediction and later stability.')
+        print(f'  The frozen {predictor} formula improved both later prediction and later stability.')
         print('  This is a candidate calibration for this setup and measured range, not yet a transfer test.')
     else:
         print('  The frozen formula did not improve both prediction and stability on later data.')
         print('  Do not adopt it as an established correction; the residual tables identify what remains.')
     if trend is not None and rmse(residual)>=rmse(comparisons[-1][1]):
-        print('  Temperature did not beat a simple elapsed-time line in this test; shared drift remains plausible.')
+        print(f'  {predictor} did not beat a simple elapsed-time line in this test; shared drift remains plausible.')
     if outside:
-        print('  Some test temperatures are extrapolations; inspect inside-range results separately.')
+        print('  Some test predictor values are extrapolations; inspect inside-range results separately.')
     if lag and lag==steps:
         print('  Selected lag reaches the search boundary; a longer lag has not been evaluated.')
     if degree==args.max_degree and degree>1:
@@ -876,8 +968,8 @@ def analyze(samples, reason, args):
 def arguments(argv):
     parser = argparse.ArgumentParser(description=__doc__,formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('campaign',help='exact campaign name, e.g. External1')
-    parser.add_argument('--sensor',choices=(*SENSORS, 'compare', 'compare-legacy'),default='synthetic',
-                        help='recorded mean predictor; compare includes all three BME280s, MAX31865 and synthetic (default synthetic)')
+    parser.add_argument('--sensor',choices=(*SENSORS, 'high', 'compare', 'compare-legacy'),default='synthetic',
+                        help='temperature or high (raw ADC moments); compare remains temperature-only (default synthetic)')
     parser.add_argument('--input',type=Path,help='PHOTONS JSON/JSONL instead of PostgreSQL')
     parser.add_argument('--bin-seconds',type=int,default=60,help='complete nonoverlapping blocks (default 60)')
     parser.add_argument('--max-degree',type=int,choices=(1,2,3),default=3,help='maximum polynomial degree (default 3)')
@@ -885,6 +977,8 @@ def arguments(argv):
     parser.add_argument('--simplicity-pct',type=float,default=5,help='prefer simpler models within this percent of best validation RMSE (default 5)')
     parser.add_argument('--temperature-bin-c',type=float,default=.1,help='minimum report temperature-bin width (default .1)')
     parser.add_argument('--direction-threshold-c-per-minute',type=float,default=.002)
+    parser.add_argument('--high-bin-mv',type=float,default=1.0,help='minimum HIGH shape-bin width in mV (default 1)')
+    parser.add_argument('--direction-threshold-mv-per-minute',type=float,default=.1)
     parser.add_argument('--skip-seconds',type=int,default=0,help='omit initial campaign seconds (default 0)')
     parser.add_argument('--start',type=utc,help='inclusive UTC/offset timestamp')
     parser.add_argument('--end',type=utc,help='exclusive UTC/offset timestamp')
@@ -892,11 +986,14 @@ def arguments(argv):
     args = parser.parse_args(argv[1:])
     if min(args.bin_seconds,args.batch_size)<1 or min(args.max_lag_seconds,args.skip_seconds)<0:
         parser.error('block/batch size must be positive; lag/skip must be nonnegative')
+    if args.sensor == 'high' and args.max_lag_seconds:
+        parser.error('HIGH mode uses matched simultaneous fragments; --max-lag-seconds must be 0')
     if args.max_lag_seconds%args.bin_seconds:
         parser.error('--max-lag-seconds must be a multiple of --bin-seconds')
     if any(not math.isfinite(v) or v<0 for v in
-           (args.simplicity_pct,args.direction_threshold_c_per_minute)) or not math.isfinite(args.temperature_bin_c) or args.temperature_bin_c<=0:
-        parser.error('finite nonnegative tolerances and positive temperature-bin width required')
+           (args.simplicity_pct,args.direction_threshold_c_per_minute,args.direction_threshold_mv_per_minute)) or any(
+               not math.isfinite(v) or v<=0 for v in (args.temperature_bin_c,args.high_bin_mv)):
+        parser.error('finite nonnegative tolerances and positive predictor-bin widths required')
     if args.start is not None and args.end is not None and args.start>=args.end:
         parser.error('--start must precede --end')
     return args
@@ -909,15 +1006,22 @@ def main(argv):
     print(f'Options: sensor={args.sensor}, block={args.bin_seconds}s, max_degree={args.max_degree}, max_lag={args.max_lag_seconds}s, simplicity={args.simplicity_pct:g}%')
     print(f'Selection: start={args.start}, end={args.end}, skip={args.skip_seconds}s; source={args.input or "read-only database"}')
     print(f'Predictor selection: {args.sensor}; target: uncorrected one-second LAP (ns).')
-    print('Synthetic: temperature.temperature_c; BME280 PI/PD/OUT: environment.pi/pd/out.temperature_c.')
-    print('MAX31865: temperature.components.rtd.temperature_c. Legacy PI/PD use the recorded component/receiver paths.')
+    if args.sensor != 'high':
+        print('Synthetic: temperature.temperature_c; BME280 PI/PD/OUT: environment.pi/pd/out.temperature_c.')
+        print('MAX31865: temperature.components.rtd.temperature_c. Legacy PI/PD use the recorded component/receiver paths.')
     print('Rows missing a selected reading are omitted; missing grouped sensors never fall back to legacy aliases.')
-    print('No new smoothing or recomputation; predictor path changes start separate epochs.')
+    print('Predictor settings/path changes start separate epochs; no temperature smoothing is added.')
     if args.sensor in ('compare', 'compare-legacy'):
         print(f'Comparison requires all {len(SENSORS if args.sensor == "compare" else LEGACY_SENSORS)} predictors on every retained row; blocks and time splits are shared.')
         print('Sensor-specific degree/lag choices use development folds only. Final-test ranking is exploratory.')
     print('New rows use measurement.raw_flight_ns directly; legacy rows reconstruct raw LAP from recorded offsets.')
-    print('Equal weight per usable second; no cumulative means; no rejection based on lap magnitude.')
+    if args.sensor == 'high':
+        print('HIGH: exact per-fragment ADC sums/counts from photons.pd_out; nominal 3300 mV / 4095 counts.')
+        print('No temperature required. HIGH60 is not used as a predictor and is not averaged again.')
+        print('Pool ADC samples and accepted races separately over matching nonoverlapping fragments.')
+        print('--bin-seconds counts nominal one-second fragments; actual durations are reported. No lag search.')
+    else:
+        print('Equal weight per usable second; no cumulative means; no rejection based on lap magnitude.')
     print('Loading campaign observations...',flush=True)
     rows = file_rows(args.input,args.campaign) if args.input else database_rows(args)
     samples,counts,reasons = collect(rows,args)
@@ -926,7 +1030,7 @@ def main(argv):
         print(f'  {key}: {value:,}')
     print('  Continuity-break reason counts can overlap. Partial blocks and lag-history losses are reported per epoch.')
     if not samples:
-        print('No usable temperature/lap pairs. Report the accounting above before changing any filters.')
+        print('No usable predictor/lap pairs. Report the accounting above before changing any filters.')
         return 1
     epochs = {}
     for sample in samples:
@@ -939,7 +1043,7 @@ def main(argv):
             selected = [replace(s, temperature=dict(s.sensor_temperatures)[sensor]) for s in observations]
             analyze(selected,reasons[epoch],sensor_args)
     print('\nREPORT NOTES')
-    print('  Epochs are fitted separately across recorded settings/calibration/synthetic-model changes, resets and recovery.')
+    print('  Epochs are fitted separately across recorded settings/calibration/predictor changes, resets and recovery.')
     print('  Deployed = stored canonical LAP; uncorrected = original legacy LAP or reconstructed pre-correction LAP.')
     print('  Candidate formulas always fit uncorrected LAP and replace, rather than compound, the deployed correction.')
     print('  Blocks and lag history never cross continuity gaps. Unknown hardware changes need explicit time selection.')
