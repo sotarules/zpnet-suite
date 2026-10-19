@@ -629,11 +629,15 @@ class StabilityAccumulator:
                 "checkpoint": copy.deepcopy(s)}
 
 # ======================================================================
-# PHOTONS: Temperature populations and JSON continuation
+# PHOTONS: Temperature / HIGH60 populations and JSON continuation
 # ======================================================================
 
 TEMPERATURE_STATS_SCHEMA = "PI_PHOTONS_TEMPERATURE_STATS_V1"
-TEMPERATURE_SENSORS = tuple(THERMAL_SENSOR_PATHS)
+TEMPERATURE_SENSORS = (*THERMAL_SENSOR_PATHS, "high60")
+HIGH60_SOURCE = "TEENSY.PHOTONS.PD_OUT.HIGH60"
+# Native units: Celsius for physical probes, millivolts for HIGH60. One
+# observation per producer second, including the firmware's HIGH60 warmup.
+SENSOR_UNITS = {name: "mV" if name == "high60" else "C" for name in TEMPERATURE_SENSORS}
 TEMPERATURE_WINDOWS = (600, 3600, 28800, 86400)
 SHORT_LIMIT = 600
 MINUTE_LIMIT = 1440
@@ -642,10 +646,11 @@ MISSING = -(1 << 31)
 
 
 def _sensor_sources():
-    return {name: source for name, (_path, source) in THERMAL_SENSOR_PATHS.items()}
+    return {**{name: source for name, (_path, source) in THERMAL_SENSOR_PATHS.items()},
+            "high60": HIGH60_SOURCE}
 
 
-def _current_names(values, saved_sources=None):
+def _current_names(values, saved_sources=None, *, new_high60=None):
     """Project durable hardware identity onto today's readout names.
 
     Old images precede the explicit source map. Their four physical lanes are
@@ -658,28 +663,45 @@ def _current_names(values, saved_sources=None):
                          "out" if "out" in values else "otdr": "PI.I2C2.BME280.0x77",
                          "rtd": "TEENSY.SPI1.MAX31865"}
     by_source = {source: values[name] for name, source in saved_sources.items()}
+    # Older checkpoints never accumulated HIGH60. Adopt an empty lane without
+    # altering any physical sensor's saved arithmetic or coverage counters.
+    if HIGH60_SOURCE not in by_source:
+        by_source[HIGH60_SOURCE] = new_high60
     return {name: copy.deepcopy(by_source[source])
             for name, source in _sensor_sources().items()}
 
 
-def _minute_json(minute):
+def _sum_key(name):
+    return "sum_nanovolt" if name == "high60" else "sum_microdegree_c"
+
+
+def _mean_key(name):
+    return "mean_mv" if name == "high60" else "mean_c"
+
+
+def _sd_key(name):
+    return "sd_mv" if name == "high60" else "sd_c"
+
+
+def _minute_json(minute, sensors=TEMPERATURE_SENSORS):
     if minute is None:
         return None
     return {"index": minute["index"], "slots": minute["slots"],
             "gaps": minute["gaps"],
             "sensors": {name: {"n": minute["counts"][i],
-                               "sum_microdegree_c": minute["sums"][i]}
-                        for i, name in enumerate(TEMPERATURE_SENSORS)}}
+                               _sum_key(name): minute["sums"][i]}
+                        for i, name in enumerate(sensors)}}
 
 
 def _minute_from_json(minute, sources):
     if minute is None:
         return None
-    values = _current_names(minute["sensors"], sources)
+    values = _current_names(minute["sensors"], sources,
+                            new_high60={"n": 0, "sum_nanovolt": 0})
     return {"index": minute["index"], "slots": minute["slots"],
             "gaps": minute["gaps"],
             "counts": [values[name]["n"] for name in TEMPERATURE_SENSORS],
-            "sums": [values[name]["sum_microdegree_c"] for name in TEMPERATURE_SENSORS]}
+            "sums": [values[name][_sum_key(name)] for name in TEMPERATURE_SENSORS]}
 
 
 def _read_legacy_rolling(image):
@@ -710,16 +732,19 @@ def _read_legacy_rolling(image):
         index, slots, gaps, *values = minute.unpack_from(raw, offset)
         offset += minute.size
         minutes.append(_minute_json({"index": index, "slots": slots, "gaps": gaps,
-                                     "counts": values[:4], "sums": values[4:]}))
+                                     "counts": values[:4], "sums": values[4:]},
+                                    sensors=tuple(THERMAL_SENSOR_PATHS)))
     # Ordinary unpacking detects short input. An extra suffix is also an
     # implementation-integrity error, not permission to reset the populations.
     if offset != len(raw):
         raise RuntimeError("legacy temperature image has unconsumed bytes")
     return {"sequence": image["sequence"], "update_count": image["update_count"],
-            "reset_count": image["reset_count"], "sensor_sources": _sensor_sources(),
+            "reset_count": image["reset_count"],
+            "sensor_sources": {name: source for name, source in _sensor_sources().items()
+                               if name != "high60"},
             "seconds": seconds, "minutes": minutes[:nm],
             "open_minute": minutes[nm] if no else None,
-            "short_population": _current_names(image["short_population"]),
+            "short_population": _current_names(image["short_population"], new_high60=_empty()),
             "short_gaps": image["short_gaps"]}
 
 
@@ -731,8 +756,10 @@ def _quantized(values):
             out.append(MISSING)
             continue
         q = round(float(value) * TEMPERATURE_SCALE)
-        if not MISSING < q <= (1 << 31) - 1:
-            raise ValueError(f"PHOTONS {name} temperature exceeds the bounded rolling representation")
+        # HIGH60 uses nanovolts; the ADC's full mV range exceeds int32.
+        bits = 64 if name == "high60" else 32
+        if not MISSING < q <= (1 << (bits - 1)) - 1:
+            raise ValueError(f"PHOTONS {name} reading exceeds the bounded rolling representation")
         out.append(q)
     return tuple(out)
 
@@ -744,7 +771,8 @@ def _temperatures(q):
 
 def _new_minute(index):
     return {"index": index, "slots": 0, "gaps": 0,
-            "counts": [0, 0, 0, 0], "sums": [0, 0, 0, 0]}
+            "counts": [0] * len(TEMPERATURE_SENSORS),
+            "sums": [0] * len(TEMPERATURE_SENSORS)}
 
 
 def _minute_append(minute, q, gap):
@@ -786,19 +814,19 @@ def _remove(p, value):
         p["n"] = n - 1
 
 
-def _surface(p):
+def _surface(p, name):
     n = p["n"]
     return {
         "n": n,
-        "mean_c": p["mean"] if n else None,
-        "sd_c": math.sqrt(max(0.0, p["m2"] / (n - 1))) if n > 1 else None,
+        _mean_key(name): p["mean"] if n else None,
+        _sd_key(name): math.sqrt(max(0.0, p["m2"] / (n - 1))) if n > 1 else None,
     }
 
 
 def _observations(environment, rtd):
     """No fallback paths: an absent/invalid physical sensor remains absent."""
     result = {}
-    for name in TEMPERATURE_SENSORS:
+    for name in THERMAL_SENSOR_PATHS:
         node = rtd if name == "rtd" else environment.get(name)
         node = node or {}
         if node.get("status") != "OK":
@@ -838,7 +866,7 @@ class _Window:
         # window. It must not contaminate an otherwise complete local window.
         interrupted = self.gaps - (int(self.entries[0][2]) if self.entries else 0)
         return {
-            name: {**_surface(pop),
+            name: {**_surface(pop, name),
                    "complete": (len(self.entries) == self.seconds
                                 and interrupted == 0 and pop["n"] == self.seconds)}
             for name, pop in self.populations.items()
@@ -932,8 +960,8 @@ class TemperatureAccumulator:
             n = sum(m["counts"][i] for m in selected)
             total_q = sum(m["sums"][i] for m in selected)
             out[name] = {"n": n,
-                         "mean_c": total_q / (n*TEMPERATURE_SCALE) if n else None,
-                         "sd_c": None,
+                         _mean_key(name): total_q / (n*TEMPERATURE_SCALE) if n else None,
+                         _sd_key(name): None,
                          "complete": complete_grid and n == span}
         return out
 
@@ -944,7 +972,10 @@ class TemperatureAccumulator:
                 "reset_count": self.last_rolling_reset_count,
                 "sensor_sources": _sensor_sources(),
                 "seconds": [{"sequence": sequence, "update_count": update_count,
-                             "gap": bool(gap), "temperature_c": _temperatures(q)}
+                             "gap": bool(gap),
+                             "temperature_c": {name: value for name, value in _temperatures(q).items()
+                                               if name != "high60"},
+                             "high60_mv": _temperatures(q)["high60"]}
                             for sequence, update_count, gap, q in self.second_tail],
                 "minutes": [_minute_json(minute) for minute in self.minutes],
                 "open_minute": _minute_json(self.open_minute),
@@ -960,11 +991,15 @@ class TemperatureAccumulator:
         self.second_tail = deque(maxlen=SHORT_LIMIT)
         self.short = _Window(SHORT_LIMIT)
         for entry in image["seconds"]:
-            values = _current_names(entry["temperature_c"], sources)
+            readings = dict(entry["temperature_c"])
+            if HIGH60_SOURCE in sources.values():
+                readings["high60"] = entry["high60_mv"]
+            values = _current_names(readings, sources)
             sequence, update_count, gap = entry["sequence"], entry["update_count"], entry["gap"]
             self.second_tail.append((sequence, update_count, int(gap), _quantized(values)))
             self.short.entries.append((sequence, values, bool(gap)))
-        self.short.populations = _current_names(image["short_population"], sources)
+        self.short.populations = _current_names(image["short_population"], sources,
+                                                new_high60=_empty())
         self.short.gaps = image["short_gaps"]
         self.minutes = deque((_minute_from_json(m, sources) for m in image["minutes"]),
                              maxlen=MINUTE_LIMIT)
@@ -1013,8 +1048,8 @@ class TemperatureAccumulator:
                 names = labels.setdefault(source, [])
                 if name not in names:
                     names.append(name)
-            state["total"] = _current_names(state["total"], sources)
-            state["camp"] = _current_names(state["camp"], sources)
+            state["total"] = _current_names(state["total"], sources, new_high60=_empty())
+            state["camp"] = _current_names(state["camp"], sources, new_high60=_empty())
             state["sensor_sources"] = _sensor_sources()
             self.state = state
         else:
@@ -1051,12 +1086,17 @@ class TemperatureAccumulator:
         campaign_id = campaign.get("campaign_id")
         public_count = campaign.get("public_count")
         values = _observations(canonical.get("environment") or {}, canonical.get("rtd") or {})
+        high_window = canonical["photons"]["pd_out"]["high_window"]
+        values["high60"] = (high_window["high_mean_mv"]
+                            if high_window["sample_count"] > 0 else None)
+        # This is the already sample-weighted firmware HIGH60, observed once
+        # per second. Do not weight overlapping 60-second windows a second time.
         if campaign_id is not None and (not isinstance(public_count, int) or public_count <= 0):
             raise ValueError("invalid PHOTONS temperature campaign public count")
         s = self.state
         if s["sequence"] is not None and s["reset_count"] == reset_count and sequence <= s["sequence"]:
             raise ValueError("PHOTONS temperature sequence did not advance")
-        # Preserve the existing microdegree rolling arithmetic. Source readings
+        # Preserve microdegree / nanovolt rolling arithmetic. Source readings
         # and cumulative Welfords retain their original full precision.
         _quantized(values)
         return sequence, reset_count, update_count, campaign, campaign_id, public_count, values
@@ -1116,14 +1156,15 @@ class TemperatureAccumulator:
         return {
             "schema": TEMPERATURE_STATS_SCHEMA,
             "observed": current,
+            "sensor_units": dict(SENSOR_UNITS),
             "windows": {"600": self.short.summarize(),
                         **{str(span): self._minute_surface(span)
                            for span in TEMPERATURE_WINDOWS if span != SHORT_LIMIT}},
-            "total": {name: {**_surface(p),
+            "total": {name: {**_surface(p, name),
                              "complete": (s["total_complete"]
                                           and p["n"] == s["total_seconds"])}
                       for name, p in s["total"].items()},
-            "camp": ({name: {**_surface(p),
+            "camp": ({name: {**_surface(p, name),
                              "complete": (s["campaign_complete"]
                                           and p["n"] == s["camp_seconds"])}
                       for name, p in s["camp"].items()} if s["campaign_id"] is not None else None),

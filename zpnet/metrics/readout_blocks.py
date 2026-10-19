@@ -1128,7 +1128,7 @@ def environment_sensor_block(snapshot: dict) -> list[str]:
 
 
 def photons_temperature_block(snapshot: dict) -> list[str]:
-    """Align physical temperatures with the preceding PHOTONS mean columns.
+    """Align physical temperatures and HIGH60 with the PHOTONS mean columns.
 
     The PHOTONS science header uses an eight-character label, a separator,
     then 12-character right-justified columns. Use precisely that geometry:
@@ -1165,10 +1165,10 @@ def photons_temperature_block(snapshot: dict) -> list[str]:
             return f"{'---':>{width}}"
         return f"{number:>{width}.{digits}f}"
 
-    def mean(pop):
-        if not isinstance(pop, dict) or pop.get("mean_c") is None:
+    def mean(pop, field="mean_c"):
+        if not isinstance(pop, dict) or pop.get(field) is None:
             return f"{'---':>12}"
-        return observed(pop["mean_c"])
+        return observed(pop[field])
 
     windows = data.get("windows") or {}
     totals = data.get("total") or {}
@@ -1184,6 +1184,18 @@ def photons_temperature_block(snapshot: dict) -> list[str]:
                + ((" " + mean(population) + " " + observed(population.get("sd_c"), 5, 10))
                   if has_campaign else ""))
         lines.append(row)
+
+    # HIGH60 shares the thermal time windows but retains its native mV units.
+    high_window = ((snapshot.get("photons") or {}).get("pd_out") or {}).get("high_window") or {}
+    high_now = high_window.get("high_mean_mv") if high_window.get("sample_count", 0) > 0 else None
+    population = campaigns.get("high60") or {}
+    lines.append(
+        f"{'HIGH60':<8} " + observed(high_now)
+        + ''.join(" " + mean((windows.get(span) or {}).get("high60"), "mean_mv") for span, _ in spans)
+        + " " + mean(totals.get("high60"), "mean_mv")
+        + ((" " + mean(population, "mean_mv") + " " + observed(population.get("sd_mv"), 5, 10))
+           if has_campaign else "")
+    )
 
     # The separate SENSOR section contains only the three BME280 channels.
     # These are their latest physical RH, pressure and barometric altitude
@@ -2421,8 +2433,7 @@ def photons_detail_readout() -> list[str]:
     lines.extend(["", _photons_summary_header(bool(campaign)),
                   _photons_summary_line(summary, bool(campaign), summary["mean"]),
                   "", *photons_temperature_block(live), "",
-                  "HIGH60_mV: sample-weighted trailing 60 s; * = window warming up",
-                  f"{'SEC':<8} {'LAP':>12} {'HIGH60_mV':>10}"
+                  f"{'SEC':<8} {'LAP':>12} {'HIGH60':>9} "
                   f" {'ACCEPT':>8} {'EXCL':>7} {'MISSED':>7} {'SPURIOUS':>8}"
                   f" {'EARLY':>6} {'DUP':>6} {'LATE':>6} {'UNARM':>6} {'SD':>10} {'SE':>10}"])
     for row in _photons_rolling_rows(payloads):

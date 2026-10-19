@@ -568,10 +568,13 @@ def build_pi_status() -> dict:
         "undervoltage_flags": get_undervoltage_flags(),
     }
 
-    # The same firmware status word reports power and thermal constraints.
-    # Keep the existing undervoltage surface for compatibility while exposing
-    # throttling as a first-class Pi diagnostic in SYSTEM.REPORT.
+    # Split the single firmware reading into power and throttling diagnostics.
+    # Retain the complete get_throttled status word only under throttling.
     firmware_flags = payload["undervoltage_flags"]
+    payload["undervoltage_flags"] = {
+        "currently_undervolted": firmware_flags["currently_undervolted"],
+        "previously_undervolted": firmware_flags["previously_undervolted"],
+    }
     payload["throttling"] = {
         "raw_hex": firmware_flags["raw_hex"],
         "currently_throttled": firmware_flags["currently_throttled"],
@@ -585,11 +588,12 @@ def build_pi_status() -> dict:
     temp = payload["cpu_temp_c"]
     mem_pct = payload["memory"]["percent"]
 
-    # Raspberry Pi thermal throttling begins around 80 C, with the hard
-    # thermal limit at 85 C. Load averages are telemetry, not host faults.
-    if temp < 80 and mem_pct < 85:
+    # Pi health policy: NOMINAL below 85 C, HOLD below 90 C.
+    # Hardware thermal protection remains independent of this classification.
+    # Load averages are telemetry, not host faults.
+    if temp < 85 and mem_pct < 85:
         payload["health_state"] = "NOMINAL"
-    elif temp < 85 and mem_pct < 95:
+    elif temp < 90 and mem_pct < 95:
         payload["health_state"] = "HOLD"
     else:
         payload["health_state"] = "DOWN"
