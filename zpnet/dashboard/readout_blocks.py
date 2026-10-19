@@ -512,6 +512,20 @@ def raspberry_pi_status_readout() -> Generator[str, None, None]:
     yield f"RASPBERRY PI STATUS: {pi.get('health_state', 'UNKNOWN')}"
     yield f"DEVICE: {pi.get('device_name', '---')}"
     yield f"CPU TEMP: {_num(pi.get('cpu_temp_c'), 1, False, ' C')}"
+    def throttle_state(current: str, previous: str) -> str:
+        active = uv.get(current)
+        occurred = uv.get(previous)
+        if active is None or occurred is None:
+            return "UNKNOWN"
+        if active:
+            return "ACTIVE"
+        if occurred:
+            return "RECOVERED"
+        return "NONE"
+
+    yield f"CPU THROTTLING: {throttle_state('currently_throttled', 'previously_throttled')}"
+    yield f"FREQUENCY CAPPED: {throttle_state('currently_frequency_capped', 'previously_frequency_capped')}"
+    yield f"SOFT TEMP LIMIT: {throttle_state('currently_soft_temp_limited', 'previously_soft_temp_limited')}"
     yield f"LOAD 1/5/15: {_num(pi.get('load_1m'),2)} / {_num(pi.get('load_5m'),2)} / {_num(pi.get('load_15m'),2)}"
     uptime = _to_float(pi.get("uptime_s"))
     yield f"UPTIME: {'---' if uptime is None else f'{uptime/3600.0:.2f} H'}"
