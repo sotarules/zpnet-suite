@@ -2575,6 +2575,8 @@ _clocks_holistic_restore_proof_expected: Dict[str, Any] = {}
 _clocks_holistic_restore_proof_reset_count = -1
 _clocks_holistic_restore_proof_update_count = -1
 _clocks_holistic_restore_proof_sequence: Optional[int] = None
+# Exact primary-key identity returned by the persistence worker's committed write.
+_clocks_holistic_restore_proof_detail_id: Optional[int] = None
 _clocks_state_worker_started = threading.Event()
 _clocks_state_enqueued = 0
 _clocks_state_published = 0
@@ -4022,6 +4024,7 @@ def _ambient_instrument_recovery(regression: Dict[str, Any]) -> None:
             source_reset_count=int(source_reset),
             source_update_count=int(source_update),
             proof_sequence=int(proof_sequence),
+            proof_detail_id=int(proof["durable_proof_detail_id"]),
         )
         recovery_receipt = _record_clocks_recovery_receipt(
             boundary_detail_id=boundary_detail_id,
@@ -6116,40 +6119,45 @@ def _find_clocks_exact_recovery_boundary_detail_id(
     source_reset_count: int,
     source_update_count: int,
     proof_sequence: int,
+    proof_detail_id: int,
 ) -> int:
-    """Find the one durable exact-N+1 CLOCKS row admitted after a restore."""
+    """Prove the committed N+1 row by its persistence-authored primary key.
+
+    The persistence worker already knows the unique id returned by INSERT or
+    UPDATE RETURNING. A historical JSONB predicate scan is unnecessary and can
+    starve the paused TEMPEST processor for its entire resume deadline.
+    """
+    detail_id = int(proof_detail_id)
+    if detail_id <= int(source_detail_id):
+        raise RuntimeError("CLOCKS exact proof detail does not follow durable source")
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
         cur.execute(
-            """
-            SELECT id
-            FROM campaign_detail
-            WHERE campaign_type = %s
-              AND id > %s
-              AND payload #>> '{schema}' = 'CLOCKS_V4'
-              AND payload #>> '{sequence}' = %s
-              AND payload #>> '{clocks,stats,reset_count}' = %s
-              AND payload #>> '{clocks,stats,update_count}' = %s
-            ORDER BY id ASC
-            LIMIT 2
-            """,
-            (
-                CAMPAIGN_TYPE_TEMPEST,
-                int(source_detail_id),
-                str(int(proof_sequence)),
-                str(int(source_reset_count)),
-                str(int(source_update_count) + 1),
-            ),
+            "SELECT payload FROM campaign_detail WHERE id = %s AND campaign_type = %s",
+            (detail_id, CAMPAIGN_TYPE_TEMPEST),
         )
-        rows = cur.fetchall()
-    if len(rows) != 1:
+        row = cur.fetchone()
+    if row is None:
+        raise RuntimeError(f"CLOCKS exact proof detail_id={detail_id} is missing")
+    payload = row["payload"]
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    if not isinstance(payload, dict) or payload.get("schema") != "CLOCKS_V4":
+        raise RuntimeError("CLOCKS exact proof payload is not CLOCKS_V4")
+    clocks = _clocks_payload(payload)
+    stats = clocks.get("stats") if isinstance(clocks, dict) else None
+    if (
+        _as_int(payload.get("sequence")) != int(proof_sequence)
+        or not isinstance(stats, dict)
+        or _as_int(stats.get("reset_count")) != int(source_reset_count)
+        or _as_int(stats.get("update_count")) != int(source_update_count) + 1
+    ):
         raise RuntimeError(
-            "exact CLOCKS recovery boundary is not unique: "
-            f"source_detail_id={source_detail_id} reset={source_reset_count} "
-            f"update={source_update_count}->{source_update_count + 1} "
-            f"sequence={proof_sequence} rows={len(rows)}"
+            "CLOCKS exact durable proof does not close source N+1: "
+            f"source={source_reset_count}/{source_update_count} "
+            f"proof_sequence={proof_sequence} proof_detail_id={detail_id}"
         )
-    return int(rows[0]["id"])
+    return detail_id
 
 
 def _record_clocks_recovery_receipt(
@@ -8343,6 +8351,7 @@ def _arm_holistic_restore_persistence_proof(
     global _clocks_holistic_restore_proof_reset_count
     global _clocks_holistic_restore_proof_update_count
     global _clocks_holistic_restore_proof_sequence
+    global _clocks_holistic_restore_proof_detail_id
 
     stats = _clocks_payload(detail).get("stats")
     reset_count = _as_int(stats.get("reset_count")) if isinstance(stats, dict) else None
@@ -8357,6 +8366,7 @@ def _arm_holistic_restore_persistence_proof(
     _clocks_holistic_restore_proof_reset_count = int(reset_count)
     _clocks_holistic_restore_proof_update_count = int(update_count) + 1
     _clocks_holistic_restore_proof_sequence = None
+    _clocks_holistic_restore_proof_detail_id = None
     _clocks_holistic_restore_proof_committed.clear()
     _clocks_holistic_restore_proof_pending.set()
 
@@ -8441,6 +8451,7 @@ def _wait_for_holistic_restore(
                     "observed": last_observed,
                     "clocks_sequence": current.get("sequence"),
                     "durable_proof_sequence": _clocks_holistic_restore_proof_sequence,
+                    "durable_proof_detail_id": _clocks_holistic_restore_proof_detail_id,
                     "waited_s": round(time.monotonic() - requested_monotonic, 3),
                 }
         now = time.monotonic()
@@ -9257,6 +9268,7 @@ def _restore_instrument_from_clocks(
             source_reset_count=int(source_reset),
             source_update_count=int(source_update),
             proof_sequence=int(proof_sequence),
+            proof_detail_id=int(proof["durable_proof_detail_id"]),
         )
         recovery_receipt = _record_clocks_recovery_receipt(
             boundary_detail_id=boundary_detail_id,
@@ -14148,7 +14160,7 @@ def _set_clocks_persistence_worker_phase(
 
 def _persist_clocks_state(
     state: Dict[str, Any], checkpoint: Dict[str, Any]
-) -> str:
+) -> Tuple[str, int]:
     encoded = json.dumps(state, separators=(",", ":"), ensure_ascii=False)
     sequence = state.get("sequence")
     pps_count = sequence
@@ -14202,7 +14214,7 @@ def _persist_clocks_state(
                 "DB_COMMIT_MERGED", sequence=_as_int(sequence),
                 detail={"detail_id": detail_id},
             )
-            return "merged"
+            return "merged", detail_id
         _set_clocks_persistence_worker_phase("DB_INSERT", sequence=_as_int(sequence))
         cur.execute(
             """
@@ -14234,7 +14246,7 @@ def _persist_clocks_state(
             "DB_COMMIT_INSERT", sequence=_as_int(sequence),
             detail={"detail_id": detail_id},
         )
-    return "inserted"
+    return "inserted", detail_id
 
 
 def _cache_clocks_state(
@@ -14919,6 +14931,7 @@ def _clocks_persistence_loop() -> None:
     """Persist CLOCKS in order, then release embedded TEMPEST candidates."""
     global _clocks_state_persisted, _clocks_state_inserted, _clocks_state_merged
     global _last_tempest_candidate_identity, _last_tempest_candidate_monotonic
+    global _clocks_holistic_restore_proof_detail_id
 
     logging.info("🚀 [clocks] CLOCKS persistence worker started")
     while True:
@@ -14956,7 +14969,7 @@ def _clocks_persistence_loop() -> None:
                 _set_clocks_persistence_worker_phase("WAIT_LOCK", sequence=worker_sequence)
                 with _clocks_persistence_lock:
                     _set_clocks_persistence_worker_phase("LOCK_ACQUIRED", sequence=worker_sequence)
-                    disposition = _persist_clocks_state(
+                    disposition, persisted_detail_id = _persist_clocks_state(
                         state, ppb_restore_checkpoint
                     )
                     _set_clocks_persistence_worker_phase(
@@ -14991,6 +15004,10 @@ def _clocks_persistence_loop() -> None:
                         and persisted_update_count
                             == _clocks_holistic_restore_proof_update_count
                     ):
+                        if persisted_detail_id <= 0:
+                            raise RuntimeError("committed CLOCKS N+1 proof lacks durable detail ID")
+                        # Publish the exact committed primary key before signaling proof.
+                        _clocks_holistic_restore_proof_detail_id = persisted_detail_id
                         _clocks_holistic_restore_proof_committed.set()
                 break
             except Exception as exc:
@@ -18035,6 +18052,7 @@ def _restore_active_campaign_state(
         source_reset_count=int(source_reset_count),
         source_update_count=int(source_update_count),
         proof_sequence=int(alpha_proof_sequence),
+        proof_detail_id=int(combined_alpha_proof["durable_proof_detail_id"]),
     )
     recovery_receipt = _record_clocks_recovery_receipt(
         boundary_detail_id=int(dead_producer_restore_supersede["recovered_detail_id"]),
