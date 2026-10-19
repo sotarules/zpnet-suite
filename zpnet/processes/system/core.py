@@ -531,6 +531,12 @@ def get_undervoltage_flags() -> dict:
             "raw_hex": raw,
             "currently_undervolted": bool(flags & (1 << 0)),
             "previously_undervolted": bool(flags & (1 << 16)),
+            "currently_throttled": bool(flags & (1 << 2)),
+            "previously_throttled": bool(flags & (1 << 18)),
+            "currently_frequency_capped": bool(flags & (1 << 1)),
+            "previously_frequency_capped": bool(flags & (1 << 17)),
+            "currently_soft_temp_limited": bool(flags & (1 << 3)),
+            "previously_soft_temp_limited": bool(flags & (1 << 19)),
         }
     except Exception:
         logging.exception("[system] vcgencmd failed")
@@ -538,6 +544,12 @@ def get_undervoltage_flags() -> dict:
             "raw_hex": "unavailable",
             "currently_undervolted": None,
             "previously_undervolted": None,
+            "currently_throttled": None,
+            "previously_throttled": None,
+            "currently_frequency_capped": None,
+            "previously_frequency_capped": None,
+            "currently_soft_temp_limited": None,
+            "previously_soft_temp_limited": None,
         }
 
 
