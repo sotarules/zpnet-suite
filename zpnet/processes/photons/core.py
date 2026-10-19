@@ -44,8 +44,8 @@ from zpnet.shared.logger import setup_logging
 # PHOTONS: Optional calibrated normalization and physical sensor identities
 # ======================================================================
 
-# Matches process_photons.cpp. This is NOT a thermal-model identity.
-ACQUISITION_ID = 0x52415731  # RAW1: uncorrected, GNSS-projected accepted races
+# Matches process_photons.cpp. New measurement ancestry cannot restore RAW1 totals.
+ACQUISITION_ID = 0x4E4F5231  # NOR1: firmware-normalized accepted LAP
 PHOTONS_MEASUREMENT_SCHEMA = "PI_PHOTONS_MEASUREMENT_V1"
 THERMAL_SENSOR_PATHS = {
     "pi": (("environment", "pi"), "PI.I2C1.BME280.0x76"),
@@ -74,7 +74,10 @@ THERMAL_FEATURE_ID = "PHOTONS_THERMAL_FEATURES_V1"
 
 
 def model_semantics(model):
-    """Return the actual fitted correction, or None when no calibration exists."""
+    """Return the mathematical correction identity, not the observed voltage."""
+    if isinstance(model, dict) and model.get("schema") == "PHOTONS_VOLTAGE_NORMALIZATION_V1":
+        return {key: copy.deepcopy(model[key]) for key in
+                ("schema", "normalization_id", "application", "reference_mv", "slope_ns_per_mv")}
     if not isinstance(model, dict) or not model.get("terms"):
         return None
     return {key: copy.deepcopy(model[key]) for key in
@@ -274,15 +277,34 @@ class Normalizer:
         photons = state["photons"]
         if photons["stats"]["acquisition_id"] != ACQUISITION_ID:
             raise ValueError("PHOTONS requires raw acquisition")
-        raw = copy.deepcopy(photons["race"]["flight_ns"])
+        firmware = photons.get("voltage_normalization")
+        if firmware is not None and self.model is not None:
+            raise ValueError("PHOTONS must not normalize already-normalized firmware LAP")
+        raw = copy.deepcopy(firmware["raw_flight_ns"] if firmware is not None
+                            else photons["race"]["flight_ns"])
         thermal = self.history.observe(state)
-        out = {"schema": PHOTONS_MEASUREMENT_SCHEMA, "authority": "PI.PHOTONS",
-               "acquisition_id": ACQUISITION_ID,
-               "acquisition_signature": acquisition_signature(state),
-               "raw_flight_ns": raw, "thermal": thermal,
-               "normalized_flight_ns": None, "correction_ns": None}
+        out = {"schema": PHOTONS_MEASUREMENT_SCHEMA,
+                "authority": "TEENSY.PHOTONS" if firmware is not None else "PI.PHOTONS",
+                "acquisition_id": ACQUISITION_ID,
+                "acquisition_signature": acquisition_signature(state),
+                "raw_flight_ns": raw, "thermal": thermal,
+                "normalized_flight_ns": None, "correction_ns": None}
         if not raw["n"]:
             out["status"] = "NO_ACCEPTED_RACES"
+            return out
+        if firmware is not None:
+            normalized = copy.deepcopy(photons["race"]["flight_ns"])
+            if normalized != firmware["published_flight_ns"]:
+                raise ValueError("firmware normalized LAP testimony differs from canonical flight")
+            if raw["n"] != normalized["n"]:
+                raise ValueError("firmware voltage normalization changed accepted population count")
+            offset = float(firmware["adjustment_ns"])
+            if abs((float(raw["mean"]) + offset) - float(normalized["mean"])) > 1e-6:
+                raise ValueError("firmware raw + voltage adjustment does not close")
+            out.update(status="FIRMWARE_CORRECTED",
+                       normalization_id=firmware["model_id"],
+                       correction_ns=-offset,
+                       normalized_flight_ns=normalized)
             return out
         if self.model is None:
             out["status"] = "RAW_ONLY"
@@ -5166,8 +5188,20 @@ def _make_photons(
                 "rejecting canonical PHOTONS row"
             )
             raise
-    # No normalization object exists until an actual calibration is deployed.
+    # The Teensy is now the one authoritative normalization engine. The Pi
+    # witnesses the same raw/offset/published triplet without a second correction.
     normalization = _normalizer.policy_snapshot()
+    firmware = instrument.get("voltage_normalization")
+    if firmware is not None:
+        if normalization is not None:
+            raise ValueError("Pi model conflicts with firmware voltage normalization")
+        normalization = {
+            "schema": "PHOTONS_VOLTAGE_NORMALIZATION_V1",
+            "normalization_id": firmware["model_id"],
+            "application": firmware["application"],
+            "reference_mv": firmware["reference_mv"],
+            "slope_ns_per_mv": firmware["slope_ns_per_mv"],
+        }
     if normalization is not None:
         state["normalization"] = normalization
     state["measurement"] = _normalizer.measure(state)

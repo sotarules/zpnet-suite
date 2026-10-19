@@ -40,9 +40,9 @@
 static constexpr uint64_t PHOTONS_FRAGMENT_PERIOD_NS = 1000000000ULL;
 static constexpr uint64_t PHOTONS_NS_PER_SECOND = 1000000000ULL;
 
-// Raw acquisition identity is independent of every Pi thermal model. Never
-// restore the old thermally corrected sufficient state into this population.
-static constexpr uint32_t PHOTONS_ACQUISITION_ID = 0x52415731UL; // 'RAW1'
+// New canonical measurement epoch: recovery must not combine earlier RAW1
+// numerator/Welford custody with normalized LAP. Original DWT evidence is still raw.
+static constexpr uint32_t PHOTONS_ACQUISITION_ID = 0x4E4F5231UL; // 'NOR1'
 
 
 // i.MX RT1062 RAM2 is write-back cached in 32-byte lines.  PHOTONS places only
@@ -2397,6 +2397,25 @@ static FLASHMEM void photons_envelope_finish(const photons_race_batch_t& batch,
 }
 
 
+// The calibration changes here, not in the DWT ISR, race filter, Pi or Metrics.
+// V1 uses the current fragment's exact HIGH population; the long 60 s window
+// is intentionally never a predictor of a changing thermal baseline.
+static constexpr Double PHOTONS_HIGH_REFERENCE_MV = 475.725600719_D;
+static constexpr Double PHOTONS_HIGH_SLOPE_NS_PER_MV = 0.555244801819_D;
+
+static photons_fragment_voltage_normalization_snapshot_t
+photons_voltage_normalization(const photons_pd_out_batch_t& batch) {
+  photons_fragment_voltage_normalization_snapshot_t n{};
+  n.adc_sample_count = batch.sample_count;
+  if (batch.sample_count != 0ULL) {
+    n.high_mv = ((Double)batch.high_sum * 3300_D) /
+                ((Double)batch.sample_count * 4095_D);
+    n.adjustment_ns = PHOTONS_HIGH_SLOPE_NS_PER_MV *
+                      (n.high_mv - PHOTONS_HIGH_REFERENCE_MV);
+  }
+  return n;
+}
+
 struct photons_fragment_drain_result_t {
   uint32_t raw_laps = 0U;
   uint32_t projected_laps = 0U;
@@ -2404,13 +2423,17 @@ struct photons_fragment_drain_result_t {
   uint32_t min_cycles = 0U;
   uint32_t max_cycles = 0U;
   photons_welford_state_t projected_flight_welford{};
+  photons_welford_state_t raw_projected_flight_welford{};
+  photons_fragment_voltage_normalization_snapshot_t normalization{};
 };
 
-
-static photons_fragment_drain_result_t photons_drain_raw_laps(void) {
+static FLASHMEM photons_fragment_drain_result_t photons_drain_raw_laps(
+    const photons_pd_out_batch_t& pd_out_batch) {
   photons_foreground_owner_assert(photons_foreground_owner_t::FRAGMENT);
   photons_fragment_drain_result_t result{};
   photons_welford_reset(result.projected_flight_welford);
+  photons_welford_reset(result.raw_projected_flight_welford);
+  result.normalization = photons_voltage_normalization(pd_out_batch);
 
   g_photons_lap_science_state.candidates_this_fragment = 0U;
   g_photons_lap_science_state.accepted.count_this_fragment = 0U;
@@ -2432,6 +2455,9 @@ static photons_fragment_drain_result_t photons_drain_raw_laps(void) {
   photons_envelope_finish(race_batch, race_cps, g_fragment_sequence + 1U);
 
   if (race_batch.accepted_count != 0ULL) {
+    // A scientific accepted population without a voltage predictor would
+    // silently publish raw LAP under a normalized model identity.
+    if (pd_out_batch.sample_count == 0ULL) __builtin_trap();
     const uint32_t cps = race_cps;
     if (cps == 0U) __builtin_trap();
     const Double n = (Double)race_batch.accepted_count;
@@ -2446,9 +2472,15 @@ static photons_fragment_drain_result_t photons_drain_raw_laps(void) {
     const Double min_ns = (Double)race_batch.accepted_min_cycles * ns_per_cycle;
     const Double max_ns = (Double)race_batch.accepted_max_cycles * ns_per_cycle;
     if (min_ns <= 0_D) __builtin_trap();
-    // Preserve raw GNSS-projected sufficient statistics. Thermal interpretation
-    // belongs to the Pi and never changes acquisition or recovery state.
     const Double m2_ns = m2_cycles * ns_per_cycle * ns_per_cycle;
+    const Double adjustment_ns = result.normalization.adjustment_ns;
+    const Double published_mean_ns = mean_ns + adjustment_ns;
+    const Double published_min_ns = min_ns + adjustment_ns;
+    const Double published_max_ns = max_ns + adjustment_ns;
+    if (published_min_ns <= 0_D) __builtin_trap();
+    photons_welford_merge_batch(
+        result.raw_projected_flight_welford,
+        race_batch.accepted_count, mean_ns, m2_ns, min_ns, max_ns);
 
     photons_welford_merge_batch(
         g_accepted_raw_cycles_welford,
@@ -2460,20 +2492,20 @@ static photons_fragment_drain_result_t photons_drain_raw_laps(void) {
     photons_welford_merge_batch(
         g_lap_time_welford,
         race_batch.accepted_count,
-        mean_ns,
+        published_mean_ns,
         m2_ns,
-        min_ns,
-        max_ns);
+        published_min_ns,
+        published_max_ns);
     photons_welford_merge_batch(
         result.projected_flight_welford,
         race_batch.accepted_count,
-        mean_ns,
+        published_mean_ns,
         m2_ns,
-        min_ns,
-        max_ns);
+        published_min_ns,
+        published_max_ns);
 
     const uint64_t accepted_ns = (uint64_t)(
-        n * mean_ns + 0.5_D);
+        n * published_mean_ns + 0.5_D);
     g_total_lap_gnss_ns += accepted_ns;
     g_photons_custody_lap_count += race_batch.accepted_count;
     g_photons_custody_total_lap_gnss_ns += accepted_ns;
@@ -2619,14 +2651,18 @@ static photons_fragment_drain_result_t photons_drain_raw_laps(void) {
     g_projection_state.last_end_gnss_ns = end_gnss_ns;
     g_projection_state.last_lap_gnss_ns = lap_gnss_ns;
 
-    // Every successfully projected physical race enters the one-second metrics
-    // Welford. The science court below independently decides whether it may
-    // mutate the canonical lifetime population.
+    // Physical GNSS-projected interval is immutable witness. The legacy ring
+    // is a discrete-nanosecond path; shift its science copy, never its endpoints.
     photons_welford_update(
-        result.projected_flight_welford,
-        (Double)lap_gnss_ns);
+        result.raw_projected_flight_welford, (Double)lap_gnss_ns);
+    if (pd_out_batch.sample_count == 0ULL) __builtin_trap();
+    const int64_t adjusted_lap = (int64_t)lap_gnss_ns +
+        result.normalization.adjustment_ns.roundedInteger();
+    if (adjusted_lap <= 0) __builtin_trap();
+    photons_welford_update(
+        result.projected_flight_welford, (Double)adjusted_lap);
 
-    science_candidate.lap_gnss_ns = lap_gnss_ns;
+    science_candidate.lap_gnss_ns = (uint64_t)adjusted_lap;
     photons_lap_science_projected_candidate(science_candidate);
     result.projected_laps++;
   }
@@ -2683,6 +2719,10 @@ static photons_fragment_drain_result_t photons_drain_raw_laps(void) {
   photons_lap_science_validate_exclusion_ledger(
       g_photons_lap_science_state);
 
+  result.normalization.raw_flight_ns =
+      photons_welford_snapshot(result.raw_projected_flight_welford);
+  result.normalization.published_flight_ns =
+      photons_welford_snapshot(result.projected_flight_welford);
   return result;
 }
 
@@ -3832,7 +3872,7 @@ static const photons_fragment_snapshot_t& photons_report_fragment_snapshot(void)
       sizeof(name##_storage))
 
 // Preserve existing envelope headroom and reserve 1 KiB for HIGH window testimony.
-static constexpr size_t PHOTONS_FRAGMENT_ROOT_CAPACITY = 17408U;
+static constexpr size_t PHOTONS_FRAGMENT_ROOT_CAPACITY = 20480U;
 static constexpr size_t PHOTONS_FRAGMENT_ROOT_GUARD_WORDS =
     PHOTONS_RAM2_CACHE_LINE_BYTES / sizeof(uint32_t);
 static constexpr size_t PHOTONS_FRAGMENT_ROOT_SECTOR_BYTES = 1024U;
@@ -3888,6 +3928,7 @@ PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_core, 2048U);
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_race, 4096U);
 // Include per-fragment moments and the nested 60-second HIGH population.
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_pd_out, 3072U);
+PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_voltage_normalization, 1536U);
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_high_window, 1024U);
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_raw_cycles, 1024U);
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_projection, 1024U);
@@ -4627,6 +4668,7 @@ static Payload& photons_fragment_payload(
   Payload& instrument = g_photons_fragment_instrument;
   Payload& race = g_photons_fragment_race;
   Payload& pd_out = g_photons_fragment_pd_out;
+  Payload& voltage_normalization = g_photons_fragment_voltage_normalization;
   Payload& raw = g_photons_fragment_raw_cycles;
   Payload& projection = g_photons_fragment_projection;
   Payload& science = g_photons_fragment_science;
@@ -4645,6 +4687,7 @@ static Payload& photons_fragment_payload(
   root.clear();
   instrument.clear();
   race.clear();
+  voltage_normalization.clear();
   raw.clear();
   projection.clear();
   science.clear();
@@ -4803,6 +4846,21 @@ static Payload& photons_fragment_payload(
       race, "flight_ns", f.race_flight_this_fragment);
   instrument.add_object("race", race);
   race.clear();
+  voltage_normalization.add("schema", "PHOTONS_VOLTAGE_NORMALIZATION_V1");
+  voltage_normalization.add("model_id", "PD200T_HIGH_LINEAR_V1");
+  voltage_normalization.add("application", "UNIFORM_OFFSET_AT_FRAGMENT_DRAIN");
+  voltage_normalization.add("adc_sample_count", f.voltage_normalization.adc_sample_count);
+  voltage_normalization.add("high_mv", toScientificDecimal(f.voltage_normalization.high_mv));
+  voltage_normalization.add("reference_mv", toScientificDecimal(PHOTONS_HIGH_REFERENCE_MV));
+  voltage_normalization.add("slope_ns_per_mv", toScientificDecimal(PHOTONS_HIGH_SLOPE_NS_PER_MV));
+  voltage_normalization.add("adjustment_ns",
+                            toScientificDecimal(f.voltage_normalization.adjustment_ns));
+  photons_payload_add_welford(voltage_normalization, "raw_flight_ns",
+                              f.voltage_normalization.raw_flight_ns);
+  photons_payload_add_welford(voltage_normalization, "published_flight_ns",
+                              f.voltage_normalization.published_flight_ns);
+  instrument.add_object("voltage_normalization", voltage_normalization);
+  voltage_normalization.clear();
   photons_payload_add_envelope(instrument, "envelope", f.envelope);
   photons_payload_add_core(instrument, "core", f.core);
 
@@ -5188,7 +5246,7 @@ static FLASHMEM void photons_fragment_tick(
   const uint32_t fragment_elapsed_ms = fragment_cut_ms - g_last_fragment_cut_ms;
   g_last_fragment_cut_ms = fragment_cut_ms;
   const photons_fragment_drain_result_t drain =
-      photons_drain_raw_laps();
+      photons_drain_raw_laps(pd_out_batch);
 
   photons_projection_anchor_value_t current_anchor{};
   const bool current_anchor_snapshot_ok =
@@ -5349,6 +5407,7 @@ static FLASHMEM void photons_fragment_tick(
       photons_welford_snapshot(drain.projected_flight_welford);
 
   fragment.pd_out = pd_out_batch;
+  fragment.voltage_normalization = drain.normalization;
   fragment.envelope = g_photons_envelope.latest;
   fragment.core = g_photons_core.latest;
 

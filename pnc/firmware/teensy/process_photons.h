@@ -251,6 +251,16 @@ struct photons_fragment_welford_snapshot_t {
   Double max = 0_D;
 };
 
+// PD200T HIGH voltage is a per-fragment predictor. Raw and published Welford
+// populations are independent testimony of the same physical accepted races.
+// The signed offset shifts mean/min/max; it must not alter n or M2.
+struct photons_fragment_voltage_normalization_snapshot_t {
+  uint64_t adc_sample_count = 0ULL;
+  Double high_mv = 0_D;
+  Double adjustment_ns = 0_D;
+  photons_fragment_welford_snapshot_t raw_flight_ns{};
+  photons_fragment_welford_snapshot_t published_flight_ns{};
+};
 
 // Fragment-local robust selection has no validity flag. The outcome names why
 // the current fragment was filtered or passed through unchanged.
@@ -697,6 +707,7 @@ struct photons_fragment_snapshot_t {
   uint32_t race_seed_count = 0;
   photons_fragment_welford_snapshot_t race_flight_this_fragment{};
   photons_pd_out_batch_t pd_out{};
+  photons_fragment_voltage_normalization_snapshot_t voltage_normalization{};
   photons_envelope_snapshot_t envelope{};
   photons_core_snapshot_t core{};
 

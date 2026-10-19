@@ -284,16 +284,25 @@ def parse_sample(row_id: int, p: Dict[str, Any], sensor: str = "synthetic") -> T
     uncorrected_ns = canonical_ns + correction_ns
     raw_source = "LEGACY_RECONSTRUCTED" if normalization_id is not None else "LEGACY"
     if measurement is not None:
-        # RAW1 is an acquisition constant, not an import from Pi process code.
-        if (stats["acquisition_id"] != 0x52415731 or
-                measurement["acquisition_id"] != 0x52415731):
-            raise ValueError("unsupported raw PHOTONS measurement contract")
+        # Firmware NOR1 publishes a normalized LAP plus a preserved raw witness.
+        firmware = ph.get("voltage_normalization")
+        identity = 0x4E4F5231 if firmware is not None else 0x52415731
+        if (stats["acquisition_id"] != identity or
+                measurement["acquisition_id"] != identity):
+            raise ValueError("unsupported PHOTONS measurement ancestry")
         raw = measurement["raw_flight_ns"]
-        if raw != flight:
-            raise ValueError("Pi raw evidence differs from the firmware distribution")
-        uncorrected_ns = number(raw["mean"])
-        raw_source = "DIRECT_RAW"
         normalized = measurement["normalized_flight_ns"]
+        if firmware is not None:
+            if raw != firmware["raw_flight_ns"] or normalized != flight:
+                raise ValueError("firmware raw/normalized evidence does not match the recorded populations")
+            if measurement["normalization_id"] != firmware["model_id"]:
+                raise ValueError("firmware normalization model identity mismatch")
+            raw_source = "DIRECT_RAW_FIRMWARE_NORMALIZED"
+        else:
+            if raw != flight:
+                raise ValueError("Pi raw evidence differs from the firmware distribution")
+            raw_source = "DIRECT_RAW"
+        uncorrected_ns = number(raw["mean"])
         if normalized is not None:
             if normalized["n"] != n or normalized["m2"] != raw["m2"]:
                 raise ValueError("normalization changed the raw population/dispersion")
