@@ -568,6 +568,20 @@ def build_pi_status() -> dict:
         "undervoltage_flags": get_undervoltage_flags(),
     }
 
+    # The same firmware status word reports power and thermal constraints.
+    # Keep the existing undervoltage surface for compatibility while exposing
+    # throttling as a first-class Pi diagnostic in SYSTEM.REPORT.
+    firmware_flags = payload["undervoltage_flags"]
+    payload["throttling"] = {
+        "raw_hex": firmware_flags["raw_hex"],
+        "currently_throttled": firmware_flags["currently_throttled"],
+        "previously_throttled": firmware_flags["previously_throttled"],
+        "currently_frequency_capped": firmware_flags["currently_frequency_capped"],
+        "previously_frequency_capped": firmware_flags["previously_frequency_capped"],
+        "currently_soft_temp_limited": firmware_flags["currently_soft_temp_limited"],
+        "previously_soft_temp_limited": firmware_flags["previously_soft_temp_limited"],
+    }
+
     temp = payload["cpu_temp_c"]
     mem_pct = payload["memory"]["percent"]
 
