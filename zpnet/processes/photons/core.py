@@ -44,8 +44,9 @@ from zpnet.shared.logger import setup_logging
 # PHOTONS: Optional calibrated normalization and physical sensor identities
 # ======================================================================
 
-# Matches process_photons.cpp. New measurement ancestry cannot restore RAW1 totals.
-ACQUISITION_ID = 0x4E4F5231  # NOR1: firmware-normalized accepted LAP
+# Matches process_photons.cpp. NOR2 cannot restore NOR1 fragment-HIGH-corrected
+# numerator/Welford custody; startup's epoch-migration court retains old rows.
+ACQUISITION_ID = 0x4E4F5232  # NOR2: HIGH60-normalized accepted LAP
 PHOTONS_MEASUREMENT_SCHEMA = "PI_PHOTONS_MEASUREMENT_V1"
 THERMAL_SENSOR_PATHS = {
     "pi": (("environment", "pi"), "PI.I2C1.BME280.0x76"),
@@ -5199,6 +5200,7 @@ def _make_photons(
             "schema": "PHOTONS_VOLTAGE_NORMALIZATION_V1",
             "normalization_id": firmware["model_id"],
             "application": firmware["application"],
+            "voltage_source": firmware["voltage_source"],
             "reference_mv": firmware["reference_mv"],
             "slope_ns_per_mv": firmware["slope_ns_per_mv"],
         }

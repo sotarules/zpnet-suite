@@ -251,11 +251,16 @@ struct photons_fragment_welford_snapshot_t {
   Double max = 0_D;
 };
 
-// PD200T HIGH voltage is a per-fragment predictor. Raw and published Welford
-// populations are independent testimony of the same physical accepted races.
-// The signed offset shifts mean/min/max; it must not alter n or M2.
+// The producer's HIGH60 voltage window is the sole normalization predictor.
+// Keep the current-fragment ADC population separately for acquisition custody.
+// Raw and published Welfords describe the same accepted races; adding the
+// signed correction must not alter n, M2, SD or SE.
 struct photons_fragment_voltage_normalization_snapshot_t {
   uint64_t adc_sample_count = 0ULL;
+  uint64_t high60_sample_count = 0ULL;
+  uint64_t high60_elapsed_ms = 0ULL;
+  uint32_t high60_fragments = 0U;
+  bool high60_complete = false;
   Double high_mv = 0_D;
   Double adjustment_ns = 0_D;
   photons_fragment_welford_snapshot_t raw_flight_ns{};

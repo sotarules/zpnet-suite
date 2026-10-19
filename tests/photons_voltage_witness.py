@@ -7,8 +7,9 @@
 
 Reads latest persisted LANTERN/PHOTONS_V1 campaign_detail rows, including
 campaign-less observations. Does not listen to PUBSUB, invoke firmware RPC,
-change database records, or change the model. The displayed HIGH predictor is
-this fragment's ADC population, NOT the lagged HIGH60 metric.
+change database records, or change the model. V2 uses the exact Teensy
+HIGH60_MV predictor persisted at photons.pd_out.high_window.high_mean_mv.
+NOR1 historical fragment-HIGH witnesses remain readable as a distinct epoch.
 
 Reconstructs the linear-model correction from the persisted firmware identity,
 reference and slope; corroborates raw, correction and published Welford
@@ -28,12 +29,14 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-VERSION = '2026-10-19.1'
+VERSION = '2026-10-19.2'
 SCHEMA = 'PHOTONS_V1'
 FIRMWARE_SCHEMA = 'PHOTONS_VOLTAGE_NORMALIZATION_V1'
-MODEL = 'PD200T_HIGH_LINEAR_V1'
+MODELS = {
+    'PD200T_HIGH_LINEAR_V1': ('FRAGMENT_HIGH_MV', 0x4E4F5231),  # historical NOR1
+    'PD200T_HIGH60_LINEAR_V1': ('PD_OUT_HIGH60_MV', 0x4E4F5232), # NOR2
+}
 APPLICATION = 'UNIFORM_OFFSET_AT_FRAGMENT_DRAIN'
-ACQUISITION_ID = 0x4E4F5231  # NOR1
 ADC_SCALE_MV = 3300.0 / 4095.0
 # Overnight HeatCool1 development fit domain; observation outside it is an
 # extrapolation, not a violation of the firmware normalization contract.
@@ -53,6 +56,10 @@ class Observation:
     campaign: str | None
     model: str
     voltage_mv: float
+    voltage_source: str
+    window_n: int
+    window_elapsed_ms: int
+    window_complete: bool
     slope_ns_per_mv: float
     raw_ns: float
     adjustment_ns: float
@@ -159,14 +166,17 @@ def parse_row(row_id, campaign, payload):
     fw = photons['voltage_normalization']
     if fw is None:
         return None
-    if fw['schema'] != FIRMWARE_SCHEMA or fw['model_id'] != MODEL:
+    if fw['schema'] != FIRMWARE_SCHEMA or fw['model_id'] not in MODELS:
         raise ValueError('unexpected Teensy normalization model identity')
+    source, acquisition_id = MODELS[fw['model_id']]
+    if source == 'PD_OUT_HIGH60_MV' and fw.get('voltage_source') != source:
+        raise ValueError('HIGH60 firmware source identity mismatch')
     if fw['application'] != APPLICATION:
         raise ValueError('unexpected Teensy normalization application policy')
     stats = photons['stats']
     measurement = payload['measurement']
     policy = payload['normalization']
-    if int(stats['acquisition_id']) != ACQUISITION_ID or int(measurement['acquisition_id']) != ACQUISITION_ID:
+    if int(stats['acquisition_id']) != acquisition_id or int(measurement['acquisition_id']) != acquisition_id:
         raise ValueError('Teensy/Pi acquisition epoch mismatch')
     if measurement['authority'] != 'TEENSY.PHOTONS':
         raise ValueError('Pi did not preserve Teensy normalization authority')
@@ -177,6 +187,8 @@ def parse_row(row_id, campaign, payload):
     for key in ('application', 'reference_mv', 'slope_ns_per_mv'):
         if str(policy[key]) != str(fw[key]):
             raise ValueError('Pi/Teensy normalization policy disagrees: ' + key)
+    if source == 'PD_OUT_HIGH60_MV' and policy.get('voltage_source') != source:
+        raise ValueError('Pi/Teensy HIGH60 source policy disagrees')
 
     pd = photons['pd_out']
     adc_n = int(pd['sample_count'])
@@ -186,19 +198,54 @@ def parse_row(row_id, campaign, payload):
     slope = finite(fw['slope_ns_per_mv'], 'slope_ns_per_mv')
     voltage = finite(fw['high_mv'], 'high_mv')
     adjustment = finite(fw['adjustment_ns'], 'adjustment_ns')
+    # The current-fragment ADC population stays an independent acquisition
+    # witness. It is NOT the NOR2 voltage predictor.
     if adc_n:
-        total = int(pd['high_sum_counts'])
-        squares = int(pd['high_sum_squares_counts'])
-        if total < 0 or total > 4095 * adc_n or squares < 0 or adc_n * squares < total * total:
-            raise ValueError('ADC integer moments are inconsistent')
-        expect_close(voltage, total * ADC_SCALE_MV / adc_n,
-                     'ADC HIGH mean voltage', CLOSURE_MV)
-        adc_sd = math.sqrt((adc_n * squares - total * total) / (adc_n * (adc_n - 1))) * ADC_SCALE_MV if adc_n > 1 else 0.0
-        adc_se = adc_sd / math.sqrt(adc_n) if adc_n > 1 else 0.0
+        frag_sum = int(pd['high_sum_counts'])
+        frag_squares = int(pd['high_sum_squares_counts'])
+        if (frag_sum < 0 or frag_sum > 4095 * adc_n or frag_squares < 0
+                or adc_n * frag_squares < frag_sum * frag_sum):
+            raise ValueError('ADC current-fragment integer moments are inconsistent')
+    elif int(pd['high_sum_counts']) != 0 or int(pd['high_sum_squares_counts']) != 0:
+        raise ValueError('empty fragment ADC population has nonzero moments')
+
+    if source == 'PD_OUT_HIGH60_MV':
+        window = pd['high_window']
+        window_n = int(window['sample_count'])
+        window_elapsed_ms = int(window['elapsed_ms'])
+        complete = window_elapsed_ms >= int(window['target_ms'])
+        if (window_n != int(fw['high60_sample_count'])
+                or window_elapsed_ms != int(fw['high60_elapsed_ms'])
+                or int(window['fragments']) != int(fw['high60_fragments'])
+                or complete != fw['high60_complete']):
+            raise ValueError('Teensy normalization HIGH60 population differs from persisted Metrics HIGH60')
+        if window_n < adc_n or (window_n and not int(window['fragments'])):
+            raise ValueError('HIGH60 population does not contain current-fragment ADC custody')
+        total, squares = int(window['high_sum_counts']), int(window['high_sum_squares_counts'])
+        if (total < 0 or total > 4095 * window_n or squares < 0
+                or window_n * squares < total * total):
+            raise ValueError('HIGH60 integer moments are inconsistent')
+        if window_n:
+            expect_close(voltage, total * ADC_SCALE_MV / window_n,
+                         'Teensy HIGH60 exact voltage', CLOSURE_MV)
+            expect_close(voltage, window['high_mean_mv'],
+                         'published Metrics HIGH60 voltage', CLOSURE_MV)
+    else:
+        window_n, window_elapsed_ms, complete = adc_n, int(photons['fragment_elapsed_ms']), True
+        total, squares = frag_sum if adc_n else 0, frag_squares if adc_n else 0
+
+    if window_n:
+        if source == 'FRAGMENT_HIGH_MV':
+            expect_close(voltage, total * ADC_SCALE_MV / window_n,
+                         'legacy fragment HIGH mean voltage', CLOSURE_MV)
+        adc_sd = (math.sqrt((window_n * squares - total * total) /
+                            (window_n * (window_n - 1))) * ADC_SCALE_MV
+                  if window_n > 1 else 0.0)
+        adc_se = adc_sd / math.sqrt(window_n) if window_n > 1 else 0.0
         expect_close(adjustment, slope * (voltage - ref), 'linear formula')
     else:
         if voltage != 0 or adjustment != 0:
-            raise ValueError('zero ADC sample population published nonzero correction')
+            raise ValueError('zero predictor population published nonzero correction')
         adc_sd = adc_se = 0.0
 
     raw = fw['raw_flight_ns']
@@ -230,6 +277,8 @@ def parse_row(row_id, campaign, payload):
     return Observation(
         id=row_id, sequence=int(payload['sequence']), reset=int(stats['reset_count']),
         campaign=campaign, model=str(fw['model_id']), voltage_mv=voltage,
+        voltage_source=source, window_n=window_n,
+        window_elapsed_ms=window_elapsed_ms, window_complete=complete,
         slope_ns_per_mv=slope,
         raw_ns=finite(raw['mean'], 'raw mean'), adjustment_ns=adjustment,
         published_ns=finite(published['mean'], 'published mean'), adc_n=adc_n,
@@ -263,6 +312,9 @@ def summary(rows):
         'first_sequence': rows[0].sequence, 'last_sequence': rows[-1].sequence,
         'fragments': len(rows), 'accepted_races': sum(r.races for r in rows),
         'adc_samples': sum(r.adc_n for r in rows),
+        'voltage_source': rows[0].voltage_source,
+        'high60_full_rows': sum(r.window_complete for r in rows),
+        'high60_window_n_range': [min(r.window_n for r in rows), max(r.window_n for r in rows)],
         'high_range_mv': [min(volts), max(volts)],
         'outside_original_fit': sum(not V1_FIT_LOW_MV <= v <= V1_FIT_HIGH_MV for v in volts),
         'raw_range_ns': [min(raw), max(raw)],
@@ -273,8 +325,8 @@ def summary(rows):
         'between_fragment_sd_change_pct': ((1 - pub_sd / raw_sd) * 100 if raw_sd else None),
         'high_raw_correlation': pearson(volts, raw),
         'high_published_correlation': pearson(volts, published),
-        'adc_one_second_se_mv_median': statistics.median(r.adc_se_mv for r in rows),
-        'adjustment_one_second_se_ps_median': statistics.median(
+        'predictor_sample_se_mv_median': statistics.median(r.adc_se_mv for r in rows),
+        'adjustment_predictor_sample_se_ps_median': statistics.median(
             abs(r.slope_ns_per_mv) * r.adc_se_mv * 1000 for r in rows),
     }
 
@@ -294,7 +346,8 @@ def print_report(args, rows, older, failures):
     print(f'PHOTONS VOLTAGE NORMALIZATION WITNESS {VERSION}')
     print(f'Generated UTC: {datetime.now(timezone.utc).isoformat(timespec="seconds")}')
     print(f'Source: read-only campaign_detail; latest {args.rows} LANTERN rows; campaign={args.campaign or "ALL (including STOPPED)"}')
-    print('Model: PD200T_HIGH_LINEAR_V1; predictor=per-fragment HIGH, NOT HIGH60; correction performed by Teensy')
+    print('Models: NOR1=one-second HIGH (historical); NOR2=producer-authored HIGH60_MV; Teensy applies correction')
+    print('HIGH60 is read directly from persisted photons.pd_out.high_window; no reconstructed filter.')
     print(f'Original development-voltage domain: {V1_FIT_LOW_MV:.3f} .. {V1_FIT_HIGH_MV:.3f} mV (outside = extrapolation)')
     print(f'Rows: normalized={len(rows)}; older/unmodeled={older}; closure_errors={len(failures)}')
     for ident, why in failures[:20]:
@@ -311,6 +364,10 @@ def print_report(args, rows, older, failures):
         print(f'\nSEGMENT {i}: rows={info["fragments"]} ids={info["first_id"]}..{info["last_id"]} '
               f'sequence={info["first_sequence"]}..{info["last_sequence"]} '
               f'accepted={info["accepted_races"]:,} ADC={info["adc_samples"]:,}')
+        print(f'  Voltage source:   {info["voltage_source"]}  model={group[0].model}')
+        if info['voltage_source'] == 'PD_OUT_HIGH60_MV':
+            print(f'  HIGH60 maturity:  {info["high60_full_rows"]}/{info["fragments"]} complete-window rows; '
+                  f'window ADC n={info["high60_window_n_range"][0]:,}..{info["high60_window_n_range"][1]:,}')
         print(f'  HIGH mV:          {info["high_range_mv"][0]:.6f} .. {info["high_range_mv"][1]:.6f}'
               f'  outside_original_fit={info["outside_original_fit"]}/{info["fragments"]}')
         print(f'  RAW LAP ns:       {info["raw_range_ns"][0]:.6f} .. {info["raw_range_ns"][1]:.6f}')
@@ -326,19 +383,20 @@ def print_report(args, rows, older, failures):
               f'published={info["published_between_fragment_sd_ps"]:.2f} ps '
               f'change={change_text}')
         print(f'  Corr(HIGH,raw/published): {raw_corr_text} / {pub_corr_text}')
-        print(f'  Median ADC SE: {info["adc_one_second_se_mv_median"]:.4f} mV; '
-              f'approx correction SE: {info["adjustment_one_second_se_ps_median"]:.1f} ps*')
+        print(f'  Median predictor-sample SE: {info["predictor_sample_se_mv_median"]:.4f} mV; '
+              f'approx correction SE: {info["adjustment_predictor_sample_se_ps_median"]:.1f} ps*')
     print('\nMOST RECENT PER-FRAGMENT WITNESSES')
-    print(' ID       SEQ     HIGH_mV    RAW_ns    ADJUST_ns   PUB_ns     N_RACE   N_ADC   ADC_SE_mV  FIT')
+    print(' ID       SEQ    HIGH_mV    RAW_ns    ADJUST_ns   PUB_ns  N_RACE N_ADC N_WINDOW WINDOW  FIT')
     for r in rows[-args.show:] if args.show else []:
-        print(f'{r.id:8d} {r.sequence:7d} {r.voltage_mv:11.4f} {r.raw_ns:10.4f} '
-              f'{r.adjustment_ns:+11.4f} {r.published_ns:10.4f} {r.races:9d} '
-              f'{r.adc_n:7d} {r.adc_se_mv:11.4f}  '
+        print(f'{r.id:8d} {r.sequence:7d} {r.voltage_mv:10.4f} {r.raw_ns:10.4f} '
+              f'{r.adjustment_ns:+11.4f} {r.published_ns:10.4f} {r.races:7d} '
+              f'{r.adc_n:5d} {r.window_n:8d} '
+              f'{"FULL" if r.window_complete else "WARM"}  '
               f'{"IN" if V1_FIT_LOW_MV <= r.voltage_mv <= V1_FIT_HIGH_MV else "OUT"}')
     print('\nCLOSURE: raw + adjustment = published; N/M2/SD/SE preserved; Pi/Teensy/model identities agree.')
-    print('* ADC SE assumes independent samples, which has not been established. It is NOT calibration accuracy.')
-    print('  Between-fragment SD is descriptive and can increase even when the arithmetic is correct.')
-    print('  Identical correction for every accepted race in a fragment cannot reduce within-fragment SD.')
+    print('* Predictor-sample SE assumes independent ADC samples; overlapping HIGH60 windows are correlated.')
+    print('  Between-fragment SD is descriptive; HIGH60 windows overlap and can lag a thermal ramp.')
+    print('  One correction per fragment cannot reduce within-fragment SD. Coefficients are still provisional.')
     print('  No database records, producer state, or normalization coefficients were modified.')
 
 

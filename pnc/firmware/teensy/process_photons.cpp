@@ -40,9 +40,10 @@
 static constexpr uint64_t PHOTONS_FRAGMENT_PERIOD_NS = 1000000000ULL;
 static constexpr uint64_t PHOTONS_NS_PER_SECOND = 1000000000ULL;
 
-// New canonical measurement epoch: recovery must not combine earlier RAW1
-// numerator/Welford custody with normalized LAP. Original DWT evidence is still raw.
-static constexpr uint32_t PHOTONS_ACQUISITION_ID = 0x4E4F5231UL; // 'NOR1'
+// HIGH60 correction is a new sufficient-state epoch. Never merge NOR1
+// one-fragment-corrected numerator/Welford custody with HIGH60-corrected LAP.
+// Original raw DWT evidence remains raw under both acquisition identities.
+static constexpr uint32_t PHOTONS_ACQUISITION_ID = 0x4E4F5232UL; // 'NOR2'
 
 
 // i.MX RT1062 RAM2 is write-back cached in 32-byte lines.  PHOTONS places only
@@ -2397,19 +2398,34 @@ static FLASHMEM void photons_envelope_finish(const photons_race_batch_t& batch,
 }
 
 
-// The calibration changes here, not in the DWT ISR, race filter, Pi or Metrics.
-// V1 uses the current fragment's exact HIGH population; the long 60 s window
-// is intentionally never a predictor of a changing thermal baseline.
+// Preserve the provisional HeatCool1 coefficients; this revision changes ONLY
+// the predictor from fragment HIGH to the existing producer-owned HIGH60_MV.
 static constexpr Double PHOTONS_HIGH_REFERENCE_MV = 475.725600719_D;
 static constexpr Double PHOTONS_HIGH_SLOPE_NS_PER_MV = 0.555244801819_D;
+
+// Shared authoritative conversion for the Metrics HIGH60 publication and the
+// scientific correction. Never construct a second rolling voltage estimator.
+static Double photons_high60_mean_mv(const photons_pd_out_window_t& window) {
+  if (window.sample_count == 0ULL) __builtin_trap();
+  return (Double(window.high_sum) * 3300_D) /
+         (Double(window.sample_count) * 4095_D);
+}
 
 static photons_fragment_voltage_normalization_snapshot_t
 photons_voltage_normalization(const photons_pd_out_batch_t& batch) {
   photons_fragment_voltage_normalization_snapshot_t n{};
-  n.adc_sample_count = batch.sample_count;
-  if (batch.sample_count != 0ULL) {
-    n.high_mv = ((Double)batch.high_sum * 3300_D) /
-                ((Double)batch.sample_count * 4095_D);
+  n.adc_sample_count = batch.sample_count; // Independent current-fragment ADC custody.
+  const auto& window = batch.high_window; // Exactly the HIGH60_MV Metrics source.
+  if (window.sample_count < batch.sample_count) __builtin_trap();
+  if (window.sample_count != 0ULL && window.fragments == 0U) __builtin_trap();
+  n.high60_sample_count = window.sample_count;
+  n.high60_elapsed_ms = window.elapsed_ms;
+  n.high60_fragments = window.fragments;
+  n.high60_complete = window.elapsed_ms >= PHOTONS_PD_OUT_HIGH_WINDOW_MS;
+  if (window.sample_count != 0ULL) {
+    // During the initial <60 s the identical HIGH60 witness is partial;
+    // document its maturity rather than silently substituting fragment HIGH.
+    n.high_mv = photons_high60_mean_mv(window);
     n.adjustment_ns = PHOTONS_HIGH_SLOPE_NS_PER_MV *
                       (n.high_mv - PHOTONS_HIGH_REFERENCE_MV);
   }
@@ -2455,9 +2471,10 @@ static FLASHMEM photons_fragment_drain_result_t photons_drain_raw_laps(
   photons_envelope_finish(race_batch, race_cps, g_fragment_sequence + 1U);
 
   if (race_batch.accepted_count != 0ULL) {
-    // A scientific accepted population without a voltage predictor would
-    // silently publish raw LAP under a normalized model identity.
-    if (pd_out_batch.sample_count == 0ULL) __builtin_trap();
+    // Preserve current-fragment acquisition integrity AND require the exact
+    // producer-owned HIGH60 predictor; never fall back to fragment HIGH.
+    if (pd_out_batch.sample_count == 0ULL ||
+        pd_out_batch.high_window.sample_count == 0ULL) __builtin_trap();
     const uint32_t cps = race_cps;
     if (cps == 0U) __builtin_trap();
     const Double n = (Double)race_batch.accepted_count;
@@ -4762,7 +4779,8 @@ static Payload& photons_fragment_payload(
   if (w.sample_count != 0ULL) {
     const Double mean = Double(w.high_sum) / Double(w.sample_count);
     high_window.add("high_mean_counts", toFixedDecimal(mean, 6));
-    high_window.add("high_mean_mv", toFixedDecimal(mean * 3300_D / 4095_D, 6));
+    high_window.add("high_mean_mv",
+                    toFixedDecimal(photons_high60_mean_mv(w), 6));
   }
   pd_out.add_object("high_window", high_window);
   high_window.clear();
@@ -4847,9 +4865,14 @@ static Payload& photons_fragment_payload(
   instrument.add_object("race", race);
   race.clear();
   voltage_normalization.add("schema", "PHOTONS_VOLTAGE_NORMALIZATION_V1");
-  voltage_normalization.add("model_id", "PD200T_HIGH_LINEAR_V1");
+  voltage_normalization.add("model_id", "PD200T_HIGH60_LINEAR_V1");
   voltage_normalization.add("application", "UNIFORM_OFFSET_AT_FRAGMENT_DRAIN");
+  voltage_normalization.add("voltage_source", "PD_OUT_HIGH60_MV");
   voltage_normalization.add("adc_sample_count", f.voltage_normalization.adc_sample_count);
+  voltage_normalization.add("high60_sample_count", f.voltage_normalization.high60_sample_count);
+  voltage_normalization.add("high60_elapsed_ms", f.voltage_normalization.high60_elapsed_ms);
+  voltage_normalization.add("high60_fragments", f.voltage_normalization.high60_fragments);
+  voltage_normalization.add("high60_complete", f.voltage_normalization.high60_complete);
   voltage_normalization.add("high_mv", toScientificDecimal(f.voltage_normalization.high_mv));
   voltage_normalization.add("reference_mv", toScientificDecimal(PHOTONS_HIGH_REFERENCE_MV));
   voltage_normalization.add("slope_ns_per_mv", toScientificDecimal(PHOTONS_HIGH_SLOPE_NS_PER_MV));
