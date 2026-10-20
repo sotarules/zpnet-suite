@@ -13,7 +13,7 @@
 //   • QTimer1 CH0 is the passive VCLOCK counter at 10 MHz.
 //   • One VCLOCK tick = 100 ns.
 //   • QTimer1 CH2 is the dynamic compare scheduler.
-//   • All public timing semantics are expressed in GNSS nanoseconds.
+//   • Ordinary timers use GNSS nanoseconds; the opt-in action lane uses raw DWT.
 //
 // Scheduling modes:
 //
@@ -42,8 +42,8 @@
 //   7. Critical recurring ISR scheduling
 //        timepop_arm_recurring_isr(period_gnss_ns, ...)
 //
-//      Use only for tiny substrate-maintenance clients that must callback and
-//      rearm inside the CH2 IRQ pass before TimePop selects the next compare.
+//      Legacy name: these callbacks run in the foreground CH2 service pass,
+//      before TimePop selects the next compare. They do NOT execute in an ISR.
 //      The callback receives the same shared fire facts as other same-deadline
 //      timed clients.
 //
@@ -53,6 +53,13 @@
 //      For polling/publication work that must still run if its appointment is
 //      missed. Overdue periods coalesce into one pending callback, followed by
 //      a future appointment. This API never supplies precision fire facts.
+//
+//   9. Short-deadline interrupt action
+//        timepop_action_arm_dwt(target_dwt, max_lateness_cycles, ...)
+//
+//      Separate one-shot CH1 lane; no ordinary slot, handle or recurrence.
+//      Priority 16 wakes early and lands on a raw DWT deadline. Priority 0
+//      science/photodiode capture remains able to preempt it.
 //
 // TimePop owns:
 //   • timed slot scheduling
@@ -216,3 +223,79 @@ bool timepop_cancel(timepop_handle_t handle);
 uint32_t timepop_cancel_by_name(const char* name);
 void timepop_dispatch(void);
 uint32_t timepop_active_count(void);
+
+// ============================================================================
+// Short-deadline action — explicit opt-in, independent of the CH2 scheduler
+// ============================================================================
+//
+// One foreground owner, one outstanding action, one result to consume. All
+// functions below are foreground-only. A second arm before take() is an
+// integrity violation. Ordinary cancel/cancel_by_name/active_count do not own
+// this lane. Hardware stays dormant until its first arm; no boot callback.
+//
+// target_dwt is an absolute *raw* ARM_DWT_CYCCNT coordinate, including wrap.
+// For LOW: actual launch DWT + predicted raw flight cycles - LOW lead cycles.
+// PHOTONS owns prediction, ADC ownership and the aperture/arrival margin.
+// This API schedules callback dispatch, not ADC aperture or conversion end.
+//
+// arm() returns false if insufficient lead remains (including time spent
+// programming hardware); nothing is queued and no result needs consuming.
+// Null callback, ISR use, occupied lane, excessive future horizon or lateness
+// tolerance trap. Limits are exposed by snapshot() in CPU cycles.
+//
+// The callback runs at Priority 16, without masking Priority 0. It must be a
+// tiny, bounded, integer-only hardware action: trigger acquisition and return.
+// No ADC completion wait, allocation, logging, scheduler calls or floating
+// point. user_data must live until take() consumes the completion/cancellation.
+//
+// Dispatch occurs no earlier than target_dwt; an already-late action is skipped.
+// Priority 0 can still preempt between the dispatch check and the peripheral
+// write. The client must record its actual trigger time and assess the ADC's
+// sampling aperture against arrival. DISPATCHED is not a timing guarantee for
+// a later register write. A hardware ADC trigger would be needed for that.
+//
+enum class timepop_action_state_t : uint8_t { IDLE, ARMED, COMPLETE };
+enum class timepop_action_outcome_t : uint8_t { NONE, DISPATCHED, MISSED, CANCELLED };
+
+struct timepop_action_context_t {
+  uint32_t target_dwt = 0;
+  uint32_t latest_dwt = 0;
+  uint32_t isr_entry_dwt = 0;
+  uint32_t dispatch_dwt = 0;
+};
+
+using timepop_action_callback_t =
+    void (*)(const timepop_action_context_t& context, void* user_data);
+
+struct timepop_action_result_t {
+  timepop_action_outcome_t outcome = timepop_action_outcome_t::NONE;
+  timepop_action_context_t context;
+  uint32_t finished_dwt = 0;
+};
+
+struct timepop_action_snapshot_t {
+  timepop_action_state_t state = timepop_action_state_t::IDLE;
+  uint32_t min_lead_cycles = 0;
+  uint32_t max_lead_cycles = 0;
+  uint32_t wake_advance_cycles = 0;
+  uint32_t max_spin_cycles = 0;
+  uint32_t max_lateness_cycles = 0;
+  uint32_t arm_count = 0;
+  uint32_t arm_too_late_count = 0;
+  uint32_t dispatched_count = 0;
+  uint32_t missed_count = 0;
+  uint32_t cancelled_count = 0;
+  uint32_t dispatch_lateness_max_cycles = 0;
+  uint32_t callback_wall_max_cycles = 0;
+  timepop_action_result_t last;
+};
+
+bool timepop_action_arm_dwt(uint32_t target_dwt,
+                           uint32_t max_lateness_cycles,
+                           timepop_action_callback_t callback,
+                           void* user_data);
+// Returns false if no action is armed; never erases an already completed result.
+bool timepop_action_cancel(void);
+// Returns true exactly once per completion; copies the result and releases lane.
+bool timepop_action_take(timepop_action_result_t* out);
+void timepop_action_snapshot(timepop_action_snapshot_t* out);

@@ -108,8 +108,9 @@
 //   substrate-maintenance work.  They are still ordinary TimePop slots and
 //   share CH2 fire facts, but their callbacks and recurring rearm happen in the
 //   foreground CH2 scheduler pass before schedule_next() selects the next compare.
-//   The legacy ISR API names remain source-compatible but no callback executes
-//   in Priority 0, Priority 16, or Priority 32.
+//   The legacy ISR API names remain source-compatible; these CH2 callbacks do
+//   not execute in Priority 0, Priority 16, or Priority 32. The explicitly
+//   separate CH1 action API in timepop.h runs its tiny hardware action at P16.
 //   The complete CH2 foreground pass holds dispatch ownership. Critical callback
 //   arm/cancel requests use the ordinary mutation queue and commit after all
 //   critical callbacks and recurring rearms for that captured event, before the

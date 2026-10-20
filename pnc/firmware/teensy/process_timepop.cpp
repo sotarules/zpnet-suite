@@ -23,6 +23,9 @@
 //   • absolute scheduling        — timepop_arm_at(target_gnss_ns, ...)
 //   • anchor-relative scheduling — timepop_arm_from_anchor(anchor_gnss_ns, offset_gnss_ns, ...)
 //   • caller-owned exact path    — timepop_arm_ns(target_gnss_ns, target_dwt, ...)
+//   • short DWT action           — timepop_action_arm_dwt(...)
+//     Independent, opt-in CH1 action at Priority 16. Ordinary CH2 callbacks
+//     retain their foreground execution and exact event-fact semantics.
 //   • timed slot priority       — lower numeric priority runs first when
 //     multiple timed slots share one captured CH2 fire fact. ASAP/ALAP are
 //     fixed deferred lanes and intentionally do not participate.
@@ -5425,11 +5428,147 @@ bool timepop_idle_witness_snapshot(timepop_idle_witness_snapshot_t* out) {
 }
 
 // ============================================================================
+// Short-deadline action API and diagnostics
+// ============================================================================
+
+bool timepop_action_arm_dwt(uint32_t target_dwt,
+                           uint32_t max_lateness_cycles,
+                           timepop_action_callback_t callback,
+                           void* user_data) {
+  return interrupt_timepop_action_arm_dwt(
+      target_dwt, max_lateness_cycles, callback, user_data);
+}
+
+bool timepop_action_cancel(void) {
+  return interrupt_timepop_action_cancel();
+}
+
+bool timepop_action_take(timepop_action_result_t* out) {
+  return interrupt_timepop_action_take(out);
+}
+
+void timepop_action_snapshot(timepop_action_snapshot_t* out) {
+  interrupt_timepop_action_snapshot(out);
+}
+
+static const char* timepop_action_outcome_name(timepop_action_outcome_t outcome) {
+  switch (outcome) {
+    case timepop_action_outcome_t::NONE: return "NONE";
+    case timepop_action_outcome_t::DISPATCHED: return "DISPATCHED";
+    case timepop_action_outcome_t::MISSED: return "MISSED";
+    case timepop_action_outcome_t::CANCELLED: return "CANCELLED";
+  }
+  __builtin_trap();
+}
+
+static FLASHMEM void timepop_action_add_result(
+    Payload& out, const timepop_action_result_t& result) {
+  out.add("outcome", timepop_action_outcome_name(result.outcome));
+  out.add("target_dwt", result.context.target_dwt);
+  out.add("latest_dwt", result.context.latest_dwt);
+  out.add("isr_entry_dwt", result.context.isr_entry_dwt);
+  out.add("dispatch_dwt", result.context.dispatch_dwt);
+  out.add("finished_dwt", result.finished_dwt);
+  if (result.outcome == timepop_action_outcome_t::DISPATCHED) {
+    out.add("dispatch_lateness_cycles",
+            result.context.dispatch_dwt - result.context.target_dwt);
+    out.add("callback_wall_cycles",
+            result.finished_dwt - result.context.dispatch_dwt);
+  }
+}
+
+static FLASHMEM Payload timepop_action_report(void) {
+  timepop_action_snapshot_t s;
+  timepop_action_snapshot(&s);
+  Payload out;
+  out.add("context", "QTIMER1_CH1_PRIORITY16_DWT_LANDING");
+  out.add("state", s.state == timepop_action_state_t::IDLE ? "IDLE" :
+                   s.state == timepop_action_state_t::ARMED ? "ARMED" : "COMPLETE");
+  out.add("dwt_cycles_per_second", DWT_EXPECTED_PER_PPS);
+  out.add("min_lead_cycles", s.min_lead_cycles);
+  out.add("max_lead_cycles", s.max_lead_cycles);
+  out.add("wake_advance_cycles", s.wake_advance_cycles);
+  out.add("max_spin_cycles", s.max_spin_cycles);
+  out.add("max_lateness_cycles", s.max_lateness_cycles);
+  out.add("arm_count", s.arm_count);
+  out.add("arm_too_late_count", s.arm_too_late_count);
+  out.add("dispatched_count", s.dispatched_count);
+  out.add("missed_count", s.missed_count);
+  out.add("cancelled_count", s.cancelled_count);
+  out.add("dispatch_lateness_max_cycles", s.dispatch_lateness_max_cycles);
+  out.add("callback_wall_max_cycles", s.callback_wall_max_cycles);
+  timepop_action_add_result(out, s.last);
+  return out;
+}
+
+// Explicit hardware witness: no ADC, GPIO, launch, or flight-statistics changes.
+// Capture the real callback entry, independently of the scheduler's dispatch
+// timestamp. The command holds foreground for delay_us + 20 us (<= 1.02 ms),
+// with interrupts enabled; it is never invoked automatically by REPORT/boot.
+struct timepop_action_witness_t {
+  volatile uint32_t entry_dwt = 0;
+};
+
+static void timepop_action_witness_callback(const timepop_action_context_t&, void* data) {
+  const uint32_t now = ARM_DWT_CYCCNT;
+  static_cast<timepop_action_witness_t*>(data)->entry_dwt = now;
+}
+
+static FLASHMEM Payload cmd_action_witness(const Payload& args) {
+  Payload out;
+  uint32_t delay_us = 100U;
+  uint32_t max_lateness_ns = 250U;
+  if ((args.has("delay_us") && !args.tryGetUInt("delay_us", delay_us)) ||
+      (args.has("max_lateness_ns") &&
+       !args.tryGetUInt("max_lateness_ns", max_lateness_ns)) ||
+      delay_us < 3U || delay_us > 1000U || max_lateness_ns > 1000U) {
+    out.add("error", "delay_us must be 3..1000; max_lateness_ns must be 0..1000");
+    return out;
+  }
+  timepop_action_snapshot_t snapshot;
+  timepop_action_snapshot(&snapshot);
+  if (snapshot.state != timepop_action_state_t::IDLE) {
+    out.add("error", "action lane belongs to an outstanding client; consume its result first");
+    return out;
+  }
+  timepop_action_witness_t witness;
+  const uint32_t delay_cycles = delay_us * (DWT_EXPECTED_PER_PPS / 1000000U);
+  const uint32_t lateness_cycles =
+      (uint32_t)((uint64_t)max_lateness_ns * DWT_NS_DEN / DWT_NS_NUM);
+  const uint32_t target = ARM_DWT_CYCCNT + delay_cycles;
+  const bool armed = timepop_action_arm_dwt(
+      target, lateness_cycles, timepop_action_witness_callback, &witness);
+  if (!armed) {
+    out.add("status", "TOO_LATE_TO_ARM");
+  } else {
+    const uint32_t finish = target + 20U * (DWT_EXPECTED_PER_PPS / 1000000U);
+    // No repeated take()/snapshot() masks while measuring the action path.
+    while ((int32_t)(ARM_DWT_CYCCNT - finish) < 0) __asm__ volatile ("nop");
+    timepop_action_result_t result;
+    if (!timepop_action_take(&result)) {
+      // A stopped external clock must not retain a pointer to this stack.
+      (void)timepop_action_cancel();
+      if (!timepop_action_take(&result)) __builtin_trap();
+    }
+    timepop_action_add_result(out, result);
+    if (result.outcome == timepop_action_outcome_t::DISPATCHED) {
+      out.add("callback_entry_dwt", (uint32_t)witness.entry_dwt);
+      out.add("callback_entry_lateness_cycles", (uint32_t)witness.entry_dwt - target);
+    }
+  }
+  out.add("delay_us", delay_us);
+  out.add("max_lateness_ns", max_lateness_ns);
+  out.add("dwt_cycles_per_second", DWT_EXPECTED_PER_PPS);
+  return out;
+}
+
+// ============================================================================
 // REPORT
 // ============================================================================
 
 static FLASHMEM Payload cmd_report(const Payload&) {
   Payload out;
+  out.add_object("action", timepop_action_report());
   out.add("transport_future_captured", g_transport_future.captured);
   out.add("transport_future_rx_checks", g_transport_future.checks[0]);
   out.add("transport_future_tx_checks", g_transport_future.checks[1]);
@@ -6009,6 +6148,7 @@ static FLASHMEM Payload cmd_rollover(const Payload&) {
 }
 
 static const process_command_entry_t TIMEPOP_COMMANDS[] = {
+  { "ACTION_WITNESS",         cmd_action_witness         },
   { "ROLLOVER",               cmd_rollover               },
   { "REPORT",                 cmd_report                 },
   { "SLOTS",                  cmd_slots                  },

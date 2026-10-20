@@ -29,7 +29,8 @@
 // Priority 16 owns the shared QTimer1 capture vector:
 //   * native VCLOCK CH0 and TimePop CH2 necessarily share one NVIC priority;
 //   * Priority 0 science captures may preempt this vector;
-//   * QTimer1 captures/defuses only and pends Priority 32 continuation.
+//   * CH0/CH2 capture/defuse and pend Priority 32 continuation;
+//   * opt-in CH1 performs a bounded DWT landing and one tiny hardware action.
 //
 // Priority 32 owns continuation:
 //   * the native VCLOCK heartbeat extends all three 16-bit timer domains;
@@ -2821,6 +2822,214 @@ static volatile uint32_t g_qtimer1_ch2_target_mismatch_count = 0U;
 static volatile uint32_t g_qtimer1_ch2_unexpected_capture_count = 0U;
 static volatile interrupt_qtimer1_ch1_handler_fn g_qtimer1_ch1_handler = nullptr;
 
+// Separate short-deadline action custody. CH1 remains stopped until first use;
+// ordinary TimePop slots, CH2 fact custody, and science priorities are untouched.
+// A 1 ms horizon fits comfortably inside half a 16-bit 10 MHz counter turn.
+static constexpr uint32_t ACTION_CYCLES_PER_TICK =
+    DWT_EXPECTED_PER_PPS / VCLOCK_COUNTS_PER_SECOND;
+static constexpr uint32_t ACTION_WAKE_ADVANCE_CYCLES = DWT_EXPECTED_PER_PPS / 1000000U;
+static constexpr uint32_t ACTION_MIN_LEAD_CYCLES = 2U * ACTION_WAKE_ADVANCE_CYCLES;
+static constexpr uint32_t ACTION_MAX_SPIN_CYCLES = 2U * ACTION_WAKE_ADVANCE_CYCLES;
+static constexpr uint32_t ACTION_MAX_LEAD_CYCLES = DWT_EXPECTED_PER_PPS / 1000U;
+static_assert(DWT_EXPECTED_PER_PPS % VCLOCK_COUNTS_PER_SECOND == 0U,
+              "action wake conversion requires integral nominal cycles/tick");
+static_assert(ACTION_MAX_LEAD_CYCLES / ACTION_CYCLES_PER_TICK < 0x8000U,
+              "action wake must fit signed hardware counter distance");
+
+static bool g_timepop_action_initialized = false;
+static volatile timepop_action_state_t g_timepop_action_state =
+    timepop_action_state_t::IDLE;
+static timepop_action_callback_t g_timepop_action_callback = nullptr;
+static void* g_timepop_action_user_data = nullptr;
+static uint16_t g_timepop_action_compare = 0U;
+// Protected by the existing Priority-0-preserving guard in foreground. Only
+// Priority 16 writes this record asynchronously; Priority 0 never accesses it.
+static timepop_action_snapshot_t g_timepop_action_diag;
+
+static void timepop_action_require_foreground(void) {
+  if (interrupt_ipsr() != 0U) __builtin_trap();
+}
+
+static void timepop_action_stop_locked(void) {
+  qtimer_disable_compare(IMXRT_TMR1, QTIMER1_RETIRED_AUX_CH);
+  // Never clear IRQ_QTIMER1 pending: CH0/CH2 share that vector.
+}
+
+bool interrupt_timepop_action_arm_dwt(uint32_t target_dwt,
+                                     uint32_t max_lateness_cycles,
+                                     timepop_action_callback_t callback,
+                                     void* user_data) {
+  timepop_action_require_foreground();
+  if (!g_interrupt_hw_ready || !callback ||
+      max_lateness_cycles > ACTION_WAKE_ADVANCE_CYCLES) __builtin_trap();
+
+  const uint32_t prior = interrupt_priority0_guard_enter();
+  if (g_timepop_action_state != timepop_action_state_t::IDLE ||
+      g_qtimer1_ch1_handler != nullptr) __builtin_trap();
+  const int32_t lead = (int32_t)(target_dwt - ARM_DWT_CYCCNT);
+  if (lead > (int32_t)ACTION_MAX_LEAD_CYCLES) __builtin_trap();
+  if (lead < (int32_t)ACTION_MIN_LEAD_CYCLES) {
+    g_timepop_action_diag.arm_too_late_count++;
+    interrupt_priority0_guard_exit(prior);
+    return false;
+  }
+
+  auto& ch = IMXRT_TMR1.CH[QTIMER1_RETIRED_AUX_CH];
+  if (!g_timepop_action_initialized) {
+    // Only CH1 is touched. No module reset, shared vector change, or rephase of
+    // CH0/CH2. Its local counter is used solely to wake the DWT landing early.
+    ch.CTRL = 0;
+    ch.SCTRL = 0;
+    ch.CSCTRL = 0;
+    ch.LOAD = 0;
+    ch.CNTR = 0;
+    ch.COMP1 = 0xFFFF;
+    ch.CMPLD1 = 0xFFFF;
+    ch.CMPLD2 = 0;
+    ch.CTRL = TMR_CTRL_CM(1) | TMR_CTRL_PCS(QTIMER1_VCLOCK_PCS);
+    IMXRT_TMR1.ENBL |= (uint16_t)(1U << QTIMER1_RETIRED_AUX_CH);
+    g_timepop_action_initialized = true;
+  }
+  timepop_action_stop_locked();
+
+  const uint32_t sample_dwt = ARM_DWT_CYCCNT;
+  const uint16_t counter = ch.CNTR;
+  const uint32_t sample_end_dwt = ARM_DWT_CYCCNT;
+  const uint32_t wake_dwt = target_dwt - ACTION_WAKE_ADVANCE_CYCLES;
+  const int32_t wake_lead = (int32_t)(wake_dwt - sample_dwt);
+  // A Priority-0 interruption between paired reads must not move the wake by
+  // an unmeasured amount. An ordinary counter quantum is absorbed by landing.
+  if (sample_end_dwt - sample_dwt > ACTION_CYCLES_PER_TICK ||
+      wake_lead < (int32_t)ACTION_WAKE_ADVANCE_CYCLES) {
+    g_timepop_action_diag.arm_too_late_count++;
+    interrupt_priority0_guard_exit(prior);
+    return false;
+  }
+  const uint16_t compare = (uint16_t)(counter +
+      (uint32_t)wake_lead / ACTION_CYCLES_PER_TICK);
+  ch.COMP1 = compare;
+  ch.CMPLD1 = compare;
+  qtimer_clear_compare_flag(IMXRT_TMR1, QTIMER1_RETIRED_AUX_CH);
+
+  g_timepop_action_callback = callback;
+  g_timepop_action_user_data = user_data;
+  g_timepop_action_compare = compare;
+  g_timepop_action_diag.last = timepop_action_result_t{};
+  g_timepop_action_diag.last.context.target_dwt = target_dwt;
+  g_timepop_action_diag.last.context.latest_dwt = target_dwt + max_lateness_cycles;
+  g_timepop_action_state = timepop_action_state_t::ARMED;
+  dmb_barrier();
+  ch.CSCTRL |= TMR_CSCTRL_TCF1EN;
+  (void)ch.CSCTRL;
+
+  // Programming/clearing can straddle the match, especially if Priority 0 ran.
+  // Never leave a missed low-word compare waiting for another 6.55 ms turn.
+  if ((int32_t)(wake_dwt - ARM_DWT_CYCCNT) <= 0 ||
+      (int16_t)(compare - ch.CNTR) <= 1) {
+    timepop_action_stop_locked();
+    g_timepop_action_callback = nullptr;
+    g_timepop_action_user_data = nullptr;
+    g_timepop_action_state = timepop_action_state_t::IDLE;
+    g_timepop_action_diag.arm_too_late_count++;
+    interrupt_priority0_guard_exit(prior);
+    return false;
+  }
+  g_timepop_action_diag.arm_count++;
+  interrupt_priority0_guard_exit(prior);
+  return true;
+}
+
+bool interrupt_timepop_action_cancel(void) {
+  timepop_action_require_foreground();
+  const uint32_t prior = interrupt_priority0_guard_enter();
+  if (g_timepop_action_state != timepop_action_state_t::ARMED) {
+    interrupt_priority0_guard_exit(prior);
+    return false;
+  }
+  timepop_action_stop_locked();
+  g_timepop_action_diag.last.outcome = timepop_action_outcome_t::CANCELLED;
+  g_timepop_action_diag.last.finished_dwt = ARM_DWT_CYCCNT;
+  g_timepop_action_diag.cancelled_count++;
+  dmb_barrier();
+  g_timepop_action_state = timepop_action_state_t::COMPLETE;
+  interrupt_priority0_guard_exit(prior);
+  return true;
+}
+
+bool interrupt_timepop_action_take(timepop_action_result_t* out) {
+  timepop_action_require_foreground();
+  if (!out) __builtin_trap();
+  const uint32_t prior = interrupt_priority0_guard_enter();
+  if (g_timepop_action_state != timepop_action_state_t::COMPLETE) {
+    interrupt_priority0_guard_exit(prior);
+    return false;
+  }
+  *out = g_timepop_action_diag.last;
+  g_timepop_action_callback = nullptr;
+  g_timepop_action_user_data = nullptr;
+  dmb_barrier();
+  g_timepop_action_state = timepop_action_state_t::IDLE;
+  interrupt_priority0_guard_exit(prior);
+  return true;
+}
+
+void interrupt_timepop_action_snapshot(timepop_action_snapshot_t* out) {
+  timepop_action_require_foreground();
+  if (!out) __builtin_trap();
+  const uint32_t prior = interrupt_priority0_guard_enter();
+  *out = g_timepop_action_diag;
+  out->state = g_timepop_action_state;
+  interrupt_priority0_guard_exit(prior);
+  out->min_lead_cycles = ACTION_MIN_LEAD_CYCLES;
+  out->max_lead_cycles = ACTION_MAX_LEAD_CYCLES;
+  out->wake_advance_cycles = ACTION_WAKE_ADVANCE_CYCLES;
+  out->max_spin_cycles = ACTION_MAX_SPIN_CYCLES;
+  out->max_lateness_cycles = ACTION_WAKE_ADVANCE_CYCLES;
+}
+
+// Keep this opt-in body out of the ordinary CH0/CH2 ISR's register/stack frame.
+static __attribute__((noinline)) void timepop_action_service_priority16(uint32_t isr_entry_dwt) {
+  auto& ch = IMXRT_TMR1.CH[QTIMER1_RETIRED_AUX_CH];
+  const uint16_t csctrl = ch.CSCTRL;
+  if ((csctrl & TMR_CSCTRL_TCF1) == 0U) return;
+  if ((csctrl & TMR_CSCTRL_TCF1EN) == 0U ||
+      ch.COMP1 != g_timepop_action_compare) __builtin_trap();
+  timepop_action_stop_locked();
+
+  auto& result = g_timepop_action_diag.last;
+  auto& ctx = result.context;
+  ctx.isr_entry_dwt = isr_entry_dwt;
+  uint32_t now = ARM_DWT_CYCCNT;
+  const int32_t remaining = (int32_t)(ctx.target_dwt - now);
+  if (remaining <= (int32_t)ACTION_MAX_SPIN_CYCLES) {
+    // Only a bounded near-deadline landing; never wait out the flight here.
+    // Priority 0 remains enabled throughout. Recheck lateness after preemption.
+    while ((int32_t)(now - ctx.target_dwt) < 0) now = ARM_DWT_CYCCNT;
+    now = ARM_DWT_CYCCNT;
+    if ((int32_t)(now - ctx.latest_dwt) <= 0) {
+      ctx.dispatch_dwt = now;
+      g_timepop_action_callback(ctx, g_timepop_action_user_data);
+      result.finished_dwt = ARM_DWT_CYCCNT;
+      result.outcome = timepop_action_outcome_t::DISPATCHED;
+      const uint32_t lateness = now - ctx.target_dwt;
+      const uint32_t wall = result.finished_dwt - now;
+      if (lateness > g_timepop_action_diag.dispatch_lateness_max_cycles)
+        g_timepop_action_diag.dispatch_lateness_max_cycles = lateness;
+      if (wall > g_timepop_action_diag.callback_wall_max_cycles)
+        g_timepop_action_diag.callback_wall_max_cycles = wall;
+      g_timepop_action_diag.dispatched_count++;
+      dmb_barrier();
+      g_timepop_action_state = timepop_action_state_t::COMPLETE;
+      return;
+    }
+  }
+  result.outcome = timepop_action_outcome_t::MISSED;
+  result.finished_dwt = ARM_DWT_CYCCNT;
+  g_timepop_action_diag.missed_count++;
+  dmb_barrier();
+  g_timepop_action_state = timepop_action_state_t::COMPLETE;
+}
+
 static volatile bool g_pps_relay_active = false;
 static volatile uint32_t g_pps_relay_countdown_cells = 0U;
 static volatile uint32_t g_pps_relay_assert_count = 0U;
@@ -2848,6 +3057,7 @@ bool interrupt_qtimer1_ch1_arm_compare(uint32_t) {
 }
 
 void interrupt_qtimer1_ch1_disable_compare(void) {
+  if (g_timepop_action_initialized) __builtin_trap();
   qtimer_disable_compare(IMXRT_TMR1, QTIMER1_RETIRED_AUX_CH);
 }
 
@@ -5642,6 +5852,11 @@ static void qtimer1_isr(void) {
   if ((ch2_csctrl & TMR_CSCTRL_TCF1) != 0U) {
     handoff_needed |=
         qtimer1_service_ch2_flag_priority16(isr_entry_dwt_raw, ch2_csctrl);
+  }
+  // Capture existing CH0/CH2 facts first. The new lane cannot consume or clear
+  // either source. With no action armed, no CH1 register is read here.
+  if (g_timepop_action_state == timepop_action_state_t::ARMED) {
+    timepop_action_service_priority16(isr_entry_dwt_raw);
   }
   if (handoff_needed) {
     interrupt_handoff_request_isr(isr_entry_dwt_raw);

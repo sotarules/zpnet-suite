@@ -8,7 +8,7 @@
 //
 // Execution tiers:
 //   Priority 0  — PPS, OCXO1, OCXO2 and guarded PHOTODIODE capture
-//   Priority 16 — QTimer1 VCLOCK + TimePop CH2 capture; software ADC HIGH completion
+//   Priority 16 — QTimer1 capture + opt-in CH1 action; software ADC HIGH completion
 //   Priority 32 — CLOCKS continuation/handoff and compare rearm
 //   Foreground  — TimePop policy and all application callbacks, including PHOTONS
 // ============================================================================
@@ -22,8 +22,8 @@
 // Foreground loop service.  Call once per loop() pass before timepop_dispatch().
 // It drains immutable CH2 fire facts and complete subscriber SPSC values, executes
 // application callbacks while foreground owns the read slots, and flushes scalar
-// feature state. No TimePop scheduler mutation or application behavior is performed
-// by Priority 0, Priority 16, or Priority 32.
+// feature state. The separate opt-in CH1 action runs at Priority 16; it may not
+// mutate the TimePop scheduler or run ordinary application processing.
 void process_interrupt_foreground_service(void);
 
 // Optional TimePop pressure marker.  The recorder itself remains owned by
@@ -1533,6 +1533,16 @@ uint32_t interrupt_vclock_counter32_observe_ambient(void);
 // CH2 status flag is accepted only when TCF1EN, software arm custody, programmed
 // COMP1 identity, and the no-outstanding-fact invariant all agree.
 void     interrupt_qtimer1_ch2_arm_compare(uint32_t target_counter32);
+
+// TimePop's separate short-deadline action. Hardware and ISR custody stay here.
+// Foreground API contracts and result types are declared in timepop.h.
+bool interrupt_timepop_action_arm_dwt(uint32_t target_dwt,
+                                     uint32_t max_lateness_cycles,
+                                     timepop_action_callback_t callback,
+                                     void* user_data);
+bool interrupt_timepop_action_cancel(void);
+bool interrupt_timepop_action_take(timepop_action_result_t* out);
+void interrupt_timepop_action_snapshot(timepop_action_snapshot_t* out);
 
 struct interrupt_clock_snapshot_t {
   uint16_t hardware16 = 0;
