@@ -18,7 +18,7 @@ Compare uses all five predictors on common rows/blocks/splits; compare-legacy
 uses synthetic, PI BME280 and MAX31865 without requiring PD or OUT.
 Each sensor's degree/lag is chosen on development data, not on the final test.
 New rows read the immutable raw one-second distribution directly and compare
-it with the separately recorded Pi correction. Legacy rows reconstruct raw LAP
+it with the recorded firmware (NOR1/NOR2) or Pi correction. Legacy rows reconstruct raw LAP
 using their recorded firmware offset. New models always fit raw LAP.
 Models: constant, linear, quadratic, cubic. Model selection uses forward-only
 validation within the first 70%; the last 30% tests the frozen choice once.
@@ -55,7 +55,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 SCHEMA = "PHOTONS_V1"
 MIN_FIT = 3
-VERSION = "2026-10-18.1"
+VERSION = "2026-10-19.1"
 HIGH_REFERENCE_MV = 3300
 HIGH_MV_PER_COUNT = HIGH_REFERENCE_MV / 4095
 SENSORS = ("synthetic", "bme280", "bme280_receiver", "bme280_out", "max31865")
@@ -284,32 +284,46 @@ def parse_sample(row_id: int, p: Dict[str, Any], sensor: str = "synthetic") -> T
     uncorrected_ns = canonical_ns + correction_ns
     raw_source = "LEGACY_RECONSTRUCTED" if normalization_id is not None else "LEGACY"
     if measurement is not None:
-        # Firmware NOR1 publishes a normalized LAP plus a preserved raw witness.
+        # NOR1 uses fragment HIGH; NOR2 uses HIGH60. Both preserve the raw
+        # distribution alongside a uniform per-fragment voltage correction.
         firmware = ph.get("voltage_normalization")
-        identity = 0x4E4F5231 if firmware is not None else 0x52415731
-        if (stats["acquisition_id"] != identity or
-                measurement["acquisition_id"] != identity):
-            raise ValueError("unsupported PHOTONS measurement ancestry")
+        identities = (0x4E4F5231, 0x4E4F5232) if firmware is not None else (0x52415731,)
+        identity = integer(stats["acquisition_id"])
+        if (identity not in identities or measurement["acquisition_id"] != identity):
+            raise ValueError(f"unsupported PHOTONS measurement ancestry: stats={identity:#x}, "
+                             f"measurement={measurement['acquisition_id']!r}, "
+                             f"firmware normalization recorded={firmware is not None}")
         raw = measurement["raw_flight_ns"]
         normalized = measurement["normalized_flight_ns"]
         if firmware is not None:
-            if raw != firmware["raw_flight_ns"] or normalized != flight:
+            if (firmware["schema"] != "PHOTONS_VOLTAGE_NORMALIZATION_V1" or
+                    firmware["application"] != "UNIFORM_OFFSET_AT_FRAGMENT_DRAIN"):
+                raise ValueError("unsupported firmware voltage normalization contract")
+            if (raw != firmware["raw_flight_ns"] or normalized != flight or
+                    normalized != firmware["published_flight_ns"]):
                 raise ValueError("firmware raw/normalized evidence does not match the recorded populations")
             if measurement["normalization_id"] != firmware["model_id"]:
                 raise ValueError("firmware normalization model identity mismatch")
+            if abs(number(measurement["correction_ns"]) + number(firmware["adjustment_ns"])) > 1e-6:
+                raise ValueError("measurement correction disagrees with firmware adjustment")
             raw_source = "DIRECT_RAW_FIRMWARE_NORMALIZED"
         else:
             if raw != flight:
                 raise ValueError("Pi raw evidence differs from the firmware distribution")
             raw_source = "DIRECT_RAW"
+        if integer(raw["n"]) != n:
+            raise ValueError("raw witness count differs from the accepted race population")
         uncorrected_ns = number(raw["mean"])
         if normalized is not None:
             if normalized["n"] != n or normalized["m2"] != raw["m2"]:
                 raise ValueError("normalization changed the raw population/dispersion")
             correction_ns = number(measurement["correction_ns"])
             canonical_ns = number(normalized["mean"])
-            if abs(uncorrected_ns - correction_ns - canonical_ns) > 1e-9:
-                raise ValueError("Pi correction does not close with raw and normalized means")
+            # Match the live Pi's closure tolerance for serialized firmware
+            # means; the Pi-only calculation retains its existing tolerance.
+            tolerance_ns = 1e-6 if firmware is not None else 1e-9
+            if abs(uncorrected_ns - correction_ns - canonical_ns) > tolerance_ns:
+                raise ValueError("recorded correction does not close with raw and normalized means")
             normalization_id = measurement["normalization_id"]
         if measurement.get("normalization_id") is not None:
             if policy is None or policy.get("normalization_id") != measurement["normalization_id"]:
@@ -318,6 +332,8 @@ def parse_sample(row_id: int, p: Dict[str, Any], sensor: str = "synthetic") -> T
             raise ValueError("uncalibrated PHOTONS must not claim normalized science")
     # Per-second center/radius/state are data, not configuration changes.
     signature = json.dumps({
+        "acquisition_id": stats.get("acquisition_id"),
+        "raw_source": raw_source,
         "race": {k: race.get(k) for k in (
             "schema", "cadence_ns", "pulse_ns", "capture_gate", "capture_min_ns", "capture_max_ns",
             "launch_bracket_max_cycles", "flight_interpretation", "launch_timing_policy")},
@@ -367,6 +383,7 @@ def database_rows(args: argparse.Namespace) -> Iterable[Tuple[int, Dict[str, Any
                 'fragment_period_ns', payload #> '{photons,fragment_period_ns}',
                 'fragment_elapsed_ms', payload #> '{photons,fragment_elapsed_ms}',
                 'pd_out', payload #> '{photons,pd_out}',
+                'voltage_normalization', payload #> '{photons,voltage_normalization}',
                 'stats', jsonb_build_object(
                     'reset_count', payload #> '{photons,stats,reset_count}',
                     'update_count', payload #> '{photons,stats,update_count}',
@@ -501,7 +518,7 @@ def collect(rows: Iterable[Tuple[int, Dict[str, Any]]], args: argparse.Namespace
         samples.append(sample)
         prev = sample
         counts["used"] += 1
-        counts["direct_raw" if sample.raw_source == "DIRECT_RAW" else
+        counts["direct_raw" if sample.raw_source in ("DIRECT_RAW", "DIRECT_RAW_FIRMWARE_NORMALIZED") else
                "reconstructed_uncorrected" if sample.normalization_id is not None else "original_uncorrected"] += 1
     return samples, counts, reasons
 
@@ -724,23 +741,27 @@ def deployed_comparison(samples, points, canonical_points, sensor):
     """Describe the installed correction even when there is too little data to fit."""
     print('\n  DEPLOYED NORMALIZATION (same observations; no refitting)')
     print(f'  Normalization identity: {samples[0].normalization_id}')
-    if samples[0].raw_source == 'DIRECT_RAW':
+    source = samples[0].raw_source
+    legacy = source == 'LEGACY_RECONSTRUCTED'
+    if source == 'DIRECT_RAW_FIRMWARE_NORMALIZED':
+        print('  Raw LAP is the preserved firmware witness; deployed LAP includes the firmware voltage adjustment.')
+    elif source == 'DIRECT_RAW':
         print('  Raw LAP is stored directly; deployed Pi output is a separate measurement.')
     else:
         print('  Legacy raw LAP reconstructed by adding the recorded firmware offset.')
     policy = json.loads(samples[0].signature)['normalization']['policy']
     if policy is None:
         print('  Policy document absent; reconstruction uses the recorded uniform firmware offset.')
-    elif samples[0].raw_source != 'DIRECT_RAW' and (sensor != 'synthetic' or policy.get('temperature_path') != ['temperature', 'temperature_c']):
+    elif legacy and (sensor != 'synthetic' or policy.get('temperature_path') != ['temperature', 'temperature_c']):
         print('  Deployed predictor differs from the selected report sensor; recorded offsets still reconstruct LAP.')
     corrections = [s.correction_ns for s in samples]
-    applied = [s.applied_temperature for s in samples]
-    ages = [s.correction_age_ms for s in samples]
     print(f'  Recorded correction range: {min(corrections):+.6f} .. {max(corrections):+.6f} ns')
-    if samples[0].raw_source != 'DIRECT_RAW':
+    if legacy:
+        applied = [s.applied_temperature for s in samples]
+        ages = [s.correction_age_ms for s in samples]
         print(f'  Applied sensor range: {min(applied):.6f} .. {max(applied):.6f} C')
         print(f'  Correction refresh age: median={st.median(ages):.0f} ms; max={max(ages):,} ms (not physical sensor-reading age).')
-    if sensor == 'synthetic' and policy is not None and policy.get('temperature_path') == ['temperature', 'temperature_c']:
+    if legacy and sensor == 'synthetic' and policy is not None and policy.get('temperature_path') == ['temperature', 'temperature_c']:
         print(f'  Max |applied synthetic temperature - row SYSTEM synthetic temperature|: '
               f'{max(abs(s.applied_temperature-s.temperature) for s in samples):.6f} C')
     raw = [s.lap_ns for s in samples]
@@ -1023,7 +1044,8 @@ def main(argv):
     if args.sensor in ('compare', 'compare-legacy'):
         print(f'Comparison requires all {len(SENSORS if args.sensor == "compare" else LEGACY_SENSORS)} predictors on every retained row; blocks and time splits are shared.')
         print('Sensor-specific degree/lag choices use development folds only. Final-test ranking is exploratory.')
-    print('New rows use measurement.raw_flight_ns directly; legacy rows reconstruct raw LAP from recorded offsets.')
+    print('New rows use measurement.raw_flight_ns directly, including NOR1/NOR2 firmware voltage normalization.')
+    print('Legacy thermal rows reconstruct raw LAP from their recorded uniform offsets.')
     if args.sensor == 'high':
         print('HIGH: exact per-fragment ADC sums/counts from photons.pd_out; nominal 3300 mV / 4095 counts.')
         print('No temperature required. HIGH60 is not used as a predictor and is not averaged again.')
@@ -1053,7 +1075,7 @@ def main(argv):
             analyze(selected,reasons[epoch],sensor_args)
     print('\nREPORT NOTES')
     print('  Epochs are fitted separately across recorded settings/calibration/predictor changes, resets and recovery.')
-    print('  Deployed = stored canonical LAP; uncorrected = original legacy LAP or reconstructed pre-correction LAP.')
+    print('  Deployed = recorded normalized LAP; uncorrected = direct raw witness, original legacy LAP or reconstructed legacy LAP.')
     print('  Candidate formulas always fit uncorrected LAP and replace, rather than compound, the deployed correction.')
     print('  Blocks and lag history never cross continuity gaps. Unknown hardware changes need explicit time selection.')
     print('  All printed SDs describe one-second or block means, not individual-photon jitter or calibration uncertainty.')
