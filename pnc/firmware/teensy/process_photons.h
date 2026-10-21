@@ -21,6 +21,10 @@
 //     single ADC2 triggers in the photodiode ISR, Priority-16 completion, and cumulative
 //     first-sample handoff and RAM2 raw capture banks. Raw edge capture belongs to
 //     process_interrupt; edge delivery runs as a bounded foreground service.
+//     LOW/HIGH witness: TimePop CH1 triggers ADC1 on the same PD OUT pin before
+//     predicted arrival. ADC2 HIGH and HIGH60 remain the correction source.
+//     Foreground closes each witness before ADC1 monitor use or another launch;
+//     capture statistics are fragment-local and never restored as live samples.
 //     Scheduling/statistics transactions have one foreground owner at a time:
 //     the cadence callback, 1 Hz fragment transaction,
 //     one RPC command, or commissioning WAVE callback. These owners may never nest;
@@ -152,6 +156,10 @@
 //                           shot replaces the prior report; rejections preserve it.
 //   • REPORT_PHOTONS      — compact always-on instrument + current CAMP report
 //   • REPORT_STATS        — detailed statistical/court/Better-Buckets report
+//   • REPORT_LOW_HIGH     — latest completed fragment's paired moments, timing,
+//                           outcomes and last/last-unpaired raw race records
+//   • LOW_LEAD [ns=N]     — inspect/set witness trigger lead, 250..50000 ns;
+//                           volatile until reboot; no correction-model change
 //   • REPORT_HISTOGRAM    — boot-lifetime raw-cycle histogram: 64 one-cycle bins
 //                           per population, with midpoint inferred from 65 seeds.
 //                           Returns the latest completed SPSC snapshot and requests

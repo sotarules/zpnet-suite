@@ -2838,17 +2838,22 @@ static uint32_t g_photons_histogram_snapshot_published = 0U; // producer writer
 static uint32_t g_photons_histogram_snapshot_consumed = 0U;  // consumer writer
 static uint32_t g_photons_histogram_snapshot_requested = 1U; // consumer writer
 
-// Dedicated byte stores belong only to COMMAND custody. Payload objects remain
-// ordinary scoped objects; no object storage is overlaid or reinterpreted.
-struct alignas(PHOTONS_RAM2_CACHE_LINE_BYTES) photons_histogram_report_store_t {
-  // Shared by histogram and envelope RPCs under exclusive COMMAND custody.
-  alignas(PHOTONS_RAM2_CACHE_LINE_BYTES) uint8_t root[16384];
+// COMMAND and FRAGMENT custody are mutually exclusive. Reuse these byte stores
+// for reports and fragment assembly; every borrower is a scoped Payload, with
+// no persistent control object left referring to overwritten bytes. The guarded
+// canonical fragment root remains separate through publication and verification.
+struct alignas(PHOTONS_RAM2_CACHE_LINE_BYTES) photons_serialization_store_t {
+  // Fragment order: LOW/HIGH witness -> copy into pd_out -> destroy witness ->
+  // instrument -> copy into canonical root. This saves 16 KiB of static RAM2
+  // versus separate 16 KiB report and 20 KiB instrument stores, restoring heap
+  // space needed by recovery/diagnostic RPCs and their response envelopes.
+  alignas(PHOTONS_RAM2_CACHE_LINE_BYTES) uint8_t root[20480];
   alignas(PHOTONS_RAM2_CACHE_LINE_BYTES) uint8_t population[2048];
   alignas(PHOTONS_RAM2_CACHE_LINE_BYTES) uint8_t bins[4096];
 };
-static photons_histogram_report_store_t g_photons_histogram_report_store DMAMEM;
-static_assert(sizeof(photons_histogram_report_store_t) == 22528U,
-              "Review the histogram report RAM2 budget after layout changes");
+static photons_serialization_store_t g_photons_serialization_store DMAMEM;
+static_assert(sizeof(photons_serialization_store_t) == 26624U,
+              "Review the shared serialization RAM2 budget after layout changes");
 
 static void photons_histogram_initialize_handoffs(void) {
   // RAM2 is NOLOAD. Construct lawful empty snapshot values explicitly before
@@ -2980,7 +2985,7 @@ static void photons_histogram_payload_population(
     Payload& parent, const char* name,
     const photons_histogram_population_t& population) {
   photons_foreground_owner_assert(photons_foreground_owner_t::COMMAND);
-  auto& store = g_photons_histogram_report_store;
+  auto& store = g_photons_serialization_store;
   Payload p(Payload::StorageMode::FIXED, store.population, sizeof(store.population));
   p.add("underflow", population.underflow);
   p.add("overflow", population.overflow);
@@ -2998,7 +3003,7 @@ static void photons_histogram_payload_population(
 static FLASHMEM Payload cmd_report_histogram(const Payload& /*args*/) {
   const photons_foreground_custody_t custody(photons_foreground_owner_t::COMMAND);
   const auto& h = photons_histogram_snapshot_acquire();
-  auto& store = g_photons_histogram_report_store;
+  auto& store = g_photons_serialization_store;
   Payload p(Payload::StorageMode::FIXED, store.root, sizeof(store.root));
   p.add("schema", "PHOTONS_HISTOGRAM_V1");
   p.add("scope", "FIRMWARE_BOOT");
@@ -3301,6 +3306,7 @@ static void photons_cadence_service(void*) {
   photons_histogram_acquire();
   interrupt_photodiode_boundary_begin();
   photons_race_close_window();
+  photons_pd_out_low_finish(photons_low_high_close_t::NEXT_LAUNCH);
   // Keep the old shot's full window, even when the new cadence is shorter.
   // The next shot and quiet-window check use the newly applied rate together.
   if (g_photons_requested_laps_per_second != g_photons_applied_laps_per_second) {
@@ -3340,7 +3346,13 @@ static void photons_cadence_service(void*) {
     return;
   }
   uint32_t before_mod_high_dwt;
+  photons_pd_out_low_prepare(g_photons_laser_launch_count + 1ULL,
+      race.reference_valid ? race.reference_cycles : 0U, receive_cycles);
   const uint32_t launch_dwt = photons_race_launch_pulse(before_mod_high_dwt);
+  // Arm before the remaining launch bookkeeping to retain TimePop's 2 us lead.
+  // The existing BASEPRI-16 guard holds CH1 until receive arming is complete;
+  // P0 capture remains live and the action reports any missed deadline.
+  photons_pd_out_low_launch(launch_dwt, launch_dwt - before_mod_high_dwt);
   g_photons_cadence_anchor_dwt = launch_dwt;
   g_photons_cadence_launches_since_start++;
   g_photons_laser_launch_count++;
@@ -3374,6 +3386,7 @@ static void photons_cadence_service(void*) {
 }
 
 static void photons_cadence_stop(void) {
+  photons_pd_out_low_finish(photons_low_high_close_t::STOP);
   g_photons_cadence_running = false;
   interrupt_photodiode_boundary_begin();
   photons_race_close_window();
@@ -3451,6 +3464,7 @@ static photons_device_snapshot_t photons_device_snapshot(void) {
   photons_device_snapshot_t out{};
 
   out.laser_mod_level = digitalRead(LASER_MOD_PIN);
+  photons_pd_out_low_finish(photons_low_high_close_t::ADC1_USER);
   out.laser_monitor_raw = analogRead(LASER_MONITOR_PIN);
   out.laser_monitor_v = photons_adc_voltage(out.laser_monitor_raw);
   out.laser_emitting =
@@ -3888,8 +3902,8 @@ static const photons_fragment_snapshot_t& photons_report_fragment_snapshot(void)
       name##_storage,                                                     \
       sizeof(name##_storage))
 
-// Preserve existing envelope headroom and reserve 1 KiB for HIGH window testimony.
-static constexpr size_t PHOTONS_FRAGMENT_ROOT_CAPACITY = 20480U;
+// Preserve existing headroom and reserve 4 KiB for LOW/HIGH witness testimony.
+static constexpr size_t PHOTONS_FRAGMENT_ROOT_CAPACITY = 24576U;
 static constexpr size_t PHOTONS_FRAGMENT_ROOT_GUARD_WORDS =
     PHOTONS_RAM2_CACHE_LINE_BYTES / sizeof(uint32_t);
 static constexpr size_t PHOTONS_FRAGMENT_ROOT_SECTOR_BYTES = 1024U;
@@ -3898,7 +3912,7 @@ static constexpr size_t PHOTONS_FRAGMENT_ROOT_SECTOR_COUNT =
 static constexpr uint32_t PHOTONS_FRAGMENT_ROOT_GUARD_BEFORE = 0x50524742UL; // 'PRGB'
 static constexpr uint32_t PHOTONS_FRAGMENT_ROOT_GUARD_AFTER  = 0x50524741UL; // 'PRGA'
 static constexpr uint32_t PHOTONS_FRAGMENT_ROOT_WITNESS_MAGIC = 0x50525731UL; // 'PRW1'
-static constexpr uint32_t PHOTONS_FRAGMENT_ROOT_WITNESS_SCHEMA_VERSION = 2U;
+static constexpr uint32_t PHOTONS_FRAGMENT_ROOT_WITNESS_SCHEMA_VERSION = 3U;
 static constexpr uint32_t PHOTONS_FRAGMENT_ROOT_HASH_OFFSET = 2166136261UL;
 static constexpr uint32_t PHOTONS_FRAGMENT_ROOT_HASH_PRIME = 16777619UL;
 
@@ -3933,7 +3947,6 @@ static Payload g_photons_fragment_root(
     Payload::StorageMode::FIXED,
     g_photons_fragment_root_region.storage,
     sizeof(g_photons_fragment_root_region.storage));
-PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_instrument, 16384U);
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_envelope, 2048U);
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_core, 2048U);
 
@@ -3944,7 +3957,7 @@ PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_core, 2048U);
 // Explicit acquisition bounds and four uint64 rejection reasons (total/delta).
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_race, 4096U);
 // Include per-fragment moments and the nested 60-second HIGH population.
-PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_pd_out, 3072U);
+PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_pd_out, 7168U);
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_voltage_normalization, 1536U);
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_high_window, 1024U);
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_raw_cycles, 1024U);
@@ -4544,7 +4557,7 @@ static FLASHMEM Payload cmd_report_core(const Payload& /*args*/) {
   const photons_foreground_custody_t custody(photons_foreground_owner_t::COMMAND);
   const auto& c = g_photons_core;
   const auto& h = c.latest_input_histogram;
-  auto& store = g_photons_histogram_report_store;
+  auto& store = g_photons_serialization_store;
   Payload p(Payload::StorageMode::FIXED, store.root, sizeof(store.root));
   p.add("schema", "PHOTONS_CORE_REPORT_V1");
   p.add("scope", "LATEST_COMPLETED_FRAGMENT");
@@ -4645,7 +4658,7 @@ static FLASHMEM Payload cmd_report_envelope(const Payload& /*args*/) {
   // Read only the completed fragment, never the accumulating live histogram.
   // Reports do not drain races, reset windows, or alter the estimator.
   const auto& e = g_photons_envelope;
-  auto& store = g_photons_histogram_report_store;
+  auto& store = g_photons_serialization_store;
   Payload p(Payload::StorageMode::FIXED, store.root, sizeof(store.root));
   p.add("schema", "PHOTONS_ENVELOPE_REPORT_V1");
   p.add("scope", "LATEST_COMPLETED_FRAGMENT");
@@ -4678,11 +4691,140 @@ static FLASHMEM Payload cmd_report_envelope(const Payload& /*args*/) {
 }
 
 
+static const char* const LOW_HIGH_OUTCOMES[] = {
+  "PAIRED", "NO_PREDICTION", "ARM_TOO_LATE", "SCHEDULE_MISSED", "CANCELLED",
+  "NO_HIGH_AT_CLOSE", "ADC_TIMEOUT", "LOW_NOT_BEFORE_HIGH", "HIGH_OUTSIDE_WINDOW",
+  "MULTIPLE_HIGH"
+};
+static_assert(sizeof(LOW_HIGH_OUTCOMES) / sizeof(*LOW_HIGH_OUTCOMES) ==
+    (uint32_t)photons_low_high_outcome_t::COUNT, "LOW/HIGH outcome names");
+static const char* const LOW_HIGH_MOMENTS[] = {
+  "low_counts", "high_counts", "delta_counts", "raw_cycles",
+  "low_lead_cycles", "prediction_error_cycles", "high_delay_cycles",
+  "low_read_after_trigger_cycles", "low_trigger_lateness_cycles",
+  "high_read_after_trigger_cycles"
+};
+static_assert(sizeof(LOW_HIGH_MOMENTS) / sizeof(*LOW_HIGH_MOMENTS) ==
+    PHOTONS_LOW_HIGH_MOMENTS, "LOW/HIGH moment names");
+
+static void photons_low_high_row_payload(Payload& parent, const char* key,
+                                       const photons_low_high_row_t& r) {
+  // Reuse foreground-only histogram serialization bytes, never its typed data.
+  // Local control objects establish fresh custody; no persistent Payload aliases.
+  auto& store = g_photons_serialization_store;
+  Payload p(Payload::StorageMode::FIXED, store.population, sizeof(store.population));
+  p.add("launch_id", r.launch_id);
+  p.add("outcome", LOW_HIGH_OUTCOMES[(uint32_t)r.outcome]);
+  p.add("close_reason", r.close_reason);
+  p.add("launch_dwt", r.launch_dwt);
+  p.add("launch_bracket_cycles", r.launch_bracket_cycles);
+  p.add("predicted_cycles", r.predicted_cycles);
+  p.add("lead_ns", r.lead_ns);
+  p.add("target_dwt", r.target_dwt);
+  p.add("action_isr_entry_dwt", r.action_isr_entry_dwt);
+  p.add("action_dispatch_dwt", r.action_dispatch_dwt);
+  p.add("low_triggers", r.low_triggers);
+  p.add("low_samples", r.low_samples);
+  p.add("high_samples", r.high_samples);
+  // Explicit counts distinguish a missing acquisition from an actual zero code.
+  if (r.low_triggers != 0U) {
+    p.add("low_trigger_dwt", r.low_trigger_dwt);
+  }
+  if (r.low_samples != 0U) {
+    p.add("low_counts", r.low_counts);
+    p.add("low_read_dwt", r.low_read_dwt);
+  }
+  if (r.high_samples != 0U) {
+    p.add("high_counts", r.high_counts);
+    p.add("edge_dwt", r.edge_dwt);
+    p.add("high_trigger_dwt", r.high_trigger_dwt);
+    p.add("high_read_dwt", r.high_read_dwt);
+  }
+  parent.add_object(key, p);
+  p.clear();
+}
+
+static void photons_low_high_payload(Payload& p, const photons_low_high_batch_t& b) {
+  p.clear();
+  p.add("schema", "PHOTONS_LOW_HIGH_WITNESS_V1");
+  p.add("role", "WITNESS_ONLY_HIGH60_CORRECTION_UNCHANGED");
+  p.add("population", "CADENCE_LAUNCHES_CLOSED_IN_FRAGMENT_NOT_SCIENCE_ACCEPTANCE");
+  p.add("pair_rule", "ONE_HIGH_IN_RECEIVE_WINDOW_AND_LOW_TRIGGER_BEFORE_ENTRY_NO_DELTA_FILTER");
+  p.add("adc", "LOW_ADC1_HIGH_ADC2_PIN40_CHANNEL9_12BIT");
+  p.add("reference_mv", 3300U);
+  p.add("dwt_cycles_per_second", (uint32_t)F_CPU_ACTUAL);
+  p.add("predictor", "RAW_RACE_REFERENCE_CYCLES_PLUS_ACTUAL_LAUNCH_DWT");
+  p.add("low_lead_next_ns", photons_pd_out_low_lead_ns());
+  p.add("max_dispatch_lateness_ns", 250U);
+  p.add("timing", "SOFTWARE_TRIGGER_AND_RESULT_READ_NOT_APERTURE_OR_HARDWARE_COMPLETION");
+  p.add("close_reasons", "0_NEXT_LAUNCH_1_FRAGMENT_2_ADC1_USER_3_STOP");
+  p.add("attempts", b.attempts);
+  if (b.attempts != 0U) {
+    p.add("configured_lead_min_ns", b.lead_min_ns);
+    p.add("configured_lead_max_ns", b.lead_max_ns);
+  }
+  p.add("low_samples", b.low_samples);
+  p.add("low_sum_counts", b.low_sum);
+  p.add("low_sum_squares_counts", b.low_squares);
+  p.add("paired_count", b.outcomes[0]);
+  p.add("low_raw_cross", b.low_raw_cross);
+  p.add("high_raw_cross", b.high_raw_cross);
+  auto& store = g_photons_serialization_store;
+  {
+    Payload outcomes(Payload::StorageMode::FIXED, store.bins, sizeof(store.bins));
+    for (uint32_t i = 0; i < (uint32_t)photons_low_high_outcome_t::COUNT; ++i)
+      outcomes.add(LOW_HIGH_OUTCOMES[i], b.outcomes[i]);
+    p.add_object("outcomes", outcomes);
+  }
+  Payload moment(Payload::StorageMode::FIXED, store.bins, sizeof(store.bins));
+  for (uint32_t i = 0; i < PHOTONS_LOW_HIGH_MOMENTS; ++i) {
+    moment.clear();
+    moment.add("sum", b.paired[i].sum);
+    moment.add("squares", b.paired[i].squares);
+    if (b.outcomes[0] != 0U) {
+      moment.add("min", b.paired[i].minimum);
+      moment.add("max", b.paired[i].maximum);
+    }
+    p.add_object(LOW_HIGH_MOMENTS[i], moment);
+  }
+  moment.clear();
+  // Two bounded per-race exemplars per fragment accompany the all-pair moments.
+  if (b.attempts != 0U) photons_low_high_row_payload(p, "last", b.last);
+  if (b.attempts != b.outcomes[0])
+    photons_low_high_row_payload(p, "last_unpaired", b.last_unpaired);
+}
+
+static FLASHMEM Payload cmd_report_low_high(const Payload&) {
+  const photons_foreground_custody_t custody(photons_foreground_owner_t::COMMAND);
+  const auto& f = photons_report_fragment_snapshot();
+  auto& store = g_photons_serialization_store;
+  Payload p(Payload::StorageMode::FIXED, store.root, sizeof(store.root));
+  photons_low_high_payload(p, f.pd_out.low_high);
+  p.add("scope", "LATEST_COMPLETED_FRAGMENT");
+  p.add("fragment_sequence", f.sequence);
+  p.add("fragment_elapsed_ms", f.fragment_elapsed_ms);
+  return Payload(p);
+}
+
+static FLASHMEM Payload cmd_low_lead(const Payload& args) {
+  const photons_foreground_custody_t custody(photons_foreground_owner_t::COMMAND);
+  uint32_t ns = photons_pd_out_low_lead_ns();
+  Payload p;
+  if ((args.has("ns") && !args.tryGetUInt("ns", ns)) || ns < 250U || ns > 50000U) {
+    p.add("error", "ns must be an integer from 250 to 50000");
+    return p;
+  }
+  if (args.has("ns")) photons_pd_out_low_set_lead_ns(ns);
+  p.add("low_lead_ns", photons_pd_out_low_lead_ns());
+  p.add("scope", "WITNESS_ONLY_VOLATILE_UNTIL_REBOOT");
+  p.add("prediction", "COMPARATOR_ISR_ENTRY_NOT_ANALOG_RISE");
+  return p;
+}
+
 static Payload& photons_fragment_payload(
     const photons_fragment_snapshot_t& f) {
   photons_foreground_owner_assert(photons_foreground_owner_t::FRAGMENT);
   Payload& root = g_photons_fragment_root;
-  Payload& instrument = g_photons_fragment_instrument;
   Payload& race = g_photons_fragment_race;
   Payload& pd_out = g_photons_fragment_pd_out;
   Payload& voltage_normalization = g_photons_fragment_voltage_normalization;
@@ -4702,7 +4844,6 @@ static Payload& photons_fragment_payload(
 
   photons_fragment_root_verify_quiescent(f.sequence);
   root.clear();
-  instrument.clear();
   race.clear();
   voltage_normalization.clear();
   raw.clear();
@@ -4723,16 +4864,6 @@ static Payload& photons_fragment_payload(
   root.add("sequence", f.sequence);
   root.add("publish_count", f.publish_count);
 
-  instrument.add("schema", "PHOTONS_INSTRUMENT_V1");
-  instrument.add("snapshot_ok", f.snapshot_ok);
-  instrument.add("valid", f.valid);
-  instrument.add("fragment_period_ns", f.fragment_period_ns);
-  instrument.add("fragment_elapsed_ms", f.fragment_elapsed_ms);
-  // Frozen before this attempt; a rejection is visible in the next admitted
-  // fragment or immediately in REPORT/REPORT_PHOTONS/REPORT_RECOVERY.
-  instrument.add("publish_reject_count_before_fragment",
-                 f.publish_reject_count_before_fragment);
-  instrument.add("source", "PD200T_REAL_RACE");
   pd_out.clear();
   pd_out.add("pin", PHOTODIODE_ANALOG_PIN);
   pd_out.add("adc_bits", 12U);
@@ -4784,6 +4915,26 @@ static Payload& photons_fragment_payload(
   }
   pd_out.add_object("high_window", high_window);
   high_window.clear();
+  {
+    auto& store = g_photons_serialization_store;
+    Payload witness(Payload::StorageMode::FIXED, store.root, sizeof(store.root));
+    photons_low_high_payload(witness, f.pd_out.low_high);
+    pd_out.add_object("low_high", witness);
+  }
+  // The witness above has been copied into its independent pd_out store and
+  // destroyed. Only now may the instrument borrow the same root scratch bytes.
+  auto& store = g_photons_serialization_store;
+  Payload instrument(Payload::StorageMode::FIXED, store.root, sizeof(store.root));
+  instrument.add("schema", "PHOTONS_INSTRUMENT_V1");
+  instrument.add("snapshot_ok", f.snapshot_ok);
+  instrument.add("valid", f.valid);
+  instrument.add("fragment_period_ns", f.fragment_period_ns);
+  instrument.add("fragment_elapsed_ms", f.fragment_elapsed_ms);
+  // Frozen before this attempt; a rejection is visible in the next admitted
+  // fragment or immediately in REPORT/REPORT_PHOTONS/REPORT_RECOVERY.
+  instrument.add("publish_reject_count_before_fragment",
+                 f.publish_reject_count_before_fragment);
+  instrument.add("source", "PD200T_REAL_RACE");
   instrument.add_object("pd_out", pd_out);
   pd_out.clear();
   instrument.add("edge_count_total", f.edge_count_total);
@@ -8135,6 +8286,8 @@ static FLASHMEM Payload cmd_off(const Payload& /*args*/) {
 // ============================================================================
 
 static const process_command_entry_t PHOTONS_COMMANDS[] = {
+  { "REPORT_LOW_HIGH",     cmd_report_low_high     },
+  { "LOW_LEAD",            cmd_low_lead            },
   { "REPORT_HISTOGRAM",    cmd_report_histogram    },
   { "REPORT_ENVELOPE",     cmd_report_envelope     },
   { "REPORT_CORE",         cmd_report_core         },

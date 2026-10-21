@@ -8,6 +8,54 @@
 // not the ADC aperture.
 static constexpr uint32_t PHOTONS_PD_OUT_HIGH_WINDOW_MS = 60000U;
 
+// LOW is an ADC1 witness; the existing ADC2 HIGH population/correction is intact.
+// Outcomes describe observations, not voltage-validity votes. No delta filter.
+enum class photons_low_high_outcome_t : uint32_t {
+  PAIRED, NO_PREDICTION, ARM_TOO_LATE, SCHEDULE_MISSED, CANCELLED,
+  NO_HIGH_AT_CLOSE, ADC_TIMEOUT, LOW_NOT_BEFORE_HIGH, HIGH_OUTSIDE_WINDOW,
+  MULTIPLE_HIGH, COUNT
+};
+static constexpr uint32_t PHOTONS_LOW_HIGH_MOMENTS = 10U;
+struct photons_low_high_moment_t {
+  int64_t sum = 0;
+  uint64_t squares = 0;
+  int32_t minimum = 0, maximum = 0;
+};
+struct photons_low_high_row_t {
+  uint64_t launch_id = 0;
+  uint32_t launch_dwt = 0, predicted_cycles = 0, target_dwt = 0;
+  uint32_t low_trigger_dwt = 0, low_read_dwt = 0;
+  uint32_t action_isr_entry_dwt = 0, action_dispatch_dwt = 0;
+  uint32_t edge_dwt = 0, high_trigger_dwt = 0, high_read_dwt = 0;
+  uint32_t low_triggers = 0, low_samples = 0, high_samples = 0;
+  uint32_t low_counts = 0, high_counts = 0, launch_bracket_cycles = 0;
+  uint32_t lead_ns = 0, close_reason = 0;
+  photons_low_high_outcome_t outcome = photons_low_high_outcome_t::NO_PREDICTION;
+};
+struct photons_low_high_batch_t {
+  uint32_t attempts = 0, low_samples = 0;
+  uint32_t lead_min_ns = 0, lead_max_ns = 0;
+  uint64_t low_sum = 0, low_squares = 0;
+  uint32_t outcomes[(uint32_t)photons_low_high_outcome_t::COUNT] = {};
+  // All moments and both cross-products use exactly the PAIRED population:
+  // LOW, HIGH, HIGH-LOW, raw flight, LOW trigger lead, prediction error,
+  // HIGH trigger delay, LOW trigger-to-read, LOW trigger lateness,
+  // HIGH trigger-to-read. All timing moments are DWT cycles.
+  photons_low_high_moment_t paired[PHOTONS_LOW_HIGH_MOMENTS];
+  int64_t low_raw_cross = 0, high_raw_cross = 0;
+  photons_low_high_row_t last, last_unpaired;
+};
+enum class photons_low_high_close_t : uint32_t {
+  NEXT_LAUNCH, FRAGMENT, ADC1_USER, STOP
+};
+// Foreground only. Prepare with detector capture withdrawn, before MOD HIGH.
+void photons_pd_out_low_prepare(uint64_t launch_id, uint32_t predicted_cycles,
+                               uint32_t receive_max_cycles);
+void photons_pd_out_low_launch(uint32_t launch_dwt, uint32_t bracket_cycles);
+void photons_pd_out_low_finish(photons_low_high_close_t reason);
+uint32_t photons_pd_out_low_lead_ns();
+void photons_pd_out_low_set_lead_ns(uint32_t ns);
+
 // Foreground-owned population, frozen into each fragment. Whole-fragment suffix
 // covering at least 60 s after warm-up; exact moments weight every physical sample.
 struct photons_pd_out_window_t {
@@ -31,6 +79,7 @@ struct photons_pd_out_batch_t {
   uint32_t adc_hc0 = 0, adc_hs = 0, adc_cfg = 0, adc_gc = 0;
   uint32_t adc_irq_enabled = 0;
   photons_pd_out_window_t high_window; // populated only at foreground batch cut
+  photons_low_high_batch_t low_high;
 };
 
 static constexpr uint32_t PHOTONS_PD_OUT_CAPTURE_ROWS = 1000U;

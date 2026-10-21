@@ -5152,6 +5152,86 @@ def _complete_live_checkpoint():
     raise RuntimeError("PHOTONS whole live checkpoint did not reach durability")
 
 
+def _pd_sample_moments(n, total, squares, scale):
+    """Sample SD and nominal IID SE from exact ADC/DWT integer moments."""
+    if any(type(value) is not int for value in (n, total, squares)):
+        raise ValueError("PD OUT moments must be integers")
+    if n < 0 or squares < 0 or (n == 0 and (total != 0 or squares != 0)):
+        raise ValueError("PD OUT moment population is inconsistent")
+    centered = n * squares - total * total
+    if centered < 0:
+        raise ValueError("PD OUT exact second moment is inconsistent")
+    sd = math.sqrt(centered / (n * (n - 1))) * scale if n >= 2 else None
+    return {"count": n, "mean": total * scale / n if n else None,
+            "sd": sd, "se": sd / math.sqrt(n) if sd is not None else None}
+
+
+def _pd_out_statistics(instrument):
+    """Interpret each fragment independently; never alter recovery or correction."""
+    pd = instrument["pd_out"]
+    scale = 3300.0 / 4095.0  # nominal reference, not an ADC calibration
+    result = {
+        "schema": "PI_PD_OUT_STATISTICS_V1",
+        "fragment_elapsed_ms": instrument["fragment_elapsed_ms"],
+        "voltage_units": "mV", "reference": "NOMINAL_3300_MV",
+        "se_policy": "SD_DIV_SQRT_N_IID_ONLY_NOT_CALIBRATION_OR_DRIFT_UNCERTAINTY",
+        "high": _pd_sample_moments(pd["sample_count"], pd["high_sum_counts"],
+                                   pd["high_sum_squares_counts"], scale),
+    }
+    witness = pd.get("low_high")
+    if witness is None:
+        return result  # pre-witness firmware has no LOW population
+    if witness["schema"] != "PHOTONS_LOW_HIGH_WITNESS_V1":
+        raise ValueError("unsupported LOW/HIGH witness schema")
+    n = witness["paired_count"]
+    outcomes = witness["outcomes"]
+    if (any(type(v) is not int or v < 0 for v in outcomes.values())
+            or sum(outcomes.values()) != witness["attempts"]
+            or outcomes["PAIRED"] != n
+            or not 0 <= n <= witness["low_samples"] <= witness["attempts"]):
+        raise ValueError("LOW/HIGH witness populations do not reconcile")
+    cps = witness["dwt_cycles_per_second"]
+    if type(cps) is not int or cps <= 0:
+        raise ValueError("LOW/HIGH DWT frequency must be positive")
+    result["low"] = _pd_sample_moments(
+        witness["low_samples"], witness["low_sum_counts"],
+        witness["low_sum_squares_counts"], scale)
+    paired = {}
+    names = (("low", "low_counts", scale), ("high", "high_counts", scale),
+             ("delta", "delta_counts", scale),
+             ("raw_ns", "raw_cycles", 1e9 / cps),
+             ("low_lead_ns", "low_lead_cycles", 1e9 / cps),
+             ("prediction_error_ns", "prediction_error_cycles", 1e9 / cps),
+             ("high_delay_ns", "high_delay_cycles", 1e9 / cps),
+             ("low_read_after_trigger_ns", "low_read_after_trigger_cycles", 1e9 / cps),
+             ("low_trigger_lateness_ns", "low_trigger_lateness_cycles", 1e9 / cps),
+             ("high_read_after_trigger_ns", "high_read_after_trigger_cycles", 1e9 / cps))
+    for name, key, factor in names:
+        moment = witness[key]
+        stats = _pd_sample_moments(n, moment["sum"], moment["squares"], factor)
+        if n:
+            if not moment["min"] * n <= moment["sum"] <= moment["max"] * n:
+                raise ValueError("LOW/HIGH moment range is inconsistent")
+            stats.update(min=moment["min"] * factor, max=moment["max"] * factor)
+        paired[name] = stats
+    if witness["delta_counts"]["sum"] != (
+            witness["high_counts"]["sum"] - witness["low_counts"]["sum"]):
+        raise ValueError("LOW/HIGH paired delta does not reconcile")
+    raw = witness["raw_cycles"]
+    for name in ("low", "high"):
+        volts = witness[name + "_counts"]
+        covariance = n * witness[name + "_raw_cross"] - volts["sum"] * raw["sum"]
+        denominator = ((n * volts["squares"] - volts["sum"] ** 2)
+                       * (n * raw["squares"] - raw["sum"] ** 2))
+        if covariance * covariance > denominator:
+            raise ValueError("LOW/HIGH paired cross moment is inconsistent")
+        paired[name + "_raw_correlation"] = (
+            covariance / math.sqrt(denominator) if denominator else None)
+    result.update(paired=paired, attempts=witness["attempts"],
+                  paired_count=n, outcomes=copy.deepcopy(outcomes))
+    return result
+
+
 def _make_photons(
     fragment: Payload, system_context: Dict[str, Any], timing
 ) -> Tuple[Payload, Dict[str, Any]]:
@@ -5197,6 +5277,7 @@ def _make_photons(
     # Keep raw acquisition and recovery testimony intact. Pi interpretation
     # lives in measurement, independently of the firmware accumulators.
     state["photons"] = copy.deepcopy(instrument)
+    state["pd_out_statistics"] = _pd_out_statistics(instrument)
     stats = _require_dict(instrument.get("stats"), "PHOTONS_FRAGMENT.photons.stats")
 
     _cadence_mark(timing, "canonical_context_copy")

@@ -160,6 +160,9 @@ static const int PHOTODIODE_ANALOG_PIN = 40; // A16; PD200T PD OUT
 // Minimum HIGH software-trigger delay from immutable photodiode ISR entry.
 // This does not measure the physical edge-to-entry latency or ADC aperture.
 static constexpr uint32_t PHOTONS_PD_OUT_HIGH_DELAY_NS = 200U;
+// Witness only: ADC1 trigger lead before the predicted comparator ISR entry.
+// The analog rise/aperture must be characterized by sweeping this lead.
+static constexpr uint32_t PHOTONS_PD_OUT_LOW_LEAD_NS = 1000U;
 // Priority-16 completion fails hard if the ADC remains unready at its deadline.
 // Retain the conservative Priority-0 reservation until new residence is measured.
 // This reservation extends clock avoidance, never the accepted flight window.
