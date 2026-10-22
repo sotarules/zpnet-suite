@@ -32,6 +32,25 @@ struct photons_low_high_row_t {
   uint32_t lead_ns = 0, close_reason = 0;
   photons_low_high_outcome_t outcome = photons_low_high_outcome_t::NO_PREDICTION;
 };
+// One foreground-owned rolling population of paired laps. No ISR work, heap,
+// voltage filtering, or independent LOW/HIGH membership. Partial windows are
+// published with their actual count; missing readings never become zero volts.
+static constexpr uint32_t PHOTONS_LOW_HIGH_WINDOW_DEFAULT = 1000U;
+static constexpr uint32_t PHOTONS_LOW_HIGH_WINDOW_MAX = 2048U;
+struct photons_low_high_sum_t {
+  int64_t sum = 0;
+  uint64_t squares = 0;
+};
+struct photons_low_high_window_t {
+  uint32_t target_laps = PHOTONS_LOW_HIGH_WINDOW_DEFAULT;
+  uint32_t count = 0, generation = 0;
+  uint64_t paired_total = 0, last_launch_id = 0;
+  uint32_t last_pair_at_ms = 0, observed_at_ms = 0, low_lead_ns = 0;
+  photons_low_high_sum_t moments[3]; // LOW, HIGH, HIGH-LOW
+};
+void photons_pd_out_low_high_set_window(uint32_t laps);
+photons_low_high_window_t photons_pd_out_low_high_window();
+
 struct photons_low_high_batch_t {
   uint32_t attempts = 0, low_samples = 0;
   uint32_t lead_min_ns = 0, lead_max_ns = 0;
@@ -44,6 +63,7 @@ struct photons_low_high_batch_t {
   photons_low_high_moment_t paired[PHOTONS_LOW_HIGH_MOMENTS];
   int64_t low_raw_cross = 0, high_raw_cross = 0;
   photons_low_high_row_t last, last_unpaired;
+  photons_low_high_window_t window; // frozen at the fragment cut
 };
 enum class photons_low_high_close_t : uint32_t {
   NEXT_LAUNCH, FRAGMENT, ADC1_USER, STOP

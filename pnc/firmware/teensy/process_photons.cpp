@@ -3957,7 +3957,8 @@ PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_core, 2048U);
 // Explicit acquisition bounds and four uint64 rejection reasons (total/delta).
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_race, 4096U);
 // Include per-fragment moments and the nested 60-second HIGH population.
-PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_pd_out, 7168U);
+// Additional fixed space for exact rolling-pair moments and provenance.
+PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_pd_out, 8192U);
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_voltage_normalization, 1536U);
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_high_window, 1024U);
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_raw_cycles, 1024U);
@@ -4744,6 +4745,36 @@ static void photons_low_high_row_payload(Payload& parent, const char* key,
   p.clear();
 }
 
+static void photons_low_high_window_payload(Payload& p,
+                                          const photons_low_high_window_t& w) {
+  p.add("schema", "PHOTONS_LOW_HIGH_WINDOW_V1");
+  p.add("population", "LAST_N_PAIRED_LAPS_NOT_SCIENCE_ACCEPTANCE");
+  p.add("target_laps", w.target_laps);
+  p.add("low_lead_ns", w.low_lead_ns);
+  p.add("max_laps", PHOTONS_LOW_HIGH_WINDOW_MAX);
+  p.add("count", w.count);
+  p.add("generation", w.generation);
+  p.add("paired_total", w.paired_total);
+  p.add("observed_at_ms", w.observed_at_ms);
+  if (w.count != 0U) {
+    p.add("last_launch_id", w.last_launch_id);
+    p.add("last_pair_at_ms", w.last_pair_at_ms);
+    p.add("last_pair_age_ms", w.observed_at_ms - w.last_pair_at_ms);
+  }
+  auto& store = g_photons_serialization_store;
+  Payload moment(Payload::StorageMode::FIXED, store.bins, sizeof(store.bins));
+  static const char* const means[] = {"low_mean_mv", "high_mean_mv", "delta_mean_mv"};
+  for (uint32_t i = 0; i < 3U; ++i) {
+    moment.clear();
+    moment.add("sum", w.moments[i].sum);
+    moment.add("squares", w.moments[i].squares);
+    p.add_object(LOW_HIGH_MOMENTS[i], moment);
+    if (w.count != 0U)
+      p.add(means[i], toFixedDecimal(
+          Double(w.moments[i].sum) * 3300_D / (Double(w.count) * 4095_D), 6));
+  }
+}
+
 static void photons_low_high_payload(Payload& p, const photons_low_high_batch_t& b) {
   p.clear();
   p.add("schema", "PHOTONS_LOW_HIGH_WITNESS_V1");
@@ -4776,22 +4807,30 @@ static void photons_low_high_payload(Payload& p, const photons_low_high_batch_t&
       outcomes.add(LOW_HIGH_OUTCOMES[i], b.outcomes[i]);
     p.add_object("outcomes", outcomes);
   }
-  Payload moment(Payload::StorageMode::FIXED, store.bins, sizeof(store.bins));
-  for (uint32_t i = 0; i < PHOTONS_LOW_HIGH_MOMENTS; ++i) {
-    moment.clear();
-    moment.add("sum", b.paired[i].sum);
-    moment.add("squares", b.paired[i].squares);
-    if (b.outcomes[0] != 0U) {
-      moment.add("min", b.paired[i].minimum);
-      moment.add("max", b.paired[i].maximum);
+  {
+    Payload moment(Payload::StorageMode::FIXED, store.bins, sizeof(store.bins));
+    for (uint32_t i = 0; i < PHOTONS_LOW_HIGH_MOMENTS; ++i) {
+      moment.clear();
+      moment.add("sum", b.paired[i].sum);
+      moment.add("squares", b.paired[i].squares);
+      if (b.outcomes[0] != 0U) {
+        moment.add("min", b.paired[i].minimum);
+        moment.add("max", b.paired[i].maximum);
+      }
+      p.add_object(LOW_HIGH_MOMENTS[i], moment);
     }
-    p.add_object(LOW_HIGH_MOMENTS[i], moment);
+    moment.clear();
   }
-  moment.clear();
   // Two bounded per-race exemplars per fragment accompany the all-pair moments.
   if (b.attempts != 0U) photons_low_high_row_payload(p, "last", b.last);
   if (b.attempts != b.outcomes[0])
     photons_low_high_row_payload(p, "last_unpaired", b.last_unpaired);
+  // Both earlier scratch borrowers have ended before the window is assembled.
+  {
+    Payload window(Payload::StorageMode::FIXED, store.population, sizeof(store.population));
+    photons_low_high_window_payload(window, b.window);
+    p.add_object("window", window);
+  }
 }
 
 static FLASHMEM Payload cmd_report_low_high(const Payload&) {
@@ -4803,6 +4842,24 @@ static FLASHMEM Payload cmd_report_low_high(const Payload&) {
   p.add("scope", "LATEST_COMPLETED_FRAGMENT");
   p.add("fragment_sequence", f.sequence);
   p.add("fragment_elapsed_ms", f.fragment_elapsed_ms);
+  return Payload(p);
+}
+
+static FLASHMEM Payload cmd_low_high_window(const Payload& args) {
+  const photons_foreground_custody_t custody(photons_foreground_owner_t::COMMAND);
+  uint32_t laps = photons_pd_out_low_high_window().target_laps;
+  if ((args.has("laps") && !args.tryGetUInt("laps", laps)) ||
+      laps == 0U || laps > PHOTONS_LOW_HIGH_WINDOW_MAX) {
+    Payload error;
+    error.add("error", "laps must be an integer from 1 to 2048");
+    return error;
+  }
+  if (args.has("laps")) photons_pd_out_low_high_set_window(laps);
+  auto& store = g_photons_serialization_store;
+  Payload p(Payload::StorageMode::FIXED, store.population, sizeof(store.population));
+  photons_low_high_window_payload(p, photons_pd_out_low_high_window());
+  p.add("scope", "WITNESS_ONLY_VOLATILE_UNTIL_REBOOT");
+  p.add("reset_policy", "SIZE_OR_LOW_LEAD_CHANGE_STOP_OR_REBASE");
   return Payload(p);
 }
 
@@ -8288,6 +8345,7 @@ static FLASHMEM Payload cmd_off(const Payload& /*args*/) {
 static const process_command_entry_t PHOTONS_COMMANDS[] = {
   { "REPORT_LOW_HIGH",     cmd_report_low_high     },
   { "LOW_LEAD",            cmd_low_lead            },
+  { "LOW_HIGH_WINDOW",     cmd_low_high_window     },
   { "REPORT_HISTOGRAM",    cmd_report_histogram    },
   { "REPORT_ENVELOPE",     cmd_report_envelope     },
   { "REPORT_CORE",         cmd_report_core         },

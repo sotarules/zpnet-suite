@@ -5166,6 +5166,40 @@ def _pd_sample_moments(n, total, squares, scale):
             "sd": sd, "se": sd / math.sqrt(n) if sd is not None else None}
 
 
+def _pd_low_high_window(window, scale):
+    """Witness the producer's exact rolling population; never smooth again."""
+    if window["schema"] != "PHOTONS_LOW_HIGH_WINDOW_V1":
+        raise ValueError("unsupported LOW/HIGH moving window schema")
+    count, target, maximum, generation, total = (
+        window[key] for key in ("count", "target_laps", "max_laps", "generation", "paired_total"))
+    if (any(type(v) is not int for v in (count, target, maximum, generation, total))
+            or not 1 <= target <= maximum or generation <= 0 or total < 0
+            or count != min(total, target)):
+        raise ValueError("LOW/HIGH moving window population is inconsistent")
+    out = {key: window[key] for key in
+           ("schema", "target_laps", "max_laps", "count", "generation", "paired_total", "low_lead_ns")}
+    for name in ("low", "high", "delta"):
+        moment = window[name + "_counts"]
+        stats = _pd_sample_moments(count, moment["sum"], moment["squares"], scale)
+        if count:
+            mean = window[name + "_mean_mv"]
+            if not math.isfinite(mean) or abs(mean - stats["mean"]) > 1e-6:
+                raise ValueError("LOW/HIGH moving mean differs from exact moments")
+            stats["mean"] = mean  # The same rounded producer value travels to Metrics.
+        out[name] = stats
+    if window["delta_counts"]["sum"] != (
+            window["high_counts"]["sum"] - window["low_counts"]["sum"]):
+        raise ValueError("LOW/HIGH moving delta does not reconcile")
+    if count:
+        age = window["last_pair_age_ms"]
+        if (type(age) is not int or not 0 <= age <= 0xffffffff
+                or age != ((window["observed_at_ms"] - window["last_pair_at_ms"]) & 0xffffffff)
+                or type(window["last_launch_id"]) is not int or window["last_launch_id"] <= 0):
+            raise ValueError("LOW/HIGH moving window endpoint is inconsistent")
+        out.update(last_launch_id=window["last_launch_id"], last_pair_age_ms=age)
+    return out
+
+
 def _pd_out_statistics(instrument):
     """Interpret each fragment independently; never alter recovery or correction."""
     pd = instrument["pd_out"]
@@ -5229,6 +5263,8 @@ def _pd_out_statistics(instrument):
             covariance / math.sqrt(denominator) if denominator else None)
     result.update(paired=paired, attempts=witness["attempts"],
                   paired_count=n, outcomes=copy.deepcopy(outcomes))
+    if "window" in witness:
+        result["moving"] = _pd_low_high_window(witness["window"], scale)
     return result
 
 

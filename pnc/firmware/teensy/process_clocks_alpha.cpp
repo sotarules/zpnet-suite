@@ -5446,7 +5446,9 @@ static const alpha_pps_counterledger_lane_t* alpha_counterledger_lane(
       clock, &g_ocxo1_pps_counterledger, &g_ocxo2_pps_counterledger);
 }
 
-bool clocks_alpha_ocxo_counterledger_snapshot(
+// These report/recovery snapshots execute in foreground. FLASHMEM keeps
+// their code out of RAM1 without relocating clock state or capture code.
+FLASHMEM bool clocks_alpha_ocxo_counterledger_snapshot(
     time_clock_id_t clock,
     clocks_alpha_ocxo_counterledger_snapshot_t* out) {
   if (!out) return false;
@@ -7812,7 +7814,7 @@ static bool alpha_recover_observed_forensics_ready(
          f->dwt_original_at_event != 0U;
 }
 
-bool clocks_alpha_ocxo_recover_proof_snapshot(
+FLASHMEM bool clocks_alpha_ocxo_recover_proof_snapshot(
     time_clock_id_t clock,
     clocks_alpha_recover_proof_snapshot_t* out) {
   if (!out) return false;

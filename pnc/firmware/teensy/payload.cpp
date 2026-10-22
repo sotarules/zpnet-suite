@@ -15,6 +15,11 @@
 extern bool transport_send_watchdog_anomaly_emergency(
     const payload_fatal_record_t& record);
 
+// Foreground Payload construction, validation and JSON work execute from
+// flash to release RAM1 ITCM banks for the DTCM stack. Storage placement,
+// ownership and failure semantics are unchanged. Keep the naked return
+// witness and fatal-stop path in their existing sections.
+
 // ============================================================================
 // Payload v4.1 instrumentation
 // ============================================================================
@@ -3404,7 +3409,7 @@ static bool json_validate_utf8_sequence(const uint8_t* data,
     return true;
 }
 
-static bool json_scan_string(json_cursor_t& c,
+static FLASHMEM bool json_scan_string(json_cursor_t& c,
                              size_t* out_begin,
                              size_t* out_end,
                              size_t* out_decoded_length) {
@@ -3478,7 +3483,7 @@ static bool json_scan_string(json_cursor_t& c,
     return false;
 }
 
-static bool json_decode_string(const uint8_t* data,
+static FLASHMEM bool json_decode_string(const uint8_t* data,
                                size_t begin,
                                size_t end,
                                char* out,
@@ -3547,7 +3552,7 @@ static bool json_decode_string(const uint8_t* data,
     return true;
 }
 
-static bool json_scan_number(json_cursor_t& c) {
+static FLASHMEM bool json_scan_number(json_cursor_t& c) {
     const size_t start = c.pos;
     if (c.pos < c.len && c.data[c.pos] == '-') ++c.pos;
     if (c.pos >= c.len) return false;
@@ -3590,7 +3595,7 @@ static bool json_match_literal(json_cursor_t& c, const char* literal) {
     return true;
 }
 
-static bool json_scan_value(json_cursor_t& c,
+static FLASHMEM bool json_scan_value(json_cursor_t& c,
                             uint32_t depth,
                             json_value_span_t* out);
 
@@ -3660,7 +3665,7 @@ static bool json_scan_array(json_cursor_t& c, uint32_t depth) {
     return false;
 }
 
-static bool json_scan_value(json_cursor_t& c,
+static FLASHMEM bool json_scan_value(json_cursor_t& c,
                             uint32_t depth,
                             json_value_span_t* out) {
     if (!out) return false;
@@ -3745,7 +3750,7 @@ static char json_hex_digit(uint8_t v) {
     return v < 10U ? (char)('0' + v) : (char)('A' + (v - 10U));
 }
 
-static size_t json_write_escaped(char* out, const char* s, size_t len) {
+static FLASHMEM size_t json_write_escaped(char* out, const char* s, size_t len) {
     size_t p = 0;
     for (size_t i = 0; i < len; ++i) {
         const uint8_t ch = (uint8_t)s[i];
@@ -4115,7 +4120,7 @@ static uint32_t payload_contract_hash_escaped(uint32_t hash,
     return hash;
 }
 
-uint32_t Payload::_contract_semantic_hash(size_t entry_limit) const {
+FLASHMEM uint32_t Payload::_contract_semantic_hash(size_t entry_limit) const {
     const uint8_t* storage = _storage();
     const size_t bounded = entry_limit < _count ? entry_limit : _count;
     uint32_t hash = payload_contract_hash_u32(PAYLOAD_CONTRACT_HASH_SEED,
@@ -4135,7 +4140,7 @@ uint32_t Payload::_contract_semantic_hash(size_t entry_limit) const {
     return hash;
 }
 
-uint32_t Payload::_json_hash_unchecked() const {
+FLASHMEM uint32_t Payload::_json_hash_unchecked() const {
     const uint8_t* storage = _storage();
     uint32_t hash = payload_contract_hash_u32(
         PAYLOAD_CONTRACT_HASH_SEED, (uint32_t)_json_size());
@@ -4166,7 +4171,7 @@ uint32_t Payload::_json_hash_unchecked() const {
     return payload_contract_hash_byte(hash, '}');
 }
 
-bool Payload::_contract_inspect(payload_contract_state_t* out) const {
+FLASHMEM bool Payload::_contract_inspect(payload_contract_state_t* out) const {
     if (!out) return false;
     *out = payload_contract_state_t{};
 
@@ -4398,7 +4403,7 @@ void Payload::_contract_accept(const payload_contract_state_t& state) {
     _contract_fingerprint_guard = ~state.structural_fingerprint;
 }
 
-bool Payload::_contract_begin(uint32_t operation_id,
+FLASHMEM bool Payload::_contract_begin(uint32_t operation_id,
                               payload_contract_state_t* before) const {
     g_payload_contract_checks++;
     payload_contract_boot_latch();
@@ -4491,7 +4496,7 @@ bool Payload::contract_valid() const {
            state.structural_fingerprint == _contract_fingerprint;
 }
 
-bool Payload::_contract_finish_preserve(
+FLASHMEM bool Payload::_contract_finish_preserve(
     uint32_t operation_id,
     const payload_contract_state_t& before,
     size_t minimum_capacity) {
@@ -4530,7 +4535,7 @@ bool Payload::_contract_finish_preserve(
     return true;
 }
 
-bool Payload::_contract_finish_add(
+FLASHMEM bool Payload::_contract_finish_add(
     uint32_t operation_id,
     const payload_contract_state_t& before,
     size_t key_len,
@@ -4613,7 +4618,7 @@ bool Payload::_contract_finish_add(
     return true;
 }
 
-bool Payload::_contract_finish_clear(
+FLASHMEM bool Payload::_contract_finish_clear(
     uint32_t operation_id,
     const payload_contract_state_t& before) {
     payload_contract_state_t after{};
@@ -4641,7 +4646,7 @@ bool Payload::_contract_finish_clear(
     return true;
 }
 
-bool Payload::_contract_finish_copy(
+FLASHMEM bool Payload::_contract_finish_copy(
     uint32_t operation_id,
     const payload_contract_state_t& before,
     uint32_t expected_semantic_hash) {
@@ -4709,7 +4714,7 @@ uint32_t PayloadArray::_json_hash_unchecked() const {
     return payload_contract_span_hash(_data(), _length);
 }
 
-bool PayloadArray::_contract_inspect(payload_contract_state_t* out) const {
+FLASHMEM bool PayloadArray::_contract_inspect(payload_contract_state_t* out) const {
     if (!out) return false;
     *out = payload_contract_state_t{};
 
@@ -4800,7 +4805,7 @@ void PayloadArray::_contract_accept(const payload_contract_state_t& state) {
     _contract_fingerprint_guard = ~state.structural_fingerprint;
 }
 
-bool PayloadArray::_contract_begin(uint32_t operation_id,
+FLASHMEM bool PayloadArray::_contract_begin(uint32_t operation_id,
                                    payload_contract_state_t* before) const {
     g_payload_contract_checks++;
     payload_contract_boot_latch();
@@ -4876,7 +4881,7 @@ bool PayloadArray::contract_valid() const {
            state.structural_fingerprint == _contract_fingerprint;
 }
 
-bool PayloadArray::_contract_finish_preserve(
+FLASHMEM bool PayloadArray::_contract_finish_preserve(
     uint32_t operation_id,
     const payload_contract_state_t& before,
     size_t minimum_capacity) {
@@ -4911,7 +4916,7 @@ bool PayloadArray::_contract_finish_preserve(
     return true;
 }
 
-bool PayloadArray::_contract_finish_add(
+FLASHMEM bool PayloadArray::_contract_finish_add(
     uint32_t operation_id,
     const payload_contract_state_t& before,
     size_t object_size,
@@ -5075,7 +5080,7 @@ bool PayloadArray::_contract_abort(
 // Payload storage and lifecycle
 // ============================================================================
 
-Payload::Payload()
+FLASHMEM Payload::Payload()
     : _heap_block(nullptr),
       _heap_block_guard(UINTPTR_MAX),
       _fixed_storage(nullptr),
@@ -5123,7 +5128,7 @@ Payload::Payload()
     }
 }
 
-Payload::Payload(StorageMode mode, void* storage, size_t capacity)
+FLASHMEM Payload::Payload(StorageMode mode, void* storage, size_t capacity)
     : _heap_block(nullptr),
       _heap_block_guard(UINTPTR_MAX),
       _fixed_storage(nullptr),
@@ -5213,7 +5218,7 @@ Payload::~Payload() {
     payload_mark_destroyed();
 }
 
-Payload::Payload(Payload&& other) noexcept
+FLASHMEM Payload::Payload(Payload&& other) noexcept
     : _heap_block(nullptr),
       _heap_block_guard(UINTPTR_MAX),
       _fixed_storage(nullptr),
@@ -5290,7 +5295,7 @@ Payload& Payload::operator=(Payload&& other) noexcept {
     return *this;
 }
 
-Payload::Payload(const Payload& other)
+FLASHMEM Payload::Payload(const Payload& other)
     : _heap_block(nullptr),
       _heap_block_guard(UINTPTR_MAX),
       _fixed_storage(nullptr),
@@ -5496,7 +5501,7 @@ size_t Payload::_data_used() const {
     return capacity - _data_begin;
 }
 
-void Payload::_reset_empty() {
+FLASHMEM void Payload::_reset_empty() {
     // Reset is used after a lawful transfer or release. It must not repair a
     // damaged storage identity and let the caller continue as if it were valid.
     if (!_storage_mode_guard_ok() || !_heap_guard_ok() ||
@@ -5547,7 +5552,7 @@ void Payload::_reset_empty() {
 }
 
 
-void Payload::_release_storage() {
+FLASHMEM void Payload::_release_storage() {
     if (!_storage_mode_guard_ok() || !_heap_guard_ok() ||
         !_fixed_storage_guard_ok() || !_fixed_capacity_guard_ok()) {
         payload_note_integrity(PAYLOAD_SELF_OK_ENTRIES_SPAN_UNREADABLE,
@@ -5594,7 +5599,7 @@ void Payload::_release_storage() {
     _reset_empty();
 }
 
-void Payload::_move_from(Payload& other) {
+FLASHMEM void Payload::_move_from(Payload& other) {
     payload_contract_state_t before{};
     payload_contract_state_t source{};
     if (!_contract_begin(PAYLOAD_OP_MOVE_FROM, &before)) {
@@ -5705,7 +5710,7 @@ void Payload::_move_from(Payload& other) {
 }
 
 
-bool Payload::_copy_from(const Payload& other) {
+FLASHMEM bool Payload::_copy_from(const Payload& other) {
     payload_contract_state_t before{};
     payload_contract_state_t source{};
     if (!_contract_begin(PAYLOAD_OP_COPY_FROM, &before)) return false;
@@ -5852,7 +5857,7 @@ bool Payload::_copy_from(const Payload& other) {
 }
 
 
-void Payload::clear() {
+FLASHMEM void Payload::clear() {
     payload_stamp_trace_record(
         payload_stamp_trace_stage_t::CLEAR_ENTER,
         PAYLOAD_OP_CLEAR,
@@ -5889,7 +5894,7 @@ Payload Payload::clone() const {
     return Payload(*this);
 }
 
-void Payload::reserve(size_t minimum_capacity) {
+FLASHMEM void Payload::reserve(size_t minimum_capacity) {
     payload_contract_state_t before{};
     if (!_contract_begin(PAYLOAD_OP_RESERVE, &before)) {
         _fatal(PAYLOAD_ERR_INTEGRITY, PAYLOAD_OP_RESERVE, minimum_capacity);
@@ -5952,7 +5957,7 @@ bool Payload::heap_entries() const {
 // Payload integrity
 // ============================================================================
 
-bool Payload::_self_ok(uint32_t operation_id) const {
+FLASHMEM bool Payload::_self_ok(uint32_t operation_id) const {
     if (!_storage_mode_guard_ok() || !_heap_guard_ok() ||
         !_fixed_storage_guard_ok() || !_fixed_capacity_guard_ok() ||
         !_count_guard_ok() || !_data_begin_guard_ok()) {
@@ -5991,7 +5996,7 @@ bool Payload::_self_ok(uint32_t operation_id) const {
     return true;
 }
 
-bool Payload::_entry_ok(const Entry& e,
+FLASHMEM bool Payload::_entry_ok(const Entry& e,
                         size_t index,
                         uint32_t operation_id) const {
     if (!_self_ok(operation_id)) return false;
@@ -6046,7 +6051,7 @@ bool Payload::_entry_ok(const Entry& e,
     return true;
 }
 
-bool Payload::_layout_ok(uint32_t operation_id) const {
+FLASHMEM bool Payload::_layout_ok(uint32_t operation_id) const {
     if (!_self_ok(operation_id)) return false;
 
     const size_t capacity = _capacity();
@@ -6112,7 +6117,7 @@ const char* Payload::_value_ptr(const Entry& e) const {
 // Single-store growth and transactional append
 // ============================================================================
 
-bool Payload::_ensure_room(size_t additional_entries,
+FLASHMEM bool Payload::_ensure_room(size_t additional_entries,
                            size_t additional_data,
                            int32_t* data_shift) {
     if (data_shift) *data_shift = 0;
@@ -6254,7 +6259,7 @@ bool Payload::_ensure_room(size_t additional_entries,
 }
 
 
-bool Payload::_append_value(const char* key,
+FLASHMEM bool Payload::_append_value(const char* key,
                             size_t key_len,
                             const char* value,
                             size_t value_len,
@@ -6707,7 +6712,7 @@ bool Payload::_append_value(const char* key,
     return true;
 }
 
-bool Payload::_append_value_writer(const char* key,
+FLASHMEM bool Payload::_append_value_writer(const char* key,
                                    size_t key_len,
                                    size_t value_len,
                                    ValueKind kind,
@@ -7413,7 +7418,7 @@ static bool payload_format_uses_floating_conversion(const char* fmt,
 // A failed append terminates without re-reading its object to reconstruct an
 // attempted size. Fatal requested_bytes is zero when no detached size exists.
 
-void Payload::add(const char* key, int32_t value) {
+FLASHMEM void Payload::add(const char* key, int32_t value) {
     size_t key_len = 0;
     if (!payload_key_length(key, &key_len)) {
         payload_note_bad_key(key);
@@ -7436,7 +7441,7 @@ void Payload::add(const char* key, int32_t value) {
     }
 }
 
-void Payload::add(const char* key, uint32_t value) {
+FLASHMEM void Payload::add(const char* key, uint32_t value) {
     size_t key_len = 0;
     if (!payload_key_length(key, &key_len)) {
         payload_note_bad_key(key);
@@ -7459,7 +7464,7 @@ void Payload::add(const char* key, uint32_t value) {
     }
 }
 
-void Payload::add(const char* key, int64_t value) {
+FLASHMEM void Payload::add(const char* key, int64_t value) {
     size_t key_len = 0;
     if (!payload_key_length(key, &key_len)) {
         payload_note_bad_key(key);
@@ -7482,7 +7487,7 @@ void Payload::add(const char* key, int64_t value) {
     }
 }
 
-void Payload::add(const char* key, uint64_t value) {
+FLASHMEM void Payload::add(const char* key, uint64_t value) {
     size_t key_len = 0;
     if (!payload_key_length(key, &key_len)) {
         payload_note_bad_key(key);
@@ -7505,7 +7510,7 @@ void Payload::add(const char* key, uint64_t value) {
     }
 }
 
-void Payload::add(const char* key, const char* value) {
+FLASHMEM void Payload::add(const char* key, const char* value) {
     size_t key_len = 0;
     if (!payload_key_length(key, &key_len)) {
         payload_note_bad_key(key);
@@ -7531,11 +7536,11 @@ void Payload::add(const char* key, const char* value) {
     }
 }
 
-void Payload::add(const char* key, const String& value) {
+FLASHMEM void Payload::add(const char* key, const String& value) {
     add(key, value.c_str());
 }
 
-void Payload::add(const char* key, bool value) {
+FLASHMEM void Payload::add(const char* key, bool value) {
     size_t key_len = 0;
     if (!payload_key_length(key, &key_len)) {
         payload_note_bad_key(key);
@@ -7550,7 +7555,7 @@ void Payload::add(const char* key, bool value) {
     }
 }
 
-void Payload::add(const char* key, const fixed_decimal_t& value) {
+FLASHMEM void Payload::add(const char* key, const fixed_decimal_t& value) {
     static constexpr uint32_t operation_id =
         PAYLOAD_OP_ADD_FIXED_DECIMAL;
 
@@ -7653,7 +7658,7 @@ void Payload::add(const char* key, const fixed_decimal_t& value) {
     }
 }
 
-void Payload::add_fmt(const char* key, const char* fmt, ...) {
+FLASHMEM void Payload::add_fmt(const char* key, const char* fmt, ...) {
     size_t key_len = 0;
     if (!payload_key_length(key, &key_len)) {
         payload_note_bad_key(key);
@@ -7695,7 +7700,7 @@ void Payload::add_fmt(const char* key, const char* fmt, ...) {
     }
 }
 
-void Payload::add_object(const char* key, const Payload& obj) {
+FLASHMEM void Payload::add_object(const char* key, const Payload& obj) {
     size_t key_len = 0;
     if (!payload_key_length(key, &key_len)) {
         payload_note_bad_key(key);
@@ -7719,7 +7724,7 @@ void Payload::add_object(const char* key, const Payload& obj) {
     }
 }
 
-void Payload::add_array(const char* key, const PayloadArray& arr) {
+FLASHMEM void Payload::add_array(const char* key, const PayloadArray& arr) {
     size_t key_len = 0;
     if (!payload_key_length(key, &key_len)) {
         payload_note_bad_key(key);
@@ -7781,7 +7786,7 @@ void Payload::add_raw_object(const char* key, const char* raw_json_object) {
 // Serialization
 // ============================================================================
 
-size_t Payload::_json_size() const {
+FLASHMEM size_t Payload::_json_size() const {
     if (!_layout_ok(PAYLOAD_OP_JSON_SIZE)) return 0;
     payload_contract_state_t observed{};
     if (!_contract_begin(PAYLOAD_OP_JSON_SIZE, &observed)) return 0;
@@ -7896,7 +7901,7 @@ size_t Payload::_json_size() const {
     return total;
 }
 
-size_t Payload::_write_json_unchecked(char* buf) const {
+FLASHMEM size_t Payload::_write_json_unchecked(char* buf) const {
     if (!buf) return 0;
     char* out = buf;
     *out++ = '{';
@@ -7935,7 +7940,7 @@ size_t Payload::json_size() const {
     return _json_size();
 }
 
-size_t Payload::write_json(char* buf, size_t buf_size) const {
+FLASHMEM size_t Payload::write_json(char* buf, size_t buf_size) const {
     if (!buf || buf_size == 0) {
         g_payload_serialize_overflow++;
         payload_note_error(PAYLOAD_ERR_SERIALIZE_OVERFLOW, PAYLOAD_OP_WRITE_JSON_BUFFER, this);
@@ -8844,7 +8849,7 @@ bool PayloadArray::_self_ok() const {
            data[_length - 1U] == ']' && data[_length] == '\0';
 }
 
-bool PayloadArray::_ensure_capacity(size_t needed) {
+FLASHMEM bool PayloadArray::_ensure_capacity(size_t needed) {
     payload_contract_state_t before{};
     if (!_contract_begin(PAYLOAD_OP_ARRAY_CAPACITY, &before)) return false;
 
@@ -8906,7 +8911,7 @@ bool PayloadArray::_ensure_capacity(size_t needed) {
 }
 
 
-void PayloadArray::_release_storage() {
+FLASHMEM void PayloadArray::_release_storage() {
     if (!_heap_guard_ok()) {
         payload_note_integrity(PAYLOAD_SELF_OK_ENTRIES_SPAN_UNREADABLE,
                                PAYLOAD_OP_ARRAY_RELEASE_STORAGE_GUARD,
@@ -9116,7 +9121,7 @@ String PayloadArray::to_json() const {
     return _json_size() != 0U ? String(_data()) : String("[]");
 }
 
-void PayloadArray::add(const Payload& obj) {
+FLASHMEM void PayloadArray::add(const Payload& obj) {
     payload_contract_state_t before{};
     if (!_contract_begin(PAYLOAD_OP_ARRAY_ADD_WRITE, &before)) {
         _fatal(PAYLOAD_ERR_INTEGRITY, PAYLOAD_OP_ARRAY_ADD_WRITE);

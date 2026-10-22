@@ -2290,14 +2290,15 @@ def _photons_rolling_rows(payloads: list[dict]) -> list[dict]:
         high_window = pd_out["high_window"]
         high_mv = high_window["high_mean_mv"] if high_window["sample_count"] > 0 else None
         high_warming = high_window["elapsed_ms"] < high_window["target_ms"]
-        paired = (current.get("pd_out_statistics") or {}).get("paired") or {}
+        moving = (current.get("pd_out_statistics") or {}).get("moving") or {}
         rows.append({
             "second": seconds,
             "mean": stats["mean"] if n > 0 else None,
             "high_mv": high_mv,
             "high_warming": high_warming,
-            "low_pair_mv": (paired.get("low") or {}).get("mean"),
-            "high_pair_mv": (paired.get("high") or {}).get("mean"),
+            "low_pair_mv": (moving.get("low") or {}).get("mean"),
+            "high_pair_mv": (moving.get("high") or {}).get("mean"),
+            "pd_window": f"{moving['count']}/{moving['target_laps']}" if moving else "---",
             "accepted": stats["accepted"],
             "excluded": stats["excluded"],
             "missed": stats["missed"],
@@ -2317,17 +2318,24 @@ def _photons_low_high_block(live: dict) -> list[str]:
     paired = stats.get("paired")
     if paired is None:
         return ["PD LOW/HIGH: WAITING FOR WITNESS FIRMWARE"]
-    lines = ["PD WITNESS: PAIRED SAMPLES / mV   (SE*: SD / SQRT(N), ASSUMES INDEPENDENCE)",
+    moving = stats.get("moving")
+    if moving is None:
+        return ["PD LOW/HIGH: WAITING FOR MOVING-WINDOW FIRMWARE"]
+    status = "READY" if moving["count"] == moving["target_laps"] else "WARMING"
+    age = moving.get("last_pair_age_ms")
+    lines = [f"PD MOVING MEANS: {moving['count']}/{moving['target_laps']} PAIRED LAPS"
+             f"  {status}  GEN {moving['generation']}  LAST PAIR AGE ms: {_fmt(age, 'd', 0)}",
+             "mV / SE*: SD / SQRT(N), ASSUMES INDEPENDENCE",
              f"{'SIGNAL':<10} {'N':>7} {'MEAN':>11} {'SD':>11} {'SE*':>11}"]
     for label, key in (("LOW", "low"), ("HIGH", "high"), ("HIGH-LOW", "delta")):
-        sample = paired[key]
+        sample = moving[key]
         lines.append(f"{label:<10} " + _fmt(sample["count"], '>7d', 7)
                      + " " + _fmt(sample["mean"], '>11.3f', 11)
                      + " " + _fmt(sample["sd"], '>11.3f', 11)
                      + " " + _fmt(sample["se"], '>11.3f', 11))
     outcomes = ", ".join(f"{name}={n}" for name, n in stats["outcomes"].items()
                          if name != "PAIRED" and n) or "NONE"
-    lines.append(f"PAIR {stats['paired_count']}/{stats['attempts']} LAUNCHES"
+    lines.append(f"FRAGMENT PAIRS {stats['paired_count']}/{stats['attempts']} LAUNCHES"
                  f"  ADC LOW/HIGH {stats['low']['count']}/{stats['high']['count']}"
                  f"  UNPAIRED: {outcomes}")
     lead = paired["low_lead_ns"]
@@ -2465,7 +2473,7 @@ def photons_detail_readout() -> list[str]:
                   _photons_summary_line(summary, bool(campaign), summary["mean"]),
                   "", *photons_temperature_block(live), "",
                   *_photons_low_high_block(live), "",
-                  f"{'SEC':<8} {'LAP':>12} {'LOW':>9} {'HIGH':>9} {'HIGH60':>9} "
+                  f"{'SEC':<8} {'LAP':>12} {'LOW':>9} {'HIGH':>9} {'PD N/WIN':>10} {'HIGH60':>9} "
                   f" {'ACCEPT':>8} {'EXCL':>7} {'MISSED':>7} {'SPURIOUS':>8}"
                   f" {'EARLY':>6} {'DUP':>6} {'LATE':>6} {'UNARM':>6} {'SD':>10} {'SE':>10}"])
     for row in _photons_rolling_rows(payloads):
@@ -2473,6 +2481,7 @@ def photons_detail_readout() -> list[str]:
             _fmt(row["second"], 'd', 0).ljust(8) + " " + _fmt(row["mean"], '>12.6f', 12)
             + " " + _fmt(row["low_pair_mv"], '>9.3f', 9)
             + " " + _fmt(row["high_pair_mv"], '>9.3f', 9)
+            + " " + row["pd_window"].rjust(10)
             + " " + _fmt(row["high_mv"], '>9.3f', 9)
             + ("*" if row["high_warming"] else " ")
             + " " + _fmt(row["accepted"], '>8d', 8)

@@ -42,11 +42,73 @@ static uint32_t g_low_lead_cycles, g_low_tolerance_cycles;
 static bool g_low_action_owned;
 static photons_low_high_batch_t g_low_batch;
 
+// 8 KiB fixed RAM2 ring. Only the initialized live prefix is read; RAM2 is
+// NOLOAD. All access is foreground-owned, after a race has been retired.
+struct pd_low_high_pair_t { uint16_t low, high; };
+alignas(32) static DMAMEM pd_low_high_pair_t
+    g_low_window_pairs[PHOTONS_LOW_HIGH_WINDOW_MAX];
+static_assert(sizeof(g_low_window_pairs) == 8192U, "Review LOW/HIGH RAM2 budget");
+static photons_low_high_window_t g_low_window;
+static uint32_t g_low_window_next;
+
+static void pd_low_window_reset() {
+  const uint32_t target = g_low_window.target_laps;
+  const uint32_t generation = g_low_window.generation + 1U;
+  if (generation == 0U) __builtin_trap();
+  g_low_window = photons_low_high_window_t{};
+  g_low_window.target_laps = target;
+  g_low_window.generation = generation;
+  g_low_window_next = 0U;
+}
+
+static void pd_low_window_push(const photons_low_high_row_t& row) {
+  if (row.low_counts > 4095U || row.high_counts > 4095U ||
+      row.launch_id <= g_low_window.last_launch_id) __builtin_trap();
+  pd_low_high_pair_t old{};
+  if (g_low_window.count == g_low_window.target_laps)
+    old = g_low_window_pairs[g_low_window_next];
+  else
+    ++g_low_window.count;
+  const int32_t values[] = {(int32_t)row.low_counts, (int32_t)row.high_counts,
+                           (int32_t)row.high_counts - (int32_t)row.low_counts};
+  const int32_t removed[] = {old.low, old.high, (int32_t)old.high - old.low};
+  for (uint32_t i = 0; i < 3U; ++i) {
+    auto& m = g_low_window.moments[i];
+    m.sum += values[i] - removed[i];
+    m.squares += (uint64_t)((int64_t)values[i] * values[i]);
+    m.squares -= (uint64_t)((int64_t)removed[i] * removed[i]);
+  }
+  g_low_window_pairs[g_low_window_next] = {
+      (uint16_t)row.low_counts, (uint16_t)row.high_counts};
+  g_low_window_next = (g_low_window_next + 1U) % g_low_window.target_laps;
+  if (++g_low_window.paired_total == 0ULL) __builtin_trap();
+  g_low_window.last_launch_id = row.launch_id;
+  g_low_window.last_pair_at_ms = millis();
+}
+
+photons_low_high_window_t photons_pd_out_low_high_window() {
+  auto out = g_low_window;
+  out.observed_at_ms = millis();
+  out.low_lead_ns = g_low_lead_ns;
+  return out;
+}
+
+void photons_pd_out_low_high_set_window(uint32_t laps) {
+  if (laps == 0U || laps > PHOTONS_LOW_HIGH_WINDOW_MAX) __builtin_trap();
+  if (laps == g_low_window.target_laps) return;
+  // Settle the current acquisition under its old settings before cutting over.
+  photons_pd_out_low_finish(photons_low_high_close_t::STOP);
+  g_low_window.target_laps = laps;
+  pd_low_window_reset();
+}
+
 uint32_t photons_pd_out_low_lead_ns() { return g_low_lead_ns; }
 
 void photons_pd_out_low_set_lead_ns(uint32_t ns) {
   if (ns < 250U || ns > 50000U) __builtin_trap();
   photons_pd_out_low_finish(photons_low_high_close_t::STOP);
+  // Never average LOW observations taken with different trigger leads.
+  if (ns != g_low_lead_ns) pd_low_window_reset();
   g_low_lead_ns = ns;
   g_low_lead_cycles = (uint32_t)(((uint64_t)F_CPU_ACTUAL * ns +
       999999999ULL) / 1000000000ULL);
@@ -190,6 +252,7 @@ void photons_pd_out_low_finish(photons_low_high_close_t reason) {
     g_low_batch.low_squares += row.low_counts * row.low_counts;
   }
   if (row.outcome == photons_low_high_outcome_t::PAIRED) {
+    pd_low_window_push(row);
     const int32_t raw = (int32_t)(row.edge_dwt - row.launch_dwt);
     const int32_t values[PHOTONS_LOW_HIGH_MOMENTS] = {
       (int32_t)row.low_counts, (int32_t)row.high_counts,
@@ -384,6 +447,7 @@ void photons_pd_out_complete_isr() {
 
 void photons_pd_out_init() {
   if (F_CPU_ACTUAL == 0U) __builtin_trap();
+  pd_low_window_reset();
   photons_pd_out_low_set_lead_ns(PHOTONS_PD_OUT_LOW_LEAD_NS);
   g_low_tolerance_cycles = F_CPU_ACTUAL / 4000000U; // 250 ns
   g_pd_high_delay_cycles = (uint32_t)(
@@ -420,6 +484,7 @@ void photons_pd_out_init() {
 
 void photons_pd_out_stop() {
   photons_pd_out_low_finish(photons_low_high_close_t::STOP);
+  pd_low_window_reset();
   // Caller has stopped PHOTODIODE. Pending completion must run before this
   // foreground callback; never cancel an outstanding measurement.
   if (g_pd_phase != pd_phase_t::IDLE) __builtin_trap();
@@ -449,6 +514,7 @@ static photons_pd_out_batch_t pd_snapshot() {
 
 void photons_pd_out_rebase(uint32_t cut_ms) {
   photons_pd_out_low_finish(photons_low_high_close_t::STOP);
+  pd_low_window_reset();
   g_low_batch = photons_low_high_batch_t{};
   pd_rotate_capture(cut_ms, false);
   g_pd_previous = pd_snapshot();
@@ -478,6 +544,7 @@ photons_pd_out_batch_t photons_pd_out_take_batch(uint32_t cut_ms) {
   out.adc_irq_enabled = NVIC_IS_ENABLED(IRQ_ADC2) ? 1U : 0U;
   out.high_window = pd_update_window(out, cut_ms);
   out.low_high = g_low_batch;
+  out.low_high.window = photons_pd_out_low_high_window();
   g_low_batch = photons_low_high_batch_t{};
   g_pd_previous = now;
   return out;

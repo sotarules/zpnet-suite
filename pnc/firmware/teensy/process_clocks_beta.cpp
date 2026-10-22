@@ -7342,7 +7342,10 @@ static uint32_t clocks_beta_public_ocxo_science_invalid_mask(
   return mask;
 }
 
-static void clock_science_build_ocxo(
+// Completed-row science and Beta publication execute after interrupt
+// facts reach foreground. Keep these large consumers in flash so RAM1
+// banks remain available for the stack; capture/continuation stay in ITCM.
+static FLASHMEM void clock_science_build_ocxo(
     clock_science_row_t& row,
     time_clock_id_t clock,
     uint32_t public_count,
@@ -8529,7 +8532,7 @@ static void clocks_fragment_campaign_snapshot_accept(
 // immutable Alpha row released only after both post-PPS OCXO edges resolve the
 // exact CounterLedger + PhaseLedger clockfaces for that same PPS.
 
-void clocks_beta_pps(uint32_t completed_pps_sequence) {
+FLASHMEM void clocks_beta_pps(uint32_t completed_pps_sequence) {
   clocks_beta_pps_owner_guard_t operation_owner{};
   clocks_stack_witness_note_hot(CLOCKS_STACK_CONTEXT_BETA_PPS_ENTRY);
   campaign_record_stage(CAMPAIGN_RECORD_STAGE_ENTRY);
