@@ -18,7 +18,7 @@ Compare uses all five predictors on common rows/blocks/splits; compare-legacy
 uses synthetic, PI BME280 and MAX31865 without requiring PD or OUT.
 Each sensor's degree/lag is chosen on development data, not on the final test.
 New rows read the immutable raw one-second distribution directly and compare
-it with the recorded firmware (NOR1/NOR2) or Pi correction. Legacy rows reconstruct raw LAP
+it with the recorded firmware (NOR1/NOR2/NOR3) or Pi correction. Legacy rows reconstruct raw LAP
 using their recorded firmware offset. New models always fit raw LAP.
 Models: constant, linear, quadratic, cubic. Model selection uses forward-only
 validation within the first 70%; the last 30% tests the frozen choice once.
@@ -55,7 +55,12 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 SCHEMA = "PHOTONS_V1"
 MIN_FIT = 3
-VERSION = "2026-10-19.1"
+VERSION = "2026-10-22.1"
+FIRMWARE_ACQUISITION_IDS = {
+    "PD200T_HIGH_LINEAR_V1": 0x4E4F5231,
+    "PD200T_HIGH60_LINEAR_V1": 0x4E4F5232,
+    "PD200T_HIGH60_LINEAR_V2": 0x4E4F5233,
+}
 HIGH_REFERENCE_MV = 3300
 HIGH_MV_PER_COUNT = HIGH_REFERENCE_MV / 4095
 SENSORS = ("synthetic", "bme280", "bme280_receiver", "bme280_out", "max31865")
@@ -284,10 +289,10 @@ def parse_sample(row_id: int, p: Dict[str, Any], sensor: str = "synthetic") -> T
     uncorrected_ns = canonical_ns + correction_ns
     raw_source = "LEGACY_RECONSTRUCTED" if normalization_id is not None else "LEGACY"
     if measurement is not None:
-        # NOR1 uses fragment HIGH; NOR2 uses HIGH60. Both preserve the raw
+        # NOR1 uses fragment HIGH; NOR2/NOR3 use HIGH60. All preserve the raw
         # distribution alongside a uniform per-fragment voltage correction.
         firmware = ph.get("voltage_normalization")
-        identities = (0x4E4F5231, 0x4E4F5232) if firmware is not None else (0x52415731,)
+        identities = (FIRMWARE_ACQUISITION_IDS[firmware["model_id"]],) if firmware is not None else (0x52415731,)
         identity = integer(stats["acquisition_id"])
         if (identity not in identities or measurement["acquisition_id"] != identity):
             raise ValueError(f"unsupported PHOTONS measurement ancestry: stats={identity:#x}, "
@@ -1044,7 +1049,7 @@ def main(argv):
     if args.sensor in ('compare', 'compare-legacy'):
         print(f'Comparison requires all {len(SENSORS if args.sensor == "compare" else LEGACY_SENSORS)} predictors on every retained row; blocks and time splits are shared.')
         print('Sensor-specific degree/lag choices use development folds only. Final-test ranking is exploratory.')
-    print('New rows use measurement.raw_flight_ns directly, including NOR1/NOR2 firmware voltage normalization.')
+    print('New rows use measurement.raw_flight_ns directly, including NOR1/NOR2/NOR3 firmware voltage normalization.')
     print('Legacy thermal rows reconstruct raw LAP from their recorded uniform offsets.')
     if args.sensor == 'high':
         print('HIGH: exact per-fragment ADC sums/counts from photons.pd_out; nominal 3300 mV / 4095 counts.')

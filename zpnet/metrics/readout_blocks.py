@@ -16,8 +16,8 @@ Stats policy:
   sufficient state plus producer-authored 10-minute, 60-minute, 8-hour, 24-hour,
   and TOTAL PPB buckets.  Metrics transcribes those PPB buckets verbatim; it does
   not estimate rolling windows from repaint history.  The live PHOTONS rolling
-  tail retains actual PUBSUB publications in memory and subtracts adjacent
-  snapshots only to recover one-second accepted-lap populations for display;
+  tail retains actual PUBSUB publications in memory and reads each second's
+  firmware-authored raw mean, normalized mean, and HIGH60 adjustment directly;
   PostgreSQL is not in that live-tail path.  Durable campaign history
   remains a database read model.  This never synthesizes individual samples,
   changes admission, or feeds science back into PHOTONS.  PHOTONS CAMP is read
@@ -2276,7 +2276,11 @@ def _get_photons_rolling_payloads() -> list[dict]:
 
 
 def _photons_rolling_rows(payloads: list[dict]) -> list[dict]:
-    """Render each producer-authored cadence cell without rolling buckets."""
+    """Expose each second's raw mean and firmware HIGH60 correction verbatim.
+
+    FACT is the published slope in ns/mV; ADJ is the signed offset added to RAW.
+    Metrics checks that testimony but never applies a second correction.
+    """
     rows = []
     for current in payloads:
         stats = _photons_fragment_stats(current)
@@ -2290,25 +2294,49 @@ def _photons_rolling_rows(payloads: list[dict]) -> list[dict]:
         high_window = pd_out["high_window"]
         high_mv = high_window["high_mean_mv"] if high_window["sample_count"] > 0 else None
         high_warming = high_window["elapsed_ms"] < high_window["target_ms"]
+        normalization = current["photons"]["voltage_normalization"]
+        if (normalization["schema"] != "PHOTONS_VOLTAGE_NORMALIZATION_V1"
+                or normalization["model_id"] not in ("PD200T_HIGH60_LINEAR_V1", "PD200T_HIGH60_LINEAR_V2")
+                or normalization["application"] != "UNIFORM_OFFSET_AT_FRAGMENT_DRAIN"
+                or normalization["voltage_source"] != "PD_OUT_HIGH60_MV"):
+            raise ValueError("PHOTONS rolling rows require firmware HIGH60 normalization")
+        raw = normalization["raw_flight_ns"]
+        published = normalization["published_flight_ns"]
+        if raw["n"] != n or published != current["photons"]["race"]["flight_ns"]:
+            raise ValueError("PHOTONS rolling raw/normalized populations disagree")
+        factor = float(normalization["slope_ns_per_mv"])
+        reference = float(normalization["reference_mv"])
+        adjustment = float(normalization["adjustment_ns"])
+        if not all(math.isfinite(v) for v in (factor, reference, adjustment)):
+            raise ValueError("PHOTONS normalization coefficients/adjustment must be finite")
+        if normalization["high60_sample_count"] != high_window["sample_count"]:
+            raise ValueError("PHOTONS normalization and HIGH60 sample counts disagree")
+        if n > 0:
+            raw_mean = float(raw["mean"])
+            if high_mv is None or not all(math.isfinite(v) for v in (
+                    raw_mean, stats["mean"], float(high_mv), float(normalization["high_mv"]))):
+                raise ValueError("PHOTONS populated second requires finite means and HIGH60")
+            if not math.isclose(float(normalization["high_mv"]), float(high_mv),
+                                rel_tol=0.0, abs_tol=1e-6):
+                raise ValueError("PHOTONS correction predictor differs from displayed HIGH60")
+            if not math.isclose(adjustment, factor * (float(high_mv) - reference),
+                                rel_tol=0.0, abs_tol=1e-6):
+                raise ValueError("PHOTONS HIGH60 formula does not close")
+            if not math.isclose(raw_mean + adjustment, stats["mean"],
+                                rel_tol=0.0, abs_tol=1e-6):
+                raise ValueError("PHOTONS RAW + ADJ does not equal NORM")
         moving = (current.get("pd_out_statistics") or {}).get("moving") or {}
         rows.append({
             "second": seconds,
-            "mean": stats["mean"] if n > 0 else None,
+            "raw_mean": float(raw["mean"]) if n > 0 else None,
+            "normalized_mean": stats["mean"] if n > 0 else None,
+            "factor": factor,
+            "adjustment_ns": adjustment if n > 0 else None,
             "high_mv": high_mv,
             "high_warming": high_warming,
             "low_pair_mv": (moving.get("low") or {}).get("mean"),
             "high_pair_mv": (moving.get("high") or {}).get("mean"),
             "pd_window": f"{moving['count']}/{moving['target_laps']}" if moving else "---",
-            "accepted": stats["accepted"],
-            "excluded": stats["excluded"],
-            "missed": stats["missed"],
-            "spurious": stats["spurious"],
-            "early": stats["early"],
-            "duplicate": stats["duplicate"],
-            "late": stats["late"],
-            "unarmed": stats["unarmed"],
-            "stddev": stats["stddev"] if n >= 2 else None,
-            "stderr": stats["stderr"] if n >= 2 else None,
         })
     return rows[-PHOTONS_ROLLING_ROWS:]
 
@@ -2473,27 +2501,23 @@ def photons_detail_readout() -> list[str]:
                   _photons_summary_line(summary, bool(campaign), summary["mean"]),
                   "", *photons_temperature_block(live), "",
                   *_photons_low_high_block(live), "",
-                  f"{'SEC':<8} {'LAP':>12} {'LOW':>9} {'HIGH':>9} {'PD N/WIN':>10} {'HIGH60':>9} "
-                  f" {'ACCEPT':>8} {'EXCL':>7} {'MISSED':>7} {'SPURIOUS':>8}"
-                  f" {'EARLY':>6} {'DUP':>6} {'LATE':>6} {'UNARM':>6} {'SD':>10} {'SE':>10}"])
+                  "NORM = RAW + ADJ; ADJ = FACT * (HIGH60 - REF); "
+                  f"REF: {float(live['photons']['voltage_normalization']['reference_mv']):.9f} mV; "
+                  "FACT: ns/mV; HIGH60*: WARMING",
+                  f"{'SEC':<8} {'RAW':>12} {'NORM':>12} {'LOW':>9} {'HIGH':>9} "
+                  f"{'PD N/WIN':>10} {'HIGH60':>9}  {'FACT':>14} {'ADJ':>12}"])
     for row in _photons_rolling_rows(payloads):
         lines.append(
-            _fmt(row["second"], 'd', 0).ljust(8) + " " + _fmt(row["mean"], '>12.6f', 12)
+            _fmt(row["second"], 'd', 0).ljust(8)
+            + " " + _fmt(row["raw_mean"], '>12.6f', 12)
+            + " " + _fmt(row["normalized_mean"], '>12.6f', 12)
             + " " + _fmt(row["low_pair_mv"], '>9.3f', 9)
             + " " + _fmt(row["high_pair_mv"], '>9.3f', 9)
             + " " + row["pd_window"].rjust(10)
             + " " + _fmt(row["high_mv"], '>9.3f', 9)
             + ("*" if row["high_warming"] else " ")
-            + " " + _fmt(row["accepted"], '>8d', 8)
-            + " " + _fmt(row["excluded"], '>7d', 7)
-            + " " + _fmt(row["missed"], '>7d', 7)
-            + " " + _fmt(row["spurious"], '>8d', 8)
-            + " " + _fmt(row["early"], '>6d', 6)
-            + " " + _fmt(row["duplicate"], '>6d', 6)
-            + " " + _fmt(row["late"], '>6d', 6)
-            + " " + _fmt(row["unarmed"], '>6d', 6)
-            + " " + _fmt(row["stddev"], '>10.6f', 10)
-            + " " + _fmt(row["stderr"], '>10.6f', 10))
+            + " " + _fmt(row["factor"], '>14.12f', 14)
+            + " " + _fmt(row["adjustment_ns"], '>+12.6f', 12))
     return lines
 
 

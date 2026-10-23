@@ -44,9 +44,10 @@ from zpnet.shared.logger import setup_logging
 # PHOTONS: Optional calibrated normalization and physical sensor identities
 # ======================================================================
 
-# Matches process_photons.cpp. NOR2 cannot restore NOR1 fragment-HIGH-corrected
-# numerator/Welford custody; startup's epoch-migration court retains old rows.
-ACQUISITION_ID = 0x4E4F5232  # NOR2: HIGH60-normalized accepted LAP
+# Matches process_photons.cpp. HighLow1 changes the HIGH60 coefficient:
+# NOR3 cannot restore NOR1/NOR2 corrected numerator/Welford/bucket custody.
+# Startup's existing epoch-migration court preserves all historical rows.
+ACQUISITION_ID = 0x4E4F5233  # NOR3: HighLow1 HIGH60-normalized accepted LAP
 PHOTONS_MEASUREMENT_SCHEMA = "PI_PHOTONS_MEASUREMENT_V1"
 THERMAL_SENSOR_PATHS = {
     "pi": (("environment", "pi"), "PI.I2C1.BME280.0x76"),
@@ -2457,11 +2458,11 @@ def _fetch_system_report() -> Dict[str, Any]:
 
 
 class _AcquisitionRestartRequired(RuntimeError):
-    """The one-time raw cutover needs matching firmware, not a thermal-model reset."""
+    """A producer calibration/acquisition cutover requires matching held firmware."""
 
 
 def _acquisition_epoch_migration() -> Optional[Dict[str, Any]]:
-    """Retire corrected ancestry once; Pi model changes never enter this court."""
+    """Retire incompatible producer calibration/acquisition ancestry once."""
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
         cur.execute("""
@@ -8515,10 +8516,10 @@ def _perform_phase5_recovery(
             report = _fetch_teensy_recovery_report()
             if (report["publication_started"] or report["staging_active"]
                     or report.get("acquisition_id") != ACQUISITION_ID):
-                # Raw sufficient statistics cannot restore the old corrected
-                # population. A held producer establishes the new raw epoch.
+                # Corrected sufficient statistics cannot cross a producer
+                # calibration/acquisition change. Require a fresh held producer.
                 raise _AcquisitionRestartRequired(
-                    "PHOTONS acquisition changed; flash matching Teensy firmware to establish a raw epoch"
+                    "PHOTONS calibration/acquisition changed; flash matching Teensy firmware to establish a new epoch"
                 )
             bringup = _fetch_teensy_bringup_report()
             if bringup is None:
@@ -8526,7 +8527,7 @@ def _perform_phase5_recovery(
             _startup_activate_detector_for_heartbeat(bringup)
             if active_master is not None:
                 _close_lantern_for_acquisition(active_master, migration)
-            logging.warning("[photons/acquisition] new raw acquisition epoch: %s", migration)
+            logging.warning("[photons/acquisition] new producer calibration/acquisition epoch: %s", migration)
             return _startup_cold_start(
                 active_master=None,
                 rows_seen=migration["historical_detail_rows_preserved"],

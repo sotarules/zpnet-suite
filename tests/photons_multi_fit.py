@@ -12,6 +12,10 @@ import sys
 from collections import defaultdict
 
 REF = 475.725600719
+HIGH60_ACQUISITION_IDS = {
+    'PD200T_HIGH60_LINEAR_V1': 0x4E4F5232,  # HeatCool1 / NOR2
+    'PD200T_HIGH60_LINEAR_V2': 0x4E4F5233,  # HighLow1 / NOR3
+}
 
 
 def get_rows(name):
@@ -48,11 +52,11 @@ def observation(ident, p):
     voltage = float(w['high_mean_mv'])
     pub = f['flight']
     if norm is not None:
-        if norm['model_id'] not in ('PD200T_HIGH60_LINEAR_V1','PD200T_HIGH_LINEAR_V1'):
+        if norm['model_id'] not in (*HIGH60_ACQUISITION_IDS, 'PD200T_HIGH_LINEAR_V1'):
             return None
-        if norm['model_id'] == 'PD200T_HIGH60_LINEAR_V1':
-            if int(f['stats']['acquisition_id']) != 0x4E4F5232:
-                raise ValueError(f'{ident}: NOR2 identity mismatch')
+        if norm['model_id'] in HIGH60_ACQUISITION_IDS:
+            if int(f['stats']['acquisition_id']) != HIGH60_ACQUISITION_IDS[norm['model_id']]:
+                raise ValueError(f'{ident}: HIGH60 calibration/acquisition identity mismatch')
             if abs(voltage-float(norm['high_mv'])) > 1e-6:
                 raise ValueError(f'{ident}: HIGH60 predictor mismatch')
         raw = norm['raw_flight_ns']
@@ -179,7 +183,7 @@ def main(argv):
     a = parser.parse_args(argv[1:])
     if len(set(a.campaigns)) != len(a.campaigns) or a.block_seconds < 10 or not math.isfinite(a.reference_mv):
         parser.error('invalid campaign names, block duration, or reference')
-    print('PHOTONS MULTI-CAMPAIGN HIGH60 REGRESSION 2026-10-19.2')
+    print('PHOTONS MULTI-CAMPAIGN HIGH60 REGRESSION 2026-10-22.1')
     print(f'READ ONLY; persisted HIGH60 direct; block={a.block_seconds}s reference={a.reference_mv:.9f}mV')
     rows = [r for name in a.campaigns for r in blocks(name,a.block_seconds)]
     counts = {name: sum(r[0] == name for r in rows) for name in a.campaigns}

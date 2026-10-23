@@ -40,10 +40,10 @@
 static constexpr uint64_t PHOTONS_FRAGMENT_PERIOD_NS = 1000000000ULL;
 static constexpr uint64_t PHOTONS_NS_PER_SECOND = 1000000000ULL;
 
-// HIGH60 correction is a new sufficient-state epoch. Never merge NOR1
-// one-fragment-corrected numerator/Welford custody with HIGH60-corrected LAP.
-// Original raw DWT evidence remains raw under both acquisition identities.
-static constexpr uint32_t PHOTONS_ACQUISITION_ID = 0x4E4F5232UL; // 'NOR2'
+// HighLow1 revises the HIGH60 coefficient. NOR3 starts fresh corrected
+// numerator/Welford/Better-Buckets custody; never restore NOR1/NOR2 populations
+// into this calibration. Original DWT and per-fragment raw evidence stay raw.
+static constexpr uint32_t PHOTONS_ACQUISITION_ID = 0x4E4F5233UL; // 'NOR3'
 
 
 // i.MX RT1062 RAM2 is write-back cached in 32-byte lines.  PHOTONS places only
@@ -2398,10 +2398,13 @@ static FLASHMEM void photons_envelope_finish(const photons_race_batch_t& batch,
 }
 
 
-// Preserve the provisional HeatCool1 coefficients; this revision changes ONLY
-// the predictor from fragment HIGH to the existing producer-owned HIGH60_MV.
+// Provisional HighLow1 fit, 2026-10-22: 185 nonoverlapping 60-second blocks,
+// HIGH60 block means 455.031..461.469 mV. Linear correction of the RAW batch
+// mean; no individual-race correction or additional LOW/temperature term.
+// Same reference as NOR2; the revised slope intentionally changes the absolute
+// normalized level. Retrospective fit only: validate on a fresh thermal cycle.
 static constexpr Double PHOTONS_HIGH_REFERENCE_MV = 475.725600719_D;
-static constexpr Double PHOTONS_HIGH_SLOPE_NS_PER_MV = 0.555244801819_D;
+static constexpr Double PHOTONS_HIGH_SLOPE_NS_PER_MV = 0.342185418750_D;
 
 // Shared authoritative conversion for the Metrics HIGH60 publication and the
 // scientific correction. Never construct a second rolling voltage estimator.
@@ -5073,7 +5076,7 @@ static Payload& photons_fragment_payload(
   instrument.add_object("race", race);
   race.clear();
   voltage_normalization.add("schema", "PHOTONS_VOLTAGE_NORMALIZATION_V1");
-  voltage_normalization.add("model_id", "PD200T_HIGH60_LINEAR_V1");
+  voltage_normalization.add("model_id", "PD200T_HIGH60_LINEAR_V2");
   voltage_normalization.add("application", "UNIFORM_OFFSET_AT_FRAGMENT_DRAIN");
   voltage_normalization.add("voltage_source", "PD_OUT_HIGH60_MV");
   voltage_normalization.add("adc_sample_count", f.voltage_normalization.adc_sample_count);
