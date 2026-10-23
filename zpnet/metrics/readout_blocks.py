@@ -1128,7 +1128,7 @@ def environment_sensor_block(snapshot: dict) -> list[str]:
 
 
 def photons_temperature_block(snapshot: dict) -> list[str]:
-    """Align physical temperatures and HIGH60 with the PHOTONS mean columns.
+    """Align temperatures, HIGH60 (mV), and ADJ (ns) with the mean columns.
 
     The PHOTONS science header uses an eight-character label, a separator,
     then 12-character right-justified columns. Use precisely that geometry:
@@ -1195,6 +1195,38 @@ def photons_temperature_block(snapshot: dict) -> list[str]:
         + " " + mean(totals.get("high60"), "mean_mv")
         + ((" " + mean(population, "mean_mv") + " " + observed(population.get("sd_mv"), 5, 10))
            if has_campaign else "")
+    )
+
+    # The active linear model commutes with the HIGH60 population means.
+    # Derive these cells from the full-precision published mV values, never
+    # from rounded display text or repaint history. CAMP_SD scales by |slope|.
+    normalization = snapshot["photons"]["voltage_normalization"]
+    if normalization["model_id"] not in ("PD200T_HIGH60_LINEAR_V1", "PD200T_HIGH60_LINEAR_V2"):
+        raise ValueError("PHOTONS ADJ buckets require a linear HIGH60 calibration")
+    factor = float(normalization["slope_ns_per_mv"])
+    reference = float(normalization["reference_mv"])
+    if not all(math.isfinite(value) for value in (factor, reference)):
+        raise ValueError("PHOTONS ADJ coefficients must be finite")
+
+    def adjustment(value):
+        if value is None:
+            return f"{'---':>12}"
+        result = factor * (float(value) - reference)
+        if not math.isfinite(result):
+            raise ValueError("PHOTONS ADJ requires a finite HIGH60 mean")
+        return f"{result:+12.6f}"
+
+    campaign_sd = population.get("sd_mv")
+    adjustment_sd = abs(factor) * float(campaign_sd) if campaign_sd is not None else None
+    if adjustment_sd is not None and (not math.isfinite(adjustment_sd) or adjustment_sd < 0):
+        raise ValueError("PHOTONS ADJ campaign SD must be finite and nonnegative")
+    lines.append(
+        f"{'ADJ':<8} " + adjustment(high_now)
+        + ''.join(" " + adjustment(((windows.get(span) or {}).get("high60") or {}).get("mean_mv"))
+                  for span, _ in spans)
+        + " " + adjustment((totals.get("high60") or {}).get("mean_mv"))
+        + ((" " + adjustment(population.get("mean_mv"))
+            + " " + observed(adjustment_sd, 6, 10)) if has_campaign else "")
     )
 
     # The separate SENSOR section contains only the three BME280 channels.
@@ -2341,41 +2373,6 @@ def _photons_rolling_rows(payloads: list[dict]) -> list[dict]:
     return rows[-PHOTONS_ROLLING_ROWS:]
 
 
-def _photons_low_high_block(live: dict) -> list[str]:
-    stats = live.get("pd_out_statistics") or {}
-    paired = stats.get("paired")
-    if paired is None:
-        return ["PD LOW/HIGH: WAITING FOR WITNESS FIRMWARE"]
-    moving = stats.get("moving")
-    if moving is None:
-        return ["PD LOW/HIGH: WAITING FOR MOVING-WINDOW FIRMWARE"]
-    status = "READY" if moving["count"] == moving["target_laps"] else "WARMING"
-    age = moving.get("last_pair_age_ms")
-    lines = [f"PD MOVING MEANS: {moving['count']}/{moving['target_laps']} PAIRED LAPS"
-             f"  {status}  GEN {moving['generation']}  LAST PAIR AGE ms: {_fmt(age, 'd', 0)}",
-             "mV / SE*: SD / SQRT(N), ASSUMES INDEPENDENCE",
-             f"{'SIGNAL':<10} {'N':>7} {'MEAN':>11} {'SD':>11} {'SE*':>11}"]
-    for label, key in (("LOW", "low"), ("HIGH", "high"), ("HIGH-LOW", "delta")):
-        sample = moving[key]
-        lines.append(f"{label:<10} " + _fmt(sample["count"], '>7d', 7)
-                     + " " + _fmt(sample["mean"], '>11.3f', 11)
-                     + " " + _fmt(sample["sd"], '>11.3f', 11)
-                     + " " + _fmt(sample["se"], '>11.3f', 11))
-    outcomes = ", ".join(f"{name}={n}" for name, n in stats["outcomes"].items()
-                         if name != "PAIRED" and n) or "NONE"
-    lines.append(f"FRAGMENT PAIRS {stats['paired_count']}/{stats['attempts']} LAUNCHES"
-                 f"  ADC LOW/HIGH {stats['low']['count']}/{stats['high']['count']}"
-                 f"  UNPAIRED: {outcomes}")
-    lead = paired["low_lead_ns"]
-    lines.append("LOW TRIGGER LEAD ns: " + _fmt(lead["mean"], '.1f', 0)
-                 + " [" + _fmt(lead.get("min"), '.1f', 0)
-                 + ", " + _fmt(lead.get("max"), '.1f', 0) + "]"
-                 + "  PREDICTION ERROR ns: "
-                 + _fmt(paired["prediction_error_ns"]["mean"], '.1f', 0)
-                 + "  r(LOW, RAW): " + _fmt(paired["low_raw_correlation"], '.3f', 0))
-    return lines
-
-
 class _PhotonsReadModel:
     """Refresh durable metadata without delaying the live publication display."""
 
@@ -2500,16 +2497,11 @@ def photons_detail_readout() -> list[str]:
     lines.extend(["", _photons_summary_header(bool(campaign)),
                   _photons_summary_line(summary, bool(campaign), summary["mean"]),
                   "", *photons_temperature_block(live), "",
-                  *_photons_low_high_block(live), "",
-                  "NORM = RAW + ADJ; ADJ = FACT * (HIGH60 - REF); "
-                  f"REF: {float(live['photons']['voltage_normalization']['reference_mv']):.9f} mV; "
-                  "FACT: ns/mV; HIGH60*: WARMING",
-                  f"{'SEC':<8} {'RAW':>12} {'NORM':>12} {'LOW':>9} {'HIGH':>9} "
+                  f"{'SEC':<8} {'LAP':>12} {'LOW':>9} {'HIGH':>9} "
                   f"{'PD N/WIN':>10} {'HIGH60':>9}  {'FACT':>14} {'ADJ':>12}"])
     for row in _photons_rolling_rows(payloads):
         lines.append(
             _fmt(row["second"], 'd', 0).ljust(8)
-            + " " + _fmt(row["raw_mean"], '>12.6f', 12)
             + " " + _fmt(row["normalized_mean"], '>12.6f', 12)
             + " " + _fmt(row["low_pair_mv"], '>9.3f', 9)
             + " " + _fmt(row["high_pair_mv"], '>9.3f', 9)

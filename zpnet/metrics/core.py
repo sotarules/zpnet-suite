@@ -75,7 +75,7 @@ def _photons_visible_lines(lines: list[str], body_height: int) -> list[str]:
     """Keep the fixed headings and newest tail rows on shorter terminals."""
     for index, line in enumerate(lines):
         columns = line.split()
-        if columns[:2] == ["SEC", "LAP"] and "ACCEPT" in columns:
+        if columns[:3] == ["SEC", "LAP", "LOW"]:
             header_end = index + 1
             row_count = body_height - header_end
             if row_count > 0:
