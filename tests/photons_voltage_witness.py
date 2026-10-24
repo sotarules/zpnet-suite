@@ -29,7 +29,8 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-VERSION = '2026-10-22.1'
+VERSION = '2026-10-24.1'
+DATABASE_BATCH_ROWS = 256
 SCHEMA = 'PHOTONS_V1'
 FIRMWARE_SCHEMA = 'PHOTONS_VOLTAGE_NORMALIZATION_V1'
 MODELS = {
@@ -99,10 +100,11 @@ def arguments(argv):
 def database_rows(args):
     from zpnet.shared.db import open_db
 
-    # Select only the measurement witnesses, not the large recovery/checkpoint
-    # state. Search backward through the indexed detail identity, then restore
-    # chronological order in Python. No second-scale feed is needed.
-    sql = """
+    # Bound JSON extraction work per statement. Select indexed identities
+    # before touching the large payloads; filtering schema in SQL would force
+    # PostgreSQL to inspect payloads beyond the batch while filling LIMIT.
+    # Descending keyset pagination excludes later inserts without OFFSET scans.
+    projection = """
         SELECT id, campaign,
                jsonb_build_object(
                    'schema', payload -> 'schema',
@@ -123,24 +125,43 @@ def database_rows(args):
                        )
                    )
                ) AS witness
-        FROM campaign_detail
-        WHERE campaign_type = %s
-          AND payload ->> 'schema' = %s
+        FROM page
+        ORDER BY id DESC
     """
-    params = ['LANTERN', SCHEMA]
-    if args.campaign is not None:
-        sql += ' AND campaign = %s'
-        params.append(args.campaign)
-    sql += ' ORDER BY id DESC LIMIT %s'
-    params.append(args.rows)
-    with open_db(row_dict=True) as conn:
-        conn.execute('SET TRANSACTION READ ONLY')
-        cur = conn.cursor()
-        cur.execute(sql, params)
-        found = cur.fetchall()
-    for row in reversed(found):
-        value = row['witness']
-        yield int(row['id']), row['campaign'], json.loads(value) if isinstance(value, str) else value
+    found = []
+    before_id = None
+    while len(found) < args.rows:
+        sql = """
+            WITH page AS MATERIALIZED (
+                SELECT id, campaign, payload
+                FROM campaign_detail
+                WHERE campaign_type = %s
+        """
+        params = ['LANTERN']
+        if args.campaign is not None:
+            sql += ' AND campaign = %s'
+            params.append(args.campaign)
+        if before_id is not None:
+            sql += ' AND id < %s'
+            params.append(before_id)
+        sql += ' ORDER BY id DESC LIMIT %s) ' + projection
+        params.append(min(DATABASE_BATCH_ROWS, args.rows - len(found)))
+        # Release each read transaction before parsing or issuing the next
+        # batch. Keep the shared connection, lock and statement timeout policy.
+        with open_db(row_dict=True) as conn:
+            conn.execute('SET TRANSACTION READ ONLY')
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                batch = cur.fetchall()
+        if not batch:
+            break
+        before_id = int(batch[-1]['id'])
+        for row in batch:
+            value = row['witness']
+            payload = json.loads(value) if isinstance(value, str) else value
+            if payload.get('schema') == SCHEMA:
+                found.append((int(row['id']), row['campaign'], payload))
+    yield from reversed(found)
 
 
 def finite(value, label):
