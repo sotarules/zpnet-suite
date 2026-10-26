@@ -28,18 +28,28 @@ static constexpr uint64_t NS_PER_MICROSECOND = 1000ULL;
 // --------------------------------------------------------------
 // Capture stays enabled throughout the pulse for short and long fiber paths.
 // Receive bounds include detector/electronics/ISR latency; do not set the upper
-// bound to the calculated optical propagation alone. Defaults acquire both a
-// short patch cable and the ~1 km spool. All conversions use F_CPU_ACTUAL.
+// bound to the calculated optical propagation alone. The 200 us horizon admits
+// short patch cables, the ~1 km spool (~5 us), and the ~20 km spool (~100 us),
+// including receiver latency. All conversions use F_CPU_ACTUAL.
+// Every allowed cadence leaves the complete receive horizon and HIGH capture
+// residence before the next launch. A late return must never become evidence
+// for a later shot. Keep the default 1000/s cadence for either fiber spool.
 static constexpr uint64_t PHOTONS_RACE_PULSE_NS = 1000ULL;
 static constexpr uint32_t PHOTONS_RECEIVE_MIN_NS = 1U;
-static constexpr uint32_t PHOTONS_RECEIVE_MAX_NS = 10000U;
+static constexpr uint32_t PHOTONS_RECEIVE_MAX_NS = 200000U;
+// Conservative HIGH capture residence, also reserved by CLOCKS quiet admission.
+static constexpr uint32_t PHOTONS_PD_OUT_ISR_BUDGET_NS = 35000U;
 
 // Requested launch opportunities per second. Foreground work, quiet guards and
 // science admission can reduce the measured completed/accepted laps per second.
-// The interval is derived with upward rounding; 2000 retains the 500 us default.
+// The interval is derived with upward rounding; 1000 gives a 1 ms interval.
 static constexpr uint32_t PHOTONS_DEFAULT_LAPS_PER_SECOND = 1000U;
 static constexpr uint32_t PHOTONS_MIN_LAPS_PER_SECOND = 1U;
-static constexpr uint32_t PHOTONS_MAX_LAPS_PER_SECOND = 100000U;
+// The extra nanosecond makes the minimum cadence strictly longer than the
+// receive-plus-ADC horizon (4255/s with the current commissioning bounds).
+static constexpr uint32_t PHOTONS_MAX_LAPS_PER_SECOND = (uint32_t)(
+    NS_PER_SECOND / ((uint64_t)PHOTONS_RECEIVE_MAX_NS +
+                     PHOTONS_PD_OUT_ISR_BUDGET_NS + 1ULL));
 
 // --------------------------------------------------------------
 // 10 MHz clock constants
@@ -167,7 +177,7 @@ static constexpr uint32_t PHOTONS_PD_OUT_LOW_LEAD_NS = 1000U;
 // Retain the conservative Priority-0 reservation until new residence is measured.
 // This reservation extends clock avoidance, never the accepted flight window.
 static constexpr uint32_t PHOTONS_PD_OUT_CONVERSION_TIMEOUT_NS = 10000U;
-static constexpr uint32_t PHOTONS_PD_OUT_ISR_BUDGET_NS = 35000U;
+// PHOTONS_PD_OUT_ISR_BUDGET_NS is declared with the receive/cadence bounds.
 
 // --------------------------------------------------------------
 // PT1000 RTD / MAX31865 -- installed hardware SPI1 wiring (2026-10-09)

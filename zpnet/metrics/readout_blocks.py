@@ -95,6 +95,8 @@ CAMPAIGN_TYPE_LANTERN = "LANTERN"
 # Retain twenty complete one-second cadence cells in the operator view.
 # The tap retains one predecessor for continuity with the existing read model.
 PHOTONS_ROLLING_ROWS = 20
+# 100,000.000000 ns fits without shifting adjacent mean/temperature columns.
+PHOTONS_MEAN_WIDTH = 14
 
 _LIVE_CACHE = create_pubsub_cache(CLOCKS_TOPIC)
 
@@ -1134,7 +1136,7 @@ def photons_temperature_block(snapshot: dict) -> list[str]:
     """Align temperatures, HIGH60 (mV), and ADJ (ns) with the mean columns.
 
     The PHOTONS science header uses an eight-character label, a separator,
-    then 12-character right-justified columns. Use precisely that geometry:
+    then PHOTONS_MEAN_WIDTH right-justified columns. Use precisely that geometry:
     NOW sits below LAP, each temperature window below its photon window,
     CAMP below CAMP, and CAMP_SD below the photon SD column. Short BME labels
     fit the existing eight-character label without shifting any data columns.
@@ -1159,10 +1161,10 @@ def photons_temperature_block(snapshot: dict) -> list[str]:
     labels = ["NOW", *(label for _, label in spans), "TOTAL"]
     if has_campaign:
         labels.append("CAMP")
-    lines = [f"{'TEMP':<8} " + " ".join(f"{label:>12}" for label in labels)
+    lines = [f"{'TEMP':<8} " + " ".join(f"{label:>{PHOTONS_MEAN_WIDTH}}" for label in labels)
              + (f" {'CAMP_SD':>10}" if has_campaign else "")]
 
-    def observed(value, digits=4, width=12):
+    def observed(value, digits=4, width=PHOTONS_MEAN_WIDTH):
         number = _to_float(value)
         if number is None or not math.isfinite(number):
             return f"{'---':>{width}}"
@@ -1170,7 +1172,7 @@ def photons_temperature_block(snapshot: dict) -> list[str]:
 
     def mean(pop, field="mean_c"):
         if not isinstance(pop, dict) or pop.get(field) is None:
-            return f"{'---':>12}"
+            return f"{'---':>{PHOTONS_MEAN_WIDTH}}"
         return observed(pop[field])
 
     windows = data.get("windows") or {}
@@ -1206,7 +1208,7 @@ def photons_temperature_block(snapshot: dict) -> list[str]:
         # actual per-fragment ADJ populations, including their own campaign SD.
         if data and "adjustment" not in totals:
             raise ValueError("NOR4 metrics requires actual adjustment populations")
-        def adj_cell(value, width=12):
+        def adj_cell(value, width=PHOTONS_MEAN_WIDTH):
             if value is None:
                 return f"{'---':>{width}}"
             value = float(value)
@@ -1260,11 +1262,11 @@ def _photons_linear_adjustment_row(lines, normalization, high_now, windows, span
 
     def adjustment(value):
         if value is None:
-            return f"{'---':>12}"
+            return f"{'---':>{PHOTONS_MEAN_WIDTH}}"
         result = factor * (float(value) - reference)
         if not math.isfinite(result):
             raise ValueError("PHOTONS ADJ requires a finite HIGH60 mean")
-        return f"{result:+12.6f}"
+        return f"{result:+{PHOTONS_MEAN_WIDTH}.6f}"
 
     campaign_sd = population.get("sd_mv")
     adjustment_sd = abs(factor) * float(campaign_sd) if campaign_sd is not None else None
@@ -2223,7 +2225,7 @@ def _photons_summary_header(include_campaign: bool) -> str:
     labels = ["LAP", "10-MIN", "60-MIN", "8-HOUR", "24-HOUR", "TOTAL"]
     if include_campaign:
         labels.append("CAMP")
-    return (f"{'SEC':<8} " + " ".join(f"{label:>12}" for label in labels)
+    return (f"{'SEC':<8} " + " ".join(f"{label:>{PHOTONS_MEAN_WIDTH}}" for label in labels)
             + f" {'TOTAL_SD':>10} {'TOTAL_SE':>10}")
 
 
@@ -2233,7 +2235,7 @@ def _photons_summary_line(summary: dict, include_campaign: bool, campaign_mean=N
         values.append(campaign_mean)
     scatter = summary.get("scatter") or {}
     return (_fmt(summary.get("seconds"), 'd', 0).ljust(8) + " "
-            + " ".join(_fmt(value, '>12.6f', 12) for value in values)
+            + " ".join(_fmt(value, f'>{PHOTONS_MEAN_WIDTH},.6f', PHOTONS_MEAN_WIDTH) for value in values)
             + " " + _fmt(scatter.get("stddev"), '>10.6f', 10)
             + " " + _fmt(scatter.get("stderr"), '>10.6f', 10))
 
@@ -2468,7 +2470,7 @@ def _photons_stability_lines(payload: dict) -> list[str]:
               (3600, "60-MIN", "60_min"), (14400, "4-HOUR", None),
               (28800, "8-HOUR", "8_hour"), (86400, "24-HOUR", "24_hour"))
     lines = [
-        f"{'WINDOW':<8} {'ROLL_NS':>12} {'OPEN_NS':>12} {'BLOCKS':>7} "
+        f"{'WINDOW':<8} {'ROLL_NS':>{PHOTONS_MEAN_WIDTH}} {'OPEN_NS':>{PHOTONS_MEAN_WIDTH}} {'BLOCKS':>7} "
         f"{'RAW_SDPS':>10} {'NORM_SDPS':>10} {'ADJPS':>10} {'TRENDPS/H':>11}",
     ]
     windows = data.get("windows") or {}
@@ -2480,8 +2482,8 @@ def _photons_stability_lines(payload: dict) -> list[str]:
         blocks = raw.get("block_count")
         lines.append(
             f"{label:<8}"
-            + _stability_cell(roll, 6, 13)
-            + _stability_cell(raw.get("current_block_mean_ns"), 6, 13)
+            + " " + _fmt(roll, f'>{PHOTONS_MEAN_WIDTH},.6f', PHOTONS_MEAN_WIDTH)
+            + " " + _fmt(raw.get("current_block_mean_ns"), f'>{PHOTONS_MEAN_WIDTH},.6f', PHOTONS_MEAN_WIDTH)
             + f"{str(blocks if blocks is not None else '---'):>7} "
             + _stability_cell(raw.get("block_sd_ps"), 2, 10)
             + _stability_cell(normalized.get("block_sd_ps"), 2, 11)
@@ -2524,19 +2526,19 @@ def photons_detail_readout() -> list[str]:
     if isinstance(measurement, dict) and measurement.get("status") == "CORRECTED":
         normalized = measurement.get("normalized_flight_ns")
         if isinstance(normalized, dict):
-            line += f"  NORM: {_fmt(normalized.get('mean'), '.6f', 0)} NS"
+            line += f"  NORM: {_fmt(normalized.get('mean'), ',.6f', 0)} NS"
     if campaign_error:
         line += "  READ MODEL: UNAVAILABLE"
     lines = [line]
     lines.extend(["", _photons_summary_header(bool(campaign)),
                   _photons_summary_line(summary, bool(campaign), summary["mean"]),
                   "", *photons_temperature_block(live), "",
-                  f"{'SEC':<8} {'LAP':>12} {'LOW':>9} {'HIGH':>9} "
+                  f"{'SEC':<8} {'LAP':>{PHOTONS_MEAN_WIDTH}} {'LOW':>9} {'HIGH':>9} "
                   f"{'PD N/WIN':>10} {'HIGH60':>9}  {'FACT':>14} {'ADJ':>12}"])
     for row in _photons_rolling_rows(payloads):
         lines.append(
             _fmt(row["second"], 'd', 0).ljust(8)
-            + " " + _fmt(row["normalized_mean"], '>12.6f', 12)
+            + " " + _fmt(row["normalized_mean"], f'>{PHOTONS_MEAN_WIDTH},.6f', PHOTONS_MEAN_WIDTH)
             + " " + _fmt(row["low_pair_mv"], '>9.3f', 9)
             + " " + _fmt(row["high_pair_mv"], '>9.3f', 9)
             + " " + row["pd_window"].rjust(10)
@@ -2565,7 +2567,7 @@ def photons_campaigns_readout() -> list[str]:
     columns = ("LAP", "10-MIN", "60-MIN", "8-HOUR", "24-HOUR", "TOTAL", "CAMP")
     lines = [f"\0LANTERN_CAMPAIGN:{newest_identity}",
              f"{'CAMPAIGN':<18} {'SEC':>8} "
-             + " ".join(f"{label:>12}" for label in columns)
+             + " ".join(f"{label:>{PHOTONS_MEAN_WIDTH}}" for label in columns)
              + f" {'TOTAL_SD':>10} {'TOTAL_SE':>10}"]
     if not rows:
         return lines + ["", "NO LANTERN CAMPAIGNS"]
@@ -2601,7 +2603,7 @@ def photons_campaigns_readout() -> list[str]:
         lines.append(
             _campaign_cell(name, bool(row.get("active")), 18)
             + f" {str(row.get('seconds') if row.get('seconds') is not None else '---'):>8} "
-            + " ".join(_fmt(value, '>12.6f', 12) for value in values)
+            + " ".join(_fmt(value, f'>{PHOTONS_MEAN_WIDTH},.6f', PHOTONS_MEAN_WIDTH) for value in values)
             + " " + _fmt(scatter.get("stddev"), '>10.6f', 10)
             + " " + _fmt(scatter.get("stderr"), '>10.6f', 10)
         )

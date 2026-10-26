@@ -129,6 +129,8 @@ AD5693R_SAFE_MAX_HW_CODE = int(
 # one low-first one-second frame: floor(target), then at most one transition to
 # floor(target)+1 for the fractional high dwell.  Thus each lane authors at
 # most two DAC codes per second.
+# Pi process-start default; a durable CLOCKS_CONTROL_V1 restore retains authority.
+DAC_DITHER_DEFAULT_ENABLED = True
 DAC_DITHER_FRAME_S = 1.0
 DAC_DITHER_SLOTS_PER_FRAME = 1000
 DAC_STATIC_SERVO_SERVICE_DELAY_S = 0.250
@@ -1179,7 +1181,7 @@ _stats_reset_in_progress = threading.Event()
 _dac_control_wakeup = threading.Event()
 _dac_control_thread_started = threading.Event()
 _dac_hardware_initialized = False
-_dac_dither_operator_enabled = False
+_dac_dither_operator_enabled = DAC_DITHER_DEFAULT_ENABLED
 _dac_servo_mode = "OFF"
 _dac_next_frame_monotonic = 0.0
 _dac_control_second = 0

@@ -70,7 +70,7 @@
 //     using the existing F_CPU_ACTUAL conversion to DWT cycles. START establishes
 //     the first origin; late service emits one pulse and starts a fresh interval;
 //   • measurement starts after recovery establishes statistical ancestry;
-//   • foreground publishes a configurable acquisition window (default 1-10000 ns) at each
+//   • foreground publishes a configurable acquisition window (default 1-200000 ns) at each
 //     launch, clipped before the cadence deadline. Bounds use the nominal DWT
 //     clock, independently of statistics/reset/recovery; science retains GNSS
 //     projection and delay classification after capture;

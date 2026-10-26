@@ -132,6 +132,15 @@ static constexpr uint64_t PHOTONS_CADENCE_MIN_NS =
 static_assert(PHOTONS_RACE_PULSE_NS > 0ULL &&
               PHOTONS_RACE_PULSE_NS < PHOTONS_CADENCE_MIN_NS,
               "PHOTONS pulse must fit the minimum cadence interval");
+// Every admitted cadence must finish the complete receive horizon and HIGH
+// capture residence before the next launch; the default remains 1000/s.
+static_assert((uint64_t)PHOTONS_RECEIVE_MAX_NS + PHOTONS_PD_OUT_ISR_BUDGET_NS <
+                  PHOTONS_CADENCE_MIN_NS,
+              "PHOTONS cadence must fit the full receive and ADC horizon");
+// LOW is scheduled relative to the learned return. Its target must remain inside
+// the TimePop precise-action contract (maximum 1 ms ahead of foreground).
+static_assert(PHOTONS_RECEIVE_MAX_NS < 1000000U,
+              "PHOTONS receive horizon must fit the LOW action scheduler");
 
 static constexpr uint32_t PHOTONS_RACE_HOLDOFF_NS = 0U; // retired wire field
 static bool g_photons_cadence_running = false;
