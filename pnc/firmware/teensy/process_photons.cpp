@@ -2852,18 +2852,23 @@ static uint32_t g_photons_histogram_snapshot_requested = 1U; // consumer writer
 // for reports and fragment assembly; every borrower is a scoped Payload, with
 // no persistent control object left referring to overwritten bytes. The guarded
 // canonical fragment root remains separate through publication and verification.
+//
+// This scratch is foreground-only, not a DMA or transport-owned buffer. The
+// transport copies serialized Payload bytes into its separate wire allocation.
+// Place these 26 KiB in DTCM (RAM1) instead of RAM2 to recover heap space; do
+// not move the raw acquisition rings, persistent histories, or wire buffers.
+// Recheck RAM1 stack margin and RAM2 heap after every firmware build.
 struct alignas(PHOTONS_RAM2_CACHE_LINE_BYTES) photons_serialization_store_t {
   // Fragment order: LOW/HIGH witness -> copy into pd_out -> destroy witness ->
-  // instrument -> copy into canonical root. This saves 16 KiB of static RAM2
-  // versus separate 16 KiB report and 20 KiB instrument stores, restoring heap
-  // space needed by recovery/diagnostic RPCs and their response envelopes.
+  // instrument -> copy into canonical root. Sharing scratch avoids separate
+  // report and instrument copies while preserving the same exact storage bounds.
   alignas(PHOTONS_RAM2_CACHE_LINE_BYTES) uint8_t root[20480];
   alignas(PHOTONS_RAM2_CACHE_LINE_BYTES) uint8_t population[2048];
   alignas(PHOTONS_RAM2_CACHE_LINE_BYTES) uint8_t bins[4096];
 };
-static photons_serialization_store_t g_photons_serialization_store DMAMEM;
+static photons_serialization_store_t g_photons_serialization_store;
 static_assert(sizeof(photons_serialization_store_t) == 26624U,
-              "Review the shared serialization RAM2 budget after layout changes");
+              "Review the shared serialization RAM1 budget after layout changes");
 
 static void photons_histogram_initialize_handoffs(void) {
   // RAM2 is NOLOAD. Construct lawful empty snapshot values explicitly before
