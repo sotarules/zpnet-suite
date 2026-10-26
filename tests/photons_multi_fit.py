@@ -13,10 +13,13 @@ from collections import defaultdict
 
 from zpnet.shared.report_db import add_read_arguments, validate_read_arguments, campaign_rows
 
+from zpnet.shared.photons_voltage import voltage_adjustment
+
 REF = 475.725600719
 HIGH60_ACQUISITION_IDS = {
     'PD200T_HIGH60_LINEAR_V1': 0x4E4F5232,  # HeatCool1 / NOR2
     'PD200T_HIGH60_LINEAR_V2': 0x4E4F5233,  # HighLow1 / NOR3
+    'PD200T_HIGH60_QUADRATIC_V1': 0x4E4F5234,  # HighLow2 trial / NOR4
 }
 
 
@@ -55,6 +58,9 @@ def observation(ident, p):
                 raise ValueError(f'{ident}: HIGH60 calibration/acquisition identity mismatch')
             if abs(voltage-float(norm['high_mv'])) > 1e-6:
                 raise ValueError(f'{ident}: HIGH60 predictor mismatch')
+        expected = voltage_adjustment(norm, norm['high_mv'])
+        if not math.isclose(float(norm['adjustment_ns']), expected, rel_tol=0.0, abs_tol=1e-6):
+            raise ValueError(f'{ident}: voltage formula closure failure')
         raw = norm['raw_flight_ns']
         n = int(raw['n'])
         if n == 0:
@@ -181,7 +187,7 @@ def main(argv):
     validate_read_arguments(parser, a)
     if len(set(a.campaigns)) != len(a.campaigns) or a.block_seconds < 10 or not math.isfinite(a.reference_mv):
         parser.error('invalid campaign names, block duration, or reference')
-    print('PHOTONS MULTI-CAMPAIGN HIGH60 REGRESSION 2026-10-25.1')
+    print('PHOTONS MULTI-CAMPAIGN HIGH60 REGRESSION 2026-10-26.2')
     print(f'READ ONLY; persisted HIGH60 direct; block={a.block_seconds}s reference={a.reference_mv:.9f}mV')
     rows = [r for name in a.campaigns for r in blocks(name,a.block_seconds,a)]
     counts = {name: sum(r[0] == name for r in rows) for name in a.campaigns}

@@ -63,6 +63,9 @@ from collections import deque
 
 from zpnet.processes.processes import PUBSUB_TAP_SOCKET, create_pubsub_cache, send_command
 from zpnet.shared.db import open_db
+from zpnet.shared.photons_voltage import (
+    QUADRATIC_MODEL, voltage_adjustment, voltage_local_slope,
+)
 
 # AD5693R doctrine mirrors Pi CLOCKS, the sole actuator authority:
 # internal 2.5 V reference, 2x gain, nominal 0..5 V output span, with the
@@ -1197,10 +1200,57 @@ def photons_temperature_block(snapshot: dict) -> list[str]:
            if has_campaign else "")
     )
 
-    # The active linear model commutes with the HIGH60 population means.
+    normalization = snapshot["photons"]["voltage_normalization"]
+    if normalization["model_id"] == QUADRATIC_MODEL:
+        # A quadratic of mean voltage is not the mean correction. Read the
+        # actual per-fragment ADJ populations, including their own campaign SD.
+        if data and "adjustment" not in totals:
+            raise ValueError("NOR4 metrics requires actual adjustment populations")
+        def adj_cell(value, width=12):
+            if value is None:
+                return f"{'---':>{width}}"
+            value = float(value)
+            if not math.isfinite(value):
+                raise ValueError("PHOTONS adjustment population must be finite")
+            return f"{value:+{width}.6f}"
+
+        adj_campaign = campaigns.get("adjustment") or {}
+        adj_now = (normalization["adjustment_ns"]
+                   if normalization["raw_flight_ns"]["n"] > 0 else None)
+        lines.append(
+            f"{'ADJ':<8} " + adj_cell(adj_now)
+            + ''.join(" " + adj_cell(((windows.get(span) or {}).get("adjustment") or {}).get("mean_ns"))
+                      for span, _ in spans)
+            + " " + adj_cell((totals.get("adjustment") or {}).get("mean_ns"))
+            + ((" " + adj_cell(adj_campaign.get("mean_ns"))
+                + " " + observed(adj_campaign.get("sd_ns"), 6, 10)) if has_campaign else "")
+        )
+    else:
+        _photons_linear_adjustment_row(lines, normalization, high_now, windows, spans,
+                                       totals, population, has_campaign, observed)
+
+    # The separate SENSOR section contains only the three BME280 channels.
+    # These are their latest physical RH, pressure and barometric altitude
+    # readings, not derived temperature statistics and not statistical means.
+    lines.extend(["", f"{'SENSOR':<12} {'RH(%)':>9} {'BARO(HPA)':>11} {'BARO_ALT(M)':>12}"])
+    for key, label in (("pi", "BME280 PI"), ("pd", "BME280 PD"),
+                       ("out", "BME280 OUT")):
+        reading = environment.get(key) or {}
+        valid = reading.get("status") == "OK"
+        lines.append(
+            f"{label:<12} "
+            + observed(reading.get("humidity_pct") if valid else None, 2, 9)
+            + " " + observed(reading.get("pressure_hpa") if valid else None, 2, 11)
+            + " " + observed(reading.get("altitude_m") if valid else None, 1, 12)
+        )
+    return lines
+
+
+def _photons_linear_adjustment_row(lines, normalization, high_now, windows, spans,
+                                    totals, population, has_campaign, observed):
+    # Historical linear models commute with the HIGH60 population means.
     # Derive these cells from the full-precision published mV values, never
     # from rounded display text or repaint history. CAMP_SD scales by |slope|.
-    normalization = snapshot["photons"]["voltage_normalization"]
     if normalization["model_id"] not in ("PD200T_HIGH60_LINEAR_V1", "PD200T_HIGH60_LINEAR_V2"):
         raise ValueError("PHOTONS ADJ buckets require a linear HIGH60 calibration")
     factor = float(normalization["slope_ns_per_mv"])
@@ -1228,23 +1278,6 @@ def photons_temperature_block(snapshot: dict) -> list[str]:
         + ((" " + adjustment(population.get("mean_mv"))
             + " " + observed(adjustment_sd, 6, 10)) if has_campaign else "")
     )
-
-    # The separate SENSOR section contains only the three BME280 channels.
-    # These are their latest physical RH, pressure and barometric altitude
-    # readings, not derived temperature statistics and not statistical means.
-    lines.extend(["", f"{'SENSOR':<12} {'RH(%)':>9} {'BARO(HPA)':>11} {'BARO_ALT(M)':>12}"])
-    for key, label in (("pi", "BME280 PI"), ("pd", "BME280 PD"),
-                       ("out", "BME280 OUT")):
-        reading = environment.get(key) or {}
-        valid = reading.get("status") == "OK"
-        lines.append(
-            f"{label:<12} "
-            + observed(reading.get("humidity_pct") if valid else None, 2, 9)
-            + " " + observed(reading.get("pressure_hpa") if valid else None, 2, 11)
-            + " " + observed(reading.get("altitude_m") if valid else None, 1, 12)
-        )
-    return lines
-
 
 # ---------------------------------------------------------------------
 # Welford row renderer — reads firmware-owned statistics verbatim
@@ -2310,7 +2343,7 @@ def _get_photons_rolling_payloads() -> list[dict]:
 def _photons_rolling_rows(payloads: list[dict]) -> list[dict]:
     """Expose each second's raw mean and firmware HIGH60 correction verbatim.
 
-    FACT is the published slope in ns/mV; ADJ is the signed offset added to RAW.
+    FACT is the local derivative d(ADJ)/d(HIGH60) in ns/mV; ADJ is the signed offset added to RAW.
     Metrics checks that testimony but never applies a second correction.
     """
     rows = []
@@ -2328,7 +2361,7 @@ def _photons_rolling_rows(payloads: list[dict]) -> list[dict]:
         high_warming = high_window["elapsed_ms"] < high_window["target_ms"]
         normalization = current["photons"]["voltage_normalization"]
         if (normalization["schema"] != "PHOTONS_VOLTAGE_NORMALIZATION_V1"
-                or normalization["model_id"] not in ("PD200T_HIGH60_LINEAR_V1", "PD200T_HIGH60_LINEAR_V2")
+                or normalization["model_id"] not in ("PD200T_HIGH60_LINEAR_V1", "PD200T_HIGH60_LINEAR_V2", QUADRATIC_MODEL)
                 or normalization["application"] != "UNIFORM_OFFSET_AT_FRAGMENT_DRAIN"
                 or normalization["voltage_source"] != "PD_OUT_HIGH60_MV"):
             raise ValueError("PHOTONS rolling rows require firmware HIGH60 normalization")
@@ -2336,10 +2369,11 @@ def _photons_rolling_rows(payloads: list[dict]) -> list[dict]:
         published = normalization["published_flight_ns"]
         if raw["n"] != n or published != current["photons"]["race"]["flight_ns"]:
             raise ValueError("PHOTONS rolling raw/normalized populations disagree")
-        factor = float(normalization["slope_ns_per_mv"])
+        factor = (voltage_local_slope(normalization, normalization["high_mv"])
+                  if high_mv is not None else None)
         reference = float(normalization["reference_mv"])
         adjustment = float(normalization["adjustment_ns"])
-        if not all(math.isfinite(v) for v in (factor, reference, adjustment)):
+        if not all(math.isfinite(v) for v in (reference, adjustment)):
             raise ValueError("PHOTONS normalization coefficients/adjustment must be finite")
         if normalization["high60_sample_count"] != high_window["sample_count"]:
             raise ValueError("PHOTONS normalization and HIGH60 sample counts disagree")
@@ -2351,7 +2385,7 @@ def _photons_rolling_rows(payloads: list[dict]) -> list[dict]:
             if not math.isclose(float(normalization["high_mv"]), float(high_mv),
                                 rel_tol=0.0, abs_tol=1e-6):
                 raise ValueError("PHOTONS correction predictor differs from displayed HIGH60")
-            if not math.isclose(adjustment, factor * (float(high_mv) - reference),
+            if not math.isclose(adjustment, voltage_adjustment(normalization, normalization["high_mv"]),
                                 rel_tol=0.0, abs_tol=1e-6):
                 raise ValueError("PHOTONS HIGH60 formula does not close")
             if not math.isclose(raw_mean + adjustment, stats["mean"],

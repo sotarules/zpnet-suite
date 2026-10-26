@@ -40,10 +40,10 @@
 static constexpr uint64_t PHOTONS_FRAGMENT_PERIOD_NS = 1000000000ULL;
 static constexpr uint64_t PHOTONS_NS_PER_SECOND = 1000000000ULL;
 
-// HighLow1 revises the HIGH60 coefficient. NOR3 starts fresh corrected
-// numerator/Welford/Better-Buckets custody; never restore NOR1/NOR2 populations
-// into this calibration. Original DWT and per-fragment raw evidence stay raw.
-static constexpr uint32_t PHOTONS_ACQUISITION_ID = 0x4E4F5233UL; // 'NOR3'
+// HighLow2 quadratic trial. NOR4 starts fresh corrected numerator/Welford/
+// Better-Buckets custody; never restore earlier corrected populations into
+// this calibration. Original DWT and per-fragment raw evidence stay raw.
+static constexpr uint32_t PHOTONS_ACQUISITION_ID = 0x4E4F5234UL; // 'NOR4'
 
 
 // i.MX RT1062 RAM2 is write-back cached in 32-byte lines.  PHOTONS places only
@@ -2398,13 +2398,18 @@ static FLASHMEM void photons_envelope_finish(const photons_race_batch_t& batch,
 }
 
 
-// Provisional HighLow1 fit, 2026-10-22: 185 nonoverlapping 60-second blocks,
-// HIGH60 block means 455.031..461.469 mV. Linear correction of the RAW batch
-// mean; no individual-race correction or additional LOW/temperature term.
-// Same reference as NOR2; the revised slope intentionally changes the absolute
-// normalized level. Retrospective fit only: validate on a fresh thermal cycle.
-static constexpr Double PHOTONS_HIGH_REFERENCE_MV = 475.725600719_D;
-static constexpr Double PHOTONS_HIGH_SLOPE_NS_PER_MV = 0.342185418750_D;
+// Provisional HighLow2 trial, 2026-10-26. Coefficients frozen from the first
+// 70% of the pre-outage time span: 2782 complete 60-second development blocks.
+// Features evaluated per second before pooling; later 30% reserved for testing.
+// Development block-mean HIGH60 range: 438.3795..465.7743 mV (not a clamp).
+// ADJ = offset + slope*x + quadratic*x*x; x = authoritative HIGH60 - 455 mV.
+// Offset matches NOR3 at 455 mV; this is not an absolute flight-time calibration.
+// No individual-race, LOW, temperature, or rate correction. New hardware and
+// thermal cycles require fresh validation; never refit or clamp at runtime.
+static constexpr Double PHOTONS_HIGH_REFERENCE_MV = 455_D;
+static constexpr Double PHOTONS_HIGH_OFFSET_NS = -7.091998360876317_D;
+static constexpr Double PHOTONS_HIGH_SLOPE_NS_PER_MV = 0.36537694032628687_D;
+static constexpr Double PHOTONS_HIGH_QUADRATIC_NS_PER_MV2 = -0.004691243835679416_D;
 
 // Shared authoritative conversion for the Metrics HIGH60 publication and the
 // scientific correction. Never construct a second rolling voltage estimator.
@@ -2429,8 +2434,10 @@ photons_voltage_normalization(const photons_pd_out_batch_t& batch) {
     // During the initial <60 s the identical HIGH60 witness is partial;
     // document its maturity rather than silently substituting fragment HIGH.
     n.high_mv = photons_high60_mean_mv(window);
-    n.adjustment_ns = PHOTONS_HIGH_SLOPE_NS_PER_MV *
-                      (n.high_mv - PHOTONS_HIGH_REFERENCE_MV);
+    const Double x = n.high_mv - PHOTONS_HIGH_REFERENCE_MV;
+    n.adjustment_ns = PHOTONS_HIGH_OFFSET_NS +
+                     x * (PHOTONS_HIGH_SLOPE_NS_PER_MV +
+                          PHOTONS_HIGH_QUADRATIC_NS_PER_MV2 * x);
   }
   return n;
 }
@@ -5076,7 +5083,7 @@ static Payload& photons_fragment_payload(
   instrument.add_object("race", race);
   race.clear();
   voltage_normalization.add("schema", "PHOTONS_VOLTAGE_NORMALIZATION_V1");
-  voltage_normalization.add("model_id", "PD200T_HIGH60_LINEAR_V2");
+  voltage_normalization.add("model_id", "PD200T_HIGH60_QUADRATIC_V1");
   voltage_normalization.add("application", "UNIFORM_OFFSET_AT_FRAGMENT_DRAIN");
   voltage_normalization.add("voltage_source", "PD_OUT_HIGH60_MV");
   voltage_normalization.add("adc_sample_count", f.voltage_normalization.adc_sample_count);
@@ -5087,6 +5094,8 @@ static Payload& photons_fragment_payload(
   voltage_normalization.add("high_mv", toScientificDecimal(f.voltage_normalization.high_mv));
   voltage_normalization.add("reference_mv", toScientificDecimal(PHOTONS_HIGH_REFERENCE_MV));
   voltage_normalization.add("slope_ns_per_mv", toScientificDecimal(PHOTONS_HIGH_SLOPE_NS_PER_MV));
+  voltage_normalization.add("offset_ns", toScientificDecimal(PHOTONS_HIGH_OFFSET_NS));
+  voltage_normalization.add("quadratic_ns_per_mv2", toScientificDecimal(PHOTONS_HIGH_QUADRATIC_NS_PER_MV2));
   voltage_normalization.add("adjustment_ns",
                             toScientificDecimal(f.voltage_normalization.adjustment_ns));
   photons_payload_add_welford(voltage_normalization, "raw_flight_ns",

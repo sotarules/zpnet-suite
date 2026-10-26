@@ -31,13 +31,18 @@ from datetime import datetime, timezone
 
 from zpnet.shared.report_db import add_read_arguments, validate_read_arguments, campaign_rows
 
-VERSION = '2026-10-25.1'
+VERSION = '2026-10-26.2'
 SCHEMA = 'PHOTONS_V1'
 FIRMWARE_SCHEMA = 'PHOTONS_VOLTAGE_NORMALIZATION_V1'
+from zpnet.shared.photons_voltage import (
+    voltage_adjustment, voltage_local_slope, voltage_coefficient_fields,
+)
+
 MODELS = {
     'PD200T_HIGH_LINEAR_V1': ('FRAGMENT_HIGH_MV', 0x4E4F5231),  # historical NOR1
     'PD200T_HIGH60_LINEAR_V1': ('PD_OUT_HIGH60_MV', 0x4E4F5232), # NOR2
     'PD200T_HIGH60_LINEAR_V2': ('PD_OUT_HIGH60_MV', 0x4E4F5233), # NOR3
+    'PD200T_HIGH60_QUADRATIC_V1': ('PD_OUT_HIGH60_MV', 0x4E4F5234), # NOR4
 }
 APPLICATION = 'UNIFORM_OFFSET_AT_FRAGMENT_DRAIN'
 ADC_SCALE_MV = 3300.0 / 4095.0
@@ -51,6 +56,7 @@ MODEL_FIT_RANGES_MV = {
     'PD200T_HIGH_LINEAR_V1': (V1_FIT_LOW_MV, V1_FIT_HIGH_MV),
     'PD200T_HIGH60_LINEAR_V1': (V1_FIT_LOW_MV, V1_FIT_HIGH_MV),
     'PD200T_HIGH60_LINEAR_V2': (455.031, 461.469),
+    'PD200T_HIGH60_QUADRATIC_V1': (438.3795, 465.7743),
 }
 # The Teensy carries sixteen significant decimal digits; these tolerances
 # cover representation rounding, not unmodeled physical measurement noise.
@@ -178,7 +184,7 @@ def parse_row(row_id, campaign, payload):
         raise ValueError('unexpected Pi normalized-measurement status')
     if policy['schema'] != FIRMWARE_SCHEMA or policy['normalization_id'] != fw['model_id']:
         raise ValueError('Pi normalization policy identity mismatch')
-    for key in ('application', 'reference_mv', 'slope_ns_per_mv'):
+    for key in ('application', *voltage_coefficient_fields(fw['model_id'])):
         if str(policy[key]) != str(fw[key]):
             raise ValueError('Pi/Teensy normalization policy disagrees: ' + key)
     if source == 'PD_OUT_HIGH60_MV' and policy.get('voltage_source') != source:
@@ -189,11 +195,11 @@ def parse_row(row_id, campaign, payload):
     if adc_n != int(fw['adc_sample_count']):
         raise ValueError('voltage witness ADC N differs from PD OUT sample N')
     ref = finite(fw['reference_mv'], 'reference_mv')
-    slope = finite(fw['slope_ns_per_mv'], 'slope_ns_per_mv')
     voltage = finite(fw['high_mv'], 'high_mv')
+    slope = voltage_local_slope(fw, voltage)
     adjustment = finite(fw['adjustment_ns'], 'adjustment_ns')
     # The current-fragment ADC population stays an independent acquisition
-    # witness. It is NOT the NOR2/NOR3 voltage predictor.
+    # witness. It is NOT the NOR2/NOR3/NOR4 voltage predictor.
     if adc_n:
         frag_sum = int(pd['high_sum_counts'])
         frag_squares = int(pd['high_sum_squares_counts'])
@@ -236,7 +242,7 @@ def parse_row(row_id, campaign, payload):
                             (window_n * (window_n - 1))) * ADC_SCALE_MV
                   if window_n > 1 else 0.0)
         adc_se = adc_sd / math.sqrt(window_n) if window_n > 1 else 0.0
-        expect_close(adjustment, slope * (voltage - ref), 'linear formula')
+        expect_close(adjustment, voltage_adjustment(fw, voltage), 'voltage polynomial')
     else:
         if voltage != 0 or adjustment != 0:
             raise ValueError('zero predictor population published nonzero correction')
@@ -343,9 +349,9 @@ def print_report(args, rows, older, failures):
     print(f'PHOTONS VOLTAGE NORMALIZATION WITNESS {VERSION}')
     print(f'Generated UTC: {datetime.now(timezone.utc).isoformat(timespec="seconds")}')
     print(f'Source: read-only campaign_detail; latest {args.rows} LANTERN rows; campaign={args.campaign or "ALL (including STOPPED)"}')
-    print('Models: NOR1=fragment HIGH; NOR2=HeatCool1 HIGH60; NOR3=HighLow1 HIGH60; Teensy applies correction')
+    print('Models: NOR1=fragment HIGH; NOR2=HeatCool1 HIGH60; NOR3=HighLow1 linear; NOR4=HighLow2 quadratic HIGH60; Teensy applies correction')
     print('HIGH60 is read directly from persisted photons.pd_out.high_window; no reconstructed filter.')
-    print('Fit ranges are model-specific; NOR3 uses the reported HighLow1 block-mean range (approximate).')
+    print('Fit ranges are model-specific block-mean ranges; NOR4 uses development data only (approximate).')
     print(f'Rows: normalized={len(rows)}; older/unmodeled={older}; closure_errors={len(failures)}')
     for ident, why in failures[:20]:
         print(f'  FAIL id={ident}: {why}')
@@ -394,6 +400,7 @@ def print_report(args, rows, older, failures):
     print('\nCLOSURE: raw + adjustment = published; N/M2/SD/SE preserved; Pi/Teensy/model identities agree.')
     print('* Predictor-sample SE assumes independent ADC samples; overlapping HIGH60 windows are correlated.')
     print('  Between-fragment SD is descriptive; HIGH60 windows overlap and can lag a thermal ramp.')
+    print('  Correction SE uses the local derivative (first-order propagation for NOR4).')
     print('  One correction per fragment cannot reduce within-fragment SD. Coefficients are still provisional.')
     print('  No database records, producer state, or normalization coefficients were modified.')
 
