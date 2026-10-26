@@ -53,9 +53,11 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
+from zpnet.shared.report_db import add_read_arguments, validate_read_arguments, campaign_rows
+
 SCHEMA = "PHOTONS_V1"
 MIN_FIT = 3
-VERSION = "2026-10-22.1"
+VERSION = "2026-10-25.1"
 FIRMWARE_ACQUISITION_IDS = {
     "PD200T_HIGH_LINEAR_V1": 0x4E4F5231,
     "PD200T_HIGH60_LINEAR_V1": 0x4E4F5232,
@@ -367,66 +369,55 @@ def parse_sample(row_id: int, p: Dict[str, Any], sensor: str = "synthetic") -> T
     ), "used"
 
 
-def database_rows(args: argparse.Namespace) -> Iterable[Tuple[int, Dict[str, Any]]]:
-    from zpnet.shared.db import open_db
 
-    # Project just the analysis surface; do not transfer large recovery rings
-    # or cumulative science populations. Keep the exact campaign predicate.
-    sql = """
-        SELECT id, jsonb_build_object(
-            'schema', payload -> 'schema',
-            'sequence', payload -> 'sequence',
-            'published_at_utc', payload -> 'published_at_utc',
-            'temperature', payload -> 'temperature',
-            'environment', payload -> 'environment',
-            'receiver', payload -> 'receiver',
-            'normalization', payload -> 'normalization',
-            'measurement', payload -> 'measurement',
-            'recovery_receipt', payload -> 'recovery_receipt',
+def database_rows(args: argparse.Namespace) -> Iterable[Tuple[int, Dict[str, Any]]]:
+    projection = """
+        SELECT id, schema #>> '{}' AS report_schema, jsonb_build_object(
+            'schema', schema,
+            'sequence', sequence,
+            'published_at_utc', published_at_utc,
+            'temperature', temperature,
+            'environment', environment,
+            'receiver', receiver,
+            'normalization', normalization,
+            'measurement', measurement,
+            'recovery_receipt', recovery_receipt,
             'photons', jsonb_build_object(
-                'snapshot_ok', payload #> '{photons,snapshot_ok}',
-                'fragment_period_ns', payload #> '{photons,fragment_period_ns}',
-                'fragment_elapsed_ms', payload #> '{photons,fragment_elapsed_ms}',
-                'pd_out', payload #> '{photons,pd_out}',
-                'voltage_normalization', payload #> '{photons,voltage_normalization}',
+                'snapshot_ok', photons #> '{snapshot_ok}',
+                'fragment_period_ns', photons #> '{fragment_period_ns}',
+                'fragment_elapsed_ms', photons #> '{fragment_elapsed_ms}',
+                'pd_out', photons #> '{pd_out}',
+                'voltage_normalization', photons #> '{voltage_normalization}',
                 'stats', jsonb_build_object(
-                    'reset_count', payload #> '{photons,stats,reset_count}',
-                    'update_count', payload #> '{photons,stats,update_count}',
-                    'acquisition_id', payload #> '{photons,stats,acquisition_id}',
-                    'normalization_id', payload #> '{photons,stats,normalization_id}',
-                    'normalization_correction_fs', payload #> '{photons,stats,normalization_correction_fs}',
-                    'normalization_temperature_micro_c', payload #> '{photons,stats,normalization_temperature_micro_c}',
-                    'normalization_update_age_ms', payload #> '{photons,stats,normalization_update_age_ms}'),
-                'recovery', jsonb_build_object('generation', payload #> '{photons,recovery,generation}'),
-                'projection', jsonb_build_object('anchor_pps_count', payload #> '{photons,projection,anchor_pps_count}'),
-                'core', payload #> '{photons,core}',
+                    'reset_count', photons #> '{stats,reset_count}',
+                    'update_count', photons #> '{stats,update_count}',
+                    'acquisition_id', photons #> '{stats,acquisition_id}',
+                    'normalization_id', photons #> '{stats,normalization_id}',
+                    'normalization_correction_fs', photons #> '{stats,normalization_correction_fs}',
+                    'normalization_temperature_micro_c', photons #> '{stats,normalization_temperature_micro_c}',
+                    'normalization_update_age_ms', photons #> '{stats,normalization_update_age_ms}'),
+                'recovery', jsonb_build_object('generation', photons #> '{recovery,generation}'),
+                'projection', jsonb_build_object('anchor_pps_count', photons #> '{projection,anchor_pps_count}'),
+                'core', photons #> '{core}',
                 'race', jsonb_build_object(
-                    'active', payload #> '{photons,race,active}',
-                    'flight_ns', payload #> '{photons,race,flight_ns}',
-                    'schema', payload #> '{photons,race,schema}',
-                    'cadence_ns', payload #> '{photons,race,cadence_ns}',
-                    'pulse_ns', payload #> '{photons,race,pulse_ns}',
-                    'capture_gate', payload #> '{photons,race,capture_gate}',
-                    'capture_min_ns', payload #> '{photons,race,capture_min_ns}',
-                    'capture_max_ns', payload #> '{photons,race,capture_max_ns}',
-                    'launch_bracket_max_cycles', payload #> '{photons,race,launch_bracket_max_cycles}',
-                    'flight_interpretation', payload #> '{photons,race,flight_interpretation}',
-                    'launch_timing_policy', payload #> '{photons,race,launch_timing_policy}'
+                    'active', photons #> '{race,active}',
+                    'flight_ns', photons #> '{race,flight_ns}',
+                    'schema', photons #> '{race,schema}',
+                    'cadence_ns', photons #> '{race,cadence_ns}',
+                    'pulse_ns', photons #> '{race,pulse_ns}',
+                    'capture_gate', photons #> '{race,capture_gate}',
+                    'capture_min_ns', photons #> '{race,capture_min_ns}',
+                    'capture_max_ns', photons #> '{race,capture_max_ns}',
+                    'launch_bracket_max_cycles', photons #> '{race,launch_bracket_max_cycles}',
+                    'flight_interpretation', photons #> '{race,flight_interpretation}',
+                    'launch_timing_policy', photons #> '{race,launch_timing_policy}'
                 )
             )
         ) AS thermal_payload
-        FROM campaign_detail
-        WHERE campaign_type = %s AND campaign = %s AND payload ->> 'schema' = %s
-        ORDER BY id ASC
     """
-    with open_db(row_dict=True) as conn:
-        conn.execute("SET TRANSACTION READ ONLY")
-        cur = conn.cursor(name="photons_thermal")
-        cur.itersize = args.batch_size
-        cur.execute(sql, ("LANTERN", args.campaign, SCHEMA))
-        for row in cur:
-            p = row["thermal_payload"]
-            yield int(row["id"]), json.loads(p) if isinstance(p, str) else p
+    for row in campaign_rows(args.campaign, projection, args):
+        p = row['thermal_payload']
+        yield int(row['id']), json.loads(p) if isinstance(p, str) else p
 
 
 def file_rows(path: Path, campaign: str) -> Iterable[Tuple[int, Dict[str, Any]]]:
@@ -519,7 +510,9 @@ def collect(rows: Iterable[Tuple[int, Dict[str, Any]]], args: argparse.Namespace
                 counts["continuity_breaks"] += 1
                 counts["counter_gap_breaks"] += int(counter_gap)
                 counts["publication_timing_breaks"] += int(publication_gap)
-        sample = replace(sample, epoch=epoch, run=run)
+        # Settings signatures are large and usually identical for an entire epoch.
+        signature = prev.signature if prev is not None and sample.signature == prev.signature else sample.signature
+        sample = replace(sample, epoch=epoch, run=run, signature=signature)
         samples.append(sample)
         prev = sample
         counts["used"] += 1
@@ -1017,8 +1010,9 @@ def arguments(argv):
     parser.add_argument('--skip-seconds',type=int,default=0,help='omit initial campaign seconds (default 0)')
     parser.add_argument('--start',type=utc,help='inclusive UTC/offset timestamp')
     parser.add_argument('--end',type=utc,help='exclusive UTC/offset timestamp')
-    parser.add_argument('--batch-size',type=int,default=512)
+    add_read_arguments(parser)
     args = parser.parse_args(argv[1:])
+    validate_read_arguments(parser, args)
     if min(args.bin_seconds,args.batch_size)<1 or min(args.max_lag_seconds,args.skip_seconds)<0:
         parser.error('block/batch size must be positive; lag/skip must be nonnegative')
     if args.sensor == 'high' and args.max_lag_seconds:
@@ -1078,6 +1072,7 @@ def main(argv):
             sensor_args.sensor = sensor
             selected = [replace(s, temperature=dict(s.sensor_temperatures)[sensor]) for s in observations]
             analyze(selected,reasons[epoch],sensor_args)
+            del selected
     print('\nREPORT NOTES')
     print('  Epochs are fitted separately across recorded settings/calibration/predictor changes, resets and recovery.')
     print('  Deployed = recorded normalized LAP; uncorrected = direct raw witness, original legacy LAP or reconstructed legacy LAP.')
@@ -1094,3 +1089,4 @@ def main(argv):
 
 if __name__ == '__main__':
     raise SystemExit(main(sys.argv))
+

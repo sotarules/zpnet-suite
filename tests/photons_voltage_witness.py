@@ -29,8 +29,9 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-VERSION = '2026-10-24.1'
-DATABASE_BATCH_ROWS = 256
+from zpnet.shared.report_db import add_read_arguments, validate_read_arguments, campaign_rows
+
+VERSION = '2026-10-25.1'
 SCHEMA = 'PHOTONS_V1'
 FIRMWARE_SCHEMA = 'PHOTONS_VOLTAGE_NORMALIZATION_V1'
 MODELS = {
@@ -91,77 +92,41 @@ def arguments(argv):
                    help='select exact persisted campaign name; default includes campaign-less observations')
     p.add_argument('--jsonl', action='store_true',
                    help='print structured row and summary results as JSON lines')
+    add_read_arguments(p)
     args = p.parse_args(argv[1:])
+    validate_read_arguments(p, args)
     if args.rows < 1 or args.show < 0:
         p.error('--rows must be positive and --show must be nonnegative')
     return args
 
 
 def database_rows(args):
-    from zpnet.shared.db import open_db
-
-    # Bound JSON extraction work per statement. Select indexed identities
-    # before touching the large payloads; filtering schema in SQL would force
-    # PostgreSQL to inspect payloads beyond the batch while filling LIMIT.
-    # Descending keyset pagination excludes later inserts without OFFSET scans.
     projection = """
-        SELECT id, campaign,
+        SELECT id, schema #>> '{}' AS report_schema, campaign,
                jsonb_build_object(
-                   'schema', payload -> 'schema',
-                   'sequence', payload -> 'sequence',
-                   'published_at_utc', payload -> 'published_at_utc',
-                   'normalization', payload -> 'normalization',
-                   'measurement', payload -> 'measurement',
+                   'schema', schema,
+                   'sequence', sequence,
+                   'published_at_utc', published_at_utc,
+                   'normalization', normalization,
+                   'measurement', measurement,
                    'photons', jsonb_build_object(
-                       'fragment_elapsed_ms', payload #> '{photons,fragment_elapsed_ms}',
-                       'pd_out', payload #> '{photons,pd_out}',
-                       'voltage_normalization', payload #> '{photons,voltage_normalization}',
+                       'fragment_elapsed_ms', photons #> '{fragment_elapsed_ms}',
+                       'pd_out', photons #> '{pd_out}',
+                       'voltage_normalization', photons #> '{voltage_normalization}',
                        'race', jsonb_build_object(
-                           'flight_ns', payload #> '{photons,race,flight_ns}'
+                           'flight_ns', photons #> '{race,flight_ns}'
                        ),
                        'stats', jsonb_build_object(
-                           'acquisition_id', payload #> '{photons,stats,acquisition_id}',
-                           'reset_count', payload #> '{photons,stats,reset_count}'
+                           'acquisition_id', photons #> '{stats,acquisition_id}',
+                           'reset_count', photons #> '{stats,reset_count}'
                        )
                    )
                ) AS witness
-        FROM page
-        ORDER BY id DESC
     """
-    found = []
-    before_id = None
-    while len(found) < args.rows:
-        sql = """
-            WITH page AS MATERIALIZED (
-                SELECT id, campaign, payload
-                FROM campaign_detail
-                WHERE campaign_type = %s
-        """
-        params = ['LANTERN']
-        if args.campaign is not None:
-            sql += ' AND campaign = %s'
-            params.append(args.campaign)
-        if before_id is not None:
-            sql += ' AND id < %s'
-            params.append(before_id)
-        sql += ' ORDER BY id DESC LIMIT %s) ' + projection
-        params.append(min(DATABASE_BATCH_ROWS, args.rows - len(found)))
-        # Release each read transaction before parsing or issuing the next
-        # batch. Keep the shared connection, lock and statement timeout policy.
-        with open_db(row_dict=True) as conn:
-            conn.execute('SET TRANSACTION READ ONLY')
-            with conn.cursor() as cur:
-                cur.execute(sql, params)
-                batch = cur.fetchall()
-        if not batch:
-            break
-        before_id = int(batch[-1]['id'])
-        for row in batch:
-            value = row['witness']
-            payload = json.loads(value) if isinstance(value, str) else value
-            if payload.get('schema') == SCHEMA:
-                found.append((int(row['id']), row['campaign'], payload))
-    yield from reversed(found)
+    for row in campaign_rows(args.campaign, projection, args, descending=True, limit=args.rows):
+        value = row['witness']
+        payload = json.loads(value) if isinstance(value, str) else value
+        yield int(row['id']), row['campaign'], payload
 
 
 def finite(value, label):
@@ -453,6 +418,9 @@ def main(argv):
         print(f'PHOTONS VOLTAGE WITNESS DATABASE ERROR: {error}', file=sys.stderr)
         return 2
 
+    # Parse newest-first without retaining JSON; report chronologically as before.
+    records.reverse()
+    failures.reverse()
     if args.jsonl:
         for r in records:
             print(json.dumps({'kind': 'row', **r.__dict__}, separators=(',', ':')))
@@ -467,3 +435,4 @@ def main(argv):
 
 if __name__ == '__main__':
     raise SystemExit(main(sys.argv))
+

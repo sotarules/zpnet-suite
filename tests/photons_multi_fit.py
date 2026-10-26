@@ -11,6 +11,8 @@ import statistics as st
 import sys
 from collections import defaultdict
 
+from zpnet.shared.report_db import add_read_arguments, validate_read_arguments, campaign_rows
+
 REF = 475.725600719
 HIGH60_ACQUISITION_IDS = {
     'PD200T_HIGH60_LINEAR_V1': 0x4E4F5232,  # HeatCool1 / NOR2
@@ -18,28 +20,22 @@ HIGH60_ACQUISITION_IDS = {
 }
 
 
-def get_rows(name):
-    from zpnet.shared.db import open_db
-    sql = '''SELECT id, jsonb_build_object(
-      'time',payload->'published_at_utc', 'sequence',payload->'sequence',
+def get_rows(name, args):
+    projection = """
+        SELECT id, schema #>> '{}' AS report_schema, jsonb_build_object(
+      'time',published_at_utc, 'sequence',sequence,
       'photons',jsonb_build_object(
-        'snapshot_ok',payload#>'{photons,snapshot_ok}',
-        'fragment_elapsed_ms',payload#>'{photons,fragment_elapsed_ms}',
-        'stats',jsonb_build_object('reset_count',payload#>'{photons,stats,reset_count}',
-                                  'acquisition_id',payload#>'{photons,stats,acquisition_id}'),
-        'high_window',payload#>'{photons,pd_out,high_window}',
-        'normalization',payload#>'{photons,voltage_normalization}',
-        'flight',payload#>'{photons,race,flight_ns}'),
-        'measurement',payload->'measurement') AS p
-      FROM campaign_detail WHERE campaign_type='LANTERN' AND campaign=%s
-        AND payload->>'schema'='PHOTONS_V1' ORDER BY id'''
-    with open_db(row_dict=True) as db:
-        db.execute('SET TRANSACTION READ ONLY')
-        cur = db.cursor(name='multi_fit')
-        cur.itersize = 1000
-        cur.execute(sql, (name,))
-        for row in cur:
-            yield row['id'], json.loads(row['p']) if isinstance(row['p'], str) else row['p']
+        'snapshot_ok',photons #> '{snapshot_ok}',
+        'fragment_elapsed_ms',photons #> '{fragment_elapsed_ms}',
+        'stats',jsonb_build_object('reset_count',photons #> '{stats,reset_count}',
+                                  'acquisition_id',photons #> '{stats,acquisition_id}'),
+        'high_window',photons #> '{pd_out,high_window}',
+        'normalization',photons #> '{voltage_normalization}',
+        'flight',photons #> '{race,flight_ns}'),
+        'measurement',measurement) AS p
+    """
+    for row in campaign_rows(name, projection, args):
+        yield row['id'], json.loads(row['p']) if isinstance(row['p'], str) else row['p']
 
 
 def observation(ident, p):
@@ -83,7 +79,7 @@ def observation(ident, p):
             voltage,raw_mean,float(pub['mean']),n,int(f['fragment_elapsed_ms'])/1000)
 
 
-def blocks(name, seconds):
+def blocks(name, seconds, args):
     output, group, previous = [], [], None
     seen, omitted = 0, 0
     def flush():
@@ -98,7 +94,7 @@ def blocks(name, seconds):
             else:
                 omitted += len(group)
             group = []
-    for ident,p in get_rows(name):
+    for ident,p in get_rows(name, args):
         seen += 1
         r = observation(ident,p)
         if r is None:
@@ -180,12 +176,14 @@ def main(argv):
     parser.add_argument('--block-seconds',type=int,default=300)
     parser.add_argument('--max-degree',type=int,choices=(1,2,3),default=3)
     parser.add_argument('--reference-mv',type=float,default=REF)
+    add_read_arguments(parser)
     a = parser.parse_args(argv[1:])
+    validate_read_arguments(parser, a)
     if len(set(a.campaigns)) != len(a.campaigns) or a.block_seconds < 10 or not math.isfinite(a.reference_mv):
         parser.error('invalid campaign names, block duration, or reference')
-    print('PHOTONS MULTI-CAMPAIGN HIGH60 REGRESSION 2026-10-22.1')
+    print('PHOTONS MULTI-CAMPAIGN HIGH60 REGRESSION 2026-10-25.1')
     print(f'READ ONLY; persisted HIGH60 direct; block={a.block_seconds}s reference={a.reference_mv:.9f}mV')
-    rows = [r for name in a.campaigns for r in blocks(name,a.block_seconds)]
+    rows = [r for name in a.campaigns for r in blocks(name,a.block_seconds,a)]
     counts = {name: sum(r[0] == name for r in rows) for name in a.campaigns}
     if any(n < 2 for n in counts.values()):
         raise ValueError('each campaign needs at least two complete blocks of HIGH60-qualified data; ' + str(counts) + '. Use --block-seconds 60 for shorter campaigns, or collect longer runs.')
@@ -227,3 +225,4 @@ def main(argv):
 
 if __name__ == '__main__':
     main(sys.argv)
+
