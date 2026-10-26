@@ -3268,6 +3268,27 @@ def _recovery_custody_snapshot() -> Dict[str, Any]:
         return _recovery_custody_snapshot_locked()
 
 
+def _require_recovery_custody_released(
+    *, source: str, recovery: Dict[str, Any],
+) -> None:
+    """Recovery cannot declare RUNNING while its observations lack authority.
+
+    In particular, a watchdog with no active TEMPEST may return
+    no_active_campaign without classifying the open recovery generation.
+    Publishing RUNNING in that state poisons every subsequent campaign row.
+    """
+    custody = _recovery_custody_snapshot()
+    if custody["active"]:
+        _require_hard_failure(
+            "recovery_custody_not_released",
+            {
+                "recovery_result": copy.deepcopy(recovery),
+                "recovery_custody": custody,
+            },
+            source=source,
+        )
+
+
 def _begin_recovery_clocks_custody(
     reason: str,
     details: Dict[str, Any],
@@ -4389,7 +4410,10 @@ def _timebase_silence_recovery(reason: str, details: Dict[str, Any]) -> None:
                 _diag["auto_recovery_attempts"] = _diag.get("auto_recovery_attempts", 0) + 1
                 _diag["timebase_silence_recovery_started"] += 1
                 try:
-                    _restore_active_campaign_state()
+                    recovery = _restore_active_campaign_state()
+                    _require_recovery_custody_released(
+                        source="TIMEBASE_SILENCE_RECOVERY", recovery=recovery,
+                    )
                     _set_operational_state(
                         OPERATIONAL_STATE_RUNNING,
                         reason="timebase_silence_recovery_complete",
@@ -4666,7 +4690,10 @@ def _begin_auto_recovery(reason: str, details: Dict[str, Any], *, source: str) -
                         "🔄 [clocks] @%s auto-recovery starting (attempt %d/%d)...",
                         system_time_z(), attempt, int(AUTO_RECOVERY_MAX_ATTEMPTS),
                     )
-                    _restore_active_campaign_state()
+                    recovery = _restore_active_campaign_state()
+                    _require_recovery_custody_released(
+                        source="AUTO_RECOVERY", recovery=recovery,
+                    )
                     _set_operational_state(
                         OPERATIONAL_STATE_RUNNING,
                         reason="auto_recovery_complete",
@@ -13488,12 +13515,13 @@ def _start_status_payload() -> Dict[str, Any]:
 
 
 def _startup_control_gate(operation: str) -> Optional[Dict[str, Any]]:
-    """Reject lifecycle starts until boot reconciliation has completed.
+    """Require fully reconciled CLOCKS ownership for control operations.
 
     The command server is intentionally exposed before boot recovery so PUBSUB
     can discover routes.  START/RESUME, however, must not race the boot DAC push
     or the holistic startup restore. STOP, REPORT, CLEAR, and recovery
-    abort remain available throughout startup.
+    abort remain available throughout startup. A post-startup recovery still
+    owns the clock until its custody has been classified and released.
     """
     if _hard_failure_active():
         return {
@@ -13502,6 +13530,29 @@ def _startup_control_gate(operation: str) -> Optional[Dict[str, Any]]:
             "payload": {"operational_state": _operational_state_snapshot()},
         }
     if _startup_control_ready.is_set():
+        custody = _recovery_custody_snapshot()
+        operational = _operational_state_snapshot()
+        if (
+            operational.get("state") != OPERATIONAL_STATE_RUNNING
+            or custody["active"]
+            or _auto_recovery_in_progress
+            or _timebase_silence_recovery_active
+            or _ambient_instrument_recovery_active.is_set()
+        ):
+            return {
+                "success": False,
+                "message": (
+                    f"{operation} unavailable until CLOCKS finishes recovery "
+                    "and releases its restore custody"
+                ),
+                "payload": {
+                    "operational_state": operational,
+                    "recovery_custody": custody,
+                    "auto_recovery_in_progress": bool(_auto_recovery_in_progress),
+                    "timebase_silence_recovery_active": bool(_timebase_silence_recovery_active),
+                    "ambient_instrument_recovery_active": _ambient_instrument_recovery_active.is_set(),
+                },
+            }
         return None
 
     now_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -15843,6 +15894,11 @@ def cmd_start(args: Optional[dict]) -> dict:
 
     location = location_status.get("current_location")
     _wait_for_preflight("flash_cut" if flash_cut else "start")
+    # Preflight may have waited while a watchdog opened new recovery custody.
+    # Revalidate lifecycle ownership before creating durable campaign intent.
+    busy = _startup_control_gate("START")
+    if busy is not None:
+        return busy
 
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
@@ -16855,6 +16911,11 @@ def _hard_failure_stats_repair_worker(
             })
             _diag["last_repair"] = copy.deepcopy(repair_record)
 
+        # Re-planning after startup may change the strategy. Preserve-only intent
+        # still prohibits destructive repair after that reconciliation boundary.
+        if repair_record.get("preserve_history_only") and strategy != "PRESERVE_HISTORY_FRESH_ALPHA":
+            raise RuntimeError("preserve_history_only forbids destructive statistics-lineage reset")
+
         # Only the actual repair transaction receives permission to pass the
         # HARD_FAILURE ingress/persistence gates.  Waiting requests never do.
         _hard_failure_stats_repair_event.set()
@@ -16925,6 +16986,20 @@ def _hard_failure_stats_repair_worker(
             int(witness["first_durable_detail_id"]),
         )
     except Exception as exc:
+        if repair_record.get("preserve_history_only"):
+            repair_record.update({
+                "phase": "FAILED_PRESERVE_HISTORY_ONLY",
+                "completed_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "success": False,
+                "error": str(exc),
+                "destructive_fallback_skipped": True,
+            })
+            _diag["repair_failures"] = _diag.get("repair_failures", 0) + 1
+            _diag["last_repair"] = copy.deepcopy(repair_record)
+            logging.exception(
+                "🛑 [clocks] preserve-history REPAIR failed; refusing destructive fallback"
+            )
+            return
         # REPAIR is the operator escape hatch. If the orderly lineage-preserving
         # repair cannot prove a replacement row, amputate the entire continuation
         # domain and reopen on the live producer rather than leaving CLOCKS wedged.
@@ -16984,8 +17059,11 @@ def _hard_failure_stats_repair_worker(
             _clocks_persistence_enabled.clear()
 
 
-def cmd_repair(_: Optional[dict]) -> Dict[str, Any]:
-    """Diagnose known CLOCKS wedges and execute the least-destructive known repair."""
+def cmd_repair(args: Optional[dict]) -> Dict[str, Any]:
+    """Repair CLOCKS; optionally prohibit every destructive-history fallback."""
+    preserve_only = (args or {}).get("preserve_history_only", False)
+    if type(preserve_only) is not bool:
+        raise ValueError("preserve_history_only must be a boolean")
     state = _operational_state_snapshot()
     state_name = str(state.get("state") or "").strip().upper()
     failure_reason = str(state.get("reason") or "")
@@ -17041,6 +17119,12 @@ def cmd_repair(_: Optional[dict]) -> Dict[str, Any]:
             if _hard_failure_active() and failure_reason in _DESTRUCTIVE_REPAIR_REASONS
             else "PRESERVE_HISTORY_FRESH_ALPHA"
         )
+        if preserve_only and strategy != "PRESERVE_HISTORY_FRESH_ALPHA":
+            return {
+                "success": False,
+                "message": "preserve_history_only forbids the selected destructive repair",
+                "payload": {"strategy": strategy, "operational_state": state},
+            }
         requested_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         _diag["repair_requests"] = _diag.get("repair_requests", 0) + 1
         repair_record: Dict[str, Any] = {
@@ -17053,6 +17137,8 @@ def cmd_repair(_: Optional[dict]) -> Dict[str, Any]:
             "trigger_reason": failure_reason,
             "startup_control_ready": startup_ready,
             "destructive": strategy == "DESTRUCTIVE_STATS_LINEAGE_RESET",
+            "preserve_history_only": bool(preserve_only),
+            "destructive_fallback_allowed": not preserve_only,
             "implicit_statistics_reset_allowed": True,
             "operator_arguments_required": False,
             "next_action": "Wait for CLOCKS.REPORT.repair.success=true.",
