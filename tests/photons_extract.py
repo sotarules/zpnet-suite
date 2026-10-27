@@ -19,7 +19,7 @@ import tempfile
 
 from zpnet.shared.report_db import add_read_arguments, validate_read_arguments
 
-VERSION = '2026-10-26.1'
+VERSION = '2026-10-27.1'
 FIELDS = [
     'detail_id', 'published_at_utc', 'sequence', 'reset_count', 'update_count',
     'recovery_generation', 'anchor_pps_count', 'context_id', 'recovery_receipt_present',
@@ -28,6 +28,9 @@ FIELDS = [
     'high60_mv', 'high60_n', 'high60_elapsed_ms', 'high60_target_ms',
     'high60_fragments', 'high60_sum_counts', 'high60_sum_squares_counts',
     'sensors',
+    # Additive V1 fields: historical rows have no HIGH5 witness (null, not zero).
+    'high5_mv', 'high5_n', 'high5_elapsed_ms', 'high5_target_ms',
+    'high5_fragments', 'high5_sum_counts', 'high5_sum_squares_counts',
 ]
 SENSORS = ['synthetic', 'bme280', 'bme280_receiver', 'bme280_out', 'max31865']
 
@@ -137,10 +140,11 @@ def extract(args, rows, thermal, witness, output):
                 counts['excluded_' + reason] += 1
                 continue
             observed = witness.parse_row(row_id, args.campaign, payload)
-            if observed is None or observed.voltage_source != 'PD_OUT_HIGH60_MV':
-                raise ValueError('accepted row requires a validated persisted HIGH60 normalization witness')
+            if observed is None or observed.voltage_source not in ('PD_OUT_HIGH60_MV', 'PD_OUT_HIGH5_MV'):
+                raise ValueError('accepted row requires a validated persisted window normalization witness')
             ph = payload['photons']
             window = ph['pd_out']['high_window']
+            high5 = ph['pd_out'].get('high5_window')
             readings, sensor_settings = sensor_context(payload, thermal)
             settings = {'acquisition': json.loads(sample.signature), 'sensors': sensor_settings}
             key = compact(settings)
@@ -158,16 +162,21 @@ def extract(args, rows, thermal, witness, output):
                 sample.fragment_elapsed_ms, sample.adc_count, sample.adc_sum, sample.adc_squares,
                 window['high_mean_mv'], window['sample_count'], window['elapsed_ms'], window['target_ms'],
                 window['fragments'], window['high_sum_counts'], window['high_sum_squares_counts'], readings,
+                *([high5.get('high_mean_mv'), high5['sample_count'], high5['elapsed_ms'],
+                   high5['target_ms'], high5['fragments'], high5['high_sum_counts'],
+                   high5['high_sum_squares_counts']] if high5 is not None else [None] * 7),
             ])
             counts['exported'] += 1
-            counts['high60_complete'] += int(observed.window_complete)
+            counts['high60_complete'] += int(window['elapsed_ms'] >= window['target_ms'])
+            if high5 is not None:
+                counts['high5_complete'] += int(high5['elapsed_ms'] >= high5['target_ms'])
             if len(pending) == 512:
                 flush()
         except Exception as exc:
             raise ValueError(f'export row {row_id}: {exc}') from exc
     flush()
     if not counts['exported']:
-        raise ValueError('no usable HIGH60 observations in selected interval')
+        raise ValueError('no usable voltage-window observations in selected interval')
     write({'type': 'summary', 'counts': dict(counts), 'contexts': len(contexts)})
     return counts
 

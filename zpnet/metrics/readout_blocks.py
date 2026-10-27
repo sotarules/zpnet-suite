@@ -17,7 +17,7 @@ Stats policy:
   and TOTAL PPB buckets.  Metrics transcribes those PPB buckets verbatim; it does
   not estimate rolling windows from repaint history.  The live PHOTONS rolling
   tail retains actual PUBSUB publications in memory and reads each second's
-  firmware-authored raw mean, normalized mean, and HIGH60 adjustment directly;
+  firmware-authored raw mean, normalized mean, and authoritative voltage adjustment directly;
   PostgreSQL is not in that live-tail path.  Durable campaign history
   remains a database read model.  This never synthesizes individual samples,
   changes admission, or feeds science back into PHOTONS.  PHOTONS CAMP is read
@@ -64,7 +64,7 @@ from collections import deque
 from zpnet.processes.processes import PUBSUB_TAP_SOCKET, create_pubsub_cache, send_command
 from zpnet.shared.db import open_db
 from zpnet.shared.photons_voltage import (
-    QUADRATIC_MODEL, voltage_adjustment, voltage_local_slope,
+    QUADRATIC_MODELS, VOLTAGE_MODELS, voltage_adjustment, voltage_local_slope, voltage_window, voltage_window_spec,
 )
 
 # AD5693R doctrine mirrors Pi CLOCKS, the sole actuator authority:
@@ -1133,7 +1133,7 @@ def environment_sensor_block(snapshot: dict) -> list[str]:
 
 
 def photons_temperature_block(snapshot: dict) -> list[str]:
-    """Align temperatures, HIGH60 (mV), and ADJ (ns) with the mean columns.
+    """Align temperatures, voltage (mV), and ADJ (ns) with the mean columns.
 
     The PHOTONS science header uses an eight-character label, a separator,
     then PHOTONS_MEAN_WIDTH right-justified columns. Use precisely that geometry:
@@ -1190,24 +1190,26 @@ def photons_temperature_block(snapshot: dict) -> list[str]:
                   if has_campaign else ""))
         lines.append(row)
 
-    # HIGH60 shares the thermal time windows but retains its native mV units.
-    high_window = ((snapshot.get("photons") or {}).get("pd_out") or {}).get("high_window") or {}
+    # Display the active model's voltage population; retain HIGH60 in telemetry.
+    normalization = snapshot["photons"]["voltage_normalization"]
+    _, voltage_lane, _ = voltage_window_spec(normalization["model_id"])
+    high_window = voltage_window(normalization, snapshot["photons"]["pd_out"])
     high_now = high_window.get("high_mean_mv") if high_window.get("sample_count", 0) > 0 else None
-    population = campaigns.get("high60") or {}
+    population = campaigns.get(voltage_lane) or {}
     lines.append(
-        f"{'HIGH60':<8} " + observed(high_now)
-        + ''.join(" " + mean((windows.get(span) or {}).get("high60"), "mean_mv") for span, _ in spans)
-        + " " + mean(totals.get("high60"), "mean_mv")
+        f"{voltage_lane.upper():<8} " + observed(high_now)
+        + ''.join(" " + mean((windows.get(span) or {}).get(voltage_lane), "mean_mv") for span, _ in spans)
+        + " " + mean(totals.get(voltage_lane), "mean_mv")
         + ((" " + mean(population, "mean_mv") + " " + observed(population.get("sd_mv"), 5, 10))
            if has_campaign else "")
     )
 
     normalization = snapshot["photons"]["voltage_normalization"]
-    if normalization["model_id"] == QUADRATIC_MODEL:
+    if normalization["model_id"] in QUADRATIC_MODELS:
         # A quadratic of mean voltage is not the mean correction. Read the
         # actual per-fragment ADJ populations, including their own campaign SD.
         if data and "adjustment" not in totals:
-            raise ValueError("NOR4 metrics requires actual adjustment populations")
+            raise ValueError("quadratic metrics requires actual adjustment populations")
         def adj_cell(value, width=PHOTONS_MEAN_WIDTH):
             if value is None:
                 return f"{'---':>{width}}"
@@ -2343,13 +2345,20 @@ def _get_photons_rolling_payloads() -> list[dict]:
 
 
 def _photons_rolling_rows(payloads: list[dict]) -> list[dict]:
-    """Expose each second's raw mean and firmware HIGH60 correction verbatim.
+    """Expose each second's raw mean and firmware voltage correction verbatim.
 
-    FACT is the local derivative d(ADJ)/d(HIGH60) in ns/mV; ADJ is the signed offset added to RAW.
+    FACT is the local derivative d(ADJ)/d(voltage) in ns/mV; ADJ is the signed offset added to RAW.
     Metrics checks that testimony but never applies a second correction.
     """
+    # A retained UI tail can straddle a firmware/model restart. Show only the
+    # newest model's contiguous suffix under its predictor heading.
+    start = len(payloads)
+    if payloads:
+        model = payloads[-1]["photons"]["voltage_normalization"]["model_id"]
+        while start and payloads[start - 1]["photons"]["voltage_normalization"]["model_id"] == model:
+            start -= 1
     rows = []
-    for current in payloads:
+    for current in payloads[start:]:
         stats = _photons_fragment_stats(current)
         campaign = current.get("campaign") or {}
         instrument_stats = (current.get("photons") or {}).get("stats") or {}
@@ -2358,15 +2367,11 @@ def _photons_rolling_rows(payloads: list[dict]) -> list[dict]:
             raise ValueError("PHOTONS cadence-cell seconds are missing")
         n = stats["n"]
         pd_out = current["photons"]["pd_out"]
-        high_window = pd_out["high_window"]
+        normalization = current["photons"]["voltage_normalization"]
+        high_window = voltage_window(normalization, pd_out)
+        _, voltage_lane, _ = voltage_window_spec(normalization["model_id"])
         high_mv = high_window["high_mean_mv"] if high_window["sample_count"] > 0 else None
         high_warming = high_window["elapsed_ms"] < high_window["target_ms"]
-        normalization = current["photons"]["voltage_normalization"]
-        if (normalization["schema"] != "PHOTONS_VOLTAGE_NORMALIZATION_V1"
-                or normalization["model_id"] not in ("PD200T_HIGH60_LINEAR_V1", "PD200T_HIGH60_LINEAR_V2", QUADRATIC_MODEL)
-                or normalization["application"] != "UNIFORM_OFFSET_AT_FRAGMENT_DRAIN"
-                or normalization["voltage_source"] != "PD_OUT_HIGH60_MV"):
-            raise ValueError("PHOTONS rolling rows require firmware HIGH60 normalization")
         raw = normalization["raw_flight_ns"]
         published = normalization["published_flight_ns"]
         if raw["n"] != n or published != current["photons"]["race"]["flight_ns"]:
@@ -2377,19 +2382,17 @@ def _photons_rolling_rows(payloads: list[dict]) -> list[dict]:
         adjustment = float(normalization["adjustment_ns"])
         if not all(math.isfinite(v) for v in (reference, adjustment)):
             raise ValueError("PHOTONS normalization coefficients/adjustment must be finite")
-        if normalization["high60_sample_count"] != high_window["sample_count"]:
-            raise ValueError("PHOTONS normalization and HIGH60 sample counts disagree")
         if n > 0:
             raw_mean = float(raw["mean"])
             if high_mv is None or not all(math.isfinite(v) for v in (
                     raw_mean, stats["mean"], float(high_mv), float(normalization["high_mv"]))):
-                raise ValueError("PHOTONS populated second requires finite means and HIGH60")
+                raise ValueError("PHOTONS populated second requires finite means and voltage")
             if not math.isclose(float(normalization["high_mv"]), float(high_mv),
                                 rel_tol=0.0, abs_tol=1e-6):
-                raise ValueError("PHOTONS correction predictor differs from displayed HIGH60")
+                raise ValueError("PHOTONS correction predictor differs from displayed voltage")
             if not math.isclose(adjustment, voltage_adjustment(normalization, normalization["high_mv"]),
                                 rel_tol=0.0, abs_tol=1e-6):
-                raise ValueError("PHOTONS HIGH60 formula does not close")
+                raise ValueError("PHOTONS voltage formula does not close")
             if not math.isclose(raw_mean + adjustment, stats["mean"],
                                 rel_tol=0.0, abs_tol=1e-6):
                 raise ValueError("PHOTONS RAW + ADJ does not equal NORM")
@@ -2401,6 +2404,7 @@ def _photons_rolling_rows(payloads: list[dict]) -> list[dict]:
             "factor": factor,
             "adjustment_ns": adjustment if n > 0 else None,
             "high_mv": high_mv,
+            "voltage_label": voltage_lane.upper(),
             "high_warming": high_warming,
             "low_pair_mv": (moving.get("low") or {}).get("mean"),
             "high_pair_mv": (moving.get("high") or {}).get("mean"),
@@ -2518,7 +2522,9 @@ def photons_detail_readout() -> list[str]:
         name += " [FINAL]"
 
     # Only the campaign name retains its operator-selected capitalization.
-    line = (f"CAMPAIGN: {name}  UNITS: NS / PD mV"
+    model_id = live["photons"]["voltage_normalization"]["model_id"]
+    normalization = VOLTAGE_MODELS[model_id][0].to_bytes(4, "big").decode("ascii")
+    line = (f"CAMPAIGN: {name}  NORMALIZATION: {normalization}"
             f"  ELAPSED: {_seconds_to_hms(summary['seconds'])}"
             f"  RECOVERABLE: {str(recoverable).upper()}")
     measurement = live.get("measurement")
@@ -2529,12 +2535,13 @@ def photons_detail_readout() -> list[str]:
             line += f"  NORM: {_fmt(normalized.get('mean'), ',.6f', 0)} NS"
     if campaign_error:
         line += "  READ MODEL: UNAVAILABLE"
+    _, voltage_lane, _ = voltage_window_spec(live["photons"]["voltage_normalization"]["model_id"])
     lines = [line]
     lines.extend(["", _photons_summary_header(bool(campaign)),
                   _photons_summary_line(summary, bool(campaign), summary["mean"]),
                   "", *photons_temperature_block(live), "",
                   f"{'SEC':<8} {'LAP':>{PHOTONS_MEAN_WIDTH}} {'LOW':>9} {'HIGH':>9} "
-                  f"{'PD N/WIN':>10} {'HIGH60':>9}  {'FACT':>14} {'ADJ':>12}"])
+                  f"{'PD N/WIN':>10} {voltage_lane.upper():>9}  {'FACT':>14} {'ADJ':>12}"])
     for row in _photons_rolling_rows(payloads):
         lines.append(
             _fmt(row["second"], 'd', 0).ljust(8)

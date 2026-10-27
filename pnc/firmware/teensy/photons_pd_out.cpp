@@ -294,12 +294,38 @@ static_assert(sizeof(pd_window_cell_t) == 32U, "HIGH window RAM2 geometry change
 alignas(32) static DMAMEM pd_window_cell_t g_pd_window_cells[PD_WINDOW_CAPACITY];
 static uint32_t g_pd_window_head, g_pd_window_cut_ms;
 static photons_pd_out_window_t g_pd_window;
+// Two suffix populations share the same 2 KiB ring. No second ring or ISR work.
+static photons_pd_out_window_t g_pd_high5_window;
+static uint32_t g_pd_high5_head;
 
 static void pd_reset_window(uint32_t cut_ms) {
   // RAM2 need not be zeroed: only the live prefix, written below, is ever read.
   g_pd_window = photons_pd_out_window_t{};
   g_pd_window_head = 0U;
+  g_pd_high5_window = photons_pd_out_window_t{};
+  g_pd_high5_head = 0U;
   g_pd_window_cut_ms = cut_ms;
+}
+
+static void pd_extend_window(photons_pd_out_window_t& window, uint32_t& head,
+                             const photons_pd_out_batch_t& batch,
+                             uint32_t elapsed, uint32_t target_ms) {
+  window.elapsed_ms += elapsed;
+  window.sample_count += batch.sample_count;
+  window.high_sum += batch.high_sum;
+  window.high_sum_squares += batch.high_sum_squares;
+  // Retain the shortest whole-fragment suffix covering the requested duration.
+  // A long delayed fragment may supersede every previous cell.
+  while (window.fragments != 0U) {
+    const auto& oldest = g_pd_window_cells[head];
+    if (window.elapsed_ms - oldest.elapsed_ms < target_ms) break;
+    window.elapsed_ms -= oldest.elapsed_ms;
+    window.sample_count -= oldest.n;
+    window.high_sum -= oldest.sum;
+    window.high_sum_squares -= oldest.squares;
+    head = (head + 1U) % PD_WINDOW_CAPACITY;
+    --window.fragments;
+  }
 }
 
 static photons_pd_out_window_t pd_update_window(
@@ -307,28 +333,21 @@ static photons_pd_out_window_t pd_update_window(
   const uint32_t elapsed = cut_ms - g_pd_window_cut_ms; // millis rollover
   if (elapsed == 0U) __builtin_trap();
   g_pd_window_cut_ms = cut_ms;
-  g_pd_window.elapsed_ms += elapsed;
-  g_pd_window.sample_count += batch.sample_count;
-  g_pd_window.high_sum += batch.high_sum;
-  g_pd_window.high_sum_squares += batch.high_sum_squares;
-  // Trim before appending: a long delayed fragment may supersede the whole ring.
-  while (g_pd_window.fragments != 0U) {
-    const auto& oldest = g_pd_window_cells[g_pd_window_head];
-    if (g_pd_window.elapsed_ms - oldest.elapsed_ms < PHOTONS_PD_OUT_HIGH_WINDOW_MS)
-      break;
-    g_pd_window.elapsed_ms -= oldest.elapsed_ms;
-    g_pd_window.sample_count -= oldest.n;
-    g_pd_window.high_sum -= oldest.sum;
-    g_pd_window.high_sum_squares -= oldest.squares;
-    g_pd_window_head = (g_pd_window_head + 1U) % PD_WINDOW_CAPACITY;
-    --g_pd_window.fragments;
-  }
+  // Trim both suffixes while every old cell still belongs to the retained ring.
+  pd_extend_window(g_pd_high5_window, g_pd_high5_head, batch, elapsed,
+                   PHOTONS_PD_OUT_HIGH5_WINDOW_MS);
+  pd_extend_window(g_pd_window, g_pd_window_head, batch, elapsed,
+                   PHOTONS_PD_OUT_HIGH_WINDOW_MS);
   if (g_pd_window.fragments == PD_WINDOW_CAPACITY) __builtin_trap();
   const uint32_t tail = (g_pd_window_head + g_pd_window.fragments) % PD_WINDOW_CAPACITY;
+  if ((g_pd_high5_head + g_pd_high5_window.fragments) % PD_WINDOW_CAPACITY != tail)
+    __builtin_trap();
   g_pd_window_cells[tail] = {batch.sample_count, batch.high_sum,
                              batch.high_sum_squares, elapsed};
   ++g_pd_window.fragments;
+  ++g_pd_high5_window.fragments;
   g_pd_window.completed_at_ms = cut_ms;
+  g_pd_high5_window.completed_at_ms = cut_ms;
   return g_pd_window;
 }
 
@@ -543,6 +562,7 @@ photons_pd_out_batch_t photons_pd_out_take_batch(uint32_t cut_ms) {
   out.adc_gc = ADC2_GC;
   out.adc_irq_enabled = NVIC_IS_ENABLED(IRQ_ADC2) ? 1U : 0U;
   out.high_window = pd_update_window(out, cut_ms);
+  out.high5_window = g_pd_high5_window;
   out.low_high = g_low_batch;
   out.low_high.window = photons_pd_out_low_high_window();
   g_low_batch = photons_low_high_batch_t{};

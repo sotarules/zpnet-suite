@@ -22,7 +22,7 @@
 //     first-sample handoff and RAM2 raw capture banks. Raw edge capture belongs to
 //     process_interrupt; edge delivery runs as a bounded foreground service.
 //     LOW/HIGH witness: TimePop CH1 triggers ADC1 on the same PD OUT pin before
-//     predicted arrival. ADC2 HIGH and HIGH60 remain the correction source.
+//     predicted arrival. ADC2 HIGH supplies the authoritative HIGH5 correction window.
 //     Foreground closes each witness before ADC1 monitor use or another launch;
 //     capture statistics are fragment-local and never restored as live samples.
 //     Scheduling/statistics transactions have one foreground owner at a time:
@@ -259,16 +259,16 @@ struct photons_fragment_welford_snapshot_t {
   Double max = 0_D;
 };
 
-// The producer's HIGH60 voltage window is the sole normalization predictor.
+// The producer's HIGH5 voltage window is the sole normalization predictor.
 // Keep the current-fragment ADC population separately for acquisition custody.
 // Raw and published Welfords describe the same accepted races; adding the
 // signed correction must not alter n, M2, SD or SE.
 struct photons_fragment_voltage_normalization_snapshot_t {
   uint64_t adc_sample_count = 0ULL;
-  uint64_t high60_sample_count = 0ULL;
-  uint64_t high60_elapsed_ms = 0ULL;
-  uint32_t high60_fragments = 0U;
-  bool high60_complete = false;
+  uint64_t high5_sample_count = 0ULL;
+  uint64_t high5_elapsed_ms = 0ULL;
+  uint32_t high5_fragments = 0U;
+  bool high5_complete = false;
   Double high_mv = 0_D;
   Double adjustment_ns = 0_D;
   photons_fragment_welford_snapshot_t raw_flight_ns{};

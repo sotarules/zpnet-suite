@@ -6,7 +6,10 @@
 // is triggered in the photodiode ISR and collected by Priority-16 software handoff.
 // Counts are raw 12-bit ADC codes; delay measurements bracket software triggers,
 // not the ADC aperture.
-static constexpr uint32_t PHOTONS_PD_OUT_HIGH_WINDOW_MS = 60000U;
+static constexpr uint32_t PHOTONS_PD_OUT_HIGH_WINDOW_MS = 60000U; // retained HIGH60 witness
+static constexpr uint32_t PHOTONS_PD_OUT_HIGH5_WINDOW_MS = 5000U;  // NOR5 authority
+static_assert(PHOTONS_PD_OUT_HIGH5_WINDOW_MS < PHOTONS_PD_OUT_HIGH_WINDOW_MS,
+              "HIGH5 must be a suffix of the retained HIGH60 ring");
 
 // LOW is an ADC1 witness; the existing ADC2 HIGH population/correction is intact.
 // Outcomes describe observations, not voltage-validity votes. No delta filter.
@@ -77,7 +80,7 @@ uint32_t photons_pd_out_low_lead_ns();
 void photons_pd_out_low_set_lead_ns(uint32_t ns);
 
 // Foreground-owned population, frozen into each fragment. Whole-fragment suffix
-// covering at least 60 s after warm-up; exact moments weight every physical sample.
+// covering its target after warm-up; exact moments weight every physical sample.
 struct photons_pd_out_window_t {
   uint64_t sample_count = 0, high_sum = 0, high_sum_squares = 0;
   uint64_t elapsed_ms = 0;
@@ -98,7 +101,8 @@ struct photons_pd_out_batch_t {
   uint32_t phase = 0; // 0=IDLE, 1=SAMPLING_HIGH
   uint32_t adc_hc0 = 0, adc_hs = 0, adc_cfg = 0, adc_gc = 0;
   uint32_t adc_irq_enabled = 0;
-  photons_pd_out_window_t high_window; // populated only at foreground batch cut
+  photons_pd_out_window_t high_window; // retained HIGH60, frozen at foreground cut
+  photons_pd_out_window_t high5_window; // authoritative HIGH5, same cut and samples
   photons_low_high_batch_t low_high;
 };
 

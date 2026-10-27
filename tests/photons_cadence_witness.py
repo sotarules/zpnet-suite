@@ -469,14 +469,17 @@ def print_fragment(row):
     print(f"busy_edges={row['busy_edges']}")
     if row['n'] == 0:
         print('NO COMPLETED ADC HIGH SAMPLES in this fragment.')
-    published = row['pd_out']['high_window']
-    progress = 'warming up' if published['elapsed_ms'] < published['target_ms'] else 'full span'
-    published_mean = published['high_mean_mv'] if published['sample_count'] > 0 else None
-    print(f"PUBLISHED HIGH: MEAN={number(published_mean)} mV; "
-          f"{published['elapsed_ms'] / 1000:.3f} s / "
-          f"{published['target_ms'] / 1000:g} s target ({progress}); "
-          f"fragments={published['fragments']} N={published['sample_count']}; "
-          f"nominal reference={published['reference_mv']} mV")
+    for key, label in (('high_window', 'HIGH60'), ('high5_window', 'HIGH5')):
+        if key not in row['pd_out']:
+            continue  # Historical firmware did not publish HIGH5.
+        published = row['pd_out'][key]
+        progress = 'warming up' if published['elapsed_ms'] < published['target_ms'] else 'full span'
+        published_mean = published['high_mean_mv'] if published['sample_count'] > 0 else None
+        print(f"PUBLISHED {label}: MEAN={number(published_mean)} mV; "
+              f"{published['elapsed_ms'] / 1000:.3f} s / "
+              f"{published['target_ms'] / 1000:g} s target ({progress}); "
+              f"fragments={published['fragments']} N={published['sample_count']}; "
+              f"nominal reference={published['reference_mv']} mV")
     window = row['rolling']
     if window['reset_reason']:
         print(f"ROLLING WINDOW RESTARTED: {window['reset_reason']}")
@@ -580,7 +583,7 @@ def adc_high_report(args):
           f'mV uses nominal reference {args.reference_mv:g} mV. Trigger timing is relative to ISR entry,\n'
           'not the physical edge or ADC aperture. n/a means the statistic is undefined.\n'
           f'Rolling window target={args.window_seconds} s; integer moments pooled across whole fragments.\n'
-          'PUBLISHED HIGH comes from firmware; LOCAL ROLLING HIGH starts with this report.\n'
+          'PUBLISHED HIGH5/HIGH60 come from firmware; LOCAL ROLLING HIGH starts with this report.\n'
           'Both means lag changes. One-second HIGH and lap normalization remain unchanged.'})
     received = 0
     previous = None

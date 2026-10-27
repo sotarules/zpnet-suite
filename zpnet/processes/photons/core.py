@@ -1,7 +1,7 @@
 """ZPNet PHOTONS: Teensy acquisition/normalization and durable Pi witnesses.
 
-The Teensy owns physical races, science admission, GNSS projection, HIGH60
-normalization, statistics, campaign boundaries and recovery. NOR4 applies one
+The Teensy owns physical races, science admission, GNSS projection, HIGH5
+normalization, statistics, campaign boundaries and recovery. NOR5 applies one
 frozen quadratic offset to each raw one-second population. Individual race
 measurements and within-fragment dispersion remain raw evidence.
 
@@ -36,7 +36,7 @@ from zpnet.shared.constants import Payload
 from zpnet.shared.db import DatabaseContentionRetry, open_db
 from zpnet.shared.logger import setup_logging
 from zpnet.shared.photons_voltage import (
-    QUADRATIC_MODEL, VOLTAGE_MODELS, voltage_adjustment, voltage_coefficient_fields,
+    HIGH5_MODEL, VOLTAGE_MODELS, voltage_adjustment, voltage_coefficient_fields, voltage_window,
 )
 
 
@@ -44,10 +44,10 @@ from zpnet.shared.photons_voltage import (
 # PHOTONS: Optional calibrated normalization and physical sensor identities
 # ======================================================================
 
-# Matches process_photons.cpp. NOR4 changes the HIGH60 correction polynomial.
-# Never restore earlier corrected numerator/Welford/bucket custody into NOR4.
+# Matches process_photons.cpp. NOR5 changes the predictor to HIGH5 and uses its own frozen polynomial.
+# Never restore earlier corrected numerator/Welford/bucket custody into NOR5.
 # Startup's existing epoch-migration court preserves all historical rows.
-ACQUISITION_ID = 0x4E4F5234  # NOR4: frozen HighLow2 quadratic HIGH60 trial
+ACQUISITION_ID = 0x4E4F5235  # NOR5: frozen HighLow3 quadratic HIGH5 trial
 PHOTONS_MEASUREMENT_SCHEMA = "PI_PHOTONS_MEASUREMENT_V1"
 THERMAL_SENSOR_PATHS = {
     "pi": (("environment", "pi"), "PI.I2C1.BME280.0x76"),
@@ -287,18 +287,16 @@ class Normalizer:
             if VOLTAGE_MODELS[firmware["model_id"]][0] != ACQUISITION_ID:
                 raise ValueError("PHOTONS voltage model/acquisition identity mismatch")
             expected = voltage_adjustment(firmware, firmware["high_mv"])
-            window = photons["pd_out"]["high_window"]
-            if firmware["high60_sample_count"] != window["sample_count"]:
-                raise ValueError("PHOTONS correction predictor population mismatch")
+            window = voltage_window(firmware, photons["pd_out"])
             if window["sample_count"]:
                 if (not math.isclose(float(firmware["high_mv"]), float(window["high_mean_mv"]),
                                      rel_tol=0.0, abs_tol=1e-6)
                         or not math.isclose(float(firmware["adjustment_ns"]), expected,
                                             rel_tol=0.0, abs_tol=1e-6)):
-                    raise ValueError("PHOTONS firmware HIGH60 polynomial does not close")
+                    raise ValueError("PHOTONS firmware HIGH5 polynomial does not close")
             elif (firmware["raw_flight_ns"]["n"] or float(firmware["high_mv"]) != 0.0
                   or float(firmware["adjustment_ns"]) != 0.0):
-                raise ValueError("empty HIGH60 population cannot support a correction")
+                raise ValueError("empty HIGH5 population cannot support a correction")
         raw = copy.deepcopy(firmware["raw_flight_ns"] if firmware is not None
                             else photons["race"]["flight_ns"])
         thermal = self.history.observe(state)
@@ -647,18 +645,19 @@ class StabilityAccumulator:
                 "checkpoint": copy.deepcopy(s)}
 
 # ======================================================================
-# PHOTONS: Temperature / HIGH60 / applied-ADJ populations and JSON continuation
+# PHOTONS: Temperature / HIGH60 / HIGH5 / applied-ADJ populations and JSON continuation
 # ======================================================================
 
 TEMPERATURE_STATS_SCHEMA = "PI_PHOTONS_TEMPERATURE_STATS_V1"
-TEMPERATURE_SENSORS = (*THERMAL_SENSOR_PATHS, "high60", "adjustment")
+TEMPERATURE_SENSORS = (*THERMAL_SENSOR_PATHS, "high60", "high5", "adjustment")
 HIGH60_SOURCE = "TEENSY.PHOTONS.PD_OUT.HIGH60"
-ADJUSTMENT_SOURCE = "TEENSY.PHOTONS.ADJ." + QUADRATIC_MODEL
-# Native units: Celsius for probes, millivolts for HIGH60, nanoseconds for ADJ. One
-# observation per producer second, including the firmware's HIGH60 warmup.
+HIGH5_SOURCE = "TEENSY.PHOTONS.PD_OUT.HIGH5"
+ADJUSTMENT_SOURCE = "TEENSY.PHOTONS.ADJ." + HIGH5_MODEL
+# Native units: Celsius for probes, millivolts for both HIGH windows, nanoseconds for ADJ. One
+# observation per producer second, including the firmware's window warmup.
 # ADJ observes the actual applied offset once per nonempty accepted fragment.
-# It has the same time grid as HIGH60, not the race-weighted LAP population.
-SENSOR_UNITS = {name: {"high60": "mV", "adjustment": "ns"}.get(name, "C")
+# It has the same time grid as the voltage windows, not the race-weighted LAP population.
+SENSOR_UNITS = {name: {"high60": "mV", "high5": "mV", "adjustment": "ns"}.get(name, "C")
                 for name in TEMPERATURE_SENSORS}
 TEMPERATURE_WINDOWS = (600, 3600, 28800, 86400)
 SHORT_LIMIT = 600
@@ -669,10 +668,10 @@ MISSING = -(1 << 31)
 
 def _sensor_sources():
     return {**{name: source for name, (_path, source) in THERMAL_SENSOR_PATHS.items()},
-            "high60": HIGH60_SOURCE, "adjustment": ADJUSTMENT_SOURCE}
+            "high60": HIGH60_SOURCE, "high5": HIGH5_SOURCE, "adjustment": ADJUSTMENT_SOURCE}
 
 
-def _current_names(values, saved_sources=None, *, new_high60=None, new_adjustment=None):
+def _current_names(values, saved_sources=None, *, new_high60=None, new_high5=None, new_adjustment=None):
     """Project durable hardware identity onto today's readout names.
 
     Old images precede the explicit source map. Their four physical lanes are
@@ -689,6 +688,9 @@ def _current_names(values, saved_sources=None, *, new_high60=None, new_adjustmen
     # altering any physical sensor's saved arithmetic or coverage counters.
     if HIGH60_SOURCE not in by_source:
         by_source[HIGH60_SOURCE] = new_high60
+    # HIGH5 did not exist in older epochs; never relabel HIGH60 observations.
+    if HIGH5_SOURCE not in by_source:
+        by_source[HIGH5_SOURCE] = new_high5
     # Pre-NOR4 images never stored actual adjustment populations. Preserve
     # their absence; never apply the new polynomial to historical HIGH60 means.
     if ADJUSTMENT_SOURCE not in by_source:
@@ -698,15 +700,15 @@ def _current_names(values, saved_sources=None, *, new_high60=None, new_adjustmen
 
 
 def _sum_key(name):
-    return {"high60": "sum_nanovolt", "adjustment": "sum_femtosecond"}.get(name, "sum_microdegree_c")
+    return {"high60": "sum_nanovolt", "high5": "sum_nanovolt", "adjustment": "sum_femtosecond"}.get(name, "sum_microdegree_c")
 
 
 def _mean_key(name):
-    return {"high60": "mean_mv", "adjustment": "mean_ns"}.get(name, "mean_c")
+    return {"high60": "mean_mv", "high5": "mean_mv", "adjustment": "mean_ns"}.get(name, "mean_c")
 
 
 def _sd_key(name):
-    return {"high60": "sd_mv", "adjustment": "sd_ns"}.get(name, "sd_c")
+    return {"high60": "sd_mv", "high5": "sd_mv", "adjustment": "sd_ns"}.get(name, "sd_c")
 
 
 def _minute_json(minute, sensors=TEMPERATURE_SENSORS):
@@ -724,6 +726,7 @@ def _minute_from_json(minute, sources):
         return None
     values = _current_names(minute["sensors"], sources,
                             new_high60={"n": 0, "sum_nanovolt": 0},
+                            new_high5={"n": 0, "sum_nanovolt": 0},
                             new_adjustment={"n": 0, "sum_femtosecond": 0})
     return {"index": minute["index"], "slots": minute["slots"],
             "gaps": minute["gaps"],
@@ -771,7 +774,7 @@ def _read_legacy_rolling(image):
                                if name in THERMAL_SENSOR_PATHS},
             "seconds": seconds, "minutes": minutes[:nm],
             "open_minute": minutes[nm] if no else None,
-            "short_population": _current_names(image["short_population"], new_high60=_empty(), new_adjustment=_empty()),
+            "short_population": _current_names(image["short_population"], new_high60=_empty(), new_high5=_empty(), new_adjustment=_empty()),
             "short_gaps": image["short_gaps"]}
 
 
@@ -783,8 +786,8 @@ def _quantized(values):
             out.append(MISSING)
             continue
         q = round(float(value) * TEMPERATURE_SCALE)
-        # HIGH60 uses nanovolts; applied ADJ uses signed femtoseconds.
-        bits = 64 if name in ("high60", "adjustment") else 32
+        # Both voltage windows use nanovolts; applied ADJ uses signed femtoseconds.
+        bits = 64 if name in ("high60", "high5", "adjustment") else 32
         if q == MISSING or not -(1 << (bits - 1)) < q <= (1 << (bits - 1)) - 1:
             raise ValueError(f"PHOTONS {name} reading exceeds the bounded rolling representation")
         out.append(q)
@@ -1003,6 +1006,7 @@ class TemperatureAccumulator:
                              "temperature_c": {name: value for name, value in _temperatures(q).items()
                                                if name in THERMAL_SENSOR_PATHS},
                              "high60_mv": _temperatures(q)["high60"],
+                             "high5_mv": _temperatures(q)["high5"],
                              "adjustment_ns": _temperatures(q)["adjustment"]}
                             for sequence, update_count, gap, q in self.second_tail],
                 "minutes": [_minute_json(minute) for minute in self.minutes],
@@ -1022,6 +1026,8 @@ class TemperatureAccumulator:
             readings = dict(entry["temperature_c"])
             if HIGH60_SOURCE in sources.values():
                 readings["high60"] = entry["high60_mv"]
+            if HIGH5_SOURCE in sources.values():
+                readings["high5"] = entry["high5_mv"]
             if ADJUSTMENT_SOURCE in sources.values():
                 readings["adjustment"] = entry["adjustment_ns"]
             values = _current_names(readings, sources)
@@ -1029,7 +1035,7 @@ class TemperatureAccumulator:
             self.second_tail.append((sequence, update_count, int(gap), _quantized(values)))
             self.short.entries.append((sequence, values, bool(gap)))
         self.short.populations = _current_names(image["short_population"], sources,
-                                                new_high60=_empty(), new_adjustment=_empty())
+                                                new_high60=_empty(), new_high5=_empty(), new_adjustment=_empty())
         self.short.gaps = image["short_gaps"]
         self.minutes = deque((_minute_from_json(m, sources) for m in image["minutes"]),
                              maxlen=MINUTE_LIMIT)
@@ -1067,11 +1073,15 @@ class TemperatureAccumulator:
                 rolling_checkpoint = embedded
             sources = state.get("sensor_sources")
             if stats["acquisition_id"] == ACQUISITION_ID:
-                if sources is None or sources.get("adjustment") != ADJUSTMENT_SOURCE:
-                    raise ValueError("NOR4 checkpoint lost its adjustment population")
+                if (sources is None or sources.get("high5") != HIGH5_SOURCE
+                        or rolling_checkpoint is None
+                        or rolling_checkpoint["sensor_sources"].get("high5") != HIGH5_SOURCE):
+                    raise ValueError("NOR5 checkpoint lost its HIGH5 population custody")
+                if sources.get("adjustment") != ADJUSTMENT_SOURCE:
+                    raise ValueError("NOR5 checkpoint lost its adjustment population")
                 if (rolling_checkpoint is None or
                         rolling_checkpoint["sensor_sources"].get("adjustment") != ADJUSTMENT_SOURCE):
-                    raise ValueError("NOR4 checkpoint lost its adjustment rolling custody")
+                    raise ValueError("NOR5 checkpoint lost its adjustment rolling custody")
             labels = state.setdefault("sensor_label_history", {})
             old_names = list(state["total"])
             old_sources = sources or {name: ("PI.I2C2.BME280.0x77" if name == "otdr"
@@ -1084,8 +1094,8 @@ class TemperatureAccumulator:
                 names = labels.setdefault(source, [])
                 if name not in names:
                     names.append(name)
-            state["total"] = _current_names(state["total"], sources, new_high60=_empty(), new_adjustment=_empty())
-            state["camp"] = _current_names(state["camp"], sources, new_high60=_empty(), new_adjustment=_empty())
+            state["total"] = _current_names(state["total"], sources, new_high60=_empty(), new_high5=_empty(), new_adjustment=_empty())
+            state["camp"] = _current_names(state["camp"], sources, new_high60=_empty(), new_high5=_empty(), new_adjustment=_empty())
             state["sensor_sources"] = _sensor_sources()
             self.state = state
         else:
@@ -1126,15 +1136,18 @@ class TemperatureAccumulator:
         values["high60"] = (high_window["high_mean_mv"]
                             if high_window["sample_count"] > 0 else None)
         normalization = canonical["photons"]["voltage_normalization"]
-        if normalization["model_id"] != QUADRATIC_MODEL:
-            raise ValueError("adjustment population requires the NOR4 model epoch")
+        high5_window = voltage_window(normalization, canonical["photons"]["pd_out"])
+        values["high5"] = (high5_window["high_mean_mv"]
+                           if high5_window["sample_count"] > 0 else None)
+        if normalization["model_id"] != HIGH5_MODEL:
+            raise ValueError("adjustment population requires the NOR5 model epoch")
         adjustment = float(normalization["adjustment_ns"])
         if not math.isfinite(adjustment):
             raise ValueError("PHOTONS applied adjustment must be finite")
         values["adjustment"] = (adjustment
                                  if normalization["raw_flight_ns"]["n"] > 0 else None)
-        # This is the already sample-weighted firmware HIGH60, observed once
-        # per second. Do not weight overlapping 60-second windows a second time.
+        # This is the already sample-weighted firmware voltage, observed once
+        # per second. Do not weight overlapping voltage windows a second time.
         if campaign_id is not None and (not isinstance(public_count, int) or public_count <= 0):
             raise ValueError("invalid PHOTONS temperature campaign public count")
         s = self.state

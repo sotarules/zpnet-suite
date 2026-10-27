@@ -18,7 +18,7 @@ Compare uses all five predictors on common rows/blocks/splits; compare-legacy
 uses synthetic, PI BME280 and MAX31865 without requiring PD or OUT.
 Each sensor's degree/lag is chosen on development data, not on the final test.
 New rows read the immutable raw one-second distribution directly and compare
-it with the recorded firmware (NOR1/NOR2/NOR3/NOR4) or Pi correction. Legacy rows reconstruct raw LAP
+it with the recorded firmware (NOR1/NOR2/NOR3/NOR4/NOR5) or Pi correction. Legacy rows reconstruct raw LAP
 using their recorded firmware offset. New models always fit raw LAP.
 Models: constant, linear, quadratic, cubic. Model selection uses forward-only
 validation within the first 70%; the last 30% tests the frozen choice once.
@@ -28,7 +28,7 @@ on complete, uninterrupted blocks. Positive lag means temperature BEFORE lap.
 --sensor high pools exact ADC sums/counts and accepted-race-weighted raw LAP
 over the SAME nonoverlapping consecutive fragments. --bin-seconds is the nominal
 block width in one-second fragments; actual firmware durations are reported.
-HIGH60 is not averaged again and no temperature context is required. HIGH units
+The applied HIGH60/HIGH5 predictor is not averaged again and no temperature context is required. HIGH units
 are nominal mV (3300/4095), not calibrated voltage. Both physical ADC samples and
 accepted races retain their own counts; they are not assumed to be paired events.
 HIGH analysis uses zero lag. Direction means rising/falling voltage, not measured
@@ -57,14 +57,15 @@ from zpnet.shared.report_db import add_read_arguments, validate_read_arguments, 
 
 SCHEMA = "PHOTONS_V1"
 MIN_FIT = 3
-VERSION = "2026-10-26.2"
-from zpnet.shared.photons_voltage import voltage_adjustment, voltage_coefficient_fields
+VERSION = "2026-10-27.1"
+from zpnet.shared.photons_voltage import voltage_adjustment, voltage_coefficient_fields, voltage_window
 
 FIRMWARE_ACQUISITION_IDS = {
     "PD200T_HIGH_LINEAR_V1": 0x4E4F5231,
     "PD200T_HIGH60_LINEAR_V1": 0x4E4F5232,
     "PD200T_HIGH60_LINEAR_V2": 0x4E4F5233,
     "PD200T_HIGH60_QUADRATIC_V1": 0x4E4F5234,
+    "PD200T_HIGH5_QUADRATIC_V1": 0x4E4F5235,
 }
 HIGH_REFERENCE_MV = 3300
 HIGH_MV_PER_COUNT = HIGH_REFERENCE_MV / 4095
@@ -294,7 +295,7 @@ def parse_sample(row_id: int, p: Dict[str, Any], sensor: str = "synthetic") -> T
     uncorrected_ns = canonical_ns + correction_ns
     raw_source = "LEGACY_RECONSTRUCTED" if normalization_id is not None else "LEGACY"
     if measurement is not None:
-        # NOR1 uses fragment HIGH; NOR2/NOR3/NOR4 use HIGH60. All preserve the raw
+        # NOR1 uses fragment HIGH; NOR2–NOR4 use HIGH60; NOR5 uses HIGH5. All preserve raw
         # distribution alongside a uniform per-fragment voltage correction.
         firmware = ph.get("voltage_normalization")
         identities = (FIRMWARE_ACQUISITION_IDS[firmware["model_id"]],) if firmware is not None else (0x52415731,)
@@ -316,6 +317,8 @@ def parse_sample(row_id: int, p: Dict[str, Any], sensor: str = "synthetic") -> T
                 raise ValueError("firmware normalization model identity mismatch")
             if abs(number(measurement["correction_ns"]) + number(firmware["adjustment_ns"])) > 1e-6:
                 raise ValueError("measurement correction disagrees with firmware adjustment")
+            if firmware["model_id"] != "PD200T_HIGH_LINEAR_V1":
+                voltage_window(firmware, ph["pd_out"])
             expected = voltage_adjustment(firmware, firmware["high_mv"])
             if not math.isclose(number(firmware["adjustment_ns"]), expected, rel_tol=0.0, abs_tol=1e-6):
                 raise ValueError("firmware voltage polynomial does not close")
@@ -1052,11 +1055,11 @@ def main(argv):
     if args.sensor in ('compare', 'compare-legacy'):
         print(f'Comparison requires all {len(SENSORS if args.sensor == "compare" else LEGACY_SENSORS)} predictors on every retained row; blocks and time splits are shared.')
         print('Sensor-specific degree/lag choices use development folds only. Final-test ranking is exploratory.')
-    print('New rows use measurement.raw_flight_ns directly, including NOR1/NOR2/NOR3/NOR4 firmware voltage normalization.')
+    print('New rows use measurement.raw_flight_ns directly, including NOR1/NOR2/NOR3/NOR4/NOR5 firmware voltage normalization.')
     print('Legacy thermal rows reconstruct raw LAP from their recorded uniform offsets.')
     if args.sensor == 'high':
         print('HIGH: exact per-fragment ADC sums/counts from photons.pd_out; nominal 3300 mV / 4095 counts.')
-        print('No temperature required. HIGH60 is not used as a predictor and is not averaged again.')
+        print('No temperature required. The applied HIGH60/HIGH5 window is not used as the fragment-HIGH predictor in this report.')
         print('Pool ADC samples and accepted races separately over matching nonoverlapping fragments.')
         print('--bin-seconds counts nominal one-second fragments; actual durations are reported. No lag search.')
     else:

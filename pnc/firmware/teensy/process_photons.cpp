@@ -40,10 +40,10 @@
 static constexpr uint64_t PHOTONS_FRAGMENT_PERIOD_NS = 1000000000ULL;
 static constexpr uint64_t PHOTONS_NS_PER_SECOND = 1000000000ULL;
 
-// HighLow2 quadratic trial. NOR4 starts fresh corrected numerator/Welford/
+// HighLow3 HIGH5 quadratic trial. NOR5 starts fresh corrected numerator/Welford/
 // Better-Buckets custody; never restore earlier corrected populations into
 // this calibration. Original DWT and per-fragment raw evidence stay raw.
-static constexpr uint32_t PHOTONS_ACQUISITION_ID = 0x4E4F5234UL; // 'NOR4'
+static constexpr uint32_t PHOTONS_ACQUISITION_ID = 0x4E4F5235UL; // 'NOR5'
 
 
 // i.MX RT1062 RAM2 is write-back cached in 32-byte lines.  PHOTONS places only
@@ -2407,22 +2407,21 @@ static FLASHMEM void photons_envelope_finish(const photons_race_batch_t& batch,
 }
 
 
-// Provisional HighLow2 trial, 2026-10-26. Coefficients frozen from the first
-// 70% of the pre-outage time span: 2782 complete 60-second development blocks.
-// Features evaluated per second before pooling; later 30% reserved for testing.
-// Development block-mean HIGH60 range: 438.3795..465.7743 mV (not a clamp).
-// ADJ = offset + slope*x + quadratic*x*x; x = authoritative HIGH60 - 455 mV.
-// Offset matches NOR3 at 455 mV; this is not an absolute flight-time calibration.
-// No individual-race, LOW, temperature, or rate correction. New hardware and
-// thermal cycles require fresh validation; never refit or clamp at runtime.
+// Provisional HighLow3 HIGH5 trial, 2026-10-27. Frozen first-70% fit:
+// 1129 complete 60-fragment development blocks; later 30% withheld from fitting.
+// Source extract SHA256: 46761a5fca0e643a1f108c99933ac6a79c095858139795c16512e3704a2d64fa
+// Per-fragment HIGH5 and its square evaluated before race-weighted block pooling.
+// Development block-mean HIGH5 range: 439.1703..459.3281 mV (not a clamp).
+// ADJ = offset + slope*x + quadratic*x*x; x = authoritative HIGH5 - 455 mV.
+// Offset preserves NOR4 at 455 mV; not an absolute flight-time calibration.
+// No per-race, LOW, temperature, rate, adaptive-window or runtime-fit correction.
 static constexpr Double PHOTONS_HIGH_REFERENCE_MV = 455_D;
 static constexpr Double PHOTONS_HIGH_OFFSET_NS = -7.091998360876317_D;
-static constexpr Double PHOTONS_HIGH_SLOPE_NS_PER_MV = 0.36537694032628687_D;
-static constexpr Double PHOTONS_HIGH_QUADRATIC_NS_PER_MV2 = -0.004691243835679416_D;
+static constexpr Double PHOTONS_HIGH_SLOPE_NS_PER_MV = 0.38806607923641423_D;
+static constexpr Double PHOTONS_HIGH_QUADRATIC_NS_PER_MV2 = -0.004808419702287202_D;
 
-// Shared authoritative conversion for the Metrics HIGH60 publication and the
-// scientific correction. Never construct a second rolling voltage estimator.
-static Double photons_high60_mean_mv(const photons_pd_out_window_t& window) {
+// Shared exact ADC conversion for both published windows and the HIGH5 correction.
+static Double photons_window_mean_mv(const photons_pd_out_window_t& window) {
   if (window.sample_count == 0ULL) __builtin_trap();
   return (Double(window.high_sum) * 3300_D) /
          (Double(window.sample_count) * 4095_D);
@@ -2432,17 +2431,17 @@ static photons_fragment_voltage_normalization_snapshot_t
 photons_voltage_normalization(const photons_pd_out_batch_t& batch) {
   photons_fragment_voltage_normalization_snapshot_t n{};
   n.adc_sample_count = batch.sample_count; // Independent current-fragment ADC custody.
-  const auto& window = batch.high_window; // Exactly the HIGH60_MV Metrics source.
+  const auto& window = batch.high5_window; // Exactly the HIGH5_MV Metrics source.
   if (window.sample_count < batch.sample_count) __builtin_trap();
   if (window.sample_count != 0ULL && window.fragments == 0U) __builtin_trap();
-  n.high60_sample_count = window.sample_count;
-  n.high60_elapsed_ms = window.elapsed_ms;
-  n.high60_fragments = window.fragments;
-  n.high60_complete = window.elapsed_ms >= PHOTONS_PD_OUT_HIGH_WINDOW_MS;
+  n.high5_sample_count = window.sample_count;
+  n.high5_elapsed_ms = window.elapsed_ms;
+  n.high5_fragments = window.fragments;
+  n.high5_complete = window.elapsed_ms >= PHOTONS_PD_OUT_HIGH5_WINDOW_MS;
   if (window.sample_count != 0ULL) {
-    // During the initial <60 s the identical HIGH60 witness is partial;
+    // During the initial <5 s the identical HIGH5 witness is partial;
     // document its maturity rather than silently substituting fragment HIGH.
-    n.high_mv = photons_high60_mean_mv(window);
+    n.high_mv = photons_window_mean_mv(window);
     const Double x = n.high_mv - PHOTONS_HIGH_REFERENCE_MV;
     n.adjustment_ns = PHOTONS_HIGH_OFFSET_NS +
                      x * (PHOTONS_HIGH_SLOPE_NS_PER_MV +
@@ -2491,9 +2490,9 @@ static FLASHMEM photons_fragment_drain_result_t photons_drain_raw_laps(
 
   if (race_batch.accepted_count != 0ULL) {
     // Preserve current-fragment acquisition integrity AND require the exact
-    // producer-owned HIGH60 predictor; never fall back to fragment HIGH.
+    // producer-owned HIGH5 predictor; never fall back to fragment HIGH.
     if (pd_out_batch.sample_count == 0ULL ||
-        pd_out_batch.high_window.sample_count == 0ULL) __builtin_trap();
+        pd_out_batch.high5_window.sample_count == 0ULL) __builtin_trap();
     const uint32_t cps = race_cps;
     if (cps == 0U) __builtin_trap();
     const Double n = (Double)race_batch.accepted_count;
@@ -3980,7 +3979,7 @@ PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_core, 2048U);
 // the nested flight_ns Welford. Keep explicit fixed custody with schema headroom.
 // Explicit acquisition bounds and four uint64 rejection reasons (total/delta).
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_race, 4096U);
-// Include per-fragment moments and the nested 60-second HIGH population.
+// Include per-fragment moments and nested HIGH60/HIGH5 populations.
 // Additional fixed space for exact rolling-pair moments and provenance.
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_pd_out, 8192U);
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_voltage_normalization, 1536U);
@@ -4802,7 +4801,7 @@ static void photons_low_high_window_payload(Payload& p,
 static void photons_low_high_payload(Payload& p, const photons_low_high_batch_t& b) {
   p.clear();
   p.add("schema", "PHOTONS_LOW_HIGH_WITNESS_V1");
-  p.add("role", "WITNESS_ONLY_HIGH60_CORRECTION_UNCHANGED");
+  p.add("role", "WITNESS_ONLY_HIGH5_CORRECTION_UNCHANGED");
   p.add("population", "CADENCE_LAUNCHES_CLOSED_IN_FRAGMENT_NOT_SCIENCE_ACCEPTANCE");
   p.add("pair_rule", "ONE_HIGH_IN_RECEIVE_WINDOW_AND_LOW_TRIGGER_BEFORE_ENTRY_NO_DELTA_FILTER");
   p.add("adc", "LOW_ADC1_HIGH_ADC2_PIN40_CHANNEL9_12BIT");
@@ -4902,6 +4901,27 @@ static FLASHMEM Payload cmd_low_lead(const Payload& args) {
   return p;
 }
 
+static void photons_pd_window_payload(Payload& high_window,
+                                      const photons_pd_out_window_t& w,
+                                      uint32_t target_ms) {
+  high_window.clear();
+  high_window.add("target_ms", target_ms);
+  high_window.add("elapsed_ms", w.elapsed_ms);
+  high_window.add("fragments", w.fragments);
+  high_window.add("started_at_ms", w.completed_at_ms - (uint32_t)w.elapsed_ms);
+  high_window.add("completed_at_ms", w.completed_at_ms);
+  high_window.add("sample_count", w.sample_count);
+  high_window.add("high_sum_counts", w.high_sum);
+  high_window.add("high_sum_squares_counts", w.high_sum_squares);
+  high_window.add("reference_mv", 3300U); // nominal, not an ADC calibration
+  if (w.sample_count != 0ULL) {
+    const Double mean = Double(w.high_sum) / Double(w.sample_count);
+    high_window.add("high_mean_counts", toFixedDecimal(mean, 6));
+    high_window.add("high_mean_mv",
+                    toFixedDecimal(photons_window_mean_mv(w), 6));
+  }
+}
+
 static Payload& photons_fragment_payload(
     const photons_fragment_snapshot_t& f) {
   photons_foreground_owner_assert(photons_foreground_owner_t::FRAGMENT);
@@ -4974,27 +4994,14 @@ static Payload& photons_fragment_payload(
     pd_out.add("high_start_after_entry_mean_cycles",
                toFixedDecimal(Double(f.pd_out.high_delay_cycles_sum) / count, 3));
   }
-  // Freeze producer-authored window testimony; Pi carries this object unchanged.
-  // Mean is omitted for an empty population, never fabricated as zero.
+  // Both frozen witnesses use the existing builder sequentially; no new store.
   Payload& high_window = g_photons_fragment_high_window;
-  high_window.clear();
-  const auto& w = f.pd_out.high_window;
-  high_window.add("target_ms", PHOTONS_PD_OUT_HIGH_WINDOW_MS);
-  high_window.add("elapsed_ms", w.elapsed_ms);
-  high_window.add("fragments", w.fragments);
-  high_window.add("started_at_ms", w.completed_at_ms - (uint32_t)w.elapsed_ms);
-  high_window.add("completed_at_ms", w.completed_at_ms);
-  high_window.add("sample_count", w.sample_count);
-  high_window.add("high_sum_counts", w.high_sum);
-  high_window.add("high_sum_squares_counts", w.high_sum_squares);
-  high_window.add("reference_mv", 3300U); // nominal, not an ADC calibration
-  if (w.sample_count != 0ULL) {
-    const Double mean = Double(w.high_sum) / Double(w.sample_count);
-    high_window.add("high_mean_counts", toFixedDecimal(mean, 6));
-    high_window.add("high_mean_mv",
-                    toFixedDecimal(photons_high60_mean_mv(w), 6));
-  }
+  photons_pd_window_payload(high_window, f.pd_out.high_window,
+                            PHOTONS_PD_OUT_HIGH_WINDOW_MS);
   pd_out.add_object("high_window", high_window);
+  photons_pd_window_payload(high_window, f.pd_out.high5_window,
+                            PHOTONS_PD_OUT_HIGH5_WINDOW_MS);
+  pd_out.add_object("high5_window", high_window);
   high_window.clear();
   {
     auto& store = g_photons_serialization_store;
@@ -5097,14 +5104,14 @@ static Payload& photons_fragment_payload(
   instrument.add_object("race", race);
   race.clear();
   voltage_normalization.add("schema", "PHOTONS_VOLTAGE_NORMALIZATION_V1");
-  voltage_normalization.add("model_id", "PD200T_HIGH60_QUADRATIC_V1");
+  voltage_normalization.add("model_id", "PD200T_HIGH5_QUADRATIC_V1");
   voltage_normalization.add("application", "UNIFORM_OFFSET_AT_FRAGMENT_DRAIN");
-  voltage_normalization.add("voltage_source", "PD_OUT_HIGH60_MV");
+  voltage_normalization.add("voltage_source", "PD_OUT_HIGH5_MV");
   voltage_normalization.add("adc_sample_count", f.voltage_normalization.adc_sample_count);
-  voltage_normalization.add("high60_sample_count", f.voltage_normalization.high60_sample_count);
-  voltage_normalization.add("high60_elapsed_ms", f.voltage_normalization.high60_elapsed_ms);
-  voltage_normalization.add("high60_fragments", f.voltage_normalization.high60_fragments);
-  voltage_normalization.add("high60_complete", f.voltage_normalization.high60_complete);
+  voltage_normalization.add("high5_sample_count", f.voltage_normalization.high5_sample_count);
+  voltage_normalization.add("high5_elapsed_ms", f.voltage_normalization.high5_elapsed_ms);
+  voltage_normalization.add("high5_fragments", f.voltage_normalization.high5_fragments);
+  voltage_normalization.add("high5_complete", f.voltage_normalization.high5_complete);
   voltage_normalization.add("high_mv", toScientificDecimal(f.voltage_normalization.high_mv));
   voltage_normalization.add("reference_mv", toScientificDecimal(PHOTONS_HIGH_REFERENCE_MV));
   voltage_normalization.add("slope_ns_per_mv", toScientificDecimal(PHOTONS_HIGH_SLOPE_NS_PER_MV));
