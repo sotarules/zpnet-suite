@@ -10543,6 +10543,42 @@ static FLASHMEM Payload cmd_recover_abort(const Payload& args) {
   return p;
 }
 
+// Read-only, bounded watchdog custody witness. REPORT_RECOVERY intentionally
+// omits the retained local reason/details, and a WATCHDOG_ANOMALY publication
+// can itself be lost. Keep the original first-anomaly evidence inspectable
+// without clearing the gate or mutating the campaign/Alpha lifecycle.
+// 'last_*' fields are boot-lifetime testimony; use anomaly_active to decide
+// whether the stored reason describes a currently surrendered campaign.
+static FLASHMEM Payload cmd_report_watchdog(const Payload&) {
+  const clocks_payload_custody_t payload_custody(
+      clocks_payload_owner_t::COMMAND);
+  Payload p;
+  p.add("report", "CLOCKS_WATCHDOG");
+  p.add("schema", "CLOCKS_WATCHDOG_REPORT_V1");
+  p.add("read_only", true);
+  p.add("campaign", campaign_name);
+  p.add("campaign_state", clocks_campaign_state_name(campaign_state));
+  p.add("campaign_seconds", campaign_seconds);
+  p.add("anomaly_active", (bool)watchdog_anomaly_active);
+  p.add("publication_blocked", clocks_watchdog_publication_blocked());
+  p.add("campaign_surrendered", (bool)watchdog_campaign_surrendered);
+  p.add("campaign_publication_armed", (bool)watchdog_campaign_publication_armed);
+  p.add("last_sequence", (uint32_t)watchdog_anomaly_sequence);
+  p.add("last_reason", watchdog_anomaly_reason);
+  p.add("last_detail0", (uint32_t)watchdog_anomaly_detail0);
+  p.add("last_detail1", (uint32_t)watchdog_anomaly_detail1);
+  p.add("last_detail2", (uint32_t)watchdog_anomaly_detail2);
+  p.add("last_detail3", (uint32_t)watchdog_anomaly_detail3);
+  p.add("last_trigger_dwt", (uint32_t)watchdog_anomaly_trigger_dwt);
+  p.add("publish_pending", (bool)watchdog_anomaly_publish_pending);
+  p.add("surrender_count", (uint32_t)watchdog_campaign_surrender_count);
+  p.add("verbose_publish_count", (uint32_t)watchdog_anomaly_verbose_publish_count);
+  p.add("legacy_publish_count", (uint32_t)watchdog_anomaly_legacy_publish_count);
+  p.add("suppressed_unarmed_count",
+        (uint32_t)watchdog_anomaly_suppressed_unarmed_count);
+  return p;
+}
+
 static FLASHMEM Payload cmd_watchdog_test(const Payload&) {
   const clocks_payload_custody_t payload_custody(
       clocks_payload_owner_t::COMMAND);
@@ -11265,6 +11301,7 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "REPORT_ROW_COURT",    cmd_report_row_court    },
   { "STATS_RESET",         cmd_stats_reset         },
   { "REPORT_RECOVERY",     cmd_report_recovery     },
+  { "REPORT_WATCHDOG",     cmd_report_watchdog     },
   { "STACK_WITNESS_RESET", cmd_stack_witness_reset },
   { "WATCHDOG_TEST",       cmd_watchdog_test       },
   { "INJECT_PROBLEM",      cmd_inject_problem      },

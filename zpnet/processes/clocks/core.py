@@ -4271,6 +4271,12 @@ def _timebase_silence_producer_progress_court(
         )
 
     def view(status: Dict[str, Any]) -> Dict[str, Any]:
+        # These fields are already present in the two existing firmware RPCs.
+        # Retain bounded causal testimony even when producer progress is unproved;
+        # no extra RPC, producer mutation, or recovery-authority change is needed.
+        def flag(key: str) -> Optional[bool]:
+            return _recovery_bool(status[key]) if key in status else None
+
         return {
             "campaign": str(status.get("campaign") or "").strip(),
             "campaign_state": str(status.get("campaign_state") or "").strip().upper(),
@@ -4280,11 +4286,41 @@ def _timebase_silence_producer_progress_court(
             "preserved": _recovery_bool(status.get("instrument_statistics_preserved")),
             "epoch_ready": _recovery_bool(status.get("recover_epoch_ready")),
             "recover_active": _recovery_bool(status.get("recover_lifecycle_active")),
-            "publication_retry": _recovery_bool(
-                status.get("fragment_publication_retry_active")
+            "enabled": flag("enabled"),
+            "watchdog_anomaly_active": flag("watchdog_anomaly_active"),
+            "watchdog_publication_blocked": flag("watchdog_publication_blocked"),
+            "recover_timeline_ready": flag("recover_timeline_ready"),
+            "campaign_record_pending": flag("campaign_record_pending"),
+            "campaign_record_stage": str(status.get("campaign_record_last_stage_name") or ""),
+            "campaign_record_stage_count": _as_int(status.get("campaign_record_stage_count")),
+            "campaign_record_take_count": _as_int(status.get("campaign_record_take_count")),
+            "campaign_record_observer_drop_count": _as_int(
+                status.get("campaign_record_observer_drop_count")
+            ),
+            "publication_retry": flag("fragment_publication_retry_active"),
+            "publication_retry_sequence": _as_int(
+                status.get("fragment_publication_retry_sequence")
+            ),
+            "publication_retry_attempt_count": _as_int(
+                status.get("fragment_publication_retry_attempt_count")
             ),
             "publication_retry_reason": str(
                 status.get("fragment_publication_retry_reason") or ""
+            ),
+            "publication_publish_reject_count": _as_int(
+                status.get("fragment_publication_publish_reject_count")
+            ),
+            "publication_service_arm_failures": _as_int(
+                status.get("fragment_publication_service_arm_failures")
+            ),
+            "publication_active_retry_exhaustion_count": _as_int(
+                status.get("fragment_publication_active_retry_exhaustion_count")
+            ),
+            "publication_last_exhausted_sequence": _as_int(
+                status.get("fragment_publication_last_exhausted_sequence")
+            ),
+            "publication_last_exhausted_reason": str(
+                status.get("fragment_publication_last_exhausted_reason") or ""
             ),
         }
 
@@ -4334,6 +4370,17 @@ def _timebase_silence_producer_progress_court(
     if proved:
         _diag["timebase_silence_producer_progress_proved"] = (
             _diag.get("timebase_silence_producer_progress_proved", 0) + 1
+        )
+    else:
+        # Previously the unproved branch was silent and the detailed firmware
+        # publication/observer counters were discarded. This is the point at
+        # which the evidence is still available, before any recovery attempt.
+        logging.warning(
+            "🧾 [clocks/silence] producer progress UNPROVED for %s: "
+            "candidate_delta=%s public_delta=%s first=%s second=%s; "
+            "continuing fail-closed lifetime classification",
+            expected_campaign or "NONE",
+            candidate_delta, public_delta, first, second,
         )
     _diag["last_timebase_silence_producer_progress"] = copy.deepcopy(result)
     return result
