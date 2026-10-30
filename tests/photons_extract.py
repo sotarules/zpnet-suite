@@ -19,7 +19,7 @@ import tempfile
 
 from zpnet.shared.report_db import add_read_arguments, validate_read_arguments
 
-VERSION = '2026-10-27.1'
+VERSION = '2026-10-29.1'
 FIELDS = [
     'detail_id', 'published_at_utc', 'sequence', 'reset_count', 'update_count',
     'recovery_generation', 'anchor_pps_count', 'context_id', 'recovery_receipt_present',
@@ -31,6 +31,9 @@ FIELDS = [
     # Additive V1 fields: historical rows have no HIGH5 witness (null, not zero).
     'high5_mv', 'high5_n', 'high5_elapsed_ms', 'high5_target_ms',
     'high5_fragments', 'high5_sum_counts', 'high5_sum_squares_counts',
+    # Width at the cut and explicit mixed-fragment evidence; legacy fields null.
+    'pulse_ns', 'requested_pulse_ns', 'pulse_ns_at_fragment_start',
+    'pulse_change_count_total', 'pulse_changes_this_fragment',
 ]
 SENSORS = ['synthetic', 'bme280', 'bme280_receiver', 'bme280_out', 'max31865']
 
@@ -165,6 +168,10 @@ def extract(args, rows, thermal, witness, output):
                 *([high5.get('high_mean_mv'), high5['sample_count'], high5['elapsed_ms'],
                    high5['target_ms'], high5['fragments'], high5['high_sum_counts'],
                    high5['high_sum_squares_counts']] if high5 is not None else [None] * 7),
+                ph['race']['pulse_ns'], ph['race'].get('requested_pulse_ns'),
+                ph['race'].get('pulse_ns_at_fragment_start'),
+                ph['race'].get('pulse_change_count_total'),
+                ph['race'].get('pulse_changes_this_fragment'),
             ])
             counts['exported'] += 1
             counts['high60_complete'] += int(window['elapsed_ms'] >= window['target_ms'])

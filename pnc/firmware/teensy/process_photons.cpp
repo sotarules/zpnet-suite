@@ -152,6 +152,14 @@ static uint64_t g_photons_cadence_ns =
     photons_interval_from_laps(PHOTONS_DEFAULT_LAPS_PER_SECOND);
 static uint32_t g_photons_cadence_cycles = 0U;
 static uint32_t g_photons_race_pulse_cycles = 0U;
+// Ad-hoc shortening only: never extend the baseline launch-guard residence.
+// Foreground command requests; cadence applies after settling the previous shot.
+static constexpr uint64_t PHOTONS_RACE_PULSE_MIN_NS = 1ULL;
+static uint64_t g_photons_requested_pulse_ns = PHOTONS_RACE_PULSE_NS;
+static uint64_t g_photons_applied_pulse_ns = PHOTONS_RACE_PULSE_NS;
+static uint64_t g_photons_pulse_change_count = 0ULL;
+static uint64_t g_photons_fragment_pulse_start_ns = PHOTONS_RACE_PULSE_NS;
+static uint64_t g_last_fragment_pulse_change_count = 0ULL;
 // An actual launch normally anchors the next opportunity. A quiet-window skip
 // consumes one opportunity and anchors the next one at its admission check.
 static uint32_t g_photons_cadence_anchor_dwt = 0U;
@@ -3161,7 +3169,7 @@ static void photons_race_seed_observe(uint32_t raw_cycles) {
 
 // Cadence service already admitted this complete acquisition and holds the
 // priority-0-preserving launch guard until the return receiver is armed.
-// Pulse width is prepared at ENABLE so no division follows quiet admission.
+// Pulse width is prepared before quiet admission; no division enters the launch.
 static uint32_t photons_race_launch_pulse(uint32_t& before_mod_high_dwt) {
   if (digitalRead(LASER_MOD_PIN) != LOW) __builtin_trap();
   const uint32_t width_cycles = g_photons_race_pulse_cycles;
@@ -3304,9 +3312,18 @@ static void photons_cadence_apply_requested_rate(void) {
   if (cycles == 0ULL || cycles >= 0x80000000ULL) __builtin_trap();
   g_photons_cadence_ns = interval_ns;
   g_photons_cadence_cycles = (uint32_t)cycles;
-  g_photons_race_pulse_cycles = (uint32_t)(
-      ((uint64_t)cps * PHOTONS_RACE_PULSE_NS + PHOTONS_NS_PER_SECOND - 1ULL) /
-      PHOTONS_NS_PER_SECOND);
+  const uint64_t pulse_ns = g_photons_requested_pulse_ns;
+  if (pulse_ns < PHOTONS_RACE_PULSE_MIN_NS ||
+      pulse_ns > PHOTONS_RACE_PULSE_NS) __builtin_trap();
+  const uint64_t pulse_cycles =
+      ((uint64_t)cps * pulse_ns + PHOTONS_NS_PER_SECOND - 1ULL) /
+      PHOTONS_NS_PER_SECOND;
+  if (pulse_cycles == 0ULL || pulse_cycles >= cycles) __builtin_trap();
+  g_photons_race_pulse_cycles = (uint32_t)pulse_cycles;
+  if (pulse_ns != g_photons_applied_pulse_ns) {
+    photons_batch_add_checked(g_photons_pulse_change_count, 1ULL);
+    g_photons_applied_pulse_ns = pulse_ns;
+  }
   g_photons_applied_laps_per_second = laps;
 }
 
@@ -3332,7 +3349,8 @@ static void photons_cadence_service(void*) {
   photons_pd_out_low_finish(photons_low_high_close_t::NEXT_LAUNCH);
   // Keep the old shot's full window, even when the new cadence is shorter.
   // The next shot and quiet-window check use the newly applied rate together.
-  if (g_photons_requested_laps_per_second != g_photons_applied_laps_per_second) {
+  if (g_photons_requested_laps_per_second != g_photons_applied_laps_per_second ||
+      g_photons_requested_pulse_ns != g_photons_applied_pulse_ns) {
     photons_cadence_apply_requested_rate();
   }
   auto& race = g_photons_race_foreground;
@@ -3978,7 +3996,8 @@ PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_core, 2048U);
 // cadence-era object. Include cadence and pending-return witnesses plus
 // the nested flight_ns Welford. Keep explicit fixed custody with schema headroom.
 // Explicit acquisition bounds and four uint64 rejection reasons (total/delta).
-PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_race, 4096U);
+// Include live-width provenance without reducing the existing numeric headroom.
+PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_race, 4608U);
 // Include per-fragment moments and nested HIGH60/HIGH5 populations.
 // Additional fixed space for exact rolling-pair moments and provenance.
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_pd_out, 8192U);
@@ -5046,6 +5065,12 @@ static Payload& photons_fragment_payload(
   race.add("requested_laps_per_second", f.race_requested_laps_per_second);
   race.add("applied_laps_per_second", f.race_applied_laps_per_second);
   race.add("pulse_ns", f.race_pulse_ns);
+  race.add("requested_pulse_ns", f.race_requested_pulse_ns);
+  race.add("pulse_ns_at_fragment_start", f.race_pulse_ns_at_fragment_start);
+  race.add("pulse_change_count_total", f.race_pulse_change_count_total);
+  race.add("pulse_changes_this_fragment", f.race_pulse_changes_this_fragment);
+  race.add("pulse_width_semantics", "REQUESTED_MOD_HIGH_DURATION_NOT_OPTICAL_WIDTH");
+  race.add("pulse_boundary_policy", "APPLIED_AT_CUT_CHANGES_MARK_MIXED_FRAGMENT");
   race.add("launch_surrogate", "DRV200_MOD_HIGH_EDGE_OBSERVED");
   race.add("flight_interpretation", "OBSERVED_DWT_ENDPOINTS");
   race.add("cadence_tick_count_total", f.race_cadence_tick_count_total);
@@ -5563,7 +5588,15 @@ static FLASHMEM void photons_fragment_tick(
   fragment.race_requested_laps_per_second = g_photons_requested_laps_per_second;
   fragment.race_applied_laps_per_second = g_photons_applied_laps_per_second;
   fragment.race_cadence_hz = (uint32_t)(PHOTONS_NS_PER_SECOND / g_photons_cadence_ns);
-  fragment.race_pulse_ns = PHOTONS_RACE_PULSE_NS;
+  fragment.race_pulse_ns = g_photons_applied_pulse_ns;
+  fragment.race_requested_pulse_ns = g_photons_requested_pulse_ns;
+  fragment.race_pulse_ns_at_fragment_start = g_photons_fragment_pulse_start_ns;
+  fragment.race_pulse_change_count_total = g_photons_pulse_change_count;
+  fragment.race_pulse_changes_this_fragment =
+      g_photons_pulse_change_count - g_last_fragment_pulse_change_count;
+  // Advance even on a rejected publication, just like the actual batch cut.
+  g_photons_fragment_pulse_start_ns = g_photons_applied_pulse_ns;
+  g_last_fragment_pulse_change_count = g_photons_pulse_change_count;
   fragment.race_cadence_tick_count_total = race.cadence_tick_count;
   fragment.race_cadence_ticks_this_fragment = (uint32_t)(
       race.cadence_tick_count -
@@ -5947,6 +5980,8 @@ static void photons_start_fragment_publisher(void) {
   // Rebase on every publisher start so disabled/recovery time is not charged
   // to the first batch. Rejected publications still advance the batch boundary.
   g_last_fragment_cut_ms = millis();
+  g_photons_fragment_pulse_start_ns = g_photons_applied_pulse_ns;
+  g_last_fragment_pulse_change_count = g_photons_pulse_change_count;
   photons_pd_out_rebase(g_last_fragment_cut_ms);
   g_fragment_timer = timepop_arm_recurring_service(
       PHOTONS_FRAGMENT_PERIOD_NS,
@@ -7398,7 +7433,7 @@ static FLASHMEM Payload cmd_report_photons(const Payload& /*args*/) {
   p.add("race_cadence_ns", canonical.race_cadence_ns);
   p.add("race_requested_laps_per_second", canonical.race_requested_laps_per_second);
   p.add("race_applied_laps_per_second", canonical.race_applied_laps_per_second);
-  p.add("race_pulse_ns", PHOTONS_RACE_PULSE_NS);
+  p.add("race_pulse_ns", canonical.race_pulse_ns);
   p.add("race_launch_surrogate", "DRV200_MOD_HIGH_EDGE_OBSERVED");
   p.add("race_cadence_tick_count_total", canonical.race_cadence_tick_count_total);
   p.add("race_cadence_ticks_this_fragment", canonical.race_cadence_ticks_this_fragment);
@@ -7696,7 +7731,7 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
         g_photons_race_foreground.active);
   p.add("race_cadence_hz", (uint32_t)(PHOTONS_NS_PER_SECOND / g_photons_cadence_ns));
   p.add("race_cadence_ns", g_photons_cadence_ns);
-  p.add("race_pulse_ns", PHOTONS_RACE_PULSE_NS);
+  p.add("race_pulse_ns", g_photons_applied_pulse_ns);
   p.add("race_launch_surrogate", "DRV200_MOD_HIGH_EDGE_OBSERVED");
   p.add("race_cadence_tick_count_total", race.cadence_tick_count);
   p.add("race_cadence_ticks_this_fragment", canonical.race_cadence_ticks_this_fragment);
@@ -7900,7 +7935,9 @@ static void photons_cadence_report(Payload& p) {
   p.add("laser_cadence_scheduling", "ACTUAL_LAUNCH_OR_QUIET_SKIP_DWT");
   p.add("laser_cadence_ns", g_photons_cadence_ns);
   p.add("laser_cadence_cycles", g_photons_cadence_cycles);
-  p.add("laser_pulse_ns", PHOTONS_RACE_PULSE_NS);
+  p.add("laser_pulse_ns", g_photons_applied_pulse_ns);
+  p.add("requested_pulse_ns", g_photons_requested_pulse_ns);
+  p.add("pulse_change_count_total", g_photons_pulse_change_count);
   p.add("laser_launch_count_total", g_photons_laser_launch_count);
   p.add("laser_cadence_deferred_count", g_photons_cadence_deferred_count);
   p.add("laser_cadence_deferred_policy", "QUIET_GUARD_NO_LAUNCH_NO_CATCHUP");
@@ -7913,6 +7950,48 @@ static void photons_cadence_report(Payload& p) {
   p.add("laser_quiet_ocxo1_skipped_count", g_photons_quiet_ocxo1_count);
   p.add("laser_quiet_ocxo2_skipped_count", g_photons_quiet_ocxo2_count);
   p.add("laser_timing", "TIMEPOP_FOREGROUND_ACTUAL_DWT_AT_MOD_HIGH");
+}
+
+static FLASHMEM void photons_pulse_width_report(Payload& p) {
+  p.add("schema", "PHOTONS_RACE_PULSE_WIDTH_V1");
+  p.add("requested_ns", g_photons_requested_pulse_ns);
+  p.add("applied_ns", g_photons_applied_pulse_ns);
+  p.add("default_ns", PHOTONS_RACE_PULSE_NS);
+  p.add("min_ns", PHOTONS_RACE_PULSE_MIN_NS);
+  p.add("max_ns", PHOTONS_RACE_PULSE_NS);
+  p.add("applied_cycles", g_photons_race_pulse_cycles);
+  p.add("change_count", g_photons_pulse_change_count);
+  p.add("apply_policy", "AFTER_CURRENT_CAPTURE_WINDOW");
+  p.add("scope", "VOLATILE_UNTIL_TEENSY_REBOOT");
+  p.add("timing_semantics", "REQUESTED_MOD_HIGH_DURATION_NOT_OPTICAL_WIDTH");
+  p.add("campaign_changed", false);
+  p.add("statistics_reset", false);
+  p.add("voltage_windows_reset", false);
+}
+
+static FLASHMEM Payload cmd_pulse_width(const Payload& args) {
+  const photons_foreground_custody_t custody(
+      photons_foreground_owner_t::COMMAND);
+  if (!g_initialized || !g_subscription_ok) __builtin_trap();
+  uint64_t ns = g_photons_requested_pulse_ns;
+  if ((args.has("ns") && !args.tryGetUInt64("ns", ns)) ||
+      ns < PHOTONS_RACE_PULSE_MIN_NS || ns > PHOTONS_RACE_PULSE_NS) {
+    Payload p;
+    p.add("status", "pulse_width_rejected");
+    p.add("error", "use ns=<integer> within min_ns..max_ns");
+    photons_pulse_width_report(p);
+    return p;
+  }
+  if (args.has("ns")) {
+    g_photons_requested_pulse_ns = ns;
+    if (!g_photons_cadence_running) photons_cadence_apply_requested_rate();
+  }
+  Payload p;
+  p.add("status", !args.has("ns") ? "pulse_width_report" :
+      (g_photons_requested_pulse_ns == g_photons_applied_pulse_ns
+          ? "pulse_width_configured" : "pulse_width_pending"));
+  photons_pulse_width_report(p);
+  return p;
 }
 
 static FLASHMEM Payload cmd_laps(const Payload& args) {
@@ -8386,6 +8465,7 @@ static const process_command_entry_t PHOTONS_COMMANDS[] = {
   { "DETECTOR_ACTIVATE",   cmd_detector_activate   },
   { "ENABLE",              cmd_enable              },
   { "LAPS",                cmd_laps                },
+  { "PULSE_WIDTH",         cmd_pulse_width         },
   { "DISABLE",             cmd_disable             },
   { "START",               cmd_start               },
   { "FLASH_CUT",           cmd_flash_cut           },

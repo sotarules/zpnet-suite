@@ -664,7 +664,13 @@ struct photons_fragment_snapshot_t {
   uint32_t race_applied_laps_per_second = 0;
   uint32_t race_pending_return_count = 0;
   uint32_t race_pending_return_count_previous = 0;
+  // Configuration at the cut, not a claim that every shot used this width.
+  // Nonzero changes mark transition fragments, including an A-B-A excursion.
   uint64_t race_pulse_ns = 0;
+  uint64_t race_requested_pulse_ns = 0;
+  uint64_t race_pulse_ns_at_fragment_start = 0;
+  uint64_t race_pulse_change_count_total = 0;
+  uint64_t race_pulse_changes_this_fragment = 0;
   uint64_t race_cadence_tick_count_total = 0;
   uint32_t race_cadence_ticks_this_fragment = 0;
   uint64_t race_attempt_count_total = 0;
