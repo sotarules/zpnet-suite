@@ -32,6 +32,7 @@ from zpnet.processes.processes import (
     send_command,
     server_setup,
 )
+from zpnet.processes.photons.laser_dac import LaserDac, requested_code
 from zpnet.shared.constants import Payload
 from zpnet.shared.db import DatabaseContentionRetry, open_db
 from zpnet.shared.logger import setup_logging
@@ -47,6 +48,8 @@ from zpnet.shared.photons_voltage import (
 # Matches process_photons.cpp. NOR5 changes the predictor to HIGH5 and uses its own frozen polynomial.
 # Never restore earlier corrected numerator/Welford/bucket custody into NOR5.
 # Startup's existing epoch-migration court preserves all historical rows.
+_laser_dac = LaserDac()  # Pi SMBus2; construction performs no hardware I/O.
+
 ACQUISITION_ID = 0x4E4F5235  # NOR5: frozen HighLow3 quadratic HIGH5 trial
 PHOTONS_MEASUREMENT_SCHEMA = "PI_PHOTONS_MEASUREMENT_V1"
 THERMAL_SENSOR_PATHS = {
@@ -5371,6 +5374,14 @@ def _make_photons(
     # lives in measurement, independently of the firmware accumulators.
     state["photons"] = copy.deepcopy(instrument)
     state["pd_out_statistics"] = _pd_out_statistics(instrument)
+    # Pi observation at receipt, never a claim about every race in this fragment.
+    # Recovery probes are not ingress and have no corresponding actuator snapshot.
+    if "_pi_laser_dac" in fragment:
+        state["laser_dac"] = {
+            **copy.deepcopy(fragment["_pi_laser_dac"]),
+            "observation_at_utc": ingress["utc"],
+            "alignment": "PI_STATE_AT_FRAGMENT_RECEIPT_NOT_RACE_AUTHORITY",
+        }
     stats = _require_dict(instrument.get("stats"), "PHOTONS_FRAGMENT.photons.stats")
 
     _cadence_mark(timing, "canonical_context_copy")
@@ -9462,6 +9473,7 @@ def on_photons_fragment(fragment: Payload) -> None:
     ingress_monotonic = time.monotonic()
     ingress_utc = _utc_now_z()
     copied["_pi_ingress"] = {"monotonic": ingress_monotonic, "utc": ingress_utc}
+    copied["_pi_laser_dac"] = _laser_dac.snapshot()
     with _state_lock:
         _fragments_received += 1
         _latest_fragment = copied
@@ -12198,6 +12210,7 @@ def cmd_report_recovery(_: Optional[dict]) -> Dict[str, Any]:
     )
     payload = response.get("payload") if isinstance(response, dict) else None
     if isinstance(payload, dict):
+        payload["laser_dac"] = _laser_dac.snapshot()
         payload["recovery"] = _recovery_report_surface()
     return response
 
@@ -12252,6 +12265,7 @@ def cmd_photons_info(_: Optional[dict]) -> Dict[str, Any]:
             "last_campaign_transition": copy.deepcopy(_last_campaign_transition),
             "last_structural_rejection": copy.deepcopy(_last_structural_rejection),
         }
+    payload["laser_dac"] = _laser_dac.snapshot()
     payload["recovery"] = _recovery_report_surface()
     with _campaign_lock:
         payload["lantern"] = {
@@ -12319,6 +12333,7 @@ def cmd_report(_: Optional[dict]) -> dict:
         }
 
     payload["cadence_timing"] = _cadence_report()
+    payload["laser_dac"] = _laser_dac.snapshot()
     payload["recovery"] = _recovery_report_surface()
     with _campaign_lock:
         payload["lantern"] = {
@@ -12627,7 +12642,51 @@ def cmd_repair(_: Optional[dict]) -> Dict[str, Any]:
     }
 
 
+def _laser_feedback_snapshot():
+    """Latest accepted producer windows, not a reconstructed Pi filter."""
+    with _state_lock:
+        if _latest_photons is None:
+            return None
+        row = _latest_photons
+        pd = row["photons"]["pd_out"]
+        return {
+            "sequence": row["sequence"],
+            "fragment_received_at_utc": row["context_timing"]["fragment_received_at_utc"],
+            "high5": copy.deepcopy(pd["high5_window"]),
+            "high60": copy.deepcopy(pd["high_window"]),
+            "servo": "NOT_IMPLEMENTED",
+        }
+
+
+def cmd_dac_info(_: Optional[dict]) -> Dict[str, Any]:
+    try:
+        payload = _laser_dac.readback()
+    except Exception as exc:
+        return {"success": False, "message": str(exc),
+                "payload": _laser_dac.snapshot()}
+    payload["feedback"] = _laser_feedback_snapshot()
+    return {"success": True, "message": "OK", "payload": payload}
+
+
+def cmd_set_dac(args: Optional[dict]) -> Dict[str, Any]:
+    try:
+        code = requested_code(args)
+    except (ValueError, TypeError, OverflowError) as exc:
+        return {"success": False, "message": str(exc)}
+    try:
+        payload = _laser_dac.set_code(code)
+    except Exception as exc:
+        logging.exception("[photons/dac] explicit laser DAC command failed")
+        return {"success": False, "message": str(exc),
+                "payload": _laser_dac.snapshot()}
+    logging.info("[photons/dac] manual code=%d DAC volts=%.6f", code,
+                 payload["commanded_dac_v"])
+    return {"success": True, "message": "OK", "payload": payload}
+
+
 COMMANDS = {
+    "SET_DAC": cmd_set_dac,
+    "DAC_INFO": cmd_dac_info,
     "ENABLE": cmd_enable,
     "DISABLE": cmd_disable,
     "START": cmd_start,
@@ -12649,6 +12708,7 @@ COMMANDS = {
 }
 
 _HARD_FAILURE_READ_ONLY_COMMANDS = {
+    "DAC_INFO",
     "REPORT_HISTOGRAM",
     "REPORT",
     "REPORT_PHOTONS",

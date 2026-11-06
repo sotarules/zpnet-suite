@@ -132,8 +132,7 @@ OT_SHDN_BIT = 0x01           # INT
 # I2C BUS IDENTITY (authoritative)
 # ------------------------------------------------------------------
 
-I2C_BUS_LEGACY = 1          # SMBUS1 — hardware I2C (SDA/SCL)
-I2C_BUS_EXPANDED = 2        # SMBUS2 — i2c-gpio on GPIO23/24
+from zpnet.shared.i2c_identity import I2C_BUS_LEGACY, I2C_BUS_EXPANDED
 
 # ------------------------------------------------------------------
 # Power monitoring (legacy: power_monitor)

@@ -87,6 +87,7 @@ from logging.handlers import RotatingFileHandler
 from typing import Dict, Any, List, Optional, Tuple
 
 from smbus2 import SMBus, i2c_msg
+from zpnet.shared.i2c_identity import I2C_BUS_LEGACY
 
 from zpnet.processes.processes import (
     server_setup,
@@ -107,7 +108,7 @@ NS_PER_SECOND = 1_000_000_000
 
 # OCXO DAC custody moved from Teensy CLOCKS to Pi CLOCKS.  These addresses are
 # authoritative ZPNet pin-map identities: 0x4E -> OCXO1, 0x4C -> OCXO2.
-DAC_I2C_BUS = 1
+DAC_I2C_BUS = I2C_BUS_LEGACY
 AD5693R_ADDR_OCXO1 = 0x4E
 AD5693R_ADDR_OCXO2 = 0x4C
 AD5693R_CMD_WRITE_INPUT_REG = 0x10
