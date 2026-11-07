@@ -86,7 +86,7 @@ from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from typing import Dict, Any, List, Optional, Tuple
 
-from smbus2 import SMBus, i2c_msg
+from zpnet.shared.ad5693r import read_input, write_register
 from zpnet.shared.i2c_identity import I2C_BUS_LEGACY
 
 from zpnet.processes.processes import (
@@ -111,8 +111,6 @@ NS_PER_SECOND = 1_000_000_000
 DAC_I2C_BUS = I2C_BUS_LEGACY
 AD5693R_ADDR_OCXO1 = 0x4E
 AD5693R_ADDR_OCXO2 = 0x4C
-AD5693R_CMD_WRITE_INPUT_REG = 0x10
-AD5693R_CMD_UPDATE_DAC_REG = 0x20
 AD5693R_CMD_WRITE_DAC_AND_INPUT = 0x30
 AD5693R_CMD_WRITE_CONTROL = 0x40
 AD5693R_CTRL_INTERNAL_VREF_2X = 0x0800
@@ -1210,28 +1208,11 @@ def _dac_voltage_from_code(value: float) -> float:
 
 def _ad5693r_write_24(address: int, command: int, data: int) -> None:
     value = int(data) & 0xFFFF
-    with SMBus(DAC_I2C_BUS) as bus:
-        msg = i2c_msg.write(
-            int(address),
-            [int(command) & 0xFF, (value >> 8) & 0xFF, value & 0xFF],
-        )
-        bus.i2c_rdwr(msg)
-
-
-def _ad5693r_write_command(address: int, command: int) -> None:
-    with SMBus(DAC_I2C_BUS) as bus:
-        msg = i2c_msg.write(int(address), [int(command) & 0xFF])
-        bus.i2c_rdwr(msg)
+    write_register(DAC_I2C_BUS, int(address), int(command) & 0xFF, value)
 
 
 def _ad5693r_read_input(address: int) -> int:
-    with SMBus(DAC_I2C_BUS) as bus:
-        msg = i2c_msg.read(int(address), 2)
-        bus.i2c_rdwr(msg)
-        data = list(msg)
-    if len(data) != 2:
-        raise OSError(f"AD5693R 0x{address:02X} returned {len(data)} bytes")
-    return ((int(data[0]) & 0xFF) << 8) | (int(data[1]) & 0xFF)
+    return read_input(DAC_I2C_BUS, int(address))
 
 
 def _dac_configure_lane(lane: _DacLaneState) -> bool:
@@ -1244,6 +1225,7 @@ def _dac_configure_lane(lane: _DacLaneState) -> bool:
     except Exception:
         with _dac_lock:
             lane.configured = False
+            lane.readback_valid = False
         logging.exception(
             "❌ [clocks/dac] failed to configure %s AD5693R at 0x%02X",
             lane.name,
@@ -1327,7 +1309,7 @@ def _dac_write_hw_code(
     with _dac_actuator_lock:
         with _dac_lock:
             lane.last_attempted_hw_code = code
-            if lane.readback_valid and code == lane.hw_code:
+            if lane.configured and lane.readback_valid and code == lane.hw_code:
                 lane.same_code_skip_count += 1
                 lane.dither_skip_same_code_count += 1
                 lane.last_write_ok = True
@@ -1344,26 +1326,21 @@ def _dac_write_hw_code(
             return False
 
         try:
-            _ad5693r_write_24(lane.address, AD5693R_CMD_WRITE_INPUT_REG, code)
+            # One complete frame authors both registers. Avoid a staged input
+            # write followed by a separate (formerly one-byte) UPDATE command.
+            _ad5693r_write_24(lane.address, AD5693R_CMD_WRITE_DAC_AND_INPUT, code)
         except Exception:
             with _dac_lock:
                 lane.write_failures += 1
                 lane.last_write_ok = False
                 lane.last_failure_stage = 1
+                # A failed ioctl does not prove the output stayed at hw_code.
+                # Force the next request through configuration and a real write,
+                # even when it asks for the last successfully commanded code.
+                lane.readback_valid = False
+                lane.configured = False
             logging.exception(
-                "❌ [clocks/dac] %s write-input failed code=%d", lane.name, code
-            )
-            return False
-
-        try:
-            _ad5693r_write_command(lane.address, AD5693R_CMD_UPDATE_DAC_REG)
-        except Exception:
-            with _dac_lock:
-                lane.write_failures += 1
-                lane.last_write_ok = False
-                lane.last_failure_stage = 2
-            logging.exception(
-                "❌ [clocks/dac] %s update-DAC failed code=%d", lane.name, code
+                "❌ [clocks/dac] %s write-DAC/input failed code=%d", lane.name, code
             )
             return False
 

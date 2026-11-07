@@ -10,7 +10,7 @@ import math
 import threading
 from datetime import datetime, timezone
 
-from smbus2 import SMBus, i2c_msg
+from zpnet.shared.ad5693r import read_input, write_register
 from zpnet.shared.i2c_identity import I2C_BUS_EXPANDED
 
 DAC_BUS = I2C_BUS_EXPANDED
@@ -62,23 +62,18 @@ class LaserDac:
             self._state.update(changes)
 
     @staticmethod
-    def _write(bus, command, value):
-        bus.i2c_rdwr(i2c_msg.write(
-            DAC_ADDRESS, [command, value >> 8, value & 0xFF]))
+    def _write(command, value):
+        write_register(DAC_BUS, DAC_ADDRESS, command, value)
 
     @staticmethod
-    def _read(bus):
-        message = i2c_msg.read(DAC_ADDRESS, 2)
-        bus.i2c_rdwr(message)
-        high, low = list(message)
-        return (high << 8) | low
+    def _read():
+        return read_input(DAC_BUS, DAC_ADDRESS)
 
     def readback(self):
         """Read input register only; cannot prove reference/gain or analog VOUT."""
         with self._io_lock:
             try:
-                with SMBus(DAC_BUS) as bus:
-                    code = self._read(bus)
+                code = self._read()
                 self._update(readback_input_code=code)
                 if (self._state["state"] == "CONFIGURED"
                         and code != self._state["commanded_code"]):
@@ -95,15 +90,16 @@ class LaserDac:
             initialize = self._state["state"] != "CONFIGURED"
             self._update(state="APPLYING")
             try:
-                with SMBus(DAC_BUS) as bus:
-                    if initialize:
-                        self._write(bus, WRITE_DAC_AND_INPUT, 0)
-                        self._write(bus, WRITE_CONTROL, INTERNAL_REFERENCE_GAIN_ONE)
-                    self._write(bus, WRITE_DAC_AND_INPUT, code)
-                    observed = self._read(bus)
-                    if observed != code:
-                        raise RuntimeError(
-                            f"laser DAC readback {observed} != requested {code}")
+                if initialize:
+                    self._write(WRITE_DAC_AND_INPUT, 0)
+                    self._write(WRITE_CONTROL, INTERNAL_REFERENCE_GAIN_ONE)
+                self._write(WRITE_DAC_AND_INPUT, code)
+                # Retry this read alone; never replay initialization/zero just
+                # because the verification transfer encountered a transient NACK.
+                observed = self._read()
+                if observed != code:
+                    raise RuntimeError(
+                        f"laser DAC readback {observed} != requested {code}")
                 volts = code * REFERENCE_V / CODE_SCALE
                 self._update(
                     state="CONFIGURED", commanded_code=code,
