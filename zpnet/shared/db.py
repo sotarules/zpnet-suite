@@ -4,7 +4,7 @@ ZPNet Shared Database Helper — PostgreSQL Backend (psycopg v3)
 This module centralizes all database access policy for ZPNet.
 
 Design principles:
-  • Short-lived connections
+  • Short-lived connections by default; opt-in worker-owned reuse
   • Explicit transaction boundaries
   • Multi-writer safe (PostgreSQL)
   • No global locks
@@ -137,6 +137,60 @@ class DatabaseContentionRetry:
 # Connection helper
 # ---------------------------------------------------------------------
 
+def _connect_db(*, row_dict: bool = False):
+    return psycopg.connect(
+        PG_DSN,
+        row_factory=dict_row if row_dict else None,
+        connect_timeout=PG_CONNECT_TIMEOUT_S,
+        application_name=PG_APPLICATION_NAME,
+        options=PG_SESSION_OPTIONS,
+    )
+
+
+class DatabaseWorkerSession:
+    """One ordered worker's connection, with a separate transaction per open().
+
+    Never share this object across threads or nest open() calls. Reuse removes
+    per-fragment connection setup without batching commits or holding an idle
+    transaction. Rotate between transactions every five minutes. Any exception
+    discards the connection (and its uncommitted transaction); only the caller
+    decides whether to retry. In particular, a lost commit acknowledgement is
+    not proof of rollback and this helper never replays a transaction.
+    """
+
+    def __init__(self, *, row_dict: bool = False):
+        self._row_dict = row_dict
+        self._conn = None
+        self._opened_at = 0.0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.close()
+
+    def close(self):
+        conn, self._conn = self._conn, None
+        if conn is not None:
+            conn.close()
+
+    @contextmanager
+    def open(self):
+        if self._conn is not None and time.monotonic() - self._opened_at >= 300.0:
+            self.close()
+        if self._conn is None:
+            self._conn = _connect_db(row_dict=self._row_dict)
+            self._opened_at = time.monotonic()
+        try:
+            yield self._conn
+            self._conn.commit()
+        except BaseException:
+            # PostgreSQL discards an uncommitted transaction on disconnect.
+            # A broken connection need not support an explicit ROLLBACK.
+            self.close()
+            raise
+
+
 @contextmanager
 def open_db(*, row_dict: bool = False):
     """
@@ -149,13 +203,7 @@ def open_db(*, row_dict: bool = False):
     Yields:
         psycopg.Connection
     """
-    conn = psycopg.connect(
-        PG_DSN,
-        row_factory=dict_row if row_dict else None,
-        connect_timeout=PG_CONNECT_TIMEOUT_S,
-        application_name=PG_APPLICATION_NAME,
-        options=PG_SESSION_OPTIONS,
-    )
+    conn = _connect_db(row_dict=row_dict)
 
     try:
         yield conn

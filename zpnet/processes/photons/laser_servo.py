@@ -18,6 +18,7 @@ import math
 import threading
 import time
 
+from zpnet.processes.photons.voltage_sweep import VoltageSweep
 from zpnet.processes.photons.laser_dac import MAX_CODE, REFERENCE_V, CODE_SCALE, requested_code
 
 # Commissioning policy: edit here, not in firmware. Positive gain assumes that
@@ -36,6 +37,7 @@ MIN_WINDOW_SAMPLES = 1000
 class LaserServo:
     def __init__(self, dac):
         self.dac = dac
+        self._sweep = VoltageSweep()
         self._control = threading.RLock()
         # Snapshot readers never acquire the actuator lock or wait for I2C.
         self._lock = threading.Lock()
@@ -59,7 +61,9 @@ class LaserServo:
 
     def snapshot(self):
         with self._lock:
-            return copy.deepcopy(self._state)
+            state = copy.deepcopy(self._state)
+        state["sweep"] = self._sweep.brief()
+        return state
 
     def _update(self, **fields):
         with self._lock:
@@ -72,6 +76,7 @@ class LaserServo:
     def _fault(self, exc):
         # Shared DAC transfers already perform bounded retries. Do not keep
         # reinitializing/zeroing a failed actuator once per feedback tick.
+        self._sweep.cancel("DAC_OR_CONTROLLER_FAULT")
         self._update(mode="FAULT", status="FAULT", last_error=str(exc))
         logging.exception("[photons/servo] latched; explicit SET_DAC then SERVO_START required")
 
@@ -92,6 +97,7 @@ class LaserServo:
 
     def manual(self, code):
         with self._control:
+            self._sweep.cancel("MANUAL_DAC_COMMAND")
             self._started = True  # An early explicit command supersedes startup.
             self._update(mode="MANUAL", status="MANUAL", last_error=None)
             self._settle()
@@ -114,6 +120,7 @@ class LaserServo:
         with self._control:
             if self.dac.snapshot()["state"] != "CONFIGURED":
                 raise ValueError("configure the DAC with SET_DAC before SERVO_START")
+            self._sweep.cancel("EXPLICIT_SERVO_START")
             self._started = True
             self._settle()
             self._update(mode="AUTO", status="SETTLING", target_mv=target, last_error=None)
@@ -122,6 +129,7 @@ class LaserServo:
 
     def stop(self):
         with self._control:
+            self._sweep.cancel("SERVO_STOP")
             # Stop does not write, zero the output, or clear a DAC fault.
             self._started = True
             self._update(mode="MANUAL", status="HOLDING")
@@ -129,11 +137,42 @@ class LaserServo:
             logging.info("[photons/servo] stopped; holding DAC output")
             return self.snapshot()
 
+    def sweep_start(self, args):
+        with self._control:
+            state = self.snapshot()
+            if state["mode"] != "AUTO" or self.dac.snapshot()["state"] != "CONFIGURED":
+                raise ValueError("SWEEP_START requires an enabled servo and configured DAC")
+            target = self._sweep.start(args, state["target_mv"])
+            self._settle()
+            self._update(target_mv=target, status="SETTLING")
+            logging.info("[photons/sweep] started %s", self._sweep.brief())
+
+    def sweep_stop(self):
+        with self._control:
+            target = self._sweep.cancel("OPERATOR_STOP")
+            if target is not None:
+                # Restore the pre-survey target through the existing bounded
+                # servo, not a sudden DAC jump. Manual commands cancel instead.
+                self._settle()
+                self._update(target_mv=target, status="SETTLING")
+            logging.info("[photons/sweep] stopped %s", self._sweep.brief())
+
+    def sweep_report(self):
+        return self._sweep.report()
+
     def tick(self, feedback, hold_reason):
         with self._control:
             if self.snapshot()["mode"] != "AUTO":
                 return
             try:
+                if self.dac.snapshot()["state"] != "CONFIGURED":
+                    raise RuntimeError("DAC is not configured")
+                target = self._sweep.observe(feedback, hold_reason, self.snapshot(),
+                                             self._ready_at, MAX_CODE)
+                if target is not None:
+                    self._settle()
+                    self._update(target_mv=target, status="SETTLING")
+                    logging.info("[photons/sweep] %s target=%.3f", self._sweep.brief(), target)
                 self._tick(feedback, hold_reason)
             except Exception as exc:
                 self._fault(exc)

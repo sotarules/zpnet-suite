@@ -34,8 +34,9 @@ from zpnet.processes.processes import (
 )
 from zpnet.processes.photons.laser_dac import LaserDac, requested_code
 from zpnet.processes.photons.laser_servo import LaserServo
+from zpnet.processes.photons.persistence_queue import PersistenceQueue
 from zpnet.shared.constants import Payload
-from zpnet.shared.db import DatabaseContentionRetry, open_db
+from zpnet.shared.db import DatabaseContentionRetry, DatabaseWorkerSession, open_db
 from zpnet.shared.logger import setup_logging
 from zpnet.shared.photons_voltage import (
     HIGH5_MODEL, VOLTAGE_MODELS, voltage_adjustment, voltage_coefficient_fields, voltage_window,
@@ -1763,11 +1764,10 @@ PHOTONS_RECOVERY_RECEIPT_SCHEMA = "PI_PHOTONS_RECOVERY_RECEIPT_V1"
 TEENSY_CAMPAIGN_START_ACCEPTED_STATUSES = {"start_requested", "flash_cut_requested"}
 TEENSY_CAMPAIGN_STOP_ACCEPTED_STATUSES = {"stop_requested"}
 
-# Phase-2 live data-plane queues.  maxsize=0 is intentionally unbounded: at the
-# current 1 Hz instrument rate, temporary downstream stalls should create visible
-# backlog rather than block PUBSUB ingress or silently discard valid testimony.
+# Ingress remains a fast in-memory handoff. Persistence carries much larger
+# recovery images: its compressed RAM budget spills to private disk storage.
+# Neither path silently discards observations when PostgreSQL falls behind.
 PHOTONS_INGRESS_QUEUE_MAXSIZE = 0
-PHOTONS_PERSIST_QUEUE_MAXSIZE = 0
 PHOTONS_STATE_RETRY_S = 0.25
 PHOTONS_PERSIST_RETRY_S = 0.25
 
@@ -1931,7 +1931,7 @@ def _cadence_report():
     return report
 
 _fragment_queue: queue.Queue[Payload] = queue.Queue(maxsize=PHOTONS_INGRESS_QUEUE_MAXSIZE)
-_persist_queue: queue.Queue[Dict[str, Any]] = queue.Queue(maxsize=PHOTONS_PERSIST_QUEUE_MAXSIZE)
+_persist_queue = PersistenceQueue()
 _state_worker_started = threading.Event()
 _persistence_worker_started = threading.Event()
 _campaign_control_ready = threading.Event()
@@ -9130,6 +9130,7 @@ def _lantern_report_from_photons(photons: Payload) -> Dict[str, Any]:
 def _persist_photons(
     photons: Payload, checkpoint: Dict[str, Any],
     temperature_rolling: Dict[str, Any], normalization_state: Dict[str, Any],
+    *, db_session: Optional[DatabaseWorkerSession] = None,
 ) -> int:
     """Persist one canonical PHOTONS row and advance the LANTERN read model.
 
@@ -9188,7 +9189,7 @@ def _persist_photons(
         }
 
     detail_id = 0
-    with open_db(row_dict=True) as conn:
+    with (db_session.open() if db_session is not None else open_db(row_dict=True)) as conn:
         cur = conn.cursor()
         cur.execute(
             """
@@ -9483,9 +9484,8 @@ def on_photons_fragment(fragment: Payload) -> None:
         _latest_fragment_received_monotonic = ingress_monotonic
         _latest_fragment_received_utc = ingress_utc
 
-    # Both Phase-2 queues are unbounded, so put_nowait() does not turn a
-    # downstream stall into PUBSUB backpressure.  Memory growth is observable
-    # through REPORT queue-depth diagnostics.
+    # Keep PUBSUB ingress independent of persistence disk I/O. REPORT exposes
+    # both queue depths and the persistence payload RAM/disk footprint.
     _fragment_queue.put_nowait(copied)
     with _state_lock:
         _fragments_queued += 1
@@ -9738,7 +9738,9 @@ def _state_loop() -> None:
                 _cadence_mark(timing, "publication_counter")
 
                 persist_item = {
-                    "photons": copy.deepcopy(photons),
+                    "photons": photons,
+                    # Queue serialization detaches this observation and all
+                    # checkpoint contents before put_nowait returns.
                     # Already detached under the checkpoint lock. Transfer
                     # ownership exactly as for the temperature/normalizer images;
                     # the state worker never mutates this checkpoint after enqueue.
@@ -9747,7 +9749,19 @@ def _state_loop() -> None:
                     "normalization_state": normalization_state,
                 }
                 _cadence_mark(timing, "persistence_item_copy")
-                _persist_queue.put_nowait(persist_item)
+                try:
+                    _persist_queue.put_nowait(persist_item)
+                except Exception as exc:
+                    # A staging failure is a custody failure, never permission
+                    # to drop a row silently or retain unlimited expanded images.
+                    _enter_hard_failure(
+                        "persistence_staging_failed",
+                        {"sequence": photons["sequence"], "error": str(exc)},
+                        source="PHOTONS_PERSISTENCE_STORAGE",
+                    )
+                    logging.exception("[photons] persistence staging failed")
+                    del persist_item
+                    continue
                 del persist_item
                 _note_persist_queue_depth()
                 _cadence_mark(timing, "persistence_enqueue")
@@ -9761,6 +9775,13 @@ def _state_loop() -> None:
 
 def _persistence_loop() -> None:
     """Persist canonical PHOTONS rows in order, retrying transient DB failures."""
+    # The worker alone owns this connection. Each row still commits before its
+    # recovery proof is advanced; reuse changes connection cost, not custody.
+    with DatabaseWorkerSession(row_dict=True) as db_session:
+        _persistence_loop_with_session(db_session)
+
+
+def _persistence_loop_with_session(db_session: DatabaseWorkerSession) -> None:
     global _rows_persisted
     global _persistence_retry_count
     global _last_persistence_failure
@@ -9772,6 +9793,7 @@ def _persistence_loop() -> None:
     while True:
         _persistence_worker_service_retirement()
         if _maintenance_queue_hold.is_set():
+            db_session.close()
             _persistence_worker_maintenance_quiescent.set()
             time.sleep(0.01)
             continue
@@ -9786,6 +9808,15 @@ def _persistence_loop() -> None:
                 persist_item = _persist_queue.get_nowait()
             except queue.Empty:
                 pass
+            except Exception as exc:
+                # The queue retains the unread head. Keep the owner alive so
+                # explicit maintenance retirement remains available.
+                _enter_hard_failure(
+                    "persistence_staging_read_failed", {"error": str(exc)},
+                    source="PHOTONS_PERSISTENCE_STORAGE",
+                )
+                time.sleep(PHOTONS_PERSIST_RETRY_S)
+                continue
             if persist_item is not None:
                 photons = _require_dict(persist_item.get("photons"), "PHOTONS persistence item")
                 checkpoint = _require_dict(
@@ -9811,6 +9842,7 @@ def _persistence_loop() -> None:
                         detail_id = _persist_photons(
                             photons, checkpoint, temperature_rolling,
                             persist_item["normalization_state"],
+                            db_session=db_session,
                         )
                         with _state_lock:
                             _rows_persisted += 1
@@ -10946,21 +10978,13 @@ def cmd_stop(_: Optional[dict]) -> dict:
 
 def _pending_persist_campaign_names() -> set[str]:
     """Return campaign names already canonicalized but not yet persisted."""
-    names: set[str] = set()
-    with _persist_queue.mutex:
-        pending = list(_persist_queue.queue)
-    for item in pending:
-        photons = item.get("photons") if isinstance(item, dict) else None
-        campaign = photons.get("campaign") if isinstance(photons, dict) else None
-        if isinstance(campaign, dict):
-            name = str(campaign.get("campaign") or "").strip()
-            if name:
-                names.add(name)
-    return names
+    return _persist_queue.campaign_names()
 
 
 def _drain_queue(q: queue.Queue) -> int:
     """Owner-internal drain; use the owner handoff after worker custody begins."""
+    if isinstance(q, PersistenceQueue):
+        return q.discard_pending()
     drained = 0
     while True:
         try:
@@ -12242,6 +12266,7 @@ def cmd_photons_info(_: Optional[dict]) -> Dict[str, Any]:
             "rows_persisted": _rows_persisted,
             "ingress_queue_depth": _fragment_queue.qsize(),
             "persist_queue_depth": _persist_queue.qsize(),
+            "persistence_storage": _persist_queue.snapshot(),
             "stats_reset_requests": _stats_reset_requests,
             "stats_reset_success": _stats_reset_success,
             "stats_reset_failures": _stats_reset_failures,
@@ -12298,6 +12323,7 @@ def cmd_report(_: Optional[dict]) -> dict:
             "ingress_queue_depth": _fragment_queue.qsize(),
             "ingress_queue_depth_max": _ingress_queue_depth_max,
             "persist_queue_depth": _persist_queue.qsize(),
+            "persistence_storage": _persist_queue.snapshot(),
             "persist_queue_depth_max": _persist_queue_depth_max,
             "system_report_retry_count": _system_report_retry_count,
             "persistence_retry_count": _persistence_retry_count,
@@ -12696,6 +12722,17 @@ def _laser_feedback_snapshot():
             "fragment_received_at_utc": row["context_timing"]["fragment_received_at_utc"],
             "high5": copy.deepcopy(pd["high5_window"]),
             "high60": copy.deepcopy(pd["high_window"]),
+            # Sweep diagnostics consume already-accepted canonical evidence;
+            # they never reconstruct RAW from a candidate normalization model.
+            "raw_flight_ns": copy.deepcopy(row["measurement"]["raw_flight_ns"]),
+            "published_flight_ns": copy.deepcopy(row["measurement"]["normalized_flight_ns"]),
+            "snapshot_ok": row["photons"]["snapshot_ok"],
+            "acquisition_signature": copy.deepcopy(row["measurement"]["acquisition_signature"]),
+            "high_fragment_mv": (pd["high_sum_counts"] / pd["sample_count"] * 3300 / 4095
+                                 if pd["sample_count"] else None),
+            "fragment_period_ns": row["photons"]["fragment_period_ns"],
+            "temperatures_c": _observations(row.get("environment", {}), row.get("rtd", {})),
+            "dac_witness": copy.deepcopy(row.get("laser_dac")),
         }
 
 
@@ -12747,7 +12784,34 @@ def cmd_servo_stop(_: Optional[dict]) -> Dict[str, Any]:
     return cmd_servo_info(None)
 
 
+def cmd_sweep_start(args: Optional[dict]) -> Dict[str, Any]:
+    # Campaign membership does not authorize an unready instrument to scan.
+    hold = _laser_servo_hold_reason()
+    if hold:
+        return {"success": False, "message": f"SWEEP_START refused: {hold}"}
+    try:
+        _laser_servo.sweep_start(args)
+    except (ValueError, TypeError, OverflowError) as exc:
+        return {"success": False, "message": str(exc)}
+    return cmd_sweep_report(None)
+
+
+def cmd_sweep_stop(_: Optional[dict]) -> Dict[str, Any]:
+    _laser_servo.sweep_stop()
+    return cmd_sweep_report(None)
+
+
+def cmd_sweep_report(_: Optional[dict]) -> Dict[str, Any]:
+    # Bounded in-memory aggregates: no Postgres query and no hardware reads.
+    payload = _laser_servo.sweep_report()
+    payload["laser_control"] = _laser_control_snapshot()
+    return {"success": True, "message": "OK", "payload": payload}
+
+
 COMMANDS = {
+    "SWEEP_START": cmd_sweep_start,
+    "SWEEP_STOP": cmd_sweep_stop,
+    "SWEEP_REPORT": cmd_sweep_report,
     "SERVO_START": cmd_servo_start,
     "SERVO_STOP": cmd_servo_stop,
     "SERVO_INFO": cmd_servo_info,
@@ -12774,6 +12838,7 @@ COMMANDS = {
 }
 
 _HARD_FAILURE_READ_ONLY_COMMANDS = {
+    "SWEEP_REPORT",
     "SERVO_INFO",
     "DAC_INFO",
     "REPORT_HISTOGRAM",
@@ -12786,7 +12851,7 @@ _HARD_FAILURE_READ_ONLY_COMMANDS = {
 }
 
 
-_STATS_RESET_ALLOWED_COMMANDS = _HARD_FAILURE_READ_ONLY_COMMANDS | {"STATS_RESET", "REPAIR", "SERVO_STOP"}
+_STATS_RESET_ALLOWED_COMMANDS = _HARD_FAILURE_READ_ONLY_COMMANDS | {"STATS_RESET", "REPAIR", "SERVO_STOP", "SWEEP_STOP"}
 
 
 def _stats_reset_guard_command(
@@ -12819,7 +12884,7 @@ def _hard_failure_guard_command(
         if (
             _hard_failure_active()
             and command not in _HARD_FAILURE_READ_ONLY_COMMANDS
-            and command not in {"REPAIR", "DISABLE", "SERVO_STOP"}
+            and command not in {"REPAIR", "DISABLE", "SERVO_STOP", "SWEEP_STOP"}
         ):
             return {
                 "success": False,
