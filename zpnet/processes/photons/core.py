@@ -33,6 +33,7 @@ from zpnet.processes.processes import (
     server_setup,
 )
 from zpnet.processes.photons.laser_dac import LaserDac, requested_code
+from zpnet.processes.photons.laser_servo import LaserServo
 from zpnet.shared.constants import Payload
 from zpnet.shared.db import DatabaseContentionRetry, open_db
 from zpnet.shared.logger import setup_logging
@@ -49,6 +50,7 @@ from zpnet.shared.photons_voltage import (
 # Never restore earlier corrected numerator/Welford/bucket custody into NOR5.
 # Startup's existing epoch-migration court preserves all historical rows.
 _laser_dac = LaserDac()  # Pi SMBus2; construction performs no hardware I/O.
+_laser_servo = LaserServo(_laser_dac)
 
 ACQUISITION_ID = 0x4E4F5235  # NOR5: frozen HighLow3 quadratic HIGH5 trial
 PHOTONS_MEASUREMENT_SCHEMA = "PI_PHOTONS_MEASUREMENT_V1"
@@ -1961,6 +1963,7 @@ _latest_fragment: Optional[Payload] = None
 _latest_fragment_received_monotonic: Optional[float] = None
 _latest_fragment_received_utc: Optional[str] = None
 _latest_photons: Optional[Payload] = None
+_latest_photons_ingress_monotonic: Optional[float] = None
 
 # One active Pi lifecycle plus any STOP-requested lifecycle whose firmware-authored
 # final fragment has not yet crossed the state worker.  Teensy owns the actual
@@ -9473,7 +9476,7 @@ def on_photons_fragment(fragment: Payload) -> None:
     ingress_monotonic = time.monotonic()
     ingress_utc = _utc_now_z()
     copied["_pi_ingress"] = {"monotonic": ingress_monotonic, "utc": ingress_utc}
-    copied["_pi_laser_dac"] = _laser_dac.snapshot()
+    copied["_pi_laser_dac"] = _laser_control_snapshot()
     with _state_lock:
         _fragments_received += 1
         _latest_fragment = copied
@@ -9491,6 +9494,7 @@ def on_photons_fragment(fragment: Payload) -> None:
 
 def _state_loop() -> None:
     """Attach SYSTEM context, validate, publish, then hand each row to persistence."""
+    global _latest_photons_ingress_monotonic
     global _latest_photons
     global _fragments_processed
     global _fragments_rejected
@@ -9724,6 +9728,7 @@ def _state_loop() -> None:
                 with _state_lock:
                     _cadence_mark(timing, "latest_state_lock")
                     _latest_photons = copy.deepcopy(photons)
+                    _latest_photons_ingress_monotonic = fragment["_pi_ingress"]["monotonic"]
 
                 publish_started_ns = _cadence_mark(timing, "latest_state_copy")
                 publish(PHOTONS_TOPIC, photons)
@@ -12210,7 +12215,7 @@ def cmd_report_recovery(_: Optional[dict]) -> Dict[str, Any]:
     )
     payload = response.get("payload") if isinstance(response, dict) else None
     if isinstance(payload, dict):
-        payload["laser_dac"] = _laser_dac.snapshot()
+        payload["laser_dac"] = _laser_control_snapshot()
         payload["recovery"] = _recovery_report_surface()
     return response
 
@@ -12265,7 +12270,7 @@ def cmd_photons_info(_: Optional[dict]) -> Dict[str, Any]:
             "last_campaign_transition": copy.deepcopy(_last_campaign_transition),
             "last_structural_rejection": copy.deepcopy(_last_structural_rejection),
         }
-    payload["laser_dac"] = _laser_dac.snapshot()
+    payload["laser_dac"] = _laser_control_snapshot()
     payload["recovery"] = _recovery_report_surface()
     with _campaign_lock:
         payload["lantern"] = {
@@ -12333,7 +12338,7 @@ def cmd_report(_: Optional[dict]) -> dict:
         }
 
     payload["cadence_timing"] = _cadence_report()
-    payload["laser_dac"] = _laser_dac.snapshot()
+    payload["laser_dac"] = _laser_control_snapshot()
     payload["recovery"] = _recovery_report_surface()
     with _campaign_lock:
         payload["lantern"] = {
@@ -12642,6 +12647,41 @@ def cmd_repair(_: Optional[dict]) -> Dict[str, Any]:
     }
 
 
+def _laser_control_snapshot():
+    payload = _laser_dac.snapshot()
+    servo = _laser_servo.snapshot()
+    payload["mode"] = servo["mode"]
+    payload["servo"] = servo
+    return payload
+
+
+def _laser_servo_hold_reason():
+    if _hard_failure_active():
+        return "HARD_FAILURE"
+    if _repair_active() or _runtime_recovery_hold.is_set():
+        return "RECOVERY"
+    if _stats_reset_in_progress.is_set() or _maintenance_queue_hold.is_set():
+        return "MAINTENANCE"
+    if not _subsystem_enabled.is_set():
+        return "DISABLED"
+    if _operational_state_snapshot()["state"] != OPERATIONAL_STATE_RUNNING:
+        return "NOT_RUNNING"
+    return None
+
+
+def _laser_servo_loop():
+    # A dedicated actuator worker keeps bounded I2C retries off publication,
+    # canonical processing and persistence paths. Never process a feedback queue
+    # in arrears: only the latest accepted, recently received window can steer.
+    while True:
+        try:
+            _laser_servo.tick(_laser_feedback_snapshot(), _laser_servo_hold_reason())
+        except Exception:
+            _laser_servo.stop()
+            logging.exception("[photons/servo] worker stopped automatic control")
+        time.sleep(0.25)
+
+
 def _laser_feedback_snapshot():
     """Latest accepted producer windows, not a reconstructed Pi filter."""
     with _state_lock:
@@ -12651,19 +12691,21 @@ def _laser_feedback_snapshot():
         pd = row["photons"]["pd_out"]
         return {
             "sequence": row["sequence"],
+            "reset_count": row["photons"]["stats"]["reset_count"],
+            "received_monotonic": _latest_photons_ingress_monotonic,
             "fragment_received_at_utc": row["context_timing"]["fragment_received_at_utc"],
             "high5": copy.deepcopy(pd["high5_window"]),
             "high60": copy.deepcopy(pd["high_window"]),
-            "servo": "NOT_IMPLEMENTED",
         }
 
 
 def cmd_dac_info(_: Optional[dict]) -> Dict[str, Any]:
     try:
-        payload = _laser_dac.readback()
+        _laser_dac.readback()
+        payload = _laser_control_snapshot()
     except Exception as exc:
         return {"success": False, "message": str(exc),
-                "payload": _laser_dac.snapshot()}
+                "payload": _laser_control_snapshot()}
     payload["feedback"] = _laser_feedback_snapshot()
     return {"success": True, "message": "OK", "payload": payload}
 
@@ -12674,17 +12716,41 @@ def cmd_set_dac(args: Optional[dict]) -> Dict[str, Any]:
     except (ValueError, TypeError, OverflowError) as exc:
         return {"success": False, "message": str(exc)}
     try:
-        payload = _laser_dac.set_code(code)
+        _laser_servo.manual(code)
+        payload = _laser_control_snapshot()
     except Exception as exc:
         logging.exception("[photons/dac] explicit laser DAC command failed")
         return {"success": False, "message": str(exc),
-                "payload": _laser_dac.snapshot()}
+                "payload": _laser_control_snapshot()}
     logging.info("[photons/dac] manual code=%d DAC volts=%.6f", code,
                  payload["commanded_dac_v"])
     return {"success": True, "message": "OK", "payload": payload}
 
 
+def cmd_servo_info(_: Optional[dict]) -> Dict[str, Any]:
+    payload = _laser_control_snapshot()
+    payload["feedback"] = _laser_feedback_snapshot()
+    payload["hold_reason"] = _laser_servo_hold_reason()
+    return {"success": True, "message": "OK", "payload": payload}
+
+
+def cmd_servo_start(args: Optional[dict]) -> Dict[str, Any]:
+    try:
+        _laser_servo.start(args)
+    except (ValueError, TypeError, OverflowError) as exc:
+        return {"success": False, "message": str(exc)}
+    return cmd_servo_info(None)
+
+
+def cmd_servo_stop(_: Optional[dict]) -> Dict[str, Any]:
+    _laser_servo.stop()
+    return cmd_servo_info(None)
+
+
 COMMANDS = {
+    "SERVO_START": cmd_servo_start,
+    "SERVO_STOP": cmd_servo_stop,
+    "SERVO_INFO": cmd_servo_info,
     "SET_DAC": cmd_set_dac,
     "DAC_INFO": cmd_dac_info,
     "ENABLE": cmd_enable,
@@ -12708,6 +12774,7 @@ COMMANDS = {
 }
 
 _HARD_FAILURE_READ_ONLY_COMMANDS = {
+    "SERVO_INFO",
     "DAC_INFO",
     "REPORT_HISTOGRAM",
     "REPORT",
@@ -12719,7 +12786,7 @@ _HARD_FAILURE_READ_ONLY_COMMANDS = {
 }
 
 
-_STATS_RESET_ALLOWED_COMMANDS = _HARD_FAILURE_READ_ONLY_COMMANDS | {"STATS_RESET", "REPAIR"}
+_STATS_RESET_ALLOWED_COMMANDS = _HARD_FAILURE_READ_ONLY_COMMANDS | {"STATS_RESET", "REPAIR", "SERVO_STOP"}
 
 
 def _stats_reset_guard_command(
@@ -12752,7 +12819,7 @@ def _hard_failure_guard_command(
         if (
             _hard_failure_active()
             and command not in _HARD_FAILURE_READ_ONLY_COMMANDS
-            and command not in {"REPAIR", "DISABLE"}
+            and command not in {"REPAIR", "DISABLE", "SERVO_STOP"}
         ):
             return {
                 "success": False,
@@ -13209,6 +13276,12 @@ def run() -> None:
     # PHOTONS_FRAGMENT ingress is unbounded, but durable reads and Teensy commands
     # are forbidden until SYSTEM proves both application planes NOMINAL.
     _wait_for_startup_infrastructure()
+
+    # Establish optical amplitude before recovery may need returning photons.
+    # A DAC fault remains observable and needs an explicit SET_DAC to recover.
+    _laser_servo.startup()
+    threading.Thread(target=_laser_servo_loop, name="photons-laser-servo",
+                     daemon=True).start()
 
     # ENABLE/DISABLE is a system-level authority boundary. A normal Teensy boot
     # initializes PHOTONS enabled; a Pi-only restart may find an explicit DISABLE.

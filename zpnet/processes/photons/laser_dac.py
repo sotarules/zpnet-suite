@@ -1,8 +1,9 @@
-"""Pi-owned manual laser amplitude control. No background writes or servo.
+"""Pi-owned laser amplitude actuator; laser_servo owns scheduling and policy.
 
 The DAC register is digital testimony, not a measurement of SMA voltage.
-Process restart does not touch hardware. The first explicit SET_DAC zeros
-the output before configuring the reference/gain, then applies the request.
+Construction performs no I/O. The first set zeros the output before
+configuring the reference/gain, then applies the request. PHOTONS startup
+explicitly sets the commissioning voltage through laser_servo.
 """
 
 import copy
@@ -41,7 +42,7 @@ class LaserDac:
             "gain": 1,
             "max_output_v": MAX_OUTPUT_V,
             "max_code": MAX_CODE,
-            "startup_policy": "NO_IO_UNTIL_EXPLICIT_COMMAND",
+            "startup_policy": "CONFIGURED_STARTUP_VOLTAGE",
             "state": "UNCONFIGURED",
             "commanded_code": None,
             "commanded_dac_v": None,
