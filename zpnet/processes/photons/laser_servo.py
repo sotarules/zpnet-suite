@@ -27,11 +27,27 @@ STARTUP_DAC_V = 1.4
 STARTUP_SERVO_ENABLED = True
 TARGET_MV = 440.0
 DEADBAND_MV = 0.5
-GAIN_V_PER_MV = 0.001
-MAX_STEP_V = 0.010
+# Smooth gain scheduling: quiet near the target, stronger during thermal ramps.
+# Gains are DAC volts per detector millivolt, not a fitted plant inverse.
+# At 1 mV error the requested step is 0.5 mV DAC; at 5 mV it is 12.5 mV;
+# at 10 mV it is 50 mV. Apply the same law in either direction, with no
+# integrator or derivative of the overlapping HIGH5 windows. Retain the full
+# settling interval after every write so larger steps do not stack on old data.
+GAIN_V_PER_MV = 0.0005
+FAR_GAIN_V_PER_MV = 0.005
+NEAR_ERROR_MV = 1.0
+FAR_ERROR_MV = 10.0
+MAX_STEP_V = 0.050
 SETTLE_SECONDS = 7.0
 MAX_FEEDBACK_AGE_SECONDS = 2.5
 MIN_WINDOW_SAMPLES = 1000
+
+
+def _correction_gain(error_mv):
+    """Continuous near-to-far gain; the caller owns deadband and DAC limits."""
+    fraction = max(0.0, min(1.0,
+        (abs(error_mv) - NEAR_ERROR_MV) / (FAR_ERROR_MV - NEAR_ERROR_MV)))
+    return GAIN_V_PER_MV + fraction * (FAR_GAIN_V_PER_MV - GAIN_V_PER_MV)
 
 
 class LaserServo:
@@ -49,6 +65,11 @@ class LaserServo:
             "mode": "STARTING", "status": "WAITING_STARTUP",
             "target_mv": TARGET_MV, "deadband_mv": DEADBAND_MV,
             "gain_v_per_mv": GAIN_V_PER_MV, "max_step_v": MAX_STEP_V,
+            "control_law": "HIGH5_SMOOTH_GAIN_V1",
+            "far_gain_v_per_mv": FAR_GAIN_V_PER_MV,
+            "near_error_mv": NEAR_ERROR_MV, "far_error_mv": FAR_ERROR_MV,
+            "effective_gain_v_per_mv": None,
+            "last_servo_step_v": None,
             "settle_seconds": SETTLE_SECONDS,
             "max_feedback_age_seconds": MAX_FEEDBACK_AGE_SECONDS,
             "minimum_window_samples": MIN_WINDOW_SAMPLES,
@@ -212,7 +233,11 @@ class LaserServo:
             raise ValueError("HIGH5 is outside the ADC measurement domain")
         state = self.snapshot()
         error = state["target_mv"] - high
-        self._update(high5_mv=high, error_mv=error, sequence=seq)
+        gain = _correction_gain(error)
+        # Report the gain for this feedback even while settling; last_servo_step_v
+        # separately records the last successful, quantized automatic DAC move.
+        self._update(high5_mv=high, error_mv=error, sequence=seq,
+                     effective_gain_v_per_mv=gain)
         # Require a freshly received window AFTER the settling boundary, not
         # merely a late worker waking up with pre-adjustment feedback in hand.
         if received < self._ready_at:
@@ -221,7 +246,7 @@ class LaserServo:
         if abs(error) <= DEADBAND_MV:
             self._update(status="IN_BAND")
             return
-        delta = max(-MAX_STEP_V, min(MAX_STEP_V, GAIN_V_PER_MV * error))
+        delta = max(-MAX_STEP_V, min(MAX_STEP_V, gain * error))
         code = max(0, min(MAX_CODE, int(
             dac["commanded_code"] + delta / REFERENCE_V * CODE_SCALE + 0.5)))
         # Incremental proportional control has no separate accumulated error:
@@ -231,6 +256,9 @@ class LaserServo:
             return
         result = self.dac.set_code(code)
         self._ready_at = time.monotonic() + SETTLE_SECONDS
-        self._update(status="SETTLING", adjustment_count=state["adjustment_count"] + 1)
-        logging.info("[photons/servo] seq=%d HIGH5=%.3f target=%.3f DAC=%.6f",
-                     seq, high, state["target_mv"], result["commanded_dac_v"])
+        step = result["commanded_dac_v"] - dac["commanded_dac_v"]
+        self._update(status="SETTLING", adjustment_count=state["adjustment_count"] + 1,
+                     last_servo_step_v=step)
+        logging.info("[photons/servo] seq=%d HIGH5=%.3f target=%.3f DAC=%.6f "
+                     "step=%+.6f gain=%.6f",
+                     seq, high, state["target_mv"], result["commanded_dac_v"], step, gain)
