@@ -2,7 +2,7 @@
 
 Operator commands (DAC volts and detector millivolts are different units):
     pc photons servo_info
-    pc photons servo_start target_mv=447.5
+    pc photons servo_start target_mv=440
     pc photons servo_stop
     pc photons set_dac volts=1.4  # also stops automatic control
 
@@ -25,7 +25,7 @@ from zpnet.processes.photons.laser_dac import MAX_CODE, REFERENCE_V, CODE_SCALE,
 # increasing modulation amplitude increases measured PD OUT HIGH5.
 STARTUP_DAC_V = 1.4
 STARTUP_SERVO_ENABLED = True
-TARGET_MV = 447.5
+TARGET_MV = 440.0
 DEADBAND_MV = 0.5
 GAIN_V_PER_MV = 0.001
 MAX_STEP_V = 0.010

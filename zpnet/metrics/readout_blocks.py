@@ -2397,6 +2397,12 @@ def _photons_rolling_rows(payloads: list[dict]) -> list[dict]:
                                 rel_tol=0.0, abs_tol=1e-6):
                 raise ValueError("PHOTONS RAW + ADJ does not equal NORM")
         moving = (current.get("pd_out_statistics") or {}).get("moving") or {}
+        # These are Pi control values captured when this fragment arrived,
+        # not analog readback or a claim about every race within the second.
+        # Never substitute the latest DAC state into an older scrolling row.
+        # Publications predating DAC/servo support display the usual '---'.
+        laser = current.get("laser_dac") or {}
+        servo = laser.get("servo") or {}
         rows.append({
             "second": seconds,
             "raw_mean": float(raw["mean"]) if n > 0 else None,
@@ -2406,6 +2412,8 @@ def _photons_rolling_rows(payloads: list[dict]) -> list[dict]:
             "high_mv": high_mv,
             "voltage_label": voltage_lane.upper(),
             "high_warming": high_warming,
+            "target_mv": servo.get("target_mv"),
+            "dac_v": laser.get("commanded_dac_v"),
             "low_pair_mv": (moving.get("low") or {}).get("mean"),
             "high_pair_mv": (moving.get("high") or {}).get("mean"),
             "pd_window": f"{moving['count']}/{moving['target_laps']}" if moving else "---",
@@ -2541,7 +2549,8 @@ def photons_detail_readout() -> list[str]:
                   _photons_summary_line(summary, bool(campaign), summary["mean"]),
                   "", *photons_temperature_block(live), "",
                   f"{'SEC':<8} {'LAP':>{PHOTONS_MEAN_WIDTH}} {'LOW':>9} {'HIGH':>9} "
-                  f"{'PD N/WIN':>10} {voltage_lane.upper():>9}  {'FACT':>14} {'ADJ':>12}"])
+                  f"{'PD N/WIN':>10} {voltage_lane.upper():>9} "
+                  f" {'TARGET mV':>10} {'DAC V':>10} {'FACT':>14} {'ADJ':>12}"])
     for row in _photons_rolling_rows(payloads):
         lines.append(
             _fmt(row["second"], 'd', 0).ljust(8)
@@ -2551,6 +2560,8 @@ def photons_detail_readout() -> list[str]:
             + " " + row["pd_window"].rjust(10)
             + " " + _fmt(row["high_mv"], '>9.3f', 9)
             + ("*" if row["high_warming"] else " ")
+            + " " + _fmt(row["target_mv"], '>10.3f', 10)
+            + " " + _fmt(row["dac_v"], '>10.6f', 10)
             + " " + _fmt(row["factor"], '>14.12f', 14)
             + " " + _fmt(row["adjustment_ns"], '>+12.6f', 12))
     return lines
