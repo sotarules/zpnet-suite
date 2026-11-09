@@ -305,7 +305,7 @@ class VoltageSweep:
                     "interpretation": [
                         "Volatile: this report is lost on process restart or the next sweep_start. Save STDOUT.",
                         "Ranked by lowest worst-visit SD of raw one-second means; no target is automatically selected.",
-                        "RAW is pre-normalization; published scatter is NOR5 context only, not the ranking criterion.",
+                        "RAW is pre-normalization; published scatter is recorded-model context only, not the ranking criterion.",
                         "Within-fragment SD is pooled from raw M2; between-second and nonoverlapping block SD describe different scales.",
                         "All measurement fragments count, including out-of-band excursions; seek/transition fragments do not.",
                         "HIGH5 windows overlap: these SDs are descriptive, not independent-sample confidence estimates.",

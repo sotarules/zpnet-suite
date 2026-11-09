@@ -7,7 +7,7 @@
 
 Reads latest persisted LANTERN/PHOTONS_V1 campaign_detail rows, including
 campaign-less observations. Does not listen to PUBSUB, invoke firmware RPC,
-change database records, or change the model. NOR2–NOR4 use persisted HIGH60; NOR5 uses the exact Teensy HIGH5 predictor
+change database records, or change the model. NOR2–NOR4 use persisted HIGH60; NOR5/NOR6/NOR7 use the exact Teensy HIGH5 predictor
 persisted at photons.pd_out.high5_window.high_mean_mv.
 NOR1 historical fragment-HIGH witnesses remain readable as a distinct epoch.
 
@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 
 from zpnet.shared.report_db import add_read_arguments, validate_read_arguments, campaign_rows
 
-VERSION = '2026-10-27.1'
+VERSION = '2026-11-08.1'
 SCHEMA = 'PHOTONS_V1'
 FIRMWARE_SCHEMA = 'PHOTONS_VOLTAGE_NORMALIZATION_V1'
 from zpnet.shared.photons_voltage import (
@@ -44,6 +44,8 @@ MODELS = {
     'PD200T_HIGH60_LINEAR_V2': ('PD_OUT_HIGH60_MV', 0x4E4F5233), # NOR3
     'PD200T_HIGH60_QUADRATIC_V1': ('PD_OUT_HIGH60_MV', 0x4E4F5234), # NOR4
     'PD200T_HIGH5_QUADRATIC_V1': ('PD_OUT_HIGH5_MV', 0x4E4F5235), # NOR5
+    'PD200T_HIGH5_SERVO_BASELINE_V1': ('PD_OUT_HIGH5_MV', 0x4E4F5236), # NOR6
+    'PD200T_HIGH5_SERVO_LINEAR_V1': ('PD_OUT_HIGH5_MV', 0x4E4F5237), # NOR7
 }
 APPLICATION = 'UNIFORM_OFFSET_AT_FRAGMENT_DRAIN'
 ADC_SCALE_MV = 3300.0 / 4095.0
@@ -59,6 +61,10 @@ MODEL_FIT_RANGES_MV = {
     'PD200T_HIGH60_LINEAR_V2': (455.031, 461.469),
     'PD200T_HIGH60_QUADRATIC_V1': (438.3795, 465.7743),
     'PD200T_HIGH5_QUADRATIC_V1': (439.1703, 459.3281),
+    # The expected 439..441 mV servo band is NOT an empirical fit range.
+    'PD200T_HIGH5_SERVO_BASELINE_V1': None,
+    # Rounded training block-mean range; diagnostic only, not ADC limits.
+    'PD200T_HIGH5_SERVO_LINEAR_V1': (437.819, 442.462),
 }
 # The Teensy carries sixteen significant decimal digits; these tolerances
 # cover representation rounding, not unmodeled physical measurement noise.
@@ -294,6 +300,7 @@ def summary(rows):
     published = [r.published_ns for r in rows]
     adj = [r.adjustment_ns for r in rows]
     raw_sd, pub_sd = sd(raw), sd(published)
+    fit_range = MODEL_FIT_RANGES_MV[rows[0].model]
     return {
         'first_id': rows[0].id, 'last_id': rows[-1].id,
         'first_sequence': rows[0].sequence, 'last_sequence': rows[-1].sequence,
@@ -304,9 +311,9 @@ def summary(rows):
         'window_n_range': [min(r.window_n for r in rows), max(r.window_n for r in rows)],
         'high_range_mv': [min(volts), max(volts)],
         'outside_original_fit': sum(not V1_FIT_LOW_MV <= v <= V1_FIT_HIGH_MV for v in volts),
-        'model_fit_range_mv': list(MODEL_FIT_RANGES_MV[rows[0].model]),
-        'outside_model_fit': sum(not MODEL_FIT_RANGES_MV[r.model][0] <= r.voltage_mv
-                                 <= MODEL_FIT_RANGES_MV[r.model][1] for r in rows),
+        'model_fit_range_mv': list(fit_range) if fit_range is not None else None,
+        'outside_model_fit': (sum(not fit_range[0] <= r.voltage_mv <= fit_range[1]
+                                  for r in rows) if fit_range is not None else None),
         'raw_range_ns': [min(raw), max(raw)],
         'adjustment_range_ns': [min(adj), max(adj)],
         'published_range_ns': [min(published), max(published)],
@@ -336,9 +343,9 @@ def print_report(args, rows, older, failures):
     print(f'PHOTONS VOLTAGE NORMALIZATION WITNESS {VERSION}')
     print(f'Generated UTC: {datetime.now(timezone.utc).isoformat(timespec="seconds")}')
     print(f'Source: read-only campaign_detail; latest {args.rows} LANTERN rows; campaign={args.campaign or "ALL (including STOPPED)"}')
-    print('Models: NOR1=fragment HIGH; NOR2=HeatCool1 HIGH60; NOR3=HighLow1 linear; NOR4=HighLow2 quadratic HIGH60; NOR5=HighLow3 quadratic HIGH5; Teensy applies correction')
+    print('Models: NOR1=fragment HIGH; NOR2=HeatCool1 HIGH60; NOR3=HighLow1 linear; NOR4=HighLow2 quadratic HIGH60; NOR5=HighLow3 quadratic HIGH5; NOR6=unfitted zero baseline at 440 mV; NOR7=NOR6-1 linear residual; Teensy applies correction')
     print('Predictor is read directly from its persisted HIGH60/HIGH5 window; no reconstructed filter.')
-    print('Fit ranges are model-specific block-mean ranges; NOR4/NOR5 use development data only (approximate).')
+    print('Fit ranges are model-specific block-mean ranges; NOR4/NOR5 use development data only (approximate); NOR6 has no fitted range.')
     print(f'Rows: normalized={len(rows)}; older/unmodeled={older}; closure_errors={len(failures)}')
     for ident, why in failures[:20]:
         print(f'  FAIL id={ident}: {why}')
@@ -359,9 +366,15 @@ def print_report(args, rows, older, failures):
             label = info['voltage_source'].removeprefix('PD_OUT_').removesuffix('_MV')
             print(f'  {label} maturity:  {info["window_full_rows"]}/{info["fragments"]} complete-window rows; '
                   f'window ADC n={info["window_n_range"][0]:,}..{info["window_n_range"][1]:,}')
-        print(f'  Fit range mV:     {info["model_fit_range_mv"][0]:.3f} .. {info["model_fit_range_mv"][1]:.3f}')
+        fit_range = info['model_fit_range_mv']
+        if fit_range is None:
+            print('  Fit range mV:     UNFITTED; zero-correction baseline')
+            fit_note = '  outside_model_fit=n/a'
+        else:
+            print(f'  Fit range mV:     {fit_range[0]:.3f} .. {fit_range[1]:.3f}')
+            fit_note = f'  outside_model_fit={info["outside_model_fit"]}/{info["fragments"]}'
         print(f'  HIGH mV:          {info["high_range_mv"][0]:.6f} .. {info["high_range_mv"][1]:.6f}'
-              f'  outside_model_fit={info["outside_model_fit"]}/{info["fragments"]}')
+              + fit_note)
         print(f'  RAW LAP ns:       {info["raw_range_ns"][0]:.6f} .. {info["raw_range_ns"][1]:.6f}')
         print(f'  ADJUSTMENT ns:    {info["adjustment_range_ns"][0]:+.6f} .. {info["adjustment_range_ns"][1]:+.6f}')
         print(f'  PUBLISHED ns:     {info["published_range_ns"][0]:.6f} .. {info["published_range_ns"][1]:.6f}')
@@ -380,11 +393,14 @@ def print_report(args, rows, older, failures):
     print('\nMOST RECENT PER-FRAGMENT WITNESSES')
     print(' ID       SEQ    HIGH_mV    RAW_ns    ADJUST_ns   PUB_ns  N_RACE N_ADC N_WINDOW WINDOW  FIT')
     for r in rows[-args.show:] if args.show else []:
+        fit_range = MODEL_FIT_RANGES_MV[r.model]
+        fit_label = ("UNFIT" if fit_range is None else
+                     "IN" if fit_range[0] <= r.voltage_mv <= fit_range[1] else "OUT")
         print(f'{r.id:8d} {r.sequence:7d} {r.voltage_mv:10.4f} {r.raw_ns:10.4f} '
               f'{r.adjustment_ns:+11.4f} {r.published_ns:10.4f} {r.races:7d} '
               f'{r.adc_n:5d} {r.window_n:8d} '
               f'{"FULL" if r.window_complete else "WARM"}  '
-              f'{"IN" if MODEL_FIT_RANGES_MV[r.model][0] <= r.voltage_mv <= MODEL_FIT_RANGES_MV[r.model][1] else "OUT"}')
+              f'{fit_label}')
     print('\nCLOSURE: raw + adjustment = published; N/M2/SD/SE preserved; Pi/Teensy/model identities agree.')
     print('* Predictor-sample SE assumes independent ADC samples; overlapping voltage windows are correlated.')
     print('  Between-fragment SD is descriptive; voltage windows overlap and can lag a thermal ramp.')

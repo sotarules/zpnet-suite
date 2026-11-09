@@ -4,6 +4,12 @@ Usage: zt photons_multi_fit HeatCool3 HeatCool4 [--block-seconds 300]
 Fits linear, quadratic, and cubic raw-LAP response using the exact persisted
 model-authoritative HIGH5/HIGH60 predictor. --predictor high60 requests the
 retained comparison witness explicitly. No alternate smoothing; no writes to database or firmware.
+
+One campaign: fit the first 70% of usable blocks and compare frozen candidates
+on the final 30%, separated by omitted blocks to clear the voltage window.
+Multiple campaigns: select by leave-one-campaign-out validation. Degree zero
+is the no-correction baseline. Validation selects the degree; it is not an
+independent final test. A new campaign is needed to confirm the chosen formula.
 """
 import argparse
 import json
@@ -22,6 +28,8 @@ WINDOW_ACQUISITION_IDS = {
     'PD200T_HIGH60_LINEAR_V2': 0x4E4F5233,  # HighLow1 / NOR3
     'PD200T_HIGH60_QUADRATIC_V1': 0x4E4F5234,  # HighLow2 trial / NOR4
     'PD200T_HIGH5_QUADRATIC_V1': 0x4E4F5235,  # HighLow3 trial / NOR5
+    'PD200T_HIGH5_SERVO_BASELINE_V1': 0x4E4F5236,  # servo-era baseline / NOR6
+    'PD200T_HIGH5_SERVO_LINEAR_V1': 0x4E4F5237,  # servo-era linear candidate / NOR7
 }
 
 
@@ -59,7 +67,7 @@ def observation(ident, p, predictor='authority'):
         if model in WINDOW_ACQUISITION_IDS:
             voltage_window(norm, f['pd_out'])
     # Legacy NOR1/raw rows retain the report's historical HIGH60 comparison.
-    selected = ('high5' if norm is not None and norm['model_id'] == 'PD200T_HIGH5_QUADRATIC_V1'
+    selected = ('high5' if norm is not None and VOLTAGE_MODELS[norm['model_id']][1] == 'PD_OUT_HIGH5_MV'
                 else 'high60') if predictor == 'authority' else predictor
     key, target = ('high5_window', 5000) if selected == 'high5' else ('high_window', 60000)
     w = f['pd_out'][key]
@@ -188,13 +196,47 @@ def evaluate(rows, coeff, ref):
     results = {}
     for name,group in groups.items():
         candidate = [r[3] for r in group]
-        errors = [x-candidate[0] for x in candidate]
+        # fit() removes one campaign intercept. Score the same centered
+        # residuals, not distance from an arbitrary first block. The latter
+        # adds the first block's squared deviation to the variance and can
+        # incorrectly rank a nested quadratic worse on its own training data.
+        mean = st.fmean(candidate)
+        errors = [x-mean for x in candidate]
         span = lambda values: max(values)-min(values)
         results[name] = (math.sqrt(st.fmean(e*e for e in errors)),
                          span([r[1] for r in group]),span([r[2] for r in group]),
                          span(candidate),candidate[-1]-candidate[0],
                          min(r[0] for r in group),max(r[0] for r in group))
     return results
+
+
+def pooled_rms(rows, results):
+    # fit() gives every block equal weight, even across unequal campaign
+    # lengths. Use that same objective when aggregating campaign scores.
+    counts = defaultdict(int)
+    for row in rows:
+        counts[row[0]] += 1
+    return math.sqrt(math.fsum(counts[name] * result[0]**2
+                              for name, result in results.items()) / len(rows))
+
+
+def formula(coeff):
+    return (' '.join(f'{-c:+.12g}*x^{i+1}' for i,c in enumerate(coeff))
+            if coeff else '0')
+
+
+def print_results(title, rows, coeff, ref, label):
+    print('\n' + title)
+    baseline = evaluate(rows, [], ref)
+    for name, result in evaluate(rows, coeff, ref).items():
+        rms, raw, pub, corrected, delta, vmin, vmax = result
+        raw_rms = baseline[name][0]
+        change = (f'{100*(1-rms/raw_rms):+.2f}%' if raw_rms else 'n/a')
+        print(f'{name}: {label}={vmin:.3f}..{vmax:.3f}mV; raw span={raw:.6f}ns; '
+              f'deployed span={pub:.6f}ns; candidate span={corrected:.6f}ns; '
+              f'candidate end-start={delta:+.6f}ns; '
+              f'raw centered RMS={raw_rms:.6f}ns; candidate centered RMS={rms:.6f}ns; '
+              f'RMS reduction={change}')
 
 
 def main(argv):
@@ -204,12 +246,16 @@ def main(argv):
     parser.add_argument('--max-degree',type=int,choices=(1,2,3),default=3)
     parser.add_argument('--reference-mv',type=float,default=REF)
     parser.add_argument("--predictor", choices=("authority", "high5", "high60"), default="authority")
+    parser.add_argument('--simplicity-pct', type=float, default=5.0,
+                        help='prefer the lowest degree within this percent of best validation RMS (default 5)')
     add_read_arguments(parser)
     a = parser.parse_args(argv[1:])
     validate_read_arguments(parser, a)
     if len(set(a.campaigns)) != len(a.campaigns) or a.block_seconds < 10 or not math.isfinite(a.reference_mv):
         parser.error('invalid campaign names, block duration, or reference')
-    print('PHOTONS MULTI-CAMPAIGN VOLTAGE REGRESSION 2026-10-27.1')
+    if not math.isfinite(a.simplicity_pct) or not 0 <= a.simplicity_pct <= 100:
+        parser.error('--simplicity-pct must be finite and in 0..100')
+    print('PHOTONS MULTI-CAMPAIGN VOLTAGE REGRESSION 2026-11-09.1')
     print(f'READ ONLY; persisted {a.predictor} predictor; block={a.block_seconds}s reference={a.reference_mv:.9f}mV')
     rows = [r for name in a.campaigns for r in blocks(name,a.block_seconds,a)]
     predictors = {r[5] for r in rows}
@@ -220,37 +266,69 @@ def main(argv):
     counts = {name: sum(r[0] == name for r in rows) for name in a.campaigns}
     if any(n < 2 for n in counts.values()):
         raise ValueError('each campaign needs at least two complete blocks of window-qualified data; ' + str(counts) + '. Use --block-seconds 60 for shorter campaigns, or collect longer runs.')
+    print('Score: population RMS about each evaluated campaign mean; equal weight per block.')
+    print('The score measures within-campaign scatter, not absolute timing agreement between campaigns.')
+    single = len(a.campaigns) == 1
+    if single:
+        # Blocks are in database/sequence order. Omit enough complete blocks
+        # to exceed the nominal trailing window, including a spare block for
+        # endpoint quantization. Each retained block spans >=90% of its target.
+        window_seconds = 5 if label == 'HIGH5' else 60
+        gap = math.ceil(window_seconds / (.9 * a.block_seconds)) + 1
+        split = int(.7 * len(rows))
+        training, validation = rows[:split], rows[split + gap:]
+        if len(training) < max(10, a.max_degree + 2) or len(validation) < 4:
+            raise ValueError('not enough blocks for chronological validation; collect longer or use --block-seconds 60')
+        print(f'Chronological split: training={len(training)} early blocks; '
+              f'embargo={gap} blocks; validation={len(validation)} later blocks.')
+        print('Coefficients are frozen from training; validation rows are never used for fitting.')
+    else:
+        training, validation = rows, rows
+        print('Validation: each campaign held out in turn; reported formula is refitted on all campaigns.')
     candidates = {}
-    for degree in range(1,a.max_degree+1):
+    for degree in range(0,a.max_degree+1):
         try:
-            coeff = fit(rows,degree,a.reference_mv)
-            train = evaluate(rows,coeff,a.reference_mv)
-            folds = []
-            if len(a.campaigns)>1:
+            coeff = fit(training,degree,a.reference_mv) if degree else []
+            train = evaluate(training,coeff,a.reference_mv)
+            if single:
+                validated = evaluate(validation,coeff,a.reference_mv)
+            else:
+                validated = {}
                 for holdout in a.campaigns:
-                    c = fit([r for r in rows if r[0]!=holdout],degree,a.reference_mv)
-                    folds.append(evaluate([r for r in rows if r[0]==holdout],c,a.reference_mv)[holdout][0])
-            train_rms = math.sqrt(st.fmean(v[0]**2 for v in train.values()))
-            cv_rms = math.sqrt(st.fmean(x*x for x in folds)) if folds else None
+                    c = fit([r for r in rows if r[0]!=holdout],degree,a.reference_mv) if degree else []
+                    validated.update(evaluate([r for r in rows if r[0]==holdout],c,a.reference_mv))
+            train_rms = pooled_rms(training,train)
+            cv_rms = pooled_rms(validation,validated)
             candidates[degree] = (coeff,train,train_rms,cv_rms)
-            print(f'degree={degree}: train drift RMS={train_rms:.6f} ns; '
-                  + (f'held-out-campaign RMS={cv_rms:.6f} ns' if cv_rms is not None else 'no held-out campaign'))
+            print(f'degree={degree}: train centered RMS={train_rms:.6f} ns; '
+                  f'validation centered RMS={cv_rms:.6f} ns; A(V)={formula(coeff)} ns')
+            for name, result in validated.items():
+                print(f'  validation {name}: RMS={result[0]:.6f}ns; '
+                      f'span={result[3]:.6f}ns; end-start={result[4]:+.6f}ns')
         except ValueError as exc:
             print(f'degree={degree}: unidentifiable ({exc})')
-    if not candidates:
-        raise ValueError('no identifiable model')
-    best = min(candidates,key=lambda d: candidates[d][3] if len(a.campaigns)>1 else candidates[d][2])
+    minimum = min(value[3] for value in candidates.values())
+    best = min(degree for degree, value in candidates.items()
+               if value[3] <= minimum * (1 + a.simplicity_pct / 100))
     coeff,train,_,_ = candidates[best]
-    print(f'\nSELECTED degree={best} (selection={"leave-one-campaign-out" if len(a.campaigns)>1 else "training only; not validated"})')
+    print(f'\nSELECTED degree={best} (selection={"chronological validation" if single else "leave-one-campaign-out"}; '
+          f'simplicity={a.simplicity_pct:g}%)')
     print(f'x = {label}_MV - {a.reference_mv:.9f}')
-    print('CORRECTION A(V) = '+' '.join(f'{-c:+.12g}*x^{i+1}' for i,c in enumerate(coeff))+' ns')
+    print('CORRECTION A(V) = '+formula(coeff)+' ns')
     print('A(V) is relative to reference; any constant shift leaves drift unchanged.')
-    for name in a.campaigns:
-        rms,raw,pub,corrected,delta,vmin,vmax = train[name]
-        print(f'{name}: {label}={vmin:.3f}..{vmax:.3f}mV; raw span={raw:.6f}ns; '
-              f'deployed span={pub:.6f}ns; candidate span={corrected:.6f}ns; '
-              f'candidate end-start={delta:+.6f}ns; candidate RMS={rms:.6f}ns')
+    print_results('TRAINING / REFIT', training, coeff, a.reference_mv, label)
+    if single:
+        print_results('LATER VALIDATION (same frozen coefficients)', validation, coeff, a.reference_mv, label)
+        # Centering each split is appropriate for scatter but hides a shift of
+        # its mean. Expose that separately; a quiet later interval can still
+        # sit at a different timing level than the training interval.
+        mean = lambda rr, cc: st.fmean(r[2] - sum(c*r[4][i] for i,c in enumerate(cc)) for r in rr)
+        print(f'Mean shift validation-minus-training: '
+              f'raw={mean(validation,[])-mean(training,[]):+.6f}ns; '
+              f'candidate={mean(validation,coeff)-mean(training,coeff):+.6f}ns')
     print('Cautions: campaign-specific offsets removed; only within-campaign drift assessed.')
+    print('Degree zero means no voltage correction. Validation selects the model, not an independent final confirmation.')
+    print('RMS describes pooled block means, not individual-race SD. The old first-block-anchored RMS is retired.')
     print('Trailing windows lag ramps and overlap; successive predictors are correlated.')
     print('Only rows with persisted complete-window voltage and raw-LAP witnesses used. Test the frozen formula on new campaigns.')
     print('No data, model coefficients, or producer state modified.')

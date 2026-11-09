@@ -1,8 +1,8 @@
 """ZPNet PHOTONS: Teensy acquisition/normalization and durable Pi witnesses.
 
 The Teensy owns physical races, science admission, GNSS projection, HIGH5
-normalization, statistics, campaign boundaries and recovery. NOR5 applies one
-frozen quadratic offset to each raw one-second population. Individual race
+normalization, statistics, campaign boundaries and recovery. NOR7 applies a
+frozen linear residual correction around the servo operating point of 440 mV. Individual race
 measurements and within-fragment dispersion remain raw evidence.
 
 The Pi preserves the instrument subtree, validates the recorded correction,
@@ -39,7 +39,7 @@ from zpnet.shared.constants import Payload
 from zpnet.shared.db import DatabaseContentionRetry, DatabaseWorkerSession, open_db
 from zpnet.shared.logger import setup_logging
 from zpnet.shared.photons_voltage import (
-    HIGH5_MODEL, VOLTAGE_MODELS, voltage_adjustment, voltage_coefficient_fields, voltage_window,
+    SERVO_LINEAR_MODEL, VOLTAGE_MODELS, voltage_adjustment, voltage_coefficient_fields, voltage_window,
 )
 
 
@@ -47,13 +47,13 @@ from zpnet.shared.photons_voltage import (
 # PHOTONS: Optional calibrated normalization and physical sensor identities
 # ======================================================================
 
-# Matches process_photons.cpp. NOR5 changes the predictor to HIGH5 and uses its own frozen polynomial.
-# Never restore earlier corrected numerator/Welford/bucket custody into NOR5.
+# Matches process_photons.cpp. NOR7 starts the servo-era linear calibration.
+# Never restore prior numerator/Welford/bucket custody into NOR7.
 # Startup's existing epoch-migration court preserves all historical rows.
 _laser_dac = LaserDac()  # Pi SMBus2; construction performs no hardware I/O.
 _laser_servo = LaserServo(_laser_dac)
 
-ACQUISITION_ID = 0x4E4F5235  # NOR5: frozen HighLow3 quadratic HIGH5 trial
+ACQUISITION_ID = 0x4E4F5237  # NOR7: frozen NOR6-1 linear residual at 440 mV
 PHOTONS_MEASUREMENT_SCHEMA = "PI_PHOTONS_MEASUREMENT_V1"
 THERMAL_SENSOR_PATHS = {
     "pi": (("environment", "pi"), "PI.I2C1.BME280.0x76"),
@@ -658,7 +658,7 @@ TEMPERATURE_STATS_SCHEMA = "PI_PHOTONS_TEMPERATURE_STATS_V1"
 TEMPERATURE_SENSORS = (*THERMAL_SENSOR_PATHS, "high60", "high5", "adjustment")
 HIGH60_SOURCE = "TEENSY.PHOTONS.PD_OUT.HIGH60"
 HIGH5_SOURCE = "TEENSY.PHOTONS.PD_OUT.HIGH5"
-ADJUSTMENT_SOURCE = "TEENSY.PHOTONS.ADJ." + HIGH5_MODEL
+ADJUSTMENT_SOURCE = "TEENSY.PHOTONS.ADJ." + SERVO_LINEAR_MODEL
 # Native units: Celsius for probes, millivolts for both HIGH windows, nanoseconds for ADJ. One
 # observation per producer second, including the firmware's window warmup.
 # ADJ observes the actual applied offset once per nonempty accepted fragment.
@@ -1082,12 +1082,12 @@ class TemperatureAccumulator:
                 if (sources is None or sources.get("high5") != HIGH5_SOURCE
                         or rolling_checkpoint is None
                         or rolling_checkpoint["sensor_sources"].get("high5") != HIGH5_SOURCE):
-                    raise ValueError("NOR5 checkpoint lost its HIGH5 population custody")
+                    raise ValueError("NOR7 checkpoint lost its HIGH5 population custody")
                 if sources.get("adjustment") != ADJUSTMENT_SOURCE:
-                    raise ValueError("NOR5 checkpoint lost its adjustment population")
+                    raise ValueError("NOR7 checkpoint lost its adjustment population")
                 if (rolling_checkpoint is None or
                         rolling_checkpoint["sensor_sources"].get("adjustment") != ADJUSTMENT_SOURCE):
-                    raise ValueError("NOR5 checkpoint lost its adjustment rolling custody")
+                    raise ValueError("NOR7 checkpoint lost its adjustment rolling custody")
             labels = state.setdefault("sensor_label_history", {})
             old_names = list(state["total"])
             old_sources = sources or {name: ("PI.I2C2.BME280.0x77" if name == "otdr"
@@ -1145,8 +1145,8 @@ class TemperatureAccumulator:
         high5_window = voltage_window(normalization, canonical["photons"]["pd_out"])
         values["high5"] = (high5_window["high_mean_mv"]
                            if high5_window["sample_count"] > 0 else None)
-        if normalization["model_id"] != HIGH5_MODEL:
-            raise ValueError("adjustment population requires the NOR5 model epoch")
+        if normalization["model_id"] != SERVO_LINEAR_MODEL:
+            raise ValueError("adjustment population requires the NOR7 model epoch")
         adjustment = float(normalization["adjustment_ns"])
         if not math.isfinite(adjustment):
             raise ValueError("PHOTONS applied adjustment must be finite")

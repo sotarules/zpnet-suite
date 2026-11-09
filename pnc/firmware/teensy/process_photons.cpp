@@ -40,10 +40,10 @@
 static constexpr uint64_t PHOTONS_FRAGMENT_PERIOD_NS = 1000000000ULL;
 static constexpr uint64_t PHOTONS_NS_PER_SECOND = 1000000000ULL;
 
-// HighLow3 HIGH5 quadratic trial. NOR5 starts fresh corrected numerator/Welford/
+// Servo-era HIGH5 linear candidate. NOR7 starts fresh numerator/Welford/
 // Better-Buckets custody; never restore earlier corrected populations into
 // this calibration. Original DWT and per-fragment raw evidence stay raw.
-static constexpr uint32_t PHOTONS_ACQUISITION_ID = 0x4E4F5235UL; // 'NOR5'
+static constexpr uint32_t PHOTONS_ACQUISITION_ID = 0x4E4F5237UL; // 'NOR7'
 
 
 // i.MX RT1062 RAM2 is write-back cached in 32-byte lines.  PHOTONS places only
@@ -2415,18 +2415,23 @@ static FLASHMEM void photons_envelope_finish(const photons_race_batch_t& batch,
 }
 
 
-// Provisional HighLow3 HIGH5 trial, 2026-10-27. Frozen first-70% fit:
-// 1129 complete 60-fragment development blocks; later 30% withheld from fitting.
-// Source extract SHA256: 46761a5fca0e643a1f108c99933ac6a79c095858139795c16512e3704a2d64fa
-// Per-fragment HIGH5 and its square evaluated before race-weighted block pooling.
-// Development block-mean HIGH5 range: 439.1703..459.3281 mV (not a clamp).
-// ADJ = offset + slope*x + quadratic*x*x; x = authoritative HIGH5 - 455 mV.
-// Offset preserves NOR4 at 455 mV; not an absolute flight-time calibration.
-// No per-race, LOW, temperature, rate, adaptive-window or runtime-fit correction.
-static constexpr Double PHOTONS_HIGH_REFERENCE_MV = 455_D;
-static constexpr Double PHOTONS_HIGH_OFFSET_NS = -7.091998360876317_D;
-static constexpr Double PHOTONS_HIGH_SLOPE_NS_PER_MV = 0.38806607923641423_D;
-static constexpr Double PHOTONS_HIGH_QUADRATIC_NS_PER_MV2 = -0.004808419702287202_D;
+// NOR7 linear residual candidate, 2026-11-09, frozen from NOR6-1.
+// First 646 60-second blocks fitted; two-block embargo; 276 later blocks
+// selected linear over quadratic. Centered validation RMS: 0.436678 ns raw,
+// 0.337821 ns linear, 0.557308 ns quadratic. Confirm on a new campaign.
+// ADJ = +0.258677287479 * (HIGH5 - 440) ns; published LAP = RAW + ADJ.
+// FACT is the constant derivative in ns/mV. No temperature or DAC term.
+// Preserve the polynomial witness contract with zero offset and curvature.
+// Reference stays fixed even if the servo target changes. No clamping or
+// extrapolation fallback; the report flags observations outside fit coverage.
+// This reduces scatter, not all drift: the validation/training mean shift
+// remained about -1.24 ns. Do not treat this as absolute flight calibration.
+// Match SERVO_LINEAR_COEFFICIENTS in photons_voltage.py. Every coefficient
+// revision needs a new model identity AND acquisition epoch; NOR6 stays zero.
+static constexpr Double PHOTONS_HIGH_REFERENCE_MV = 440_D;
+static constexpr Double PHOTONS_HIGH_OFFSET_NS = 0_D;
+static constexpr Double PHOTONS_HIGH_SLOPE_NS_PER_MV = 0.258677287479_D;
+static constexpr Double PHOTONS_HIGH_QUADRATIC_NS_PER_MV2 = 0_D;
 
 // Shared exact ADC conversion for both published windows and the HIGH5 correction.
 static Double photons_window_mean_mv(const photons_pd_out_window_t& window) {
@@ -5129,7 +5134,7 @@ static Payload& photons_fragment_payload(
   instrument.add_object("race", race);
   race.clear();
   voltage_normalization.add("schema", "PHOTONS_VOLTAGE_NORMALIZATION_V1");
-  voltage_normalization.add("model_id", "PD200T_HIGH5_QUADRATIC_V1");
+  voltage_normalization.add("model_id", "PD200T_HIGH5_SERVO_LINEAR_V1");
   voltage_normalization.add("application", "UNIFORM_OFFSET_AT_FRAGMENT_DRAIN");
   voltage_normalization.add("voltage_source", "PD_OUT_HIGH5_MV");
   voltage_normalization.add("adc_sample_count", f.voltage_normalization.adc_sample_count);

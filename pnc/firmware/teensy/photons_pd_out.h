@@ -7,7 +7,7 @@
 // Counts are raw 12-bit ADC codes; delay measurements bracket software triggers,
 // not the ADC aperture.
 static constexpr uint32_t PHOTONS_PD_OUT_HIGH_WINDOW_MS = 60000U; // retained HIGH60 witness
-static constexpr uint32_t PHOTONS_PD_OUT_HIGH5_WINDOW_MS = 5000U;  // NOR5 authority
+static constexpr uint32_t PHOTONS_PD_OUT_HIGH5_WINDOW_MS = 5000U;  // NOR5/NOR6 predictor
 static_assert(PHOTONS_PD_OUT_HIGH5_WINDOW_MS < PHOTONS_PD_OUT_HIGH_WINDOW_MS,
               "HIGH5 must be a suffix of the retained HIGH60 ring");
 

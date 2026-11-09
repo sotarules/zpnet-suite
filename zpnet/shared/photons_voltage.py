@@ -1,20 +1,27 @@
 """Recorded Teensy voltage models; validation only, never a second correction.
 
 NOR4 retains the HighLow2 HIGH60 fit; NOR5 uses the HighLow3 HIGH5 fit.
-Both offsets preserve NOR3 at 455 mV; historical model identities never change.
+Their offsets preserve NOR3 at 455 mV; historical model identities never change.
+NOR6 starts a separate servo-era, zero-correction baseline at 440 mV.
+NOR7 adds a frozen linear residual correction fitted on NOR6-1.
+Both retain the polynomial witness contract; NOR7 curvature is exactly zero.
 The schema remains additive V1; model identity selects the polynomial contract.
 """
 import math
 
 QUADRATIC_MODEL = "PD200T_HIGH60_QUADRATIC_V1"  # historical NOR4
-HIGH5_MODEL = "PD200T_HIGH5_QUADRATIC_V1"
-QUADRATIC_MODELS = (QUADRATIC_MODEL, HIGH5_MODEL)
+HIGH5_MODEL = "PD200T_HIGH5_QUADRATIC_V1"  # historical NOR5
+SERVO_MODEL = "PD200T_HIGH5_SERVO_BASELINE_V1"  # NOR6, not a fitted calibration
+SERVO_LINEAR_MODEL = "PD200T_HIGH5_SERVO_LINEAR_V1"  # NOR7, provisional NOR6-1 fit
+QUADRATIC_MODELS = (QUADRATIC_MODEL, HIGH5_MODEL, SERVO_MODEL, SERVO_LINEAR_MODEL)
 VOLTAGE_MODELS = {
     "PD200T_HIGH_LINEAR_V1": (0x4E4F5231, "FRAGMENT_HIGH_MV"),
     "PD200T_HIGH60_LINEAR_V1": (0x4E4F5232, "PD_OUT_HIGH60_MV"),
     "PD200T_HIGH60_LINEAR_V2": (0x4E4F5233, "PD_OUT_HIGH60_MV"),
     QUADRATIC_MODEL: (0x4E4F5234, "PD_OUT_HIGH60_MV"),
     HIGH5_MODEL: (0x4E4F5235, "PD_OUT_HIGH5_MV"),
+    SERVO_MODEL: (0x4E4F5236, "PD_OUT_HIGH5_MV"),
+    SERVO_LINEAR_MODEL: (0x4E4F5237, "PD_OUT_HIGH5_MV"),
 }
 QUADRATIC_COEFFICIENTS = {
     "reference_mv": 455.0,
@@ -29,8 +36,37 @@ HIGH5_COEFFICIENTS = {
     "slope_ns_per_mv": 0.38806607923641423,
     "quadratic_ns_per_mv2": -0.004808419702287202,
 }
+# The servo's nominal operating point is not a fitted timing coefficient.
+# Keep it fixed even if an operator changes the servo target during a sweep.
+# Do not inherit NOR5's intercept/curvature or regress timing on the DAC:
+# equal HIGH5 does not establish equal edge shape, and a changing DAC is an
+# actuator witness, not a calibrated flight-time correction. Initially RAW
+# equals published LAP. Fit residual response on a development subset of the
+# new hardware data, then check a held-out thermal interval before deployment.
+# Any later coefficient revision needs a new model identity/acquisition epoch;
+# never reinterpret recorded NOR6 baseline rows using newly fitted numbers.
+SERVO_COEFFICIENTS = {
+    "reference_mv": 440.0,
+    "offset_ns": 0.0,
+    "slope_ns_per_mv": 0.0,
+    "quadratic_ns_per_mv2": 0.0,
+}
+# NOR6-1, 2026-11-09: 60-second blocks, first 646 for fitting,
+# two-block embargo, last 276 for model selection. Validation centered RMS
+# 0.436678 -> 0.337821 ns; quadratic worsened it to 0.557308 ns.
+# Frozen candidate, not an independent confirmation or absolute timing fit.
+# The remaining between-period mean drift is not removed by this slope.
+# Reference stays fixed when the servo target changes; no DAC/time feedback.
+SERVO_LINEAR_COEFFICIENTS = {
+    "reference_mv": 440.0,
+    "offset_ns": 0.0,
+    "slope_ns_per_mv": 0.258677287479,
+    "quadratic_ns_per_mv2": 0.0,
+}
 FROZEN_QUADRATICS = {QUADRATIC_MODEL: QUADRATIC_COEFFICIENTS,
-                     HIGH5_MODEL: HIGH5_COEFFICIENTS}
+                     HIGH5_MODEL: HIGH5_COEFFICIENTS,
+                     SERVO_MODEL: SERVO_COEFFICIENTS,
+                     SERVO_LINEAR_MODEL: SERVO_LINEAR_COEFFICIENTS}
 VOLTAGE_WINDOWS = {
     "PD_OUT_HIGH60_MV": ("high_window", "high60", 60000),
     "PD_OUT_HIGH5_MV": ("high5_window", "high5", 5000),
