@@ -1,9 +1,9 @@
 """ZPNet PHOTONS: Teensy acquisition/normalization and durable Pi witnesses.
 
 The Teensy owns physical races, science admission, GNSS projection, HIGH5
-normalization, statistics, campaign boundaries and recovery. NOR7 applies a
-frozen linear residual correction around the servo operating point of 440 mV. Individual race
-measurements and within-fragment dispersion remain raw evidence.
+statistics, campaign boundaries and recovery. NONE publishes the raw
+GNSS-projected flight times without voltage or temperature correction. The
+independent Pi laser servo still controls HIGH5; it never targets flight time.
 
 The Pi preserves the instrument subtree, validates the recorded correction,
 adds thermal witnesses and actual-ADJ populations, and persists canonical
@@ -27,6 +27,8 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from psycopg.errors import ForeignKeyViolation
+
 from zpnet.processes.processes import (
     publish,
     send_command,
@@ -39,7 +41,7 @@ from zpnet.shared.constants import Payload
 from zpnet.shared.db import DatabaseContentionRetry, DatabaseWorkerSession, open_db
 from zpnet.shared.logger import setup_logging
 from zpnet.shared.photons_voltage import (
-    SERVO_LINEAR_MODEL, VOLTAGE_MODELS, voltage_adjustment, voltage_coefficient_fields, voltage_window,
+    NONE_MODEL, VOLTAGE_MODELS, voltage_adjustment, voltage_coefficient_fields, voltage_window,
 )
 
 
@@ -47,13 +49,13 @@ from zpnet.shared.photons_voltage import (
 # PHOTONS: Optional calibrated normalization and physical sensor identities
 # ======================================================================
 
-# Matches process_photons.cpp. NOR7 starts the servo-era linear calibration.
-# Never restore prior numerator/Welford/bucket custody into NOR7.
+# Matches process_photons.cpp. NONE starts an uncorrected timing epoch.
+# Never restore corrected numerator/Welford/bucket custody into NONE.
 # Startup's existing epoch-migration court preserves all historical rows.
 _laser_dac = LaserDac()  # Pi SMBus2; construction performs no hardware I/O.
 _laser_servo = LaserServo(_laser_dac)
 
-ACQUISITION_ID = 0x4E4F5237  # NOR7: frozen NOR6-1 linear residual at 440 mV
+ACQUISITION_ID = 0x4E4F4E45  # ASCII NONE; raw flight, independent laser servo
 PHOTONS_MEASUREMENT_SCHEMA = "PI_PHOTONS_MEASUREMENT_V1"
 THERMAL_SENSOR_PATHS = {
     "pi": (("environment", "pi"), "PI.I2C1.BME280.0x76"),
@@ -324,7 +326,10 @@ class Normalizer:
             offset = float(firmware["adjustment_ns"])
             if abs((float(raw["mean"]) + offset) - float(normalized["mean"])) > 1e-6:
                 raise ValueError("firmware raw + voltage adjustment does not close")
-            out.update(status="FIRMWARE_CORRECTED",
+            # NONE preserves the entire distribution exactly, not just its mean.
+            if firmware["model_id"] == NONE_MODEL and (offset != 0.0 or raw != normalized):
+                raise ValueError("NONE must publish the unchanged raw flight distribution")
+            out.update(status="FIRMWARE_RAW" if firmware["model_id"] == NONE_MODEL else "FIRMWARE_CORRECTED",
                        normalization_id=firmware["model_id"],
                        correction_ns=-offset,
                        normalized_flight_ns=normalized)
@@ -658,7 +663,7 @@ TEMPERATURE_STATS_SCHEMA = "PI_PHOTONS_TEMPERATURE_STATS_V1"
 TEMPERATURE_SENSORS = (*THERMAL_SENSOR_PATHS, "high60", "high5", "adjustment")
 HIGH60_SOURCE = "TEENSY.PHOTONS.PD_OUT.HIGH60"
 HIGH5_SOURCE = "TEENSY.PHOTONS.PD_OUT.HIGH5"
-ADJUSTMENT_SOURCE = "TEENSY.PHOTONS.ADJ." + SERVO_LINEAR_MODEL
+ADJUSTMENT_SOURCE = "TEENSY.PHOTONS.ADJ." + NONE_MODEL
 # Native units: Celsius for probes, millivolts for both HIGH windows, nanoseconds for ADJ. One
 # observation per producer second, including the firmware's window warmup.
 # ADJ observes the actual applied offset once per nonempty accepted fragment.
@@ -1082,12 +1087,12 @@ class TemperatureAccumulator:
                 if (sources is None or sources.get("high5") != HIGH5_SOURCE
                         or rolling_checkpoint is None
                         or rolling_checkpoint["sensor_sources"].get("high5") != HIGH5_SOURCE):
-                    raise ValueError("NOR7 checkpoint lost its HIGH5 population custody")
+                    raise ValueError("NONE checkpoint lost its HIGH5 population custody")
                 if sources.get("adjustment") != ADJUSTMENT_SOURCE:
-                    raise ValueError("NOR7 checkpoint lost its adjustment population")
+                    raise ValueError("NONE checkpoint lost its adjustment population")
                 if (rolling_checkpoint is None or
                         rolling_checkpoint["sensor_sources"].get("adjustment") != ADJUSTMENT_SOURCE):
-                    raise ValueError("NOR7 checkpoint lost its adjustment rolling custody")
+                    raise ValueError("NONE checkpoint lost its adjustment rolling custody")
             labels = state.setdefault("sensor_label_history", {})
             old_names = list(state["total"])
             old_sources = sources or {name: ("PI.I2C2.BME280.0x77" if name == "otdr"
@@ -1145,8 +1150,8 @@ class TemperatureAccumulator:
         high5_window = voltage_window(normalization, canonical["photons"]["pd_out"])
         values["high5"] = (high5_window["high_mean_mv"]
                            if high5_window["sample_count"] > 0 else None)
-        if normalization["model_id"] != SERVO_LINEAR_MODEL:
-            raise ValueError("adjustment population requires the NOR7 model epoch")
+        if normalization["model_id"] != NONE_MODEL:
+            raise ValueError("adjustment population requires the NONE model epoch")
         adjustment = float(normalization["adjustment_ns"])
         if not math.isfinite(adjustment):
             raise ValueError("PHOTONS applied adjustment must be finite")
@@ -9860,6 +9865,25 @@ def _persistence_loop_with_session(db_session: DatabaseWorkerSession) -> None:
                         with _state_lock:
                             _persistence_retry_count += 1
                             _last_persistence_failure = failure
+                        if isinstance(exc, ForeignKeyViolation):
+                            # A missing campaign parent is broken custody, not
+                            # transient DB contention. In particular, a shared
+                            # TRUNCATE can remove a still-owned campaign. Retrying
+                            # forever holds _persistence_lock and prevents the
+                            # owner from acknowledging maintenance quiescence.
+                            # Do not recreate the parent or claim this row durable.
+                            logging.exception(
+                                "[photons] persistence foreign-key violation; "
+                                "latching HARD_FAILURE instead of retrying"
+                            )
+                            _enter_hard_failure(
+                                "persistence_foreign_key_violation",
+                                failure,
+                                source="PHOTONS_PERSISTENCE",
+                            )
+                            with _state_lock:
+                                _hard_failure_persistence_dropped += 1
+                            break
                         if contention.retry(exc):
                             continue
                         if not failure_logged:

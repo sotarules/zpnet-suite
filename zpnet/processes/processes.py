@@ -501,7 +501,22 @@ def _serve_commands(
 
             handler = commands[cmd]
             handler_started_ns = time.monotonic_ns()
-            resp = handler(args)
+            try:
+                resp = handler(args)
+            except Exception as exc:
+                # A command failure must not kill the only command-serving
+                # thread. Preserve the traceback and return failure; never retry
+                # a handler here, since it may already have committed changes.
+                logging.exception("[%s] command %s failed", subsystem, cmd)
+                resp = {
+                    "success": False,
+                    "message": str(exc),
+                    "payload": {
+                        "error": "command_handler_failed",
+                        "command": cmd,
+                        "exception_type": type(exc).__name__,
+                    },
+                }
             handler_ms = (time.monotonic_ns() - handler_started_ns) / 1_000_000.0
             request_age_ms = (time.monotonic_ns() - request_started_ns) / 1_000_000.0
 

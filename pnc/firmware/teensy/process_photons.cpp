@@ -40,10 +40,10 @@
 static constexpr uint64_t PHOTONS_FRAGMENT_PERIOD_NS = 1000000000ULL;
 static constexpr uint64_t PHOTONS_NS_PER_SECOND = 1000000000ULL;
 
-// Servo-era HIGH5 linear candidate. NOR7 starts fresh numerator/Welford/
-// Better-Buckets custody; never restore earlier corrected populations into
-// this calibration. Original DWT and per-fragment raw evidence stay raw.
-static constexpr uint32_t PHOTONS_ACQUISITION_ID = 0x4E4F5237UL; // 'NOR7'
+// NONE starts fresh raw numerator/Welford/Better-Buckets custody.
+// Corrected NOR populations cannot be restored into this acquisition epoch.
+// GNSS projection and science admission remain part of the measurement.
+static constexpr uint32_t PHOTONS_ACQUISITION_ID = 0x4E4F4E45UL; // 'NONE'
 
 
 // i.MX RT1062 RAM2 is write-back cached in 32-byte lines.  PHOTONS places only
@@ -2415,22 +2415,15 @@ static FLASHMEM void photons_envelope_finish(const photons_race_batch_t& batch,
 }
 
 
-// NOR7 linear residual candidate, 2026-11-09, frozen from NOR6-1.
-// First 646 60-second blocks fitted; two-block embargo; 276 later blocks
-// selected linear over quadratic. Centered validation RMS: 0.436678 ns raw,
-// 0.337821 ns linear, 0.557308 ns quadratic. Confirm on a new campaign.
-// ADJ = +0.258677287479 * (HIGH5 - 440) ns; published LAP = RAW + ADJ.
-// FACT is the constant derivative in ns/mV. No temperature or DAC term.
-// Preserve the polynomial witness contract with zero offset and curvature.
-// Reference stays fixed even if the servo target changes. No clamping or
-// extrapolation fallback; the report flags observations outside fit coverage.
-// This reduces scatter, not all drift: the validation/training mean shift
-// remained about -1.24 ns. Do not treat this as absolute flight calibration.
-// Match SERVO_LINEAR_COEFFICIENTS in photons_voltage.py. Every coefficient
-// revision needs a new model identity AND acquisition epoch; NOR6 stays zero.
+// NONE: publish raw GNSS-projected flight times at every accumulation level.
+// HIGH5 remains available to the independent Pi laser servo and reports.
+// These frozen zero coefficients preserve the existing witness schema only;
+// no voltage-dependent timing arithmetic is executed. FACT = ADJ = 0.
+// Match NONE_COEFFICIENTS in photons_voltage.py; historical NOR models stay
+// immutable. A future correction requires a different acquisition epoch.
 static constexpr Double PHOTONS_HIGH_REFERENCE_MV = 440_D;
 static constexpr Double PHOTONS_HIGH_OFFSET_NS = 0_D;
-static constexpr Double PHOTONS_HIGH_SLOPE_NS_PER_MV = 0.258677287479_D;
+static constexpr Double PHOTONS_HIGH_SLOPE_NS_PER_MV = 0_D;
 static constexpr Double PHOTONS_HIGH_QUADRATIC_NS_PER_MV2 = 0_D;
 
 // Shared exact ADC conversion for both published windows and the HIGH5 correction.
@@ -2455,10 +2448,7 @@ photons_voltage_normalization(const photons_pd_out_batch_t& batch) {
     // During the initial <5 s the identical HIGH5 witness is partial;
     // document its maturity rather than silently substituting fragment HIGH.
     n.high_mv = photons_window_mean_mv(window);
-    const Double x = n.high_mv - PHOTONS_HIGH_REFERENCE_MV;
-    n.adjustment_ns = PHOTONS_HIGH_OFFSET_NS +
-                     x * (PHOTONS_HIGH_SLOPE_NS_PER_MV +
-                          PHOTONS_HIGH_QUADRATIC_NS_PER_MV2 * x);
+    // Witness only: adjustment_ns remains exactly zero even during warmup.
   }
   return n;
 }
@@ -2521,10 +2511,10 @@ static FLASHMEM photons_fragment_drain_result_t photons_drain_raw_laps(
     const Double max_ns = (Double)race_batch.accepted_max_cycles * ns_per_cycle;
     if (min_ns <= 0_D) __builtin_trap();
     const Double m2_ns = m2_cycles * ns_per_cycle * ns_per_cycle;
-    const Double adjustment_ns = result.normalization.adjustment_ns;
-    const Double published_mean_ns = mean_ns + adjustment_ns;
-    const Double published_min_ns = min_ns + adjustment_ns;
-    const Double published_max_ns = max_ns + adjustment_ns;
+    // NONE feeds raw flight directly into totals, Welfords and buckets.
+    const Double published_mean_ns = mean_ns;
+    const Double published_min_ns = min_ns;
+    const Double published_max_ns = max_ns;
     if (published_min_ns <= 0_D) __builtin_trap();
     photons_welford_merge_batch(
         result.raw_projected_flight_welford,
@@ -5134,7 +5124,7 @@ static Payload& photons_fragment_payload(
   instrument.add_object("race", race);
   race.clear();
   voltage_normalization.add("schema", "PHOTONS_VOLTAGE_NORMALIZATION_V1");
-  voltage_normalization.add("model_id", "PD200T_HIGH5_SERVO_LINEAR_V1");
+  voltage_normalization.add("model_id", "NONE");
   voltage_normalization.add("application", "UNIFORM_OFFSET_AT_FRAGMENT_DRAIN");
   voltage_normalization.add("voltage_source", "PD_OUT_HIGH5_MV");
   voltage_normalization.add("adc_sample_count", f.voltage_normalization.adc_sample_count);

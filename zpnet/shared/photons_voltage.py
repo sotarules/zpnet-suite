@@ -4,7 +4,9 @@ NOR4 retains the HighLow2 HIGH60 fit; NOR5 uses the HighLow3 HIGH5 fit.
 Their offsets preserve NOR3 at 455 mV; historical model identities never change.
 NOR6 starts a separate servo-era, zero-correction baseline at 440 mV.
 NOR7 adds a frozen linear residual correction fitted on NOR6-1.
-Both retain the polynomial witness contract; NOR7 curvature is exactly zero.
+NONE publishes raw GNSS-projected flight times with no voltage correction.
+HIGH5 remains a servo/diagnostic witness; the zero polynomial is a wire-format
+compatibility contract, not a fitted model. Historical NOR identities stay frozen.
 The schema remains additive V1; model identity selects the polynomial contract.
 """
 import math
@@ -13,7 +15,8 @@ QUADRATIC_MODEL = "PD200T_HIGH60_QUADRATIC_V1"  # historical NOR4
 HIGH5_MODEL = "PD200T_HIGH5_QUADRATIC_V1"  # historical NOR5
 SERVO_MODEL = "PD200T_HIGH5_SERVO_BASELINE_V1"  # NOR6, not a fitted calibration
 SERVO_LINEAR_MODEL = "PD200T_HIGH5_SERVO_LINEAR_V1"  # NOR7, provisional NOR6-1 fit
-QUADRATIC_MODELS = (QUADRATIC_MODEL, HIGH5_MODEL, SERVO_MODEL, SERVO_LINEAR_MODEL)
+NONE_MODEL = "NONE"
+QUADRATIC_MODELS = (QUADRATIC_MODEL, HIGH5_MODEL, SERVO_MODEL, SERVO_LINEAR_MODEL, NONE_MODEL)
 VOLTAGE_MODELS = {
     "PD200T_HIGH_LINEAR_V1": (0x4E4F5231, "FRAGMENT_HIGH_MV"),
     "PD200T_HIGH60_LINEAR_V1": (0x4E4F5232, "PD_OUT_HIGH60_MV"),
@@ -22,6 +25,7 @@ VOLTAGE_MODELS = {
     HIGH5_MODEL: (0x4E4F5235, "PD_OUT_HIGH5_MV"),
     SERVO_MODEL: (0x4E4F5236, "PD_OUT_HIGH5_MV"),
     SERVO_LINEAR_MODEL: (0x4E4F5237, "PD_OUT_HIGH5_MV"),
+    NONE_MODEL: (0x4E4F4E45, "PD_OUT_HIGH5_MV"),  # ASCII NONE; distinct raw epoch
 }
 QUADRATIC_COEFFICIENTS = {
     "reference_mv": 455.0,
@@ -63,10 +67,19 @@ SERVO_LINEAR_COEFFICIENTS = {
     "slope_ns_per_mv": 0.258677287479,
     "quadratic_ns_per_mv2": 0.0,
 }
+# Keep the existing telemetry fields so old NOR reports remain readable.
+# NONE never converts HIGH5, temperature, or DAC voltage into a timing offset.
+NONE_COEFFICIENTS = {
+    "reference_mv": 440.0,
+    "offset_ns": 0.0,
+    "slope_ns_per_mv": 0.0,
+    "quadratic_ns_per_mv2": 0.0,
+}
 FROZEN_QUADRATICS = {QUADRATIC_MODEL: QUADRATIC_COEFFICIENTS,
                      HIGH5_MODEL: HIGH5_COEFFICIENTS,
                      SERVO_MODEL: SERVO_COEFFICIENTS,
-                     SERVO_LINEAR_MODEL: SERVO_LINEAR_COEFFICIENTS}
+                     SERVO_LINEAR_MODEL: SERVO_LINEAR_COEFFICIENTS,
+                     NONE_MODEL: NONE_COEFFICIENTS}
 VOLTAGE_WINDOWS = {
     "PD_OUT_HIGH60_MV": ("high_window", "high60", 60000),
     "PD_OUT_HIGH5_MV": ("high5_window", "high5", 5000),

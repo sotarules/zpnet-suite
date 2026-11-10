@@ -35,7 +35,7 @@ VERSION = '2026-11-08.1'
 SCHEMA = 'PHOTONS_V1'
 FIRMWARE_SCHEMA = 'PHOTONS_VOLTAGE_NORMALIZATION_V1'
 from zpnet.shared.photons_voltage import (
-    voltage_adjustment, voltage_local_slope, voltage_coefficient_fields, voltage_window,
+    NONE_MODEL, voltage_adjustment, voltage_local_slope, voltage_coefficient_fields, voltage_window,
 )
 
 MODELS = {
@@ -46,6 +46,7 @@ MODELS = {
     'PD200T_HIGH5_QUADRATIC_V1': ('PD_OUT_HIGH5_MV', 0x4E4F5235), # NOR5
     'PD200T_HIGH5_SERVO_BASELINE_V1': ('PD_OUT_HIGH5_MV', 0x4E4F5236), # NOR6
     'PD200T_HIGH5_SERVO_LINEAR_V1': ('PD_OUT_HIGH5_MV', 0x4E4F5237), # NOR7
+    NONE_MODEL: ('PD_OUT_HIGH5_MV', 0x4E4F4E45), # uncorrected, retained voltage witness
 }
 APPLICATION = 'UNIFORM_OFFSET_AT_FRAGMENT_DRAIN'
 ADC_SCALE_MV = 3300.0 / 4095.0
@@ -65,6 +66,7 @@ MODEL_FIT_RANGES_MV = {
     'PD200T_HIGH5_SERVO_BASELINE_V1': None,
     # Rounded training block-mean range; diagnostic only, not ADC limits.
     'PD200T_HIGH5_SERVO_LINEAR_V1': (437.819, 442.462),
+    NONE_MODEL: None,
 }
 # The Teensy carries sixteen significant decimal digits; these tolerances
 # cover representation rounding, not unmodeled physical measurement noise.
@@ -188,7 +190,8 @@ def parse_row(row_id, campaign, payload):
         raise ValueError('Teensy/Pi acquisition epoch mismatch')
     if measurement['authority'] != 'TEENSY.PHOTONS':
         raise ValueError('Pi did not preserve Teensy normalization authority')
-    if measurement['status'] not in ('FIRMWARE_CORRECTED', 'NO_ACCEPTED_RACES'):
+    expected_status = 'FIRMWARE_RAW' if fw['model_id'] == NONE_MODEL else 'FIRMWARE_CORRECTED'
+    if measurement['status'] not in (expected_status, 'NO_ACCEPTED_RACES'):
         raise ValueError('unexpected Pi normalized-measurement status')
     if policy['schema'] != FIRMWARE_SCHEMA or policy['normalization_id'] != fw['model_id']:
         raise ValueError('Pi normalization policy identity mismatch')
@@ -258,8 +261,10 @@ def parse_row(row_id, campaign, payload):
         return None
     if adc_n == 0:
         raise ValueError('accepted race population has no ADC voltage evidence')
-    if measurement['status'] != 'FIRMWARE_CORRECTED':
-        raise ValueError('nonempty accepted flight population is not marked corrected')
+    if measurement['status'] != expected_status:
+        raise ValueError('accepted flight population status disagrees with its strategy')
+    if fw['model_id'] == NONE_MODEL and (adjustment != 0.0 or raw != published):
+        raise ValueError('NONE must preserve the raw flight distribution exactly')
     check_welford(raw, published, adjustment)
     if published != measurement['normalized_flight_ns']:
         raise ValueError('Pi normalized witness differs from Teensy published flight')
@@ -343,9 +348,9 @@ def print_report(args, rows, older, failures):
     print(f'PHOTONS VOLTAGE NORMALIZATION WITNESS {VERSION}')
     print(f'Generated UTC: {datetime.now(timezone.utc).isoformat(timespec="seconds")}')
     print(f'Source: read-only campaign_detail; latest {args.rows} LANTERN rows; campaign={args.campaign or "ALL (including STOPPED)"}')
-    print('Models: NOR1=fragment HIGH; NOR2=HeatCool1 HIGH60; NOR3=HighLow1 linear; NOR4=HighLow2 quadratic HIGH60; NOR5=HighLow3 quadratic HIGH5; NOR6=unfitted zero baseline at 440 mV; NOR7=NOR6-1 linear residual; Teensy applies correction')
+    print('Models: NOR1=fragment HIGH; NOR2=HeatCool1 HIGH60; NOR3=HighLow1 linear; NOR4=HighLow2 quadratic HIGH60; NOR5=HighLow3 quadratic HIGH5; NOR6=unfitted zero baseline at 440 mV; NOR7=NOR6-1 linear residual; NONE=raw timing with zero correction; Teensy owns publication')
     print('Predictor is read directly from its persisted HIGH60/HIGH5 window; no reconstructed filter.')
-    print('Fit ranges are model-specific block-mean ranges; NOR4/NOR5 use development data only (approximate); NOR6 has no fitted range.')
+    print('Fit ranges are model-specific block-mean ranges; NOR4/NOR5 use development data only (approximate); NOR6/NONE have no fitted range.')
     print(f'Rows: normalized={len(rows)}; older/unmodeled={older}; closure_errors={len(failures)}')
     for ident, why in failures[:20]:
         print(f'  FAIL id={ident}: {why}')

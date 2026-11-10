@@ -18,7 +18,7 @@ Compare uses all five predictors on common rows/blocks/splits; compare-legacy
 uses synthetic, PI BME280 and MAX31865 without requiring PD or OUT.
 Each sensor's degree/lag is chosen on development data, not on the final test.
 New rows read the immutable raw one-second distribution directly and compare
-it with the recorded firmware (NOR1/NOR2/NOR3/NOR4/NOR5/NOR6/NOR7) or Pi correction. Legacy rows reconstruct raw LAP
+it with the recorded firmware (NOR1/NOR2/NOR3/NOR4/NOR5/NOR6/NOR7/NONE) or Pi correction. Legacy rows reconstruct raw LAP
 using their recorded firmware offset. New models always fit raw LAP.
 Models: constant, linear, quadratic, cubic. Model selection uses forward-only
 validation within the first 70%; the last 30% tests the frozen choice once.
@@ -68,6 +68,7 @@ FIRMWARE_ACQUISITION_IDS = {
     "PD200T_HIGH5_QUADRATIC_V1": 0x4E4F5235,
     "PD200T_HIGH5_SERVO_BASELINE_V1": 0x4E4F5236,
     "PD200T_HIGH5_SERVO_LINEAR_V1": 0x4E4F5237,
+    "NONE": 0x4E4F4E45,
 }
 HIGH_REFERENCE_MV = 3300
 HIGH_MV_PER_COUNT = HIGH_REFERENCE_MV / 4095
@@ -327,7 +328,8 @@ def parse_sample(row_id: int, p: Dict[str, Any], sensor: str = "synthetic") -> T
             for key in voltage_coefficient_fields(firmware["model_id"]):
                 if str(policy[key]) != str(firmware[key]):
                     raise ValueError("Pi/Teensy voltage coefficient mismatch: " + key)
-            raw_source = "DIRECT_RAW_FIRMWARE_NORMALIZED"
+            raw_source = ("DIRECT_RAW" if firmware["model_id"] == "NONE"
+                          else "DIRECT_RAW_FIRMWARE_NORMALIZED")
         else:
             if raw != flight:
                 raise ValueError("Pi raw evidence differs from the firmware distribution")
@@ -1057,7 +1059,7 @@ def main(argv):
     if args.sensor in ('compare', 'compare-legacy'):
         print(f'Comparison requires all {len(SENSORS if args.sensor == "compare" else LEGACY_SENSORS)} predictors on every retained row; blocks and time splits are shared.')
         print('Sensor-specific degree/lag choices use development folds only. Final-test ranking is exploratory.')
-    print('New rows use measurement.raw_flight_ns directly, including NOR1/NOR2/NOR3/NOR4/NOR5/NOR6/NOR7 firmware voltage normalization.')
+    print('New rows use measurement.raw_flight_ns directly, including NOR1/NOR2/NOR3/NOR4/NOR5/NOR6/NOR7/NONE firmware voltage normalization.')
     print('Legacy thermal rows reconstruct raw LAP from their recorded uniform offsets.')
     if args.sensor == 'high':
         print('HIGH: exact per-fragment ADC sums/counts from photons.pd_out; nominal 3300 mV / 4095 counts.')
