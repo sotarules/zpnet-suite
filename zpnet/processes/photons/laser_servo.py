@@ -259,6 +259,6 @@ class LaserServo:
         step = result["commanded_dac_v"] - dac["commanded_dac_v"]
         self._update(status="SETTLING", adjustment_count=state["adjustment_count"] + 1,
                      last_servo_step_v=step)
-        logging.info("[photons/servo] seq=%d HIGH5=%.3f target=%.3f DAC=%.6f "
+        logging.debug("[photons/servo] seq=%d HIGH5=%.3f target=%.3f DAC=%.6f "
                      "step=%+.6f gain=%.6f",
                      seq, high, state["target_mv"], result["commanded_dac_v"], step, gain)
