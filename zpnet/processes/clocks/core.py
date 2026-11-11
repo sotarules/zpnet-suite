@@ -7417,12 +7417,13 @@ def _ppb_export_collect_history(
             break
         for endpoint in page:
             sequence = int(endpoint["rolling_sequence"])
-            if sequence < oldest:
+            # The first page uses cursor 0 (the live ring head), so Alpha
+            # may append after META and return endpoints newer than this window.
+            # Keep only the requested snapshot; the page's oldest endpoint still
+            # advances the immutable cursor. If old entries rolled out, return
+            # incomplete custody for the caller's existing fresh-META retry.
+            if sequence < oldest or sequence > newest:
                 continue
-            if sequence > newest:
-                raise RuntimeError(
-                    f"{history} export crossed snapshot newest boundary: {sequence}>{newest}"
-                )
             prior = collected.get(sequence)
             if prior is not None and not _ppb_endpoints_equal(prior, endpoint):
                 raise RuntimeError(
