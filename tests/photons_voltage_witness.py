@@ -9,6 +9,7 @@ Reads latest persisted LANTERN/PHOTONS_V1 campaign_detail rows, including
 campaign-less observations. Does not listen to PUBSUB, invoke firmware RPC,
 change database records, or change the model. NOR2–NOR4 use persisted HIGH60; NOR5/NOR6/NOR7 use the exact Teensy HIGH5 predictor
 persisted at photons.pd_out.high5_window.high_mean_mv.
+NOR8 checks its recorded synthetic temperature; HIGH5 remains diagnostic.
 NOR1 historical fragment-HIGH witnesses remain readable as a distinct epoch.
 
 Reconstructs the linear-model correction from the persisted firmware identity,
@@ -31,11 +32,11 @@ from datetime import datetime, timezone
 
 from zpnet.shared.report_db import add_read_arguments, validate_read_arguments, campaign_rows
 
-VERSION = '2026-11-08.1'
+VERSION = '2026-11-10.1'
 SCHEMA = 'PHOTONS_V1'
 FIRMWARE_SCHEMA = 'PHOTONS_VOLTAGE_NORMALIZATION_V1'
 from zpnet.shared.photons_voltage import (
-    NONE_MODEL, voltage_adjustment, voltage_local_slope, voltage_coefficient_fields, voltage_window,
+    NONE_MODEL, THERMAL_MODEL, voltage_adjustment, voltage_local_slope, voltage_coefficient_fields, voltage_window,
 )
 
 MODELS = {
@@ -46,6 +47,7 @@ MODELS = {
     'PD200T_HIGH5_QUADRATIC_V1': ('PD_OUT_HIGH5_MV', 0x4E4F5235), # NOR5
     'PD200T_HIGH5_SERVO_BASELINE_V1': ('PD_OUT_HIGH5_MV', 0x4E4F5236), # NOR6
     'PD200T_HIGH5_SERVO_LINEAR_V1': ('PD_OUT_HIGH5_MV', 0x4E4F5237), # NOR7
+    THERMAL_MODEL: ('PD_OUT_HIGH5_MV', 0x4E4F5238),
     NONE_MODEL: ('PD_OUT_HIGH5_MV', 0x4E4F4E45), # uncorrected, retained voltage witness
 }
 APPLICATION = 'UNIFORM_OFFSET_AT_FRAGMENT_DRAIN'
@@ -67,6 +69,7 @@ MODEL_FIT_RANGES_MV = {
     # Rounded training block-mean range; diagnostic only, not ADC limits.
     'PD200T_HIGH5_SERVO_LINEAR_V1': (437.819, 442.462),
     NONE_MODEL: None,
+    THERMAL_MODEL: None,
 }
 # The Teensy carries sixteen significant decimal digits; these tolerances
 # cover representation rounding, not unmodeled physical measurement noise.
@@ -96,6 +99,7 @@ class Observation:
     adc_se_mv: float
     seconds: float
     stamp: str
+    applied_temperature_c: float | None
 
 
 def arguments(argv):
@@ -275,6 +279,7 @@ def parse_row(row_id, campaign, payload):
     return Observation(
         id=row_id, sequence=int(payload['sequence']), reset=int(stats['reset_count']),
         campaign=campaign, model=str(fw['model_id']), voltage_mv=voltage,
+        applied_temperature_c=(float(fw['temperature_c']) if fw['model_id'] == THERMAL_MODEL else None),
         voltage_source=source, window_n=window_n,
         window_elapsed_ms=window_elapsed_ms, window_complete=complete,
         slope_ns_per_mv=slope,
@@ -348,9 +353,9 @@ def print_report(args, rows, older, failures):
     print(f'PHOTONS VOLTAGE NORMALIZATION WITNESS {VERSION}')
     print(f'Generated UTC: {datetime.now(timezone.utc).isoformat(timespec="seconds")}')
     print(f'Source: read-only campaign_detail; latest {args.rows} LANTERN rows; campaign={args.campaign or "ALL (including STOPPED)"}')
-    print('Models: NOR1=fragment HIGH; NOR2=HeatCool1 HIGH60; NOR3=HighLow1 linear; NOR4=HighLow2 quadratic HIGH60; NOR5=HighLow3 quadratic HIGH5; NOR6=unfitted zero baseline at 440 mV; NOR7=NOR6-1 linear residual; NONE=raw timing with zero correction; Teensy owns publication')
+    print('Models: NOR1=fragment HIGH; NOR2=HeatCool1 HIGH60; NOR3=HighLow1 linear; NOR4=HighLow2 quadratic HIGH60; NOR5=HighLow3 quadratic HIGH5; NOR6=unfitted zero baseline at 440 mV; NOR7=NOR6-1 linear residual; NONE=raw timing; NOR8=synthetic temperature, HIGH5 diagnostic only; Teensy owns publication')
     print('Predictor is read directly from its persisted HIGH60/HIGH5 window; no reconstructed filter.')
-    print('Fit ranges are model-specific block-mean ranges; NOR4/NOR5 use development data only (approximate); NOR6/NONE have no fitted range.')
+    print('Fit ranges are model-specific block-mean ranges; NOR4/NOR5 use development data only (approximate); NOR6/NONE/NOR8 have no fitted voltage range.')
     print(f'Rows: normalized={len(rows)}; older/unmodeled={older}; closure_errors={len(failures)}')
     for ident, why in failures[:20]:
         print(f'  FAIL id={ident}: {why}')
@@ -371,9 +376,15 @@ def print_report(args, rows, older, failures):
             label = info['voltage_source'].removeprefix('PD_OUT_').removesuffix('_MV')
             print(f'  {label} maturity:  {info["window_full_rows"]}/{info["fragments"]} complete-window rows; '
                   f'window ADC n={info["window_n_range"][0]:,}..{info["window_n_range"][1]:,}')
+        if group[0].model == THERMAL_MODEL:
+            temperatures = [r.applied_temperature_c for r in group]
+            print(f'  Applied synthetic: {min(temperatures):.6f} .. {max(temperatures):.6f} C')
+            print('  Thermal uncertainty is not estimated by the ADC voltage SE below.')
         fit_range = info['model_fit_range_mv']
         if fit_range is None:
-            print('  Fit range mV:     UNFITTED; zero-correction baseline')
+            print('  Fit range mV:     NOT APPLICABLE; temperature correction'
+                  if group[0].model == THERMAL_MODEL else
+                  '  Fit range mV:     UNFITTED; zero-correction baseline')
             fit_note = '  outside_model_fit=n/a'
         else:
             print(f'  Fit range mV:     {fit_range[0]:.3f} .. {fit_range[1]:.3f}')
@@ -394,7 +405,7 @@ def print_report(args, rows, older, failures):
               f'change={change_text}')
         print(f'  Corr(HIGH,raw/published): {raw_corr_text} / {pub_corr_text}')
         print(f'  Median predictor-sample SE: {info["predictor_sample_se_mv_median"]:.4f} mV; '
-              f'approx correction SE: {info["adjustment_predictor_sample_se_ps_median"]:.1f} ps*')
+              f'voltage-derived correction SE: {info["adjustment_predictor_sample_se_ps_median"]:.1f} ps*')
     print('\nMOST RECENT PER-FRAGMENT WITNESSES')
     print(' ID       SEQ    HIGH_mV    RAW_ns    ADJUST_ns   PUB_ns  N_RACE N_ADC N_WINDOW WINDOW  FIT')
     for r in rows[-args.show:] if args.show else []:

@@ -58,7 +58,7 @@ from zpnet.shared.report_db import add_read_arguments, validate_read_arguments, 
 SCHEMA = "PHOTONS_V1"
 MIN_FIT = 3
 VERSION = "2026-10-27.1"
-from zpnet.shared.photons_voltage import voltage_adjustment, voltage_coefficient_fields, voltage_window
+from zpnet.shared.photons_voltage import THERMAL_MODEL, voltage_adjustment, voltage_coefficient_fields, voltage_window
 
 FIRMWARE_ACQUISITION_IDS = {
     "PD200T_HIGH_LINEAR_V1": 0x4E4F5231,
@@ -68,6 +68,7 @@ FIRMWARE_ACQUISITION_IDS = {
     "PD200T_HIGH5_QUADRATIC_V1": 0x4E4F5235,
     "PD200T_HIGH5_SERVO_BASELINE_V1": 0x4E4F5236,
     "PD200T_HIGH5_SERVO_LINEAR_V1": 0x4E4F5237,
+    "SYNTHETIC_TEMPERATURE_LINEAR_V1": 0x4E4F5238,
     "NONE": 0x4E4F4E45,
 }
 HIGH_REFERENCE_MV = 3300
@@ -328,6 +329,9 @@ def parse_sample(row_id: int, p: Dict[str, Any], sensor: str = "synthetic") -> T
             for key in voltage_coefficient_fields(firmware["model_id"]):
                 if str(policy[key]) != str(firmware[key]):
                     raise ValueError("Pi/Teensy voltage coefficient mismatch: " + key)
+            if firmware["model_id"] == THERMAL_MODEL:
+                applied_temperature = number(firmware["temperature_c"])
+                correction_age_ms = integer(firmware["temperature_age_ms"])
             raw_source = ("DIRECT_RAW" if firmware["model_id"] == "NONE"
                           else "DIRECT_RAW_FIRMWARE_NORMALIZED")
         else:

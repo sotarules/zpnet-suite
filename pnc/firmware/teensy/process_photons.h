@@ -271,6 +271,10 @@ struct photons_fragment_voltage_normalization_snapshot_t {
   bool high5_complete = false;
   Double high_mv = 0_D;
   Double adjustment_ns = 0_D;
+  // NOR8 captures the actual Pi-owned temperature once per acquisition batch.
+  uint32_t temperature_sequence = 0U;
+  uint32_t temperature_age_ms = 0U;
+  Double temperature_c = 0_D;
   photons_fragment_welford_snapshot_t raw_flight_ns{};
   photons_fragment_welford_snapshot_t published_flight_ns{};
 };

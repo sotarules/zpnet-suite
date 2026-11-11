@@ -7,7 +7,8 @@ NOR7 adds a frozen linear residual correction fitted on NOR6-1.
 NONE publishes raw GNSS-projected flight times with no voltage correction.
 HIGH5 remains a servo/diagnostic witness; the zero polynomial is a wire-format
 compatibility contract, not a fitted model. Historical NOR identities stay frozen.
-The schema remains additive V1; model identity selects the polynomial contract.
+NOR8 uses the recorded synthetic temperature with a frozen linear correction.
+The schema remains additive V1; model identity selects the correction contract.
 """
 import math
 
@@ -16,7 +17,11 @@ HIGH5_MODEL = "PD200T_HIGH5_QUADRATIC_V1"  # historical NOR5
 SERVO_MODEL = "PD200T_HIGH5_SERVO_BASELINE_V1"  # NOR6, not a fitted calibration
 SERVO_LINEAR_MODEL = "PD200T_HIGH5_SERVO_LINEAR_V1"  # NOR7, provisional NOR6-1 fit
 NONE_MODEL = "NONE"
-QUADRATIC_MODELS = (QUADRATIC_MODEL, HIGH5_MODEL, SERVO_MODEL, SERVO_LINEAR_MODEL, NONE_MODEL)
+THERMAL_MODEL = "SYNTHETIC_TEMPERATURE_LINEAR_V1"
+THERMAL_TEMPERATURE_MODEL_ID = 1697807025
+THERMAL_REFERENCE_C = 31.532819436
+THERMAL_SLOPE_NS_PER_C = 0.848958168665
+QUADRATIC_MODELS = (QUADRATIC_MODEL, HIGH5_MODEL, SERVO_MODEL, SERVO_LINEAR_MODEL, NONE_MODEL, THERMAL_MODEL)
 VOLTAGE_MODELS = {
     "PD200T_HIGH_LINEAR_V1": (0x4E4F5231, "FRAGMENT_HIGH_MV"),
     "PD200T_HIGH60_LINEAR_V1": (0x4E4F5232, "PD_OUT_HIGH60_MV"),
@@ -25,6 +30,7 @@ VOLTAGE_MODELS = {
     HIGH5_MODEL: (0x4E4F5235, "PD_OUT_HIGH5_MV"),
     SERVO_MODEL: (0x4E4F5236, "PD_OUT_HIGH5_MV"),
     SERVO_LINEAR_MODEL: (0x4E4F5237, "PD_OUT_HIGH5_MV"),
+    THERMAL_MODEL: (0x4E4F5238, "PD_OUT_HIGH5_MV"),  # HIGH5 diagnostic only
     NONE_MODEL: (0x4E4F4E45, "PD_OUT_HIGH5_MV"),  # ASCII NONE; distinct raw epoch
 }
 QUADRATIC_COEFFICIENTS = {
@@ -79,7 +85,8 @@ FROZEN_QUADRATICS = {QUADRATIC_MODEL: QUADRATIC_COEFFICIENTS,
                      HIGH5_MODEL: HIGH5_COEFFICIENTS,
                      SERVO_MODEL: SERVO_COEFFICIENTS,
                      SERVO_LINEAR_MODEL: SERVO_LINEAR_COEFFICIENTS,
-                     NONE_MODEL: NONE_COEFFICIENTS}
+                     NONE_MODEL: NONE_COEFFICIENTS,
+                     THERMAL_MODEL: NONE_COEFFICIENTS}
 VOLTAGE_WINDOWS = {
     "PD_OUT_HIGH60_MV": ("high_window", "high60", 60000),
     "PD_OUT_HIGH5_MV": ("high5_window", "high5", 5000),
@@ -126,6 +133,9 @@ def voltage_coefficient_fields(model_id):
     if model_id not in VOLTAGE_MODELS:
         raise ValueError("unknown PHOTONS voltage model: " + str(model_id))
     fields = ("reference_mv", "slope_ns_per_mv")
+    if model_id == THERMAL_MODEL:
+        return fields + ("offset_ns", "quadratic_ns_per_mv2",
+                         "temperature_model_id", "reference_temperature_c", "slope_ns_per_c")
     return fields + (("offset_ns", "quadratic_ns_per_mv2")
                      if model_id in QUADRATIC_MODELS else ())
 
@@ -138,6 +148,11 @@ def voltage_coefficients(witness):
         raise ValueError("unsupported PHOTONS voltage contract")
     if model != "PD200T_HIGH_LINEAR_V1" and witness["voltage_source"] != VOLTAGE_MODELS[model][1]:
         raise ValueError("PHOTONS voltage predictor identity mismatch")
+    if model == THERMAL_MODEL:
+        if (witness["temperature_model_id"] != THERMAL_TEMPERATURE_MODEL_ID
+                or float(witness["reference_temperature_c"]) != THERMAL_REFERENCE_C
+                or float(witness["slope_ns_per_c"]) != THERMAL_SLOPE_NS_PER_C):
+            raise ValueError("NOR8 synthetic temperature policy mismatch")
     values = {key: float(witness[key]) for key in fields}
     if not all(math.isfinite(value) for value in values.values()):
         raise ValueError("PHOTONS voltage coefficients must be finite")
@@ -156,6 +171,16 @@ def voltage_coefficients(witness):
 
 def voltage_adjustment(witness, voltage_mv):
     reference, offset, slope, quadratic = voltage_coefficients(witness)
+    if witness["model_id"] == THERMAL_MODEL:
+        if witness["temperature_sequence"] == 0:
+            if witness["raw_flight_ns"]["n"]:
+                raise ValueError("NOR8 science requires a recorded temperature")
+            return 0.0
+        temperature = float(witness["temperature_c"])
+        if (not math.isfinite(temperature) or not -100 <= temperature <= 150
+                or not 0 <= witness["temperature_age_ms"] <= 3000):
+            raise ValueError("NOR8 temperature witness is outside its acquisition contract")
+        return -THERMAL_SLOPE_NS_PER_C * (temperature - THERMAL_REFERENCE_C)
     x = float(voltage_mv) - reference
     result = offset + x * (slope + quadratic * x)
     if not math.isfinite(result):

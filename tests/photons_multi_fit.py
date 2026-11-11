@@ -30,6 +30,7 @@ WINDOW_ACQUISITION_IDS = {
     'PD200T_HIGH5_QUADRATIC_V1': 0x4E4F5235,  # HighLow3 trial / NOR5
     'PD200T_HIGH5_SERVO_BASELINE_V1': 0x4E4F5236,  # servo-era baseline / NOR6
     'PD200T_HIGH5_SERVO_LINEAR_V1': 0x4E4F5237,  # servo-era linear candidate / NOR7
+    'SYNTHETIC_TEMPERATURE_LINEAR_V1': 0x4E4F5238,
     'NONE': 0x4E4F4E45,  # raw timing with retained HIGH5 diagnostic witness
 }
 

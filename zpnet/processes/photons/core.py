@@ -1,9 +1,9 @@
 """ZPNet PHOTONS: Teensy acquisition/normalization and durable Pi witnesses.
 
 The Teensy owns physical races, science admission, GNSS projection, HIGH5
-statistics, campaign boundaries and recovery. NONE publishes the raw
-GNSS-projected flight times without voltage or temperature correction. The
-independent Pi laser servo still controls HIGH5; it never targets flight time.
+statistics, campaign boundaries and recovery. NOR8 applies the frozen
+None1 synthetic-temperature residual to raw GNSS-projected flight times.
+The independent Pi laser servo still controls HIGH5; it never targets flight time.
 
 The Pi preserves the instrument subtree, validates the recorded correction,
 adds thermal witnesses and actual-ADJ populations, and persists canonical
@@ -36,12 +36,13 @@ from zpnet.processes.processes import (
 )
 from zpnet.processes.photons.laser_dac import LaserDac, requested_code
 from zpnet.processes.photons.laser_servo import LaserServo
+from zpnet.processes.photons.thermal_bridge import ThermalBridge
 from zpnet.processes.photons.persistence_queue import PersistenceQueue
 from zpnet.shared.constants import Payload
 from zpnet.shared.db import DatabaseContentionRetry, DatabaseWorkerSession, open_db
 from zpnet.shared.logger import setup_logging
 from zpnet.shared.photons_voltage import (
-    NONE_MODEL, VOLTAGE_MODELS, voltage_adjustment, voltage_coefficient_fields, voltage_window,
+    NONE_MODEL, THERMAL_MODEL, VOLTAGE_MODELS, voltage_adjustment, voltage_coefficient_fields, voltage_window,
 )
 
 
@@ -49,13 +50,13 @@ from zpnet.shared.photons_voltage import (
 # PHOTONS: Optional calibrated normalization and physical sensor identities
 # ======================================================================
 
-# Matches process_photons.cpp. NONE starts an uncorrected timing epoch.
-# Never restore corrected numerator/Welford/bucket custody into NONE.
+# Matches process_photons.cpp. NOR8 starts a synthetic-temperature epoch.
+# Never restore other numerator/Welford/bucket custody into NOR8.
 # Startup's existing epoch-migration court preserves all historical rows.
 _laser_dac = LaserDac()  # Pi SMBus2; construction performs no hardware I/O.
 _laser_servo = LaserServo(_laser_dac)
 
-ACQUISITION_ID = 0x4E4F4E45  # ASCII NONE; raw flight, independent laser servo
+ACQUISITION_ID = 0x4E4F5238  # NOR8: frozen synthetic-temperature residual
 PHOTONS_MEASUREMENT_SCHEMA = "PI_PHOTONS_MEASUREMENT_V1"
 THERMAL_SENSOR_PATHS = {
     "pi": (("environment", "pi"), "PI.I2C1.BME280.0x76"),
@@ -663,7 +664,7 @@ TEMPERATURE_STATS_SCHEMA = "PI_PHOTONS_TEMPERATURE_STATS_V1"
 TEMPERATURE_SENSORS = (*THERMAL_SENSOR_PATHS, "high60", "high5", "adjustment")
 HIGH60_SOURCE = "TEENSY.PHOTONS.PD_OUT.HIGH60"
 HIGH5_SOURCE = "TEENSY.PHOTONS.PD_OUT.HIGH5"
-ADJUSTMENT_SOURCE = "TEENSY.PHOTONS.ADJ." + NONE_MODEL
+ADJUSTMENT_SOURCE = "TEENSY.PHOTONS.ADJ." + THERMAL_MODEL
 # Native units: Celsius for probes, millivolts for both HIGH windows, nanoseconds for ADJ. One
 # observation per producer second, including the firmware's window warmup.
 # ADJ observes the actual applied offset once per nonempty accepted fragment.
@@ -1087,12 +1088,12 @@ class TemperatureAccumulator:
                 if (sources is None or sources.get("high5") != HIGH5_SOURCE
                         or rolling_checkpoint is None
                         or rolling_checkpoint["sensor_sources"].get("high5") != HIGH5_SOURCE):
-                    raise ValueError("NONE checkpoint lost its HIGH5 population custody")
+                    raise ValueError("NOR8 checkpoint lost its HIGH5 population custody")
                 if sources.get("adjustment") != ADJUSTMENT_SOURCE:
-                    raise ValueError("NONE checkpoint lost its adjustment population")
+                    raise ValueError("NOR8 checkpoint lost its adjustment population")
                 if (rolling_checkpoint is None or
                         rolling_checkpoint["sensor_sources"].get("adjustment") != ADJUSTMENT_SOURCE):
-                    raise ValueError("NONE checkpoint lost its adjustment rolling custody")
+                    raise ValueError("NOR8 checkpoint lost its adjustment rolling custody")
             labels = state.setdefault("sensor_label_history", {})
             old_names = list(state["total"])
             old_sources = sources or {name: ("PI.I2C2.BME280.0x77" if name == "otdr"
@@ -1150,8 +1151,8 @@ class TemperatureAccumulator:
         high5_window = voltage_window(normalization, canonical["photons"]["pd_out"])
         values["high5"] = (high5_window["high_mean_mv"]
                            if high5_window["sample_count"] > 0 else None)
-        if normalization["model_id"] != NONE_MODEL:
-            raise ValueError("adjustment population requires the NONE model epoch")
+        if normalization["model_id"] != THERMAL_MODEL:
+            raise ValueError("adjustment population requires the NOR8 model epoch")
         adjustment = float(normalization["adjustment_ns"])
         if not math.isfinite(adjustment):
             raise ValueError("PHOTONS applied adjustment must be finite")
@@ -13368,6 +13369,9 @@ def run() -> None:
 
     # Establish optical amplitude before recovery may need returning photons.
     # A DAC fault remains observable and needs an explicit SET_DAC to recover.
+    # Live temperature transport is independent of persistence/replay. Never
+    # refresh a producer lease from a recovered historical PHOTONS row.
+    ThermalBridge(send_command, _fetch_system_report).start()
     _laser_servo.startup()
     threading.Thread(target=_laser_servo_loop, name="photons-laser-servo",
                      daemon=True).start()
