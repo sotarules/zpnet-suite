@@ -9825,6 +9825,25 @@ def _adopt_surviving_clocks_producer_pi_state(
         "gap_count": int(ppb_snapshot.get("gap_count") or 0),
     }
     pi_control = _dac_restore_control_from_clocks(clocks, realize=True)
+    if campaign_source_detail is not None:
+        # The complete Alpha checkpoint can predate the active Beta campaign.
+        # Its exact, independently validated durable boundary then owns the newer
+        # operator servo mode. Startup CLOCKS_FRAGMENT rows cannot supply it:
+        # their Pi control snapshot was authored by this process starting OFF.
+        # Restore only the mode; do not splice newer DAC populations, targets,
+        # or predictor history into the checkpoint's statistics ancestry.
+        # The ordinary mode setter resets the predictor when the mode changes.
+        boundary_control = _clocks_payload(campaign_source_detail)["control"]
+        previous, restored = _dac_set_servo_mode(boundary_control["servo_mode"])
+        pi_control["servo_mode"] = restored
+        pi_control["control"] = _dac_control_snapshot()
+        pi_control["servo_mode_source_detail_id"] = campaign_source_detail["_db_detail_id"]
+        logging.info(
+            "[clocks/recovery] Pi servo mode %s -> %s from durable campaign detail=%s "
+            "(Alpha checkpoint detail=%s)",
+            previous, restored, campaign_source_detail["_db_detail_id"],
+            snapshot_detail["_db_detail_id"],
+        )
     gnss_raw_result = _restore_gnss_raw_payload(gnss_raw)
     if not gnss_raw_result.get("restored"):
         raise RuntimeError(f"CLOCKS live-adopt GNSS_RAW restore failed: {gnss_raw_result}")
