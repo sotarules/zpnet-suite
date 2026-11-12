@@ -55,6 +55,8 @@ from zpnet.shared.photons_voltage import (
 # Startup's existing epoch-migration court preserves all historical rows.
 _laser_dac = LaserDac()  # Pi SMBus2; construction performs no hardware I/O.
 _laser_servo = LaserServo(_laser_dac)
+_laser_feedback_lock = threading.Lock()
+_latest_laser_feedback = None
 
 ACQUISITION_ID = 0x4E4F5238  # NOR8: frozen synthetic-temperature residual
 PHOTONS_MEASUREMENT_SCHEMA = "PI_PHOTONS_MEASUREMENT_V1"
@@ -12721,19 +12723,97 @@ def _laser_servo_hold_reason():
 
 
 def _laser_servo_loop():
-    # A dedicated actuator worker keeps bounded I2C retries off publication,
-    # canonical processing and persistence paths. Never process a feedback queue
-    # in arrears: only the latest accepted, recently received window can steer.
+    # The actuator owns a latest-only view of immutable ingress testimony.
+    # Historical rows still pass through the canonical worker and persistence
+    # in order; catching up must never replay historical actuator decisions.
+    global _latest_laser_feedback
+    previous_fragment = None
+    next_warning = 0.0
+    backlog_reported = False
     while True:
+        fragment = None
         try:
-            _laser_servo.tick(_laser_feedback_snapshot(), _laser_servo_hold_reason())
+            hold = _laser_servo_hold_reason()
+            with _state_lock:
+                fragment = _latest_fragment
+            if hold:
+                previous_fragment = None
+                with _laser_feedback_lock:
+                    _latest_laser_feedback = None
+            elif fragment is not previous_fragment and fragment is not None:
+                # Reuse the producer structural court, not SYSTEM.REPORT or
+                # the stateful science/recovery accumulators. Validate once per
+                # new arrival, outside ingress and outside the state lock.
+                sequence, _, _, instrument = _validate_photons_fragment(fragment)
+                witness = instrument["voltage_normalization"]
+                if VOLTAGE_MODELS[witness["model_id"]][0] != ACQUISITION_ID:
+                    raise ValueError("servo feedback acquisition identity mismatch")
+                window = voltage_window(witness, instrument["pd_out"])
+                if window["target_ms"] != 5000:
+                    raise ValueError("servo requires the producer HIGH5 window")
+                feedback = {
+                    "source": "VALIDATED_LIVE_FRAGMENT",
+                    "sequence": sequence,
+                    "reset_count": instrument["stats"]["reset_count"],
+                    "received_monotonic": fragment["_pi_ingress"]["monotonic"],
+                    "fragment_received_at_utc": fragment["_pi_ingress"]["utc"],
+                    "snapshot_ok": _require_bool(instrument["snapshot_ok"], "servo.snapshot_ok"),
+                    "high5": copy.deepcopy(window),
+                    "high60": copy.deepcopy(instrument["pd_out"]["high_window"]),
+                }
+                with _laser_feedback_lock:
+                    _latest_laser_feedback = feedback
+                previous_fragment = fragment
+            feedback = _laser_feedback_snapshot()
+            # Recheck lifecycle after validation. Maintenance/recovery still
+            # outrank control, even when the latest optical window is fresh.
+            hold = _laser_servo_hold_reason()
+            if not hold and feedback is not None and not feedback["snapshot_ok"]:
+                hold = "INCOMPLETE_SNAPSHOT"
+            _laser_servo.tick(
+                feedback, hold,
+                sweep_feedback=_laser_canonical_feedback_snapshot,
+            )
+
+            now = time.monotonic()
+            ingress_depth = _fragment_queue.qsize()
+            persistence_depth = _persist_queue.qsize()
+            delayed = ingress_depth >= 10 or persistence_depth >= 60
+            if delayed and now >= next_warning:
+                logging.warning(
+                    "[photons/backlog] ingress=%d persistence=%d; "
+                    "servo=%s live_feedback_age_s=%s; historical rows retained",
+                    ingress_depth, persistence_depth, _laser_servo.snapshot()["status"],
+                    round(feedback["age_seconds"], 3) if feedback else None,
+                )
+                next_warning = now + 60.0
+                backlog_reported = True
+            elif not delayed and backlog_reported:
+                logging.info("[photons/backlog] queues recovered ingress=%d persistence=%d",
+                             ingress_depth, persistence_depth)
+                backlog_reported = False
         except Exception:
+            # A malformed live fragment must not leave the preceding window
+            # available for further automatic writes. Require explicit restart
+            # of the servo after the integrity failure has been investigated.
+            with _laser_feedback_lock:
+                _latest_laser_feedback = None
             _laser_servo.stop()
             logging.exception("[photons/servo] worker stopped automatic control")
+            previous_fragment = fragment
         time.sleep(0.25)
 
 
 def _laser_feedback_snapshot():
+    """Actuator input; its receipt age never resets when the worker reads it."""
+    with _laser_feedback_lock:
+        feedback = copy.deepcopy(_latest_laser_feedback)
+    if feedback is not None:
+        feedback["age_seconds"] = time.monotonic() - feedback["received_monotonic"]
+    return feedback
+
+
+def _laser_canonical_feedback_snapshot():
     """Latest accepted producer windows, not a reconstructed Pi filter."""
     with _state_lock:
         if _latest_photons is None:
@@ -12744,6 +12824,9 @@ def _laser_feedback_snapshot():
             "sequence": row["sequence"],
             "reset_count": row["photons"]["stats"]["reset_count"],
             "received_monotonic": _latest_photons_ingress_monotonic,
+            "source": "CANONICAL_PROCESSED_FRAGMENT",
+            "age_seconds": (time.monotonic() - _latest_photons_ingress_monotonic
+                            if _latest_photons_ingress_monotonic is not None else None),
             "fragment_received_at_utc": row["context_timing"]["fragment_received_at_utc"],
             "high5": copy.deepcopy(pd["high5_window"]),
             "high60": copy.deepcopy(pd["high_window"]),
@@ -12769,6 +12852,7 @@ def cmd_dac_info(_: Optional[dict]) -> Dict[str, Any]:
         return {"success": False, "message": str(exc),
                 "payload": _laser_control_snapshot()}
     payload["feedback"] = _laser_feedback_snapshot()
+    payload["processed_feedback"] = _laser_canonical_feedback_snapshot()
     return {"success": True, "message": "OK", "payload": payload}
 
 
@@ -12792,6 +12876,7 @@ def cmd_set_dac(args: Optional[dict]) -> Dict[str, Any]:
 def cmd_servo_info(_: Optional[dict]) -> Dict[str, Any]:
     payload = _laser_control_snapshot()
     payload["feedback"] = _laser_feedback_snapshot()
+    payload["processed_feedback"] = _laser_canonical_feedback_snapshot()
     payload["hold_reason"] = _laser_servo_hold_reason()
     return {"success": True, "message": "OK", "payload": payload}
 

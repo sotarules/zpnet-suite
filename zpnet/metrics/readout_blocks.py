@@ -773,7 +773,11 @@ def _recoverable_status(config_key: str) -> str:
     with open_db(row_dict=True) as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT payload FROM config WHERE config_key = %s",
+                # Metrics needs three readiness fields, never the potentially
+                # large resurrection checkpoint attached to this config row.
+                "SELECT jsonb_build_object('schema', payload -> 'schema', "
+                "'valid', payload -> 'valid', 'recoverable', payload -> 'recoverable') "
+                "AS payload FROM config WHERE config_key = %s",
                 (config_key,),
             )
             rows = cur.fetchall()
@@ -2253,94 +2257,57 @@ def _photons_summary_line(summary: dict, include_campaign: bool, campaign_mean=N
 
 
 def _get_lantern_campaign_summaries() -> list[dict]:
-    """Return LANTERN masters plus exact campaign-local accepted-lap statistics.
+    """Read only each campaign's latest durable statistics, on panel demand.
 
-    campaign_master remains provenance/latest-read-model authority.  The local
-    Welford is reconstructed from the cumulative PHOTONS sufficient state at the
-    campaign's exclusive start boundary and its latest labeled durable row.
+    The displayed CAMP mean is producer-authored. Neither an exclusive-start
+    lookup nor inverse Welford subtraction contributes to this screen. Select
+    the endpoint by relational keys before extracting its small JSON view;
+    never transfer temperature rings or recovery checkpoints to Metrics.
     """
     with open_db(row_dict=True) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT
-                    master.id,
-                    master.ts,
-                    master.campaign_type,
-                    master.campaign,
-                    master.active,
-                    master.payload,
-                    first_detail.sequence AS first_sequence,
-                    last_detail.sequence AS last_sequence,
-                    prior_detail.payload AS prior_payload,
-                    last_detail.payload AS last_payload
-                FROM campaign_master AS master
-                LEFT JOIN LATERAL (
-                    SELECT d.id, d.sequence, d.payload
-                    FROM campaign_detail AS d
-                    WHERE d.campaign_type = %s
-                      AND d.campaign = master.campaign
-                    ORDER BY d.id ASC
-                    LIMIT 1
-                ) AS first_detail ON true
-                LEFT JOIN LATERAL (
-                    SELECT d.id, d.sequence, d.payload
-                    FROM campaign_detail AS d
-                    WHERE d.campaign_type = %s
-                      AND d.campaign = master.campaign
-                    ORDER BY d.id DESC
-                    LIMIT 1
-                ) AS last_detail ON true
-                LEFT JOIN LATERAL (
-                    SELECT d.id, d.sequence, d.payload
-                    FROM campaign_detail AS d
-                    WHERE d.campaign_type = %s
-                      AND d.id < first_detail.id
-                    ORDER BY d.id DESC
-                    LIMIT 1
-                ) AS prior_detail ON true
-                WHERE master.campaign_type = %s
-                ORDER BY master.ts DESC, master.id DESC
-                """,
-                (
-                    CAMPAIGN_TYPE_LANTERN,
-                    CAMPAIGN_TYPE_LANTERN,
-                    CAMPAIGN_TYPE_LANTERN,
-                    CAMPAIGN_TYPE_LANTERN,
-                ),
-            )
-            rows = list(cur.fetchall())
+        conn.execute("SET TRANSACTION READ ONLY")
+        conn.execute("SET LOCAL statement_timeout = '2s'")
+        conn.execute("SET LOCAL max_parallel_workers_per_gather = 0")
+        rows = conn.execute(
+            """
+            SELECT master.id, master.campaign, master.active,
+                   master.payload ->> 'interrupted_at' AS interrupted_at,
+                   last_detail.sequence AS last_sequence,
+                   CASE WHEN last_detail.id IS NOT NULL THEN jsonb_build_object(
+                       'campaign', last_detail.payload -> 'campaign',
+                       'photons', jsonb_build_object(
+                           'stats', last_detail.payload #> '{photons,stats}'
+                       )
+                   ) END AS last_payload
+            FROM campaign_master AS master
+            LEFT JOIN LATERAL (
+                SELECT d.id, d.sequence, d.payload
+                FROM campaign_detail AS d
+                WHERE d.campaign_type = master.campaign_type
+                  AND d.campaign = master.campaign
+                ORDER BY d.id DESC LIMIT 1
+            ) AS last_detail ON true
+            WHERE master.campaign_type = %s
+            ORDER BY master.ts DESC, master.id DESC
+            """,
+            (CAMPAIGN_TYPE_LANTERN,),
+        ).fetchall()
 
-    summaries: list[dict] = []
+    summaries = []
     for row in rows:
-        master_payload = _json_object(row.get("payload"))
-        prior_payload = _json_object(row.get("prior_payload"))
-        last_payload = _json_object(row.get("last_payload"))
-        stats = _photons_population_delta(prior_payload, last_payload)
+        last_payload = _json_object(row["last_payload"])
         campaign_stats = _photons_producer_campaign_stats(last_payload)
         summaries.append({
-            "id": _to_int(row.get("id")),
-            "campaign": row.get("campaign"),
-            "active": bool(row.get("active")),
-            "stability": last_payload.get("stability") or (master_payload.get("report") or {}).get("stability"),
-            "started_at": master_payload.get("started_at"),
-            "stopped_at": master_payload.get("stopped_at"),
-            "interrupted_at": master_payload.get("interrupted_at"),
-            "start_after_sequence": _to_int(master_payload.get("start_after_sequence")),
-            "stop_after_sequence": _to_int(master_payload.get("stop_after_sequence")),
-            "first_sequence": _to_int(row.get("first_sequence")),
-            "last_sequence": _to_int(row.get("last_sequence")),
-            "stats": stats,
+            "id": _to_int(row["id"]),
+            "campaign": row["campaign"],
+            "active": bool(row["active"]),
+            "interrupted_at": row["interrupted_at"],
+            "last_sequence": _to_int(row["last_sequence"]),
             "total_scatter": _photons_instrument_stats(last_payload),
             "lap_buckets": _photons_producer_lap_buckets(last_payload, historical=True),
             "campaign_mean_lap_ns": _photons_population_mean(campaign_stats) if campaign_stats else None,
             "seconds": _to_int((last_payload.get("campaign") or {}).get("public_count")),
-            # Private presentation helpers used to derive live campaign
-            # populations. They are never rendered as instrument testimony.
-            "_prior_payload": prior_payload,
-            "_last_payload": last_payload,
         })
-
     return summaries
 
 
@@ -2438,9 +2405,12 @@ class _PhotonsReadModel:
         self._lock = threading.Lock()
         self._thread = None
         self._snapshot = (None, None, "LOADING")
+        self._campaigns_requested_until = 0.0
 
-    def get(self):
+    def get(self, *, campaigns=False):
         with self._lock:
+            if campaigns:
+                self._campaigns_requested_until = time.monotonic() + 10.0
             if self._thread is None:
                 self._thread = threading.Thread(
                     target=self._refresh_loop,
@@ -2451,19 +2421,30 @@ class _PhotonsReadModel:
             return self._snapshot
 
     def _refresh_loop(self):
+        next_campaign_refresh = 0.0
+        summaries, campaign_error = None, None
         while True:
-            try:
-                summaries = _get_lantern_campaign_summaries()
-                campaign_error = None
-            except Exception as exc:
-                summaries, campaign_error = [], str(exc)
+            with self._lock:
+                campaigns_requested = time.monotonic() < self._campaigns_requested_until
+            # The live detail panel gets all science from PUBSUB. Its old
+            # once-per-second all-campaign lateral query was unused work.
+            # Only an open campaign-list panel requests historical summaries.
+            if campaigns_requested and time.monotonic() >= next_campaign_refresh:
+                try:
+                    summaries = _get_lantern_campaign_summaries()
+                    campaign_error = None
+                except Exception as exc:
+                    summaries, campaign_error = None, str(exc)
+                # Back off after failure too; multiple displays must not hammer
+                # a struggling database with immediate retries.
+                next_campaign_refresh = time.monotonic() + 30.0
             try:
                 recoverable = _recoverable_status(PHOTONS_RECOVERY_CONFIG_KEY)
             except Exception as exc:
                 recoverable = f"UNAVAILABLE: {exc}"
             with self._lock:
                 self._snapshot = (summaries, campaign_error, recoverable)
-            time.sleep(1.0)
+            time.sleep(5.0)
 
 
 _PHOTONS_READ_MODEL = _PhotonsReadModel()
@@ -2521,20 +2502,9 @@ def photons_detail_readout() -> list[str]:
     if not payloads:
         return ["PHOTONS: FEED UNAVAILABLE"]
     live = payloads[-1]
-    summaries, campaign_error, recoverable = _PHOTONS_READ_MODEL.get()
-    summaries = summaries or []
+    _, _, recoverable = _PHOTONS_READ_MODEL.get()
     campaign = live.get("campaign") or {}
-    before = None
-    if campaign:
-        # The live tail can contain the exact START boundary before DB catches up.
-        start = _to_int(campaign.get("start_after_sequence"))
-        before = next((p for p in reversed(payloads)
-                       if _to_int(p.get("sequence")) == start), None)
-        if before is None:
-            match = next((r for r in summaries if r.get("campaign") == campaign.get("campaign")), None)
-            if match:
-                before = match.get("_prior_payload")
-    summary = _photons_summary(live, before)
+    summary = _photons_summary(live)
     name = str(campaign.get("campaign") or "STOPPED")
     if campaign.get("final"):
         name += " [FINAL]"
@@ -2551,8 +2521,6 @@ def photons_detail_readout() -> list[str]:
         normalized = measurement.get("normalized_flight_ns")
         if isinstance(normalized, dict):
             line += f"  NORM: {_fmt(normalized.get('mean'), ',.6f', 0)} NS"
-    if campaign_error:
-        line += "  READ MODEL: UNAVAILABLE"
     _, voltage_lane, _ = voltage_window_spec(live["photons"]["voltage_normalization"]["model_id"])
     lines = [line]
     lines.extend(["", _photons_summary_header(bool(campaign)),
@@ -2585,7 +2553,7 @@ def photons_campaigns_readout() -> list[str]:
     moment; they are not separate campaign-only rolling populations. Neither
     block stability nor history coverage belongs in this operator table.
     """
-    rows, campaign_error, _ = _PHOTONS_READ_MODEL.get()
+    rows, campaign_error, _ = _PHOTONS_READ_MODEL.get(campaigns=True)
     if campaign_error:
         return ["\0LANTERN_CAMPAIGNS:ERROR",
                 f"LANTERN CAMPAIGNS: UNAVAILABLE: {str(campaign_error).upper()}"]
@@ -2599,7 +2567,7 @@ def photons_campaigns_readout() -> list[str]:
              + f" {'TOTAL_SD':>10} {'TOTAL_SE':>10}"]
     if not rows:
         return lines + ["", "NO LANTERN CAMPAIGNS"]
-    # Historical campaign rows remain the one-second background PostgreSQL
+    # Historical campaign rows use the throttled background PostgreSQL
     # read model. The active campaign has a fresher, already-authoritative
     # canonical PHOTONS publication; use it without querying the database on
     # each display refresh. Match the durable campaign ID, not just its name.

@@ -76,6 +76,8 @@ class LaserServo:
             "startup_dac_v": STARTUP_DAC_V,
             "startup_servo_enabled": STARTUP_SERVO_ENABLED,
             "feedback_source": "PD_OUT_HIGH5_MV",
+            "feedback_path": "VALIDATED_LIVE_FRAGMENT",
+            "feedback_age_seconds": None,
             "high5_mv": None, "error_mv": None, "sequence": None,
             "adjustment_count": 0, "last_error": None,
         }
@@ -88,7 +90,13 @@ class LaserServo:
 
     def _update(self, **fields):
         with self._lock:
+            previous = self._state["status"]
             self._state.update(fields)
+            current = self._state["status"]
+        if current == "STALE_FEEDBACK" and previous != current:
+            logging.warning("[photons/servo] stale live feedback; holding DAC")
+        elif previous == "STALE_FEEDBACK" and current != previous:
+            logging.info("[photons/servo] stale-feedback hold ended; status=%s", current)
 
     def _settle(self):
         self._previous = None
@@ -181,14 +189,20 @@ class LaserServo:
     def sweep_report(self):
         return self._sweep.report()
 
-    def tick(self, feedback, hold_reason):
+    def tick(self, feedback, hold_reason, *, sweep_feedback):
         with self._control:
             if self.snapshot()["mode"] != "AUTO":
                 return
             try:
                 if self.dac.snapshot()["state"] != "CONFIGURED":
                     raise RuntimeError("DAC is not configured")
-                target = self._sweep.observe(feedback, hold_reason, self.snapshot(),
+                # Sweep scoring requires canonical timing/temperature witnesses. A
+                # delayed science stream cancels a sweep, but cannot starve the
+                # ordinary amplitude servo of fresh producer HIGH5 feedback.
+                # Resolve the lazy canonical view under the command lock so a
+                # concurrent SWEEP_START cannot race an inactive-sweep check.
+                canonical = sweep_feedback() if self._sweep.active() else None
+                target = self._sweep.observe(canonical, hold_reason, self.snapshot(),
                                              self._ready_at, MAX_CODE)
                 if target is not None:
                     self._settle()
@@ -200,6 +214,8 @@ class LaserServo:
 
     def _tick(self, feedback, hold_reason):
         now = time.monotonic()
+        received = feedback["received_monotonic"] if feedback is not None else None
+        self._update(feedback_age_seconds=now - received if received is not None else None)
         dac = self.dac.snapshot()
         if dac["state"] != "CONFIGURED":
             raise RuntimeError("DAC is not configured; automatic writes suspended")
@@ -207,7 +223,6 @@ class LaserServo:
             self._settle()
             self._update(status=hold_reason or "WAITING_FEEDBACK")
             return
-        received = feedback["received_monotonic"]
         if received is None or not 0 <= now - received <= MAX_FEEDBACK_AGE_SECONDS:
             self._settle()
             self._update(status="STALE_FEEDBACK")
