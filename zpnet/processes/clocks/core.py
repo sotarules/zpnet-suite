@@ -119,6 +119,7 @@ AD5693R_OUTPUT_GAIN = 2.0
 AD5693R_OUTPUT_FULL_SCALE_VOLTAGE = 5.0
 AD5693R_SAFE_MAX_OUTPUT_VOLTAGE = 3.3
 AD5693R_CODE_SCALE = 65536.0
+CLOCKS_DAC_BASELINE_CONFIG_KEY = "CLOCKS_DAC_BASELINE"
 AD5693R_SAFE_MAX_HW_CODE = int(
     (AD5693R_SAFE_MAX_OUTPUT_VOLTAGE / AD5693R_OUTPUT_FULL_SCALE_VOLTAGE)
     * AD5693R_CODE_SCALE
@@ -1185,6 +1186,11 @@ _dac_servo_mode = "OFF"
 _dac_next_frame_monotonic = 0.0
 _dac_control_second = 0
 
+# A baseline is reference metadata, independent of actuator/recovery custody.
+# Replace the complete pair after committing it; never mutate a saved snapshot.
+_dac_baseline_lock = threading.Lock()
+_dac_baseline: Optional[Dict[str, Any]] = None
+
 _dac_lanes: Dict[str, _DacLaneState] = {
     "ocxo1": _DacLaneState("ocxo1", AD5693R_ADDR_OCXO1),
     "ocxo2": _DacLaneState("ocxo2", AD5693R_ADDR_OCXO2),
@@ -1204,6 +1210,62 @@ def _dac_rounded_hw_code(value: float) -> int:
 
 def _dac_voltage_from_code(value: float) -> float:
     return (_dac_clamp_target(value) / AD5693R_CODE_SCALE) * AD5693R_OUTPUT_FULL_SCALE_VOLTAGE
+
+
+def _dac_baseline_snapshot() -> Optional[Dict[str, Any]]:
+    with _dac_baseline_lock:
+        return copy.deepcopy(_dac_baseline)
+
+
+def _dac_load_baseline() -> None:
+    """Load the reference once before workers start; recovery never restores it."""
+    global _dac_baseline
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT payload FROM config WHERE config_key = %s",
+            (CLOCKS_DAC_BASELINE_CONFIG_KEY,),
+        )
+        rows = cur.fetchall()
+    if len(rows) > 1:
+        raise RuntimeError("CLOCKS_DAC_BASELINE is not a singleton")
+    baseline = rows[0]["payload"] if rows else None
+    if baseline is not None and baseline["schema"] != "CLOCKS_DAC_BASELINE_V1":
+        raise RuntimeError("Unsupported CLOCKS DAC baseline schema")
+    with _dac_baseline_lock:
+        _dac_baseline = baseline
+
+
+def _dac_store_baseline(baseline: Optional[Dict[str, Any]]) -> None:
+    """Set/clear both references together, without changing clocks or DACs.
+
+    The command server serializes writers, and startup loads before admitting
+    these commands. Database I/O holds no actuator or observation locks.
+    """
+    global _dac_baseline
+    with open_db() as conn:
+        cur = conn.cursor()
+        if baseline is None:
+            cur.execute(
+                "DELETE FROM config WHERE config_key = %s",
+                (CLOCKS_DAC_BASELINE_CONFIG_KEY,),
+            )
+        else:
+            encoded = json.dumps(baseline, allow_nan=False)
+            cur.execute(
+                "UPDATE config SET payload = %s::jsonb WHERE config_key = %s",
+                (encoded, CLOCKS_DAC_BASELINE_CONFIG_KEY),
+            )
+            if cur.rowcount == 0:
+                cur.execute(
+                    "INSERT INTO config (config_key, payload) VALUES (%s, %s::jsonb)",
+                    (CLOCKS_DAC_BASELINE_CONFIG_KEY, encoded),
+                )
+        if cur.rowcount > 1:
+            raise RuntimeError("CLOCKS_DAC_BASELINE is not a singleton")
+    # open_db has committed successfully before the live reference changes.
+    with _dac_baseline_lock:
+        _dac_baseline = copy.deepcopy(baseline)
 
 
 def _ad5693r_write_24(address: int, command: int, data: int) -> None:
@@ -2401,6 +2463,7 @@ def _dac_info_payload() -> Dict[str, Any]:
                 else "STATIC_ROUNDED"
             ),
             "initialization_authored_output": False,
+            "dac_baseline": _dac_baseline_snapshot(),
             **lanes,
         }
 
@@ -10813,6 +10876,12 @@ def _attach_tempest_to_state_detail(detail: Dict[str, Any]) -> None:
                 )
                 attached = cur.fetchone()
                 if attached is not None:
+                    # The incoming report carries raw firmware clocks. Attach
+                    # the Pi baseline from this exact durable observation, not
+                    # today's live reference or a later set/clear command.
+                    report["clocks"]["dac_baseline"] = copy.deepcopy(
+                        attached["payload"]["clocks"].get("dac_baseline")
+                    )
                     report["campaign_dac"] = _record_campaign_dac(
                         cur, campaign=campaign, detail_id=int(attached["id"]),
                         state=attached["payload"], public_count=int(public_count),
@@ -14147,6 +14216,9 @@ def _build_canonical_clocks_state(
     # front-end consumers do not care that CLOCKS_FRAGMENT stopped carrying it.
     clocks["control"] = _dac_control_snapshot()
     clocks["dac_observation"] = dac_observation
+    # Each persisted observation retains its reference even after set/clear.
+    # This field is reporting metadata and never enters clock or servo math.
+    clocks["dac_baseline"] = _dac_baseline_snapshot()
     ppb_restore_checkpoint: Optional[Dict[str, Any]] = None
     stats = clocks.get("stats")
     if isinstance(stats, dict):
@@ -19595,6 +19667,86 @@ def cmd_dac_info(_: Optional[dict] = None) -> Dict[str, Any]:
     return {"success": True, "message": "OK", "payload": _dac_info_payload()}
 
 
+def cmd_set_dac_baseline(args: Optional[dict]) -> Dict[str, Any]:
+    """Freeze the system or named campaign MEAN, retaining fractional codes.
+
+    Both sources record Pi target observations, not a measured analog voltage
+    or an instantaneous dither endpoint. Voltage uses the existing DAC scale.
+    A baseline has no clock authority: no zero, stats reset, or servo change.
+    """
+    unavailable = _startup_control_gate("SET_DAC_BASELINE")
+    if unavailable is not None:
+        return unavailable
+    args = {str(key).lower(): value for key, value in (args or {}).items()}
+    if set(args) - {"campaign"}:
+        return {"success": False, "message": "SET_DAC_BASELINE accepts only campaign=<name>"}
+    campaign = None
+    source = "system"
+    if "campaign" in args:
+        campaign = args["campaign"]
+        if not isinstance(campaign, str) or not campaign.strip():
+            return {"success": False, "message": "campaign must be a nonempty name"}
+        campaign = campaign.strip()
+        source = "campaign"
+        with open_db(row_dict=True) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT payload -> 'campaign_dac' AS campaign_dac "
+                "FROM campaign_master WHERE campaign_type = %s AND campaign = %s",
+                (CAMPAIGN_TYPE_TEMPEST, campaign),
+            )
+            row = cur.fetchone()
+        if row is None:
+            return {"success": False, "message": f"TEMPEST campaign not found: {campaign}"}
+        recording = row["campaign_dac"]
+        if recording is None:
+            return {"success": False, "message": f"Campaign has no DAC recording: {campaign}"}
+        if recording["schema"] != "CAMPAIGN_DAC_V1" or recording["campaign"] != campaign:
+            raise RuntimeError("Campaign DAC recording schema/identity mismatch")
+        populations = {name: recording[name] for name in ("ocxo1", "ocxo2")}
+        provenance = {"source_detail_id": recording["last_detail_id"]}
+    else:
+        # Copy both means and their ancestry at one statistics boundary.
+        with _dac_stats_epoch_lock:
+            with _dac_lock:
+                populations = {name: lane.welford.snapshot() for name, lane in _dac_lanes.items()}
+                provenance = {
+                    "source_reset_count": _dac_stats_reset_count,
+                    "source_update_count": _dac_stats_update_count,
+                    "source_sequence": _dac_stats_last_sequence,
+                }
+    baseline = {
+        "schema": "CLOCKS_DAC_BASELINE_V1",
+        "set_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "source": source,
+        "campaign": campaign,
+        **provenance,
+    }
+    for name, population in populations.items():
+        n = population["n"]
+        if n == 0:
+            return {"success": False, "message": f"{name.upper()} has no {source} DAC samples"}
+        mean = population["mean"]
+        if type(n) is not int or n < 0 or not math.isfinite(mean) or not 0 <= mean <= AD5693R_SAFE_MAX_HW_CODE:
+            raise RuntimeError(f"{name.upper()} DAC mean/population violates the recording contract")
+        baseline[name] = {"mean_code": mean, "voltage": _dac_voltage_from_code(mean), "n": n}
+    _dac_store_baseline(baseline)
+    logging.info("[clocks] DAC baseline set from %s: %s", campaign or source, baseline)
+    return {"success": True, "message": "DAC baseline set", "payload": {"dac_baseline": baseline}}
+
+
+def cmd_clear_dac_baseline(args: Optional[dict]) -> Dict[str, Any]:
+    """Remove only the reference; clearing an unset baseline also succeeds."""
+    unavailable = _startup_control_gate("CLEAR_DAC_BASELINE")
+    if unavailable is not None:
+        return unavailable
+    if args:
+        return {"success": False, "message": "CLEAR_DAC_BASELINE takes no arguments"}
+    _dac_store_baseline(None)
+    logging.info("[clocks] DAC baseline cleared")
+    return {"success": True, "message": "DAC baseline cleared", "payload": {"dac_baseline": None}}
+
+
 
 COMMANDS = {
     # Lifecycle handlers are defined later in this module. Late-bind them so
@@ -19616,6 +19768,8 @@ COMMANDS = {
     "DELETE": cmd_delete,
     "TRUNCATE": cmd_truncate,
     "SET_DAC": cmd_set_dac,
+    "SET_DAC_BASELINE": cmd_set_dac_baseline,
+    "CLEAR_DAC_BASELINE": cmd_clear_dac_baseline,
     "SERVOS": cmd_servos,
     "DITHER": cmd_set_dither,
     "DITHER_ENABLE": cmd_dither_enable,
@@ -19919,6 +20073,10 @@ def run() -> None:
     # CLOCKS_FRAGMENT ingress open while waiting, but do not touch PostgreSQL or
     # issue Teensy RPC until those exact planes have been proved usable.
     _wait_for_startup_infrastructure()
+
+    # This reference survives restarts independently of historical CLOCKS
+    # restore images. Load it before any live observation can be published.
+    _dac_load_baseline()
 
     # Firmware boots enabled, but a Pi-only restart may find an explicit DISABLE.
     # Keep the command socket alive without starting workers against deliberate

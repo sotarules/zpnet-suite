@@ -45,10 +45,13 @@ Clock row doctrine:
 
 Column layout (CLK rows):
   NAME   VALUE   10-MIN   60-MIN   8-HOUR   24-HOUR   TOTAL   CAMP   RES
-         MEAN   SD   SE   N
 
 Column layout (DAC rows):
-  NAME   VALUE   VOUT   DITHER   MEAN   SD   SE   N
+  OCXO   VOUT   MEAN_V
+  With a baseline: BASELINE_V   DELTA_V   DELTA_PPB
+  MEAN_V uses the campaign mean while active, otherwise the system mean.
+  DELTA_V is that same mean minus BASELINE_V.
+  Raw DAC codes, dither and Welford populations remain in the source reports.
 
 Column layout (INT rows):
   NAME   END_GNSS_NS   DELTA_NS
@@ -60,6 +63,7 @@ import socket
 import threading
 import time
 from collections import deque
+from fractions import Fraction
 
 from zpnet.processes.processes import PUBSUB_TAP_SOCKET, create_pubsub_cache, send_command
 from zpnet.shared.db import open_db
@@ -75,6 +79,15 @@ DAC_OUTPUT_GAIN = 2.0
 DAC_OUTPUT_FULL_SCALE_VOLTAGE = 5.0
 DAC_SAFE_MAX_OUTPUT_VOLTAGE = 3.3
 DAC_CODE_SCALE = 65536.0
+
+# Approximate physical tuning slopes from the reversible +/-8-code witness
+# run (12-second plateaus), rounded from the companion-subtracted medians.
+# These fixed reporting coefficients never affect clocks or servo feedback.
+# DELTA_PPB = -K * (selected mean code - baseline mean code): a lower servo
+# voltage implies a faster oscillator at the baseline voltage. Six decimal
+# PPB places resolve 1 fs over 1 s; that is resolution, not calibration accuracy.
+DAC_DELTA_PPB_PER_CODE = {"ocxo1": Fraction(364, 1000), "ocxo2": Fraction(384, 1000)}
+DAC_REPORT_VOLTS_PER_CODE = Fraction(5, 65536)
 
 DAC_MIN_CODE = 0.0
 DAC_MAX_CODE = float(
@@ -915,69 +928,69 @@ def _campaign_dac_values(recording: dict | None, lane: str):
     return mean, volts, n, first
 
 
-def _dac_detail_lines(r: dict, campaign_dac: dict | None) -> list[str]:
-    """Render DAC telemetry as a dedicated, spacious table.
+def _dac_fixed_cell(value: Fraction | None, decimals: int, width: int, *, signed=False) -> str:
+    """Round once, ties-to-even, using integer arithmetic through rendering."""
+    if value is None:
+        return f"{'---':>{width}}"
+    scale = 10 ** decimals
+    scaled = round(value * scale)
+    whole, fraction = divmod(abs(scaled), scale)
+    # A rounded zero has no negative sign, even after a small negative delta.
+    sign = "-" if scaled < 0 else "+" if signed else ""
+    text = f"{sign}{whole}.{fraction:0{decimals}d}"
+    return f"{text:>{width}}"
 
-    DAC rows no longer inherit the clock-table geometry. VALUE and VOUT are
-    separate columns, and every subsequent field has an explicit gutter so
-    adjacent numbers can never visually merge.
+
+def _dac_mean_voltage_cells(lane: str, mean_code, baseline: dict | None, width: int) -> list[str]:
+    """Share the exact mean/baseline conversion between live and campaign views.
+
+    Use full stored codes until final rendering; nanovolt display rounding
+    must not discard femtoseconds from the derived one-second PPB equivalent.
+    An absent mean or historical baseline stays absent, never inferred.
     """
-    lines: list[str] = []
+    mean = Fraction(str(mean_code)) if mean_code is not None else None
+    mean_v = mean * DAC_REPORT_VOLTS_PER_CODE if mean is not None else None
+    base_v = delta_v = delta_ppb = None
+    if baseline is not None:
+        base_code = Fraction(str(baseline[lane]["mean_code"]))
+        base_v = base_code * DAC_REPORT_VOLTS_PER_CODE
+        if mean is not None:
+            delta_code = mean - base_code
+            delta_v = delta_code * DAC_REPORT_VOLTS_PER_CODE
+            delta_ppb = -DAC_DELTA_PPB_PER_CODE[lane] * delta_code
+    return [
+        _dac_fixed_cell(mean_v, 9, width),
+        _dac_fixed_cell(base_v, 9, width),
+        _dac_fixed_cell(delta_v, 9, width, signed=True),
+        _dac_fixed_cell(delta_ppb, 6, width, signed=True),
+    ]
 
+
+def _dac_detail_lines(r: dict, campaign_dac: dict | None) -> list[str]:
+    """Voltage-only view; the offset is a fixed one-second equivalent, not accumulated."""
     W_NAME = 6
-    W_VALUE = 10
-    W_VOUT = 13
-    W_DITHER = 21
-    W_MEAN = 10
-    W_SD = 8
-    W_SE = 8
-    W_N = 7
-    W_CAMP_MEAN = 13
-    W_CAMP_VOLTS = 13
-    W_CAMP_N = 9
-    G = " "
-
-    lines.append(
-        f"{'DAC':<{W_NAME}}"
-        f"{'VALUE':>{W_VALUE}}{G}"
-        f"{'VOUT':>{W_VOUT}}{G}"
-        f"{'DITHER':>{W_DITHER}}{G}"
-        f"{'MEAN':>{W_MEAN}}{G}"
-        f"{'SD':>{W_SD}}{G}"
-        f"{'SE':>{W_SE}}{G}"
-        f"{'N':>{W_N}}{G}"
-        f"{'CAMP DAC MEAN':>{W_CAMP_MEAN}}{G}"
-        f"{'CAMP VOLTS':>{W_CAMP_VOLTS}}{G}"
-        f"{'DAC N':>{W_CAMP_N}}"
-    )
-
+    W_NUMBER = 14
+    baseline = r.get("dac_baseline")
+    use_campaign = bool(r.get("campaign_present"))
+    columns = ["VOUT", "MEAN_V"]
+    lines = []
+    if baseline is not None:
+        columns.extend(["BASELINE_V", "DELTA_V", "DELTA_PPB"])
+    lines.append(f"{'OCXO':<{W_NAME}}" + "".join(f" {label:>{W_NUMBER}}" for label in columns))
     for name, key in (("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")):
-        dac_now = _dac_current_value(r, key)
-        dac_voltage = _dac_current_voltage(r, key)
-        dither_summary = _dac_timebase_dither_summary(r, key, dac_now)
-
-        mean = _to_float(_welford_value(r, f"{key}_dac", "mean"))
-        sd = _to_float(_welford_value(r, f"{key}_dac", "stddev"))
-        se = _to_float(_welford_value(r, f"{key}_dac", "stderr"))
+        system_mean = _to_float(_welford_value(r, f"{key}_dac", "mean"))
         wn = _to_int(_welford_value(r, f"{key}_dac", "n"))
-        if wn == 0:
-            mean = sd = se = wn = None
-
-        camp_mean, camp_volts, camp_n, _ = _campaign_dac_values(campaign_dac, key)
-        lines.append(
-            f"{name:<{W_NAME}}"
-            f"{_fmt(dac_now, f'>{W_VALUE}.3f', W_VALUE)}{G}"
-            f"{_fmt(dac_voltage, f'>{W_VOUT}.9f', W_VOUT)}{G}"
-            f"{dither_summary:>{W_DITHER}}{G}"
-            f"{_fmt(mean, f'>{W_MEAN}.3f', W_MEAN)}{G}"
-            f"{_fmt(sd, f'>{W_SD}.3f', W_SD)}{G}"
-            f"{_fmt(se, f'>{W_SE}.3f', W_SE)}{G}"
-            f"{_fmt(wn, f'>{W_N}d', W_N)}{G}"
-            f"{_fmt(camp_mean, f'>{W_CAMP_MEAN}.6f', W_CAMP_MEAN)}{G}"
-            f"{_fmt(camp_volts, f'>{W_CAMP_VOLTS}.9f', W_CAMP_VOLTS)}{G}"
-            f"{_fmt(camp_n, f'>{W_CAMP_N}d', W_CAMP_N)}"
-        )
-
+        if not wn:
+            system_mean = None
+        camp_mean, _, _, _ = _campaign_dac_values(campaign_dac, key)
+        # An active campaign without samples never substitutes system history.
+        mean = camp_mean if use_campaign else system_mean
+        target = _dac_current_value(r, key)
+        vout = Fraction(str(target)) * DAC_REPORT_VOLTS_PER_CODE if target is not None else None
+        cells = [_dac_fixed_cell(vout, 9, W_NUMBER)]
+        mean_cells = _dac_mean_voltage_cells(key, mean, baseline, W_NUMBER)
+        cells.extend(mean_cells if baseline is not None else mean_cells[:1])
+        lines.append(f"{name:<{W_NAME}} " + " ".join(cells))
     return lines
 
 
@@ -1410,6 +1423,8 @@ def _get_campaign_rows() -> list[dict]:
     ``campaign_master.payload.report`` is the compact campaign-list projection.
     The UI performs no campaign_detail lookup and no per-campaign aggregation.
     A campaign without a report remains visible with empty science columns.
+    Baselines belong to each saved report, so changing the live system baseline
+    never reinterprets stopped campaigns or backfills older campaigns.
     """
     with open_db(row_dict=True) as conn:
         with conn.cursor() as cur:
@@ -1422,6 +1437,9 @@ def _get_campaign_rows() -> list[dict]:
                     master.campaign,
                     master.active,
                     master.payload -> 'campaign_dac' AS campaign_dac,
+                    master.payload #>> '{campaign_dac,last_observation,servo_mode}'
+                        AS servo_mode,
+                    master.payload #> '{report,clocks,dac_baseline}' AS dac_baseline,
                     master.payload ? 'report' AS report_present,
                     (master.payload #>> '{report,science_eligible}')::boolean
                         AS viable,
@@ -1511,7 +1529,9 @@ def campaigns_readout() -> list[str]:
     newest_identity = str(rows[0].get("id")) if rows else "EMPTY"
     lines = [f"\0CAMPAIGN:{newest_identity}"]
 
-    W_CAMPAIGN = 20
+    # Split the existing name area so SERVO does not push DELTA_PPB off screen.
+    W_CAMPAIGN = 13
+    W_SERVO = 6
     W_DEV = 6
     W_VALUE = 20
     W_PPB_BUCKET = 9
@@ -1520,14 +1540,12 @@ def campaigns_readout() -> list[str]:
     W_SD = 7
     W_SE = 7
     W_N = 8
-    W_DAC_MEAN = 13
-    W_DAC_VOLTS = 13
-    W_DAC_N = 9
-    W_DAC_FROM = 9
+    W_VOLTAGE = 12
     G = " "
 
     lines.append(
         f"{'CAMPAIGN':<{W_CAMPAIGN}}{G}"
+        f"{'SERVO':>{W_SERVO}}{G}"
         f"{'DEV':<{W_DEV}}"
         f"{'VALUE':>{W_VALUE}}"
         f"{'10-MIN':>{W_PPB_BUCKET}}"
@@ -1541,10 +1559,10 @@ def campaigns_readout() -> list[str]:
         f"{'SD':>{W_SD}}"
         f"{'SE':>{W_SE}}"
         f"{'N':>{W_N}}{G}"
-        f"{'CAMP DAC MEAN':>{W_DAC_MEAN}}{G}"
-        f"{'CAMP VOLTS':>{W_DAC_VOLTS}}{G}"
-        f"{'DAC N':>{W_DAC_N}}{G}"
-        f"{'DAC FROM':>{W_DAC_FROM}}"
+        f"{'MEAN_V':>{W_VOLTAGE}}{G}"
+        f"{'BASELINE_V':>{W_VOLTAGE}}{G}"
+        f"{'DELTA_V':>{W_VOLTAGE}}{G}"
+        f"{'DELTA_PPB':>{W_VOLTAGE}}"
     )
 
     if not rows:
@@ -1554,6 +1572,9 @@ def campaigns_readout() -> list[str]:
 
     for row_index, row in enumerate(rows):
         campaign_name = str(row.get("campaign") or "?")
+        # A stopped campaign keeps its last recorded mode; missing history is
+        # unknown, not OFF, and never borrows today's live servo setting.
+        servo_mode = str(row.get("servo_mode") or "---").upper()
         if not row.get("report_present"):
             campaign_name += " [WAIT]"
         elif row.get("viable") is False:
@@ -1580,11 +1601,15 @@ def campaigns_readout() -> list[str]:
             stderr = _to_float(row.get(f"{lane_key}_stderr"))
             n = _to_int(row.get(f"{lane_key}_n"))
 
-            dac_mean, dac_volts, dac_n, dac_from = _campaign_dac_values(
+            dac_mean, _, _, _ = _campaign_dac_values(
                 row.get("campaign_dac"), lane_key
+            )
+            voltage_cells = _dac_mean_voltage_cells(
+                lane_key, dac_mean, row.get("dac_baseline"), W_VOLTAGE
             )
             lines.append(
                 f"{campaign_cell}{G}"
+                f"{servo_mode:>{W_SERVO}}{G}"
                 f"{lane_name:<{W_DEV}}"
                 f"{_comma_int(value, W_VALUE)}"
                 f"{''.join(_fmt(v, f'>{W_PPB_BUCKET}.3f', W_PPB_BUCKET) for v in ppb_values)}"
@@ -1593,10 +1618,7 @@ def campaigns_readout() -> list[str]:
                 f"{_fmt(stddev, f'>{W_SD}.3f', W_SD)}"
                 f"{_fmt(stderr, f'>{W_SE}.3f', W_SE)}"
                 f"{_fmt(n, f'>{W_N}d', W_N)}{G}"
-                f"{_fmt(dac_mean, f'>{W_DAC_MEAN}.6f', W_DAC_MEAN)}{G}"
-                f"{_fmt(dac_volts, f'>{W_DAC_VOLTS}.9f', W_DAC_VOLTS)}{G}"
-                f"{_fmt(dac_n, f'>{W_DAC_N}d', W_DAC_N)}{G}"
-                f"{_fmt(dac_from, f'>{W_DAC_FROM}d', W_DAC_FROM)}"
+                f"{G.join(voltage_cells)}"
             )
 
         if row_index != len(rows) - 1:
@@ -1670,7 +1692,6 @@ def clocks_combined_readout() -> list[str]:
     campaign = r.get("campaign") or "STOPPED"
     elapsed = r.get("campaign_elapsed") or "00:00:00"
     instrument_elapsed = r.get("instrument_elapsed") or "00:00:00"
-    n = _monitor_count(r)
 
     servo_state = _servo_state(r)
 
@@ -1678,9 +1699,9 @@ def clocks_combined_readout() -> list[str]:
     recoverable_str = _recoverable_status(CLOCKS_RECOVERY_CONFIG_KEY)
 
     if state == "STARTED" or r.get("campaign_present"):
-        identity = f"CAMPAIGN: {campaign}  ELAPSED: {elapsed}  n={n}"
+        identity = f"CAMPAIGN: {campaign}  ELAPSED: {elapsed}"
     else:
-        identity = f"CAMPAIGN: STOPPED  INSTRUMENT: {instrument_elapsed}  n={n}"
+        identity = f"CAMPAIGN: STOPPED  INSTRUMENT: {instrument_elapsed}"
     lines.append(
         identity
         + f"    SERVO: {servo_str}"
@@ -1693,10 +1714,6 @@ def clocks_combined_readout() -> list[str]:
     W_VALUE = 20
     W_PPB_BUCKET = 9
     W_RES   = 6
-    W_MEAN  = 9
-    W_SD    = 7
-    W_SE    = 7
-    W_N     = 7
     # ── CLK header ──
     lines.append(
         f"{'CLK':<{W_NAME}}"
@@ -1708,10 +1725,6 @@ def clocks_combined_readout() -> list[str]:
         f"{'TOTAL':>{W_PPB_BUCKET}}"
         f"{'CAMP':>{W_PPB_BUCKET}}"
         f"{'RES':>{W_RES}}"
-        f"{'MEAN':>{W_MEAN}}"
-        f"{'SD':>{W_SD}}"
-        f"{'SE':>{W_SE}}"
-        f"{'N':>{W_N}}"
     )
 
     # ── GNSS (reference nanosecond clock) ──
@@ -1722,7 +1735,6 @@ def clocks_combined_readout() -> list[str]:
         f"{_comma_int(gnss_ns, W_VALUE)}"
         f"{_ppb_cols_fragment(r, 'gnss', W_PPB_BUCKET)}"
         f"{_sign_int(gnss_res, W_RES)}"
-        f"{_welford_cols_fragment(r, 'gnss', W_MEAN, W_SD, W_SE, W_N)}"
     )
 
     # ── VCLOCK (GNSS-disciplined nanosecond clock) ──
@@ -1737,7 +1749,6 @@ def clocks_combined_readout() -> list[str]:
         f"{_comma_int(vclock_ns, W_VALUE)}"
         f"{_ppb_cols_fragment(r, 'vclock', W_PPB_BUCKET)}"
         f"{_sign_int(vclock_res, W_RES)}"
-        f"{_welford_cols_fragment_or_zero(r, 'vclock', W_MEAN, W_SD, W_SE, W_N)}"
     )
 
     # ── OCXO1, OCXO2 (nanosecond clocks) ──
@@ -1749,7 +1760,6 @@ def clocks_combined_readout() -> list[str]:
             f"{_comma_int(ocxo_ns, W_VALUE)}"
             f"{_ppb_cols_fragment(r, key, W_PPB_BUCKET)}"
             f"{_sign_int(res, W_RES)}"
-            f"{_welford_cols_fragment(r, key, W_MEAN, W_SD, W_SE, W_N)}"
         )
 
     # GN_RAW and DWT remain available in CLOCKS and focused reports, but are
