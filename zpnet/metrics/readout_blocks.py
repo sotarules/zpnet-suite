@@ -83,8 +83,9 @@ DAC_CODE_SCALE = 65536.0
 # Approximate physical tuning slopes from the reversible +/-8-code witness
 # run (12-second plateaus), rounded from the companion-subtracted medians.
 # These fixed reporting coefficients never affect clocks or servo feedback.
-# DELTA_PPB = -K * (selected mean code - baseline mean code): a lower servo
-# voltage implies a faster oscillator at the baseline voltage. Six decimal
+# DELTA_PPB uses the mean code difference after removing the corresponding
+# mean decay corrections. Lower corrected voltage implies a faster oscillator
+# at the baseline voltage. Six decimal
 # PPB places resolve 1 fs over 1 s; that is resolution, not calibration accuracy.
 DAC_DELTA_PPB_PER_CODE = {"ocxo1": Fraction(364, 1000), "ocxo2": Fraction(384, 1000)}
 DAC_REPORT_VOLTS_PER_CODE = Fraction(5, 65536)
@@ -945,7 +946,40 @@ def _dac_fixed_cell(value: Fraction | None, decimals: int, width: int, *, signed
     return f"{text:>{width}}"
 
 
-def _dac_mean_voltage_cells(lane: str, mean_code, baseline: dict | None, width: int) -> list[str]:
+def _decay_fraction(value: dict | None) -> Fraction:
+    # Older recorded populations predate correction and contribute zero.
+    return Fraction(value["numerator"], value["denominator"]) if value is not None else Fraction(0)
+
+
+def _decay_profile_state(decay: dict | None) -> str:
+    return ("ON" if decay["profile_enabled"] else "OFF") if decay is not None else "---"
+
+
+def _decay_rate_cell(
+    decay: dict | None, lane: str, width: int, *, candidate: bool = False,
+) -> str:
+    rate = None
+    if decay is not None:
+        if candidate:
+            fit = decay.get("candidate")
+            encoded = fit[lane]["slope_codes_per_second"] if fit is not None else None
+        else:
+            encoded = decay["slope_codes_per_second"][lane]
+        if encoded is not None:
+            rate = _decay_fraction(encoded) * DAC_REPORT_VOLTS_PER_CODE * 1_000_000_000
+    return _dac_fixed_cell(rate, 6, width, signed=True)
+
+
+def _campaign_decay_mean(recording: dict | None, lane: str) -> Fraction:
+    if recording is None or not recording[lane]["n"]:
+        return Fraction(0)
+    return _decay_fraction(recording.get("decay_sum_codes", {}).get(lane)) / recording[lane]["n"]
+
+
+def _dac_mean_voltage_cells(
+    lane: str, mean_code, baseline: dict | None, width: int,
+    mean_correction: Fraction = Fraction(0),
+) -> list[str]:
     """Share the exact mean/baseline conversion between live and campaign views.
 
     Use full stored codes until final rendering; nanovolt display rounding
@@ -961,7 +995,12 @@ def _dac_mean_voltage_cells(lane: str, mean_code, baseline: dict | None, width: 
         if mean is not None:
             delta_code = mean - base_code
             delta_v = delta_code * DAC_REPORT_VOLTS_PER_CODE
-            delta_ppb = -DAC_DELTA_PPB_PER_CODE[lane] * delta_code
+            # Voltage columns remain the recorded physical target means. Only
+            # PPB removes the correction averaged over those same observations.
+            base_correction = _decay_fraction(baseline[lane].get("decay_mean_code"))
+            delta_ppb = -DAC_DELTA_PPB_PER_CODE[lane] * (
+                delta_code - (mean_correction - base_correction)
+            )
     return [
         _dac_fixed_cell(mean_v, 9, width),
         _dac_fixed_cell(base_v, 9, width),
@@ -977,9 +1016,14 @@ def _dac_detail_lines(r: dict, campaign_dac: dict | None) -> list[str]:
     baseline = r.get("dac_baseline")
     use_campaign = bool(r.get("campaign_present"))
     columns = ["VOUT", "MEAN_V"]
+    decay = r.get("decay")
     lines = []
     if baseline is not None:
         columns.extend(["BASELINE_V", "DELTA_V", "DELTA_PPB"])
+    columns.append("DECAY(nV/s)")
+    learning = decay is not None and decay["profile_enabled"]
+    if learning:
+        columns.append("PROFILE(nV/s)")
     lines.append(f"{'OCXO':<{W_NAME}}" + "".join(f" {label:>{W_NUMBER}}" for label in columns))
     for name, key in (("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")):
         system_mean = _to_float(_welford_value(r, f"{key}_dac", "mean"))
@@ -992,8 +1036,16 @@ def _dac_detail_lines(r: dict, campaign_dac: dict | None) -> list[str]:
         target = _dac_current_value(r, key)
         vout = Fraction(str(target)) * DAC_REPORT_VOLTS_PER_CODE if target is not None else None
         cells = [_dac_fixed_cell(vout, 9, W_NUMBER)]
-        mean_cells = _dac_mean_voltage_cells(key, mean, baseline, W_NUMBER)
+        if use_campaign:
+            correction = _campaign_decay_mean(campaign_dac, key)
+        else:
+            total = r.get("decay_system", {}).get(key, {}).get("sum")
+            correction = _decay_fraction(total) / wn if wn else Fraction(0)
+        mean_cells = _dac_mean_voltage_cells(key, mean, baseline, W_NUMBER, correction)
         cells.extend(mean_cells if baseline is not None else mean_cells[:1])
+        cells.append(_decay_rate_cell(decay, key, W_NUMBER))
+        if learning:
+            cells.append(_decay_rate_cell(decay, key, W_NUMBER, candidate=True))
         lines.append(f"{name:<{W_NAME}} " + " ".join(cells))
     return lines
 
@@ -1444,6 +1496,7 @@ def _get_campaign_rows() -> list[dict]:
                     master.payload #>> '{campaign_dac,last_observation,servo_mode}'
                         AS servo_mode,
                     master.payload #> '{report,clocks,dac_baseline}' AS dac_baseline,
+                    master.payload #> '{report,clocks,decay}' AS decay,
                     master.payload ? 'report' AS report_present,
                     (master.payload #>> '{report,science_eligible}')::boolean
                         AS viable,
@@ -1533,23 +1586,27 @@ def campaigns_readout() -> list[str]:
     newest_identity = str(rows[0].get("id")) if rows else "EMPTY"
     lines = [f"\0CAMPAIGN:{newest_identity}"]
 
-    # Split the existing name area so SERVO does not push DELTA_PPB off screen.
-    W_CAMPAIGN = 13
+    # Fit the voltage and decay columns in the established 190-column view.
+    # Campaign names use the existing bounded ~ suffix and active * marker.
+    W_CAMPAIGN = 10
     W_SERVO = 6
-    W_DEV = 6
-    W_VALUE = 20
-    W_PPB_BUCKET = 9
-    W_RES = 6
-    W_MEAN = 9
-    W_SD = 7
-    W_SE = 7
-    W_N = 8
+    W_PROFILE = 4
+    W_DECAY = 12
+    W_DEV = 5
+    W_VALUE = 19
+    W_PPB_BUCKET = 8
+    W_RES = 4
+    W_MEAN = 8
+    W_SD = 6
+    W_SE = 6
+    W_N = 7
     W_VOLTAGE = 12
     G = " "
 
     lines.append(
         f"{'CAMPAIGN':<{W_CAMPAIGN}}{G}"
         f"{'SERVO':>{W_SERVO}}{G}"
+        f"{'PROF':>{W_PROFILE}}{G}"
         f"{'DEV':<{W_DEV}}"
         f"{'VALUE':>{W_VALUE}}"
         f"{'10-MIN':>{W_PPB_BUCKET}}"
@@ -1558,6 +1615,7 @@ def campaigns_readout() -> list[str]:
         f"{'24-HOUR':>{W_PPB_BUCKET}}"
         f"{'TOTAL':>{W_PPB_BUCKET}}"
         f"{'CAMP':>{W_PPB_BUCKET}}"
+        f"{'DECAY(nV/s)':>{W_DECAY}}"
         f"{'RES':>{W_RES}}"
         f"{'MEAN':>{W_MEAN}}"
         f"{'SD':>{W_SD}}"
@@ -1609,14 +1667,17 @@ def campaigns_readout() -> list[str]:
                 row.get("campaign_dac"), lane_key
             )
             voltage_cells = _dac_mean_voltage_cells(
-                lane_key, dac_mean, row.get("dac_baseline"), W_VOLTAGE
+                lane_key, dac_mean, row.get("dac_baseline"), W_VOLTAGE,
+                _campaign_decay_mean(row.get("campaign_dac"), lane_key),
             )
             lines.append(
                 f"{campaign_cell}{G}"
                 f"{servo_mode:>{W_SERVO}}{G}"
+                f"{_decay_profile_state(row.get('decay')):>{W_PROFILE}}{G}"
                 f"{lane_name:<{W_DEV}}"
                 f"{_comma_int(value, W_VALUE)}"
                 f"{''.join(_fmt(v, f'>{W_PPB_BUCKET}.3f', W_PPB_BUCKET) for v in ppb_values)}"
+                f"{_decay_rate_cell(row.get('decay'), lane_key, W_DECAY)}"
                 f"{_sign_int(residual, W_RES)}"
                 f"{_fmt(mean, f'>{W_MEAN}.3f', W_MEAN)}"
                 f"{_fmt(stddev, f'>{W_SD}.3f', W_SD)}"
@@ -1709,6 +1770,7 @@ def clocks_combined_readout() -> list[str]:
     lines.append(
         identity
         + f"    SERVO: {servo_str}"
+        + f"    DECAY_PROFILE: {_decay_profile_state(r.get('decay'))}"
         + f"    RECOVERABLE: {recoverable_str}"
     )
     lines.append("")

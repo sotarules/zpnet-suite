@@ -83,8 +83,11 @@ import threading
 import subprocess
 import time
 from datetime import datetime, timezone
+from fractions import Fraction
 from logging.handlers import RotatingFileHandler
 from typing import Dict, Any, List, Optional, Tuple
+
+from zpnet.shared.clocks_decay import DecayProfiler, rational, fraction
 
 from zpnet.shared.ad5693r import read_input, write_register
 from zpnet.shared.i2c_identity import I2C_BUS_LEGACY
@@ -120,6 +123,7 @@ AD5693R_OUTPUT_FULL_SCALE_VOLTAGE = 5.0
 AD5693R_SAFE_MAX_OUTPUT_VOLTAGE = 3.3
 AD5693R_CODE_SCALE = 65536.0
 CLOCKS_DAC_BASELINE_CONFIG_KEY = "CLOCKS_DAC_BASELINE"
+CLOCKS_DECAY_CONFIG_KEY = "CLOCKS_DECAY_PROFILE"
 AD5693R_SAFE_MAX_HW_CODE = int(
     (AD5693R_SAFE_MAX_OUTPUT_VOLTAGE / AD5693R_OUTPUT_FULL_SCALE_VOLTAGE)
     * AD5693R_CODE_SCALE
@@ -1190,6 +1194,59 @@ _dac_control_second = 0
 # Replace the complete pair after committing it; never mutate a saved snapshot.
 _dac_baseline_lock = threading.Lock()
 _dac_baseline: Optional[Dict[str, Any]] = None
+# Serializes model transitions with the exact target observations they affect.
+# Lock order: DAC statistics epoch -> DAC -> decay. No reverse acquisition.
+_decay_lock = threading.RLock()
+_decay = DecayProfiler()
+_decay_system_sum = {name: Fraction(0) for name in ("ocxo1", "ocxo2")}
+
+
+def _decay_snapshot() -> dict:
+    with _decay_lock:
+        return _decay.snapshot()
+
+
+def _decay_system_snapshot() -> dict:
+    with _dac_lock:
+        return {name: {"sum": rational(value)} for name, value in _decay_system_sum.items()}
+
+
+def _decay_write_config(state: dict) -> None:
+    with open_db() as conn:
+        cur = conn.cursor()
+        encoded = json.dumps(state, allow_nan=False)
+        cur.execute("UPDATE config SET payload = %s::jsonb WHERE config_key = %s",
+                    (encoded, CLOCKS_DECAY_CONFIG_KEY))
+        if cur.rowcount == 0:
+            cur.execute("INSERT INTO config (config_key, payload) VALUES (%s, %s::jsonb)",
+                        (CLOCKS_DECAY_CONFIG_KEY, encoded))
+        if cur.rowcount != 1:
+            raise RuntimeError("CLOCKS_DECAY_PROFILE is not a singleton")
+
+
+def _decay_load() -> None:
+    global _decay
+    # Accepted models are configuration; restoring old firmware custody must
+    # never roll back an operator's later profile/freeze command.
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT payload FROM config WHERE config_key = %s",
+                    (CLOCKS_DECAY_CONFIG_KEY,))
+        rows = cur.fetchall()
+        if len(rows) > 1:
+            raise RuntimeError("CLOCKS_DECAY_PROFILE is not a singleton")
+        if rows:
+            _decay = DecayProfiler.from_checkpoint(rows[0]["payload"])
+        cur.execute("SELECT payload #> '{clocks,decay}' AS decay FROM campaign_detail "
+                    "WHERE campaign_type = %s AND payload ->> 'schema' = 'CLOCKS_V4' "
+                    "AND payload -> 'holistic_restore_superseded' IS DISTINCT FROM 'true'::jsonb "
+                    "ORDER BY id DESC LIMIT 1", (CAMPAIGN_TYPE_TEMPEST,))
+        latest = cur.fetchone()
+    if latest and latest["decay"]:
+        _decay.restore_timing(latest["decay"])
+    if not rows:
+        _decay_write_config(_decay.checkpoint())
+
 
 _dac_lanes: Dict[str, _DacLaneState] = {
     "ocxo1": _DacLaneState("ocxo1", AD5693R_ADDR_OCXO1),
@@ -1727,6 +1784,8 @@ def _dac_set_servo_mode(mode: str) -> Tuple[str, str]:
             for lane in _dac_lanes.values():
                 _dac_reset_servo_predictor_locked(lane)
             _dac_servo_mode = normalized
+            with _decay_lock:
+                _decay.restart_profile()
         if normalized == "OFF":
             for lane in _dac_lanes.values():
                 _dac_clear_pending_locked(lane)
@@ -2226,6 +2285,18 @@ def _dac_process_completed_row(
                 "ocxo1": float(_dac_lanes["ocxo1"].target_code),
                 "ocxo2": float(_dac_lanes["ocxo2"].target_code),
             }
+            with _decay_lock:
+                _decay.observe(int(teensy_clocks["clockfaces"]["gnss_ns"]),
+                               {name: observation[name] for name in _dac_lanes},
+                               _dac_servo_mode)
+                correction = {name: _decay.correction(name) for name in _dac_lanes}
+                observation["decay_correction_codes"] = {
+                    name: rational(value) for name, value in correction.items()}
+                observation["_decay"] = _decay.snapshot()
+            for name, value in correction.items():
+                _decay_system_sum[name] += value
+            observation["_decay_system"] = _decay_system_snapshot()
+            observation["_dac_welfords"] = _dac_welford_snapshots()
             mode = _dac_servo_mode
 
     if mode == "OFF":
@@ -2328,6 +2399,8 @@ def _dac_reset_statistics() -> Dict[str, Any]:
         before = _dac_welford_snapshots()
         for lane in _dac_lanes.values():
             lane.welford.reset()
+        for name in _decay_system_sum:
+            _decay_system_sum[name] = Fraction(0)
         after = _dac_welford_snapshots()
     return {"before": before, "after": after}
 
@@ -2387,6 +2460,11 @@ def _dac_restore_control_from_clocks(clocks: Dict[str, Any], *, realize: bool) -
                 _dac_clear_pending_locked(lane)
                 _dac_reset_total_state_locked(lane)
                 lane.welford.restore(auxiliary.get(f"{lane_name}_dac"))
+                saved_sum = clocks.get("decay_system", {}).get(lane_name, {}).get("sum")
+                _decay_system_sum[lane_name] = fraction(saved_sum) if saved_sum else Fraction(0)
+            if clocks.get("decay"):
+                with _decay_lock:
+                    _decay.restore_timing(clocks["decay"])
 
             # The restored DAC Welford belongs to this exact canonical Teensy
             # statistics epoch.  Discard any startup/fresh-boot chronology that
@@ -2464,6 +2542,7 @@ def _dac_info_payload() -> Dict[str, Any]:
             ),
             "initialization_authored_output": False,
             "dac_baseline": _dac_baseline_snapshot(),
+            "decay": _decay_snapshot(),
             **lanes,
         }
 
@@ -10746,6 +10825,13 @@ def _campaign_dac_advance(
             for name, accumulator in lanes.items():
                 accumulator.update(observation[name])
                 state[name] = accumulator.snapshot()
+            # Old observations have zero adjustment. Sum corrections over the
+            # identical admitted population, including its pre-install history.
+            sums = state.setdefault("decay_sum_codes", {})
+            for name in lanes:
+                before = fraction(sums[name]) if name in sums else Fraction(0)
+                sample = observation.get("decay_correction_codes", {}).get(name)
+                sums[name] = rational(before + (fraction(sample) if sample else Fraction(0)))
         state["observations"] += 1
         state["last_detail_id"] = detail_id
         state["last_sequence"] = sequence
@@ -10882,6 +10968,8 @@ def _attach_tempest_to_state_detail(detail: Dict[str, Any]) -> None:
                     report["clocks"]["dac_baseline"] = copy.deepcopy(
                         attached["payload"]["clocks"].get("dac_baseline")
                     )
+                    report["clocks"]["decay"] = copy.deepcopy(
+                        attached["payload"]["clocks"].get("decay"))
                     report["campaign_dac"] = _record_campaign_dac(
                         cur, campaign=campaign, detail_id=int(attached["id"]),
                         state=attached["payload"], public_count=int(public_count),
@@ -14219,6 +14307,17 @@ def _build_canonical_clocks_state(
     # Each persisted observation retains its reference even after set/clear.
     # This field is reporting metadata and never enters clock or servo math.
     clocks["dac_baseline"] = _dac_baseline_snapshot()
+    if dac_observation:
+        # These snapshots share the target's exact admission boundary, even if
+        # STATS_RESET runs while canonical serialization is in progress.
+        clocks["decay"] = dac_observation.pop("_decay")
+        clocks["decay_system"] = dac_observation.pop("_decay_system")
+        dac_welfords = dac_observation.pop("_dac_welfords")
+    else:
+        with _dac_lock:
+            clocks["decay"] = _decay_snapshot()
+            clocks["decay_system"] = _decay_system_snapshot()
+            dac_welfords = _dac_welford_snapshots()
     ppb_restore_checkpoint: Optional[Dict[str, Any]] = None
     stats = clocks.get("stats")
     if isinstance(stats, dict):
@@ -14226,7 +14325,7 @@ def _build_canonical_clocks_state(
         if not isinstance(auxiliary, dict):
             auxiliary = {}
             stats["auxiliary_welford"] = auxiliary
-        auxiliary.update(_dac_welford_snapshots())
+        auxiliary.update(dac_welfords)
 
         # Pi owns persistence/recovery orchestration. Keep the literal bounded
         # resurrection image private: it is committed to config.CLOCKS_RECOVERY
@@ -19521,6 +19620,9 @@ def cmd_set_dac(args: Optional[dict]) -> Dict[str, Any]:
         ok2 = _dac_set_target_explicit(_dac_lanes["ocxo2"], dac2)
 
     with _dac_lock:
+        # Explicit calibration steps must not become the learned aging slope.
+        with _decay_lock:
+            _decay.restart_profile()
         lane1 = _dac_lanes["ocxo1"]
         lane2 = _dac_lanes["ocxo2"]
         result = {
@@ -19705,11 +19807,14 @@ def cmd_set_dac_baseline(args: Optional[dict]) -> Dict[str, Any]:
             raise RuntimeError("Campaign DAC recording schema/identity mismatch")
         populations = {name: recording[name] for name in ("ocxo1", "ocxo2")}
         provenance = {"source_detail_id": recording["last_detail_id"]}
+        correction_sums = {name: fraction(value) for name, value in
+                           recording.get("decay_sum_codes", {}).items()}
     else:
         # Copy both means and their ancestry at one statistics boundary.
         with _dac_stats_epoch_lock:
             with _dac_lock:
                 populations = {name: lane.welford.snapshot() for name, lane in _dac_lanes.items()}
+                correction_sums = dict(_decay_system_sum)
                 provenance = {
                     "source_reset_count": _dac_stats_reset_count,
                     "source_update_count": _dac_stats_update_count,
@@ -19729,7 +19834,8 @@ def cmd_set_dac_baseline(args: Optional[dict]) -> Dict[str, Any]:
         mean = population["mean"]
         if type(n) is not int or n < 0 or not math.isfinite(mean) or not 0 <= mean <= AD5693R_SAFE_MAX_HW_CODE:
             raise RuntimeError(f"{name.upper()} DAC mean/population violates the recording contract")
-        baseline[name] = {"mean_code": mean, "voltage": _dac_voltage_from_code(mean), "n": n}
+        baseline[name] = {"mean_code": mean, "voltage": _dac_voltage_from_code(mean), "n": n,
+                          "decay_mean_code": rational(correction_sums.get(name, Fraction(0)) / n)}
     _dac_store_baseline(baseline)
     logging.info("[clocks] DAC baseline set from %s: %s", campaign or source, baseline)
     return {"success": True, "message": "DAC baseline set", "payload": {"dac_baseline": baseline}}
@@ -19746,6 +19852,41 @@ def cmd_clear_dac_baseline(args: Optional[dict]) -> Dict[str, Any]:
     logging.info("[clocks] DAC baseline cleared")
     return {"success": True, "message": "DAC baseline cleared", "payload": {"dac_baseline": None}}
 
+
+
+def cmd_decay_profile(args: Optional[dict]) -> Dict[str, Any]:
+    """Learn while stationary; freeze a local slope before a TEMPEST run.
+
+    A model transition is continuous and does not zero an existing baseline.
+    Use a new stationary campaign and SET_DAC_BASELINE campaign=... to establish
+    its reference independently of older cumulative DAC history.
+    """
+    global _decay
+    unavailable = _startup_control_gate("DECAY_PROFILE")
+    if unavailable is not None:
+        return unavailable
+    args = {str(k).lower(): v for k, v in (args or {}).items()}
+    if not args:
+        return {"success": True, "message": "OK", "payload": {"decay": _decay_snapshot()}}
+    if set(args) - {"enabled", "decay_profile", "window_hours"}:
+        return {"success": False, "message": "Use decay_profile enabled=true|false [window_hours=24]"}
+    raw = args.get("enabled", args.get("decay_profile"))
+    if str(raw).lower() not in {"true", "false"}:
+        return {"success": False, "message": "enabled=true or enabled=false is required"}
+    enabled = str(raw).lower() == "true"
+    # Only explicit infrequent model commands serialize observation admission
+    # across a config commit; ordinary per-second processing never writes config.
+    with _decay_lock:
+        proposed = copy.deepcopy(_decay)
+        try:
+            proposed.set_profiling(enabled, args.get("window_hours"))
+        except (TypeError, ValueError) as exc:
+            return {"success": False, "message": str(exc)}
+        _decay_write_config(proposed.checkpoint())
+        _decay = proposed
+        snapshot = _decay.snapshot()
+    return {"success": True, "message": "Decay profiling enabled" if enabled else "Decay factor frozen",
+            "payload": {"decay": snapshot}}
 
 
 COMMANDS = {
@@ -19768,6 +19909,7 @@ COMMANDS = {
     "DELETE": cmd_delete,
     "TRUNCATE": cmd_truncate,
     "SET_DAC": cmd_set_dac,
+    "DECAY_PROFILE": cmd_decay_profile,
     "SET_DAC_BASELINE": cmd_set_dac_baseline,
     "CLEAR_DAC_BASELINE": cmd_clear_dac_baseline,
     "SERVOS": cmd_servos,
@@ -20077,6 +20219,7 @@ def run() -> None:
     # This reference survives restarts independently of historical CLOCKS
     # restore images. Load it before any live observation can be published.
     _dac_load_baseline()
+    _decay_load()
 
     # Firmware boots enabled, but a Pi-only restart may find an explicit DISABLE.
     # Keep the command socket alive without starting workers against deliberate
