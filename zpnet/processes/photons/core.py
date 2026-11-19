@@ -27,7 +27,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from psycopg.errors import ForeignKeyViolation
+from psycopg.errors import ForeignKeyViolation, LockNotAvailable
 
 from zpnet.processes.processes import (
     publish,
@@ -7228,6 +7228,7 @@ def _ppb_checkpoint_reacquire_loop() -> None:
         repaired_update = int(result["update_count"])
         durable_checkpoint: Optional[Dict[str, Any]] = None
         superseded = False
+        lock_timeout_reported = False
         while (
             not _hard_failure_active()
             and not (
@@ -7238,7 +7239,28 @@ def _ppb_checkpoint_reacquire_loop() -> None:
             if _ppb_checkpoint_reacquire_requested.is_set():
                 superseded = True
                 break
-            durable = _read_photons_recovery_config()
+            try:
+                durable = _read_photons_recovery_config()
+            except LockNotAvailable as exc:
+                # The live export already succeeded. Retry the confirmation
+                # read without exporting again or relaxing the durable proof.
+                if not lock_timeout_reported:
+                    with _ppb_checkpoint_lock:
+                        _ppb_checkpoint_reacquire_failure_count += 1
+                        _ppb_checkpoint_reacquire_last_failure = {
+                            "failed_at_utc": _utc_now_z(),
+                            "error": str(exc),
+                            "stage": "DURABLE_CONFIRMATION",
+                        }
+                    logging.warning(
+                        "⚠️ [photons/ppb] durable checkpoint read hit a lock timeout; "
+                        "retrying confirmation: reset=%d update=%d",
+                        repaired_reset, repaired_update,
+                    )
+                    lock_timeout_reported = True
+                time.sleep(PHOTONS_STATE_RETRY_S)
+                continue
+            lock_timeout_reported = False
             if durable is not None:
                 durable_reset = int(durable["reset_count"])
                 durable_update = int(durable["update_count"])
