@@ -2319,12 +2319,11 @@ def _photons_summary_line(summary: dict, include_campaign: bool, campaign_mean=N
 
 
 def _get_lantern_campaign_summaries() -> list[dict]:
-    """Read only each campaign's latest durable statistics, on panel demand.
+    """Read the latest durable display summary from each LANTERN master.
 
-    The displayed CAMP mean is producer-authored. Neither an exclusive-start
-    lookup nor inverse Welford subtraction contributes to this screen. Select
-    the endpoint by relational keys before extracting its small JSON view;
-    never transfer temperature rings or recovery checkpoints to Metrics.
+    PHOTONS writes master.report in the same transaction as the canonical
+    detail row, including the final observation. A master without a report
+    has no summary to show; opening this panel never searches per-second history.
     """
     with open_db(row_dict=True) as conn:
         conn.execute("SET TRANSACTION READ ONLY")
@@ -2334,21 +2333,18 @@ def _get_lantern_campaign_summaries() -> list[dict]:
             """
             SELECT master.id, master.campaign, master.active,
                    master.payload ->> 'interrupted_at' AS interrupted_at,
-                   last_detail.sequence AS last_sequence,
-                   CASE WHEN last_detail.id IS NOT NULL THEN jsonb_build_object(
-                       'campaign', last_detail.payload -> 'campaign',
+                   master.payload #>> '{report,sequence}' AS last_sequence,
+                   CASE WHEN jsonb_typeof(master.payload -> 'report') = 'object'
+                        THEN jsonb_build_object(
+                       'campaign', jsonb_build_object(
+                           'stats', master.payload #> '{report,campaign_stats}',
+                           'public_count', master.payload #> '{report,campaign_public_count}'
+                       ),
                        'photons', jsonb_build_object(
-                           'stats', last_detail.payload #> '{photons,stats}'
+                           'stats', master.payload #> '{report,instrument_stats}'
                        )
                    ) END AS last_payload
             FROM campaign_master AS master
-            LEFT JOIN LATERAL (
-                SELECT d.id, d.sequence, d.payload
-                FROM campaign_detail AS d
-                WHERE d.campaign_type = master.campaign_type
-                  AND d.campaign = master.campaign
-                ORDER BY d.id DESC LIMIT 1
-            ) AS last_detail ON true
             WHERE master.campaign_type = %s
             ORDER BY master.ts DESC, master.id DESC
             """,
