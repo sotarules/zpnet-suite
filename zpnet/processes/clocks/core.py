@@ -19882,10 +19882,18 @@ def cmd_decay_profile(args: Optional[dict]) -> Dict[str, Any]:
             proposed.set_profiling(enabled, args.get("window_hours"))
         except (TypeError, ValueError) as exc:
             return {"success": False, "message": str(exc)}
+        if enabled:
+            message = "Decay profiling enabled"
+        elif not _decay.profile_enabled:
+            message = "Decay profiling already off"
+        elif proposed.model_id != _decay.model_id:
+            message = "Decay factor frozen"
+        else:
+            message = "Decay profiling off. Insufficient training data to replace the applied slope."
         _decay_write_config(proposed.checkpoint())
         _decay = proposed
         snapshot = _decay.snapshot()
-    return {"success": True, "message": "Decay profiling enabled" if enabled else "Decay factor frozen",
+    return {"success": True, "message": message,
             "payload": {"decay": snapshot}}
 
 

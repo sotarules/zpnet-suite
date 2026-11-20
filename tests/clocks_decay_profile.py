@@ -156,7 +156,7 @@ def show(row: dict, campaign: str | None) -> None:
         print(f"{lane.upper():<7}{raw:>16}{added:>16}{normalized:>18}")
     print("\nSix decimals of nV/s resolve one femtovolt/second; this is representation, not accuracy.")
     print("RMS describes minute-mean residuals, not independent-sample uncertainty or forecast error.")
-    print("The active model stays fixed during learning; turning profiling off accepts the selected fit.")
+    print("Turning profiling off accepts a sufficiently trained fit. Otherwise the current slope stays in use.")
     print("Freezing changes the slope continuously; setting a matching DAC baseline establishes zero.")
     print("Corrections are averaged over the same observations as the voltage mean; raw voltages remain recorded.")
     print("History before installation or the first freeze has zero adjustment; a fresh stationary campaign")

@@ -192,9 +192,10 @@ class DecayProfiler:
         self._refresh_fits()
         candidate = self._fits.get(f"{self.window_hours:g}")
         if candidate is None or candidate["span_seconds"] < 600:
-            # Ten minutes is a minimum identifiable population, not a claim
-            # that its slope predicts a 12--48 hour experiment accurately.
-            raise ValueError("Decay profiling needs at least 10 minutes of completed 10-MIN servo observations")
+            # The minimum span governs replacing the applied model. An
+            # operator can stop learning at any point in the session.
+            self.profile_enabled = False
+            return
         # Re-anchor the accepted linear correction continuously. Freezing changes
         # the derivative, not the current offset or an existing DAC baseline.
         self.offset = {name: self.correction(name) for name in LANES}
