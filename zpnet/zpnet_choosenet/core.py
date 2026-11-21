@@ -1,15 +1,14 @@
 """
 ZPNet Choosenet Network Healer
-(v2026-03-16-ping-definitive)
 
-Performs definitive network reachability test (ICMP ping to 8.8.8.8).
-If test fails, invokes choosenet.sh healing script and retries until success.
-When choosenet.sh reports success, emits CHOOSENET_SUCCESS event containing
-the previous and new SSIDs.
+Preserve an associated Wi-Fi network with an IPv4 default gateway, even if
+there is no Internet service. The gateway can be a home router or a phone
+hotspot: a local laptop-to-Pi SSH connection must not be disrupted because
+an external ping fails.
 
-The definitive test no longer depends on ZPNet Server availability.
-A downed or restarting server is not a network fault and must not
-trigger WPA supplicant recovery.
+If Wi-Fi loses its route, recheck once after a short settling interval before
+invoking choosenet.sh to look for another configured network. Successful
+script invocations retain the CHOOSENET_SUCCESS event.
 
 Author: The Mule
 """
@@ -23,8 +22,6 @@ from zpnet.shared.events import create_event
 from zpnet.shared.constants import (
     CHOOSENET_PATH,
     CHOOSENET_RETRY_INTERVAL_S,
-    DEFINITIVE_TEST_HOST,
-    DEFINITIVE_TEST_TIMEOUT_S,
 )
 
 # ---------------------------------------------------------------------
@@ -44,23 +41,28 @@ def get_ssid() -> str:
         return ""
 
 
-def zpnet_definitive_test() -> bool:
-    """
-    Verify basic internet reachability via ICMP ping to a public host.
+GATEWAY_CONFIRM_DELAY_S = 10
 
-    This tests the network itself, not the ZPNet application stack.
-    A downed ZPNet Server no longer triggers false network recovery.
+
+def wifi_gateway_available() -> bool:
+    """A Wi-Fi association with a default IPv4 gateway is locally usable.
+
+    Neither a remote host nor an SSH client is required. Match the route to
+    the actual associated Wi-Fi interface so Ethernet/VPN routes cannot
+    falsely suppress recovery of a disconnected hotspot.
     """
-    try:
-        result = subprocess.run(
-            ["ping", "-c", "1", "-W", str(DEFINITIVE_TEST_TIMEOUT_S), DEFINITIVE_TEST_HOST],
-            capture_output=True,
-            text=True,
-        )
-        return result.returncode == 0
-    except Exception as e:
-        logging.warning(f"[choosenet] connectivity test failed: {e}")
+    association = subprocess.run(
+        ["iwgetid"], capture_output=True, text=True,
+    )
+    if association.returncode != 0:
         return False
+
+    interface = association.stdout.split(maxsplit=1)[0]
+    route = subprocess.run(
+        ["ip", "-4", "route", "show", "default", "dev", interface],
+        capture_output=True, check=True, text=True,
+    )
+    return any(line.startswith("default via ") for line in route.stdout.splitlines())
 
 
 def run_choosenet() -> tuple[bool, str]:
@@ -102,17 +104,28 @@ def run() -> None:
     previous_ssid = get_ssid()
 
     while True:
-        # Step 1 — definitive test
-        if zpnet_definitive_test():
-            logging.info(
-                f"✅ ZPNet definitive test passed. SSID {previous_ssid} is healthy."
-            )
+        # Step 1 — a local Wi-Fi gateway is sufficient, Internet or not.
+        if wifi_gateway_available():
             previous_ssid = get_ssid()
+            logging.info(f"✅ Wi-Fi gateway available on SSID '{previous_ssid}'.")
+            time.sleep(CHOOSENET_RETRY_INTERVAL_S)
+            continue
+
+        # Allow association/DHCP transitions to settle before bouncing Wi-Fi.
+        logging.warning(
+            f"⚠️ No Wi-Fi default gateway on SSID '{previous_ssid}'; "
+            f"rechecking in {GATEWAY_CONFIRM_DELAY_S}s before recovery."
+        )
+        time.sleep(GATEWAY_CONFIRM_DELAY_S)
+        if wifi_gateway_available():
+            previous_ssid = get_ssid()
+            logging.info(f"✅ Wi-Fi gateway recovered on SSID '{previous_ssid}'.")
             time.sleep(CHOOSENET_RETRY_INTERVAL_S)
             continue
 
         logging.warning(
-            f"🚨 ZPNet definitive test FAILED for SSID {previous_ssid}. Attempting recovery..."
+            f"🚨 No usable Wi-Fi gateway for SSID '{previous_ssid}'. "
+            "Attempting network selection..."
         )
 
         # Step 2 — attempt healing
