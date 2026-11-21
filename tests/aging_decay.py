@@ -32,6 +32,7 @@ For Holdover, the critical output is:
 
 Usage:
     python -m zpnet.tests.aging_decay <campaign_name> [--servo-ok]
+    zt aging_decay Float1 --free-run-quadratic
     .zt aging_decay FreeRun1
     .zt aging_decay Shakeout10 --servo-ok
 
@@ -42,6 +43,9 @@ examining the residual drift the servo couldn't fully correct).
 
 from __future__ import annotations
 
+import argparse
+from collections import Counter
+from datetime import datetime
 import json
 import math
 import sys
@@ -498,6 +502,167 @@ def detect_phases(ts: List[float], ys: List[float],
 # Main analysis
 # ─────────────────────────────────────────────────────────────────────
 
+def free_run_rows(campaign):
+    # Bound the work before expanding JSON. Each page releases its read-only
+    # transaction, and the startup watermark fixes the end of an active run.
+    with open_db(row_dict=True) as db:
+        db.execute("SET TRANSACTION READ ONLY")
+        bounds = db.execute(
+            "SELECT min(id) AS first, max(id) AS last FROM campaign_detail "
+            "WHERE campaign_type = %s AND campaign = %s", (CAMPAIGN_TYPE, campaign)
+        ).fetchone()
+    if bounds["first"] is None:
+        raise SystemExit(f"No TEMPEST rows for {campaign}")
+    first, last = bounds["first"], bounds["last"]
+    print(f"Reading {campaign} through detail {last} (read only).", flush=True)
+    for start in range(first, last + 1, 512):
+        with open_db(row_dict=True) as db:
+            db.execute("SET TRANSACTION READ ONLY")
+            rows = db.execute(
+                """
+                WITH parts AS MATERIALIZED (
+                    SELECT id, viable, payload -> 'campaign' AS camp,
+                           payload #> '{clocks,control}' AS ctrl,
+                           payload #>> '{clocks,stats,reset_count}' AS epoch,
+                           payload #>> '{clocks,gnss_time_utc}' AS utc
+                    FROM campaign_detail
+                    WHERE campaign_type = %s AND campaign = %s AND id BETWEEN %s AND %s
+                      AND payload ->> 'schema' = 'CLOCKS_V4'
+                      AND payload -> 'holistic_restore_superseded' IS DISTINCT FROM 'true'::jsonb
+                )
+                SELECT id, utc, epoch, (camp ->> 'public_count')::bigint AS pps,
+                       viable AND (camp #>> '{status,timeline_valid}')::boolean
+                           AND (camp #>> '{disposition,science_eligible}')::boolean AS science,
+                       (camp #>> '{clockfaces,gnss_ns}')::bigint AS gnss,
+                       (camp #>> '{clockfaces,ocxo1_ns}')::bigint AS o1,
+                       (camp #>> '{clockfaces,ocxo2_ns}')::bigint AS o2,
+                       ctrl ->> 'servo_mode' AS mode,
+                       (ctrl ->> 'dither_operator_enabled')::boolean AS dither,
+                       ctrl #>> '{ocxo1,target_code}' AS target1,
+                       ctrl #>> '{ocxo2,target_code}' AS target2
+                FROM parts WHERE camp ->> 'schema' = 'TEMPEST_FRAGMENT_V1' ORDER BY id
+                """, (CAMPAIGN_TYPE, campaign, start, min(start + 511, last)),
+            ).fetchall()
+        yield from rows
+
+
+def free_run_blocks(rows):
+    # An observed target/epoch change starts a new experiment. Dither changes
+    # the hardware code within a second, so compare its fractional target.
+    segments = []
+    counts = Counter()
+    segment = previous = first = None
+    ns = 1_000_000_000
+    for row in rows:
+        counts["rows"] += 1
+        identity = (row["epoch"], row["target1"], row["target2"])
+        eligible = (row["mode"] == "OFF" and row["dither"] is True
+                    and None not in identity and row["pps"] is not None)
+        if not eligible:
+            counts["outside_or_unknown_controls"] += 1
+            segment = first = None
+            previous = row
+            continue
+
+        step = (row["pps"] - previous["pps"] if previous and previous["pps"] is not None
+                else None)
+        discontinuity = (
+            previous is not None and step is not None and step > 0
+            and row["science"] and previous["science"]
+            and all(row[k] is not None and previous[k] is not None for k in ("gnss", "o1", "o2"))
+            and (row["gnss"] - previous["gnss"] != step * ns
+                 or row["o1"] <= previous["o1"] or row["o2"] <= previous["o2"])
+        )
+        if discontinuity:
+            counts["clock_discontinuities"] += 1
+        if (segment is None or segment["identity"] != identity or step is None
+                or step <= 0 or discontinuity):
+            release = (step == 1 and previous["mode"] in ("10-MIN", "TOTAL", "CAMP")
+                       and previous["epoch"] == row["epoch"])
+            segment = dict(anchor=row, identity=identity, blocks=[], last_pps=row["pps"],
+                           gaps=0, release=release)
+            segments.append(segment)
+            first = None
+        elif step != 1:
+            # Preserve elapsed PPS time across a hole, but never measure across it.
+            segment["gaps"] += 1
+            first = None
+        segment["last_pps"] = row["pps"]
+        if not row["science"] or any(row[k] is None for k in ("gnss", "o1", "o2")):
+            counts["unusable_endpoints"] += 1
+            first = None
+        else:
+            if first is None:
+                first = row
+            elif row["pps"] - first["pps"] == 60:
+                elapsed = row["gnss"] - first["gnss"]
+                midpoint_h = (first["pps"] + 30 - segment["anchor"]["pps"]) / 3600
+                rates = [compute_ppb(row[k] - first[k], elapsed) for k in ("o1", "o2")]
+                segment["blocks"].append((midpoint_h, *rates))
+                first = row
+        previous = row
+    return segments, counts
+
+
+def free_run_fit(times, rates):
+    # Center and scale before using the existing least-squares solver. Return
+    # coefficients in hours from the run anchor, including the tiny correction
+    # for observing a 60-second average of a quadratic, centered on its midpoint.
+    center = (times[0] + times[-1]) / 2
+    scale = (times[-1] - times[0]) / 2
+    a, b, c = fit_quadratic([(t - center) / scale for t in times], rates)
+    a, b = a / scale**2, b / scale
+    return a, b - 2*a*center, c - b*center + a*(center**2 - (1/60)**2/12)
+
+
+def free_run_report(campaign, release_utc=None):
+    segments, counts = free_run_blocks(free_run_rows(campaign))
+    print("Recorded endpoints:", dict(counts))
+    if not segments:
+        raise SystemExit("No servo-OFF, dither-enabled interval with recorded DAC targets.")
+    run = max(segments, key=lambda s: len(s["blocks"]))
+    blocks = run["blocks"]
+    anchor = run["anchor"]
+    print(f"Using run with most complete minutes among {len(segments)} control segments.")
+    print(f"Segment begins at PPS {anchor['pps']}, detail {anchor['id']}, GNSS UTC {anchor['utc']}; "
+          + ("first OFF sample following active servo." if run["release"] else
+             "first observed sample in this segment; physical release time unconfirmed."))
+    print(f"Through PPS {run['last_pps']}; fixed DAC targets {anchor['target1']}, "
+          f"{anchor['target2']}; {len(blocks)} nonoverlapping 60-s rates from "
+          f"{(run['last_pps']-anchor['pps'])/3600:.3f} h; PPS gaps {run['gaps']}.")
+    if run["gaps"]:
+        print("Rates exclude gaps. Continued control settings inside gaps are assumed.")
+    if len(blocks) < 5:
+        raise SystemExit("Need five complete minutes in one control segment for a fit and holdout.")
+    offset = 0.0
+    if release_utc is not None:
+        if not anchor["utc"]:
+            raise SystemExit("A recorded GNSS UTC anchor is required for --release-utc.")
+        start = datetime.fromisoformat(anchor["utc"].replace("Z", "+00:00"))
+        offset = (start - release_utc).total_seconds() / 3600
+        if offset < 0 or (run["release"] and offset > 1 / 3600):
+            raise SystemExit("Supplied release time disagrees with the selected segment.")
+        print(f"t=0 at operator-supplied release {release_utc.isoformat()}.")
+    else:
+        print("t=0 at the first recorded PPS of the selected segment.")
+    times = [offset + block[0] for block in blocks]
+    cut = len(times) * 4 // 5
+    print(f"Fit range {times[0]-1/120:.5f}..{times[-1]+1/120:.5f} h. "
+          f"Holdout uses the final {len(times)-cut} minutes after training on {cut}.")
+    for col, lane in enumerate(("OCXO1", "OCXO2"), 1):
+        ys = [block[col] for block in blocks]
+        a, b, c = free_run_fit(times, ys)
+        print(f"{lane} frequency error (ppb) = {a:+.12g}*t^2 {b:+.12g}*t {c:+.12g}")
+        print("  t in hours from t=0 above; coefficients use all accepted minutes.")
+        aq, bq, cq = free_run_fit(times[:cut], ys[:cut])
+        bl, cl = fit_linear(times[:cut], ys[:cut])
+        for model, aa, bb, cc in (("quadratic", aq, bq, cq), ("linear", 0, bl, cl)):
+            errors = [y - (aa*(t*t + (1/60)**2/12) + bb*t + cc)
+                      for t, y in zip(times[cut:], ys[cut:])]
+            print(f"  {model:<9} holdout RMS {math.sqrt(sum(e*e for e in errors)/len(errors)):.6f}"
+                  f" ppb; mean observed minus predicted {sum(errors)/len(errors):+.6f} ppb")
+
+
 def analyze(campaign: str, servo_ok: bool = False) -> None:
     rows = fetch_timebase(campaign)
 
@@ -816,7 +981,7 @@ def list_campaigns() -> None:
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: aging_decay <campaign_name> [--servo-ok]")
+        print("Usage: aging_decay <campaign_name> [--servo-ok | --free-run-quadratic]")
         print()
         print("  Analyzes OCXO frequency drift over time to characterize")
         print("  natural aging behavior for Holdover prediction.")
@@ -827,6 +992,21 @@ def main():
         sys.exit(1)
 
     campaign = sys.argv[1]
+    if "--free-run-quadratic" in sys.argv[2:]:
+        parser = argparse.ArgumentParser(description="Fit servo-OFF, dither-on OCXO frequency errors.")
+        parser.add_argument("--free-run-quadratic", action="store_true")
+        parser.add_argument("--release-utc", help="known physical release time, e.g. 2026-11-20T02:00:00Z")
+        options = parser.parse_args(sys.argv[2:])
+        release = None
+        if options.release_utc:
+            try:
+                release = datetime.fromisoformat(options.release_utc.replace("Z", "+00:00"))
+            except ValueError:
+                parser.error("--release-utc requires an ISO 8601 timestamp")
+            if release.utcoffset() is None:
+                parser.error("--release-utc requires Z or a UTC offset")
+        free_run_report(campaign, release)
+        return
     servo_ok = "--servo-ok" in sys.argv
     analyze(campaign, servo_ok=servo_ok)
 
