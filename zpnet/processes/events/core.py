@@ -65,6 +65,9 @@ from zpnet.shared.logger import setup_logging
 DESPOOL_BATCH_SIZE = 50          # records per HTTP POST
 DESPOOL_INTERVAL_S = 5.0         # polling interval when server is reachable
 DESPOOL_BACKOFF_S = 60.0         # polling interval when server is unreachable
+# Field operations: retain all local records without attempting remote REST uploads.
+# Flip to True to resume the existing events and campaign-detail despoolers.
+REMOTE_DESPOOL_ENABLED = False
 # SYSTEM inserts the generalized state row and a campaign owner may decorate that
 # same row shortly afterward.  Egress waits beyond the bounded local attachment
 # interval so the server receives the settled snapshot rather than its transient
@@ -381,8 +384,8 @@ def run() -> None:
 
     Execution contexts:
       • Pub/Sub handler via server_setup (EVENTS topic)
-      • Events despooler loop thread
-      • Campaign-detail despooler loop thread
+      • Events despooler loop thread (optional remote egress)
+      • Campaign-detail despooler loop thread (optional remote egress)
     """
     setup_logging()
 
@@ -397,23 +400,23 @@ def run() -> None:
             blocking=False,
         )
 
-        # --------------------------------------------------------------
-        # Start events despooler thread (independent fault barrier)
-        # --------------------------------------------------------------
-        threading.Thread(
-            target=events_despooler_loop,
-            daemon=True,
-            name="events-despooler",
-        ).start()
-
-        # --------------------------------------------------------------
-        # Start campaign-detail despooler thread (independent fault barrier)
-        # --------------------------------------------------------------
-        threading.Thread(
-            target=campaign_detail_despooler_loop,
-            daemon=True,
-            name="campaign-detail-despooler",
-        ).start()
+        if REMOTE_DESPOOL_ENABLED:
+            # Restore both independent outbound workers when desired.
+            threading.Thread(
+                target=events_despooler_loop,
+                daemon=True,
+                name="events-despooler",
+            ).start()
+            threading.Thread(
+                target=campaign_detail_despooler_loop,
+                daemon=True,
+                name="campaign-detail-despooler",
+            ).start()
+        else:
+            logging.info(
+                "[events] remote REST despooling paused; "
+                "local ingress and PostgreSQL persistence remain active"
+            )
 
         logging.info("🏁 [events] entering main loop")
         while True:
