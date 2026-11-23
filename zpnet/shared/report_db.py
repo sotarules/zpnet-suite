@@ -56,7 +56,7 @@ def _read(sql, params, *, session=None, fast=False):
         return db.execute(sql, params).fetchall()
 
 
-def campaign_rows(campaign, projection, args, *, descending=False, limit=None):
+def campaign_rows(campaign, projection, args, *, descending=False, limit=None, include_laser_dac=False):
     """Yield projected rows; projection is trusted report SQL, never user input.
 
     Schema filtering follows the bounded page, so LIMIT bounds payload reads
@@ -65,6 +65,7 @@ def campaign_rows(campaign, projection, args, *, descending=False, limit=None):
     """
     from zpnet.shared.db import DatabaseWorkerSession
 
+    dac_column = ", laser_dac jsonb" if include_laser_dac else ""
     scan_started = time.monotonic()
     read_seconds = sleep_seconds = last_read_seconds = 0.0
     queries = scanned = matched = 0
@@ -143,7 +144,7 @@ def campaign_rows(campaign, projection, args, *, descending=False, limit=None):
                         schema jsonb, sequence jsonb, published_at_utc jsonb,
                         temperature jsonb, environment jsonb, receiver jsonb,
                         normalization jsonb, measurement jsonb, recovery_receipt jsonb,
-                        photons jsonb)
+                        photons jsonb{dac_column})
                 ) ''' + projection + f' FROM unpacked ORDER BY id {direction}'
                 batch = read(sql, values)
                 delay = max(args.batch_pause, args.read_backoff * last_read_seconds)

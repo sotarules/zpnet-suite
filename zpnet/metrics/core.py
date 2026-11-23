@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from zpnet.shared.logger import setup_logging
-from zpnet.metrics.readout_blocks import READOUTS, status_header
+from zpnet.metrics.readout_blocks import READOUTS, RtdTemperatureWarning, status_header
 
 # ---------------------------------------------------------------------
 # Configuration
@@ -118,6 +118,8 @@ def _main(stdscr: curses.window) -> None:
     curses.init_pair(1, curses.COLOR_GREEN, -1)
     curses.init_pair(2, curses.COLOR_WHITE, -1)
 
+    curses.init_pair(3, curses.COLOR_YELLOW, -1)
+    COLOR_WARNING = curses.color_pair(3)
     COLOR_NORMAL = curses.color_pair(1)
     COLOR_HEADER = curses.color_pair(2) | curses.A_BOLD
 
@@ -244,6 +246,9 @@ def _main(stdscr: curses.window) -> None:
             text = line[:max_x - 1]
             try:
                 stdscr.addstr(row, 0, text, COLOR_NORMAL)
+                if isinstance(line, RtdTemperatureWarning) and len(text) > line.now_start:
+                    width = min(len(text), line.now_end) - line.now_start
+                    stdscr.chgat(row, line.now_start, width, COLOR_WARNING)
             except curses.error:
                 pass
 

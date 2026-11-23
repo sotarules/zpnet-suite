@@ -68,7 +68,7 @@ from fractions import Fraction
 from zpnet.processes.processes import PUBSUB_TAP_SOCKET, create_pubsub_cache, send_command
 from zpnet.shared.db import open_db
 from zpnet.shared.photons_voltage import (
-    QUADRATIC_MODELS, VOLTAGE_MODELS, voltage_adjustment, voltage_local_slope, voltage_window, voltage_window_spec,
+    QUADRATIC_MODELS, VOLTAGE_MODELS, voltage_adjustment, voltage_window, voltage_window_spec,
 )
 
 # AD5693R doctrine mirrors Pi CLOCKS, the sole actuator authority:
@@ -457,6 +457,42 @@ def _gnss_status(r: dict | None = None, snapshot: dict | None = None) -> dict:
 
     g["lock_quality"] = _derive_gnss_lock_quality(g)
     return g
+
+
+def _altitude_text(altitude_m) -> str:
+    if altitude_m is None:
+        return "---"
+    meters = float(altitude_m)
+    return f"{meters:.1f} m ({meters / 0.3048:.1f} ft)"
+
+
+def _gnss_status_line(snapshot: dict) -> str:
+    gnss = _gnss_status(snapshot.get("clocks"), snapshot)
+    freq_mode_name = gnss.get("freq_mode_name") or "?"
+    pos_mode = gnss.get("pos_mode") or "?"
+    traim = gnss.get("traim") or "?"
+    sats = gnss.get("satellites") if gnss.get("satellites") is not None else "?"
+    hdop = gnss.get("hdop")
+    hdop_str = f"{float(hdop):.2f}" if hdop is not None else "---"
+    lat = gnss.get("latitude_deg")
+    lon = gnss.get("longitude_deg")
+    alt_gnss = gnss.get("altitude_m")
+    gnss_line = (
+        f"GNSS  MODE: {pos_mode}"
+        f"  DISC: {freq_mode_name}"
+        f"  SATS: {sats}"
+        f"  HDOP: {hdop_str}"
+        f"  TRAIM: {traim}"
+    )
+    pos_parts = []
+    if lat is not None and lon is not None:
+        pos_parts.append(f"LAT: {float(lat):.6f}")
+        pos_parts.append(f"LON: {float(lon):.6f}")
+    if alt_gnss is not None:
+        pos_parts.append("ALT: " + _altitude_text(alt_gnss))
+    if pos_parts:
+        gnss_line += "  " + "  ".join(pos_parts)
+    return gnss_line
 
 
 # ---------------------------------------------------------------------
@@ -1201,6 +1237,12 @@ def environment_sensor_block(snapshot: dict) -> list[str]:
     return lines
 
 
+class RtdTemperatureWarning(str):
+    """Temperature row whose NOW field needs the advisory color."""
+    now_start = 9  # Eight-character sensor label plus separator
+    now_end = now_start + PHOTONS_MEAN_WIDTH
+
+
 def photons_temperature_block(snapshot: dict) -> list[str]:
     """Align temperatures, voltage (mV), and ADJ (ns) with the mean columns.
 
@@ -1257,6 +1299,10 @@ def photons_temperature_block(snapshot: dict) -> list[str]:
                + " " + mean(totals.get(key))
                + ((" " + mean(population) + " " + observed(population.get("sd_c"), 5, 10))
                   if has_campaign else ""))
+        if key == "rtd" and reading.get("status") == "OK":
+            temp = _to_float(reading.get("temperature_c"))
+            if temp is not None and math.isfinite(temp) and not 25.0 <= temp <= 31.0:
+                row = RtdTemperatureWarning(row)
         lines.append(row)
 
     # Display the active model's voltage population; retain HIGH60 in telemetry.
@@ -1888,38 +1934,7 @@ def clocks_combined_readout() -> list[str]:
     except Exception:
         snapshot = {}
 
-    gnss = _gnss_status(r, snapshot)
-    freq_mode_name = gnss.get("freq_mode_name") or "?"
-    pos_mode = gnss.get("pos_mode") or "?"
-    traim = gnss.get("traim") or "?"
-    sats = gnss.get("satellites") if gnss.get("satellites") is not None else "?"
-    hdop = gnss.get("hdop")
-    hdop_str = f"{float(hdop):.2f}" if hdop is not None else "---"
-    lat = gnss.get("latitude_deg")
-    lon = gnss.get("longitude_deg")
-    alt_gnss = gnss.get("altitude_m")
-    ellipsoid = gnss.get("ellipsoid_height_m")
-    geoid = gnss.get("geoid_sep_m")
-    gnss_line = (
-        f"GNSS  MODE: {pos_mode}"
-        f"  DISC: {freq_mode_name}"
-        f"  SATS: {sats}"
-        f"  HDOP: {hdop_str}"
-        f"  TRAIM: {traim}"
-    )
-    pos_parts = []
-    if lat is not None and lon is not None:
-        pos_parts.append(f"LAT: {float(lat):.6f}")
-        pos_parts.append(f"LON: {float(lon):.6f}")
-    if alt_gnss is not None:
-        pos_parts.append(f"ALT(MSL): {float(alt_gnss):.1f}m")
-    if ellipsoid is not None:
-        pos_parts.append(f"ELLIP: {float(ellipsoid):.1f}m")
-    if geoid is not None:
-        pos_parts.append(f"GEOID: {float(geoid):.1f}m")
-    if pos_parts:
-        gnss_line += "  " + "  ".join(pos_parts)
-    lines.append(gnss_line)
+    lines.append(_gnss_status_line(snapshot))
     lines.append("")
 
     # Both instrument readouts share the same physical sensor presentation.
@@ -2382,7 +2397,7 @@ def _get_photons_rolling_payloads() -> list[dict]:
 def _photons_rolling_rows(payloads: list[dict]) -> list[dict]:
     """Expose each second's raw mean and firmware voltage correction verbatim.
 
-    FACT is the local derivative d(ADJ)/d(voltage) in ns/mV; ADJ is the signed offset added to RAW.
+    ADJ is the signed offset added to RAW.
     Metrics checks that testimony but never applies a second correction.
     """
     # A retained UI tail can straddle a firmware/model restart. Show only the
@@ -2411,8 +2426,6 @@ def _photons_rolling_rows(payloads: list[dict]) -> list[dict]:
         published = normalization["published_flight_ns"]
         if raw["n"] != n or published != current["photons"]["race"]["flight_ns"]:
             raise ValueError("PHOTONS rolling raw/normalized populations disagree")
-        factor = (voltage_local_slope(normalization, normalization["high_mv"])
-                  if high_mv is not None else None)
         reference = float(normalization["reference_mv"])
         adjustment = float(normalization["adjustment_ns"])
         if not all(math.isfinite(v) for v in (reference, adjustment)):
@@ -2442,7 +2455,7 @@ def _photons_rolling_rows(payloads: list[dict]) -> list[dict]:
             "second": seconds,
             "raw_mean": float(raw["mean"]) if n > 0 else None,
             "normalized_mean": stats["mean"] if n > 0 else None,
-            "factor": factor,
+            "altitude_m": (current.get("gnss") or {}).get("altitude_m"),
             "adjustment_ns": adjustment if n > 0 else None,
             "high_mv": high_mv,
             "voltage_label": voltage_lane.upper(),
@@ -2556,9 +2569,10 @@ def _photons_stability_lines(payload: dict) -> list[str]:
 
 def photons_detail_readout() -> list[str]:
     """Show selected population means/scatter above individual cadence cells."""
+    gnss_line = _gnss_status_line(_get_system_snapshot())
     payloads = _get_photons_rolling_payloads()
     if not payloads:
-        return ["PHOTONS: FEED UNAVAILABLE"]
+        return ["PHOTONS: FEED UNAVAILABLE", gnss_line]
     live = payloads[-1]
     _, _, recoverable = _PHOTONS_READ_MODEL.get()
     campaign = live.get("campaign") or {}
@@ -2583,10 +2597,10 @@ def photons_detail_readout() -> list[str]:
     lines = [line]
     lines.extend(["", _photons_summary_header(bool(campaign)),
                   _photons_summary_line(summary, bool(campaign), summary["mean"]),
-                  "", *photons_temperature_block(live), "",
+                  "", *photons_temperature_block(live), "", gnss_line, "",
                   f"{'SEC':<8} {'LAP':>{PHOTONS_MEAN_WIDTH}} {'LOW':>9} {'HIGH':>9} "
                   f"{'PD N/WIN':>10} {voltage_lane.upper():>9} "
-                  f" {'TARGET mV':>10} {'DAC V':>10} {'FACT':>14} {'ADJ':>12}"])
+                  f" {'TARGET mV':>10} {'DAC V':>10} {'ADJ':>12}  ALT"])
     for row in _photons_rolling_rows(payloads):
         lines.append(
             _fmt(row["second"], 'd', 0).ljust(8)
@@ -2598,8 +2612,8 @@ def photons_detail_readout() -> list[str]:
             + ("*" if row["high_warming"] else " ")
             + " " + _fmt(row["target_mv"], '>10.3f', 10)
             + " " + _fmt(row["dac_v"], '>10.6f', 10)
-            + " " + _fmt(row["factor"], '>14.12f', 14)
-            + " " + _fmt(row["adjustment_ns"], '>+12.6f', 12))
+            + " " + _fmt(row["adjustment_ns"], '>+12.6f', 12)
+            + "  " + _altitude_text(row["altitude_m"]))
     return lines
 
 
