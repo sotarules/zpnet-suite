@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<title>ZPNet STATS</title>
+<style>
+  @font-face {
+    font-family: "IBM 3270";
+    src: url("/3270.ttf") format("truetype");
+    font-display: block;
+  }
+  :root {
+    color-scheme: dark;
+    background: #000;
+    color: #00ff00;
+    font: 16px "IBM 3270", monospace;
+  }
+  body { margin: 0; }
+  main {
+    max-width: 28rem;
+    margin: auto;
+    padding: max(0.75rem, env(safe-area-inset-top)) 1rem
+             max(0.75rem, env(safe-area-inset-bottom));
+  }
+  dl { margin: 0; padding: 0.5rem 0; }
+  dl + dl { border-top: 1px solid #285428; }
+  .row {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 0.5rem;
+    padding: clamp(0.25rem, 0.9vh, 0.6rem) 0;
+  }
+  dt { font-size: clamp(0.86rem, 4vw, 1.05rem); }
+  dd {
+    margin: 0;
+    text-align: right;
+    white-space: nowrap;
+    font-size: clamp(1.3rem, 6.3vw, 1.8rem);
+  }
+  .unit { font-size: 0.8rem; }
+  .lap .row { display: block; }
+  .lap dd { font-size: clamp(1.7rem, 8.5vw, 2.85rem); }
+  #status { margin: 0.375rem 0 0; min-height: 1.2em; color: #ffdc67; }
+</style>
+<main>
+  <dl>
+    <div class="row"><dt>SYSTEM TIME</dt><dd><span id="system_time">---</span> <span class="unit">UTC</span></dd></div>
+    <div class="row"><dt>ALT · GNSS</dt><dd><span id="altitude">---</span> <span class="unit">m</span></dd></div>
+  </dl>
+  <dl>
+    <div class="row"><dt>MAX31865</dt><dd><span id="max31865">---</span> <span class="unit">°C</span></dd></div>
+    <div class="row"><dt>BME PD</dt><dd><span id="bme_pd">---</span> <span class="unit">°C</span></dd></div>
+    <div class="row"><dt>BME OUT</dt><dd><span id="bme_out">---</span> <span class="unit">°C</span></dd></div>
+  </dl>
+  <dl class="lap">
+    <div class="row"><dt>PHOTON LAP · 1 SECOND</dt><dd><span id="lap">---</span> <span class="unit">ns</span></dd></div>
+  </dl>
+  <dl>
+    <div class="row"><dt>OCXO1 · 10 MIN</dt><dd><span id="ocxo1">---</span> <span class="unit">ppb</span></dd></div>
+    <div class="row"><dt>OCXO2 · 10 MIN</dt><dd><span id="ocxo2">---</span> <span class="unit">ppb</span></dd></div>
+  </dl>
+  <p id="status" role="status">CONNECTING TO ZPNET</p>
+</main>
+<script>
+  const fields = ["system_time", "altitude", "max31865", "bme_pd",
+                  "bme_out", "lap", "ocxo1", "ocxo2"];
+  const statusLine = document.getElementById("status");
+
+  function render(stats, message) {
+    for (const name of fields) {
+      document.getElementById(name).textContent = stats[name] ?? "---";
+    }
+    statusLine.textContent = message;
+  }
+
+  async function refresh() {
+    const request = new AbortController();
+    const timeout = setTimeout(() => request.abort(), 2500);
+    try {
+      const response = await fetch("/stats.json", {signal: request.signal, cache: "no-store"});
+      if (!response.ok) throw new Error("STATS request failed");
+      const stats = await response.json();
+      const stale = [];
+      if (!stats.clocks_live) stale.push("CLOCKS");
+      if (!stats.photons_live) stale.push("PHOTONS");
+      render(stats, stale.length ? stale.join(" + ") + " FEED UNAVAILABLE" : "");
+    } catch {
+      render({}, "ZPNET CONNECTION LOST");
+    } finally {
+      clearTimeout(timeout);
+      setTimeout(refresh, 1000);
+    }
+  }
+
+  refresh();
+</script>
+</html>
