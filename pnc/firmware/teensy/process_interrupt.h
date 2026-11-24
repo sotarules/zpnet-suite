@@ -72,6 +72,16 @@ enum class interrupt_subscriber_kind_t : uint8_t {
   PHOTODIODE,
 };
 
+struct interrupt_ocxo_overlap_snapshot_t {
+  uint32_t capture_depth;
+  uint32_t front_capture_isr_dwt;
+  uint32_t dispatch_depth;
+  uint32_t front_dispatch_edge_dwt;
+};
+
+interrupt_ocxo_overlap_snapshot_t interrupt_ocxo_overlap_snapshot(
+    interrupt_subscriber_kind_t lane);
+
 enum class interrupt_provider_kind_t : uint8_t {
   NONE = 0,
   QTIMER1,

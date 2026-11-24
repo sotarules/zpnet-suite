@@ -8263,9 +8263,8 @@ static bool clocks_watchdog_surrender_now(const char* reason,
   watchdog_campaign_surrendered = true;
   watchdog_campaign_publication_armed = false;
   watchdog_anomaly_active = true;
-  watchdog_anomaly_publish_pending = publish_pending && first;
-
   if (first) {
+    watchdog_anomaly_publish_pending = publish_pending;
     clocks_fragment_watchdog_reset_publication_custody();
   }
 
@@ -8292,6 +8291,7 @@ static void clocks_watchdog_anomaly_callback(timepop_ctx_t*, timepop_diag_t*, vo
   p.add("detail2",          watchdog_anomaly_detail2);
   p.add("detail3",          watchdog_anomaly_detail3);
 
+  clocks_alpha_append_overlap_report(p);
   watchdog_anomaly_legacy_publish_count++;
   publish("WATCHDOG_ANOMALY", p);
 
@@ -10570,6 +10570,7 @@ static FLASHMEM Payload cmd_report_watchdog(const Payload&) {
   p.add("last_detail2", (uint32_t)watchdog_anomaly_detail2);
   p.add("last_detail3", (uint32_t)watchdog_anomaly_detail3);
   p.add("last_trigger_dwt", (uint32_t)watchdog_anomaly_trigger_dwt);
+  clocks_alpha_append_overlap_report(p);
   p.add("publish_pending", (bool)watchdog_anomaly_publish_pending);
   p.add("surrender_count", (uint32_t)watchdog_campaign_surrender_count);
   p.add("verbose_publish_count", (uint32_t)watchdog_anomaly_verbose_publish_count);

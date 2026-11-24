@@ -4502,6 +4502,14 @@ def _timebase_silence_producer_progress_court(
             expected_campaign or "NONE",
             candidate_delta, public_delta, first, second,
         )
+    if first["watchdog_anomaly_active"] or second["watchdog_anomaly_active"]:
+        try:
+            report = send_command(machine="TEENSY", subsystem="CLOCKS",
+                                  command="REPORT_WATCHDOG", retries=1, retry_delay_s=0.0)
+            result["watchdog_report"] = report
+            logging.warning("[clocks/silence] REPORT_WATCHDOG for %s: %s", expected_campaign, report)
+        except Exception:
+            logging.exception("[clocks/silence] REPORT_WATCHDOG failed for %s", expected_campaign)
     _diag["last_timebase_silence_producer_progress"] = copy.deepcopy(result)
     return result
 
@@ -13433,7 +13441,10 @@ def _exact_active_tempest_restore_boundary(
         return None  # A zero-row Flash Cut retains its existing separate court.
     alpha_id = _as_int(alpha_detail.get("_db_detail_id"))
     if alpha_id is None or detail_id <= alpha_id:
-        raise RuntimeError("active TEMPEST boundary does not follow the Alpha checkpoint")
+        raise RuntimeError(
+            f"active TEMPEST boundary does not follow the Alpha checkpoint "
+            f"(campaign={name}, last_detail_id={detail_id}, alpha_detail_id={alpha_id})"
+        )
 
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()

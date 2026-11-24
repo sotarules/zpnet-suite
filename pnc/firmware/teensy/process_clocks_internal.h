@@ -1834,6 +1834,8 @@ extern volatile bool     watchdog_anomaly_active;
 extern volatile bool     watchdog_anomaly_publish_pending;
 extern volatile uint32_t watchdog_anomaly_sequence;
 extern char              watchdog_anomaly_reason[64];
+bool clocks_watchdog_campaign_armed(void);
+void clocks_alpha_append_overlap_report(Payload& p);
 extern volatile uint32_t watchdog_anomaly_detail0;
 extern volatile uint32_t watchdog_anomaly_detail1;
 extern volatile uint32_t watchdog_anomaly_detail2;

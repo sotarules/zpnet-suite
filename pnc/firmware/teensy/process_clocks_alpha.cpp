@@ -3090,6 +3090,26 @@ static void alpha_counterledger_phase_pending_clear(
   alpha_counterledger_phase_pending_refresh(s);
 }
 
+static struct {
+  uint32_t pending_dwt;
+  uint32_t edge_pair_updates;
+  uint32_t left_dwt;
+  uint32_t right_dwt;
+  interrupt_ocxo_overlap_snapshot_t queues;
+} first_overlap;
+
+void clocks_alpha_append_overlap_report(Payload& p) {
+  if (strcmp(watchdog_anomaly_reason, "alpha_phaseledger_pending_overlap") != 0) return;
+  p.add("pending_vclock_dwt", first_overlap.pending_dwt);
+  p.add("edge_pair_updates", first_overlap.edge_pair_updates);
+  p.add("last_left_edge_dwt", first_overlap.left_dwt);
+  p.add("last_right_edge_dwt", first_overlap.right_dwt);
+  p.add("ocxo_capture_depth", first_overlap.queues.capture_depth);
+  p.add("front_capture_isr_dwt", first_overlap.queues.front_capture_isr_dwt);
+  p.add("ocxo_dispatch_depth", first_overlap.queues.dispatch_depth);
+  p.add("front_dispatch_edge_dwt", first_overlap.queues.front_dispatch_edge_dwt);
+}
+
 static void alpha_counterledger_phase_pending_enqueue(
     time_clock_id_t clock,
     alpha_pps_counterledger_lane_t& s,
@@ -3115,6 +3135,13 @@ static void alpha_counterledger_phase_pending_enqueue(
     // grow a queue or silently overwrite custody.
     const uint32_t prior_sequence = s.pending_phase_pps_sequence;
     s.phase_pending_overflow_count++;
+    if (clocks_watchdog_campaign_armed()) {
+      const auto lane = clock == time_clock_id_t::OCXO1
+          ? interrupt_subscriber_kind_t::OCXO1 : interrupt_subscriber_kind_t::OCXO2;
+      first_overlap = {s.pending_phase_pps_dwt_at_edge, s.phase_last_edge_pair_update_count,
+                       s.phase_last_edge_pair_previous_dwt, s.phase_last_edge_pair_next_dwt,
+                       interrupt_ocxo_overlap_snapshot(lane)};
+    }
     clocks_watchdog_anomaly(
         "alpha_phaseledger_pending_overlap",
         (uint32_t)((uint8_t)clock),

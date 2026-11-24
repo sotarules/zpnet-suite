@@ -4748,6 +4748,31 @@ static bool timepop_foreground_mailbox_take(
   return true;
 }
 
+interrupt_ocxo_overlap_snapshot_t interrupt_ocxo_overlap_snapshot(
+    interrupt_subscriber_kind_t lane) {
+  const bool first = lane == interrupt_subscriber_kind_t::OCXO1;
+  const auto& ring = first ? g_ocxo1_capture_ring : g_ocxo2_capture_ring;
+  const auto& rt = g_subscribers[first ? INTERRUPT_SUBSCRIBER_INDEX_OCXO1
+                                       : INTERRUPT_SUBSCRIBER_INDEX_OCXO2];
+  interrupt_ocxo_overlap_snapshot_t out{};
+  const uint32_t prior = interrupt_priority0_guard_enter();
+  out.capture_depth = capture_ring_pending(ring);
+  if (out.capture_depth) {
+    dmb_barrier();
+    out.front_capture_isr_dwt =
+        ring.items[ring.tail % HANDOFF_OCXO_RING_SIZE].isr_entry_dwt_raw;
+  }
+  out.dispatch_depth = interrupt_dispatch_queue_depth(rt);
+  if (out.dispatch_depth) {
+    const auto& q = rt.dispatch_queue;
+    out.front_dispatch_edge_dwt =
+        q.values[q.read_sequence % INTERRUPT_SUBSCRIBER_DISPATCH_QUEUE_CAPACITY]
+            .event.dwt_at_event;
+  }
+  interrupt_priority0_guard_exit(prior);
+  return out;
+}
+
 static bool handoff_any_pending(void) {
   return capture_ring_pending(g_vclock_capture_ring) != 0U ||
          capture_ring_pending(g_ch2_capture_ring) != 0U ||
