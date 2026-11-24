@@ -1301,7 +1301,7 @@ def photons_temperature_block(snapshot: dict) -> list[str]:
                   if has_campaign else ""))
         if key == "rtd" and reading.get("status") == "OK":
             temp = _to_float(reading.get("temperature_c"))
-            if temp is not None and math.isfinite(temp) and not 25.0 <= temp <= 31.0:
+            if temp is not None and math.isfinite(temp) and (temp < 25.0 or temp >= 34.0):
                 row = RtdTemperatureWarning(row)
         lines.append(row)
 

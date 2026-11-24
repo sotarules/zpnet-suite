@@ -4952,7 +4952,8 @@ def _hard_fault(reason: str, details: Dict[str, Any]) -> None:
         global _auto_recovery_in_progress
         try:
             logging.info("🔄 [clocks] @%s auto-recovery starting...", system_time_z())
-            _restore_active_campaign_state()
+            recovery = _restore_active_campaign_state()
+            _require_recovery_custody_released(source="HARD_FAULT", recovery=recovery)
             logging.info("✅ [clocks] @%s auto-recovery complete", system_time_z())
         except Exception:
             logging.exception("💥 [clocks] auto-recovery FAILED — campaign deactivated")
@@ -17088,6 +17089,7 @@ def _hard_failure_stats_repair_worker(
                 state_name == OPERATIONAL_STATE_RUNNING
                 and startup_ready
                 and not _hard_failure_active()
+                and not _recovery_custody_snapshot()["active"]
             ):
                 repaired = True
                 repair_record.update({
@@ -17291,6 +17293,7 @@ def cmd_repair(args: Optional[dict]) -> Dict[str, Any]:
         state_name == OPERATIONAL_STATE_RUNNING
         and startup_ready
         and not _hard_failure_active()
+        and not _recovery_custody_snapshot()["active"]
     ):
         with _ppb_checkpoint_lock:
             checkpoint = _ppb_checkpoint_snapshot_locked(
