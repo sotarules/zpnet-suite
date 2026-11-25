@@ -3,10 +3,13 @@
 import argparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import logging
 import math
 from pathlib import Path
+import threading
+import time
 
-from zpnet.processes.processes import create_pubsub_cache
+from zpnet.processes.processes import create_pubsub_cache, send_command
 
 
 FONT = Path("/usr/share/fonts/truetype/3270/3270-Regular.ttf")
@@ -39,6 +42,61 @@ def fresh(cache, topic):
     return cache.get(topic) if age is not None and age <= FEED_MAX_AGE_S else None
 
 
+class LastTempest:
+    """Refresh the completed campaign off the HTTP path while CLOCKS is idle."""
+
+    def __init__(self):
+        self.row = None
+        self.next_read = 0
+        self.lock = threading.Lock()
+
+    def get(self):
+        with self.lock:
+            if time.monotonic() >= self.next_read:
+                self.next_read = math.inf
+                threading.Thread(target=self._refresh, daemon=True).start()
+            return self.row
+
+    def _refresh(self):
+        row = None
+        try:
+            response = send_command(machine="PI", subsystem="CLOCKS", command="LIST_CAMPAIGNS",
+                                    args={"latest_closed": True}, retries=1)
+            if response["success"]:
+                rows = response["payload"]["campaigns"]
+                if len(rows) == 1 and not rows[0]["active"] and "end_ppb" in rows[0]:
+                    row = rows[0]
+        except Exception:
+            logging.exception("STATS could not read the last TEMPEST campaign")
+        finally:
+            with self.lock:
+                self.row = row
+                self.next_read = time.monotonic() + 5
+
+
+_last_tempest = LastTempest()
+
+
+def tempest_snapshot(clocks):
+    if clocks is None:
+        return None
+    campaign = clocks.get("campaign") or {}
+    active = campaign.get("state") == "STARTED"
+    if not active:
+        campaign = _last_tempest.get()
+    if not campaign:
+        return None
+    result = {"name": campaign["name" if active else "campaign"], "active": active}
+    for lane in ("ocxo1", "ocxo2"):
+        start = field(campaign, "start_ppb", lane)
+        latest = (field(clocks, "clocks", "stats", lane, "ppb_buckets", "10_min")
+                  if active else field(campaign, "end_ppb", lane))
+        delta = latest - start if latest is not None and start is not None else None
+        result[lane] = {"start": number(start, "+.3f"), "delta": number(delta, "+.3f"),
+                        "end": number(field(campaign, "end_ppb", lane), "+.3f")}
+    return result
+
+
 def snapshot(cache):
     clocks = fresh(cache, "CLOCKS")
     photons = fresh(cache, "PHOTONS")
@@ -66,6 +124,7 @@ def snapshot(cache):
         "delta": number(delta, "+.6f"),
         "ocxo1": number(field(stats, "ocxo1", "ppb_buckets", "10_min"), "+.3f"),
         "ocxo2": number(field(stats, "ocxo2", "ppb_buckets", "10_min"), "+.3f"),
+        "tempest": tempest_snapshot(clocks),
         "clocks_live": clocks is not None,
         "photons_live": photons is not None,
     }

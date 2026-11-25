@@ -5415,6 +5415,26 @@ def _ppb_window_value_from_endpoints(
     raise ValueError(f"unsupported Better-Buckets lane {lane!r}")
 
 
+def _ocxo_ppb_window(checkpoint, update_count, seconds):
+    """Frequency error over admitted intervals in an exact instrument-time window."""
+    if update_count > checkpoint["update_count"]:
+        return None
+    start = update_count - seconds
+    end = None
+    # The ring contains cumulative endpoints only for admitted rows. During an
+    # exclusion the cumulative totals stay at the last admitted endpoint.
+    for endpoint in reversed(checkpoint["second_history"]):
+        sequence = endpoint["rolling_sequence"]
+        if end is None and sequence <= update_count:
+            end = endpoint
+        if sequence <= start:
+            if end["interval_count"] == endpoint["interval_count"]:
+                break
+            return {lane: _ppb_window_value_from_endpoints(end, endpoint, lane)
+                    for lane in ("ocxo1", "ocxo2")}
+    return None
+
+
 def _validate_firmware_ppb_checkpoint_delta(stats: Dict[str, Any]) -> Dict[str, Any]:
     """Validate one row-local firmware proof/delta without mutating Pi state."""
     raw = stats.get("rolling_ppb_checkpoint") if isinstance(stats, dict) else None
@@ -10389,6 +10409,7 @@ def _surrender_unresurrectable_alpha_lineage(
                         payload = payload
                             || jsonb_build_object(
                                 'stopped_at', to_jsonb(%s::text),
+                                'end_ppb', payload->'latest_ppb',
                                 'continuity_surrendered', true,
                                 'continuity_surrendered_at', to_jsonb(%s::text),
                                 'continuity_surrender_reason', to_jsonb(%s::text),
@@ -13226,6 +13247,7 @@ def _tempest_detail_from_state_snapshot(state: Dict[str, Any]) -> Dict[str, Any]
 
     fragment = copy.deepcopy(campaign)
     fragment.pop("adjudication", None)
+    fragment.pop("start_ppb", None)
     public_count = _tempest_public_count(fragment)
     sequence = _as_int(state.get("sequence"))
     if sequence is None or sequence <= 0:
@@ -13329,6 +13351,7 @@ def _recovery_timebase_from_clocks_state(
 
     fragment = copy.deepcopy(campaign)
     fragment.pop("adjudication", None)
+    fragment.pop("start_ppb", None)
 
     extra_clocks = {
         "gnss_raw_instrument_ns": _as_int(instrument.get("ns")) or 0,
@@ -14344,6 +14367,10 @@ def _build_canonical_clocks_state(
         # beside the durable observation, never transported inside CLOCKS itself.
         if mutate_alpha_custody:
             ppb_restore_checkpoint = _ppb_checkpoint_ingest(stats)
+            for seconds in (1, 60):
+                stats[f"ppb_{seconds}s"] = _ocxo_ppb_window(
+                    ppb_restore_checkpoint, ppb_restore_checkpoint["update_count"], seconds
+                )
         else:
             with _ppb_checkpoint_lock:
                 runtime = _ppb_checkpoint_runtime_ensure_locked()
@@ -14439,6 +14466,54 @@ def _set_clocks_persistence_worker_phase(
     _diag["clocks_persistence_worker"] = snapshot
 
 
+def _tempest_pre_start_ppb(state, checkpoint):
+    """Take the trailing minute immediately before Beta public row #1."""
+    update = checkpoint["update_count"]
+    if update == 1:
+        # A stats reset on row #1 drops the prior epoch's ring. Its exact
+        # adjacent live observation still owns the campaign starting minute.
+        with _clocks_lock:
+            prior = _latest_clocks
+            if (prior.get("sequence") == state["sequence"] - 1
+                    and not prior.get("restored_display_seed")
+                    and not prior.get("startup_lifetime_unclassified")
+                    and _path_get(prior, "clocks.stats.reset_count") == checkpoint["reset_count"] - 1):
+                return _path_get(prior, "clocks.stats.ppb_60s")
+    return _ocxo_ppb_window(checkpoint, update - 1, 60)
+
+
+def _persist_tempest_ppb(cur, state):
+    """Serialize endpoint updates with STOP, in the same transaction as this detail."""
+    campaign = _state_campaign(state)
+    if not campaign or state.get("holistic_restore_superseded"):
+        return
+    name = _tempest_campaign_name(campaign)
+    start = json.dumps(campaign.get("start_ppb"))
+    current = json.dumps(_path_get(state, "clocks.stats.ppb_60s"))
+    cur.execute(
+        """
+        UPDATE campaign_master
+        SET payload = payload || jsonb_build_object(
+                'start_ppb', COALESCE(payload->'start_ppb', %s::jsonb),
+                'latest_ppb', %s::jsonb)
+            || CASE WHEN active THEN '{}'::jsonb
+                    ELSE jsonb_build_object('end_ppb', %s::jsonb) END
+        WHERE campaign_type = %s AND campaign = %s
+        RETURNING payload->>'flash_cut_from'
+        """,
+        (start, current, current, CAMPAIGN_TYPE_TEMPEST, name),
+    )
+    # CLOCKS has a private PPS between campaigns. The incoming start is the
+    # shared cut boundary, including when the outgoing tail was still queued.
+    master = cur.fetchone()
+    if master and master[0] and campaign.get("public_count") == 1:
+        cur.execute(
+            """UPDATE campaign_master SET payload = payload || jsonb_build_object('end_ppb', %s::jsonb)
+               WHERE campaign_type = %s AND campaign = %s AND NOT active""",
+            (start, CAMPAIGN_TYPE_TEMPEST, master[0]),
+        )
+
+
 def _persist_clocks_state(
     state: Dict[str, Any], checkpoint: Dict[str, Any]
 ) -> Tuple[str, int]:
@@ -14483,6 +14558,7 @@ def _persist_clocks_state(
             detail_id = int(
                 merged_row["id"] if isinstance(merged_row, dict) else merged_row[0]
             )
+            _persist_tempest_ppb(cur, state)
             if persist_recovery:
                 _set_clocks_persistence_worker_phase(
                     "DB_RECOVERY_CONFIG_MERGE", sequence=_as_int(sequence),
@@ -14515,6 +14591,7 @@ def _persist_clocks_state(
         detail_id = int(
             inserted_row["id"] if isinstance(inserted_row, dict) else inserted_row[0]
         )
+        _persist_tempest_ppb(cur, state)
         if persist_recovery:
             _set_clocks_persistence_worker_phase(
                 "DB_RECOVERY_CONFIG_INSERT", sequence=_as_int(sequence),
@@ -14933,13 +15010,18 @@ def _holistic_restore_proof_custody_for_state(
     )
 
 
-def _clocks_state_loop() -> None:
+def _clocks_state_loop(active_master=None) -> None:
     """Build and publish CLOCKS_V4 without storage latency stalling the live feed."""
     global _clocks_state_published, _clocks_state_dropped
     global _clocks_epoch_birth_reset_count
     global _clocks_epoch_birth_last_seen_reset_count
     global _clocks_epoch_birth_last_seen_update_count
 
+    # Seed the frozen boundary before consuming queued rows after a Pi restart.
+    saved = active_master["payload"] if active_master else {}
+    start_name = active_master["campaign"] if "start_ppb" in saved else None
+    start_ppb = saved.get("start_ppb")
+    start_request = None
     _clocks_state_worker_started.set()
     logging.info("🚀 [clocks] canonical CLOCKS_V4 state worker started")
     while True:
@@ -15102,6 +15184,18 @@ def _clocks_state_loop() -> None:
                     system_context,
                     mutate_alpha_custody=not preclassification_newborn,
                 )
+                campaign = _state_campaign(state)
+                if campaign and not preclassification_newborn:
+                    name = _tempest_campaign_name(campaign)
+                    # A new explicit START can reuse a deleted campaign name.
+                    # A replay of row #1 must retain an already frozen start.
+                    request = _start_requested_monotonic if _start_requested_campaign == name else None
+                    new_request = request is not None and request != start_request
+                    if new_request or (name != start_name and campaign.get("public_count") == 1):
+                        start_name, start_request = name, request
+                        start_ppb = (_tempest_pre_start_ppb(state, ppb_restore_checkpoint)
+                                     if campaign.get("public_count") == 1 else None)
+                    campaign["start_ppb"] = start_ppb if name == start_name else None
                 if preclassification_newborn:
                     _diag["startup_preclassification_rows_non_authoritative"] = (
                         _diag.get("startup_preclassification_rows_non_authoritative", 0) + 1
@@ -16189,7 +16283,8 @@ def cmd_start(args: Optional[dict]) -> dict:
             """
             UPDATE campaign_master
             SET active = false,
-                payload = payload || jsonb_build_object('stopped_at', to_jsonb(%s::text))
+                payload = payload || jsonb_build_object(
+                    'stopped_at', to_jsonb(%s::text), 'end_ppb', payload->'latest_ppb')
             WHERE campaign_type = %s
               AND active = true
             """,
@@ -16286,7 +16381,7 @@ def cmd_start(args: Optional[dict]) -> dict:
                         """
                         UPDATE campaign_master
                         SET active = true,
-                            payload = payload - 'stopped_at'
+                            payload = payload - 'stopped_at' - 'end_ppb'
                         WHERE campaign_type = %s
                           AND campaign = %s
                         """,
@@ -16372,7 +16467,7 @@ def cmd_stop(_: Optional[dict]) -> dict:
             UPDATE campaign_master
             SET active = false,
                 payload = payload
-                    || jsonb_build_object('stopped_at', to_jsonb(%s::text))
+                    || jsonb_build_object('stopped_at', to_jsonb(%s::text), 'end_ppb', payload->'latest_ppb')
                     || CASE
                         WHEN payload ? 'report'
                         THEN jsonb_build_object(
@@ -19451,8 +19546,14 @@ def cmd_truncate(args: Optional[dict]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------
 
 
-def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
-    """List TEMPEST campaigns and their recorded state."""
+def cmd_list_campaigns(args: Optional[dict]) -> Dict[str, Any]:
+    """List TEMPEST campaigns, optionally just the latest closed PPB record."""
+    selection = "ORDER BY master.ts ASC, master.id ASC"
+    if (args or {}).get("latest_closed") is True:
+        selection = (
+            "AND NOT master.active AND master.payload ? 'end_ppb' "
+            "ORDER BY master.ts DESC, master.id DESC LIMIT 1"
+        )
     try:
         with open_db(row_dict=True) as conn:
             cur = conn.cursor()
@@ -19466,8 +19567,7 @@ def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
                     master.payload
                 FROM campaign_master AS master
                 WHERE master.campaign_type = %s
-                ORDER BY master.ts ASC, master.id ASC
-                """,
+                """ + selection,
                 (CAMPAIGN_TYPE_TEMPEST,),
             )
             rows = cur.fetchall()
@@ -19490,6 +19590,8 @@ def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
             "started_at": payload.get("started_at"),
             "stopped_at": payload.get("stopped_at"),
             "resumed_at": payload.get("resumed_at"),
+            "start_ppb": payload.get("start_ppb"),
+            "end_ppb": payload.get("end_ppb"),
             "location": payload.get("location"),
             "public_count": report.get("public_count"),
             "sequence": report.get("sequence"),
@@ -20293,6 +20395,7 @@ def run() -> None:
     # them. No valid startup second is silently discarded.
     threading.Thread(
         target=_clocks_state_loop,
+        args=(_get_active_campaign(),),
         daemon=True,
         name="clocks-state",
     ).start()

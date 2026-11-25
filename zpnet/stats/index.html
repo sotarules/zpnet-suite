@@ -42,6 +42,11 @@
   .unit { font-size: 0.8rem; }
   .lap .row { display: block; }
   .lap dd { font-size: clamp(1.7rem, 8.5vw, 2.85rem); }
+  #tempest { width: 100%; border-top: 1px solid #285428; text-align: right; }
+  #tempest caption { text-align: left; overflow-wrap: anywhere; }
+  #tempest th { font-weight: normal; }
+  #tempest th:first-child { text-align: left; }
+  #tempest td { font-size: clamp(1.2rem, 5.5vw, 1.6rem); }
   #status { margin: 0.375rem 0 0; min-height: 1.2em; color: #ffdc67; }
 </style>
 <main>
@@ -68,6 +73,15 @@
     <div class="row"><dt>OCXO1 · 10 MIN</dt><dd><span id="ocxo1">---</span> <span class="unit">ppb</span></dd></div>
     <div class="row"><dt>OCXO2 · 10 MIN</dt><dd><span id="ocxo2">---</span> <span class="unit">ppb</span></dd></div>
   </dl>
+  <table id="tempest" hidden>
+    <caption></caption>
+    <thead><tr><th>ppb</th><th>OCXO1</th><th>OCXO2</th></tr></thead>
+    <tbody>
+      <tr data-key="start"><th>START · 60 S</th><td></td><td></td></tr>
+      <tr data-key="end"><th>END · 60 S</th><td></td><td></td></tr>
+      <tr data-key="delta"><th></th><td></td><td></td></tr>
+    </tbody>
+  </table>
   <p id="status" role="status">CONNECTING TO ZPNET</p>
 </main>
 <script>
@@ -80,6 +94,19 @@
       document.getElementById(name).textContent = stats[name] ?? "---";
     }
     document.getElementById("campaign").hidden = !stats.campaign_active;
+    const table = document.getElementById("tempest");
+    const run = stats.tempest;
+    table.hidden = !run;
+    if (run) {
+      table.caption.textContent = (run.active ? "TEMPEST · " : "LAST TEMPEST · ") + run.name;
+      for (const row of table.tBodies[0].rows) {
+        const key = row.dataset.key;
+        row.hidden = key === "end" && run.active;
+        if (key === "delta") row.cells[0].textContent = run.active ? "DELTA · 10 MIN" : "END − START";
+        row.cells[1].textContent = run.ocxo1[key] ?? "---";
+        row.cells[2].textContent = run.ocxo2[key] ?? "---";
+      }
+    }
     statusLine.textContent = message;
   }
 

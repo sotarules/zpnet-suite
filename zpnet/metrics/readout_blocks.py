@@ -1538,6 +1538,8 @@ def _get_campaign_rows() -> list[dict]:
                     master.campaign_type,
                     master.campaign,
                     master.active,
+                    master.payload -> 'start_ppb' AS start_ppb,
+                    master.payload -> 'end_ppb' AS end_ppb,
                     master.payload -> 'campaign_dac' AS campaign_dac,
                     master.payload #>> '{campaign_dac,last_observation,servo_mode}'
                         AS servo_mode,
@@ -1620,6 +1622,11 @@ def _campaign_cell(name: str, active: bool, width: int) -> str:
     if len(label) > usable:
         label = label[:max(1, usable - 1)] + "~"
     return f"{label + marker:<{width}}"
+
+
+def _ocxo_ppb_pair(values) -> str:
+    values = values or {}
+    return " / ".join(_sign_float(values.get(lane), 0, 3) for lane in ("ocxo1", "ocxo2"))
 
 
 def campaigns_readout() -> list[str]:
@@ -1732,6 +1739,10 @@ def campaigns_readout() -> list[str]:
                 f"{G.join(voltage_cells)}"
             )
 
+        endpoints = f"  OCXO1 / OCXO2   START PPB: {_ocxo_ppb_pair(row.get('start_ppb'))}"
+        if not row.get("active"):
+            endpoints += f"   END PPB: {_ocxo_ppb_pair(row.get('end_ppb'))}"
+        lines.append(endpoints)
         if row_index != len(rows) - 1:
             lines.append("")
 
@@ -1811,6 +1822,14 @@ def clocks_combined_readout() -> list[str]:
 
     if state == "STARTED" or r.get("campaign_present"):
         identity = f"CAMPAIGN: {campaign}  ELAPSED: {elapsed}"
+        start = _field(r, "campaign_delta.start_ppb") or {}
+        delta = {}
+        for lane in ("ocxo1", "ocxo2"):
+            ten_min = _ppb_bucket(r, lane, "10_min")
+            if ten_min is not None and start.get(lane) is not None:
+                delta[lane] = ten_min - start[lane]
+        identity += (f"   OCXO1 / OCXO2   START PPB: {_ocxo_ppb_pair(start)}"
+                     f"   DELTA 10-MIN: {_ocxo_ppb_pair(delta)}")
     else:
         identity = f"CAMPAIGN: STOPPED  INSTRUMENT: {instrument_elapsed}"
     lines.append(
