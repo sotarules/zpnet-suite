@@ -47,6 +47,11 @@ def snapshot(cache):
     )
     flight = field(photons, "photons", "race", "flight_ns") or {}
     lap = flight.get("mean") if int(flight.get("n", 0)) > 0 else None
+    high5 = field(photons, "photons", "pd_out", "high5_window") or {}
+    campaign = field(photons, "campaign") or {}
+    active = bool(campaign) and not campaign.get("final")
+    start = campaign.get("start_lap_ns") if active else None
+    delta = lap - start if lap is not None and start is not None else None
     stats = field(clocks, "clocks", "stats")
     return {
         "system_time": system_time[11:19] if system_time else None,
@@ -55,6 +60,10 @@ def snapshot(cache):
         "bme_pd": temperature(field(clocks, "environment", "pd")),
         "bme_out": temperature(field(clocks, "environment", "out")),
         "lap": number(lap, ",.6f"),
+        "high5": number(high5.get("high_mean_mv"), ".3f") if high5.get("sample_count", 0) else None,
+        "campaign_active": active,
+        "start_lap": number(start, ",.6f"),
+        "delta": number(delta, "+.6f"),
         "ocxo1": number(field(stats, "ocxo1", "ppb_buckets", "10_min"), "+.3f"),
         "ocxo2": number(field(stats, "ocxo2", "ppb_buckets", "10_min"), "+.3f"),
         "clocks_live": clocks is not None,

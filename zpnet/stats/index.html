@@ -58,6 +58,13 @@
     <div class="row"><dt>PHOTON LAP · 1 SECOND</dt><dd><span id="lap">---</span> <span class="unit">ns</span></dd></div>
   </dl>
   <dl>
+    <div class="row"><dt>HIGH5</dt><dd><span id="high5">---</span> <span class="unit">mV</span></dd></div>
+  </dl>
+  <dl id="campaign" hidden>
+    <div class="row"><dt>START LAP</dt><dd><span id="start_lap">---</span> <span class="unit">ns</span></dd></div>
+    <div class="row"><dt>DELTA · 1 SECOND</dt><dd><span id="delta">---</span> <span class="unit">ns</span></dd></div>
+  </dl>
+  <dl>
     <div class="row"><dt>OCXO1 · 10 MIN</dt><dd><span id="ocxo1">---</span> <span class="unit">ppb</span></dd></div>
     <div class="row"><dt>OCXO2 · 10 MIN</dt><dd><span id="ocxo2">---</span> <span class="unit">ppb</span></dd></div>
   </dl>
@@ -65,13 +72,14 @@
 </main>
 <script>
   const fields = ["system_time", "altitude", "max31865", "bme_pd",
-                  "bme_out", "lap", "ocxo1", "ocxo2"];
+                  "bme_out", "lap", "high5", "start_lap", "delta", "ocxo1", "ocxo2"];
   const statusLine = document.getElementById("status");
 
   function render(stats, message) {
     for (const name of fields) {
       document.getElementById(name).textContent = stats[name] ?? "---";
     }
+    document.getElementById("campaign").hidden = !stats.campaign_active;
     statusLine.textContent = message;
   }
 
