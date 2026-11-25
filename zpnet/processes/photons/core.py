@@ -3523,6 +3523,22 @@ def _lap_value_from_endpoints(
     return {"sample_count": lap_count, "mean_lap_ns": total_ns / lap_count}
 
 
+def _lap_60s(checkpoint, update_count):
+    """Mean of accepted published laps in the 60 producer seconds ending here."""
+    end = None
+    for endpoint in reversed(checkpoint["second_history"]):
+        sequence = endpoint["sequence"]
+        if sequence == update_count:
+            end = endpoint
+        elif sequence == update_count - 60:
+            if end is not None and end["lap_count"] != endpoint["lap_count"]:
+                return _lap_value_from_endpoints(end, endpoint)["mean_lap_ns"]
+            break
+        elif sequence < update_count - 60:
+            break
+    return None
+
+
 def _validate_firmware_ppb_checkpoint_delta(stats: Dict[str, Any]) -> Dict[str, Any]:
     """Validate one row-local PHOTONS checkpoint proof without mutating Pi state."""
     stats = _require_dict(stats, "photons.stats")
@@ -5443,6 +5459,7 @@ def _make_photons(
     if normalization is not None:
         state["normalization"] = normalization
     state["measurement"] = _normalizer.measure(state)
+    state["lap_60s_ns"] = _lap_60s(checkpoint, stats["update_count"])
     _cadence_mark(timing, "normalization")
     return state, checkpoint
 
@@ -7320,6 +7337,9 @@ def _rehydrate_pi_campaign(
             _active_campaign = None
             return
 
+        master_payload = _require_dict(
+            active_master.get("master_payload"), "active campaign master payload"
+        )
         start_after: Optional[int] = None
         public_count = 0
         if source is not None and isinstance(source.get("campaign_restore"), dict):
@@ -7354,9 +7374,6 @@ def _rehydrate_pi_campaign(
                     f"cannot reattach Pi ownership during Teensy campaign state {state!r}"
                 )
         else:
-            master_payload = _require_dict(
-                active_master.get("master_payload"), "active campaign master payload"
-            )
             report = master_payload.get("report")
             report = report if isinstance(report, dict) else {}
             raw_start = master_payload.get("start_after_sequence")
@@ -7381,6 +7398,8 @@ def _rehydrate_pi_campaign(
             "start_after_sequence": start_after,
             "firmware_public_count": public_count,
         }
+        if "start_lap_ns" in master_payload:
+            window["start_lap_ns"] = master_payload["start_lap_ns"]
         if allow_first_public_count_splice:
             window["restart_public_count_splice_pending"] = True
         _active_campaign = window
@@ -8996,6 +9015,9 @@ def _campaign_public_decoration(window: Dict[str, Any]) -> Dict[str, Any]:
     }
     if window.get("stopped_at"):
         out["stopped_at"] = str(window["stopped_at"])
+    for key in ("start_lap_ns", "end_lap_ns"):
+        if key in window:
+            out[key] = window[key]
     start_after = window.get("start_after_sequence")
     if start_after is not None:
         out["start_after_sequence"] = int(start_after)
@@ -9016,6 +9038,8 @@ def _campaign_public_decoration(window: Dict[str, Any]) -> Dict[str, Any]:
 
 def _campaign_decoration_from_firmware(
     firmware_campaign: Dict[str, Any],
+    checkpoint: Dict[str, Any],
+    lap_60s_ns: Optional[float],
 ) -> Dict[str, Any]:
     """Merge Teensy-authored boundary/science with Pi-owned durable provenance."""
     global _closing_campaigns
@@ -9072,9 +9096,22 @@ def _campaign_decoration_from_firmware(
             window.pop("restart_public_count_splice_pending", None)
         window["firmware_public_count"] = public_count
 
+        if "start_lap_ns" not in window:
+            # START commits on the preceding private (or old campaign's final)
+            # row. Use that observation even across a subsequent STATS_RESET.
+            with _state_lock:
+                predecessor = _latest_photons or {}
+            if predecessor.get("sequence") == start_after and "lap_60s_ns" in predecessor:
+                window["start_lap_ns"] = predecessor["lap_60s_ns"]
+            else:
+                # A delayed first public row may still have both exact anchors.
+                boundary_update = checkpoint["current_sequence"] - public_count
+                window["start_lap_ns"] = _lap_60s(checkpoint, boundary_update)
+
         if final:
             stop_after = int(firmware_campaign["stop_after_sequence"])
             window["stop_after_sequence"] = stop_after
+            window["end_lap_ns"] = lap_60s_ns
             window["firmware_final_seen"] = True
 
         out = _campaign_public_decoration(window)
@@ -9274,8 +9311,10 @@ def _persist_photons(
                 "boundary_contract": "TEENSY_AUTHORED_PUBLISHED_FRAGMENT_BOUNDARY",
                 "start_boundary_pending": False,
                 "flash_cut_pending": False,
+                "start_lap_ns": campaign.get("start_lap_ns"),
             }
             if campaign.get("final") is True:
+                boundary_payload["end_lap_ns"] = campaign.get("end_lap_ns")
                 boundary_payload["stop_after_sequence"] = _require_int(
                     campaign.get("stop_after_sequence"),
                     "PHOTONS.campaign.stop_after_sequence",
@@ -9696,7 +9735,7 @@ def _state_loop() -> None:
                     )
                     if firmware_campaign is not None:
                         photons["campaign"] = _campaign_decoration_from_firmware(
-                            firmware_campaign
+                            firmware_campaign, ppb_restore_checkpoint, photons["lap_60s_ns"]
                         )
                     # The state worker is the exclusive statistics owner. This
                     # is attached BEFORE publication and BEFORE the ordered
@@ -11341,6 +11380,8 @@ def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
                 "active": bool(row["active"]),
                 "started_at": payload.get("started_at"),
                 "stopped_at": payload.get("stopped_at"),
+                "start_lap_ns": payload.get("start_lap_ns"),
+                "end_lap_ns": payload.get("end_lap_ns"),
                 "interrupted_at": payload.get("interrupted_at"),
                 "interruption_reason": payload.get("interruption_reason"),
                 "start_after_sequence": payload.get("start_after_sequence"),

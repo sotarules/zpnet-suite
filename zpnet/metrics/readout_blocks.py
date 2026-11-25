@@ -2348,6 +2348,8 @@ def _get_lantern_campaign_summaries() -> list[dict]:
             """
             SELECT master.id, master.campaign, master.active,
                    master.payload ->> 'interrupted_at' AS interrupted_at,
+                   master.payload ->> 'start_lap_ns' AS start_lap_ns,
+                   master.payload ->> 'end_lap_ns' AS end_lap_ns,
                    master.payload #>> '{report,sequence}' AS last_sequence,
                    CASE WHEN jsonb_typeof(master.payload -> 'report') = 'object'
                         THEN jsonb_build_object(
@@ -2375,6 +2377,8 @@ def _get_lantern_campaign_summaries() -> list[dict]:
             "campaign": row["campaign"],
             "active": bool(row["active"]),
             "interrupted_at": row["interrupted_at"],
+            "start_lap_ns": _to_float(row["start_lap_ns"]),
+            "end_lap_ns": _to_float(row["end_lap_ns"]),
             "last_sequence": _to_int(row["last_sequence"]),
             "total_scatter": _photons_instrument_stats(last_payload),
             "lap_buckets": _photons_producer_lap_buckets(last_payload, historical=True),
@@ -2584,9 +2588,15 @@ def photons_detail_readout() -> list[str]:
     # Only the campaign name retains its operator-selected capitalization.
     model_id = live["photons"]["voltage_normalization"]["model_id"]
     normalization = VOLTAGE_MODELS[model_id][0].to_bytes(4, "big").decode("ascii")
+    rolling_rows = _photons_rolling_rows(payloads)
     line = (f"CAMPAIGN: {name}  NORMALIZATION: {normalization}"
-            f"  ELAPSED: {_seconds_to_hms(summary['seconds'])}"
-            f"  RECOVERABLE: {str(recoverable).upper()}")
+            f"  ELAPSED: {_seconds_to_hms(summary['seconds'])}")
+    if campaign:
+        start = campaign.get("start_lap_ns")
+        lap = rolling_rows[-1]["normalized_mean"]
+        delta = lap - start if lap is not None and start is not None else None
+        line += f"  START LAP: {_fmt(start, ',.6f', 0)} NS  DELTA: {_fmt(delta, '+.6f', 0)} NS"
+    line += f"  RECOVERABLE: {str(recoverable).upper()}"
     measurement = live.get("measurement")
     # Report a second, corrected mean only when a real calibration produced one.
     if isinstance(measurement, dict) and measurement.get("status") == "CORRECTED":
@@ -2601,7 +2611,7 @@ def photons_detail_readout() -> list[str]:
                   f"{'SEC':<8} {'LAP':>{PHOTONS_MEAN_WIDTH}} {'LOW':>9} {'HIGH':>9} "
                   f"{'PD N/WIN':>10} {voltage_lane.upper():>9} "
                   f" {'TARGET mV':>10} {'DAC V':>10} {'ADJ':>12}  ALT"])
-    for row in _photons_rolling_rows(payloads):
+    for row in rolling_rows:
         lines.append(
             _fmt(row["second"], 'd', 0).ljust(8)
             + " " + _fmt(row["normalized_mean"], f'>{PHOTONS_MEAN_WIDTH},.6f', PHOTONS_MEAN_WIDTH)
@@ -2632,11 +2642,11 @@ def photons_campaigns_readout() -> list[str]:
     if rows is None:
         return ["\0LANTERN_CAMPAIGNS:LOADING", "LANTERN CAMPAIGNS: LOADING"]
     newest_identity = str(rows[0].get("id")) if rows else "EMPTY"
-    columns = ("LAP", "10-MIN", "60-MIN", "8-HOUR", "24-HOUR", "TOTAL", "CAMP")
+    columns = ("START LAP", "LAP", "10-MIN", "60-MIN", "8-HOUR", "24-HOUR", "TOTAL", "CAMP")
     lines = [f"\0LANTERN_CAMPAIGN:{newest_identity}",
              f"{'CAMPAIGN':<18} {'SEC':>8} "
              + " ".join(f"{label:>{PHOTONS_MEAN_WIDTH}}" for label in columns)
-             + f" {'TOTAL_SD':>10} {'TOTAL_SE':>10}"]
+             + f" {'TOTAL_SD':>10} {'TOTAL_SE':>10} {'END LAP':>{PHOTONS_MEAN_WIDTH}}"]
     if not rows:
         return lines + ["", "NO LANTERN CAMPAIGNS"]
     # Historical campaign rows use the throttled background PostgreSQL
@@ -2656,6 +2666,7 @@ def photons_campaigns_readout() -> list[str]:
                 and (_to_int(live.get("sequence")) or -1) >= (row.get("last_sequence") or -1)):
             current = _photons_summary(live)
             row = {**row, "seconds": current["seconds"], "campaign_mean_lap_ns": current["mean"],
+                   "start_lap_ns": live_identity.get("start_lap_ns", row.get("start_lap_ns")),
                    "lap_buckets": current["buckets"], "total_scatter": current["scatter"]}
         name = str(row.get("campaign") or "?")
         lap = row.get("campaign_mean_lap_ns")
@@ -2665,7 +2676,7 @@ def photons_campaigns_readout() -> list[str]:
             name += " [INT]"
         buckets = row.get("lap_buckets") or {}
         scatter = row.get("total_scatter") or {}
-        values = [lap] + [buckets.get(key) for key in PPB_BUCKET_KEYS] + [lap]
+        values = [row.get("start_lap_ns"), lap] + [buckets.get(key) for key in PPB_BUCKET_KEYS] + [lap]
         if len(lines) > 2 and lines[-1] != "":
             lines.append("")
         lines.append(
@@ -2674,6 +2685,8 @@ def photons_campaigns_readout() -> list[str]:
             + " ".join(_fmt(value, f'>{PHOTONS_MEAN_WIDTH},.6f', PHOTONS_MEAN_WIDTH) for value in values)
             + " " + _fmt(scatter.get("stddev"), '>10.6f', 10)
             + " " + _fmt(scatter.get("stderr"), '>10.6f', 10)
+            + ("" if row.get("active") else
+               " " + _fmt(row.get("end_lap_ns"), f'>{PHOTONS_MEAN_WIDTH},.6f', PHOTONS_MEAN_WIDTH))
         )
     return lines
 
