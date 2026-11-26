@@ -32,6 +32,7 @@
     gap: 0.5rem;
     padding: clamp(0.25rem, 0.9vh, 0.6rem) 0;
   }
+  .row[hidden] { display: none; }
   dt { font-size: clamp(0.86rem, 4vw, 1.05rem); }
   dd {
     margin: 0;
@@ -60,7 +61,7 @@
     <div class="row"><dt>BME OUT</dt><dd><span id="bme_out">---</span> <span class="unit">°C</span></dd></div>
   </dl>
   <dl class="lap">
-    <div class="row"><dt>PHOTON LAP · 1 SECOND</dt><dd><span id="lap">---</span> <span class="unit">ns</span></dd></div>
+    <div class="row"><dt>PHOTON LAP · 60-SEC</dt><dd><span id="lap">---</span> <span class="unit">ns</span></dd></div>
   </dl>
   <dl>
     <div class="row"><dt>HIGH5</dt><dd><span id="high5">---</span> <span class="unit">mV</span></dd></div>
@@ -68,21 +69,24 @@
   <section id="campaign" aria-labelledby="lantern-title" hidden>
     <p class="campaign-title" id="lantern-title">PHOTONS · LANTERN · <span id="lantern_name"></span></p>
     <dl>
+      <div class="row"><dt>START ALT</dt><dd><span id="start_alt">---</span> <span class="unit">m</span></dd></div>
       <div class="row"><dt>START LAP</dt><dd><span id="start_lap">---</span> <span class="unit">ns</span></dd></div>
-      <div class="row"><dt>DELTA · 1 SECOND</dt><dd><span id="delta">---</span> <span class="unit">ns</span></dd></div>
+      <div class="row"><dt>DELTA · 60-SEC</dt><dd><span id="delta">---</span> <span class="unit">ns</span></dd></div>
     </dl>
   </section>
   <section>
     <p class="campaign-title" id="tempest-title" hidden></p>
     <dl>
-      <div class="row"><dt>OCXO1 · 10 MIN</dt><dd><span id="ocxo1">---</span> <span class="unit">ppb</span></dd></div>
-      <div class="row"><dt>OCXO2 · 10 MIN</dt><dd><span id="ocxo2">---</span> <span class="unit">ppb</span></dd></div>
+      <div class="row" id="clock-start-alt-row" hidden><dt>START ALT</dt><dd><span id="clock-start-alt">---</span> <span class="unit">m</span></dd></div>
+      <div class="row" id="clock-end-alt-row" hidden><dt>END ALT</dt><dd><span id="clock-end-alt">---</span> <span class="unit">m</span></dd></div>
+      <div class="row"><dt>OCXO1 · 60-SEC</dt><dd><span id="ocxo1">---</span> <span class="unit">ppb</span></dd></div>
+      <div class="row"><dt>OCXO2 · 60-SEC</dt><dd><span id="ocxo2">---</span> <span class="unit">ppb</span></dd></div>
     </dl>
     <table id="tempest" aria-labelledby="tempest-title" hidden>
       <thead><tr><th>ppb</th><th>OCXO1</th><th>OCXO2</th></tr></thead>
       <tbody>
-        <tr data-key="start"><th>START · 60 S</th><td></td><td></td></tr>
-        <tr data-key="end"><th>END · 60 S</th><td></td><td></td></tr>
+        <tr data-key="start"><th>START · 60-SEC</th><td></td><td></td></tr>
+        <tr data-key="end"><th>END · 60-SEC</th><td></td><td></td></tr>
         <tr data-key="delta"><th></th><td></td><td></td></tr>
       </tbody>
     </table>
@@ -91,7 +95,7 @@
 </main>
 <script>
   const fields = ["system_time", "altitude", "max31865", "bme_pd",
-                  "bme_out", "lap", "high5", "lantern_name", "start_lap", "delta", "ocxo1", "ocxo2"];
+                  "bme_out", "lap", "high5", "lantern_name", "start_alt", "start_lap", "delta", "ocxo1", "ocxo2"];
   const statusLine = document.getElementById("status");
 
   function render(stats, message) {
@@ -104,12 +108,16 @@
     const title = document.getElementById("tempest-title");
     title.hidden = !run;
     table.hidden = !run;
+    document.getElementById("clock-start-alt-row").hidden = !run;
+    document.getElementById("clock-end-alt-row").hidden = !run || run.active;
     if (run) {
+      document.getElementById("clock-start-alt").textContent = run.start_alt ?? "---";
+      document.getElementById("clock-end-alt").textContent = run.end_alt ?? "---";
       title.textContent = (run.active ? "CLOCKS · TEMPEST · " : "CLOCKS · LAST TEMPEST · ") + run.name;
       for (const row of table.tBodies[0].rows) {
         const key = row.dataset.key;
         row.hidden = key === "end" && run.active;
-        if (key === "delta") row.cells[0].textContent = run.active ? "DELTA · 10 MIN" : "END − START";
+        if (key === "delta") row.cells[0].textContent = run.active ? "DELTA · 60-SEC" : "END − START";
         row.cells[1].textContent = run.ocxo1[key] ?? "---";
         row.cells[2].textContent = run.ocxo2[key] ?? "---";
       }

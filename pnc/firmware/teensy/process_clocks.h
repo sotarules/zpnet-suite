@@ -403,6 +403,7 @@ struct clocks_fragment_ppb_value_snapshot_t {
 // Instrument-owned PPB populations only. Campaign PPB is intentionally absent;
 // campaign-relative frequency belongs in clocks_fragment_campaign_snapshot_t.
 struct clocks_fragment_ppb_buckets_snapshot_t {
+  clocks_fragment_ppb_value_snapshot_t second_60{};
   clocks_fragment_ppb_value_snapshot_t minute_10{};
   clocks_fragment_ppb_value_snapshot_t minute_60{};
   clocks_fragment_ppb_value_snapshot_t hour_8{};
@@ -439,6 +440,7 @@ struct clocks_fragment_ppb_checkpoint_delta_snapshot_t {
   clocks_fragment_ppb_endpoint_snapshot_t current{};
   clocks_fragment_ppb_endpoint_snapshot_t origin{};
 
+  clocks_fragment_ppb_window_proof_snapshot_t second_60{};
   clocks_fragment_ppb_window_proof_snapshot_t minute_10{};
   clocks_fragment_ppb_window_proof_snapshot_t minute_60{};
   clocks_fragment_ppb_window_proof_snapshot_t hour_8{};

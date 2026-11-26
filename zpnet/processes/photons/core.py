@@ -1743,6 +1743,7 @@ PHOTONS_LEGACY_PPB_SEMANTICS = "LAP_BASELINE_NS_OFFSET_V1"
 
 PHOTONS_RECOVERY_SCHEMA_VERSION = 1
 PHOTONS_RECOVERY_CHUNK_MAX_ENDPOINTS = 4
+PHOTONS_RECOVERY_60_SEC_SECONDS = 60
 PHOTONS_RECOVERY_10_MIN_SECONDS = 10 * 60
 PHOTONS_RECOVERY_60_MIN_SECONDS = 60 * 60
 PHOTONS_RECOVERY_8_HOUR_SECONDS = 8 * 60 * 60
@@ -3523,20 +3524,26 @@ def _lap_value_from_endpoints(
     return {"sample_count": lap_count, "mean_lap_ns": total_ns / lap_count}
 
 
-def _lap_60s(checkpoint, update_count):
-    """Mean of accepted published laps in the 60 producer seconds ending here."""
-    end = None
-    for endpoint in reversed(checkpoint["second_history"]):
-        sequence = endpoint["sequence"]
-        if sequence == update_count:
-            end = endpoint
-        elif sequence == update_count - 60:
-            if end is not None and end["lap_count"] != endpoint["lap_count"]:
-                return _lap_value_from_endpoints(end, endpoint)["mean_lap_ns"]
-            break
-        elif sequence < update_count - 60:
-            break
-    return None
+def _minute_lap(row):
+    if "lap_60s_ns" in row:  # Pre-bucket durable predecessor during an upgrade.
+        return row["lap_60s_ns"]
+    bucket = row["photons"]["stats"]["lap_buckets"].get("60_sec") or {}
+    return bucket.get("mean_lap_ns")
+
+
+def _missed_start_lap(checkpoint, end_sequence):
+    """Recover only a witnessed START population when the boundary row was missed."""
+    start_sequence = max(0, end_sequence - PHOTONS_RECOVERY_60_SEC_SECONDS)
+    endpoints = [e for e in checkpoint["second_history"]
+                 if start_sequence <= e["sequence"] <= end_sequence]
+    if not endpoints:
+        return None
+    start, end = endpoints[0], endpoints[-1]
+    if (start["sequence"] != start_sequence or end["sequence"] != end_sequence
+            or (start_sequence and len(endpoints) != end_sequence - start_sequence + 1)
+            or end["lap_count"] == start["lap_count"]):
+        return None
+    return _lap_value_from_endpoints(end, start)["mean_lap_ns"]
 
 
 def _validate_firmware_ppb_checkpoint_delta(stats: Dict[str, Any]) -> Dict[str, Any]:
@@ -3624,6 +3631,7 @@ def _validate_firmware_ppb_checkpoint_delta(stats: Dict[str, Any]) -> Dict[str, 
     proof_checks = 0
     buckets = _require_dict(stats.get("lap_buckets"), "photons.stats.lap_buckets")
     windows = (
+        ("60_sec", PHOTONS_RECOVERY_60_SEC_SECONDS),
         ("10_min", PHOTONS_RECOVERY_10_MIN_SECONDS),
         ("60_min", PHOTONS_RECOVERY_60_MIN_SECONDS),
         ("8_hour", PHOTONS_RECOVERY_8_HOUR_SECONDS),
@@ -3981,6 +3989,7 @@ def _ppb_checkpoint_assert_history_matches_proof_locked(
     runtime: Dict[str, Any], delta: Dict[str, Any]
 ) -> None:
     for key, seconds, exact in (
+        ("60_sec", PHOTONS_RECOVERY_60_SEC_SECONDS, True),
         ("10_min", PHOTONS_RECOVERY_10_MIN_SECONDS, True),
         ("60_min", PHOTONS_RECOVERY_60_MIN_SECONDS, False),
         ("8_hour", PHOTONS_RECOVERY_8_HOUR_SECONDS, False),
@@ -5459,7 +5468,6 @@ def _make_photons(
     if normalization is not None:
         state["normalization"] = normalization
     state["measurement"] = _normalizer.measure(state)
-    state["lap_60s_ns"] = _lap_60s(checkpoint, stats["update_count"])
     _cadence_mark(timing, "normalization")
     return state, checkpoint
 
@@ -7398,8 +7406,9 @@ def _rehydrate_pi_campaign(
             "start_after_sequence": start_after,
             "firmware_public_count": public_count,
         }
-        if "start_lap_ns" in master_payload:
-            window["start_lap_ns"] = master_payload["start_lap_ns"]
+        for key in ("start_lap_ns", "start_altitude_m"):
+            if key in master_payload:
+                window[key] = master_payload[key]
         if allow_first_public_count_splice:
             window["restart_public_count_splice_pending"] = True
         _active_campaign = window
@@ -9015,7 +9024,7 @@ def _campaign_public_decoration(window: Dict[str, Any]) -> Dict[str, Any]:
     }
     if window.get("stopped_at"):
         out["stopped_at"] = str(window["stopped_at"])
-    for key in ("start_lap_ns", "end_lap_ns"):
+    for key in ("start_lap_ns", "start_altitude_m", "end_lap_ns", "end_altitude_m"):
         if key in window:
             out[key] = window[key]
     start_after = window.get("start_after_sequence")
@@ -9039,7 +9048,7 @@ def _campaign_public_decoration(window: Dict[str, Any]) -> Dict[str, Any]:
 def _campaign_decoration_from_firmware(
     firmware_campaign: Dict[str, Any],
     checkpoint: Dict[str, Any],
-    lap_60s_ns: Optional[float],
+    photons: Payload,
 ) -> Dict[str, Any]:
     """Merge Teensy-authored boundary/science with Pi-owned durable provenance."""
     global _closing_campaigns
@@ -9101,17 +9110,20 @@ def _campaign_decoration_from_firmware(
             # row. Use that observation even across a subsequent STATS_RESET.
             with _state_lock:
                 predecessor = _latest_photons or {}
-            if predecessor.get("sequence") == start_after and "lap_60s_ns" in predecessor:
-                window["start_lap_ns"] = predecessor["lap_60s_ns"]
+            if predecessor.get("sequence") == start_after:
+                window["start_lap_ns"] = _minute_lap(predecessor)
+                window["start_altitude_m"] = predecessor["gnss"].get("altitude_m")
             else:
                 # A delayed first public row may still have both exact anchors.
-                boundary_update = checkpoint["current_sequence"] - public_count
-                window["start_lap_ns"] = _lap_60s(checkpoint, boundary_update)
+                boundary_update = checkpoint["update_count"] - public_count
+                window["start_lap_ns"] = _missed_start_lap(checkpoint, boundary_update)
+                window["start_altitude_m"] = None
 
         if final:
             stop_after = int(firmware_campaign["stop_after_sequence"])
             window["stop_after_sequence"] = stop_after
-            window["end_lap_ns"] = lap_60s_ns
+            window["end_lap_ns"] = _minute_lap(photons)
+            window["end_altitude_m"] = photons["gnss"].get("altitude_m")
             window["firmware_final_seen"] = True
 
         out = _campaign_public_decoration(window)
@@ -9312,9 +9324,11 @@ def _persist_photons(
                 "start_boundary_pending": False,
                 "flash_cut_pending": False,
                 "start_lap_ns": campaign.get("start_lap_ns"),
+                "start_altitude_m": campaign.get("start_altitude_m"),
             }
             if campaign.get("final") is True:
                 boundary_payload["end_lap_ns"] = campaign.get("end_lap_ns")
+                boundary_payload["end_altitude_m"] = campaign.get("end_altitude_m")
                 boundary_payload["stop_after_sequence"] = _require_int(
                     campaign.get("stop_after_sequence"),
                     "PHOTONS.campaign.stop_after_sequence",
@@ -9735,7 +9749,7 @@ def _state_loop() -> None:
                     )
                     if firmware_campaign is not None:
                         photons["campaign"] = _campaign_decoration_from_firmware(
-                            firmware_campaign, ppb_restore_checkpoint, photons["lap_60s_ns"]
+                            firmware_campaign, ppb_restore_checkpoint, photons
                         )
                     # The state worker is the exclusive statistics owner. This
                     # is attached BEFORE publication and BEFORE the ordered
@@ -11332,8 +11346,12 @@ def cmd_truncate(_: Optional[dict]) -> Dict[str, Any]:
     return {"success": True, "message": "OK", "payload": result}
 
 
-def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
+def cmd_list_campaigns(args: Optional[dict]) -> Dict[str, Any]:
     """List LANTERN campaign masters and optical recording summaries."""
+    selection = "ORDER BY master.ts ASC, master.id ASC"
+    if (args or {}).get("latest_closed") is True:
+        selection = ("AND NOT master.active AND master.payload ? 'end_lap_ns' "
+                     "ORDER BY master.ts DESC, master.id DESC LIMIT 1")
     try:
         with open_db(row_dict=True) as conn:
             cur = conn.cursor()
@@ -11348,8 +11366,7 @@ def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
                     master.payload
                 FROM campaign_master AS master
                 WHERE master.campaign_type = %s
-                ORDER BY master.ts ASC, master.id ASC
-                """,
+                """ + selection,
                 (CAMPAIGN_TYPE_LANTERN,),
             )
             rows = cur.fetchall()
@@ -11380,6 +11397,8 @@ def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
                 "active": bool(row["active"]),
                 "started_at": payload.get("started_at"),
                 "stopped_at": payload.get("stopped_at"),
+                "start_altitude_m": payload.get("start_altitude_m"),
+                "end_altitude_m": payload.get("end_altitude_m"),
                 "start_lap_ns": payload.get("start_lap_ns"),
                 "end_lap_ns": payload.get("end_lap_ns"),
                 "interrupted_at": payload.get("interrupted_at"),
@@ -11723,7 +11742,7 @@ def _stats_reset_birth_court(
     }
 
 
-PPB_BUCKET_NAMES = ("10_min", "60_min", "8_hour", "24_hour", "total")
+PPB_BUCKET_NAMES = ("60_sec", "10_min", "60_min", "8_hour", "24_hour", "total")
 
 
 def _fetch_teensy_stats_reset_report() -> Dict[str, Any]:

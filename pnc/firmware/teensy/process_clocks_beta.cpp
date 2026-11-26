@@ -1244,6 +1244,7 @@ static void clocks_fragment_add_ppb_buckets(
     const clocks_fragment_ppb_buckets_snapshot_t& buckets) {
   clocks_payload_owner_assert(clocks_payload_owner_t::FRAGMENT);
   Payload values;
+  clocks_fragment_add_ppb_bucket(values, "60_sec", buckets.second_60);
   clocks_fragment_add_ppb_bucket(values, "10_min", buckets.minute_10);
   clocks_fragment_add_ppb_bucket(values, "60_min", buckets.minute_60);
   clocks_fragment_add_ppb_bucket(values, "8_hour", buckets.hour_8);
@@ -1306,6 +1307,8 @@ static void clocks_fragment_add_ppb_checkpoint(
         value, "origin", checkpoint.origin);
   }
 
+  clocks_fragment_add_ppb_window_proof(
+      value, "60_sec", checkpoint.second_60);
   clocks_fragment_add_ppb_window_proof(
       value, "10_min", checkpoint.minute_10);
   clocks_fragment_add_ppb_window_proof(
@@ -6662,6 +6665,7 @@ static FLASHMEM clocks_fragment_ppb_value_snapshot_t clocks_fragment_ppb_value(
 static FLASHMEM clocks_fragment_ppb_buckets_snapshot_t clocks_fragment_ppb_buckets(
     const clocks_instrument_ppb_buckets_snapshot_t& source) {
   clocks_fragment_ppb_buckets_snapshot_t out{};
+  out.second_60 = clocks_fragment_ppb_value(source.second_60);
   out.minute_10 = clocks_fragment_ppb_value(source.minute_10);
   out.minute_60 = clocks_fragment_ppb_value(source.minute_60);
   out.hour_8 = clocks_fragment_ppb_value(source.hour_8);
@@ -6787,6 +6791,7 @@ static void clocks_fragment_ppb_checkpoint_from_alpha(
     clocks_fragment_ppb_endpoint_from_alpha(out.origin, source.origin);
   }
 
+  clocks_fragment_ppb_window_proof_from_alpha(out.second_60, source.second_60);
   clocks_fragment_ppb_window_proof_from_alpha(out.minute_10, source.minute_10);
   clocks_fragment_ppb_window_proof_from_alpha(out.minute_60, source.minute_60);
   clocks_fragment_ppb_window_proof_from_alpha(out.hour_8, source.hour_8);

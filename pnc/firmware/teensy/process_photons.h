@@ -496,6 +496,7 @@ struct photons_fragment_lap_value_snapshot_t {
 // Existing PPB-named checkpoint types below retain the count/time recovery wire
 // protocol only; they carry no lap baseline or residual statistics.
 struct photons_fragment_lap_buckets_snapshot_t {
+  photons_fragment_lap_value_snapshot_t second_60{};
   photons_fragment_lap_value_snapshot_t minute_10{};
   photons_fragment_lap_value_snapshot_t minute_60{};
   photons_fragment_lap_value_snapshot_t hour_8{};
@@ -532,6 +533,7 @@ struct photons_fragment_ppb_checkpoint_delta_snapshot_t {
   photons_fragment_ppb_endpoint_snapshot_t current{};
   photons_fragment_ppb_endpoint_snapshot_t origin{};
 
+  photons_fragment_ppb_window_proof_snapshot_t second_60{};
   photons_fragment_ppb_window_proof_snapshot_t minute_10{};
   photons_fragment_ppb_window_proof_snapshot_t minute_60{};
   photons_fragment_ppb_window_proof_snapshot_t hour_8{};

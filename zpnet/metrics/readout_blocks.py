@@ -13,7 +13,7 @@ Stats policy:
   CLOCKS statistics are read verbatim from the producer-authored instrument and
   campaign surfaces, including the GNSS reference Welford and Pi-owned DAC
   Welfords.  PHOTONS publishes cumulative accepted-lap Welford/grand-ratio
-  sufficient state plus producer-authored 10-minute, 60-minute, 8-hour, 24-hour,
+  sufficient state plus producer-authored 60-second, 10-minute, 60-minute, 8-hour, 24-hour,
   and TOTAL PPB buckets.  Metrics transcribes those PPB buckets verbatim; it does
   not estimate rolling windows from repaint history.  The live PHOTONS rolling
   tail retains actual PUBSUB publications in memory and reads each second's
@@ -31,7 +31,7 @@ Clock row doctrine:
   here because they are not primary TEMPEST science clocks.
   VALUE is the Beta-authored campaign-relative clockface while a campaign is
   active; otherwise it is the canonical always-on instrument clockface.
-  10-MIN/60-MIN/8-HOUR/24-HOUR are firmware/Pi-producer-authored rolling PPB
+  60-SEC/10-MIN/60-MIN/8-HOUR/24-HOUR are firmware/Pi-producer-authored rolling PPB
   buckets.  Metrics never estimates a rolling population from repaint history.
   TOTAL is the always-on population since boot or the last statistics reset.
   TOTAL owns the displayed Welford population and the legacy stats.<lane>.ppb
@@ -44,7 +44,7 @@ Clock row doctrine:
   RES is the firmware-published residual for the prior PPS interval.
 
 Column layout (CLK rows):
-  NAME   VALUE   10-MIN   60-MIN   8-HOUR   24-HOUR   TOTAL   CAMP   RES
+  NAME   VALUE   60-SEC   10-MIN   60-MIN   8-HOUR   24-HOUR   TOTAL   CAMP   RES
 
 Column layout (DAC rows):
   OCXO   VOUT   MEAN_V
@@ -66,6 +66,7 @@ from collections import deque
 from fractions import Fraction
 
 from zpnet.processes.processes import PUBSUB_TAP_SOCKET, create_pubsub_cache, send_command
+from zpnet.shared.campaign_endpoints import last_lantern, last_tempest
 from zpnet.shared.db import open_db
 from zpnet.shared.photons_voltage import (
     QUADRATIC_MODELS, VOLTAGE_MODELS, voltage_adjustment, voltage_window, voltage_window_spec,
@@ -98,7 +99,7 @@ DAC_MAX_CODE = float(
 FEATURE_GRID_COLUMNS = 4
 FEATURE_GRID_CELL_WIDTH = 39
 
-PPB_BUCKET_KEYS = ("10_min", "60_min", "8_hour", "24_hour", "total")
+PPB_BUCKET_KEYS = ("60_sec", "10_min", "60_min", "8_hour", "24_hour", "total")
 PPB_VISIBLE_COLUMN_COUNT = len(PPB_BUCKET_KEYS) + 1  # + campaign
 
 CLOCKS_TOPIC = "CLOCKS"
@@ -1538,6 +1539,8 @@ def _get_campaign_rows() -> list[dict]:
                     master.campaign_type,
                     master.campaign,
                     master.active,
+                    master.payload ->> 'start_altitude_m' AS start_altitude_m,
+                    master.payload ->> 'end_altitude_m' AS end_altitude_m,
                     master.payload -> 'start_ppb' AS start_ppb,
                     master.payload -> 'end_ppb' AS end_ppb,
                     master.payload -> 'campaign_dac' AS campaign_dac,
@@ -1555,6 +1558,8 @@ def _get_campaign_rows() -> list[dict]:
 
                     master.payload #>> '{report,fragment,clockfaces,ocxo1_ns}'
                         AS ocxo1_ns,
+                    master.payload #>> '{report,clocks,stats,ocxo1,ppb_buckets,60_sec}'
+                        AS ocxo1_ppb_60_sec,
                     master.payload #>> '{report,clocks,stats,ocxo1,ppb_buckets,10_min}'
                         AS ocxo1_ppb_10_min,
                     master.payload #>> '{report,clocks,stats,ocxo1,ppb_buckets,60_min}'
@@ -1582,6 +1587,8 @@ def _get_campaign_rows() -> list[dict]:
 
                     master.payload #>> '{report,fragment,clockfaces,ocxo2_ns}'
                         AS ocxo2_ns,
+                    master.payload #>> '{report,clocks,stats,ocxo2,ppb_buckets,60_sec}'
+                        AS ocxo2_ppb_60_sec,
                     master.payload #>> '{report,clocks,stats,ocxo2,ppb_buckets,10_min}'
                         AS ocxo2_ppb_10_min,
                     master.payload #>> '{report,clocks,stats,ocxo2,ppb_buckets,60_min}'
@@ -1662,6 +1669,7 @@ def campaigns_readout() -> list[str]:
         f"{'PROF':>{W_PROFILE}}{G}"
         f"{'DEV':<{W_DEV}}"
         f"{'VALUE':>{W_VALUE}}"
+        f"{'60-SEC':>{W_PPB_BUCKET}}"
         f"{'10-MIN':>{W_PPB_BUCKET}}"
         f"{'60-MIN':>{W_PPB_BUCKET}}"
         f"{'8-HOUR':>{W_PPB_BUCKET}}"
@@ -1703,6 +1711,7 @@ def campaigns_readout() -> list[str]:
         for lane_name, lane_key in (("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")):
             value = _to_int(row.get(f"{lane_key}_ns"))
             ppb_values = (
+                _to_float(row.get(f"{lane_key}_ppb_60_sec")),
                 _to_float(row.get(f"{lane_key}_ppb_10_min")),
                 _to_float(row.get(f"{lane_key}_ppb_60_min")),
                 _to_float(row.get(f"{lane_key}_ppb_8_hour")),
@@ -1740,7 +1749,9 @@ def campaigns_readout() -> list[str]:
             )
 
         endpoints = f"  OCXO1 / OCXO2   START PPB: {_ocxo_ppb_pair(row.get('start_ppb'))}"
+        endpoints += f"   START ALT: {_altitude_text(row.get('start_altitude_m'))}"
         if not row.get("active"):
+            endpoints += f"   END ALT: {_altitude_text(row.get('end_altitude_m'))}"
             endpoints += f"   END PPB: {_ocxo_ppb_pair(row.get('end_ppb'))}"
         lines.append(endpoints)
         if row_index != len(rows) - 1:
@@ -1825,13 +1836,18 @@ def clocks_combined_readout() -> list[str]:
         start = _field(r, "campaign_delta.start_ppb") or {}
         delta = {}
         for lane in ("ocxo1", "ocxo2"):
-            ten_min = _ppb_bucket(r, lane, "10_min")
-            if ten_min is not None and start.get(lane) is not None:
-                delta[lane] = ten_min - start[lane]
+            minute = _ppb_bucket(r, lane, "60_sec")
+            if minute is not None and start.get(lane) is not None:
+                delta[lane] = minute - start[lane]
         identity += (f"   OCXO1 / OCXO2   START PPB: {_ocxo_ppb_pair(start)}"
-                     f"   DELTA 10-MIN: {_ocxo_ppb_pair(delta)}")
+                     f"   START ALT: {_altitude_text(_field(r, 'campaign_delta.start_altitude_m'))}"
+                     f"   DELTA 60-SEC: {_ocxo_ppb_pair(delta)}")
     else:
         identity = f"CAMPAIGN: STOPPED  INSTRUMENT: {instrument_elapsed}"
+        last = last_tempest.get()
+        if last:
+            identity += (f"   LAST: {last['campaign']}   END PPB: {_ocxo_ppb_pair(last.get('end_ppb'))}"
+                         f"   END ALT: {_altitude_text(last.get('end_altitude_m'))}")
     lines.append(
         identity
         + f"    SERVO: {servo_str}"
@@ -1849,6 +1865,7 @@ def clocks_combined_readout() -> list[str]:
     lines.append(
         f"{'CLK':<{W_NAME}}"
         f"{'VALUE':>{W_VALUE}}"
+        f"{'60-SEC':>{W_PPB_BUCKET}}"
         f"{'10-MIN':>{W_PPB_BUCKET}}"
         f"{'60-MIN':>{W_PPB_BUCKET}}"
         f"{'8-HOUR':>{W_PPB_BUCKET}}"
@@ -2334,7 +2351,7 @@ def _photons_summary(payload: dict, before: dict | None = None) -> dict:
 
 
 def _photons_summary_header(include_campaign: bool) -> str:
-    labels = ["LAP", "10-MIN", "60-MIN", "8-HOUR", "24-HOUR", "TOTAL"]
+    labels = ["60-SEC", "10-MIN", "60-MIN", "8-HOUR", "24-HOUR", "TOTAL"]
     if include_campaign:
         labels.append("CAMP")
     return (f"{'SEC':<8} " + " ".join(f"{label:>{PHOTONS_MEAN_WIDTH}}" for label in labels)
@@ -2342,7 +2359,7 @@ def _photons_summary_header(include_campaign: bool) -> str:
 
 
 def _photons_summary_line(summary: dict, include_campaign: bool, campaign_mean=None) -> str:
-    values = [summary.get("mean")] + [summary.get("buckets", {}).get(k) for k in PPB_BUCKET_KEYS]
+    values = [summary.get("buckets", {}).get(k) for k in PPB_BUCKET_KEYS]
     if include_campaign:
         values.append(campaign_mean)
     scatter = summary.get("scatter") or {}
@@ -2367,6 +2384,8 @@ def _get_lantern_campaign_summaries() -> list[dict]:
             """
             SELECT master.id, master.campaign, master.active,
                    master.payload ->> 'interrupted_at' AS interrupted_at,
+                   master.payload ->> 'start_altitude_m' AS start_altitude_m,
+                   master.payload ->> 'end_altitude_m' AS end_altitude_m,
                    master.payload ->> 'start_lap_ns' AS start_lap_ns,
                    master.payload ->> 'end_lap_ns' AS end_lap_ns,
                    master.payload #>> '{report,sequence}' AS last_sequence,
@@ -2396,6 +2415,8 @@ def _get_lantern_campaign_summaries() -> list[dict]:
             "campaign": row["campaign"],
             "active": bool(row["active"]),
             "interrupted_at": row["interrupted_at"],
+            "start_altitude_m": _to_float(row["start_altitude_m"]),
+            "end_altitude_m": _to_float(row["end_altitude_m"]),
             "start_lap_ns": _to_float(row["start_lap_ns"]),
             "end_lap_ns": _to_float(row["end_lap_ns"]),
             "last_sequence": _to_int(row["last_sequence"]),
@@ -2563,7 +2584,7 @@ def _photons_stability_lines(payload: dict) -> list[str]:
     if data.get("status") != "ACTIVE":
         return []
     bucket_means = _photons_producer_lap_buckets(payload)
-    labels = ((60, "1-MIN", None), (600, "10-MIN", "10_min"),
+    labels = ((60, "60-SEC", "60_sec"), (600, "10-MIN", "10_min"),
               (3600, "60-MIN", "60_min"), (14400, "4-HOUR", None),
               (28800, "8-HOUR", "8_hour"), (86400, "24-HOUR", "24_hour"))
     lines = [
@@ -2612,9 +2633,18 @@ def photons_detail_readout() -> list[str]:
             f"  ELAPSED: {_seconds_to_hms(summary['seconds'])}")
     if campaign:
         start = campaign.get("start_lap_ns")
-        lap = rolling_rows[-1]["normalized_mean"]
+        lap = summary["buckets"]["60_sec"]
         delta = lap - start if lap is not None and start is not None else None
-        line += f"  START LAP: {_fmt(start, ',.6f', 0)} NS  DELTA: {_fmt(delta, '+.6f', 0)} NS"
+        line += (f"  START LAP: {_fmt(start, ',.6f', 0)} NS"
+                 f"  START ALT: {_altitude_text(campaign.get('start_altitude_m'))}"
+                 f"  DELTA 60-SEC: {_fmt(delta, '+.6f', 0)} NS")
+        if campaign.get("final"):
+            line += f"  END ALT: {_altitude_text(campaign.get('end_altitude_m'))}"
+    else:
+        last = last_lantern.get()
+        if last:
+            line += (f"  LAST: {last['campaign']}  END LAP: {_fmt(last.get('end_lap_ns'), ',.6f', 0)} NS"
+                     f"  END ALT: {_altitude_text(last.get('end_altitude_m'))}")
     line += f"  RECOVERABLE: {str(recoverable).upper()}"
     measurement = live.get("measurement")
     # Report a second, corrected mean only when a real calibration produced one.
@@ -2661,7 +2691,7 @@ def photons_campaigns_readout() -> list[str]:
     if rows is None:
         return ["\0LANTERN_CAMPAIGNS:LOADING", "LANTERN CAMPAIGNS: LOADING"]
     newest_identity = str(rows[0].get("id")) if rows else "EMPTY"
-    columns = ("START LAP", "LAP", "10-MIN", "60-MIN", "8-HOUR", "24-HOUR", "TOTAL", "CAMP")
+    columns = ("START LAP", "60-SEC", "10-MIN", "60-MIN", "8-HOUR", "24-HOUR", "TOTAL", "CAMP")
     lines = [f"\0LANTERN_CAMPAIGN:{newest_identity}",
              f"{'CAMPAIGN':<18} {'SEC':>8} "
              + " ".join(f"{label:>{PHOTONS_MEAN_WIDTH}}" for label in columns)
@@ -2685,6 +2715,7 @@ def photons_campaigns_readout() -> list[str]:
                 and (_to_int(live.get("sequence")) or -1) >= (row.get("last_sequence") or -1)):
             current = _photons_summary(live)
             row = {**row, "seconds": current["seconds"], "campaign_mean_lap_ns": current["mean"],
+                   "start_altitude_m": live_identity.get("start_altitude_m"),
                    "start_lap_ns": live_identity.get("start_lap_ns", row.get("start_lap_ns")),
                    "lap_buckets": current["buckets"], "total_scatter": current["scatter"]}
         name = str(row.get("campaign") or "?")
@@ -2695,7 +2726,7 @@ def photons_campaigns_readout() -> list[str]:
             name += " [INT]"
         buckets = row.get("lap_buckets") or {}
         scatter = row.get("total_scatter") or {}
-        values = [row.get("start_lap_ns"), lap] + [buckets.get(key) for key in PPB_BUCKET_KEYS] + [lap]
+        values = [row.get("start_lap_ns")] + [buckets.get(key) for key in PPB_BUCKET_KEYS] + [lap]
         if len(lines) > 2 and lines[-1] != "":
             lines.append("")
         lines.append(
@@ -2707,6 +2738,10 @@ def photons_campaigns_readout() -> list[str]:
             + ("" if row.get("active") else
                " " + _fmt(row.get("end_lap_ns"), f'>{PHOTONS_MEAN_WIDTH},.6f', PHOTONS_MEAN_WIDTH))
         )
+        altitudes = f"  START ALT: {_altitude_text(row.get('start_altitude_m'))}"
+        if not row.get("active"):
+            altitudes += f"   END ALT: {_altitude_text(row.get('end_altitude_m'))}"
+        lines.append(altitudes)
     return lines
 
 

@@ -1629,6 +1629,7 @@ struct clocks_instrument_ppb_value_snapshot_t {
 // Alpha owns only the always-on populations. Beta decorates the public handoff
 // with the campaign-scoped value because campaign identity is not Alpha state.
 struct clocks_instrument_ppb_buckets_snapshot_t {
+  clocks_instrument_ppb_value_snapshot_t second_60{};
   clocks_instrument_ppb_value_snapshot_t minute_10{};
   clocks_instrument_ppb_value_snapshot_t minute_60{};
   clocks_instrument_ppb_value_snapshot_t hour_8{};
@@ -1672,6 +1673,7 @@ struct clocks_alpha_ppb_checkpoint_delta_snapshot_t {
   clocks_alpha_ppb_cumulative_endpoint_snapshot_t current{};
   clocks_alpha_ppb_cumulative_endpoint_snapshot_t origin{};
 
+  clocks_alpha_ppb_window_proof_snapshot_t second_60{};
   clocks_alpha_ppb_window_proof_snapshot_t minute_10{};
   clocks_alpha_ppb_window_proof_snapshot_t minute_60{};
   clocks_alpha_ppb_window_proof_snapshot_t hour_8{};

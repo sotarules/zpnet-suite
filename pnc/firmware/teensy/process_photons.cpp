@@ -87,6 +87,7 @@ static constexpr uint32_t PHOTONS_SCIENCE_GATE_MIN_CYCLES = 64U;
 // literal suffix may contain an explicit chronology gap; window publication must
 // prove that its requested old edge lies inside the newest contiguous suffix
 // rather than silently relabeling a shorter available baseline.
+static constexpr uint32_t PHOTONS_PPB_SECOND_60_SECONDS = 60U;
 static constexpr uint32_t PHOTONS_PPB_MINUTE_10_SECONDS = 10U * 60U;
 static constexpr uint32_t PHOTONS_PPB_MINUTE_60_SECONDS = 60U * 60U;
 static constexpr uint32_t PHOTONS_PPB_HOUR_8_SECONDS = 8U * 60U * 60U;
@@ -1063,6 +1064,13 @@ photons_ppb_checkpoint_delta_snapshot(void) {
   out.origin_valid = true;
   out.origin = photons_ppb_endpoint_snapshot(origin);
 
+  out.second_60 = photons_ppb_window_proof(
+      g_photons_ppb_seconds,
+      g_photons_ppb_seconds_head,
+      g_photons_ppb_seconds_count,
+      PHOTONS_PPB_SECOND_60_SECONDS,
+      false,
+      current);
   out.minute_10 = photons_ppb_window_proof(
       g_photons_ppb_seconds,
       g_photons_ppb_seconds_head,
@@ -1202,6 +1210,13 @@ static photons_fragment_lap_buckets_snapshot_t photons_ppb_buckets_snapshot(void
     __builtin_trap();
   }
 
+  out.second_60 = photons_ppb_window_snapshot(
+      g_photons_ppb_seconds,
+      g_photons_ppb_seconds_head,
+      g_photons_ppb_seconds_count,
+      PHOTONS_PPB_SECOND_60_SECONDS,
+      false,
+      current);
   out.minute_10 = photons_ppb_window_snapshot(
       g_photons_ppb_seconds,
       g_photons_ppb_seconds_head,
@@ -5376,6 +5391,8 @@ static Payload& photons_fragment_payload(
       stats, "lap_time", f.stats.lap_time_welford);
 
   photons_payload_add_lap_value(
+      ppb_buckets, "60_sec", f.stats.lap_buckets.second_60);
+  photons_payload_add_lap_value(
       ppb_buckets, "10_min", f.stats.lap_buckets.minute_10);
   photons_payload_add_lap_value(
       ppb_buckets, "60_min", f.stats.lap_buckets.minute_60);
@@ -5412,6 +5429,8 @@ static Payload& photons_fragment_payload(
     photons_payload_add_ppb_endpoint(
         ppb_checkpoint, "origin", checkpoint.origin);
   }
+  photons_payload_add_ppb_window_proof(
+      ppb_checkpoint, "60_sec", checkpoint.second_60);
   photons_payload_add_ppb_window_proof(
       ppb_checkpoint, "10_min", checkpoint.minute_10);
   photons_payload_add_ppb_window_proof(
@@ -7529,6 +7548,8 @@ static FLASHMEM Payload cmd_report_photons(const Payload& /*args*/) {
   p.add("lap_count", canonical.stats.lap_count);
   p.add("total_lap_gnss_ns", canonical.stats.total_lap_gnss_ns);
   p.add("mean_lap_ns", toFixedDecimal(canonical.stats.mean_lap_ns, 6));
+  photons_payload_add_flat_lap_bucket(p, "lap_60_sec",
+                                      canonical.stats.lap_buckets.second_60);
   photons_payload_add_flat_lap_bucket(p, "lap_10_min",
                                       canonical.stats.lap_buckets.minute_10);
   photons_payload_add_flat_lap_bucket(p, "lap_60_min",
@@ -7618,6 +7639,8 @@ static FLASHMEM Payload cmd_report_stats(const Payload& /*args*/) {
         canonical.science.exclusion_reasons.raw_cycle_excursion);
   p.add("science_exclusion_isr_delay",
         canonical.science.exclusion_reasons.isr_delay);
+  photons_payload_add_flat_lap_bucket(p, "lap_60_sec",
+                                      canonical.stats.lap_buckets.second_60);
   photons_payload_add_flat_lap_bucket(p, "lap_10_min",
                                       canonical.stats.lap_buckets.minute_10);
   photons_payload_add_flat_lap_bucket(p, "lap_60_min",

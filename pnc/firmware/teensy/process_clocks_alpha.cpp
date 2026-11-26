@@ -1923,6 +1923,7 @@ enum class alpha_ppb_lane_t : uint8_t {
   OCXO2 = 3,
 };
 
+static constexpr uint32_t ALPHA_PPB_SECOND_60_SECONDS = 60U;
 static constexpr uint32_t ALPHA_PPB_MINUTE_10_SECONDS = 10U * 60U;
 static constexpr uint32_t ALPHA_PPB_MINUTE_60_SECONDS = 60U * 60U;
 static constexpr uint32_t ALPHA_PPB_HOUR_8_SECONDS = 8U * 60U * 60U;
@@ -2511,6 +2512,8 @@ static void alpha_ppb_checkpoint_delta_snapshot(
     out.origin = alpha_ppb_endpoint_snapshot(g_alpha_ppb_origin);
   }
 
+  out.second_60 = alpha_ppb_window_proof(
+      ALPHA_PPB_SECOND_60_SECONDS, true);
   out.minute_10 = alpha_ppb_window_proof(
       ALPHA_PPB_MINUTE_10_SECONDS, true);
   out.minute_60 = alpha_ppb_window_proof(
@@ -2593,6 +2596,8 @@ alpha_ppb_windows_from_checkpoint(
 
   // One selected anchor authors both the row-local proof and its recorded value.
   // Never walk the live rings a second time to derive the published bucket.
+  out.second_60 = alpha_ppb_value_from_proof(
+      lane, checkpoint.current, checkpoint.second_60);
   out.minute_10 = alpha_ppb_value_from_proof(
       lane, checkpoint.current, checkpoint.minute_10);
   out.minute_60 = alpha_ppb_value_from_proof(
