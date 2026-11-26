@@ -10,20 +10,11 @@ Data source:
   updating even if an instrument stream stops.
 
 Stats policy:
-  CLOCKS statistics are read verbatim from the producer-authored instrument and
-  campaign surfaces, including the GNSS reference Welford and Pi-owned DAC
-  Welfords.  PHOTONS publishes cumulative accepted-lap Welford/grand-ratio
-  sufficient state plus producer-authored 60-second, 10-minute, 60-minute, 8-hour, 24-hour,
-  and TOTAL PPB buckets.  Metrics transcribes those PPB buckets verbatim; it does
-  not estimate rolling windows from repaint history.  The live PHOTONS rolling
-  tail retains actual PUBSUB publications in memory and reads each second's
-  firmware-authored raw mean, normalized mean, and authoritative voltage adjustment directly;
-  PostgreSQL is not in that live-tail path.  Durable campaign history
-  remains a database read model.  This never synthesizes individual samples,
-  changes admission, or feeds science back into PHOTONS.  PHOTONS CAMP is read
-  verbatim from the Teensy-authored campaign.stats.ppb surface.  PHOTONS RES_NS
-  is presentation math for the local accepted-lap mean minus LAP_BASELINE_NS,
-  rendered in the system-wide nanosecond coordinate to six fractional digits.
+  Present producer-authored always-on 60-second PPB and LAP measurements.
+  Campaigns delimit observations; start/end readings and altitudes are saved
+  bookends.  Do not substitute cumulative or campaign means for a 60-SEC value.
+  The rolling PHOTONS tail retains the actual one-second PUBSUB publications.
+  PostgreSQL remains the authority for durable history.
 
 Clock row doctrine:
   The dense operator table shows GNSS, VCLOCK, OCXO1, and OCXO2 only.
@@ -31,20 +22,16 @@ Clock row doctrine:
   here because they are not primary TEMPEST science clocks.
   VALUE is the Beta-authored campaign-relative clockface while a campaign is
   active; otherwise it is the canonical always-on instrument clockface.
-  60-SEC/10-MIN/60-MIN/8-HOUR/24-HOUR are firmware/Pi-producer-authored rolling PPB
-  buckets.  Metrics never estimates a rolling population from repaint history.
-  TOTAL is the always-on population since boot or the last statistics reset.
-  TOTAL owns the displayed Welford population and the legacy stats.<lane>.ppb
-  fallback while producers migrate to ppb_buckets.
-  CAMP is the firmware-authored campaign population. CAMP DAC MEAN is the
-  Pi-recorded campaign target population; it never resets the running servo.
+  60-SEC is the producer-authored rolling PPB measurement.
+  DAC MEAN remains the separate Pi-recorded actuator population; it never
+  resets the running servo.
   CAMP VOLTS derives from that fractional mean at nominal 5 V / 65536 codes.
   DAC N counts recorded eligible samples; DAC FROM identifies recording onset.
   Legacy campaigns have no DAC recording; missing history is not backfilled.
   RES is the firmware-published residual for the prior PPS interval.
 
 Column layout (CLK rows):
-  NAME   VALUE   60-SEC   10-MIN   60-MIN   8-HOUR   24-HOUR   TOTAL   CAMP   RES
+  NAME   VALUE   60-SEC   RES
 
 Column layout (DAC rows):
   OCXO   VOUT   MEAN_V
@@ -67,9 +54,10 @@ from fractions import Fraction
 
 from zpnet.processes.processes import PUBSUB_TAP_SOCKET, create_pubsub_cache, send_command
 from zpnet.shared.campaign_endpoints import last_lantern, last_tempest
+from zpnet.shared.display_format import altitude_text as _altitude_text
 from zpnet.shared.db import open_db
 from zpnet.shared.photons_voltage import (
-    QUADRATIC_MODELS, VOLTAGE_MODELS, voltage_adjustment, voltage_window, voltage_window_spec,
+    VOLTAGE_MODELS, voltage_adjustment, voltage_window, voltage_window_spec,
 )
 
 # AD5693R doctrine mirrors Pi CLOCKS, the sole actuator authority:
@@ -99,8 +87,7 @@ DAC_MAX_CODE = float(
 FEATURE_GRID_COLUMNS = 4
 FEATURE_GRID_CELL_WIDTH = 39
 
-PPB_BUCKET_KEYS = ("60_sec", "10_min", "60_min", "8_hour", "24_hour", "total")
-PPB_VISIBLE_COLUMN_COUNT = len(PPB_BUCKET_KEYS) + 1  # + campaign
+PPB_BUCKET_KEYS = ("60_sec",)
 
 CLOCKS_TOPIC = "CLOCKS"
 PHOTONS_TOPIC = "PHOTONS"
@@ -460,13 +447,6 @@ def _gnss_status(r: dict | None = None, snapshot: dict | None = None) -> dict:
     return g
 
 
-def _altitude_text(altitude_m) -> str:
-    if altitude_m is None:
-        return "---"
-    meters = float(altitude_m)
-    return f"{meters:.1f} m ({meters / 0.3048:.1f} ft)"
-
-
 def _gnss_status_line(snapshot: dict) -> str:
     gnss = _gnss_status(snapshot.get("clocks"), snapshot)
     freq_mode_name = gnss.get("freq_mode_name") or "?"
@@ -652,9 +632,7 @@ def _ppb_bucket(r: dict, lane: str, bucket: str):
 
 
 def _ppb_cols_fragment(r: dict, lane: str, width: int) -> str:
-    values = [_ppb_bucket(r, lane, bucket) for bucket in PPB_BUCKET_KEYS]
-    values.append(_campaign_ppb(r, lane))
-    return "".join(_fmt(value, f">{width}.3f", width) for value in values)
+    return _fmt(_ppb_bucket(r, lane, "60_sec"), f">{width}.3f", width)
 
 
 def _welford_value(r: dict, prefix: str, field: str):
@@ -1210,7 +1188,7 @@ def environment_sensor_block(snapshot: dict) -> list[str]:
     """
     environment = snapshot.get("environment") or {}
     columns = (f"{'SENSOR':<12} {'STATE':<12} {'TEMP(C)':>10}"
-               f" {'RH(%)':>9} {'BARO(hPa)':>11} {'BARO_ALT(m)':>12}")
+               f" {'RH(%)':>9} {'BARO(hPa)':>11} {'BARO_ALT':>18}")
     lines = [columns]
 
     def fmt(value, decimals: int, width: int) -> str:
@@ -1227,14 +1205,14 @@ def environment_sensor_block(snapshot: dict) -> list[str]:
             + f" {fmt(reading.get('temperature_c') if active else None, 4, 10)}"
             + f" {fmt(reading.get('humidity_pct') if active else None, 2, 9)}"
             + f" {fmt(reading.get('pressure_hpa') if active else None, 2, 11)}"
-            + f" {fmt(reading.get('altitude_m') if active else None, 1, 12)}"
+            + f" {_altitude_text(reading.get('altitude_m') if active else None):>18}"
         )
 
     rtd = snapshot.get("rtd") or {}
     state = str(rtd.get("status") or "INITIALIZING")
     lines.append(f"{'MAX31865':<12} {state:<12}"
                  + f" {fmt(rtd.get('temperature_c') if state == 'OK' else None, 4, 10)}"
-                 + f" {'---':>9} {'---':>11} {'---':>12}")
+                 + f" {'---':>9} {'---':>11} {'---':>18}")
     return lines
 
 
@@ -1245,36 +1223,10 @@ class RtdTemperatureWarning(str):
 
 
 def photons_temperature_block(snapshot: dict) -> list[str]:
-    """Align temperatures, voltage (mV), and ADJ (ns) with the mean columns.
-
-    The PHOTONS science header uses an eight-character label, a separator,
-    then PHOTONS_MEAN_WIDTH right-justified columns. Use precisely that geometry:
-    NOW sits below LAP, each temperature window below its photon window,
-    CAMP below CAMP, and CAMP_SD below the photon SD column. Short BME labels
-    fit the existing eight-character label without shifting any data columns.
-
-    Partial-coverage facts remain present in temperature_stats and its durable
-    checkpoint. The operator explicitly chose not to render '~' markers; hiding
-    that annotation does not promote an incomplete population to a complete one.
-    CLOCKS retains its independent environment_sensor_block layout unchanged.
-    """
-    data = snapshot.get("temperature_stats")
-    if data is not None and (not isinstance(data, dict) or
-                             data.get("schema") != "PI_PHOTONS_TEMPERATURE_STATS_V1"):
-        raise ValueError("unsupported PHOTONS temperature statistics schema")
-    # Always render the same layout, even before the first statistical record.
-    # Only the live physical NOW readings are then available.
-    data = data or {}
+    """Current sensor and optical-control readings, independent of campaigns."""
     environment = snapshot.get("environment") or {}
     rtd = snapshot.get("rtd") or {}
-    has_campaign = bool(snapshot.get("campaign"))
-    spans = (("600", "10-MIN"), ("3600", "60-MIN"),
-             ("28800", "8-HOUR"), ("86400", "24-HOUR"))
-    labels = ["NOW", *(label for _, label in spans), "TOTAL"]
-    if has_campaign:
-        labels.append("CAMP")
-    lines = [f"{'TEMP':<8} " + " ".join(f"{label:>{PHOTONS_MEAN_WIDTH}}" for label in labels)
-             + (f" {'CAMP_SD':>10}" if has_campaign else "")]
+    lines = [f"{'TEMP':<8} {'NOW':>{PHOTONS_MEAN_WIDTH}}"]
 
     def observed(value, digits=4, width=PHOTONS_MEAN_WIDTH):
         number = _to_float(value)
@@ -1282,77 +1234,25 @@ def photons_temperature_block(snapshot: dict) -> list[str]:
             return f"{'---':>{width}}"
         return f"{number:>{width}.{digits}f}"
 
-    def mean(pop, field="mean_c"):
-        if not isinstance(pop, dict) or pop.get(field) is None:
-            return f"{'---':>{PHOTONS_MEAN_WIDTH}}"
-        return observed(pop[field])
-
-    windows = data.get("windows") or {}
-    totals = data.get("total") or {}
-    campaigns = data.get("camp") or {}
     for key, label in (("pi", "BME PI"), ("pd", "BME PD"),
                        ("out", "BME OUT"), ("rtd", "MAX31865")):
         reading = rtd if key == "rtd" else environment.get(key) or {}
-        population = campaigns.get(key) or {}
-        row = (f"{label:<8} "
-               + observed(reading.get("temperature_c") if reading.get("status") == "OK" else None)
-               + ''.join(" " + mean((windows.get(span) or {}).get(key)) for span, _ in spans)
-               + " " + mean(totals.get(key))
-               + ((" " + mean(population) + " " + observed(population.get("sd_c"), 5, 10))
-                  if has_campaign else ""))
-        if key == "rtd" and reading.get("status") == "OK":
-            temp = _to_float(reading.get("temperature_c"))
-            if temp is not None and math.isfinite(temp) and (temp < 25.0 or temp >= 34.0):
-                row = RtdTemperatureWarning(row)
+        temp = _to_float(reading.get("temperature_c")) if reading.get("status") == "OK" else None
+        row = f"{label:<8} " + observed(temp)
+        if key == "rtd" and temp is not None and math.isfinite(temp) and (temp < 25.0 or temp >= 34.0):
+            row = RtdTemperatureWarning(row)
         lines.append(row)
 
-    # Display the active model's voltage population; retain HIGH60 in telemetry.
     normalization = snapshot["photons"]["voltage_normalization"]
     _, voltage_lane, _ = voltage_window_spec(normalization["model_id"])
     high_window = voltage_window(normalization, snapshot["photons"]["pd_out"])
     high_now = high_window.get("high_mean_mv") if high_window.get("sample_count", 0) > 0 else None
-    population = campaigns.get(voltage_lane) or {}
-    lines.append(
-        f"{voltage_lane.upper():<8} " + observed(high_now)
-        + ''.join(" " + mean((windows.get(span) or {}).get(voltage_lane), "mean_mv") for span, _ in spans)
-        + " " + mean(totals.get(voltage_lane), "mean_mv")
-        + ((" " + mean(population, "mean_mv") + " " + observed(population.get("sd_mv"), 5, 10))
-           if has_campaign else "")
-    )
+    lines.append(f"{voltage_lane.upper():<8} " + observed(high_now))
+    adj_now = (normalization["adjustment_ns"]
+               if normalization["raw_flight_ns"]["n"] > 0 else None)
+    lines.append(f"{'ADJ':<8} " + _fmt(adj_now, f'>+{PHOTONS_MEAN_WIDTH}.6f', PHOTONS_MEAN_WIDTH))
 
-    normalization = snapshot["photons"]["voltage_normalization"]
-    if normalization["model_id"] in QUADRATIC_MODELS:
-        # A quadratic of mean voltage is not the mean correction. Read the
-        # actual per-fragment ADJ populations, including their own campaign SD.
-        if data and "adjustment" not in totals:
-            raise ValueError("quadratic metrics requires actual adjustment populations")
-        def adj_cell(value, width=PHOTONS_MEAN_WIDTH):
-            if value is None:
-                return f"{'---':>{width}}"
-            value = float(value)
-            if not math.isfinite(value):
-                raise ValueError("PHOTONS adjustment population must be finite")
-            return f"{value:+{width}.6f}"
-
-        adj_campaign = campaigns.get("adjustment") or {}
-        adj_now = (normalization["adjustment_ns"]
-                   if normalization["raw_flight_ns"]["n"] > 0 else None)
-        lines.append(
-            f"{'ADJ':<8} " + adj_cell(adj_now)
-            + ''.join(" " + adj_cell(((windows.get(span) or {}).get("adjustment") or {}).get("mean_ns"))
-                      for span, _ in spans)
-            + " " + adj_cell((totals.get("adjustment") or {}).get("mean_ns"))
-            + ((" " + adj_cell(adj_campaign.get("mean_ns"))
-                + " " + observed(adj_campaign.get("sd_ns"), 6, 10)) if has_campaign else "")
-        )
-    else:
-        _photons_linear_adjustment_row(lines, normalization, high_now, windows, spans,
-                                       totals, population, has_campaign, observed)
-
-    # The separate SENSOR section contains only the three BME280 channels.
-    # These are their latest physical RH, pressure and barometric altitude
-    # readings, not derived temperature statistics and not statistical means.
-    lines.extend(["", f"{'SENSOR':<12} {'RH(%)':>9} {'BARO(HPA)':>11} {'BARO_ALT(M)':>12}"])
+    lines.extend(["", f"{'SENSOR':<12} {'RH(%)':>9} {'BARO(HPA)':>11} {'BARO_ALT':>18}"])
     for key, label in (("pi", "BME280 PI"), ("pd", "BME280 PD"),
                        ("out", "BME280 OUT")):
         reading = environment.get(key) or {}
@@ -1361,43 +1261,9 @@ def photons_temperature_block(snapshot: dict) -> list[str]:
             f"{label:<12} "
             + observed(reading.get("humidity_pct") if valid else None, 2, 9)
             + " " + observed(reading.get("pressure_hpa") if valid else None, 2, 11)
-            + " " + observed(reading.get("altitude_m") if valid else None, 1, 12)
+            + f" {_altitude_text(reading.get('altitude_m') if valid else None):>18}"
         )
     return lines
-
-
-def _photons_linear_adjustment_row(lines, normalization, high_now, windows, spans,
-                                    totals, population, has_campaign, observed):
-    # Historical linear models commute with the HIGH60 population means.
-    # Derive these cells from the full-precision published mV values, never
-    # from rounded display text or repaint history. CAMP_SD scales by |slope|.
-    if normalization["model_id"] not in ("PD200T_HIGH60_LINEAR_V1", "PD200T_HIGH60_LINEAR_V2"):
-        raise ValueError("PHOTONS ADJ buckets require a linear HIGH60 calibration")
-    factor = float(normalization["slope_ns_per_mv"])
-    reference = float(normalization["reference_mv"])
-    if not all(math.isfinite(value) for value in (factor, reference)):
-        raise ValueError("PHOTONS ADJ coefficients must be finite")
-
-    def adjustment(value):
-        if value is None:
-            return f"{'---':>{PHOTONS_MEAN_WIDTH}}"
-        result = factor * (float(value) - reference)
-        if not math.isfinite(result):
-            raise ValueError("PHOTONS ADJ requires a finite HIGH60 mean")
-        return f"{result:+{PHOTONS_MEAN_WIDTH}.6f}"
-
-    campaign_sd = population.get("sd_mv")
-    adjustment_sd = abs(factor) * float(campaign_sd) if campaign_sd is not None else None
-    if adjustment_sd is not None and (not math.isfinite(adjustment_sd) or adjustment_sd < 0):
-        raise ValueError("PHOTONS ADJ campaign SD must be finite and nonnegative")
-    lines.append(
-        f"{'ADJ':<8} " + adjustment(high_now)
-        + ''.join(" " + adjustment(((windows.get(span) or {}).get("high60") or {}).get("mean_mv"))
-                  for span, _ in spans)
-        + " " + adjustment((totals.get("high60") or {}).get("mean_mv"))
-        + ((" " + adjustment(population.get("mean_mv"))
-            + " " + observed(adjustment_sd, 6, 10)) if has_campaign else "")
-    )
 
 # ---------------------------------------------------------------------
 # Welford row renderer — reads firmware-owned statistics verbatim
@@ -1521,98 +1387,21 @@ def _dwt_expected_cycles(r: dict):
 
 
 def _get_campaign_rows() -> list[dict]:
-    """Return typed TEMPEST campaign masters as a direct read model.
-
-    ``campaign_master.payload.report`` is the compact campaign-list projection.
-    The UI performs no campaign_detail lookup and no per-campaign aggregation.
-    A campaign without a report remains visible with empty science columns.
-    Baselines belong to each saved report, so changing the live system baseline
-    never reinterprets stopped campaigns or backfills older campaigns.
-    """
+    """Read the durable TEMPEST bookends and latest paired observation."""
     with open_db(row_dict=True) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT
-                    master.id,
-                    master.ts,
-                    master.campaign_type,
-                    master.campaign,
-                    master.active,
-                    master.payload ->> 'start_altitude_m' AS start_altitude_m,
-                    master.payload ->> 'end_altitude_m' AS end_altitude_m,
-                    master.payload -> 'start_ppb' AS start_ppb,
-                    master.payload -> 'end_ppb' AS end_ppb,
-                    master.payload -> 'campaign_dac' AS campaign_dac,
-                    master.payload #>> '{campaign_dac,last_observation,servo_mode}'
-                        AS servo_mode,
-                    master.payload #> '{report,clocks,dac_baseline}' AS dac_baseline,
-                    master.payload #> '{report,clocks,decay}' AS decay,
-                    master.payload ? 'report' AS report_present,
-                    (master.payload #>> '{report,science_eligible}')::boolean
-                        AS viable,
-                    master.payload #>> '{report,sequence}'
-                        AS sequence,
-                    master.payload #>> '{report,public_count}'
-                        AS pps_count,
-
-                    master.payload #>> '{report,fragment,clockfaces,ocxo1_ns}'
-                        AS ocxo1_ns,
-                    master.payload #>> '{report,clocks,stats,ocxo1,ppb_buckets,60_sec}'
-                        AS ocxo1_ppb_60_sec,
-                    master.payload #>> '{report,clocks,stats,ocxo1,ppb_buckets,10_min}'
-                        AS ocxo1_ppb_10_min,
-                    master.payload #>> '{report,clocks,stats,ocxo1,ppb_buckets,60_min}'
-                        AS ocxo1_ppb_60_min,
-                    master.payload #>> '{report,clocks,stats,ocxo1,ppb_buckets,8_hour}'
-                        AS ocxo1_ppb_8_hour,
-                    master.payload #>> '{report,clocks,stats,ocxo1,ppb_buckets,24_hour}'
-                        AS ocxo1_ppb_24_hour,
-                    COALESCE(
-                        master.payload #>> '{report,clocks,stats,ocxo1,ppb_buckets,total}',
-                        master.payload #>> '{report,clocks,stats,ocxo1,ppb}'
-                    ) AS ocxo1_ppb_total,
-                    master.payload #>> '{report,fragment,stats,ppb,ocxo1}'
-                        AS ocxo1_ppb_campaign,
-                    master.payload #>> '{report,fragment,ocxo1,science,fast_residual_ns}'
-                        AS ocxo1_residual,
-                    master.payload #>> '{report,clocks,stats,ocxo1,welford,mean}'
-                        AS ocxo1_mean,
-                    master.payload #>> '{report,clocks,stats,ocxo1,welford,stddev}'
-                        AS ocxo1_stddev,
-                    master.payload #>> '{report,clocks,stats,ocxo1,welford,stderr}'
-                        AS ocxo1_stderr,
-                    master.payload #>> '{report,clocks,stats,ocxo1,welford,n}'
-                        AS ocxo1_n,
-
-                    master.payload #>> '{report,fragment,clockfaces,ocxo2_ns}'
-                        AS ocxo2_ns,
-                    master.payload #>> '{report,clocks,stats,ocxo2,ppb_buckets,60_sec}'
-                        AS ocxo2_ppb_60_sec,
-                    master.payload #>> '{report,clocks,stats,ocxo2,ppb_buckets,10_min}'
-                        AS ocxo2_ppb_10_min,
-                    master.payload #>> '{report,clocks,stats,ocxo2,ppb_buckets,60_min}'
-                        AS ocxo2_ppb_60_min,
-                    master.payload #>> '{report,clocks,stats,ocxo2,ppb_buckets,8_hour}'
-                        AS ocxo2_ppb_8_hour,
-                    master.payload #>> '{report,clocks,stats,ocxo2,ppb_buckets,24_hour}'
-                        AS ocxo2_ppb_24_hour,
-                    COALESCE(
-                        master.payload #>> '{report,clocks,stats,ocxo2,ppb_buckets,total}',
-                        master.payload #>> '{report,clocks,stats,ocxo2,ppb}'
-                    ) AS ocxo2_ppb_total,
-                    master.payload #>> '{report,fragment,stats,ppb,ocxo2}'
-                        AS ocxo2_ppb_campaign,
-                    master.payload #>> '{report,fragment,ocxo2,science,fast_residual_ns}'
-                        AS ocxo2_residual,
-                    master.payload #>> '{report,clocks,stats,ocxo2,welford,mean}'
-                        AS ocxo2_mean,
-                    master.payload #>> '{report,clocks,stats,ocxo2,welford,stddev}'
-                        AS ocxo2_stddev,
-                    master.payload #>> '{report,clocks,stats,ocxo2,welford,stderr}'
-                        AS ocxo2_stderr,
-                    master.payload #>> '{report,clocks,stats,ocxo2,welford,n}'
-                        AS ocxo2_n
+                SELECT master.id, master.campaign, master.active,
+                       master.payload ->> 'start_altitude_m' AS start_altitude_m,
+                       master.payload ->> 'end_altitude_m' AS end_altitude_m,
+                       master.payload ->> 'latest_altitude_m' AS latest_altitude_m,
+                       master.payload -> 'start_ppb' AS start_ppb,
+                       master.payload -> 'end_ppb' AS end_ppb,
+                       master.payload -> 'latest_ppb' AS latest_ppb,
+                       master.payload ? 'report' AS report_present,
+                       (master.payload #>> '{report,science_eligible}')::boolean AS viable,
+                       master.payload #>> '{report,public_count}' AS pps_count
                 FROM campaign_master AS master
                 WHERE master.campaign_type = 'TEMPEST'
                 ORDER BY master.ts DESC, master.id DESC
@@ -1636,127 +1425,56 @@ def _ocxo_ppb_pair(values) -> str:
     return " / ".join(_sign_float(values.get(lane), 0, 3) for lane in ("ocxo1", "ocxo2"))
 
 
+def _campaign_bookend_cells(start, end, start_alt, end_alt, width, decimals):
+    delta = end - start if start is not None and end is not None else None
+    altitude_delta = end_alt - start_alt if start_alt is not None and end_alt is not None else None
+    return (f"{_fmt(start, f'>{width},.{decimals}f', width)} "
+            f"{_altitude_text(start_alt):>18} "
+            f"{_fmt(end, f'>{width},.{decimals}f', width)} "
+            f"{_altitude_text(end_alt):>18} "
+            f"{_fmt(delta, f'>+{width},.{decimals}f', width)} "
+            f"{_altitude_text(altitude_delta, signed=True):>18}")
+
+
 def campaigns_readout() -> list[str]:
-    """Render each campaign with the same OCXO science fields as CLOCKS."""
+    """Keep each campaign's two OCXO bookend rows together."""
     try:
         rows = _get_campaign_rows()
     except Exception as e:
         return ["\0CAMPAIGNS:ERROR", f"CAMPAIGNS: UNAVAILABLE: {e}"]
 
     newest_identity = str(rows[0].get("id")) if rows else "EMPTY"
-    lines = [f"\0CAMPAIGN:{newest_identity}"]
-
-    # Fit the voltage and decay columns in the established 190-column view.
-    # Campaign names use the existing bounded ~ suffix and active * marker.
-    W_CAMPAIGN = 10
-    W_SERVO = 6
-    W_PROFILE = 4
-    W_DECAY = 12
-    W_DEV = 5
-    W_VALUE = 19
-    W_PPB_BUCKET = 8
-    W_RES = 4
-    W_MEAN = 8
-    W_SD = 6
-    W_SE = 6
-    W_N = 7
-    W_VOLTAGE = 12
-    G = " "
-
-    lines.append(
-        f"{'CAMPAIGN':<{W_CAMPAIGN}}{G}"
-        f"{'SERVO':>{W_SERVO}}{G}"
-        f"{'PROF':>{W_PROFILE}}{G}"
-        f"{'DEV':<{W_DEV}}"
-        f"{'VALUE':>{W_VALUE}}"
-        f"{'60-SEC':>{W_PPB_BUCKET}}"
-        f"{'10-MIN':>{W_PPB_BUCKET}}"
-        f"{'60-MIN':>{W_PPB_BUCKET}}"
-        f"{'8-HOUR':>{W_PPB_BUCKET}}"
-        f"{'24-HOUR':>{W_PPB_BUCKET}}"
-        f"{'TOTAL':>{W_PPB_BUCKET}}"
-        f"{'CAMP':>{W_PPB_BUCKET}}"
-        f"{'DECAY(nV/s)':>{W_DECAY}}"
-        f"{'RES':>{W_RES}}"
-        f"{'MEAN':>{W_MEAN}}"
-        f"{'SD':>{W_SD}}"
-        f"{'SE':>{W_SE}}"
-        f"{'N':>{W_N}}{G}"
-        f"{'MEAN_V':>{W_VOLTAGE}}{G}"
-        f"{'BASELINE_V':>{W_VOLTAGE}}{G}"
-        f"{'DELTA_V':>{W_VOLTAGE}}{G}"
-        f"{'DELTA_PPB':>{W_VOLTAGE}}"
-    )
-
+    width = 13
+    lines = [f"\0CAMPAIGN:{newest_identity}",
+             f"{'CAMPAIGN':<18} {'OCXO':<5} {'SEC':>8} "
+             f"{'START PPB':>{width}} {'START ALT':>18} "
+             f"{'END PPB':>{width}} {'END ALT':>18} "
+             f"{'DELTA PPB':>{width}} {'DELTA ALT':>18}"]
     if not rows:
-        lines.append("")
-        lines.append("NO CAMPAIGNS")
-        return lines
+        return lines + ["", "NO CAMPAIGNS"]
 
     for row_index, row in enumerate(rows):
-        campaign_name = str(row.get("campaign") or "?")
-        # A stopped campaign keeps its last recorded mode; missing history is
-        # unknown, not OFF, and never borrows today's live servo setting.
-        servo_mode = str(row.get("servo_mode") or "---").upper()
+        active = bool(row.get("active"))
+        name = str(row.get("campaign") or "?")
         if not row.get("report_present"):
-            campaign_name += " [WAIT]"
+            name += " [WAIT]"
         elif row.get("viable") is False:
-            campaign_name += " [X]"
-        campaign_cell = _campaign_cell(
-            campaign_name,
-            bool(row.get("active")),
-            W_CAMPAIGN,
-        )
-
-        for lane_name, lane_key in (("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")):
-            value = _to_int(row.get(f"{lane_key}_ns"))
-            ppb_values = (
-                _to_float(row.get(f"{lane_key}_ppb_60_sec")),
-                _to_float(row.get(f"{lane_key}_ppb_10_min")),
-                _to_float(row.get(f"{lane_key}_ppb_60_min")),
-                _to_float(row.get(f"{lane_key}_ppb_8_hour")),
-                _to_float(row.get(f"{lane_key}_ppb_24_hour")),
-                _to_float(row.get(f"{lane_key}_ppb_total")),
-                _to_float(row.get(f"{lane_key}_ppb_campaign")),
-            )
-            residual = _to_int(row.get(f"{lane_key}_residual"))
-            mean = _to_float(row.get(f"{lane_key}_mean"))
-            stddev = _to_float(row.get(f"{lane_key}_stddev"))
-            stderr = _to_float(row.get(f"{lane_key}_stderr"))
-            n = _to_int(row.get(f"{lane_key}_n"))
-
-            dac_mean, _, _, _ = _campaign_dac_values(
-                row.get("campaign_dac"), lane_key
-            )
-            voltage_cells = _dac_mean_voltage_cells(
-                lane_key, dac_mean, row.get("dac_baseline"), W_VOLTAGE,
-                _campaign_decay_mean(row.get("campaign_dac"), lane_key),
-            )
-            lines.append(
-                f"{campaign_cell}{G}"
-                f"{servo_mode:>{W_SERVO}}{G}"
-                f"{_decay_profile_state(row.get('decay')):>{W_PROFILE}}{G}"
-                f"{lane_name:<{W_DEV}}"
-                f"{_comma_int(value, W_VALUE)}"
-                f"{''.join(_fmt(v, f'>{W_PPB_BUCKET}.3f', W_PPB_BUCKET) for v in ppb_values)}"
-                f"{_decay_rate_cell(row.get('decay'), lane_key, W_DECAY)}"
-                f"{_sign_int(residual, W_RES)}"
-                f"{_fmt(mean, f'>{W_MEAN}.3f', W_MEAN)}"
-                f"{_fmt(stddev, f'>{W_SD}.3f', W_SD)}"
-                f"{_fmt(stderr, f'>{W_SE}.3f', W_SE)}"
-                f"{_fmt(n, f'>{W_N}d', W_N)}{G}"
-                f"{G.join(voltage_cells)}"
-            )
-
-        endpoints = f"  OCXO1 / OCXO2   START PPB: {_ocxo_ppb_pair(row.get('start_ppb'))}"
-        endpoints += f"   START ALT: {_altitude_text(row.get('start_altitude_m'))}"
-        if not row.get("active"):
-            endpoints += f"   END ALT: {_altitude_text(row.get('end_altitude_m'))}"
-            endpoints += f"   END PPB: {_ocxo_ppb_pair(row.get('end_ppb'))}"
-        lines.append(endpoints)
-        if row_index != len(rows) - 1:
+            name += " [X]"
+        start_alt = _to_float(row.get("start_altitude_m"))
+        end_alt = _to_float(row.get("latest_altitude_m" if active else "end_altitude_m"))
+        end_ppb = row.get("latest_ppb" if active else "end_ppb") or {}
+        start_ppb = row.get("start_ppb") or {}
+        seconds = _to_int(row.get("pps_count"))
+        if row_index:
             lines.append("")
-
+        for label, lane in (("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")):
+            start = _to_float(start_ppb.get(lane))
+            end = _to_float(end_ppb.get(lane))
+            lines.append(
+                f"{_campaign_cell(name, active, 18)} {label:<5} "
+                f"{_fmt(seconds, '>8d', 8)} "
+                + _campaign_bookend_cells(start, end, start_alt, end_alt, width, 3)
+            )
     return lines
 
 
@@ -1866,12 +1584,6 @@ def clocks_combined_readout() -> list[str]:
         f"{'CLK':<{W_NAME}}"
         f"{'VALUE':>{W_VALUE}}"
         f"{'60-SEC':>{W_PPB_BUCKET}}"
-        f"{'10-MIN':>{W_PPB_BUCKET}}"
-        f"{'60-MIN':>{W_PPB_BUCKET}}"
-        f"{'8-HOUR':>{W_PPB_BUCKET}}"
-        f"{'24-HOUR':>{W_PPB_BUCKET}}"
-        f"{'TOTAL':>{W_PPB_BUCKET}}"
-        f"{'CAMP':>{W_PPB_BUCKET}}"
         f"{'RES':>{W_RES}}"
     )
 
@@ -2331,42 +2043,26 @@ def _photons_population_mean(stats: dict, *, count_key: str = "lap_count"):
     return mean
 
 
-def _photons_summary(payload: dict, before: dict | None = None) -> dict:
+def _photons_summary(payload: dict) -> dict:
     instrument_stats = (payload.get("photons") or {}).get("stats") or {}
     campaign = payload.get("campaign") or {}
-    selected = _photons_producer_campaign_stats(payload) if campaign else instrument_stats
     seconds = _to_int(campaign.get("public_count") if campaign else instrument_stats.get("update_count"))
     if seconds is None or seconds < 0:
-        raise ValueError("PHOTONS population seconds are missing")
-    # SD/SE describe accepted races in the current resettable TOTAL population.
-    # Campaign-start Welford subtraction cannot cross PHOTONS.STATS_RESET;
-    # that would erase the presentation even while TOTAL continues normally.
-    scatter = _photons_instrument_stats(payload)
+        raise ValueError("PHOTONS observation seconds are missing")
     return {
         "seconds": seconds,
-        "mean": _photons_population_mean(selected),
         "buckets": _photons_producer_lap_buckets(payload),
-        "scatter": scatter or {},
     }
 
 
-def _photons_summary_header(include_campaign: bool) -> str:
-    labels = ["60-SEC", "10-MIN", "60-MIN", "8-HOUR", "24-HOUR", "TOTAL"]
-    if include_campaign:
-        labels.append("CAMP")
-    return (f"{'SEC':<8} " + " ".join(f"{label:>{PHOTONS_MEAN_WIDTH}}" for label in labels)
-            + f" {'TOTAL_SD':>10} {'TOTAL_SE':>10}")
+def _photons_summary_header() -> str:
+    return f"{'SEC':<8} {'60-SEC':>{PHOTONS_MEAN_WIDTH}}"
 
 
-def _photons_summary_line(summary: dict, include_campaign: bool, campaign_mean=None) -> str:
-    values = [summary.get("buckets", {}).get(k) for k in PPB_BUCKET_KEYS]
-    if include_campaign:
-        values.append(campaign_mean)
-    scatter = summary.get("scatter") or {}
-    return (_fmt(summary.get("seconds"), 'd', 0).ljust(8) + " "
-            + " ".join(_fmt(value, f'>{PHOTONS_MEAN_WIDTH},.6f', PHOTONS_MEAN_WIDTH) for value in values)
-            + " " + _fmt(scatter.get("stddev"), '>10.6f', 10)
-            + " " + _fmt(scatter.get("stderr"), '>10.6f', 10))
+def _photons_summary_line(summary: dict) -> str:
+    value = summary["buckets"]["60_sec"]
+    return (_fmt(summary["seconds"], 'd', 0).ljust(8) + " "
+            + _fmt(value, f'>{PHOTONS_MEAN_WIDTH},.6f', PHOTONS_MEAN_WIDTH))
 
 
 def _get_lantern_campaign_summaries() -> list[dict]:
@@ -2409,7 +2105,6 @@ def _get_lantern_campaign_summaries() -> list[dict]:
     summaries = []
     for row in rows:
         last_payload = _json_object(row["last_payload"])
-        campaign_stats = _photons_producer_campaign_stats(last_payload)
         summaries.append({
             "id": _to_int(row["id"]),
             "campaign": row["campaign"],
@@ -2420,9 +2115,8 @@ def _get_lantern_campaign_summaries() -> list[dict]:
             "start_lap_ns": _to_float(row["start_lap_ns"]),
             "end_lap_ns": _to_float(row["end_lap_ns"]),
             "last_sequence": _to_int(row["last_sequence"]),
-            "total_scatter": _photons_instrument_stats(last_payload),
-            "lap_buckets": _photons_producer_lap_buckets(last_payload, historical=True),
-            "campaign_mean_lap_ns": _photons_population_mean(campaign_stats) if campaign_stats else None,
+            "lap_buckets": (_photons_producer_lap_buckets(last_payload, historical=True)
+                            if row["active"] else {}),
             "seconds": _to_int((last_payload.get("campaign") or {}).get("public_count")),
         })
     return summaries
@@ -2654,8 +2348,8 @@ def photons_detail_readout() -> list[str]:
             line += f"  NORM: {_fmt(normalized.get('mean'), ',.6f', 0)} NS"
     _, voltage_lane, _ = voltage_window_spec(live["photons"]["voltage_normalization"]["model_id"])
     lines = [line]
-    lines.extend(["", _photons_summary_header(bool(campaign)),
-                  _photons_summary_line(summary, bool(campaign), summary["mean"]),
+    lines.extend(["", _photons_summary_header(),
+                  _photons_summary_line(summary),
                   "", *photons_temperature_block(live), "", gnss_line, "",
                   f"{'SEC':<8} {'LAP':>{PHOTONS_MEAN_WIDTH}} {'LOW':>9} {'HIGH':>9} "
                   f"{'PD N/WIN':>10} {voltage_lane.upper():>9} "
@@ -2677,13 +2371,7 @@ def photons_detail_readout() -> list[str]:
 
 
 def photons_campaigns_readout() -> list[str]:
-    """Display each campaign's last durable LAP/rolling/TOTAL/CAMP means.
-
-    All means come from the canonical observation at the campaign's current
-    or final boundary. The rolling windows describe the instrument at that
-    moment; they are not separate campaign-only rolling populations. Neither
-    block stability nor history coverage belongs in this operator table.
-    """
+    """Show campaign bookends; an active row uses the latest observation."""
     rows, campaign_error, _ = _PHOTONS_READ_MODEL.get(campaigns=True)
     if campaign_error:
         return ["\0LANTERN_CAMPAIGNS:ERROR",
@@ -2691,57 +2379,51 @@ def photons_campaigns_readout() -> list[str]:
     if rows is None:
         return ["\0LANTERN_CAMPAIGNS:LOADING", "LANTERN CAMPAIGNS: LOADING"]
     newest_identity = str(rows[0].get("id")) if rows else "EMPTY"
-    columns = ("START LAP", "60-SEC", "10-MIN", "60-MIN", "8-HOUR", "24-HOUR", "TOTAL", "CAMP")
+    width = PHOTONS_MEAN_WIDTH
     lines = [f"\0LANTERN_CAMPAIGN:{newest_identity}",
              f"{'CAMPAIGN':<18} {'SEC':>8} "
-             + " ".join(f"{label:>{PHOTONS_MEAN_WIDTH}}" for label in columns)
-             + f" {'TOTAL_SD':>10} {'TOTAL_SE':>10} {'END LAP':>{PHOTONS_MEAN_WIDTH}}"]
+             f"{'START LAP':>{width}} {'START ALT':>18} "
+             f"{'END LAP':>{width}} {'END ALT':>18} "
+             f"{'DELTA LAP':>{width}} {'DELTA ALT':>18}"]
     if not rows:
         return lines + ["", "NO LANTERN CAMPAIGNS"]
-    # Historical campaign rows use the throttled background PostgreSQL
-    # read model. The active campaign has a fresher, already-authoritative
-    # canonical PHOTONS publication; use it without querying the database on
-    # each display refresh. Match the durable campaign ID, not just its name.
+
     live = _get_photons_snapshot()
     live_campaign = live.get("campaign")
     live_identity = (
         live_campaign if isinstance(live_campaign, dict)
         and not live_campaign.get("final") else None
     )
-    for row in rows:
-        if (row.get("active") and live_identity is not None
+    for row_index, row in enumerate(rows):
+        active = bool(row.get("active"))
+        start = row.get("start_lap_ns")
+        start_alt = row.get("start_altitude_m")
+        seconds = row.get("seconds")
+        end = (row.get("lap_buckets") or {}).get("60_sec") if active else row.get("end_lap_ns")
+        # The active master projection does not record the current GNSS altitude.
+        # Never pair its saved lap with altitude from an unrelated publication.
+        end_alt = None if active else row.get("end_altitude_m")
+        if (active and live_identity is not None
                 and live_identity.get("campaign_id") == row.get("id")
                 and live_identity.get("campaign") == row.get("campaign")
                 and (_to_int(live.get("sequence")) or -1) >= (row.get("last_sequence") or -1)):
             current = _photons_summary(live)
-            row = {**row, "seconds": current["seconds"], "campaign_mean_lap_ns": current["mean"],
-                   "start_altitude_m": live_identity.get("start_altitude_m"),
-                   "start_lap_ns": live_identity.get("start_lap_ns", row.get("start_lap_ns")),
-                   "lap_buckets": current["buckets"], "total_scatter": current["scatter"]}
+            seconds = current["seconds"]
+            start = live_identity.get("start_lap_ns", start)
+            start_alt = live_identity.get("start_altitude_m", start_alt)
+            end = current["buckets"]["60_sec"]
+            end_alt = (live.get("gnss") or {}).get("altitude_m")
         name = str(row.get("campaign") or "?")
-        lap = row.get("campaign_mean_lap_ns")
-        if lap is None:
-            name += " [WAIT]"
-        elif row.get("interrupted_at"):
+        if row.get("interrupted_at"):
             name += " [INT]"
-        buckets = row.get("lap_buckets") or {}
-        scatter = row.get("total_scatter") or {}
-        values = [row.get("start_lap_ns")] + [buckets.get(key) for key in PPB_BUCKET_KEYS] + [lap]
-        if len(lines) > 2 and lines[-1] != "":
+        elif end is None or start is None:
+            name += " [WAIT]"
+        if row_index:
             lines.append("")
         lines.append(
-            _campaign_cell(name, bool(row.get("active")), 18)
-            + f" {str(row.get('seconds') if row.get('seconds') is not None else '---'):>8} "
-            + " ".join(_fmt(value, f'>{PHOTONS_MEAN_WIDTH},.6f', PHOTONS_MEAN_WIDTH) for value in values)
-            + " " + _fmt(scatter.get("stddev"), '>10.6f', 10)
-            + " " + _fmt(scatter.get("stderr"), '>10.6f', 10)
-            + ("" if row.get("active") else
-               " " + _fmt(row.get("end_lap_ns"), f'>{PHOTONS_MEAN_WIDTH},.6f', PHOTONS_MEAN_WIDTH))
+            f"{_campaign_cell(name, active, 18)} {_fmt(seconds, '>8d', 8)} "
+            + _campaign_bookend_cells(start, end, start_alt, end_alt, width, 6)
         )
-        altitudes = f"  START ALT: {_altitude_text(row.get('start_altitude_m'))}"
-        if not row.get("active"):
-            altitudes += f"   END ALT: {_altitude_text(row.get('end_altitude_m'))}"
-        lines.append(altitudes)
     return lines
 
 

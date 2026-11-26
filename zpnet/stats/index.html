@@ -43,17 +43,38 @@
   .unit { font-size: 0.8rem; }
   .lap .row { display: block; }
   .lap dd { font-size: clamp(1.7rem, 8.5vw, 2.85rem); }
-  #tempest { width: 100%; border-top: 1px solid #285428; text-align: right; }
   .campaign-title { margin: 0; padding-top: 0.5rem; text-align: left; overflow-wrap: anywhere; }
-  #tempest th { font-weight: normal; }
-  #tempest th:first-child { text-align: left; }
-  #tempest td { font-size: clamp(1.2rem, 5.5vw, 1.6rem); }
+  .campaign .row { padding: clamp(0.15rem, 0.45vh, 0.35rem) 0; }
   #status { margin: 0.375rem 0 0; min-height: 1.2em; color: #ffdc67; }
+  /* Compact field display: keep both campaign bookends visible on phones. */
+  @media (max-width: 600px) and (max-height: 1000px) {
+    :root { font-size: 15px; line-height: 1.12; }
+    main {
+      padding: max(0.4rem, env(safe-area-inset-top)) 1rem
+               max(0.4rem, env(safe-area-inset-bottom));
+    }
+    dl { padding: 0.25rem 0; }
+    .row { padding: 0.2rem 0; }
+    .campaign .row { padding: 0.1rem 0; }
+    dt { font-size: clamp(0.86rem, 3.6vw, 1.05rem); }
+    dd {
+      font-size: clamp(1.15rem, min(5.6vw, 2.5vh), 1.6rem);
+      font-size: clamp(1.15rem, min(5.6vw, 2.5dvh), 1.6rem);
+      line-height: 1.12;
+    }
+    .lap dd {
+      font-size: clamp(1.7rem, min(7.8vw, 4vh), 2.55rem);
+      font-size: clamp(1.7rem, min(7.8vw, 4dvh), 2.55rem);
+    }
+    .campaign-title { padding-top: 0.3rem; }
+    #status { margin-top: 0.25rem; }
+    #status:empty { display: none; }
+  }
 </style>
 <main>
   <dl>
     <div class="row"><dt>SYSTEM TIME</dt><dd><span id="system_time">---</span> <span class="unit">UTC</span></dd></div>
-    <div class="row"><dt>ALT · GNSS</dt><dd><span id="altitude">---</span> <span class="unit">m</span></dd></div>
+    <div class="row"><dt>ALT · GNSS</dt><dd><span id="altitude">---</span></dd></div>
   </dl>
   <dl>
     <div class="row"><dt>MAX31865</dt><dd><span id="max31865">---</span> <span class="unit">°C</span></dd></div>
@@ -66,62 +87,63 @@
   <dl>
     <div class="row"><dt>HIGH5</dt><dd><span id="high5">---</span> <span class="unit">mV</span></dd></div>
   </dl>
-  <section id="campaign" aria-labelledby="lantern-title" hidden>
-    <p class="campaign-title" id="lantern-title">PHOTONS · LANTERN · <span id="lantern_name"></span></p>
+  <section class="campaign" id="lantern" aria-labelledby="lantern-title" hidden>
+    <p class="campaign-title" id="lantern-title"></p>
     <dl>
-      <div class="row"><dt>START ALT</dt><dd><span id="start_alt">---</span> <span class="unit">m</span></dd></div>
-      <div class="row"><dt>START LAP</dt><dd><span id="start_lap">---</span> <span class="unit">ns</span></dd></div>
-      <div class="row"><dt>DELTA · 60-SEC</dt><dd><span id="delta">---</span> <span class="unit">ns</span></dd></div>
+      <div class="row"><dt>START LAP</dt><dd><span data-field="start_lap">---</span> <span class="unit">ns</span></dd></div>
+      <div class="row"><dt>START ALT</dt><dd><span data-field="start_alt">---</span></dd></div>
+      <div class="row"><dt>END LAP</dt><dd><span data-field="end_lap">---</span> <span class="unit">ns</span></dd></div>
+      <div class="row"><dt>END ALT</dt><dd><span data-field="end_alt">---</span></dd></div>
+      <div class="row"><dt>DELTA LAP</dt><dd><span data-field="delta">---</span> <span class="unit">ns</span></dd></div>
+      <div class="row"><dt>DELTA ALT</dt><dd><span data-field="delta_alt">---</span></dd></div>
     </dl>
   </section>
-  <section>
-    <p class="campaign-title" id="tempest-title" hidden></p>
+  <dl id="clock-live">
+    <div class="row"><dt>OCXO1 · 60-SEC</dt><dd><span id="ocxo1">---</span> <span class="unit">ppb</span></dd></div>
+    <div class="row"><dt>OCXO2 · 60-SEC</dt><dd><span id="ocxo2">---</span> <span class="unit">ppb</span></dd></div>
+  </dl>
+  <section class="campaign" id="tempest" aria-labelledby="tempest-title" hidden>
+    <p class="campaign-title" id="tempest-title"></p>
     <dl>
-      <div class="row" id="clock-start-alt-row" hidden><dt>START ALT</dt><dd><span id="clock-start-alt">---</span> <span class="unit">m</span></dd></div>
-      <div class="row" id="clock-end-alt-row" hidden><dt>END ALT</dt><dd><span id="clock-end-alt">---</span> <span class="unit">m</span></dd></div>
-      <div class="row"><dt>OCXO1 · 60-SEC</dt><dd><span id="ocxo1">---</span> <span class="unit">ppb</span></dd></div>
-      <div class="row"><dt>OCXO2 · 60-SEC</dt><dd><span id="ocxo2">---</span> <span class="unit">ppb</span></dd></div>
+      <div class="row"><dt>START PPB · OCXO1</dt><dd><span data-field="ocxo1.start">---</span> <span class="unit">ppb</span></dd></div>
+      <div class="row"><dt>START PPB · OCXO2</dt><dd><span data-field="ocxo2.start">---</span> <span class="unit">ppb</span></dd></div>
+      <div class="row"><dt>START ALT</dt><dd><span data-field="start_alt">---</span></dd></div>
+      <div class="row"><dt>END PPB · OCXO1</dt><dd><span data-field="ocxo1.end">---</span> <span class="unit">ppb</span></dd></div>
+      <div class="row"><dt>END PPB · OCXO2</dt><dd><span data-field="ocxo2.end">---</span> <span class="unit">ppb</span></dd></div>
+      <div class="row"><dt>END ALT</dt><dd><span data-field="end_alt">---</span></dd></div>
+      <div class="row"><dt>DELTA PPB · OCXO1</dt><dd><span data-field="ocxo1.delta">---</span> <span class="unit">ppb</span></dd></div>
+      <div class="row"><dt>DELTA PPB · OCXO2</dt><dd><span data-field="ocxo2.delta">---</span> <span class="unit">ppb</span></dd></div>
+      <div class="row"><dt>DELTA ALT</dt><dd><span data-field="delta_alt">---</span></dd></div>
     </dl>
-    <table id="tempest" aria-labelledby="tempest-title" hidden>
-      <thead><tr><th>ppb</th><th>OCXO1</th><th>OCXO2</th></tr></thead>
-      <tbody>
-        <tr data-key="start"><th>START · 60-SEC</th><td></td><td></td></tr>
-        <tr data-key="end"><th>END · 60-SEC</th><td></td><td></td></tr>
-        <tr data-key="delta"><th></th><td></td><td></td></tr>
-      </tbody>
-    </table>
   </section>
   <p id="status" role="status">CONNECTING TO ZPNET</p>
 </main>
 <script>
   const fields = ["system_time", "altitude", "max31865", "bme_pd",
-                  "bme_out", "lap", "high5", "lantern_name", "start_alt", "start_lap", "delta", "ocxo1", "ocxo2"];
+                  "bme_out", "lap", "high5", "ocxo1", "ocxo2"];
   const statusLine = document.getElementById("status");
+
+  function renderCampaign(id, run, activeTitle, closedTitle) {
+    const section = document.getElementById(id);
+    section.hidden = !run;
+    if (!run) return;
+    section.querySelector(".campaign-title").textContent =
+      (run.active ? activeTitle : closedTitle) + run.name;
+    for (const span of section.querySelectorAll("[data-field]")) {
+      const value = span.dataset.field.split(".").reduce((obj, key) => obj[key], run);
+      span.textContent = value ?? "---";
+    }
+  }
 
   function render(stats, message) {
     for (const name of fields) {
       document.getElementById(name).textContent = stats[name] ?? "---";
     }
-    document.getElementById("campaign").hidden = !stats.campaign_active;
-    const table = document.getElementById("tempest");
-    const run = stats.tempest;
-    const title = document.getElementById("tempest-title");
-    title.hidden = !run;
-    table.hidden = !run;
-    document.getElementById("clock-start-alt-row").hidden = !run;
-    document.getElementById("clock-end-alt-row").hidden = !run || run.active;
-    if (run) {
-      document.getElementById("clock-start-alt").textContent = run.start_alt ?? "---";
-      document.getElementById("clock-end-alt").textContent = run.end_alt ?? "---";
-      title.textContent = (run.active ? "CLOCKS · TEMPEST · " : "CLOCKS · LAST TEMPEST · ") + run.name;
-      for (const row of table.tBodies[0].rows) {
-        const key = row.dataset.key;
-        row.hidden = key === "end" && run.active;
-        if (key === "delta") row.cells[0].textContent = run.active ? "DELTA · 60-SEC" : "END − START";
-        row.cells[1].textContent = run.ocxo1[key] ?? "---";
-        row.cells[2].textContent = run.ocxo2[key] ?? "---";
-      }
-    }
+    renderCampaign("lantern", stats.lantern, "PHOTONS · LANTERN · ", "PHOTONS · LAST LANTERN · ");
+    renderCampaign("tempest", stats.tempest, "CLOCKS · TEMPEST · ", "CLOCKS · LAST TEMPEST · ");
+    // Active END rows already display the live 60-SEC values. Keep the
+    // independent live readings visible when there is no active TEMPEST.
+    document.getElementById("clock-live").hidden = Boolean(stats.tempest?.active);
     statusLine.textContent = message;
   }
 

@@ -7,7 +7,8 @@ import math
 from pathlib import Path
 
 from zpnet.processes.processes import create_pubsub_cache
-from zpnet.shared.campaign_endpoints import last_tempest
+from zpnet.shared.campaign_endpoints import last_lantern, last_tempest
+from zpnet.shared.display_format import altitude_text
 
 
 FONT = Path("/usr/share/fonts/truetype/3270/3270-Regular.ttf")
@@ -40,6 +41,21 @@ def fresh(cache, topic):
     return cache.get(topic) if age is not None and age <= FEED_MAX_AGE_S else None
 
 
+def difference(start, end):
+    return end - start if start is not None and end is not None else None
+
+
+def altitude_bookends(campaign, observation, active):
+    start = campaign.get("start_altitude_m")
+    end = (field(observation, "gnss", "altitude_m") if active
+           else campaign.get("end_altitude_m"))
+    return {
+        "start_alt": altitude_text(start),
+        "end_alt": altitude_text(end),
+        "delta_alt": altitude_text(difference(start, end), signed=True),
+    }
+
+
 def tempest_snapshot(clocks):
     if clocks is None:
         return None
@@ -49,17 +65,37 @@ def tempest_snapshot(clocks):
         campaign = last_tempest.get()
     if not campaign:
         return None
-    result = {"name": campaign["name" if active else "campaign"], "active": active}
-    result["start_alt"] = number(campaign.get("start_altitude_m"), ",.1f")
-    result["end_alt"] = number(campaign.get("end_altitude_m"), ",.1f")
+    result = {"name": campaign["name" if active else "campaign"], "active": active,
+              **altitude_bookends(campaign, clocks, active)}
     for lane in ("ocxo1", "ocxo2"):
         start = field(campaign, "start_ppb", lane)
-        latest = (field(clocks, "clocks", "stats", lane, "ppb_buckets", "60_sec")
-                  if active else field(campaign, "end_ppb", lane))
-        delta = latest - start if latest is not None and start is not None else None
-        result[lane] = {"start": number(start, "+.3f"), "delta": number(delta, "+.3f"),
-                        "end": number(field(campaign, "end_ppb", lane), "+.3f")}
+        end = (field(clocks, "clocks", "stats", lane, "ppb_buckets", "60_sec")
+               if active else field(campaign, "end_ppb", lane))
+        result[lane] = {"start": number(start, "+.3f"), "end": number(end, "+.3f"),
+                        "delta": number(difference(start, end), "+.3f")}
     return result
+
+
+def lantern_snapshot(photons):
+    if photons is None:
+        return None
+    campaign = photons.get("campaign") or {}
+    active = bool(campaign) and not campaign.get("final")
+    if not active:
+        campaign = last_lantern.get()
+    if not campaign:
+        return None
+    start = campaign.get("start_lap_ns")
+    end = (field(photons, "photons", "stats", "lap_buckets", "60_sec", "mean_lap_ns")
+           if active else campaign.get("end_lap_ns"))
+    return {
+        "name": campaign["campaign"],
+        "active": active,
+        **altitude_bookends(campaign, photons, active),
+        "start_lap": number(start, ",.6f"),
+        "end_lap": number(end, ",.6f"),
+        "delta": number(difference(start, end), "+.6f"),
+    }
 
 
 def snapshot(cache):
@@ -70,24 +106,16 @@ def snapshot(cache):
     )
     lap = field(photons, "photons", "stats", "lap_buckets", "60_sec", "mean_lap_ns")
     high5 = field(photons, "photons", "pd_out", "high5_window") or {}
-    campaign = field(photons, "campaign") or {}
-    active = bool(campaign) and not campaign.get("final")
-    start = campaign.get("start_lap_ns") if active else None
-    delta = lap - start if lap is not None and start is not None else None
     stats = field(clocks, "clocks", "stats")
     return {
         "system_time": system_time[11:19] if system_time else None,
-        "altitude": number(field(clocks, "gnss", "altitude_m"), ",.0f"),
+        "altitude": altitude_text(field(clocks, "gnss", "altitude_m")),
         "max31865": temperature(field(clocks, "rtd")),
         "bme_pd": temperature(field(clocks, "environment", "pd")),
         "bme_out": temperature(field(clocks, "environment", "out")),
         "lap": number(lap, ",.6f"),
         "high5": number(high5.get("high_mean_mv"), ".3f") if high5.get("sample_count", 0) else None,
-        "campaign_active": active,
-        "lantern_name": campaign.get("campaign") if active else None,
-        "start_lap": number(start, ",.6f"),
-        "start_alt": number(campaign.get("start_altitude_m"), ",.1f") if active else None,
-        "delta": number(delta, "+.6f"),
+        "lantern": lantern_snapshot(photons),
         "ocxo1": number(field(stats, "ocxo1", "ppb_buckets", "60_sec"), "+.3f"),
         "ocxo2": number(field(stats, "ocxo2", "ppb_buckets", "60_sec"), "+.3f"),
         "tempest": tempest_snapshot(clocks),

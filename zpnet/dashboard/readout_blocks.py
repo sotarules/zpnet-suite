@@ -12,6 +12,7 @@ import math
 from collections.abc import Generator
 
 from zpnet.processes.processes import create_pubsub_cache, send_command
+from zpnet.shared.display_format import altitude_text
 
 VREF = 5.0
 DAC_CODE_SCALE = 65536.0
@@ -196,12 +197,8 @@ def _clock_report() -> tuple[dict | None, str]:
 def _frequency(report: dict, lane: str) -> tuple[float | None, float | None]:
     if lane == "gnss":
         return 1.0, 0.0
-    if lane == "gnss_raw":
-        return _to_float(_extra(report, "gnss_raw_tau")), _to_float(_extra(report, "gnss_raw_ppb"))
-    return (
-        _to_float(_field(report, f"stats.{lane}.tau")),
-        _to_float(_field(report, f"stats.{lane}.ppb")),
-    )
+    ppb = _to_float(_field(report, f"stats.{lane}.ppb_buckets.60_sec"))
+    return (None, None) if ppb is None else (1.0 + ppb / 1e9, ppb)
 
 def _clockface_value(report: dict, lane: str):
     """Return the operator clockface in the currently active coordinate scope."""
@@ -322,7 +319,7 @@ def gnss_report_readout() -> Generator[str, None, None]:
     yield f"SATS: {_integer(g.get('satellites'))}  HDOP: {_num(g.get('hdop'), 2)}  PPS ERR: {_num(discipline.get('pps_timing_error_ns') or g.get('pps_timing_error_ns'), 1, True, ' ns')}"
     if g.get("latitude_deg") is not None and g.get("longitude_deg") is not None:
         yield f"LAT: {_num(g.get('latitude_deg'), 6)}  LON: {_num(g.get('longitude_deg'), 6)}"
-    yield f"ALT MSL: {_num(g.get('altitude_m'), 1, False, ' m')}  ELLIP: {_num(g.get('ellipsoid_height_m'), 1, False, ' m')}"
+    yield f"ALT MSL: {altitude_text(g.get('altitude_m'))}  ELLIP: {altitude_text(g.get('ellipsoid_height_m'))}"
     yield f"GEOID: {_num(g.get('geoid_sep_m'), 1, False, ' m')}  TEMP: {_num(clock.get('temperature_c') or g.get('temperature_c'), 1, False, ' C')}"
 
 
@@ -332,17 +329,14 @@ def clocks_tau_readout() -> Generator[str, None, None]:
         yield header
     if report is None:
         return
-    yield f"{'CLK':<7}{'VALUE':>20}{'TAU':>17}{'PPB':>12}{'CAMP PPB':>12}{'N':>8}"
-    for label, lane in (("GNSS", "gnss"), ("VCLOCK", "vclock"), ("OCXO1", "ocxo1"),
-                        ("OCXO2", "ocxo2"), ("GN_RAW", "gnss_raw"), ("DWT", "dwt")):
+    yield f"{'CLK':<7}{'VALUE':>20}{'TAU':>17}{'60-SEC PPB':>12}"
+    for label, lane in (("GNSS", "gnss"), ("VCLOCK", "vclock"),
+                        ("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")):
         value_text = _integer(_clockface_value(report, lane), comma=True)
         tau, ppb = _frequency(report, lane)
         tau_text = "---" if tau is None else f"{tau:.12f}"
         ppb_text = "---" if ppb is None else f"{ppb:+.3f}"
-        campaign_ppb = _campaign_ppb(report, lane)
-        campaign_ppb_text = "---" if campaign_ppb is None else f"{campaign_ppb:+.3f}"
-        sample_n = _to_int(_welford(report, lane, "n"))
-        yield f"{label:<7}{value_text:>20}{tau_text:>17}{ppb_text:>12}{campaign_ppb_text:>12}{_integer(sample_n):>8}"
+        yield f"{label:<7}{value_text:>20}{tau_text:>17}{ppb_text:>12}"
 
 
 def clocks_prediction_readout() -> Generator[str, None, None]:
@@ -368,22 +362,19 @@ def clocks_comparison_readout() -> Generator[str, None, None]:
         yield header
     if report is None:
         return
-    baseline = _get_clocks_baseline()
-    if not baseline:
-        yield "NO BASELINE SET"
-        yield "USE: .pc clocks set_baseline campaign=<NAME>"
+    campaign = _dict(report.get("campaign_delta"))
+    if campaign.get("state") != "STARTED":
+        yield "NO ACTIVE CAMPAIGN"
         return
 
-    baseline_report = _dict(baseline.get("baseline_report"))
-    yield f"BASELINE: {baseline.get('baseline_campaign', '?')}"
     yield f"CAMPAIGN: {report.get('campaign') or '?'}"
-    yield f"{'CLK':<7}{'BASE':>10}{'NOW':>10}{'DELTA':>10}"
-    for label, lane in (("GNSS", "gnss"), ("VCLK", "vclock"), ("OCXO1", "ocxo1"),
-                        ("OCXO2", "ocxo2"), ("GN_RAW", "gnss_raw"), ("DWT", "dwt")):
-        base = _campaign_ppb_from_master_report(baseline_report, lane)
-        now = _campaign_ppb(report, lane)
-        delta = None if base is None or now is None else now - base
-        yield f"{label:<7}{_num(base):>10}{_num(now):>10}{_num(delta, 3, True):>10}"
+    yield f"START ALT: {altitude_text(campaign.get('start_altitude_m'))}"
+    yield f"{'CLK':<7}{'START':>10}{'60-SEC':>10}{'DELTA':>10}"
+    for label, lane in (("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")):
+        start = _to_float(_path_get(campaign, f"start_ppb.{lane}"))
+        _, now = _frequency(report, lane)
+        delta = None if start is None or now is None else now - start
+        yield f"{label:<7}{_num(start):>10}{_num(now):>10}{_num(delta, 3, True):>10}"
 
 
 def clocks_servo_readout() -> Generator[str, None, None]:
@@ -393,7 +384,7 @@ def clocks_servo_readout() -> Generator[str, None, None]:
     if report is None:
         return
     yield f"SERVO: {_servo_mode(report)}"
-    yield f"{'OCXO':<6}{'DAC':>10}{'VOUT':>9}{'RES NS':>9}{'PPB':>9}"
+    yield f"{'OCXO':<6}{'DAC':>10}{'VOUT':>9}{'RES NS':>9}{'60-SEC':>9}"
     for label, lane in (("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")):
         code = _dac_value(report, lane)
         volts = _dac_voltage(code)
@@ -462,7 +453,7 @@ def environment_status_readout() -> Generator[str, None, None]:
         yield f"{label}: {status}"
         if status == "OK":
             yield f"  TEMP: {_num(reading['temperature_c'], 4, False, ' C')}  RH: {_num(reading['humidity_pct'], 2, False, ' %')}"
-            yield f"  BARO: {_num(reading['pressure_hpa'], 2, False, ' HPA')}  ALT: {_num(reading['altitude_m'], 1, False, ' M')}"
+            yield f"  BARO: {_num(reading['pressure_hpa'], 2, False, ' HPA')}  ALT: {altitude_text(reading['altitude_m'])}"
         yield f"  FAIL: {_integer(reading.get('read_fail_count'))}  RECOVER: {_integer(reading.get('recovery_count'))}"
 
 
