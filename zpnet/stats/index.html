@@ -24,7 +24,7 @@
              max(0.75rem, env(safe-area-inset-bottom));
   }
   dl { margin: 0; padding: 0.5rem 0; }
-  dl + dl { border-top: 1px solid #285428; }
+  main > dl:not(:first-child), main > section { border-top: 1px solid #285428; }
   .row {
     display: flex;
     align-items: baseline;
@@ -43,7 +43,7 @@
   .lap .row { display: block; }
   .lap dd { font-size: clamp(1.7rem, 8.5vw, 2.85rem); }
   #tempest { width: 100%; border-top: 1px solid #285428; text-align: right; }
-  #tempest caption { text-align: left; overflow-wrap: anywhere; }
+  .campaign-title { margin: 0; padding-top: 0.5rem; text-align: left; overflow-wrap: anywhere; }
   #tempest th { font-weight: normal; }
   #tempest th:first-child { text-align: left; }
   #tempest td { font-size: clamp(1.2rem, 5.5vw, 1.6rem); }
@@ -65,28 +65,33 @@
   <dl>
     <div class="row"><dt>HIGH5</dt><dd><span id="high5">---</span> <span class="unit">mV</span></dd></div>
   </dl>
-  <dl id="campaign" hidden>
-    <div class="row"><dt>START LAP</dt><dd><span id="start_lap">---</span> <span class="unit">ns</span></dd></div>
-    <div class="row"><dt>DELTA · 1 SECOND</dt><dd><span id="delta">---</span> <span class="unit">ns</span></dd></div>
-  </dl>
-  <dl>
-    <div class="row"><dt>OCXO1 · 10 MIN</dt><dd><span id="ocxo1">---</span> <span class="unit">ppb</span></dd></div>
-    <div class="row"><dt>OCXO2 · 10 MIN</dt><dd><span id="ocxo2">---</span> <span class="unit">ppb</span></dd></div>
-  </dl>
-  <table id="tempest" hidden>
-    <caption></caption>
-    <thead><tr><th>ppb</th><th>OCXO1</th><th>OCXO2</th></tr></thead>
-    <tbody>
-      <tr data-key="start"><th>START · 60 S</th><td></td><td></td></tr>
-      <tr data-key="end"><th>END · 60 S</th><td></td><td></td></tr>
-      <tr data-key="delta"><th></th><td></td><td></td></tr>
-    </tbody>
-  </table>
+  <section id="campaign" aria-labelledby="lantern-title" hidden>
+    <p class="campaign-title" id="lantern-title">PHOTONS · LANTERN · <span id="lantern_name"></span></p>
+    <dl>
+      <div class="row"><dt>START LAP</dt><dd><span id="start_lap">---</span> <span class="unit">ns</span></dd></div>
+      <div class="row"><dt>DELTA · 1 SECOND</dt><dd><span id="delta">---</span> <span class="unit">ns</span></dd></div>
+    </dl>
+  </section>
+  <section>
+    <p class="campaign-title" id="tempest-title" hidden></p>
+    <dl>
+      <div class="row"><dt>OCXO1 · 10 MIN</dt><dd><span id="ocxo1">---</span> <span class="unit">ppb</span></dd></div>
+      <div class="row"><dt>OCXO2 · 10 MIN</dt><dd><span id="ocxo2">---</span> <span class="unit">ppb</span></dd></div>
+    </dl>
+    <table id="tempest" aria-labelledby="tempest-title" hidden>
+      <thead><tr><th>ppb</th><th>OCXO1</th><th>OCXO2</th></tr></thead>
+      <tbody>
+        <tr data-key="start"><th>START · 60 S</th><td></td><td></td></tr>
+        <tr data-key="end"><th>END · 60 S</th><td></td><td></td></tr>
+        <tr data-key="delta"><th></th><td></td><td></td></tr>
+      </tbody>
+    </table>
+  </section>
   <p id="status" role="status">CONNECTING TO ZPNET</p>
 </main>
 <script>
   const fields = ["system_time", "altitude", "max31865", "bme_pd",
-                  "bme_out", "lap", "high5", "start_lap", "delta", "ocxo1", "ocxo2"];
+                  "bme_out", "lap", "high5", "lantern_name", "start_lap", "delta", "ocxo1", "ocxo2"];
   const statusLine = document.getElementById("status");
 
   function render(stats, message) {
@@ -96,9 +101,11 @@
     document.getElementById("campaign").hidden = !stats.campaign_active;
     const table = document.getElementById("tempest");
     const run = stats.tempest;
+    const title = document.getElementById("tempest-title");
+    title.hidden = !run;
     table.hidden = !run;
     if (run) {
-      table.caption.textContent = (run.active ? "TEMPEST · " : "LAST TEMPEST · ") + run.name;
+      title.textContent = (run.active ? "CLOCKS · TEMPEST · " : "CLOCKS · LAST TEMPEST · ") + run.name;
       for (const row of table.tBodies[0].rows) {
         const key = row.dataset.key;
         row.hidden = key === "end" && run.active;

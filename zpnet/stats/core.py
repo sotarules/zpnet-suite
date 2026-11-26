@@ -120,6 +120,7 @@ def snapshot(cache):
         "lap": number(lap, ",.6f"),
         "high5": number(high5.get("high_mean_mv"), ".3f") if high5.get("sample_count", 0) else None,
         "campaign_active": active,
+        "lantern_name": campaign.get("campaign") if active else None,
         "start_lap": number(start, ",.6f"),
         "delta": number(delta, "+.6f"),
         "ocxo1": number(field(stats, "ocxo1", "ppb_buckets", "10_min"), "+.3f"),
