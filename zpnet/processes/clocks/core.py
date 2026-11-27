@@ -13233,6 +13233,7 @@ def _tempest_detail_from_state_snapshot(state: Dict[str, Any]) -> Dict[str, Any]
     fragment.pop("adjudication", None)
     fragment.pop("start_ppb", None)
     fragment.pop("start_altitude_m", None)
+    fragment.pop("ppb_bookend_window", None)
     public_count = _tempest_public_count(fragment)
     sequence = _as_int(state.get("sequence"))
     if sequence is None or sequence <= 0:
@@ -13338,6 +13339,7 @@ def _recovery_timebase_from_clocks_state(
     fragment.pop("adjudication", None)
     fragment.pop("start_ppb", None)
     fragment.pop("start_altitude_m", None)
+    fragment.pop("ppb_bookend_window", None)
 
     extra_clocks = {
         "gnss_raw_instrument_ns": _as_int(instrument.get("ns")) or 0,
@@ -14448,15 +14450,22 @@ def _set_clocks_persistence_worker_phase(
     _diag["clocks_persistence_worker"] = snapshot
 
 
-def _ocxo_minute(state):
-    values = {lane: _path_get(state, f"clocks.stats.{lane}.ppb_buckets.60_sec")
+# New campaigns use the retained ten-minute frequency population for their
+# bookends. A pre-existing 60-SEC master retains its original measurement species.
+TEMPEST_PPB_BOOKEND_WINDOW = "10_min"
+
+
+def _ocxo_bookend(state, window):
+    if window not in ("60_sec", "10_min"):
+        raise ValueError(f"unsupported TEMPEST PPB bookend window: {window!r}")
+    values = {lane: _path_get(state, f"clocks.stats.{lane}.ppb_buckets.{window}")
               for lane in ("ocxo1", "ocxo2")}
-    if values["ocxo1"] is not None:
-        return values
-    return _path_get(state, "clocks.stats.ppb_60s")  # Pre-bucket durable row.
+    if window == "60_sec" and values["ocxo1"] is None:
+        return _path_get(state, "clocks.stats.ppb_60s")  # Legacy durable row.
+    return values
 
 
-def _tempest_start_boundary(state, checkpoint):
+def _tempest_start_boundary(state, checkpoint, window):
     """Snapshot the private PPS preceding the first public TEMPEST row."""
     previous_epoch = checkpoint["reset_count"]
     if checkpoint["update_count"] == 1:
@@ -14467,15 +14476,17 @@ def _tempest_start_boundary(state, checkpoint):
                 and not prior.get("restored_display_seed")
                 and not prior.get("startup_lifetime_unclassified")
                 and _path_get(prior, "clocks.stats.reset_count") == previous_epoch):
-            return _ocxo_minute(prior), _path_get(prior, "gnss.altitude_m")
+            return _ocxo_bookend(prior, window), _path_get(prior, "gnss.altitude_m")
 
     # A missed boundary can retain recoverable frequency evidence in Alpha's
     # ring. Altitude belongs to the missing observation and stays unknown.
     end = next((e for e in reversed(checkpoint["second_history"])
                 if e["rolling_sequence"] < checkpoint["update_count"]), None)
     if end is not None and checkpoint["recoverable"]:
+        window_seconds = (PPB_10_MIN_SECONDS if window == "10_min"
+                          else PPB_60_SEC_SECONDS)
         anchor = _ppb_checkpoint_history_anchor_locked(
-            {**checkpoint, "current": end}, PPB_60_SEC_SECONDS, exact_second_history=True)
+            {**checkpoint, "current": end}, window_seconds, exact_second_history=True)
         if anchor is not None and end["interval_count"] > anchor["interval_count"]:
             return {lane: _ppb_window_value_from_endpoints(end, anchor, lane)
                     for lane in ("ocxo1", "ocxo2")}, None
@@ -14488,8 +14499,9 @@ def _persist_tempest_endpoints(cur, state):
     if not campaign or state.get("holistic_restore_superseded"):
         return
     name = _tempest_campaign_name(campaign)
+    window = campaign.get("ppb_bookend_window", "60_sec")
     start = json.dumps(campaign.get("start_ppb"))
-    current = json.dumps(_ocxo_minute(state))
+    current = json.dumps(_ocxo_bookend(state, window))
     start_alt = json.dumps(campaign.get("start_altitude_m"))
     altitude = json.dumps(_path_get(state, "gnss.altitude_m"))
     cur.execute(
@@ -14506,15 +14518,17 @@ def _persist_tempest_endpoints(cur, state):
         """,
         (start, start_alt, current, altitude, current, altitude, CAMPAIGN_TYPE_TEMPEST, name),
     )
-    # CLOCKS has a private PPS between campaigns. The incoming start is the
-    # shared cut boundary, including when the outgoing tail was still queued.
+    # CLOCKS has a private PPS between campaigns. For identical bookend windows
+    # the incoming START and outgoing END share the same private boundary.
+    # Never overwrite a historical 60-SEC END with a new 10-MIN START.
     master = cur.fetchone()
     if master and master[0] and campaign.get("public_count") == 1:
         cur.execute(
             """UPDATE campaign_master SET payload = payload || jsonb_build_object(
                    'end_ppb', %s::jsonb, 'end_altitude_m', %s::jsonb)
-               WHERE campaign_type = %s AND campaign = %s AND NOT active""",
-            (start, start_alt, CAMPAIGN_TYPE_TEMPEST, master[0]),
+               WHERE campaign_type = %s AND campaign = %s AND NOT active
+                 AND COALESCE(payload->>'ppb_bookend_window', '60_sec') = %s""",
+            (start, start_alt, CAMPAIGN_TYPE_TEMPEST, master[0], window),
         )
 
 
@@ -15026,6 +15040,7 @@ def _clocks_state_loop(active_master=None) -> None:
     start_name = active_master["campaign"] if "start_ppb" in saved else None
     start_ppb = saved.get("start_ppb")
     start_alt = saved.get("start_altitude_m")
+    bookend_window = saved.get("ppb_bookend_window", "60_sec")
     start_request = None
     _clocks_state_worker_started.set()
     logging.info("🚀 [clocks] canonical CLOCKS_V4 state worker started")
@@ -15198,12 +15213,20 @@ def _clocks_state_loop(active_master=None) -> None:
                     new_request = request is not None and request != start_request
                     if new_request or (name != start_name and campaign.get("public_count") == 1):
                         start_name, start_request = name, request
+                        # Preserve the saved species after a Pi restart; a new
+                        # campaign is always born on the 10-MIN window.
+                        bookend_window = (
+                            saved.get("ppb_bookend_window", "60_sec")
+                            if not new_request and active_master and active_master["campaign"] == name
+                            else TEMPEST_PPB_BOOKEND_WINDOW
+                        )
                         start_ppb, start_alt = (
-                            _tempest_start_boundary(state, ppb_restore_checkpoint)
+                            _tempest_start_boundary(state, ppb_restore_checkpoint, bookend_window)
                             if campaign.get("public_count") == 1 else (None, None)
                         )
                     campaign["start_ppb"] = start_ppb if name == start_name else None
                     campaign["start_altitude_m"] = start_alt if name == start_name else None
+                    campaign["ppb_bookend_window"] = bookend_window
                 if preclassification_newborn:
                     _diag["startup_preclassification_rows_non_authoritative"] = (
                         _diag.get("startup_preclassification_rows_non_authoritative", 0) + 1
@@ -16275,6 +16298,7 @@ def cmd_start(args: Optional[dict]) -> dict:
         "campaign_type": CAMPAIGN_TYPE_TEMPEST,
         "location": location,
         "started_at": cutover_ts,
+        "ppb_bookend_window": TEMPEST_PPB_BOOKEND_WINDOW,
     }
     if flash_cut:
         campaign_payload.update({
@@ -19609,6 +19633,7 @@ def cmd_list_campaigns(args: Optional[dict]) -> Dict[str, Any]:
             "end_altitude_m": payload.get("end_altitude_m"),
             "start_ppb": payload.get("start_ppb"),
             "end_ppb": payload.get("end_ppb"),
+            "ppb_bookend_window": payload.get("ppb_bookend_window", "60_sec"),
             "location": payload.get("location"),
             "public_count": report.get("public_count"),
             "sequence": report.get("sequence"),

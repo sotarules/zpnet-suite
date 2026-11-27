@@ -100,7 +100,9 @@
   </section>
   <dl id="clock-live">
     <div class="row"><dt>OCXO1 · 60-SEC</dt><dd><span id="ocxo1">---</span> <span class="unit">ppb</span></dd></div>
+    <div class="row"><dt>OCXO1 · 10-MIN</dt><dd><span id="ocxo1_10">---</span> <span class="unit">ppb</span></dd></div>
     <div class="row"><dt>OCXO2 · 60-SEC</dt><dd><span id="ocxo2">---</span> <span class="unit">ppb</span></dd></div>
+    <div class="row"><dt>OCXO2 · 10-MIN</dt><dd><span id="ocxo2_10">---</span> <span class="unit">ppb</span></dd></div>
   </dl>
   <section class="campaign" id="tempest" aria-labelledby="tempest-title" hidden>
     <p class="campaign-title" id="tempest-title"></p>
@@ -120,7 +122,7 @@
 </main>
 <script>
   const fields = ["system_time", "altitude", "max31865", "bme_pd",
-                  "bme_out", "lap", "high5", "ocxo1", "ocxo2"];
+                  "bme_out", "lap", "high5", "ocxo1", "ocxo2", "ocxo1_10", "ocxo2_10"];
   const statusLine = document.getElementById("status");
 
   function renderCampaign(id, run, activeTitle, closedTitle) {
@@ -128,7 +130,8 @@
     section.hidden = !run;
     if (!run) return;
     section.querySelector(".campaign-title").textContent =
-      (run.active ? activeTitle : closedTitle) + run.name;
+      (run.active ? activeTitle : closedTitle) + run.name +
+      (id === "tempest" ? " · PPB " + run.ppb_window : "");
     for (const span of section.querySelectorAll("[data-field]")) {
       const value = span.dataset.field.split(".").reduce((obj, key) => obj[key], run);
       span.textContent = value ?? "---";
@@ -141,9 +144,8 @@
     }
     renderCampaign("lantern", stats.lantern, "PHOTONS · LANTERN · ", "PHOTONS · LAST LANTERN · ");
     renderCampaign("tempest", stats.tempest, "CLOCKS · TEMPEST · ", "CLOCKS · LAST TEMPEST · ");
-    // Active END rows already display the live 60-SEC values. Keep the
-    // independent live readings visible when there is no active TEMPEST.
-    document.getElementById("clock-live").hidden = Boolean(stats.tempest?.active);
+    // Always show both live windows, even during a campaign. TEMPEST bookends
+    // are an independent, frozen-start comparison using their recorded species.
     statusLine.textContent = message;
   }
 

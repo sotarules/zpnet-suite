@@ -10,9 +10,9 @@ Data source:
   updating even if an instrument stream stops.
 
 Stats policy:
-  Present producer-authored always-on 60-second PPB and LAP measurements.
+  Present producer-authored always-on 60-second LAP and 60-SEC/10-MIN PPB.
   Campaigns delimit observations; start/end readings and altitudes are saved
-  bookends.  Do not substitute cumulative or campaign means for a 60-SEC value.
+  bookends in their recorded window. Never substitute campaign means for PPB.
   The rolling PHOTONS tail retains the actual one-second PUBSUB publications.
   PostgreSQL remains the authority for durable history.
 
@@ -22,7 +22,7 @@ Clock row doctrine:
   here because they are not primary TEMPEST science clocks.
   VALUE is the Beta-authored campaign-relative clockface while a campaign is
   active; otherwise it is the canonical always-on instrument clockface.
-  60-SEC is the producer-authored rolling PPB measurement.
+  60-SEC and 10-MIN are producer-authored rolling PPB measurements.
   DAC MEAN remains the separate Pi-recorded actuator population; it never
   resets the running servo.
   CAMP VOLTS derives from that fractional mean at nominal 5 V / 65536 codes.
@@ -31,7 +31,7 @@ Clock row doctrine:
   RES is the firmware-published residual for the prior PPS interval.
 
 Column layout (CLK rows):
-  NAME   VALUE   60-SEC   RES
+  NAME   VALUE   60-SEC   10-MIN   RES
 
 Column layout (DAC rows):
   OCXO   VOUT   MEAN_V
@@ -631,8 +631,8 @@ def _ppb_bucket(r: dict, lane: str, bucket: str):
     return _to_float(_freq_value(r, lane, "ppb"))
 
 
-def _ppb_cols_fragment(r: dict, lane: str, width: int) -> str:
-    return _fmt(_ppb_bucket(r, lane, "60_sec"), f">{width}.3f", width)
+def _ppb_cols_fragment(r: dict, lane: str, width: int, bucket: str = "60_sec") -> str:
+    return _fmt(_ppb_bucket(r, lane, bucket), f">{width}.3f", width)
 
 
 def _welford_value(r: dict, prefix: str, field: str):
@@ -1413,6 +1413,7 @@ def _get_campaign_rows() -> list[dict]:
                        master.payload ->> 'start_altitude_m' AS start_altitude_m,
                        master.payload ->> 'end_altitude_m' AS end_altitude_m,
                        master.payload ->> 'latest_altitude_m' AS latest_altitude_m,
+                       master.payload ->> 'ppb_bookend_window' AS ppb_bookend_window,
                        master.payload -> 'start_ppb' AS start_ppb,
                        master.payload -> 'end_ppb' AS end_ppb,
                        master.payload -> 'latest_ppb' AS latest_ppb,
@@ -1463,7 +1464,7 @@ def campaigns_readout() -> list[str]:
     newest_identity = str(rows[0].get("id")) if rows else "EMPTY"
     width = 13
     lines = [f"\0CAMPAIGN:{newest_identity}",
-             f"{'CAMPAIGN':<18} {'OCXO':<5} {'SEC':>8} "
+             f"{'CAMPAIGN':<18} {'OCXO':<5} {'SEC':>8} {'PPB WIN':>7} "
              f"{'START PPB':>{width}} {'START ALT':>18} "
              f"{'END PPB':>{width}} {'END ALT':>18} "
              f"{'DELTA PPB':>{width}} {'DELTA ALT':>18}"]
@@ -1481,6 +1482,8 @@ def campaigns_readout() -> list[str]:
         end_alt = _to_float(row.get("latest_altitude_m" if active else "end_altitude_m"))
         end_ppb = row.get("latest_ppb" if active else "end_ppb") or {}
         start_ppb = row.get("start_ppb") or {}
+        window = row.get("ppb_bookend_window") or "60_sec"
+        window_label = "10-MIN" if window == "10_min" else "60-SEC"
         seconds = _to_int(row.get("pps_count"))
         if row_index:
             lines.append("")
@@ -1489,7 +1492,7 @@ def campaigns_readout() -> list[str]:
             end = _to_float(end_ppb.get(lane))
             lines.append(
                 f"{_campaign_cell(name, active, 18)} {label:<5} "
-                f"{_fmt(seconds, '>8d', 8)} "
+                f"{_fmt(seconds, '>8d', 8)} {window_label:>7} "
                 + _campaign_bookend_cells(start, end, start_alt, end_alt, width, 3)
             )
     return lines
@@ -1569,19 +1572,23 @@ def clocks_combined_readout() -> list[str]:
     if state == "STARTED" or r.get("campaign_present"):
         identity = f"CAMPAIGN: {campaign}  ELAPSED: {elapsed}"
         start = _field(r, "campaign_delta.start_ppb") or {}
+        window = _field(r, "campaign_delta.ppb_bookend_window") or "60_sec"
+        window_label = "10-MIN" if window == "10_min" else "60-SEC"
         delta = {}
         for lane in ("ocxo1", "ocxo2"):
-            minute = _ppb_bucket(r, lane, "60_sec")
-            if minute is not None and start.get(lane) is not None:
-                delta[lane] = minute - start[lane]
-        identity += (f"   OCXO1 / OCXO2   START PPB: {_ocxo_ppb_pair(start)}"
+            now = _ppb_bucket(r, lane, window)
+            if now is not None and start.get(lane) is not None:
+                delta[lane] = now - start[lane]
+        identity += (f"   OCXO1 / OCXO2   START {window_label} PPB: {_ocxo_ppb_pair(start)}"
                      f"   START ALT: {_altitude_text(_field(r, 'campaign_delta.start_altitude_m'))}"
-                     f"   DELTA 60-SEC: {_ocxo_ppb_pair(delta)}")
+                     f"   DELTA {window_label}: {_ocxo_ppb_pair(delta)}")
     else:
         identity = f"CAMPAIGN: STOPPED  INSTRUMENT: {instrument_elapsed}"
         last = last_tempest.get()
         if last:
-            identity += (f"   LAST: {last['campaign']}   END PPB: {_ocxo_ppb_pair(last.get('end_ppb'))}"
+            window_label = ("10-MIN" if last.get("ppb_bookend_window") == "10_min"
+                            else "60-SEC")
+            identity += (f"   LAST: {last['campaign']}   END {window_label} PPB: {_ocxo_ppb_pair(last.get('end_ppb'))}"
                          f"   END ALT: {_altitude_text(last.get('end_altitude_m'))}")
     lines.append(
         identity
@@ -1601,6 +1608,7 @@ def clocks_combined_readout() -> list[str]:
         f"{'CLK':<{W_NAME}}"
         f"{'VALUE':>{W_VALUE}}"
         f"{'60-SEC':>{W_PPB_BUCKET}}"
+        f"{'10-MIN':>{W_PPB_BUCKET}}"
         f"{'RES':>{W_RES}}"
     )
 
@@ -1611,6 +1619,7 @@ def clocks_combined_readout() -> list[str]:
         f"{'GNSS':<{W_NAME}}"
         f"{_comma_int(gnss_ns, W_VALUE)}"
         f"{_ppb_cols_fragment(r, 'gnss', W_PPB_BUCKET)}"
+        f"{_ppb_cols_fragment(r, 'gnss', W_PPB_BUCKET, '10_min')}"
         f"{_sign_int(gnss_res, W_RES)}"
     )
 
@@ -1625,6 +1634,7 @@ def clocks_combined_readout() -> list[str]:
         f"{'VCLOCK':<{W_NAME}}"
         f"{_comma_int(vclock_ns, W_VALUE)}"
         f"{_ppb_cols_fragment(r, 'vclock', W_PPB_BUCKET)}"
+        f"{_ppb_cols_fragment(r, 'vclock', W_PPB_BUCKET, '10_min')}"
         f"{_sign_int(vclock_res, W_RES)}"
     )
 
@@ -1636,6 +1646,7 @@ def clocks_combined_readout() -> list[str]:
             f"{name:<{W_NAME}}"
             f"{_comma_int(ocxo_ns, W_VALUE)}"
             f"{_ppb_cols_fragment(r, key, W_PPB_BUCKET)}"
+            f"{_ppb_cols_fragment(r, key, W_PPB_BUCKET, '10_min')}"
             f"{_sign_int(res, W_RES)}"
         )
 

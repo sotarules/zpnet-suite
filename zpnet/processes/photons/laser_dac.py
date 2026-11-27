@@ -1,9 +1,9 @@
 """Pi-owned laser amplitude actuator; laser_servo owns scheduling and policy.
 
 The DAC register is digital testimony, not a measurement of SMA voltage.
-Construction performs no I/O. The first set zeros the output before
-configuring the reference/gain, then applies the request. PHOTONS startup
-explicitly sets the commissioning voltage through laser_servo.
+Construction performs no I/O. PHOTONS adopts a nonzero powered DAC input on
+Pi-only restarts without writing. A cold zero-scale DAC is commissioned at
+1.4 V by the servo; its first write establishes reference/gain and code.
 """
 
 import copy
@@ -69,6 +69,36 @@ class LaserDac:
     @staticmethod
     def _read():
         return read_input(DAC_BUS, DAC_ADDRESS)
+
+    def adopt_live_input(self):
+        """Keep the actual input code on a Pi-only restart without a DAC write.
+
+        The AD5693R resets its input/DAC registers to zero on a physical reset.
+        Nonzero code is retained configuration from this instrument's sole
+        previous Pi owner, not proof of analog VOUT or the reference setting.
+        """
+        with self._io_lock:
+            if self._state["state"] != "UNCONFIGURED":
+                raise RuntimeError("laser DAC adoption requires an unconfigured process")
+            try:
+                code = self._read()
+                if code == 0:
+                    self._update(readback_input_code=0)
+                    return None
+                if not 0 < code <= MAX_CODE:
+                    raise RuntimeError(f"retained laser DAC code {code} exceeds safe range 1..{MAX_CODE}")
+                volts = code * REFERENCE_V / CODE_SCALE
+                self._update(
+                    state="CONFIGURED", startup_policy="RETAINED_LIVE_DAC_INPUT",
+                    commanded_code=code, commanded_dac_v=volts,
+                    estimated_mod_v_into_50_ohm=volts * 50 / 97,
+                    readback_input_code=code, last_error=None,
+                )
+                # No write occurred: last_write_at_utc and write_count stay empty.
+                return self.snapshot()
+            except Exception as exc:
+                self._update(state="FAULT", last_error=str(exc))
+                raise
 
     def readback(self):
         """Read input register only; cannot prove reference/gain or analog VOUT."""

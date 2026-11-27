@@ -6,7 +6,8 @@ Operator commands (DAC volts and detector millivolts are different units):
     pc photons servo_stop
     pc photons set_dac volts=1.4  # also stops automatic control
 
-Startup deliberately establishes 1.4 V, including on a Pi-only restart.
+Startup retains the powered DAC input code across Pi-only process restarts;
+only a zero-scale, physically reset DAC is commissioned at 1.4 V.
 Automatic mode is volatile and starts enabled by default. STOP campaign does
 not stop this instrument controller; SERVO_STOP holds the last DAC setting.
 NOR9 normalization and HIGH5/HIGHV witnesses remain unchanged.
@@ -76,6 +77,7 @@ class LaserServo:
             "max_feedback_age_seconds": MAX_FEEDBACK_AGE_SECONDS,
             "minimum_fragment_samples": MIN_FRAGMENT_SAMPLES,
             "startup_dac_v": STARTUP_DAC_V,
+            "startup_source": None,
             "startup_servo_enabled": STARTUP_SERVO_ENABLED,
             "feedback_source": "PD_OUT_HIGH1_MV",
             "feedback_path": "VALIDATED_LIVE_FRAGMENT",
@@ -117,12 +119,20 @@ class LaserServo:
                 return
             self._started = True
             try:
-                self.dac.set_code(requested_code({"volts": STARTUP_DAC_V}))
+                retained = self.dac.adopt_live_input()
+                if retained is None:
+                    state = self.dac.set_code(requested_code({"volts": STARTUP_DAC_V}))
+                    source = "COLD_ZERO_SCALE_COMMISSION"
+                else:
+                    state = retained
+                    source = "RETAINED_LIVE_DAC_INPUT"
+                # The startup gate still requires fresh post-restart feedback.
+                # Warm adoption itself does not cause any voltage transition.
                 self._settle()
                 self._update(mode="AUTO" if STARTUP_SERVO_ENABLED else "MANUAL",
-                             status="SETTLING")
-                logging.info("[photons/servo] startup DAC=%.6f target=%.3f auto=%s",
-                             STARTUP_DAC_V, TARGET_MV, STARTUP_SERVO_ENABLED)
+                             status="SETTLING", startup_source=source)
+                logging.info("[photons/servo] startup DAC=%.6f source=%s target=%.3f auto=%s",
+                             state["commanded_dac_v"], source, TARGET_MV, STARTUP_SERVO_ENABLED)
             except Exception as exc:
                 self._fault(exc)
 

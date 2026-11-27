@@ -65,11 +65,13 @@ def tempest_snapshot(clocks):
         campaign = last_tempest.get()
     if not campaign:
         return None
+    window = campaign.get("ppb_bookend_window") or "60_sec"
     result = {"name": campaign["name" if active else "campaign"], "active": active,
+              "ppb_window": "10-MIN" if window == "10_min" else "60-SEC",
               **altitude_bookends(campaign, clocks, active)}
     for lane in ("ocxo1", "ocxo2"):
         start = field(campaign, "start_ppb", lane)
-        end = (field(clocks, "clocks", "stats", lane, "ppb_buckets", "60_sec")
+        end = (field(clocks, "clocks", "stats", lane, "ppb_buckets", window)
                if active else field(campaign, "end_ppb", lane))
         result[lane] = {"start": number(start, "+.3f"), "end": number(end, "+.3f"),
                         "delta": number(difference(start, end), "+.3f")}
@@ -118,6 +120,8 @@ def snapshot(cache):
         "lantern": lantern_snapshot(photons),
         "ocxo1": number(field(stats, "ocxo1", "ppb_buckets", "60_sec"), "+.3f"),
         "ocxo2": number(field(stats, "ocxo2", "ppb_buckets", "60_sec"), "+.3f"),
+        "ocxo1_10": number(field(stats, "ocxo1", "ppb_buckets", "10_min"), "+.3f"),
+        "ocxo2_10": number(field(stats, "ocxo2", "ppb_buckets", "10_min"), "+.3f"),
         "tempest": tempest_snapshot(clocks),
         "clocks_live": clocks is not None,
         "photons_live": photons is not None,
