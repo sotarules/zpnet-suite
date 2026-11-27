@@ -140,15 +140,9 @@ DAC_DITHER_SLOTS_PER_FRAME = 1000
 DAC_STATIC_SERVO_SERVICE_DELAY_S = 0.250
 SERVO_MAX_STEP = 64.0
 SERVO_TARGET_PPB = 0.100
-SERVO_CAMP_SETTLE_SECONDS = 5
 SERVO_TOTAL_MIN_SAMPLES = 10
 SERVO_PPB_PER_DAC_LSB_ESTIMATE = 100.0
-# Match 10-MIN precision: the legacy 3 PPB deadband made CAMP appear idle
-# throughout the sub-PPB range, even with fractional DAC dither enabled.
-SERVO_CAMP_DEADBAND_PPB = 0.025
 SERVO_SOFT_LANDING_PPB = 300.0
-SERVO_CAMP_FILTER_ALPHA = 0.35
-SERVO_CAMP_GAIN = 1.0
 SERVO_10_MIN_FILTER_ALPHA = 1.0
 SERVO_10_MIN_GAIN = 1.0
 SERVO_10_MIN_DEADBAND_PPB = 0.025
@@ -1777,8 +1771,12 @@ def _dac_reset_servo_predictor_locked(lane: _DacLaneState) -> None:
 def _dac_set_servo_mode(mode: str) -> Tuple[str, str]:
     global _dac_servo_mode
     normalized = str(mode or "").strip().upper()
-    if normalized not in {"OFF", "TOTAL", "CAMP", "10-MIN"}:
-        raise ValueError("SERVOS mode must be OFF, TOTAL, CAMP, or 10-MIN")
+    # Legacy persisted CAMP control must not depend on campaign labels.
+    # A direct operator request for CAMP is rejected by cmd_servos below.
+    if normalized == "CAMP":
+        normalized = "10-MIN"
+    if normalized not in {"OFF", "TOTAL", "10-MIN"}:
+        raise ValueError("SERVOS mode must be OFF, TOTAL, or 10-MIN")
     with _dac_lock:
         previous = _dac_servo_mode
         if previous != normalized:
@@ -2090,7 +2088,6 @@ def _servo_total(
 
 def _dac_servo_inputs(
     clocks: Dict[str, Any],
-    campaign: Optional[Dict[str, Any]],
     lane_name: str,
 ) -> Dict[str, Any]:
     stats = clocks.get("stats") if isinstance(clocks, dict) else None
@@ -2103,12 +2100,6 @@ def _dac_servo_inputs(
     buckets = buckets if isinstance(buckets, dict) else {}
     tau_state = stats.get(f"{lane_name}_tau_state")
     tau_state = tau_state if isinstance(tau_state, dict) else {}
-    campaign = campaign if isinstance(campaign, dict) else {}
-    campaign_stats = campaign.get("stats")
-    campaign_stats = campaign_stats if isinstance(campaign_stats, dict) else {}
-    campaign_ppb = campaign_stats.get("ppb")
-    campaign_ppb = campaign_ppb if isinstance(campaign_ppb, dict) else {}
-    campaign_started = str(campaign.get("state") or "").strip().upper() == "STARTED"
     reference = raw_cycles.get("vclock")
     observed = raw_cycles.get(lane_name)
     reference = reference if isinstance(reference, dict) else {}
@@ -2144,12 +2135,6 @@ def _dac_servo_inputs(
         total_ppb = 0.0
         total_finite = False
     try:
-        camp_ppb = float(campaign_ppb.get(lane_name))
-        camp_finite = math.isfinite(camp_ppb)
-    except (TypeError, ValueError):
-        camp_ppb = 0.0
-        camp_finite = False
-    try:
         population = int(tau_state.get("sample_count") or 0)
     except (TypeError, ValueError):
         population = 0
@@ -2159,8 +2144,6 @@ def _dac_servo_inputs(
         "interval_ppb": interval_ppb,
         "10_min_valid": interval_valid and ten_min_finite,
         "10_min_ppb": ten_min_ppb,
-        "camp_valid": interval_valid and campaign_started and camp_finite,
-        "camp_ppb": camp_ppb,
         "total_valid": (
             interval_valid and total_finite and population >= SERVO_TOTAL_MIN_SAMPLES
         ),
@@ -2171,7 +2154,6 @@ def _dac_servo_inputs(
 
 def _dac_process_completed_row(
     teensy_clocks: Dict[str, Any],
-    campaign: Optional[Dict[str, Any]],
     sequence: int,
 ) -> Optional[Dict[str, Any]]:
     global _dac_control_second
@@ -2304,26 +2286,8 @@ def _dac_process_completed_row(
         return observation
 
     for lane_name, lane in _dac_lanes.items():
-        inputs = _dac_servo_inputs(teensy_clocks, campaign, lane_name)
-        if mode == "CAMP":
-            if not inputs["camp_valid"]:
-                continue
-            with _dac_lock:
-                lane.servo_settle_count += 1
-                ready = lane.servo_settle_count >= SERVO_CAMP_SETTLE_SECONDS
-                if ready:
-                    lane.servo_settle_count = 0
-            if ready:
-                _servo_slope(
-                    lane,
-                    selected_valid=True,
-                    selected_ppb=float(inputs["camp_ppb"]),
-                    filter_alpha=SERVO_CAMP_FILTER_ALPHA,
-                    gain=SERVO_CAMP_GAIN,
-                    deadband_ppb=SERVO_CAMP_DEADBAND_PPB,
-                    use_soft_landing=True,
-                )
-        elif mode == "TOTAL":
+        inputs = _dac_servo_inputs(teensy_clocks, lane_name)
+        if mode == "TOTAL":
             _servo_total(
                 lane,
                 total_valid=bool(inputs["total_valid"]),
@@ -2406,6 +2370,19 @@ def _dac_reset_statistics() -> Dict[str, Any]:
     return {"before": before, "after": after}
 
 
+def _dac_resume_target(saved_target: float, observed_code: int, dither: bool) -> float:
+    """Surviving powered hardware wins; preserve fractional dither only nearby.
+
+    Zero is the AD5693R power-on/reset signature in our operating envelope.
+    Only that case authorizes an explicit durable-target restoration.
+    """
+    if observed_code == 0:
+        return saved_target
+    if dither and abs(saved_target - observed_code) <= 1.0:
+        return saved_target
+    return float(observed_code)
+
+
 def _dac_restore_control_from_clocks(clocks: Dict[str, Any], *, realize: bool) -> Dict[str, Any]:
     control = clocks.get("control") if isinstance(clocks, dict) else None
     stats = clocks.get("stats") if isinstance(clocks, dict) else None
@@ -2415,7 +2392,10 @@ def _dac_restore_control_from_clocks(clocks: Dict[str, Any], *, realize: bool) -
     auxiliary = stats.get("auxiliary_welford")
     auxiliary = auxiliary if isinstance(auxiliary, dict) else {}
     mode = str(control.get("servo_mode") or "OFF").upper()
-    if mode not in {"OFF", "TOTAL", "CAMP", "10-MIN"}:
+    if mode == "CAMP":
+        logging.warning("[clocks/recovery] migrating legacy CAMP servo to always-on 10-MIN")
+        mode = "10-MIN"
+    if mode not in {"OFF", "TOTAL", "10-MIN"}:
         raise ValueError(f"invalid restored servo mode {mode!r}")
     dither = bool(control.get("dither_operator_enabled"))
 
@@ -2476,19 +2456,40 @@ def _dac_restore_control_from_clocks(clocks: Dict[str, Any], *, realize: bool) -
             _dac_stats_reset_fence_count = None
 
     if realize:
-        if dither:
-            _dac_control_wakeup.set()
-        else:
-            for lane in _dac_lanes.values():
+        for lane in _dac_lanes.values():
+            # Read the actual surviving device *after* the durable control image
+            # has been loaded. Pi process lifetimes do not own DAC power cycles.
+            observed_code = _ad5693r_read_input(lane.address)
+            if not 0 <= observed_code <= AD5693R_SAFE_MAX_HW_CODE:
+                raise RuntimeError(
+                    f"{lane.name} DAC live code {observed_code} outside safe hardware envelope"
+                )
+            with _dac_lock:
+                saved_target = float(lane.target_code)
+                lane.hw_code = observed_code
+                lane.readback_code = observed_code
+                lane.readback_valid = True
+                lane.reset_signature = observed_code == 0
+                lane.target_code = _dac_resume_target(saved_target, observed_code, dither)
+                lane.last_good_hw_code = observed_code
+            if observed_code:
+                logging.info(
+                    "[clocks/recovery] %s retained powered DAC code=%d; "
+                    "adopted target=%.6f without VOUT write",
+                    lane.name, observed_code, lane.target_code,
+                )
+            elif not dither and _dac_rounded_hw_code(saved_target) != 0:
+                # Explicitly proved zero-scale reset: hardware lost its setting.
                 if not _dac_write_hw_code(
                     lane,
-                    _dac_rounded_hw_code(lane.target_code),
+                    _dac_rounded_hw_code(saved_target),
                     author_source=DAC_AUTHOR_EXPLICIT_COMMAND,
                     latch_fault=True,
                 ):
-                    raise RuntimeError(f"failed to restore {lane.name} DAC hardware")
-    else:
-        _dac_control_wakeup.set()
+                    raise RuntimeError(f"failed to restore reset {lane.name} DAC hardware")
+        # Dither may resume its independent periodic control on the next frame;
+        # no saved-target write is forced onto surviving DACs by Pi recovery.
+    _dac_control_wakeup.set()
 
     return {
         "restored": True,
@@ -5211,6 +5212,22 @@ def _wait_for_startup_infrastructure() -> Dict[str, Any]:
             last_signature = signature
 
         time.sleep(STARTUP_INFRASTRUCTURE_POLL_S)
+
+
+def _campaign_location_snapshot() -> Dict[str, Any]:
+    """Read SYSTEM's already-selected GNSS location without touching the receiver.
+
+    START/FLASH_CUT are observational boundaries. Only SYSTEM startup and the
+    explicit SET_LOCATION command may reassert GF-8802 hardware configuration.
+    """
+    report = _fetch_system_report()
+    location = report["location"]
+    gnss = report["gnss"]
+    return {
+        "current_location": location["current_location"],
+        "verified_pos_mode_name": location.get("receiver_mode"),
+        "freq_mode_name": gnss.get("freq_mode_name"),
+    }
 
 
 def _ensure_system_location(*, context: str) -> Dict[str, Any]:
@@ -14311,7 +14328,6 @@ def _build_canonical_clocks_state(
     if mutate_alpha_custody:
         dac_observation = _dac_process_completed_row(
             teensy_clocks,
-            clocks_fragment.get("campaign"),
             sequence,
         )
     pi_clocks = _pi_clocks_state_snapshot()
@@ -15920,6 +15936,25 @@ def _request_teensy_stop_best_effort() -> None:
         pass
 
 
+def _confirm_teensy_stopped_for_cold_start(timeout_s: float = 4.0) -> None:
+    """Read-only firmware boundary gate after an asynchronous campaign STOP."""
+    deadline = time.monotonic() + timeout_s
+    observed = None
+    while time.monotonic() < deadline:
+        response = send_command(
+            machine="TEENSY", subsystem="CLOCKS", command="REPORT_RECOVERY"
+        )
+        payload = response.get("payload") if isinstance(response, dict) else None
+        if isinstance(payload, dict) and response.get("success"):
+            observed = payload.get("campaign_state")
+            if observed == "STOPPED" and payload.get("restore_court_ready") is True:
+                return
+        time.sleep(0.05)
+    raise RuntimeError(
+        f"CLOCKS cold START requires a completed, idle Teensy STOP; last={observed!r}"
+    )
+
+
 class TeensyStartRejected(RuntimeError):
     """Raised when CLOCKS.START routes successfully but firmware rejects it."""
 
@@ -16240,15 +16275,12 @@ def cmd_start(args: Optional[dict]) -> dict:
     flash_cut = active_row is not None
     prev_campaign = active_row["campaign"] if flash_cut else None
 
+    _wait_for_preflight("flash_cut" if flash_cut else "start")
     try:
-        location_status = _ensure_system_location(
-            context="FLASH_CUT_START" if flash_cut else "CAMPAIGN_START"
-        )
+        location_status = _campaign_location_snapshot()
     except Exception as e:
         return {"success": False, "message": str(e)}
-
-    location = location_status.get("current_location")
-    _wait_for_preflight("flash_cut" if flash_cut else "start")
+    location = location_status["current_location"]
     # Preflight may have waited while a watchdog opened new recovery custody.
     # Revalidate lifecycle ownership before creating durable campaign intent.
     busy = _startup_control_gate("START")
@@ -16282,6 +16314,8 @@ def cmd_start(args: Optional[dict]) -> dict:
     # NONE; a Flash Cut must never resurrect the previous campaign's location.
     try:
         _wait_for_timebase_routes(context="flash_cut" if flash_cut else "start")
+        if not flash_cut:
+            _confirm_teensy_stopped_for_cold_start()
     except Exception as e:
         return {"success": False, "message": str(e)}
 
@@ -16331,9 +16365,7 @@ def cmd_start(args: Optional[dict]) -> dict:
             (CAMPAIGN_TYPE_TEMPEST, campaign, json.dumps(campaign_payload)),
         )
 
-    if not flash_cut:
-        _request_teensy_stop_best_effort()
-
+    # The producer is already running: a cold campaign START is not a device STOP.
     drained = _reset_trackers()
     if drained:
         logging.info("🧹 [start] drained %d stale CLOCKS_FRAGMENT campaign delta(s) before arm", drained)
@@ -16468,7 +16500,7 @@ def cmd_start(args: Optional[dict]) -> dict:
             "flash_cut": flash_cut,
             "previous_campaign": prev_campaign,
             "sync_wait_removed": True,
-            "teensy_stop_sent": not flash_cut,
+            "teensy_stop_sent": False,
             "first_fragment_timeout_s": (
                 FLASH_CUT_FIRST_FRAGMENT_TIMEOUT_S if flash_cut else START_FIRST_FRAGMENT_TIMEOUT_S
             ),
@@ -16480,17 +16512,19 @@ def cmd_stop(_: Optional[dict]) -> dict:
     global _campaign_active
 
     row = _get_active_campaign()
-    stop_location = (
-        row["payload"].get("location")
-        if row and isinstance(row.get("payload"), dict)
-        else None
-    )
+    if row is None:
+        return {"success": True, "message": "NO_ACTIVE_CAMPAIGN"}
 
-    _request_teensy_stop_best_effort()
-    # STOP should be enough on current firmware.  RECOVER_ABORT is harmless if
-    # supported and prevents old half-open RECOVER latches from surviving a Pi
-    # STOP issued after a failed recovery attempt.
-    _request_teensy_recover_abort_best_effort("pi_stop_cleanup")
+    # Ordinary STOP closes a label, not a recovery lifetime. Never send
+    # RECOVER_ABORT or clear Alpha publication custody from this path.
+    try:
+        response = send_command(machine="TEENSY", subsystem="CLOCKS", command="STOP")
+    except Exception as exc:
+        return {"success": False, "message": f"CLOCKS.STOP could not be delivered: {exc}"}
+    payload = response.get("payload") if isinstance(response, dict) else None
+    status = payload.get("status") if isinstance(payload, dict) else None
+    if not response.get("success") or status != "stop_requested":
+        return {"success": False, "message": f"CLOCKS.STOP refused: {response!r}"}
 
     # Retire in-memory authorship before retiring its durable campaign row.
     # Otherwise the fragment consumer can observe _campaign_active=True
@@ -16527,19 +16561,9 @@ def cmd_stop(_: Optional[dict]) -> dict:
     _drain_timebase_ingress()
     _reset_trackers()
 
-    try:
-        location_status = _ensure_system_location(context="CAMPAIGN_STOP")
-        logging.info(
-            "📍 [clocks] stop location reconciliation complete: "
-            "SYSTEM=%s campaign_snapshot=%s GF-8802=%s",
-            location_status.get("current_location") or "NONE",
-            stop_location or "NONE",
-            location_status.get("verified_pos_mode_name") or "?",
-        )
-    except Exception:
-        logging.exception("⚠️ [clocks] failed to reconcile SYSTEM location at stop (ignored)")
-
-    logging.info("⏹️ [clocks] campaign stopped")
+    # Receiver configuration is exclusively SYSTEM/GNSS-owned. A campaign
+    # STOP does not reassert or modify a location selection.
+    logging.info("⏹️ [clocks] campaign stopped (GNSS and hardware unchanged)")
     return {"success": True, "message": "OK"}
 
 
@@ -19835,7 +19859,7 @@ def cmd_set_dac(args: Optional[dict]) -> Dict[str, Any]:
 
 
 def cmd_servos(args: Optional[dict]) -> Dict[str, Any]:
-    """Set the Pi-owned OCXO servo mode: OFF, TOTAL, CAMP, or 10-MIN."""
+    """Set the Pi-owned always-on OCXO servo mode: OFF, TOTAL, or 10-MIN."""
     args = args or {}
     _, raw = _arg_first_present(
         args,
@@ -19844,9 +19868,13 @@ def cmd_servos(args: Optional[dict]) -> Dict[str, Any]:
     if raw is None:
         return {
             "success": False,
-            "message": "SERVOS requires OFF, TOTAL, CAMP, or 10-MIN",
+            "message": "SERVOS requires OFF, TOTAL, or 10-MIN",
             "payload": {"servo_mode": _dac_servo_mode},
         }
+    if str(raw).strip().upper() == "CAMP":
+        return {"success": False,
+                "message": "CAMP servo was retired: use 10-MIN (always-on), TOTAL, or OFF",
+                "payload": {"servo_mode": _dac_servo_mode}}
     try:
         previous, requested = _dac_set_servo_mode(str(raw))
     except ValueError as exc:

@@ -9744,59 +9744,37 @@ static FLASHMEM Payload cmd_rearm(const Payload& args) {
 static FLASHMEM Payload cmd_stop(const Payload&) {
   const clocks_payload_custody_t payload_custody(
       clocks_payload_owner_t::COMMAND);
-  clocks_ppb_restore_protocol_clear(true);
-  g_clocks_restore_requested = false;
-  g_clocks_restore_state = clocks_recovery_restore_state_t{};
-  const bool had_live_smartzero = interrupt_smartzero_running();
-  const bool had_pending_start = request_start;
-  const bool had_pending_zero = request_zero;
-  const bool had_pending_recover = request_recover;
-  const bool had_pending_rearm = request_rearm;
-  const bool had_recovering = clocks_campaign_recovery_lifecycle_active();
-
-  interrupt_smartzero_abort();
-  if (had_live_smartzero || had_pending_start || had_pending_zero) {
-    clocks_alpha_smartzero_pending_clear();
-  }
-
-  request_start = false;
-  request_zero = false;
-  request_recover = false;
-  request_rearm = false;
-  flash_cut_clear_pending();
+  // STOP is only a bookend request. Never reinterpret it as RECOVER_ABORT,
+  // STATS_RESET, SMARTZERO_ABORT, or publication-custody retirement.
+  const bool lifecycle_busy =
+      request_start || request_stop || request_zero || request_recover ||
+      request_rearm || request_flash_cut || g_clocks_restore_requested ||
+      g_ppb_restore_protocol_active ||
+      clocks_campaign_recovery_lifecycle_active() ||
+      interrupt_smartzero_running() || clocks_alpha_epoch_install_in_progress();
 
   Payload p;
-
-  if (campaign_state == clocks_campaign_state_t::STARTED &&
-      !had_pending_recover && !had_pending_rearm && !had_recovering) {
-    request_stop = true;
-    p.add("status", "stop_requested");
+  if (lifecycle_busy) {
+    p.add("status", "stop_rejected_lifecycle_busy");
+    p.add("campaign_state", clocks_campaign_state_name(campaign_state));
+    return p;
+  }
+  if (campaign_state == clocks_campaign_state_t::STOPPED) {
+    p.add("status", "stopped_idle");
     p.add("service_epoch_preserved", true);
     p.add("statistics_preserved", true);
     return p;
   }
-
-  if (had_recovering || had_pending_recover) {
-    recover_lifecycle_abort("stop_command_abort_recover");
-    p.add("status", "recover_aborted_by_stop");
-    p.add("service_epoch_preserved", true);
+  if (campaign_state != clocks_campaign_state_t::STARTED) {
+    p.add("status", "stop_rejected_not_started");
     p.add("campaign_state", clocks_campaign_state_name(campaign_state));
     return p;
   }
 
-  // STOP while no campaign is running is a campaign-lifecycle abort. It must
-  // not invalidate the installed epoch or alter always-on instrument state.
-  request_stop = false;
-  clocks_watchdog_clear_surrender_for_new_lifecycle();
-
-  p.add("status", (had_live_smartzero || had_pending_start || had_pending_zero)
-                      ? "smartzero_abort_requested"
-                      : "stopped_idle");
+  request_stop = true;
+  p.add("status", "stop_requested");
   p.add("service_epoch_preserved", true);
-  p.add("had_live_smartzero", had_live_smartzero);
-  p.add("had_pending_start", had_pending_start);
-  p.add("had_pending_zero", had_pending_zero);
-  payload_add_smartzero_summary(p);
+  p.add("statistics_preserved", true);
   return p;
 }
 
