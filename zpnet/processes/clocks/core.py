@@ -16468,6 +16468,12 @@ def cmd_stop(_: Optional[dict]) -> dict:
     # STOP issued after a failed recovery attempt.
     _request_teensy_recover_abort_best_effort("pi_stop_cleanup")
 
+    # Retire in-memory authorship before retiring its durable campaign row.
+    # Otherwise the fragment consumer can observe _campaign_active=True
+    # after PostgreSQL has already made _get_active_campaign() return None,
+    # misclassifying an intentional STOP as a no_active_campaign hard fault.
+    _campaign_active = False
+
     stopped_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     with open_db() as conn:
         cur = conn.cursor()
@@ -16492,7 +16498,6 @@ def cmd_stop(_: Optional[dict]) -> dict:
             (stopped_at, CAMPAIGN_TYPE_TEMPEST),
         )
 
-    _campaign_active = False
     _clear_start_wait_state()
     _clear_flash_cut_wait_state()
     _drain_timebase_ingress()
