@@ -15,6 +15,9 @@ static volatile pd_phase_t g_pd_phase = pd_phase_t::IDLE;
 static uint32_t g_pd_high_delay_cycles;
 static uint32_t g_pd_conversion_timeout_cycles;
 static uint32_t g_pd_isr_budget_cycles;
+static uint32_t g_pd_highv_last_start_limit_cycles;
+static uint64_t g_pd_pulse_ns, g_pd_pending_pulse_ns;
+static uint32_t g_pd_highv_last_start_max_cycles;
 static volatile uint32_t g_pd_busy_edges;
 static volatile uint32_t g_pd_high_start_count;
 static volatile uint32_t g_pd_high_complete_count;
@@ -396,6 +399,11 @@ uint32_t photons_pd_out_isr_budget_cycles() {
   return g_pd_isr_budget_cycles;
 }
 
+void photons_pd_out_set_pulse_ns(uint64_t ns) {
+  if (g_pd_phase != pd_phase_t::IDLE) __builtin_trap();
+  g_pd_pulse_ns = ns;
+}
+
 void photons_pd_out_high_isr(uint32_t edge_entry_dwt) {
   if (g_pd_phase != pd_phase_t::IDLE) {
     g_pd_busy_edges++;
@@ -409,6 +417,7 @@ void photons_pd_out_high_isr(uint32_t edge_entry_dwt) {
   ADC2_HC0 = ADC_HC_ADCH(PD_CHANNEL); // AIEN clear: no hardware completion IRQ
   g_pd_pending_entry_dwt = edge_entry_dwt;
   g_pd_pending_start_dwt = start;
+  g_pd_pending_pulse_ns = g_pd_pulse_ns;
   g_pd_pending_bank = __atomic_load_n(&g_pd_write_bank, __ATOMIC_ACQUIRE);
   // process_interrupt publishes the software pend after closing the edge gate.
   // No completion polling, RAM2 row storage or moment arithmetic at Priority 0.
@@ -417,26 +426,49 @@ void photons_pd_out_high_isr(uint32_t edge_entry_dwt) {
 void photons_pd_out_complete_isr() {
   if (g_pd_phase != pd_phase_t::SAMPLING_HIGH) __builtin_trap();
   const uint32_t entry = g_pd_pending_entry_dwt;
-  const uint32_t start = g_pd_pending_start_dwt;
-  while (!(ADC2_HS & ADC_HS_COCO0)) {
-    // Recheck completion after reading the deadline: a clock ISR may have
-    // preempted either read. A ready result is legal even after a long preemption.
-    if ((uint32_t)(ARM_DWT_CYCCNT - start) >= g_pd_conversion_timeout_cycles &&
-        !(ADC2_HS & ADC_HS_COCO0)) __builtin_trap();
+  uint32_t starts[PHOTONS_PD_OUT_CAPTURE_SAMPLES] = {g_pd_pending_start_dwt};
+  uint32_t reads[PHOTONS_PD_OUT_CAPTURE_SAMPLES];
+  uint16_t samples[PHOTONS_PD_OUT_CAPTURE_SAMPLES];
+  uint32_t last_start_after_entry = 0U;
+  for (uint32_t i = 0U; i < PHOTONS_PD_OUT_CAPTURE_SAMPLES; ++i) {
+    while (!(ADC2_HS & ADC_HS_COCO0)) {
+      // A clock ISR may preempt either read. A ready result remains readable
+      // after preemption; timing membership below determines HIGHV custody.
+      if ((uint32_t)(ARM_DWT_CYCCNT - starts[i]) >= g_pd_conversion_timeout_cycles &&
+          !(ADC2_HS & ADC_HS_COCO0)) __builtin_trap();
+    }
+    samples[i] = (uint16_t)ADC2_R0;
+    reads[i] = ARM_DWT_CYCCNT;
+    if (i + 1U < PHOTONS_PD_OUT_CAPTURE_SAMPLES) {
+      // Launch the next conversion before any RAM2 or statistics work.
+      starts[i + 1U] = ARM_DWT_CYCCNT;
+      ADC2_HC0 = ADC_HC_ADCH(PD_CHANNEL);
+      // Bracket AFTER the register write: preemption cannot make a late
+      // trigger look early. This is software timing, not the ADC aperture.
+      last_start_after_entry = ARM_DWT_CYCCNT - entry;
+    }
   }
-  const uint32_t high = ADC2_R0;
-  const uint32_t end = ARM_DWT_CYCCNT;
+  const uint32_t high = samples[0];
+  const uint32_t start = starts[0];
+  const uint32_t end = reads[0];
   const uint32_t delay = start - entry;
+  const uint32_t low_pair = samples[0] < samples[1] ? samples[0] : samples[1];
+  const uint32_t high_pair = samples[0] > samples[1] ? samples[0] : samples[1];
+  const uint32_t vote = samples[2] < low_pair ? low_pair :
+      (samples[2] > high_pair ? high_pair : samples[2]);
   auto& capture = g_pd_capture[g_pd_pending_bank];
   const uint32_t row = capture.stored_rows;
   capture.rows_seen++;
   if (row < PHOTONS_PD_OUT_CAPTURE_ROWS) {
-    capture.samples[row][0] = (uint16_t)high;
+    for (uint32_t i = 0U; i < PHOTONS_PD_OUT_CAPTURE_SAMPLES; ++i)
+      capture.samples[row][i] = samples[i];
     if (row == 0U) {
       capture.first_entry_dwt = entry;
-      capture.start_cycles[0] = delay;
-      // Includes handoff latency and higher-priority preemption, NOT aperture.
-      capture.read_cycles[0] = end - start;
+      for (uint32_t i = 0U; i < PHOTONS_PD_OUT_CAPTURE_SAMPLES; ++i) {
+        capture.start_cycles[i] = starts[i] - entry;
+        // Includes handoff latency and higher-priority preemption, NOT aperture.
+        capture.read_cycles[i] = reads[i] - starts[i];
+      }
     }
     capture.stored_rows = row + 1U;
   }
@@ -446,6 +478,19 @@ void photons_pd_out_complete_isr() {
   g_pd_totals.high_sum += high;
   g_pd_totals.high_sum_squares += high * high;
   g_pd_totals.high_delay_cycles_sum += delay;
+  if (g_pd_pending_pulse_ns < PHOTONS_PD_OUT_HIGHV_MIN_PULSE_NS) {
+    ++g_pd_totals.highv_short_pulse_count;
+  } else if (last_start_after_entry > g_pd_highv_last_start_limit_cycles) {
+    ++g_pd_totals.highv_late_count;
+  } else {
+    ++g_pd_totals.highv_sample_count;
+    g_pd_totals.highv_sum += vote;
+    g_pd_totals.highv_sum_squares += vote * vote;
+  }
+  if (last_start_after_entry >
+      __atomic_load_n(&g_pd_highv_last_start_max_cycles, __ATOMIC_RELAXED))
+    __atomic_store_n(&g_pd_highv_last_start_max_cycles, last_start_after_entry,
+                     __ATOMIC_RELAXED);
   __asm__ volatile ("dmb" ::: "memory");
   g_pd_generation++;
   g_pd_high_complete_count++;
@@ -478,6 +523,8 @@ void photons_pd_out_init() {
   g_pd_isr_budget_cycles = (uint32_t)(
       ((uint64_t)F_CPU_ACTUAL * PHOTONS_PD_OUT_ISR_BUDGET_NS + 999999999ULL) /
       1000000000ULL);
+  g_pd_highv_last_start_limit_cycles = (uint32_t)(
+      (uint64_t)F_CPU_ACTUAL * PHOTONS_PD_OUT_HIGHV_LAST_START_NS / 1000000000ULL);
   const uint32_t now_ms = millis();
   pd_reset_capture(g_pd_capture[0], now_ms);
   pd_reset_capture(g_pd_capture[1], now_ms);
@@ -507,6 +554,7 @@ void photons_pd_out_stop() {
   // Caller has stopped PHOTODIODE. Pending completion must run before this
   // foreground callback; never cancel an outstanding measurement.
   if (g_pd_phase != pd_phase_t::IDLE) __builtin_trap();
+  g_pd_pulse_ns = 0ULL;
   __asm__ volatile ("dsb" ::: "memory");
   ADC2_HC0 = ADC_HC_ADCH(31);
   (void)ADC2_R0;
@@ -524,6 +572,11 @@ static photons_pd_out_batch_t pd_snapshot() {
     out.high_sum = g_pd_totals.high_sum;
     out.high_sum_squares = g_pd_totals.high_sum_squares;
     out.high_delay_cycles_sum = g_pd_totals.high_delay_cycles_sum;
+    out.highv_sample_count = g_pd_totals.highv_sample_count;
+    out.highv_sum = g_pd_totals.highv_sum;
+    out.highv_sum_squares = g_pd_totals.highv_sum_squares;
+    out.highv_short_pulse_count = g_pd_totals.highv_short_pulse_count;
+    out.highv_late_count = g_pd_totals.highv_late_count;
     __asm__ volatile ("dmb" ::: "memory");
     if (before == g_pd_generation) break;
   }
@@ -537,6 +590,7 @@ void photons_pd_out_rebase(uint32_t cut_ms) {
   g_low_batch = photons_low_high_batch_t{};
   pd_rotate_capture(cut_ms, false);
   g_pd_previous = pd_snapshot();
+  __atomic_exchange_n(&g_pd_highv_last_start_max_cycles, 0U, __ATOMIC_RELAXED);
   pd_reset_window(cut_ms);
 }
 
@@ -552,6 +606,14 @@ photons_pd_out_batch_t photons_pd_out_take_batch(uint32_t cut_ms) {
   out.high_sum = now.high_sum - g_pd_previous.high_sum;
   out.high_sum_squares = now.high_sum_squares - g_pd_previous.high_sum_squares;
   out.high_delay_cycles_sum = now.high_delay_cycles_sum - g_pd_previous.high_delay_cycles_sum;
+  out.highv_sample_count = now.highv_sample_count - g_pd_previous.highv_sample_count;
+  out.highv_sum = now.highv_sum - g_pd_previous.highv_sum;
+  out.highv_sum_squares = now.highv_sum_squares - g_pd_previous.highv_sum_squares;
+  out.highv_short_pulse_count = now.highv_short_pulse_count - g_pd_previous.highv_short_pulse_count;
+  out.highv_late_count = now.highv_late_count - g_pd_previous.highv_late_count;
+  // Adjacent independent diagnostic cut, like the raw-bank/scalar cuts above.
+  out.highv_last_start_max_cycles = __atomic_exchange_n(
+      &g_pd_highv_last_start_max_cycles, 0U, __ATOMIC_RELAXED);
   out.busy_edges = now.busy_edges - g_pd_previous.busy_edges;
   out.high_start_count_total = g_pd_high_start_count;
   out.high_complete_count_total = g_pd_high_complete_count;

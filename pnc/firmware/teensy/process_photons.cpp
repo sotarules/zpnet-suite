@@ -115,7 +115,7 @@ static constexpr uint32_t PHOTONS_RECOVERY_CHUNK_MAX_ENDPOINTS = 4U;
 // ADC on pin 20. DRV200 bias current and hardware enable are local controls.
 
 static constexpr Double PHOTONS_LASER_EMIT_THRESHOLD_V = 0.75_D;
-static constexpr uint64_t PHOTONS_PULSE_DEFAULT_NS = 1000ULL;
+static constexpr uint64_t PHOTONS_PULSE_DEFAULT_NS = PHOTONS_RACE_PULSE_NS;
 
 // Laser cadence is independent of detector arrivals and campaign recording.
 // Commissioning parameters live together in config.h. They describe the
@@ -3241,21 +3241,17 @@ static void photons_race_seed_observe(uint32_t raw_cycles) {
   (void)photons_race_try_lock_reference();
 }
 
-// Cadence service already admitted this complete acquisition and holds the
-// priority-0-preserving launch guard until the return receiver is armed.
-// Pulse width is prepared before quiet admission; no division enters the launch.
+// Cadence service holds the launch guard until the return receiver is armed.
+// Relax to P32 only after arming so LOW's predicted trigger and the P16 ADC
+// handoff remain serviceable; P32/lower handlers wait until MOD LOW.
 static uint32_t photons_race_launch_pulse(uint32_t& before_mod_high_dwt) {
   if (digitalRead(LASER_MOD_PIN) != LOW) __builtin_trap();
-  const uint32_t width_cycles = g_photons_race_pulse_cycles;
+  photons_pd_out_set_pulse_ns(g_photons_applied_pulse_ns);
   // One additional DWT read; keep MOD HIGH and the science timestamp adjacent.
   interrupt_photodiode_boundary_capture_begin();
   const uint32_t before_high = ARM_DWT_CYCCNT;
   digitalWriteFast(LASER_MOD_PIN, HIGH);
   const uint32_t launch_dwt = ARM_DWT_CYCCNT;
-  // A short-path return may preempt this wait. Preserve the full configured
-  // pulse; ISR time may extend HIGH, but never becomes the return timestamp.
-  while ((uint32_t)(ARM_DWT_CYCCNT - launch_dwt) < width_cycles) {}
-  digitalWriteFast(LASER_MOD_PIN, LOW);
   before_mod_high_dwt = before_high;
   return launch_dwt;
 }
@@ -3435,9 +3431,8 @@ static void photons_cadence_service(void*) {
   const uint32_t prior_basepri = interrupt_photons_launch_guard_enter();
   const uint32_t receive_cycles =
       photons_receive_upper_cycles(g_photons_cadence_cycles - 1U);
-  // A receive edge can arrive at the end of its admissible horizon and then
-  // hold priority zero through three synchronous ADC conversions. Reserve that
-  // residence for CLOCKS avoidance without widening scientific acceptance.
+  // Reserve the complete receive-plus-ADC residence for CLOCKS avoidance;
+  // conversion waits remain at Priority 16 and do not widen science acceptance.
   const uint32_t receive_and_adc_cycles =
       receive_cycles + photons_pd_out_isr_budget_cycles();
   const uint32_t acquisition_cycles = receive_and_adc_cycles > g_photons_race_pulse_cycles
@@ -3498,6 +3493,11 @@ static void photons_cadence_service(void*) {
   photons_arm_receive_window(launch_dwt, g_photons_cadence_cycles - 1U,
       before_mod_high_dwt, interrupt_photodiode_launch_kind_t::CADENCE);
   interrupt_photodiode_boundary_end();
+  interrupt_photons_launch_guard_allow_adc(prior_basepri);
+  // Pulse duration still uses the adjacent MOD-high timestamp. Interrupts can
+  // extend the requested width; they never move the recorded launch or return.
+  while ((uint32_t)(ARM_DWT_CYCCNT - launch_dwt) < g_photons_race_pulse_cycles) {}
+  digitalWriteFast(LASER_MOD_PIN, LOW);
   interrupt_photons_launch_guard_exit(prior_basepri);
 }
 
@@ -3748,6 +3748,7 @@ static void photons_wave_emit_pulse(uint64_t requested_ns) {
       photons_pulse_width(requested_ns, dwt_cycles_per_second);
 
   interrupt_photodiode_boundary_begin();
+  photons_pd_out_set_pulse_ns(requested_ns);
   interrupt_photodiode_boundary_capture_begin();
   const uint32_t before_mod_high_dwt = ARM_DWT_CYCCNT;
   digitalWriteFast(LASER_MOD_PIN, HIGH);
@@ -4018,8 +4019,8 @@ static const photons_fragment_snapshot_t& photons_report_fragment_snapshot(void)
       name##_storage,                                                     \
       sizeof(name##_storage))
 
-// Preserve existing headroom and reserve 4 KiB for LOW/HIGH witness testimony.
-static constexpr size_t PHOTONS_FRAGMENT_ROOT_CAPACITY = 24576U;
+// Preserve existing headroom plus 1 KiB for the observational HIGHV object.
+static constexpr size_t PHOTONS_FRAGMENT_ROOT_CAPACITY = 25600U;
 static constexpr size_t PHOTONS_FRAGMENT_ROOT_GUARD_WORDS =
     PHOTONS_RAM2_CACHE_LINE_BYTES / sizeof(uint32_t);
 static constexpr size_t PHOTONS_FRAGMENT_ROOT_SECTOR_BYTES = 1024U;
@@ -4074,8 +4075,8 @@ PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_core, 2048U);
 // Include live-width provenance without reducing the existing numeric headroom.
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_race, 4608U);
 // Include per-fragment moments and nested HIGH60/HIGH5 populations.
-// Additional fixed space for exact rolling-pair moments and provenance.
-PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_pd_out, 8192U);
+// Additional fixed space for rolling-pair moments and the HIGHV burst witness.
+PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_pd_out, 9216U);
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_voltage_normalization, 2048U);
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_high_window, 1024U);
 PHOTONS_FRAGMENT_FIXED_RAM2(g_photons_fragment_raw_cycles, 1024U);
@@ -5062,7 +5063,7 @@ static Payload& photons_fragment_payload(
   pd_out.clear();
   pd_out.add("pin", PHOTODIODE_ANALOG_PIN);
   pd_out.add("adc_bits", 12U);
-  pd_out.add("acquisition", "SINGLE_P0_TRIGGER_P16_COMPLETION");
+  pd_out.add("acquisition", "TRIPLET_P0_TRIGGER_P16_COMPLETION");
   pd_out.add("samples_per_capture", PHOTONS_PD_OUT_CAPTURE_SAMPLES);
   pd_out.add("published_high_sample", 1U);
   pd_out.add("completion_priority", 16U);
@@ -5085,6 +5086,10 @@ static Payload& photons_fragment_payload(
   if (f.pd_out.sample_count != 0ULL) {
     const Double count = Double(f.pd_out.sample_count);
     pd_out.add("high_mean_counts", toFixedDecimal(Double(f.pd_out.high_sum) / count, 6));
+    // HIGH1: completed fragment mean of the original first ADC sample per pulse.
+    // Exact population moments above remain authoritative for the future Pi servo.
+    pd_out.add("high1_mv", toFixedDecimal(
+        (Double(f.pd_out.high_sum) / count) * 3300_D / 4095_D, 6));
     pd_out.add("high_start_after_entry_mean_cycles",
                toFixedDecimal(Double(f.pd_out.high_delay_cycles_sum) / count, 3));
   }
@@ -5096,6 +5101,23 @@ static Payload& photons_fragment_payload(
   photons_pd_window_payload(high_window, f.pd_out.high5_window,
                             PHOTONS_PD_OUT_HIGH5_WINDOW_MS);
   pd_out.add_object("high5_window", high_window);
+  high_window.clear();
+  high_window.add("schema", "PD_OUT_HIGHV_MEDIAN3_V1");
+  high_window.add("samples_per_vote", PHOTONS_PD_OUT_CAPTURE_SAMPLES);
+  high_window.add("sample_count", f.pd_out.highv_sample_count);
+  high_window.add("high_sum_counts", f.pd_out.highv_sum);
+  high_window.add("high_sum_squares_counts", f.pd_out.highv_sum_squares);
+  high_window.add("short_pulse_count", f.pd_out.highv_short_pulse_count);
+  high_window.add("late_count", f.pd_out.highv_late_count);
+  high_window.add("last_start_max_cycles", f.pd_out.highv_last_start_max_cycles);
+  high_window.add("last_start_limit_ns", PHOTONS_PD_OUT_HIGHV_LAST_START_NS);
+  high_window.add("minimum_pulse_ns", PHOTONS_PD_OUT_HIGHV_MIN_PULSE_NS);
+  if (f.pd_out.highv_sample_count != 0ULL) {
+    const Double mean = Double(f.pd_out.highv_sum) / Double(f.pd_out.highv_sample_count);
+    high_window.add("high_mean_counts", toFixedDecimal(mean, 6));
+    high_window.add("high_mean_mv", toFixedDecimal(mean * 3300_D / 4095_D, 6));
+  }
+  pd_out.add_object("highv", high_window);
   high_window.clear();
   {
     auto& store = g_photons_serialization_store;
@@ -8429,6 +8451,7 @@ static FLASHMEM Payload cmd_pulse(const Payload& args) {
   g_pulse_armed_sequence = pulse_sequence;
   photons_memory_barrier();
 
+  photons_pd_out_set_pulse_ns(requested_ns);
   interrupt_photodiode_boundary_capture_begin();
   const uint32_t start_dwt = ARM_DWT_CYCCNT;
   digitalWriteFast(LASER_MOD_PIN, HIGH);

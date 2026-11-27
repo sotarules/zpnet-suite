@@ -12841,6 +12841,10 @@ def _laser_servo_loop():
                     "received_monotonic": fragment["_pi_ingress"]["monotonic"],
                     "fragment_received_at_utc": fragment["_pi_ingress"]["utc"],
                     "snapshot_ok": _require_bool(instrument["snapshot_ok"], "servo.snapshot_ok"),
+                    # Original first ADC sample, exactly one completed fragment.
+                    # HIGH5 remains the NOR9 witness and sweep-scoring window.
+                    "high1_mv": instrument["pd_out"].get("high1_mv"),
+                    "high1_n": instrument["pd_out"]["sample_count"],
                     "high5": copy.deepcopy(window),
                     "high60": copy.deepcopy(instrument["pd_out"]["high_window"]),
                 }

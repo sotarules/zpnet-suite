@@ -20,7 +20,7 @@ report. Neither window changes lap normalization. Requires the published HIGH
 window firmware patch. mV uses a nominal reference; SE assumes independent
 samples and does not establish accuracy.
 
---adc-capture reads one page of the latest completed RAM2 single-sample capture through
+--adc-capture reads one page of the latest completed RAM2 raw capture through
 the established Teensy RPC broker. Each ADC reading is displayed separately in mV;
 there is no averaging, filtering or voting. Capture refreshes every PHOTONS fragment,
 so separate requests can have different capture IDs. --jsonl retains the full payload.
@@ -54,7 +54,7 @@ import sys
 import threading
 import time
 
-VERSION = '2026-10-18.1'
+VERSION = '2026-11-27.1'
 TAP = '/tmp/zpnet_pubsub_tap.sock'
 COMMAND = '/tmp/zpnet-photons-command.sock'
 TOPICS = ('PHOTONS_FRAGMENT', 'PHOTONS')
@@ -480,6 +480,14 @@ def print_fragment(row):
               f"{published['target_ms'] / 1000:g} s target ({progress}); "
               f"fragments={published['fragments']} N={published['sample_count']}; "
               f"nominal reference={published['reference_mv']} mV")
+    if 'highv' in row['pd_out']:
+        vote = row['pd_out']['highv']
+        mean = vote['high_mean_mv'] if vote['sample_count'] else None
+        last_start_ns = vote['last_start_max_cycles'] * 1e9 / row['pd_out']['dwt_cycles_per_second']
+        print(f"PUBLISHED HIGHV: MEAN={number(mean)} mV; N={vote['sample_count']}; "
+              f"short pulses={vote['short_pulse_count']}; late triplets={vote['late_count']}; "
+              f"last-trigger max={last_start_ns:.3f} ns "
+              f"(limit={vote['last_start_limit_ns']} ns; software timing, not aperture)")
     window = row['rolling']
     if window['reset_reason']:
         print(f"ROLLING WINDOW RESTARTED: {window['reset_reason']}")
@@ -513,17 +521,18 @@ def adc_capture_report(args):
             print(json.dumps(payload, separators=(',', ':'), allow_nan=False))
             return 0
 
-        if payload['samples_per_row'] != 1:
-            raise ValueError('single-sample firmware required for this report version')
+        samples = payload['samples_per_row']
+        if samples not in (1, 3):
+            raise ValueError('unsupported ADC capture sample count')
 
-        print(f'PHOTONS ADC SINGLE CAPTURE REPORT {VERSION}')
+        print(f'PHOTONS ADC RAW CAPTURE REPORT {VERSION}')
         print(f"Capture {payload['capture_id']}  window={payload['elapsed_ms']} ms  "
               f"rows seen={payload['rows_seen']}  stored={payload['stored_rows']}  "
               f"omitted={payload['omitted_rows']}")
         print(f"Boot milliseconds: {payload['started_at_ms']} -> {payload['completed_at_ms']}; "
               f"requested index={payload['requested_index']} count={payload['requested_count']}; "
               f"returned={payload['returned_count']} next_index={payload['next_index']}")
-        print(f"One {payload['adc_bits']}-bit ADC2 reading per edge on pin {payload['adc_pin']}; "
+        print(f"{samples} x {payload['adc_bits']}-bit ADC2 readings per edge on pin {payload['adc_pin']}; "
               f"nominal reference={payload['reference_mv']} mV.")
         print('Each value is one reading expressed in mV; no averaging, filtering or voting.')
         print('The latest completed capture refreshes automatically; separate calls may show different capture IDs.')
@@ -542,7 +551,8 @@ def adc_capture_report(args):
             print('START is from ISR entry; READ includes handoff and preemption through result read, not ADC aperture.')
         else:
             print('No ADC samples in this completed window; first-row timing is unavailable.')
-        print('   INDEX       SAMPLE 1 mV')
+        print('   INDEX' + ''.join(f'{f"SAMPLE {sample} mV":>18s}'
+                                  for sample in range(1, samples + 1)))
         first = payload['requested_index']
         for index in range(first, first + payload['returned_count']):
             row = payload[f'row_{index:04d}']

@@ -1222,6 +1222,21 @@ class RtdTemperatureWarning(str):
     now_end = now_start + PHOTONS_MEAN_WIDTH
 
 
+def _photons_high1_mv(pd_out: dict):
+    """One fragment's original first-sample HIGH mean, independent of HIGHV."""
+    return pd_out.get("high1_mv") if pd_out.get("sample_count", 0) > 0 else None
+
+
+def _photons_highv_mv(pd_out: dict):
+    """Current fragment's mean of pulse votes; historical rows have no HIGHV."""
+    highv = pd_out.get("highv")
+    if highv is None:
+        return None
+    if highv["schema"] != "PD_OUT_HIGHV_MEDIAN3_V1":
+        raise ValueError("unsupported PHOTONS HIGHV schema")
+    return highv["high_mean_mv"] if highv["sample_count"] > 0 else None
+
+
 def photons_temperature_block(snapshot: dict) -> list[str]:
     """Current sensor and optical-control readings, independent of campaigns."""
     environment = snapshot.get("environment") or {}
@@ -1247,7 +1262,9 @@ def photons_temperature_block(snapshot: dict) -> list[str]:
     _, voltage_lane, _ = voltage_window_spec(normalization["model_id"])
     high_window = voltage_window(normalization, snapshot["photons"]["pd_out"])
     high_now = high_window.get("high_mean_mv") if high_window.get("sample_count", 0) > 0 else None
+    lines.append(f"{'HIGH1':<8} " + observed(_photons_high1_mv(snapshot["photons"]["pd_out"])))
     lines.append(f"{voltage_lane.upper():<8} " + observed(high_now))
+    lines.append(f"{'HIGHV':<8} " + observed(_photons_highv_mv(snapshot["photons"]["pd_out"])))
     adj_now = (normalization["adjustment_ns"]
                if normalization["raw_flight_ns"]["n"] > 0 else None)
     lines.append(f"{'ADJ':<8} " + _fmt(adj_now, f'>+{PHOTONS_MEAN_WIDTH}.6f', PHOTONS_MEAN_WIDTH))
@@ -2196,6 +2213,8 @@ def _photons_rolling_rows(payloads: list[dict]) -> list[dict]:
             "altitude_m": (current.get("gnss") or {}).get("altitude_m"),
             "adjustment_ns": adjustment if n > 0 else None,
             "high_mv": high_mv,
+            "high1_mv": _photons_high1_mv(pd_out),
+            "highv_mv": _photons_highv_mv(pd_out),
             "voltage_label": voltage_lane.upper(),
             "high_warming": high_warming,
             "target_mv": servo.get("target_mv"),
@@ -2352,8 +2371,8 @@ def photons_detail_readout() -> list[str]:
                   _photons_summary_line(summary),
                   "", *photons_temperature_block(live), "", gnss_line, "",
                   f"{'SEC':<8} {'LAP':>{PHOTONS_MEAN_WIDTH}} {'LOW':>9} {'HIGH':>9} "
-                  f"{'PD N/WIN':>10} {voltage_lane.upper():>9} "
-                  f" {'TARGET mV':>10} {'DAC V':>10} {'ADJ':>12}  ALT"])
+                  f"{'PD N/WIN':>10} {'HIGH1':>9} {voltage_lane.upper():>9} "
+                  f" {'HIGHV':>9} {'TARGET mV':>10} {'DAC V':>10} {'ADJ':>12}  ALT"])
     for row in rolling_rows:
         lines.append(
             _fmt(row["second"], 'd', 0).ljust(8)
@@ -2361,8 +2380,10 @@ def photons_detail_readout() -> list[str]:
             + " " + _fmt(row["low_pair_mv"], '>9.3f', 9)
             + " " + _fmt(row["high_pair_mv"], '>9.3f', 9)
             + " " + row["pd_window"].rjust(10)
+            + " " + _fmt(row["high1_mv"], ">9.3f", 9)
             + " " + _fmt(row["high_mv"], '>9.3f', 9)
             + ("*" if row["high_warming"] else " ")
+            + " " + _fmt(row["highv_mv"], '>9.3f', 9)
             + " " + _fmt(row["target_mv"], '>10.3f', 10)
             + " " + _fmt(row["dac_v"], '>10.6f', 10)
             + " " + _fmt(row["adjustment_ns"], '>+12.6f', 12)

@@ -34,7 +34,7 @@ static constexpr uint64_t NS_PER_MICROSECOND = 1000ULL;
 // Every allowed cadence leaves the complete receive horizon and HIGH capture
 // residence before the next launch. A late return must never become evidence
 // for a later shot. Keep the default 1000/s cadence for either fiber spool.
-static constexpr uint64_t PHOTONS_RACE_PULSE_NS = 1000ULL;
+static constexpr uint64_t PHOTONS_RACE_PULSE_NS = 5000ULL;
 static constexpr uint32_t PHOTONS_RECEIVE_MIN_NS = 1U;
 static constexpr uint32_t PHOTONS_RECEIVE_MAX_NS = 200000U;
 // Conservative HIGH capture residence, also reserved by CLOCKS quiet admission.
@@ -156,7 +156,7 @@ static const int LASER_MOD_PIN      = 35;
 //
 // PHOTODIODE_ANALOG_PIN:
 //   PD200T PD OUT analog diagnostic input: Teensy 40 / A16 (0..3.3 V).
-//   Dedicated ADC2 channel 9 captures three synchronous diagnostic samples;
+//   Dedicated ADC2 channel 9 captures three sequential diagnostic samples;
 //   existing HIGH statistics use the first conversion of each triplet.
 //   Original PD OUT pin 38 remains MAX31865 CS.
 // Receiver timing uses only TTL OUT on pin 34.
@@ -170,6 +170,12 @@ static const int PHOTODIODE_ANALOG_PIN = 40; // A16; PD200T PD OUT
 // Minimum HIGH software-trigger delay from immutable photodiode ISR entry.
 // This does not measure the physical edge-to-entry latency or ADC aperture.
 static constexpr uint32_t PHOTONS_PD_OUT_HIGH_DELAY_NS = 200U;
+// HIGHV votes only on 5 us (or wider) launches whose third software trigger
+// completes within 4.5 us of ISR entry. Measured ordinary trigger brackets
+// reach 4.263 us; the original 4 us budget excluded every observed triplet.
+// This is a software acquisition budget, not proof of the electrical plateau.
+static constexpr uint32_t PHOTONS_PD_OUT_HIGHV_MIN_PULSE_NS = 5000U;
+static constexpr uint32_t PHOTONS_PD_OUT_HIGHV_LAST_START_NS = 4500U;
 // Witness only: ADC1 trigger lead before the predicted comparator ISR entry.
 // The analog rise/aperture must be characterized by sweeping this lead.
 static constexpr uint32_t PHOTONS_PD_OUT_LOW_LEAD_NS = 1000U;

@@ -813,6 +813,14 @@ uint32_t interrupt_photons_launch_guard_enter(void) {
   return interrupt_priority0_guard_enter();
 }
 
+void interrupt_photons_launch_guard_allow_adc(uint32_t prior_basepri) {
+  const uint32_t mask = prior_basepri != 0U &&
+      prior_basepri < INTERRUPT_PRIORITY_CONTINUATION
+          ? prior_basepri : INTERRUPT_PRIORITY_CONTINUATION;
+  dmb_barrier();
+  __asm__ volatile ("msr basepri, %0" :: "r" (mask) : "memory");
+}
+
 void interrupt_photons_launch_guard_exit(uint32_t prior_basepri) {
   interrupt_priority0_guard_exit(prior_basepri);
 }
@@ -8072,12 +8080,12 @@ static FLASHMEM void add_photodiode_launch_trace(Payload& payload) {
 // Each page is serialized before the foreground scheduler may rotate the banks.
 // Capture and report storage both live in RAM2; no full capture reaches the stack.
 static constexpr uint32_t ADC_CAPTURE_REPORT_MAX_ROWS = 64U;
-static constexpr size_t ADC_CAPTURE_REPORT_BYTES = 8U * 1024U;
+static constexpr size_t ADC_CAPTURE_REPORT_BYTES = 12U * 1024U;
 alignas(uint32_t) static DMAMEM char g_adc_capture_report[ADC_CAPTURE_REPORT_BYTES];
 alignas(uint32_t) static DMAMEM char g_adc_capture_report_row[512];
 // Per-row bound includes the Payload directory entry, row key, and JSON object.
-// The remaining 4096 bytes cover report and first-sample timing metadata.
-static_assert(4096U + ADC_CAPTURE_REPORT_MAX_ROWS * 64U <=
+// The remaining 4096 bytes cover report and first-triplet timing metadata.
+static_assert(4096U + ADC_CAPTURE_REPORT_MAX_ROWS * 128U <=
                   ADC_CAPTURE_REPORT_BYTES,
               "ADC capture report page exceeds fixed RAM2 storage");
 
@@ -8085,7 +8093,7 @@ static FLASHMEM Payload cmd_report_adc_capture(const Payload& args) {
   Payload p(Payload::StorageMode::FIXED, g_adc_capture_report,
             sizeof(g_adc_capture_report));
   p.add("report", "INTERRUPT_ADC_CAPTURE");
-  p.add("version", "2026-10-17.2");
+  p.add("version", "2026-11-27.1");
   p.add("page_limit", ADC_CAPTURE_REPORT_MAX_ROWS);
 
   uint32_t index = 0U;
@@ -8117,18 +8125,19 @@ static FLASHMEM Payload cmd_report_adc_capture(const Payload& args) {
   p.add("row_capacity", PHOTONS_PD_OUT_CAPTURE_ROWS);
   p.add("samples_per_row", PHOTONS_PD_OUT_CAPTURE_SAMPLES);
   p.add("population", "PHYSICAL_PHOTODIODE_EDGES_NOT_ACCEPTED_LAPS");
-  p.add("capture_policy", "FIRST_1000_SAMPLES_PER_COMPLETED_FRAGMENT");
+  p.add("capture_policy", "FIRST_1000_TRIPLETS_PER_COMPLETED_FRAGMENT");
   p.add("refresh", "AUTOMATIC_EACH_PHOTONS_FRAGMENT_FOREGROUND_BOUNDARY");
   p.add("page_scope", "LATEST_COMPLETED_CAPTURE_AT_THIS_REQUEST");
-  p.add("acquisition", "SINGLE_P0_TRIGGER_P16_COMPLETION");
+  p.add("acquisition", "TRIPLET_P0_TRIGGER_P16_COMPLETION");
   p.add("adc_pin", 40U);
   p.add("adc_bits", 12U);
   p.add("reference_mv", 3300U);
   p.add("reference", "NOMINAL_NOT_CALIBRATED");
   p.add("reported_units", "mV");
   p.add("conversion", "RAW_CODE_TIMES_3300_DIVIDED_BY_4095");
-  p.add("sample_processing", "NONE_NO_AVERAGING_FILTERING_OR_VOTING");
-  p.add("published_high", "ONE_SAMPLE_PER_PHYSICAL_CAPTURE");
+  p.add("sample_processing", "RAW_ACQUISITION_ORDER_BEFORE_HIGHV_VOTE");
+  p.add("published_high", "FIRST_SAMPLE_PER_PHYSICAL_CAPTURE_UNCHANGED");
+  p.add("published_highv", "MEDIAN_OF_TIMELY_TRIPLET_FOR_PULSE_AT_LEAST_5_US");
   p.add("dwt_cycles_per_second", (uint32_t)F_CPU_ACTUAL);
   p.add("high_delay_target_ns", PHOTONS_PD_OUT_HIGH_DELAY_NS);
   p.add("conversion_timeout_ns", PHOTONS_PD_OUT_CONVERSION_TIMEOUT_NS);

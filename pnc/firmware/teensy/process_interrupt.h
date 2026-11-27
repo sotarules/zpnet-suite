@@ -1387,10 +1387,13 @@ static constexpr uint32_t INTERRUPT_PHOTONS_QUIET_LAUNCH_BUDGET_NS = 1000U;
 // Foreground-only, bounded decision-to-launch transaction. BASEPRI 16 excludes
 // lower-priority deferral but keeps priority-0 PPS/OCXO capture live. Detector
 // capture is re-enabled by boundary_capture_begin() before MOD HIGH. Arm the
-// new receive window and boundary_end() before restoring BASEPRI; callbacks
-// wait until foreground service, after launch publication is complete.
-// All old-capture drains/callbacks precede entry; report construction follows exit.
+// new receive window and boundary_end(), then allow_adc() admits P0/P16 while
+// keeping P32/lower work masked for the bounded remaining MOD-high wait. Restore
+// the original BASEPRI after MOD LOW; a stricter outer mask is never relaxed.
+// Callbacks wait until foreground service after launch publication is complete.
+// All old-capture drains precede entry; report construction follows exit.
 uint32_t interrupt_photons_launch_guard_enter(void);
+void interrupt_photons_launch_guard_allow_adc(uint32_t prior_basepri);
 void interrupt_photons_launch_guard_exit(uint32_t prior_basepri);
 
 // Zero admits a launch. Otherwise PPS/OCXO source bits identify protected lanes.

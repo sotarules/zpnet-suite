@@ -93,6 +93,11 @@ struct photons_pd_out_batch_t {
   uint64_t high_sum = 0;
   uint64_t high_sum_squares = 0; // exact raw-code second moment for HIGH witness
   uint64_t high_delay_cycles_sum = 0;
+  // One median-of-three vote per timely, sufficiently wide physical pulse.
+  // HIGH/HIGH5/HIGH60 continue to contain only the first ADC conversion.
+  uint64_t highv_sample_count = 0, highv_sum = 0, highv_sum_squares = 0;
+  uint64_t highv_short_pulse_count = 0, highv_late_count = 0;
+  uint32_t highv_last_start_max_cycles = 0;
   uint32_t busy_edges = 0;
   // Lifetime stage counters and live foreground register observations.
   // These are diagnostic observations, not an atomic hardware snapshot.
@@ -107,7 +112,7 @@ struct photons_pd_out_batch_t {
 };
 
 static constexpr uint32_t PHOTONS_PD_OUT_CAPTURE_ROWS = 1000U;
-static constexpr uint32_t PHOTONS_PD_OUT_CAPTURE_SAMPLES = 1U;
+static constexpr uint32_t PHOTONS_PD_OUT_CAPTURE_SAMPLES = 3U;
 
 // Two instances live in RAM2: Priority-16-owned current second and foreground-owned
 // completed second. Raw codes are retained in acquisition order, without voting.
@@ -123,6 +128,9 @@ struct photons_pd_out_capture_t {
 
 // Boot, before activation. ADC2 hardware interrupt generation stays disabled.
 void photons_pd_out_init();
+// Foreground, with detector capture withdrawn, before the next MOD HIGH.
+// Zero denotes no declared pulse; it cannot contribute a HIGHV vote.
+void photons_pd_out_set_pulse_ns(uint64_t ns);
 // Physical GPIO ISR only, after its immutable timestamp and entry diagnostics.
 void photons_pd_out_high_isr(uint32_t edge_entry_dwt);
 // Software-pended Priority 16 only. Clock captures can preempt this wait.

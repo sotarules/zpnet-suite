@@ -1,4 +1,4 @@
-"""Slow Pi-owned optical-amplitude control; LAP never enters this controller.
+"""One-second Pi-owned optical-amplitude control; LAP never enters this controller.
 
 Operator commands (DAC volts and detector millivolts are different units):
     pc photons servo_info
@@ -9,7 +9,7 @@ Operator commands (DAC volts and detector millivolts are different units):
 Startup deliberately establishes 1.4 V, including on a Pi-only restart.
 Automatic mode is volatile and starts enabled by default. STOP campaign does
 not stop this instrument controller; SERVO_STOP holds the last DAC setting.
-NOR5 remains unchanged: servo experiments must establish a future NOR6 fit.
+NOR9 normalization and HIGH5/HIGHV witnesses remain unchanged.
 """
 
 import copy
@@ -22,25 +22,26 @@ from zpnet.processes.photons.voltage_sweep import VoltageSweep
 from zpnet.processes.photons.laser_dac import MAX_CODE, REFERENCE_V, CODE_SCALE, requested_code
 
 # Commissioning policy: edit here, not in firmware. Positive gain assumes that
-# increasing modulation amplitude increases measured PD OUT HIGH5.
+# increasing modulation amplitude increases measured PD OUT HIGH1.
 STARTUP_DAC_V = 1.4
 STARTUP_SERVO_ENABLED = True
 TARGET_MV = 440.0
 DEADBAND_MV = 0.5
-# Smooth gain scheduling: quiet near the target, stronger during thermal ramps.
-# Gains are DAC volts per detector millivolt, not a fitted plant inverse.
-# At 1 mV error the requested step is 0.5 mV DAC; at 5 mV it is 12.5 mV;
-# at 10 mV it is 50 mV. Apply the same law in either direction, with no
-# integrator or derivative of the overlapping HIGH5 windows. Retain the full
-# settling interval after every write so larger steps do not stack on old data.
-GAIN_V_PER_MV = 0.0005
-FAR_GAIN_V_PER_MV = 0.005
+# One completed first-sample HIGH population per second is the controller's
+# feedback; median-voted HIGHV and overlapping HIGH5 remain diagnostic only.
+# These are bounded DAC volts per measured detector millivolt, not a calibrated
+# physical inverse. The incremental law may cross 440 mV on successive seconds.
+GAIN_V_PER_MV = 0.005
+FAR_GAIN_V_PER_MV = 0.010
 NEAR_ERROR_MV = 1.0
-FAR_ERROR_MV = 10.0
-MAX_STEP_V = 0.050
+FAR_ERROR_MV = 5.0
+MAX_STEP_V = 0.025
+# Keep startup/recovery settling conservative. A routine automatic DAC write
+# waits only for the next fresh producer second, never a recycled observation.
 SETTLE_SECONDS = 7.0
+POST_WRITE_SETTLE_SECONDS = 0.25
 MAX_FEEDBACK_AGE_SECONDS = 2.5
-MIN_WINDOW_SAMPLES = 1000
+MIN_FRAGMENT_SAMPLES = 400
 
 
 def _correction_gain(error_mv):
@@ -61,24 +62,25 @@ class LaserServo:
         self._previous = None
         self._ready_at = 0.0
         self._state = {
-            "schema": "PI_PHOTONS_HIGH5_SERVO_V1",
+            "schema": "PI_PHOTONS_HIGH1_SERVO_V1",
             "mode": "STARTING", "status": "WAITING_STARTUP",
             "target_mv": TARGET_MV, "deadband_mv": DEADBAND_MV,
             "gain_v_per_mv": GAIN_V_PER_MV, "max_step_v": MAX_STEP_V,
-            "control_law": "HIGH5_SMOOTH_GAIN_V1",
+            "control_law": "HIGH1_FAST_GAIN_V1",
             "far_gain_v_per_mv": FAR_GAIN_V_PER_MV,
             "near_error_mv": NEAR_ERROR_MV, "far_error_mv": FAR_ERROR_MV,
             "effective_gain_v_per_mv": None,
             "last_servo_step_v": None,
             "settle_seconds": SETTLE_SECONDS,
+            "post_write_settle_seconds": POST_WRITE_SETTLE_SECONDS,
             "max_feedback_age_seconds": MAX_FEEDBACK_AGE_SECONDS,
-            "minimum_window_samples": MIN_WINDOW_SAMPLES,
+            "minimum_fragment_samples": MIN_FRAGMENT_SAMPLES,
             "startup_dac_v": STARTUP_DAC_V,
             "startup_servo_enabled": STARTUP_SERVO_ENABLED,
-            "feedback_source": "PD_OUT_HIGH5_MV",
+            "feedback_source": "PD_OUT_HIGH1_MV",
             "feedback_path": "VALIDATED_LIVE_FRAGMENT",
             "feedback_age_seconds": None,
-            "high5_mv": None, "error_mv": None, "sequence": None,
+            "high1_mv": None, "high5_mv": None, "error_mv": None, "sequence": None,
             "adjustment_count": 0, "last_error": None,
         }
 
@@ -238,23 +240,23 @@ class LaserServo:
                     or w["completed_at_ms"] <= previous_ms):
                 self._ready_at = now + SETTLE_SECONDS
         self._previous = identity
-        if (w["target_ms"] != 5000 or w["elapsed_ms"] < 5000
-                or w["fragments"] < 5 or w["sample_count"] < MIN_WINDOW_SAMPLES):
-            self._ready_at = now + SETTLE_SECONDS
-            self._update(status="WAITING_FULL_HIGH5", sequence=seq)
+        if feedback["high1_n"] < MIN_FRAGMENT_SAMPLES:
+            self._ready_at = now + POST_WRITE_SETTLE_SECONDS
+            self._update(status="WAITING_HIGH1", sequence=seq)
             return
-        high = w["high_mean_mv"]
+        high = feedback["high1_mv"]
         if not math.isfinite(high) or not 0 < high < w["reference_mv"]:
-            raise ValueError("HIGH5 is outside the ADC measurement domain")
+            raise ValueError("HIGH1 is outside the ADC measurement domain")
         state = self.snapshot()
         error = state["target_mv"] - high
         gain = _correction_gain(error)
         # Report the gain for this feedback even while settling; last_servo_step_v
         # separately records the last successful, quantized automatic DAC move.
-        self._update(high5_mv=high, error_mv=error, sequence=seq,
+        self._update(high1_mv=high, high5_mv=w.get("high_mean_mv"),
+                     error_mv=error, sequence=seq,
                      effective_gain_v_per_mv=gain)
-        # Require a freshly received window AFTER the settling boundary, not
-        # merely a late worker waking up with pre-adjustment feedback in hand.
+        # Act only on a newly completed, post-write fragment. The 0.25-s gate
+        # is not a seven-second averaging delay; each sequence is used once.
         if received < self._ready_at:
             self._update(status="SETTLING")
             return
@@ -270,10 +272,10 @@ class LaserServo:
             self._update(status="LIMIT_HIGH" if error > 0 else "LIMIT_LOW")
             return
         result = self.dac.set_code(code)
-        self._ready_at = time.monotonic() + SETTLE_SECONDS
+        self._ready_at = time.monotonic() + POST_WRITE_SETTLE_SECONDS
         step = result["commanded_dac_v"] - dac["commanded_dac_v"]
         self._update(status="SETTLING", adjustment_count=state["adjustment_count"] + 1,
                      last_servo_step_v=step)
-        logging.debug("[photons/servo] seq=%d HIGH5=%.3f target=%.3f DAC=%.6f "
+        logging.debug("[photons/servo] seq=%d HIGH1=%.3f target=%.3f DAC=%.6f "
                      "step=%+.6f gain=%.6f",
                      seq, high, state["target_mv"], result["commanded_dac_v"], step, gain)
