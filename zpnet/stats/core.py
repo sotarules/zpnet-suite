@@ -57,9 +57,7 @@ def altitude_bookends(campaign, observation, active):
 
 
 def tempest_snapshot(clocks):
-    if clocks is None:
-        return None
-    campaign = clocks.get("campaign") or {}
+    campaign = (clocks.get("campaign") or {}) if clocks is not None else {}
     active = campaign.get("state") == "STARTED"
     if not active:
         campaign = last_tempest.get()
@@ -79,20 +77,20 @@ def tempest_snapshot(clocks):
 
 
 def lantern_snapshot(photons):
-    if photons is None:
-        return None
-    campaign = photons.get("campaign") or {}
+    campaign = (photons.get("campaign") or {}) if photons is not None else {}
     active = bool(campaign) and not campaign.get("final")
     if not active:
         campaign = last_lantern.get()
     if not campaign:
         return None
+    window = campaign.get("lap_bookend_window") or "60_sec"
     start = campaign.get("start_lap_ns")
-    end = (field(photons, "photons", "stats", "lap_buckets", "60_sec", "mean_lap_ns")
+    end = (field(photons, "photons", "stats", "lap_buckets", window, "mean_lap_ns")
            if active else campaign.get("end_lap_ns"))
     return {
         "name": campaign["campaign"],
         "active": active,
+        "lap_window": "10-MIN" if window == "10_min" else "60-SEC",
         **altitude_bookends(campaign, photons, active),
         "start_lap": number(start, ",.6f"),
         "end_lap": number(end, ",.6f"),
@@ -106,7 +104,7 @@ def snapshot(cache):
     system_time = field(clocks, "clocks", "system_time_utc") or field(
         clocks, "published_at_utc"
     )
-    lap = field(photons, "photons", "stats", "lap_buckets", "60_sec", "mean_lap_ns")
+    lap = field(photons, "photons", "stats", "lap_buckets", "10_min", "mean_lap_ns")
     high5 = field(photons, "photons", "pd_out", "high5_window") or {}
     stats = field(clocks, "clocks", "stats")
     return {

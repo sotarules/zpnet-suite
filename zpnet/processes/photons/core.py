@@ -1741,6 +1741,9 @@ PHOTONS_RACE_SEED_QUORUM = 3
 PHOTONS_EMPTY_HEARTBEAT_LEGACY_LAUNCH_SURROGATE = "LD_ON_FALLING_EDGE"
 PHOTONS_LAP_SEMANTICS = "MEAN_LAP_NS_V1"
 PHOTONS_LEGACY_PPB_SEMANTICS = "LAP_BASELINE_NS_OFFSET_V1"
+# Only campaign comparisons change; firmware acquisition and rolling populations
+# remain continuous. Historic campaigns without this marker used 60-SEC.
+LANTERN_LAP_BOOKEND_WINDOW = "10_min"
 
 PHOTONS_RECOVERY_SCHEMA_VERSION = 1
 PHOTONS_RECOVERY_CHUNK_MAX_ENDPOINTS = 4
@@ -3525,16 +3528,21 @@ def _lap_value_from_endpoints(
     return {"sample_count": lap_count, "mean_lap_ns": total_ns / lap_count}
 
 
-def _minute_lap(row):
-    if "lap_60s_ns" in row:  # Pre-bucket durable predecessor during an upgrade.
-        return row["lap_60s_ns"]
-    bucket = row["photons"]["stats"]["lap_buckets"].get("60_sec") or {}
+def _lap_bookend(row, window):
+    """Producer-authored rolling LAP under the campaign's frozen window."""
+    if window not in ("60_sec", "10_min"):
+        raise ValueError(f"unsupported LANTERN bookend window: {window!r}")
+    if window == "60_sec" and "lap_60s_ns" in row:
+        return row["lap_60s_ns"]  # Pre-bucket historic durable row.
+    bucket = row["photons"]["stats"]["lap_buckets"].get(window) or {}
     return bucket.get("mean_lap_ns")
 
 
-def _missed_start_lap(checkpoint, end_sequence):
-    """Recover only a witnessed START population when the boundary row was missed."""
-    start_sequence = max(0, end_sequence - PHOTONS_RECOVERY_60_SEC_SECONDS)
+def _missed_start_lap(checkpoint, end_sequence, window):
+    """Recover exactly the recorded START species, never substitute 60-SEC."""
+    seconds = (PHOTONS_RECOVERY_10_MIN_SECONDS if window == "10_min"
+               else PHOTONS_RECOVERY_60_SEC_SECONDS)
+    start_sequence = max(0, end_sequence - seconds)
     endpoints = [e for e in checkpoint["second_history"]
                  if start_sequence <= e["sequence"] <= end_sequence]
     if not endpoints:
@@ -7406,6 +7414,7 @@ def _rehydrate_pi_campaign(
             "started_at": active_master["started_at"],
             "start_after_sequence": start_after,
             "firmware_public_count": public_count,
+            "lap_bookend_window": master_payload.get("lap_bookend_window", "60_sec"),
         }
         for key in ("start_lap_ns", "start_altitude_m"):
             if key in master_payload:
@@ -9022,6 +9031,7 @@ def _campaign_public_decoration(window: Dict[str, Any]) -> Dict[str, Any]:
         "campaign": window["campaign"],
         "campaign_id": int(window["campaign_id"]),
         "started_at": window["started_at"],
+        "lap_bookend_window": window.get("lap_bookend_window", "60_sec"),
     }
     if window.get("stopped_at"):
         out["stopped_at"] = str(window["stopped_at"])
@@ -9106,24 +9116,27 @@ def _campaign_decoration_from_firmware(
             window.pop("restart_public_count_splice_pending", None)
         window["firmware_public_count"] = public_count
 
+        bookend_window = window.get("lap_bookend_window", "60_sec")
         if "start_lap_ns" not in window:
             # START commits on the preceding private (or old campaign's final)
             # row. Use that observation even across a subsequent STATS_RESET.
             with _state_lock:
                 predecessor = _latest_photons or {}
             if predecessor.get("sequence") == start_after:
-                window["start_lap_ns"] = _minute_lap(predecessor)
+                window["start_lap_ns"] = _lap_bookend(predecessor, bookend_window)
                 window["start_altitude_m"] = predecessor["gnss"].get("altitude_m")
             else:
                 # A delayed first public row may still have both exact anchors.
                 boundary_update = checkpoint["update_count"] - public_count
-                window["start_lap_ns"] = _missed_start_lap(checkpoint, boundary_update)
+                window["start_lap_ns"] = _missed_start_lap(
+                    checkpoint, boundary_update, bookend_window
+                )
                 window["start_altitude_m"] = None
 
         if final:
             stop_after = int(firmware_campaign["stop_after_sequence"])
             window["stop_after_sequence"] = stop_after
-            window["end_lap_ns"] = _minute_lap(photons)
+            window["end_lap_ns"] = _lap_bookend(photons, bookend_window)
             window["end_altitude_m"] = photons["gnss"].get("altitude_m")
             window["firmware_final_seen"] = True
 
@@ -9324,6 +9337,10 @@ def _persist_photons(
                 "boundary_contract": "TEENSY_AUTHORED_PUBLISHED_FRAGMENT_BOUNDARY",
                 "start_boundary_pending": False,
                 "flash_cut_pending": False,
+                "lap_bookend_window": campaign.get("lap_bookend_window", "60_sec"),
+                "latest_lap_ns": _lap_bookend(
+                    photons, campaign.get("lap_bookend_window", "60_sec")
+                ),
                 "start_lap_ns": campaign.get("start_lap_ns"),
                 "start_altitude_m": campaign.get("start_altitude_m"),
             }
@@ -10788,6 +10805,7 @@ def cmd_start(args: Optional[dict]) -> dict:
                     "started_at": started_at,
                     "boundary_contract": "TEENSY_AUTHORED_PUBLISHED_FRAGMENT_BOUNDARY",
                     "start_boundary_pending": True,
+                    "lap_bookend_window": LANTERN_LAP_BOOKEND_WINDOW,
                     "instrument_always_on": True,
                     "starts_physical_measurement": False,
                     "location": start_location,
@@ -10839,6 +10857,7 @@ def cmd_start(args: Optional[dict]) -> dict:
             "started_at": started_at,
             "start_after_sequence": None,
             "firmware_public_count": 0,
+            "lap_bookend_window": LANTERN_LAP_BOOKEND_WINDOW,
             **({"flash_cut_from": previous["campaign"]} if flash_cut else {}),
         }
 
@@ -11402,6 +11421,8 @@ def cmd_list_campaigns(args: Optional[dict]) -> Dict[str, Any]:
                 "end_altitude_m": payload.get("end_altitude_m"),
                 "start_lap_ns": payload.get("start_lap_ns"),
                 "end_lap_ns": payload.get("end_lap_ns"),
+                "latest_lap_ns": payload.get("latest_lap_ns"),
+                "lap_bookend_window": payload.get("lap_bookend_window", "60_sec"),
                 "interrupted_at": payload.get("interrupted_at"),
                 "interruption_reason": payload.get("interruption_reason"),
                 "start_after_sequence": payload.get("start_after_sequence"),

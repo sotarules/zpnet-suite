@@ -87,7 +87,7 @@ DAC_MAX_CODE = float(
 FEATURE_GRID_COLUMNS = 4
 FEATURE_GRID_CELL_WIDTH = 39
 
-PPB_BUCKET_KEYS = ("60_sec",)
+PPB_BUCKET_KEYS = ("60_sec", "10_min")
 
 CLOCKS_TOPIC = "CLOCKS"
 PHOTONS_TOPIC = "PHOTONS"
@@ -2084,13 +2084,15 @@ def _photons_summary(payload: dict) -> dict:
 
 
 def _photons_summary_header() -> str:
-    return f"{'SEC':<8} {'60-SEC':>{PHOTONS_MEAN_WIDTH}}"
+    return (f"{'SEC':<8} {'60-SEC':>{PHOTONS_MEAN_WIDTH}}"
+            f" {'10-MIN':>{PHOTONS_MEAN_WIDTH}}")
 
 
 def _photons_summary_line(summary: dict) -> str:
-    value = summary["buckets"]["60_sec"]
+    buckets = summary["buckets"]
     return (_fmt(summary["seconds"], 'd', 0).ljust(8) + " "
-            + _fmt(value, f'>{PHOTONS_MEAN_WIDTH},.6f', PHOTONS_MEAN_WIDTH))
+            + _fmt(buckets["60_sec"], f'>{PHOTONS_MEAN_WIDTH},.6f', PHOTONS_MEAN_WIDTH)
+            + " " + _fmt(buckets["10_min"], f'>{PHOTONS_MEAN_WIDTH},.6f', PHOTONS_MEAN_WIDTH))
 
 
 def _get_lantern_campaign_summaries() -> list[dict]:
@@ -2112,6 +2114,8 @@ def _get_lantern_campaign_summaries() -> list[dict]:
                    master.payload ->> 'end_altitude_m' AS end_altitude_m,
                    master.payload ->> 'start_lap_ns' AS start_lap_ns,
                    master.payload ->> 'end_lap_ns' AS end_lap_ns,
+                   COALESCE(master.payload ->> 'lap_bookend_window', '60_sec')
+                       AS lap_bookend_window,
                    master.payload #>> '{report,sequence}' AS last_sequence,
                    CASE WHEN jsonb_typeof(master.payload -> 'report') = 'object'
                         THEN jsonb_build_object(
@@ -2142,6 +2146,7 @@ def _get_lantern_campaign_summaries() -> list[dict]:
             "end_altitude_m": _to_float(row["end_altitude_m"]),
             "start_lap_ns": _to_float(row["start_lap_ns"]),
             "end_lap_ns": _to_float(row["end_lap_ns"]),
+            "lap_bookend_window": row["lap_bookend_window"],
             "last_sequence": _to_int(row["last_sequence"]),
             "lap_buckets": (_photons_producer_lap_buckets(last_payload, historical=True)
                             if row["active"] else {}),
@@ -2356,18 +2361,22 @@ def photons_detail_readout() -> list[str]:
     line = (f"CAMPAIGN: {name}  NORMALIZATION: {normalization}"
             f"  ELAPSED: {_seconds_to_hms(summary['seconds'])}")
     if campaign:
+        window = campaign.get("lap_bookend_window", "60_sec")
+        label = "10-MIN" if window == "10_min" else "60-SEC"
         start = campaign.get("start_lap_ns")
-        lap = summary["buckets"]["60_sec"]
+        lap = summary["buckets"][window]
         delta = lap - start if lap is not None and start is not None else None
-        line += (f"  START LAP: {_fmt(start, ',.6f', 0)} NS"
+        line += (f"  START {label} LAP: {_fmt(start, ',.6f', 0)} NS"
                  f"  START ALT: {_altitude_text(campaign.get('start_altitude_m'))}"
-                 f"  DELTA 60-SEC: {_fmt(delta, '+.6f', 0)} NS")
+                 f"  DELTA {label}: {_fmt(delta, '+.6f', 0)} NS")
         if campaign.get("final"):
             line += f"  END ALT: {_altitude_text(campaign.get('end_altitude_m'))}"
     else:
         last = last_lantern.get()
         if last:
-            line += (f"  LAST: {last['campaign']}  END LAP: {_fmt(last.get('end_lap_ns'), ',.6f', 0)} NS"
+            label = ("10-MIN" if last.get("lap_bookend_window") == "10_min"
+                     else "60-SEC")
+            line += (f"  LAST: {last['campaign']}  END {label} LAP: {_fmt(last.get('end_lap_ns'), ',.6f', 0)} NS"
                      f"  END ALT: {_altitude_text(last.get('end_altitude_m'))}")
     line += f"  RECOVERABLE: {str(recoverable).upper()}"
     measurement = live.get("measurement")
@@ -2413,7 +2422,7 @@ def photons_campaigns_readout() -> list[str]:
     newest_identity = str(rows[0].get("id")) if rows else "EMPTY"
     width = PHOTONS_MEAN_WIDTH
     lines = [f"\0LANTERN_CAMPAIGN:{newest_identity}",
-             f"{'CAMPAIGN':<18} {'SEC':>8} "
+             f"{'CAMPAIGN':<18} {'SEC':>8} {'LAP WIN':>7} "
              f"{'START LAP':>{width}} {'START ALT':>18} "
              f"{'END LAP':>{width}} {'END ALT':>18} "
              f"{'DELTA LAP':>{width}} {'DELTA ALT':>18}"]
@@ -2428,10 +2437,12 @@ def photons_campaigns_readout() -> list[str]:
     )
     for row_index, row in enumerate(rows):
         active = bool(row.get("active"))
+        window = row.get("lap_bookend_window") or "60_sec"
+        window_label = "10-MIN" if window == "10_min" else "60-SEC"
         start = row.get("start_lap_ns")
         start_alt = row.get("start_altitude_m")
         seconds = row.get("seconds")
-        end = (row.get("lap_buckets") or {}).get("60_sec") if active else row.get("end_lap_ns")
+        end = (row.get("lap_buckets") or {}).get(window) if active else row.get("end_lap_ns")
         # The active master projection does not record the current GNSS altitude.
         # Never pair its saved lap with altitude from an unrelated publication.
         end_alt = None if active else row.get("end_altitude_m")
@@ -2443,7 +2454,7 @@ def photons_campaigns_readout() -> list[str]:
             seconds = current["seconds"]
             start = live_identity.get("start_lap_ns", start)
             start_alt = live_identity.get("start_altitude_m", start_alt)
-            end = current["buckets"]["60_sec"]
+            end = current["buckets"][window]
             end_alt = (live.get("gnss") or {}).get("altitude_m")
         name = str(row.get("campaign") or "?")
         if row.get("interrupted_at"):
@@ -2454,6 +2465,7 @@ def photons_campaigns_readout() -> list[str]:
             lines.append("")
         lines.append(
             f"{_campaign_cell(name, active, 18)} {_fmt(seconds, '>8d', 8)} "
+            f"{window_label:>7} "
             + _campaign_bookend_cells(start, end, start_alt, end_alt, width, 6)
         )
     return lines

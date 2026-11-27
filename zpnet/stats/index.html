@@ -41,8 +41,12 @@
     font-size: clamp(1.3rem, 6.3vw, 1.8rem);
   }
   .unit { font-size: 0.8rem; }
-  .lap .row { display: block; }
+  .live-primary .row { display: block; }
+  .live-primary dt { color: #85ff85; }
+  .live-primary dd { line-height: 1.13; }
   .lap dd { font-size: clamp(1.7rem, 8.5vw, 2.85rem); }
+  .ocxo-focus dd { font-size: clamp(1.65rem, 8vw, 2.55rem); }
+  .ocxo-focus .row + .row { border-top: 1px solid #173717; }
   .campaign-title { margin: 0; padding-top: 0.5rem; text-align: left; overflow-wrap: anywhere; }
   .campaign .row { padding: clamp(0.15rem, 0.45vh, 0.35rem) 0; }
   #status { margin: 0.375rem 0 0; min-height: 1.2em; color: #ffdc67; }
@@ -63,10 +67,21 @@
       line-height: 1.12;
     }
     .lap dd {
-      font-size: clamp(1.7rem, min(7.8vw, 4vh), 2.55rem);
-      font-size: clamp(1.7rem, min(7.8vw, 4dvh), 2.55rem);
+      font-size: clamp(1.45rem, min(7vw, 3.3vh), 2.2rem);
+      font-size: clamp(1.45rem, min(7vw, 3.3dvh), 2.2rem);
     }
-    .campaign-title { padding-top: 0.3rem; }
+    .ocxo-focus dd {
+      font-size: clamp(1.4rem, min(6.7vw, 3.1dvh), 2.1rem);
+    }
+    /* Compact field viewport: leave breathing room for Safari chrome. */
+    dd { font-size: clamp(1rem, min(5vw, 2.25dvh), 1.4rem); }
+    .live-primary dd { line-height: 1.05; }
+    .campaign dd {
+      font-size: clamp(0.95rem, min(4.5vw, 2dvh), 1.28rem);
+      line-height: 1.04;
+    }
+    .campaign .row { padding: 0.06rem 0; }
+    .campaign-title { padding-top: 0.2rem; }
     #status { margin-top: 0.25rem; }
     #status:empty { display: none; }
   }
@@ -81,8 +96,12 @@
     <div class="row"><dt>BME PD</dt><dd><span id="bme_pd">---</span> <span class="unit">°C</span></dd></div>
     <div class="row"><dt>BME OUT</dt><dd><span id="bme_out">---</span> <span class="unit">°C</span></dd></div>
   </dl>
-  <dl class="lap">
-    <div class="row"><dt>PHOTON LAP · 60-SEC</dt><dd><span id="lap">---</span> <span class="unit">ns</span></dd></div>
+  <dl class="lap live-primary">
+    <div class="row"><dt>PHOTON LAP · 10-MIN</dt><dd><span id="lap">---</span> <span class="unit">ns</span></dd></div>
+  </dl>
+  <dl class="ocxo-focus live-primary" id="clock-live">
+    <div class="row"><dt>OCXO1 · 10-MIN</dt><dd><span id="ocxo1_10">---</span> <span class="unit">ppb</span></dd></div>
+    <div class="row"><dt>OCXO2 · 10-MIN</dt><dd><span id="ocxo2_10">---</span> <span class="unit">ppb</span></dd></div>
   </dl>
   <dl>
     <div class="row"><dt>HIGH5</dt><dd><span id="high5">---</span> <span class="unit">mV</span></dd></div>
@@ -98,12 +117,6 @@
       <div class="row"><dt>DELTA ALT</dt><dd><span data-field="delta_alt">---</span></dd></div>
     </dl>
   </section>
-  <dl id="clock-live">
-    <div class="row"><dt>OCXO1 · 60-SEC</dt><dd><span id="ocxo1">---</span> <span class="unit">ppb</span></dd></div>
-    <div class="row"><dt>OCXO1 · 10-MIN</dt><dd><span id="ocxo1_10">---</span> <span class="unit">ppb</span></dd></div>
-    <div class="row"><dt>OCXO2 · 60-SEC</dt><dd><span id="ocxo2">---</span> <span class="unit">ppb</span></dd></div>
-    <div class="row"><dt>OCXO2 · 10-MIN</dt><dd><span id="ocxo2_10">---</span> <span class="unit">ppb</span></dd></div>
-  </dl>
   <section class="campaign" id="tempest" aria-labelledby="tempest-title" hidden>
     <p class="campaign-title" id="tempest-title"></p>
     <dl>
@@ -122,7 +135,7 @@
 </main>
 <script>
   const fields = ["system_time", "altitude", "max31865", "bme_pd",
-                  "bme_out", "lap", "high5", "ocxo1", "ocxo2", "ocxo1_10", "ocxo2_10"];
+                  "bme_out", "lap", "high5", "ocxo1_10", "ocxo2_10"];
   const statusLine = document.getElementById("status");
 
   function renderCampaign(id, run, activeTitle, closedTitle) {
@@ -131,7 +144,7 @@
     if (!run) return;
     section.querySelector(".campaign-title").textContent =
       (run.active ? activeTitle : closedTitle) + run.name +
-      (id === "tempest" ? " · PPB " + run.ppb_window : "");
+      (id === "tempest" ? " · PPB " + run.ppb_window : " · LAP " + run.lap_window);
     for (const span of section.querySelectorAll("[data-field]")) {
       const value = span.dataset.field.split(".").reduce((obj, key) => obj[key], run);
       span.textContent = value ?? "---";
