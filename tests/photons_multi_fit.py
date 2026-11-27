@@ -20,7 +20,9 @@ from collections import defaultdict
 
 from zpnet.shared.report_db import add_read_arguments, validate_read_arguments, campaign_rows
 
-from zpnet.shared.photons_voltage import voltage_adjustment, voltage_window, VOLTAGE_MODELS
+from zpnet.shared.photons_voltage import (
+    NOR9_MODEL, NOR9_ACQUISITION_ID, voltage_adjustment, voltage_window, VOLTAGE_MODELS,
+)
 
 REF = 475.725600719
 WINDOW_ACQUISITION_IDS = {
@@ -31,6 +33,7 @@ WINDOW_ACQUISITION_IDS = {
     'PD200T_HIGH5_SERVO_BASELINE_V1': 0x4E4F5236,  # servo-era baseline / NOR6
     'PD200T_HIGH5_SERVO_LINEAR_V1': 0x4E4F5237,  # servo-era linear candidate / NOR7
     'SYNTHETIC_TEMPERATURE_LINEAR_V1': 0x4E4F5238,
+    NOR9_MODEL: NOR9_ACQUISITION_ID,
     'NONE': 0x4E4F4E45,  # raw timing with retained HIGH5 diagnostic witness
 }
 

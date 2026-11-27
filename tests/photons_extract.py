@@ -34,6 +34,8 @@ FIELDS = [
     # Width at the cut and explicit mixed-fragment evidence; legacy fields null.
     'pulse_ns', 'requested_pulse_ns', 'pulse_ns_at_fragment_start',
     'pulse_change_count_total', 'pulse_changes_this_fragment',
+    # Exact producer-latched inputs; older rows have no RTD correction input.
+    'applied_synthetic_c', 'applied_rtd_c', 'applied_temperature_age_ms',
 ]
 SENSORS = ['synthetic', 'bme280', 'bme280_receiver', 'bme280_out', 'max31865']
 
@@ -172,6 +174,8 @@ def extract(args, rows, thermal, witness, output):
                 ph['race'].get('pulse_ns_at_fragment_start'),
                 ph['race'].get('pulse_change_count_total'),
                 ph['race'].get('pulse_changes_this_fragment'),
+                observed.applied_temperature_c, observed.applied_rtd_temperature_c,
+                ph['voltage_normalization'].get('temperature_age_ms'),
             ])
             counts['exported'] += 1
             counts['high60_complete'] += int(window['elapsed_ms'] >= window['target_ms'])

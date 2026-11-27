@@ -40,10 +40,10 @@
 static constexpr uint64_t PHOTONS_FRAGMENT_PERIOD_NS = 1000000000ULL;
 static constexpr uint64_t PHOTONS_NS_PER_SECOND = 1000000000ULL;
 
-// NOR8 starts fresh temperature-corrected numerator/Welford/Better-Buckets custody.
+// NOR9 starts fresh temperature-corrected numerator/Welford/Better-Buckets custody.
 // Corrected NOR populations cannot be restored into this acquisition epoch.
 // GNSS projection and science admission remain part of the measurement.
-static constexpr uint32_t PHOTONS_ACQUISITION_ID = 0x4E4F5238UL; // 'NOR8'
+static constexpr uint32_t PHOTONS_ACQUISITION_ID = 0x4E4F5239UL; // 'NOR9'
 
 
 // i.MX RT1062 RAM2 is write-back cached in 32-byte lines.  PHOTONS places only
@@ -2438,11 +2438,17 @@ static FLASHMEM void photons_envelope_finish(const photons_race_batch_t& batch,
 // HIGH5 remains available to the independent Pi laser servo and reports.
 // These frozen zero coefficients preserve the existing witness schema only;
 // no voltage-dependent timing arithmetic is executed. Voltage FACT = 0.
-// Match the NOR8 contract in photons_voltage.py; historical NOR models stay
-// immutable. A future correction requires a different acquisition epoch.
+// NOR9 retains NOR8 and adds bounded MAX31865 compensation fitted on Minute1
+// (2026-11-26), cross-checked on PeninsulaHot1. The predictor is SYSTEM's
+// existing 30-sample RTD mean. Both temperatures share one fragment lease.
+// Match the frozen NOR9 contract in photons_voltage.py.
 static constexpr uint32_t PHOTONS_TEMPERATURE_MODEL_ID = 1697807025U;
 static constexpr Double PHOTONS_TEMPERATURE_REFERENCE_C = 31.532819436_D;
 static constexpr Double PHOTONS_TEMPERATURE_SLOPE_NS_PER_C = 0.848958168665_D;
+static constexpr Double PHOTONS_RTD_REFERENCE_C = 32.8_D;
+static constexpr Double PHOTONS_RTD_SPAN_C = 0.46_D;
+static constexpr Double PHOTONS_RTD_SLOPE_NS_PER_C = 4.9_D;
+static constexpr uint32_t PHOTONS_RTD_WINDOW_SAMPLES = 30U;
 // Foreground-owned input lease. A probe ties expiry to the Teensy's clock, so
 // a delayed serial command cannot make an old Pi sample fresh on arrival.
 static uint32_t g_thermal_probe = 0U;
@@ -2452,9 +2458,11 @@ static uint32_t g_thermal_received_ms = 0U;
 static uint32_t g_thermal_deadline_ms = 0U;
 static uint32_t g_thermal_age_ms = 0U;
 static Double g_thermal_c = 0_D;
+static Double g_thermal_rtd_c = 0_D;
 static uint32_t g_batch_thermal_sequence = 0U;
 static uint32_t g_batch_thermal_age_ms = 0U;
 static Double g_batch_thermal_c = 0_D;
+static Double g_batch_thermal_rtd_c = 0_D;
 static bool g_thermal_fragment_start = true;
 
 static bool photons_thermal_ready() {
@@ -2471,6 +2479,7 @@ static bool photons_thermal_latch() {
     g_thermal_fragment_start = false;
     g_batch_thermal_sequence = g_thermal_sequence;
     g_batch_thermal_c = g_thermal_c;
+    g_batch_thermal_rtd_c = g_thermal_rtd_c;
     g_batch_thermal_age_ms = g_thermal_age_ms + (now - g_thermal_received_ms);
   }
   return true;
@@ -2495,10 +2504,15 @@ photons_voltage_normalization(const photons_pd_out_batch_t& batch) {
     n.temperature_sequence = g_batch_thermal_sequence;
     n.temperature_age_ms = g_batch_thermal_age_ms;
     n.temperature_c = g_batch_thermal_c;
+    n.rtd_temperature_c = g_batch_thermal_rtd_c;
   }
   if (n.temperature_sequence != 0U) {
+    Double excess = n.rtd_temperature_c - PHOTONS_RTD_REFERENCE_C;
+    if (excess < 0_D) excess = 0_D;
+    if (excess > PHOTONS_RTD_SPAN_C) excess = PHOTONS_RTD_SPAN_C;
     n.adjustment_ns = -PHOTONS_TEMPERATURE_SLOPE_NS_PER_C *
-        (n.temperature_c - PHOTONS_TEMPERATURE_REFERENCE_C);
+        (n.temperature_c - PHOTONS_TEMPERATURE_REFERENCE_C) -
+        PHOTONS_RTD_SLOPE_NS_PER_C * excess;
   }
   n.adc_sample_count = batch.sample_count; // Independent current-fragment ADC custody.
   const auto& window = batch.high5_window; // Exactly the HIGH5_MV Metrics source.
@@ -2512,7 +2526,7 @@ photons_voltage_normalization(const photons_pd_out_batch_t& batch) {
     // During the initial <5 s the identical HIGH5 witness is partial;
     // document its maturity rather than silently substituting fragment HIGH.
     n.high_mv = photons_window_mean_mv(window);
-    // HIGH5 is a servo/diagnostic witness; it never controls NOR8 timing.
+    // HIGH5 is a servo/diagnostic witness; it never controls NOR9 timing.
   }
   return n;
 }
@@ -5190,13 +5204,18 @@ static Payload& photons_fragment_payload(
   instrument.add_object("race", race);
   race.clear();
   voltage_normalization.add("schema", "PHOTONS_VOLTAGE_NORMALIZATION_V1");
-  voltage_normalization.add("model_id", "SYNTHETIC_TEMPERATURE_LINEAR_V1");
+  voltage_normalization.add("model_id", "SYNTHETIC_TEMPERATURE_RTD_BOUNDED_V1");
   voltage_normalization.add("temperature_model_id", PHOTONS_TEMPERATURE_MODEL_ID);
   voltage_normalization.add("reference_temperature_c", toScientificDecimal(PHOTONS_TEMPERATURE_REFERENCE_C));
   voltage_normalization.add("slope_ns_per_c", toScientificDecimal(PHOTONS_TEMPERATURE_SLOPE_NS_PER_C));
   voltage_normalization.add("temperature_sequence", f.voltage_normalization.temperature_sequence);
   voltage_normalization.add("temperature_age_ms", f.voltage_normalization.temperature_age_ms);
   voltage_normalization.add("temperature_c", toScientificDecimal(f.voltage_normalization.temperature_c));
+  voltage_normalization.add("rtd_temperature_c", toScientificDecimal(f.voltage_normalization.rtd_temperature_c));
+  voltage_normalization.add("rtd_reference_temperature_c", toScientificDecimal(PHOTONS_RTD_REFERENCE_C));
+  voltage_normalization.add("rtd_span_c", toScientificDecimal(PHOTONS_RTD_SPAN_C));
+  voltage_normalization.add("rtd_slope_ns_per_c", toScientificDecimal(PHOTONS_RTD_SLOPE_NS_PER_C));
+  voltage_normalization.add("rtd_window_samples", PHOTONS_RTD_WINDOW_SAMPLES);
   voltage_normalization.add("application", "UNIFORM_OFFSET_AT_FRAGMENT_DRAIN");
   voltage_normalization.add("voltage_source", "PD_OUT_HIGH5_MV");
   voltage_normalization.add("adc_sample_count", f.voltage_normalization.adc_sample_count);
@@ -8533,7 +8552,7 @@ static FLASHMEM Payload cmd_off(const Payload& /*args*/) {
 // Registration
 // ============================================================================
 
-// NOR8 transport is separate from lifecycle/recovery. It cannot mutate counts,
+// NOR9 transport is separate from lifecycle/recovery. It cannot mutate counts,
 // campaigns or already-latched correction inputs. No model/coefficients supplied
 // by an operator can alter the frozen firmware calibration.
 static FLASHMEM Payload cmd_thermal_probe(const Payload&) {
@@ -8552,13 +8571,15 @@ static FLASHMEM Payload cmd_thermal_probe(const Payload&) {
 static FLASHMEM Payload cmd_thermal_update(const Payload& args) {
   const photons_foreground_custody_t custody(photons_foreground_owner_t::COMMAND);
   uint32_t probe=0U, lease=0U, model=0U;
-  Double temperature;
+  Double temperature, rtd_temperature;
   Payload p;
   if (!args.tryGetUInt("probe", probe) || probe != g_thermal_probe || probe == 0U ||
       !args.tryGetUInt("lease_ms", lease) || lease > 3000U ||
       !args.tryGetUInt("temperature_model_id", model) || model != PHOTONS_TEMPERATURE_MODEL_ID ||
       !photons_recovery_get_double(args, "temperature_c", temperature) ||
-      temperature < -100_D || temperature > 150_D) {
+      !photons_recovery_get_double(args, "rtd_temperature_c", rtd_temperature) ||
+      temperature < -100_D || temperature > 150_D ||
+      rtd_temperature < -100_D || rtd_temperature > 150_D) {
     p.add("status", "thermal_update_rejected");
     return p;
   }
@@ -8572,6 +8593,7 @@ static FLASHMEM Payload cmd_thermal_update(const Payload& args) {
     if (++sequence == 0U) ++sequence;
     g_thermal_sequence = sequence;
     g_thermal_c = temperature;
+    g_thermal_rtd_c = rtd_temperature;
     g_thermal_received_ms = now;
     g_thermal_deadline_ms = g_thermal_probe_ms + lease;
     g_thermal_age_ms = 3000U - lease + elapsed;

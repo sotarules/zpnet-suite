@@ -259,7 +259,7 @@ struct photons_fragment_welford_snapshot_t {
   Double max = 0_D;
 };
 
-// The producer's HIGH5 voltage window is the sole normalization predictor.
+// HIGH5 remains the independent laser-servo/diagnostic witness.
 // Keep the current-fragment ADC population separately for acquisition custody.
 // Raw and published Welfords describe the same accepted races; adding the
 // signed correction must not alter n, M2, SD or SE.
@@ -271,10 +271,12 @@ struct photons_fragment_voltage_normalization_snapshot_t {
   bool high5_complete = false;
   Double high_mv = 0_D;
   Double adjustment_ns = 0_D;
-  // NOR8 captures the actual Pi-owned temperature once per acquisition batch.
+  // NOR9 captures both Pi-owned temperature means once per acquisition batch.
+  // The shared age is the conservative age of the oldest input.
   uint32_t temperature_sequence = 0U;
   uint32_t temperature_age_ms = 0U;
   Double temperature_c = 0_D;
+  Double rtd_temperature_c = 0_D;
   photons_fragment_welford_snapshot_t raw_flight_ns{};
   photons_fragment_welford_snapshot_t published_flight_ns{};
 };
