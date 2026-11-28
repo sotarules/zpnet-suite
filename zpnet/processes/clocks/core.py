@@ -9997,7 +9997,8 @@ def _adopt_surviving_clocks_producer_pi_state(
         "gap_count": int(ppb_snapshot.get("gap_count") or 0),
     }
     pi_control = _dac_restore_control_from_clocks(clocks, realize=True)
-    if campaign_source_detail is not None:
+    if (campaign_source_detail is not None
+            and campaign_source_detail["_db_detail_id"] > snapshot_detail["_db_detail_id"]):
         # The complete Alpha checkpoint can predate the active Beta campaign.
         # Its exact, independently validated durable boundary then owns the newer
         # operator servo mode. Startup CLOCKS_FRAGMENT rows cannot supply it:
@@ -13468,7 +13469,11 @@ def _exact_active_tempest_restore_boundary(
     if not name or detail_id is None or detail_id <= 0:
         return None  # A zero-row Flash Cut retains its existing separate court.
     alpha_id = _as_int(alpha_detail.get("_db_detail_id"))
-    if alpha_id is None or detail_id <= alpha_id:
+    idle_checkpoint = not alpha_campaign or (
+        _tempest_campaign_name(alpha_campaign) == name
+        and str(alpha_campaign.get("state") or "").upper() == "STOPPED"
+    )
+    if alpha_id is None or detail_id == alpha_id or (detail_id < alpha_id and not idle_checkpoint):
         raise RuntimeError(
             f"active TEMPEST boundary does not follow the Alpha checkpoint "
             f"(campaign={name}, last_detail_id={detail_id}, alpha_detail_id={alpha_id})"
@@ -13502,11 +13507,14 @@ def _exact_active_tempest_restore_boundary(
 
     alpha_stats = _clocks_payload(alpha_detail).get("stats") or {}
     beta_stats = _clocks_payload(state).get("stats") or {}
-    if (_as_int(alpha_stats.get("reset_count")) != _as_int(beta_stats.get("reset_count"))
-            or _as_int(alpha_stats.get("update_count")) is None
-            or _as_int(beta_stats.get("update_count")) is None
-            or int(beta_stats["update_count"]) < int(alpha_stats["update_count"])):
-        raise RuntimeError("active TEMPEST boundary does not descend from Alpha epoch")
+    alpha_epoch = _as_int(alpha_stats.get("reset_count"))
+    alpha_update = _as_int(alpha_stats.get("update_count"))
+    beta_update = _as_int(beta_stats.get("update_count"))
+    if (alpha_epoch is None or alpha_epoch != _as_int(beta_stats.get("reset_count"))
+            or alpha_update is None or beta_update is None
+            or (detail_id > alpha_id and beta_update < alpha_update)
+            or (detail_id < alpha_id and beta_update >= alpha_update)):
+        raise RuntimeError("active TEMPEST boundary disagrees with Alpha epoch or update order")
 
     tb = _recovery_timebase_from_clocks_state(
         state, name, source_detail_id=int(detail_id), source_campaign=name,
@@ -17986,7 +17994,7 @@ def _restore_active_campaign_state(
 
     if startup_instrument_verdict is None:
         _instrument_probe, startup_instrument_verdict = _restore_instrument_from_clocks(
-            combined_recovery_detail
+            combined_recovery_detail, campaign_source_detail=campaign_source_detail,
         )
 
     producer_disposition = str(
@@ -18006,6 +18014,10 @@ def _restore_active_campaign_state(
             "active TEMPEST dead-producer recovery requires a LOST producer verdict; "
             f"got {producer_disposition or 'NONE'}"
         )
+
+    if (campaign_source_detail is not None
+            and campaign_source_detail["_db_detail_id"] < combined_snapshot.source_detail_id):
+        raise RuntimeError("older TEMPEST boundary requires a surviving Alpha for rearm")
 
     logging.info(
         "📐 [recovery] durable source is public count=%d at GNSS time %s; "

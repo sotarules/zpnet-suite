@@ -1334,9 +1334,11 @@ static bool interrupt_dispatch_foreground_one(
 }
 
 static void interrupt_dispatch_foreground_service(void) {
-  for (uint32_t i = 0U; i < INTERRUPT_SUBSCRIBER_COUNT; ++i) {
-    (void)interrupt_dispatch_foreground_one(g_subscribers[i]);
-  }
+  // A queued OCXO edge can close the previous VCLOCK phase bracket.
+  // A new VCLOCK fact can also resolve against the cached edge pair.
+  (void)interrupt_dispatch_foreground_one(g_subscribers[INTERRUPT_SUBSCRIBER_INDEX_OCXO1]);
+  (void)interrupt_dispatch_foreground_one(g_subscribers[INTERRUPT_SUBSCRIBER_INDEX_OCXO2]);
+  (void)interrupt_dispatch_foreground_one(g_subscribers[INTERRUPT_SUBSCRIBER_INDEX_VCLOCK]);
 }
 
 // ============================================================================
